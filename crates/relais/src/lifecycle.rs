@@ -372,6 +372,36 @@ impl State {
         )
     }
 
+    /// Whether a run's own state counts as an accepted candidate (SPEC
+    /// §20): the runner's own verification (`Accepted`), or a person's
+    /// salvage of a terminal run's work (`AcceptedByPerson`) — the
+    /// candidate `relais decide --answer approve`/`salvaged` accepted
+    /// either way, never a state still in flight or one that ended
+    /// without one. The single definition both `relais feedback` (the
+    /// per-run path and the `--task` lookup) and `relais report` read, so
+    /// the two cannot drift apart (#118).
+    ///
+    /// Spelled out, not `matches!`: that macro expands to a wildcard arm,
+    /// so a state added later would answer `false` here without the
+    /// compiler ever mentioning it.
+    pub fn is_accepted(self) -> bool {
+        match self {
+            Self::Accepted | Self::AcceptedByPerson => true,
+            Self::Prepared
+            | Self::Running
+            | Self::Verifying
+            | Self::Repairing
+            | Self::Escalating
+            | Self::NeedsReview
+            | Self::NeedsDecision
+            | Self::Blocked
+            | Self::Failed
+            | Self::BudgetExhausted
+            | Self::Cancelled
+            | Self::Interrupted => false,
+        }
+    }
+
     /// Whether a run's final state leaves a person something to do: the
     /// quality bar held and a human is owed a look (`needs_review`,
     /// `needs_decision`), or the run's own state is uncertain and is
