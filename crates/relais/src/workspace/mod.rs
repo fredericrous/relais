@@ -837,6 +837,15 @@ pub fn create_replay_checkout(source_repo: &Path, base_sha: &str, dest: &Path) -
     git(dest, &["init", "-q"])?;
     let source = source_repo.to_string_lossy().into_owned();
     git(dest, &["fetch", "--depth", "1", "-q", &source, base_sha])?;
+    // A fetch alone leaves `dest`'s working tree empty: `git init` starts
+    // on an unborn branch and fetching a commit does not move it. Anything
+    // that reads the checkout's tree — preflight resolving architecture
+    // decisions from a tracked `.adr.yaml`, for one — found nothing, and
+    // every replay in a repository requiring that decision was blocked at
+    // $0 before dispatching anything. Checking out `FETCH_HEAD` detached
+    // makes the working tree actually be the source repository's tree at
+    // `base_sha`.
+    git(dest, &["checkout", "-q", "--detach", "FETCH_HEAD"])?;
     // The checkout must carry the SAME repository identity as the source,
     // or it has none of its own worth having. `repo::identity` reads
     // `remote get-url origin` and otherwise falls back to the canonical
@@ -1539,6 +1548,41 @@ mod tests {
             "the replay workspace must start from the base, not the accepted answer: {content}"
         );
         remove_worktree(&dest, &wt_path);
+    }
+
+    /// A fetch alone leaves the checkout's working tree empty; a caller
+    /// reading a file tracked at `base_sha` (preflight resolving
+    /// architecture decisions from `.adr.yaml`, for one) needs the tree
+    /// checked out, not merely the commit fetched.
+    ///
+    /// FALSIFY: drop the `git checkout --detach FETCH_HEAD` step and this
+    /// test fails — `file.txt` is absent and `HEAD` is unborn. Confirmed,
+    /// then restored.
+    #[test]
+    fn create_replay_checkout_checks_out_the_base_commit() {
+        let (dir, repo) = temp_repo();
+        let base_sha = resolve_base(&repo, "HEAD").expect("base");
+        git(
+            &repo,
+            &["remote", "add", "origin", "git@example.invalid:o/r.git"],
+        )
+        .expect("origin");
+
+        let dest = dir.join("replay-checkout");
+        create_replay_checkout(&repo, &base_sha, &dest).expect("checkout");
+
+        assert_eq!(
+            std::fs::read_to_string(dest.join("file.txt")).expect("file tracked at base_sha"),
+            "base\n",
+            "the checkout's working tree must be the source's tree at base_sha"
+        );
+        assert_eq!(
+            git(&dest, &["rev-parse", "HEAD"])
+                .expect("HEAD resolves")
+                .trim(),
+            base_sha,
+            "HEAD must resolve to base_sha"
+        );
     }
 
     /// The sweep sees both layouts and only directories that are

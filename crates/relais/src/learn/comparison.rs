@@ -209,6 +209,11 @@ pub struct ComparisonReport {
     pub basis: ComparisonBasis,
     pub paired_tasks: usize,
     pub min_paired_tasks: usize,
+    /// Settled trials for this candidate whose outcome was
+    /// [`TrialOutcome::Errored`] — "not comparable evidence for or against
+    /// the arm" by that variant's own doc, so they never enter a pair. Set
+    /// aside rather than dropped: this count is how they stay visible.
+    pub errored_trials_set_aside: usize,
     pub incumbent: ArmSummary,
     pub arm: ArmSummary,
     pub interval: PairedInterval,
@@ -256,6 +261,10 @@ impl ComparisonReport {
              issues no grant\n",
         );
         out.push_str(&format!("basis: {}, n={}\n", self.basis, self.paired_tasks));
+        out.push_str(&format!(
+            "errored trials set aside (not comparable evidence for or against the arm): {}\n",
+            self.errored_trials_set_aside
+        ));
         out.push_str(&format!("incumbent: {}\n", render_arm(&self.incumbent)));
         out.push_str(&format!("candidate arm: {}\n", render_arm(&self.arm)));
         out.push_str(&format!(
@@ -342,13 +351,7 @@ pub fn evaluate_candidate(
         .map(RecipeSpec::recipe_id)
         .collect();
     let trials = ledger.settled_trials_for_recipes(&recipe_ids)?;
-
-    // One trial per task, the earliest settled: a task replayed more
-    // than once still weighs as one paired observation.
-    let mut by_task: BTreeMap<TaskId, TrialRow> = BTreeMap::new();
-    for trial in trials {
-        by_task.entry(trial.task_id.clone()).or_insert(trial);
-    }
+    let (by_task, errored_trials_set_aside) = earliest_non_errored_per_task(trials);
 
     let basis = comparison_basis(by_task.values());
 
@@ -395,6 +398,7 @@ pub fn evaluate_candidate(
         basis,
         paired_tasks: pairs.len(),
         min_paired_tasks,
+        errored_trials_set_aside,
         incumbent: incumbent_summary,
         arm: arm_summary_value,
         interval,
@@ -416,6 +420,31 @@ fn trial_cost_from_run(
     };
     Ok(TrialCost::new(cost, completeness)
         .expect("a cost/completeness pair read back from the ledger's own settled values is always a consistent one"))
+}
+
+/// One trial per task, the earliest settled NON-errored trial, plus how
+/// many errored trials were set aside along the way. An errored trial
+/// ended on an infrastructure fault, not a verification verdict —
+/// [`TrialOutcome::Errored`]'s own doc says it is "not comparable evidence
+/// for or against the arm" — so it never becomes a task's paired
+/// observation: a task whose earliest settled trial errored pairs on its
+/// next, non-errored one instead, and a task with nothing else contributes
+/// no pair at all. Set aside rather than dropped: the count this returns
+/// is how they stay visible in the rendered report.
+fn earliest_non_errored_per_task(trials: Vec<TrialRow>) -> (BTreeMap<TaskId, TrialRow>, usize) {
+    let mut by_task: BTreeMap<TaskId, TrialRow> = BTreeMap::new();
+    let mut errored_set_aside = 0usize;
+    for trial in trials {
+        let outcome = trial
+            .outcome
+            .expect("settled_trials_for_recipes only returns settled trials");
+        if outcome == TrialOutcome::Errored {
+            errored_set_aside += 1;
+            continue;
+        }
+        by_task.entry(trial.task_id.clone()).or_insert(trial);
+    }
+    (by_task, errored_set_aside)
 }
 
 /// What the matched trials rest on. Every trial `dataset replay` writes
@@ -571,6 +600,112 @@ fn bootstrap_paired_interval(pairs: &[PairedTask], seed: u64, resamples: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::{RunId, TrialId};
+
+    /// A settled trial row for one task, with only the fields the pairing
+    /// logic reads left variable.
+    fn settled_trial(id: &str, task_id: &str, created_at: &str, outcome: TrialOutcome) -> TrialRow {
+        TrialRow {
+            trial_id: TrialId::from_stored(id),
+            task_id: TaskId::from_stored(task_id),
+            source_run_id: RunId::from_stored(format!("run-{id}")),
+            incumbent_recipe_id: "recipe-incumbent".into(),
+            arm_recipe_id: "recipe-arm".into(),
+            arm_index: 0,
+            assignment_probability: 1.0,
+            seed: 0,
+            base_sha: "base-sha".into(),
+            contract_hash: "contract-hash".into(),
+            verification_profile_hash: "profile-hash".into(),
+            workspace_isolation: "fresh_checkout_no_accepted_answer".into(),
+            outcome: Some(outcome),
+            accepted_without_escalation: Some(false),
+            cost: Some(TrialCost::UNKNOWN),
+            duration_ms: Some(1),
+            created_at: created_at.into(),
+        }
+    }
+
+    /// L (a): a task whose earliest settled trial errored, followed by a
+    /// real one, pairs on the real one — never on the errored trial, and
+    /// never as a task with no pair at all.
+    ///
+    /// FALSIFY: pick the earliest settled trial of any outcome instead of
+    /// the earliest non-errored one, and this test fails — the errored
+    /// trial, being earliest, would win the task's slot and its `Errored`
+    /// outcome would carry no pairable acceptance. Confirmed, then
+    /// restored.
+    #[test]
+    fn a_task_with_an_errored_trial_then_an_accepted_one_pairs_on_the_accepted_trial() {
+        let trials = vec![
+            settled_trial(
+                "t1",
+                "task-a",
+                "2020-01-01T00:00:00Z",
+                TrialOutcome::Errored,
+            ),
+            settled_trial(
+                "t2",
+                "task-a",
+                "2020-01-02T00:00:00Z",
+                TrialOutcome::Accepted,
+            ),
+        ];
+        let (by_task, errored_set_aside) = earliest_non_errored_per_task(trials);
+        assert_eq!(errored_set_aside, 1);
+        let trial = by_task
+            .get(&TaskId::from_stored("task-a"))
+            .expect("the task has a pair");
+        assert_eq!(trial.trial_id, TrialId::from_stored("t2"));
+        assert_eq!(trial.outcome, Some(TrialOutcome::Accepted));
+    }
+
+    /// L (b): a task with only errored trials contributes no pair at all,
+    /// and every one of its errored trials is still counted as set aside.
+    ///
+    /// FALSIFY: fall back to the earliest trial of any outcome when none
+    /// is non-errored, and this test fails — `task-b` would wrongly gain a
+    /// pair carrying an `Errored` outcome. Confirmed, then restored.
+    #[test]
+    fn a_task_with_only_errored_trials_contributes_no_pair() {
+        let trials = vec![
+            settled_trial(
+                "t1",
+                "task-b",
+                "2020-01-01T00:00:00Z",
+                TrialOutcome::Errored,
+            ),
+            settled_trial(
+                "t2",
+                "task-b",
+                "2020-01-02T00:00:00Z",
+                TrialOutcome::Errored,
+            ),
+        ];
+        let (by_task, errored_set_aside) = earliest_non_errored_per_task(trials);
+        assert_eq!(errored_set_aside, 2);
+        assert!(!by_task.contains_key(&TaskId::from_stored("task-b")));
+    }
+
+    /// L (c): the set-aside count appears in the rendered report,
+    /// additively — the errored trials never vanish from view.
+    #[test]
+    fn the_rendered_report_names_the_errored_trials_set_aside() {
+        let report = ComparisonReport {
+            errored_trials_set_aside: 3,
+            ..passing_report()
+        };
+        let rendered = report.render();
+        // The exact line, count included: a bare `contains('3')` also
+        // matched digits elsewhere in the report. FALSIFIED: rendering a
+        // constant 0 in place of the count turned this red; restored.
+        assert!(
+            rendered.contains(
+                "errored trials set aside (not comparable evidence for or against the arm): 3\n"
+            ),
+            "{rendered}"
+        );
+    }
 
     fn passing_report() -> ComparisonReport {
         ComparisonReport {
@@ -578,6 +713,7 @@ mod tests {
             basis: ComparisonBasis::Replay,
             paired_tasks: 25,
             min_paired_tasks: MIN_PAIRED_TASKS,
+            errored_trials_set_aside: 0,
             incumbent: ArmSummary {
                 acceptance: AcceptanceEstimate::Estimated(0.8),
                 cost_per_acceptance: CostPerAcceptance {
@@ -691,6 +827,7 @@ mod tests {
             basis: ComparisonBasis::Replay,
             paired_tasks: pairs.len(),
             min_paired_tasks: MIN_PAIRED_TASKS,
+            errored_trials_set_aside: 0,
             incumbent: arm_summary(&incumbent_observations),
             arm: arm_summary(&observations),
             interval: bootstrap_paired_interval(&pairs, seed, DEFAULT_BOOTSTRAP_RESAMPLES),

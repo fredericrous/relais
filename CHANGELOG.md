@@ -476,6 +476,28 @@ missing here.
   drift apart again; `relais report`'s accepted/standing task counts
   already used the wider definition and are unaffected.
 
+- **A replay checkout's working tree is no longer empty (#126).**
+  `workspace::create_replay_checkout` fetched the base commit but never
+  checked it out, so a caller reading the tree before dispatching — such
+  as preflight resolving architecture decisions from a tracked
+  `.adr.yaml` — found nothing, and every replay in a repository requiring
+  that decision blocked at preflight before spending anything. It now
+  checks out `FETCH_HEAD` detached after the fetch, so the checkout's
+  working tree is actually the source repository's tree at the base SHA.
+
+- **`recipe evaluate` no longer scores an errored trial as a rejection
+  (#125).** A task's earliest settled trial could be one that errored on
+  an infrastructure fault rather than a verification verdict —
+  `TrialOutcome::Errored`'s own doc already says it is "not comparable
+  evidence for or against the arm" — but `evaluate_candidate` paired on
+  whichever trial settled first regardless of outcome, so an errored
+  trial that happened to be earliest became that task's only observation
+  and read as a rejected arm. Each task now pairs on its earliest settled
+  NON-errored trial; a task with only errored trials contributes no pair.
+  Errored trials are set aside, not dropped: the report counts how many
+  it excluded for the candidate and prints that count in its rendered
+  output (and its JSON, additively).
+
 - **`relais plan` now refuses a contract whose read hints do not resolve
   at the base revision, exactly as `relais run` already does (#97).**
   `plan` used to route a contract whose `read_hints` named a path the
