@@ -1198,3 +1198,239 @@ fn recipe_subcommands_never_touch_the_ledger() {
         "recipe list/show/diff must leave the ledger byte-identical"
     );
 }
+
+// SPEC §27: `recipe promote` and `recipe rollback`. The ledger is filled
+// through the library's own `insert_replay_trial`/`settle_trial`, so the
+// comparison the binary recomputes is built from settled trials, never a
+// hand-made report.
+
+/// A candidate that only APPENDS revision 2 of `docs-touchup` to `base`,
+/// and the `recipe_id` trials must name to count as its arm.
+fn write_appending_candidate(world: &World, base: &str) -> (PathBuf, String) {
+    let candidate = format!(
+        "{base}\n[[recipes]]\nname = \"docs-touchup\"\nscope_within = [\"docs/**\"]\ntier = \"implementation\"\nrevision = 2\n"
+    );
+    let path = world.root.join("promote-candidate.toml");
+    std::fs::write(&path, &candidate).expect("write candidate");
+    let parsed = RepoPolicy::from_toml_str(&candidate).expect("the candidate parses");
+    let arm_id = parsed.recipes.last().expect("a new revision").recipe_id();
+    (path, arm_id)
+}
+
+/// `count` settled, accepted replay trials for `arm_recipe_id`, one per
+/// task.
+fn settle_accepted_replays(world: &World, arm_recipe_id: &str, count: usize) {
+    use relais::ids::{RunId, TaskId, TrialId};
+    use relais::ledger::{Ledger, NewReplayTrial, TrialCost, TrialOutcome};
+    let ledger = Ledger::open(&world.state.join("ledger.sqlite")).expect("ledger opens");
+    for n in 0..count {
+        let trial_id = TrialId::from_stored(format!("trial-{n}"));
+        let task_id = TaskId::from_stored(format!("task-{n}"));
+        let run_id = RunId::from_stored(format!("run-{n}"));
+        ledger
+            .insert_replay_trial(&NewReplayTrial {
+                trial_id: &trial_id,
+                task_id: &task_id,
+                source_run_id: &run_id,
+                incumbent_recipe_id: "incumbent",
+                arm_recipe_id,
+                base_sha: "base",
+                contract_hash: "contract",
+                verification_profile_hash: "profile",
+                workspace_isolation: "fresh_checkout_no_accepted_answer",
+            })
+            .expect("insert trial");
+        ledger
+            .settle_trial(
+                &trial_id,
+                TrialOutcome::Accepted,
+                true,
+                TrialCost::UNKNOWN,
+                1,
+            )
+            .expect("settle trial");
+    }
+}
+
+fn policy_text(world: &World) -> String {
+    std::fs::read_to_string(world.repo.join("relais.toml")).expect("read policy")
+}
+
+/// (a) An n=3 replay comparison — the only real one measured on the
+/// machine this was written on — makes `promote` refuse with its own exit
+/// code, name the below-20 gate, and leave relais.toml byte-identical,
+/// with and without `--write`.
+///
+/// FALSIFY: `ComparisonReport::promotable` was made to mint a `Promotable`
+/// whatever `failures` said (the moral equivalent of `promote` skipping
+/// the check); this test failed on the exit code and on the file being
+/// written to, then the check was restored.
+#[test]
+fn promote_refuses_a_three_task_comparison_and_writes_nothing() {
+    let world = World::new("promote-refuse");
+    let base = world.write_policy_with_recipes();
+    let (candidate, arm_id) = write_appending_candidate(&world, &base);
+    settle_accepted_replays(&world, &arm_id, 3);
+    let before = policy_text(&world);
+
+    for extra in [&[][..], &["--write"][..]] {
+        let mut args = vec!["recipe", "promote", candidate.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        let out = world.relais(&args);
+        let stderr = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(17), "{stderr}");
+        assert!(stderr.contains("basis: replay, n=3"), "{stderr}");
+        assert!(
+            stderr.contains("3 paired task(s) is below the 20 required"),
+            "{stderr}"
+        );
+        assert_eq!(
+            policy_text(&world),
+            before,
+            "a refused promotion leaves relais.toml untouched"
+        );
+    }
+}
+
+/// (b) A promotable comparison, with `--write`, appends exactly the new
+/// fragment and issues no grant: `plan` then blocks on
+/// `missing_trust_grant`, on the very key `promote` printed.
+#[test]
+fn promote_appends_the_fragment_and_plan_then_wants_a_grant() {
+    let world = World::new("promote-write");
+    let base = world.write_policy_with_recipes();
+    let (candidate, arm_id) = write_appending_candidate(&world, &base);
+    settle_accepted_replays(&world, &arm_id, 20);
+    world.write_machine_without_a_grant();
+    let before = policy_text(&world);
+
+    let shown = world.relais(&["recipe", "promote", candidate.to_str().unwrap()]);
+    assert_eq!(shown.status.code(), Some(0), "{}", text(&shown.stderr));
+    assert_eq!(
+        policy_text(&world),
+        before,
+        "without --write nothing is written"
+    );
+    let shown_stdout = text(&shown.stdout);
+    assert!(
+        shown_stdout.contains("basis: replay, n=20"),
+        "{shown_stdout}"
+    );
+    assert!(shown_stdout.contains("[[recipes]]"), "{shown_stdout}");
+
+    let written = world.relais(&["recipe", "promote", candidate.to_str().unwrap(), "--write"]);
+    assert_eq!(written.status.code(), Some(0), "{}", text(&written.stderr));
+    let after = policy_text(&world);
+    assert!(
+        after.starts_with(&before),
+        "every existing byte is kept, as a prefix"
+    );
+    let appended = &after[before.len()..];
+    assert_eq!(
+        appended.matches("[[recipes]]").count(),
+        1,
+        "exactly the one new revision: {appended}"
+    );
+    assert!(appended.contains("revision = 2"), "{appended}");
+    let policy = RepoPolicy::from_toml_str(&after).expect("the result parses");
+    assert_eq!(policy.recipes.len(), 3);
+    assert_eq!(policy.recipes[2].recipe_id(), arm_id);
+    assert_eq!(
+        std::fs::read_to_string(world.config.join("machine.toml")).expect("machine"),
+        "schema_version = 1\n",
+        "machine.toml is never touched"
+    );
+
+    git(&world.repo, &["add", "-A"]);
+    git(&world.repo, &["commit", "-q", "-m", "promote"]);
+    let task = world.write_task("task.json");
+    let plan = world.relais(&["plan", "--task", task.to_str().unwrap()]);
+    let plan_stdout = text(&plan.stdout);
+    assert!(plan_stdout.contains("missing_trust_grant"), "{plan_stdout}");
+    let key_line = |stdout: &str| {
+        stdout
+            .lines()
+            .find(|line| line.starts_with("[trust.\""))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("no grant block in {stdout}"))
+    };
+    assert_eq!(
+        key_line(&text(&written.stdout)),
+        key_line(&plan_stdout),
+        "promote prints the block the next plan asks for"
+    );
+}
+
+/// (c) Rollback appends revision N+1 whose fields equal N-1's, and that
+/// becomes the effective recipe; history is only ever appended to.
+#[test]
+fn rollback_appends_a_revision_equal_to_the_one_below_the_effective() {
+    let world = World::new("rollback");
+    let base = world.write_policy_with_recipes().replace(
+        "tier = \"implementation\"\nrevision = 1\nenabled = false",
+        "tier = \"escalation\"\nrevision = 1",
+    );
+    std::fs::write(world.repo.join("relais.toml"), &base).expect("policy");
+    let before = policy_text(&world);
+
+    let shown = world.relais(&["recipe", "rollback", "docs-touchup"]);
+    assert_eq!(shown.status.code(), Some(0), "{}", text(&shown.stderr));
+    assert_eq!(
+        policy_text(&world),
+        before,
+        "without --write nothing is written"
+    );
+    assert!(text(&shown.stdout).contains("trust grant: MISSING"));
+
+    let written = world.relais(&["recipe", "rollback", "docs-touchup", "--write"]);
+    assert_eq!(written.status.code(), Some(0), "{}", text(&written.stderr));
+    let after = policy_text(&world);
+    assert!(after.starts_with(&before));
+    let policy = RepoPolicy::from_toml_str(&after).expect("the result parses");
+    assert_eq!(policy.recipes.len(), 3);
+    let effective = relais::policy::select_highest_enabled_revision(&policy.recipes, |recipe| {
+        recipe.name == "docs-touchup"
+    })
+    .expect("an effective recipe");
+    let restored = relais::policy::RecipeSpec {
+        revision: 2,
+        ..policy.recipes[0].clone()
+    };
+    assert_eq!(effective, &restored, "revision 2 repeats revision 0");
+    let history = RepoPolicy::from_toml_str(&before).expect("before parses");
+    assert_eq!(policy.recipes[..2], history.recipes[..]);
+}
+
+/// (d) A recipe with a single revision, or no such recipe, is refused
+/// naming what exists, and nothing is written.
+#[test]
+fn rollback_of_a_single_revision_recipe_is_refused() {
+    let world = World::new("rollback-single");
+    let base = world.write_policy_with_recipes();
+    let cut = base.find("\n[[recipes]]").expect("first revision");
+    let second = cut
+        + base[cut + 1..]
+            .find("\n[[recipes]]")
+            .expect("second revision")
+        + 1;
+    let single = &base[..second];
+    std::fs::write(world.repo.join("relais.toml"), single).expect("policy");
+    RepoPolicy::from_toml_str(single).expect("one revision parses");
+
+    let out = world.relais(&["recipe", "rollback", "docs-touchup", "--write"]);
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("`docs-touchup` has 1 revision(s) (0)"),
+        "{stderr}"
+    );
+    assert_eq!(policy_text(&world), single);
+
+    let unknown = world.relais(&["recipe", "rollback", "nope"]);
+    assert_eq!(unknown.status.code(), Some(2));
+    assert!(
+        text(&unknown.stderr).contains("declared recipes: docs-touchup"),
+        "{}",
+        text(&unknown.stderr)
+    );
+}

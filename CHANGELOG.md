@@ -10,6 +10,19 @@ missing here.
 
 ### Added
 
+- **`relais recipe promote <candidate.toml>` and `relais recipe
+  rollback <name>`** (SPEC §27), the two human-gated ways a recipe
+  revision enters or leaves `relais.toml`. `promote` admits the
+  candidate through `validate_candidate`, recomputes the comparison
+  from settled trials and proceeds only when every gate holds; a
+  comparison below 20 paired tasks is refused with exit code 17 and
+  nothing written. `rollback` appends a new revision repeating the one
+  below the effective one, and needs no evaluation. Both print the
+  fragment and the trust block for the resulting policy; `--write`
+  appends the fragment as text, keeping every existing byte. Neither
+  issues a grant: the next `relais plan` reports `missing_trust_grant`
+  until a person pastes the printed block.
+
 - **`relais feedback` gains `--note <text>`** (#98), recording free-text
   context on a final outcome the same way `relais decide --note`
   already does. `relais explain <run>` prints that run's own outcome,

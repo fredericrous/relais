@@ -28,6 +28,7 @@
 //! | 14 | `NoTrainingRecords` | nothing to train on yet |
 //! | 15 | `NoTierCoverage` | not enough records for one tier |
 //! | 16 | `SolverDiverged` | the learner did not converge |
+//! | 17 | `PromotionRefused` | `recipe promote` refused: the comparison does not clear every gate; nothing was written |
 //!
 //! README.md carries the same table for people who do not read source.
 
@@ -46,12 +47,14 @@ use relais::learn::comparison::{
     evaluate_candidate, DEFAULT_BOOTSTRAP_RESAMPLES, MIN_PAIRED_TASKS,
 };
 use relais::learn::predict::RegistryPredictor;
+use relais::learn::promote::{admit, Amendment};
 use relais::ledger::{OrchestrationUsageRow, TrialCost, TrialOutcome};
 use relais::lifecycle::RunPurpose;
 use relais::money::{CostCompleteness, MicroUsd};
 use relais::orchestration::{self, PriceTable, TranscriptSource};
 use relais::policy::{
-    effective_authority, HookAdmissionSettings, MachineSettings, RecipeSpec, RepoPolicy,
+    effective_authority, grant_key, HookAdmissionSettings, MachineSettings, RecipeSpec,
+    RepoIdentity, RepoPolicy,
 };
 use relais::runner::{execute, worktree_root, Reason, RunConfig, State, Terminal};
 use relais::verify::{independence_summary, Receipt};
@@ -423,6 +426,27 @@ enum RecipeCommand {
         /// boundary a learner's proposal is (route::validate_candidate)
         candidate: PathBuf,
     },
+    /// Add a candidate's new recipe revision(s) to the repository's
+    /// `relais.toml`, only when the recomputed comparison clears every
+    /// gate (SPEC §27). Prints by default; `--write` appends the text.
+    /// Never grants trust and never runs anything.
+    Promote {
+        /// Path to the candidate `relais.toml`
+        candidate: PathBuf,
+        /// Append the fragment(s) to relais.toml instead of printing
+        #[arg(long)]
+        write: bool,
+    },
+    /// Restore the revision below the effective one by appending a new
+    /// revision that repeats it (SPEC §27). Needs no evaluation. Prints
+    /// by default; `--write` appends the text. Never grants trust.
+    Rollback {
+        /// The recipe's name
+        name: String,
+        /// Append the fragment to relais.toml instead of printing
+        #[arg(long)]
+        write: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -543,6 +567,8 @@ enum CliOutcome {
     NoTierCoverage,
     /// The learner did not converge.
     SolverDiverged,
+    /// `recipe promote`: the recomputed comparison failed a gate.
+    PromotionRefused,
 }
 
 /// The one exit-code table. Pure, total, and exhaustive over
@@ -568,6 +594,7 @@ const fn exit_code(outcome: &CliOutcome) -> i32 {
         CliOutcome::NoTrainingRecords => 14,
         CliOutcome::NoTierCoverage => 15,
         CliOutcome::SolverDiverged => 16,
+        CliOutcome::PromotionRefused => 17,
     }
 }
 
@@ -608,6 +635,15 @@ enum CliError {
     Usage { detail: String },
     /// No dataset has been built yet.
     NoDataset { dir: PathBuf },
+    /// A recipe amendment could not be built.
+    Amend(relais::learn::promote::AmendError),
+    /// A built amendment could not be appended to the repository policy:
+    /// opening relais.toml for append, or writing to it, failed.
+    AppendPolicy {
+        operation: relais::learn::promote::Operation,
+        path: PathBuf,
+        cause: std::io::Error,
+    },
 }
 
 impl std::fmt::Display for CliError {
@@ -628,6 +664,16 @@ impl std::fmt::Display for CliError {
             }
             CliError::Operational { operation, cause } => write!(f, "{operation}: {cause}"),
             CliError::Usage { detail } => f.write_str(detail),
+            CliError::Amend(e) => write!(f, "{e}"),
+            CliError::AppendPolicy {
+                operation,
+                path,
+                cause,
+            } => write!(
+                f,
+                "{operation}: cannot append to {}: {cause}",
+                path.display()
+            ),
             CliError::NoDataset { dir } => write!(
                 f,
                 "no dataset under {} — run `relais dataset build` first",
@@ -643,10 +689,11 @@ impl std::error::Error for CliError {
             CliError::Home(e) => Some(e),
             CliError::Cwd(e) => Some(e),
             CliError::Locate(e) => Some(e),
-            CliError::Read { cause, .. } => Some(cause),
+            CliError::Read { cause, .. } | CliError::AppendPolicy { cause, .. } => Some(cause),
             CliError::Invalid { cause, .. } | CliError::Operational { cause, .. } => {
                 Some(cause.as_ref())
             }
+            CliError::Amend(e) => Some(e),
             CliError::Usage { .. } | CliError::NoDataset { .. } => None,
         }
     }
@@ -663,12 +710,15 @@ impl CliError {
             CliError::Locate(_)
             | CliError::Read { .. }
             | CliError::Invalid { .. }
-            | CliError::Usage { .. } => CliOutcome::InvalidInput,
+            | CliError::Usage { .. }
+            | CliError::Amend(_) => CliOutcome::InvalidInput,
             // "No dataset has been built yet" IS "nothing to train on
             // yet", which the table already has a code for; exit 2 told
             // a caller its invocation was wrong when it was not.
             CliError::NoDataset { .. } => CliOutcome::NoTrainingRecords,
-            CliError::Operational { .. } => CliOutcome::OperationalFailure,
+            CliError::Operational { .. } | CliError::AppendPolicy { .. } => {
+                CliOutcome::OperationalFailure
+            }
         }
     }
 }
@@ -755,6 +805,12 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             RecipeCommand::Show { name } => recipe_show_command(&name),
             RecipeCommand::Diff { candidate } => recipe_diff_command(&candidate),
             RecipeCommand::Evaluate { candidate } => recipe_evaluate_command(&candidate),
+            RecipeCommand::Promote { candidate, write } => {
+                recipe_promote_command(&candidate, AmendMode::from_flag(write))
+            }
+            RecipeCommand::Rollback { name, write } => {
+                recipe_rollback_command(&name, AmendMode::from_flag(write))
+            }
         },
         Command::Train => train_command(),
         Command::Evaluate { artifact } => evaluate_command(&artifact),
@@ -2170,20 +2226,8 @@ fn plan_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliErro
         println!("trust grant: {} (in machine.toml)", authority.grant_key);
     } else {
         println!(
-            "trust grant: MISSING for {}. Review the execution declaration, then paste this \n\
-             into {}:\n\n\
-             [trust.\"{}\"]\n\
-             granted_at = \"{}\"\n\
-             reviewed_by = \"<your name>\"\n\
-             repo = \"{}\"\n\
-             note = \"<what you reviewed>\"\n",
-            authority.grant_key,
-            paths::machine_settings_path()
-                .map_err(CliError::Home)?
-                .display(),
-            authority.grant_key,
-            chrono::Utc::now().format("%Y-%m-%d"),
-            repo_identity.label(),
+            "{}",
+            missing_grant_text(&authority.grant_key, &repo_identity)?
         );
     }
     match &decision {
@@ -3020,6 +3064,162 @@ fn recipe_evaluate_command(candidate_path: &Path) -> Result<CliOutcome, CliError
     )?;
     print!("{}", report.render());
     Ok(CliOutcome::Accepted)
+}
+
+/// What `relais plan` prints for a repository whose policy has no trust
+/// grant yet: the block a person reviews and pastes into machine.toml.
+/// `recipe promote` and `recipe rollback` print the same block for the
+/// policy they would produce, so it is one text, not two.
+fn missing_grant_text(grant_key: &str, repo_identity: &RepoIdentity) -> Result<String, CliError> {
+    Ok(format!(
+        "trust grant: MISSING for {grant_key}. Review the execution declaration, then paste this \n\
+         into {}:\n\n\
+         [trust.\"{grant_key}\"]\n\
+         granted_at = \"{}\"\n\
+         reviewed_by = \"<your name>\"\n\
+         repo = \"{}\"\n\
+         note = \"<what you reviewed>\"\n",
+        paths::machine_settings_path()
+            .map_err(CliError::Home)?
+            .display(),
+        chrono::Utc::now().format("%Y-%m-%d"),
+        repo_identity.label(),
+    ))
+}
+
+/// Whether an amendment is shown or appended. A parameter of its own
+/// rather than a `bool`, so a call site says which it means.
+#[derive(Clone, Copy)]
+enum AmendMode {
+    Print,
+    Write,
+}
+
+impl AmendMode {
+    fn from_flag(write: bool) -> Self {
+        if write {
+            Self::Write
+        } else {
+            Self::Print
+        }
+    }
+}
+
+/// Show an amendment: the fragment(s) it appends, then the trust block
+/// for the policy that would result; with [`AmendMode::Write`], append
+/// the fragment(s) to relais.toml as text. Never rewrites the file,
+/// never touches machine.toml, never issues a grant (SPEC §27).
+fn present_amendment(
+    root: &Path,
+    incumbent: &RepoPolicy,
+    amendment: &Amendment,
+    mode: AmendMode,
+) -> Result<CliOutcome, CliError> {
+    let path = root.join("relais.toml");
+    let subject = path.display().to_string();
+    let fragment = amendment.fragment(&subject).map_err(CliError::Amend)?;
+    println!("recipe revision(s) to append to {subject}:\n\n{fragment}");
+    let resulting = amendment.resulting_policy(incumbent);
+    let authority_hash = resulting.authority_hash();
+    let repo_identity = relais::repo::identity(root);
+    println!(
+        "policy hash after this change: {authority_hash}\n{}",
+        missing_grant_text(&grant_key(&authority_hash, &repo_identity), &repo_identity)?
+    );
+    match mode {
+        AmendMode::Print => {
+            println!("nothing was written; re-run with --write to append the fragment");
+        }
+        AmendMode::Write => {
+            let existing = std::fs::read_to_string(&path).map_err(|cause| CliError::Read {
+                what: "the repository policy",
+                path: path.clone(),
+                cause,
+            })?;
+            let appendix = amendment
+                .appendix(&existing, &subject)
+                .map_err(CliError::Amend)?;
+            let append_failed = |cause| CliError::AppendPolicy {
+                operation: amendment.operation(),
+                path: path.clone(),
+                cause,
+            };
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .map_err(append_failed)?;
+            std::io::Write::write_all(&mut file, appendix.as_bytes()).map_err(append_failed)?;
+            println!(
+                "appended to {subject}; no trust grant was issued, so the next `relais plan` \
+                 reports missing_trust_grant until the block above is pasted into machine.toml"
+            );
+        }
+    }
+    Ok(CliOutcome::Accepted)
+}
+
+/// Add a candidate's new recipe revision(s) to the repository's policy,
+/// only when the recomputed comparison clears every gate (SPEC §27).
+fn recipe_promote_command(candidate_path: &Path, mode: AmendMode) -> Result<CliOutcome, CliError> {
+    let (root, incumbent) = load_repo_policy()?;
+    let candidate_text =
+        std::fs::read_to_string(candidate_path).map_err(|cause| CliError::Read {
+            what: "the candidate recipe",
+            path: candidate_path.to_path_buf(),
+            cause,
+        })?;
+    let candidate_policy =
+        RepoPolicy::from_toml_str(&candidate_text).map_err(|cause| CliError::Invalid {
+            what: "the candidate recipe",
+            path: candidate_path.to_path_buf(),
+            cause: Box::new(cause),
+        })?;
+    let bounds = route::default_tuning_bounds(&incumbent);
+    let candidate = match route::validate_candidate(&incumbent, &candidate_policy, &bounds) {
+        Ok(candidate) => candidate,
+        Err(rejection) => {
+            eprintln!("relais recipe promote: candidate refused: {rejection}");
+            return Ok(CliOutcome::Blocked);
+        }
+    };
+
+    // Recomputed here, from the ledger's settled trials — never read from
+    // a verdict an earlier `recipe evaluate` printed.
+    let ledger = open_ledger()?;
+    let report = operational(
+        evaluate_candidate(
+            &ledger,
+            candidate.policy(),
+            MIN_PAIRED_TASKS,
+            DEFAULT_BOOTSTRAP_RESAMPLES,
+        ),
+        "recipe promote",
+    )?;
+    let subject = candidate_path.display().to_string();
+    let proof = match admit(&report, &subject) {
+        Ok(proof) => proof,
+        Err(refused) => {
+            eprintln!("{refused}");
+            eprint!("{}", report.render_evidence());
+            eprintln!("nothing was written");
+            return Ok(CliOutcome::PromotionRefused);
+        }
+    };
+    let amendment = Amendment::for_promotion(proof, &incumbent, candidate.policy(), &subject)
+        .map_err(CliError::Amend)?;
+    println!("evaluation this rests on:");
+    print!("{}", report.render_evidence());
+    println!();
+    present_amendment(&root, &incumbent, &amendment, mode)
+}
+
+/// Restore the revision below the effective one by appending a new
+/// revision that repeats it (SPEC §27). Removing a change needs no
+/// evaluation.
+fn recipe_rollback_command(name: &str, mode: AmendMode) -> Result<CliOutcome, CliError> {
+    let (root, incumbent) = load_repo_policy()?;
+    let amendment = Amendment::for_rollback(&incumbent, name).map_err(CliError::Amend)?;
+    present_amendment(&root, &incumbent, &amendment, mode)
 }
 
 fn status_command(run_id: Option<&str>) -> Result<CliOutcome, CliError> {
@@ -4552,12 +4752,13 @@ mod tests {
         CliOutcome::NoTrainingRecords,
         CliOutcome::NoTierCoverage,
         CliOutcome::SolverDiverged,
+        CliOutcome::PromotionRefused,
     ];
 
     #[test]
     fn the_exit_code_table_is_total_and_injective() {
         let mut seen: Vec<i32> = ALL.iter().map(exit_code).collect();
-        assert_eq!(seen.len(), 17, "every documented outcome is listed");
+        assert_eq!(seen.len(), 18, "every documented outcome is listed");
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(
