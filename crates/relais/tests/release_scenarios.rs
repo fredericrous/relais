@@ -250,6 +250,29 @@ amont_agent = "off"
         path
     }
 
+    /// A task carrying a read hint, for the scenarios that need `plan`
+    /// and `run` to agree on whether it resolves at the base revision.
+    fn write_task_with_read_hint(&self, name: &str, review: &str, read_hint: &str) -> PathBuf {
+        let path = self.root.join(name);
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "schema_version": 1,
+                "kind": "change",
+                "objective": "Remove the obsolete entry point",
+                "base_ref": "HEAD",
+                "write_scope": ["src/**"],
+                "read_hints": [read_hint],
+                "acceptance": ["src/main.rs no longer exists"],
+                "verification_profile": "default",
+                "review": review,
+            })
+            .to_string(),
+        )
+        .expect("task");
+        path
+    }
+
     fn relais(&self, args: &[&str]) -> Output {
         self.relais_with_env(args, &[])
     }
@@ -1392,6 +1415,63 @@ fn an_unrunnable_baseline_and_a_failed_setup_block_before_any_launch() {
         .filter(|entry| entry.path().join("candidate-1.patch").exists())
         .count();
     assert_eq!(candidates, 0, "no blocked run reached a candidate");
+}
+
+// relais#97: `plan` performs the same read-hint fingerprint check `run`
+// performs in `assemble_context`, so a contract `run` would refuse is
+// never routed by `plan` first.
+//
+// FALSIFY: comment out the `fingerprint_hints` check this scenario adds
+// to `plan_command` (crates/relais/src/main.rs) and re-run — `plan`
+// prints a route instead of `read_hint_unresolvable` while `run` still
+// blocks, so this test fails. Restore the check before committing.
+#[test]
+fn plan_and_run_agree_on_an_unresolvable_read_hint() {
+    let world = World::new("readhint");
+    let hash = world.write_policy(3);
+    world.write_machine(&hash, "");
+    let base_sha = git(&world.repo, &["rev-parse", "HEAD"]).trim().to_string();
+    let task = world.write_task_with_read_hint(
+        "task.json",
+        "off",
+        "src/does-not-exist.rs:1 — the entry point",
+    );
+
+    let plan = world.relais(&["plan", "--task", task.to_str().unwrap()]);
+    assert_eq!(plan.status.code(), Some(3), "{}", text(&plan.stderr));
+    let plan_stderr = text(&plan.stderr);
+    assert!(
+        plan_stderr.contains("read_hint_unresolvable"),
+        "{plan_stderr}"
+    );
+    assert!(
+        plan_stderr.contains("src/does-not-exist.rs:1"),
+        "names the unresolvable hint: {plan_stderr}"
+    );
+    assert!(
+        plan_stderr.contains(&base_sha),
+        "names the base revision: {plan_stderr}"
+    );
+
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(3), "{}", text(&run.stderr));
+    let run_stderr = text(&run.stderr);
+    assert!(
+        run_stderr.contains("read_hint_unresolvable"),
+        "{run_stderr}"
+    );
+    assert_eq!(world.worker_launches(), 0, "no worker was launched");
+
+    // A contract whose hints all resolve: plan and run both proceed
+    // past the check.
+    let ok_task = world.write_task_with_read_hint("ok-task.json", "off", "src/main.rs");
+    let plan = world.relais(&["plan", "--task", ok_task.to_str().unwrap()]);
+    assert_eq!(plan.status.code(), Some(0), "{}", text(&plan.stderr));
+    assert!(
+        !text(&plan.stderr).contains("read_hint_unresolvable"),
+        "{}",
+        text(&plan.stderr)
+    );
 }
 
 // SPEC §14: a worker cannot obtain acceptance by omitting a failed

@@ -461,6 +461,15 @@ missing here.
 
 ### Fixed
 
+- **`relais plan` now refuses a contract whose read hints do not resolve
+  at the base revision, exactly as `relais run` already does (#97).**
+  `plan` used to route a contract whose `read_hints` named a path the
+  base revision does not have, printing a route a subsequent `run` would
+  then block on preflight — the fingerprint check `run` performs in
+  `assemble_context` now also runs in `plan`, before it prints a route,
+  and reports `read_hint_unresolvable` naming each unresolvable hint and
+  the base revision.
+
 - **A CLI call now attributes to the actual Claude Code session, not the
   shell PID.** `resolve_session_id` read `CLAUDE_SESSION_ID`, a variable
   no installed Claude Code sets; it never fired, so every run fell
