@@ -3238,6 +3238,35 @@ impl Ledger {
         .transpose()
     }
 
+    /// The most recently recorded outcome for a run, if any — `relais
+    /// explain <run>`'s source: a per-run query (`WHERE run_id = ?`), not
+    /// [`Ledger::latest_outcome`]'s task-scoped one. A later run of the
+    /// same task recording its own feedback must not shadow an earlier
+    /// run's outcome when THAT run is explained.
+    pub fn outcome_of_run(&self, run_id: &RunId) -> Result<Option<StoredOutcome>> {
+        let row: Option<OutcomeRow> = self
+            .conn
+            .query_row(
+                "SELECT run_id, task_id, kind, detail_json, at FROM outcomes
+                 WHERE run_id = ?1 ORDER BY id DESC LIMIT 1",
+                [run_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(run_id, task_id, kind, detail_json, at)| {
+            parse_outcome_row(run_id, task_id, kind, detail_json, at)
+        })
+        .transpose()
+    }
+
     /// Every outcome recorded at or after `since`, oldest first.
     pub fn outcomes_since(&self, since: &str) -> Result<Vec<StoredOutcome>> {
         let mut stmt = self.conn.prepare(
@@ -5025,6 +5054,7 @@ mod tests {
                 correction_magnitude: None,
                 evidence: vec![],
                 actor: "a person".into(),
+                note: None,
             },
         )
         .expect("valid outcome");
@@ -6615,6 +6645,7 @@ mod tests {
                 correction_magnitude: None,
                 evidence: vec!["run-a/review.txt".into()],
                 actor: "a reviewer".into(),
+                note: None,
             },
         )
         .expect("a valid outcome")

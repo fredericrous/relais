@@ -210,6 +210,9 @@ enum Command {
         /// Who is recording this feedback
         #[arg(long = "actor")]
         actor: String,
+        /// Free-form context for this outcome
+        #[arg(long = "note")]
+        note: Option<String>,
     },
     /// Install the Claude Code integration; preview-first, --write applies
     /// (SPEC §3). User-level installation is explicit, not the default.
@@ -764,6 +767,7 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             magnitude,
             evidence,
             actor,
+            note,
         } => feedback_command(FeedbackRequest {
             run_id,
             task,
@@ -772,6 +776,7 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             magnitude,
             evidence,
             actor,
+            note,
         }),
         Command::Install {
             claude,
@@ -3140,6 +3145,23 @@ fn explain_command(run_id: &str) -> Result<CliOutcome, CliError> {
                 .unwrap_or_default()
         );
     }
+    // A per-run query (`outcome_of_run`), not the task-scoped
+    // `latest_outcome`: a later run of the same task recording its own
+    // feedback must not hide an earlier run's outcome when THAT run is
+    // the one being explained (SPEC §20, issue #98).
+    if let Some(stored) = operational(ledger.outcome_of_run(&run), "explain")? {
+        println!(
+            "outcome: {}{}",
+            stored.outcome.kind.as_str(),
+            stored
+                .outcome
+                .detail
+                .note
+                .as_deref()
+                .map(|note| format!(" — {note}"))
+                .unwrap_or_default()
+        );
+    }
     let evidence = operational(ledger.evidence(&run), "explain")?;
     if !evidence.is_empty() {
         println!("evidence:");
@@ -3758,6 +3780,7 @@ struct FeedbackRequest {
     magnitude: Option<f64>,
     evidence: Vec<String>,
     actor: String,
+    note: Option<String>,
 }
 
 fn feedback_command(request: FeedbackRequest) -> Result<CliOutcome, CliError> {
@@ -3769,6 +3792,7 @@ fn feedback_command(request: FeedbackRequest) -> Result<CliOutcome, CliError> {
         magnitude,
         evidence,
         actor,
+        note,
     } = request;
     let ledger = open_ledger()?;
     let run = match feedback_run(&ledger, run_id.as_deref(), task.as_deref())? {
@@ -3882,6 +3906,7 @@ fn feedback_command(request: FeedbackRequest) -> Result<CliOutcome, CliError> {
         correction_magnitude: magnitude,
         evidence,
         actor,
+        note,
     };
     let recorded = match relais::outcome::Outcome::new(kind, detail) {
         Ok(outcome) => outcome,
