@@ -33,8 +33,6 @@ globset = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 # Timestamps and report windows; stored as RFC3339 strings / unix seconds.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-# XDG config/state/data dirs: machine settings, ledger, artifact registry.
-dirs = "5"
 # kill(pid, 0) for coordinator lease reconciliation — checking liveness
 # without sending a signal that could terminate anything.
 libc = "0.2"

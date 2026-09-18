@@ -130,7 +130,22 @@ fn main() {
     let cli = Cli::parse();
     let code = match cli.command {
         Command::Doctor { .. } => stub("doctor", "M7"),
-        Command::Init => stub("init", "M1"),
+        Command::Init => {
+            match relais::policy::write_init_template(std::path::Path::new("relais.toml")) {
+                Ok(true) => {
+                    println!("wrote relais.toml (edit the model IDs and verification profile, then add a trust grant in machine.toml)");
+                    0
+                }
+                Ok(false) => {
+                    eprintln!("relais init: relais.toml already exists; init never overwrites");
+                    2
+                }
+                Err(e) => {
+                    eprintln!("relais init: {e}");
+                    1
+                }
+            }
+        }
         Command::Plan { .. } => stub("plan", "M3"),
         Command::Run { .. } => stub("run", "M5"),
         Command::Status { .. } => stub("status", "M7"),

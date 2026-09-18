@@ -16,6 +16,7 @@ pub mod install;
 pub mod learn;
 pub mod ledger;
 pub mod money;
+pub mod paths;
 pub mod policy;
 pub mod report;
 pub mod rng;
