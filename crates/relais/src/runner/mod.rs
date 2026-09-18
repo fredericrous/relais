@@ -29,6 +29,8 @@ use crate::verify::{self, amont_gaps, Receipt, VerificationReport};
 use crate::workspace::{self, TaskWorktree, WorkspaceError};
 use serde::Serialize;
 
+pub mod scheduler;
+
 /// Reason codes recorded on every transition (SPEC §9's observation
 /// table). Stable strings so `explain` and reports stay comparable
 /// across versions.
@@ -55,6 +57,12 @@ pub mod reason {
     pub const BASELINE_FAILURE_NOT_WAIVED: &str = "baseline_failure_not_waived";
     pub const REVIEW_FINDINGS: &str = "review_findings";
     pub const ADMISSION_UNAVAILABLE: &str = "admission_unavailable";
+    pub const PLAN_ACCEPTED: &str = "plan_accepted";
+    pub const PLAN_REJECTED: &str = "plan_rejected";
+    pub const PACKAGE_STARTED: &str = "package_started";
+    pub const PACKAGE_FINISHED: &str = "package_finished";
+    pub const INTEGRATION_CONFLICT: &str = "integration_conflict";
+    pub const INTEGRATION_FAILED: &str = "integration_failed";
     pub const ADMISSION_REFUSED: &str = "admission_refused";
     pub const DUPLICATE_DISPATCH: &str = "duplicate_dispatch";
 }
@@ -244,19 +252,30 @@ enum AttemptKind {
 /// The supervised execution path (SPEC §3): preflight, route, then a
 /// bounded sequence of attempts the runner — not a model — owns.
 pub fn execute(config: &RunConfig<'_>) -> RunOutcome {
-    let run = RunEngine::new(config);
+    let run = RunEngine::new(config, None);
     run.run()
 }
 
-struct RunEngine<'a> {
-    config: &'a RunConfig<'a>,
-    run_id: String,
-    artifacts: PathBuf,
-    state: State,
+/// A work package's run (SPEC §19): the same lifecycle, attributed to
+/// its root run in the ledger.
+pub fn execute_child(config: &RunConfig<'_>, parent_run: &str, package_id: &str) -> RunOutcome {
+    let run = RunEngine::new(
+        config,
+        Some((parent_run.to_string(), package_id.to_string())),
+    );
+    run.run()
+}
+
+pub(crate) struct RunEngine<'a> {
+    pub(crate) config: &'a RunConfig<'a>,
+    pub(crate) run_id: String,
+    pub(crate) artifacts: PathBuf,
+    pub(crate) state: State,
+    parent: Option<(String, String)>,
 }
 
 impl<'a> RunEngine<'a> {
-    fn new(config: &'a RunConfig<'a>) -> Self {
+    fn new(config: &'a RunConfig<'a>, parent: Option<(String, String)>) -> Self {
         let run_id = RunId::generate();
         let artifacts = config.artifacts_dir.join(run_id.as_str());
         Self {
@@ -264,10 +283,11 @@ impl<'a> RunEngine<'a> {
             run_id: run_id.to_string(),
             artifacts,
             state: State::Prepared,
+            parent,
         }
     }
 
-    fn transition(&mut self, to: State, reason_code: &str, detail: serde_json::Value) {
+    pub(crate) fn transition(&mut self, to: State, reason_code: &str, detail: serde_json::Value) {
         let from = self.state;
         self.config
             .ledger
@@ -284,15 +304,15 @@ impl<'a> RunEngine<'a> {
         self.state = to;
     }
 
-    fn outcome_for(&self, outcome: RunOutcome) -> RunOutcome {
+    pub(crate) fn outcome_for(&self, outcome: RunOutcome) -> RunOutcome {
         outcome
     }
 
-    fn fail_preflight(&mut self, code: &str, detail: String) -> RunOutcome {
+    pub(crate) fn fail_preflight(&mut self, code: &str, detail: String) -> RunOutcome {
         self.block(reason::BLOCKED_PREFLIGHT, code, detail)
     }
 
-    fn block(&mut self, reason_code: &str, code: &str, detail: String) -> RunOutcome {
+    pub(crate) fn block(&mut self, reason_code: &str, code: &str, detail: String) -> RunOutcome {
         let outcome = RunOutcome::Blocked {
             run_id: self.run_id.clone(),
             code: code.to_string(),
@@ -306,7 +326,7 @@ impl<'a> RunEngine<'a> {
         self.outcome_for(outcome)
     }
 
-    fn budget_exhausted(&mut self, detail: String) -> RunOutcome {
+    pub(crate) fn budget_exhausted(&mut self, detail: String) -> RunOutcome {
         self.transition(
             State::BudgetExhausted,
             reason::LIMIT_REACHED,
@@ -318,7 +338,7 @@ impl<'a> RunEngine<'a> {
         })
     }
 
-    fn cancelled(&mut self, detail: String) -> RunOutcome {
+    pub(crate) fn cancelled(&mut self, detail: String) -> RunOutcome {
         self.transition(
             State::Cancelled,
             reason::CANCELLED_BY_USER,
@@ -336,7 +356,7 @@ impl<'a> RunEngine<'a> {
     /// against the run's wall clock; refusals on budget, depth or the
     /// aggregate agent cap are budget exhaustion, and a run cancelled
     /// while queued or running ends cancelled with its evidence kept.
-    fn managed_launch(
+    pub(crate) fn managed_launch(
         &mut self,
         mut spec: LaunchSpec,
         depth: u32,
@@ -497,13 +517,24 @@ impl<'a> RunEngine<'a> {
     fn run(mut self) -> RunOutcome {
         std::fs::create_dir_all(&self.artifacts).expect("artifact directory");
         let ledger = self.config.ledger;
-        ledger
-            .insert_run(
-                &self.run_id,
-                &self.config.repo_dir.to_string_lossy(),
-                Some(&self.config.session_id),
-            )
-            .expect("ledger records the run");
+        match &self.parent {
+            None => ledger
+                .insert_run(
+                    &self.run_id,
+                    &self.config.repo_dir.to_string_lossy(),
+                    Some(&self.config.session_id),
+                )
+                .expect("ledger records the run"),
+            Some((parent_run, package_id)) => ledger
+                .insert_child_run(
+                    &self.run_id,
+                    &self.config.repo_dir.to_string_lossy(),
+                    Some(&self.config.session_id),
+                    parent_run,
+                    package_id,
+                )
+                .expect("ledger records the package run"),
+        }
 
         // Preflight: dirty base is explicit, never copied (SPEC §8).
         if let Ok(dirty) = workspace::dirty_paths(self.config.repo_dir) {
@@ -672,6 +703,29 @@ impl<'a> RunEngine<'a> {
             }
         };
 
+        let deadline = Instant::now() + Duration::from_secs(authority.max_wall_seconds);
+
+        // Bounded decomposition (SPEC §19): work packages as runs of their
+        // own, an assembled candidate verified independently. A planner
+        // may answer "single worker", in which case the ordinary path
+        // continues below.
+        if let Some(decomposition) = &self.config.contract.decomposition {
+            let root = scheduler::RootContext {
+                authority: &authority,
+                base_sha: &base_sha,
+                contract_hash: &contract_hash,
+                manifest: &manifest,
+                decision: &decision,
+                baseline_failures: &baseline_failures,
+                logs_dir: &logs_dir,
+                deadline,
+            };
+            match scheduler::run_decomposed(&mut self, &root, decomposition) {
+                scheduler::Decomposed::Outcome(outcome) => return outcome,
+                scheduler::Decomposed::SingleWorker => {}
+            }
+        }
+
         // One owned worktree for the whole run: repairs continue from a
         // candidate whose scope and integrity passed; a scope violation
         // stops everything (SPEC §8, §9).
@@ -682,7 +736,6 @@ impl<'a> RunEngine<'a> {
                 Err(e) => return self.fail_preflight("worktree_unavailable", e.to_string()),
             };
 
-        let deadline = Instant::now() + Duration::from_secs(authority.max_wall_seconds);
         let mut attempt_index: u32 = 0;
         let mut tier = initial_tier;
         let mut kind = AttemptKind::Initial;
@@ -1246,7 +1299,7 @@ impl<'a> RunEngine<'a> {
     /// Verify the immutable candidate copy: a throwaway worktree at the
     /// candidate SHA, profile commands with logged, hashed evidence, and
     /// amont-derived gaps when the profile names required checks.
-    fn verify_candidate(
+    pub(crate) fn verify_candidate(
         &self,
         _worktree: &TaskWorktree,
         candidate_sha: &str,
@@ -1278,7 +1331,7 @@ impl<'a> RunEngine<'a> {
     /// One separate review call per candidate requiring it (SPEC §9, §10).
     /// The reviewer cannot edit or waive anything; findings are triaged,
     /// and "no findings" is recorded as evidence, not proof.
-    fn review_candidate(
+    pub(crate) fn review_candidate(
         &mut self,
         manifest: &ContextManifest,
         authority: &EffectiveAuthority,
@@ -1425,7 +1478,7 @@ impl<'a> RunEngine<'a> {
 }
 
 /// Completeness degrades to the worst observed (SPEC §11).
-fn worst_completeness(a: CostCompleteness, b: CostCompleteness) -> CostCompleteness {
+pub(crate) fn worst_completeness(a: CostCompleteness, b: CostCompleteness) -> CostCompleteness {
     match (a, b) {
         (_, CostCompleteness::Unknown) | (CostCompleteness::Unknown, _) => {
             CostCompleteness::Unknown
@@ -1439,7 +1492,7 @@ fn worst_completeness(a: CostCompleteness, b: CostCompleteness) -> CostCompleten
     }
 }
 
-enum ReviewOutcome {
+pub(crate) enum ReviewOutcome {
     NoFindings,
     Findings(String),
     Unavailable(String),
@@ -2535,6 +2588,361 @@ mod tests {
             gate.status().runs[outcome.run_id()].queued,
             0,
             "the queue entry is gone"
+        );
+    }
+
+    // -- bounded decomposition (SPEC §19) ----------------------------------
+
+    fn plan_json(overlap: bool) -> serde_json::Value {
+        serde_json::json!({
+            "packages": [
+                {
+                    "id": "a",
+                    "objective": "Create the a module",
+                    "write_scope": ["src/a/**"],
+                    "acceptance": ["src/a/lib.rs exists"]
+                },
+                {
+                    "id": "b",
+                    "objective": "Create the b module on top of a",
+                    "write_scope": [if overlap { "src/a/**" } else { "src/b/**" }],
+                    "depends_on": if overlap { serde_json::json!([]) } else { serde_json::json!(["a"]) },
+                    "acceptance": ["src/b/lib.rs exists"]
+                }
+            ],
+            "integration_acceptance": ["both modules exist together"],
+            "limits": { "attempts_per_package": 1 }
+        })
+    }
+
+    fn decomposed_contract(fixture: &Fixture, decomposition: serde_json::Value) -> TaskContract {
+        let _ = fixture;
+        TaskContract::from_json_str(
+            &serde_json::json!({
+                "schema_version": 1,
+                "kind": "change",
+                "objective": "Add the a and b modules",
+                "base_ref": "HEAD",
+                "write_scope": ["src/**"],
+                "acceptance": ["the modules exist"],
+                "verification_profile": "profile",
+                "review": "off",
+                "decomposition": decomposition,
+            })
+            .to_string(),
+        )
+        .expect("contract")
+    }
+
+    /// A worker that builds whichever package its prompt names, and
+    /// checks that package b really starts from a's output.
+    fn package_worker(launches: Arc<std::sync::atomic::AtomicUsize>) -> MockBackend {
+        MockBackend::new(move |spec| {
+            launches.fetch_add(1, Ordering::SeqCst);
+            if spec.prompt.contains("bounded planner") {
+                return MockOutcome {
+                    result_text: Some(
+                        "here you go:\n{\"packages\":[],\"integration_acceptance\":[]}".into(),
+                    ),
+                    exit_code: Some(0),
+                    usage: Some(usage(7)),
+                    ..Default::default()
+                };
+            }
+            if spec.prompt.contains("work package `a`") {
+                std::fs::create_dir_all(spec.work_dir.join("src/a")).expect("mkdir");
+                std::fs::write(spec.work_dir.join("src/a/lib.rs"), "pub fn a() {}\n")
+                    .expect("write");
+            } else if spec.prompt.contains("work package `b`") {
+                assert!(
+                    spec.work_dir.join("src/a/lib.rs").exists(),
+                    "package b starts from the integrated head that contains a"
+                );
+                std::fs::create_dir_all(spec.work_dir.join("src/b")).expect("mkdir");
+                std::fs::write(spec.work_dir.join("src/b/lib.rs"), "pub fn b() {}\n")
+                    .expect("write");
+            } else {
+                // The single-worker fallback: the whole task at once.
+                std::fs::create_dir_all(spec.work_dir.join("src/a")).expect("mkdir");
+                std::fs::create_dir_all(spec.work_dir.join("src/b")).expect("mkdir");
+                std::fs::write(spec.work_dir.join("src/a/lib.rs"), "").expect("write");
+                std::fs::write(spec.work_dir.join("src/b/lib.rs"), "").expect("write");
+            }
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        })
+    }
+
+    #[test]
+    fn decomposed_change_assembles_packages_and_verifies_the_integrated_candidate() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = package_worker(Arc::clone(&launches));
+        let contract = decomposed_contract(&fixture, plan_json(false));
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        let RunOutcome::Accepted { run_id, receipt } = outcome else {
+            panic!("expected acceptance, got {outcome:?}");
+        };
+        assert_eq!(launches.load(Ordering::SeqCst), 2, "one worker per package");
+        assert_eq!(receipt.attempts, 2);
+        assert_eq!(
+            receipt.cost.to_micros(),
+            200,
+            "the tree's cost, counted once"
+        );
+        assert_eq!(receipt.models_used, vec!["sonnet".to_string()]);
+        // The integrated candidate carries both packages and is what the
+        // receipt names.
+        let integration = fixture.artifacts.join(&run_id).join("integration");
+        assert!(integration.join("src/a/lib.rs").exists());
+        assert!(integration.join("src/b/lib.rs").exists());
+        let head = git(&integration, &["rev-parse", "HEAD"]).trim().to_string();
+        assert_eq!(receipt.candidate_sha, head);
+        assert!(fixture
+            .artifacts
+            .join(&run_id)
+            .join("candidate-integrated.patch")
+            .exists());
+        assert!(fixture.artifacts.join(&run_id).join("plan.json").exists());
+        // Packages are runs of their own, attributed to the root.
+        let children = fixture.ledger.child_runs(&run_id).expect("children");
+        assert_eq!(
+            children
+                .iter()
+                .map(|(_, package, status)| (package.as_str(), status.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("a", "accepted"), ("b", "accepted")]
+        );
+        assert_eq!(
+            fixture.ledger.run_cost(&run_id).expect("cost").to_micros(),
+            200
+        );
+        assert_eq!(
+            fixture
+                .ledger
+                .runs_since("2000-01-01T00:00:00+00:00")
+                .expect("runs")
+                .len(),
+            1,
+            "reports list the root once"
+        );
+        let reasons: Vec<String> = fixture
+            .ledger
+            .transitions(&run_id)
+            .expect("transitions")
+            .into_iter()
+            .map(|t| t.reason)
+            .collect();
+        assert!(reasons.contains(&reason::PLAN_ACCEPTED.to_string()));
+        assert_eq!(
+            reasons
+                .iter()
+                .filter(|r| *r == reason::PACKAGE_STARTED)
+                .count(),
+            2
+        );
+        assert_eq!(
+            reasons.last().map(String::as_str),
+            Some(reason::CHECKS_AND_REVIEW_PASSED)
+        );
+    }
+
+    #[test]
+    fn a_plan_with_overlapping_independent_packages_is_rejected_before_any_dispatch() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = package_worker(Arc::clone(&launches));
+        let contract = decomposed_contract(&fixture, plan_json(true));
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        assert!(
+            matches!(&outcome, RunOutcome::NeedsDecision { reason, detail, .. }
+                if reason == reason::PLAN_REJECTED && detail.contains("overlap")),
+            "{outcome:?}"
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_plan_outside_the_contract_scope_or_limits_is_rejected() {
+        let fixture = Fixture::new();
+        let mut repo = fixture.repo_policy(vec![passing_check()], 3);
+        repo.execution.max_agents_total = 1;
+        let backend = package_worker(Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let mut plan = plan_json(false);
+        plan["packages"][1]["write_scope"] = serde_json::json!(["docs/**"]);
+        let contract = decomposed_contract(&fixture, plan);
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        let RunOutcome::NeedsDecision { detail, .. } = outcome else {
+            panic!("expected needs_decision, got {outcome:?}");
+        };
+        assert!(detail.contains("not within the contract scope"), "{detail}");
+        assert!(
+            detail.contains("exceeds the aggregate agent cap"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn a_failed_package_stops_the_graph_and_the_root_mirrors_its_state() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&launches);
+        let backend = MockBackend::new(move |_spec| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            MockOutcome {
+                result_text: Some(
+                    "relais-blocked: the a module needs a crate that is not vendored".into(),
+                ),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        });
+        let contract = decomposed_contract(&fixture, plan_json(false));
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        let RunOutcome::Blocked {
+            run_id,
+            code,
+            detail,
+        } = outcome
+        else {
+            panic!("expected blocked, got {outcome:?}");
+        };
+        assert_eq!(code, "env_missing");
+        assert!(detail.starts_with("package `a`"), "{detail}");
+        assert_eq!(
+            launches.load(Ordering::SeqCst),
+            1,
+            "package b never started"
+        );
+        assert_eq!(
+            fixture.ledger.run_status(&run_id).expect("status"),
+            Some(State::Blocked)
+        );
+        let children = fixture.ledger.child_runs(&run_id).expect("children");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].2, "blocked");
+        assert_eq!(
+            fixture.ledger.run_cost(&run_id).expect("cost").to_micros(),
+            100
+        );
+    }
+
+    #[test]
+    fn the_aggregate_agent_cap_bounds_the_whole_run_not_each_package() {
+        let fixture = Fixture::new();
+        let mut repo = fixture.repo_policy(vec![passing_check()], 3);
+        // Two dispatches in total; package a's worker plus its required
+        // review use them both, so package b cannot start.
+        repo.execution.max_agents_total = 2;
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&launches);
+        let backend = MockBackend::new(move |spec| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            if spec.prompt.contains("semantic reviewer") {
+                return MockOutcome {
+                    result_text: Some("FINDINGS: none".into()),
+                    exit_code: Some(0),
+                    ..Default::default()
+                };
+            }
+            std::fs::create_dir_all(spec.work_dir.join("src/a")).expect("mkdir");
+            std::fs::write(spec.work_dir.join("src/a/lib.rs"), "").expect("write");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        });
+        let mut contract = decomposed_contract(&fixture, plan_json(false));
+        contract.review = Review::Required;
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        assert!(
+            matches!(&outcome, RunOutcome::BudgetExhausted { detail, .. }
+                if detail.contains("aggregate agent cap") && detail.contains("`b`")),
+            "{outcome:?}"
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_planner_answering_single_worker_falls_back_to_the_ordinary_path() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = package_worker(Arc::clone(&launches));
+        let contract = decomposed_contract(&fixture, serde_json::json!("propose"));
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        let RunOutcome::Accepted { run_id, receipt } = outcome else {
+            panic!("expected acceptance, got {outcome:?}");
+        };
+        assert_eq!(launches.load(Ordering::SeqCst), 2, "planner + one worker");
+        assert_eq!(receipt.attempts, 1);
+        assert_eq!(
+            fixture.ledger.run_cost(&run_id).expect("cost").to_micros(),
+            107,
+            "planning overhead is the run's cost"
+        );
+        assert!(fixture
+            .artifacts
+            .join(&run_id)
+            .join("plan-proposal.txt")
+            .exists());
+        assert!(fixture
+            .ledger
+            .child_runs(&run_id)
+            .expect("children")
+            .is_empty());
+    }
+
+    #[test]
+    fn a_proposed_plan_is_validated_not_trusted() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&launches);
+        let backend = MockBackend::new(move |spec| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                spec.prompt.contains("bounded planner"),
+                "only the planner may run"
+            );
+            assert!(
+                spec.disallowed_tools.contains(&"Write".to_string()),
+                "the planner cannot edit"
+            );
+            MockOutcome {
+                result_text: Some(
+                    r#"{"packages":[{"id":"x","objective":"widen","write_scope":["relais.toml"],"acceptance":["ok"]},{"id":"y","objective":"more","write_scope":["src/y/**"],"acceptance":["ok"]}],"integration_acceptance":["ok"]}"#.into(),
+                ),
+                exit_code: Some(0),
+                usage: Some(usage(5)),
+                ..Default::default()
+            }
+        });
+        let contract = decomposed_contract(&fixture, serde_json::json!("propose"));
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        assert!(
+            matches!(&outcome, RunOutcome::NeedsDecision { reason, detail, .. }
+                if reason == reason::PLAN_REJECTED && detail.contains("relais.toml")),
+            "{outcome:?}"
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture
+                .ledger
+                .run_cost(outcome.run_id())
+                .expect("cost")
+                .to_micros(),
+            5
         );
     }
 

@@ -943,6 +943,17 @@ fn explain_command(run_id: &str) -> i32 {
             println!("      {detail}");
         }
     }
+    let children = ledger.child_runs(run_id).expect("children");
+    if !children.is_empty() {
+        println!("work packages (SPEC §19; each a run of its own, costed into this one):");
+        for (child, package, status) in &children {
+            println!(
+                "  {package}: {child} {status} (attempts: {}, cost: {})",
+                ledger.attempt_count(child).expect("attempts"),
+                ledger.run_cost(child).expect("cost")
+            );
+        }
+    }
     let cost = ledger.run_cost(run_id).expect("cost");
     let completeness = ledger.run_cost_completeness(run_id).expect("completeness");
     println!(
