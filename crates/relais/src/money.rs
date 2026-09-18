@@ -90,12 +90,15 @@ pub enum CostKind {
 }
 
 /// How complete a cost figure is. An interrupted run's cost is an
-/// incomplete lower bound, not an authoritative total (SPEC §11).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// incomplete lower bound, not an authoritative total (SPEC §11). The
+/// default is `Unknown`: absent usage is unknown, never zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum CostCompleteness {
     Actual,
     Estimated,
     IncompleteLowerBound,
+    #[default]
     Unknown,
 }
 
