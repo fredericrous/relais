@@ -12,7 +12,7 @@ use relais::context::AvalVerdict;
 use relais::contract::TaskContract;
 use relais::learn::predict::RegistryPredictor;
 use relais::policy::{effective_authority, MachineSettings, RepoPolicy};
-use relais::runner::{execute, RunConfig, RunOutcome, State};
+use relais::runner::{execute, Reason, RunConfig, State, Terminal};
 use relais::{doctor, ledger::Ledger, paths, report, route, workspace};
 
 #[derive(Parser)]
@@ -855,8 +855,8 @@ fn run_command(task: &Path) -> i32 {
         heartbeat_every: std::time::Duration::from_secs(30),
     });
     let run_dir = paths::runs_dir().join(outcome.run_id());
-    match &outcome {
-        RunOutcome::Accepted { receipt, .. } => {
+    match &outcome.terminal {
+        Terminal::Accepted(receipt) => {
             println!("accepted: {}", receipt.candidate_sha);
             println!("receipt: {}/receipt.json", run_dir.display());
             println!(
@@ -872,7 +872,7 @@ fn run_command(task: &Path) -> i32 {
             println!("run:     {}", outcome.run_id());
             0
         }
-        RunOutcome::NeedsDecision { reason, detail, .. } => {
+        Terminal::NeedsDecision { reason, detail } => {
             eprintln!("needs_decision ({reason}): {detail}");
             eprintln!(
                 "evidence and the preserved candidate are under {}",
@@ -880,7 +880,7 @@ fn run_command(task: &Path) -> i32 {
             );
             2
         }
-        RunOutcome::NeedsReview { detail, .. } => {
+        Terminal::NeedsReview { detail } => {
             eprintln!("needs_review: {detail}");
             eprintln!(
                 "evidence and the preserved candidate are under {}",
@@ -888,16 +888,16 @@ fn run_command(task: &Path) -> i32 {
             );
             2
         }
-        RunOutcome::Blocked { code, detail, .. } => {
+        Terminal::Blocked { code, detail } => {
             eprintln!("blocked ({code}): {detail}");
             3
         }
-        RunOutcome::Failed { detail, .. } => {
+        Terminal::Failed { detail } => {
             eprintln!("failed: {detail}");
             eprintln!("the preserved candidate is under {}", run_dir.display());
             4
         }
-        RunOutcome::BudgetExhausted { detail, .. } => {
+        Terminal::BudgetExhausted { detail } => {
             eprintln!("budget_exhausted: {detail}");
             eprintln!(
                 "the patch and evidence are preserved under {}",
@@ -905,12 +905,12 @@ fn run_command(task: &Path) -> i32 {
             );
             4
         }
-        RunOutcome::Interrupted { detail, .. } => {
+        Terminal::Interrupted { detail } => {
             eprintln!("interrupted: {detail}");
             eprintln!("run `relais resume {}` to reconcile", outcome.run_id());
             4
         }
-        RunOutcome::Cancelled { detail, .. } => {
+        Terminal::Cancelled { detail } => {
             eprintln!("cancelled: {detail}");
             eprintln!(
                 "the preserved candidate and evidence are under {}",
@@ -1087,7 +1087,7 @@ fn resume_command(run_id: &str) -> i32 {
             attempt_id: None,
             from_state: Some(state),
             to_state: State::Interrupted,
-            reason: relais::runner::reason::RECONCILED_INTERRUPTED.to_string(),
+            reason: Reason::ReconciledInterrupted.as_str().to_string(),
             detail: Some(serde_json::json!({ "detail": detail })),
             at: relais::ledger::now_rfc3339(),
         })

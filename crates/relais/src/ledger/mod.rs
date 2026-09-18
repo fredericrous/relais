@@ -715,25 +715,9 @@ impl Ledger {
                 serde_json::to_string(&self.run_cost_completeness(&child)?).expect("serializes"),
             );
         }
-        let mut completeness = CostCompleteness::Actual;
-        for value in values {
-            let parsed: CostCompleteness =
-                serde_json::from_str(&value).unwrap_or(CostCompleteness::Unknown);
-            completeness = match (completeness, parsed) {
-                (_, CostCompleteness::Unknown) | (CostCompleteness::Unknown, _) => {
-                    CostCompleteness::Unknown
-                }
-                (_, CostCompleteness::IncompleteLowerBound)
-                | (CostCompleteness::IncompleteLowerBound, _) => {
-                    CostCompleteness::IncompleteLowerBound
-                }
-                (_, CostCompleteness::Estimated) | (CostCompleteness::Estimated, _) => {
-                    CostCompleteness::Estimated
-                }
-                (CostCompleteness::Actual, CostCompleteness::Actual) => CostCompleteness::Actual,
-            };
-        }
-        Ok(completeness)
+        Ok(CostCompleteness::worst(values.iter().map(|value| {
+            serde_json::from_str(value).unwrap_or(CostCompleteness::Unknown)
+        })))
     }
 
     pub fn store_receipt(
@@ -1099,7 +1083,7 @@ mod tests {
                 attempt_id: None,
                 from_state: Some(State::Prepared),
                 to_state: State::Blocked,
-                reason: crate::runner::reason::BLOCKED_PREFLIGHT.into(),
+                reason: crate::runner::Reason::BlockedPreflight.as_str().into(),
                 detail: Some(serde_json::json!({"code": "missing_trust_grant"})),
                 at: now_rfc3339(),
             })

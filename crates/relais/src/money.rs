@@ -92,7 +92,14 @@ pub enum CostKind {
 /// How complete a cost figure is. An interrupted run's cost is an
 /// incomplete lower bound, not an authoritative total (SPEC §11). The
 /// default is `Unknown`: absent usage is unknown, never zero.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+///
+/// A total order from most to least complete, so the completeness of a
+/// sum is `max` over its parts: one unknown makes the total unknown, one
+/// lower bound makes it a lower bound. `fold(Actual, max)` replaces the
+/// three hand-written worst-of matches this used to have.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CostCompleteness {
     Actual,
@@ -100,6 +107,13 @@ pub enum CostCompleteness {
     IncompleteLowerBound,
     #[default]
     Unknown,
+}
+
+impl CostCompleteness {
+    /// The completeness of a figure made of these parts.
+    pub fn worst<I: IntoIterator<Item = CostCompleteness>>(parts: I) -> Self {
+        parts.into_iter().fold(Self::Actual, Self::max)
+    }
 }
 
 #[cfg(test)]
@@ -122,6 +136,30 @@ mod tests {
         );
         assert_eq!(MicroUsd::from_dollars(f64::NAN), MicroUsd::ZERO);
         assert_eq!(MicroUsd::from_dollars(f64::INFINITY), MicroUsd::ZERO);
+    }
+
+    #[test]
+    fn completeness_is_ordered_from_actual_to_unknown() {
+        use CostCompleteness::*;
+        assert!(
+            Actual < Estimated
+                && Estimated < IncompleteLowerBound
+                && IncompleteLowerBound < Unknown
+        );
+        assert_eq!(CostCompleteness::worst([Actual, Actual]), Actual);
+        assert_eq!(
+            CostCompleteness::worst([Actual, Estimated, Actual]),
+            Estimated
+        );
+        assert_eq!(
+            CostCompleteness::worst([IncompleteLowerBound, Unknown]),
+            Unknown
+        );
+        assert_eq!(
+            CostCompleteness::worst(std::iter::empty()),
+            Actual,
+            "nothing is complete"
+        );
     }
 
     #[test]

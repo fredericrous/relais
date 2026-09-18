@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use crate::contract::{Kind, Review, TaskContract};
 use crate::money::MicroUsd;
-use crate::policy::{Blocker, EffectiveAuthority, MachineSettings, RepoPolicy, Tier};
+use crate::policy::{BlockCode, Blocker, EffectiveAuthority, MachineSettings, RepoPolicy, Tier};
 
 /// Estimates from an owned, Relais-trained artifact (SPEC §16). The
 /// predictor abstains (returns `None`) when it has no supported coverage
@@ -311,7 +311,7 @@ pub fn route(inputs: RouteInputs<'_>) -> RouteDecision {
             max_repairs_before_escalation: 0,
             escalation_tier: None,
             blocked: vec![Blocker {
-                code: "model_unavailable".into(),
+                code: BlockCode::ModelUnavailable,
                 detail: format!(
                     "no model configured at or above the {} floor",
                     floor.as_str()
@@ -723,7 +723,10 @@ mod tests {
             },
         );
         let d = route_with(&change_contract(&["crates/amont/**"]), &repo, &machine);
-        assert!(d.blocked.iter().any(|b| b.code == "model_unavailable"));
+        assert!(d
+            .blocked
+            .iter()
+            .any(|b| b.code == BlockCode::ModelUnavailable));
         assert_eq!(d.tier, None);
     }
 
@@ -741,7 +744,10 @@ mod tests {
             routing: Default::default(),
         };
         let d = route_with(&change_contract(&["crates/amont/**"]), &repo, &machine);
-        assert!(d.blocked.iter().any(|b| b.code == "missing_trust_grant"));
+        assert!(d
+            .blocked
+            .iter()
+            .any(|b| b.code == BlockCode::MissingTrustGrant));
         assert_eq!(d.tier, None);
     }
 

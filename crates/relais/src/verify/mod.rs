@@ -253,15 +253,52 @@ pub struct AmontCheck {
     pub stage: Option<String>,
     pub source: Option<String>,
     pub effective_severity: Option<String>,
-    pub status: Option<String>,
+    pub status: Option<AmontStatus>,
     pub reason: Option<String>,
 }
 
-/// Statuses that mean the check is genuinely in force. Docs say
-/// `ready|inert|skipped|unavailable`; code has emitted `runs` — anything
-/// not in the active set is a gap, which is the conservative direction
-/// (SPEC §10, and the amont docs/code status mismatch).
-const ACTIVE_STATUSES: &[&str] = &["ready", "runs", "active"];
+/// What amont's inventory says about a check. Docs say
+/// `ready|inert|skipped|unavailable`; code has emitted `runs` — only the
+/// in-force spellings count as such, and a spelling this relais does not
+/// know is kept verbatim and treated as a gap, the conservative direction
+/// (SPEC §10).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AmontStatus {
+    Ready,
+    Runs,
+    Active,
+    Inert,
+    Skipped,
+    Unavailable,
+    #[serde(untagged)]
+    Unknown(String),
+}
+
+impl AmontStatus {
+    pub fn parse(text: &str) -> Self {
+        serde_json::from_value(serde_json::Value::String(text.to_string()))
+            .unwrap_or_else(|_| Self::Unknown(text.to_string()))
+    }
+
+    /// Genuinely in force, as opposed to inert, skipped, unavailable or
+    /// something this relais cannot vouch for.
+    pub fn in_force(&self) -> bool {
+        matches!(self, Self::Ready | Self::Runs | Self::Active)
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Ready => "ready",
+            Self::Runs => "runs",
+            Self::Active => "active",
+            Self::Inert => "inert",
+            Self::Skipped => "skipped",
+            Self::Unavailable => "unavailable",
+            Self::Unknown(text) => text,
+        }
+    }
+}
 
 pub fn parse_amont_list(stdout: &str) -> Option<AmontInventory> {
     let value: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
@@ -292,7 +329,7 @@ pub fn parse_amont_list(stdout: &str) -> Option<AmontInventory> {
             status: check
                 .get("status")
                 .and_then(|s| s.as_str())
-                .map(String::from),
+                .map(AmontStatus::parse),
             reason: check
                 .get("reason")
                 .and_then(|s| s.as_str())
@@ -343,10 +380,11 @@ pub fn amont_gaps(inventory: Option<&AmontInventory>, required_ids: &[String]) -
     for required in required_ids {
         match inventory.checks.iter().find(|check| &check.id == required) {
             None => gaps.push(format!("{required}: not in effective inventory")),
-            Some(check) => match check.status.as_deref() {
-                Some(status) if ACTIVE_STATUSES.contains(&status) => {}
+            Some(check) => match &check.status {
+                Some(status) if status.in_force() => {}
                 Some(status) => gaps.push(format!(
-                    "{required}: status `{status}` — a skipped, inert, unavailable or untrusted required check is a gap, not a pass"
+                    "{required}: status `{}` — a skipped, inert, unavailable or untrusted required check is a gap, not a pass",
+                    status.as_str()
                 )),
                 None => gaps.push(format!("{required}: no status reported")),
             },
