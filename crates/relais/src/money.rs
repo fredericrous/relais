@@ -6,8 +6,11 @@
 //! cost kinds stay distinct because API spend, usage credits, estimated
 //! API-equivalents and subscription consumption are not interchangeable.
 
+use serde::{Deserialize, Serialize};
+
 /// Micro-dollars in a signed 64-bit integer (~9.2 trillion dollars headroom).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct MicroUsd(i64);
 
 impl MicroUsd {
@@ -78,7 +81,7 @@ impl std::fmt::Display for MicroUsd {
 /// What a recorded cost figure is (SPEC §11: distinguish API spend,
 /// usage-credit spend, estimated API-equivalent cost, subscription
 /// consumption).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CostKind {
     ApiSpend,
     UsageCreditSpend,
@@ -88,7 +91,7 @@ pub enum CostKind {
 
 /// How complete a cost figure is. An interrupted run's cost is an
 /// incomplete lower bound, not an authoritative total (SPEC §11).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CostCompleteness {
     Actual,
     Estimated,
