@@ -31,7 +31,7 @@ use crate::ledger::{now_rfc3339, UsageEvent};
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::policy::{EffectiveAuthority, MachineSettings, Tier};
 use crate::route::RouteDecision;
-use crate::verify::{Receipt, VerificationReport};
+use crate::verify::{self, Receipt, VerificationReport};
 use crate::workspace::{self, WorkspaceError};
 
 use super::{
@@ -47,6 +47,8 @@ pub(crate) struct RootContext<'a> {
     pub manifest: &'a ContextManifest,
     pub decision: &'a RouteDecision,
     pub baseline_failures: &'a [String],
+    pub integration_gaps: &'a [String],
+    pub baseline_cached: bool,
     pub logs_dir: &'a Path,
     pub deadline: Instant,
 }
@@ -322,13 +324,13 @@ pub(crate) fn run_decomposed(
         }
         engine.state = State::Verifying;
         let label = 900 + integration_repairs;
-        let (checks, gaps) = match engine.verify_candidate(
-            &integration,
-            &head,
-            root.authority,
-            root.logs_dir,
-            label,
-        ) {
+        let verify::Verified {
+            checks,
+            gaps,
+            amont_bypasses,
+            amont_downgrades,
+        } = match engine.verify_candidate(&integration, &head, root.authority, root.logs_dir, label)
+        {
             Ok(result) => result,
             Err(e) => {
                 return Decomposed::Outcome(
@@ -357,11 +359,20 @@ pub(crate) fn run_decomposed(
         if failures.is_empty() {
             let _ = integration
                 .export_patch(&head, &engine.artifacts.join("candidate-integrated.patch"));
+            let verification_inputs_changed = verify::verification_inputs_touched(
+                &root.authority.verification_profile,
+                &integration.changed_paths().unwrap_or_default(),
+            );
             return Decomposed::Outcome(accept_integrated(
                 engine,
                 root,
                 &head,
-                checks,
+                Assembled {
+                    checks,
+                    amont_bypasses,
+                    amont_downgrades,
+                    verification_inputs_changed,
+                },
                 attempts_total,
                 models_used,
             ));
@@ -647,11 +658,19 @@ fn fast_forward(integration_path: &Path, candidate_sha: &str) -> Result<String, 
     Ok(String::from_utf8_lossy(&head.stdout).trim().to_string())
 }
 
+/// What the integrated candidate's verification established.
+struct Assembled {
+    checks: Vec<crate::verify::CheckOutcome>,
+    amont_bypasses: Vec<String>,
+    amont_downgrades: Vec<String>,
+    verification_inputs_changed: Vec<String>,
+}
+
 fn accept_integrated(
     engine: &mut RunEngine<'_>,
     root: &RootContext<'_>,
     head: &str,
-    checks: Vec<crate::verify::CheckOutcome>,
+    assembled: Assembled,
     attempts_total: u32,
     mut models_used: Vec<String>,
 ) -> RunOutcome {
@@ -660,13 +679,16 @@ fn accept_integrated(
     let mut completeness = ledger
         .run_cost_completeness(&engine.run_id)
         .expect("completeness");
-    if root.decision.review >= Review::Required {
+    let review_required = root.decision.review >= Review::Required
+        || !assembled.verification_inputs_changed.is_empty();
+    if review_required {
         let mut review_cost = MicroUsd::ZERO;
         let mut review_completeness = CostCompleteness::Actual;
         let review = engine.review_candidate(
             root.manifest,
             root.authority,
             head,
+            &assembled.verification_inputs_changed,
             &mut review_cost,
             &mut review_completeness,
             root.deadline,
@@ -709,11 +731,14 @@ fn accept_integrated(
         base_sha: root.base_sha.to_string(),
         contract_hash: root.contract_hash.to_string(),
         policy_hash: root.authority.authority_hash.clone(),
-        checks,
+        checks: assembled.checks,
         gaps: Vec::new(),
         baseline_failures: root.baseline_failures.to_vec(),
-        amont_bypasses: Vec::new(),
-        amont_downgrades: Vec::new(),
+        amont_bypasses: assembled.amont_bypasses,
+        amont_downgrades: assembled.amont_downgrades,
+        verification_inputs_changed: assembled.verification_inputs_changed,
+        integration_gaps: root.integration_gaps.to_vec(),
+        baseline_cached: root.baseline_cached,
     };
     let receipt = Receipt {
         run_id: engine.run_id.clone(),

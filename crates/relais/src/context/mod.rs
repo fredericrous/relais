@@ -27,6 +27,12 @@ pub const DEFAULT_CONTEXT_BUDGET_BYTES: usize = 64 * 1024;
 pub enum AvalVerdict {
     Active {
         adr: String,
+        /// What was decided, in the record's words — the constraint the
+        /// worker is handed (SPEC §7: "necessary constraints").
+        #[serde(default)]
+        choice: Option<String>,
+        #[serde(default)]
+        reason: Option<String>,
     },
     Undecided,
     Contradiction {
@@ -77,6 +83,14 @@ pub fn parse_aval_output(exit_code: i32, stdout: &str) -> AvalVerdict {
                 .and_then(|a| a.as_str())
                 .unwrap_or("?")
                 .to_string(),
+            choice: value
+                .get("choice")
+                .and_then(|c| c.as_str())
+                .map(str::to_string),
+            reason: value
+                .get("reason")
+                .and_then(|r| r.as_str())
+                .map(str::to_string),
         },
         Some("undecided") => AvalVerdict::Undecided,
         Some("contradiction") => AvalVerdict::Contradiction {
@@ -187,10 +201,63 @@ impl std::fmt::Display for ContextError {
 
 impl std::error::Error for ContextError {}
 
+/// A source file's identity at the base revision: git's own blob id,
+/// which is a content hash the repository already computed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileFingerprint {
     pub path: String,
-    pub sha256: String,
+    pub blob: String,
+}
+
+/// How many files a context package fingerprints at most; beyond that
+/// the manifest names the hint and says it was truncated rather than
+/// growing without bound.
+pub const FINGERPRINT_CAP: usize = 400;
+
+/// Fingerprint the files under each read hint at `base_sha`, from the
+/// tree itself (`git ls-tree`), so what the worker was pointed at is
+/// recorded exactly as it was — whatever the working tree does later.
+pub fn fingerprint_hints(
+    repo_dir: &Path,
+    base_sha: &str,
+    hints: &[String],
+) -> Vec<FileFingerprint> {
+    let mut out = Vec::new();
+    for hint in hints {
+        let output = std::process::Command::new("git")
+            .args(["ls-tree", "-r", base_sha, "--", hint.trim_end_matches('/')])
+            .current_dir(repo_dir)
+            .output();
+        let Ok(output) = output else { continue };
+        if !output.status.success() {
+            continue;
+        }
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            // `<mode> <type> <object>\t<path>`
+            let Some((meta, path)) = line.split_once('\t') else {
+                continue;
+            };
+            let mut fields = meta.split_whitespace();
+            let (_mode, kind, object) = (fields.next(), fields.next(), fields.next());
+            if kind != Some("blob") {
+                continue;
+            }
+            if let Some(object) = object {
+                out.push(FileFingerprint {
+                    path: path.to_string(),
+                    blob: object.to_string(),
+                });
+            }
+            if out.len() >= FINGERPRINT_CAP {
+                out.push(FileFingerprint {
+                    path: format!("{hint}: truncated at {FINGERPRINT_CAP} files"),
+                    blob: String::new(),
+                });
+                return out;
+            }
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -287,12 +354,25 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         resolved.push((key.clone(), verdict));
     }
 
-    // Active decisions' full bodies are retrieved only when needed; the
-    // constraint text here is the decision summary the worker starts from.
+    // The constraint is the decision in the record's own words — what
+    // `aval resolve --json` carries as `choice` and `reason`; the full
+    // body stays behind `aval show ADR` for the worker to fetch on demand.
     let constraints: Vec<String> = resolved
         .iter()
-        .filter(|(_, verdict)| matches!(verdict, AvalVerdict::Active { .. }))
-        .map(|(key, verdict)| format!("active architectural decision on `{key}`: {verdict:?}"))
+        .filter_map(|(key, verdict)| match verdict {
+            AvalVerdict::Active {
+                adr,
+                choice,
+                reason,
+            } => Some(match (choice, reason) {
+                (Some(choice), Some(reason)) => {
+                    format!("`{key}` ({adr}): {choice} — because {reason}")
+                }
+                (Some(choice), None) => format!("`{key}` ({adr}): {choice}"),
+                _ => format!("`{key}` is decided by {adr} (run `aval show {adr}` for the text)"),
+            }),
+            _ => None,
+        })
         .collect();
 
     let manifest = ContextManifest {
@@ -370,7 +450,7 @@ mod tests {
             policy_hash: "phash",
             fingerprints: vec![FileFingerprint {
                 path: "crates/amont/src/main.rs".into(),
-                sha256: "abc".into(),
+                blob: "abc".into(),
             }],
             tool_versions: ToolVersions {
                 relais: "0.1.0".into(),
@@ -386,6 +466,8 @@ mod tests {
         let _ = key;
         AvalVerdict::Active {
             adr: "ADR-0021".into(),
+            choice: None,
+            reason: None,
         }
     }
 
@@ -394,10 +476,13 @@ mod tests {
         assert_eq!(
             parse_aval_output(
                 0,
-                r#"{"state":"active","exit":0,"key":"storage.object-store","adr":"ADR-0021"}"#
+                r#"{"state":"active","exit":0,"key":"storage.object-store","adr":"ADR-0021",
+                    "choice":"RGW behind Ceph","reason":"one storage plane"}"#
             ),
             AvalVerdict::Active {
-                adr: "ADR-0021".into()
+                adr: "ADR-0021".into(),
+                choice: Some("RGW behind Ceph".into()),
+                reason: Some("one storage plane".into()),
             }
         );
         assert_eq!(
@@ -528,6 +613,8 @@ mod tests {
         };
         let big = |_: &str, _: Option<&str>| AvalVerdict::Active {
             adr: "ADR-0001".into(),
+            choice: None,
+            reason: None,
         };
         let err = assemble(inputs(&c, &r, &big)).unwrap_err();
         assert!(

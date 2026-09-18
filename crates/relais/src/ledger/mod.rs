@@ -512,10 +512,44 @@ impl Ledger {
                 transition.at,
             ],
         )?;
-        if transition.to_state.is_terminal() {
-            self.set_run_status(&transition.run_id, transition.to_state)?;
-        }
+        // Every transition, not only the terminal ones: `relais status`
+        // used to say `prepared` for a run ten minutes into verifying.
+        self.set_run_status(&transition.run_id, transition.to_state)?;
         Ok(())
+    }
+
+    /// One piece of evidence bound to a run: the context manifest, a
+    /// candidate patch, a check log, the receipt — by path and content
+    /// hash (SPEC §12: "every transition has … evidence references").
+    pub fn record_evidence(
+        &self,
+        run_id: &str,
+        attempt_id: Option<i64>,
+        kind: &str,
+        path: &Path,
+        sha256: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO evidence (run_id, attempt_id, kind, path, sha256, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                run_id,
+                attempt_id,
+                kind,
+                path.to_string_lossy(),
+                sha256,
+                now_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn evidence(&self, run_id: &str) -> Result<Vec<(String, String, Option<String>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT kind, path, sha256 FROM evidence WHERE run_id = ?1 ORDER BY id")?;
+        let rows = stmt.query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn transitions(&self, run_id: &str) -> Result<Vec<Transition>> {

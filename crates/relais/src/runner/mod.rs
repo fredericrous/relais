@@ -56,6 +56,7 @@ pub mod reason {
     pub const VERIFICATION_GAP: &str = "verification_gap";
     pub const BASELINE_FAILURE_NOT_WAIVED: &str = "baseline_failure_not_waived";
     pub const REVIEW_FINDINGS: &str = "review_findings";
+    pub const VERIFICATION_INPUTS_CHANGED: &str = "verification_inputs_changed";
     pub const ADMISSION_UNAVAILABLE: &str = "admission_unavailable";
     pub const PLAN_ACCEPTED: &str = "plan_accepted";
     pub const PLAN_REJECTED: &str = "plan_rejected";
@@ -563,6 +564,15 @@ impl<'a> RunEngine<'a> {
             let first = &authority.blockers[0];
             return self.fail_preflight(&first.code, first.detail.clone());
         }
+        // Integrations (SPEC §5): a missing required one blocks execution;
+        // optional gaps travel in the receipt and are never passes.
+        if let Some(blocker) = crate::policy::probe_integrations(self.config.repo_policy).first() {
+            return self.fail_preflight(&blocker.code, blocker.detail.clone());
+        }
+        let integration_gaps = verify::integration_gaps(
+            &self.config.repo_policy.integrations,
+            &crate::policy::binary_available,
+        );
 
         // Managed runs register their root budget and agent-tree limits
         // before any dispatch; children can only narrow them (SPEC §23).
@@ -611,16 +621,41 @@ impl<'a> RunEngine<'a> {
             contract_hash: &contract_hash,
             base_sha: &base_sha,
             policy_hash: &authority.authority_hash,
-            fingerprints: Vec::new(),
+            fingerprints: context::fingerprint_hints(
+                self.config.repo_dir,
+                &base_sha,
+                &self.config.contract.read_hints,
+            ),
             tool_versions: context::ToolVersions {
                 relais: crate::version().to_string(),
-                aval: None,
-                amont: None,
-                claude_code: None,
+                aval: crate::policy::integration_version("aval"),
+                amont: crate::policy::integration_version("amont"),
+                claude_code: self
+                    .config
+                    .backend
+                    .probe()
+                    .and_then(|capabilities| capabilities.version),
             },
             resolver: &resolver,
         }) {
-            Ok(manifest) => manifest,
+            Ok(manifest) => {
+                // The context package is evidence: written next to the run
+                // and referenced by hash (SPEC §7, §12).
+                let manifest_path = self.artifacts.join("manifest.json");
+                let manifest_json =
+                    serde_json::to_string_pretty(&manifest).expect("manifest serializes");
+                std::fs::write(&manifest_path, &manifest_json).expect("manifest artifact");
+                ledger
+                    .record_evidence(
+                        &self.run_id,
+                        None,
+                        "context_manifest",
+                        &manifest_path,
+                        Some(&context::manifest_hash(&manifest)),
+                    )
+                    .expect("evidence recorded");
+                manifest
+            }
             Err(ContextError::ContradictionBlocked { key, heads }) => {
                 let detail = format!("aval contradiction on `{key}` ({heads} heads)");
                 self.transition(
@@ -695,25 +730,53 @@ impl<'a> RunEngine<'a> {
         // Baseline verification at the base SHA: pre-existing failures are
         // visible from the start (SPEC §10).
         let logs_dir = self.artifacts.join("logs");
-        let baseline_failures = match verify::verification_worktree(
-            self.config.repo_dir,
+        let baseline_cache = verify::BaselineCache::new(
+            &self
+                .config
+                .artifacts_dir
+                .parent()
+                .unwrap_or(&self.config.artifacts_dir)
+                .join("baseline-cache"),
+        );
+        let baseline_key = verify::baseline_key(
             &base_sha,
-            &self.artifacts.join("verify-base"),
-        ) {
-            Ok(baseline) => verify::run_profile(
-                baseline.path(),
-                &authority.verification_profile,
-                &logs_dir,
-                "base",
-            )
-            .expect("baseline verification runs")
-            .into_iter()
-            .filter(|outcome| outcome.failed())
-            .map(|outcome| outcome.label)
-            .collect::<Vec<String>>(),
-            Err(e) => {
-                return self.fail_preflight("baseline_verification_failed", e.to_string());
-            }
+            &authority.verification_profile,
+            &manifest.tool_versions,
+        );
+        let cached_baseline = if authority.verification_profile.cache_baseline {
+            baseline_cache.get(&baseline_key)
+        } else {
+            None
+        };
+        let baseline_cached = cached_baseline.is_some();
+        let baseline_failures = match cached_baseline {
+            Some(failures) => failures,
+            None => match verify::verification_worktree(
+                self.config.repo_dir,
+                &base_sha,
+                &self.artifacts.join("verify-base"),
+            ) {
+                Ok(baseline) => {
+                    let failures = verify::run_profile(
+                        baseline.path(),
+                        &authority.verification_profile,
+                        &logs_dir,
+                        "base",
+                    )
+                    .expect("baseline verification runs")
+                    .into_iter()
+                    .filter(|outcome| outcome.failed())
+                    .map(|outcome| outcome.label)
+                    .collect::<Vec<String>>();
+                    if authority.verification_profile.cache_baseline {
+                        baseline_cache.put(&baseline_key, &failures);
+                    }
+                    failures
+                }
+                Err(e) => {
+                    return self.fail_preflight("baseline_verification_failed", e.to_string());
+                }
+            },
         };
 
         let deadline = Instant::now() + Duration::from_secs(authority.max_wall_seconds);
@@ -739,6 +802,8 @@ impl<'a> RunEngine<'a> {
                 manifest: &manifest,
                 decision: &decision,
                 baseline_failures: &baseline_failures,
+                integration_gaps: &integration_gaps,
+                baseline_cached,
                 logs_dir: &logs_dir,
                 deadline,
             };
@@ -1067,6 +1132,24 @@ impl<'a> RunEngine<'a> {
                 )
                 .expect("patch export");
 
+            ledger
+                .record_evidence(
+                    &self.run_id,
+                    Some(attempt_id),
+                    "candidate_patch",
+                    &self
+                        .artifacts
+                        .join(format!("candidate-{attempt_index}.patch")),
+                    workspace::sha256_file(
+                        &self
+                            .artifacts
+                            .join(format!("candidate-{attempt_index}.patch")),
+                    )
+                    .ok()
+                    .as_deref(),
+                )
+                .expect("evidence recorded");
+
             // Write scope is checked on the actual diff; a violation can
             // never be accepted (SPEC §8, §9).
             match workspace::check_scope(&worktree, self.config.contract) {
@@ -1098,10 +1181,28 @@ impl<'a> RunEngine<'a> {
                 }
             }
 
+            // A candidate that changes what verification IS — build
+            // manifests, the test tree, the commands — gets explicit
+            // review whatever the route said (SPEC §10: never silently
+            // weakened).
+            let verification_inputs_changed = verify::verification_inputs_touched(
+                &authority.verification_profile,
+                &worktree.changed_paths().unwrap_or_default(),
+            );
+            let review_required =
+                decision.review >= Review::Required || !verification_inputs_changed.is_empty();
+            if !verification_inputs_changed.is_empty() && decision.review < Review::Required {
+                self.transition(
+                    State::Verifying,
+                    reason::VERIFICATION_INPUTS_CHANGED,
+                    serde_json::json!({ "paths": verification_inputs_changed }),
+                );
+            }
+
             // Verification against an immutable copy of the candidate
             // (SPEC §10).
             self.state = State::Verifying;
-            let (checks, gaps) = match self.verify_candidate(
+            let verified = match self.verify_candidate(
                 &worktree,
                 &candidate_sha,
                 &authority,
@@ -1113,6 +1214,12 @@ impl<'a> RunEngine<'a> {
                     return self.fail_preflight("verification_unavailable", e.to_string());
                 }
             };
+            let verify::Verified {
+                checks,
+                gaps,
+                amont_bypasses,
+                amont_downgrades,
+            } = verified;
             let failures: Vec<String> = checks
                 .iter()
                 .filter(|check| check.failed())
@@ -1221,11 +1328,12 @@ impl<'a> RunEngine<'a> {
             }
 
             // Checks pass. Semantic review is risk-dependent (SPEC §10).
-            if decision.review >= Review::Required {
+            if review_required {
                 let review = self.review_candidate(
                     &manifest,
                     &authority,
                     &candidate_sha,
+                    &verification_inputs_changed,
                     &mut total_cost,
                     &mut cost_completeness,
                     deadline,
@@ -1266,8 +1374,11 @@ impl<'a> RunEngine<'a> {
                 checks,
                 gaps,
                 baseline_failures,
-                amont_bypasses: Vec::new(),
-                amont_downgrades: Vec::new(),
+                amont_bypasses,
+                amont_downgrades,
+                verification_inputs_changed,
+                integration_gaps: integration_gaps.clone(),
+                baseline_cached,
             };
             let receipt = Receipt {
                 run_id: self.run_id.clone(),
@@ -1295,6 +1406,15 @@ impl<'a> RunEngine<'a> {
                 serde_json::to_string_pretty(&receipt).expect("serializes"),
             )
             .expect("receipt artifact");
+            ledger
+                .record_evidence(
+                    &self.run_id,
+                    Some(attempt_id),
+                    "receipt",
+                    &self.artifacts.join("receipt.json"),
+                    Some(&receipt_hash),
+                )
+                .expect("evidence recorded");
             ledger
                 .finish_attempt(
                     attempt_id,
@@ -1329,7 +1449,7 @@ impl<'a> RunEngine<'a> {
         authority: &EffectiveAuthority,
         logs_dir: &Path,
         attempt_index: u32,
-    ) -> Result<(Vec<verify::CheckOutcome>, Vec<String>), String> {
+    ) -> Result<verify::Verified, String> {
         let verify_path = self.artifacts.join(format!("verify-{attempt_index}"));
         let holder =
             verify::verification_worktree(self.config.repo_dir, candidate_sha, &verify_path)
@@ -1341,24 +1461,61 @@ impl<'a> RunEngine<'a> {
             &format!("attempt{attempt_index}"),
         )
         .map_err(|e| e.to_string())?;
+        for check in &checks {
+            let _ = self.config.ledger.record_evidence(
+                &self.run_id,
+                None,
+                "check_log",
+                Path::new(&check.log_path),
+                Some(&check.log_sha256),
+            );
+        }
+        // amont's effective inventory (SPEC §10): consulted whenever the
+        // integration is on, for the bypasses and downgrades it declares
+        // and for the gaps among the checks this profile requires.
+        let amont_on = self
+            .config
+            .repo_policy
+            .integrations
+            .amont
+            .as_ref()
+            .is_some_and(|dependency| dependency.mode() != crate::policy::DependencyMode::Off)
+            && crate::policy::integration_available("amont");
+        let inventory = if amont_on {
+            verify::amont_list(self.config.repo_dir, None, false)
+        } else {
+            None
+        };
         let required = &authority.verification_profile.amont_checks;
         let gaps = if required.is_empty() {
             Vec::new()
         } else {
-            let inventory = verify::amont_list(self.config.repo_dir, None, false);
             amont_gaps(inventory.as_ref(), required)
         };
-        Ok((checks, gaps))
+        Ok(verify::Verified {
+            checks,
+            gaps,
+            amont_bypasses: inventory
+                .as_ref()
+                .map(|inventory| inventory.bypasses.clone())
+                .unwrap_or_default(),
+            amont_downgrades: inventory
+                .as_ref()
+                .map(|inventory| inventory.downgrades.clone())
+                .unwrap_or_default(),
+        })
     }
 
     /// One separate review call per candidate requiring it (SPEC §9, §10).
     /// The reviewer cannot edit or waive anything; findings are triaged,
     /// and "no findings" is recorded as evidence, not proof.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn review_candidate(
         &mut self,
         manifest: &ContextManifest,
         authority: &EffectiveAuthority,
         candidate_sha: &str,
+        verification_inputs_changed: &[String],
         total_cost: &mut MicroUsd,
         cost_completeness: &mut CostCompleteness,
         deadline: Instant,
@@ -1387,6 +1544,16 @@ impl<'a> RunEngine<'a> {
             prompt.push_str("architectural constraints:\n");
             for constraint in &manifest.constraints {
                 prompt.push_str(&format!("  - {constraint}\n"));
+            }
+        }
+        if !verification_inputs_changed.is_empty() {
+            prompt.push_str(
+                "this candidate CHANGES VERIFICATION INPUTS (build manifests, tests, fixtures or \
+                 the checks themselves). Judge whether each change weakens what the acceptance \
+                 criteria verify; a deleted or loosened test is a finding:\n",
+            );
+            for path in verification_inputs_changed {
+                prompt.push_str(&format!("  - {path}\n"));
             }
         }
         prompt.push_str(&format!("\ncandidate commit: {candidate_sha}\n"));
@@ -1719,6 +1886,8 @@ mod tests {
                         VerificationProfile {
                             commands,
                             amont_checks: Vec::new(),
+                            inputs: Vec::new(),
+                            cache_baseline: false,
                         },
                     )]),
                 },
@@ -1759,6 +1928,8 @@ mod tests {
             let machine = self.machine_for(repo);
             let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
                 adr: "ADR-0001".into(),
+                choice: None,
+                reason: None,
             };
             execute(&RunConfig {
                 repo_dir: &self.repo,
@@ -1785,6 +1956,8 @@ mod tests {
         ) -> RunOutcome {
             let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
                 adr: "ADR-0001".into(),
+                choice: None,
+                reason: None,
             };
             execute(&RunConfig {
                 repo_dir: &self.repo,
@@ -1812,6 +1985,8 @@ mod tests {
         ) -> RunOutcome {
             let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
                 adr: "ADR-0001".into(),
+                choice: None,
+                reason: None,
             };
             execute(&RunConfig {
                 repo_dir: &self.repo,
@@ -2611,6 +2786,185 @@ mod tests {
             gate.status().runs[outcome.run_id()].queued,
             0,
             "the queue entry is gone"
+        );
+    }
+
+    // -- enforcement the spec promises (SPEC §5, §7, §10, §18) ---------------
+
+    /// A worker that edits the test tree gets explicit review even when the
+    /// route said none: verification inputs cannot be weakened silently.
+    #[test]
+    fn changing_verification_inputs_forces_review() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&launches);
+        let backend = MockBackend::new(move |spec| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            if spec.prompt.contains("semantic reviewer") {
+                assert!(
+                    spec.prompt.contains("CHANGES VERIFICATION INPUTS")
+                        && spec.prompt.contains("tests/regression.rs"),
+                    "the reviewer is told what changed: {}",
+                    spec.prompt
+                );
+                return MockOutcome {
+                    result_text: Some("FINDINGS: none".into()),
+                    exit_code: Some(0),
+                    ..Default::default()
+                };
+            }
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            std::fs::create_dir_all(spec.work_dir.join("tests")).expect("mkdir");
+            std::fs::write(
+                spec.work_dir.join("tests/regression.rs"),
+                "#[test] fn t() {}\n",
+            )
+            .expect("test");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        });
+        let mut contract = fixture.contract_with_scope(&["src/**", "tests/**"]);
+        contract.review = Review::Off;
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        let RunOutcome::Accepted { run_id, receipt } = outcome else {
+            panic!("expected acceptance after review, got {outcome:?}");
+        };
+        assert_eq!(
+            launches.load(Ordering::SeqCst),
+            2,
+            "worker, then the forced review"
+        );
+        assert_eq!(
+            receipt.verification.verification_inputs_changed,
+            vec!["tests/regression.rs".to_string()]
+        );
+        let reasons: Vec<String> = fixture
+            .ledger
+            .transitions(&run_id)
+            .expect("transitions")
+            .into_iter()
+            .map(|t| t.reason)
+            .collect();
+        assert!(reasons.contains(&reason::VERIFICATION_INPUTS_CHANGED.to_string()));
+    }
+
+    #[test]
+    fn a_missing_required_integration_blocks_before_any_dispatch() {
+        let fixture = Fixture::new();
+        let mut repo = fixture.repo_policy(vec![passing_check()], 3);
+        repo.integrations.aval = Some(Dependency::Full {
+            mode: DependencyMode::Required,
+            bin: Some("relais-test-no-such-binary".into()),
+        });
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&launches);
+        let backend = MockBackend::new(move |_spec| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            MockOutcome::default()
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+        assert!(
+            matches!(&outcome, RunOutcome::Blocked { code, .. } if code == "integration_missing"),
+            "{outcome:?}"
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn optional_integration_gaps_ride_in_the_receipt_and_are_not_passes() {
+        let fixture = Fixture::new();
+        let mut repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        repo.integrations.amont_agent = Some(Dependency::Full {
+            mode: DependencyMode::Optional,
+            bin: Some("relais-test-no-such-binary".into()),
+        });
+        let backend = conditional_worker("relais task");
+        let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+        let RunOutcome::Accepted { receipt, .. } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(
+            receipt
+                .verification
+                .integration_gaps
+                .iter()
+                .any(|gap| gap.starts_with("amont-agent:") && gap.contains("not passed")),
+            "{:?}",
+            receipt.verification.integration_gaps
+        );
+    }
+
+    #[test]
+    fn the_context_package_is_persisted_with_fingerprints_and_evidence() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let backend = conditional_worker("relais task");
+        let mut contract = fixture.contract(Review::Off);
+        contract.read_hints = vec!["src".into()];
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        let RunOutcome::Accepted { run_id, .. } = outcome else {
+            panic!("{outcome:?}");
+        };
+        let manifest: ContextManifest = serde_json::from_str(
+            &std::fs::read_to_string(fixture.artifacts.join(&run_id).join("manifest.json"))
+                .expect("manifest"),
+        )
+        .expect("parses");
+        assert_eq!(manifest.fingerprints.len(), 1);
+        assert_eq!(manifest.fingerprints[0].path, "src/main.rs");
+        assert_eq!(manifest.fingerprints[0].blob.len(), 40, "git's blob id");
+        let evidence = fixture.ledger.evidence(&run_id).expect("evidence");
+        let kinds: Vec<&str> = evidence.iter().map(|(kind, _, _)| kind.as_str()).collect();
+        assert!(kinds.contains(&"context_manifest"), "{kinds:?}");
+        assert!(kinds.contains(&"candidate_patch"), "{kinds:?}");
+        assert!(kinds.contains(&"check_log"), "{kinds:?}");
+        assert!(kinds.contains(&"receipt"), "{kinds:?}");
+        assert!(evidence.iter().all(|(_, _, sha)| sha.is_some()));
+    }
+
+    #[test]
+    fn baseline_results_are_cached_only_when_the_profile_opts_in() {
+        let fixture = Fixture::new();
+        let mut repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let backend = conditional_worker("relais task");
+        let first = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+        let RunOutcome::Accepted { receipt, .. } = first else {
+            panic!("{first:?}");
+        };
+        assert!(!receipt.verification.baseline_cached, "off by default");
+        repo.verification
+            .profiles
+            .get_mut("profile")
+            .expect("profile")
+            .cache_baseline = true;
+        let machine = fixture.machine_for(&repo);
+        let second =
+            fixture.execute_with_machine(&fixture.contract(Review::Off), &repo, &machine, &backend);
+        let RunOutcome::Accepted { receipt, .. } = second else {
+            panic!("{second:?}");
+        };
+        assert!(
+            !receipt.verification.baseline_cached,
+            "the first opted-in run fills the cache"
+        );
+        let third =
+            fixture.execute_with_machine(&fixture.contract(Review::Off), &repo, &machine, &backend);
+        let RunOutcome::Accepted { receipt, .. } = third else {
+            panic!("{third:?}");
+        };
+        assert!(
+            receipt.verification.baseline_cached,
+            "the same base, profile and tools hit"
+        );
+        assert_eq!(
+            receipt.verification.baseline_failures.len(),
+            1,
+            "the cached baseline still names the pre-existing failure"
         );
     }
 

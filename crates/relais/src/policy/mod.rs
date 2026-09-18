@@ -135,6 +135,17 @@ pub struct VerificationProfile {
     /// check is a gap, not a pass (SPEC §10).
     #[serde(default)]
     pub amont_checks: Vec<String>,
+    /// Extra globs (beyond the built-in build-manifest and test-tree
+    /// defaults) naming files this profile's verdict depends on. A
+    /// candidate touching one requires review (SPEC §10).
+    #[serde(default)]
+    pub inputs: Vec<String>,
+    /// Cache baseline results by base SHA, profile and toolchain (SPEC
+    /// §18). Off by default: a profile with undeclared external
+    /// dependencies or nondeterministic checks is not cacheable, and only
+    /// the repository knows which it has.
+    #[serde(default)]
+    pub cache_baseline: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -598,6 +609,36 @@ fn default_bin(name: &str) -> &str {
 fn which_missing(bin: &str) -> bool {
     let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&path).all(|dir| !dir.join(bin).is_file())
+}
+
+/// Is this binary on PATH?
+pub fn binary_available(bin: &str) -> bool {
+    !which_missing(bin)
+}
+
+/// Is the integration's binary on PATH? By the integration's config name
+/// (`amont_agent` → `amont-agent`), ignoring any `bin` override.
+pub fn integration_available(name: &str) -> bool {
+    let name = name.replace('-', "_");
+    binary_available(default_bin(&name))
+}
+
+/// `<tool> --version`'s first line, or `None` when the tool is absent or
+/// will not answer — recorded in the context manifest so a receipt names
+/// the toolchain it was verified with.
+pub fn integration_version(name: &str) -> Option<String> {
+    let output = std::process::Command::new(default_bin(name))
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
 }
 
 /// Starter `relais.toml` written by `relais init`. Models and profiles

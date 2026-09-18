@@ -494,6 +494,8 @@ mod tests {
                             timeout_seconds: 300,
                         }],
                         amont_checks: Vec::new(),
+                        inputs: Vec::new(),
+                        cache_baseline: false,
                     },
                 )]),
             },

@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +52,19 @@ pub struct VerificationReport {
     pub baseline_failures: Vec<String>,
     pub amont_bypasses: Vec<String>,
     pub amont_downgrades: Vec<String>,
+    /// Verification inputs the candidate changed (build manifests, tests,
+    /// the commands themselves): reviewed explicitly, never silently
+    /// accepted (SPEC §10).
+    #[serde(default)]
+    pub verification_inputs_changed: Vec<String>,
+    /// Optional integrations that were not available: reported, never
+    /// counted as passed (SPEC §5).
+    #[serde(default)]
+    pub integration_gaps: Vec<String>,
+    /// Whether the baseline results came from the cache (SPEC §18) or a
+    /// fresh run at the base.
+    #[serde(default)]
+    pub baseline_cached: bool,
 }
 impl VerificationReport {
     pub fn accepted(&self) -> bool {
@@ -93,20 +106,10 @@ pub fn run_command(
         .current_dir(dir)
         .stdout(log_file.try_clone()?)
         .stderr(log_file);
-    let started = Instant::now();
+    crate::adapter::own_process_group(&mut command);
     let mut child = command.spawn()?;
     let timeout = Duration::from_secs(spec.timeout_seconds.max(1));
-    let timed_out = loop {
-        if child.try_wait()?.is_some() {
-            break false;
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            break true;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let status = child.wait()?;
+    let (status, timed_out, _cancelled) = crate::adapter::wait_for_exit(&mut child, timeout, None)?;
     let log_bytes = std::fs::read(&log_path)?;
     Ok(CheckOutcome {
         label: label.to_string(),
@@ -116,6 +119,23 @@ pub fn run_command(
         log_path: log_path.to_string_lossy().into_owned(),
         log_sha256: sha256_hex(&log_bytes),
     })
+}
+
+/// A check's label: the command's own identity (`make check@1a2b3c4d`),
+/// so a baseline failure matches the same command at the candidate even
+/// after the profile is reordered or a command is inserted — a position
+/// (`cmd0`) would silently re-pair them.
+pub fn check_label(spec: &CommandSpec) -> String {
+    let identity = sha256_hex(
+        serde_json::to_string(&spec.argv)
+            .expect("argv serializes")
+            .as_bytes(),
+    );
+    format!(
+        "{}@{}",
+        spec.argv.first().map(String::as_str).unwrap_or("?"),
+        &identity[..8]
+    )
 }
 
 /// Run a full profile against a directory. The SAME labels identify the
@@ -129,11 +149,91 @@ pub fn run_profile(
 ) -> std::io::Result<Vec<CheckOutcome>> {
     let mut outcomes = Vec::new();
     for (index, command) in profile.commands.iter().enumerate() {
-        let label = format!("cmd{index}");
-        let log_stem = format!("{prefix}-{label}");
+        let label = check_label(command);
+        let log_stem = format!("{prefix}-cmd{index}");
         outcomes.push(run_command(dir, command, logs_dir, &label, &log_stem)?);
     }
     Ok(outcomes)
+}
+
+/// Files the profile's verdict depends on: build manifests, lockfiles,
+/// the test tree, and any repository-relative program the profile runs.
+/// A candidate that changes one of these can make verification pass by
+/// changing what verification IS (SPEC §10: "changes to required checks,
+/// fixtures or acceptance tests receive explicit review and cannot
+/// silently weaken the contract"), so the runner requires review for it.
+pub const DEFAULT_VERIFICATION_INPUTS: &[&str] = &[
+    "Makefile",
+    "makefile",
+    "GNUmakefile",
+    "justfile",
+    "Cargo.toml",
+    "Cargo.lock",
+    "**/Cargo.toml",
+    "rust-toolchain.toml",
+    "package.json",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "pyproject.toml",
+    "requirements*.txt",
+    "go.mod",
+    "go.sum",
+    "**/tests/**",
+    "**/test/**",
+    "**/__tests__/**",
+    "**/*_test.*",
+    "**/*.test.*",
+    "**/*.spec.*",
+    "**/conftest.py",
+    "**/pytest.ini",
+    "**/fixtures/**",
+];
+
+/// The verification-input patterns for a profile: the defaults, the
+/// profile's own declarations, and each command's program when it lives
+/// in the repository (`./scripts/check.sh`).
+pub fn verification_inputs(profile: &VerificationProfile) -> Vec<String> {
+    let mut patterns: Vec<String> = DEFAULT_VERIFICATION_INPUTS
+        .iter()
+        .map(|p| p.to_string())
+        .collect();
+    patterns.extend(profile.inputs.iter().cloned());
+    for command in &profile.commands {
+        if let Some(program) = command.argv.first() {
+            let relative = program.trim_start_matches("./");
+            if program.starts_with("./") || program.contains('/') && !program.starts_with('/') {
+                patterns.push(relative.to_string());
+            }
+        }
+    }
+    patterns.sort();
+    patterns.dedup();
+    patterns
+}
+
+/// Which of `changed` are verification inputs.
+pub fn verification_inputs_touched(
+    profile: &VerificationProfile,
+    changed: &[String],
+) -> Vec<String> {
+    let mut builder = globset::GlobSetBuilder::new();
+    for pattern in verification_inputs(profile) {
+        if let Ok(glob) = globset::GlobBuilder::new(&pattern)
+            .literal_separator(true)
+            .build()
+        {
+            builder.add(glob);
+        }
+    }
+    let Ok(set) = builder.build() else {
+        return Vec::new();
+    };
+    changed
+        .iter()
+        .filter(|path| set.is_match(path))
+        .cloned()
+        .collect()
 }
 
 /// The effective check inventory from `amont list --json`
@@ -255,6 +355,67 @@ pub fn amont_gaps(inventory: Option<&AmontInventory>, required_ids: &[String]) -
     gaps
 }
 
+/// What one candidate's verification established: the checks that ran,
+/// the required checks that are gaps, and what amont's inventory declares
+/// about itself.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Verified {
+    pub checks: Vec<CheckOutcome>,
+    pub gaps: Vec<String>,
+    pub amont_bypasses: Vec<String>,
+    pub amont_downgrades: Vec<String>,
+}
+
+/// The baseline cache key: everything the base verdict is a function of
+/// that relais can observe (SPEC §18: "candidate content, dependency
+/// lockfiles, toolchain, command, configuration"). Lockfiles are part of
+/// the base tree; the toolchain is the recorded tool versions.
+pub fn baseline_key(
+    base_sha: &str,
+    profile: &VerificationProfile,
+    tools: &crate::context::ToolVersions,
+) -> String {
+    sha256_hex(
+        serde_json::json!({
+            "base": base_sha,
+            "profile": profile,
+            "tools": tools,
+        })
+        .to_string()
+        .as_bytes(),
+    )
+}
+
+/// Cached baseline failures, one JSON file per key, opt-in per profile
+/// (SPEC §18: not cacheable by default). A miss reruns the checks; a
+/// corrupt entry is a miss.
+pub struct BaselineCache {
+    dir: PathBuf,
+}
+
+impl BaselineCache {
+    pub fn new(dir: &Path) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<Vec<String>> {
+        let text = std::fs::read_to_string(self.dir.join(format!("{key}.json"))).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    pub fn put(&self, key: &str, failures: &[String]) {
+        if std::fs::create_dir_all(&self.dir).is_err() {
+            return;
+        }
+        let _ = std::fs::write(
+            self.dir.join(format!("{key}.json")),
+            serde_json::to_string(failures).expect("serializes"),
+        );
+    }
+}
+
 /// A runner receipt (SPEC §12). Written by the runner into the ledger and
 /// the run's artifact directory; a worker JSON document cannot impersonate
 /// one because only `store_receipt` writes this shape and the ledger never
@@ -341,25 +502,32 @@ impl Drop for VerificationWorktree<'_> {
 }
 
 /// Integration availability recorded into the report: required gaps block,
-/// optional gaps are visible and never passes (SPEC §5).
+/// optional gaps are visible and never passes (SPEC §5). `available` is
+/// asked about the BINARY the declaration names (`bin = …` overrides the
+/// default), not the integration's config name.
 pub fn integration_gaps(
     integrations: &Integrations,
     available: &dyn Fn(&str) -> bool,
 ) -> Vec<String> {
     let mut gaps = Vec::new();
-    for (name, mode) in [
-        ("aval", integrations.aval.as_ref().map(|d| d.mode())),
-        ("amont", integrations.amont.as_ref().map(|d| d.mode())),
+    for (name, default_bin, dependency) in [
+        ("aval", "aval", integrations.aval.as_ref()),
+        ("amont", "amont", integrations.amont.as_ref()),
         (
             "amont-agent",
-            integrations.amont_agent.as_ref().map(|d| d.mode()),
+            "amont-agent",
+            integrations.amont_agent.as_ref(),
         ),
     ] {
-        match mode {
-            Some(DependencyMode::Required) if !available(name) => {
+        let Some(dependency) = dependency else {
+            continue;
+        };
+        let bin = dependency.bin().unwrap_or(default_bin);
+        match dependency.mode() {
+            DependencyMode::Required if !available(bin) => {
                 gaps.push(format!("{name}: required integration unavailable"))
             }
-            Some(DependencyMode::Optional) if !available(name) => gaps.push(format!(
+            DependencyMode::Optional if !available(bin) => gaps.push(format!(
                 "{name}: optional integration not installed (reported, not passed)"
             )),
             _ => {}
@@ -433,17 +601,106 @@ mod tests {
         let profile = VerificationProfile {
             commands: vec![command(&["sh", "-c", "true"], 10)],
             amont_checks: Vec::new(),
+            inputs: Vec::new(),
+            cache_baseline: false,
         };
         let base = run_profile(&dir, &profile, &logs, "base").expect("base");
         let candidate = run_profile(&dir, &profile, &logs, "attempt1").expect("candidate");
-        assert_eq!(base[0].label, "cmd0");
+        assert_eq!(base[0].label, check_label(&profile.commands[0]));
+        assert!(base[0].label.starts_with("sh@"), "{}", base[0].label);
         assert_eq!(
-            candidate[0].label, "cmd0",
+            candidate[0].label, base[0].label,
             "the same command keeps its label"
         );
         assert_ne!(
             base[0].log_path, candidate[0].log_path,
             "logs never collide"
+        );
+        // A reordered profile does not re-pair a baseline failure with a
+        // different command: the label is the command's, not its slot's.
+        let reordered = VerificationProfile {
+            commands: vec![
+                command(&["sh", "-c", "false"], 10),
+                profile.commands[0].clone(),
+            ],
+            ..profile.clone()
+        };
+        let again = run_profile(&dir, &reordered, &logs, "attempt2").expect("reordered");
+        assert_eq!(again[1].label, base[0].label);
+        assert_ne!(again[0].label, base[0].label);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn verification_inputs_include_defaults_declared_globs_and_repo_programs() {
+        let profile = VerificationProfile {
+            commands: vec![
+                command(&["./scripts/check.sh"], 10),
+                command(&["make", "check"], 10),
+            ],
+            amont_checks: Vec::new(),
+            inputs: vec!["ci/**".into()],
+            cache_baseline: false,
+        };
+        let touched = verification_inputs_touched(
+            &profile,
+            &[
+                "src/lib.rs".into(),
+                "Makefile".into(),
+                "crates/x/Cargo.toml".into(),
+                "tests/smoke.rs".into(),
+                "src/foo_test.go".into(),
+                "scripts/check.sh".into(),
+                "ci/lint.yml".into(),
+                "docs/README.md".into(),
+            ],
+        );
+        assert_eq!(
+            touched,
+            vec![
+                "Makefile",
+                "crates/x/Cargo.toml",
+                "tests/smoke.rs",
+                "src/foo_test.go",
+                "scripts/check.sh",
+                "ci/lint.yml",
+            ]
+        );
+    }
+
+    #[test]
+    fn baseline_cache_is_keyed_on_base_profile_and_tools() {
+        let dir = std::env::temp_dir().join(format!("relais-bcache-{}", std::process::id()));
+        let cache = BaselineCache::new(&dir);
+        let profile = VerificationProfile {
+            commands: vec![command(&["make", "check"], 10)],
+            amont_checks: Vec::new(),
+            inputs: Vec::new(),
+            cache_baseline: true,
+        };
+        let tools = crate::context::ToolVersions {
+            relais: "0.1.0".into(),
+            aval: None,
+            amont: Some("amont 1.36.1".into()),
+            claude_code: None,
+        };
+        let key = baseline_key("abc", &profile, &tools);
+        assert_eq!(cache.get(&key), None, "a miss reruns the checks");
+        cache.put(&key, &["make@deadbeef".to_string()]);
+        assert_eq!(cache.get(&key), Some(vec!["make@deadbeef".to_string()]));
+        let other_tools = crate::context::ToolVersions {
+            amont: Some("amont 1.37.0".into()),
+            ..tools.clone()
+        };
+        assert_ne!(
+            key,
+            baseline_key("abc", &profile, &other_tools),
+            "toolchain is in the key"
+        );
+        assert_ne!(
+            key,
+            baseline_key("abd", &profile, &tools),
+            "base is in the key"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -513,6 +770,9 @@ mod tests {
             baseline_failures: vec![],
             amont_bypasses: vec![],
             amont_downgrades: vec![],
+            verification_inputs_changed: Vec::new(),
+            integration_gaps: Vec::new(),
+            baseline_cached: false,
         };
         assert!(report.accepted());
         assert!(report.new_failures().is_empty());
@@ -544,6 +804,9 @@ mod tests {
             baseline_failures: vec!["flaky".into()],
             amont_bypasses: vec![],
             amont_downgrades: vec![],
+            verification_inputs_changed: Vec::new(),
+            integration_gaps: Vec::new(),
+            baseline_cached: false,
         };
         assert!(!report.accepted(), "baseline failures are not auto-waived");
         assert!(
@@ -571,6 +834,9 @@ mod tests {
                 baseline_failures: vec![],
                 amont_bypasses: vec![],
                 amont_downgrades: vec![],
+                verification_inputs_changed: Vec::new(),
+                integration_gaps: Vec::new(),
+                baseline_cached: false,
             },
             models_used: vec!["sonnet".into()],
             attempts: 1,
