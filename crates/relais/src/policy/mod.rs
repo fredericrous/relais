@@ -212,6 +212,21 @@ pub struct RepoPolicy {
     pub risk: Vec<RiskRule>,
     #[serde(default)]
     pub architecture: ArchitectureConfig,
+    /// Explicitly configured deterministic recipes (SPEC §6.3). Used only
+    /// when one fully covers the task; never inferred from prose.
+    #[serde(default)]
+    pub recipes: Vec<RecipeSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecipeSpec {
+    pub name: String,
+    #[serde(default)]
+    pub kind: Option<crate::contract::Kind>,
+    #[serde(default)]
+    pub scope_within: Vec<String>,
+    pub tier: Tier,
 }
 
 impl RepoPolicy {
@@ -304,6 +319,8 @@ pub struct MachineSettings {
     pub concurrency: ConcurrencyLimits,
     #[serde(default)]
     pub trials: TrialEnvelope,
+    #[serde(default)]
+    pub routing: RoutingSettings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -368,12 +385,35 @@ pub struct ConcurrencyLimits {
 /// Authorized experimentation envelope (SPEC §13, §17). Automatic trials
 /// and promotion stay inside it; anything wider needs an explicit policy
 /// edit. Risk floors and required checks are never trainable parameters.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct TrialEnvelope {
     pub enabled: bool,
     pub max_daily_trials: Option<u32>,
     pub max_trial_cost_micros: Option<i64>,
+}
+
+/// Learned-routing switch and the quality requirement estimates are
+/// selected against (SPEC §6, §17: "expected complete-strategy cost
+/// subject to the configured quality requirement"). Disabling learned
+/// routing disables only the predictor — execution, verification and
+/// accounting are unaffected.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RoutingSettings {
+    pub learned_enabled: bool,
+    /// Minimum estimated acceptance a profile needs to be selected over
+    /// the conservative baseline.
+    pub quality_floor: Option<f64>,
+}
+
+impl Default for RoutingSettings {
+    fn default() -> Self {
+        Self {
+            learned_enabled: true,
+            quality_floor: Some(0.75),
+        }
+    }
 }
 
 impl MachineSettings {

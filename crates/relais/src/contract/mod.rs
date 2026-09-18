@@ -29,10 +29,14 @@ pub enum Kind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Review {
+    /// No review; the least cautious value.
+    Off,
+    /// Review if the route's risk calls for it.
     #[default]
     Optional,
+    /// A separate reviewer must pass; the most cautious value, and a
+    /// floor nothing can lower.
     Required,
-    Off,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
