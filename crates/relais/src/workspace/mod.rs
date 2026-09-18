@@ -149,14 +149,22 @@ impl TaskWorktree {
 
     /// Immutable candidate snapshot, including added files, outside model
     /// control: a commit object created by plumbing, with no commit hooks
-    /// and no working-tree mutation. The commit SHA is the candidate's
-    /// identity in receipts and evidence.
-    pub fn snapshot_candidate(&self, label: &str) -> Result<String> {
+    /// and no working-tree mutation. The message is FIXED so the SHA is a
+    /// pure function of (tree, base) — identical content is an identical
+    /// candidate identity, which the same-failure recurrence check
+    /// depends on.
+    pub fn snapshot_candidate(&self, _label: &str) -> Result<String> {
         git(&self.path, &["add", "-A"])?;
         let tree = git(&self.path, &["write-tree"])?;
-        let message = format!("relais candidate: {label}");
         let commit = Command::new("git")
-            .args(["commit-tree", &tree, "-p", &self.base_sha, "-m", &message])
+            .args([
+                "commit-tree",
+                &tree,
+                "-p",
+                &self.base_sha,
+                "-m",
+                "relais candidate snapshot",
+            ])
             .current_dir(&self.path)
             .output()
             .map_err(|e| WorkspaceError::Git(format!("commit-tree: {e}")))?;

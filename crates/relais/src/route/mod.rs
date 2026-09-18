@@ -444,6 +444,7 @@ mod tests {
                             argv: vec!["make".into(), "check".into()],
                             timeout_seconds: 300,
                         }],
+                        amont_checks: Vec::new(),
                     },
                 )]),
             },

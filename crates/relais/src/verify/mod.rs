@@ -70,15 +70,18 @@ impl VerificationReport {
 
 /// Run one command against a directory, capturing the merged log to a file
 /// under `logs_dir`, hashing it, and enforcing a wall timeout. The log is
-/// evidence: it exists whether the check passed or failed.
+/// evidence: it exists whether the check passed or failed. The LABEL is
+/// stable across baseline and candidate runs (it identifies the command);
+/// the LOG STEM differs so logs never collide.
 pub fn run_command(
     dir: &Path,
     spec: &CommandSpec,
     logs_dir: &Path,
     label: &str,
+    log_stem: &str,
 ) -> std::io::Result<CheckOutcome> {
     std::fs::create_dir_all(logs_dir)?;
-    let log_path = logs_dir.join(format!("{label}.log"));
+    let log_path = logs_dir.join(format!("{log_stem}.log"));
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -115,8 +118,9 @@ pub fn run_command(
     })
 }
 
-/// Run a full profile against a directory (used for both the candidate
-/// worktree and the baseline preflight at the base SHA).
+/// Run a full profile against a directory. The SAME labels identify the
+/// same commands at the base and at every candidate, which is what makes
+/// baseline-vs-candidate comparison meaningful (SPEC §10).
 pub fn run_profile(
     dir: &Path,
     profile: &VerificationProfile,
@@ -125,8 +129,9 @@ pub fn run_profile(
 ) -> std::io::Result<Vec<CheckOutcome>> {
     let mut outcomes = Vec::new();
     for (index, command) in profile.commands.iter().enumerate() {
-        let label = format!("{prefix}-cmd{index}");
-        outcomes.push(run_command(dir, command, logs_dir, &label)?);
+        let label = format!("cmd{index}");
+        let log_stem = format!("{prefix}-{label}");
+        outcomes.push(run_command(dir, command, logs_dir, &label, &log_stem)?);
     }
     Ok(outcomes)
 }
@@ -378,8 +383,14 @@ mod tests {
     fn passing_and_failing_commands_are_recorded_with_log_hashes() {
         let dir = std::env::temp_dir().join(format!("relais-verify-{}", std::process::id()));
         let logs = dir.join("logs");
-        let pass =
-            run_command(&dir, &command(&["sh", "-c", "echo ok"], 10), &logs, "pass").expect("run");
+        let pass = run_command(
+            &dir,
+            &command(&["sh", "-c", "echo ok"], 10),
+            &logs,
+            "cmd0",
+            "x-cmd0",
+        )
+        .expect("run");
         assert!(!pass.failed());
         assert_eq!(pass.exit, Some(0));
         assert_eq!(pass.log_sha256.len(), 64);
@@ -387,7 +398,8 @@ mod tests {
             &dir,
             &command(&["sh", "-c", "echo bad >&2; exit 1"], 10),
             &logs,
-            "fail",
+            "cmd1",
+            "x-cmd1",
         )
         .expect("run");
         assert!(fail.failed());
@@ -401,10 +413,38 @@ mod tests {
     fn timeouts_kill_the_check_and_count_as_failures() {
         let dir = std::env::temp_dir().join(format!("relais-verify-t-{}", std::process::id()));
         let logs = dir.join("logs");
-        let hung =
-            run_command(&dir, &command(&["sh", "-c", "sleep 5"], 1), &logs, "hung").expect("run");
+        let hung = run_command(
+            &dir,
+            &command(&["sh", "-c", "sleep 5"], 1),
+            &logs,
+            "cmd0",
+            "x-cmd0",
+        )
+        .expect("run");
         assert!(hung.timed_out);
         assert!(hung.failed());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn labels_are_stable_across_baseline_and_candidate_runs() {
+        let dir = std::env::temp_dir().join(format!("relais-verify-l-{}", std::process::id()));
+        let logs = dir.join("logs");
+        let profile = VerificationProfile {
+            commands: vec![command(&["sh", "-c", "true"], 10)],
+            amont_checks: Vec::new(),
+        };
+        let base = run_profile(&dir, &profile, &logs, "base").expect("base");
+        let candidate = run_profile(&dir, &profile, &logs, "attempt1").expect("candidate");
+        assert_eq!(base[0].label, "cmd0");
+        assert_eq!(
+            candidate[0].label, "cmd0",
+            "the same command keeps its label"
+        );
+        assert_ne!(
+            base[0].log_path, candidate[0].log_path,
+            "logs never collide"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -12,6 +12,9 @@
 //! ship. No adapter may advertise guarantees its backend cannot enforce.
 
 pub mod claude;
+pub mod mock;
+
+pub use mock::{MockBackend, MockOutcome};
 
 use std::io::Write;
 use std::path::PathBuf;

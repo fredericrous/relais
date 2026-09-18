@@ -459,7 +459,7 @@ impl Ledger {
     pub fn attach_dispatch_process(
         &self,
         dispatch_id: &str,
-        pid: u32,
+        pid: Option<u32>,
         session_id: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
@@ -467,7 +467,7 @@ impl Ledger {
              WHERE dispatch_id = ?1",
             params![
                 dispatch_id,
-                pid as i64,
+                pid.map(|pid| pid as i64),
                 session_id,
                 "launched",
                 now_rfc3339()
@@ -754,7 +754,7 @@ mod tests {
             "same dispatch ID cannot create a duplicate"
         );
         ledger
-            .attach_dispatch_process("disp-1", 4242, Some("sess-1"))
+            .attach_dispatch_process("disp-1", Some(4242), Some("sess-1"))
             .expect("attach");
         let live = ledger.live_dispatches().expect("live");
         assert_eq!(live, vec![("disp-1".into(), "run-d".into(), Some(4242))]);

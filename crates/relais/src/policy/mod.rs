@@ -130,6 +130,11 @@ pub struct VerificationPolicy {
 pub struct VerificationProfile {
     #[serde(default)]
     pub commands: Vec<CommandSpec>,
+    /// amont check IDs (from `amont list --json`) this profile requires to
+    /// be in force. A skipped, inert, unavailable or untrusted required
+    /// check is a gap, not a pass (SPEC §10).
+    #[serde(default)]
+    pub amont_checks: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
