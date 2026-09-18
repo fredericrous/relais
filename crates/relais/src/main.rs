@@ -88,7 +88,7 @@ enum Command {
         outcome: FeedbackOutcome,
     },
     /// Install the Claude Code integration; preview-first, --write applies
-    /// (SPEC §3)
+    /// (SPEC §3). User-level installation is explicit, not the default.
     Install {
         /// Install the Claude Code skill and agent definitions
         #[arg(long = "claude")]
@@ -96,8 +96,11 @@ enum Command {
         /// Apply the reviewed changes instead of previewing
         #[arg(long)]
         write: bool,
+        /// Install at the user level (~/.claude) instead of this project
+        #[arg(long)]
+        user: bool,
     },
-    /// Remove only owned, unchanged artifacts (SPEC §3)
+    /// Remove only owned, unchanged artifacts (SPEC §3).
     Uninstall {
         /// Remove the Claude Code skill and agent definitions
         #[arg(long = "claude")]
@@ -105,6 +108,9 @@ enum Command {
         /// Apply the removal instead of previewing
         #[arg(long)]
         write: bool,
+        /// Remove from the user level (~/.claude) instead of this project
+        #[arg(long)]
+        user: bool,
     },
     /// Coordinator operations (SPEC §23). Started lazily by the CLI when
     /// anything needs it; --daemon is the internal foreground form.
@@ -151,17 +157,25 @@ fn main() {
         Command::Evaluate { artifact } => evaluate_command(&artifact),
         Command::Promote { artifact_id } => promote_command(&artifact_id),
         Command::Feedback { run_id, outcome } => feedback_command(&run_id, outcome),
-        Command::Install { claude, write: _ } => {
+        Command::Install {
+            claude,
+            write,
+            user,
+        } => {
             if claude {
-                stub("install --claude", "M9")
+                install_command(write, user)
             } else {
                 eprintln!("relais install: name what to install (--claude)");
                 2
             }
         }
-        Command::Uninstall { claude, write: _ } => {
+        Command::Uninstall {
+            claude,
+            write,
+            user,
+        } => {
             if claude {
-                stub("uninstall --claude", "M9")
+                uninstall_command(write, user)
             } else {
                 eprintln!("relais uninstall: name what to remove (--claude)");
                 2
@@ -172,9 +186,67 @@ fn main() {
     std::process::exit(code);
 }
 
-fn stub(name: &str, milestone: &str) -> i32 {
-    eprintln!("relais {name}: not implemented yet (milestone {milestone})");
-    2
+fn install_command(write: bool, user: bool) -> i32 {
+    let root = if user {
+        relais::install::InstallRoot::user()
+    } else {
+        relais::install::InstallRoot::project(&cwd())
+    };
+    let plan = root.plan();
+    println!(
+        "relais install --claude ({})\n{}",
+        if user { "user level" } else { "project level" },
+        plan.render()
+    );
+    if !write {
+        println!("preview only: re-run with --write to apply");
+        return 0;
+    }
+    match root.apply(&plan) {
+        Ok(applied) => {
+            println!("applied {} change(s)", applied.len());
+            0
+        }
+        Err(e) => {
+            eprintln!("relais install: {e}");
+            1
+        }
+    }
+}
+
+fn uninstall_command(write: bool, user: bool) -> i32 {
+    let root = if user {
+        relais::install::InstallRoot::user()
+    } else {
+        relais::install::InstallRoot::project(&cwd())
+    };
+    let plan = root.uninstall_plan();
+    println!(
+        "relais uninstall --claude ({})\n{}",
+        if user { "user level" } else { "project level" },
+        plan.render()
+    );
+    if plan.actions.is_empty() {
+        println!("nothing owned to remove");
+        return 0;
+    }
+    if !write {
+        println!("preview only: re-run with --write to apply");
+        return 0;
+    }
+    match root.apply_uninstall(&plan) {
+        Ok(applied) => {
+            println!(
+                "removed {} owned artifact(s); conflicts were kept",
+                applied.len()
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("relais uninstall: {e}");
+            1
+        }
+    }
 }
 
 fn registry() -> relais::learn::registry::Registry {
