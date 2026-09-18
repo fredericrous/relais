@@ -272,6 +272,8 @@ pub(crate) struct RunEngine<'a> {
     pub(crate) artifacts: PathBuf,
     pub(crate) state: State,
     parent: Option<(String, String)>,
+    /// `<backend> <version>` as probed at run start; unknown = `None`.
+    pub(crate) harness: Option<String>,
 }
 
 impl<'a> RunEngine<'a> {
@@ -284,6 +286,7 @@ impl<'a> RunEngine<'a> {
             artifacts,
             state: State::Prepared,
             parent,
+            harness: None,
         }
     }
 
@@ -667,6 +670,16 @@ impl<'a> RunEngine<'a> {
             let first = &decision.blocked[0];
             return self.fail_preflight(&first.code, first.detail.clone());
         }
+        if let Some(estimates) = &decision.estimates {
+            ledger
+                .record_prediction(
+                    &self.run_id,
+                    &estimates.artifact_id,
+                    &estimates.input_hash,
+                    &estimates.raw,
+                )
+                .expect("prediction recorded");
+        }
         std::fs::write(
             self.artifacts.join("route.txt"),
             decision.explain(
@@ -704,6 +717,15 @@ impl<'a> RunEngine<'a> {
         };
 
         let deadline = Instant::now() + Duration::from_secs(authority.max_wall_seconds);
+        // The harness identity every dispatch of this run records, probed
+        // once (SPEC §16: model/effort/harness identity are features).
+        self.harness = self.config.backend.probe().map(|capabilities| {
+            format!(
+                "{} {}",
+                self.config.backend.name(),
+                capabilities.version.as_deref().unwrap_or("?")
+            )
+        });
 
         // Bounded decomposition (SPEC §19): work packages as runs of their
         // own, an assembled candidate verified independently. A planner
@@ -831,6 +853,7 @@ impl<'a> RunEngine<'a> {
                     &serde_json::json!({
                         "model": model_profile.id,
                         "effort": model_profile.effort,
+                        "harness": self.harness,
                         "tier": tier.as_str(),
                         "kind": format!("{kind:?}"),
                         "prompt_bytes": prompt.len(),

@@ -185,23 +185,28 @@ impl Registry {
     /// Promotion requires the artifact to carry an evaluation whose gates
     /// passed; the previous pointer is kept for immediate rollback
     /// (SPEC §17).
-    pub fn promote(
-        &self,
-        artifact_id: &str,
-        gates: &PromotionGates,
-    ) -> std::result::Result<(), ArtifactError> {
+    /// Activate an evaluated artifact. The evidence is the evaluator's own
+    /// report, deserialized as the type the evaluator wrote — a `Value`
+    /// probe for a top-level `gates_passed` used to look one level too
+    /// high and refused every artifact `relais train` ever produced.
+    pub fn promote(&self, artifact_id: &str) -> std::result::Result<(), ArtifactError> {
         let artifact = self.load(artifact_id)?;
         let Some(evaluation) = &artifact.evaluation else {
             return Err(ArtifactError::Malformed(format!(
                 "artifact {artifact_id} has no evaluation report; promotion requires evidence"
             )));
         };
-        if evaluation.get("gates_passed") != Some(&serde_json::Value::Bool(true)) {
+        let report: super::evaluate::EvalReport = serde_json::from_value(evaluation.clone())
+            .map_err(|e| {
+                ArtifactError::Malformed(format!(
+                    "artifact {artifact_id} carries an evaluation report this relais cannot read: {e}"
+                ))
+            })?;
+        if !report.gates.gates_passed {
             return Err(ArtifactError::Malformed(format!(
                 "artifact {artifact_id} failed its evaluation gates; promote rejects it"
             )));
         }
-        let _ = gates;
         if let Some(current) = self.active().ok().flatten() {
             let rollback = self.dir.join("previous.json");
             std::fs::write(
@@ -325,31 +330,66 @@ mod tests {
         assert!(Artifact::from_json(&serde_json::to_string(&bad_std).unwrap()).is_err());
     }
 
+    /// The evaluator's report, as `relais train` stores it — the ONLY
+    /// shape promotion may read. A hand-written `{"gates_passed": true}`
+    /// here once let promotion pass its test while refusing every real
+    /// artifact.
+    fn evaluation(gates_passed: bool) -> serde_json::Value {
+        let report = super::super::evaluate::EvalReport {
+            version: super::super::evaluate::EVAL_SCHEMA_VERSION,
+            train_records: 10,
+            calibration_records: 2,
+            test_records: 2,
+            calibration_bins: vec![],
+            test_acceptance_rate: Some(0.9),
+            baseline_acceptance_rate: Some(0.8),
+            mean_cost_selected: None,
+            mean_cost_baseline: None,
+            abstention_rate: 0.1,
+            coverage: vec![("implementation".into(), 5)],
+            gates: PromotionGates {
+                gates_passed,
+                min_records_per_tier: 5,
+                coverage: vec![("implementation".into(), 5)],
+                test_acceptance_rate: Some(0.9),
+                quality_floor: 0.75,
+                abstention_rate: 0.1,
+            },
+        };
+        serde_json::to_value(report).expect("serializes")
+    }
+
     #[test]
     fn promotion_requires_evidence_and_preserves_rollback() {
         let (registry, dir) = temp_registry();
         let unevaluated = artifact("art-no-eval", None);
         registry.store(&unevaluated).expect("store");
-        assert!(registry.promote("art-no-eval", &fake_gates()).is_err());
+        assert!(registry.promote("art-no-eval").is_err());
+        let failed = artifact("art-failed", Some(evaluation(false)));
+        registry.store(&failed).expect("store");
+        assert!(
+            registry.promote("art-failed").is_err(),
+            "failed gates refuse"
+        );
+        let top_level_probe =
+            artifact("art-probe", Some(serde_json::json!({"gates_passed": true})));
+        registry.store(&top_level_probe).expect("store");
+        assert!(
+            registry.promote("art-probe").is_err(),
+            "a document that is not the evaluator's report is not evidence"
+        );
 
-        let evaluated = artifact("art-eval", Some(serde_json::json!({"gates_passed": true})));
+        let evaluated = artifact("art-eval", Some(evaluation(true)));
         registry.store(&evaluated).expect("store");
-        registry
-            .promote("art-eval", &fake_gates())
-            .expect("promote");
+        registry.promote("art-eval").expect("promote");
         assert_eq!(
             registry.active().expect("active").unwrap().artifact_id,
             "art-eval"
         );
 
-        let better = artifact(
-            "art-better",
-            Some(serde_json::json!({"gates_passed": true})),
-        );
+        let better = artifact("art-better", Some(evaluation(true)));
         registry.store(&better).expect("store");
-        registry
-            .promote("art-better", &fake_gates())
-            .expect("promote");
+        registry.promote("art-better").expect("promote");
         assert_eq!(
             registry.active().expect("active").unwrap().artifact_id,
             "art-better"
@@ -364,16 +404,5 @@ mod tests {
             "art-eval"
         );
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    fn fake_gates() -> PromotionGates {
-        PromotionGates {
-            gates_passed: true,
-            min_records_per_tier: 5,
-            coverage: vec![("implementation".into(), 5)],
-            test_acceptance_rate: Some(0.9),
-            quality_floor: 0.75,
-            abstention_rate: 0.1,
-        }
     }
 }

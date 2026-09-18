@@ -7,8 +7,10 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use relais::adapter::Backend;
 use relais::context::AvalVerdict;
 use relais::contract::TaskContract;
+use relais::learn::predict::RegistryPredictor;
 use relais::policy::{effective_authority, MachineSettings, RepoPolicy};
 use relais::runner::{execute, RunConfig, RunOutcome, State};
 use relais::{doctor, ledger::Ledger, paths, report, route, workspace};
@@ -274,6 +276,29 @@ fn uninstall_command(write: bool, user: bool) -> i32 {
     }
 }
 
+/// The registry, when learned routing is on and the registry opens; a
+/// missing or unreadable registry is the conservative baseline, not an
+/// error (SPEC §21: missing trained evidence produces conservative
+/// execution without disabling the rest of the product).
+fn learned_registry(machine: &MachineSettings) -> Option<relais::learn::registry::Registry> {
+    if !machine.routing.learned_enabled {
+        return None;
+    }
+    relais::learn::registry::Registry::open(&paths::registry_dir()).ok()
+}
+
+/// `<backend> <version>` for `plan`, which must not need the harness to
+/// answer: unknown when it is not installed.
+fn harness_identity() -> Option<String> {
+    let backend = relais::adapter::claude::ClaudeBackend::discover().ok()?;
+    let capabilities = backend.probe()?;
+    Some(format!(
+        "{} {}",
+        backend.name(),
+        capabilities.version.as_deref().unwrap_or("?")
+    ))
+}
+
 fn registry() -> relais::learn::registry::Registry {
     relais::learn::registry::Registry::open(&paths::registry_dir()).unwrap_or_else(|e| {
         eprintln!("relais: artifact registry is unavailable: {e}");
@@ -458,15 +483,7 @@ fn evaluate_command(artifact_id: &str) -> i32 {
 
 fn promote_command(artifact_id: &str) -> i32 {
     let reg = registry();
-    let gates = relais::learn::registry::PromotionGates {
-        gates_passed: true,
-        min_records_per_tier: relais::learn::evaluate::DEFAULT_MIN_RECORDS_PER_TIER,
-        coverage: vec![],
-        test_acceptance_rate: None,
-        quality_floor: 0.75,
-        abstention_rate: 0.0,
-    };
-    match reg.promote(artifact_id, &gates) {
+    match reg.promote(artifact_id) {
         Ok(()) => {
             println!(
                 "promoted {artifact_id}; the previous artifact stays for `relais promote` rollback"
@@ -747,12 +764,19 @@ fn plan_command(task: &Path) -> i32 {
         }
     };
     let authority = effective_authority(&repo, &machine, &contract);
+    let harness = harness_identity();
+    let registry = learned_registry(&machine);
+    let predictor = registry
+        .as_ref()
+        .map(|registry| RegistryPredictor::new(registry, &repo, harness.as_deref()));
     let decision = route::route(route::RouteInputs {
         contract: &contract,
         repo: &repo,
         machine: &machine,
         authority: &authority,
-        predictor: None,
+        predictor: predictor
+            .as_ref()
+            .map(|predictor| predictor as &dyn route::RoutePredictor),
     });
     println!("contract hash: {}", contract.hash());
     println!("policy hash: {}", authority.authority_hash);
@@ -801,6 +825,19 @@ fn run_command(task: &Path) -> i32 {
         return 3;
     }
     let gate = relais::coordinator::RemoteGate::new(socket);
+    // Learned routing reads the registry's active artifact, pinned for
+    // this run (SPEC §17); disabled routing leaves everything else intact.
+    let harness = backend.probe().map(|capabilities| {
+        format!(
+            "{} {}",
+            backend.name(),
+            capabilities.version.as_deref().unwrap_or("?")
+        )
+    });
+    let registry = learned_registry(&machine);
+    let predictor = registry
+        .as_ref()
+        .map(|registry| RegistryPredictor::new(registry, &repo, harness.as_deref()));
     let outcome = execute(&RunConfig {
         repo_dir: &cwd(),
         contract: &contract,
@@ -810,7 +847,9 @@ fn run_command(task: &Path) -> i32 {
         backend: backend.as_ref(),
         artifacts_dir: paths::runs_dir(),
         aval_resolver: &aval_resolver,
-        predictor: None,
+        predictor: predictor
+            .as_ref()
+            .map(|predictor| predictor as &dyn route::RoutePredictor),
         gate: Some(&gate),
         session_id: relais::coordinator::session_id(),
         heartbeat_every: std::time::Duration::from_secs(30),

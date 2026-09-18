@@ -12,7 +12,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::features::{expand, FeatureSchema, SparseVec, TaskFeatures, TrainingExample};
+use super::features::{
+    expand, FeatureSchema, ProfileIdentity, SparseVec, TaskFeatures, TrainingExample,
+};
 use crate::ids::sha256_hex;
 use crate::ledger::Ledger;
 use crate::policy::{RepoPolicy, Tier};
@@ -111,7 +113,17 @@ pub fn build(
             .unwrap_or(crate::money::CostCompleteness::Unknown);
         let cost_complete = completeness == crate::money::CostCompleteness::Actual;
         let task = TaskFeatures::extract(&contract, repo_policy);
-        let sparse: SparseVec = expand(&task, tier, &objective, &schema);
+        let identity = ledger
+            .first_dispatch_intent(&run_id)
+            .ok()
+            .flatten()
+            .map(|intent| ProfileIdentity {
+                model: intent["model"].as_str().unwrap_or("unknown").to_string(),
+                effort: intent["effort"].as_str().map(str::to_string),
+                harness: intent["harness"].as_str().map(str::to_string),
+            })
+            .unwrap_or_default();
+        let sparse: SparseVec = expand(&task, tier, &objective, &identity, &schema);
         let dispatched_at = ledger
             .transitions(&run_id)
             .unwrap_or_default()
@@ -119,8 +131,11 @@ pub fn build(
             .map(|transition| transition.at.clone())
             .unwrap_or_default();
         records.push(TrainingExample {
-            family: contract.hash(),
+            family: task_family(&contract),
             tier,
+            task,
+            objective: objective.clone(),
+            identity,
             sparse,
             accepted_without_escalation,
             complete_cost: cost,
@@ -137,6 +152,33 @@ pub fn build(
         fingerprint,
         built_at: crate::ledger::now_rfc3339(),
     }
+}
+
+/// The family a contract belongs to, for split grouping (SPEC §17:
+/// "avoid counting many retries or near-identical task variants as
+/// independent examples"). Kind, scope and the objective's token SET
+/// — not its exact text, so a re-worded retry of the same task stays with
+/// the original, while a different task on the same scope does not.
+pub fn task_family(contract: &crate::contract::TaskContract) -> String {
+    let mut tokens: Vec<String> = contract
+        .objective
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_lowercase())
+        .collect();
+    tokens.sort();
+    tokens.dedup();
+    let mut scope = contract.write_scope.clone().unwrap_or_default();
+    scope.sort();
+    sha256_hex(
+        serde_json::json!({
+            "kind": contract.kind,
+            "scope": scope,
+            "tokens": tokens,
+        })
+        .to_string()
+        .as_bytes(),
+    )
 }
 
 impl Tier {
@@ -210,6 +252,9 @@ mod tests {
         TrainingExample {
             family: family.into(),
             tier: Tier::Implementation,
+            task: TaskFeatures::extract(&contract(), &repo_policy()),
+            objective: "objective".into(),
+            identity: ProfileIdentity::default(),
             sparse: SparseVec(vec![(0, 1.0)]),
             accepted_without_escalation: accepted,
             complete_cost: crate::money::MicroUsd::from_micros(100),
@@ -392,6 +437,20 @@ argv = ["true"]
             "a rescue by the stronger tier is"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn families_group_reworded_retries_but_not_different_tasks() {
+        let base = contract();
+        let mut reworded = base.clone();
+        reworded.objective = "the escaping: fix".into();
+        assert_eq!(task_family(&base), task_family(&reworded));
+        let mut other = base.clone();
+        other.objective = "Add a --json flag".into();
+        assert_ne!(task_family(&base), task_family(&other));
+        let mut elsewhere = base.clone();
+        elsewhere.write_scope = Some(vec!["docs/**".into()]);
+        assert_ne!(task_family(&base), task_family(&elsewhere));
     }
 
     #[test]

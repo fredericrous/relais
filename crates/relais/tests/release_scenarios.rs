@@ -215,10 +215,14 @@ if printf '%s' "$prompt" | grep -q "blockage-please"; then
   printf '{"result":"relais-blocked: the vendored crate is missing","session_id":"w-b","total_cost_usd":0.001,"model":"%s","usage":{"input_tokens":10,"output_tokens":2}}\n' "$model"
   exit 0
 fi
-case "$model" in
-  fable) rm -f src/main.rs ;;
-  *) echo churn > "src/tick-$$-$(date +%s%N).txt" ;;
-esac
+if printf '%s' "$prompt" | grep -q "an easy one"; then
+  rm -f src/main.rs
+else
+  case "$model" in
+    fable) rm -f src/main.rs ;;
+    *) echo churn > "src/tick-$$-$(date +%s%N).txt" ;;
+  esac
+fi
 printf '{"result":"DONE","session_id":"w-1","total_cost_usd":0.01,"model":"%s","usage":{"input_tokens":100,"output_tokens":10}}\n' "$model"
 "#;
 
@@ -574,6 +578,100 @@ fn install_is_preview_first_and_uninstall_keeps_foreign_and_modified_files() {
     assert!(
         world.repo.join(".claude/agents/custom.md").exists(),
         "foreign files are kept"
+    );
+}
+
+// SPEC §17, §21: execute → verify → label → build dataset → train →
+// evaluate → promote → route. The loop closes: a promoted artifact is
+// what `plan` and `run` consult, and it says so.
+#[test]
+fn the_learning_loop_closes_from_runs_to_a_learned_route() {
+    let world = World::new("learn");
+    let hash = world.write_policy(3);
+    world.write_machine(&hash, "");
+    // Twelve distinct easy tasks the cheap tier solves outright: twelve
+    // families, all accepted without escalation.
+    for n in 0..12 {
+        let path = world.root.join(format!("easy-{n}.json"));
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "schema_version": 1,
+                "kind": "change",
+                "objective": format!("Remove the entry point, an easy one, variant {n} {}", ["alpha","beta","gamma","delta","eps","zeta","eta","theta","iota","kappa","lambda","mu"][n]),
+                "base_ref": "HEAD",
+                "write_scope": ["src/**"],
+                "acceptance": ["src/main.rs no longer exists"],
+                "verification_profile": "default",
+                "review": "off",
+            })
+            .to_string(),
+        )
+        .expect("task");
+        let run = world.relais(&["run", "--task", path.to_str().unwrap()]);
+        assert_eq!(run.status.code(), Some(0), "{}", text(&run.stderr));
+        let receipt_attempts = World::run_id_of(&text(&run.stdout));
+        let _ = receipt_attempts;
+    }
+    let built = world.relais(&["dataset", "build"]);
+    assert_eq!(built.status.code(), Some(0), "{}", text(&built.stderr));
+    assert!(
+        text(&built.stdout).contains("12 accepted-without-escalation"),
+        "{}",
+        text(&built.stdout)
+    );
+    let trained = world.relais(&["train"]);
+    let trained_out = text(&trained.stdout);
+    assert_eq!(
+        trained.status.code(),
+        Some(0),
+        "{trained_out}
+{}",
+        text(&trained.stderr)
+    );
+    assert!(trained_out.contains("gates: PASSED"), "{trained_out}");
+    let artifact = trained_out
+        .lines()
+        .find_map(|line| line.strip_prefix("candidate artifact: "))
+        .expect("artifact id")
+        .trim()
+        .to_string();
+    let evaluated = world.relais(&["evaluate", "--artifact", &artifact]);
+    assert_eq!(
+        evaluated.status.code(),
+        Some(0),
+        "{}",
+        text(&evaluated.stderr)
+    );
+    let promoted = world.relais(&["promote", &artifact]);
+    assert_eq!(
+        promoted.status.code(),
+        Some(0),
+        "promotion reads the evaluator's own report: {}",
+        text(&promoted.stderr)
+    );
+    // The next plan is routed by the artifact, and says which one.
+    let task = world.write_task("next.json", "off");
+    let plan = world.relais(&["plan", "--task", task.to_str().unwrap()]);
+    let planned = text(&plan.stdout);
+    assert_eq!(
+        plan.status.code(),
+        Some(0),
+        "{planned}
+{}",
+        text(&plan.stderr)
+    );
+    assert!(
+        planned.contains(&format!("learned artifact {artifact}")),
+        "{planned}"
+    );
+    // Learned routing can be switched off without touching anything else.
+    world.write_machine(&hash, "[routing]\nlearned_enabled = false\n");
+    let plan = world.relais(&["plan", "--task", task.to_str().unwrap()]);
+    assert!(
+        text(&plan.stdout).contains("cold start"),
+        "{}",
+        text(&plan.stdout)
     );
 }
 

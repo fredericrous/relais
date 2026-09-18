@@ -9,7 +9,6 @@
 use serde::{Deserialize, Serialize};
 
 use super::features::{dot, SparseVec};
-use crate::rng::SplitMix64;
 
 pub const LEARNER_SCHEMA_VERSION: u32 = 1;
 
@@ -49,6 +48,112 @@ impl Default for SolverSettings {
     }
 }
 
+/// A differentiable objective over (weights, bias): the per-sample loss
+/// and its derivative with respect to the linear score. L2 on the
+/// weights is added HERE, once, so the loss the line search compares and
+/// the gradient it steps along are the same function — the cost model
+/// used to compare an unregularized loss while stepping along a
+/// regularized gradient, and could accept a step uphill in the objective
+/// it was minimizing.
+struct Objective<'a> {
+    features: &'a [SparseVec],
+    targets: &'a [f64],
+    lambda: f64,
+    /// loss(score, target)
+    loss: fn(f64, f64) -> f64,
+    /// d loss / d score
+    derivative: fn(f64, f64) -> f64,
+}
+
+impl Objective<'_> {
+    fn value(&self, weights: &[f64], bias: f64) -> f64 {
+        let n = self.features.len().max(1) as f64;
+        let data: f64 = self
+            .features
+            .iter()
+            .zip(self.targets)
+            .map(|(features, target)| (self.loss)(dot(features, weights) + bias, *target))
+            .sum();
+        data / n + self.lambda * weights.iter().map(|w| w * w).sum::<f64>() / 2.0
+    }
+
+    fn gradient(&self, weights: &[f64], bias: f64) -> (Vec<f64>, f64) {
+        let n = self.features.len().max(1) as f64;
+        let mut gradient = vec![0.0f64; weights.len()];
+        let mut gradient_bias = 0.0f64;
+        for (features, target) in self.features.iter().zip(self.targets) {
+            let error = (self.derivative)(dot(features, weights) + bias, *target);
+            for (index, value) in &features.0 {
+                if let Some(slot) = gradient.get_mut(*index) {
+                    *slot += error * value;
+                }
+            }
+            gradient_bias += error;
+        }
+        for (slot, weight) in gradient.iter_mut().zip(weights) {
+            *slot = *slot / n + self.lambda * weight;
+        }
+        (gradient, gradient_bias / n)
+    }
+}
+
+/// Full-batch gradient descent with backtracking line search over a
+/// fixed dimension, bounded iterations, and convergence declared only
+/// when the gradient norm or the relative loss change falls below
+/// tolerance. Deterministic by construction: full-batch descent has no
+/// data order, so reproducibility is the recorded settings, not a seed.
+fn descend(
+    objective: &Objective<'_>,
+    dim: usize,
+    settings: SolverSettings,
+) -> (Vec<f64>, f64, FitReport) {
+    let mut weights = vec![0.0f64; dim];
+    let mut bias = 0.0f64;
+    let mut report = FitReport {
+        iterations: 0,
+        converged: false,
+        final_loss: objective.value(&weights, bias),
+    };
+    let mut step = 0.5;
+    for iteration in 0..settings.max_iterations {
+        report.iterations = iteration + 1;
+        let (gradient, gradient_bias) = objective.gradient(&weights, bias);
+        let grad_norm =
+            (gradient.iter().map(|g| g * g).sum::<f64>() + gradient_bias * gradient_bias).sqrt();
+        if grad_norm < settings.tolerance {
+            report.converged = true;
+            break;
+        }
+        let previous = objective.value(&weights, bias);
+        // Backtracking: never accept an uphill step in THIS objective.
+        let mut accepted = false;
+        for _ in 0..20 {
+            let candidate: Vec<f64> = gradient
+                .iter()
+                .zip(&weights)
+                .map(|(g, w)| w - step * g)
+                .collect();
+            let candidate_bias = bias - step * gradient_bias;
+            if objective.value(&candidate, candidate_bias) <= previous {
+                weights = candidate;
+                bias = candidate_bias;
+                accepted = true;
+                break;
+            }
+            step *= 0.5;
+        }
+        let current = objective.value(&weights, bias);
+        if !accepted || (previous - current).abs() < settings.tolerance * previous.abs().max(1e-12)
+        {
+            report.converged = accepted;
+            break;
+        }
+        step = (step * 1.2).min(1.0);
+    }
+    report.final_loss = objective.value(&weights, bias);
+    (weights, bias, report)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogisticModel {
     pub dim: usize,
@@ -57,107 +162,25 @@ pub struct LogisticModel {
 }
 
 impl LogisticModel {
-    /// Full-batch gradient descent with backtracking line search, seeded
-    /// sample order, bounded iterations, and convergence declared only
-    /// when the gradient norm and the relative loss change fall below
-    /// tolerance. Reproducible: settings + seed are recorded in the
-    /// artifact.
+    /// Regularized logistic regression over `dim` coordinates — the
+    /// feature schema's dimension, not the largest index the corpus
+    /// happened to use, so an artifact's shape is a function of its
+    /// schema and a bucket unseen in training still has a (zero) weight.
     pub fn fit(
         features: &[SparseVec],
         labels: &[f64],
+        dim: usize,
         settings: SolverSettings,
     ) -> (Self, FitReport) {
         assert_eq!(features.len(), labels.len(), "features and labels align");
-        let dim = features
-            .iter()
-            .map(|features| {
-                features
-                    .0
-                    .iter()
-                    .map(|(index, _)| index + 1)
-                    .max()
-                    .unwrap_or(0)
-            })
-            .max()
-            .unwrap_or(0);
-        let mut rng = SplitMix64::new(settings.seed);
-        let mut order: Vec<usize> = (0..features.len()).collect();
-        rng.shuffle(&mut order);
-
-        let mut weights = vec![0.0f64; dim];
-        let mut bias = 0.0f64;
-        let n = features.len() as f64;
-
-        let loss_at = |weights: &[f64], bias: f64| -> f64 {
-            let mut total = 0.0;
-            for (features, label) in features.iter().zip(labels) {
-                total += logistic_loss(dot(features, weights) + bias, *label);
-            }
-            total / n + settings.lambda * weights.iter().map(|w| w * w).sum::<f64>() / 2.0
+        let objective = Objective {
+            features,
+            targets: labels,
+            lambda: settings.lambda,
+            loss: logistic_loss,
+            derivative: |z, y| sigmoid(z) - y,
         };
-
-        let mut report = FitReport {
-            iterations: 0,
-            converged: false,
-            final_loss: loss_at(&weights, bias),
-        };
-        let mut step = 0.5;
-        for iteration in 0..settings.max_iterations {
-            report.iterations = iteration + 1;
-            let mut gradient = vec![0.0f64; dim];
-            let mut gradient_bias = 0.0f64;
-            for &sample in &order {
-                let error = sigmoid(dot(&features[sample], &weights) + bias) - labels[sample];
-                for (index, value) in &features[sample].0 {
-                    if let Some(slot) = gradient.get_mut(*index) {
-                        *slot += error * value;
-                    }
-                }
-                gradient_bias += error;
-            }
-            for (slot, weight) in gradient.iter_mut().zip(&weights) {
-                *slot = *slot / n + settings.lambda * weight;
-            }
-            gradient_bias /= n;
-
-            let grad_norm: f64 =
-                gradient.iter().map(|g| g * g).sum::<f64>() + gradient_bias * gradient_bias;
-            if grad_norm.sqrt() < settings.tolerance {
-                report.converged = true;
-                report.final_loss = loss_at(&weights, bias);
-                break;
-            }
-
-            let previous = loss_at(&weights, bias);
-            // Backtracking line search: never accept an uphill step.
-            let accepted = 'accepted: {
-                for _ in 0..20 {
-                    let candidate: Vec<f64> = gradient
-                        .iter()
-                        .zip(&weights)
-                        .map(|(g, w)| w - step * g)
-                        .collect();
-                    let candidate_bias = bias - step * gradient_bias;
-                    if loss_at(&candidate, candidate_bias) <= previous {
-                        weights = candidate;
-                        bias = candidate_bias;
-                        break 'accepted true;
-                    }
-                    step *= 0.5;
-                }
-                false
-            };
-            let current = loss_at(&weights, bias);
-            if !accepted
-                || (previous - current).abs() < settings.tolerance * previous.abs().max(1e-12)
-            {
-                report.converged = accepted;
-                report.final_loss = current;
-                break;
-            }
-            step = (step * 1.2).min(1.0);
-        }
-        report.final_loss = loss_at(&weights, bias);
+        let (weights, bias, report) = descend(&objective, dim, settings);
         (Self { dim, weights, bias }, report)
     }
 
@@ -185,123 +208,37 @@ impl CostModel {
         features: &[SparseVec],
         costs_micros: &[f64],
         cohorts: &[String],
+        dim: usize,
         settings: SolverSettings,
     ) -> (Self, FitReport) {
+        assert_eq!(
+            features.len(),
+            costs_micros.len(),
+            "features and costs align"
+        );
         let log_targets: Vec<f64> = costs_micros
             .iter()
             .map(|c| (c.max(0.0) + 1.0).ln())
             .collect();
-        let mut cohort_means: Vec<(String, f64)> = Vec::new();
-        let mut counts: Vec<(String, usize)> = Vec::new();
+        let mut cohort_means: std::collections::BTreeMap<String, (f64, usize)> =
+            std::collections::BTreeMap::new();
         for (cohort, cost) in cohorts.iter().zip(costs_micros) {
-            match counts.iter_mut().find(|(name, _)| name == cohort) {
-                Some((_, count)) => {
-                    *count += 1;
-                    let total = cohort_means
-                        .iter_mut()
-                        .find(|(name, _)| name == cohort)
-                        .expect("counts and means stay aligned");
-                    total.1 += cost;
-                }
-                None => {
-                    counts.push((cohort.clone(), 1));
-                    cohort_means.push((cohort.clone(), *cost));
-                }
-            }
+            let entry = cohort_means.entry(cohort.clone()).or_insert((0.0, 0));
+            entry.0 += cost;
+            entry.1 += 1;
         }
-        for (mean, (_, count)) in cohort_means.iter_mut().zip(&counts) {
-            mean.1 /= (*count).max(1) as f64;
-        }
-        cohort_means.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let dim = features
-            .iter()
-            .map(|features| {
-                features
-                    .0
-                    .iter()
-                    .map(|(index, _)| index + 1)
-                    .max()
-                    .unwrap_or(0)
-            })
-            .max()
-            .unwrap_or(0);
-        let n = features.len() as f64;
-        let mut weights = vec![0.0f64; dim];
-        let mut bias = 0.0f64;
-        let mut rng = SplitMix64::new(settings.seed);
-        let mut order: Vec<usize> = (0..features.len()).collect();
-        rng.shuffle(&mut order);
-        let mut step = 0.5;
-        let mut report = FitReport {
-            iterations: 0,
-            converged: false,
-            final_loss: 0.0,
+        let cohort_means = cohort_means
+            .into_iter()
+            .map(|(cohort, (total, count))| (cohort, total / count.max(1) as f64))
+            .collect();
+        let objective = Objective {
+            features,
+            targets: &log_targets,
+            lambda: settings.lambda,
+            loss: |z, y| (z - y) * (z - y) / 2.0,
+            derivative: |z, y| z - y,
         };
-        let predict =
-            |weights: &[f64], bias: f64, features: &SparseVec| dot(features, weights) + bias;
-        for iteration in 0..settings.max_iterations {
-            report.iterations = iteration + 1;
-            let mut gradient = vec![0.0f64; dim];
-            let mut gradient_bias = 0.0f64;
-            for &sample in &order {
-                let error = predict(&weights, bias, &features[sample]) - log_targets[sample];
-                for (index, value) in &features[sample].0 {
-                    if let Some(slot) = gradient.get_mut(*index) {
-                        *slot += error * value;
-                    }
-                }
-                gradient_bias += error;
-            }
-            for (slot, weight) in gradient.iter_mut().zip(&weights) {
-                *slot = *slot / n + settings.lambda * weight;
-            }
-            gradient_bias /= n;
-            let grad_norm: f64 =
-                gradient.iter().map(|g| g * g).sum::<f64>() + gradient_bias * gradient_bias;
-            if grad_norm.sqrt() < settings.tolerance {
-                report.converged = true;
-                break;
-            }
-            let previous = weights
-                .iter()
-                .zip(&gradient)
-                .map(|(w, g)| w - step * g)
-                .collect::<Vec<f64>>();
-            let candidate_bias = bias - step * gradient_bias;
-            let previous_loss: f64 = (0..features.len())
-                .map(|sample| {
-                    let error = predict(&weights, bias, &features[sample]) - log_targets[sample];
-                    error * error
-                })
-                .sum::<f64>()
-                / n;
-            let candidate_loss: f64 = (0..features.len())
-                .map(|sample| {
-                    let error =
-                        predict(&previous, candidate_bias, &features[sample]) - log_targets[sample];
-                    error * error
-                })
-                .sum::<f64>()
-                / n;
-            if candidate_loss <= previous_loss {
-                weights = previous;
-                bias = candidate_bias;
-                if (previous_loss - candidate_loss).abs()
-                    < settings.tolerance * previous_loss.abs().max(1e-12)
-                {
-                    report.converged = true;
-                    break;
-                }
-                step = (step * 1.2).min(1.0);
-            } else {
-                step *= 0.5;
-                if step < 1e-9 {
-                    break;
-                }
-            }
-            report.final_loss = candidate_loss;
-        }
+        let (weights, bias, report) = descend(&objective, dim, settings);
         (
             Self {
                 dim,
@@ -370,6 +307,7 @@ mod tests {
         let (model, report) = LogisticModel::fit(
             &features,
             &labels,
+            1,
             SolverSettings {
                 lambda: 0.01,
                 max_iterations: 5_000,
@@ -401,7 +339,7 @@ mod tests {
             tolerance: 1e-8,
             seed: 1,
         };
-        let (model, report) = LogisticModel::fit(&features, &labels, settings);
+        let (model, report) = LogisticModel::fit(&features, &labels, 1, settings);
         let eps = 1e-4;
         let mut weights = model.weights.clone();
         let base = {
@@ -442,7 +380,7 @@ mod tests {
         let costs = vec![1.0, 100.0, 1_000_000.0];
         let cohorts = vec!["a".to_string(); 3];
         let (model, _report) =
-            CostModel::fit(&features, &costs, &cohorts, SolverSettings::default());
+            CostModel::fit(&features, &costs, &cohorts, 1, SolverSettings::default());
         for (feature, cost) in features.iter().zip(&costs) {
             let prediction = model.predict(feature, Some("a"));
             assert!(prediction.is_finite() && prediction >= 0.0);
@@ -461,9 +399,45 @@ mod tests {
             tolerance: 1e-10,
             seed: 42,
         };
-        let (a, _) = LogisticModel::fit(&features, &labels, settings);
-        let (b, _) = LogisticModel::fit(&features, &labels, settings);
-        assert_eq!(a, b, "same seed, same fit");
+        let (a, _) = LogisticModel::fit(&features, &labels, 1, settings);
+        let (b, _) = LogisticModel::fit(&features, &labels, 1, settings);
+        assert_eq!(a, b, "same settings, same fit");
+    }
+
+    #[test]
+    fn the_cost_line_search_and_gradient_share_one_objective() {
+        // With λ large the regularizer dominates: a line search that
+        // compared the UNregularized loss would keep accepting steps that
+        // raise the regularized objective. Every accepted step must lower
+        // the objective the report states.
+        let features = vec![SparseVec(vec![(0, 1.0)]), SparseVec(vec![(0, 2.0)])];
+        let costs = vec![10.0, 20.0];
+        let cohorts = vec!["a".to_string(); 2];
+        let settings = SolverSettings {
+            lambda: 5.0,
+            max_iterations: 200,
+            tolerance: 1e-12,
+            seed: 0,
+        };
+        let (model, report) = CostModel::fit(&features, &costs, &cohorts, 1, settings);
+        let objective = Objective {
+            features: &features,
+            targets: &costs.iter().map(|c| (c + 1.0).ln()).collect::<Vec<_>>(),
+            lambda: settings.lambda,
+            loss: |z, y| (z - y) * (z - y) / 2.0,
+            derivative: |z, y| z - y,
+        };
+        let at_zero = objective.value(&[0.0], 0.0);
+        let at_fit = objective.value(&model.weights, model.bias);
+        assert!(
+            at_fit <= at_zero,
+            "descent never ends above where it started"
+        );
+        assert!(
+            (report.final_loss - at_fit).abs() < 1e-12,
+            "the reported loss IS the objective"
+        );
+        assert_eq!(model.dim, 1);
     }
 
     #[test]
@@ -482,10 +456,12 @@ mod tests {
             architecture_keys: 0.0,
             objective_len: 42.0,
         };
+        let identity = crate::learn::features::ProfileIdentity::default();
         let a = expand(
             &task,
             crate::policy::Tier::Implementation,
             "some objective",
+            &identity,
             &schema,
         );
         let standardization = Standardization::fit(std::slice::from_ref(&a), feature_dim(&schema));
@@ -494,6 +470,7 @@ mod tests {
             &task,
             crate::policy::Tier::Implementation,
             "some objective",
+            &identity,
             &schema,
         ));
         assert_eq!(applied, again);

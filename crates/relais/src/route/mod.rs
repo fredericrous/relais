@@ -32,11 +32,16 @@ pub trait RoutePredictor {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Estimates {
     pub artifact_id: String,
+    /// Hash of the exact inputs the artifact saw, so the ledger's
+    /// prediction row can be matched to a later outcome.
+    pub input_hash: String,
     /// Acceptance-without-escalation estimate per tier; complete-strategy
     /// cost per tier. Predictions are not guarantees; the deterministic
     /// runner still owns policy and acceptance.
     pub acceptance: BTreeMap<Tier, f64>,
     pub cost: BTreeMap<Tier, MicroUsd>,
+    /// The full inference result, recorded as evidence.
+    pub raw: serde_json::Value,
 }
 
 pub struct RouteInputs<'a> {
@@ -60,6 +65,9 @@ pub struct RouteDecision {
     pub blocked: Vec<Blocker>,
     /// Whether a learned artifact actually chose the tier (vs. baseline).
     pub routed_by: RoutedBy,
+    /// What the artifact estimated, when one was consulted — recorded by
+    /// the runner as a prediction row whatever it decided.
+    pub estimates: Option<Estimates>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +243,7 @@ pub fn route(inputs: RouteInputs<'_>) -> RouteDecision {
             escalation_tier: None,
             blocked: authority.blockers.clone(),
             routed_by: RoutedBy::ConservativeBaseline,
+            estimates: None,
         };
     }
 
@@ -309,10 +318,12 @@ pub fn route(inputs: RouteInputs<'_>) -> RouteDecision {
                 ),
             }],
             routed_by: RoutedBy::ConservativeBaseline,
+            estimates: None,
         };
     }
 
     // Deterministic recipes win when they fully cover the task (SPEC §6.3).
+    let mut estimates_seen: Option<Estimates> = None;
     let recipe_recipes: Vec<Recipe> = repo.recipes.iter().map(Recipe::from).collect();
     let selected: (Tier, RoutedBy) = if let Some(recipe) = recipe_recipes
         .iter()
@@ -327,7 +338,9 @@ pub fn route(inputs: RouteInputs<'_>) -> RouteDecision {
         match predictor.estimate(contract, authority, &eligible) {
             Some(estimates) => {
                 let quality_floor = machine.routing.quality_floor.unwrap_or(0.75);
-                match select_learned(&estimates, &eligible, quality_floor) {
+                let selection = select_learned(&estimates, &eligible, quality_floor);
+                estimates_seen = Some(estimates.clone());
+                match selection {
                     Some(tier) => {
                         reasons.push(format!(
                             "learned artifact {} estimated acceptance/cost and selected {}",
@@ -374,6 +387,7 @@ pub fn route(inputs: RouteInputs<'_>) -> RouteDecision {
         escalation_tier,
         blocked: Vec::new(),
         routed_by: selected.1,
+        estimates: estimates_seen,
     }
 }
 
@@ -755,8 +769,10 @@ mod tests {
             }
             Some(Estimates {
                 artifact_id: "artifact-test-1".into(),
+                input_hash: "in".into(),
                 acceptance,
                 cost,
+                raw: serde_json::Value::Null,
             })
         }
     }

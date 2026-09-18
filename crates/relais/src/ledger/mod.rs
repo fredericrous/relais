@@ -756,6 +756,60 @@ impl Ledger {
         Ok(())
     }
 
+    /// The intent recorded for a run's first dispatch: model, effort and
+    /// harness identity as they were at dispatch time (SPEC §21: features
+    /// are reconstructed without future information).
+    pub fn first_dispatch_intent(&self, run_id: &str) -> Result<Option<serde_json::Value>> {
+        let text: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT intent_json FROM dispatches WHERE run_id = ?1
+                 ORDER BY created_at, dispatch_id LIMIT 1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(text.and_then(|text| serde_json::from_str(&text).ok()))
+    }
+
+    /// What a learned artifact estimated for a run at routing time, so a
+    /// report can compare the estimate with what happened (SPEC §16).
+    pub fn record_prediction(
+        &self,
+        run_id: &str,
+        artifact_id: &str,
+        input_hash: &str,
+        result: &serde_json::Value,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO predictions (run_id, artifact_id, input_hash, result_json, at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                run_id,
+                artifact_id,
+                input_hash,
+                serde_json::to_string(result).expect("prediction serializes"),
+                now_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn predictions(&self, run_id: &str) -> Result<Vec<(String, String, serde_json::Value)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT artifact_id, input_hash, result_json FROM predictions WHERE run_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([run_id], |row| {
+            let text: String = row.get(2)?;
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn record_features(&self, dispatch_id: &str, features: &serde_json::Value) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO features (dispatch_id, feature_json, at) VALUES (?1, ?2, ?3)",

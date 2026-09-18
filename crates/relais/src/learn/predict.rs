@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::features::{
-    expand, feature_dim, FeatureSchema, SparseVec, Standardization, TaskFeatures,
+    expand, feature_dim, FeatureSchema, ProfileIdentity, SparseVec, Standardization, TaskFeatures,
 };
 use super::registry::Registry;
 use crate::contract::TaskContract;
@@ -40,14 +40,35 @@ pub fn estimate_from_registry(
     registry: &Registry,
     contract: &TaskContract,
     repo_policy: &RepoPolicy,
-    _authority: &EffectiveAuthority,
+    authority: &EffectiveAuthority,
     eligible: &[Tier],
+    harness: Option<&str>,
 ) -> InferenceResult {
     let schema = FeatureSchema::standard();
     let task = TaskFeatures::extract(contract, repo_policy);
+    // The identity a tier would dispatch WITH — the same tokens the
+    // dataset builder reads back from the dispatch intent.
+    let identity_of = |tier: Tier| -> ProfileIdentity {
+        authority
+            .models
+            .get(&tier)
+            .map(|profile| profile_identity(profile, harness))
+            .unwrap_or_default()
+    };
     let inputs: Vec<(Tier, SparseVec)> = eligible
         .iter()
-        .map(|tier| (*tier, expand(&task, *tier, &contract.objective, &schema)))
+        .map(|tier| {
+            (
+                *tier,
+                expand(
+                    &task,
+                    *tier,
+                    &contract.objective,
+                    &identity_of(*tier),
+                    &schema,
+                ),
+            )
+        })
         .collect();
     let input_hash = crate::ids::sha256_hex(
         serde_json::to_string(&inputs.iter().map(|(_, sparse)| sparse).collect::<Vec<_>>())
@@ -105,19 +126,40 @@ pub fn estimate_from_registry(
     }
 }
 
+/// One profile's identity tokens, as the runner records them in the
+/// dispatch intent and the dataset reads them back: one function, so the
+/// train and inference sides cannot drift.
+pub fn profile_identity(
+    profile: &crate::policy::ModelProfile,
+    harness: Option<&str>,
+) -> ProfileIdentity {
+    ProfileIdentity {
+        model: profile.id.clone(),
+        effort: profile.effort.map(|effort| {
+            serde_json::to_value(effort)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| format!("{effort:?}").to_lowercase())
+        }),
+        harness: harness.map(str::to_string),
+    }
+}
+
 /// The bridge the router consumes: a RoutePredictor backed by the local
 /// registry's active artifact. Runs pin what they read; a newly trained
 /// artifact affects only new runs.
 pub struct RegistryPredictor<'a> {
     registry: &'a Registry,
     repo_policy: &'a RepoPolicy,
+    harness: Option<String>,
 }
 
 impl<'a> RegistryPredictor<'a> {
-    pub fn new(registry: &'a Registry, repo_policy: &'a RepoPolicy) -> Self {
+    pub fn new(registry: &'a Registry, repo_policy: &'a RepoPolicy, harness: Option<&str>) -> Self {
         Self {
             registry,
             repo_policy,
+            harness: harness.map(str::to_string),
         }
     }
 }
@@ -135,10 +177,13 @@ impl RoutePredictor for RegistryPredictor<'_> {
             self.repo_policy,
             authority,
             eligible,
+            self.harness.as_deref(),
         );
         if result.abstention_reason.is_some() {
             return None;
         }
+        let input_hash = result.input_hash.clone();
+        let raw = serde_json::to_value(&result).expect("serializes");
         let mut acceptance = std::collections::BTreeMap::new();
         let mut cost = std::collections::BTreeMap::new();
         for (tier, probability) in result.acceptance {
@@ -156,8 +201,10 @@ impl RoutePredictor for RegistryPredictor<'_> {
         }
         Some(Estimates {
             artifact_id: result.artifact_id,
+            input_hash,
             acceptance,
             cost,
+            raw,
         })
     }
 }
@@ -167,6 +214,7 @@ impl RoutePredictor for RegistryPredictor<'_> {
 pub fn standardized_inputs(
     task: &TaskFeatures,
     objective: &str,
+    identity: &ProfileIdentity,
     tiers: &[Tier],
     schema: &FeatureSchema,
     standardization: &Standardization,
@@ -174,7 +222,7 @@ pub fn standardized_inputs(
     tiers
         .iter()
         .map(|tier| {
-            let expanded = expand(task, *tier, objective, schema);
+            let expanded = expand(task, *tier, objective, identity, schema);
             (*tier, standardization.apply(&expanded))
         })
         .collect()
@@ -227,14 +275,20 @@ mod tests {
         let repo = repo_policy();
         let task = contract();
         let auth = authority();
-        let result =
-            estimate_from_registry(&registry, &task, &repo, &auth, &[Tier::Implementation]);
+        let result = estimate_from_registry(
+            &registry,
+            &task,
+            &repo,
+            &auth,
+            &[Tier::Implementation],
+            None,
+        );
         assert_eq!(
             result.abstention_reason.as_deref(),
             Some("no active learned artifact")
         );
         let repo = repo_policy();
-        let predictor = RegistryPredictor::new(&registry, &repo);
+        let predictor = RegistryPredictor::new(&registry, &repo, None);
         assert!(predictor
             .estimate(&task, &auth, &[Tier::Implementation])
             .is_none());
@@ -274,31 +328,25 @@ mod tests {
             solver: crate::learn::learner::SolverSettings::default(),
             trained_at: "now".into(),
             relais_version: crate::version().into(),
-            evaluation: Some(serde_json::json!({"gates_passed": true})),
+            evaluation: None,
         };
         artifact.standardization = Standardization::fit(
             &[crate::learn::features::SparseVec(vec![(0, 1.0)])],
             feature_dim(&FeatureSchema::standard()),
         );
         registry.store(&artifact).expect("store");
-        registry
-            .promote(
-                "art-test",
-                &crate::learn::registry::PromotionGates {
-                    gates_passed: true,
-                    min_records_per_tier: 1,
-                    coverage: vec![],
-                    test_acceptance_rate: Some(1.0),
-                    quality_floor: 0.5,
-                    abstention_rate: 0.0,
-                },
-            )
-            .expect("promote");
+        // Promotion needs the evaluator's report; write the active pointer
+        // the way the registry does after a real promotion.
+        std::fs::write(
+            dir.join("active.json"),
+            serde_json::json!({ "artifact_id": "art-test" }).to_string(),
+        )
+        .expect("activate");
 
         let repo = repo_policy();
         let task = contract();
         let auth = authority();
-        let predictor = RegistryPredictor::new(&registry, &repo);
+        let predictor = RegistryPredictor::new(&registry, &repo, Some("claude-code 2.1"));
         let estimates = predictor
             .estimate(&task, &auth, &[Tier::Implementation])
             .expect("implementation is covered");
