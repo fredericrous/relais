@@ -15,3 +15,38 @@ features. Relais is a working name; package availability has not been checked.
 make check   # toolchain lint test msrv
 make build
 ```
+
+## Layout
+
+One crate, `crates/relais`, one binary. Modules follow SPEC §13:
+
+| module | owns |
+|---|---|
+| `contract` | task contracts: validated, frozen, hashed; work plans (§4, §19) |
+| `policy` | `relais.toml`, machine settings, the effective authority (§5) |
+| `route` | deterministic routing, risk floors, the learned predictor hook (§6) |
+| `context` | context manifests and aval resolution (§7) |
+| `workspace` | owned worktrees, candidate snapshots, scope checks (§8) |
+| `adapter` | the `Backend` trait, the Claude Code adapter, a mock (§20) |
+| `runner` | attempt lifecycle, repair/escalation, review, receipts (§9, §10) |
+| `runner::scheduler` | bounded decomposition and integration (§19) |
+| `verify` | verification profiles, amont gaps, receipts (§10) |
+| `admission` | the pure admission state machine: caps, budgets, leases (§23) |
+| `coordinator` | the per-user daemon, election, socket protocol, client (§23) |
+| `ledger` | the SQLite ledger with additive migrations (§12) |
+| `report`, `doctor`, `install` | reporting, diagnostics, the Claude integration |
+| `learn` | features, dataset, learner, predict, evaluate, registry (§16, §17) |
+
+`crates/relais/tests/release_scenarios.rs` runs the §14 release scenarios
+through the real binary against a fake `claude`; the §23 concurrency
+scenarios are unit tests over the admission state machine.
+
+## Known limits
+
+- The decomposition scheduler executes packages sequentially in
+  topological order; waves of independent packages are computed and
+  recorded but not yet run concurrently.
+- Native Claude Code subagents are observed, not admitted: only managed
+  dispatch through `relais run` is capped by the coordinator.
+- The `msrv` target proves the declared floor only when that toolchain is
+  installed (`rustup toolchain install 1.88.0`); otherwise it says so.
