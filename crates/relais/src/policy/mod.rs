@@ -517,9 +517,16 @@ pub fn effective_authority(
         .max_wall_seconds
         .min(contract.limits.wall_seconds);
 
+    // Only the rules the declared scope could touch raise the review
+    // floor; a rule about `**/trust/**` says nothing about a docs change.
     let review_floor = contract.review.max(
         repo.risk
             .iter()
+            .filter(|rule| {
+                rule.paths
+                    .iter()
+                    .any(|pattern| crate::route::write_scope_could_touch(contract, pattern))
+            })
             .map(|rule| rule.review.unwrap_or(Review::Off))
             .max()
             .unwrap_or(Review::Off),
@@ -632,6 +639,9 @@ timeout_seconds = 300
 
 # Risk floors: writes touching these patterns cannot route below the
 # minimum tier, and the review requirement here is a floor, not a hint.
+# Floors apply to the DECLARED scope: a contract scoped `src/**` could
+# write `src/trust/x`, so a `**/trust/**` rule floors it — scope
+# contracts as narrowly as the task allows.
 [[risk]]
 paths = ["**/trust/**", "**/restore/**"]
 minimum_tier = "escalation"

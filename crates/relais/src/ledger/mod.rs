@@ -448,6 +448,20 @@ impl Ledger {
 
     /// How many worker attempts a run consumed — the attempts table is
     /// the source of truth for the ladder.
+    /// Did the ladder move? True when any attempt of the run ran at the
+    /// `escalation` phase — the label source for "accepted WITHOUT
+    /// escalation" (SPEC §17). Not derived from the models seen: the
+    /// reviewer and the planner run on their own models without any
+    /// escalation having happened.
+    pub fn escalation_attempted(&self, run_id: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM attempts WHERE run_id = ?1 AND phase = 'escalation'",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     pub fn attempt_count(&self, run_id: &str) -> Result<usize> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM attempts WHERE run_id = ?1",

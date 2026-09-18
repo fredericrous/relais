@@ -96,11 +96,12 @@ pub fn build(
             exclusions.push(format!("{run_id}: unknown tier `{tier_name}`"));
             continue;
         };
-        let models = ledger.models_used(&run_id).unwrap_or_default();
         // A cheap worker rescued by a stronger worker did not succeed
-        // without escalation: more than one distinct model means the
-        // ladder moved.
-        let escalated = models.len() > 1;
+        // without escalation. The attempt table's phase says whether the
+        // ladder moved; the set of models seen does NOT — a reviewer at
+        // the escalation tier is not an escalation, and counting it as
+        // one labelled every reviewed run a failure of its worker.
+        let escalated = ledger.escalation_attempted(&run_id).unwrap_or(true);
         let accepted_without_escalation = state == State::Accepted && !escalated;
         let cost = ledger
             .run_cost(&run_id)
@@ -264,6 +265,133 @@ mod tests {
                 .all(|record| record.family != "family-1"),
             "no family straddles a boundary"
         );
+    }
+
+    fn contract() -> crate::contract::TaskContract {
+        crate::contract::TaskContract::from_json_str(
+            r#"{"schema_version":1,"kind":"change","objective":"Fix the escaping",
+                "base_ref":"HEAD","write_scope":["crates/**"],"acceptance":["parses"],
+                "verification_profile":"p"}"#,
+        )
+        .expect("contract")
+    }
+
+    fn repo_policy() -> RepoPolicy {
+        RepoPolicy::from_toml_str(
+            r#"schema_version = 1
+[models.implementation]
+id = "sonnet"
+[[verification.profiles.p.commands]]
+argv = ["true"]
+"#,
+        )
+        .expect("policy")
+    }
+
+    #[test]
+    fn a_reviewed_run_is_not_labelled_as_escalated() {
+        use crate::ledger::{Ledger, Transition, UsageEvent};
+        use crate::money::{CostCompleteness, CostKind, MicroUsd};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "relais-dataset-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let contract = contract();
+        let contract_json = serde_json::to_string(&contract.canonical_value()).expect("json");
+        let usage = |event: &str, run: &str, model: &str| UsageEvent {
+            event_id: event.into(),
+            run_id: run.into(),
+            attempt_id: None,
+            parent_event_id: None,
+            model: Some(model.into()),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost: MicroUsd::from_micros(10),
+            cost_kind: CostKind::ApiSpend,
+            completeness: CostCompleteness::Actual,
+            inclusive: false,
+            at: crate::ledger::now_rfc3339(),
+        };
+        let accept = |run: &str| {
+            ledger
+                .record_transition(&Transition {
+                    run_id: run.into(),
+                    attempt_id: None,
+                    from_state: Some(State::Verifying),
+                    to_state: State::Accepted,
+                    reason: "checks_and_review_passed".into(),
+                    detail: None,
+                    at: crate::ledger::now_rfc3339(),
+                })
+                .expect("transition");
+        };
+        let contract_of = |run_id: &str| {
+            ledger
+                .run_contract_and_tier(run_id)
+                .ok()
+                .flatten()
+                .and_then(|(json, objective, tier)| {
+                    crate::contract::TaskContract::from_json_str(&json)
+                        .ok()
+                        .map(|c| (c, objective, tier))
+                })
+        };
+        // Run A: one sonnet attempt, reviewed by fable. Two models, no
+        // escalation.
+        ledger.insert_run("run-a", "/r", None).expect("run");
+        let revision = ledger
+            .insert_contract_revision("run-a", &contract.hash(), &contract_json, "HEAD", None)
+            .expect("revision");
+        ledger
+            .insert_attempt("run-a", revision, 1, "implementation", "initial")
+            .expect("attempt");
+        ledger
+            .record_usage(&usage("a-worker", "run-a", "sonnet"))
+            .expect("usage");
+        ledger
+            .record_usage(&usage("a-review", "run-a", "fable"))
+            .expect("usage");
+        accept("run-a");
+        let (_, positives, negatives) =
+            build(&ledger, &contract_of, &repo_policy()).acceptance_labels();
+        assert_eq!(
+            (positives, negatives),
+            (1, 0),
+            "a reviewer on another model is not an escalation"
+        );
+        // Run B: sonnet failed, fable rescued it. Escalated.
+        ledger.insert_run("run-b", "/r", None).expect("run");
+        let revision = ledger
+            .insert_contract_revision("run-b", &contract.hash(), &contract_json, "HEAD", None)
+            .expect("revision");
+        ledger
+            .insert_attempt("run-b", revision, 1, "implementation", "initial")
+            .expect("attempt");
+        ledger
+            .insert_attempt("run-b", revision, 2, "escalation", "escalation")
+            .expect("attempt");
+        ledger
+            .record_usage(&usage("b-worker", "run-b", "sonnet"))
+            .expect("usage");
+        ledger
+            .record_usage(&usage("b-fable", "run-b", "fable"))
+            .expect("usage");
+        accept("run-b");
+        let (_, positives, negatives) =
+            build(&ledger, &contract_of, &repo_policy()).acceptance_labels();
+        assert_eq!(
+            (positives, negatives),
+            (1, 1),
+            "a rescue by the stronger tier is"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

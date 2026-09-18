@@ -74,33 +74,68 @@ pub enum RoutedBy {
     ConservativeBaseline,
 }
 
-/// Conservative scope-vs-pattern overlap. Routing happens before any
-/// diff exists, so floors are computed from the DECLARED scope patterns
-/// (SPEC §6). The test is deliberately biased toward firing: over-applying
-/// a floor costs an escalation tier, under-applying one silently routes a
-/// sensitive write to a cheap model, which is the failure the spec
-/// forbids.
+/// Could one path match BOTH globs? Routing happens before any diff
+/// exists, so floors are computed from the DECLARED scope patterns
+/// (SPEC §6). The answer is exact for `**` (zero or more segments) and
+/// conservative inside a segment (a `*` segment is judged by its literal
+/// prefix and suffix only), so an over-approximation costs an escalation
+/// tier while an under-approximation would route a sensitive write to a
+/// cheap model — the failure the spec forbids.
+///
+/// It used to answer "yes" to anything when either side began with `**`,
+/// which made the init template's `**/trust/**` rule floor a contract
+/// scoped to `docs/README.md`. A directory scope such as `src/**` still
+/// takes that floor, correctly: `src/trust/x` matches both.
 pub(crate) fn scope_could_touch(scope: &str, pattern: &str) -> bool {
-    let scope = scope.trim_start_matches("./");
-    let pattern = pattern.trim_start_matches("./");
-    if scope.starts_with("**") || pattern.starts_with("**") {
+    let segments = |glob: &str| -> Vec<String> {
+        glob.trim_start_matches("./")
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    globs_overlap(&segments(scope), &segments(pattern))
+}
+
+fn globs_overlap(a: &[String], b: &[String]) -> bool {
+    match (a.first(), b.first()) {
+        (None, None) => true,
+        (Some(x), _) if x == "**" => {
+            globs_overlap(&a[1..], b) || (!b.is_empty() && globs_overlap(a, &b[1..]))
+        }
+        (_, Some(y)) if y == "**" => {
+            globs_overlap(a, &b[1..]) || (!a.is_empty() && globs_overlap(&a[1..], b))
+        }
+        (Some(x), Some(y)) => segments_overlap(x, y) && globs_overlap(&a[1..], &b[1..]),
+        _ => false,
+    }
+}
+
+/// Two single segments: equal, or wildcarded with compatible literal
+/// prefix and suffix. `*.rs` and `main.rs` overlap; `a*` and `b*` do not.
+fn segments_overlap(a: &str, b: &str) -> bool {
+    if a == b {
         return true;
     }
-    let scope_segments: Vec<&str> = scope.split('/').collect();
-    let pattern_segments: Vec<&str> = pattern.split('/').collect();
-    for (s, p) in scope_segments.iter().zip(pattern_segments.iter()) {
-        if *s == "**" || *p == "**" {
-            return true;
-        }
-        if s == p {
-            continue;
-        }
-        if s.contains('*') || p.contains('*') {
-            return true;
-        }
+    let wild = |s: &str| s.contains('*') || s.contains('?') || s.contains('[');
+    if !wild(a) && !wild(b) {
         return false;
     }
-    true
+    // A literal segment is its own prefix AND suffix; a wildcarded one
+    // contributes the text before its first and after its last wildcard.
+    let literal = |s: &str| -> (String, String) {
+        if !wild(s) {
+            return (s.to_string(), s.to_string());
+        }
+        let first = s.find(['*', '?', '[']).unwrap_or(s.len());
+        let last = s.rfind(['*', '?', ']']).map_or(s.len(), |i| i + 1);
+        (s[..first].to_string(), s[last.max(first)..].to_string())
+    };
+    let (pa, sa) = literal(a);
+    let (pb, sb) = literal(b);
+    let prefixes = pa.starts_with(&pb) || pb.starts_with(&pa);
+    let suffixes = sa.ends_with(&sb) || sb.ends_with(&sa);
+    prefixes && suffixes
 }
 
 pub fn write_scope_could_touch(contract: &TaskContract, pattern: &str) -> bool {
@@ -587,6 +622,42 @@ mod tests {
             d.tier,
             Some(Tier::Escalation),
             "declared scope that COULD touch a rule area must take the floor"
+        );
+    }
+
+    #[test]
+    fn overlap_is_exact_for_double_star_and_conservative_within_a_segment() {
+        // The init template's rule against a single-file scope elsewhere.
+        assert!(!scope_could_touch("docs/README.md", "**/trust/**"));
+        assert!(!scope_could_touch("src/main.rs", "**/trust/**"));
+        // …and against directory scopes that genuinely could reach it.
+        assert!(scope_could_touch("src/**", "**/trust/**"));
+        assert!(scope_could_touch("crates/amont/trust/**", "**/trust/**"));
+        assert!(scope_could_touch("**", "crates/other/**"));
+        assert!(!scope_could_touch("**/trust/**", "src/main.rs"));
+        assert!(scope_could_touch("**/*.rs", "src/main.rs"));
+        assert!(!scope_could_touch("**/*.rs", "src/main.py"));
+        assert!(!scope_could_touch("crates/a/**", "crates/b/**"));
+        assert!(scope_could_touch("crates/a*/**", "crates/ab/**"));
+        assert!(!scope_could_touch("crates/a*/**", "crates/b/**"));
+        assert!(scope_could_touch("./src/**", "src/lib.rs"));
+    }
+
+    #[test]
+    fn a_risk_rules_review_floor_is_scoped_to_its_paths() {
+        let mut repo = repo_policy();
+        repo.risk.push(RiskRule {
+            paths: vec!["**/trust/**".into()],
+            minimum_tier: Tier::Escalation,
+            review: Some(Review::Required),
+        });
+        let machine = machine_for(&repo);
+        let d = route_with(&change_contract(&["docs/README.md"]), &repo, &machine);
+        assert_eq!(d.tier, Some(Tier::Implementation));
+        assert_eq!(
+            d.review,
+            Review::Optional,
+            "a rule the scope cannot touch does not force review"
         );
     }
 
