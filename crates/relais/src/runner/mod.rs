@@ -12,9 +12,12 @@
 //! under explicit aggregate limits.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::adapter::{Backend, LaunchSpec};
+use crate::adapter::{Backend, LaunchResult, LaunchSpec};
+use crate::admission::{Decision, DispatchRequest, Gate, ResourceClass, RunRegistration};
 use crate::context::{self, AvalVerdict, ContextError, ContextManifest};
 use crate::contract::{Review, TaskContract};
 use crate::ids::{DispatchId, RunId};
@@ -51,6 +54,9 @@ pub mod reason {
     pub const VERIFICATION_GAP: &str = "verification_gap";
     pub const BASELINE_FAILURE_NOT_WAIVED: &str = "baseline_failure_not_waived";
     pub const REVIEW_FINDINGS: &str = "review_findings";
+    pub const ADMISSION_UNAVAILABLE: &str = "admission_unavailable";
+    pub const ADMISSION_REFUSED: &str = "admission_refused";
+    pub const DUPLICATE_DISPATCH: &str = "duplicate_dispatch";
 }
 
 /// The attempt lifecycle states (SPEC §9). Stored as their snake_case
@@ -166,6 +172,12 @@ pub enum RunOutcome {
         run_id: String,
         detail: String,
     },
+    /// Cancelled through the coordinator (one subtree, run or session:
+    /// SPEC §23); the candidate and evidence are preserved.
+    Cancelled {
+        run_id: String,
+        detail: String,
+    },
 }
 
 impl RunOutcome {
@@ -177,7 +189,8 @@ impl RunOutcome {
             | RunOutcome::Blocked { run_id, .. }
             | RunOutcome::Failed { run_id, .. }
             | RunOutcome::BudgetExhausted { run_id, .. }
-            | RunOutcome::Interrupted { run_id, .. } => run_id,
+            | RunOutcome::Interrupted { run_id, .. }
+            | RunOutcome::Cancelled { run_id, .. } => run_id,
         }
     }
 
@@ -190,6 +203,7 @@ impl RunOutcome {
             RunOutcome::Failed { .. } => State::Failed,
             RunOutcome::BudgetExhausted { .. } => State::BudgetExhausted,
             RunOutcome::Interrupted { .. } => State::Interrupted,
+            RunOutcome::Cancelled { .. } => State::Cancelled,
         }
     }
 }
@@ -206,7 +220,19 @@ pub struct RunConfig<'a> {
     /// corpus; production wiring calls `context::aval_resolve`.
     pub aval_resolver: &'a dyn Fn(&str, Option<&str>) -> AvalVerdict,
     pub predictor: Option<&'a dyn RoutePredictor>,
+    /// Managed dispatch (SPEC §23): every launch is admitted, heartbeat
+    /// and settled through this gate. `None` = unmanaged execution,
+    /// which the receipt labels as such; `relais run` always sets one.
+    pub gate: Option<&'a (dyn Gate + Sync)>,
+    /// The interactive session this run belongs to, for fair scheduling
+    /// and attribution.
+    pub session_id: String,
+    /// Lease heartbeat period while a worker runs.
+    pub heartbeat_every: Duration,
 }
+
+/// Poll period while queued for admission.
+const ADMISSION_POLL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttemptKind {
@@ -263,6 +289,10 @@ impl<'a> RunEngine<'a> {
     }
 
     fn fail_preflight(&mut self, code: &str, detail: String) -> RunOutcome {
+        self.block(reason::BLOCKED_PREFLIGHT, code, detail)
+    }
+
+    fn block(&mut self, reason_code: &str, code: &str, detail: String) -> RunOutcome {
         let outcome = RunOutcome::Blocked {
             run_id: self.run_id.clone(),
             code: code.to_string(),
@@ -270,17 +300,209 @@ impl<'a> RunEngine<'a> {
         };
         self.transition(
             State::Blocked,
-            reason::BLOCKED_PREFLIGHT,
+            reason_code,
             serde_json::json!({ "code": code, "detail": detail }),
         );
         self.outcome_for(outcome)
+    }
+
+    fn budget_exhausted(&mut self, detail: String) -> RunOutcome {
+        self.transition(
+            State::BudgetExhausted,
+            reason::LIMIT_REACHED,
+            serde_json::json!({ "detail": detail }),
+        );
+        self.outcome_for(RunOutcome::BudgetExhausted {
+            run_id: self.run_id.clone(),
+            detail,
+        })
+    }
+
+    fn cancelled(&mut self, detail: String) -> RunOutcome {
+        self.transition(
+            State::Cancelled,
+            reason::CANCELLED_BY_USER,
+            serde_json::json!({ "detail": detail }),
+        );
+        self.outcome_for(RunOutcome::Cancelled {
+            run_id: self.run_id.clone(),
+            detail,
+        })
+    }
+
+    /// Managed dispatch (SPEC §23): admission before launch, heartbeats
+    /// during, release and settlement after. A coordinator outage blocks
+    /// the launch rather than making it unmanaged; a queue wait counts
+    /// against the run's wall clock; refusals on budget, depth or the
+    /// aggregate agent cap are budget exhaustion, and a run cancelled
+    /// while queued or running ends cancelled with its evidence kept.
+    fn managed_launch(
+        &mut self,
+        mut spec: LaunchSpec,
+        depth: u32,
+        parent: Option<&str>,
+        reserve_micros: i64,
+        deadline: Instant,
+    ) -> Result<LaunchResult, RunOutcome> {
+        let Some(gate) = self.config.gate else {
+            self.config
+                .ledger
+                .attach_dispatch_process(&spec.dispatch_id, None, Some(&self.config.session_id))
+                .expect("attach");
+            return self.config.backend.launch(&spec).map_err(|e| {
+                self.block(
+                    reason::BLOCKED_PREFLIGHT,
+                    "backend_unavailable",
+                    e.to_string(),
+                )
+            });
+        };
+        let request = DispatchRequest {
+            dispatch_id: spec.dispatch_id.clone(),
+            run_id: self.run_id.clone(),
+            session_id: self.config.session_id.clone(),
+            parent_dispatch: parent.map(str::to_string),
+            depth,
+            resource: ResourceClass::ModelWork,
+            reserve_micros,
+        };
+        loop {
+            match gate.admit(&request) {
+                Err(e) => {
+                    return Err(self.block(
+                        reason::ADMISSION_UNAVAILABLE,
+                        "admission_unavailable",
+                        format!("{e}; the request is preserved and nothing was launched"),
+                    ));
+                }
+                Ok(Decision::Granted) => break,
+                Ok(Decision::AlreadyAdmitted) => {
+                    // Somebody already holds this ID: launching would
+                    // duplicate an agent. Stop and let resume reconcile.
+                    self.transition(
+                        State::Interrupted,
+                        reason::DUPLICATE_DISPATCH,
+                        serde_json::json!({ "dispatch_id": spec.dispatch_id }),
+                    );
+                    return Err(self.outcome_for(RunOutcome::Interrupted {
+                        run_id: self.run_id.clone(),
+                        detail: format!(
+                            "dispatch {} was already admitted elsewhere; not launching a duplicate",
+                            spec.dispatch_id
+                        ),
+                    }));
+                }
+                Ok(Decision::Queued { position }) => {
+                    if Instant::now() >= deadline {
+                        let _ = gate.withdraw(&spec.dispatch_id);
+                        return Err(self.budget_exhausted(format!(
+                            "the wall clock ran out while queued for admission (position {position})"
+                        )));
+                    }
+                    std::thread::sleep(ADMISSION_POLL);
+                }
+                Ok(Decision::Refused { code, detail }) => {
+                    return Err(match code.as_str() {
+                        "run_cancelled" => self.cancelled(detail),
+                        "budget_exceeded" | "run_agent_cap" | "depth_exceeded" => {
+                            self.budget_exhausted(format!("{code}: {detail}"))
+                        }
+                        _ => self.block(reason::ADMISSION_REFUSED, &code, detail),
+                    });
+                }
+            }
+        }
+
+        // The dispatch is `launched` in the ledger BEFORE the process
+        // exists (SPEC §12): a runner crash from here on leaves a live
+        // dispatch for `resume` to reconcile, never a silent gap.
+        self.config
+            .ledger
+            .attach_dispatch_process(&spec.dispatch_id, None, Some(&self.config.session_id))
+            .expect("attach");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let pid_slot = Arc::new(AtomicU32::new(0));
+        spec.cancel = Some(Arc::clone(&cancel));
+        spec.pid_slot = Some(Arc::clone(&pid_slot));
+        let stop = AtomicBool::new(false);
+        let heartbeat_every = self.config.heartbeat_every;
+        let ledger_path = self.config.ledger.path().to_path_buf();
+        let session_id = self.config.session_id.clone();
+        let launched = std::thread::scope(|scope| {
+            let dispatch_id = spec.dispatch_id.clone();
+            let cancel = Arc::clone(&cancel);
+            let pid_slot = Arc::clone(&pid_slot);
+            let stop = &stop;
+            scope.spawn(move || {
+                let mut last: Option<Instant> = None;
+                let mut bound_pid = false;
+                while !stop.load(Ordering::SeqCst) {
+                    let pid = pid_slot.load(Ordering::SeqCst);
+                    if !bound_pid && pid != 0 {
+                        // Bind the process to the lease and the ledger
+                        // on its own connection: the runner's is busy
+                        // blocking on the launch.
+                        bound_pid = true;
+                        let _ = gate.bind(&dispatch_id, None, Some(pid));
+                        if let Ok(ledger) = Ledger::open(&ledger_path) {
+                            let _ = ledger.attach_dispatch_process(
+                                &dispatch_id,
+                                Some(pid),
+                                Some(&session_id),
+                            );
+                        }
+                    }
+                    if last.is_none_or(|last| last.elapsed() >= heartbeat_every) {
+                        last = Some(Instant::now());
+                        if let Ok(status) = gate.heartbeat(&dispatch_id) {
+                            if status.cancelled {
+                                cancel.store(true, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            });
+            let result = self.config.backend.launch(&spec);
+            stop.store(true, Ordering::SeqCst);
+            result
+        });
+
+        let result = match launched {
+            Ok(result) => result,
+            Err(e) => {
+                let _ = gate.release(&spec.dispatch_id);
+                let _ = gate.settle(&spec.dispatch_id, None);
+                return Err(self.block(
+                    reason::BLOCKED_PREFLIGHT,
+                    "backend_unavailable",
+                    e.to_string(),
+                ));
+            }
+        };
+        // Bind, free the seat, settle the reservation: unknown usage
+        // settles as unknown, never zero (SPEC §23). Failures here are
+        // the coordinator's to reconcile; the work already happened.
+        let _ = gate.bind(&spec.dispatch_id, result.session_id.as_deref(), None);
+        let _ = gate.release(&spec.dispatch_id);
+        let spent = if result.usage.cost_completeness == CostCompleteness::Unknown {
+            None
+        } else {
+            result.usage.cost.map(MicroUsd::to_micros)
+        };
+        let _ = gate.settle(&spec.dispatch_id, spent);
+        Ok(result)
     }
 
     fn run(mut self) -> RunOutcome {
         std::fs::create_dir_all(&self.artifacts).expect("artifact directory");
         let ledger = self.config.ledger;
         ledger
-            .insert_run(&self.run_id, &self.config.repo_dir.to_string_lossy(), None)
+            .insert_run(
+                &self.run_id,
+                &self.config.repo_dir.to_string_lossy(),
+                Some(&self.config.session_id),
+            )
             .expect("ledger records the run");
 
         // Preflight: dirty base is explicit, never copied (SPEC §8).
@@ -306,6 +528,25 @@ impl<'a> RunEngine<'a> {
         if !authority.blockers.is_empty() {
             let first = &authority.blockers[0];
             return self.fail_preflight(&first.code, first.detail.clone());
+        }
+
+        // Managed runs register their root budget and agent-tree limits
+        // before any dispatch; children can only narrow them (SPEC §23).
+        if let Some(gate) = self.config.gate {
+            let registration = RunRegistration {
+                run_id: self.run_id.clone(),
+                session_id: self.config.session_id.clone(),
+                budget_micros: self.config.machine.spending.per_run_micros,
+                max_agents: Some(authority.max_agents_total),
+                max_depth: Some(authority.max_agent_depth),
+            };
+            if let Err(e) = gate.register_run(&registration) {
+                return self.block(
+                    reason::ADMISSION_UNAVAILABLE,
+                    "admission_unavailable",
+                    format!("{e}; nothing was launched"),
+                );
+            }
         }
 
         // The base resolves once (SPEC §4).
@@ -559,30 +800,41 @@ impl<'a> RunEngine<'a> {
             let remaining_wall = deadline
                 .saturating_duration_since(Instant::now())
                 .max(Duration::from_secs(1));
+            // What this attempt may still spend, not the whole ceiling
+            // again: the budget is the run's, not the attempt's.
+            let remaining_budget = self
+                .config
+                .machine
+                .spending
+                .per_run_micros
+                .map(|ceiling| (ceiling - total_cost.to_micros()).max(0));
             let spec = LaunchSpec {
                 dispatch_id: dispatch_id.as_str().to_string(),
                 prompt,
                 model: model_profile.id.clone(),
                 effort: model_profile.effort,
                 max_turns: None,
-                budget_micros: self.config.machine.spending.per_run_micros,
+                budget_micros: remaining_budget,
                 disallowed_tools: authority.disallowed_tools.clone(),
                 work_dir: worktree_path.clone(),
                 wall_timeout: remaining_wall,
+                cancel: None,
+                pid_slot: None,
             };
 
-            let result = match self.config.backend.launch(&spec) {
-                Ok(result) => result,
-                Err(e) => {
-                    ledger
-                        .finish_dispatch(dispatch_id.as_str(), "launch_failed")
-                        .expect("finish");
-                    return self.fail_preflight("backend_unavailable", e.to_string());
-                }
-            };
-            ledger
-                .attach_dispatch_process(dispatch_id.as_str(), None, result.session_id.as_deref())
-                .expect("attach");
+            let result =
+                match self.managed_launch(spec, 0, None, remaining_budget.unwrap_or(0), deadline) {
+                    Ok(result) => result,
+                    Err(outcome) => {
+                        ledger
+                            .finish_dispatch(dispatch_id.as_str(), "launch_failed")
+                            .expect("finish");
+                        ledger
+                            .finish_attempt(attempt_id, outcome.state(), None, None)
+                            .expect("attempt");
+                        return outcome;
+                    }
+                };
             ledger
                 .finish_dispatch(dispatch_id.as_str(), "completed")
                 .expect("finish");
@@ -608,19 +860,7 @@ impl<'a> RunEngine<'a> {
             };
             ledger.record_usage(&event).expect("usage recorded");
             total_cost += event.cost;
-            cost_completeness = match (cost_completeness, usage.cost_completeness) {
-                (_, CostCompleteness::Unknown) | (CostCompleteness::Unknown, _) => {
-                    CostCompleteness::Unknown
-                }
-                (CostCompleteness::IncompleteLowerBound, _)
-                | (_, CostCompleteness::IncompleteLowerBound) => {
-                    CostCompleteness::IncompleteLowerBound
-                }
-                (CostCompleteness::Estimated, _) | (_, CostCompleteness::Estimated) => {
-                    CostCompleteness::Estimated
-                }
-                (CostCompleteness::Actual, CostCompleteness::Actual) => CostCompleteness::Actual,
-            };
+            cost_completeness = worst_completeness(cost_completeness, usage.cost_completeness);
             if let Some(model) = &result.effective_model {
                 if !models_used.contains(model) {
                     models_used.push(model.clone());
@@ -649,6 +889,23 @@ impl<'a> RunEngine<'a> {
                     run_id: self.run_id.clone(),
                     detail,
                 });
+            }
+
+            // Cancelled through the coordinator: the worktree and
+            // evidence stay; nothing else is dispatched (SPEC §23).
+            if result.cancelled {
+                ledger
+                    .finish_attempt(
+                        attempt_id,
+                        State::Cancelled,
+                        Some(worktree_path.to_string_lossy().as_ref()),
+                        None,
+                    )
+                    .expect("attempt");
+                return self.cancelled(
+                    "the dispatch was cancelled through the coordinator; the worktree is preserved"
+                        .to_string(),
+                );
             }
 
             // Missing terminal result = interrupted, not failed (SPEC §9).
@@ -889,7 +1146,15 @@ impl<'a> RunEngine<'a> {
 
             // Checks pass. Semantic review is risk-dependent (SPEC §10).
             if decision.review >= Review::Required {
-                match self.review_candidate(&manifest, &decision, &authority, &candidate_sha) {
+                let review = self.review_candidate(
+                    &manifest,
+                    &authority,
+                    &candidate_sha,
+                    &mut total_cost,
+                    &mut cost_completeness,
+                    deadline,
+                );
+                match review {
                     ReviewOutcome::Findings(detail) => {
                         self.transition(
                             State::NeedsReview,
@@ -1014,19 +1279,20 @@ impl<'a> RunEngine<'a> {
     /// The reviewer cannot edit or waive anything; findings are triaged,
     /// and "no findings" is recorded as evidence, not proof.
     fn review_candidate(
-        &self,
+        &mut self,
         manifest: &ContextManifest,
-        decision: &RouteDecision,
         authority: &EffectiveAuthority,
         candidate_sha: &str,
+        total_cost: &mut MicroUsd,
+        cost_completeness: &mut CostCompleteness,
+        deadline: Instant,
     ) -> ReviewOutcome {
         let reviewer_tier = Tier::Escalation;
-        let Some(profile) = authority.models.get(&reviewer_tier) else {
+        let Some(profile) = authority.models.get(&reviewer_tier).cloned() else {
             return ReviewOutcome::Unavailable(
                 "no reviewer model configured at the escalation tier".into(),
             );
         };
-        let _ = decision;
         let patch_path = self.artifacts.join("candidate-latest.patch");
         let mut prompt = String::from(
             "You are a semantic reviewer. You cannot edit or waive checks; you report findings only.\n\
@@ -1058,21 +1324,62 @@ impl<'a> RunEngine<'a> {
         ));
 
         let dispatch_id = DispatchId::generate();
+        let remaining_budget = self
+            .config
+            .machine
+            .spending
+            .per_run_micros
+            .map(|ceiling| (ceiling - total_cost.to_micros()).max(0));
         let spec = LaunchSpec {
             dispatch_id: dispatch_id.as_str().to_string(),
             prompt,
             model: profile.id.clone(),
             effort: profile.effort,
             max_turns: None,
-            budget_micros: None,
+            budget_micros: remaining_budget,
             disallowed_tools: authority.disallowed_tools.clone(),
             work_dir: self.artifacts.join("worktree"),
-            wall_timeout: Duration::from_secs(authority.max_wall_seconds),
+            wall_timeout: deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_secs(1)),
+            cancel: None,
+            pid_slot: None,
         };
-        let result = match self.config.backend.launch(&spec) {
-            Ok(result) => result,
-            Err(e) => return ReviewOutcome::Unavailable(e.to_string()),
-        };
+        self.config
+            .ledger
+            .record_dispatch_intent(
+                dispatch_id.as_str(),
+                &self.run_id,
+                None,
+                &serde_json::json!({
+                    "model": profile.id,
+                    "effort": profile.effort,
+                    "tier": reviewer_tier.as_str(),
+                    "kind": "Review",
+                }),
+                remaining_budget.unwrap_or(0),
+            )
+            .expect("intent recorded");
+        // The review is one separate managed call with its own seat;
+        // its cost is the run's (SPEC §9, §11).
+        let result =
+            match self.managed_launch(spec, 0, None, remaining_budget.unwrap_or(0), deadline) {
+                Ok(result) => result,
+                Err(outcome) => {
+                    let _ = self
+                        .config
+                        .ledger
+                        .finish_dispatch(dispatch_id.as_str(), "launch_failed");
+                    return ReviewOutcome::Unavailable(format!(
+                        "reviewer dispatch ended {}",
+                        outcome.state()
+                    ));
+                }
+            };
+        self.config
+            .ledger
+            .finish_dispatch(dispatch_id.as_str(), "completed")
+            .expect("finish");
         let event = UsageEvent {
             event_id: dispatch_id.as_str().to_string(),
             run_id: self.run_id.clone(),
@@ -1093,6 +1400,8 @@ impl<'a> RunEngine<'a> {
             .ledger
             .record_usage(&event)
             .expect("review usage recorded");
+        *total_cost += event.cost;
+        *cost_completeness = worst_completeness(*cost_completeness, result.usage.cost_completeness);
         if result.terminal_result_missing() {
             return ReviewOutcome::Unavailable(
                 "the reviewer ended without a terminal result".into(),
@@ -1112,6 +1421,21 @@ impl<'a> RunEngine<'a> {
         } else {
             ReviewOutcome::Findings(format!("reviewer output without a clear verdict:\n{text}"))
         }
+    }
+}
+
+/// Completeness degrades to the worst observed (SPEC §11).
+fn worst_completeness(a: CostCompleteness, b: CostCompleteness) -> CostCompleteness {
+    match (a, b) {
+        (_, CostCompleteness::Unknown) | (CostCompleteness::Unknown, _) => {
+            CostCompleteness::Unknown
+        }
+        (CostCompleteness::IncompleteLowerBound, _)
+        | (_, CostCompleteness::IncompleteLowerBound) => CostCompleteness::IncompleteLowerBound,
+        (CostCompleteness::Estimated, _) | (_, CostCompleteness::Estimated) => {
+            CostCompleteness::Estimated
+        }
+        (CostCompleteness::Actual, CostCompleteness::Actual) => CostCompleteness::Actual,
     }
 }
 
@@ -1370,6 +1694,9 @@ mod tests {
                 artifacts_dir: self.artifacts.clone(),
                 aval_resolver: &resolver,
                 predictor: None,
+                gate: None,
+                session_id: "test-session".into(),
+                heartbeat_every: Duration::from_millis(50),
             })
         }
 
@@ -1393,6 +1720,36 @@ mod tests {
                 artifacts_dir: self.artifacts.clone(),
                 aval_resolver: &resolver,
                 predictor: None,
+                gate: None,
+                session_id: "test-session".into(),
+                heartbeat_every: Duration::from_millis(50),
+            })
+        }
+
+        fn execute_managed(
+            &self,
+            contract: &TaskContract,
+            repo: &RepoPolicy,
+            machine: &MachineSettings,
+            backend: &dyn Backend,
+            gate: &(dyn Gate + Sync),
+        ) -> RunOutcome {
+            let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
+                adr: "ADR-0001".into(),
+            };
+            execute(&RunConfig {
+                repo_dir: &self.repo,
+                contract,
+                repo_policy: repo,
+                machine,
+                ledger: &self.ledger,
+                backend,
+                artifacts_dir: self.artifacts.clone(),
+                aval_resolver: &resolver,
+                predictor: None,
+                gate: Some(gate),
+                session_id: "test-session".into(),
+                heartbeat_every: Duration::from_millis(50),
             })
         }
     }
@@ -1983,6 +2340,202 @@ mod tests {
             "research tier"
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    // -- managed dispatch (SPEC §23) -------------------------------------
+
+    #[test]
+    fn managed_run_registers_admits_and_settles_through_the_gate() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let mut machine = fixture.machine_for(&repo);
+        machine.spending.per_run_micros = Some(1_000);
+        let gate = crate::admission::LocalGate::new(ConcurrencyLimits {
+            max_active_agents: Some(1),
+            max_active_agents_per_session: Some(1),
+            ..ConcurrencyLimits::default()
+        });
+        let backend = conditional_worker("relais task");
+        let outcome = fixture.execute_managed(
+            &fixture.contract(Review::Required),
+            &repo,
+            &machine,
+            &backend,
+            &gate,
+        );
+        let RunOutcome::Accepted { run_id, receipt } = outcome else {
+            panic!("expected acceptance, got {outcome:?}");
+        };
+        let status = gate.status();
+        let run = &status.runs[&run_id];
+        assert_eq!(run.session_id, "test-session");
+        assert_eq!(
+            run.budget_micros,
+            Some(1_000),
+            "the root budget was registered"
+        );
+        assert_eq!(
+            run.admitted_total, 2,
+            "worker and reviewer were each admitted"
+        );
+        assert_eq!(run.active, 0, "seats were released");
+        assert_eq!(run.reserved_micros, 0, "reservations were settled");
+        // The worker reported 100; the reviewer reported nothing, which
+        // settles as its reservation (a lower bound), never as zero.
+        assert_eq!(run.uncertain_settlements, 1);
+        assert!(run.settled_micros >= 100);
+        assert_eq!(receipt.cost.to_micros(), 100);
+        assert_eq!(receipt.cost_completeness, CostCompleteness::Unknown);
+        assert_eq!(
+            fixture
+                .ledger
+                .runs_since("2000-01-01T00:00:00+00:00")
+                .expect("runs")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn coordinator_outage_blocks_instead_of_launching_unmanaged() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let machine = fixture.machine_for(&repo);
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&launches);
+        let backend = MockBackend::new(move |_spec| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                ..Default::default()
+            }
+        });
+        let gate = crate::coordinator::RemoteGate::new(PathBuf::from(
+            "/tmp/relais-test-no-coordinator.sock",
+        ));
+        let outcome = fixture.execute_managed(
+            &fixture.contract(Review::Off),
+            &repo,
+            &machine,
+            &backend,
+            &gate,
+        );
+        assert!(
+            matches!(&outcome, RunOutcome::Blocked { code, .. } if code == "admission_unavailable"),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            launches.load(Ordering::SeqCst),
+            0,
+            "nothing was launched unmanaged"
+        );
+        assert_eq!(
+            fixture.ledger.run_status(outcome.run_id()).expect("status"),
+            Some(State::Blocked)
+        );
+    }
+
+    #[test]
+    fn cancellation_through_the_gate_stops_the_worker_and_preserves_the_worktree() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let machine = fixture.machine_for(&repo);
+        let gate = Arc::new(crate::admission::LocalGate::new(
+            ConcurrencyLimits::default(),
+        ));
+        let cancel_via = Arc::clone(&gate);
+        let backend = MockBackend::new(move |spec| {
+            // The worker is mid-flight when the run is cancelled from
+            // another tab; the heartbeat carries the cancellation in.
+            for run_id in cancel_via.status().runs.keys() {
+                cancel_via.cancel_run(run_id);
+            }
+            let flag = spec
+                .cancel
+                .as_ref()
+                .expect("managed launches carry a cancel flag");
+            let started = Instant::now();
+            while !flag.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::fs::write(spec.work_dir.join("src/partial.rs"), "// half done\n").expect("write");
+            MockOutcome {
+                result_text: None,
+                exit_code: None,
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute_managed(
+            &fixture.contract(Review::Off),
+            &repo,
+            &machine,
+            &backend,
+            gate.as_ref(),
+        );
+        let RunOutcome::Cancelled { run_id, detail } = outcome else {
+            panic!("expected cancellation, got {outcome:?}");
+        };
+        assert!(detail.contains("preserved"));
+        assert!(
+            fixture
+                .artifacts
+                .join(&run_id)
+                .join("worktree/src/partial.rs")
+                .exists(),
+            "the half-done worktree is kept for diagnosis"
+        );
+        assert_eq!(
+            fixture.ledger.run_status(&run_id).expect("status"),
+            Some(State::Cancelled)
+        );
+        assert!(gate.status().runs[&run_id].cancelled);
+    }
+
+    #[test]
+    fn queued_admission_counts_against_the_wall_clock() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let machine = fixture.machine_for(&repo);
+        let gate = crate::admission::LocalGate::new(ConcurrencyLimits {
+            max_active_agents: Some(1),
+            ..ConcurrencyLimits::default()
+        });
+        // Another tab holds the only seat.
+        gate.register_run(&RunRegistration {
+            run_id: "other-run".into(),
+            session_id: "other-tab".into(),
+            budget_micros: None,
+            max_agents: None,
+            max_depth: None,
+        })
+        .expect("register");
+        assert_eq!(
+            gate.admit(&DispatchRequest {
+                dispatch_id: "other-dispatch".into(),
+                run_id: "other-run".into(),
+                session_id: "other-tab".into(),
+                parent_dispatch: None,
+                depth: 0,
+                resource: ResourceClass::ModelWork,
+                reserve_micros: 0,
+            })
+            .expect("admit"),
+            Decision::Granted
+        );
+        let mut contract = fixture.contract(Review::Off);
+        contract.limits.wall_seconds = 1;
+        let backend = conditional_worker("");
+        let outcome = fixture.execute_managed(&contract, &repo, &machine, &backend, &gate);
+        assert!(
+            matches!(&outcome, RunOutcome::BudgetExhausted { detail, .. } if detail.contains("queued")),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            gate.status().runs[outcome.run_id()].queued,
+            0,
+            "the queue entry is gone"
+        );
     }
 
     #[test]

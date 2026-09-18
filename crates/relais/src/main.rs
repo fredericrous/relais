@@ -112,13 +112,38 @@ enum Command {
         #[arg(long)]
         user: bool,
     },
-    /// Coordinator operations (SPEC §23). Started lazily by the CLI when
-    /// anything needs it; --daemon is the internal foreground form.
+    /// Coordinator operations (SPEC §23): status, cancellation, stop.
+    /// The daemon starts lazily on the first managed dispatch.
     Coordinator {
-        /// Run the shared per-user coordinator in the foreground
-        #[arg(long)]
-        daemon: bool,
+        #[command(subcommand)]
+        cmd: CoordinatorCommand,
     },
+}
+
+#[derive(Subcommand)]
+enum CoordinatorCommand {
+    /// Run the shared per-user coordinator in the foreground (internal;
+    /// the CLI spawns this detached)
+    Daemon,
+    /// Sessions, runs, agent trees, queued work and the limits in force
+    Status {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel one run, one agent subtree, or one session — never
+    /// unrelated tabs
+    Cancel {
+        #[arg(long)]
+        run: Option<String>,
+        #[arg(long)]
+        dispatch: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Ask the running coordinator to exit; runs in flight keep their
+    /// ledger state and `relais resume` reconciles them
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -181,7 +206,7 @@ fn main() {
                 2
             }
         }
-        Command::Coordinator { daemon } => stub_coordinator(daemon),
+        Command::Coordinator { cmd } => coordinator_command(cmd),
     };
     std::process::exit(code);
 }
@@ -455,9 +480,151 @@ fn promote_command(artifact_id: &str) -> i32 {
     }
 }
 
-fn stub_coordinator(_daemon: bool) -> i32 {
-    eprintln!("relais coordinator: not implemented yet (milestone M6)");
-    2
+fn coordinator_command(cmd: CoordinatorCommand) -> i32 {
+    use relais::coordinator::{self, Request, Response};
+    let socket = coordinator::socket_path();
+    match cmd {
+        CoordinatorCommand::Daemon => {
+            // Absent machine settings are not an error for the daemon:
+            // the defaults apply and the grant check stays with `run`.
+            let limits = std::fs::read_to_string(paths::machine_settings_path())
+                .ok()
+                .and_then(|text| MachineSettings::from_toml_str(&text).ok())
+                .map(|machine| coordinator::effective_limits(&machine.concurrency))
+                .unwrap_or_else(|| coordinator::effective_limits(&Default::default()));
+            let ledger = Ledger::open(&paths::ledger_path()).ok();
+            match coordinator::run_daemon(&socket, limits, ledger.as_ref()) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("relais coordinator: {e}");
+                    1
+                }
+            }
+        }
+        CoordinatorCommand::Status { json } => {
+            let client = coordinator::Client::new(socket.clone());
+            let snapshot = match client.status() {
+                Ok(snapshot) => snapshot,
+                Err(_) => {
+                    println!(
+                        "no coordinator is serving this user ({}); one starts on the first managed dispatch",
+                        socket.display()
+                    );
+                    return 0;
+                }
+            };
+            if json {
+                print!(
+                    "{}",
+                    serde_json::to_string_pretty(&snapshot).expect("serializes")
+                );
+                return 0;
+            }
+            println!("coordinator: {}", socket.display());
+            println!(
+                "limits: agents {} (per session {}), heavy {}, training {}, depth {}, per run {}",
+                opt(snapshot.limits.max_active_agents),
+                opt(snapshot.limits.max_active_agents_per_session),
+                opt(snapshot.limits.max_heavy_commands),
+                opt(snapshot.limits.max_training_jobs),
+                opt(snapshot.limits.max_agent_depth),
+                opt(snapshot.limits.max_agents_per_run),
+            );
+            println!(
+                "active: {} | waiting parents: {} | queued: {} | stale leases: {} | over cap: {}",
+                snapshot
+                    .active_by_class
+                    .iter()
+                    .map(|(class, count)| format!("{class}={count}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                snapshot.waiting,
+                snapshot.queued,
+                snapshot.stale_leases,
+                snapshot.over_admitted
+            );
+            println!("sessions: {}", snapshot.sessions.join(", "));
+            for (run_id, run) in &snapshot.runs {
+                println!(
+                    "  {run_id} [{}] active {} waiting {} queued {} admitted {} | budget {} reserved {} settled {}{}{}",
+                    run.session_id,
+                    run.active,
+                    run.waiting,
+                    run.queued,
+                    run.admitted_total,
+                    run.budget_micros
+                        .map(|micros| relais::money::MicroUsd::from_micros(micros).to_string())
+                        .unwrap_or_else(|| "none".into()),
+                    relais::money::MicroUsd::from_micros(run.reserved_micros),
+                    relais::money::MicroUsd::from_micros(run.settled_micros),
+                    if run.uncertain_settlements > 0 {
+                        format!(" ({} uncertain: lower bound)", run.uncertain_settlements)
+                    } else {
+                        String::new()
+                    },
+                    if run.cancelled { " CANCELLED" } else { "" }
+                );
+            }
+            println!(
+                "enforcement: managed dispatch only; native subagents are observed, not capped"
+            );
+            0
+        }
+        CoordinatorCommand::Cancel {
+            run,
+            dispatch,
+            session,
+        } => {
+            let request = match (run, dispatch, session) {
+                (Some(run_id), None, None) => Request::CancelRun { run_id },
+                (None, Some(dispatch_id), None) => Request::CancelDispatch { dispatch_id },
+                (None, None, Some(session_id)) => Request::CancelSession { session_id },
+                _ => {
+                    eprintln!("relais coordinator cancel: name exactly one of --run, --dispatch, --session");
+                    return 2;
+                }
+            };
+            let client = coordinator::Client::new(socket);
+            match client.request(&request) {
+                Ok(Response::Cancelled { dispatches }) => {
+                    println!(
+                        "cancelled; {} bound worker process(es) signalled: {}",
+                        dispatches.len(),
+                        dispatches.join(", ")
+                    );
+                    0
+                }
+                Ok(other) => {
+                    eprintln!("relais coordinator cancel: unexpected reply {other:?}");
+                    1
+                }
+                Err(e) => {
+                    eprintln!("relais coordinator cancel: {e}");
+                    3
+                }
+            }
+        }
+        CoordinatorCommand::Stop => {
+            let client = coordinator::Client::new(socket);
+            match client.request(&Request::Shutdown) {
+                Ok(_) => {
+                    // The accept loop observes the flag on its next
+                    // connection.
+                    let _ = client.ping();
+                    println!("coordinator asked to stop");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("relais coordinator stop: {e}");
+                    3
+                }
+            }
+        }
+    }
+}
+
+fn opt(value: Option<u32>) -> String {
+    value.map_or_else(|| "unlimited".into(), |value| value.to_string())
 }
 
 fn cwd() -> PathBuf {
@@ -625,6 +792,15 @@ fn run_command(task: &Path) -> i32 {
     };
     let aval_resolver =
         move |key: &str, scope: Option<&str>| relais::context::aval_resolve(&cwd(), key, scope);
+    // Managed dispatch is the only path `relais run` takes: a missing
+    // coordinator blocks the run rather than launching unmanaged
+    // (SPEC §23).
+    let socket = relais::coordinator::socket_path();
+    if let Err(e) = relais::coordinator::ensure_running(&socket) {
+        eprintln!("relais run: blocked (admission_unavailable): {e}");
+        return 3;
+    }
+    let gate = relais::coordinator::RemoteGate::new(socket);
     let outcome = execute(&RunConfig {
         repo_dir: &cwd(),
         contract: &contract,
@@ -635,6 +811,9 @@ fn run_command(task: &Path) -> i32 {
         artifacts_dir: paths::runs_dir(),
         aval_resolver: &aval_resolver,
         predictor: None,
+        gate: Some(&gate),
+        session_id: relais::coordinator::session_id(),
+        heartbeat_every: std::time::Duration::from_secs(30),
     });
     let run_dir = paths::runs_dir().join(outcome.run_id());
     match &outcome {
@@ -690,6 +869,14 @@ fn run_command(task: &Path) -> i32 {
         RunOutcome::Interrupted { detail, .. } => {
             eprintln!("interrupted: {detail}");
             eprintln!("run `relais resume {}` to reconcile", outcome.run_id());
+            4
+        }
+        RunOutcome::Cancelled { detail, .. } => {
+            eprintln!("cancelled: {detail}");
+            eprintln!(
+                "the preserved candidate and evidence are under {}",
+                run_dir.display()
+            );
             4
         }
     }
@@ -791,31 +978,74 @@ fn resume_command(run_id: &str) -> i32 {
         return 0;
     }
     // An absent terminal result never means nothing executed (SPEC §12).
-    // Without the coordinator's lease table, resume does NOT re-dispatch:
-    // it reports what is known and stops.
+    // Reconcile liveness first: the process table for bound PIDs, the
+    // coordinator for the rest. Resume never re-dispatches; it marks
+    // what is provably dead interrupted and preserves everything.
     let live: Vec<_> = ledger
         .live_dispatches()
         .expect("dispatches")
         .into_iter()
         .filter(|(_dispatch, run, _pid)| run == run_id)
         .collect();
-    if live.is_empty() {
+    let coordinator_view = relais::coordinator::Client::new(relais::coordinator::socket_path())
+        .status()
+        .ok()
+        .and_then(|snapshot| snapshot.runs.get(run_id).cloned());
+    let mut still_live = Vec::new();
+    let mut dead = Vec::new();
+    let mut uncertain = Vec::new();
+    for (dispatch, _run, pid) in &live {
+        match pid.and_then(|pid| u32::try_from(pid).ok()) {
+            Some(pid) if relais::coordinator::process_alive(pid) => {
+                still_live.push(format!("{dispatch} (pid {pid})"));
+            }
+            Some(pid) => {
+                ledger
+                    .finish_dispatch(dispatch, "reconciled_dead")
+                    .expect("finish");
+                dead.push(format!("{dispatch} (pid {pid} is gone)"));
+            }
+            None => match &coordinator_view {
+                Some(run) if run.active > 0 || run.waiting > 0 => {
+                    still_live.push(format!("{dispatch} (coordinator holds a lease)"));
+                }
+                _ => uncertain.push(dispatch.clone()),
+            },
+        }
+    }
+    if !still_live.is_empty() {
         println!(
-            "{run_id} is {state} with no live dispatch recorded; it may have been interrupted \
-             before launch. Refusing to blindly repeat anything — start a NEW run with a \
-             revised contract if the task is still wanted"
+            "{run_id} is {state} with worker(s) still live: {}. Resume does not re-dispatch \
+             while a worker may be running; `relais coordinator cancel --run {run_id}` stops \
+             it, `relais explain {run_id}` shows the evidence",
+            still_live.join(", ")
         );
         return 4;
     }
+    let detail = if live.is_empty() {
+        "no dispatch was live; the run stopped before or between launches".to_string()
+    } else {
+        format!(
+            "provably dead: [{}]; unknown outcome (uncertain, not retried): [{}]",
+            dead.join(", "),
+            uncertain.join(", ")
+        )
+    };
+    ledger
+        .record_transition(&relais::ledger::Transition {
+            run_id: run_id.to_string(),
+            attempt_id: None,
+            from_state: Some(state),
+            to_state: State::Interrupted,
+            reason: relais::runner::reason::RECONCILED_INTERRUPTED.to_string(),
+            detail: Some(serde_json::json!({ "detail": detail })),
+            at: relais::ledger::now_rfc3339(),
+        })
+        .expect("transition");
     println!(
-        "{run_id} is {state} with {} dispatched worker(s) possibly still running elsewhere \
-         ({}). Resume does not re-dispatch while a worker may be live; \
-         `relais explain {run_id}` shows the evidence",
-        live.len(),
-        live.iter()
-            .map(|(dispatch, _, _)| dispatch.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
+        "{run_id}: {state} -> interrupted ({detail}). Changes are preserved under {}; nothing \
+         was replayed. Start a NEW run with a revised contract if the task is still wanted",
+        paths::runs_dir().join(run_id).display()
     );
     4
 }

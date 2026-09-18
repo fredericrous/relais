@@ -453,6 +453,11 @@ pub struct EffectiveAuthority {
     pub max_attempts: u32,
     pub max_wall_seconds: u64,
     pub max_repairs_before_escalation: u32,
+    /// Agent-tree limits: repo policy intersected with machine
+    /// concurrency, the coordinator enforces them per run (SPEC §23).
+    pub allow_nested_agents: bool,
+    pub max_agent_depth: u32,
+    pub max_agents_total: u32,
     pub verification_profile: VerificationProfile,
     pub review_floor: Review,
     pub disallowed_tools: Vec<String>,
@@ -520,11 +525,27 @@ pub fn effective_authority(
             .unwrap_or(Review::Off),
     );
 
+    let max_agent_depth = machine
+        .concurrency
+        .max_agent_depth
+        .map_or(repo.execution.max_agent_depth, |cap| {
+            cap.min(repo.execution.max_agent_depth)
+        });
+    let max_agents_total = machine
+        .concurrency
+        .max_agents_per_run
+        .map_or(repo.execution.max_agents_total, |cap| {
+            cap.min(repo.execution.max_agents_total)
+        });
+
     EffectiveAuthority {
         models,
         max_attempts,
         max_wall_seconds,
         max_repairs_before_escalation: repo.execution.max_repairs_before_escalation,
+        allow_nested_agents: repo.execution.allow_nested_agents,
+        max_agent_depth,
+        max_agents_total,
         verification_profile: profile,
         review_floor,
         disallowed_tools: machine.permissions.disallowed_tools.clone(),

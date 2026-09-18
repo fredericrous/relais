@@ -171,6 +171,7 @@ const MIGRATIONS: &[(&str, &str)] = &[(
 
 pub struct Ledger {
     conn: Connection,
+    path: std::path::PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,9 +213,22 @@ impl Ledger {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        let ledger = Ledger { conn };
+        // Several processes and threads share one ledger in short
+        // transactions (SPEC §23); a writer in progress is a wait, not
+        // an error.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let ledger = Ledger {
+            conn,
+            path: path.to_path_buf(),
+        };
         ledger.migrate()?;
         Ok(ledger)
+    }
+
+    /// Where this ledger lives, so a side thread can open its own
+    /// connection (a connection is not shareable across threads).
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     fn migrate(&self) -> Result<()> {

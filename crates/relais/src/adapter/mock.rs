@@ -74,6 +74,10 @@ impl Backend for MockBackend {
                 .result_text
                 .as_deref()
                 .is_some_and(|text| text.contains("relais-blocked:")),
+            cancelled: spec
+                .cancel
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)),
         })
     }
 }
