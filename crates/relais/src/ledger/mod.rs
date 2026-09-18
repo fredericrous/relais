@@ -341,6 +341,35 @@ impl Ledger {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// The stored contract JSON and the first attempt's tier for a run —
+    /// what dataset construction needs to reconstruct dispatch-time
+    /// features without future information (SPEC §21).
+    pub fn run_contract_and_tier(&self, run_id: &str) -> Result<Option<(String, String, String)>> {
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT revisions.contract_json, attempts.tier
+                 FROM contract_revisions revisions
+                 JOIN attempts ON attempts.run_id = revisions.run_id
+                 WHERE revisions.run_id = ?1
+                 ORDER BY revisions.id, attempts.id
+                 LIMIT 1",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(contract_json, tier)| {
+            let value: serde_json::Value =
+                serde_json::from_str(&contract_json).unwrap_or(serde_json::Value::Null);
+            let objective = value
+                .get("objective")
+                .and_then(|objective| objective.as_str())
+                .unwrap_or_default()
+                .to_string();
+            (contract_json, objective, tier)
+        }))
+    }
+
     /// How many worker attempts a run consumed — the attempts table is
     /// the source of truth for the ladder.
     pub fn attempt_count(&self, run_id: &str) -> Result<usize> {

@@ -1,0 +1,403 @@
+//! Pre-dispatch feature extraction (SPEC §16, §17, §21).
+//!
+//! Deterministic, shared byte-for-byte between training and inference.
+//! ONLY information available at dispatch enters: actual patch size,
+//! later failures and final outcomes are labels, never features. Free
+//! text (the objective) is untrusted data, hashed through a frozen
+//! tokenizer configuration — never an embedding API, never policy
+//! instructions. Unavailable features are represented explicitly (the
+//! caller records absence), not defaulted into silence.
+
+use serde::{Deserialize, Serialize};
+
+use crate::contract::{Kind, TaskContract};
+use crate::money::MicroUsd;
+use crate::policy::{RepoPolicy, Tier};
+
+pub const FEATURE_SCHEMA_VERSION: u32 = 1;
+pub const DEFAULT_HASHED_BUCKETS: usize = 256;
+
+/// Frozen hashing configuration: the tokenizer and bucket count live in
+/// the artifact and both train and inference read them from the same
+/// place (SPEC §16: "the same frozen tokenizer and hashing configuration
+/// at train and inference time").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeatureSchema {
+    pub version: u32,
+    pub hashed_buckets: usize,
+}
+
+impl FeatureSchema {
+    pub fn standard() -> Self {
+        Self {
+            version: FEATURE_SCHEMA_VERSION,
+            hashed_buckets: DEFAULT_HASHED_BUCKETS,
+        }
+    }
+}
+
+/// Dense task-level features, all observable before any dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TaskFeatures {
+    pub kind_change: f64,
+    pub kind_inspect: f64,
+    pub scope_patterns: f64,
+    pub scope_wildcards: f64,
+    pub read_hints: f64,
+    pub acceptance_count: f64,
+    pub risk_hints: f64,
+    pub verification_commands: f64,
+    pub verification_amont_checks: f64,
+    pub architecture_keys: f64,
+    pub objective_len: f64,
+}
+
+pub const TASK_FEATURE_COUNT: usize = 11;
+pub const TIER_COUNT: usize = 3;
+
+impl TaskFeatures {
+    pub fn extract(contract: &TaskContract, repo: &RepoPolicy) -> Self {
+        let scope_patterns = contract
+            .write_scope
+            .as_deref()
+            .is_some_and(|s| !s.is_empty()) as u64 as f64;
+        let scope_wildcards = contract
+            .write_scope
+            .as_deref()
+            .map(|patterns| patterns.iter().any(|pattern| pattern.contains('*')) as u64 as f64)
+            .unwrap_or(0.0);
+        let profile = repo
+            .verification
+            .profiles
+            .get(&contract.verification_profile);
+        TaskFeatures {
+            kind_change: (contract.kind == Kind::Change) as u64 as f64,
+            kind_inspect: (contract.kind == Kind::Inspect) as u64 as f64,
+            scope_patterns,
+            scope_wildcards,
+            read_hints: contract.read_hints.len().min(16) as f64,
+            acceptance_count: contract.acceptance.len().min(16) as f64,
+            risk_hints: contract.risk_hints.len().min(16) as f64,
+            verification_commands: profile
+                .map(|profile| profile.commands.len().min(8) as f64)
+                .unwrap_or(-1.0),
+            verification_amont_checks: profile
+                .map(|profile| profile.amont_checks.len().min(8) as f64)
+                .unwrap_or(-1.0),
+            architecture_keys: contract.architecture.keys.len().min(16) as f64,
+            objective_len: contract.objective.len().min(512) as f64,
+        }
+    }
+
+    pub fn dense(&self) -> [f64; TASK_FEATURE_COUNT] {
+        [
+            self.kind_change,
+            self.kind_inspect,
+            self.scope_patterns,
+            self.scope_wildcards,
+            self.read_hints,
+            self.acceptance_count,
+            self.risk_hints,
+            self.verification_commands,
+            self.verification_amont_checks,
+            self.architecture_keys,
+            self.objective_len,
+        ]
+    }
+}
+
+/// One (index, value) sparse vector over the expanded layout:
+/// [task features (11)] + [tier one-hot (3)] + [task×tier interactions
+/// (11×3)] + [hashed objective buckets]. Interactions exist so capability
+/// varies by task class rather than only assigning a global strength to
+/// each model (SPEC §16).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SparseVec(pub Vec<(usize, f64)>);
+
+fn tier_offset(tier: Tier) -> usize {
+    TASK_FEATURE_COUNT
+        + match tier {
+            Tier::Research => 0,
+            Tier::Implementation => 1,
+            Tier::Escalation => 2,
+        }
+}
+
+/// Tokenizer: lowercase, split on non-alphanumeric, tokens capped at 24
+/// chars. Frozen with FEATURE_SCHEMA_VERSION; changing it is a new
+/// schema version, never a silent edit.
+fn tokenize(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_alphanumeric() {
+            current.push(ch.to_ascii_lowercase());
+            if current.chars().count() >= 24 {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+pub fn hash_bucket(token: &str, buckets: usize) -> usize {
+    (fnv1a(token.as_bytes()) % buckets as u64) as usize
+}
+
+pub fn expand(
+    task: &TaskFeatures,
+    tier: Tier,
+    objective: &str,
+    schema: &FeatureSchema,
+) -> SparseVec {
+    let mut features: Vec<(usize, f64)> = Vec::with_capacity(48);
+    for (index, value) in task.dense().into_iter().enumerate() {
+        features.push((index, value));
+    }
+    let tier_hot = tier_offset(tier);
+    features.push((tier_hot, 1.0));
+    // Interactions: each task feature gated by this tier.
+    for (index, value) in task.dense().into_iter().enumerate() {
+        features.push((
+            TASK_FEATURE_COUNT + TIER_COUNT + index * TIER_COUNT + (tier_hot - TASK_FEATURE_COUNT),
+            value,
+        ));
+    }
+    let interaction_base = TASK_FEATURE_COUNT + TIER_COUNT + TASK_FEATURE_COUNT * TIER_COUNT;
+    for token in tokenize(objective) {
+        features.push((
+            interaction_base + hash_bucket(&token, schema.hashed_buckets),
+            1.0,
+        ));
+    }
+    // Coalesce duplicate hashed buckets into counts.
+    features.sort_by_key(|(index, _)| *index);
+    let mut coalesced: Vec<(usize, f64)> = Vec::with_capacity(features.len());
+    for (index, value) in features {
+        match coalesced.last_mut() {
+            Some((last_index, last_value)) if *last_index == index => {
+                *last_value += value;
+            }
+            _ => coalesced.push((index, value)),
+        }
+    }
+    SparseVec(coalesced)
+}
+
+pub fn feature_dim(schema: &FeatureSchema) -> usize {
+    TASK_FEATURE_COUNT + TIER_COUNT + TASK_FEATURE_COUNT * TIER_COUNT + schema.hashed_buckets
+}
+
+pub fn dot(features: &SparseVec, weights: &[f64]) -> f64 {
+    features
+        .0
+        .iter()
+        .map(|(index, value)| {
+            weights
+                .get(*index)
+                .copied()
+                .map(|weight| weight * value)
+                .unwrap_or(0.0)
+        })
+        .sum()
+}
+
+/// Standardization fitted ONLY on training data (SPEC §16), applied
+/// identically at train and inference.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Standardization {
+    pub means: Vec<f64>,
+    pub stds: Vec<f64>,
+}
+
+impl Standardization {
+    pub fn fit(feature_sets: &[SparseVec], dim: usize) -> Self {
+        let mut sums = vec![0.0f64; dim];
+        let mut counts = vec![0usize; dim];
+        for features in feature_sets {
+            for (index, value) in &features.0 {
+                if let Some(sum) = sums.get_mut(*index) {
+                    *sum += value;
+                    counts[*index] += 1;
+                }
+            }
+        }
+        let mut means = vec![0.0f64; dim];
+        let mut stds = vec![0.0f64; dim];
+        for index in 0..dim {
+            if counts[index] == 0 {
+                stds[index] = 1.0;
+                continue;
+            }
+            let mean = sums[index] / counts[index] as f64;
+            let mut variance = 0.0;
+            for features in feature_sets {
+                for (feature_index, value) in &features.0 {
+                    if *feature_index == index {
+                        variance += (value - mean) * (value - mean);
+                    }
+                }
+            }
+            means[index] = mean;
+            stds[index] = if counts[index] > 1 {
+                (variance / counts[index] as f64).sqrt().max(1e-8)
+            } else {
+                1.0
+            };
+        }
+        Self { means, stds }
+    }
+
+    pub fn apply(&self, features: &SparseVec) -> SparseVec {
+        SparseVec(
+            features
+                .0
+                .iter()
+                .map(|(index, value)| {
+                    let standardized = (value - self.means[*index]) / self.stds[*index];
+                    (*index, standardized)
+                })
+                .collect(),
+        )
+    }
+}
+
+/// A complete training example: features, the label (evidence-backed),
+/// and the complete-strategy cost. Attempt-level outcomes stay distinct
+/// from complete-strategy outcomes (SPEC §17): `accepted_without_escalation`
+/// is the attempt-level acceptance label; `complete_cost` belongs to the
+/// whole strategy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrainingExample {
+    pub family: String,
+    pub tier: Tier,
+    pub sparse: SparseVec,
+    pub accepted_without_escalation: bool,
+    pub complete_cost: MicroUsd,
+    pub cost_complete: bool,
+    pub dispatched_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contract() -> TaskContract {
+        TaskContract::from_json_str(
+            &serde_json::json!({
+                "schema_version": 1, "kind": "change",
+                "objective": "Fix the JSON escaping defect in list output",
+                "base_ref": "HEAD", "write_scope": ["crates/**"],
+                "read_hints": ["crates"],
+                "acceptance": ["one", "two"],
+                "verification_profile": "default",
+                "risk_hints": ["public-output-contract"],
+            })
+            .to_string(),
+        )
+        .expect("contract")
+    }
+
+    fn repo() -> RepoPolicy {
+        RepoPolicy::from_toml_str(crate::policy::INIT_TEMPLATE).expect("policy")
+    }
+
+    #[test]
+    fn extraction_is_deterministic_and_dispatch_time_only() {
+        let task = TaskFeatures::extract(&contract(), &repo());
+        assert_eq!(task.kind_change, 1.0);
+        assert_eq!(task.kind_inspect, 0.0);
+        assert_eq!(task.acceptance_count, 2.0);
+        assert_eq!(task.risk_hints, 1.0);
+        assert_eq!(task.verification_commands, 1.0);
+        let again = TaskFeatures::extract(&contract(), &repo());
+        assert_eq!(task, again);
+    }
+
+    #[test]
+    fn expansion_is_shared_between_train_and_inference() {
+        let schema = FeatureSchema::standard();
+        let task = TaskFeatures::extract(&contract(), &repo());
+        let a = expand(&task, Tier::Implementation, &contract().objective, &schema);
+        let b = expand(&task, Tier::Implementation, &contract().objective, &schema);
+        assert_eq!(a, b, "the same inputs give the same features");
+        assert!(a.0.iter().all(|(index, _)| *index < feature_dim(&schema)));
+        let escalation = expand(&task, Tier::Escalation, &contract().objective, &schema);
+        let a_hot =
+            a.0.iter()
+                .find(|(index, _)| *index == tier_offset(Tier::Implementation));
+        assert!(a_hot.is_some(), "tier one-hot is present");
+        let escalation_hot = escalation
+            .0
+            .iter()
+            .find(|(index, _)| *index == tier_offset(Tier::Escalation));
+        assert!(escalation_hot.is_some());
+    }
+
+    #[test]
+    fn hashed_features_use_the_frozen_tokenizer() {
+        let schema = FeatureSchema::standard();
+        let task = TaskFeatures::extract(&contract(), &repo());
+        let a = expand(
+            &task,
+            Tier::Research,
+            "Fix the JSON escaping defect",
+            &schema,
+        );
+        let b = expand(
+            &task,
+            Tier::Research,
+            "fix THE json ESCAPING defect",
+            &schema,
+        );
+        assert_eq!(a, b, "case and punctuation do not move the hash");
+        let c = expand(
+            &task,
+            Tier::Research,
+            "completely different objective",
+            &schema,
+        );
+        assert_ne!(a, c);
+        assert_eq!(hash_bucket("json", 256), hash_bucket("json", 256));
+    }
+
+    #[test]
+    fn standardization_is_fitted_on_the_given_data_only() {
+        let schema = FeatureSchema::standard();
+        let task = TaskFeatures::extract(&contract(), &repo());
+        let dense = expand(&task, Tier::Research, "objective", &schema);
+        let standardization =
+            Standardization::fit(std::slice::from_ref(&dense), feature_dim(&schema));
+        let applied = standardization.apply(&dense);
+        assert!(
+            applied.0.iter().all(|(_, value)| value.is_finite()),
+            "no division by zero"
+        );
+        // A single sample: mean = the value, std clamped to 1, so the
+        // standardized value is 0 — the transform is deterministic, and
+        // multi-sample fits are where the standardization carries signal.
+        let applied_value = applied.0.iter().find(|(index, _)| *index == 0).copied();
+        assert_eq!(applied_value, Some((0, 0.0)));
+    }
+
+    #[test]
+    fn dot_product_ignores_out_of_range_indices() {
+        let weights = vec![1.0; 4];
+        let features = SparseVec(vec![(0, 2.0), (9, 5.0)]);
+        assert_eq!(dot(&features, &weights), 2.0);
+    }
+}

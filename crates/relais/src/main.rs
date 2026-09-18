@@ -145,11 +145,11 @@ fn main() {
         Command::Resume { run_id } => resume_command(&run_id),
         Command::Report { since, json } => report_command(since.as_deref(), json),
         Command::Dataset { cmd } => match cmd {
-            DatasetCommand::Build => stub("dataset build", "M8"),
+            DatasetCommand::Build => dataset_build_command(),
         },
-        Command::Train => stub("train", "M8"),
-        Command::Evaluate { .. } => stub("evaluate", "M8"),
-        Command::Promote { .. } => stub("promote", "M8"),
+        Command::Train => train_command(),
+        Command::Evaluate { artifact } => evaluate_command(&artifact),
+        Command::Promote { artifact_id } => promote_command(&artifact_id),
         Command::Feedback { run_id, outcome } => feedback_command(&run_id, outcome),
         Command::Install { claude, write: _ } => {
             if claude {
@@ -175,6 +175,212 @@ fn main() {
 fn stub(name: &str, milestone: &str) -> i32 {
     eprintln!("relais {name}: not implemented yet (milestone {milestone})");
     2
+}
+
+fn registry() -> relais::learn::registry::Registry {
+    relais::learn::registry::Registry::open(&paths::registry_dir()).unwrap_or_else(|e| {
+        eprintln!("relais: artifact registry is unavailable: {e}");
+        std::process::exit(1);
+    })
+}
+
+fn datasets_dir() -> PathBuf {
+    paths::state_dir().join("datasets")
+}
+
+fn latest_dataset() -> Result<relais::learn::dataset::Dataset, i32> {
+    let dir = datasets_dir();
+    let newest = std::fs::read_dir(&dir).ok().and_then(|entries| {
+        entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .max()
+    });
+    let Some(path) = newest else {
+        eprintln!(
+            "relais: no dataset under {} — run `relais dataset build` first",
+            dir.display()
+        );
+        return Err(2);
+    };
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        eprintln!("relais: cannot read {}: {e}", path.display());
+        2
+    })?;
+    serde_json::from_str(&text).map_err(|e| {
+        eprintln!("relais: dataset {} is malformed: {e}", path.display());
+        2
+    })
+}
+
+fn dataset_build_command() -> i32 {
+    let repo = load_repo_policy().unwrap_or_else(|code| std::process::exit(code));
+    let ledger = open_ledger();
+    let contract_of = |run_id: &str| -> Option<(TaskContract, String, String)> {
+        ledger
+            .run_contract_and_tier(run_id)
+            .ok()
+            .flatten()
+            .and_then(|(contract_json, objective, tier)| {
+                TaskContract::from_json_str(&contract_json)
+                    .ok()
+                    .map(|contract| (contract, objective, tier))
+            })
+    };
+    let dataset = relais::learn::dataset::build(&ledger, &contract_of, &repo);
+    let (_, positives, negatives) = dataset.acceptance_labels();
+    let dir = datasets_dir();
+    std::fs::create_dir_all(&dir).expect("dataset dir");
+    let path = dir.join(format!(
+        "{}.json",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S")
+    ));
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&dataset).expect("serializes"),
+    )
+    .expect("dataset write");
+    println!(
+        "dataset: {} (fingerprint {})",
+        path.display(),
+        dataset.fingerprint
+    );
+    println!(
+        "records: {} ({} accepted-without-escalation, {} not)",
+        dataset.records.len(),
+        positives,
+        negatives
+    );
+    println!("coverage: {}", {
+        let mut coverage: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for record in &dataset.records {
+            *coverage
+                .entry(record.tier.as_str().to_string())
+                .or_default() += 1;
+        }
+        coverage
+            .into_iter()
+            .map(|(tier, count)| format!("{tier}:{count}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    });
+    if dataset.exclusions.is_empty() {
+        println!("exclusions: none");
+    } else {
+        println!("exclusions ({}):", dataset.exclusions.len());
+        for exclusion in dataset.exclusions.iter().take(20) {
+            println!("  {exclusion}");
+        }
+    }
+    0
+}
+
+fn train_command() -> i32 {
+    let dataset = match latest_dataset() {
+        Ok(dataset) => dataset,
+        Err(code) => return code,
+    };
+    let settings = relais::learn::learner::SolverSettings::default();
+    println!(
+        "training on {} record(s) (seed {})",
+        dataset.records.len(),
+        settings.seed
+    );
+    let outcome = match relais::learn::evaluate::train_and_evaluate(
+        &dataset,
+        settings,
+        0.75,
+        relais::learn::evaluate::DEFAULT_MIN_RECORDS_PER_TIER,
+    ) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            eprintln!("relais train: {e}");
+            return 2;
+        }
+    };
+    let artifact_id = format!("artifact-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"));
+    let artifact = relais::learn::registry::Artifact {
+        schema_version: relais::learn::registry::ARTIFACT_SCHEMA_VERSION,
+        artifact_id: artifact_id.clone(),
+        feature_schema: relais::learn::features::FeatureSchema::standard(),
+        standardization: outcome.standardization,
+        acceptance: outcome.acceptance,
+        cost: outcome.cost,
+        tiers_supported: outcome.tiers_supported,
+        cohorts: vec!["change".into(), "inspect".into()],
+        dataset_fingerprint: dataset.fingerprint,
+        solver: settings,
+        trained_at: relais::ledger::now_rfc3339(),
+        relais_version: relais::version().into(),
+        evaluation: Some(serde_json::to_value(&outcome.report).expect("serializes")),
+    };
+    let reg = registry();
+    reg.store(&artifact).unwrap_or_else(|e| {
+        eprintln!("relais train: {e}");
+        std::process::exit(1);
+    });
+    print!("{}", outcome.report.render());
+    println!("candidate artifact: {artifact_id}");
+    if outcome.report.gates.gates_passed {
+        println!("`relais promote {artifact_id}` activates it (rollback is immediate)");
+    } else {
+        println!("gates failed; promote will refuse this artifact");
+    }
+    0
+}
+
+fn evaluate_command(artifact_id: &str) -> i32 {
+    let reg = registry();
+    let artifact = match reg.load(artifact_id) {
+        Ok(artifact) => artifact,
+        Err(e) => {
+            eprintln!("relais evaluate: {e}");
+            return 2;
+        }
+    };
+    let Some(evaluation) = &artifact.evaluation else {
+        eprintln!("relais evaluate: artifact {artifact_id} carries no evaluation report");
+        return 2;
+    };
+    let report: relais::learn::evaluate::EvalReport =
+        serde_json::from_value(evaluation.clone()).expect("stored evaluations parse");
+    print!("{}", report.render());
+    println!("dataset fingerprint: {}", artifact.dataset_fingerprint);
+    println!(
+        "trained at: {} with relais {}",
+        artifact.trained_at, artifact.relais_version
+    );
+    if report.gates.gates_passed {
+        0
+    } else {
+        2
+    }
+}
+
+fn promote_command(artifact_id: &str) -> i32 {
+    let reg = registry();
+    let gates = relais::learn::registry::PromotionGates {
+        gates_passed: true,
+        min_records_per_tier: relais::learn::evaluate::DEFAULT_MIN_RECORDS_PER_TIER,
+        coverage: vec![],
+        test_acceptance_rate: None,
+        quality_floor: 0.75,
+        abstention_rate: 0.0,
+    };
+    match reg.promote(artifact_id, &gates) {
+        Ok(()) => {
+            println!(
+                "promoted {artifact_id}; the previous artifact stays for `relais promote` rollback"
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("relais promote: {e}");
+            2
+        }
+    }
 }
 
 fn stub_coordinator(_daemon: bool) -> i32 {
