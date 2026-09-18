@@ -1,0 +1,9 @@
+# The toolchain this repository builds with, pinned. Under
+# `cargo clippy --all-targets -- -D warnings`, every clippy release is a
+# potential breaking change; the pin is what makes a red build attributable
+# to a change somebody made. Bumping it is a deliberate PR in the same
+# change as any new-lint fixes it forces. NOT the MSRV — the floor the
+# source is allowed to require is `rust-version` in Cargo.toml.
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]

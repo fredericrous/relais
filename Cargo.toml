@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/relais"]
+
+# Shared release metadata, so the crate cannot disagree with the workspace
+# about who it is. The floor `rust-version` is what the `msrv` job in CI
+# actually compiles against; the build toolchain is pinned separately in
+# rust-toolchain.toml. The two numbers move independently and mean different
+# things.
+[workspace.package]
+version = "0.1.0"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/fredericrous/relais"
+authors = ["Frederic Rousseau"]
+edition = "2021"
+
+# NOT on the commit-hook path — amont's std-only constraint does not apply
+# here (SPEC §13) — but the CLI starts often enough that size and start-up
+# cost are still worth having.
+[profile.release]
+strip = true
+opt-level = "s"
+lto = true

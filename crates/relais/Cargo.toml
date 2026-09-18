@@ -1,0 +1,40 @@
+[package]
+name = "relais"
+description = "Coding-agent execution companion: routing, context, verification, accounting"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Validated boundaries: contract schema, policy, context manifest, learning
+# artifacts. Contracts REJECT unknown fields, so serde's deny_unknown_fields
+# is load-bearing (SPEC §4: "Unknown fields are rejected").
+serde = { version = "1", features = ["derive"] }
+# Contract/context wire format, coordinator protocol, ledger payloads.
+# Canonical hashing serializes through serde_json::Value, whose default
+# BTreeMap ordering gives sorted-key, byte-stable output.
+serde_json = "1"
+# relais.toml (repository policy) and machine-owned settings.
+toml = "0.8"
+# CLI. Derive-based, one binary.
+clap = { version = "4", features = ["derive"] }
+# Contract / policy / candidate / log hashes. The ledger keys evidence by
+# content, and trust grants are content-bound (SPEC §5).
+sha2 = "0.10"
+# write_scope and risk path patterns. Scope checking runs on the actual
+# diff against these patterns, never on the prompt's word for it.
+globset = "0.4"
+# Machine-local ledger (SPEC §12). Bundled: hermetic, no system SQLite to
+# drift against. rusqlite is the maintained standard; a ledger is the one
+# place a dependency is clearly cheaper than hand-rolling.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Timestamps and report windows; stored as RFC3339 strings / unix seconds.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# XDG config/state/data dirs: machine settings, ledger, artifact registry.
+dirs = "5"
+# kill(pid, 0) for coordinator lease reconciliation — checking liveness
+# without sending a signal that could terminate anything.
+libc = "0.2"
