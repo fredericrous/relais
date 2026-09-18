@@ -331,6 +331,27 @@ impl Ledger {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Distinct models that actually ran for a run, from usage events.
+    pub fn models_used(&self, run_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT model FROM usage_events
+             WHERE run_id = ?1 AND model IS NOT NULL ORDER BY model",
+        )?;
+        let rows = stmt.query_map([run_id], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// How many worker attempts a run consumed — the attempts table is
+    /// the source of truth for the ladder.
+    pub fn attempt_count(&self, run_id: &str) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM attempts WHERE run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     pub fn finish_attempt(
         &self,
         attempt_id: i64,
