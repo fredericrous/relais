@@ -144,7 +144,9 @@ must not edit files.
 
 2. Preflight without spending: `relais plan --task .relais/task.json`
 
-3. Execute: `relais run --task .relais/task.json`
+3. Execute, naming this session so the coordinator's per-session limits
+   and attribution are per TAB rather than per shell (SPEC §23):
+   `RELAIS_SESSION_ID="${CLAUDE_SESSION_ID:-$$}" relais run --task .relais/task.json`
 
 4. Read the outcome: accepted (receipt + patch), needs_decision,
 needs_review, blocked, failed, budget_exhausted or interrupted. The

@@ -29,7 +29,7 @@ use crate::admission::{Decision, DispatchRequest, Gate, Refusal, ResourceClass, 
 use crate::context::{self, AvalVerdict, ContextError, ContextManifest};
 use crate::contract::{Review, TaskContract};
 use crate::ids::{DispatchId, RunId};
-use crate::ledger::{now_rfc3339, Ledger, LedgerError, Transition, UsageEvent};
+use crate::ledger::{Ledger, LedgerError, Transition, UsageEvent};
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::policy::{
     effective_authority, BlockCode, EffectiveAuthority, MachineSettings, RepoPolicy, Tier,
@@ -202,7 +202,7 @@ impl<'a> RunEngine<'a> {
             to_state: to,
             reason: reason.as_str().to_string(),
             detail: Some(detail),
-            at: now_rfc3339(),
+            at: self.config.ledger.now(),
         })?;
         self.state = to;
         Ok(())
@@ -913,7 +913,7 @@ impl<'a> RunEngine<'a> {
                 cost_kind: CostKind::ApiSpend,
                 completeness: usage.cost_completeness,
                 inclusive: usage.inclusive,
-                at: now_rfc3339(),
+                at: self.config.ledger.now(),
             };
             ledger.record_usage(&event)?;
             progress.total_cost += event.cost;
@@ -1465,7 +1465,7 @@ impl<'a> RunEngine<'a> {
             cost_kind: CostKind::ApiSpend,
             completeness: result.usage.cost_completeness,
             inclusive: result.usage.inclusive,
-            at: now_rfc3339(),
+            at: self.config.ledger.now(),
         };
         if let Err(e) = self.config.ledger.record_usage(&event) {
             return ReviewOutcome::Unavailable(format!("the ledger refused the review usage: {e}"));

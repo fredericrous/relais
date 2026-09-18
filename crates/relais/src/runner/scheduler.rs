@@ -27,7 +27,7 @@ use crate::context::ContextManifest;
 use crate::contract::{Decomposition, DecompositionMode, Kind, TaskContract, WorkPlan};
 use crate::contract::{Review, WorkPackage};
 use crate::ids::DispatchId;
-use crate::ledger::{now_rfc3339, UsageEvent};
+use crate::ledger::UsageEvent;
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::policy::{BlockCode, EffectiveAuthority, MachineSettings, Tier};
 use crate::route::RouteDecision;
@@ -891,7 +891,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         cost_kind: CostKind::ApiSpend,
         completeness: result.usage.cost_completeness,
         inclusive: result.usage.inclusive,
-        at: now_rfc3339(),
+        at: engine.config.ledger.now(),
     })?;
     if result.cancelled {
         return Ok(Proposal::Failed(engine.stop(

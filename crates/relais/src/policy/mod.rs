@@ -739,6 +739,17 @@ amont_agent = "required"
 argv = ["make", "check"]
 timeout_seconds = 300
 
+# A candidate that touches what the profile's verdict depends on — build
+# manifests, lockfiles, the test tree, fixtures, or a program the profile
+# runs — is reviewed explicitly whatever the route said (SPEC §10). The
+# built-in list covers the common ones; add this repository's own here.
+# [verification.profiles.default]
+# inputs = ["scripts/check.sh", "ci/**"]
+# Cache baseline results by base SHA, profile and toolchain (SPEC §18).
+# Off by default: only a profile with no undeclared external dependency
+# and no nondeterministic check is safe to cache.
+# cache_baseline = true
+
 # Risk floors: writes touching these patterns cannot route below the
 # minimum tier, and the review requirement here is a floor, not a hint.
 # Floors apply to the DECLARED scope: a contract scoped `src/**` could

@@ -28,7 +28,8 @@ One crate, `crates/relais`, one binary. Modules follow SPEC §13:
 | `context` | context manifests and aval resolution (§7) |
 | `workspace` | owned worktrees, candidate snapshots, scope checks (§8) |
 | `adapter` | the `Backend` trait, the Claude Code adapter, a mock (§20) |
-| `runner` | attempt lifecycle, repair/escalation, review, receipts (§9, §10) |
+| `runner` | the interpreter: observes, records, performs one effect per step (§9, §10) |
+| `runner::machine` | the §9 observation table as a pure function, one test per row |
 | `runner::scheduler` | bounded decomposition and integration (§19) |
 | `verify` | verification profiles, amont gaps, receipts (§10) |
 | `admission` | the pure admission state machine: caps, budgets, leases (§23) |
@@ -40,6 +41,17 @@ One crate, `crates/relais`, one binary. Modules follow SPEC §13:
 `crates/relais/tests/release_scenarios.rs` runs the §14 release scenarios
 through the real binary against a fake `claude`; the §23 concurrency
 scenarios are unit tests over the admission state machine.
+
+## Reading the code
+
+Start at `runner::machine::decide`: it is the spec's §9 table with each
+row a `match` arm and a unit test. `runner::RunEngine::run_inner` is the
+interpreter around it; everything it touches — git, SQLite, processes —
+is behind a `Result`, and a failure of the runner's own machinery ends a
+run as `interrupted` with reason `runner_failure`, never as a panic.
+`admission::AdmissionState` is the same shape for §23: every method takes
+`now`, liveness is a callback, and the concurrency scenarios run in
+milliseconds.
 
 ## Known limits
 
