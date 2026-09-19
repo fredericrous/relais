@@ -1,0 +1,126 @@
+name: CI
+
+# `make check` — toolchain, lint, test, msrv — on every push to main and
+# every pull request, so a green check on the PR means what a green
+# `make check` means on the workstation. The jobs mirror the Makefile
+# targets one for one; change a flag in one place, change it in the other.
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  # For `audit`: a new advisory against a crate in the tree appears
+  # without anybody pushing anything. Monday morning, so it is read at the
+  # start of a week.
+  schedule:
+    - cron: "23 6 * * 1"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# GitHub's DEFAULT shell is `bash -e {0}` — no pipefail. Only naming bash
+# explicitly gets `bash -eo pipefail {0}`; without it a `make test | tee`
+# reports tee's exit status and a failing suite goes green.
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # `make lint`: the two commands, exactly.
+  lint:
+    name: lint (fmt, clippy -D warnings)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins the build toolchain; rustup on the runner
+      # honours it, so this is the same clippy the Makefile runs.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-lint-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  # `make test`: the library suite plus the release scenarios, which drive
+  # the real binary against a fake `claude`, a temporary repository and a
+  # lazily started coordinator. A macOS leg on purpose: the coordinator's
+  # Unix-socket path limits and process-group handling differ by platform,
+  # and the product ships to a macOS workstation.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-test-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      # The scenarios commit in a temporary repository; git wants an
+      # identity. Hooks are disabled per fixture, not here.
+      - run: |
+          git config --global user.email "ci@relais.invalid"
+          git config --global user.name "relais ci"
+      - run: cargo test
+
+  # `make msrv`: the floor `rust-version` claims, actually compiled
+  # against. Without this, `rust-version` is a string nothing tests.
+  msrv:
+    # Literal, not `${{ env.MSRV }}`: the env context is unavailable in a
+    # job's name and renders empty rather than erroring.
+    name: msrv (the crate builds on 1.88)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Keep in step with [workspace.package] rust-version in Cargo.toml.
+      MSRV: "1.88.0"
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install "$MSRV" --profile minimal --no-self-update
+      - run: cargo "+$MSRV" build
+
+  # The dependency tree, watched. `cargo install --locked cargo-audit`, not
+  # a marketplace action: pulling an unaudited third-party action into the
+  # job whose purpose is supply-chain hygiene is self-defeating.
+  #
+  # NON-BLOCKING, deliberately: an advisory is information about a
+  # dependency, not a defect in the change under review, and a scheduled
+  # run that goes red on somebody else's disclosure trains people to
+  # ignore red. Findings surface as ::warning:: annotations.
+  audit:
+    name: cargo audit (advisory, non-blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ runner.os }}-v1
+      - name: Install cargo-audit
+        run: command -v cargo-audit > /dev/null || cargo install --locked cargo-audit
+      - name: Audit the resolved tree
+        run: |
+          set -euo pipefail
+          if ! cargo audit --color never > audit.txt 2>&1; then
+            cat audit.txt
+            echo "::warning::cargo audit reported findings (advisory; see the job log)"
+          else
+            cat audit.txt
+          fi

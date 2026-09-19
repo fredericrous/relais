@@ -16,6 +16,11 @@ make check   # toolchain lint test msrv
 make build
 ```
 
+CI (`.github/workflows/ci.yaml`) runs the same targets on every push and
+pull request — lint and msrv on Linux, the test suite on Linux and macOS —
+plus a weekly, non-blocking `cargo audit`. A green check on a PR means what
+a green `make check` means on the workstation.
+
 ## Layout
 
 One crate, `crates/relais`, one binary. Modules follow SPEC §13:
@@ -60,5 +65,6 @@ milliseconds.
   recorded but not yet run concurrently.
 - Native Claude Code subagents are observed, not admitted: only managed
   dispatch through `relais run` is capped by the coordinator.
-- The `msrv` target proves the declared floor only when that toolchain is
-  installed (`rustup toolchain install 1.88.0`); otherwise it says so.
+- The local `msrv` target proves the declared floor only when that
+  toolchain is installed (`rustup toolchain install 1.88.0`); otherwise it
+  says so. CI always installs it.
