@@ -73,7 +73,7 @@ impl Backend for MockBackend {
             worker_claims_blockage: outcome
                 .result_text
                 .as_deref()
-                .is_some_and(|text| text.contains("relais-blocked:")),
+                .is_some_and(super::claims_blockage),
             cancelled: spec
                 .cancel
                 .as_ref()

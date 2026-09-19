@@ -106,11 +106,36 @@ impl TaskFeatures {
     }
 }
 
+/// The execution profile's identity at dispatch (SPEC §16: "model/effort/
+/// harness identity" are initial features). A new model or harness
+/// version is a new identity; evidence is not blindly inherited.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ProfileIdentity {
+    pub model: String,
+    pub effort: Option<String>,
+    pub harness: Option<String>,
+}
+
+impl ProfileIdentity {
+    /// The tokens this identity hashes to. Prefixed so `sonnet` the model
+    /// and `sonnet` in an objective never share a bucket.
+    fn tokens(&self) -> Vec<String> {
+        let mut tokens = vec![format!("model={}", self.model)];
+        if let Some(effort) = &self.effort {
+            tokens.push(format!("effort={effort}"));
+        }
+        if let Some(harness) = &self.harness {
+            tokens.push(format!("harness={harness}"));
+        }
+        tokens
+    }
+}
+
 /// One (index, value) sparse vector over the expanded layout:
 /// [task features (11)] + [tier one-hot (3)] + [task×tier interactions
-/// (11×3)] + [hashed objective buckets]. Interactions exist so capability
-/// varies by task class rather than only assigning a global strength to
-/// each model (SPEC §16).
+/// (11×3)] + [hashed buckets: objective tokens and profile identity].
+/// Interactions exist so capability varies by task class rather than
+/// only assigning a global strength to each model (SPEC §16).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SparseVec(pub Vec<(usize, f64)>);
 
@@ -162,6 +187,7 @@ pub fn expand(
     task: &TaskFeatures,
     tier: Tier,
     objective: &str,
+    identity: &ProfileIdentity,
     schema: &FeatureSchema,
 ) -> SparseVec {
     let mut features: Vec<(usize, f64)> = Vec::with_capacity(48);
@@ -178,7 +204,7 @@ pub fn expand(
         ));
     }
     let interaction_base = TASK_FEATURE_COUNT + TIER_COUNT + TASK_FEATURE_COUNT * TIER_COUNT;
-    for token in tokenize(objective) {
+    for token in tokenize(objective).into_iter().chain(identity.tokens()) {
         features.push((
             interaction_base + hash_bucket(&token, schema.hashed_buckets),
             1.0,
@@ -216,50 +242,51 @@ pub fn dot(features: &SparseVec, weights: &[f64]) -> f64 {
         .sum()
 }
 
-/// Standardization fitted ONLY on training data (SPEC §16), applied
-/// identically at train and inference.
+/// Scaling fitted ONLY on training data (SPEC §16), applied identically
+/// at train and inference.
+///
+/// Scale only, no centering. The vectors are sparse: an absent entry IS
+/// zero, and a transform that subtracted a mean would have to touch every
+/// absent entry to stay a transform of the same space. Dividing by the
+/// root-mean-square over ALL N samples (absent entries counted as zero)
+/// keeps zero at zero and puts every coordinate on a comparable scale.
+/// The earlier version took moments over present entries only — a
+/// statistic of a different, per-coordinate population — in O(dim·N·nnz).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Standardization {
+    /// Kept at zero; retained in the artifact so the transform's shape is
+    /// explicit and a future centering scheme is a schema change, not a
+    /// silent reinterpretation.
     pub means: Vec<f64>,
     pub stds: Vec<f64>,
 }
 
 impl Standardization {
     pub fn fit(feature_sets: &[SparseVec], dim: usize) -> Self {
-        let mut sums = vec![0.0f64; dim];
-        let mut counts = vec![0usize; dim];
+        let n = feature_sets.len().max(1) as f64;
+        let mut sum_squares = vec![0.0f64; dim];
         for features in feature_sets {
             for (index, value) in &features.0 {
-                if let Some(sum) = sums.get_mut(*index) {
-                    *sum += value;
-                    counts[*index] += 1;
+                if let Some(slot) = sum_squares.get_mut(*index) {
+                    *slot += value * value;
                 }
             }
         }
-        let mut means = vec![0.0f64; dim];
-        let mut stds = vec![0.0f64; dim];
-        for index in 0..dim {
-            if counts[index] == 0 {
-                stds[index] = 1.0;
-                continue;
-            }
-            let mean = sums[index] / counts[index] as f64;
-            let mut variance = 0.0;
-            for features in feature_sets {
-                for (feature_index, value) in &features.0 {
-                    if *feature_index == index {
-                        variance += (value - mean) * (value - mean);
-                    }
+        let stds = sum_squares
+            .iter()
+            .map(|sum| {
+                let rms = (sum / n).sqrt();
+                if rms > 1e-8 {
+                    rms
+                } else {
+                    1.0
                 }
-            }
-            means[index] = mean;
-            stds[index] = if counts[index] > 1 {
-                (variance / counts[index] as f64).sqrt().max(1e-8)
-            } else {
-                1.0
-            };
+            })
+            .collect();
+        Self {
+            means: vec![0.0; dim],
+            stds,
         }
-        Self { means, stds }
     }
 
     pub fn apply(&self, features: &SparseVec) -> SparseVec {
@@ -268,8 +295,9 @@ impl Standardization {
                 .0
                 .iter()
                 .map(|(index, value)| {
-                    let standardized = (value - self.means[*index]) / self.stds[*index];
-                    (*index, standardized)
+                    let mean = self.means.get(*index).copied().unwrap_or(0.0);
+                    let std = self.stds.get(*index).copied().unwrap_or(1.0);
+                    (*index, (value - mean) / std)
                 })
                 .collect(),
         )
@@ -285,6 +313,13 @@ impl Standardization {
 pub struct TrainingExample {
     pub family: String,
     pub tier: Tier,
+    /// The dispatch-time inputs, kept so an evaluator can ask what the
+    /// artifact would have chosen among OTHER tiers for this task —
+    /// `sparse` alone is the expansion for the observed tier only.
+    pub task: TaskFeatures,
+    pub objective: String,
+    pub identity: ProfileIdentity,
+    /// `expand(task, tier, objective, identity)`, cached.
     pub sparse: SparseVec,
     pub accepted_without_escalation: bool,
     pub complete_cost: MicroUsd,
@@ -332,11 +367,34 @@ mod tests {
     fn expansion_is_shared_between_train_and_inference() {
         let schema = FeatureSchema::standard();
         let task = TaskFeatures::extract(&contract(), &repo());
-        let a = expand(&task, Tier::Implementation, &contract().objective, &schema);
-        let b = expand(&task, Tier::Implementation, &contract().objective, &schema);
+        let identity = ProfileIdentity {
+            model: "sonnet".into(),
+            effort: Some("medium".into()),
+            harness: Some("claude-code 2.1".into()),
+        };
+        let a = expand(
+            &task,
+            Tier::Implementation,
+            &contract().objective,
+            &identity,
+            &schema,
+        );
+        let b = expand(
+            &task,
+            Tier::Implementation,
+            &contract().objective,
+            &identity,
+            &schema,
+        );
         assert_eq!(a, b, "the same inputs give the same features");
         assert!(a.0.iter().all(|(index, _)| *index < feature_dim(&schema)));
-        let escalation = expand(&task, Tier::Escalation, &contract().objective, &schema);
+        let escalation = expand(
+            &task,
+            Tier::Escalation,
+            &contract().objective,
+            &identity,
+            &schema,
+        );
         let a_hot =
             a.0.iter()
                 .find(|(index, _)| *index == tier_offset(Tier::Implementation));
@@ -346,22 +404,39 @@ mod tests {
             .iter()
             .find(|(index, _)| *index == tier_offset(Tier::Escalation));
         assert!(escalation_hot.is_some());
+        // A new harness version is a new identity (SPEC §17: evidence is
+        // not blindly inherited).
+        let newer = ProfileIdentity {
+            harness: Some("claude-code 2.2".into()),
+            ..identity.clone()
+        };
+        let c = expand(
+            &task,
+            Tier::Implementation,
+            &contract().objective,
+            &newer,
+            &schema,
+        );
+        assert_ne!(a, c);
     }
 
     #[test]
     fn hashed_features_use_the_frozen_tokenizer() {
         let schema = FeatureSchema::standard();
         let task = TaskFeatures::extract(&contract(), &repo());
+        let identity = ProfileIdentity::default();
         let a = expand(
             &task,
             Tier::Research,
             "Fix the JSON escaping defect",
+            &identity,
             &schema,
         );
         let b = expand(
             &task,
             Tier::Research,
             "fix THE json ESCAPING defect",
+            &identity,
             &schema,
         );
         assert_eq!(a, b, "case and punctuation do not move the hash");
@@ -369,6 +444,7 @@ mod tests {
             &task,
             Tier::Research,
             "completely different objective",
+            &identity,
             &schema,
         );
         assert_ne!(a, c);
@@ -376,22 +452,27 @@ mod tests {
     }
 
     #[test]
-    fn standardization_is_fitted_on_the_given_data_only() {
-        let schema = FeatureSchema::standard();
-        let task = TaskFeatures::extract(&contract(), &repo());
-        let dense = expand(&task, Tier::Research, "objective", &schema);
-        let standardization =
-            Standardization::fit(std::slice::from_ref(&dense), feature_dim(&schema));
-        let applied = standardization.apply(&dense);
-        assert!(
-            applied.0.iter().all(|(_, value)| value.is_finite()),
-            "no division by zero"
+    fn scaling_is_fitted_on_the_given_data_and_keeps_zero_at_zero() {
+        let dim = 3;
+        let samples = vec![
+            SparseVec(vec![(0, 3.0), (1, 1.0)]),
+            SparseVec(vec![(0, 4.0)]),
+        ];
+        let standardization = Standardization::fit(&samples, dim);
+        // Coordinate 0: rms over BOTH samples = sqrt((9+16)/2) = 3.5355…
+        assert!((standardization.stds[0] - (12.5f64).sqrt()).abs() < 1e-12);
+        // Coordinate 1: the absent entry counts as zero: sqrt((1+0)/2).
+        assert!((standardization.stds[1] - (0.5f64).sqrt()).abs() < 1e-12);
+        // Coordinate 2 was never seen: scale 1, never a division by zero.
+        assert_eq!(standardization.stds[2], 1.0);
+        let applied = standardization.apply(&SparseVec(vec![(1, 1.0), (7, 2.0)]));
+        assert!(applied.0.iter().all(|(_, value)| value.is_finite()));
+        assert_eq!(
+            applied.0[1],
+            (7, 2.0),
+            "an index past the fit is passed through"
         );
-        // A single sample: mean = the value, std clamped to 1, so the
-        // standardized value is 0 — the transform is deterministic, and
-        // multi-sample fits are where the standardization carries signal.
-        let applied_value = applied.0.iter().find(|(index, _)| *index == 0).copied();
-        assert_eq!(applied_value, Some((0, 0.0)));
+        assert!(standardization.means.iter().all(|mean| *mean == 0.0));
     }
 
     #[test]

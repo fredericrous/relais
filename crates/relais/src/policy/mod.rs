@@ -135,6 +135,17 @@ pub struct VerificationProfile {
     /// check is a gap, not a pass (SPEC §10).
     #[serde(default)]
     pub amont_checks: Vec<String>,
+    /// Extra globs (beyond the built-in build-manifest and test-tree
+    /// defaults) naming files this profile's verdict depends on. A
+    /// candidate touching one requires review (SPEC §10).
+    #[serde(default)]
+    pub inputs: Vec<String>,
+    /// Cache baseline results by base SHA, profile and toolchain (SPEC
+    /// §18). Off by default: a profile with undeclared external
+    /// dependencies or nondeterministic checks is not cacheable, and only
+    /// the repository knows which it has.
+    #[serde(default)]
+    pub cache_baseline: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -437,9 +448,70 @@ impl MachineSettings {
 /// Why execution is blocked before any model is launched. Each blocker is
 /// a stable code plus a human explanation; `blocked:*` codes surface in
 /// `plan`, `run` and `explain` output.
+/// Why execution cannot proceed. Each code is stable — it is what
+/// `plan`, `run` and `explain` print after `blocked:` — and an enum so a
+/// misspelled code is a compile error rather than a silent new outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockCode {
+    DirtyBase,
+    MissingTrustGrant,
+    VerificationProfileUnknown,
+    ModelNotAllowed,
+    ModelUnavailable,
+    IntegrationMissing,
+    BaseUnresolvable,
+    AvalToolFailure,
+    ContextSizing,
+    BaselineVerificationFailed,
+    WorktreeUnavailable,
+    BackendUnavailable,
+    AdmissionUnavailable,
+    AdmissionRefused,
+    SnapshotFailed,
+    ScopeCheckFailed,
+    VerificationUnavailable,
+    EnvMissing,
+    ArchitectureContradiction,
+    DecompositionKind,
+}
+
+impl BlockCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DirtyBase => "dirty_base",
+            Self::MissingTrustGrant => "missing_trust_grant",
+            Self::VerificationProfileUnknown => "verification_profile_unknown",
+            Self::ModelNotAllowed => "model_not_allowed",
+            Self::ModelUnavailable => "model_unavailable",
+            Self::IntegrationMissing => "integration_missing",
+            Self::BaseUnresolvable => "base_unresolvable",
+            Self::AvalToolFailure => "aval_tool_failure",
+            Self::ContextSizing => "context_sizing",
+            Self::BaselineVerificationFailed => "baseline_verification_failed",
+            Self::WorktreeUnavailable => "worktree_unavailable",
+            Self::BackendUnavailable => "backend_unavailable",
+            Self::AdmissionUnavailable => "admission_unavailable",
+            Self::AdmissionRefused => "admission_refused",
+            Self::SnapshotFailed => "snapshot_failed",
+            Self::ScopeCheckFailed => "scope_check_failed",
+            Self::VerificationUnavailable => "verification_unavailable",
+            Self::EnvMissing => "env_missing",
+            Self::ArchitectureContradiction => "architecture_contradiction",
+            Self::DecompositionKind => "decomposition_kind",
+        }
+    }
+}
+
+impl std::fmt::Display for BlockCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blocker {
-    pub code: String,
+    pub code: BlockCode,
     pub detail: String,
 }
 
@@ -479,7 +551,7 @@ pub fn effective_authority(
     }
     if !repo.models.is_empty() && models.is_empty() {
         blockers.push(Blocker {
-            code: "model_not_allowed".into(),
+            code: BlockCode::ModelNotAllowed,
             detail: "the machine's allowed_models excludes every configured model".into(),
         });
     }
@@ -491,7 +563,7 @@ pub fn effective_authority(
         .cloned()
         .unwrap_or_else(|| {
             blockers.push(Blocker {
-                code: "verification_profile_unknown".into(),
+                code: BlockCode::VerificationProfileUnknown,
                 detail: format!(
                     "verification profile `{}` is not defined in relais.toml",
                     contract.verification_profile
@@ -504,7 +576,7 @@ pub fn effective_authority(
     let trust_granted = machine.trust.contains_key(&authority_hash);
     if !trust_granted {
         blockers.push(Blocker {
-            code: "missing_trust_grant".into(),
+            code: BlockCode::MissingTrustGrant,
             detail: format!(
                 "no content-bound trust grant for this execution declaration (authority hash {authority_hash}); grants are recorded in machine.toml after review"
             ),
@@ -517,9 +589,16 @@ pub fn effective_authority(
         .max_wall_seconds
         .min(contract.limits.wall_seconds);
 
+    // Only the rules the declared scope could touch raise the review
+    // floor; a rule about `**/trust/**` says nothing about a docs change.
     let review_floor = contract.review.max(
         repo.risk
             .iter()
+            .filter(|rule| {
+                rule.paths
+                    .iter()
+                    .any(|pattern| crate::route::write_scope_could_touch(contract, pattern))
+            })
             .map(|rule| rule.review.unwrap_or(Review::Off))
             .max()
             .unwrap_or(Review::Off),
@@ -570,7 +649,7 @@ pub fn probe_integrations(repo: &RepoPolicy) -> Vec<Blocker> {
                 let bin = dependency.bin().unwrap_or(default_bin(name));
                 if which_missing(bin) {
                     blockers.push(Blocker {
-                        code: "integration_missing".into(),
+                        code: BlockCode::IntegrationMissing,
                         detail: format!("required integration `{name}` is not available on PATH"),
                     });
                 }
@@ -591,6 +670,36 @@ fn default_bin(name: &str) -> &str {
 fn which_missing(bin: &str) -> bool {
     let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&path).all(|dir| !dir.join(bin).is_file())
+}
+
+/// Is this binary on PATH?
+pub fn binary_available(bin: &str) -> bool {
+    !which_missing(bin)
+}
+
+/// Is the integration's binary on PATH? By the integration's config name
+/// (`amont_agent` → `amont-agent`), ignoring any `bin` override.
+pub fn integration_available(name: &str) -> bool {
+    let name = name.replace('-', "_");
+    binary_available(default_bin(&name))
+}
+
+/// `<tool> --version`'s first line, or `None` when the tool is absent or
+/// will not answer — recorded in the context manifest so a receipt names
+/// the toolchain it was verified with.
+pub fn integration_version(name: &str) -> Option<String> {
+    let output = std::process::Command::new(default_bin(name))
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
 }
 
 /// Starter `relais.toml` written by `relais init`. Models and profiles
@@ -630,8 +739,22 @@ amont_agent = "required"
 argv = ["make", "check"]
 timeout_seconds = 300
 
+# A candidate that touches what the profile's verdict depends on — build
+# manifests, lockfiles, the test tree, fixtures, or a program the profile
+# runs — is reviewed explicitly whatever the route said (SPEC §10). The
+# built-in list covers the common ones; add this repository's own here.
+# [verification.profiles.default]
+# inputs = ["scripts/check.sh", "ci/**"]
+# Cache baseline results by base SHA, profile and toolchain (SPEC §18).
+# Off by default: only a profile with no undeclared external dependency
+# and no nondeterministic check is safe to cache.
+# cache_baseline = true
+
 # Risk floors: writes touching these patterns cannot route below the
 # minimum tier, and the review requirement here is a floor, not a hint.
+# Floors apply to the DECLARED scope: a contract scoped `src/**` could
+# write `src/trust/x`, so a `**/trust/**` rule floors it — scope
+# contracts as narrowly as the task allows.
 [[risk]]
 paths = ["**/trust/**", "**/restore/**"]
 minimum_tier = "escalation"
@@ -799,7 +922,10 @@ keys = ["output.contract"]
         let machine = MachineSettings::from_toml_str(&machine_toml("")).expect("machine parses");
         let a = effective_authority(&repo, &machine, &contract());
         assert!(!a.trust_granted);
-        assert!(a.blockers.iter().any(|b| b.code == "missing_trust_grant"));
+        assert!(a
+            .blockers
+            .iter()
+            .any(|b| b.code == BlockCode::MissingTrustGrant));
     }
 
     #[test]
@@ -829,7 +955,7 @@ keys = ["output.contract"]
         assert!(a
             .blockers
             .iter()
-            .any(|b| b.code == "verification_profile_unknown"));
+            .any(|b| b.code == BlockCode::VerificationProfileUnknown));
     }
 
     #[test]

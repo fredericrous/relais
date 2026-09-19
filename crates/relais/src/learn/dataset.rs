@@ -12,7 +12,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::features::{expand, FeatureSchema, SparseVec, TaskFeatures, TrainingExample};
+use super::features::{
+    expand, FeatureSchema, ProfileIdentity, SparseVec, TaskFeatures, TrainingExample,
+};
 use crate::ids::sha256_hex;
 use crate::ledger::Ledger;
 use crate::policy::{RepoPolicy, Tier};
@@ -96,11 +98,12 @@ pub fn build(
             exclusions.push(format!("{run_id}: unknown tier `{tier_name}`"));
             continue;
         };
-        let models = ledger.models_used(&run_id).unwrap_or_default();
         // A cheap worker rescued by a stronger worker did not succeed
-        // without escalation: more than one distinct model means the
-        // ladder moved.
-        let escalated = models.len() > 1;
+        // without escalation. The attempt table's phase says whether the
+        // ladder moved; the set of models seen does NOT — a reviewer at
+        // the escalation tier is not an escalation, and counting it as
+        // one labelled every reviewed run a failure of its worker.
+        let escalated = ledger.escalation_attempted(&run_id).unwrap_or(true);
         let accepted_without_escalation = state == State::Accepted && !escalated;
         let cost = ledger
             .run_cost(&run_id)
@@ -110,7 +113,17 @@ pub fn build(
             .unwrap_or(crate::money::CostCompleteness::Unknown);
         let cost_complete = completeness == crate::money::CostCompleteness::Actual;
         let task = TaskFeatures::extract(&contract, repo_policy);
-        let sparse: SparseVec = expand(&task, tier, &objective, &schema);
+        let identity = ledger
+            .first_dispatch_intent(&run_id)
+            .ok()
+            .flatten()
+            .map(|intent| ProfileIdentity {
+                model: intent["model"].as_str().unwrap_or("unknown").to_string(),
+                effort: intent["effort"].as_str().map(str::to_string),
+                harness: intent["harness"].as_str().map(str::to_string),
+            })
+            .unwrap_or_default();
+        let sparse: SparseVec = expand(&task, tier, &objective, &identity, &schema);
         let dispatched_at = ledger
             .transitions(&run_id)
             .unwrap_or_default()
@@ -118,8 +131,11 @@ pub fn build(
             .map(|transition| transition.at.clone())
             .unwrap_or_default();
         records.push(TrainingExample {
-            family: contract.hash(),
+            family: task_family(&contract),
             tier,
+            task,
+            objective: objective.clone(),
+            identity,
             sparse,
             accepted_without_escalation,
             complete_cost: cost,
@@ -136,6 +152,33 @@ pub fn build(
         fingerprint,
         built_at: crate::ledger::now_rfc3339(),
     }
+}
+
+/// The family a contract belongs to, for split grouping (SPEC §17:
+/// "avoid counting many retries or near-identical task variants as
+/// independent examples"). Kind, scope and the objective's token SET
+/// — not its exact text, so a re-worded retry of the same task stays with
+/// the original, while a different task on the same scope does not.
+pub fn task_family(contract: &crate::contract::TaskContract) -> String {
+    let mut tokens: Vec<String> = contract
+        .objective
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_lowercase())
+        .collect();
+    tokens.sort();
+    tokens.dedup();
+    let mut scope = contract.write_scope.clone().unwrap_or_default();
+    scope.sort();
+    sha256_hex(
+        serde_json::json!({
+            "kind": contract.kind,
+            "scope": scope,
+            "tokens": tokens,
+        })
+        .to_string()
+        .as_bytes(),
+    )
 }
 
 impl Tier {
@@ -209,6 +252,9 @@ mod tests {
         TrainingExample {
             family: family.into(),
             tier: Tier::Implementation,
+            task: TaskFeatures::extract(&contract(), &repo_policy()),
+            objective: "objective".into(),
+            identity: ProfileIdentity::default(),
             sparse: SparseVec(vec![(0, 1.0)]),
             accepted_without_escalation: accepted,
             complete_cost: crate::money::MicroUsd::from_micros(100),
@@ -264,6 +310,147 @@ mod tests {
                 .all(|record| record.family != "family-1"),
             "no family straddles a boundary"
         );
+    }
+
+    fn contract() -> crate::contract::TaskContract {
+        crate::contract::TaskContract::from_json_str(
+            r#"{"schema_version":1,"kind":"change","objective":"Fix the escaping",
+                "base_ref":"HEAD","write_scope":["crates/**"],"acceptance":["parses"],
+                "verification_profile":"p"}"#,
+        )
+        .expect("contract")
+    }
+
+    fn repo_policy() -> RepoPolicy {
+        RepoPolicy::from_toml_str(
+            r#"schema_version = 1
+[models.implementation]
+id = "sonnet"
+[[verification.profiles.p.commands]]
+argv = ["true"]
+"#,
+        )
+        .expect("policy")
+    }
+
+    #[test]
+    fn a_reviewed_run_is_not_labelled_as_escalated() {
+        use crate::ledger::{Ledger, Transition, UsageEvent};
+        use crate::money::{CostCompleteness, CostKind, MicroUsd};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "relais-dataset-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let contract = contract();
+        let contract_json = serde_json::to_string(&contract.canonical_value()).expect("json");
+        let usage = |event: &str, run: &str, model: &str| UsageEvent {
+            event_id: event.into(),
+            run_id: run.into(),
+            attempt_id: None,
+            parent_event_id: None,
+            model: Some(model.into()),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost: MicroUsd::from_micros(10),
+            cost_kind: CostKind::ApiSpend,
+            completeness: CostCompleteness::Actual,
+            inclusive: false,
+            at: crate::ledger::now_rfc3339(),
+        };
+        let accept = |run: &str| {
+            ledger
+                .record_transition(&Transition {
+                    run_id: run.into(),
+                    attempt_id: None,
+                    from_state: Some(State::Verifying),
+                    to_state: State::Accepted,
+                    reason: "checks_and_review_passed".into(),
+                    detail: None,
+                    at: crate::ledger::now_rfc3339(),
+                })
+                .expect("transition");
+        };
+        let contract_of = |run_id: &str| {
+            ledger
+                .run_contract_and_tier(run_id)
+                .ok()
+                .flatten()
+                .and_then(|(json, objective, tier)| {
+                    crate::contract::TaskContract::from_json_str(&json)
+                        .ok()
+                        .map(|c| (c, objective, tier))
+                })
+        };
+        // Run A: one sonnet attempt, reviewed by fable. Two models, no
+        // escalation.
+        ledger.insert_run("run-a", "/r", None).expect("run");
+        let revision = ledger
+            .insert_contract_revision("run-a", &contract.hash(), &contract_json, "HEAD", None)
+            .expect("revision");
+        ledger
+            .insert_attempt("run-a", revision, 1, "implementation", "initial")
+            .expect("attempt");
+        ledger
+            .record_usage(&usage("a-worker", "run-a", "sonnet"))
+            .expect("usage");
+        ledger
+            .record_usage(&usage("a-review", "run-a", "fable"))
+            .expect("usage");
+        accept("run-a");
+        let (_, positives, negatives) =
+            build(&ledger, &contract_of, &repo_policy()).acceptance_labels();
+        assert_eq!(
+            (positives, negatives),
+            (1, 0),
+            "a reviewer on another model is not an escalation"
+        );
+        // Run B: sonnet failed, fable rescued it. Escalated.
+        ledger.insert_run("run-b", "/r", None).expect("run");
+        let revision = ledger
+            .insert_contract_revision("run-b", &contract.hash(), &contract_json, "HEAD", None)
+            .expect("revision");
+        ledger
+            .insert_attempt("run-b", revision, 1, "implementation", "initial")
+            .expect("attempt");
+        ledger
+            .insert_attempt("run-b", revision, 2, "escalation", "escalation")
+            .expect("attempt");
+        ledger
+            .record_usage(&usage("b-worker", "run-b", "sonnet"))
+            .expect("usage");
+        ledger
+            .record_usage(&usage("b-fable", "run-b", "fable"))
+            .expect("usage");
+        accept("run-b");
+        let (_, positives, negatives) =
+            build(&ledger, &contract_of, &repo_policy()).acceptance_labels();
+        assert_eq!(
+            (positives, negatives),
+            (1, 1),
+            "a rescue by the stronger tier is"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn families_group_reworded_retries_but_not_different_tasks() {
+        let base = contract();
+        let mut reworded = base.clone();
+        reworded.objective = "the escaping: fix".into();
+        assert_eq!(task_family(&base), task_family(&reworded));
+        let mut other = base.clone();
+        other.objective = "Add a --json flag".into();
+        assert_ne!(task_family(&base), task_family(&other));
+        let mut elsewhere = base.clone();
+        elsewhere.write_scope = Some(vec!["docs/**".into()]);
+        assert_ne!(task_family(&base), task_family(&elsewhere));
     }
 
     #[test]

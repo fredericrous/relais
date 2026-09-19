@@ -96,7 +96,33 @@ pub enum Decision {
     /// would duplicate an agent.
     AlreadyAdmitted,
     /// Never admissible under current policy; not queued.
-    Refused { code: String, detail: String },
+    Refused { code: Refusal, detail: String },
+}
+
+/// Why a request is refused outright rather than queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Refusal {
+    /// The root runner has not registered this run.
+    UnknownRun,
+    RunCancelled,
+    DepthExceeded,
+    /// The run's aggregate agent cap is used up; no package resets it.
+    RunAgentCap,
+    /// The reservation does not fit the run's remaining root budget.
+    BudgetExceeded,
+}
+
+impl Refusal {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownRun => "unknown_run",
+            Self::RunCancelled => "run_cancelled",
+            Self::DepthExceeded => "depth_exceeded",
+            Self::RunAgentCap => "run_agent_cap",
+            Self::BudgetExceeded => "budget_exceeded",
+        }
+    }
 }
 
 /// What a heartbeat answers: whether the coordinator still knows the
@@ -313,7 +339,7 @@ impl AdmissionState {
     fn check_hard_limits(&self, request: &DispatchRequest) -> Option<Decision> {
         let Some(run) = self.runs.get(&request.run_id) else {
             return Some(Decision::Refused {
-                code: "unknown_run".into(),
+                code: Refusal::UnknownRun,
                 detail: format!(
                     "run {} is not registered; the root runner registers before dispatch",
                     request.run_id
@@ -322,14 +348,14 @@ impl AdmissionState {
         };
         if run.cancelled {
             return Some(Decision::Refused {
-                code: "run_cancelled".into(),
+                code: Refusal::RunCancelled,
                 detail: format!("run {} was cancelled", request.run_id),
             });
         }
         let max_depth = min_opt(run.max_depth, self.limits.max_agent_depth);
         if max_depth.is_some_and(|max| request.depth > max) {
             return Some(Decision::Refused {
-                code: "depth_exceeded".into(),
+                code: Refusal::DepthExceeded,
                 detail: format!(
                     "depth {} exceeds the effective maximum {}",
                     request.depth,
@@ -345,7 +371,7 @@ impl AdmissionState {
         let max_agents = min_opt(run.max_agents, self.limits.max_agents_per_run);
         if max_agents.is_some_and(|max| run.admitted_total + queued_for_run >= max) {
             return Some(Decision::Refused {
-                code: "run_agent_cap".into(),
+                code: Refusal::RunAgentCap,
                 detail: format!(
                     "run {} has used its aggregate agent cap ({}); no work package resets it",
                     request.run_id,
@@ -358,7 +384,7 @@ impl AdmissionState {
             let reserve = request.reserve_micros.max(0);
             if committed + reserve > budget {
                 return Some(Decision::Refused {
-                    code: "budget_exceeded".into(),
+                    code: Refusal::BudgetExceeded,
                     detail: format!(
                         "reserving {reserve} on top of {committed} committed exceeds the run budget {budget}"
                     ),
@@ -1241,7 +1267,10 @@ mod tests {
         grandkid.reserve_micros = 200;
         assert!(matches!(
             state.request(&grandkid, t0),
-            Decision::Refused { ref code, .. } if code == "budget_exceeded"
+            Decision::Refused {
+                code: Refusal::BudgetExceeded,
+                ..
+            }
         ));
         // Settling the child below its reservation frees the difference.
         state.release("kid", t0);
@@ -1269,7 +1298,10 @@ mod tests {
         let t0 = Instant::now();
         assert!(matches!(
             state.request(&child("deep", "run-a", "tab-a", "nobody", 3), t0),
-            Decision::Refused { ref code, .. } if code == "depth_exceeded"
+            Decision::Refused {
+                code: Refusal::DepthExceeded,
+                ..
+            }
         ));
         // max_agents_per_run = 6 counts every admission of the run's life,
         // released or not: no work package resets the root budget.
@@ -1285,11 +1317,17 @@ mod tests {
         }
         assert!(matches!(
             state.request(&req("d6", "run-a", "tab-a"), t0),
-            Decision::Refused { ref code, .. } if code == "run_agent_cap"
+            Decision::Refused {
+                code: Refusal::RunAgentCap,
+                ..
+            }
         ));
         assert!(matches!(
             state.request(&req("x", "run-unknown", "tab-a"), t0),
-            Decision::Refused { ref code, .. } if code == "unknown_run"
+            Decision::Refused {
+                code: Refusal::UnknownRun,
+                ..
+            }
         ));
     }
 
@@ -1380,7 +1418,10 @@ mod tests {
         assert!(granted(state.request(&first, t0)));
         assert!(matches!(
             state.request(&second, t0),
-            Decision::Refused { ref code, .. } if code == "budget_exceeded"
+            Decision::Refused {
+                code: Refusal::BudgetExceeded,
+                ..
+            }
         ));
         // Releasing the seat without settling keeps the money reserved.
         state.release("d1", t0);
@@ -1445,7 +1486,10 @@ mod tests {
         assert!(!state.heartbeat("root-b", t0).cancelled);
         assert!(matches!(
             state.request(&req("late", "run-a", "tab-a"), t0),
-            Decision::Refused { ref code, .. } if code == "run_cancelled"
+            Decision::Refused {
+                code: Refusal::RunCancelled,
+                ..
+            }
         ));
     }
 

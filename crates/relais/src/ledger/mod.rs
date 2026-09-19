@@ -51,8 +51,52 @@ impl From<std::io::Error> for LedgerError {
 
 type Result<T> = std::result::Result<T, LedgerError>;
 
+/// Where the ledger's timestamps come from. The wall clock in
+/// production; a fixed or scripted clock in tests, so a transition's
+/// `at`, a dispatch's `created_at` and the dataset's temporal splits are
+/// assertable values rather than "whenever the test ran".
+pub trait Clock: Send + Sync {
+    fn now_rfc3339(&self) -> String;
+}
+
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_rfc3339(&self) -> String {
+        chrono::Utc::now().to_rfc3339()
+    }
+}
+
+/// A clock that answers a scripted sequence and then repeats its last
+/// value: `FixedClock::new(["2026-09-18T10:00:00+00:00", …])`.
+pub struct FixedClock {
+    times: std::sync::Mutex<(Vec<String>, usize)>,
+}
+
+impl FixedClock {
+    pub fn new<I: IntoIterator<Item = S>, S: Into<String>>(times: I) -> Self {
+        let times: Vec<String> = times.into_iter().map(Into::into).collect();
+        assert!(!times.is_empty(), "a fixed clock needs at least one time");
+        Self {
+            times: std::sync::Mutex::new((times, 0)),
+        }
+    }
+}
+
+impl Clock for FixedClock {
+    fn now_rfc3339(&self) -> String {
+        let mut guard = self.times.lock().expect("clock lock");
+        let (times, index) = &mut *guard;
+        let now = times[(*index).min(times.len() - 1)].clone();
+        *index += 1;
+        now
+    }
+}
+
+/// The wall clock, for callers that stamp outside the ledger (the CLI's
+/// `report --since` default, dataset build time).
 pub fn now_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339()
+    SystemClock.now_rfc3339()
 }
 
 /// Additive migrations, in order. Existing steps are never edited; a new
@@ -184,6 +228,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
 pub struct Ledger {
     conn: Connection,
     path: std::path::PathBuf,
+    clock: Box<dyn Clock>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,6 +264,11 @@ pub struct Transition {
 
 impl Ledger {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_clock(path, Box::new(SystemClock))
+    }
+
+    /// The same ledger on an injected clock.
+    pub fn open_with_clock(path: &Path, clock: Box<dyn Clock>) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -232,9 +282,16 @@ impl Ledger {
         let ledger = Ledger {
             conn,
             path: path.to_path_buf(),
+            clock,
         };
         ledger.migrate()?;
         Ok(ledger)
+    }
+
+    /// The ledger's idea of now — the one clock every record it writes
+    /// is stamped by, and the one the runner stamps its events with.
+    pub fn now(&self) -> String {
+        self.clock.now_rfc3339()
     }
 
     /// Where this ledger lives, so a side thread can open its own
@@ -264,7 +321,7 @@ impl Ledger {
                 self.conn.execute_batch(sql)?;
                 self.conn.execute(
                     "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-                    params![version, now_rfc3339()],
+                    params![version, self.now()],
                 )?;
             }
         }
@@ -281,7 +338,7 @@ impl Ledger {
     }
 
     pub fn insert_run(&self, id: &str, repo_path: &str, root_session: Option<&str>) -> Result<()> {
-        let now = now_rfc3339();
+        let now = self.now();
         self.conn.execute(
             "INSERT INTO runs (id, repo_path, status, root_session, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
@@ -299,7 +356,7 @@ impl Ledger {
         parent_run: &str,
         package_id: &str,
     ) -> Result<()> {
-        let now = now_rfc3339();
+        let now = self.now();
         self.conn.execute(
             "INSERT INTO runs (id, repo_path, status, root_session, created_at, updated_at,
                                parent_run, package_id)
@@ -343,7 +400,7 @@ impl Ledger {
     pub fn set_run_status(&self, id: &str, status: State) -> Result<()> {
         self.conn.execute(
             "UPDATE runs SET status = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id, status.as_str(), now_rfc3339()],
+            params![id, status.as_str(), self.now()],
         )?;
         Ok(())
     }
@@ -370,14 +427,7 @@ impl Ledger {
             "INSERT INTO contract_revisions
                 (run_id, hash, contract_json, base_ref, base_sha, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                run_id,
-                hash,
-                contract_json,
-                base_ref,
-                base_sha,
-                now_rfc3339()
-            ],
+            params![run_id, hash, contract_json, base_ref, base_sha, self.now()],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -401,7 +451,7 @@ impl Ledger {
                 tier,
                 phase,
                 State::Running.as_str(),
-                now_rfc3339()
+                self.now()
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -448,6 +498,20 @@ impl Ledger {
 
     /// How many worker attempts a run consumed — the attempts table is
     /// the source of truth for the ladder.
+    /// Did the ladder move? True when any attempt of the run ran at the
+    /// `escalation` phase — the label source for "accepted WITHOUT
+    /// escalation" (SPEC §17). Not derived from the models seen: the
+    /// reviewer and the planner run on their own models without any
+    /// escalation having happened.
+    pub fn escalation_attempted(&self, run_id: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM attempts WHERE run_id = ?1 AND phase = 'escalation'",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     pub fn attempt_count(&self, run_id: &str) -> Result<usize> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM attempts WHERE run_id = ?1",
@@ -472,7 +536,7 @@ impl Ledger {
             params![
                 attempt_id,
                 state.as_str(),
-                now_rfc3339(),
+                self.now(),
                 worktree,
                 candidate_sha
             ],
@@ -498,10 +562,44 @@ impl Ledger {
                 transition.at,
             ],
         )?;
-        if transition.to_state.is_terminal() {
-            self.set_run_status(&transition.run_id, transition.to_state)?;
-        }
+        // Every transition, not only the terminal ones: `relais status`
+        // used to say `prepared` for a run ten minutes into verifying.
+        self.set_run_status(&transition.run_id, transition.to_state)?;
         Ok(())
+    }
+
+    /// One piece of evidence bound to a run: the context manifest, a
+    /// candidate patch, a check log, the receipt — by path and content
+    /// hash (SPEC §12: "every transition has … evidence references").
+    pub fn record_evidence(
+        &self,
+        run_id: &str,
+        attempt_id: Option<i64>,
+        kind: &str,
+        path: &Path,
+        sha256: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO evidence (run_id, attempt_id, kind, path, sha256, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                run_id,
+                attempt_id,
+                kind,
+                path.to_string_lossy(),
+                sha256,
+                self.now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn evidence(&self, run_id: &str) -> Result<Vec<(String, String, Option<String>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT kind, path, sha256 FROM evidence WHERE run_id = ?1 ORDER BY id")?;
+        let rows = stmt.query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn transitions(&self, run_id: &str) -> Result<Vec<Transition>> {
@@ -563,7 +661,7 @@ impl Ledger {
         intent: &serde_json::Value,
         reserved_micros: i64,
     ) -> Result<bool> {
-        let now = now_rfc3339();
+        let now = self.now();
         let inserted = self.conn.execute(
             "INSERT OR IGNORE INTO dispatches
                 (dispatch_id, run_id, attempt_id, intent_json, state,
@@ -596,7 +694,7 @@ impl Ledger {
                 pid.map(|pid| pid as i64),
                 session_id,
                 "launched",
-                now_rfc3339()
+                self.now()
             ],
         )?;
         Ok(())
@@ -605,7 +703,7 @@ impl Ledger {
     pub fn finish_dispatch(&self, dispatch_id: &str, state: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE dispatches SET state = ?2, updated_at = ?3 WHERE dispatch_id = ?1",
-            params![dispatch_id, state, now_rfc3339()],
+            params![dispatch_id, state, self.now()],
         )?;
         Ok(())
     }
@@ -667,25 +765,9 @@ impl Ledger {
                 serde_json::to_string(&self.run_cost_completeness(&child)?).expect("serializes"),
             );
         }
-        let mut completeness = CostCompleteness::Actual;
-        for value in values {
-            let parsed: CostCompleteness =
-                serde_json::from_str(&value).unwrap_or(CostCompleteness::Unknown);
-            completeness = match (completeness, parsed) {
-                (_, CostCompleteness::Unknown) | (CostCompleteness::Unknown, _) => {
-                    CostCompleteness::Unknown
-                }
-                (_, CostCompleteness::IncompleteLowerBound)
-                | (CostCompleteness::IncompleteLowerBound, _) => {
-                    CostCompleteness::IncompleteLowerBound
-                }
-                (_, CostCompleteness::Estimated) | (CostCompleteness::Estimated, _) => {
-                    CostCompleteness::Estimated
-                }
-                (CostCompleteness::Actual, CostCompleteness::Actual) => CostCompleteness::Actual,
-            };
-        }
-        Ok(completeness)
+        Ok(CostCompleteness::worst(values.iter().map(|value| {
+            serde_json::from_str(value).unwrap_or(CostCompleteness::Unknown)
+        })))
     }
 
     pub fn store_receipt(
@@ -701,7 +783,7 @@ impl Ledger {
                 run_id,
                 serde_json::to_string(receipt_json).expect("receipt serializes"),
                 hash,
-                now_rfc3339()
+                self.now()
             ],
         )?;
         Ok(())
@@ -736,10 +818,64 @@ impl Ledger {
                 run_id,
                 kind,
                 detail.map(|d| serde_json::to_string(d).expect("detail serializes")),
-                now_rfc3339()
+                self.now()
             ],
         )?;
         Ok(())
+    }
+
+    /// The intent recorded for a run's first dispatch: model, effort and
+    /// harness identity as they were at dispatch time (SPEC §21: features
+    /// are reconstructed without future information).
+    pub fn first_dispatch_intent(&self, run_id: &str) -> Result<Option<serde_json::Value>> {
+        let text: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT intent_json FROM dispatches WHERE run_id = ?1
+                 ORDER BY created_at, dispatch_id LIMIT 1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(text.and_then(|text| serde_json::from_str(&text).ok()))
+    }
+
+    /// What a learned artifact estimated for a run at routing time, so a
+    /// report can compare the estimate with what happened (SPEC §16).
+    pub fn record_prediction(
+        &self,
+        run_id: &str,
+        artifact_id: &str,
+        input_hash: &str,
+        result: &serde_json::Value,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO predictions (run_id, artifact_id, input_hash, result_json, at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                run_id,
+                artifact_id,
+                input_hash,
+                serde_json::to_string(result).expect("prediction serializes"),
+                self.now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn predictions(&self, run_id: &str) -> Result<Vec<(String, String, serde_json::Value)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT artifact_id, input_hash, result_json FROM predictions WHERE run_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([run_id], |row| {
+            let text: String = row.get(2)?;
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn record_features(&self, dispatch_id: &str, features: &serde_json::Value) -> Result<()> {
@@ -748,7 +884,7 @@ impl Ledger {
             params![
                 dispatch_id,
                 serde_json::to_string(features).expect("features serialize"),
-                now_rfc3339()
+                self.now()
             ],
         )?;
         Ok(())
@@ -855,6 +991,50 @@ mod tests {
             "existing rows survive the additive migration"
         );
         assert!(upgraded.child_runs("old-run").expect("children").is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_injected_clock_stamps_every_record() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "relais-ledger-clock-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let ledger = Ledger::open_with_clock(
+            &dir.join("ledger.sqlite"),
+            Box::new(FixedClock::new([
+                "2026-09-18T10:00:00+00:00",
+                "2026-09-18T10:00:01+00:00",
+            ])),
+        )
+        .expect("ledger");
+        // Migrations already consumed the first tick or two; the
+        // sequence then repeats its last value.
+        ledger.insert_run("run-1", "/r", None).expect("run");
+        ledger
+            .record_transition(&Transition {
+                run_id: "run-1".into(),
+                attempt_id: None,
+                from_state: None,
+                to_state: State::Running,
+                reason: "plan_accepted".into(),
+                detail: None,
+                at: ledger.now(),
+            })
+            .expect("transition");
+        let at = ledger.transitions("run-1").expect("transitions")[0]
+            .at
+            .clone();
+        assert_eq!(at, "2026-09-18T10:00:01+00:00");
+        assert_eq!(
+            ledger.now(),
+            "2026-09-18T10:00:01+00:00",
+            "repeats its last value"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -997,7 +1177,7 @@ mod tests {
                 attempt_id: None,
                 from_state: Some(State::Prepared),
                 to_state: State::Blocked,
-                reason: crate::runner::reason::BLOCKED_PREFLIGHT.into(),
+                reason: crate::runner::Reason::BlockedPreflight.as_str().into(),
                 detail: Some(serde_json::json!({"code": "missing_trust_grant"})),
                 at: now_rfc3339(),
             })

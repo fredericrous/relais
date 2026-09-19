@@ -175,6 +175,17 @@ pub struct ProcessEnd {
     pub cancelled: bool,
 }
 
+/// Does a worker's terminal text PROPOSE blockage? The marker must open a
+/// line: a worker that merely mentions the protocol ("do not write
+/// relais-blocked: unless…") is not claiming it. The runner, not the
+/// worker, assigns the blocked state from this proposal (SPEC §9).
+pub fn claims_blockage(result_text: &str) -> bool {
+    result_text.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("relais-blocked:") || line.starts_with("RELAIS-BLOCKED:")
+    })
+}
+
 /// The adapter contract (SPEC §20).
 pub trait Backend {
     fn name(&self) -> &'static str;
@@ -204,8 +215,7 @@ pub fn run_with_timeout(
     );
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    #[cfg(unix)]
-    command.process_group(0);
+    own_process_group(&mut command);
     let mut child = command
         .spawn()
         .map_err(|e| BackendError::Launch(format!("spawn: {e}")))?;
@@ -225,26 +235,8 @@ pub fn run_with_timeout(
     let stdout = std::thread::spawn(move || read_to_end(stdout_pipe));
     let stderr = std::thread::spawn(move || read_to_end(stderr_pipe));
 
-    let started = Instant::now();
-    let (timed_out, cancelled) = loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break (false, false),
-            Ok(None) => {}
-            Err(e) => return Err(BackendError::Launch(format!("wait: {e}"))),
-        }
-        if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
-            let _ = kill_process_group(&mut child);
-            break (false, true);
-        }
-        if started.elapsed() >= wall_timeout {
-            let _ = kill_process_group(&mut child);
-            break (true, false);
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let status = child
-        .wait()
-        .map_err(|e| BackendError::Launch(format!("final wait: {e}")))?;
+    let (status, timed_out, cancelled) = wait_for_exit(&mut child, wall_timeout, cancel)
+        .map_err(|e| BackendError::Launch(format!("wait: {e}")))?;
     let stdout = stdout
         .join()
         .map_err(|_| BackendError::Launch("stdout reader panicked".into()))?;
@@ -260,6 +252,42 @@ pub fn run_with_timeout(
         timed_out,
         cancelled,
     })
+}
+
+/// Wait for a child under a wall clock and an optional cancel flag,
+/// killing its WHOLE process group when either fires. The one loop every
+/// subprocess in relais waits in — the verification runner used to have
+/// its own copy that killed only the direct child and left `cargo test`
+/// grandchildren running in a worktree about to be removed.
+pub fn wait_for_exit(
+    child: &mut std::process::Child,
+    wall_timeout: Duration,
+    cancel: Option<&AtomicBool>,
+) -> std::io::Result<(std::process::ExitStatus, bool, bool)> {
+    let started = Instant::now();
+    let (timed_out, cancelled) = loop {
+        if child.try_wait()?.is_some() {
+            break (false, false);
+        }
+        if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            let _ = kill_process_group(child);
+            break (false, true);
+        }
+        if started.elapsed() >= wall_timeout {
+            let _ = kill_process_group(child);
+            break (true, false);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let status = child.wait()?;
+    Ok((status, timed_out, cancelled))
+}
+
+/// Put a command in its own process group so a kill reaches everything it
+/// spawned. Every subprocess relais waits on goes through here.
+pub fn own_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    command.process_group(0);
 }
 
 fn read_to_end(mut pipe: impl std::io::Read) -> Vec<u8> {
@@ -378,6 +406,17 @@ mod tests {
             "output before the kill is kept: {}",
             end.stdout
         );
+    }
+
+    #[test]
+    fn a_blockage_claim_opens_a_line_and_a_mention_does_not() {
+        assert!(claims_blockage("relais-blocked: the crate is not vendored"));
+        assert!(claims_blockage(
+            "done reading\n  RELAIS-BLOCKED: no network"
+        ));
+        assert!(!claims_blockage(
+            "I will not write relais-blocked: here because the task is possible"
+        ));
     }
 
     #[test]

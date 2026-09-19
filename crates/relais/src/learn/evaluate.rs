@@ -11,7 +11,9 @@
 use serde::{Deserialize, Serialize};
 
 use super::dataset::{temporal_splits, Dataset, TemporalSplits};
-use super::features::{feature_dim, FeatureSchema, SparseVec, Standardization, TrainingExample};
+use super::features::{
+    expand, feature_dim, FeatureSchema, SparseVec, Standardization, TrainingExample,
+};
 use super::learner::{CostModel, LogisticModel, SolverSettings};
 use super::registry::PromotionGates;
 use crate::money::MicroUsd;
@@ -101,7 +103,12 @@ pub fn train_and_evaluate(
         .iter()
         .map(|record| record.accepted_without_escalation as u64 as f64)
         .collect();
-    let (mut acceptance, _report) = LogisticModel::fit(&train_features, &train_labels, settings);
+    let (mut acceptance, _report) = LogisticModel::fit(
+        &train_features,
+        &train_labels,
+        feature_dim(&schema),
+        settings,
+    );
 
     let cost_examples: Vec<(SparseVec, f64, String)> = train
         .iter()
@@ -110,14 +117,7 @@ pub fn train_and_evaluate(
             (
                 standardization.apply(&record.sparse),
                 record.complete_cost.to_micros() as f64,
-                if record.tier == Tier::Escalation {
-                    "escalation"
-                } else if record.tier == Tier::Implementation {
-                    "change"
-                } else {
-                    "inspect"
-                }
-                .to_string(),
+                cohort_of(record.tier).to_string(),
             )
         })
         .collect();
@@ -149,6 +149,7 @@ pub fn train_and_evaluate(
                 .iter()
                 .map(|(_, _, cohort)| cohort.clone())
                 .collect::<Vec<_>>(),
+            feature_dim(&schema),
             settings,
         )
     };
@@ -182,9 +183,37 @@ pub fn train_and_evaluate(
         }
     }
 
-    let mut accepted_on_test = 0;
+    // Evaluation on the test split, on observed support only (SPEC §17:
+    // "do not infer performance for profiles with zero observation
+    // probability"). For each test task the candidate artifact SELECTS a
+    // tier — the cheapest trained tier whose estimated acceptance clears
+    // the quality floor, exactly as the router will. A test record is
+    // evidence for that policy only when its observed tier IS the
+    // selection; a record at another tier says nothing about it. The
+    // baseline is what cold-start routing does: the floor tier.
+    let select = |record: &TrainingExample| -> Option<Tier> {
+        tiers
+            .iter()
+            .filter_map(|tier| {
+                let features = standardization.apply(&expand(
+                    &record.task,
+                    *tier,
+                    &record.objective,
+                    &record.identity,
+                    &schema,
+                ));
+                let probability = acceptance.predict_proba(&features);
+                (probability >= quality_floor)
+                    .then(|| (*tier, cost.predict(&features, Some(cohort_of(*tier)))))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(tier, _)| tier)
+    };
     let mut test_size = 0;
     let mut abstentions = 0;
+    let mut supported = 0;
+    let mut accepted_on_support = 0;
+    let mut baseline_size = 0;
     let mut baseline_accepted = 0;
     let mut selected_costs: Vec<i64> = Vec::new();
     let mut baseline_costs: Vec<i64> = Vec::new();
@@ -194,35 +223,29 @@ pub fn train_and_evaluate(
     }
     for record in &test {
         test_size += 1;
-        if !tiers.contains(&record.tier) {
-            abstentions += 1;
-            continue;
+        match select(record) {
+            None => abstentions += 1,
+            Some(selected) if selected == record.tier => {
+                supported += 1;
+                if record.accepted_without_escalation {
+                    accepted_on_support += 1;
+                }
+                selected_costs.push(record.complete_cost.to_micros());
+            }
+            Some(_) => {}
         }
-        if record.accepted_without_escalation {
-            accepted_on_test += 1;
+        if matches!(record.tier, Tier::Implementation | Tier::Research) {
+            baseline_size += 1;
+            if record.accepted_without_escalation {
+                baseline_accepted += 1;
+            }
+            baseline_costs.push(record.complete_cost.to_micros());
         }
-        selected_costs.push(record.complete_cost.to_micros());
-        // Baseline: the conservative floor tier observed on this split.
-        let Some(baseline_record) = test.iter().find(|candidate| {
-            candidate.tier == Tier::Implementation || candidate.tier == Tier::Research
-        }) else {
-            continue;
-        };
-        if baseline_record.accepted_without_escalation {
-            baseline_accepted += 1;
-        }
-        baseline_costs.push(baseline_record.complete_cost.to_micros());
     }
-    let test_acceptance_rate = if test_size > abstentions {
-        Some(accepted_on_test as f64 / (test_size - abstentions) as f64)
-    } else {
-        None
-    };
-    let baseline_acceptance_rate = if test_size > abstentions {
-        Some(baseline_accepted as f64 / (test_size - abstentions).max(1) as f64)
-    } else {
-        None
-    };
+    let test_acceptance_rate =
+        (supported > 0).then(|| accepted_on_support as f64 / supported as f64);
+    let baseline_acceptance_rate =
+        (baseline_size > 0).then(|| baseline_accepted as f64 / baseline_size as f64);
     let mean_cost_selected = mean_of(&selected_costs);
     let mean_cost_baseline = mean_of(&baseline_costs);
     let abstention_rate = if test_size > 0 {
@@ -279,6 +302,15 @@ pub fn train_and_evaluate(
     })
 }
 
+/// The cost cohort a tier's strategy is compared against.
+fn cohort_of(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Escalation => "escalation",
+        Tier::Implementation => "change",
+        Tier::Research => "inspect",
+    }
+}
+
 fn calibrate(
     acceptance: &mut LogisticModel,
     standardization: &Standardization,
@@ -301,6 +333,7 @@ fn calibrate(
     let (scale, _) = LogisticModel::fit(
         &logits,
         &labels,
+        1,
         SolverSettings {
             lambda: 0.1,
             max_iterations: 500,
@@ -382,13 +415,40 @@ impl EvalReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::learn::features::TrainingExample;
+    use crate::learn::features::{ProfileIdentity, TaskFeatures, TrainingExample};
 
+    /// A record whose label is learnable from its inputs: accepted tasks
+    /// share one objective vocabulary, rejected ones another, so the
+    /// hashed tokens carry the signal the learner must find.
     fn record(family: &str, at: &str, accepted: bool, tier: Tier) -> TrainingExample {
+        let schema = FeatureSchema::standard();
+        let task = TaskFeatures {
+            kind_change: 1.0,
+            kind_inspect: 0.0,
+            scope_patterns: 1.0,
+            scope_wildcards: 1.0,
+            read_hints: 1.0,
+            acceptance_count: if accepted { 1.0 } else { 4.0 },
+            risk_hints: 0.0,
+            verification_commands: 1.0,
+            verification_amont_checks: 0.0,
+            architecture_keys: 0.0,
+            objective_len: 40.0,
+        };
+        let objective = if accepted {
+            "tidy the small helper"
+        } else {
+            "rewrite the entire subsystem"
+        };
+        let identity = ProfileIdentity::default();
+        let sparse = expand(&task, tier, objective, &identity, &schema);
         TrainingExample {
             family: family.into(),
             tier,
-            sparse: SparseVec(vec![(0, if accepted { 3.0 } else { -3.0 })]),
+            task,
+            objective: objective.into(),
+            identity,
+            sparse,
             accepted_without_escalation: accepted,
             complete_cost: MicroUsd::from_micros(if accepted { 100 } else { 900 }),
             cost_complete: true,

@@ -89,22 +89,7 @@ pub fn runs_report(ledger: &Ledger, since: &str) -> Result<Report, crate::ledger
             )
         })
         .count();
-    let cost_completeness =
-        runs.iter()
-            .map(|run| run.cost_completeness)
-            .fold(CostCompleteness::Actual, |acc, next| match (acc, next) {
-                (_, CostCompleteness::Unknown) | (CostCompleteness::Unknown, _) => {
-                    CostCompleteness::Unknown
-                }
-                (CostCompleteness::IncompleteLowerBound, _)
-                | (_, CostCompleteness::IncompleteLowerBound) => {
-                    CostCompleteness::IncompleteLowerBound
-                }
-                (CostCompleteness::Estimated, _) | (_, CostCompleteness::Estimated) => {
-                    CostCompleteness::Estimated
-                }
-                (CostCompleteness::Actual, CostCompleteness::Actual) => CostCompleteness::Actual,
-            });
+    let cost_completeness = CostCompleteness::worst(runs.iter().map(|run| run.cost_completeness));
     let cost_per_accepted = if accepted > 0 {
         Some(MicroUsd::from_micros(
             (total_cost.to_micros() as f64 / accepted as f64).round() as i64,

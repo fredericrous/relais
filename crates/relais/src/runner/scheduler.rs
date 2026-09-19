@@ -27,16 +27,16 @@ use crate::context::ContextManifest;
 use crate::contract::{Decomposition, DecompositionMode, Kind, TaskContract, WorkPlan};
 use crate::contract::{Review, WorkPackage};
 use crate::ids::DispatchId;
-use crate::ledger::{now_rfc3339, UsageEvent};
+use crate::ledger::UsageEvent;
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
-use crate::policy::{EffectiveAuthority, MachineSettings, Tier};
+use crate::policy::{BlockCode, EffectiveAuthority, MachineSettings, Tier};
 use crate::route::RouteDecision;
-use crate::verify::{Receipt, VerificationReport};
+use crate::verify::{self, Receipt, VerificationReport};
 use crate::workspace::{self, WorkspaceError};
 
 use super::{
-    execute_child, reason, worst_completeness, ReviewOutcome, RunConfig, RunEngine, RunOutcome,
-    State,
+    execute_child, Budget, Limit, Next, Observation, Reason, ReviewOutcome, RunConfig, RunEngine,
+    RunError, RunOutcome, State, Terminal,
 };
 
 /// Everything the root preflight established that the packages inherit.
@@ -47,6 +47,8 @@ pub(crate) struct RootContext<'a> {
     pub manifest: &'a ContextManifest,
     pub decision: &'a RouteDecision,
     pub baseline_failures: &'a [String],
+    pub integration_gaps: &'a [String],
+    pub baseline_cached: bool,
     pub logs_dir: &'a Path,
     pub deadline: Instant,
 }
@@ -182,62 +184,60 @@ pub(crate) fn run_decomposed(
     engine: &mut RunEngine<'_>,
     root: &RootContext<'_>,
     decomposition: &Decomposition,
-) -> Decomposed {
+) -> Result<Decomposed, RunError> {
     let contract = engine.config.contract;
     if contract.kind != Kind::Change {
-        return Decomposed::Outcome(engine.fail_preflight(
-            "decomposition_kind",
+        return Ok(Decomposed::Outcome(engine.fail_preflight(
+            BlockCode::DecompositionKind,
             "only kind=change can be decomposed".into(),
-        ));
+        )?));
     }
     let plan = match decomposition {
         Decomposition::Plan(plan) => plan.clone(),
-        Decomposition::Mode(DecompositionMode::Propose) => match propose_plan(engine, root) {
+        Decomposition::Mode(DecompositionMode::Propose) => match propose_plan(engine, root)? {
             Proposal::Plan(plan) => plan,
-            Proposal::SingleWorker => return Decomposed::SingleWorker,
+            Proposal::SingleWorker => return Ok(Decomposed::SingleWorker),
             Proposal::Rejected(detail) => {
-                engine.transition(
-                    State::NeedsDecision,
-                    reason::PLAN_REJECTED,
+                return Ok(Decomposed::Outcome(engine.finish(
+                    Reason::PlanRejected,
                     serde_json::json!({ "detail": detail }),
-                );
-                return Decomposed::Outcome(engine.outcome_for(RunOutcome::NeedsDecision {
-                    run_id: engine.run_id.clone(),
-                    reason: reason::PLAN_REJECTED.into(),
-                    detail,
-                }));
+                    Terminal::NeedsDecision {
+                        reason: Reason::PlanRejected,
+                        detail,
+                    },
+                )?));
             }
-            Proposal::Failed(outcome) => return Decomposed::Outcome(outcome),
+            Proposal::Failed(outcome) => return Ok(Decomposed::Outcome(outcome)),
         },
     };
     let problems = check_plan(&plan, contract, root.authority);
     if !problems.is_empty() {
         let detail = format!("the work plan was rejected: {}", problems.join("; "));
-        engine.transition(
-            State::NeedsDecision,
-            reason::PLAN_REJECTED,
+        return Ok(Decomposed::Outcome(engine.finish(
+            Reason::PlanRejected,
             serde_json::json!({ "problems": problems }),
-        );
-        return Decomposed::Outcome(engine.outcome_for(RunOutcome::NeedsDecision {
-            run_id: engine.run_id.clone(),
-            reason: reason::PLAN_REJECTED.into(),
-            detail,
-        }));
+            Terminal::NeedsDecision {
+                reason: Reason::PlanRejected,
+                detail,
+            },
+        )?));
     }
-    let order = plan.validate().expect("checked above");
-    let _ = std::fs::write(
+    let order = plan
+        .validate()
+        .map_err(|e| RunError::Other(format!("a checked plan failed to validate: {e}")))?;
+    std::fs::write(
         engine.artifacts.join("plan.json"),
-        serde_json::to_string_pretty(&plan).expect("serializes"),
-    );
+        serde_json::to_string_pretty(&plan).expect("a plan serializes"),
+    )?;
     engine.transition(
         State::Running,
-        reason::PLAN_ACCEPTED,
+        Reason::PlanAccepted,
         serde_json::json!({
             "packages": order.iter().map(|(index, wave)| {
                 serde_json::json!({ "id": plan.packages[*index].id, "wave": wave })
             }).collect::<Vec<_>>(),
         }),
-    );
+    )?;
 
     // The integration worktree: every accepted package fast-forwards it.
     let integration_path = engine.artifacts.join("integration");
@@ -248,9 +248,9 @@ pub(crate) fn run_decomposed(
     ) {
         Ok(worktree) => worktree,
         Err(e) => {
-            return Decomposed::Outcome(
-                engine.fail_preflight("worktree_unavailable", e.to_string()),
-            )
+            return Ok(Decomposed::Outcome(
+                engine.fail_preflight(BlockCode::WorktreeUnavailable, e.to_string())?,
+            ))
         }
     };
     let mut head = root.base_sha.to_string();
@@ -268,86 +268,73 @@ pub(crate) fn run_decomposed(
             &head,
             &mut attempts_total,
             &mut models_used,
-        );
+        )?;
         match outcome {
             PackageEnd::Accepted(candidate) => match fast_forward(&integration_path, &candidate) {
                 Ok(new_head) => head = new_head,
                 Err(detail) => {
-                    engine.transition(
-                        State::NeedsDecision,
-                        reason::INTEGRATION_CONFLICT,
+                    return Ok(Decomposed::Outcome(engine.finish(
+                        Reason::IntegrationConflict,
                         serde_json::json!({ "package": package.id, "detail": detail }),
-                    );
-                    return Decomposed::Outcome(engine.outcome_for(RunOutcome::NeedsDecision {
-                        run_id: engine.run_id.clone(),
-                        reason: reason::INTEGRATION_CONFLICT.into(),
-                        detail: format!(
-                            "package `{}` cannot be integrated: {detail}; its candidate is preserved",
-                            package.id
-                        ),
-                    }));
+                        Terminal::NeedsDecision {
+                            reason: Reason::IntegrationConflict,
+                            detail: format!(
+                                "package `{}` cannot be integrated: {detail}; its candidate is preserved",
+                                package.id
+                            ),
+                        },
+                    )?));
                 }
             },
-            PackageEnd::Stop(outcome) => return Decomposed::Outcome(outcome),
+            PackageEnd::Stop(outcome) => return Ok(Decomposed::Outcome(outcome)),
         }
     }
 
     // Independent final verification of the assembled candidate (SPEC
     // §19), against the ROOT contract's scope and profile.
+    let budget = Budget {
+        attempts_used: attempts_total,
+        max_attempts: root.authority.max_attempts,
+        repairs_used: 0,
+        max_repairs: 0,
+        tier: root.decision.tier.unwrap_or(Tier::Implementation),
+        escalation_tier: None,
+    };
     let mut integration_repairs: u32 = 0;
     loop {
         match workspace::check_scope(&integration, contract) {
             Ok(_) => {}
             Err(WorkspaceError::ScopeViolation(paths)) => {
-                let detail = format!(
-                    "the integrated diff leaves the contract scope: {}",
-                    paths.join(", ")
-                );
-                engine.transition(
-                    State::NeedsDecision,
-                    reason::SCOPE_EXCEEDED,
-                    serde_json::json!({ "paths": paths }),
-                );
-                return Decomposed::Outcome(engine.outcome_for(RunOutcome::NeedsDecision {
-                    run_id: engine.run_id.clone(),
-                    reason: reason::SCOPE_EXCEEDED.into(),
-                    detail,
-                }));
+                return Ok(Decomposed::Outcome(
+                    engine.stop(&budget, Observation::ScopeViolation(paths))?,
+                ));
             }
             Err(e) => {
-                return Decomposed::Outcome(
-                    engine.fail_preflight("scope_check_failed", e.to_string()),
-                )
+                return Ok(Decomposed::Outcome(
+                    engine.fail_preflight(BlockCode::ScopeCheckFailed, e.to_string())?,
+                ))
             }
         }
         engine.state = State::Verifying;
         let label = 900 + integration_repairs;
-        let (checks, gaps) = match engine.verify_candidate(
-            &integration,
-            &head,
-            root.authority,
-            root.logs_dir,
-            label,
-        ) {
+        let verify::Verified {
+            checks,
+            gaps,
+            amont_bypasses,
+            amont_downgrades,
+        } = match engine.verify_candidate(&integration, &head, root.authority, root.logs_dir, label)
+        {
             Ok(result) => result,
             Err(e) => {
-                return Decomposed::Outcome(
-                    engine.fail_preflight("verification_unavailable", e.to_string()),
-                )
+                return Ok(Decomposed::Outcome(
+                    engine.fail_preflight(BlockCode::VerificationUnavailable, e)?,
+                ))
             }
         };
         if !gaps.is_empty() {
-            let detail = format!("required checks are gaps, not passes: {}", gaps.join("; "));
-            engine.transition(
-                State::NeedsDecision,
-                reason::VERIFICATION_GAP,
-                serde_json::json!({ "gaps": gaps }),
-            );
-            return Decomposed::Outcome(engine.outcome_for(RunOutcome::NeedsDecision {
-                run_id: engine.run_id.clone(),
-                reason: reason::VERIFICATION_GAP.into(),
-                detail,
-            }));
+            return Ok(Decomposed::Outcome(
+                engine.stop(&budget, Observation::VerificationGap(gaps))?,
+            ));
         }
         let failures: Vec<String> = checks
             .iter()
@@ -355,16 +342,25 @@ pub(crate) fn run_decomposed(
             .map(|check| check.label.clone())
             .collect();
         if failures.is_empty() {
-            let _ = integration
-                .export_patch(&head, &engine.artifacts.join("candidate-integrated.patch"));
-            return Decomposed::Outcome(accept_integrated(
+            integration
+                .export_patch(&head, &engine.artifacts.join("candidate-integrated.patch"))?;
+            let verification_inputs_changed = verify::verification_inputs_touched(
+                &root.authority.verification_profile,
+                &integration.changed_paths()?,
+            );
+            return Ok(Decomposed::Outcome(accept_integrated(
                 engine,
                 root,
                 &head,
-                checks,
+                Assembled {
+                    checks,
+                    amont_bypasses,
+                    amont_downgrades,
+                    verification_inputs_changed,
+                },
                 attempts_total,
                 models_used,
-            ));
+            )?));
         }
         // One bounded integration repair from the assembled head, within
         // the same aggregate budget (SPEC §19). It is a package with the
@@ -374,15 +370,11 @@ pub(crate) fn run_decomposed(
                 "the integrated candidate fails verification after one repair: {}",
                 failures.join(", ")
             );
-            engine.transition(
-                State::Failed,
-                reason::INTEGRATION_FAILED,
+            return Ok(Decomposed::Outcome(engine.finish(
+                Reason::IntegrationFailed,
                 serde_json::json!({ "failures": failures }),
-            );
-            return Decomposed::Outcome(engine.outcome_for(RunOutcome::Failed {
-                run_id: engine.run_id.clone(),
-                detail,
-            }));
+                Terminal::Failed { detail },
+            )?));
         }
         integration_repairs += 1;
         let repair = WorkPackage {
@@ -398,9 +390,9 @@ pub(crate) fn run_decomposed(
         };
         engine.transition(
             State::Repairing,
-            reason::BEHAVIORAL_FAILURE,
+            Reason::BehavioralFailure,
             serde_json::json!({ "failures": failures, "package": repair.id }),
-        );
+        )?;
         match run_package(
             engine,
             root,
@@ -410,23 +402,21 @@ pub(crate) fn run_decomposed(
             &head,
             &mut attempts_total,
             &mut models_used,
-        ) {
+        )? {
             PackageEnd::Accepted(candidate) => match fast_forward(&integration_path, &candidate) {
                 Ok(new_head) => head = new_head,
                 Err(detail) => {
-                    engine.transition(
-                        State::NeedsDecision,
-                        reason::INTEGRATION_CONFLICT,
+                    return Ok(Decomposed::Outcome(engine.finish(
+                        Reason::IntegrationConflict,
                         serde_json::json!({ "package": repair.id, "detail": detail }),
-                    );
-                    return Decomposed::Outcome(engine.outcome_for(RunOutcome::NeedsDecision {
-                        run_id: engine.run_id.clone(),
-                        reason: reason::INTEGRATION_CONFLICT.into(),
-                        detail,
-                    }));
+                        Terminal::NeedsDecision {
+                            reason: Reason::IntegrationConflict,
+                            detail,
+                        },
+                    )?));
                 }
             },
-            PackageEnd::Stop(outcome) => return Decomposed::Outcome(outcome),
+            PackageEnd::Stop(outcome) => return Ok(Decomposed::Outcome(outcome)),
         }
     }
 }
@@ -449,47 +439,59 @@ fn run_package(
     input_sha: &str,
     attempts_total: &mut u32,
     models_used: &mut Vec<String>,
-) -> PackageEnd {
+) -> Result<PackageEnd, RunError> {
     let ledger = engine.config.ledger;
     let contract = engine.config.contract;
+    let budget = Budget {
+        attempts_used: *attempts_total,
+        max_attempts: root.authority.max_attempts,
+        repairs_used: 0,
+        max_repairs: 0,
+        tier: root.decision.tier.unwrap_or(Tier::Implementation),
+        escalation_tier: None,
+    };
 
     // Aggregate limits, checked before every package (SPEC §19).
     let remaining_wall = root.deadline.saturating_duration_since(Instant::now());
     if remaining_wall < Duration::from_secs(1) {
-        return PackageEnd::Stop(engine.budget_exhausted(format!(
-            "wall clock for the run is exhausted before package `{}`",
-            package.id
-        )));
+        return Ok(PackageEnd::Stop(
+            engine.stop(&budget, Observation::LimitReached(Limit::WallClock))?,
+        ));
     }
-    let spent = ledger.run_cost(&engine.run_id).expect("cost");
+    let spent = ledger.run_cost(&engine.run_id)?;
     let remaining_budget = engine
         .config
         .machine
         .spending
         .per_run_micros
         .map(|ceiling| ceiling - spent.to_micros());
-    if remaining_budget.is_some_and(|remaining| remaining <= 0) {
-        return PackageEnd::Stop(engine.budget_exhausted(format!(
-            "per-run spend ceiling reached ({spent}) before package `{}`",
-            package.id
-        )));
+    if let Some(ceiling) = engine.config.machine.spending.per_run_micros {
+        if remaining_budget.is_some_and(|remaining| remaining <= 0) {
+            return Ok(PackageEnd::Stop(engine.stop(
+                &budget,
+                Observation::LimitReached(Limit::Spend {
+                    spent: spent.to_string(),
+                    ceiling: MicroUsd::from_micros(ceiling).to_string(),
+                }),
+            )?));
+        }
     }
-    let dispatched: u32 = std::iter::once(engine.run_id.clone())
-        .chain(
-            ledger
-                .child_runs(&engine.run_id)
-                .expect("children")
-                .into_iter()
-                .map(|(run_id, _, _)| run_id),
-        )
-        .map(|run_id| ledger.dispatch_count(&run_id).expect("dispatches"))
-        .sum();
+    let mut dispatched: u32 = ledger.dispatch_count(&engine.run_id)?;
+    for (run_id, _, _) in ledger.child_runs(&engine.run_id)? {
+        dispatched += ledger.dispatch_count(&run_id)?;
+    }
     let remaining_agents = root.authority.max_agents_total.saturating_sub(dispatched);
     if remaining_agents == 0 {
-        return PackageEnd::Stop(engine.budget_exhausted(format!(
-            "aggregate agent cap {} reached before package `{}`",
-            root.authority.max_agents_total, package.id
-        )));
+        return Ok(PackageEnd::Stop(engine.stop(
+            &budget,
+            Observation::LimitReached(Limit::Admission {
+                code: "run_agent_cap".into(),
+                detail: format!(
+                    "aggregate agent cap {} reached before package `{}`",
+                    root.authority.max_agents_total, package.id
+                ),
+            }),
+        )?));
     }
 
     // The package contract: the package's objective, scope and
@@ -539,89 +541,98 @@ fn run_package(
     };
     engine.transition(
         State::Running,
-        reason::PACKAGE_STARTED,
+        Reason::PackageStarted,
         serde_json::json!({ "package": package.id, "wave": wave, "input": input_sha }),
-    );
+    )?;
     let outcome = execute_child(&child_config, &engine.run_id, &package.id);
     let child_run = outcome.run_id().to_string();
-    *attempts_total += ledger.attempt_count(&child_run).expect("attempts") as u32;
-    for model in ledger.models_used(&child_run).expect("models") {
+    *attempts_total += ledger.attempt_count(&child_run)? as u32;
+    for model in ledger.models_used(&child_run)? {
         if !models_used.contains(&model) {
             models_used.push(model);
         }
     }
     engine.transition(
         State::Running,
-        reason::PACKAGE_FINISHED,
+        Reason::PackageFinished,
         serde_json::json!({
             "package": package.id,
             "child_run": child_run,
             "state": outcome.state().as_str(),
         }),
-    );
-    match outcome {
-        RunOutcome::Accepted { receipt, .. } => PackageEnd::Accepted(receipt.candidate_sha),
-        other => {
+    )?;
+    match outcome.terminal {
+        Terminal::Accepted(receipt) => Ok(PackageEnd::Accepted(receipt.candidate_sha)),
+        terminal => {
             let prefix = format!(
                 "package `{}` ({child_run}) ended {}: ",
                 package.id,
-                other.state()
+                terminal.state()
             );
-            PackageEnd::Stop(mirror(engine, other, &prefix))
+            Ok(PackageEnd::Stop(mirror(engine, terminal, &prefix)?))
         }
     }
 }
 
 /// The root takes the child's terminal state, with the package named.
-fn mirror(engine: &mut RunEngine<'_>, outcome: RunOutcome, prefix: &str) -> RunOutcome {
-    let run_id = engine.run_id.clone();
-    let mirrored = match outcome {
-        RunOutcome::Accepted { .. } => unreachable!("acceptance is not mirrored"),
-        RunOutcome::NeedsDecision { reason, detail, .. } => RunOutcome::NeedsDecision {
-            run_id,
+fn mirror(
+    engine: &mut RunEngine<'_>,
+    terminal: Terminal,
+    prefix: &str,
+) -> Result<RunOutcome, RunError> {
+    let with_prefix = |detail: String| format!("{prefix}{detail}");
+    let (reason, mirrored) = match terminal {
+        Terminal::Accepted(_) => return Err(RunError::Other("acceptance is not mirrored".into())),
+        Terminal::NeedsDecision { reason, detail } => (
             reason,
-            detail: format!("{prefix}{detail}"),
-        },
-        RunOutcome::NeedsReview { detail, .. } => RunOutcome::NeedsReview {
-            run_id,
-            detail: format!("{prefix}{detail}"),
-        },
-        RunOutcome::Blocked { code, detail, .. } => RunOutcome::Blocked {
-            run_id,
-            code,
-            detail: format!("{prefix}{detail}"),
-        },
-        RunOutcome::Failed { detail, .. } => RunOutcome::Failed {
-            run_id,
-            detail: format!("{prefix}{detail}"),
-        },
-        RunOutcome::BudgetExhausted { detail, .. } => RunOutcome::BudgetExhausted {
-            run_id,
-            detail: format!("{prefix}{detail}"),
-        },
-        RunOutcome::Interrupted { detail, .. } => RunOutcome::Interrupted {
-            run_id,
-            detail: format!("{prefix}{detail}"),
-        },
-        RunOutcome::Cancelled { detail, .. } => RunOutcome::Cancelled {
-            run_id,
-            detail: format!("{prefix}{detail}"),
-        },
+            Terminal::NeedsDecision {
+                reason,
+                detail: with_prefix(detail),
+            },
+        ),
+        Terminal::NeedsReview { detail } => (
+            Reason::PackageFinished,
+            Terminal::NeedsReview {
+                detail: with_prefix(detail),
+            },
+        ),
+        Terminal::Blocked { code, detail } => (
+            Reason::BlockedPreflight,
+            Terminal::Blocked {
+                code,
+                detail: with_prefix(detail),
+            },
+        ),
+        Terminal::Failed { detail } => (
+            Reason::PackageFinished,
+            Terminal::Failed {
+                detail: with_prefix(detail),
+            },
+        ),
+        Terminal::BudgetExhausted { detail } => (
+            Reason::LimitReached,
+            Terminal::BudgetExhausted {
+                detail: with_prefix(detail),
+            },
+        ),
+        Terminal::Interrupted { detail } => (
+            Reason::ProcessCrash,
+            Terminal::Interrupted {
+                detail: with_prefix(detail),
+            },
+        ),
+        Terminal::Cancelled { detail } => (
+            Reason::CancelledByUser,
+            Terminal::Cancelled {
+                detail: with_prefix(detail),
+            },
+        ),
     };
-    let reason_code = match &mirrored {
-        RunOutcome::NeedsDecision { reason, .. } => reason.clone(),
-        RunOutcome::Blocked { code, .. } => code.clone(),
-        RunOutcome::Cancelled { .. } => reason::CANCELLED_BY_USER.to_string(),
-        RunOutcome::Interrupted { .. } => reason::PROCESS_CRASH.to_string(),
-        RunOutcome::BudgetExhausted { .. } => reason::LIMIT_REACHED.to_string(),
-        _ => reason::PACKAGE_FINISHED.to_string(),
-    };
-    engine.transition(
-        mirrored.state(),
-        &reason_code,
+    engine.finish(
+        reason,
         serde_json::json!({ "detail": prefix.trim_end_matches(": ") }),
-    );
-    engine.outcome_for(mirrored)
+        mirrored,
+    )
 }
 
 /// Advance the integration worktree to a candidate that descends from
@@ -647,33 +658,50 @@ fn fast_forward(integration_path: &Path, candidate_sha: &str) -> Result<String, 
     Ok(String::from_utf8_lossy(&head.stdout).trim().to_string())
 }
 
+/// What the integrated candidate's verification established.
+struct Assembled {
+    checks: Vec<crate::verify::CheckOutcome>,
+    amont_bypasses: Vec<String>,
+    amont_downgrades: Vec<String>,
+    verification_inputs_changed: Vec<String>,
+}
+
 fn accept_integrated(
     engine: &mut RunEngine<'_>,
     root: &RootContext<'_>,
     head: &str,
-    checks: Vec<crate::verify::CheckOutcome>,
+    assembled: Assembled,
     attempts_total: u32,
     mut models_used: Vec<String>,
-) -> RunOutcome {
+) -> Result<RunOutcome, RunError> {
     let ledger = engine.config.ledger;
-    let mut total_cost = ledger.run_cost(&engine.run_id).expect("cost");
-    let mut completeness = ledger
-        .run_cost_completeness(&engine.run_id)
-        .expect("completeness");
-    if root.decision.review >= Review::Required {
+    let mut total_cost = ledger.run_cost(&engine.run_id)?;
+    let mut completeness = ledger.run_cost_completeness(&engine.run_id)?;
+    let budget = Budget {
+        attempts_used: attempts_total,
+        max_attempts: root.authority.max_attempts,
+        repairs_used: 0,
+        max_repairs: 0,
+        tier: root.decision.tier.unwrap_or(Tier::Implementation),
+        escalation_tier: None,
+    };
+    let review_required = root.decision.review >= Review::Required
+        || !assembled.verification_inputs_changed.is_empty();
+    if review_required {
         let mut review_cost = MicroUsd::ZERO;
         let mut review_completeness = CostCompleteness::Actual;
         let review = engine.review_candidate(
             root.manifest,
             root.authority,
             head,
+            &assembled.verification_inputs_changed,
             &mut review_cost,
             &mut review_completeness,
             root.deadline,
         );
         total_cost += review_cost;
-        completeness = worst_completeness(completeness, review_completeness);
-        for model in ledger.models_used(&engine.run_id).expect("models") {
+        completeness = completeness.max(review_completeness);
+        for model in ledger.models_used(&engine.run_id)? {
             if !models_used.contains(&model) {
                 models_used.push(model);
             }
@@ -681,27 +709,19 @@ fn accept_integrated(
         match review {
             ReviewOutcome::NoFindings => {}
             ReviewOutcome::Findings(detail) => {
-                engine.transition(
-                    State::NeedsReview,
-                    reason::REVIEW_FINDINGS,
-                    serde_json::json!({ "detail": detail }),
-                );
-                return engine.outcome_for(RunOutcome::NeedsReview {
-                    run_id: engine.run_id.clone(),
-                    detail,
-                });
+                return engine.stop(&budget, Observation::ReviewFindings(detail));
             }
             ReviewOutcome::Unavailable(detail) => {
-                engine.transition(
-                    State::NeedsReview,
-                    reason::REVIEW_UNAVAILABLE,
-                    serde_json::json!({ "detail": detail }),
-                );
-                return engine.outcome_for(RunOutcome::NeedsReview {
-                    run_id: engine.run_id.clone(),
-                    detail,
-                });
+                return engine.stop(&budget, Observation::ReviewUnavailable(detail));
             }
+        }
+    }
+    match engine.decide(&budget, Observation::ChecksAndReviewPassed)? {
+        Next::Accept => {}
+        other => {
+            return Err(RunError::Other(format!(
+                "the machine answered {other:?} to a passing integrated candidate"
+            )))
         }
     }
     let report = VerificationReport {
@@ -709,11 +729,14 @@ fn accept_integrated(
         base_sha: root.base_sha.to_string(),
         contract_hash: root.contract_hash.to_string(),
         policy_hash: root.authority.authority_hash.clone(),
-        checks,
+        checks: assembled.checks,
         gaps: Vec::new(),
         baseline_failures: root.baseline_failures.to_vec(),
-        amont_bypasses: Vec::new(),
-        amont_downgrades: Vec::new(),
+        amont_bypasses: assembled.amont_bypasses,
+        amont_downgrades: assembled.amont_downgrades,
+        verification_inputs_changed: assembled.verification_inputs_changed,
+        integration_gaps: root.integration_gaps.to_vec(),
+        baseline_cached: root.baseline_cached,
     };
     let receipt = Receipt {
         run_id: engine.run_id.clone(),
@@ -728,32 +751,10 @@ fn accept_integrated(
         cost_completeness: completeness,
         cost: total_cost,
     };
-    let receipt_hash = receipt.hash();
-    ledger
-        .store_receipt(
-            &engine.run_id,
-            &serde_json::to_value(&receipt).expect("serializes"),
-            &receipt_hash,
-        )
-        .expect("receipt stored");
-    std::fs::write(
-        engine.artifacts.join("receipt.json"),
-        serde_json::to_string_pretty(&receipt).expect("serializes"),
-    )
-    .expect("receipt artifact");
-    engine.transition(
-        State::Accepted,
-        reason::CHECKS_AND_REVIEW_PASSED,
-        serde_json::json!({
-            "candidate": head,
-            "receipt_hash": receipt_hash,
-            "attempts": attempts_total,
-            "integrated": true,
-        }),
-    );
-    engine.outcome_for(RunOutcome::Accepted {
+    engine.seal(&receipt, None, None, head)?;
+    Ok(RunOutcome {
         run_id: engine.run_id.clone(),
-        receipt: Box::new(receipt),
+        terminal: Terminal::Accepted(Box::new(receipt)),
     })
 }
 
@@ -768,7 +769,7 @@ enum Proposal {
 /// is data: parsed, then validated like an explicit plan. An empty
 /// package list means "one worker"; anything unparseable goes back to a
 /// human with the raw proposal preserved.
-fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Proposal {
+fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Proposal, RunError> {
     let contract = engine.config.contract;
     let profile = root
         .authority
@@ -777,7 +778,9 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Proposal 
         .or_else(|| root.authority.models.get(&Tier::Implementation))
         .cloned();
     let Some(profile) = profile else {
-        return Proposal::Rejected("no research or implementation model to plan with".into());
+        return Ok(Proposal::Rejected(
+            "no research or implementation model to plan with".into(),
+        ));
     };
     let mut prompt = String::from(
         "You are a bounded planner. Decide whether the task below separates into independent work \
@@ -805,23 +808,25 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Proposal 
         }
     }
     let dispatch_id = DispatchId::generate();
+    let spent = engine.config.ledger.run_cost(&engine.run_id)?.to_micros();
     let remaining_budget = engine
         .config
         .machine
         .spending
         .per_run_micros
-        .map(|ceiling| (ceiling - ledger_cost(engine)).max(0));
-    engine
-        .config
-        .ledger
-        .record_dispatch_intent(
-            dispatch_id.as_str(),
-            &engine.run_id,
-            None,
-            &serde_json::json!({ "model": profile.id, "kind": "Plan" }),
-            remaining_budget.unwrap_or(0),
-        )
-        .expect("intent recorded");
+        .map(|ceiling| (ceiling - spent).max(0));
+    engine.config.ledger.record_dispatch_intent(
+        dispatch_id.as_str(),
+        &engine.run_id,
+        None,
+        &serde_json::json!({
+            "model": profile.id,
+            "effort": profile.effort,
+            "harness": engine.harness,
+            "kind": "plan",
+        }),
+        remaining_budget.unwrap_or(0),
+    )?;
     let spec = LaunchSpec {
         dispatch_id: dispatch_id.as_str().to_string(),
         prompt,
@@ -842,73 +847,78 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Proposal 
         cancel: None,
         pid_slot: None,
     };
-    let result =
-        match engine.managed_launch(spec, 0, None, remaining_budget.unwrap_or(0), root.deadline) {
-            Ok(result) => result,
-            Err(outcome) => {
-                let _ = engine
-                    .config
-                    .ledger
-                    .finish_dispatch(dispatch_id.as_str(), "launch_failed");
-                return Proposal::Failed(outcome);
-            }
-        };
+    let budget = Budget {
+        attempts_used: 0,
+        max_attempts: root.authority.max_attempts,
+        repairs_used: 0,
+        max_repairs: 0,
+        tier: Tier::Research,
+        escalation_tier: None,
+    };
+    let result = match engine.managed_launch(
+        spec,
+        0,
+        None,
+        remaining_budget.unwrap_or(0),
+        root.deadline,
+        &budget,
+    )? {
+        Ok(result) => result,
+        Err(outcome) => {
+            engine
+                .config
+                .ledger
+                .finish_dispatch(dispatch_id.as_str(), "launch_failed")?;
+            return Ok(Proposal::Failed(outcome));
+        }
+    };
     engine
         .config
         .ledger
-        .finish_dispatch(dispatch_id.as_str(), "completed")
-        .expect("finish");
+        .finish_dispatch(dispatch_id.as_str(), "completed")?;
     // Planning overhead is the run's cost (SPEC §19).
-    engine
-        .config
-        .ledger
-        .record_usage(&UsageEvent {
-            event_id: dispatch_id.as_str().to_string(),
-            run_id: engine.run_id.clone(),
-            attempt_id: None,
-            parent_event_id: None,
-            model: result.effective_model.clone(),
-            input_tokens: result.usage.input_tokens,
-            output_tokens: result.usage.output_tokens,
-            cache_read_tokens: result.usage.cache_read_tokens,
-            cache_write_tokens: result.usage.cache_write_tokens,
-            cost: result.usage.cost.unwrap_or(MicroUsd::ZERO),
-            cost_kind: CostKind::ApiSpend,
-            completeness: result.usage.cost_completeness,
-            inclusive: result.usage.inclusive,
-            at: now_rfc3339(),
-        })
-        .expect("planner usage recorded");
+    engine.config.ledger.record_usage(&UsageEvent {
+        event_id: dispatch_id.as_str().to_string(),
+        run_id: engine.run_id.clone(),
+        attempt_id: None,
+        parent_event_id: None,
+        model: result.effective_model.clone(),
+        input_tokens: result.usage.input_tokens,
+        output_tokens: result.usage.output_tokens,
+        cache_read_tokens: result.usage.cache_read_tokens,
+        cache_write_tokens: result.usage.cache_write_tokens,
+        cost: result.usage.cost.unwrap_or(MicroUsd::ZERO),
+        cost_kind: CostKind::ApiSpend,
+        completeness: result.usage.cost_completeness,
+        inclusive: result.usage.inclusive,
+        at: engine.config.ledger.now(),
+    })?;
     if result.cancelled {
-        return Proposal::Failed(engine.cancelled("cancelled while planning".into()));
+        return Ok(Proposal::Failed(engine.stop(
+            &budget,
+            Observation::Cancelled("cancelled while planning".into()),
+        )?));
     }
     if result.terminal_result_missing() {
-        return Proposal::Rejected("the planner ended without a terminal result".into());
+        return Ok(Proposal::Rejected(
+            "the planner ended without a terminal result".into(),
+        ));
     }
     let text = result.result_text.unwrap_or_default();
-    let _ = std::fs::write(engine.artifacts.join("plan-proposal.txt"), &text);
+    std::fs::write(engine.artifacts.join("plan-proposal.txt"), &text)?;
     let Some(json) = extract_json_object(&text) else {
-        return Proposal::Rejected(
+        return Ok(Proposal::Rejected(
             "the planner produced no JSON object; the proposal is preserved in plan-proposal.txt"
                 .into(),
-        );
+        ));
     };
-    match serde_json::from_str::<WorkPlan>(json) {
+    Ok(match serde_json::from_str::<WorkPlan>(json) {
         Ok(plan) if plan.packages.is_empty() => Proposal::SingleWorker,
         Ok(plan) => Proposal::Plan(plan),
         Err(e) => Proposal::Rejected(format!(
             "the planner's proposal does not parse as a work plan: {e}; preserved in plan-proposal.txt"
         )),
-    }
-}
-
-fn ledger_cost(engine: &RunEngine<'_>) -> i64 {
-    engine
-        .config
-        .ledger
-        .run_cost(&engine.run_id)
-        .map(MicroUsd::to_micros)
-        .unwrap_or(0)
+    })
 }
 
 /// The outermost `{ ... }` of a text, or nothing.

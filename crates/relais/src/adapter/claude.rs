@@ -161,9 +161,10 @@ impl Backend for ClaudeBackend {
         );
 
         let parsed = parse_result_json(&stdout, &spec.model);
-        let worker_claims_blockage = parsed.result_text.as_deref().is_some_and(|text| {
-            text.contains("RELAYS-BLOCKED:") || text.contains("relais-blocked:")
-        });
+        let worker_claims_blockage = parsed
+            .result_text
+            .as_deref()
+            .is_some_and(super::claims_blockage);
         Ok(LaunchResult {
             dispatch_id: spec.dispatch_id.clone(),
             exit_code: exit,

@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use crate::contract::{Kind, Review, TaskContract};
 use crate::money::MicroUsd;
-use crate::policy::{Blocker, EffectiveAuthority, MachineSettings, RepoPolicy, Tier};
+use crate::policy::{BlockCode, Blocker, EffectiveAuthority, MachineSettings, RepoPolicy, Tier};
 
 /// Estimates from an owned, Relais-trained artifact (SPEC §16). The
 /// predictor abstains (returns `None`) when it has no supported coverage
@@ -32,11 +32,16 @@ pub trait RoutePredictor {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Estimates {
     pub artifact_id: String,
+    /// Hash of the exact inputs the artifact saw, so the ledger's
+    /// prediction row can be matched to a later outcome.
+    pub input_hash: String,
     /// Acceptance-without-escalation estimate per tier; complete-strategy
     /// cost per tier. Predictions are not guarantees; the deterministic
     /// runner still owns policy and acceptance.
     pub acceptance: BTreeMap<Tier, f64>,
     pub cost: BTreeMap<Tier, MicroUsd>,
+    /// The full inference result, recorded as evidence.
+    pub raw: serde_json::Value,
 }
 
 pub struct RouteInputs<'a> {
@@ -60,6 +65,9 @@ pub struct RouteDecision {
     pub blocked: Vec<Blocker>,
     /// Whether a learned artifact actually chose the tier (vs. baseline).
     pub routed_by: RoutedBy,
+    /// What the artifact estimated, when one was consulted — recorded by
+    /// the runner as a prediction row whatever it decided.
+    pub estimates: Option<Estimates>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,33 +82,68 @@ pub enum RoutedBy {
     ConservativeBaseline,
 }
 
-/// Conservative scope-vs-pattern overlap. Routing happens before any
-/// diff exists, so floors are computed from the DECLARED scope patterns
-/// (SPEC §6). The test is deliberately biased toward firing: over-applying
-/// a floor costs an escalation tier, under-applying one silently routes a
-/// sensitive write to a cheap model, which is the failure the spec
-/// forbids.
+/// Could one path match BOTH globs? Routing happens before any diff
+/// exists, so floors are computed from the DECLARED scope patterns
+/// (SPEC §6). The answer is exact for `**` (zero or more segments) and
+/// conservative inside a segment (a `*` segment is judged by its literal
+/// prefix and suffix only), so an over-approximation costs an escalation
+/// tier while an under-approximation would route a sensitive write to a
+/// cheap model — the failure the spec forbids.
+///
+/// It used to answer "yes" to anything when either side began with `**`,
+/// which made the init template's `**/trust/**` rule floor a contract
+/// scoped to `docs/README.md`. A directory scope such as `src/**` still
+/// takes that floor, correctly: `src/trust/x` matches both.
 pub(crate) fn scope_could_touch(scope: &str, pattern: &str) -> bool {
-    let scope = scope.trim_start_matches("./");
-    let pattern = pattern.trim_start_matches("./");
-    if scope.starts_with("**") || pattern.starts_with("**") {
+    let segments = |glob: &str| -> Vec<String> {
+        glob.trim_start_matches("./")
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    globs_overlap(&segments(scope), &segments(pattern))
+}
+
+fn globs_overlap(a: &[String], b: &[String]) -> bool {
+    match (a.first(), b.first()) {
+        (None, None) => true,
+        (Some(x), _) if x == "**" => {
+            globs_overlap(&a[1..], b) || (!b.is_empty() && globs_overlap(a, &b[1..]))
+        }
+        (_, Some(y)) if y == "**" => {
+            globs_overlap(a, &b[1..]) || (!a.is_empty() && globs_overlap(&a[1..], b))
+        }
+        (Some(x), Some(y)) => segments_overlap(x, y) && globs_overlap(&a[1..], &b[1..]),
+        _ => false,
+    }
+}
+
+/// Two single segments: equal, or wildcarded with compatible literal
+/// prefix and suffix. `*.rs` and `main.rs` overlap; `a*` and `b*` do not.
+fn segments_overlap(a: &str, b: &str) -> bool {
+    if a == b {
         return true;
     }
-    let scope_segments: Vec<&str> = scope.split('/').collect();
-    let pattern_segments: Vec<&str> = pattern.split('/').collect();
-    for (s, p) in scope_segments.iter().zip(pattern_segments.iter()) {
-        if *s == "**" || *p == "**" {
-            return true;
-        }
-        if s == p {
-            continue;
-        }
-        if s.contains('*') || p.contains('*') {
-            return true;
-        }
+    let wild = |s: &str| s.contains('*') || s.contains('?') || s.contains('[');
+    if !wild(a) && !wild(b) {
         return false;
     }
-    true
+    // A literal segment is its own prefix AND suffix; a wildcarded one
+    // contributes the text before its first and after its last wildcard.
+    let literal = |s: &str| -> (String, String) {
+        if !wild(s) {
+            return (s.to_string(), s.to_string());
+        }
+        let first = s.find(['*', '?', '[']).unwrap_or(s.len());
+        let last = s.rfind(['*', '?', ']']).map_or(s.len(), |i| i + 1);
+        (s[..first].to_string(), s[last.max(first)..].to_string())
+    };
+    let (pa, sa) = literal(a);
+    let (pb, sb) = literal(b);
+    let prefixes = pa.starts_with(&pb) || pb.starts_with(&pa);
+    let suffixes = sa.ends_with(&sb) || sb.ends_with(&sa);
+    prefixes && suffixes
 }
 
 pub fn write_scope_could_touch(contract: &TaskContract, pattern: &str) -> bool {
@@ -200,6 +243,7 @@ pub fn route(inputs: RouteInputs<'_>) -> RouteDecision {
             escalation_tier: None,
             blocked: authority.blockers.clone(),
             routed_by: RoutedBy::ConservativeBaseline,
+            estimates: None,
         };
     }
 
@@ -267,17 +311,19 @@ pub fn route(inputs: RouteInputs<'_>) -> RouteDecision {
             max_repairs_before_escalation: 0,
             escalation_tier: None,
             blocked: vec![Blocker {
-                code: "model_unavailable".into(),
+                code: BlockCode::ModelUnavailable,
                 detail: format!(
                     "no model configured at or above the {} floor",
                     floor.as_str()
                 ),
             }],
             routed_by: RoutedBy::ConservativeBaseline,
+            estimates: None,
         };
     }
 
     // Deterministic recipes win when they fully cover the task (SPEC §6.3).
+    let mut estimates_seen: Option<Estimates> = None;
     let recipe_recipes: Vec<Recipe> = repo.recipes.iter().map(Recipe::from).collect();
     let selected: (Tier, RoutedBy) = if let Some(recipe) = recipe_recipes
         .iter()
@@ -292,7 +338,9 @@ pub fn route(inputs: RouteInputs<'_>) -> RouteDecision {
         match predictor.estimate(contract, authority, &eligible) {
             Some(estimates) => {
                 let quality_floor = machine.routing.quality_floor.unwrap_or(0.75);
-                match select_learned(&estimates, &eligible, quality_floor) {
+                let selection = select_learned(&estimates, &eligible, quality_floor);
+                estimates_seen = Some(estimates.clone());
+                match selection {
                     Some(tier) => {
                         reasons.push(format!(
                             "learned artifact {} estimated acceptance/cost and selected {}",
@@ -339,6 +387,7 @@ pub fn route(inputs: RouteInputs<'_>) -> RouteDecision {
         escalation_tier,
         blocked: Vec::new(),
         routed_by: selected.1,
+        estimates: estimates_seen,
     }
 }
 
@@ -445,6 +494,8 @@ mod tests {
                             timeout_seconds: 300,
                         }],
                         amont_checks: Vec::new(),
+                        inputs: Vec::new(),
+                        cache_baseline: false,
                     },
                 )]),
             },
@@ -591,6 +642,42 @@ mod tests {
     }
 
     #[test]
+    fn overlap_is_exact_for_double_star_and_conservative_within_a_segment() {
+        // The init template's rule against a single-file scope elsewhere.
+        assert!(!scope_could_touch("docs/README.md", "**/trust/**"));
+        assert!(!scope_could_touch("src/main.rs", "**/trust/**"));
+        // …and against directory scopes that genuinely could reach it.
+        assert!(scope_could_touch("src/**", "**/trust/**"));
+        assert!(scope_could_touch("crates/amont/trust/**", "**/trust/**"));
+        assert!(scope_could_touch("**", "crates/other/**"));
+        assert!(!scope_could_touch("**/trust/**", "src/main.rs"));
+        assert!(scope_could_touch("**/*.rs", "src/main.rs"));
+        assert!(!scope_could_touch("**/*.rs", "src/main.py"));
+        assert!(!scope_could_touch("crates/a/**", "crates/b/**"));
+        assert!(scope_could_touch("crates/a*/**", "crates/ab/**"));
+        assert!(!scope_could_touch("crates/a*/**", "crates/b/**"));
+        assert!(scope_could_touch("./src/**", "src/lib.rs"));
+    }
+
+    #[test]
+    fn a_risk_rules_review_floor_is_scoped_to_its_paths() {
+        let mut repo = repo_policy();
+        repo.risk.push(RiskRule {
+            paths: vec!["**/trust/**".into()],
+            minimum_tier: Tier::Escalation,
+            review: Some(Review::Required),
+        });
+        let machine = machine_for(&repo);
+        let d = route_with(&change_contract(&["docs/README.md"]), &repo, &machine);
+        assert_eq!(d.tier, Some(Tier::Implementation));
+        assert_eq!(
+            d.review,
+            Review::Optional,
+            "a rule the scope cannot touch does not force review"
+        );
+    }
+
+    #[test]
     fn disjoint_scope_leaves_the_floor_alone() {
         let mut repo = repo_policy();
         repo.risk.push(RiskRule {
@@ -636,7 +723,10 @@ mod tests {
             },
         );
         let d = route_with(&change_contract(&["crates/amont/**"]), &repo, &machine);
-        assert!(d.blocked.iter().any(|b| b.code == "model_unavailable"));
+        assert!(d
+            .blocked
+            .iter()
+            .any(|b| b.code == BlockCode::ModelUnavailable));
         assert_eq!(d.tier, None);
     }
 
@@ -654,7 +744,10 @@ mod tests {
             routing: Default::default(),
         };
         let d = route_with(&change_contract(&["crates/amont/**"]), &repo, &machine);
-        assert!(d.blocked.iter().any(|b| b.code == "missing_trust_grant"));
+        assert!(d
+            .blocked
+            .iter()
+            .any(|b| b.code == BlockCode::MissingTrustGrant));
         assert_eq!(d.tier, None);
     }
 
@@ -684,8 +777,10 @@ mod tests {
             }
             Some(Estimates {
                 artifact_id: "artifact-test-1".into(),
+                input_hash: "in".into(),
                 acceptance,
                 cost,
+                raw: serde_json::Value::Null,
             })
         }
     }
