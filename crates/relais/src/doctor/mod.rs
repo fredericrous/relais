@@ -271,15 +271,21 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
         },
     });
 
-    let socket = paths::state_dir().join("relais.sock");
+    let socket = crate::coordinator::socket_path();
+    let answered = crate::coordinator::Client::new(socket.clone()).ping();
     findings.push(Finding {
         component: "coordinator",
         ok: true,
-        level: if socket.exists() { "ok" } else { "warn" },
-        detail: if socket.exists() {
-            "socket present; a coordinator is serving this user".to_string()
-        } else {
-            "no coordinator socket; it will start lazily on the first managed dispatch".to_string()
+        level: if answered.is_ok() { "ok" } else { "warn" },
+        detail: match answered {
+            Ok(pid) => format!("coordinator pid {pid} answers on {}", socket.display()),
+            Err(_) if socket.exists() => format!(
+                "socket {} exists but nobody answers; the next managed dispatch takes it over",
+                socket.display()
+            ),
+            Err(_) => {
+                "no coordinator running; it starts lazily on the first managed dispatch".to_string()
+            }
         },
     });
 

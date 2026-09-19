@@ -145,8 +145,20 @@ impl Backend for ClaudeBackend {
             .current_dir(&spec.work_dir)
             .env_remove("CLAUDE_CODE_EXTRA_BUDGET");
         let wall = spec.wall_timeout.max(Duration::from_secs(1));
-        let (exit, stdout, stderr, timed_out) =
-            run_with_timeout(command, wall, Some(spec.prompt.clone().into_bytes()))?;
+        let end = run_with_timeout(
+            command,
+            wall,
+            Some(spec.prompt.clone().into_bytes()),
+            spec.cancel.as_deref(),
+            spec.pid_slot.as_deref(),
+        )?;
+        let (exit, stdout, stderr, timed_out, cancelled) = (
+            end.exit_code,
+            end.stdout,
+            end.stderr,
+            end.timed_out,
+            end.cancelled,
+        );
 
         let parsed = parse_result_json(&stdout, &spec.model);
         let worker_claims_blockage = parsed.result_text.as_deref().is_some_and(|text| {
@@ -158,7 +170,7 @@ impl Backend for ClaudeBackend {
             stdout,
             stderr,
             timed_out,
-            result_text: if timed_out {
+            result_text: if timed_out || cancelled {
                 None
             } else {
                 parsed.result_text.or(Some(String::new()))
@@ -167,6 +179,7 @@ impl Backend for ClaudeBackend {
             effective_model: parsed.effective_model,
             usage: parsed.usage,
             worker_claims_blockage,
+            cancelled,
         })
     }
 }

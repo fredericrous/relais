@@ -9,7 +9,7 @@ members = ["crates/relais"]
 # things.
 [workspace.package]
 version = "0.1.0"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/fredericrous/relais"
 authors = ["Frederic Rousseau"]

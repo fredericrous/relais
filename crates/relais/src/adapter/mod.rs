@@ -19,6 +19,8 @@ pub use mock::{MockBackend, MockOutcome};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -98,6 +100,14 @@ pub struct LaunchSpec {
     pub disallowed_tools: Vec<String>,
     pub work_dir: PathBuf,
     pub wall_timeout: Duration,
+    /// Set by the runner when the coordinator cancels this dispatch; the
+    /// adapter kills the process group and reports `cancelled`
+    /// (SPEC §20: the adapter contract includes cancellation).
+    pub cancel: Option<Arc<AtomicBool>>,
+    /// Receives the child PID as soon as it exists, so the runner can
+    /// bind it to the lease and the ledger while the worker runs
+    /// (SPEC §12: persist the PID after the dispatch intent).
+    pub pid_slot: Option<Arc<AtomicU32>>,
 }
 
 /// Provider-reported usage as extracted from one terminal result.
@@ -142,6 +152,9 @@ pub struct LaunchResult {
     pub effective_model: Option<String>,
     pub usage: UsageReport,
     pub worker_claims_blockage: bool,
+    /// Killed on a cancellation request, not on the wall clock.
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 impl LaunchResult {
@@ -150,6 +163,16 @@ impl LaunchResult {
     pub fn terminal_result_missing(&self) -> bool {
         self.timed_out || self.exit_code.is_none()
     }
+}
+
+/// How a process run ended, beyond its exit code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessEnd {
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub timed_out: bool,
+    pub cancelled: bool,
 }
 
 /// The adapter contract (SPEC §20).
@@ -171,7 +194,9 @@ pub fn run_with_timeout(
     mut command: Command,
     wall_timeout: Duration,
     stdin_bytes: Option<Vec<u8>>,
-) -> Result<(Option<i32>, String, String, bool), BackendError> {
+    cancel: Option<&AtomicBool>,
+    pid_slot: Option<&AtomicU32>,
+) -> Result<ProcessEnd, BackendError> {
     command.stdin(
         stdin_bytes
             .as_ref()
@@ -184,6 +209,9 @@ pub fn run_with_timeout(
     let mut child = command
         .spawn()
         .map_err(|e| BackendError::Launch(format!("spawn: {e}")))?;
+    if let Some(slot) = pid_slot {
+        slot.store(child.id(), Ordering::SeqCst);
+    }
 
     if let Some(bytes) = stdin_bytes {
         let mut stdin = child.stdin.take().expect("stdin is piped when bytes exist");
@@ -198,15 +226,19 @@ pub fn run_with_timeout(
     let stderr = std::thread::spawn(move || read_to_end(stderr_pipe));
 
     let started = Instant::now();
-    let timed_out = loop {
+    let (timed_out, cancelled) = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break false,
+            Ok(Some(_)) => break (false, false),
             Ok(None) => {}
             Err(e) => return Err(BackendError::Launch(format!("wait: {e}"))),
         }
+        if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            let _ = kill_process_group(&mut child);
+            break (false, true);
+        }
         if started.elapsed() >= wall_timeout {
             let _ = kill_process_group(&mut child);
-            break true;
+            break (true, false);
         }
         std::thread::sleep(Duration::from_millis(20));
     };
@@ -219,12 +251,15 @@ pub fn run_with_timeout(
     let stderr = stderr
         .join()
         .map_err(|_| BackendError::Launch("stderr reader panicked".into()))?;
-    Ok((
-        status.code(),
-        String::from_utf8_lossy(&stdout).into_owned(),
-        String::from_utf8_lossy(&stderr).into_owned(),
+    Ok(ProcessEnd {
+        // A killed process has no exit code: interrupted, never a
+        // completed attempt.
+        exit_code: if cancelled { None } else { status.code() },
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
         timed_out,
-    ))
+        cancelled,
+    })
 }
 
 fn read_to_end(mut pipe: impl std::io::Read) -> Vec<u8> {
@@ -285,22 +320,29 @@ impl Backend for ScriptBackend {
             .args(&self.args)
             .current_dir(&spec.work_dir)
             .stdin(Stdio::null());
-        let (exit, stdout, stderr, timed_out) = run_with_timeout(command, spec.wall_timeout, None)?;
+        let end = run_with_timeout(
+            command,
+            spec.wall_timeout,
+            None,
+            spec.cancel.as_deref(),
+            spec.pid_slot.as_deref(),
+        )?;
         Ok(LaunchResult {
             dispatch_id: spec.dispatch_id.clone(),
-            exit_code: exit,
-            result_text: if timed_out {
+            exit_code: end.exit_code,
+            result_text: if end.timed_out || end.cancelled {
                 None
             } else {
-                Some(stdout.clone())
+                Some(end.stdout.clone())
             },
-            stdout,
-            stderr,
-            timed_out,
+            stdout: end.stdout,
+            stderr: end.stderr,
+            timed_out: end.timed_out,
             session_id: None,
             effective_model: Some(spec.model.clone()),
             usage: UsageReport::unknown(),
             worker_claims_blockage: false,
+            cancelled: end.cancelled,
         })
     }
 }
@@ -314,31 +356,73 @@ mod tests {
         let mut command = Command::new("sh");
         command.args(["-c", "echo start; sleep 30; echo done"]);
         let started = Instant::now();
-        let (exit, stdout, _, timed_out) =
-            run_with_timeout(command, Duration::from_millis(300), None).expect("runs");
-        assert!(timed_out, "must be marked interrupted by the wall clock");
-        assert_eq!(exit, None);
+        let pid_slot = AtomicU32::new(0);
+        let end = run_with_timeout(
+            command,
+            Duration::from_millis(300),
+            None,
+            None,
+            Some(&pid_slot),
+        )
+        .expect("runs");
+        assert_ne!(pid_slot.load(Ordering::SeqCst), 0, "the PID was published");
+        assert!(
+            end.timed_out,
+            "must be marked interrupted by the wall clock"
+        );
+        assert!(!end.cancelled);
+        assert_eq!(end.exit_code, None);
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(
-            stdout.contains("start"),
-            "output before the kill is kept: {stdout}"
+            end.stdout.contains("start"),
+            "output before the kill is kept: {}",
+            end.stdout
         );
+    }
+
+    #[test]
+    fn cancellation_kills_the_child_and_is_not_a_timeout() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo start; sleep 30; echo done"]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let end = run_with_timeout(command, Duration::from_secs(30), None, Some(&cancel), None)
+            .expect("runs");
+        assert!(end.cancelled);
+        assert!(!end.timed_out);
+        assert_eq!(
+            end.exit_code, None,
+            "a cancelled run has no terminal result"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
     fn run_with_timeout_feeds_stdin_and_captures_output() {
         let mut command = Command::new("sh");
         command.args(["-c", "cat; echo processed"]);
-        let (exit, stdout, stderr, timed_out) = run_with_timeout(
+        let end = run_with_timeout(
             command,
             Duration::from_secs(10),
             Some(b"prompt-bytes".to_vec()),
+            None,
+            None,
         )
         .expect("runs");
-        assert_eq!(exit, Some(0));
-        assert!(!timed_out);
-        assert!(stdout.contains("prompt-bytes"));
-        assert!(stdout.contains("processed"), "{stdout} {stderr}");
+        assert_eq!(end.exit_code, Some(0));
+        assert!(!end.timed_out);
+        assert!(end.stdout.contains("prompt-bytes"));
+        assert!(
+            end.stdout.contains("processed"),
+            "{} {}",
+            end.stdout,
+            end.stderr
+        );
     }
 
     #[test]
@@ -354,6 +438,7 @@ mod tests {
             effective_model: None,
             usage: UsageReport::unknown(),
             worker_claims_blockage: false,
+            cancelled: false,
         };
         assert!(result.terminal_result_missing());
         let completed = LaunchResult {

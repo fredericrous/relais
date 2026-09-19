@@ -66,6 +66,168 @@ pub struct TaskContract {
     pub limits: Limits,
     #[serde(default)]
     pub review: Review,
+    /// Bounded decomposition into work packages (SPEC §19): an explicit
+    /// plan, or `"propose"` to let a bounded planner suggest one that
+    /// deterministic validation then accepts or rejects. Absent for the
+    /// ordinary single-worker run; omitted from the canonical form when
+    /// absent so existing contract hashes are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decomposition: Option<Decomposition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Decomposition {
+    /// `"propose"`: a planner model proposes a `WorkPlan`; planning
+    /// overhead counts against the run.
+    Mode(DecompositionMode),
+    Plan(WorkPlan),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecompositionMode {
+    Propose,
+}
+
+/// A dependency graph of work packages with per-package acceptance,
+/// integration acceptance and aggregate limits (SPEC §19). Shape is
+/// validated here; coverage against the contract scope and the run's
+/// authority is checked by the scheduler with the effective authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkPlan {
+    pub packages: Vec<WorkPackage>,
+    /// Acceptance for the assembled candidate; independent receipts do
+    /// not constitute final acceptance.
+    pub integration_acceptance: Vec<String>,
+    #[serde(default)]
+    pub limits: PlanLimits,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkPackage {
+    pub id: String,
+    pub objective: String,
+    pub write_scope: Vec<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    pub acceptance: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanLimits {
+    #[serde(default = "default_max_packages")]
+    pub max_packages: u32,
+    #[serde(default = "default_attempts_per_package")]
+    pub attempts_per_package: u32,
+}
+
+impl Default for PlanLimits {
+    fn default() -> Self {
+        Self {
+            max_packages: default_max_packages(),
+            attempts_per_package: default_attempts_per_package(),
+        }
+    }
+}
+
+fn default_max_packages() -> u32 {
+    4
+}
+
+fn default_attempts_per_package() -> u32 {
+    2
+}
+
+impl WorkPlan {
+    /// Shape validation: ids unique and non-empty, every package carries
+    /// an objective, scope and acceptance, dependencies resolve, and the
+    /// graph is acyclic. Returns the packages in a topological order
+    /// with each package's wave (0 = no dependencies).
+    pub fn validate(&self) -> Result<Vec<(usize, u32)>, ContractError> {
+        if self.packages.len() < 2 {
+            return Err(ContractError::PlanTooSmall(self.packages.len()));
+        }
+        if self.packages.len() as u32 > self.limits.max_packages {
+            return Err(ContractError::PlanTooLarge(
+                self.packages.len(),
+                self.limits.max_packages,
+            ));
+        }
+        if self.limits.attempts_per_package < 1 {
+            return Err(ContractError::BadAttempts(self.limits.attempts_per_package));
+        }
+        if self.integration_acceptance.is_empty() {
+            return Err(ContractError::PlanMissingIntegrationAcceptance);
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for package in &self.packages {
+            if package.id.trim().is_empty() || !ids.insert(package.id.as_str()) {
+                return Err(ContractError::PlanDuplicatePackage(package.id.clone()));
+            }
+            if package.objective.trim().is_empty() {
+                return Err(ContractError::PlanPackageIncomplete(
+                    package.id.clone(),
+                    "objective",
+                ));
+            }
+            if package.write_scope.is_empty() {
+                return Err(ContractError::PlanPackageIncomplete(
+                    package.id.clone(),
+                    "write_scope",
+                ));
+            }
+            if package.acceptance.is_empty() {
+                return Err(ContractError::PlanPackageIncomplete(
+                    package.id.clone(),
+                    "acceptance",
+                ));
+            }
+        }
+        for package in &self.packages {
+            for dependency in &package.depends_on {
+                if dependency == &package.id || !ids.contains(dependency.as_str()) {
+                    return Err(ContractError::PlanBadDependency(
+                        package.id.clone(),
+                        dependency.clone(),
+                    ));
+                }
+            }
+        }
+        // Kahn's algorithm, waves = longest path from a root.
+        let index_of = |id: &str| {
+            self.packages
+                .iter()
+                .position(|p| p.id == id)
+                .expect("known")
+        };
+        let mut indegree: Vec<usize> = self.packages.iter().map(|p| p.depends_on.len()).collect();
+        let mut wave: Vec<u32> = vec![0; self.packages.len()];
+        let mut order = Vec::new();
+        let mut ready: Vec<usize> = (0..self.packages.len())
+            .filter(|&i| indegree[i] == 0)
+            .collect();
+        while let Some(current) = ready.first().copied() {
+            ready.remove(0);
+            order.push((current, wave[current]));
+            for (i, package) in self.packages.iter().enumerate() {
+                if package.depends_on.iter().any(|d| index_of(d) == current) {
+                    indegree[i] -= 1;
+                    wave[i] = wave[i].max(wave[current] + 1);
+                    if indegree[i] == 0 {
+                        ready.push(i);
+                    }
+                }
+            }
+        }
+        if order.len() != self.packages.len() {
+            return Err(ContractError::PlanCycle);
+        }
+        Ok(order)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -119,6 +281,14 @@ pub enum ContractError {
     EmptyBaseRef,
     EmptyVerificationProfile,
     MalformedJson(String),
+    DecompositionOnInspect,
+    PlanTooSmall(usize),
+    PlanTooLarge(usize, u32),
+    PlanMissingIntegrationAcceptance,
+    PlanDuplicatePackage(String),
+    PlanPackageIncomplete(String, &'static str),
+    PlanBadDependency(String, String),
+    PlanCycle,
 }
 
 impl std::fmt::Display for ContractError {
@@ -146,6 +316,29 @@ impl std::fmt::Display for ContractError {
             Self::EmptyBaseRef => write!(f, "base_ref is empty"),
             Self::EmptyVerificationProfile => write!(f, "verification_profile is empty"),
             Self::MalformedJson(detail) => write!(f, "contract is not valid JSON: {detail}"),
+            Self::DecompositionOnInspect => {
+                write!(f, "kind=inspect cannot be decomposed into work packages")
+            }
+            Self::PlanTooSmall(n) => write!(
+                f,
+                "a work plan needs at least two packages, got {n}; simple tasks stay single-worker"
+            ),
+            Self::PlanTooLarge(n, max) => {
+                write!(f, "work plan has {n} packages, more than its limit {max}")
+            }
+            Self::PlanMissingIntegrationAcceptance => write!(
+                f,
+                "work plan needs integration_acceptance: independent receipts are not final acceptance"
+            ),
+            Self::PlanDuplicatePackage(id) => write!(f, "package id `{id}` is empty or duplicated"),
+            Self::PlanPackageIncomplete(id, field) => {
+                write!(f, "package `{id}` has no {field}")
+            }
+            Self::PlanBadDependency(id, dep) => write!(
+                f,
+                "package `{id}` depends on `{dep}`, which is itself or not a package"
+            ),
+            Self::PlanCycle => write!(f, "work plan dependencies form a cycle"),
         }
     }
 }
@@ -217,7 +410,13 @@ impl TaskContract {
                 if self.write_scope.as_deref().is_some_and(|s| !s.is_empty()) {
                     return Err(ContractError::WriteScopeOnInspect);
                 }
+                if self.decomposition.is_some() {
+                    return Err(ContractError::DecompositionOnInspect);
+                }
             }
+        }
+        if let Some(Decomposition::Plan(plan)) = &self.decomposition {
+            plan.validate()?;
         }
         Ok(())
     }

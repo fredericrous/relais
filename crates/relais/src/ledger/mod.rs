@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::runner::State;
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 1;
+pub const LEDGER_SCHEMA_VERSION: u64 = 2;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -57,9 +57,10 @@ pub fn now_rfc3339() -> String {
 
 /// Additive migrations, in order. Existing steps are never edited; a new
 /// step appends. `schema_migrations` records what applied.
-const MIGRATIONS: &[(&str, &str)] = &[(
-    "v1",
-    r#"
+const MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "v1",
+        r#"
     CREATE TABLE runs (
         id TEXT PRIMARY KEY,
         repo_path TEXT NOT NULL,
@@ -167,10 +168,22 @@ const MIGRATIONS: &[(&str, &str)] = &[(
         at TEXT NOT NULL
     );
     "#,
-)];
+    ),
+    (
+        // Work packages (SPEC §19) are runs of their own, linked to the root
+        // run so cost, attempts and identity aggregate over the tree.
+        "v2",
+        r#"
+    ALTER TABLE runs ADD COLUMN parent_run TEXT;
+    ALTER TABLE runs ADD COLUMN package_id TEXT;
+    CREATE INDEX idx_runs_parent ON runs(parent_run);
+    "#,
+    ),
+];
 
 pub struct Ledger {
     conn: Connection,
+    path: std::path::PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,9 +225,22 @@ impl Ledger {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        let ledger = Ledger { conn };
+        // Several processes and threads share one ledger in short
+        // transactions (SPEC §23); a writer in progress is a wait, not
+        // an error.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let ledger = Ledger {
+            conn,
+            path: path.to_path_buf(),
+        };
         ledger.migrate()?;
         Ok(ledger)
+    }
+
+    /// Where this ledger lives, so a side thread can open its own
+    /// connection (a connection is not shareable across threads).
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     fn migrate(&self) -> Result<()> {
@@ -262,6 +288,56 @@ impl Ledger {
             params![id, repo_path, State::Prepared.as_str(), root_session, now],
         )?;
         Ok(())
+    }
+
+    /// A work package's run: its own lifecycle, attributed to the root.
+    pub fn insert_child_run(
+        &self,
+        id: &str,
+        repo_path: &str,
+        root_session: Option<&str>,
+        parent_run: &str,
+        package_id: &str,
+    ) -> Result<()> {
+        let now = now_rfc3339();
+        self.conn.execute(
+            "INSERT INTO runs (id, repo_path, status, root_session, created_at, updated_at,
+                               parent_run, package_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)",
+            params![
+                id,
+                repo_path,
+                State::Prepared.as_str(),
+                root_session,
+                now,
+                parent_run,
+                package_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// (run_id, package_id, status) of a root run's packages, in
+    /// creation order.
+    pub fn child_runs(&self, parent_run: &str) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, package_id, status FROM runs WHERE parent_run = ?1 ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([parent_run], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Every dispatch ever recorded for a run: the aggregate agent count
+    /// no work package resets (SPEC §19).
+    pub fn dispatch_count(&self, run_id: &str) -> Result<u32> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM dispatches WHERE run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as u32)
     }
 
     pub fn set_run_status(&self, id: &str, status: State) -> Result<()> {
@@ -551,6 +627,16 @@ impl Ledger {
     /// parent is excluded and the parent is counted once. An inclusive
     /// event with no children simply counts itself.
     pub fn run_cost(&self, run_id: &str) -> Result<MicroUsd> {
+        let mut total = self.run_own_cost(run_id)?;
+        // A root run's cost is its tree's: packages are separate runs
+        // attributed to it (SPEC §19, §23), each counted once.
+        for (child, _, _) in self.child_runs(run_id)? {
+            total = total.saturating_add(self.run_cost(&child)?);
+        }
+        Ok(total)
+    }
+
+    fn run_own_cost(&self, run_id: &str) -> Result<MicroUsd> {
         let micros: i64 = self.conn.query_row(
             "SELECT COALESCE(SUM(cost_micros), 0) FROM usage_events
              WHERE run_id = ?1
@@ -569,13 +655,18 @@ impl Ledger {
     /// anywhere makes the run's cost unknown; an incomplete anywhere makes
     /// it an incomplete lower bound.
     pub fn run_cost_completeness(&self, run_id: &str) -> Result<CostCompleteness> {
-        let values: Vec<String> = {
+        let mut values: Vec<String> = {
             let mut stmt = self
                 .conn
                 .prepare("SELECT DISTINCT completeness FROM usage_events WHERE run_id = ?1")?;
             let rows = stmt.query_map([run_id], |row| row.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
+        for (child, _, _) in self.child_runs(run_id)? {
+            values.push(
+                serde_json::to_string(&self.run_cost_completeness(&child)?).expect("serializes"),
+            );
+        }
         let mut completeness = CostCompleteness::Actual;
         for value in values {
             let parsed: CostCompleteness =
@@ -663,11 +754,13 @@ impl Ledger {
         Ok(())
     }
 
-    /// All runs created at or after `since` (RFC3339), newest first.
+    /// All root runs created at or after `since` (RFC3339), newest first.
+    /// Package runs are folded into their root's cost and are not listed
+    /// twice.
     pub fn runs_since(&self, since: &str) -> Result<Vec<(String, String, String, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, repo_path, status, created_at FROM runs
-             WHERE created_at >= ?1 ORDER BY created_at DESC",
+             WHERE created_at >= ?1 AND parent_run IS NULL ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([since], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
@@ -716,13 +809,88 @@ mod tests {
     #[test]
     fn migrations_are_idempotent_and_additive() {
         let (ledger, dir) = temp_ledger();
-        assert_eq!(ledger.schema_version().expect("count"), 1);
+        assert_eq!(
+            ledger.schema_version().expect("count"),
+            LEDGER_SCHEMA_VERSION
+        );
         drop(ledger);
         let reopened = Ledger::open(&dir.join("ledger.sqlite")).expect("reopen");
         assert_eq!(
             reopened.schema_version().expect("count"),
-            1,
+            LEDGER_SCHEMA_VERSION,
             "no double-apply"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_v1_ledger_upgrades_additively_and_keeps_its_rows() {
+        let (ledger, dir) = temp_ledger();
+        drop(ledger);
+        let path = dir.join("ledger.sqlite");
+        // Rewind to v1: drop the v2 columns' migration record and the
+        // columns themselves, as a ledger written by an older relais
+        // would look.
+        {
+            let conn = Connection::open(&path).expect("raw open");
+            conn.execute_batch(
+                "DROP INDEX idx_runs_parent;
+                 ALTER TABLE runs DROP COLUMN parent_run;
+                 ALTER TABLE runs DROP COLUMN package_id;
+                 DELETE FROM schema_migrations WHERE version = 'v2';
+                 INSERT INTO runs (id, repo_path, status, created_at, updated_at)
+                 VALUES ('old-run', '/r', 'accepted', '2026-01-01T00:00:00+00:00',
+                         '2026-01-01T00:00:00+00:00');",
+            )
+            .expect("rewind");
+        }
+        let upgraded = Ledger::open(&path).expect("upgrade");
+        assert_eq!(
+            upgraded.schema_version().expect("count"),
+            LEDGER_SCHEMA_VERSION
+        );
+        assert_eq!(
+            upgraded.run_status("old-run").expect("status"),
+            Some(State::Accepted),
+            "existing rows survive the additive migration"
+        );
+        assert!(upgraded.child_runs("old-run").expect("children").is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_root_run_costs_its_whole_tree_once() {
+        let (ledger, dir) = temp_ledger();
+        ledger.insert_run("root", "/r", None).expect("root");
+        ledger
+            .insert_child_run("pkg-a", "/r", None, "root", "a")
+            .expect("child");
+        ledger
+            .insert_child_run("pkg-b", "/r", None, "root", "b")
+            .expect("child");
+        ledger
+            .record_usage(&event("e-root", "root", 10))
+            .expect("usage");
+        ledger
+            .record_usage(&event("e-a", "pkg-a", 100))
+            .expect("usage");
+        ledger
+            .record_usage(&event("e-b", "pkg-b", 1000))
+            .expect("usage");
+        assert_eq!(ledger.run_cost("root").expect("cost").to_micros(), 1110);
+        assert_eq!(ledger.run_cost("pkg-a").expect("cost").to_micros(), 100);
+        let listed = ledger
+            .runs_since("2000-01-01T00:00:00+00:00")
+            .expect("runs");
+        assert_eq!(listed.len(), 1, "packages are not listed as separate runs");
+        assert_eq!(
+            ledger
+                .child_runs("root")
+                .expect("children")
+                .iter()
+                .map(|(_, package, _)| package.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
         );
         std::fs::remove_dir_all(&dir).ok();
     }
