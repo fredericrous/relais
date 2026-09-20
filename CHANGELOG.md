@@ -24,9 +24,10 @@ repository today, with the audit that made it so.
   the namespaced agent definitions.
 - **The learning loop**: dataset build, train, evaluate, promote — owned,
   local, and pinned per run.
-- **Prebuilt binaries** for Linux (glibc and musl, x86_64 and aarch64),
-  macOS (Intel and Apple silicon) and Windows, with checksums, and
-  `install/install.sh` / `install.ps1` to fetch them verified.
+- **Prebuilt binaries** for Linux (glibc and musl, x86_64 and aarch64)
+  and macOS (Intel and Apple silicon), with checksums, and
+  `install/install.sh` to fetch them verified. No Windows: the
+  coordinator is a Unix socket and signals.
 
 ### Fixed, before anyone upgraded
 
