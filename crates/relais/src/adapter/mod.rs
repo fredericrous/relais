@@ -73,6 +73,52 @@ pub struct Capabilities {
     pub sandbox: SandboxCapability,
 }
 
+impl Capabilities {
+    /// Who, if anyone, enforces a turn ceiling. SPEC §11 lists turns
+    /// among the ceilings the runner enforces, and Claude Code 2.1.x has
+    /// no flag for one: the honest answer is to report which it is, on
+    /// every run, rather than let a receipt imply a ceiling nothing
+    /// applied.
+    pub fn turn_ceiling(&self) -> TurnCeiling {
+        if self.supports_max_turns {
+            TurnCeiling::Harness
+        } else {
+            TurnCeiling::Unavailable
+        }
+    }
+}
+
+/// Whether the installed harness can be given a turn ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnCeiling {
+    /// The harness takes a turn limit and enforces it.
+    Harness,
+    /// This harness has no turn-limit flag; attempts and wall time are
+    /// the ceilings that actually bound the run.
+    #[default]
+    Unavailable,
+}
+
+impl TurnCeiling {
+    /// The value recorded in the context manifest, so a receipt says
+    /// which it was for that run.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Harness => "harness",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    /// The line `doctor` prints.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Harness => "turn ceiling: enforced by the harness",
+            Self::Unavailable => "turn ceiling: not available on this Claude Code — attempts and wall time are enforced by the runner, turns are not",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionEnforcement {
