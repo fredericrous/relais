@@ -135,6 +135,13 @@ pub struct VerificationProfile {
     /// check is a gap, not a pass (SPEC §10).
     #[serde(default)]
     pub amont_checks: Vec<String>,
+    /// amont check IDs whose bypass or severity downgrade this profile
+    /// accepts. A bypassed or downgraded check cannot fail the gate, so
+    /// it is a verification gap by default (SPEC §10); naming it here is
+    /// the "waiver already in policy" the same section allows — a
+    /// reviewed, content-bound decision, not something a run may reach.
+    #[serde(default)]
+    pub amont_waivers: Vec<String>,
     /// Extra globs (beyond the built-in build-manifest and test-tree
     /// defaults) naming files this profile's verdict depends on. A
     /// candidate touching one requires review (SPEC §10).
@@ -411,13 +418,55 @@ pub struct Permissions {
     pub allowed_tools: Vec<String>,
 }
 
+/// The deny floor (SPEC §8: "a worker cannot commit, merge, push or
+/// publish through the normal allowed tool profile").
+///
+/// Claude Code matches a `Bash(…:*)` rule as a PREFIX of the literal
+/// command line, so the publishing verbs are only half the list: `sh -c
+/// 'git push'`, `git -C . commit` and `env git commit` all reach the
+/// same operation without ever starting the command line `git push`.
+/// The wrappers below are the evasions that can be expressed as
+/// permission rules, and they are denied outright rather than
+/// pattern-matched — a rule cannot look inside `-c` at what is about to
+/// run.
+///
+/// This is a floor, NOT a sandbox. SPEC §8 is explicit: "this is an
+/// acceptance boundary, not a claim of filesystem isolation… tools with
+/// Bash access are not a security sandbox". Any worker that can run one
+/// unlisted program can run `git` through it (`make push`, a script it
+/// wrote, a language runtime's subprocess call), and no deny list
+/// enumerates that. What actually holds is downstream: relais snapshots
+/// the candidate itself, judges the diff against the declared scope,
+/// and never integrates anything — a worker that did manage to commit
+/// has changed nothing about what gets accepted. Strong confinement
+/// needs the separately configured OS/container backend §8 describes.
 fn default_disallowed_tools() -> Vec<String> {
     vec![
+        // The operations themselves.
         "Bash(git commit:*)".into(),
         "Bash(git merge:*)".into(),
         "Bash(git push:*)".into(),
         "Bash(git rebase:*)".into(),
         "Bash(git reset:*)".into(),
+        "Bash(git tag:*)".into(),
+        "Bash(git am:*)".into(),
+        "Bash(git cherry-pick:*)".into(),
+        // Same operations, spelled so a prefix match misses them: git's
+        // own pre-subcommand options move the verb off the front of the
+        // command line.
+        "Bash(git -C:*)".into(),
+        "Bash(git -c:*)".into(),
+        "Bash(git --git-dir:*)".into(),
+        "Bash(git --work-tree:*)".into(),
+        "Bash(git --exec-path:*)".into(),
+        // A shell or an environment wrapper hides any command line at
+        // all behind its own.
+        "Bash(sh -c:*)".into(),
+        "Bash(bash -c:*)".into(),
+        "Bash(zsh -c:*)".into(),
+        "Bash(dash -c:*)".into(),
+        "Bash(env git:*)".into(),
+        "Bash(eval:*)".into(),
     ]
 }
 
@@ -818,6 +867,14 @@ timeout_seconds = 300
 # built-in list covers the common ones; add this repository's own here.
 # [verification.profiles.default]
 # inputs = ["scripts/check.sh", "ci/**"]
+# amont check IDs this profile requires to be in force. Left empty, every
+# check the inventory reports as in force at `block` severity is required.
+# amont_checks = ["pre-push-cargo-test"]
+# Bypasses and severity downgrades this profile accepts. A bypassed or
+# downgraded check cannot fail the gate, so by default it is a
+# verification GAP and the run ends needs_decision (SPEC §10). Listing an
+# ID here is a reviewed waiver in policy — the run can never grant one.
+# amont_waivers = ["pre-push-cargo-test"]
 # Cache baseline results by base SHA, profile and toolchain (SPEC §18).
 # Off by default: only a profile with no undeclared external dependency
 # and no nondeterministic check is safe to cache.
@@ -1054,6 +1111,28 @@ keys = ["output.contract"]
             .permissions
             .disallowed_tools
             .contains(&"Bash(git push:*)".to_string()));
+    }
+
+    /// The rules match a command-line prefix, so denying the verb is not
+    /// denying the operation: every wrapper that can be named as a rule
+    /// is named (audit B7). The list is a floor, not a sandbox.
+    #[test]
+    fn the_deny_floor_names_the_prefix_match_evasions() {
+        let machine = MachineSettings::from_toml_str(&machine_toml("")).expect("parses");
+        let floor = machine.permissions.disallowed_tools;
+        for rule in [
+            "Bash(git commit:*)",
+            "Bash(git -C:*)",
+            "Bash(git -c:*)",
+            "Bash(git --git-dir:*)",
+            "Bash(sh -c:*)",
+            "Bash(bash -c:*)",
+            "Bash(zsh -c:*)",
+            "Bash(env git:*)",
+            "Bash(eval:*)",
+        ] {
+            assert!(floor.contains(&rule.to_string()), "{rule} is on the floor");
+        }
     }
 
     #[test]

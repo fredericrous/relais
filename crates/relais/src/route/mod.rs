@@ -560,6 +560,7 @@ mod tests {
                             timeout_seconds: 300,
                         }],
                         amont_checks: Vec::new(),
+                        amont_waivers: Vec::new(),
                         inputs: Vec::new(),
                         cache_baseline: false,
                     },

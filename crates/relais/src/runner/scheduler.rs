@@ -19,7 +19,6 @@
 //! fast-forward, and every package sees the packages before it.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::adapter::LaunchSpec;
@@ -239,8 +238,11 @@ pub(crate) fn run_decomposed(
         }),
     )?;
 
-    // The integration worktree: every accepted package fast-forwards it.
-    let integration_path = engine.artifacts.join("integration");
+    // The integration worktree: every accepted package fast-forwards
+    // it. Outside the artifact directory like every other worktree
+    // (audit B6) — a package's worker cannot reach the assembled
+    // candidate, or the root's receipt, through a relative path.
+    let integration_path = engine.worktrees.join("integration");
     let integration = match workspace::create_worktree(
         engine.config.repo_dir,
         root.base_sha,
@@ -350,7 +352,7 @@ pub(crate) fn run_decomposed(
         if failures.is_empty() {
             integration
                 .export_patch(&head, &engine.artifacts.join("candidate-integrated.patch"))?;
-            let verification_inputs_changed = verify::verification_inputs_touched(
+            let touched_inputs = verify::classify_verification_inputs(
                 &root.authority.verification_profile,
                 &integration.changed_paths_in(&head)?,
             );
@@ -362,7 +364,7 @@ pub(crate) fn run_decomposed(
                     checks,
                     amont_bypasses,
                     amont_downgrades,
-                    verification_inputs_changed,
+                    touched_inputs,
                 },
                 attempts_total,
                 models_used,
@@ -543,6 +545,10 @@ fn run_package(
         machine: &child_machine,
         ledger,
         backend: engine.config.backend,
+        // The package's artifacts hang off the root run's; its
+        // worktrees hang off THEIR parent, so a package worker's tree
+        // sits under `packages/worktrees/<child-run>/` and no package's
+        // record — its own or a sibling's — is its cwd's parent (B6).
         artifacts_dir: engine.artifacts.join("packages").join(&package.id),
         aval_resolver: engine.config.aval_resolver,
         predictor: engine.config.predictor,
@@ -650,9 +656,11 @@ fn mirror(
 /// its head. A non-fast-forward means the package was built on a stale
 /// input: a decision, not a silent merge.
 fn fast_forward(integration_path: &Path, candidate_sha: &str) -> Result<String, String> {
-    let merge = Command::new("git")
+    // `workspace::git_command` and not `Command::new("git")`: an
+    // inherited GIT_DIR or GIT_INDEX_FILE would merge into a different
+    // repository than the one this path names (audit B15).
+    let merge = workspace::git_command(integration_path)
         .args(["merge", "--ff-only", candidate_sha])
-        .current_dir(integration_path)
         .output()
         .map_err(|e| format!("git merge: {e}"))?;
     if !merge.status.success() {
@@ -661,9 +669,8 @@ fn fast_forward(integration_path: &Path, candidate_sha: &str) -> Result<String, 
             String::from_utf8_lossy(&merge.stderr).trim()
         ));
     }
-    let head = Command::new("git")
+    let head = workspace::git_command(integration_path)
         .args(["rev-parse", "HEAD"])
-        .current_dir(integration_path)
         .output()
         .map_err(|e| format!("git rev-parse: {e}"))?;
     Ok(String::from_utf8_lossy(&head.stdout).trim().to_string())
@@ -674,7 +681,7 @@ struct Assembled {
     checks: Vec<crate::verify::CheckOutcome>,
     amont_bypasses: Vec<String>,
     amont_downgrades: Vec<String>,
-    verification_inputs_changed: Vec<String>,
+    touched_inputs: verify::TouchedInputs,
 }
 
 fn accept_integrated(
@@ -696,8 +703,27 @@ fn accept_integrated(
         tier: root.decision.tier.unwrap_or(Tier::Implementation),
         escalation_tier: None,
     };
-    let review_required = root.decision.review >= Review::Required
-        || !assembled.verification_inputs_changed.is_empty();
+    // The assembled candidate is judged like any other (SPEC §19):
+    // policy-class verification inputs are the user's decision, the test
+    // tree is a reviewer's (audit B8).
+    if !assembled.touched_inputs.policy.is_empty() {
+        let detail = format!(
+            "the assembled candidate changes what verification is: {}; the checks it passed are \
+             no longer the checks the policy declares. The integrated candidate is preserved",
+            assembled.touched_inputs.policy.join(", ")
+        );
+        return engine.finish(
+            Reason::VerificationInputsChanged,
+            serde_json::json!({ "paths": assembled.touched_inputs.policy, "candidate": head }),
+            Terminal::NeedsDecision {
+                reason: Reason::VerificationInputsChanged,
+                detail,
+            },
+        );
+    }
+    let verification_inputs_changed = assembled.touched_inputs.tests;
+    let review_required =
+        root.decision.review >= Review::Required || !verification_inputs_changed.is_empty();
     if review_required {
         let mut review_cost = MicroUsd::ZERO;
         let mut review_completeness = CostCompleteness::Actual;
@@ -705,7 +731,8 @@ fn accept_integrated(
             root.manifest,
             root.authority,
             head,
-            &assembled.verification_inputs_changed,
+            root.decision.tier.unwrap_or(Tier::Implementation),
+            &verification_inputs_changed,
             &mut review_cost,
             &mut review_completeness,
             root.deadline,
@@ -745,7 +772,7 @@ fn accept_integrated(
         baseline_failures: root.baseline_failures.to_vec(),
         amont_bypasses: assembled.amont_bypasses,
         amont_downgrades: assembled.amont_downgrades,
-        verification_inputs_changed: assembled.verification_inputs_changed,
+        verification_inputs_changed,
         integration_gaps: root.integration_gaps.to_vec(),
         baseline_cached: root.baseline_cached,
     };

@@ -56,6 +56,12 @@ pub enum Reason {
     /// The candidate carries the base tree: verification is the
     /// baseline's, not re-run.
     CandidateIdenticalToBase,
+    /// Policy configures no tier but the candidate's own, so the review
+    /// was not an independent opinion (SPEC §10).
+    ReviewerSameTier,
+    /// An accepted run's task worktree could not be released; its
+    /// content is in the patch and the candidate ref regardless.
+    WorktreeNotReleased,
     /// The run ended because the runner itself could not go on — a
     /// ledger or filesystem failure — not because of anything a worker
     /// did (SPEC §12: uncertain state is interrupted, never retried).
@@ -98,6 +104,8 @@ impl Reason {
             Self::DuplicateDispatch => "duplicate_dispatch",
             Self::PermissionDenied => "permission_denied",
             Self::CandidateIdenticalToBase => "candidate_identical_to_base",
+            Self::ReviewerSameTier => "reviewer_same_tier",
+            Self::WorktreeNotReleased => "worktree_not_released",
             Self::RunnerFailure => "runner_failure",
         }
     }
