@@ -909,6 +909,25 @@ mod tests {
         }
     }
 
+    /// Elect, allowing for the window in which a process another test
+    /// spawned still holds an inherited copy of a released lock
+    /// descriptor (see `procs::LockFile`). Production answers the same
+    /// window by retrying: `ensure_running` pings until the daemon
+    /// answers.
+    fn elect_within(
+        socket: &Path,
+        patience: Duration,
+    ) -> Result<(Listener, LockFile), CoordinatorError> {
+        let deadline = Instant::now() + patience;
+        loop {
+            match elect(socket) {
+                Ok(won) => return Ok(won),
+                Err(e) if Instant::now() >= deadline => return Err(e),
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
     fn registration(run: &str, session: &str) -> RunRegistration {
         RunRegistration {
             run_id: run.into(),
@@ -958,7 +977,8 @@ mod tests {
         );
         drop(listener);
         drop(lock);
-        let (listener, lock) = elect(&socket).expect("a released lock is taken");
+        let (listener, lock) =
+            elect_within(&socket, Duration::from_secs(5)).expect("a released lock is taken");
         drop(listener);
         drop(lock);
         std::fs::remove_dir_all(&dir).ok();
@@ -978,7 +998,8 @@ mod tests {
         std::fs::write(&lock_path, std::process::id().to_string()).expect("stale lock");
         // And a leftover endpoint nobody answers, from the same death.
         std::fs::write(&socket, "leftover").expect("stale endpoint");
-        let (listener, lock) = elect(&socket).expect("no holder: the lock is free");
+        let (listener, lock) =
+            elect_within(&socket, Duration::from_secs(5)).expect("no holder: the lock is free");
         assert!(socket.exists(), "the stale endpoint was replaced, not kept");
         assert_eq!(
             std::fs::read_to_string(&lock_path).expect("lock").trim(),

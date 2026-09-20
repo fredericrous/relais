@@ -72,6 +72,15 @@ pub fn kill_tree(child: &mut Child) -> io::Result<()> {
 /// which locks a byte range exclusively and fails immediately rather
 /// than waiting — the same contract, spelled twice.
 ///
+/// One caveat, and it is the kernel's: the lock belongs to the open
+/// file description, and `fork` copies it. A process spawned while the
+/// lock is held owns a copy of the descriptor until it `exec`s, which
+/// closes it (Rust opens files close-on-exec). So for the microseconds
+/// of somebody else's fork/exec, a released lock can still read as
+/// held. Election already answers that by retrying — `ensure_running`
+/// starts a daemon and pings until it answers — so the window costs a
+/// poll, never a wedge.
+///
 /// This is what makes coordinator election atomic (SPEC §23: "atomically
 /// elect one coordinator"). A PID written into a file is not: after a
 /// SIGKILL the file stays, the PID gets recycled by an unrelated
@@ -350,11 +359,30 @@ mod tests {
             "the PID is written, as information"
         );
         drop(held);
+        // With a little patience: a process this suite spawns elsewhere
+        // can hold an inherited copy of the descriptor for the moment
+        // between fork and exec, and the lock lives as long as any copy
+        // does. Close-on-exec ends it, microseconds later — see the
+        // note on `LockFile`.
         assert!(
-            LockFile::try_acquire(&path).expect("acquire").is_some(),
+            acquire_within(&path, std::time::Duration::from_secs(5)).is_some(),
             "the lock goes with its holder, leaving the file behind"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Take the lock, giving a fork/exec window time to close.
+    fn acquire_within(path: &std::path::Path, patience: std::time::Duration) -> Option<LockFile> {
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            if let Ok(Some(lock)) = LockFile::try_acquire(path) {
+                return Some(lock);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     // C5: the escalation the coordinator reaches for one grace period
