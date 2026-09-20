@@ -1011,22 +1011,6 @@ impl<'a> RunEngine<'a> {
                 )?;
             }
 
-            // Tools the harness refused: a worker that could not act is
-            // blocked, and a stronger model is not bought for a missing
-            // permission (SPEC §8, §9).
-            if !result.permission_denials.is_empty() {
-                ledger.finish_attempt(
-                    attempt_id,
-                    State::Blocked,
-                    Some(worktree_path.to_string_lossy().as_ref()),
-                    None,
-                )?;
-                return self.stop(
-                    &progress.budget,
-                    Observation::PermissionDenied(result.permission_denials.clone()),
-                );
-            }
-
             // A worker blockage proposal is recorded as evidence and the
             // runner assigns blocked — the environment is never escalated
             // to a stronger model (SPEC §9).
@@ -1121,6 +1105,35 @@ impl<'a> RunEngine<'a> {
                     return self.fail_preflight(BlockCode::SnapshotFailed, e.to_string());
                 }
             };
+            // Tools the harness refused. A worker that produced nothing
+            // while being refused could not act: blocked, and a stronger
+            // model is not bought for a missing permission (SPEC §8, §9).
+            // A worker that delivered a candidate anyway was refused
+            // something it did not need; that is evidence on the run,
+            // and the candidate is judged like any other.
+            if !result.permission_denials.is_empty() {
+                if identical {
+                    ledger.finish_attempt(
+                        attempt_id,
+                        State::Blocked,
+                        Some(worktree_path.to_string_lossy().as_ref()),
+                        Some(&candidate_sha),
+                    )?;
+                    return self.stop(
+                        &progress.budget,
+                        Observation::PermissionDenied(result.permission_denials.clone()),
+                    );
+                }
+                self.transition(
+                    State::Verifying,
+                    Reason::PermissionDenied,
+                    serde_json::json!({
+                        "tools": result.permission_denials,
+                        "candidate": candidate_sha,
+                        "note": "refused during the attempt; the candidate was still produced",
+                    }),
+                )?;
+            }
             let reuse = if identical {
                 self.transition(
                     State::Verifying,
@@ -2599,6 +2612,43 @@ mod tests {
             fixture.ledger.run_cost(&run_id).expect("cost"),
             MicroUsd::from_micros(100),
             "the refused attempt's cost is still the task's"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_refusal_the_worker_worked_around_is_evidence_not_a_block() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let backend = MockBackend::new(|spec| {
+            if spec.prompt.contains("semantic reviewer") {
+                return MockOutcome {
+                    result_text: Some("FINDINGS: none".into()),
+                    exit_code: Some(0),
+                    ..Default::default()
+                };
+            }
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            MockOutcome {
+                result_text: Some("DONE (ls was refused, I used Glob)".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                permission_denials: vec!["Bash(ls -la)".into()],
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Optional), &repo, &backend);
+        let RunOutcome { run_id, terminal } = outcome;
+        assert!(
+            matches!(terminal, Terminal::Accepted(_)),
+            "a delivered candidate is judged on its checks, got {terminal:?}"
+        );
+        let transitions = fixture.ledger.transitions(&run_id).expect("history");
+        assert!(
+            transitions
+                .iter()
+                .any(|t| t.reason == Reason::PermissionDenied.as_str()),
+            "the refusal is on the record: {transitions:?}"
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }

@@ -330,10 +330,21 @@ pub fn parse_result_json(stdout: &str, requested_model: &str) -> ParsedClaudeRes
                 let name = denial
                     .get("tool_name")
                     .and_then(|name| name.as_str())
-                    .unwrap_or("unknown tool")
-                    .to_string();
-                if !tools.contains(&name) {
-                    tools.push(name);
+                    .unwrap_or("unknown tool");
+                // A Bash denial is only actionable with the command: the
+                // allowlist rule to add is `Bash(<command>:*)`.
+                let entry = match denial
+                    .get("tool_input")
+                    .and_then(|input| input.get("command"))
+                    .and_then(|command| command.as_str())
+                {
+                    Some(command) if name == "Bash" => {
+                        format!("Bash({})", command.chars().take(120).collect::<String>())
+                    }
+                    _ => name.to_string(),
+                };
+                if !tools.contains(&entry) {
+                    tools.push(entry);
                 }
             }
             tools
@@ -503,9 +514,12 @@ mod tests {
         let json = r#"{"result":"I need permission","is_error":false,
             "permission_denials":[{"tool_name":"Edit","tool_use_id":"a"},
                                   {"tool_name":"Edit","tool_use_id":"b"},
-                                  {"tool_name":"Bash","tool_use_id":"c"}]}"#;
+                                  {"tool_name":"Bash","tool_use_id":"c","tool_input":{"command":"git diff --stat"}}]}"#;
         let parsed = parse_result_json(json, "sonnet");
-        assert_eq!(parsed.permission_denials, vec!["Edit", "Bash"]);
+        assert_eq!(
+            parsed.permission_denials,
+            vec!["Edit", "Bash(git diff --stat)"]
+        );
         let parsed = parse_result_json(r#"{"result":"boom","is_error":true}"#, "sonnet");
         assert!(parsed.is_error);
     }
