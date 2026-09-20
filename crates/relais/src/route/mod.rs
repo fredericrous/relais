@@ -400,8 +400,14 @@ fn select_learned(estimates: &Estimates, eligible: &[Tier], quality_floor: f64) 
                 .get(*tier)
                 .is_some_and(|acceptance| *acceptance >= quality_floor)
         })
-        .min_by_key(|tier| estimates.cost.get(*tier).map(|cost| cost.to_micros()))
-        .copied()
+        .filter_map(|tier| {
+            estimates
+                .cost
+                .get(tier)
+                .map(|cost| (tier, cost.to_micros()))
+        })
+        .min_by_key(|(_, cost_micros)| *cost_micros)
+        .map(|(tier, _)| *tier)
 }
 
 impl RouteDecision {
@@ -829,6 +835,44 @@ mod tests {
         });
         assert_eq!(d.tier, Some(Tier::Implementation));
         assert_eq!(d.routed_by, RoutedBy::ConservativeBaseline);
+    }
+
+    #[test]
+    fn select_learned_skips_a_tier_with_no_cost_estimate() {
+        let mut acceptance = BTreeMap::new();
+        acceptance.insert(Tier::Research, 0.9);
+        acceptance.insert(Tier::Implementation, 0.9);
+        let mut cost = BTreeMap::new();
+        // Research clears the floor and has no cost estimate; if `None`
+        // costs sorted first it would win despite being unpriced.
+        cost.insert(Tier::Implementation, MicroUsd::from_micros(400));
+        let estimates = Estimates {
+            artifact_id: "artifact-test-1".into(),
+            input_hash: "in".into(),
+            acceptance,
+            cost,
+            raw: serde_json::Value::Null,
+        };
+        let eligible = [Tier::Research, Tier::Implementation];
+        let selected = select_learned(&estimates, &eligible, 0.5);
+        assert_eq!(selected, Some(Tier::Implementation));
+    }
+
+    #[test]
+    fn select_learned_abstains_when_no_eligible_tier_has_a_cost_estimate() {
+        let mut acceptance = BTreeMap::new();
+        acceptance.insert(Tier::Research, 0.9);
+        acceptance.insert(Tier::Implementation, 0.9);
+        let estimates = Estimates {
+            artifact_id: "artifact-test-1".into(),
+            input_hash: "in".into(),
+            acceptance,
+            cost: BTreeMap::new(),
+            raw: serde_json::Value::Null,
+        };
+        let eligible = [Tier::Research, Tier::Implementation];
+        let selected = select_learned(&estimates, &eligible, 0.5);
+        assert_eq!(selected, None);
     }
 
     #[test]
