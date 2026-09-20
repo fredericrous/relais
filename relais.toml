@@ -1,0 +1,61 @@
+schema_version = 1
+
+# Profiles the router selects among. Explicit model IDs keep policies
+# reproducible; the effective model is recorded on every dispatch.
+[models.research]
+id = "haiku"
+
+[models.implementation]
+id = "sonnet"
+effort = "medium"
+
+[models.escalation]
+id = "fable"
+effort = "medium"
+
+[execution]
+max_attempts = 3
+max_repairs_before_escalation = 1
+max_wall_seconds = 1200
+allow_nested_agents = true
+max_agent_depth = 3
+max_agents_total = 24
+
+# required blocks execution when missing; optional gaps are reported and
+# never counted as passed checks.
+[integrations]
+aval = "required"
+amont = "required"
+amont_agent = "required"
+
+[[verification.profiles.default.commands]]
+argv = ["make", "check"]
+timeout_seconds = 300
+
+# A candidate that touches what the profile's verdict depends on — build
+# manifests, lockfiles, the test tree, fixtures, or a program the profile
+# runs — is reviewed explicitly whatever the route said (SPEC §10). The
+# built-in list covers the common ones; add this repository's own here.
+# [verification.profiles.default]
+# inputs = ["scripts/check.sh", "ci/**"]
+# Cache baseline results by base SHA, profile and toolchain (SPEC §18).
+# Off by default: only a profile with no undeclared external dependency
+# and no nondeterministic check is safe to cache.
+# cache_baseline = true
+
+# Risk floors: writes touching these patterns cannot route below the
+# minimum tier, and the review requirement here is a floor, not a hint.
+# Floors apply to the DECLARED scope: a contract scoped `src/**` could
+# write `src/trust/x`, so a `**/trust/**` rule floors it — scope
+# contracts as narrowly as the task allows.
+[[risk]]
+paths = ["**/trust/**", "**/restore/**"]
+minimum_tier = "escalation"
+review = "required"
+
+# Path-to-aval-key mappings. aval resolves exact keys; it has no
+# source-impact analysis, so the mapping lives here (SPEC §7).
+# [[architecture.mapping]]
+# paths = ["crates/**"]
+# keys = ["storage.object-store"]
+# scope = "default"
