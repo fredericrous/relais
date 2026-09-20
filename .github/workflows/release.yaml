@@ -99,8 +99,12 @@ jobs:
             os: macos-latest
           - target: x86_64-apple-darwin
             os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
+          # No Windows target: the coordinator is a Unix socket plus
+          # kill(2)/getppid(2) (SPEC §23 names an "equivalent local IPC
+          # mechanism on other supported platforms" that does not exist
+          # yet). The first dry run proved it — the msvc build failed on
+          # `std::os::unix` — and a matrix entry that cannot compile is a
+          # red release, not a platform.
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain for ${{ matrix.target }}
@@ -170,29 +174,19 @@ jobs:
           # release that shipped only the executable would leave the reader
           # with an exit code and nothing that says what it means.
           cp README.md LICENSE docs/SPEC.md "$staging/"
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cp "target/${{ matrix.target }}/release/relais.exe" "$staging/"
-            (cd dist && 7z a "$name.zip" "$name" > /dev/null)
-            echo "asset=dist/$name.zip" >> "$GITHUB_OUTPUT"
-          else
-            cp "target/${{ matrix.target }}/release/relais" "$staging/"
-            (cd dist && tar czf "$name.tar.gz" "$name")
-            echo "asset=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
-          fi
+          cp "target/${{ matrix.target }}/release/relais" "$staging/"
+          (cd dist && tar czf "$name.tar.gz" "$name")
+          echo "asset=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
 
       # Prove the thing we are about to hand people actually runs. A release
       # asset that cannot execute is the one defect no amount of `cargo test`
       # catches, because tests never touch the packaged artifact.
       - name: The packaged binary runs
-        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-pc-windows-msvc'
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin'
         run: |
           set -euo pipefail
           version="${{ needs.guard.outputs.version }}"
           bin="dist/relais-${version}-${{ matrix.target }}/relais"
-          # An `if`, not `[ … ] && …`: under `set -e` a false test as the last
-          # command of a line is a FAILING step, so the short form would abort
-          # every non-Windows target here.
-          if [ "${{ runner.os }}" = "Windows" ]; then bin="$bin.exe"; fi
           "$bin" --help | grep -q 'doctor'
           "$bin" --version | grep -q "$version"
           echo "the packaged binary answers --help and --version"
