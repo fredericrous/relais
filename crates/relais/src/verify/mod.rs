@@ -156,13 +156,15 @@ pub fn run_profile(
     Ok(outcomes)
 }
 
-/// Files the profile's verdict depends on: build manifests, lockfiles,
-/// the test tree, and any repository-relative program the profile runs.
-/// A candidate that changes one of these can make verification pass by
-/// changing what verification IS (SPEC §10: "changes to required checks,
-/// fixtures or acceptance tests receive explicit review and cannot
-/// silently weaken the contract"), so the runner requires review for it.
-pub const DEFAULT_VERIFICATION_INPUTS: &[&str] = &[
+/// What verification IS, as opposed to what it tests: build manifests,
+/// lockfiles, toolchain pins, the check runner's own configuration, and
+/// any repository-relative program the profile runs. A candidate that
+/// edits one of these does not pass the checks — it changes them, and
+/// the tree the checks ran on is no longer the tree the policy
+/// described. SPEC §9 puts that in the user's hands ("changes protected
+/// verification → needs_decision"): no model review can settle whether
+/// relaxing a lockfile or a build flag is what the task wanted.
+pub const POLICY_VERIFICATION_INPUTS: &[&str] = &[
     "Makefile",
     "makefile",
     "GNUmakefile",
@@ -179,22 +181,34 @@ pub const DEFAULT_VERIFICATION_INPUTS: &[&str] = &[
     "requirements*.txt",
     "go.mod",
     "go.sum",
+    "**/pytest.ini",
+    "**/tox.ini",
+];
+
+/// The test tree: the cases and fixtures the checks execute. SPEC §10
+/// explicitly invites candidates to add regression tests ("requested
+/// behavior may need new regression tests"), so an edit here is normal
+/// work — it just cannot go in unlooked-at, because a deleted or
+/// loosened test weakens the contract as surely as a changed command.
+/// That is the "explicit review" of §10, not a `needs_decision`.
+pub const TEST_TREE_INPUTS: &[&str] = &[
     "**/tests/**",
     "**/test/**",
     "**/__tests__/**",
     "**/*_test.*",
     "**/*.test.*",
     "**/*.spec.*",
+    "**/test_*.*",
     "**/conftest.py",
-    "**/pytest.ini",
     "**/fixtures/**",
 ];
 
-/// The verification-input patterns for a profile: the defaults, the
-/// profile's own declarations, and each command's program when it lives
-/// in the repository (`./scripts/check.sh`).
+/// The policy-class patterns for a profile: the built-in list, the
+/// profile's own `inputs` declarations (the repository naming what its
+/// verdict depends on), and each command's program when it lives in the
+/// repository (`./scripts/check.sh`) — the commands' own inputs.
 pub fn verification_inputs(profile: &VerificationProfile) -> Vec<String> {
-    let mut patterns: Vec<String> = DEFAULT_VERIFICATION_INPUTS
+    let mut patterns: Vec<String> = POLICY_VERIFICATION_INPUTS
         .iter()
         .map(|p| p.to_string())
         .collect();
@@ -212,28 +226,74 @@ pub fn verification_inputs(profile: &VerificationProfile) -> Vec<String> {
     patterns
 }
 
-/// Which of `changed` are verification inputs.
-pub fn verification_inputs_touched(
-    profile: &VerificationProfile,
-    changed: &[String],
-) -> Vec<String> {
+/// Verification inputs a candidate touched, split by what the two
+/// classes mean for the run. Only path classes are detectable: a
+/// `#[cfg(test)]` module inside a source file is a test too, and nothing
+/// here can see it — which is why `tests` is a review, not a proof.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TouchedInputs {
+    /// Changes the user decides on (`needs_decision`).
+    pub policy: Vec<String>,
+    /// Changes a reviewer judges (review required).
+    pub tests: Vec<String>,
+}
+
+impl TouchedInputs {
+    pub fn is_empty(&self) -> bool {
+        self.policy.is_empty() && self.tests.is_empty()
+    }
+
+    /// Every touched input, policy class first — what the receipt
+    /// records and what a reviewer is shown.
+    pub fn all(&self) -> Vec<String> {
+        let mut all = self.policy.clone();
+        all.extend(self.tests.iter().cloned());
+        all
+    }
+}
+
+fn matcher(patterns: &[String]) -> Option<globset::GlobSet> {
     let mut builder = globset::GlobSetBuilder::new();
-    for pattern in verification_inputs(profile) {
-        if let Ok(glob) = globset::GlobBuilder::new(&pattern)
+    for pattern in patterns {
+        if let Ok(glob) = globset::GlobBuilder::new(pattern)
             .literal_separator(true)
             .build()
         {
             builder.add(glob);
         }
     }
-    let Ok(set) = builder.build() else {
-        return Vec::new();
-    };
-    changed
-        .iter()
-        .filter(|path| set.is_match(path))
-        .cloned()
-        .collect()
+    builder.build().ok()
+}
+
+/// Which of `changed` are verification inputs, and of which class. A
+/// path in both classes (a `tests/Cargo.toml`) is policy: the stricter
+/// outcome wins.
+pub fn classify_verification_inputs(
+    profile: &VerificationProfile,
+    changed: &[String],
+) -> TouchedInputs {
+    let policy_set = matcher(&verification_inputs(profile));
+    let test_set = matcher(
+        &TEST_TREE_INPUTS
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>(),
+    );
+    let mut touched = TouchedInputs::default();
+    for path in changed {
+        if policy_set
+            .as_ref()
+            .is_some_and(|set| set.is_match(path.as_str()))
+        {
+            touched.policy.push(path.clone());
+        } else if test_set
+            .as_ref()
+            .is_some_and(|set| set.is_match(path.as_str()))
+        {
+            touched.tests.push(path.clone());
+        }
+    }
+    touched
 }
 
 /// The effective check inventory from `amont list --json`
@@ -393,6 +453,73 @@ pub fn amont_gaps(inventory: Option<&AmontInventory>, required_ids: &[String]) -
     gaps
 }
 
+/// The check id a `bypasses`/`downgrades` entry names. The inventory
+/// keeps entries verbatim as JSON, because amont spells a bypass as a
+/// bare string and a downgrade as an object (`{"id":…,"severity":…}`),
+/// and neither shape is worth guessing away at parse time. A waiver is
+/// written by the user as a plain check id, so this is where the two
+/// meet.
+pub fn waived_id(entry: &str) -> String {
+    let trimmed = entry.trim();
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(serde_json::Value::String(id)) => id,
+        Ok(serde_json::Value::Object(fields)) => fields
+            .get("id")
+            .and_then(|id| id.as_str())
+            .unwrap_or(trimmed)
+            .to_string(),
+        _ => trimmed.to_string(),
+    }
+}
+
+/// Bypasses and downgrades the profile has not waived, as gaps. amont's
+/// inventory declares them about ITSELF: a bypassed check did not run
+/// and a downgraded one cannot fail the gate, so a candidate verified
+/// under either was verified by something weaker than the policy
+/// describes. SPEC §10 — "a skipped, inert, unavailable or untrusted
+/// required check is a gap, not a pass" — makes that a gap unless the
+/// profile names the check in `amont_waivers`, which is the "waiver
+/// already in policy" the same section allows.
+pub fn amont_waiver_gaps(inventory: Option<&AmontInventory>, waivers: &[String]) -> Vec<String> {
+    let Some(inventory) = inventory else {
+        return Vec::new();
+    };
+    let mut gaps = Vec::new();
+    for (kind, entries) in [
+        ("bypassed", &inventory.bypasses),
+        ("downgraded", &inventory.downgrades),
+    ] {
+        for entry in entries {
+            let id = waived_id(entry);
+            if waivers.iter().any(|waiver| waiver == &id) {
+                continue;
+            }
+            gaps.push(format!(
+                "{id}: {kind} in amont's effective inventory ({entry}) and not waived by the \
+                 verification profile — a check that cannot fail is not a pass"
+            ));
+        }
+    }
+    gaps
+}
+
+/// The checks a profile that names none should require: everything the
+/// inventory reports as in force at blocking severity. A profile with an
+/// empty `amont_checks` otherwise depends on nothing, so a bypassed or
+/// inert gate would be invisible to the run that relies on it (SPEC §10:
+/// "use amont's effective inventory to identify checks and gaps").
+pub fn default_required_checks(inventory: &AmontInventory) -> Vec<String> {
+    inventory
+        .checks
+        .iter()
+        .filter(|check| {
+            check.status.as_ref().is_some_and(AmontStatus::in_force)
+                && check.effective_severity.as_deref() == Some("block")
+        })
+        .map(|check| check.id.clone())
+        .collect()
+}
+
 /// What one candidate's verification established: the checks that ran,
 /// the required checks that are gaps, and what amont's inventory declares
 /// about itself.
@@ -488,7 +615,7 @@ pub fn verification_worktree<'a>(
     path: &Path,
 ) -> Result<VerificationWorktree<'a>, std::io::Error> {
     std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))?;
-    let output = Command::new("git")
+    let output = crate::workspace::git_command(repo_dir)
         .args([
             "worktree",
             "add",
@@ -496,7 +623,6 @@ pub fn verification_worktree<'a>(
             &path.to_string_lossy(),
             candidate_sha,
         ])
-        .current_dir(repo_dir)
         .output()?;
     if !output.status.success() {
         return Err(std::io::Error::other(format!(
@@ -525,16 +651,24 @@ impl VerificationWorktree<'_> {
 
 impl Drop for VerificationWorktree<'_> {
     fn drop(&mut self) {
-        // Verification leaves no state behind; failure to clean is
-        // reported, not ignored, but never blocks acceptance either way.
-        let _ = Command::new("git")
+        // A verification worktree is throwaway by design: it exists for
+        // the length of one profile run, and nothing is ever integrated
+        // from it. Releasing it here — rather than leaving it for a
+        // cleanup command nobody runs — is what keeps `git worktree
+        // list` from growing an entry per attempt and per run. Failure
+        // to clean never blocks acceptance either way, but the
+        // administrative entry is pruned too, so a directory removed
+        // from underneath us does not leave a stale registration.
+        let _ = crate::workspace::git_command(&self.repo_dir)
             .args([
                 "worktree",
                 "remove",
                 "--force",
                 &self.path.to_string_lossy(),
             ])
-            .current_dir(&self.repo_dir)
+            .output();
+        let _ = crate::workspace::git_command(&self.repo_dir)
+            .args(["worktree", "prune"])
             .output();
     }
 }
@@ -639,6 +773,7 @@ mod tests {
         let profile = VerificationProfile {
             commands: vec![command(&["sh", "-c", "true"], 10)],
             amont_checks: Vec::new(),
+            amont_waivers: Vec::new(),
             inputs: Vec::new(),
             cache_baseline: false,
         };
@@ -670,17 +805,18 @@ mod tests {
     }
 
     #[test]
-    fn verification_inputs_include_defaults_declared_globs_and_repo_programs() {
+    fn verification_inputs_split_policy_from_the_test_tree() {
         let profile = VerificationProfile {
             commands: vec![
                 command(&["./scripts/check.sh"], 10),
                 command(&["make", "check"], 10),
             ],
             amont_checks: Vec::new(),
+            amont_waivers: Vec::new(),
             inputs: vec!["ci/**".into()],
             cache_baseline: false,
         };
-        let touched = verification_inputs_touched(
+        let touched = classify_verification_inputs(
             &profile,
             &[
                 "src/lib.rs".into(),
@@ -688,22 +824,39 @@ mod tests {
                 "crates/x/Cargo.toml".into(),
                 "tests/smoke.rs".into(),
                 "src/foo_test.go".into(),
+                "tests/test_parser.py".into(),
                 "scripts/check.sh".into(),
                 "ci/lint.yml".into(),
                 "docs/README.md".into(),
             ],
         );
         assert_eq!(
-            touched,
+            touched.policy,
             vec![
                 "Makefile",
                 "crates/x/Cargo.toml",
-                "tests/smoke.rs",
-                "src/foo_test.go",
                 "scripts/check.sh",
                 "ci/lint.yml",
-            ]
+            ],
+            "build manifests, the profile's declared inputs and the commands' own programs"
         );
+        assert_eq!(
+            touched.tests,
+            vec!["tests/smoke.rs", "src/foo_test.go", "tests/test_parser.py"],
+            "the test tree is work SPEC §10 invites, not a policy change"
+        );
+        assert_eq!(touched.all().len(), 7);
+        assert!(classify_verification_inputs(&profile, &["src/lib.rs".into()]).is_empty());
+    }
+
+    /// A path both classes could claim is judged by the stricter one:
+    /// a manifest inside the test tree still decides what gets built.
+    #[test]
+    fn a_manifest_in_the_test_tree_is_a_policy_change() {
+        let profile = VerificationProfile::default();
+        let touched = classify_verification_inputs(&profile, &["tests/fixtures/Cargo.toml".into()]);
+        assert_eq!(touched.policy, vec!["tests/fixtures/Cargo.toml"]);
+        assert!(touched.tests.is_empty());
     }
 
     #[test]
@@ -713,6 +866,7 @@ mod tests {
         let profile = VerificationProfile {
             commands: vec![command(&["make", "check"], 10)],
             amont_checks: Vec::new(),
+            amont_waivers: Vec::new(),
             inputs: Vec::new(),
             cache_baseline: true,
         };
@@ -775,6 +929,89 @@ mod tests {
         );
         assert!(gaps[0].contains("inert"), "{gaps:?}");
         assert!(gaps[1].contains("not in effective inventory"), "{gaps:?}");
+    }
+
+    #[test]
+    fn bypasses_and_downgrades_are_gaps_unless_the_profile_waives_them() {
+        let inventory = parse_amont_list(AMONT_SAMPLE).expect("envelope parses");
+        let gaps = amont_waiver_gaps(Some(&inventory), &[]);
+        assert_eq!(gaps.len(), 1, "one downgrade, no bypasses: {gaps:?}");
+        assert!(
+            gaps[0].starts_with("pre-push-cargo-test: downgraded"),
+            "{gaps:?}"
+        );
+        assert!(
+            amont_waiver_gaps(Some(&inventory), &["pre-push-cargo-test".to_string()]).is_empty(),
+            "an explicit policy waiver is the one thing that clears it"
+        );
+        // A bypass is a bare string in the envelope; its id is the
+        // string, not the quoted JSON.
+        let bypassed = parse_amont_list(
+            r#"{"format":"amont-list-v1","checks":[],"bypasses":["pre-commit-fmt"],"downgrades":[]}"#,
+        )
+        .expect("parses");
+        let gaps = amont_waiver_gaps(Some(&bypassed), &[]);
+        assert!(gaps[0].starts_with("pre-commit-fmt: bypassed"), "{gaps:?}");
+        assert!(amont_waiver_gaps(Some(&bypassed), &["pre-commit-fmt".to_string()]).is_empty());
+        assert!(
+            amont_waiver_gaps(None, &[]).is_empty(),
+            "no inventory is the missing-inventory gap's business, not this one"
+        );
+    }
+
+    #[test]
+    fn a_profile_naming_no_checks_requires_the_in_force_blocking_ones() {
+        let inventory = parse_amont_list(AMONT_SAMPLE).expect("envelope parses");
+        assert_eq!(
+            default_required_checks(&inventory),
+            vec!["pre-commit-lint-shell".to_string()],
+            "the inert `block` check is not required into existence; it is simply not in force"
+        );
+        // …and requiring it is what turns an inert check into a gap.
+        assert!(
+            !amont_gaps(Some(&inventory), &default_required_checks(&inventory))
+                .iter()
+                .any(|gap| gap.contains("pre-commit-lint-shell"))
+        );
+    }
+
+    #[test]
+    fn a_verification_worktree_releases_itself_when_its_checks_are_done() {
+        let dir = std::env::temp_dir().join(format!("relais-vwt-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        let no_hooks = dir.join("no-hooks");
+        std::fs::create_dir_all(&no_hooks).expect("mkdir");
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "core.hooksPath", &no_hooks.to_string_lossy()]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "base\n").expect("write");
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        let path = dir.join("verify/verify-1");
+        {
+            let holder = verification_worktree(&repo, &head, &path).expect("worktree");
+            assert!(holder.path().join("f.txt").is_file());
+            assert!(git(&["worktree", "list"]).contains("verify-1"));
+        }
+        assert!(
+            !git(&["worktree", "list"]).contains("verify-1"),
+            "the throwaway worktree is gone, administrative entry included"
+        );
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

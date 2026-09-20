@@ -59,6 +59,28 @@ impl From<std::io::Error> for WorkspaceError {
 
 type Result<T> = std::result::Result<T, WorkspaceError>;
 
+/// Every git process relais spawns, with the ambient repository
+/// environment removed. `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,
+/// `GIT_OBJECT_DIRECTORY` and `GIT_ALTERNATE_OBJECT_DIRECTORIES` override
+/// `current_dir`: inherited from a hook, a rebase or a parent `git` they
+/// silently point the snapshot, the scope check or the worktree at
+/// another repository's objects — the run would then verify one tree and
+/// record another. Relais always means the directory it names.
+pub fn git_command(dir: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.current_dir(dir);
+    for variable in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ] {
+        command.env_remove(variable);
+    }
+    command
+}
+
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     git_raw(dir, args).map(|output| output.trim().to_string())
 }
@@ -66,9 +88,8 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 /// Like `git`, but without trimming: `status --porcelain` encodes the
 /// status in leading bytes that a whole-output trim would eat.
 fn git_raw(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+    let output = git_command(dir)
         .args(args)
-        .current_dir(dir)
         .output()
         .map_err(|e| WorkspaceError::Git(format!("git could not be launched: {e}")))?;
     if output.status.success() {
@@ -114,6 +135,11 @@ pub fn create_worktree(
     base_sha: &str,
     worktree_path: &Path,
 ) -> Result<TaskWorktree> {
+    // The worktree root lives outside the run's artifact directory
+    // (SPEC §8, audit B6), so its parent is ours to create.
+    if let Some(parent) = worktree_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     git(
         repo_dir,
         &[
@@ -158,7 +184,7 @@ impl TaskWorktree {
     pub fn snapshot_candidate(&self, _label: &str) -> Result<String> {
         git(&self.path, &["add", "-A"])?;
         let tree = git(&self.path, &["write-tree"])?;
-        let commit = Command::new("git")
+        let commit = git_command(&self.path)
             .args([
                 "commit-tree",
                 &tree,
@@ -173,7 +199,6 @@ impl TaskWorktree {
             .env("GIT_COMMITTER_NAME", "relais")
             .env("GIT_COMMITTER_EMAIL", "relais@localhost")
             .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")
-            .current_dir(&self.path)
             .output()
             .map_err(|e| WorkspaceError::Git(format!("commit-tree: {e}")))?;
         if !commit.status.success() {
@@ -346,6 +371,49 @@ pub fn release_worktree(repo_dir: &Path, worktree_path: &Path, exported: bool) -
         ],
     )?;
     Ok(())
+}
+
+/// The ref name a run's attempt candidate is kept under.
+pub fn candidate_ref(run_id: &str, attempt: u32) -> String {
+    format!("refs/relais/candidates/{run_id}/{attempt}")
+}
+
+/// Point a ref at a candidate commit. `commit-tree` produces an object
+/// nothing references: it survives only until the next `git gc`, which
+/// would take the receipt's `candidate_sha`, the retained worktree's
+/// history and the patch's base with it. A ref under
+/// `refs/relais/candidates/` is outside `refs/heads`, so it shows up in
+/// no branch listing, is not pushed by a default refspec, and keeps the
+/// object reachable for exactly as long as relais says it should be.
+pub fn name_candidate(repo_dir: &Path, run_id: &str, attempt: u32, sha: &str) -> Result<String> {
+    let name = candidate_ref(run_id, attempt);
+    git(repo_dir, &["update-ref", &name, sha])?;
+    Ok(name)
+}
+
+/// Drop every candidate ref of one run, releasing its commits to the
+/// next `git gc`. Nothing calls this yet: a candidate outlives its run on
+/// purpose (SPEC §8 — the patch and the base revision stay integrable
+/// afterwards), and deciding WHEN a run's evidence stops being wanted is
+/// a retention policy, not a runner step. It is the one operation a
+/// future `relais gc` needs, and it is here so the ref namespace has an
+/// owner rather than growing without one.
+pub fn forget_run_refs(repo_dir: &Path, run_id: &str) -> Result<Vec<String>> {
+    let prefix = format!("refs/relais/candidates/{run_id}/");
+    let listed = git(
+        repo_dir,
+        &["for-each-ref", "--format=%(refname)", &format!("{prefix}*")],
+    )?;
+    let names: Vec<String> = listed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    for name in &names {
+        git(repo_dir, &["update-ref", "-d", name])?;
+    }
+    Ok(names)
 }
 
 pub fn sha256_file(path: &Path) -> Result<String> {
@@ -567,6 +635,73 @@ mod tests {
             "{err}"
         );
         release_worktree(&repo, &wt_path, true).expect("released");
+    }
+
+    #[test]
+    fn a_named_candidate_survives_gc_and_forget_releases_it() {
+        let (_dir, repo) = temp_repo();
+        let sha = resolve_base(&repo, "HEAD").expect("base");
+        let wt_path = repo.parent().unwrap().join("wt-ref");
+        let wt = create_worktree(&repo, &sha, &wt_path).expect("worktree");
+        std::fs::write(wt_path.join("src/main.rs"), "fn main() { kept }\n").expect("edit");
+        let candidate = wt.snapshot_candidate("attempt-1").expect("snapshot");
+        let name = name_candidate(&repo, "run-42", 1, &candidate).expect("ref");
+        assert_eq!(name, "refs/relais/candidates/run-42/1");
+        assert_eq!(
+            git(&repo, &["rev-parse", &name]).expect("resolves"),
+            candidate
+        );
+        // A named candidate is not a branch: it is invisible to branch
+        // listings and to a default push refspec.
+        let branches = git(&repo, &["branch", "--list"]).expect("branches");
+        assert!(!branches.contains("run-42"), "{branches}");
+        // Pruning everything unreachable leaves the candidate alone.
+        release_worktree(&repo, &wt_path, true).expect("released");
+        git(&repo, &["gc", "--prune=now", "-q"]).expect("gc");
+        assert_eq!(
+            git(&repo, &["rev-parse", &name]).expect("still there"),
+            candidate
+        );
+        assert_eq!(
+            forget_run_refs(&repo, "run-42").expect("forget"),
+            vec![name.clone()]
+        );
+        assert!(
+            git(&repo, &["rev-parse", "--verify", &name]).is_err(),
+            "the ref is gone"
+        );
+        assert!(
+            forget_run_refs(&repo, "run-42")
+                .expect("forget again")
+                .is_empty(),
+            "forgetting twice is not an error"
+        );
+    }
+
+    #[test]
+    fn an_ambient_git_environment_cannot_redirect_a_git_call() {
+        let (_dir, repo) = temp_repo();
+        // A hook, a rebase or a parent `git` exports these; they beat
+        // `current_dir`, so an unsanitised child would read the wrong
+        // repository. `git_command` removes them.
+        let command = git_command(&repo);
+        let removed: Vec<&std::ffi::OsStr> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key)
+            .collect();
+        for variable in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        ] {
+            assert!(
+                removed.contains(&std::ffi::OsStr::new(variable)),
+                "{variable} is cleared"
+            );
+        }
     }
 
     #[test]

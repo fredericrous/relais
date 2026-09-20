@@ -195,6 +195,12 @@ timeout_seconds = 30
         self.state.join("runs").join(run_id)
     }
 
+    /// The run's task worktree — a SIBLING of the artifact directory, so
+    /// that nothing the run records is the worker's cwd parent.
+    fn worktree(&self, run_id: &str) -> PathBuf {
+        self.state.join("worktrees").join(run_id).join("task")
+    }
+
     /// The single run this world has made. Outcomes other than
     /// `accepted` print no run-id line on stdout, and the directory is
     /// the same identity the ledger uses.
@@ -304,7 +310,10 @@ fi
 if printf '%s' "$prompt" | grep -q "late-write-please"; then
   # stdout is redirected away so the pipe closes when this script exits:
   # otherwise the runner would still be reading it when the write lands.
-  ( sleep 2; echo late > src/late.txt ) >/dev/null 2>&1 &
+  # The marker is written OUTSIDE the worktree and after the attempted
+  # write, so the scenario can prove the background write really ran
+  # even when the accepted run has already released the worktree.
+  ( sleep 2; echo late > src/late.txt; echo done > "$here/late-write.log" ) >/dev/null 2>&1 &
   rm -f src/main.rs
   printf '{"result":"DONE","session_id":"w-l","total_cost_usd":0.01,"modelUsage":{"%s":{"outputTokens":10}},"permission_denials":[],"usage":{"input_tokens":100,"output_tokens":10}}\n' "$model"
   exit 0
@@ -974,12 +983,21 @@ fn files_written_after_the_result_are_not_in_the_candidate() {
     let candidate = receipt["candidate_sha"].as_str().expect("candidate");
 
     // The background write really happened — otherwise the assertions
-    // below would hold for the wrong reason.
-    let late = world.run_dir(&run_id).join("worktree").join("src/late.txt");
+    // below would hold for the wrong reason. The marker is outside the
+    // worktree on purpose: an accepted run releases its task worktree
+    // once the tree still equals the exported candidate, so where the
+    // late write lands is not knowable, and whether it lands at all is
+    // not what this scenario is about.
+    let marker = world.root.join("late-write.log");
     assert!(
-        World::wait_for(&late, 10),
-        "the worker's background write never landed in {}",
-        late.display()
+        World::wait_for(&marker, 10),
+        "the worker's background write never ran ({})",
+        marker.display()
+    );
+    let late = world.worktree(&run_id).join("src/late.txt");
+    assert!(
+        !world.worktree(&run_id).exists() || late.exists(),
+        "a surviving worktree holds the late write; a released one holds nothing"
     );
 
     let tree = git(&world.repo, &["ls-tree", "-r", "--name-only", candidate]);

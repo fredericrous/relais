@@ -131,6 +131,36 @@ pub struct RunConfig<'a> {
 /// Poll period while queued for admission.
 const ADMISSION_POLL: Duration = Duration::from_millis(250);
 
+/// Where a run's git worktrees live: a SIBLING of the artifact
+/// directory, never inside it (audit B6).
+///
+/// The worker's cwd is its task worktree, and it has Bash. With the
+/// worktree under `runs/<id>/worktree`, everything the run records —
+/// `receipt.json`, the candidate patches, the check logs — sat exactly
+/// one `../` away, and `relais run` printed that receipt path as the
+/// run's answer. A worker could therefore write the document the user is
+/// told to read. Moving the worktrees out puts the record where no
+/// relative path from the worker's tree names it by construction; the
+/// ledger copy of the receipt was always honest, and now the file is
+/// too. Both roots stay under the state directory, so nothing escapes
+/// `RELAIS_STATE_DIR`.
+pub fn worktree_root(artifacts_dir: &Path) -> PathBuf {
+    state_sibling(artifacts_dir, "worktrees")
+}
+
+/// Where a run's throwaway verification worktrees live. Separate from
+/// the task worktree's parent as well as from the artifacts: a straggling
+/// descendant of the worker must not be able to reach the immutable copy
+/// being verified through a relative path either (SPEC §10: no concurrent
+/// worker may modify the verified candidate).
+pub fn verify_root(artifacts_dir: &Path) -> PathBuf {
+    state_sibling(artifacts_dir, "verify")
+}
+
+fn state_sibling(artifacts_dir: &Path, name: &str) -> PathBuf {
+    artifacts_dir.parent().unwrap_or(artifacts_dir).join(name)
+}
+
 /// The supervised execution path (SPEC §3): preflight, route, then a
 /// bounded sequence of attempts the runner — not a model — owns.
 pub fn execute(config: &RunConfig<'_>) -> RunOutcome {
@@ -169,6 +199,13 @@ pub(crate) struct RunEngine<'a> {
     pub(crate) config: &'a RunConfig<'a>,
     pub(crate) run_id: String,
     pub(crate) artifacts: PathBuf,
+    /// This run's worktrees, outside the artifact directory (B6): the
+    /// task worktree the worker gets, or the scheduler's integration
+    /// worktree — never both, since a decomposed run has no task
+    /// worktree of its own.
+    pub(crate) worktrees: PathBuf,
+    /// This run's throwaway verification worktrees.
+    pub(crate) verify_dir: PathBuf,
     pub(crate) state: State,
     parent: Option<(String, String)>,
     /// `<backend> <version>` as probed at run start; unknown = `None`.
@@ -190,10 +227,14 @@ impl<'a> RunEngine<'a> {
     fn new(config: &'a RunConfig<'a>, parent: Option<(String, String)>) -> Self {
         let run_id = RunId::generate();
         let artifacts = config.artifacts_dir.join(run_id.as_str());
+        let worktrees = worktree_root(&config.artifacts_dir).join(run_id.as_str());
+        let verify_dir = verify_root(&config.artifacts_dir).join(run_id.as_str());
         Self {
             config,
             run_id: run_id.to_string(),
             artifacts,
+            worktrees,
+            verify_dir,
             state: State::Prepared,
             parent,
             harness: None,
@@ -513,14 +554,29 @@ impl<'a> RunEngine<'a> {
             )?,
         }
 
-        // Preflight: dirty base is explicit, never copied (SPEC §8).
-        if let Ok(dirty) = workspace::dirty_paths(self.config.repo_dir) {
-            if !dirty.is_empty() {
+        // Preflight: dirty base is explicit, never copied (SPEC §8). A
+        // status check that cannot RUN is not a clean tree: it is no
+        // answer at all, and proceeding would be the silent copy §8
+        // forbids, performed on an unknown tree (audit B11). The refusal
+        // is the same one a dirty tree gets, with the reason the check
+        // gave.
+        match workspace::dirty_paths(self.config.repo_dir) {
+            Ok(dirty) if dirty.is_empty() => {}
+            Ok(dirty) => {
                 return self.fail_preflight(
                     BlockCode::DirtyBase,
                     format!(
                         "working tree has uncommitted changes ({}); commit or stash first",
                         dirty.join(", ")
+                    ),
+                );
+            }
+            Err(e) => {
+                return self.fail_preflight(
+                    BlockCode::DirtyBase,
+                    format!(
+                        "the working tree's status could not be read ({e}); relais cannot show \
+                         that the base is clean and will not run against a tree it cannot see"
                     ),
                 );
             }
@@ -722,7 +778,7 @@ impl<'a> RunEngine<'a> {
             None => match verify::verification_worktree(
                 self.config.repo_dir,
                 &base_sha,
-                &self.artifacts.join("verify-base"),
+                &self.verify_dir.join("verify-base"),
             ) {
                 Ok(baseline) => {
                     let checks = verify::run_profile(
@@ -785,7 +841,7 @@ impl<'a> RunEngine<'a> {
         // One owned worktree for the whole run: repairs continue from a
         // candidate whose scope and integrity passed; a scope violation
         // stops everything (SPEC §8, §9).
-        let worktree_path = self.artifacts.join("worktree");
+        let worktree_path = self.worktrees.join("task");
         let worktree =
             match workspace::create_worktree(self.config.repo_dir, &base_sha, &worktree_path) {
                 Ok(worktree) => worktree,
@@ -1070,6 +1126,22 @@ impl<'a> RunEngine<'a> {
                     return self.fail_preflight(BlockCode::SnapshotFailed, e.to_string());
                 }
             };
+            // `commit-tree` leaves a dangling object: the candidate the
+            // receipt names, the patch's other side and the worktree's
+            // history would all go in the next `git gc`. A ref under
+            // `refs/relais/candidates/` keeps it reachable without
+            // putting a branch in the user's namespace (audit B15).
+            // A ref that could not be written is not fatal — the object
+            // exists and this run can verify it — but the worktree is
+            // then the only thing keeping it alive, so it is not
+            // released below.
+            let candidate_ref = workspace::name_candidate(
+                self.config.repo_dir,
+                &self.run_id,
+                attempt_index,
+                &candidate_sha,
+            )
+            .ok();
             ledger.finish_attempt(
                 attempt_id,
                 State::Verifying,
@@ -1113,14 +1185,47 @@ impl<'a> RunEngine<'a> {
                 }
             }
 
-            // A candidate that changes what verification IS — build
-            // manifests, the test tree, the commands — gets explicit
-            // review whatever the route said (SPEC §10: never silently
-            // weakened).
-            let verification_inputs_changed = verify::verification_inputs_touched(
+            // A candidate that changes what verification IS gets neither
+            // a silent pass nor one uniform answer (SPEC §9, §10).
+            // Editing the profile's own inputs — build manifests,
+            // lockfiles, the commands' programs — is "changes protected
+            // verification": §9's table sends that to the user as
+            // `needs_decision`, because no reviewer can decide on the
+            // user's behalf that a loosened build is what was wanted.
+            // Editing the TEST TREE is work §10 explicitly invites, so
+            // it stays what it was: explicit review, whatever the route
+            // said (audit B8).
+            let touched_inputs = verify::classify_verification_inputs(
                 &authority.verification_profile,
                 &worktree.changed_paths_in(&candidate_sha)?,
             );
+            if !touched_inputs.policy.is_empty() {
+                let detail = format!(
+                    "the candidate changes what verification is: {}; these are the profile's own \
+                     inputs, so passing its checks would not mean what the policy says it means. \
+                     This is yours to decide, not a reviewer's — the candidate and its patch are \
+                     preserved",
+                    touched_inputs.policy.join(", ")
+                );
+                ledger.finish_attempt(
+                    attempt_id,
+                    State::NeedsDecision,
+                    Some(worktree_path.to_string_lossy().as_ref()),
+                    Some(&candidate_sha),
+                )?;
+                return self.finish(
+                    Reason::VerificationInputsChanged,
+                    serde_json::json!({
+                        "paths": touched_inputs.policy,
+                        "candidate": candidate_sha,
+                    }),
+                    Terminal::NeedsDecision {
+                        reason: Reason::VerificationInputsChanged,
+                        detail,
+                    },
+                );
+            }
+            let verification_inputs_changed = touched_inputs.tests;
             let review_required =
                 decision.review >= Review::Required || !verification_inputs_changed.is_empty();
             if !verification_inputs_changed.is_empty() && decision.review < Review::Required {
@@ -1260,6 +1365,7 @@ impl<'a> RunEngine<'a> {
                     &manifest,
                     &authority,
                     &candidate_sha,
+                    tier,
                     &verification_inputs_changed,
                     &mut progress.total_cost,
                     &mut progress.cost_completeness,
@@ -1318,6 +1424,16 @@ impl<'a> RunEngine<'a> {
                 Some(&worktree_path),
                 &candidate_sha,
             )?;
+            // The patch is exported and the candidate is named: what the
+            // user integrates no longer depends on this directory —
+            // unless something wrote to it since, which the release
+            // check is what notices.
+            self.release_task_worktree(
+                &worktree,
+                &candidate_sha,
+                &patch_path,
+                candidate_ref.as_deref(),
+            );
             return Ok(RunOutcome {
                 run_id: self.run_id.clone(),
                 terminal: Terminal::Accepted(Box::new(receipt)),
@@ -1371,6 +1487,92 @@ impl<'a> RunEngine<'a> {
             ))
         })?;
         Ok(ledger.spend_since(&day_start)?)
+    }
+
+    /// Where a reviewer reads the candidate from: the run's own task
+    /// worktree, the assembled integration worktree when the run was
+    /// decomposed, and the repository itself when neither exists (a
+    /// reviewer with a working directory that is not there cannot even
+    /// be launched).
+    pub(crate) fn review_dir(&self) -> PathBuf {
+        for candidate in [
+            self.worktrees.join("task"),
+            self.worktrees.join("integration"),
+        ] {
+            if candidate.is_dir() {
+                return candidate;
+            }
+        }
+        self.config.repo_dir.to_path_buf()
+    }
+
+    /// Release an ACCEPTED run's task worktree.
+    ///
+    /// SPEC §8's "retained worktree" is what a run that did not accept
+    /// leaves behind: the unfinished work lives there and nowhere else.
+    /// An accepted run's content lives in two durable places already —
+    /// the exported patch and the named candidate commit — so keeping
+    /// its worktree only grows `git worktree list` by one entry per
+    /// accepted run (audit B15).
+    ///
+    /// Released only when all three hold: the patch exists, the ref
+    /// names the candidate, and the tree STILL holds exactly that
+    /// candidate. The last one is §8's other half — "never force-cleans
+    /// a worktree containing unexported changes" — and it is not
+    /// theoretical: a descendant that outlived the worker's result
+    /// writes into this directory after the snapshot, and that content
+    /// is in no patch. Anything unaccounted for keeps the worktree, on
+    /// the record. A failure here never touches the outcome; the
+    /// receipt is already written.
+    pub(crate) fn release_task_worktree(
+        &self,
+        worktree: &TaskWorktree,
+        candidate_sha: &str,
+        patch_path: &Path,
+        candidate_ref: Option<&str>,
+    ) {
+        if candidate_ref.is_none() || !patch_path.is_file() {
+            return;
+        }
+        let keep = |detail: serde_json::Value| {
+            let _ = self.config.ledger.record_transition(&Transition {
+                run_id: self.run_id.clone(),
+                attempt_id: None,
+                from_state: Some(State::Accepted),
+                to_state: State::Accepted,
+                reason: Reason::WorktreeNotReleased.as_str().to_string(),
+                detail: Some(detail),
+                at: self.config.ledger.now(),
+            });
+        };
+        // Re-snapshotting is the comparison: the candidate identity is a
+        // pure function of the tree, so an equal SHA means every byte is
+        // in the patch and the ref.
+        match worktree.snapshot_candidate("release check") {
+            Ok(now) if now == candidate_sha => {}
+            Ok(now) => {
+                return keep(serde_json::json!({
+                    "worktree": worktree.path.to_string_lossy(),
+                    "accepted_candidate": candidate_sha,
+                    "tree_now": now,
+                    "detail": "the tree changed after the accepted candidate was snapshotted; \
+                               the worktree is kept, because those changes are in no patch",
+                }));
+            }
+            Err(e) => {
+                return keep(serde_json::json!({
+                    "worktree": worktree.path.to_string_lossy(),
+                    "error": e.to_string(),
+                    "detail": "the tree could not be compared to the accepted candidate",
+                }));
+            }
+        }
+        if let Err(e) = workspace::release_worktree(self.config.repo_dir, &worktree.path, true) {
+            keep(serde_json::json!({
+                "worktree": worktree.path.to_string_lossy(),
+                "error": e.to_string(),
+            }));
+        }
     }
 
     /// Store a receipt in the ledger and next to the run, with its
@@ -1431,7 +1633,7 @@ impl<'a> RunEngine<'a> {
             // its outcomes, by identity.
             Some(outcomes) => outcomes.to_vec(),
             None => {
-                let verify_path = self.artifacts.join(format!("verify-{attempt_index}"));
+                let verify_path = self.verify_dir.join(format!("verify-{attempt_index}"));
                 let holder = verify::verification_worktree(
                     self.config.repo_dir,
                     candidate_sha,
@@ -1472,12 +1674,31 @@ impl<'a> RunEngine<'a> {
         } else {
             None
         };
-        let required = &authority.verification_profile.amont_checks;
-        let gaps = if required.is_empty() {
+        // A profile that names no checks is not a profile that depends
+        // on none: what it depends on is whatever amont is enforcing,
+        // so the in-force blocking checks are the default required set
+        // (audit B10).
+        let required = if authority.verification_profile.amont_checks.is_empty() {
+            inventory
+                .as_ref()
+                .map(verify::default_required_checks)
+                .unwrap_or_default()
+        } else {
+            authority.verification_profile.amont_checks.clone()
+        };
+        let mut gaps = if required.is_empty() {
             Vec::new()
         } else {
-            amont_gaps(inventory.as_ref(), required)
+            amont_gaps(inventory.as_ref(), &required)
         };
+        // A bypass or a downgrade is amont saying a check cannot fail.
+        // That is a gap on this candidate unless policy waived it
+        // ahead of the run — acceptance must not depend on a check that
+        // was not enforcing (SPEC §10, audit B10).
+        gaps.extend(verify::amont_waiver_gaps(
+            inventory.as_ref(),
+            &authority.verification_profile.amont_waivers,
+        ));
         Ok(verify::Verified {
             checks,
             gaps,
@@ -1503,15 +1724,15 @@ impl<'a> RunEngine<'a> {
         manifest: &ContextManifest,
         authority: &EffectiveAuthority,
         candidate_sha: &str,
+        candidate_tier: Tier,
         verification_inputs_changed: &[String],
         total_cost: &mut MicroUsd,
         cost_completeness: &mut CostCompleteness,
         deadline: Instant,
     ) -> ReviewOutcome {
-        let reviewer_tier = Tier::Escalation;
-        let Some(profile) = authority.models.get(&reviewer_tier).cloned() else {
+        let Some((reviewer_tier, same_tier)) = reviewer_tier(authority, candidate_tier) else {
             return ReviewOutcome::Unavailable(
-                "no reviewer model configured at the escalation tier".into(),
+                "no reviewer model is configured at any tier".into(),
             );
         };
         // The review is a dispatch and costs money like any other. It is
@@ -1523,6 +1744,34 @@ impl<'a> RunEngine<'a> {
         // (SPEC §11: stop admitting work once the ceiling is reached).
         if let Some(exhausted) = self.review_spend_blocked(*total_cost) {
             return ReviewOutcome::Unavailable(exhausted);
+        }
+        let Some(profile) = authority.models.get(&reviewer_tier).cloned() else {
+            return ReviewOutcome::Unavailable(format!(
+                "no reviewer model configured at the {} tier",
+                reviewer_tier.as_str()
+            ));
+        };
+        // "A separate reviewer" (SPEC §10) is separate in fact, not just
+        // in dispatch: on an escalated run the escalation model wrote
+        // the candidate, and asking it for findings asks it about its
+        // own work. When policy leaves no other tier, the review still
+        // happens — a second opinion from the same model is worth more
+        // than none — but the run records that it was not independent
+        // (audit B14).
+        if same_tier {
+            if let Err(e) = self.transition(
+                State::Verifying,
+                Reason::ReviewerSameTier,
+                serde_json::json!({
+                    "reviewer_same_tier": true,
+                    "tier": reviewer_tier.as_str(),
+                    "candidate": candidate_sha,
+                }),
+            ) {
+                return ReviewOutcome::Unavailable(format!(
+                    "the ledger refused the reviewer-tier record: {e}"
+                ));
+            }
         }
         let patch_path = self.artifacts.join("candidate-latest.patch");
         let mut prompt = String::from(
@@ -1544,9 +1793,10 @@ impl<'a> RunEngine<'a> {
         }
         if !verification_inputs_changed.is_empty() {
             prompt.push_str(
-                "this candidate CHANGES VERIFICATION INPUTS (build manifests, tests, fixtures or \
-                 the checks themselves). Judge whether each change weakens what the acceptance \
-                 criteria verify; a deleted or loosened test is a finding.\n",
+                "this candidate CHANGES THE TEST TREE (tests or fixtures the checks execute). \
+                 Adding regression tests is expected work; judge whether each change weakens \
+                 what the acceptance criteria verify — a deleted, skipped or loosened test is a \
+                 finding.\n",
             );
             // Paths come out of the candidate's diff: worker-chosen text,
             // quoted like every other piece the runner did not write.
@@ -1560,10 +1810,8 @@ impl<'a> RunEngine<'a> {
             "candidate patch (read it): {}\n",
             patch_path.display()
         ));
-        prompt.push_str(&format!(
-            "source to inspect: {}\n",
-            self.artifacts.join("worktree").display()
-        ));
+        let review_dir = self.review_dir();
+        prompt.push_str(&format!("source to inspect: {}\n", review_dir.display()));
 
         let dispatch_id = DispatchId::generate();
         let remaining_budget = self
@@ -1582,7 +1830,7 @@ impl<'a> RunEngine<'a> {
             disallowed_tools: authority.disallowed_tools.clone(),
             // The reviewer reports; it gets no allowlist.
             allowed_tools: Vec::new(),
-            work_dir: self.artifacts.join("worktree"),
+            work_dir: review_dir,
             wall_timeout: deadline
                 .saturating_duration_since(Instant::now())
                 .max(Duration::from_secs(1)),
@@ -1804,6 +2052,33 @@ pub(crate) fn utc_day_start(now_rfc3339: &str) -> Option<String> {
     )
 }
 
+/// Which tier reviews a candidate written at `candidate_tier`, and
+/// whether that is the candidate's own tier.
+///
+/// The strongest OTHER configured tier, so a review is a second opinion
+/// rather than a model re-reading itself (SPEC §10: "a separate
+/// reviewer"). Only when policy configures no other tier at all does the
+/// candidate's own tier review — the caller records that the review was
+/// not independent (audit B14).
+pub(crate) fn reviewer_tier(
+    authority: &EffectiveAuthority,
+    candidate_tier: Tier,
+) -> Option<(Tier, bool)> {
+    authority
+        .models
+        .keys()
+        .copied()
+        .filter(|tier| *tier != candidate_tier)
+        .max()
+        .map(|tier| (tier, false))
+        .or_else(|| {
+            authority
+                .models
+                .contains_key(&candidate_tier)
+                .then_some((candidate_tier, true))
+        })
+}
+
 fn build_prompt(
     contract: &TaskContract,
     manifest: &ContextManifest,
@@ -1941,6 +2216,16 @@ mod tests {
             }
         }
 
+        /// The run's task worktree — a sibling of the artifact tree, not
+        /// a child of it (audit B6).
+        fn worktree(&self, run_id: &str) -> PathBuf {
+            worktree_root(&self.artifacts).join(run_id).join("task")
+        }
+
+        fn verify_dir(&self, run_id: &str) -> PathBuf {
+            verify_root(&self.artifacts).join(run_id)
+        }
+
         fn contract(&self, review: Review) -> TaskContract {
             TaskContract::from_json_str(
                 &serde_json::json!({
@@ -2016,6 +2301,7 @@ mod tests {
                         VerificationProfile {
                             commands,
                             amont_checks: Vec::new(),
+                            amont_waivers: Vec::new(),
                             inputs: Vec::new(),
                             cache_baseline: false,
                         },
@@ -2274,12 +2560,84 @@ mod tests {
             .expect("receipt")
             .expect("present");
         assert_eq!(stored["outcome"], "accepted");
-        let worktree = fixture.artifacts.join(&run_id).join("worktree");
+        // The accepted candidate lives in the patch and in its named
+        // ref, so the worktree is released rather than left to
+        // accumulate (audit B15); the patch still applies to the base.
         assert!(
-            !worktree.join("src/main.rs").exists(),
-            "the candidate is the accepted state"
+            !fixture.worktree(&run_id).exists(),
+            "released on acceptance"
         );
-        assert!(worktree.is_dir(), "the worktree is retained");
+        let run_dir = fixture.artifacts.join(&run_id);
+        let patch = run_dir.join("candidate-1.patch");
+        assert!(patch.is_file());
+        let named = git(
+            &fixture.repo,
+            &[
+                "rev-parse",
+                &workspace::candidate_ref(&run_id, receipt.attempts),
+            ],
+        );
+        assert_eq!(
+            named.trim(),
+            receipt.candidate_sha,
+            "the candidate is named"
+        );
+        let worktrees = git(&fixture.repo, &["worktree", "list"]);
+        assert!(
+            !worktrees.contains(&run_id),
+            "no worktree entry survives an accepted run: {worktrees}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// The run's record is not reachable from the worker's tree by a
+    /// relative path: `receipt.json` used to be the PARENT of the
+    /// worker's cwd, and `relais run` prints that path as the receipt
+    /// (audit B6).
+    #[test]
+    fn the_run_record_is_not_a_parent_of_the_workers_directory() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<PathBuf>::new()));
+        let record = Arc::clone(&seen);
+        let backend = MockBackend::new(move |spec| {
+            record.lock().unwrap().push(spec.work_dir.clone());
+            // What a worker with Bash did before B6: write the document
+            // the user is told to read, one `../` from its own cwd.
+            let mut climb = spec.work_dir.clone();
+            for _ in 0..2 {
+                let Some(parent) = climb.parent().map(Path::to_path_buf) else {
+                    break;
+                };
+                std::fs::write(parent.join("receipt.json"), "{\"outcome\":\"accepted\"}").ok();
+                climb = parent;
+            }
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Optional), &repo, &backend);
+        let run_id = outcome.run_id().to_string();
+        assert!(
+            matches!(outcome.terminal, Terminal::Accepted(_)),
+            "{outcome:?}"
+        );
+        let work_dir = seen.lock().unwrap()[0].clone();
+        assert!(
+            !work_dir.starts_with(fixture.artifacts.join(&run_id)),
+            "the worktree is outside the run's artifacts: {}",
+            work_dir.display()
+        );
+        let receipt = std::fs::read_to_string(fixture.artifacts.join(&run_id).join("receipt.json"))
+            .expect("the run wrote its receipt");
+        assert!(
+            receipt.contains("\"run_id\""),
+            "the printed receipt is the runner's, not the worker's: {receipt}"
+        );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
@@ -2447,10 +2805,9 @@ mod tests {
         else {
             panic!("expected interrupted, got {outcome:?}");
         };
-        let worktree = fixture.artifacts.join(&run_id).join("worktree");
         assert!(
-            worktree.is_dir(),
-            "changes are preserved for reconciliation"
+            fixture.worktree(&run_id).is_dir(),
+            "a run that did not accept keeps SPEC §8's retained worktree"
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
@@ -2522,6 +2879,229 @@ mod tests {
         };
         assert_eq!(code, BlockCode::DirtyBase);
         assert!(detail.contains("commit or stash"), "{detail}");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A status check that cannot run is not a clean tree. The guard
+    /// used to be `if let Ok(dirty)`, so a repository git refuses to
+    /// answer about went straight to dispatch (audit B11).
+    #[test]
+    fn an_unreadable_working_tree_blocks_like_a_dirty_one() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let machine = fixture.machine_for(&repo);
+        let contract = fixture.contract(Review::Optional);
+        let backend = MockBackend::new(|_| panic!("no dispatch may happen"));
+        let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
+            adr: "ADR-0001".into(),
+            choice: None,
+            reason: None,
+        };
+        // A directory that is not a git repository at all: `git status`
+        // exits non-zero and says why.
+        let not_a_repo = fixture.dir.join("not-a-repo");
+        std::fs::create_dir_all(&not_a_repo).expect("mkdir");
+        let outcome = execute(&RunConfig {
+            repo_dir: &not_a_repo,
+            contract: &contract,
+            repo_policy: &repo,
+            machine: &machine,
+            ledger: &fixture.ledger,
+            backend: &backend,
+            artifacts_dir: fixture.artifacts.clone(),
+            aval_resolver: &resolver,
+            predictor: None,
+            gate: None,
+            session_id: "test-session".into(),
+            heartbeat_every: Duration::from_millis(50),
+        });
+        let RunOutcome {
+            terminal: Terminal::Blocked { code, detail },
+            ..
+        } = outcome
+        else {
+            panic!("expected blocked, got {outcome:?}");
+        };
+        assert_eq!(code, BlockCode::DirtyBase);
+        assert!(
+            detail.contains("could not be read"),
+            "the refusal says the check failed, not that the tree was dirty: {detail}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// SPEC §9: "diff exceeds contract or changes protected
+    /// verification → needs_decision". A candidate that edits the build
+    /// manifest changes what the checks it passed even mean, and no
+    /// model review can settle that for the user (audit B8).
+    #[test]
+    fn editing_the_profiles_own_inputs_is_the_users_decision_not_a_reviewers() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&launches);
+        let backend = MockBackend::new(move |spec| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                !spec.prompt.contains("semantic reviewer"),
+                "a verification-policy change never reaches a reviewer"
+            );
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            std::fs::write(
+                spec.work_dir.join("Cargo.toml"),
+                "[package]\nname = \"x\"\n",
+            )
+            .expect("manifest");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        });
+        let mut contract = fixture.contract_with_scope(&["src/**", "Cargo.toml"]);
+        contract.review = Review::Required;
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        let run_id = outcome.run_id().to_string();
+        let RunOutcome {
+            terminal:
+                Terminal::NeedsDecision {
+                    reason: why,
+                    detail,
+                },
+            ..
+        } = outcome
+        else {
+            panic!("expected needs_decision, got {outcome:?}");
+        };
+        assert_eq!(why, Reason::VerificationInputsChanged);
+        assert!(detail.contains("Cargo.toml"), "{detail}");
+        assert_eq!(launches.load(Ordering::SeqCst), 1, "no reviewer was bought");
+        assert!(
+            fixture
+                .artifacts
+                .join(&run_id)
+                .join("candidate-1.patch")
+                .is_file(),
+            "the candidate is preserved for the decision"
+        );
+        assert!(
+            fixture.worktree(&run_id).is_dir(),
+            "and so is its worktree: this run did not accept"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// The reviewer is the strongest tier that did NOT write the
+    /// candidate: on an escalated run the old code asked the author
+    /// about its own work (audit B14).
+    #[test]
+    fn the_reviewer_is_not_the_tier_that_wrote_the_candidate() {
+        let fixture = Fixture::new();
+        let mut repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        // A risk floor puts the whole run on the escalation tier.
+        repo.risk.push(RiskRule {
+            paths: vec!["src/**".into()],
+            minimum_tier: Tier::Escalation,
+            review: Some(Review::Required),
+        });
+        let reviewers = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&reviewers);
+        let backend = MockBackend::new(move |spec| {
+            if spec.prompt.contains("semantic reviewer") {
+                seen.lock().unwrap().push(spec.model.clone());
+                return MockOutcome {
+                    result_text: Some("FINDINGS: none".into()),
+                    exit_code: Some(0),
+                    ..Default::default()
+                };
+            }
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Accepted(receipt),
+        } = outcome
+        else {
+            panic!("expected acceptance, got {outcome:?}");
+        };
+        assert_eq!(receipt.models_used, vec!["fable".to_string()], "escalated");
+        assert_eq!(
+            *reviewers.lock().unwrap(),
+            vec!["sonnet".to_string()],
+            "the candidate's own model does not review it"
+        );
+        let reasons: Vec<String> = fixture
+            .ledger
+            .transitions(&run_id)
+            .expect("transitions")
+            .into_iter()
+            .map(|t| t.reason)
+            .collect();
+        assert!(
+            !reasons.contains(&Reason::ReviewerSameTier.as_str().to_string()),
+            "an independent review is not recorded as a same-tier one"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// With one tier configured there is no second opinion to buy. The
+    /// review still happens — and the run records that it was not
+    /// independent, rather than implying it was.
+    #[test]
+    fn a_single_tier_policy_reviews_with_the_same_tier_and_says_so() {
+        let fixture = Fixture::new();
+        let mut repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        repo.models.retain(|tier, _| *tier == Tier::Implementation);
+        let reviewers = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&reviewers);
+        let backend = MockBackend::new(move |spec| {
+            if spec.prompt.contains("semantic reviewer") {
+                seen.lock().unwrap().push(spec.model.clone());
+                return MockOutcome {
+                    result_text: Some("FINDINGS: none".into()),
+                    exit_code: Some(0),
+                    ..Default::default()
+                };
+            }
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Accepted(_),
+        } = outcome
+        else {
+            panic!("expected acceptance, got {outcome:?}");
+        };
+        assert_eq!(*reviewers.lock().unwrap(), vec!["sonnet".to_string()]);
+        let same_tier = fixture
+            .ledger
+            .transitions(&run_id)
+            .expect("transitions")
+            .into_iter()
+            .find(|t| t.reason == Reason::ReviewerSameTier.as_str())
+            .expect("the run records that the reviewer was the author's tier");
+        assert_eq!(
+            same_tier
+                .detail
+                .as_ref()
+                .and_then(|d| d.get("reviewer_same_tier")),
+            Some(&serde_json::json!(true))
+        );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
@@ -2976,9 +3556,9 @@ mod tests {
             Reason::SameFailureRecurrence.as_str(),
             "the second empty candidate has the FIRST one's identity"
         );
-        let run_dir = fixture.artifacts.join(&run_id);
+        let verify_dir = fixture.verify_dir(&run_id);
         assert!(
-            !run_dir.join("verify-1").exists() && !run_dir.join("verify-2").exists(),
+            !verify_dir.join("verify-1").exists() && !verify_dir.join("verify-2").exists(),
             "an identical tree spends no verification command"
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
@@ -3019,7 +3599,7 @@ mod tests {
             .expect("the worker's answer is the deliverable and is kept");
         assert!(answer.contains("trust entry is stale"));
         assert!(
-            !run_dir.join("verify-1").exists(),
+            !fixture.verify_dir(&run_id).join("verify-1").exists(),
             "the candidate is the base tree; its results are the baseline's"
         );
         assert_eq!(receipt.verification.checks.len(), 1);
@@ -3226,11 +3806,7 @@ mod tests {
         };
         assert!(detail.contains("preserved"));
         assert!(
-            fixture
-                .artifacts
-                .join(&run_id)
-                .join("worktree/src/partial.rs")
-                .exists(),
+            fixture.worktree(&run_id).join("src/partial.rs").exists(),
             "the half-done worktree is kept for diagnosis"
         );
         assert_eq!(
@@ -3300,7 +3876,7 @@ mod tests {
             counter.fetch_add(1, Ordering::SeqCst);
             if spec.prompt.contains("semantic reviewer") {
                 assert!(
-                    spec.prompt.contains("CHANGES VERIFICATION INPUTS")
+                    spec.prompt.contains("CHANGES THE TEST TREE")
                         && spec.prompt.contains("tests/regression.rs"),
                     "the reviewer is told what changed: {}",
                     spec.prompt
@@ -3506,10 +4082,19 @@ mod tests {
         let repo = fixture.repo_policy(vec![passing_check()], 3);
         let artifacts = fixture.artifacts.clone();
         let backend = MockBackend::new(move |spec| {
-            // Mid-launch, the run directory (worktree's parent) loses its
-            // write bit: the runner's next artifact write must fail.
-            let run_dir = spec.work_dir.parent().expect("run dir").to_path_buf();
-            assert!(run_dir.starts_with(&artifacts));
+            // Mid-launch, the run's ARTIFACT directory loses its write
+            // bit: the runner's next artifact write must fail. The
+            // worktree is elsewhere now (B6), so the run id is read off
+            // the worktree path instead of its parent.
+            let run_id = spec
+                .work_dir
+                .parent()
+                .and_then(Path::file_name)
+                .expect("worktrees/<run-id>/task")
+                .to_string_lossy()
+                .into_owned();
+            let run_dir = artifacts.join(run_id);
+            assert!(run_dir.is_dir(), "{}", run_dir.display());
             std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o555))
                 .expect("chmod");
             MockOutcome {
@@ -3652,7 +4237,9 @@ mod tests {
         assert_eq!(receipt.models_used, vec!["sonnet".to_string()]);
         // The integrated candidate carries both packages and is what the
         // receipt names.
-        let integration = fixture.artifacts.join(&run_id).join("integration");
+        let integration = worktree_root(&fixture.artifacts)
+            .join(&run_id)
+            .join("integration");
         assert!(integration.join("src/a/lib.rs").exists());
         assert!(integration.join("src/b/lib.rs").exists());
         let head = git(&integration, &["rev-parse", "HEAD"]).trim().to_string();
@@ -3704,6 +4291,86 @@ mod tests {
             reasons.last().map(String::as_str),
             Some(Reason::ChecksAndReviewPassed.as_str())
         );
+    }
+
+    /// A package that edits the build manifest reaches the user, not a
+    /// reviewer, and the root mirrors it: the same rule at every level
+    /// (SPEC §9, §19, audit B8).
+    #[test]
+    fn a_package_touching_the_profiles_inputs_takes_the_whole_run_to_needs_decision() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&launches);
+        let backend = MockBackend::new(move |spec| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            if spec.prompt.contains("work package `a`") {
+                std::fs::create_dir_all(spec.work_dir.join("src/a")).expect("mkdir");
+                std::fs::write(spec.work_dir.join("src/a/lib.rs"), "pub fn a() {}\n")
+                    .expect("write");
+            } else if spec.prompt.contains("work package `m`") {
+                std::fs::write(
+                    spec.work_dir.join("Cargo.toml"),
+                    "[package]\nname = \"m\"\n",
+                )
+                .expect("write");
+            }
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        });
+        let contract = TaskContract::from_json_str(
+            &serde_json::json!({
+                "schema_version": 1,
+                "kind": "change",
+                "objective": "Add the a module and bump the manifest",
+                "base_ref": "HEAD",
+                "write_scope": ["src/**", "Cargo.toml"],
+                "acceptance": ["the module exists"],
+                "verification_profile": "profile",
+                "review": "off",
+                "decomposition": {
+                    "packages": [
+                        {
+                            "id": "a",
+                            "objective": "Create the a module",
+                            "write_scope": ["src/a/**"],
+                            "acceptance": ["src/a/lib.rs exists"]
+                        },
+                        {
+                            "id": "m",
+                            "objective": "Declare the new module in the manifest",
+                            "write_scope": ["Cargo.toml"],
+                            "depends_on": ["a"],
+                            "acceptance": ["the manifest names it"]
+                        }
+                    ],
+                    "integration_acceptance": ["both land together"],
+                    "limits": { "attempts_per_package": 1 }
+                },
+            })
+            .to_string(),
+        )
+        .expect("contract");
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        let RunOutcome {
+            terminal:
+                Terminal::NeedsDecision {
+                    reason: why,
+                    detail,
+                },
+            ..
+        } = outcome
+        else {
+            panic!("expected needs_decision, got {outcome:?}");
+        };
+        assert_eq!(why, Reason::VerificationInputsChanged);
+        assert!(detail.contains("package `m`"), "{detail}");
+        assert!(detail.contains("Cargo.toml"), "{detail}");
+        assert_eq!(launches.load(Ordering::SeqCst), 2, "no reviewer was bought");
     }
 
     #[test]
