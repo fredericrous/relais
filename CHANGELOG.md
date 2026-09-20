@@ -6,6 +6,21 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## v0.1.1
+
+### Added
+
+- **Windows.** The coordinator's endpoint on Windows is a loopback TCP
+  port and a 32-byte nonce written to the same file a Unix socket would
+  occupy; a connection that does not present the nonce is dropped before
+  a byte of its request is read, and the file's ACL under the user's
+  profile is the permission restriction SPEC §23 asks for. Process
+  liveness, termination and parentage go through process handles; a
+  worker tree is killed with `taskkill /T`. The release ships an
+  `x86_64-pc-windows-msvc` zip again and `install/install.ps1` is back.
+  Election, the stale-endpoint probe and cleanup are unchanged: they
+  see one path and one listener on every platform.
+
 ## v0.1.0
 
 The first release: the companion described in `docs/SPEC.md`, usable on a
@@ -26,8 +41,8 @@ repository today, with the audit that made it so.
   local, and pinned per run.
 - **Prebuilt binaries** for Linux (glibc and musl, x86_64 and aarch64)
   and macOS (Intel and Apple silicon), with checksums, and
-  `install/install.sh` to fetch them verified. No Windows: the
-  coordinator is a Unix socket and signals.
+  `install/install.sh` to fetch them verified. (No Windows in this
+  release; 0.1.1 adds it.)
 
 ### Fixed, before anyone upgraded
 

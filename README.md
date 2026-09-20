@@ -14,7 +14,9 @@ features. Relais is a working name; package availability has not been checked.
     curl -fsSL https://raw.githubusercontent.com/fredericrous/relais/main/install/install.sh | sh
 
 Pin a version or move the destination with `RELAIS_VERSION` and
-`RELAIS_BIN_DIR`. Prebuilt, checksummed binaries for Linux and macOS are on the
+`RELAIS_BIN_DIR`. Windows:
+`irm https://raw.githubusercontent.com/fredericrous/relais/main/install/install.ps1 | iex`.
+Prebuilt, checksummed binaries for Linux, macOS and Windows are on the
 [releases page](https://github.com/fredericrous/relais/releases); a release
 is cut by a `v*` tag that matches `Cargo.toml` and has a `CHANGELOG.md`
 section. Or from source: `cargo install --path crates/relais`.
@@ -106,7 +108,9 @@ the findings still open.
 
 - Claude Code 2.1.x has no turn ceiling flag; attempts and wall time
   are enforced by the runner, turns are not.
-- Linux and macOS only: the coordinator is a Unix socket and signals.
+- On Windows the coordinator's endpoint is a loopback TCP port plus a
+  nonce in the socket file rather than a Unix socket; the file's ACL is
+  the permission restriction. Worker trees are killed with `taskkill`.
 
 - The decomposition scheduler executes packages sequentially in
   topological order; waves of independent packages are computed and

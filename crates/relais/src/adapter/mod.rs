@@ -23,9 +23,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-
 use serde::{Deserialize, Serialize};
 
 use crate::money::{CostCompleteness, MicroUsd};
@@ -287,8 +284,14 @@ pub fn run_with_timeout(
         .map_err(|_| BackendError::Launch("stderr reader panicked".into()))?;
     Ok(ProcessEnd {
         // A killed process has no exit code: interrupted, never a
-        // completed attempt.
-        exit_code: if cancelled { None } else { status.code() },
+        // completed attempt. Decided here, not read from the status —
+        // Windows reports a terminated process as exit 1, and 1 is a
+        // usage error, not a kill.
+        exit_code: if cancelled || timed_out {
+            None
+        } else {
+            status.code()
+        },
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
         timed_out,
@@ -312,11 +315,11 @@ pub fn wait_for_exit(
             break (false, false);
         }
         if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
-            let _ = kill_process_group(child);
+            let _ = crate::procs::kill_tree(child);
             break (false, true);
         }
         if started.elapsed() >= wall_timeout {
-            let _ = kill_process_group(child);
+            let _ = crate::procs::kill_tree(child);
             break (true, false);
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -328,32 +331,13 @@ pub fn wait_for_exit(
 /// Put a command in its own process group so a kill reaches everything it
 /// spawned. Every subprocess relais waits on goes through here.
 pub fn own_process_group(command: &mut Command) {
-    #[cfg(unix)]
-    command.process_group(0);
+    crate::procs::own_process_group(command);
 }
 
 fn read_to_end(mut pipe: impl std::io::Read) -> Vec<u8> {
     let mut buffer = Vec::new();
     let _ = std::io::Read::read_to_end(&mut pipe, &mut buffer);
     buffer
-}
-
-#[cfg(unix)]
-fn kill_process_group(child: &mut std::process::Child) -> std::io::Result<()> {
-    // The whole group: a harness that spawned its own children must not
-    // survive the kill (SPEC §23 cancellation).
-    let pgid = child.id() as i32;
-    let result = unsafe { libc::kill(-pgid, libc::SIGKILL) };
-    if result == -1 {
-        child.kill()
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_process_group(child: &mut std::process::Child) -> std::io::Result<()> {
-    child.kill()
 }
 
 /// A stub backend for tests and `relais doctor --dry`: a shell command
@@ -425,10 +409,26 @@ impl Backend for ScriptBackend {
 mod tests {
     use super::*;
 
+    /// A child that prints, then outlives any test timeout, in the
+    /// platform's own shell: the point is the kill, not the script.
+    fn slow_child() -> Command {
+        if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.args([
+                "/C",
+                "echo start && ping -n 60 127.0.0.1 > NUL && echo done",
+            ]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", "echo start; sleep 30; echo done"]);
+            command
+        }
+    }
+
     #[test]
     fn run_with_timeout_kills_slow_children() {
-        let mut command = Command::new("sh");
-        command.args(["-c", "echo start; sleep 30; echo done"]);
+        let command = slow_child();
         let started = Instant::now();
         let pid_slot = AtomicU32::new(0);
         let end = run_with_timeout(
@@ -467,8 +467,7 @@ mod tests {
 
     #[test]
     fn cancellation_kills_the_child_and_is_not_a_timeout() {
-        let mut command = Command::new("sh");
-        command.args(["-c", "echo start; sleep 30; echo done"]);
+        let command = slow_child();
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cancel);
         std::thread::spawn(move || {

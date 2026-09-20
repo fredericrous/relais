@@ -33,6 +33,19 @@ globset = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 # Timestamps and report windows; stored as RFC3339 strings / unix seconds.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# Process facts and signals live in `procs`; the endpoint in `ipc`. Each
+# platform gets the one binding crate it needs and nothing else.
 # kill(pid, 0) for coordinator lease reconciliation — checking liveness
 # without sending a signal that could terminate anything.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Process handles and the Toolhelp snapshot. Microsoft's own raw bindings,
+# no build script, feature-gated to the four modules `procs` touches.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+] }
