@@ -48,9 +48,13 @@ timeout_seconds = 300
 # Floors apply to the DECLARED scope: a contract scoped `src/**` could
 # write `src/trust/x`, so a `**/trust/**` rule floors it — scope
 # contracts as narrowly as the task allows.
+# This repository has no trust/ or restore/ tree; a rule on them would
+# only floor every `**` scope to the escalation tier (see
+# docs/AUDIT-2026-09-20.md, A10). The adapter and the coordinator are
+# the authority-bearing code here.
 [[risk]]
-paths = ["**/trust/**", "**/restore/**"]
-minimum_tier = "escalation"
+paths = ["crates/relais/src/adapter/**", "crates/relais/src/coordinator/**", "crates/relais/src/admission/**"]
+minimum_tier = "implementation"
 review = "required"
 
 # Path-to-aval-key mappings. aval resolves exact keys; it has no

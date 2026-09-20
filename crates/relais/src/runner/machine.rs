@@ -51,6 +51,11 @@ pub enum Reason {
     IntegrationFailed,
     AdmissionRefused,
     DuplicateDispatch,
+    /// The harness refused the worker a tool it needed (SPEC §8).
+    PermissionDenied,
+    /// The candidate carries the base tree: verification is the
+    /// baseline's, not re-run.
+    CandidateIdenticalToBase,
     /// The run ended because the runner itself could not go on — a
     /// ledger or filesystem failure — not because of anything a worker
     /// did (SPEC §12: uncertain state is interrupted, never retried).
@@ -91,6 +96,8 @@ impl Reason {
             Self::IntegrationFailed => "integration_failed",
             Self::AdmissionRefused => "admission_refused",
             Self::DuplicateDispatch => "duplicate_dispatch",
+            Self::PermissionDenied => "permission_denied",
+            Self::CandidateIdenticalToBase => "candidate_identical_to_base",
             Self::RunnerFailure => "runner_failure",
         }
     }
@@ -301,8 +308,12 @@ pub enum Observation {
     ReviewFindings(String),
     /// Required review could not be obtained.
     ReviewUnavailable(String),
-    /// The worker process ended without a terminal result.
-    TerminalResultMissing { timed_out: bool },
+    /// The worker process ended without a terminal result: killed,
+    /// non-zero exit, or output the adapter could not read.
+    TerminalResultMissing { timed_out: bool, detail: String },
+    /// The harness refused the worker these tools. A worker that could
+    /// not act is blocked, not failed, and never escalated (SPEC §8).
+    PermissionDenied(Vec<String>),
     /// The dispatch was cancelled through the coordinator.
     Cancelled(String),
     /// The provider ran a model other than the one requested.
@@ -504,16 +515,41 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
             Terminal::NeedsReview { detail },
         ),
 
-        Observation::TerminalResultMissing { timed_out } => Decision::stop(
+        Observation::TerminalResultMissing { timed_out, detail } => Decision::stop(
             State::Interrupted,
             Reason::ProcessCrash,
-            serde_json::json!({ "timed_out": timed_out }),
+            serde_json::json!({ "timed_out": timed_out, "detail": detail }),
             Terminal::Interrupted {
-                detail: "the worker process ended without a terminal result; state is \
-                         interrupted and the worktree is preserved"
-                    .into(),
+                detail: if detail.is_empty() {
+                    "the worker process ended without a terminal result; state is \
+                     interrupted and the worktree is preserved"
+                        .into()
+                } else {
+                    format!(
+                        "the worker process ended without a terminal result ({detail}); \
+                         state is interrupted and the worktree is preserved"
+                    )
+                },
             },
         ),
+
+        Observation::PermissionDenied(tools) => {
+            let detail = format!(
+                "the harness refused the worker these tools: {}; grant them in the machine \
+                 permissions allowlist or narrow the task — a stronger model is not bought \
+                 for a missing permission",
+                tools.join(", ")
+            );
+            Decision::stop(
+                State::Blocked,
+                Reason::PermissionDenied,
+                serde_json::json!({ "tools": tools }),
+                Terminal::Blocked {
+                    code: BlockCode::PermissionDenied,
+                    detail,
+                },
+            )
+        }
 
         Observation::Cancelled(detail) => Decision::stop(
             State::Cancelled,
@@ -650,6 +686,21 @@ mod tests {
     }
 
     #[test]
+    fn refused_tools_are_blocked_never_escalated() {
+        let b = budget(0, Some(Tier::Escalation));
+        let d = decide(&b, Observation::PermissionDenied(vec!["Edit".into()]));
+        assert_eq!(d.state, State::Blocked);
+        assert_eq!(d.reason, Reason::PermissionDenied);
+        assert!(matches!(
+            d.next,
+            Next::Stop(Terminal::Blocked {
+                code: BlockCode::PermissionDenied,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn same_failure_on_an_unchanged_candidate_fails_immediately() {
         // Even with a repair and an escalation still available.
         let d = decide(
@@ -714,7 +765,14 @@ mod tests {
             Reason::ReviewUnavailable
         );
         assert_eq!(
-            decide(&b, Observation::TerminalResultMissing { timed_out: true }).state,
+            decide(
+                &b,
+                Observation::TerminalResultMissing {
+                    timed_out: true,
+                    detail: String::new()
+                }
+            )
+            .state,
             State::Interrupted
         );
         assert_eq!(
