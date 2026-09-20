@@ -14,7 +14,14 @@ use serde::{Deserialize, Serialize};
 use super::features::FeatureSchema;
 use super::learner::{CostModel, LogisticModel, SolverSettings};
 
-pub const ARTIFACT_SCHEMA_VERSION: u32 = 1;
+/// Version 2 adds the cost model's observed log-cost range, which
+/// inference reads to tell an estimate from an extrapolation. A version-1
+/// artifact carries no range; read with a defaulted (0, 0) one it would
+/// price every tier at zero — the cheapest possible — so those artifacts
+/// are refused by version rather than silently reinterpreted. Retrain to
+/// get a version-2 artifact; the previous one stays promotable only by
+/// the relais that wrote it.
+pub const ARTIFACT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -38,7 +45,19 @@ pub struct Artifact {
 #[derive(Debug)]
 pub enum ArtifactError {
     Malformed(String),
-    IncompatibleSchema { found: u32, expected: u32 },
+    IncompatibleSchema {
+        found: u32,
+        expected: u32,
+    },
+    /// A coefficient array, or a standardization array, whose length is
+    /// not the feature schema's dimension. Predicting anyway means
+    /// silently reading zeros for every coordinate the artifact has no
+    /// weight for.
+    DimensionMismatch {
+        field: &'static str,
+        found: usize,
+        expected: usize,
+    },
     NonFinite,
     Io(std::io::Error),
 }
@@ -50,6 +69,15 @@ impl std::fmt::Display for ArtifactError {
             Self::IncompatibleSchema { found, expected } => write!(
                 f,
                 "artifact schema {found} is not understood (this relais reads {expected})"
+            ),
+            Self::DimensionMismatch {
+                field,
+                found,
+                expected,
+            } => write!(
+                f,
+                "artifact {field} has {found} entries but its feature schema has {expected} \
+                 dimension(s); it cannot predict over this feature space"
             ),
             Self::NonFinite => write!(f, "artifact contains non-finite values"),
             Self::Io(e) => write!(f, "{e}"),
@@ -73,6 +101,31 @@ impl Artifact {
             return Err(ArtifactError::Malformed(
                 "feature schema version mismatch inside artifact".into(),
             ));
+        }
+        // Shape, before finiteness: every array in the artifact must have
+        // exactly the schema's dimension. `dot` reads a missing weight as
+        // zero and `Standardization::apply` a missing scale as one, so an
+        // eight-weight artifact would happily "predict" over a
+        // three-hundred-dimension space — a confident number computed from
+        // eight of the features and silence about the rest, with no
+        // abstention anywhere (SPEC §21: malformed artifacts are
+        // rejected).
+        let expected = super::features::feature_dim(&self.feature_schema);
+        for (field, found) in [
+            ("acceptance.dim", self.acceptance.dim),
+            ("acceptance.weights", self.acceptance.weights.len()),
+            ("cost.dim", self.cost.dim),
+            ("cost.weights", self.cost.weights.len()),
+            ("standardization.means", self.standardization.means.len()),
+            ("standardization.stds", self.standardization.stds.len()),
+        ] {
+            if found != expected {
+                return Err(ArtifactError::DimensionMismatch {
+                    field,
+                    found,
+                    expected,
+                });
+            }
         }
         let finite = |value: f64| value.is_finite();
         if !self.acceptance.weights.iter().copied().all(finite)
@@ -253,28 +306,32 @@ pub struct PromotionGates {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::learn::features::{FeatureSchema, Standardization};
+    use crate::learn::features::{feature_dim, FeatureSchema, Standardization};
     use crate::policy::Tier;
 
     fn artifact(id: &str, evaluation: Option<serde_json::Value>) -> Artifact {
+        // Every array is the schema's dimension, as a real artifact's is.
+        let dim = feature_dim(&FeatureSchema::standard());
         Artifact {
             schema_version: ARTIFACT_SCHEMA_VERSION,
             artifact_id: id.into(),
             feature_schema: FeatureSchema::standard(),
             standardization: Standardization {
-                means: vec![0.0],
-                stds: vec![1.0],
+                means: vec![0.0; dim],
+                stds: vec![1.0; dim],
             },
             acceptance: LogisticModel {
-                dim: 1,
-                weights: vec![1.0],
+                dim,
+                weights: vec![1.0; dim],
                 bias: 0.0,
             },
             cost: CostModel {
-                dim: 1,
-                weights: vec![0.5],
+                dim,
+                weights: vec![0.5; dim],
                 bias: 0.0,
-                cohort_means: vec![("implementation".into(), 120.0)],
+                cohort_means: vec![("change".into(), 120.0)],
+                observed_log_min: 0.0,
+                observed_log_max: 10.0,
             },
             tiers_supported: vec![Tier::Implementation],
             cohorts: vec!["change".into()],
@@ -328,6 +385,80 @@ mod tests {
         let mut bad_std = artifact("art-4", None);
         bad_std.standardization.stds[0] = 0.0;
         assert!(Artifact::from_json(&serde_json::to_string(&bad_std).unwrap()).is_err());
+    }
+
+    /// D1: an artifact whose arrays are shorter than the feature space it
+    /// claims to predict over was accepted, and predicted with confidence
+    /// from the handful of coordinates it had weights for.
+    #[test]
+    fn arrays_shorter_than_the_feature_schema_are_rejected() {
+        let dim = feature_dim(&FeatureSchema::standard());
+        assert!(dim > 8, "the schema is wider than the truncated fixture");
+
+        let eight_weights = |mut artifact: Artifact| -> Artifact {
+            artifact.acceptance.dim = 8;
+            artifact.acceptance.weights = vec![0.1; 8];
+            artifact
+        };
+        let short_acceptance = eight_weights(artifact("art-dim-1", None));
+        assert!(
+            matches!(
+                short_acceptance.validate(),
+                Err(ArtifactError::DimensionMismatch {
+                    field: "acceptance.dim",
+                    found: 8,
+                    ..
+                })
+            ),
+            "an 8-weight acceptance model may not predict over {dim} dimensions"
+        );
+        assert!(Artifact::from_json(&short_acceptance.to_json()).is_err());
+
+        // A `dim` that agrees with the schema while the weights do not is
+        // the same lie one field further in.
+        let mut lying_dim = artifact("art-dim-2", None);
+        lying_dim.acceptance.weights.truncate(8);
+        assert!(matches!(
+            lying_dim.validate(),
+            Err(ArtifactError::DimensionMismatch {
+                field: "acceptance.weights",
+                found: 8,
+                ..
+            })
+        ));
+
+        let mut short_cost = artifact("art-dim-3", None);
+        short_cost.cost.dim = 8;
+        short_cost.cost.weights = vec![0.01; 8];
+        assert!(matches!(
+            short_cost.validate(),
+            Err(ArtifactError::DimensionMismatch {
+                field: "cost.dim",
+                ..
+            })
+        ));
+
+        let mut short_stds = artifact("art-dim-4", None);
+        short_stds.standardization.stds.truncate(dim - 1);
+        assert!(matches!(
+            short_stds.validate(),
+            Err(ArtifactError::DimensionMismatch {
+                field: "standardization.stds",
+                ..
+            })
+        ));
+        let mut short_means = artifact("art-dim-5", None);
+        short_means.standardization.means.pop();
+        assert!(matches!(
+            short_means.validate(),
+            Err(ArtifactError::DimensionMismatch {
+                field: "standardization.means",
+                ..
+            })
+        ));
+
+        // The well-shaped fixture still loads.
+        assert!(artifact("art-dim-ok", None).validate().is_ok());
     }
 
     /// The evaluator's report, as `relais train` stores it — the ONLY

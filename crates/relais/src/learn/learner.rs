@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::features::{dot, SparseVec};
+use crate::rng::SplitMix64;
 
 pub const LEARNER_SCHEMA_VERSION: u32 = 1;
 
@@ -97,18 +98,76 @@ impl Objective<'_> {
     }
 }
 
+/// Passes the seeded warm-up makes over the training data before the
+/// deterministic descent takes over.
+const WARM_START_EPOCHS: usize = 3;
+/// Base step of the warm-up, decayed by 1/sqrt(1+t) across the passes.
+const WARM_START_RATE: f64 = 0.1;
+
+/// Seeded data ordering (SPEC §16), which is what the recorded seed buys.
+///
+/// Full-batch descent is order-free by construction, so a seed that only
+/// labelled the artifact promised reproducibility nothing could break:
+/// the old `fits_are_seed_reproducible` compared a deterministic function
+/// with itself. The seed now chooses the order of a short stochastic
+/// warm-up — `WARM_START_EPOCHS` passes over the data in a seeded
+/// permutation, one step per sample — and the deterministic line-search
+/// descent starts from where the warm-up left off. Two seeds therefore
+/// reach different fits, and the convex regularized objective brings both
+/// to the same minimizer within the recorded tolerance; the same seed
+/// reproduces a fit exactly. A warm-up that did not lower the objective
+/// (or left it non-finite: a skewed target can make one sample's step
+/// huge) is discarded, so a seed can never make a fit worse than starting
+/// from the origin.
+fn warm_start(objective: &Objective<'_>, dim: usize, seed: u64) -> (Vec<f64>, f64) {
+    let origin = (vec![0.0f64; dim], 0.0f64);
+    let n = objective.features.len();
+    if n < 2 || dim == 0 {
+        return origin;
+    }
+    let mut weights = vec![0.0f64; dim];
+    let mut bias = 0.0f64;
+    let mut order: Vec<usize> = (0..n).collect();
+    let mut rng = SplitMix64::new(seed);
+    let mut steps_taken = 0.0f64;
+    for _ in 0..WARM_START_EPOCHS {
+        rng.shuffle(&mut order);
+        for index in &order {
+            let features = &objective.features[*index];
+            let target = objective.targets[*index];
+            let error = (objective.derivative)(dot(features, &weights) + bias, target);
+            if !error.is_finite() {
+                return origin;
+            }
+            let rate = WARM_START_RATE / (1.0 + steps_taken).sqrt();
+            steps_taken += 1.0;
+            for (index, value) in &features.0 {
+                if let Some(slot) = weights.get_mut(*index) {
+                    *slot -= rate * (error * value + objective.lambda * *slot);
+                }
+            }
+            bias -= rate * error;
+        }
+    }
+    let warm = objective.value(&weights, bias);
+    if warm.is_finite() && warm <= objective.value(&origin.0, origin.1) {
+        (weights, bias)
+    } else {
+        origin
+    }
+}
+
 /// Full-batch gradient descent with backtracking line search over a
 /// fixed dimension, bounded iterations, and convergence declared only
 /// when the gradient norm or the relative loss change falls below
-/// tolerance. Deterministic by construction: full-batch descent has no
-/// data order, so reproducibility is the recorded settings, not a seed.
+/// tolerance. The starting point is the seeded warm-up above; from there
+/// the path is a function of the recorded settings alone.
 fn descend(
     objective: &Objective<'_>,
     dim: usize,
     settings: SolverSettings,
 ) -> (Vec<f64>, f64, FitReport) {
-    let mut weights = vec![0.0f64; dim];
-    let mut bias = 0.0f64;
+    let (mut weights, mut bias) = warm_start(objective, dim, settings.seed);
     let mut report = FitReport {
         iterations: 0,
         converged: false,
@@ -201,7 +260,29 @@ pub struct CostModel {
     pub bias: f64,
     /// Empirical per-cohort means, the retained baseline (SPEC §16).
     pub cohort_means: Vec<(String, f64)>,
+    /// The log1p-space range of the costs this model was FITTED on. It is
+    /// what lets inference tell an estimate from an extrapolation: a
+    /// linear prediction further outside this range than
+    /// `EXTRAPOLATION_MARGIN_LN` is not supported by anything the model
+    /// saw, and `predict` abstains to the empirical cohort mean. A model
+    /// fitted on nothing carries the empty range (+∞, −∞), which supports
+    /// no prediction at all — deliberately, so an untrained cost model
+    /// prices no tier rather than pricing every tier at zero. `default`
+    /// exists so an artifact written before this field still parses and
+    /// is then refused by artifact schema version, with a message that
+    /// says so, rather than by a missing-field error.
+    #[serde(default)]
+    pub observed_log_min: f64,
+    #[serde(default)]
+    pub observed_log_max: f64,
 }
+
+/// How far outside the observed log-cost range a prediction may fall
+/// before it stops being an estimate: one order of magnitude. Cost is
+/// heavy-tailed, so some extrapolation is expected and a 10× band is
+/// generous; beyond it the artifact is inventing coverage it never
+/// measured (SPEC §16: "neither predictor may invent coverage").
+pub const EXTRAPOLATION_MARGIN_LN: f64 = std::f64::consts::LN_10;
 
 impl CostModel {
     pub fn fit(
@@ -239,32 +320,65 @@ impl CostModel {
             derivative: |z, y| z - y,
         };
         let (weights, bias, report) = descend(&objective, dim, settings);
+        let observed_log_min = log_targets.iter().copied().fold(f64::INFINITY, f64::min);
+        let observed_log_max = log_targets
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
         (
             Self {
                 dim,
                 weights,
                 bias,
                 cohort_means,
+                observed_log_min,
+                observed_log_max,
             },
             report,
         )
     }
 
-    pub fn predict(&self, features: &SparseVec, cohort: Option<&str>) -> f64 {
+    /// The estimate, in micro-USD, or `None` when this model cannot
+    /// honestly produce one.
+    ///
+    /// There used to be a `clamp(-20, 20)` here, which made two promises
+    /// it could not keep: `exp_m1` of a clamped argument is always finite,
+    /// so the `cohort_means` fallback below was unreachable, and the cap
+    /// silently topped every estimate out at e^20 micros — about $485 —
+    /// so a genuinely expensive strategy was priced as a merely expensive
+    /// one. The cap is gone. What bounds the answer now is evidence: a
+    /// prediction outside the log-cost range the model was fitted on, by
+    /// more than `EXTRAPOLATION_MARGIN_LN`, abstains to the cohort's
+    /// empirical mean, and so does an argument large enough to overflow
+    /// `exp_m1`. With no mean for the cohort — an unseen kind of task —
+    /// the answer is `None`: the router then has no price for that tier
+    /// and leaves it unselected, which is the conservative baseline, not a
+    /// free tier (a cost of 0 would have made the unpriced tier the
+    /// cheapest one).
+    pub fn predict(&self, features: &SparseVec, cohort: Option<&str>) -> Option<f64> {
         let log_prediction = dot(features, &self.weights) + self.bias;
-        let prediction = log_prediction.clamp(-20.0, 20.0).exp_m1();
-        if prediction.is_finite() {
-            prediction.max(0.0)
-        } else {
-            cohort
-                .and_then(|cohort| {
-                    self.cohort_means
-                        .iter()
-                        .find(|(name, _)| name == cohort)
-                        .map(|(_, mean)| *mean)
-                })
-                .unwrap_or(0.0)
+        let supported = log_prediction.is_finite()
+            && self.observed_log_min.is_finite()
+            && self.observed_log_max.is_finite()
+            && log_prediction >= self.observed_log_min - EXTRAPOLATION_MARGIN_LN
+            && log_prediction <= self.observed_log_max + EXTRAPOLATION_MARGIN_LN;
+        if supported {
+            let prediction = log_prediction.exp_m1();
+            if prediction.is_finite() {
+                return Some(prediction.max(0.0));
+            }
         }
+        self.cohort_mean(cohort)
+    }
+
+    /// The retained empirical baseline for a cohort (SPEC §16), if this
+    /// model observed that cohort at all.
+    pub fn cohort_mean(&self, cohort: Option<&str>) -> Option<f64> {
+        let cohort = cohort?;
+        self.cohort_means
+            .iter()
+            .find(|(name, _)| name == cohort)
+            .map(|(_, mean)| *mean)
     }
 }
 
@@ -382,7 +496,7 @@ mod tests {
         let (model, _report) =
             CostModel::fit(&features, &costs, &cohorts, 1, SolverSettings::default());
         for (feature, cost) in features.iter().zip(&costs) {
-            let prediction = model.predict(feature, Some("a"));
+            let prediction = model.predict(feature, Some("a")).expect("in support");
             assert!(prediction.is_finite() && prediction >= 0.0);
             let _ = cost;
         }
@@ -391,17 +505,133 @@ mod tests {
     }
 
     #[test]
-    fn fits_are_seed_reproducible() {
-        let (features, labels) = make_data(2.0, -2.0, 6);
-        let settings = SolverSettings {
-            lambda: 0.01,
-            max_iterations: 50,
-            tolerance: 1e-10,
-            seed: 42,
+    fn an_extrapolating_cost_prediction_abstains_to_the_cohort_mean() {
+        // Fitted on cheap tasks only; asked about a feature vector whose
+        // linear prediction is orders of magnitude above anything the
+        // model saw. The old clamp answered with a number; the fallback it
+        // pretended to have was unreachable.
+        let features = vec![
+            SparseVec(vec![(0, 1.0)]),
+            SparseVec(vec![(0, 1.1)]),
+            SparseVec(vec![(0, 0.9)]),
+        ];
+        let costs = vec![100.0, 110.0, 90.0];
+        let cohorts = vec!["change".to_string(); 3];
+        let (model, _) = CostModel::fit(&features, &costs, &cohorts, 1, SolverSettings::default());
+        let mean = model.cohort_mean(Some("change")).expect("observed cohort");
+        assert!((mean - 100.0).abs() < 1e-9);
+
+        let far_outside = SparseVec(vec![(0, 400.0)]);
+        let log_prediction = dot(&far_outside, &model.weights) + model.bias;
+        assert!(
+            log_prediction > model.observed_log_max + EXTRAPOLATION_MARGIN_LN,
+            "the fixture must actually extrapolate: {log_prediction}"
+        );
+        assert_eq!(
+            model.predict(&far_outside, Some("change")),
+            Some(mean),
+            "outside the observed range the estimate is the cohort baseline"
+        );
+        assert_eq!(
+            model.predict(&far_outside, Some("inspect")),
+            None,
+            "an unobserved cohort has no baseline to abstain to"
+        );
+        assert_eq!(model.predict(&far_outside, None), None);
+        // Inside the observed range the model still answers.
+        let inside = SparseVec(vec![(0, 1.0)]);
+        let estimate = model.predict(&inside, Some("change")).expect("supported");
+        assert!(estimate > 0.0 && estimate < 10_000.0, "{estimate}");
+    }
+
+    #[test]
+    fn cost_estimates_are_not_capped_at_the_old_ceiling() {
+        // e^20 micros ≈ $485 was the old silent ceiling. A strategy that
+        // really cost $2,000 must be priced at $2,000.
+        let expensive_micros = 2_000_000_000.0f64;
+        let log_expensive = (expensive_micros + 1.0).ln();
+        let model = CostModel {
+            dim: 1,
+            weights: vec![0.0],
+            bias: log_expensive,
+            cohort_means: vec![("change".into(), expensive_micros)],
+            observed_log_min: log_expensive - 0.5,
+            observed_log_max: log_expensive + 0.5,
         };
-        let (a, _) = LogisticModel::fit(&features, &labels, 1, settings);
-        let (b, _) = LogisticModel::fit(&features, &labels, 1, settings);
-        assert_eq!(a, b, "same settings, same fit");
+        let estimate = model
+            .predict(&SparseVec(vec![(0, 0.0)]), Some("change"))
+            .expect("in support");
+        assert!(
+            estimate > 20.0f64.exp(),
+            "the clamp topped estimates out at e^20 micros ≈ $485: {estimate}"
+        );
+        assert!((estimate - expensive_micros).abs() / expensive_micros < 1e-9);
+    }
+
+    #[test]
+    fn the_same_seed_reproduces_a_fit_and_different_seeds_do_not() {
+        let (features, labels) = make_data(2.0, -2.0, 6);
+        let settings = |seed| SolverSettings {
+            lambda: 0.01,
+            max_iterations: 200,
+            tolerance: 1e-8,
+            seed,
+        };
+        let (a, report_a) = LogisticModel::fit(&features, &labels, 1, settings(42));
+        let (again, _) = LogisticModel::fit(&features, &labels, 1, settings(42));
+        assert_eq!(a, again, "the recorded seed reproduces the fit exactly");
+
+        // The seed orders the warm-up, so it moves the fit: a different
+        // seed is a different path and a different final point.
+        let (b, report_b) = LogisticModel::fit(&features, &labels, 1, settings(7));
+        assert_ne!(
+            a.weights, b.weights,
+            "a seed that changes nothing is not a seed"
+        );
+        assert!(report_a.converged && report_b.converged, "both converge");
+        // …and to the same minimizer within the declared tolerance
+        // (SPEC §21: agreement within declared numerical tolerances).
+        for sample in &features {
+            let pa = a.predict_proba(sample);
+            let pb = b.predict_proba(sample);
+            assert!(
+                (pa - pb).abs() < 0.05,
+                "convex objective, one minimizer: {pa} vs {pb}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_warm_up_that_does_not_help_is_discarded() {
+        // Targets in log-cost space are large; one seeded step per sample
+        // can overshoot badly. The warm-up is only kept when it lowers the
+        // objective, so no seed can produce a worse fit than the origin.
+        let features = vec![
+            SparseVec(vec![(0, 10.0)]),
+            SparseVec(vec![(0, 20.0)]),
+            SparseVec(vec![(0, 30.0)]),
+        ];
+        let costs = vec![1.0, 100.0, 5_000_000.0];
+        let cohorts = vec!["change".to_string(); 3];
+        for seed in [0u64, 1, 2, 99] {
+            let settings = SolverSettings {
+                seed,
+                ..SolverSettings::default()
+            };
+            let (model, report) = CostModel::fit(&features, &costs, &cohorts, 1, settings);
+            let objective = Objective {
+                features: &features,
+                targets: &costs.iter().map(|c| (c + 1.0).ln()).collect::<Vec<_>>(),
+                lambda: settings.lambda,
+                loss: |z, y| (z - y) * (z - y) / 2.0,
+                derivative: |z, y| z - y,
+            };
+            assert!(
+                objective.value(&model.weights, model.bias) <= objective.value(&[0.0], 0.0),
+                "seed {seed} must not end above the origin"
+            );
+            assert!(report.final_loss.is_finite());
+        }
     }
 
     #[test]
