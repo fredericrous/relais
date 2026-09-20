@@ -9,6 +9,18 @@ Status: in development against the target specification in `docs/SPEC.md`. The
 commands, schemas and integrations there are proposed interfaces, not shipped
 features. Relais is a working name; package availability has not been checked.
 
+## Install
+
+    curl -fsSL https://raw.githubusercontent.com/fredericrous/relais/main/install/install.sh | sh
+
+Pin a version or move the destination with `RELAIS_VERSION` and
+`RELAIS_BIN_DIR`. Windows:
+`irm https://raw.githubusercontent.com/fredericrous/relais/main/install/install.ps1 | iex`.
+Prebuilt, checksummed binaries for Linux, macOS and Windows are on the
+[releases page](https://github.com/fredericrous/relais/releases); a release
+is cut by a `v*` tag that matches `Cargo.toml` and has a `CHANGELOG.md`
+section. Or from source: `cargo install --path crates/relais`.
+
 ## Build
 
 ```sh
