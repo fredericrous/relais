@@ -29,6 +29,15 @@ pub const AGING_AFTER: Duration = Duration::from_secs(30);
 /// (SPEC §23).
 pub const LEASE_GRACE: Duration = Duration::from_secs(300);
 
+/// A registered run that has admitted nothing for this long, and has no
+/// dispatch or queued request left, is presumed abandoned — its root
+/// runner died without cancelling — and stops holding the daemon open.
+/// Deliberately far longer than any verification profile (repo policy's
+/// `max_wall_seconds` defaults to 1200 s): a run between dispatches is
+/// verifying, and reaping it early is exactly the bug that killed
+/// in-flight runs. The proper end of a run is `finish_run`.
+pub const RUN_ABANDON_GRACE: Duration = Duration::from_secs(3600);
+
 /// Resource classes are scheduled separately: a lightweight remote
 /// research agent does not consume the class a compiler or test
 /// container does (SPEC §23).
@@ -212,6 +221,14 @@ struct Run {
     max_agents: Option<u32>,
     max_depth: Option<u32>,
     cancelled: bool,
+    /// The run reached an end state — cancelled, or reported finished by
+    /// its root runner. Only a terminal run lets the daemon idle-exit; a
+    /// registered, non-terminal run with no dispatch in flight is a run
+    /// between dispatches (verifying), not an idle coordinator.
+    terminal: bool,
+    /// Last registration, admission or settlement for this run. The
+    /// backstop for a root runner that died without cancelling.
+    last_activity: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -266,6 +283,9 @@ impl AdmissionState {
                 run.budget = min_opt_i64(run.budget, registration.budget_micros);
                 run.max_agents = min_opt(run.max_agents, registration.max_agents);
                 run.max_depth = min_opt(run.max_depth, registration.max_depth);
+                // A resumed run is live again, whatever it was before.
+                run.terminal = false;
+                run.last_activity = Instant::now();
             }
             None => {
                 self.runs.insert(
@@ -279,6 +299,8 @@ impl AdmissionState {
                         max_agents: registration.max_agents,
                         max_depth: registration.max_depth,
                         cancelled: false,
+                        terminal: false,
+                        last_activity: Instant::now(),
                     },
                 );
             }
@@ -353,12 +375,13 @@ impl AdmissionState {
             });
         }
         let max_depth = min_opt(run.max_depth, self.limits.max_agent_depth);
-        if max_depth.is_some_and(|max| request.depth > max) {
+        let depth = self.effective_depth(request);
+        if max_depth.is_some_and(|max| depth > max) {
             return Some(Decision::Refused {
                 code: Refusal::DepthExceeded,
                 detail: format!(
                     "depth {} exceeds the effective maximum {}",
-                    request.depth,
+                    depth,
                     max_depth.unwrap_or(0)
                 ),
             });
@@ -379,10 +402,27 @@ impl AdmissionState {
                 ),
             });
         }
+        // `reserve_micros` arrives from the socket: a client can send any
+        // i64. A negative reservation would credit the run instead of
+        // debiting it, so it is refused rather than clamped silently.
+        if request.reserve_micros < 0 {
+            return Some(Decision::Refused {
+                code: Refusal::BudgetExceeded,
+                detail: format!(
+                    "reserve_micros {} is negative; a reservation debits the run budget and is never below zero",
+                    request.reserve_micros
+                ),
+            });
+        }
         if let Some(budget) = run.budget {
-            let committed = run.settled + self.outstanding_reservations(&request.run_id);
-            let reserve = request.reserve_micros.max(0);
-            if committed + reserve > budget {
+            let committed = run
+                .settled
+                .saturating_add(self.outstanding_reservations(&request.run_id));
+            let reserve = request.reserve_micros;
+            // Saturating throughout: `i64::MAX` off the wire wraps in
+            // release and panics in debug, which poisons the mutex and
+            // takes the coordinator down for every later connection.
+            if committed.saturating_add(reserve) > budget {
                 return Some(Decision::Refused {
                     code: Refusal::BudgetExceeded,
                     detail: format!(
@@ -394,12 +434,26 @@ impl AdmissionState {
         None
     }
 
+    /// The depth to enforce. `request.depth` is a self-report; when the
+    /// named parent is a dispatch this coordinator admitted, its recorded
+    /// depth plus one is the fact, and a child claiming 0 under a deep
+    /// parent does not reset the cap. With no parent, or a parent this
+    /// coordinator never saw, the self-report is all there is.
+    fn effective_depth(&self, request: &DispatchRequest) -> u32 {
+        request
+            .parent_dispatch
+            .as_deref()
+            .and_then(|parent| self.depth_of(parent))
+            .map_or(request.depth, |parent_depth| parent_depth.saturating_add(1))
+    }
+
     fn outstanding_reservations(&self, run_id: &str) -> i64 {
         self.dispatches
             .values()
             .filter(|dispatch| dispatch.run_id == run_id)
-            .map(|dispatch| dispatch.reserved)
-            .sum()
+            .fold(0i64, |total, dispatch| {
+                total.saturating_add(dispatch.reserved)
+            })
     }
 
     fn active_count(&self, class: ResourceClass, session: Option<&str>) -> u32 {
@@ -447,8 +501,13 @@ impl AdmissionState {
             .parent_dispatch
             .as_ref()
             .is_none_or(|parent| self.dispatches.contains_key(parent));
+        // Record the derived depth, not the self-report: a grandchild
+        // derives from what is recorded here.
+        let depth = self.effective_depth(&request);
         if let Some(run) = self.runs.get_mut(&request.run_id) {
             run.admitted_total += 1;
+            run.terminal = false;
+            run.last_activity = now;
         }
         if let Some(session) = self.sessions.get_mut(&request.session_id) {
             session.last_served = Some(now);
@@ -460,7 +519,7 @@ impl AdmissionState {
                 run_id: request.run_id,
                 parent: request.parent_dispatch,
                 parent_known,
-                depth: request.depth,
+                depth,
                 class: request.resource,
                 reserved: request.reserve_micros.max(0),
                 waiting: false,
@@ -597,13 +656,17 @@ impl AdmissionState {
         let reserved = std::mem::take(&mut dispatch.reserved);
         let run_id = dispatch.run_id.clone();
         if let Some(run) = self.runs.get_mut(&run_id) {
+            // Saturating: `spent_micros` is reported by the caller and
+            // `reserved` came off the wire; a total that wraps would read
+            // as a run that has spent nothing.
             match spent_micros {
-                Some(spent) => run.settled += spent.max(0),
+                Some(spent) => run.settled = run.settled.saturating_add(spent.max(0)),
                 None => {
-                    run.settled += reserved;
+                    run.settled = run.settled.saturating_add(reserved.max(0));
                     run.uncertain += 1;
                 }
             }
+            run.last_activity = now;
         }
         self.forget_if_settled(dispatch_id);
         self.drain(now);
@@ -690,6 +753,7 @@ impl AdmissionState {
         let mut to_signal = Vec::new();
         if let Some(run) = self.runs.get_mut(run_id) {
             run.cancelled = true;
+            run.terminal = true;
         }
         for (id, dispatch) in self.dispatches.iter_mut() {
             if dispatch.run_id == run_id {
@@ -717,6 +781,20 @@ impl AdmissionState {
             to_signal.extend(self.cancel_run(&run_id, now));
         }
         to_signal
+    }
+
+    /// The root runner reports its run over — accepted, failed, blocked,
+    /// whatever: no further dispatch is coming. Nothing is signalled and
+    /// nothing is cancelled; the run simply stops holding the daemon
+    /// open. Returns false for a run this coordinator does not know.
+    pub fn finish_run(&mut self, run_id: &str) -> bool {
+        match self.runs.get_mut(run_id) {
+            Some(run) => {
+                run.terminal = true;
+                true
+            }
+            None => false,
+        }
     }
 
     /// A cancelled dispatch whose caller acknowledged the cancellation:
@@ -766,7 +844,33 @@ impl AdmissionState {
                 None => report.stale.push(id),
             }
         }
+        self.reap_runs(now);
         report
+    }
+
+    /// Drop run rows that hold nothing: a terminal run with no dispatch
+    /// and no queued request, or a run whose root runner has been silent
+    /// past `RUN_ABANDON_GRACE`. Everything else — including a run that
+    /// is merely between dispatches — is kept, because a registered run
+    /// is what stops the daemon from idling out under a live run.
+    fn reap_runs(&mut self, now: Instant) {
+        let busy: std::collections::BTreeSet<String> = self
+            .dispatches
+            .values()
+            .map(|dispatch| dispatch.run_id.clone())
+            .chain(
+                self.queue
+                    .iter()
+                    .map(|queued| queued.request.run_id.clone()),
+            )
+            .collect();
+        self.runs.retain(|run_id, run| {
+            if busy.contains(run_id) {
+                return true;
+            }
+            let abandoned = now.saturating_duration_since(run.last_activity) >= RUN_ABANDON_GRACE;
+            !(run.terminal || abandoned)
+        });
     }
 
     /// Adopt a dispatch recorded as live in the ledger after a coordinator
@@ -894,10 +998,21 @@ impl AdmissionState {
             .map(|dispatch| dispatch.depth)
     }
 
-    /// True when nothing is registered as active, waiting or queued — the
-    /// coordinator's idle-exit condition.
+    /// True when nothing is registered as active, waiting or queued AND
+    /// every registered run has reached an end state — the coordinator's
+    /// idle-exit condition.
+    ///
+    /// The run clause is load-bearing. A run spends minutes between
+    /// dispatches — snapshotting, verifying the candidate — with no
+    /// dispatch and nothing queued. Judging idleness on dispatches alone
+    /// made the daemon unlink its socket and lock mid-run, and the run's
+    /// next `admit` came back `blocked:admission_unavailable` or
+    /// `UnknownRun` because `RemoteGate` never re-elects: idle-exit
+    /// killed the very run it was counting as absent.
     pub fn is_idle(&self) -> bool {
-        self.dispatches.is_empty() && self.queue.is_empty()
+        self.dispatches.is_empty()
+            && self.queue.is_empty()
+            && self.runs.values().all(|run| run.terminal)
     }
 }
 
@@ -937,6 +1052,14 @@ pub trait Gate {
     fn settle(&self, dispatch_id: &str, spent_micros: Option<i64>) -> Result<(), GateError>;
     /// Abandon a request that was never launched.
     fn withdraw(&self, dispatch_id: &str) -> Result<(), GateError>;
+    /// The run reached an end state and will dispatch nothing more. Until
+    /// a root runner says so, a registered run keeps the coordinator from
+    /// idling out (see `AdmissionState::is_idle`), so a runner that owns a
+    /// run's lifecycle should call this on every terminal path. The
+    /// default is a no-op for gates that do not track run lifetime.
+    fn finish_run(&self, _run_id: &str) -> Result<(), GateError> {
+        Ok(())
+    }
     /// What this gate can enforce, for reports (SPEC §23: observed-only
     /// paths are labelled, never claimed as guarantees).
     fn enforcement(&self) -> &'static str;
@@ -1057,6 +1180,14 @@ impl Gate for LocalGate {
             .lock()
             .expect("admission lock")
             .withdraw(dispatch_id, Instant::now());
+        Ok(())
+    }
+
+    fn finish_run(&self, run_id: &str) -> Result<(), GateError> {
+        self.state
+            .lock()
+            .expect("admission lock")
+            .finish_run(run_id);
         Ok(())
     }
 
@@ -1566,6 +1697,127 @@ mod tests {
         // A claimed dispatch cannot be withdrawn: its launch may be live.
         assert!(!state.withdraw("a2", t0));
         assert_eq!(state.status(t0).runs["run-a"].settled_micros, 0);
+    }
+
+    // C3: depth, session and reservation are self-reported over a socket.
+    #[test]
+    fn a_child_cannot_reset_the_depth_cap_by_claiming_zero() {
+        let mut state = state();
+        let t0 = Instant::now();
+        // limits(): max_agent_depth = 2. Parents wait so the session cap
+        // does not queue their children.
+        assert!(granted(state.request(&req("root", "run-a", "tab-a"), t0)));
+        state.mark_waiting("root", t0);
+        assert!(granted(
+            state.request(&child("kid", "run-a", "tab-a", "root", 1), t0)
+        ));
+        state.mark_waiting("kid", t0);
+        assert_eq!(state.depth_of("kid"), Some(1));
+        assert!(granted(
+            state.request(&child("deep", "run-a", "tab-a", "kid", 2), t0)
+        ));
+        assert_eq!(state.depth_of("deep"), Some(2));
+        // A grandchild that lies about its depth is measured against its
+        // parent's recorded depth, not its own claim.
+        let liar = child("liar", "run-a", "tab-a", "deep", 0);
+        assert!(matches!(
+            state.request(&liar, t0),
+            Decision::Refused {
+                code: Refusal::DepthExceeded,
+                ..
+            }
+        ));
+        // Honest depth from a known parent is recorded as derived.
+        let honest = child("honest", "run-a", "tab-a", "root", 9);
+        assert!(granted(state.request(&honest, t0)));
+        assert_eq!(state.depth_of("honest"), Some(1), "derived, not claimed");
+    }
+
+    #[test]
+    fn a_hostile_reservation_cannot_wrap_or_credit_the_budget() {
+        let mut state = AdmissionState::new(limits());
+        let t0 = Instant::now();
+        state.register_run(&RunRegistration {
+            run_id: "run-a".into(),
+            session_id: "tab-a".into(),
+            budget_micros: Some(1_000),
+            max_agents: Some(10),
+            max_depth: Some(3),
+        });
+        let mut negative = req("negative", "run-a", "tab-a");
+        negative.reserve_micros = -1_000_000;
+        assert!(
+            matches!(
+                state.request(&negative, t0),
+                Decision::Refused {
+                    code: Refusal::BudgetExceeded,
+                    ..
+                }
+            ),
+            "a negative reservation would credit the run"
+        );
+        let mut huge = req("huge", "run-a", "tab-a");
+        huge.reserve_micros = i64::MAX;
+        assert!(matches!(
+            state.request(&huge, t0),
+            Decision::Refused {
+                code: Refusal::BudgetExceeded,
+                ..
+            }
+        ));
+        // Neither attempt took a seat or moved the ledger.
+        let status = state.status(t0);
+        assert_eq!(status.runs["run-a"].admitted_total, 0);
+        assert_eq!(status.runs["run-a"].reserved_micros, 0);
+        // A saturated settlement never wraps into a run that spent nothing.
+        let mut ok = req("ok", "run-a", "tab-a");
+        ok.reserve_micros = 10;
+        assert!(granted(state.request(&ok, t0)));
+        state.release("ok", t0);
+        state.settle("ok", Some(i64::MAX), t0);
+        assert!(state.status(t0).runs["run-a"].settled_micros > 0);
+    }
+
+    // C1: the daemon used to unlink its socket under a run that was
+    // merely between dispatches.
+    #[test]
+    fn a_run_between_dispatches_is_not_idle() {
+        let mut state = state();
+        let t0 = Instant::now();
+        assert!(granted(state.request(&req("d1", "run-a", "tab-a"), t0)));
+        state.release("d1", t0);
+        state.settle("d1", Some(1), t0);
+        assert!(
+            state.dispatches.is_empty(),
+            "the dispatch is settled and gone"
+        );
+        assert!(
+            !state.is_idle(),
+            "run-a is registered and unfinished: it is verifying, not absent"
+        );
+        // The root runner reports the run over; now the daemon may exit.
+        assert!(state.finish_run("run-a"));
+        assert!(state.finish_run("run-b"));
+        assert!(state.finish_run("run-c"));
+        assert!(!state.finish_run("run-unknown"));
+        assert!(state.is_idle());
+        // Reconcile reaps the terminal rows; a cancelled run is terminal.
+        state.reconcile(t0, &|_pid| true);
+        assert!(state.status(t0).runs.is_empty());
+        // A run that never reports finished still stops holding the
+        // daemon open once its root runner has been silent long enough.
+        state.register_run(&RunRegistration {
+            run_id: "run-z".into(),
+            session_id: "tab-z".into(),
+            budget_micros: None,
+            max_agents: None,
+            max_depth: None,
+        });
+        assert!(!state.is_idle());
+        state.reconcile(t0 + RUN_ABANDON_GRACE + Duration::from_secs(60), &|_pid| {
+            true
+        });
+        assert!(state.is_idle(), "an abandoned run cannot pin the daemon");
     }
 
     #[test]

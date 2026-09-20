@@ -119,6 +119,15 @@ pub fn parse_aval_output(exit_code: i32, stdout: &str) -> AvalVerdict {
 /// is part of aval's stable interface: 0 active, 4 undecided,
 /// 5 contradiction, 6 retired, 7 unknown, 1/2/3 tool or corpus failure.
 pub fn aval_resolve(repo_dir: &Path, key: &str, scope: Option<&str>) -> AvalVerdict {
+    // aval takes no `--` separator, so a key that looks like a flag would
+    // be parsed as one. Such a key is a mapping error, reported as the
+    // tool failure it would otherwise become in a less legible form.
+    if key.starts_with('-') || key.trim().is_empty() {
+        return AvalVerdict::ToolFailure {
+            exit: 2,
+            detail: format!("decision key `{key}` is not a key aval can be asked for"),
+        };
+    }
     let mut command = std::process::Command::new("aval");
     command
         .arg("resolve")

@@ -149,10 +149,12 @@ impl TaskWorktree {
 
     /// Immutable candidate snapshot, including added files, outside model
     /// control: a commit object created by plumbing, with no commit hooks
-    /// and no working-tree mutation. The message is FIXED so the SHA is a
-    /// pure function of (tree, base) — identical content is an identical
-    /// candidate identity, which the same-failure recurrence check
-    /// depends on.
+    /// and no working-tree mutation. Author, committer, dates and message
+    /// are all FIXED, so the SHA is a pure function of (tree, base):
+    /// identical content is an identical candidate identity, which the
+    /// same-failure recurrence check depends on (SPEC §9). `commit-tree`
+    /// would otherwise stamp the wall clock into the object and give the
+    /// same tree a new identity every second.
     pub fn snapshot_candidate(&self, _label: &str) -> Result<String> {
         git(&self.path, &["add", "-A"])?;
         let tree = git(&self.path, &["write-tree"])?;
@@ -165,6 +167,12 @@ impl TaskWorktree {
                 "-m",
                 "relais candidate snapshot",
             ])
+            .env("GIT_AUTHOR_NAME", "relais")
+            .env("GIT_AUTHOR_EMAIL", "relais@localhost")
+            .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_NAME", "relais")
+            .env("GIT_COMMITTER_EMAIL", "relais@localhost")
+            .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")
             .current_dir(&self.path)
             .output()
             .map_err(|e| WorkspaceError::Git(format!("commit-tree: {e}")))?;
@@ -177,9 +185,53 @@ impl TaskWorktree {
         Ok(String::from_utf8_lossy(&commit.stdout).trim().to_string())
     }
 
-    /// Export the candidate as a patch artifact.
+    /// Paths the CANDIDATE changes against the base — read from the two
+    /// commit objects, never from the working tree, so what the scope
+    /// check judges is exactly what verification ran and the receipt
+    /// names (SPEC §8, §10). A descendant still writing after the
+    /// snapshot cannot move a path out of this list. NUL-separated and
+    /// unquoted: git C-quotes non-ASCII names on the line-oriented form,
+    /// which would defeat both the glob and the protected-prefix test.
+    pub fn changed_paths_in(&self, candidate_sha: &str) -> Result<Vec<String>> {
+        let output = git_raw(
+            &self.path,
+            &[
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                &self.base_sha,
+                candidate_sha,
+            ],
+        )?;
+        let mut paths: Vec<String> = output
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(|path| path.to_string())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
+    /// Does the candidate carry the same tree as the base? Knowable from
+    /// the objects before a single verification command is spent.
+    pub fn same_tree_as_base(&self, candidate_sha: &str) -> Result<bool> {
+        let base = git(
+            &self.path,
+            &["rev-parse", &format!("{}^{{tree}}", self.base_sha)],
+        )?;
+        let candidate = git(
+            &self.path,
+            &["rev-parse", &format!("{candidate_sha}^{{tree}}")],
+        )?;
+        Ok(base == candidate)
+    }
+
+    /// Export the candidate as a patch artifact. Untrimmed: a patch whose
+    /// last line lost its newline is one `git apply` calls corrupt.
     pub fn export_patch(&self, candidate_sha: &str, out_path: &Path) -> Result<()> {
-        let diff = git(&self.path, &["diff", &self.base_sha, candidate_sha])?;
+        let diff = git_raw(&self.path, &["diff", &self.base_sha, candidate_sha])?;
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -191,28 +243,41 @@ impl TaskWorktree {
 /// Protected repository configuration (SPEC §8): changes here are rejected
 /// unless the contract explicitly includes them in its write scope. The
 /// policy file itself, the check gate's trust declaration, Claude Code
-/// project settings and the aval registry are all positions a worker could
-/// use to widen its own authority.
+/// project settings, the aval registry, CI, the project instructions a
+/// reviewer's session loads, and the ignore file (an unprotected
+/// `.gitignore` lets a worker hide files from the diff, the snapshot and
+/// the exported patch) are all positions a worker could use to widen its
+/// own authority or narrow what is seen.
 pub const PROTECTED_PATH_PREFIXES: &[&str] = &[
     "relais.toml",
     "amont.conf",
     ".adr.yaml",
     ".claude/",
     ".github/workflows/",
+    ".gitignore",
+    "CLAUDE.md",
+    "AGENTS.md",
 ];
 
-pub fn is_protected_path(path: &str) -> bool {
+/// The protected prefix a path falls under, if any.
+pub fn protected_prefix(path: &str) -> Option<&'static str> {
     PROTECTED_PATH_PREFIXES
         .iter()
-        .any(|prefix| path == prefix.trim_end_matches('/') || path.starts_with(prefix))
+        .copied()
+        .find(|prefix| path == prefix.trim_end_matches('/') || path.starts_with(prefix))
 }
 
-/// Check the actual diff against the declared scope. A path is in scope
-/// when some write_scope pattern matches it (gitignore-style semantics via
-/// globset). Protected paths additionally need the contract to name them
-/// explicitly, pattern-for-pattern.
+pub fn is_protected_path(path: &str) -> bool {
+    protected_prefix(path).is_some()
+}
+
+/// Check the candidate's diff against the declared scope. A path is in
+/// scope when some write_scope pattern matches it (gitignore-style
+/// semantics via globset). Protected paths additionally need the contract
+/// to name them explicitly, pattern-for-pattern.
 pub fn check_scope(
     worktree: &TaskWorktree,
+    candidate_sha: &str,
     contract: &TaskContract,
 ) -> std::result::Result<Vec<String>, WorkspaceError> {
     let patterns: &[String] = match contract.write_scope.as_deref() {
@@ -228,25 +293,23 @@ pub fn check_scope(
                 .map_err(|e| WorkspaceError::Git(format!("bad scope pattern `{pattern}`: {e}")))?,
         );
     }
-    let matcher = matcher.build().expect("valid patterns");
+    let matcher = matcher
+        .build()
+        .map_err(|e| WorkspaceError::Git(format!("bad scope patterns: {e}")))?;
 
     let mut violations = Vec::new();
-    for path in worktree.changed_paths()? {
+    for path in worktree.changed_paths_in(candidate_sha)? {
         let in_scope = matcher.is_match(&path);
-        let protected = is_protected_path(&path);
         // "Explicitly within an approved contract" (SPEC §8) means the
-        // scope names the protected area itself — a pattern that starts
-        // with a protected prefix — not a blanket `**` that happens to
-        // match it.
-        let explicitly_allowed = protected
-            && patterns.iter().any(|pattern| {
-                PROTECTED_PATH_PREFIXES
-                    .iter()
-                    .any(|prefix| pattern.starts_with(prefix))
-                    && matcher.is_match(&path)
-            });
-        if !in_scope || (protected && !explicitly_allowed) {
-            violations.push(if protected && !explicitly_allowed {
+        // scope names THIS protected area — a pattern that starts with
+        // the prefix the path falls under — not a blanket `**` that
+        // happens to match it, and not some other protected prefix.
+        let explicitly_allowed = match protected_prefix(&path) {
+            None => true,
+            Some(prefix) => in_scope && patterns.iter().any(|pattern| pattern.starts_with(prefix)),
+        };
+        if !in_scope || !explicitly_allowed {
+            violations.push(if in_scope {
                 format!("{path} (protected repository configuration)")
             } else {
                 path
@@ -262,15 +325,15 @@ pub fn check_scope(
 
 /// Remove an owned worktree — unless it holds unexported changes. A
 /// snapshot taken and exported makes the changes exported; nothing else
-/// does (SPEC §8).
+/// does (SPEC §8). A status check that cannot run is a reason to keep
+/// the worktree, never to force-remove it.
 pub fn release_worktree(repo_dir: &Path, worktree_path: &Path, exported: bool) -> Result<()> {
     if !exported {
-        if let Ok(status) = git(worktree_path, &["status", "--porcelain"]) {
-            if !status.is_empty() {
-                return Err(WorkspaceError::UnexportedChanges(
-                    worktree_path.to_path_buf(),
-                ));
-            }
+        let status = git(worktree_path, &["status", "--porcelain"])?;
+        if !status.is_empty() {
+            return Err(WorkspaceError::UnexportedChanges(
+                worktree_path.to_path_buf(),
+            ));
         }
     }
     git(
@@ -396,6 +459,9 @@ mod tests {
         wt.export_patch(&candidate, &patch).expect("export");
         let patch_text = std::fs::read_to_string(&patch).expect("patch");
         assert!(patch_text.contains("+added by worker"), "{patch_text}");
+        // The artifact is what the user integrates: it must apply as is.
+        git(&repo, &["apply", "--check", &patch.to_string_lossy()])
+            .expect("the exported patch applies to the base checkout");
         release_worktree(&repo, &wt_path, true).expect("released");
     }
 
@@ -407,7 +473,10 @@ mod tests {
         let wt = create_worktree(&repo, &sha, &wt_path).expect("worktree");
         std::fs::write(wt_path.join("src/main.rs"), "// touched\n").expect("edit");
         let contract = contract_with_scope(&["src/**"]);
-        assert!(check_scope(&wt, &contract).expect("scope").is_empty());
+        let candidate = wt.snapshot_candidate("attempt-1").expect("snapshot");
+        assert!(check_scope(&wt, &candidate, &contract)
+            .expect("scope")
+            .is_empty());
         release_worktree(&repo, &wt_path, true).expect("released");
     }
 
@@ -419,7 +488,8 @@ mod tests {
         let wt = create_worktree(&repo, &sha, &wt_path).expect("worktree");
         std::fs::write(wt_path.join("outside.rs"), "// out of scope\n").expect("edit");
         let contract = contract_with_scope(&["src/**"]);
-        let err = check_scope(&wt, &contract).unwrap_err();
+        let candidate = wt.snapshot_candidate("attempt-1").expect("snapshot");
+        let err = check_scope(&wt, &candidate, &contract).unwrap_err();
         assert!(matches!(err, WorkspaceError::ScopeViolation(_)), "{err}");
         release_worktree(&repo, &wt_path, true).expect("released");
     }
@@ -432,17 +502,69 @@ mod tests {
         let wt = create_worktree(&repo, &sha, &wt_path).expect("worktree");
         std::fs::create_dir_all(wt_path.join(".claude")).expect("mkdir");
         std::fs::write(wt_path.join(".claude/settings.json"), "{}").expect("write");
+        let candidate = wt.snapshot_candidate("attempt-1").expect("snapshot");
         // Named in write scope as a directory pattern: still protected.
         let loose = contract_with_scope(&["**"]);
         assert!(
-            check_scope(&wt, &loose).is_err(),
+            check_scope(&wt, &candidate, &loose).is_err(),
             "a broad pattern must not unlock .claude/"
         );
         // Explicitly named, pattern-for-pattern: allowed.
         let explicit = contract_with_scope(&["**", ".claude/**"]);
         assert!(
-            check_scope(&wt, &explicit).is_ok(),
+            check_scope(&wt, &candidate, &explicit).is_ok(),
             "explicit naming allows it"
+        );
+        // Naming ONE protected area unlocks that area only: the policy
+        // file is a different prefix and stays protected.
+        std::fs::write(wt_path.join("relais.toml"), "schema_version = 1\n").expect("write");
+        let candidate = wt.snapshot_candidate("attempt-2").expect("snapshot");
+        let err = check_scope(&wt, &candidate, &explicit).unwrap_err();
+        assert!(err.to_string().contains("relais.toml (protected"), "{err}");
+        release_worktree(&repo, &wt_path, true).expect("released");
+    }
+
+    #[test]
+    fn candidate_identity_is_a_function_of_content_not_time() {
+        let (_dir, repo) = temp_repo();
+        let sha = resolve_base(&repo, "HEAD").expect("base");
+        let wt_path = repo.parent().unwrap().join("wt-ident");
+        let wt = create_worktree(&repo, &sha, &wt_path).expect("worktree");
+        std::fs::write(wt_path.join("src/main.rs"), "fn main() { v2 }\n").expect("edit");
+        let first = wt.snapshot_candidate("attempt-1").expect("snapshot");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let second = wt.snapshot_candidate("attempt-2").expect("snapshot");
+        assert_eq!(
+            first, second,
+            "same tree, same identity, whatever the clock says"
+        );
+        assert!(!wt.same_tree_as_base(&first).expect("tree compare"));
+        std::fs::write(wt_path.join("src/main.rs"), "fn main() {}\n").expect("revert");
+        let reverted = wt.snapshot_candidate("attempt-3").expect("snapshot");
+        assert!(wt.same_tree_as_base(&reverted).expect("tree compare"));
+        release_worktree(&repo, &wt_path, true).expect("released");
+    }
+
+    #[test]
+    fn scope_judges_the_snapshot_not_the_live_tree_and_reads_non_ascii_paths() {
+        let (_dir, repo) = temp_repo();
+        let sha = resolve_base(&repo, "HEAD").expect("base");
+        let wt_path = repo.parent().unwrap().join("wt-toctou");
+        let wt = create_worktree(&repo, &sha, &wt_path).expect("worktree");
+        std::fs::create_dir_all(wt_path.join(".claude")).expect("mkdir");
+        std::fs::write(wt_path.join(".claude/réglages.json"), "{}").expect("write");
+        let candidate = wt.snapshot_candidate("attempt-1").expect("snapshot");
+        // The worker (or a straggling descendant) deletes the file after
+        // the snapshot: the candidate still carries it, and the check
+        // still sees it, under its real name.
+        std::fs::remove_file(wt_path.join(".claude/réglages.json")).expect("rm");
+        let paths = wt.changed_paths_in(&candidate).expect("paths");
+        assert_eq!(paths, vec![".claude/réglages.json".to_string()]);
+        let loose = contract_with_scope(&["**"]);
+        let err = check_scope(&wt, &candidate, &loose).unwrap_err();
+        assert!(
+            err.to_string().contains("réglages.json (protected"),
+            "{err}"
         );
         release_worktree(&repo, &wt_path, true).expect("released");
     }

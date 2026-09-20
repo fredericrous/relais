@@ -142,6 +142,25 @@ fn default_attempts_per_package() -> u32 {
     2
 }
 
+/// `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`. A package id is not a label: the
+/// scheduler uses it as a filesystem path component for the package's
+/// worktree and artifacts, and with `"decomposition": "propose"` the ids
+/// are model output. `../..`, an absolute path, a NUL or a name that is
+/// merely long must never reach a `join`.
+fn is_valid_package_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    if id.len() > 64 {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 impl WorkPlan {
     /// Shape validation: ids unique and non-empty, every package carries
     /// an objective, scope and acceptance, dependencies resolve, and the
@@ -167,6 +186,9 @@ impl WorkPlan {
         for package in &self.packages {
             if package.id.trim().is_empty() || !ids.insert(package.id.as_str()) {
                 return Err(ContractError::PlanDuplicatePackage(package.id.clone()));
+            }
+            if !is_valid_package_id(&package.id) {
+                return Err(ContractError::PlanBadPackageId(package.id.clone()));
             }
             if package.objective.trim().is_empty() {
                 return Err(ContractError::PlanPackageIncomplete(
@@ -286,6 +308,7 @@ pub enum ContractError {
     PlanTooLarge(usize, u32),
     PlanMissingIntegrationAcceptance,
     PlanDuplicatePackage(String),
+    PlanBadPackageId(String),
     PlanPackageIncomplete(String, &'static str),
     PlanBadDependency(String, String),
     PlanCycle,
@@ -331,6 +354,10 @@ impl std::fmt::Display for ContractError {
                 "work plan needs integration_acceptance: independent receipts are not final acceptance"
             ),
             Self::PlanDuplicatePackage(id) => write!(f, "package id `{id}` is empty or duplicated"),
+            Self::PlanBadPackageId(id) => write!(
+                f,
+                "package id `{id}` is not [A-Za-z0-9][A-Za-z0-9_-]{{0,63}}: ids name directories on disk"
+            ),
             Self::PlanPackageIncomplete(id, field) => {
                 write!(f, "package `{id}` has no {field}")
             }
@@ -597,6 +624,53 @@ mod tests {
         m2.limits = Limits::default();
         assert_eq!(m1.hash(), m2.hash(), "omitted limits hash as their default");
         assert_eq!(m1.review, Review::Optional);
+    }
+
+    fn plan_with_ids(first: &str, second: &str) -> WorkPlan {
+        let package = |id: &str| WorkPackage {
+            id: id.into(),
+            objective: "do the thing".into(),
+            write_scope: vec!["src/**".into()],
+            depends_on: Vec::new(),
+            acceptance: vec!["it builds".into()],
+        };
+        WorkPlan {
+            packages: vec![package(first), package(second)],
+            integration_acceptance: vec!["the whole thing builds".into()],
+            limits: PlanLimits::default(),
+        }
+    }
+
+    // SPEC §19 + the scheduler: a package id is a directory name on disk,
+    // and under `"decomposition": "propose"` it is model output.
+    #[test]
+    fn plan_package_ids_are_safe_path_components() {
+        plan_with_ids("api", "web-ui_2")
+            .validate()
+            .expect("ordinary ids validate");
+
+        for bad in ["../x", "/abs", "a/b", ".hidden", "-lead", "x y", "é"] {
+            assert_eq!(
+                plan_with_ids(bad, "ok").validate().unwrap_err(),
+                ContractError::PlanBadPackageId(bad.into()),
+                "id `{bad}` must be refused"
+            );
+        }
+        // Empty is caught by the earlier empty/duplicate rule.
+        assert_eq!(
+            plan_with_ids("", "ok").validate().unwrap_err(),
+            ContractError::PlanDuplicatePackage(String::new())
+        );
+        // 64 characters is the ceiling; 65 is refused.
+        let long = "a".repeat(64);
+        plan_with_ids(&long, "ok")
+            .validate()
+            .expect("64 characters fit");
+        let too_long = "a".repeat(65);
+        assert_eq!(
+            plan_with_ids(&too_long, "ok").validate().unwrap_err(),
+            ContractError::PlanBadPackageId(too_long)
+        );
     }
 
     #[test]

@@ -134,17 +134,31 @@ const ADMISSION_POLL: Duration = Duration::from_millis(250);
 /// The supervised execution path (SPEC §3): preflight, route, then a
 /// bounded sequence of attempts the runner — not a model — owns.
 pub fn execute(config: &RunConfig<'_>) -> RunOutcome {
-    RunEngine::new(config, None).run()
+    finished(config, RunEngine::new(config, None).run())
 }
 
 /// A work package's run (SPEC §19): the same lifecycle, attributed to
 /// its root run in the ledger.
 pub fn execute_child(config: &RunConfig<'_>, parent_run: &str, package_id: &str) -> RunOutcome {
-    RunEngine::new(
+    finished(
         config,
-        Some((parent_run.to_string(), package_id.to_string())),
+        RunEngine::new(
+            config,
+            Some((parent_run.to_string(), package_id.to_string())),
+        )
+        .run(),
     )
-    .run()
+}
+
+/// Tell the coordinator the run is over, whatever its end: a registered
+/// run keeps the daemon from idle-exiting (SPEC §23), so one that has
+/// ended must say so. Best effort — the outcome is already decided and
+/// recorded, and an unreachable coordinator reaps it on its own grace.
+fn finished(config: &RunConfig<'_>, outcome: RunOutcome) -> RunOutcome {
+    if let Some(gate) = config.gate {
+        let _ = gate.finish_run(outcome.run_id());
+    }
+    outcome
 }
 
 /// What a managed launch produced: the worker's result, or the run's
@@ -683,28 +697,31 @@ impl<'a> RunEngine<'a> {
             .then(|| baseline_cache.get(&baseline_key))
             .flatten();
         let baseline_cached = cached_baseline.is_some();
-        let baseline_failures = match cached_baseline {
-            Some(failures) => failures,
+        // The baseline's check outcomes are kept: a candidate identical to
+        // the base has exactly these results, without re-running them.
+        let (baseline_failures, baseline_checks) = match cached_baseline {
+            Some(failures) => (failures, None),
             None => match verify::verification_worktree(
                 self.config.repo_dir,
                 &base_sha,
                 &self.artifacts.join("verify-base"),
             ) {
                 Ok(baseline) => {
-                    let failures: Vec<String> = verify::run_profile(
+                    let checks = verify::run_profile(
                         baseline.path(),
                         &authority.verification_profile,
                         &logs_dir,
                         "base",
-                    )?
-                    .into_iter()
-                    .filter(|outcome| outcome.failed())
-                    .map(|outcome| outcome.label)
-                    .collect();
+                    )?;
+                    let failures: Vec<String> = checks
+                        .iter()
+                        .filter(|outcome| outcome.failed())
+                        .map(|outcome| outcome.label.clone())
+                        .collect();
                     if authority.verification_profile.cache_baseline {
                         baseline_cache.put(&baseline_key, &failures);
                     }
-                    failures
+                    (failures, Some(checks))
                 }
                 Err(e) => {
                     return self
@@ -873,6 +890,7 @@ impl<'a> RunEngine<'a> {
                 max_turns: None,
                 budget_micros: remaining_budget,
                 disallowed_tools: authority.disallowed_tools.clone(),
+                allowed_tools: authority.allowed_tools.clone(),
                 work_dir: worktree_path.clone(),
                 wall_timeout: remaining_wall,
                 cancel: None,
@@ -930,7 +948,7 @@ impl<'a> RunEngine<'a> {
             if let Some(effective) = result
                 .effective_model
                 .as_deref()
-                .filter(|model| *model != model_profile.id)
+                .filter(|model| !crate::adapter::model_matches(&model_profile.id, model))
             {
                 return self.stop(
                     &progress.budget,
@@ -971,8 +989,26 @@ impl<'a> RunEngine<'a> {
                     &progress.budget,
                     Observation::TerminalResultMissing {
                         timed_out: result.timed_out,
+                        detail: result.failure_detail.clone().unwrap_or_default(),
                     },
                 );
+            }
+
+            // The worker's answer is evidence — for an inspect task it is
+            // the whole deliverable (SPEC §4) — recorded before anything
+            // is judged about it.
+            if let Some(text) = result.result_text.as_deref() {
+                let result_path = self
+                    .artifacts
+                    .join(format!("attempt-{attempt_index}-result.txt"));
+                std::fs::write(&result_path, text)?;
+                ledger.record_evidence(
+                    &self.run_id,
+                    Some(attempt_id),
+                    "worker_result",
+                    &result_path,
+                    workspace::sha256_file(&result_path).ok().as_deref(),
+                )?;
             }
 
             // A worker blockage proposal is recorded as evidence and the
@@ -1012,6 +1048,8 @@ impl<'a> RunEngine<'a> {
                 .artifacts
                 .join(format!("candidate-{attempt_index}.patch"));
             worktree.export_patch(&candidate_sha, &patch_path)?;
+            // The reviewer's prompt names this path; it must exist.
+            std::fs::copy(&patch_path, self.artifacts.join("candidate-latest.patch"))?;
             ledger.record_evidence(
                 &self.run_id,
                 Some(attempt_id),
@@ -1022,7 +1060,7 @@ impl<'a> RunEngine<'a> {
 
             // Write scope is checked on the actual diff; a violation can
             // never be accepted (SPEC §8, §9).
-            match workspace::check_scope(&worktree, self.config.contract) {
+            match workspace::check_scope(&worktree, &candidate_sha, self.config.contract) {
                 Ok(_) => {}
                 Err(WorkspaceError::ScopeViolation(paths)) => {
                     ledger.finish_attempt(
@@ -1044,7 +1082,7 @@ impl<'a> RunEngine<'a> {
             // weakened).
             let verification_inputs_changed = verify::verification_inputs_touched(
                 &authority.verification_profile,
-                &worktree.changed_paths()?,
+                &worktree.changed_paths_in(&candidate_sha)?,
             );
             let review_required =
                 decision.review >= Review::Required || !verification_inputs_changed.is_empty();
@@ -1057,8 +1095,55 @@ impl<'a> RunEngine<'a> {
             }
 
             // Verification against an immutable copy of the candidate
-            // (SPEC §10).
+            // (SPEC §10). A candidate that carries the base tree has the
+            // baseline's results by identity: the commands are not spent
+            // again, and the receipt says so.
             self.state = State::Verifying;
+            let identical = match worktree.same_tree_as_base(&candidate_sha) {
+                Ok(same) => same,
+                Err(e) => {
+                    return self.fail_preflight(BlockCode::SnapshotFailed, e.to_string());
+                }
+            };
+            // Tools the harness refused. A worker that produced nothing
+            // while being refused could not act: blocked, and a stronger
+            // model is not bought for a missing permission (SPEC §8, §9).
+            // A worker that delivered a candidate anyway was refused
+            // something it did not need; that is evidence on the run,
+            // and the candidate is judged like any other.
+            if !result.permission_denials.is_empty() {
+                if identical {
+                    ledger.finish_attempt(
+                        attempt_id,
+                        State::Blocked,
+                        Some(worktree_path.to_string_lossy().as_ref()),
+                        Some(&candidate_sha),
+                    )?;
+                    return self.stop(
+                        &progress.budget,
+                        Observation::PermissionDenied(result.permission_denials.clone()),
+                    );
+                }
+                self.transition(
+                    State::Verifying,
+                    Reason::PermissionDenied,
+                    serde_json::json!({
+                        "tools": result.permission_denials,
+                        "candidate": candidate_sha,
+                        "note": "refused during the attempt; the candidate was still produced",
+                    }),
+                )?;
+            }
+            let reuse = if identical {
+                self.transition(
+                    State::Verifying,
+                    Reason::CandidateIdenticalToBase,
+                    serde_json::json!({ "candidate": candidate_sha }),
+                )?;
+                baseline_checks.as_deref()
+            } else {
+                None
+            };
             let verify::Verified {
                 checks,
                 gaps,
@@ -1070,6 +1155,7 @@ impl<'a> RunEngine<'a> {
                 &authority,
                 &logs_dir,
                 attempt_index,
+                reuse,
             ) {
                 Ok(result) => result,
                 Err(e) => {
@@ -1079,11 +1165,17 @@ impl<'a> RunEngine<'a> {
             if !gaps.is_empty() {
                 return self.stop(&progress.budget, Observation::VerificationGap(gaps));
             }
-            let failures: Vec<String> = checks
+            let mut failures: Vec<String> = checks
                 .iter()
                 .filter(|check| check.failed())
                 .map(|check| check.label.clone())
                 .collect();
+            // A change task whose candidate changes nothing has not met
+            // its objective, whatever the baseline says: a behavioural
+            // failure the worker can repair, never an acceptance.
+            if identical && self.config.contract.kind == crate::contract::Kind::Change {
+                failures.push("empty_candidate".into());
+            }
 
             if !failures.is_empty() {
                 let unchanged_candidate =
@@ -1247,18 +1339,29 @@ impl<'a> RunEngine<'a> {
         authority: &EffectiveAuthority,
         logs_dir: &Path,
         attempt_index: u32,
+        reuse: Option<&[verify::CheckOutcome]>,
     ) -> Result<verify::Verified, String> {
-        let verify_path = self.artifacts.join(format!("verify-{attempt_index}"));
-        let holder =
-            verify::verification_worktree(self.config.repo_dir, candidate_sha, &verify_path)
+        let checks = match reuse {
+            // The candidate is the base tree: the baseline's outcomes are
+            // its outcomes, by identity.
+            Some(outcomes) => outcomes.to_vec(),
+            None => {
+                let verify_path = self.artifacts.join(format!("verify-{attempt_index}"));
+                let holder = verify::verification_worktree(
+                    self.config.repo_dir,
+                    candidate_sha,
+                    &verify_path,
+                )
                 .map_err(|e| e.to_string())?;
-        let checks = verify::run_profile(
-            holder.path(),
-            &authority.verification_profile,
-            logs_dir,
-            &format!("attempt{attempt_index}"),
-        )
-        .map_err(|e| e.to_string())?;
+                verify::run_profile(
+                    holder.path(),
+                    &authority.verification_profile,
+                    logs_dir,
+                    &format!("attempt{attempt_index}"),
+                )
+                .map_err(|e| e.to_string())?
+            }
+        };
         for check in &checks {
             let _ = self.config.ledger.record_evidence(
                 &self.run_id,
@@ -1381,6 +1484,8 @@ impl<'a> RunEngine<'a> {
             max_turns: None,
             budget_micros: remaining_budget,
             disallowed_tools: authority.disallowed_tools.clone(),
+            // The reviewer reports; it gets no allowlist.
+            allowed_tools: Vec::new(),
             work_dir: self.artifacts.join("worktree"),
             wall_timeout: deadline
                 .saturating_duration_since(Instant::now())
@@ -1478,7 +1583,15 @@ impl<'a> RunEngine<'a> {
             );
         }
         let text = result.result_text.unwrap_or_default();
-        let _ = std::fs::write(self.artifacts.join("review.txt"), &text);
+        let review_path = self.artifacts.join("review.txt");
+        let _ = std::fs::write(&review_path, &text);
+        let _ = self.config.ledger.record_evidence(
+            &self.run_id,
+            None,
+            "review_result",
+            &review_path,
+            workspace::sha256_file(&review_path).ok().as_deref(),
+        );
         if text
             .lines()
             .rev()
@@ -2458,6 +2571,244 @@ mod tests {
             receipt.models_used,
             vec!["haiku".to_string()],
             "research tier"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    // -- the harness boundary (SPEC §8, §9, §11) --------------------------
+
+    #[test]
+    fn refused_tools_block_the_run_and_buy_no_stronger_model() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let launches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&launches);
+        let backend = MockBackend::new(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            MockOutcome {
+                result_text: Some("I need your permission to edit src/main.rs".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                permission_denials: vec!["Edit".into(), "Bash".into()],
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Optional), &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Blocked { code, detail },
+        } = outcome
+        else {
+            panic!("expected blocked, got {outcome:?}");
+        };
+        assert_eq!(code, BlockCode::PermissionDenied);
+        assert!(detail.contains("Edit, Bash"), "{detail}");
+        assert_eq!(
+            launches.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no repair, no escalation for a missing permission"
+        );
+        assert_eq!(
+            fixture.ledger.run_cost(&run_id).expect("cost"),
+            MicroUsd::from_micros(100),
+            "the refused attempt's cost is still the task's"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_refusal_the_worker_worked_around_is_evidence_not_a_block() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let backend = MockBackend::new(|spec| {
+            if spec.prompt.contains("semantic reviewer") {
+                return MockOutcome {
+                    result_text: Some("FINDINGS: none".into()),
+                    exit_code: Some(0),
+                    ..Default::default()
+                };
+            }
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            MockOutcome {
+                result_text: Some("DONE (ls was refused, I used Glob)".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                permission_denials: vec!["Bash(ls -la)".into()],
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Optional), &repo, &backend);
+        let RunOutcome { run_id, terminal } = outcome;
+        assert!(
+            matches!(terminal, Terminal::Accepted(_)),
+            "a delivered candidate is judged on its checks, got {terminal:?}"
+        );
+        let transitions = fixture.ledger.transitions(&run_id).expect("history");
+        assert!(
+            transitions
+                .iter()
+                .any(|t| t.reason == Reason::PermissionDenied.as_str()),
+            "the refusal is on the record: {transitions:?}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_harness_that_exits_non_zero_is_interrupted_not_an_empty_attempt() {
+        let fixture = Fixture::new();
+        // Green at the base: an empty candidate would pass verification,
+        // which is exactly the acceptance that must not happen.
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let backend = MockBackend::new(|_| MockOutcome {
+            result_text: Some(String::new()),
+            exit_code: Some(1),
+            ..Default::default()
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Optional), &repo, &backend);
+        assert!(
+            matches!(outcome.terminal, Terminal::Interrupted { .. }),
+            "expected interrupted, got {outcome:?}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn an_empty_candidate_on_a_change_is_a_failure_the_worker_may_repair_once() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&prompts);
+        let backend = MockBackend::new(move |spec| {
+            seen.lock().unwrap().push(spec.prompt.clone());
+            MockOutcome {
+                result_text: Some("DONE (nothing needed changing)".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Optional), &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Failed { detail },
+        } = outcome
+        else {
+            panic!("a change that changes nothing is not accepted, got {outcome:?}");
+        };
+        assert!(detail.contains("empty_candidate"), "{detail}");
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(
+            prompts.len(),
+            2,
+            "initial, then one repair; identical tree → fail"
+        );
+        assert!(
+            prompts[1].contains("empty_candidate"),
+            "the repair prompt names the failure: {}",
+            prompts[1]
+        );
+        let transitions = fixture.ledger.transitions(&run_id).expect("history");
+        assert_eq!(
+            transitions.last().unwrap().reason,
+            Reason::SameFailureRecurrence.as_str(),
+            "the second empty candidate has the FIRST one's identity"
+        );
+        let run_dir = fixture.artifacts.join(&run_id);
+        assert!(
+            !run_dir.join("verify-1").exists() && !run_dir.join("verify-2").exists(),
+            "an identical tree spends no verification command"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn an_inspect_answer_is_kept_and_its_identical_tree_reuses_the_baseline() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let backend = MockBackend::new(|_| MockOutcome {
+            result_text: Some("REPORT: the check is inert because its trust entry is stale".into()),
+            exit_code: Some(0),
+            usage: Some(usage(50)),
+            ..Default::default()
+        });
+        let contract = TaskContract::from_json_str(
+            &serde_json::json!({
+                "schema_version": 1,
+                "kind": "inspect",
+                "objective": "Say why the check is inert",
+                "base_ref": "HEAD",
+                "acceptance": ["evidence of why the check is inert"],
+                "verification_profile": "profile",
+            })
+            .to_string(),
+        )
+        .expect("contract");
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Accepted(receipt),
+        } = outcome
+        else {
+            panic!("expected acceptance, got {outcome:?}");
+        };
+        let run_dir = fixture.artifacts.join(&run_id);
+        let answer = std::fs::read_to_string(run_dir.join("attempt-1-result.txt"))
+            .expect("the worker's answer is the deliverable and is kept");
+        assert!(answer.contains("trust entry is stale"));
+        assert!(
+            !run_dir.join("verify-1").exists(),
+            "the candidate is the base tree; its results are the baseline's"
+        );
+        assert_eq!(receipt.verification.checks.len(), 1);
+        assert!(receipt.verification.checks[0].log_path.contains("base-"));
+        let transitions = fixture.ledger.transitions(&run_id).expect("history");
+        assert!(
+            transitions
+                .iter()
+                .any(|t| t.reason == Reason::CandidateIdenticalToBase.as_str()),
+            "{transitions:?}"
+        );
+        let evidence = fixture.ledger.evidence(&run_id).expect("evidence");
+        assert!(
+            evidence.iter().any(|(kind, _, _)| kind == "worker_result"),
+            "{evidence:?}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn an_alias_resolved_to_a_dated_id_is_not_a_substitution() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let backend = MockBackend::new(|spec| {
+            if spec.prompt.contains("semantic reviewer") {
+                return MockOutcome {
+                    result_text: Some("FINDINGS: none".into()),
+                    exit_code: Some(0),
+                    ..Default::default()
+                };
+            }
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                effective_model: Some("claude-sonnet-5-20261001".into()),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Optional), &repo, &backend);
+        let RunOutcome {
+            terminal: Terminal::Accepted(receipt),
+            ..
+        } = outcome
+        else {
+            panic!("expected acceptance, got {outcome:?}");
+        };
+        assert_eq!(
+            receipt.models_used,
+            vec!["claude-sonnet-5-20261001".to_string()],
+            "the effective model is what the receipt records"
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }

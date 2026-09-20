@@ -273,9 +273,12 @@ impl RepoPolicy {
     }
 
     /// Hash over the executable authority: models, execution limits,
-    /// verification profiles, integration modes, risk rules and
+    /// verification profiles, integration modes, risk rules, recipes and
     /// architecture mappings. Machine trust grants are content-bound to
     /// this hash — a changed declaration invalidates them (SPEC §5).
+    /// Recipes are executable authority: one that covers a task picks its
+    /// tier outright, ahead of the learner, so a grant must not survive
+    /// an edit to them.
     pub fn authority_hash(&self) -> String {
         let value = serde_json::json!({
             "models": self.models,
@@ -283,6 +286,7 @@ impl RepoPolicy {
             "verification": self.verification,
             "integrations": self.integrations,
             "risk": self.risk,
+            "recipes": self.recipes,
             "architecture": self.architecture,
         });
         canonical_json_hash(&value)
@@ -366,6 +370,15 @@ pub struct TrustGrant {
 pub struct Permissions {
     #[serde(default = "default_disallowed_tools")]
     pub disallowed_tools: Vec<String>,
+    /// Claude Code permission rules the worker is granted, passed via
+    /// `--settings` (`{"permissions":{"allow":[…]}}`) — "Edit", "Write",
+    /// "Bash(cargo test:*)" and the like. Machine-owned and machine-owned
+    /// only: repo policy never appears here, so a repository cannot widen
+    /// what its own workers may do (SPEC §8). Empty by default: with no
+    /// grant a `change` worker is denied `Edit`/`Write` by the harness and
+    /// the attempt ends blocked rather than silently doing nothing.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
 }
 
 fn default_disallowed_tools() -> Vec<String> {
@@ -382,6 +395,7 @@ impl Default for Permissions {
     fn default() -> Self {
         Self {
             disallowed_tools: default_disallowed_tools(),
+            allowed_tools: Vec::new(),
         }
     }
 }
@@ -474,6 +488,10 @@ pub enum BlockCode {
     EnvMissing,
     ArchitectureContradiction,
     DecompositionKind,
+    /// The harness refused the worker a tool it needed: missing
+    /// permissions are a blocked result, never a worker that chose to do
+    /// nothing (SPEC §8).
+    PermissionDenied,
 }
 
 impl BlockCode {
@@ -499,6 +517,7 @@ impl BlockCode {
             Self::EnvMissing => "env_missing",
             Self::ArchitectureContradiction => "architecture_contradiction",
             Self::DecompositionKind => "decomposition_kind",
+            Self::PermissionDenied => "permission_denied",
         }
     }
 }
@@ -533,6 +552,10 @@ pub struct EffectiveAuthority {
     pub verification_profile: VerificationProfile,
     pub review_floor: Review,
     pub disallowed_tools: Vec<String>,
+    /// Machine-owned permission grant handed to the worker via
+    /// `--settings`. Repo policy contributes nothing: authority here only
+    /// narrows, and a repository cannot broaden its own workers' reach.
+    pub allowed_tools: Vec<String>,
     pub authority_hash: String,
     pub trust_granted: bool,
     pub blockers: Vec<Blocker>,
@@ -628,6 +651,7 @@ pub fn effective_authority(
         verification_profile: profile,
         review_floor,
         disallowed_tools: machine.permissions.disallowed_tools.clone(),
+        allowed_tools: machine.permissions.allowed_tools.clone(),
         authority_hash,
         trust_granted,
         blockers,
@@ -752,13 +776,20 @@ timeout_seconds = 300
 
 # Risk floors: writes touching these patterns cannot route below the
 # minimum tier, and the review requirement here is a floor, not a hint.
-# Floors apply to the DECLARED scope: a contract scoped `src/**` could
-# write `src/trust/x`, so a `**/trust/**` rule floors it — scope
-# contracts as narrowly as the task allows.
-[[risk]]
-paths = ["**/trust/**", "**/restore/**"]
-minimum_tier = "escalation"
-review = "required"
+# Floors apply to the DECLARED scope, over-approximated: a contract
+# scoped `src/**` COULD write `src/trust/x`, so a `**/trust/**` rule
+# floors it. That is why no rule ships enabled. A leading-`**` pattern
+# matches every scope that ends in `**`, which is nearly every ordinary
+# contract, so one such rule pins the whole repository to the escalation
+# tier with mandatory review and the cheap tiers become unreachable.
+#
+# Write rules against the real directories instead of a `**` prefix
+# (`crates/relais/src/trust/**`, not `**/trust/**`), and scope contracts
+# as narrowly as the task allows.
+# [[risk]]
+# paths = ["crates/*/src/trust/**", "crates/*/src/restore/**"]
+# minimum_tier = "escalation"
+# review = "required"
 
 # Path-to-aval-key mappings. aval resolves exact keys; it has no
 # source-impact analysis, so the mapping lives here (SPEC §7).
@@ -977,6 +1008,47 @@ keys = ["output.contract"]
     }
 
     #[test]
+    fn allowed_tools_are_machine_owned_and_empty_by_default() {
+        let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        let machine =
+            MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo))).expect("parses");
+        assert!(machine.permissions.allowed_tools.is_empty());
+        let a = effective_authority(&repo, &machine, &contract());
+        assert!(a.allowed_tools.is_empty(), "no grant, no tools");
+
+        let granted = MachineSettings::from_toml_str(&machine_toml(&format!(
+            "{}\n[permissions]\nallowed_tools = [\"Edit\", \"Write\", \"Bash(cargo test:*)\"]\n",
+            grant_for(&repo)
+        )))
+        .expect("parses");
+        let a = effective_authority(&repo, &granted, &contract());
+        assert_eq!(a.allowed_tools, ["Edit", "Write", "Bash(cargo test:*)"]);
+        assert!(
+            a.disallowed_tools.contains(&"Bash(git push:*)".to_string()),
+            "naming allowed tools never shortens the deny floor"
+        );
+    }
+
+    #[test]
+    fn recipes_are_hashed_as_executable_authority() {
+        let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        let with_recipe = RepoPolicy::from_toml_str(&format!(
+            "{REPO_TOML}\n[[recipes]]\nname = \"docs\"\nscope_within = [\"docs/**\"]\ntier = \"research\"\n"
+        ))
+        .expect("parses");
+        assert_eq!(with_recipe.recipes.len(), 1);
+        assert_ne!(
+            repo.authority_hash(),
+            with_recipe.authority_hash(),
+            "a recipe picks a tier ahead of the learner: adding one is an authority change"
+        );
+        // A grant bound to the recipe-less declaration does not carry over.
+        let machine =
+            MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo))).expect("parses");
+        assert!(!effective_authority(&with_recipe, &machine, &contract()).trust_granted);
+    }
+
+    #[test]
     fn integration_table_form() {
         let repo = RepoPolicy::from_toml_str(
             r#"
@@ -996,6 +1068,12 @@ amont = { mode = "optional", bin = "/opt/amont/bin/amont" }
         let policy = RepoPolicy::from_toml_str(INIT_TEMPLATE).expect("template parses");
         assert_eq!(policy.models.len(), 3);
         assert!(policy.verification.profiles.contains_key("default"));
+        assert!(
+            policy.risk.is_empty(),
+            "the template ships risk rules as commented examples: a live \
+             leading-`**` rule floors every `…/**` scope to escalation and \
+             makes the cheap tiers unreachable"
+        );
     }
 
     #[test]

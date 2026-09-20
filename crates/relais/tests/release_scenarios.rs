@@ -197,8 +197,9 @@ fn text(bytes: &[u8]) -> String {
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 case "$1" in
   --version) echo "fake-claude 9.9.9"; exit 0 ;;
-  --help) echo "usage: claude -p --model --effort --max-turns --output-format --budget --disallowed-tools"; exit 0 ;;
+  --help) echo "usage: claude -p --model <model> --effort <level> --output-format <format> --max-budget-usd <amount> --disallowed-tools <tools...> --settings <file-or-json>"; exit 0 ;;
 esac
+printf '%s\n' "$@" > "$(dirname "$0")/argv-last.log"
 prompt=$(cat)
 model=""
 while [ $# -gt 0 ]; do
@@ -208,11 +209,11 @@ while [ $# -gt 0 ]; do
   shift
 done
 if printf '%s' "$prompt" | grep -q "semantic reviewer"; then
-  printf '{"result":"looked at it\\nFINDINGS: none","session_id":"rev-1","total_cost_usd":0.002,"model":"%s","usage":{"input_tokens":10,"output_tokens":2}}\n' "$model"
+  printf '{"result":"looked at it\\nFINDINGS: none","session_id":"rev-1","total_cost_usd":0.002,"modelUsage":{"%s":{"outputTokens":2}},"permission_denials":[],"usage":{"input_tokens":10,"output_tokens":2}}\n' "$model"
   exit 0
 fi
 if printf '%s' "$prompt" | grep -q "blockage-please"; then
-  printf '{"result":"relais-blocked: the vendored crate is missing","session_id":"w-b","total_cost_usd":0.001,"model":"%s","usage":{"input_tokens":10,"output_tokens":2}}\n' "$model"
+  printf '{"result":"relais-blocked: the vendored crate is missing","session_id":"w-b","total_cost_usd":0.001,"modelUsage":{"%s":{"outputTokens":2}},"permission_denials":[],"usage":{"input_tokens":10,"output_tokens":2}}\n' "$model"
   exit 0
 fi
 if printf '%s' "$prompt" | grep -q "an easy one"; then
@@ -223,7 +224,7 @@ else
     *) echo churn > "src/tick-$$-$(date +%s%N).txt" ;;
   esac
 fi
-printf '{"result":"DONE","session_id":"w-1","total_cost_usd":0.01,"model":"%s","usage":{"input_tokens":100,"output_tokens":10}}\n' "$model"
+printf '{"result":"DONE","session_id":"w-1","total_cost_usd":0.01,"modelUsage":{"%s":{"outputTokens":10}},"permission_denials":[],"usage":{"input_tokens":100,"output_tokens":10}}\n' "$model"
 "#;
 
 // SPEC §14: a bounded change routes to the configured model, passes
@@ -718,4 +719,45 @@ fn coordinator_cancel_and_stop_leave_state_consistent() {
     // The next run starts a fresh coordinator by itself.
     let again = world.relais(&["run", "--task", task.to_str().unwrap()]);
     assert_eq!(again.status.code(), Some(0), "{}", text(&again.stderr));
+}
+
+// SPEC §8, §11: the machine's permission allowlist reaches the worker as an
+// explicit settings document, the dollar ceiling as the CLI's own flag, and
+// no permission-mode or bypass flag ever appears on the argv.
+#[test]
+fn launch_argv_carries_machine_permissions_and_the_budget_flag() {
+    let world = World::new("argv");
+    let hash = world.write_policy(1);
+    world.write_machine(
+        &hash,
+        "[spending]\nper_run_micros = 2500000\n\n[permissions]\nallowed_tools = [\"Edit\", \"Bash(cargo test:*)\"]\n",
+    );
+    let task = world.write_task("task.json", "off");
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    let argv = std::fs::read_to_string(world.root.join("argv-last.log")).expect("argv log");
+    let args: Vec<&str> = argv.lines().collect();
+    assert_eq!(args[0], "-p", "{argv}");
+    let budget_at = args
+        .iter()
+        .position(|arg| *arg == "--max-budget-usd")
+        .unwrap_or_else(|| panic!("budget flag missing: {argv}"));
+    assert_eq!(args[budget_at + 1], "2.5");
+    assert!(!args.contains(&"--budget"), "{argv}");
+    let settings_at = args
+        .iter()
+        .position(|arg| *arg == "--settings")
+        .unwrap_or_else(|| panic!("settings flag missing: {argv}"));
+    let settings: serde_json::Value = serde_json::from_str(args[settings_at + 1]).expect("json");
+    assert_eq!(
+        settings["permissions"]["allow"],
+        serde_json::json!(["Edit", "Bash(cargo test:*)"])
+    );
+    assert!(args.contains(&"--disallowed-tools"), "{argv}");
+    assert!(
+        !argv.contains("permission-mode") && !argv.contains("dangerously"),
+        "{argv}"
+    );
+    // sonnet churns and never fixes; one attempt, then failed — the point
+    // here is the argv, not the outcome.
+    assert_ne!(run.status.code(), Some(0));
 }

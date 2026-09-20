@@ -60,7 +60,18 @@ pub struct Capabilities {
     pub supports_effort: bool,
     pub supports_max_turns: bool,
     pub supports_output_format_json: bool,
+    /// A per-launch API dollar ceiling (`--max-budget-usd` on Claude
+    /// Code). Best effort across in-flight requests (SPEC §11).
     pub supports_budget: bool,
+    /// A tool deny list. The one launch control that constrains the
+    /// worker: when the harness cannot take it, the launch fails closed.
+    #[serde(default)]
+    pub supports_disallowed_tools: bool,
+    /// An explicit settings document (`--settings`), which is how a
+    /// machine-owned permission allowlist reaches the worker without any
+    /// permission-mode flag (SPEC §8).
+    #[serde(default)]
+    pub supports_settings: bool,
     pub permission_enforcement: PermissionEnforcement,
     pub sandbox: SandboxCapability,
 }
@@ -98,6 +109,10 @@ pub struct LaunchSpec {
     pub max_turns: Option<u32>,
     pub budget_micros: Option<i64>,
     pub disallowed_tools: Vec<String>,
+    /// Machine-owned permission rules the worker may use without asking
+    /// (a print-mode harness cannot ask). Explicit and reviewed, never a
+    /// bypass: a tool outside this list is still denied (SPEC §8).
+    pub allowed_tools: Vec<String>,
     pub work_dir: PathBuf,
     pub wall_timeout: Duration,
     /// Set by the runner when the coordinator cancels this dispatch; the
@@ -155,14 +170,41 @@ pub struct LaunchResult {
     /// Killed on a cancellation request, not on the wall clock.
     #[serde(default)]
     pub cancelled: bool,
+    /// Tools the harness refused the worker, as it reported them. A
+    /// worker that could not act is not a worker that chose not to:
+    /// missing permissions produce a blocked result (SPEC §8).
+    #[serde(default)]
+    pub permission_denials: Vec<String>,
+    /// Why the harness ended without a usable result — its stderr, or
+    /// the error it reported — for the interrupted transition's evidence.
+    #[serde(default)]
+    pub failure_detail: Option<String>,
 }
 
 impl LaunchResult {
-    /// A terminal result is missing when the process died without one:
-    /// interrupted, not failed (SPEC §9).
+    /// A terminal result is missing when the process died without one,
+    /// or ended with a non-zero status, or produced nothing the adapter
+    /// could read as a result: interrupted, not failed, and never a
+    /// completed attempt with an empty candidate (SPEC §9).
     pub fn terminal_result_missing(&self) -> bool {
-        self.timed_out || self.exit_code.is_none()
+        self.timed_out || self.cancelled || self.exit_code != Some(0) || self.result_text.is_none()
     }
+}
+
+/// Does the model the harness ran satisfy the model the route requested?
+/// An explicit ID must match exactly. A short alias (`sonnet`, `haiku`,
+/// `fable`) is satisfied by any concrete ID that carries it, because the
+/// harness resolves aliases to dated IDs and reports those (SPEC §5:
+/// aliases are permitted, the effective model is recorded). Anything
+/// else is a substitution.
+pub fn model_matches(requested: &str, effective: &str) -> bool {
+    let requested = requested.trim().to_ascii_lowercase();
+    let effective = effective.trim().to_ascii_lowercase();
+    if requested == effective {
+        return true;
+    }
+    let is_alias = !requested.contains('-') && !requested.contains(':');
+    is_alias && effective.contains(&requested)
 }
 
 /// How a process run ended, beyond its exit code.
@@ -337,6 +379,8 @@ impl Backend for ScriptBackend {
             supports_max_turns: false,
             supports_output_format_json: false,
             supports_budget: false,
+            supports_disallowed_tools: false,
+            supports_settings: false,
             permission_enforcement: PermissionEnforcement::Observed,
             sandbox: SandboxCapability::WorktreeOnly,
         })
@@ -371,6 +415,8 @@ impl Backend for ScriptBackend {
             usage: UsageReport::unknown(),
             worker_claims_blockage: false,
             cancelled: end.cancelled,
+            permission_denials: Vec::new(),
+            failure_detail: None,
         })
     }
 }
@@ -478,13 +524,46 @@ mod tests {
             usage: UsageReport::unknown(),
             worker_claims_blockage: false,
             cancelled: false,
+            permission_denials: Vec::new(),
+            failure_detail: None,
         };
         assert!(result.terminal_result_missing());
         let completed = LaunchResult {
             timed_out: false,
             exit_code: Some(0),
-            ..result
+            result_text: Some("DONE".into()),
+            ..result.clone()
         };
         assert!(!completed.terminal_result_missing());
+        // A non-zero exit or an unreadable result is not a completed
+        // attempt with an empty candidate; it is a missing result.
+        let usage_error = LaunchResult {
+            timed_out: false,
+            exit_code: Some(1),
+            result_text: Some(String::new()),
+            ..result.clone()
+        };
+        assert!(usage_error.terminal_result_missing());
+        let unreadable = LaunchResult {
+            timed_out: false,
+            exit_code: Some(0),
+            result_text: None,
+            ..result
+        };
+        assert!(unreadable.terminal_result_missing());
+    }
+
+    #[test]
+    fn aliases_are_satisfied_by_dated_ids_and_explicit_ids_must_match() {
+        assert!(model_matches("sonnet", "claude-sonnet-5"));
+        assert!(model_matches("haiku", "claude-haiku-4-5-20251001"));
+        assert!(model_matches("fable", "claude-fable-5-1"));
+        assert!(model_matches("claude-sonnet-5", "claude-sonnet-5"));
+        assert!(!model_matches(
+            "claude-sonnet-5",
+            "claude-sonnet-5-20261001"
+        ));
+        assert!(!model_matches("haiku", "claude-sonnet-5"));
+        assert!(!model_matches("sonnet", "claude-haiku-4-5"));
     }
 }

@@ -141,11 +141,7 @@ impl Report {
                 },
             ));
             if let Some(detail) = &run.final_detail {
-                let mut line = detail.clone();
-                if line.len() > 120 {
-                    line = format!("{}…", &line[..120]);
-                }
-                out.push_str(&format!("    {line}\n"));
+                out.push_str(&format!("    {}\n", truncate_chars(detail, 120)));
             }
         }
         out.push('\n');
@@ -180,6 +176,17 @@ impl Report {
     }
 }
 
+/// Clip a line to `max` CHARACTERS, never bytes: the text is model prose
+/// and a byte slice at a fixed offset panics whenever the boundary falls
+/// inside a multi-byte character (an em dash, an accented word, an emoji).
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(max).collect();
+    format!("{head}…")
+}
+
 pub fn completeness_label(completeness: CostCompleteness) -> &'static str {
     match completeness {
         CostCompleteness::Actual => "actual",
@@ -193,6 +200,45 @@ pub fn completeness_label(completeness: CostCompleteness) -> &'static str {
 mod tests {
     use super::*;
     use crate::ledger::{now_rfc3339, Transition};
+
+    /// The detail line is reviewer prose: a fixed BYTE slice at 120 in a
+    /// sentence whose 121st byte lands inside an em dash panics.
+    #[test]
+    fn render_truncates_on_char_boundaries_not_bytes() {
+        // 119 ASCII characters, then an em dash straddling byte 120.
+        let detail = format!("{}—{}", "a".repeat(119), "b".repeat(50));
+        assert!(!detail.is_char_boundary(120), "the fixture must straddle");
+        let report = Report {
+            since: "2026-09-01".into(),
+            runs: vec![RunLine {
+                run_id: "run-a".into(),
+                status: "accepted".into(),
+                attempts: 1,
+                cost: MicroUsd::from_micros(10),
+                cost_completeness: CostCompleteness::Actual,
+                models: vec!["haiku".into()],
+                final_detail: Some(detail),
+            }],
+            accepted: 1,
+            total_cost: MicroUsd::from_micros(10),
+            cost_per_accepted: Some(MicroUsd::from_micros(10)),
+            acceptance_rate: Some(1.0),
+            pending_decisions: 0,
+            cost_completeness: CostCompleteness::Actual,
+        };
+        let rendered = report.render();
+        assert!(
+            rendered.contains(&format!("    {}—…\n", "a".repeat(119))),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn truncate_chars_keeps_short_text_and_clips_by_character() {
+        assert_eq!(truncate_chars("héllo", 120), "héllo");
+        assert_eq!(truncate_chars("héllo", 2), "hé…");
+        assert_eq!(truncate_chars("—————", 3), "———…");
+    }
 
     #[test]
     fn cost_per_accepted_counts_failed_runs_in_the_numerator() {

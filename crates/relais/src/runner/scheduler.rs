@@ -302,7 +302,7 @@ pub(crate) fn run_decomposed(
     };
     let mut integration_repairs: u32 = 0;
     loop {
-        match workspace::check_scope(&integration, contract) {
+        match workspace::check_scope(&integration, &head, contract) {
             Ok(_) => {}
             Err(WorkspaceError::ScopeViolation(paths)) => {
                 return Ok(Decomposed::Outcome(
@@ -322,8 +322,14 @@ pub(crate) fn run_decomposed(
             gaps,
             amont_bypasses,
             amont_downgrades,
-        } = match engine.verify_candidate(&integration, &head, root.authority, root.logs_dir, label)
-        {
+        } = match engine.verify_candidate(
+            &integration,
+            &head,
+            root.authority,
+            root.logs_dir,
+            label,
+            None,
+        ) {
             Ok(result) => result,
             Err(e) => {
                 return Ok(Decomposed::Outcome(
@@ -346,7 +352,7 @@ pub(crate) fn run_decomposed(
                 .export_patch(&head, &engine.artifacts.join("candidate-integrated.patch"))?;
             let verification_inputs_changed = verify::verification_inputs_touched(
                 &root.authority.verification_profile,
-                &integration.changed_paths()?,
+                &integration.changed_paths_in(&head)?,
             );
             return Ok(Decomposed::Outcome(accept_integrated(
                 engine,
@@ -839,6 +845,8 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
             tools.extend(["Edit".to_string(), "Write".to_string()]);
             tools
         },
+        // The planner reads; it gets no allowlist.
+        allowed_tools: Vec::new(),
         work_dir: engine.config.repo_dir.to_path_buf(),
         wall_timeout: root
             .deadline

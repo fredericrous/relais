@@ -12,7 +12,7 @@
 //! unmanaged one: `RemoteGate` reports the request as unadmitted and the
 //! runner blocks, preserving the request (SPEC §23).
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -44,6 +44,10 @@ pub const DEFAULT_LIMITS: ConcurrencyLimits = ConcurrencyLimits {
 /// socket; the next CLI call starts a fresh one.
 pub const IDLE_EXIT: Duration = Duration::from_secs(600);
 const RECONCILE_EVERY: Duration = Duration::from_secs(15);
+/// Ceiling on one wire request. Every legitimate request is a short JSON
+/// object; anything larger is a malformed or hostile client, and is
+/// answered with an error rather than buffered.
+const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -99,6 +103,12 @@ pub enum Request {
     },
     Withdraw {
         dispatch_id: String,
+    },
+    /// The run reached an end state; nothing is cancelled or signalled.
+    /// Until a run is finished (or cancelled) it keeps the daemon from
+    /// idle-exiting under a run that is merely verifying.
+    FinishRun {
+        run_id: String,
     },
     CancelDispatch {
         dispatch_id: String,
@@ -281,7 +291,7 @@ impl Coordinator {
                 }
                 let now = Instant::now();
                 let (report, idle) = {
-                    let mut state = reconcile_state.lock().expect("admission lock");
+                    let mut state = lock_state(&reconcile_state);
                     (state.reconcile(now, &process_alive), state.is_idle())
                 };
                 for (_dispatch, pid) in report.to_signal {
@@ -320,6 +330,17 @@ impl Coordinator {
     }
 }
 
+/// One request thread that panicked must not wedge every later
+/// connection: a poisoned admission mutex is recovered, not propagated.
+/// The state machine mutates one field at a time and every write path is
+/// total, so the worst a recovered lock carries is one half-applied
+/// lifecycle event — against a daemon that answers nothing at all.
+fn lock_state(state: &Mutex<AdmissionState>) -> std::sync::MutexGuard<'_, AdmissionState> {
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn handle_connection(
     stream: UnixStream,
     state: &Mutex<AdmissionState>,
@@ -331,21 +352,32 @@ fn handle_connection(
     stream
         .set_write_timeout(Some(REQUEST_TIMEOUT))
         .map_err(|e| e.to_string())?;
-    let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+    // Capped read: a client that never sends a newline used to grow this
+    // buffer without bound, one thread per connection.
+    let mut reader =
+        BufReader::new(stream.try_clone().map_err(|e| e.to_string())?).take(MAX_REQUEST_BYTES);
     let mut writer = stream;
     let mut line = String::new();
-    if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+    let read = reader.read_line(&mut line).map_err(|e| e.to_string())?;
+    if read == 0 {
         return Ok(());
     }
-    let response = match serde_json::from_str::<Request>(line.trim()) {
-        Ok(Request::Shutdown) => {
-            shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
-            Response::Ok { known: true }
+    let oversized = read as u64 == MAX_REQUEST_BYTES && !line.ends_with('\n');
+    let response = if oversized {
+        Response::Error {
+            detail: format!("request exceeds {MAX_REQUEST_BYTES} bytes"),
         }
-        Ok(request) => handle(request, &mut state.lock().expect("admission lock")),
-        Err(e) => Response::Error {
-            detail: format!("unparseable request: {e}"),
-        },
+    } else {
+        match serde_json::from_str::<Request>(line.trim()) {
+            Ok(Request::Shutdown) => {
+                shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+                Response::Ok { known: true }
+            }
+            Ok(request) => handle(request, &mut lock_state(state)),
+            Err(e) => Response::Error {
+                detail: format!("unparseable request: {e}"),
+            },
+        }
     };
     let payload = serde_json::to_string(&response).map_err(|e| e.to_string())?;
     writeln!(writer, "{payload}").map_err(|e| e.to_string())?;
@@ -399,6 +431,9 @@ pub fn handle(request: Request, state: &mut AdmissionState) -> Response {
         },
         Request::Withdraw { dispatch_id } => Response::Ok {
             known: state.withdraw(&dispatch_id, now),
+        },
+        Request::FinishRun { run_id } => Response::Ok {
+            known: state.finish_run(&run_id),
         },
         Request::CancelDispatch { dispatch_id } => {
             let signalled = state.cancel_dispatch(&dispatch_id, now);
@@ -586,6 +621,13 @@ impl Gate for RemoteGate {
     fn withdraw(&self, dispatch_id: &str) -> Result<(), GateError> {
         self.call(Request::Withdraw {
             dispatch_id: dispatch_id.into(),
+        })
+        .map(|_| ())
+    }
+
+    fn finish_run(&self, run_id: &str) -> Result<(), GateError> {
+        self.call(Request::FinishRun {
+            run_id: run_id.into(),
         })
         .map(|_| ())
     }
@@ -808,6 +850,23 @@ mod tests {
         BufReader::new(stream).read_line(&mut line).expect("read");
         assert!(line.contains("unparseable request"));
 
+        // C4: a request with no newline in sight is answered with an
+        // error at the cap instead of growing the daemon's memory.
+        let stream = UnixStream::connect(&socket).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut writer = stream.try_clone().expect("clone");
+        let flood = std::thread::spawn(move || {
+            // The server stops reading at the cap and closes: the tail of
+            // this write is expected to fail, which is the point.
+            let _ = writer.write_all(&vec![b'a'; MAX_REQUEST_BYTES as usize + 64]);
+        });
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).expect("read");
+        assert!(line.contains("exceeds"), "{line}");
+        let _ = flood.join();
+
         // Shutdown removes the socket and lock; a state snapshot taken
         // through the shared handle still reflects the served run.
         assert!(matches!(
@@ -860,6 +919,29 @@ mod tests {
         drop(state);
         std::fs::remove_file(&socket).ok();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // C3/C4: one request thread panicking must not wedge every later
+    // connection — a poisoned admission lock is recovered, not rethrown.
+    #[test]
+    fn a_poisoned_admission_lock_does_not_wedge_the_daemon() {
+        let state = Mutex::new(AdmissionState::new(limits()));
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = state.lock().expect("lock");
+            panic!("a request thread died holding the admission lock");
+        }));
+        std::panic::set_hook(hook);
+        assert!(died.is_err());
+        assert!(state.is_poisoned());
+
+        let mut recovered = lock_state(&state);
+        recovered.register_run(&registration("run-1", "tab-a"));
+        assert!(
+            !recovered.is_idle(),
+            "the state machine keeps serving after a poisoned lock"
+        );
     }
 
     #[test]

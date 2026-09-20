@@ -21,6 +21,8 @@ pub struct MockOutcome {
     pub effective_model: Option<String>,
     pub usage: Option<UsageReport>,
     pub session_id: Option<String>,
+    /// Tools the scripted harness "refused" the worker.
+    pub permission_denials: Vec<String>,
 }
 
 pub struct MockBackend {
@@ -49,6 +51,8 @@ impl Backend for MockBackend {
             supports_max_turns: true,
             supports_output_format_json: false,
             supports_budget: false,
+            supports_disallowed_tools: true,
+            supports_settings: true,
             permission_enforcement: PermissionEnforcement::Observed,
             sandbox: SandboxCapability::WorktreeOnly,
         })
@@ -78,6 +82,8 @@ impl Backend for MockBackend {
                 .cancel
                 .as_ref()
                 .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)),
+            permission_denials: outcome.permission_denials,
+            failure_detail: None,
         })
     }
 }

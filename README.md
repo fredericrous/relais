@@ -58,7 +58,44 @@ run as `interrupted` with reason `runner_failure`, never as a panic.
 `now`, liveness is a callback, and the concurrency scenarios run in
 milliseconds.
 
+## Using it on a repository
+
+```sh
+cd the-repo && relais init          # writes relais.toml; edit models + profile, commit it
+relais plan --task task.json        # prints the authority hash; blocked until trusted
+```
+
+Machine-owned settings live in `~/.config/relais/machine.toml` and are
+never written by a run. The trust grant is keyed by the authority hash
+`plan` printed; editing `relais.toml` changes the hash and voids the
+grant. A print-mode worker cannot ask for permission, so the tools it may
+use are an explicit machine-owned allowlist — nothing is granted
+implicitly, and no permission-mode flag is ever passed:
+
+```toml
+schema_version = 1
+
+[spending]
+per_run_micros = 3000000            # $3 per run, best effort (SPEC §11)
+
+[permissions]
+allowed_tools = ["Edit", "Write", "Bash(cargo test:*)", "Bash(make test:*)"]
+
+[trust."<authority hash from relais plan>"]
+granted_at = "2026-09-20T00:00:00Z"
+reviewed_by = "you"
+```
+
+Then `relais run --task task.json`. A worker refused a tool ends the run
+`blocked (permission_denied)` naming the tool; nothing is escalated.
+
+`docs/AUDIT-2026-09-20.md` is the audit this behaviour came out of, with
+the findings still open.
+
 ## Known limits
+
+- Claude Code 2.1.x has no turn ceiling flag; attempts and wall time
+  are enforced by the runner, turns are not.
 
 - The decomposition scheduler executes packages sequentially in
   topological order; waves of independent packages are computed and
