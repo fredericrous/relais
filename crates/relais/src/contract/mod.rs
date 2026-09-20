@@ -161,6 +161,18 @@ fn is_valid_package_id(id: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// A package objective is one line of at most 2000 characters. Under
+/// `"decomposition": "propose"` it is model output, and the scheduler
+/// splices it into a child contract's objective, which the worker prompt
+/// then quotes: a newline inside it would add lines to that quoted block
+/// (SPEC §16 — free text is untrusted data). Rejecting the plan is the
+/// bound; the prompt's fence is the second line of defence.
+pub const MAX_PACKAGE_OBJECTIVE_CHARS: usize = 2000;
+
+fn is_valid_package_objective(objective: &str) -> bool {
+    objective.chars().count() <= MAX_PACKAGE_OBJECTIVE_CHARS && !objective.contains(['\n', '\r'])
+}
+
 impl WorkPlan {
     /// Shape validation: ids unique and non-empty, every package carries
     /// an objective, scope and acceptance, dependencies resolve, and the
@@ -195,6 +207,9 @@ impl WorkPlan {
                     package.id.clone(),
                     "objective",
                 ));
+            }
+            if !is_valid_package_objective(&package.objective) {
+                return Err(ContractError::PlanBadPackageObjective(package.id.clone()));
             }
             if package.write_scope.is_empty() {
                 return Err(ContractError::PlanPackageIncomplete(
@@ -309,6 +324,7 @@ pub enum ContractError {
     PlanMissingIntegrationAcceptance,
     PlanDuplicatePackage(String),
     PlanBadPackageId(String),
+    PlanBadPackageObjective(String),
     PlanPackageIncomplete(String, &'static str),
     PlanBadDependency(String, String),
     PlanCycle,
@@ -357,6 +373,12 @@ impl std::fmt::Display for ContractError {
             Self::PlanBadPackageId(id) => write!(
                 f,
                 "package id `{id}` is not [A-Za-z0-9][A-Za-z0-9_-]{{0,63}}: ids name directories on disk"
+            ),
+            Self::PlanBadPackageObjective(id) => write!(
+                f,
+                "package `{id}` objective must be a single line of at most \
+                 {MAX_PACKAGE_OBJECTIVE_CHARS} characters: it is spliced into a child contract \
+                 and quoted in a worker prompt"
             ),
             Self::PlanPackageIncomplete(id, field) => {
                 write!(f, "package `{id}` has no {field}")

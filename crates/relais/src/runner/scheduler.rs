@@ -35,8 +35,8 @@ use crate::verify::{self, Receipt, VerificationReport};
 use crate::workspace::{self, WorkspaceError};
 
 use super::{
-    execute_child, Budget, Limit, Next, Observation, Reason, ReviewOutcome, RunConfig, RunEngine,
-    RunError, RunOutcome, State, Terminal,
+    data_block, data_list_block, execute_child, Budget, Limit, Next, Observation, Reason,
+    ReviewOutcome, RunConfig, RunEngine, RunError, RunOutcome, State, Terminal,
 };
 
 /// Everything the root preflight established that the packages inherit.
@@ -502,6 +502,11 @@ fn run_package(
 
     // The package contract: the package's objective, scope and
     // acceptance, the root's everything else, from the input revision.
+    // Under `"decomposition": "propose"` the package objective is model
+    // output; `WorkPlan::validate` has already refused a plan whose
+    // objective is not a single line of at most
+    // `MAX_PACKAGE_OBJECTIVE_CHARS`, so splicing it here cannot add lines
+    // to the child's objective, and `build_prompt` quotes it as data.
     let child_contract = TaskContract {
         schema_version: contract.schema_version,
         kind: Kind::Change,
@@ -798,20 +803,17 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
          acceptance; at most 4 packages. If one worker is the right shape, answer \
          {\"packages\":[],\"integration_acceptance\":[]}.\n\n",
     );
-    prompt.push_str(&format!("objective: {}\n", contract.objective));
+    // The objective, the acceptance criteria and the constraints are
+    // project text, not instructions to the planner (SPEC §16): each one
+    // is quoted inside its own labelled fence.
+    prompt.push_str(&data_block("objective", &contract.objective));
     prompt.push_str(&format!(
         "write_scope: {:?}\n",
         contract.write_scope.as_deref().unwrap_or_default()
     ));
-    prompt.push_str("acceptance:\n");
-    for criterion in &contract.acceptance {
-        prompt.push_str(&format!("  - {criterion}\n"));
-    }
+    prompt.push_str(&data_list_block("acceptance", &contract.acceptance));
     if !root.manifest.constraints.is_empty() {
-        prompt.push_str("constraints:\n");
-        for constraint in &root.manifest.constraints {
-            prompt.push_str(&format!("  - {constraint}\n"));
-        }
+        prompt.push_str(&data_list_block("constraints", &root.manifest.constraints));
     }
     let dispatch_id = DispatchId::generate();
     let spent = engine.config.ledger.run_cost(&engine.run_id)?.to_micros();

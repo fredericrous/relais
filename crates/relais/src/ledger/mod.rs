@@ -24,6 +24,21 @@ pub const LEDGER_SCHEMA_VERSION: u64 = 3;
 pub enum LedgerError {
     Sqlite(rusqlite::Error),
     Io(std::io::Error),
+    /// A stored row this binary cannot read: an unknown state string, a
+    /// receipt that is not JSON. A ledger is external state — truncated,
+    /// hand-edited or written by another version — so reading one is a
+    /// fallible operation, never an assertion about what SQLite holds.
+    Corrupt {
+        what: String,
+        detail: String,
+    },
+    /// The ledger carries more applied migrations than this binary knows:
+    /// a newer relais wrote it, and writing it back could lose what that
+    /// version recorded.
+    SchemaAhead {
+        found: u64,
+        known: u64,
+    },
 }
 
 impl std::fmt::Display for LedgerError {
@@ -31,6 +46,15 @@ impl std::fmt::Display for LedgerError {
         match self {
             LedgerError::Sqlite(e) => write!(f, "ledger: {e}"),
             LedgerError::Io(e) => write!(f, "ledger: {e}"),
+            LedgerError::Corrupt { what, detail } => {
+                write!(f, "ledger: {what} cannot be read: {detail}")
+            }
+            LedgerError::SchemaAhead { found, known } => write!(
+                f,
+                "ledger: {found} applied migration(s), this relais knows {known} — \
+                 a newer relais wrote this ledger; upgrade relais or point \
+                 RELAIS_STATE_DIR at another one"
+            ),
         }
     }
 }
@@ -50,6 +74,17 @@ impl From<std::io::Error> for LedgerError {
 }
 
 type Result<T> = std::result::Result<T, LedgerError>;
+
+/// A state string as the ledger stored it. An unrecognised one is a
+/// corrupt row — a value from a newer relais, a truncated write, a hand
+/// edit — and the caller is told, rather than the state silently reading
+/// as "no such run" or the process aborting mid-report.
+fn parse_state(stored: &str) -> Result<State> {
+    State::parse(stored).ok_or_else(|| LedgerError::Corrupt {
+        what: "run state".into(),
+        detail: format!("`{stored}` is not a state this relais knows"),
+    })
+}
 
 /// Where the ledger's timestamps come from. The wall clock in
 /// production; a fixed or scripted clock in tests, so a transition's
@@ -358,6 +393,17 @@ impl Ledger {
             )",
             [],
         )?;
+        // Migrations are additive and never edited, so more applied steps
+        // than this binary ships means a NEWER relais owns this ledger.
+        // Refuse before touching it: its extra tables and columns are not
+        // ours to write through.
+        let applied_count = self.schema_version()?;
+        if applied_count > LEDGER_SCHEMA_VERSION {
+            return Err(LedgerError::SchemaAhead {
+                found: applied_count,
+                known: LEDGER_SCHEMA_VERSION,
+            });
+        }
         for (version, sql) in MIGRATIONS {
             let applied: Option<String> = self
                 .conn
@@ -462,7 +508,7 @@ impl Ledger {
                 row.get(0)
             })
             .optional()?;
-        Ok(status.and_then(|s| State::parse(&s)))
+        status.map(|s| parse_state(&s)).transpose()
     }
 
     pub fn insert_contract_revision(
@@ -657,21 +703,45 @@ impl Ledger {
             "SELECT run_id, attempt_id, from_state, to_state, reason, detail_json, at
              FROM transitions WHERE run_id = ?1 ORDER BY id",
         )?;
+        // The rows come back raw and are interpreted here: a state this
+        // binary does not know is a LedgerError, not a panic in the
+        // middle of `explain`.
+        type Row = (
+            String,
+            Option<i64>,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+            String,
+        );
         let rows = stmt.query_map([run_id], |row| {
-            let from_state: Option<String> = row.get(2)?;
-            let detail: Option<String> = row.get(5)?;
-            Ok(Transition {
-                run_id: row.get(0)?,
-                attempt_id: row.get(1)?,
-                from_state: from_state.and_then(|s| State::parse(&s)),
-                to_state: State::parse(&row.get::<_, String>(3)?)
-                    .expect("ledger only stores valid states"),
-                reason: row.get(4)?,
-                detail: detail.and_then(|d| serde_json::from_str(&d).ok()),
-                at: row.get(6)?,
-            })
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
         })?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        let rows: Vec<Row> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(run_id, attempt_id, from_state, to_state, reason, detail, at)| {
+                    Ok(Transition {
+                        run_id,
+                        attempt_id,
+                        from_state: from_state.as_deref().map(parse_state).transpose()?,
+                        to_state: parse_state(&to_state)?,
+                        reason,
+                        detail: detail.and_then(|d| serde_json::from_str(&d).ok()),
+                        at,
+                    })
+                },
+            )
+            .collect()
     }
 
     pub fn record_usage(&self, event: &UsageEvent) -> Result<bool> {
@@ -851,12 +921,17 @@ impl Ledger {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        Ok(row.map(|(json, hash)| {
-            (
-                serde_json::from_str(&json).expect("ledger stores valid receipts"),
-                hash,
-            )
-        }))
+        // A receipt is the run's evidence; a stored one that will not
+        // parse is reported, so `explain` prints the rest of what it
+        // knows instead of aborting.
+        row.map(|(json, hash)| {
+            let value = serde_json::from_str(&json).map_err(|e| LedgerError::Corrupt {
+                what: format!("the receipt of run {run_id}"),
+                detail: e.to_string(),
+            })?;
+            Ok((value, hash))
+        })
+        .transpose()
     }
 
     pub fn record_outcome(
@@ -1107,6 +1182,100 @@ mod tests {
             LEDGER_SCHEMA_VERSION,
             "no double-apply"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // SPEC §12: a ledger is external state. A row this binary cannot read
+    // is an error the CLI can print, never an abort in the middle of
+    // `status`, `explain` or `report`.
+    #[test]
+    fn an_unknown_stored_state_is_an_error_not_a_panic() {
+        let (ledger, dir) = temp_ledger();
+        ledger.insert_run("run-future", "/repo", None).expect("run");
+        ledger
+            .record_transition(&Transition {
+                run_id: "run-future".into(),
+                attempt_id: None,
+                from_state: None,
+                to_state: State::Running,
+                reason: "dispatched".into(),
+                detail: None,
+                at: now_rfc3339(),
+            })
+            .expect("transition");
+        // A state only a newer relais knows, in both places one is read.
+        ledger
+            .conn
+            .execute_batch(
+                "UPDATE runs SET status = 'hibernating' WHERE id = 'run-future';
+                 UPDATE transitions SET to_state = 'hibernating' WHERE run_id = 'run-future';",
+            )
+            .expect("write the future");
+
+        match ledger.run_status("run-future") {
+            Err(LedgerError::Corrupt { what, detail }) => {
+                assert_eq!(what, "run state");
+                assert!(detail.contains("hibernating"), "{detail}");
+            }
+            other => panic!("an unknown state must be an error, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                ledger.transitions("run-future"),
+                Err(LedgerError::Corrupt { .. })
+            ),
+            "reading the history of that run is an error too"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unparseable_receipt_is_an_error_not_a_panic() {
+        let (ledger, dir) = temp_ledger();
+        ledger.insert_run("run-bad", "/repo", None).expect("run");
+        ledger
+            .conn
+            .execute(
+                "INSERT INTO receipts (run_id, receipt_json, hash, at)
+                 VALUES ('run-bad', '{truncated', 'h', 'then')",
+                [],
+            )
+            .expect("truncated receipt");
+        assert!(matches!(
+            ledger.receipt("run-bad"),
+            Err(LedgerError::Corrupt { .. })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_ledger_from_a_newer_relais_is_refused() {
+        let (ledger, dir) = temp_ledger();
+        drop(ledger);
+        let path = dir.join("ledger.sqlite");
+        {
+            let conn = Connection::open(&path).expect("raw open");
+            conn.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES ('v99', 'then')",
+                [],
+            )
+            .expect("a migration this relais does not ship");
+        }
+        match Ledger::open(&path) {
+            Err(LedgerError::SchemaAhead { found, known }) => {
+                assert_eq!(
+                    (found, known),
+                    (LEDGER_SCHEMA_VERSION + 1, LEDGER_SCHEMA_VERSION)
+                );
+                let message = LedgerError::SchemaAhead { found, known }.to_string();
+                assert!(message.contains(&found.to_string()), "{message}");
+                assert!(message.contains(&known.to_string()), "{message}");
+            }
+            other => panic!(
+                "a newer ledger must be refused, got {:?}",
+                other.map(|_| ())
+            ),
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
