@@ -353,16 +353,18 @@ fn dataset_build_command() -> i32 {
     let dataset = relais::learn::dataset::build(&ledger, &contract_of, &repo);
     let (_, positives, negatives) = dataset.acceptance_labels();
     let dir = datasets_dir();
-    std::fs::create_dir_all(&dir).expect("dataset dir");
+    or_exit(std::fs::create_dir_all(&dir), "dataset build");
     let path = dir.join(format!(
         "{}.json",
         chrono::Utc::now().format("%Y%m%dT%H%M%S")
     ));
-    std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&dataset).expect("serializes"),
-    )
-    .expect("dataset write");
+    or_exit(
+        std::fs::write(
+            &path,
+            or_exit(serde_json::to_string_pretty(&dataset), "dataset build"),
+        ),
+        "dataset build",
+    );
     println!(
         "dataset: {} (fingerprint {})",
         path.display(),
@@ -466,8 +468,19 @@ fn evaluate_command(artifact_id: &str) -> i32 {
         eprintln!("relais evaluate: artifact {artifact_id} carries no evaluation report");
         return 2;
     };
+    // A stored evaluation is registry data on disk, possibly written by
+    // another version: unreadable is an error to print, not an abort.
     let report: relais::learn::evaluate::EvalReport =
-        serde_json::from_value(evaluation.clone()).expect("stored evaluations parse");
+        match serde_json::from_value(evaluation.clone()) {
+            Ok(report) => report,
+            Err(e) => {
+                eprintln!(
+                    "relais evaluate: artifact {artifact_id} carries an evaluation report this \
+                     relais cannot read: {e}"
+                );
+                return 2;
+            }
+        };
     print!("{}", report.render());
     println!("dataset fingerprint: {}", artifact.dataset_fingerprint);
     println!(
@@ -699,6 +712,18 @@ fn open_ledger() -> Ledger {
     })
 }
 
+/// A ledger or registry read that the CLI cannot continue without. The
+/// ledger is external state — locked by another relais, truncated by a
+/// crash, or written by a newer version — so a failed read prints one
+/// `relais: …` line and exits non-zero; `status`, `explain`, `resume`,
+/// `evaluate` and `report` never abort on a panic instead (SPEC §12).
+fn or_exit<T, E: std::fmt::Display>(result: std::result::Result<T, E>, what: &str) -> T {
+    result.unwrap_or_else(|e| {
+        eprintln!("relais {what}: {e}");
+        std::process::exit(1);
+    })
+}
+
 fn doctor_command(json: bool) -> i32 {
     let report = doctor::doctor(&cwd());
     if json {
@@ -924,21 +949,20 @@ fn status_command(run_id: Option<&str>) -> i32 {
     let ledger = open_ledger();
     match run_id {
         None => {
-            let report =
-                report::runs_report(&ledger, "2000-01-01T00:00:00+00:00").unwrap_or_else(|e| {
-                    eprintln!("relais status: {e}");
-                    std::process::exit(1);
-                });
+            let report = or_exit(
+                report::runs_report(&ledger, "2000-01-01T00:00:00+00:00"),
+                "status",
+            );
             print!("{}", report.render());
             0
         }
         Some(run_id) => {
-            let Some(state) = ledger.run_status(run_id).unwrap_or(None) else {
+            let Some(state) = or_exit(ledger.run_status(run_id), "status") else {
                 eprintln!("relais status: unknown run {run_id}");
                 return 2;
             };
-            let cost = ledger.run_cost(run_id).expect("cost");
-            let attempts = ledger.attempt_count(run_id).expect("attempts");
+            let cost = or_exit(ledger.run_cost(run_id), "status");
+            let attempts = or_exit(ledger.attempt_count(run_id), "status");
             println!("{run_id}: {state} (attempts: {attempts}, cost: {cost})");
             0
         }
@@ -947,10 +971,7 @@ fn status_command(run_id: Option<&str>) -> i32 {
 
 fn explain_command(run_id: &str) -> i32 {
     let ledger = open_ledger();
-    let transitions = ledger.transitions(run_id).unwrap_or_else(|e| {
-        eprintln!("relais explain: {e}");
-        std::process::exit(1);
-    });
+    let transitions = or_exit(ledger.transitions(run_id), "explain");
     if transitions.is_empty() {
         eprintln!("relais explain: unknown run {run_id}");
         return 2;
@@ -981,21 +1002,21 @@ fn explain_command(run_id: &str) -> i32 {
             println!("      {detail}");
         }
     }
-    let children = ledger.child_runs(run_id).expect("children");
+    let children = or_exit(ledger.child_runs(run_id), "explain");
     if !children.is_empty() {
         println!("work packages (SPEC §19; each a run of its own, costed into this one):");
         for (child, package, status) in &children {
             println!(
                 "  {package}: {child} {status} (attempts: {}, cost: {})",
-                ledger.attempt_count(child).expect("attempts"),
-                ledger.run_cost(child).expect("cost")
+                or_exit(ledger.attempt_count(child), "explain"),
+                or_exit(ledger.run_cost(child), "explain")
             );
         }
     }
-    let cost = ledger.run_cost(run_id).expect("cost");
-    let completeness = ledger.run_cost_completeness(run_id).expect("completeness");
+    let cost = or_exit(ledger.run_cost(run_id), "explain");
+    let completeness = or_exit(ledger.run_cost_completeness(run_id), "explain");
     println!("cost: {}", report::cost_line(cost, completeness));
-    if let Some((receipt, _hash)) = ledger.receipt(run_id).expect("receipt") {
+    if let Some((receipt, _hash)) = or_exit(ledger.receipt(run_id), "explain") {
         println!(
             "receipt: candidate {} ({} attempt(s), [{}])",
             receipt["candidate_sha"].as_str().unwrap_or("?"),
@@ -1015,7 +1036,7 @@ fn explain_command(run_id: &str) -> i32 {
 
 fn resume_command(run_id: &str) -> i32 {
     let ledger = open_ledger();
-    let Some(state) = ledger.run_status(run_id).unwrap_or(None) else {
+    let Some(state) = or_exit(ledger.run_status(run_id), "resume") else {
         eprintln!("relais resume: unknown run {run_id}");
         return 2;
     };
@@ -1027,9 +1048,7 @@ fn resume_command(run_id: &str) -> i32 {
     // Reconcile liveness first: the process table for bound PIDs, the
     // coordinator for the rest. Resume never re-dispatches; it marks
     // what is provably dead interrupted and preserves everything.
-    let live: Vec<_> = ledger
-        .live_dispatches()
-        .expect("dispatches")
+    let live: Vec<_> = or_exit(ledger.live_dispatches(), "resume")
         .into_iter()
         .filter(|(_dispatch, run, _pid)| run == run_id)
         .collect();
@@ -1046,9 +1065,10 @@ fn resume_command(run_id: &str) -> i32 {
                 still_live.push(format!("{dispatch} (pid {pid})"));
             }
             Some(pid) => {
-                ledger
-                    .finish_dispatch(dispatch, "reconciled_dead")
-                    .expect("finish");
+                or_exit(
+                    ledger.finish_dispatch(dispatch, "reconciled_dead"),
+                    "resume",
+                );
                 dead.push(format!("{dispatch} (pid {pid} is gone)"));
             }
             None => match &coordinator_view {
@@ -1077,8 +1097,8 @@ fn resume_command(run_id: &str) -> i32 {
             uncertain.join(", ")
         )
     };
-    ledger
-        .record_transition(&relais::ledger::Transition {
+    or_exit(
+        ledger.record_transition(&relais::ledger::Transition {
             run_id: run_id.to_string(),
             attempt_id: None,
             from_state: Some(state),
@@ -1086,8 +1106,9 @@ fn resume_command(run_id: &str) -> i32 {
             reason: Reason::ReconciledInterrupted.as_str().to_string(),
             detail: Some(serde_json::json!({ "detail": detail })),
             at: relais::ledger::now_rfc3339(),
-        })
-        .expect("transition");
+        }),
+        "resume",
+    );
     println!(
         "{run_id}: {state} -> interrupted ({detail}). Changes are preserved under {}; nothing \
          was replayed. Start a NEW run with a revised contract if the task is still wanted",
@@ -1103,14 +1124,11 @@ fn report_command(since: Option<&str>, json: bool) -> i32 {
             .to_string()
     });
     let ledger = open_ledger();
-    let report = report::runs_report(&ledger, &since).unwrap_or_else(|e| {
-        eprintln!("relais report: {e}");
-        std::process::exit(1);
-    });
+    let report = or_exit(report::runs_report(&ledger, &since), "report");
     if json {
         print!(
             "{}",
-            serde_json::to_string_pretty(&report).expect("serializes")
+            or_exit(serde_json::to_string_pretty(&report), "report")
         );
     } else {
         print!("{}", report.render());
@@ -1120,7 +1138,7 @@ fn report_command(since: Option<&str>, json: bool) -> i32 {
 
 fn feedback_command(run_id: &str, outcome: FeedbackOutcome) -> i32 {
     let ledger = open_ledger();
-    let state = ledger.run_status(run_id).unwrap_or(None);
+    let state = or_exit(ledger.run_status(run_id), "feedback");
     if state.is_none() {
         eprintln!("relais feedback: unknown run {run_id}");
         return 2;
@@ -1142,12 +1160,7 @@ fn feedback_command(run_id: &str, outcome: FeedbackOutcome) -> i32 {
         FeedbackOutcome::Reverted => "reverted",
         FeedbackOutcome::Regression => "confirmed_regression",
     };
-    ledger
-        .record_outcome(run_id, kind, None)
-        .unwrap_or_else(|e| {
-            eprintln!("relais feedback: {e}");
-            std::process::exit(1);
-        });
+    or_exit(ledger.record_outcome(run_id, kind, None), "feedback");
     println!("recorded {kind} for {run_id}");
     let _ = AvalVerdict::Unknown;
     0
