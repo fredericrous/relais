@@ -284,8 +284,14 @@ pub fn run_with_timeout(
         .map_err(|_| BackendError::Launch("stderr reader panicked".into()))?;
     Ok(ProcessEnd {
         // A killed process has no exit code: interrupted, never a
-        // completed attempt.
-        exit_code: if cancelled { None } else { status.code() },
+        // completed attempt. Decided here, not read from the status —
+        // Windows reports a terminated process as exit 1, and 1 is a
+        // usage error, not a kill.
+        exit_code: if cancelled || timed_out {
+            None
+        } else {
+            status.code()
+        },
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
         timed_out,
@@ -403,10 +409,26 @@ impl Backend for ScriptBackend {
 mod tests {
     use super::*;
 
+    /// A child that prints, then outlives any test timeout, in the
+    /// platform's own shell: the point is the kill, not the script.
+    fn slow_child() -> Command {
+        if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.args([
+                "/C",
+                "echo start && ping -n 60 127.0.0.1 > NUL && echo done",
+            ]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", "echo start; sleep 30; echo done"]);
+            command
+        }
+    }
+
     #[test]
     fn run_with_timeout_kills_slow_children() {
-        let mut command = Command::new("sh");
-        command.args(["-c", "echo start; sleep 30; echo done"]);
+        let command = slow_child();
         let started = Instant::now();
         let pid_slot = AtomicU32::new(0);
         let end = run_with_timeout(
@@ -445,8 +467,7 @@ mod tests {
 
     #[test]
     fn cancellation_kills_the_child_and_is_not_a_timeout() {
-        let mut command = Command::new("sh");
-        command.args(["-c", "echo start; sleep 30; echo done"]);
+        let command = slow_child();
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cancel);
         std::thread::spawn(move || {
