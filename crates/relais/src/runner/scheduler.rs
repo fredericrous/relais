@@ -895,7 +895,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         output_tokens: result.usage.output_tokens,
         cache_read_tokens: result.usage.cache_read_tokens,
         cache_write_tokens: result.usage.cache_write_tokens,
-        cost: result.usage.cost.unwrap_or(MicroUsd::ZERO),
+        cost: result.usage.cost,
         cost_kind: CostKind::ApiSpend,
         completeness: result.usage.cost_completeness,
         inclusive: result.usage.inclusive,

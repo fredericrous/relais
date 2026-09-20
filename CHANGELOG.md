@@ -6,6 +6,22 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## v0.1.2
+
+### Fixed
+
+- **Unknown usage is unknown, not zero.** A dispatch whose harness reported
+  no cost was stored as `0` and summed into a figure that read as money,
+  with only a completeness label to say otherwise. The ledger's
+  `cost_micros` is nullable since schema v3 (the table is rebuilt on first
+  open, rows preserved, and every row whose completeness already said
+  `unknown` gets the NULL its zero stood for); unknown usage is left out of
+  every sum; and every cost line — `run`, `status`, `explain`, `report` —
+  reads `unknown (no usage was reported)` or `at least $x (unknown: …)`
+  instead of a number. A session with subagents is recorded `inclusive`,
+  and the ledger's dedup of inclusive parents is documented as ready for a
+  managed nested dispatch that does not exist yet.
+
 ## v0.1.1
 
 ### Added

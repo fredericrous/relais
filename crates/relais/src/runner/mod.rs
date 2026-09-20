@@ -927,14 +927,18 @@ impl<'a> RunEngine<'a> {
                 output_tokens: usage.output_tokens,
                 cache_read_tokens: usage.cache_read_tokens,
                 cache_write_tokens: usage.cache_write_tokens,
-                cost: usage.cost.unwrap_or(MicroUsd::ZERO),
+                cost: usage.cost,
                 cost_kind: CostKind::ApiSpend,
                 completeness: usage.cost_completeness,
                 inclusive: usage.inclusive,
                 at: self.config.ledger.now(),
             };
             ledger.record_usage(&event)?;
-            progress.total_cost += event.cost;
+            // Unknown is not zero: the total stays what was reported, and
+            // the completeness folded below says it is a lower bound.
+            if let Some(cost) = event.cost {
+                progress.total_cost += cost;
+            }
             progress.cost_completeness = progress.cost_completeness.max(usage.cost_completeness);
             if let Some(model) = &result.effective_model {
                 if !progress.models_used.contains(model) {
@@ -1566,7 +1570,7 @@ impl<'a> RunEngine<'a> {
             output_tokens: result.usage.output_tokens,
             cache_read_tokens: result.usage.cache_read_tokens,
             cache_write_tokens: result.usage.cache_write_tokens,
-            cost: result.usage.cost.unwrap_or(MicroUsd::ZERO),
+            cost: result.usage.cost,
             cost_kind: CostKind::ApiSpend,
             completeness: result.usage.cost_completeness,
             inclusive: result.usage.inclusive,
@@ -1575,7 +1579,9 @@ impl<'a> RunEngine<'a> {
         if let Err(e) = self.config.ledger.record_usage(&event) {
             return ReviewOutcome::Unavailable(format!("the ledger refused the review usage: {e}"));
         }
-        *total_cost += event.cost;
+        if let Some(cost) = event.cost {
+            *total_cost += cost;
+        }
         *cost_completeness = (*cost_completeness).max(result.usage.cost_completeness);
         if result.terminal_result_missing() {
             return ReviewOutcome::Unavailable(
@@ -2649,6 +2655,64 @@ mod tests {
                 .iter()
                 .any(|t| t.reason == Reason::PermissionDenied.as_str()),
             "the refusal is on the record: {transitions:?}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn unreported_usage_is_unknown_in_the_receipt_not_zero() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let backend = MockBackend::new(|spec| {
+            if spec.prompt.contains("semantic reviewer") {
+                return MockOutcome {
+                    result_text: Some("FINDINGS: none".into()),
+                    exit_code: Some(0),
+                    usage: Some(usage(40)),
+                    ..Default::default()
+                };
+            }
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                // The harness said nothing about cost.
+                usage: Some(crate::adapter::UsageReport::unknown()),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Accepted(receipt),
+        } = outcome
+        else {
+            panic!("expected acceptance, got {outcome:?}");
+        };
+        assert_eq!(
+            receipt.cost_completeness,
+            CostCompleteness::Unknown,
+            "one unreported dispatch makes the run's cost unknown"
+        );
+        assert_eq!(
+            receipt.cost,
+            MicroUsd::from_micros(40),
+            "the reported part is a lower bound, not the reviewer plus a zero"
+        );
+        assert_eq!(
+            fixture.ledger.run_cost(&run_id).expect("cost"),
+            MicroUsd::from_micros(40)
+        );
+        assert_eq!(
+            fixture
+                .ledger
+                .run_cost_completeness(&run_id)
+                .expect("completeness"),
+            CostCompleteness::Unknown
+        );
+        assert_eq!(
+            crate::report::cost_line(receipt.cost, receipt.cost_completeness),
+            "at least $0.00004 (unknown: some usage was not reported)"
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
