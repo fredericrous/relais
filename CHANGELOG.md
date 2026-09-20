@@ -6,6 +6,73 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## v0.1.3
+
+The rest of the audit: issues #6–#10 closed, five pull requests
+(#15–#19), each merged after green checks on Linux, macOS and Windows.
+
+### Changed
+
+- **The acceptance boundary is tighter** (#19). Task worktrees live
+  under `<state>/worktrees/<run>/`, not beside the run's receipt, so a
+  worker with Bash cannot write `../receipt.json`; verification trees
+  are under `<state>/verify/` and release themselves. The tool deny
+  floor also covers `git -C`/`-c`/`--git-dir`, `sh|bash|zsh|dash -c`,
+  `env git` and `eval` — a floor, not a sandbox. A candidate that edits
+  the verification profile's own inputs (manifests, lockfiles, the
+  commands' programs, listed `inputs`) ends `needs_decision`; edits to
+  the test tree still go to review. Un-waived amont bypasses and
+  downgrades are verification gaps (`amont_waivers` on a profile waives
+  named checks); a profile with no `amont_checks` takes the inventory's
+  in-force blocking checks. A failing `git status` blocks instead of
+  proceeding. The reviewer is the strongest tier that did not write the
+  candidate. Every git command relais spawns drops `GIT_DIR`,
+  `GIT_WORK_TREE`, `GIT_INDEX_FILE` and friends; candidate commits are
+  held by `refs/relais/candidates/<run>/<n>` so `git gc` cannot drop
+  them; an accepted run's worktree is released once the patch and the
+  ref exist, and kept — with both SHAs on the record — if its tree
+  moved after the snapshot.
+- **The coordinator survives its own failures** (#18). Election holds
+  an OS lock (`flock`, `LockFile`) for the daemon's lifetime, so a
+  recycled PID after a SIGKILL cannot wedge every `relais run`. A lease
+  with nothing bound for three grace periods is reclaimed; ledger rows
+  with no PID are the runner's to reconcile, not seats. A cancelled
+  dispatch is acknowledged by the runner and freed at once; reconcile
+  signals once, escalates to a hard kill after a grace period, then
+  stops. EPERM on liveness means alive. `Bind` refuses a dead PID. A
+  finished dispatch id is remembered (4096 of them) and refused on
+  repeat; over-admission from resumed parents is capped. Twelve threads
+  now race the real socket in a test, and write leases exist in the
+  state machine (runner wiring is the follow-up).
+- **The learner tells the truth about what it knows** (#15). Artifacts
+  whose weights disagree with the feature schema's dimension are
+  rejected. A task family straddling the temporal cutoff goes to the
+  later split, never to train. Calibration bins are measured on held-out
+  data. The cost model abstains to its cohort mean outside the range it
+  was fitted on and has no $485 ceiling; the cohort is the contract's
+  real kind. The seed seeds a stochastic warm-up. A `**` contract is no
+  longer "covered" by a `docs/**` recipe.
+- **Install upgrades, ledger errors, prompts as data** (#16). An
+  installed block is "unchanged" when it hashes to what its marker
+  recorded, so a new template upgrades it and uninstall removes it; an
+  update splices the block in place; a reordered marker pair is
+  reported, not a panic. Stored states and receipts that do not parse
+  are errors, a ledger written by a newer relais is refused by name, and
+  no CLI command aborts on a ledger error. Every externally-sourced
+  string in a prompt sits in a labelled, fenced data block; a planner
+  package objective must be one line.
+- **No dead configuration** (#17). `per_day_micros` is enforced across
+  runs on the UTC day. `[trials]` says it is not implemented when
+  enabled. `[context] budget_bytes` is repository policy, hashed, and
+  counts the whole package the worker receives. `doctor` respects
+  `[integrations]` modes, names the directories in effect, flags
+  environment overrides, and reports whether the harness has a turn
+  ceiling (recorded in the manifest). `HOME` unset is an error, not a
+  panic. The reviewer is spend-gated. Three new release scenarios: a
+  wall-clock-killed worker resumes without a second launch; a worker
+  editing `relais.toml` ends `needs_decision`; a file written after the
+  result is not in the candidate.
+
 ## v0.1.2
 
 ### Fixed
