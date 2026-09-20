@@ -134,17 +134,31 @@ const ADMISSION_POLL: Duration = Duration::from_millis(250);
 /// The supervised execution path (SPEC §3): preflight, route, then a
 /// bounded sequence of attempts the runner — not a model — owns.
 pub fn execute(config: &RunConfig<'_>) -> RunOutcome {
-    RunEngine::new(config, None).run()
+    finished(config, RunEngine::new(config, None).run())
 }
 
 /// A work package's run (SPEC §19): the same lifecycle, attributed to
 /// its root run in the ledger.
 pub fn execute_child(config: &RunConfig<'_>, parent_run: &str, package_id: &str) -> RunOutcome {
-    RunEngine::new(
+    finished(
         config,
-        Some((parent_run.to_string(), package_id.to_string())),
+        RunEngine::new(
+            config,
+            Some((parent_run.to_string(), package_id.to_string())),
+        )
+        .run(),
     )
-    .run()
+}
+
+/// Tell the coordinator the run is over, whatever its end: a registered
+/// run keeps the daemon from idle-exiting (SPEC §23), so one that has
+/// ended must say so. Best effort — the outcome is already decided and
+/// recorded, and an unreachable coordinator reaps it on its own grace.
+fn finished(config: &RunConfig<'_>, outcome: RunOutcome) -> RunOutcome {
+    if let Some(gate) = config.gate {
+        let _ = gate.finish_run(outcome.run_id());
+    }
+    outcome
 }
 
 /// What a managed launch produced: the worker's result, or the run's
