@@ -358,7 +358,7 @@ argv = ["true"]
             output_tokens: None,
             cache_read_tokens: None,
             cache_write_tokens: None,
-            cost: MicroUsd::from_micros(10),
+            cost: Some(MicroUsd::from_micros(10)),
             cost_kind: CostKind::ApiSpend,
             completeness: CostCompleteness::Actual,
             inclusive: false,

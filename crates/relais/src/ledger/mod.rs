@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::runner::State;
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 2;
+pub const LEDGER_SCHEMA_VERSION: u64 = 3;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -223,6 +223,48 @@ const MIGRATIONS: &[(&str, &str)] = &[
     CREATE INDEX idx_runs_parent ON runs(parent_run);
     "#,
     ),
+    (
+        // Unknown usage is unknown, never zero (SPEC §11). `cost_micros`
+        // was NOT NULL, so a dispatch whose harness reported no cost was
+        // stored as 0 and summed into a figure that read as money. SQLite
+        // cannot drop a NOT NULL constraint in place: the table is rebuilt
+        // with the column nullable, rows preserved, and every row whose
+        // completeness already said `unknown` gets the NULL its zero stood
+        // for. `SUM` skips NULL, so a run's cost becomes the lower bound
+        // its completeness label always claimed it was.
+        "v3",
+        r#"
+    CREATE TABLE usage_events_v3 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL UNIQUE,
+        run_id TEXT NOT NULL,
+        attempt_id INTEGER,
+        parent_event_id TEXT,
+        model TEXT,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        cache_read_tokens INTEGER,
+        cache_write_tokens INTEGER,
+        cost_micros INTEGER,
+        cost_kind TEXT NOT NULL,
+        completeness TEXT NOT NULL,
+        inclusive INTEGER NOT NULL DEFAULT 0,
+        at TEXT NOT NULL
+    );
+    INSERT INTO usage_events_v3
+        (id, event_id, run_id, attempt_id, parent_event_id, model,
+         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+         cost_micros, cost_kind, completeness, inclusive, at)
+    SELECT id, event_id, run_id, attempt_id, parent_event_id, model,
+           input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+           CASE WHEN completeness = '"unknown"' THEN NULL ELSE cost_micros END,
+           cost_kind, completeness, inclusive, at
+    FROM usage_events;
+    DROP TABLE usage_events;
+    ALTER TABLE usage_events_v3 RENAME TO usage_events;
+    CREATE INDEX idx_usage_run ON usage_events(run_id);
+    "#,
+    ),
 ];
 
 pub struct Ledger {
@@ -242,11 +284,19 @@ pub struct UsageEvent {
     pub output_tokens: Option<i64>,
     pub cache_read_tokens: Option<i64>,
     pub cache_write_tokens: Option<i64>,
-    pub cost: MicroUsd,
+    /// `None` = the harness reported no cost. Unknown, never zero (SPEC
+    /// §11): it is stored as NULL, left out of every sum, and makes the
+    /// run's completeness `unknown`.
+    pub cost: Option<MicroUsd>,
     pub cost_kind: CostKind,
     pub completeness: CostCompleteness,
     /// True when this event's total already includes its descendants:
     /// an inclusive parent is never added to its children (SPEC §11).
+    /// Set by the adapter when the harness reports subagents in the
+    /// session; no producer records the descendants as rows of their
+    /// own today (native subagents are observed, not dispatched), so
+    /// `parent_event_id` stays `None` until managed nested dispatch
+    /// exists. The dedup in `run_cost` is ready for it.
     pub inclusive: bool,
     pub at: String,
 }
@@ -641,7 +691,7 @@ impl Ledger {
                 event.output_tokens,
                 event.cache_read_tokens,
                 event.cache_write_tokens,
-                event.cost.to_micros(),
+                event.cost.map(MicroUsd::to_micros),
                 serde_json::to_string(&event.cost_kind).expect("cost kind serializes"),
                 serde_json::to_string(&event.completeness).expect("completeness serializes"),
                 event.inclusive,
@@ -719,11 +769,14 @@ impl Ledger {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// Aggregate cost for a run. Inclusive parent totals are alternative
-    /// aggregation sources (SPEC §11): an inclusive event already
-    /// contains its descendants, so a child attributed to an inclusive
-    /// parent is excluded and the parent is counted once. An inclusive
-    /// event with no children simply counts itself.
+    /// Aggregate cost for a run: the sum of what was REPORTED. Unknown
+    /// usage is NULL and `SUM` skips it, so the figure is a lower bound
+    /// whenever `run_cost_completeness` says `unknown` — read the two
+    /// together (`report::cost_line` does). Inclusive parent totals are
+    /// alternative aggregation sources (SPEC §11): an inclusive event
+    /// already contains its descendants, so a child attributed to an
+    /// inclusive parent is excluded and the parent is counted once. An
+    /// inclusive event with no children simply counts itself.
     pub fn run_cost(&self, run_id: &str) -> Result<MicroUsd> {
         let mut total = self.run_own_cost(run_id)?;
         // A root run's cost is its tree's: packages are separate runs
@@ -934,12 +987,110 @@ mod tests {
             output_tokens: Some(10),
             cache_read_tokens: None,
             cache_write_tokens: None,
-            cost: MicroUsd::from_micros(micros),
+            cost: Some(MicroUsd::from_micros(micros)),
             cost_kind: CostKind::ApiSpend,
             completeness: CostCompleteness::Actual,
             inclusive: false,
             at: now_rfc3339(),
         }
+    }
+
+    #[test]
+    fn unknown_usage_is_null_left_out_of_the_sum_and_poisons_completeness() {
+        let (ledger, dir) = temp_ledger();
+        ledger.insert_run("run-u", "/r", None).expect("run");
+        ledger
+            .record_usage(&event("known", "run-u", 700))
+            .expect("known");
+        let mut unknown = event("unknown", "run-u", 0);
+        unknown.cost = None;
+        unknown.completeness = CostCompleteness::Unknown;
+        ledger.record_usage(&unknown).expect("unknown");
+        assert_eq!(
+            ledger.run_cost("run-u").expect("cost"),
+            MicroUsd::from_micros(700),
+            "the reported part, a lower bound"
+        );
+        assert_eq!(
+            ledger.run_cost_completeness("run-u").expect("completeness"),
+            CostCompleteness::Unknown
+        );
+        let stored: Option<i64> = ledger
+            .conn
+            .query_row(
+                "SELECT cost_micros FROM usage_events WHERE event_id = 'unknown'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row");
+        assert_eq!(stored, None, "NULL, not 0");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v3_turns_the_zeros_that_stood_for_unknown_into_null() {
+        let dir = std::env::temp_dir().join(format!("relais-ledger-v3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("ledger.sqlite");
+        // A v2 ledger, as 0.1.1 wrote it: NOT NULL cost, unknown stored as 0.
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL);",
+            )
+            .expect("migrations table");
+            for (version, sql) in &MIGRATIONS[..2] {
+                conn.execute_batch(sql).expect("v1/v2");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, 'then')",
+                    [version],
+                )
+                .expect("mark");
+            }
+            conn.execute_batch(
+                r#"INSERT INTO runs (id, repo_path, status, created_at, updated_at)
+                   VALUES ('run-old', '/r', 'accepted', 't', 't');
+                   INSERT INTO usage_events (event_id, run_id, cost_micros, cost_kind, completeness, at)
+                   VALUES ('e-known', 'run-old', 500, '"api_spend"', '"actual"', 't'),
+                          ('e-unknown', 'run-old', 0, '"api_spend"', '"unknown"', 't');"#,
+            )
+            .expect("old rows");
+        }
+        let ledger = Ledger::open(&path).expect("migrates");
+        assert_eq!(ledger.schema_version().expect("version"), 3);
+        let unknown: Option<i64> = ledger
+            .conn
+            .query_row(
+                "SELECT cost_micros FROM usage_events WHERE event_id = 'e-unknown'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row");
+        assert_eq!(unknown, None);
+        let known: Option<i64> = ledger
+            .conn
+            .query_row(
+                "SELECT cost_micros FROM usage_events WHERE event_id = 'e-known'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row");
+        assert_eq!(known, Some(500), "reported cost survives the rebuild");
+        assert_eq!(
+            ledger.run_cost("run-old").expect("cost"),
+            MicroUsd::from_micros(500)
+        );
+        // The index came back with the table.
+        let indexed: i64 = ledger
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_usage_run'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("index");
+        assert_eq!(indexed, 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -128,12 +128,11 @@ impl Report {
         }
         for run in &self.runs {
             out.push_str(&format!(
-                "{}  {:<16} attempts {:<3} {:>10} ({})  [{}]\n",
+                "{}  {:<16} attempts {:<3} {}  [{}]\n",
                 run.run_id,
                 run.status,
                 run.attempts,
-                run.cost.to_string(),
-                completeness_label(run.cost_completeness),
+                cost_line(run.cost, run.cost_completeness),
                 if run.models.is_empty() {
                     "-".to_string()
                 } else {
@@ -155,9 +154,8 @@ impl Report {
             }
         ));
         out.push_str(&format!(
-            "total recorded cost: {} ({}) — failed runs included\n",
-            self.total_cost,
-            completeness_label(self.cost_completeness)
+            "total recorded cost: {} — failed runs included\n",
+            cost_line(self.total_cost, self.cost_completeness)
         ));
         match self.cost_per_accepted {
             Some(cost) => out.push_str(&format!(
@@ -187,6 +185,24 @@ fn truncate_chars(text: &str, max: usize) -> String {
     format!("{head}…")
 }
 
+/// A cost and its completeness as one phrase, because the number alone
+/// lies whenever usage went unreported: `$0 (unknown)` reads as free.
+/// The reported sum is a lower bound the label qualifies; when nothing
+/// at all was reported, there is no number to print (SPEC §11: never
+/// replace missing usage with zero).
+pub fn cost_line(cost: MicroUsd, completeness: CostCompleteness) -> String {
+    match completeness {
+        CostCompleteness::Unknown if cost == MicroUsd::ZERO => {
+            "unknown (no usage was reported)".to_string()
+        }
+        CostCompleteness::Unknown => {
+            format!("at least {cost} (unknown: some usage was not reported)")
+        }
+        CostCompleteness::IncompleteLowerBound => format!("at least {cost} (incomplete)"),
+        other => format!("{cost} ({})", completeness_label(other)),
+    }
+}
+
 pub fn completeness_label(completeness: CostCompleteness) -> &'static str {
     match completeness {
         CostCompleteness::Actual => "actual",
@@ -198,6 +214,35 @@ pub fn completeness_label(completeness: CostCompleteness) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_cost_line_never_reads_unreported_usage_as_free() {
+        use super::*;
+        assert_eq!(
+            cost_line(MicroUsd::ZERO, CostCompleteness::Unknown),
+            "unknown (no usage was reported)"
+        );
+        assert_eq!(
+            cost_line(MicroUsd::from_micros(1_500_000), CostCompleteness::Unknown),
+            "at least $1.5 (unknown: some usage was not reported)"
+        );
+        assert_eq!(
+            cost_line(
+                MicroUsd::from_micros(20),
+                CostCompleteness::IncompleteLowerBound
+            ),
+            "at least $0.00002 (incomplete)"
+        );
+        assert_eq!(
+            cost_line(MicroUsd::from_micros(1_000_000), CostCompleteness::Actual),
+            "$1 (actual)"
+        );
+        assert_eq!(
+            cost_line(MicroUsd::ZERO, CostCompleteness::Actual),
+            "$0 (actual)",
+            "a reported zero is a zero"
+        );
+    }
+
     use super::*;
     use crate::ledger::{now_rfc3339, Transition};
 
@@ -266,7 +311,7 @@ mod tests {
                     output_tokens: Some(1),
                     cache_read_tokens: None,
                     cache_write_tokens: None,
-                    cost: MicroUsd::from_micros(cost),
+                    cost: Some(MicroUsd::from_micros(cost)),
                     cost_kind: crate::money::CostKind::ApiSpend,
                     completeness: CostCompleteness::Actual,
                     inclusive: false,

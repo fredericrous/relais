@@ -865,9 +865,8 @@ fn run_command(task: &Path) -> i32 {
                 receipt.attempts
             );
             println!(
-                "cost:    {} ({})",
-                receipt.cost,
-                report::completeness_label(receipt.cost_completeness)
+                "cost:    {}",
+                report::cost_line(receipt.cost, receipt.cost_completeness)
             );
             println!("run:     {}", outcome.run_id());
             0
@@ -995,10 +994,7 @@ fn explain_command(run_id: &str) -> i32 {
     }
     let cost = ledger.run_cost(run_id).expect("cost");
     let completeness = ledger.run_cost_completeness(run_id).expect("completeness");
-    println!(
-        "cost: {cost} ({})",
-        report::completeness_label(completeness)
-    );
+    println!("cost: {}", report::cost_line(cost, completeness));
     if let Some((receipt, _hash)) = ledger.receipt(run_id).expect("receipt") {
         println!(
             "receipt: candidate {} ({} attempt(s), [{}])",
