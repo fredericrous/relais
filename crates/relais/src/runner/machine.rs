@@ -62,6 +62,12 @@ pub enum Reason {
     /// An accepted run's task worktree could not be released; its
     /// content is in the patch and the candidate ref regardless.
     WorktreeNotReleased,
+    /// Verification had to wait for a worktree's writer to relinquish
+    /// its lease before snapshotting (SPEC §23).
+    WriteLeaseWait,
+    /// A writer still held the worktree when the run's clock ran out:
+    /// nothing was snapshotted, the tree is preserved.
+    WriteLeaseHeld,
     /// The run ended because the runner itself could not go on — a
     /// ledger or filesystem failure — not because of anything a worker
     /// did (SPEC §12: uncertain state is interrupted, never retried).
@@ -106,6 +112,8 @@ impl Reason {
             Self::CandidateIdenticalToBase => "candidate_identical_to_base",
             Self::ReviewerSameTier => "reviewer_same_tier",
             Self::WorktreeNotReleased => "worktree_not_released",
+            Self::WriteLeaseWait => "write_lease_wait",
+            Self::WriteLeaseHeld => "write_lease_held",
             Self::RunnerFailure => "runner_failure",
         }
     }

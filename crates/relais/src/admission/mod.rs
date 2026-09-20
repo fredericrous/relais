@@ -992,10 +992,13 @@ impl AdmissionState {
     /// explicitly non-overlapping write leases"). Idempotent for the
     /// holder; false when somebody else holds it.
     ///
-    /// Nothing in the runner calls this yet — the workspace layer still
-    /// gives every writing attempt its own worktree, which is the
-    /// stronger guarantee. This is the coordinator-side half, so that
-    /// "verification waits for write leases" has something to wait on.
+    /// The runner takes it for every candidate-writing dispatch after
+    /// admission and before the process exists, releases it when the
+    /// process has ended, and verification waits for the worktree's
+    /// holder to be gone before snapshotting (`RunEngine::wait_for_writers`).
+    /// Each writing attempt still gets its own worktree — the lease is
+    /// the coordinator-side record that lets a second writer be refused
+    /// and a straggler be waited for, across tabs.
     pub fn acquire_write(&mut self, worktree: &str, dispatch_id: &str, now: Instant) -> bool {
         match self.write_leases.get(worktree) {
             Some(lease) => lease.holder == dispatch_id,
@@ -1466,6 +1469,25 @@ pub trait Gate {
     fn finish_run(&self, _run_id: &str) -> Result<(), GateError> {
         Ok(())
     }
+    /// Take the exclusive write lease on a worktree for a dispatch that
+    /// is about to write it (SPEC §23). `Ok(false)` = somebody else holds
+    /// it; the caller must not launch a second writer into that tree.
+    /// Gates that track no leases grant every request.
+    fn acquire_write(&self, _dispatch_id: &str, _worktree: &str) -> Result<bool, GateError> {
+        Ok(true)
+    }
+    /// The dispatch has stopped writing the worktree. Only the holder can
+    /// release; a mismatched release is ignored, never somebody else's
+    /// lease freed.
+    fn release_write(&self, _dispatch_id: &str, _worktree: &str) -> Result<(), GateError> {
+        Ok(())
+    }
+    /// Who holds a worktree's write lease, if anyone: what verification
+    /// waits to become `None` before it snapshots (SPEC §23: "root
+    /// verification waits for all relevant write leases to be released").
+    fn write_lease_holder(&self, _worktree: &str) -> Result<Option<String>, GateError> {
+        Ok(None)
+    }
     /// What this gate can enforce, for reports (SPEC §23: observed-only
     /// paths are labelled, never claimed as guarantees).
     fn enforcement(&self) -> &'static str;
@@ -1619,6 +1641,31 @@ impl Gate for LocalGate {
             .expect("admission lock")
             .finish_run(run_id);
         Ok(())
+    }
+
+    fn acquire_write(&self, dispatch_id: &str, worktree: &str) -> Result<bool, GateError> {
+        Ok(self.state.lock().expect("admission lock").acquire_write(
+            worktree,
+            dispatch_id,
+            Instant::now(),
+        ))
+    }
+
+    fn release_write(&self, dispatch_id: &str, worktree: &str) -> Result<(), GateError> {
+        self.state
+            .lock()
+            .expect("admission lock")
+            .release_write(worktree, dispatch_id);
+        Ok(())
+    }
+
+    fn write_lease_holder(&self, worktree: &str) -> Result<Option<String>, GateError> {
+        Ok(self
+            .state
+            .lock()
+            .expect("admission lock")
+            .write_lease_holder(worktree)
+            .map(|(holder, _)| holder.to_string()))
     }
 
     fn enforcement(&self) -> &'static str {

@@ -122,6 +122,22 @@ pub enum Request {
     FinishRun {
         run_id: String,
     },
+    /// Exclusive write access to a worktree for a dispatch about to write
+    /// it (SPEC §23). Refused, with the holder named, when another
+    /// dispatch holds it.
+    AcquireWrite {
+        dispatch_id: String,
+        worktree: String,
+    },
+    /// The dispatch stopped writing; only the holder's release counts.
+    ReleaseWrite {
+        dispatch_id: String,
+        worktree: String,
+    },
+    /// Who is writing a worktree, for verification to wait on.
+    WriteLeaseHolder {
+        worktree: String,
+    },
     CancelDispatch {
         dispatch_id: String,
     },
@@ -159,6 +175,9 @@ pub enum Response {
     },
     Heartbeat {
         status: HeartbeatStatus,
+    },
+    WriteLease {
+        holder: Option<String>,
     },
     Cancelled {
         dispatches: Vec<String>,
@@ -551,6 +570,32 @@ pub fn handle(request: Request, state: &mut AdmissionState) -> Response {
         } => ok(state.settle(&dispatch_id, spent_micros, now)),
         Request::Withdraw { dispatch_id } => ok(state.withdraw(&dispatch_id, now)),
         Request::FinishRun { run_id } => ok(state.finish_run(&run_id)),
+        Request::AcquireWrite {
+            dispatch_id,
+            worktree,
+        } => {
+            if state.acquire_write(&worktree, &dispatch_id, now) {
+                ok(true)
+            } else {
+                let holder = state
+                    .write_lease_holder(&worktree)
+                    .map(|(holder, _)| holder.to_string())
+                    .unwrap_or_default();
+                ok_with(
+                    false,
+                    format!("worktree {worktree} is being written by dispatch {holder}"),
+                )
+            }
+        }
+        Request::ReleaseWrite {
+            dispatch_id,
+            worktree,
+        } => ok(state.release_write(&worktree, &dispatch_id)),
+        Request::WriteLeaseHolder { worktree } => Response::WriteLease {
+            holder: state
+                .write_lease_holder(&worktree)
+                .map(|(holder, _)| holder.to_string()),
+        },
         Request::CancelDispatch { dispatch_id } => {
             let signalled = state.cancel_dispatch(&dispatch_id, now);
             for (_, pid) in &signalled {
@@ -772,6 +817,37 @@ impl Gate for RemoteGate {
             run_id: run_id.into(),
         })
         .map(|_| ())
+    }
+
+    fn acquire_write(&self, dispatch_id: &str, worktree: &str) -> Result<bool, GateError> {
+        match self.call(Request::AcquireWrite {
+            dispatch_id: dispatch_id.into(),
+            worktree: worktree.into(),
+        })? {
+            Response::Ok { known, .. } => Ok(known),
+            other => Err(GateError(format!(
+                "unexpected write-lease reply: {other:?}"
+            ))),
+        }
+    }
+
+    fn release_write(&self, dispatch_id: &str, worktree: &str) -> Result<(), GateError> {
+        self.call(Request::ReleaseWrite {
+            dispatch_id: dispatch_id.into(),
+            worktree: worktree.into(),
+        })
+        .map(|_| ())
+    }
+
+    fn write_lease_holder(&self, worktree: &str) -> Result<Option<String>, GateError> {
+        match self.call(Request::WriteLeaseHolder {
+            worktree: worktree.into(),
+        })? {
+            Response::WriteLease { holder } => Ok(holder),
+            other => Err(GateError(format!(
+                "unexpected write-lease reply: {other:?}"
+            ))),
+        }
     }
 
     fn enforcement(&self) -> &'static str {
@@ -1045,6 +1121,29 @@ mod tests {
             Decision::Granted
         );
         gate.resume("d1").expect("resume");
+        // Write leases over the wire: exclusive, named, released by the
+        // holder only, gone with settlement.
+        assert!(gate.acquire_write("d1", "/wt/one").expect("acquire"));
+        assert!(
+            !gate.acquire_write("d2", "/wt/one").expect("acquire"),
+            "a second writer is refused"
+        );
+        assert_eq!(
+            gate.write_lease_holder("/wt/one")
+                .expect("holder")
+                .as_deref(),
+            Some("d1")
+        );
+        gate.release_write("d2", "/wt/one").expect("release");
+        assert_eq!(
+            gate.write_lease_holder("/wt/one")
+                .expect("holder")
+                .as_deref(),
+            Some("d1"),
+            "only the holder can release"
+        );
+        gate.release_write("d1", "/wt/one").expect("release");
+        assert_eq!(gate.write_lease_holder("/wt/one").expect("holder"), None);
         gate.release("d2").expect("release");
         gate.settle("d2", None).expect("settle");
         let snapshot = client.status().expect("status");

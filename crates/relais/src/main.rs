@@ -574,6 +574,12 @@ fn coordinator_command(cmd: CoordinatorCommand) -> i32 {
                 snapshot.over_admitted
             );
             println!("sessions: {}", snapshot.sessions.join(", "));
+            if !snapshot.write_leases.is_empty() {
+                println!("write leases:");
+                for (worktree, holder) in &snapshot.write_leases {
+                    println!("  {worktree} <- {holder}");
+                }
+            }
             for (run_id, run) in &snapshot.runs {
                 println!(
                     "  {run_id} [{}] active {} waiting {} queued {} admitted {} | budget {} reserved {} settled {}{}{}",

@@ -6,6 +6,24 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## v0.1.4
+
+### Added
+
+- **Write leases reach the runner** (SPEC §23). Every candidate-writing
+  dispatch takes the exclusive write lease on its worktree after
+  admission and before its process exists, and gives it back when the
+  process has ended; the reviewer and the planner, which only read, take
+  none. A worktree somebody else is writing refuses the launch outright,
+  naming the holder. Before a candidate is snapshotted, and before the
+  scheduler verifies an integrated candidate, the runner waits for the
+  relevant worktrees' holders to be gone — a wait that happened is a
+  transition on the run, and a holder still there at the run's deadline
+  ends the run `interrupted` with nothing snapshotted from a tree in
+  motion. The three operations travel the coordinator socket, so the
+  guarantee holds across tabs; `relais coordinator status` lists the
+  leases in force.
+
 ## v0.1.3
 
 The rest of the audit: issues #6–#10 closed, five pull requests
