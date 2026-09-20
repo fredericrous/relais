@@ -228,9 +228,10 @@ impl TaskWorktree {
         Ok(base == candidate)
     }
 
-    /// Export the candidate as a patch artifact.
+    /// Export the candidate as a patch artifact. Untrimmed: a patch whose
+    /// last line lost its newline is one `git apply` calls corrupt.
     pub fn export_patch(&self, candidate_sha: &str, out_path: &Path) -> Result<()> {
-        let diff = git(&self.path, &["diff", &self.base_sha, candidate_sha])?;
+        let diff = git_raw(&self.path, &["diff", &self.base_sha, candidate_sha])?;
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -458,6 +459,9 @@ mod tests {
         wt.export_patch(&candidate, &patch).expect("export");
         let patch_text = std::fs::read_to_string(&patch).expect("patch");
         assert!(patch_text.contains("+added by worker"), "{patch_text}");
+        // The artifact is what the user integrates: it must apply as is.
+        git(&repo, &["apply", "--check", &patch.to_string_lossy()])
+            .expect("the exported patch applies to the base checkout");
         release_worktree(&repo, &wt_path, true).expect("released");
     }
 
