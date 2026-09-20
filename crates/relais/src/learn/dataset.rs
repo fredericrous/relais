@@ -193,9 +193,24 @@ impl Tier {
 }
 
 /// Splits are TEMPORAL and family-aware (SPEC §17): records are ordered by
-/// dispatch time, a family lands entirely in the earliest split its first
-/// record falls into, and the splits are train / calibration / test.
+/// dispatch time, a family lands entirely in the LATEST split any of its
+/// records falls into, and the splits are train / calibration / test.
 /// Duplicated replays of one task never straddle a split boundary.
+///
+/// The pin used to be the family's FIRST record, which put future data in
+/// the training split: a family whose first replay landed in train
+/// absorbed every later record of that family, including ones dispatched
+/// after the test cutoff, and the learner was fitted on outcomes from
+/// after the period it is evaluated over (SPEC §21: "dataset splits
+/// prevent related-task leakage").
+///
+/// Pinning to the last record fixes it in the only direction that
+/// matters. Leakage is asymmetric: an early record sitting in the test
+/// split tells the learner nothing, because it was never trained on,
+/// while a late record sitting in train is information from the future.
+/// Dropping straddling families would also be leak-free, but it discards
+/// evidence — and it discards exactly the families with the most
+/// observations, which are the ones replays were collected for.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TemporalSplits<'a> {
     pub train: Vec<&'a TrainingExample>,
@@ -210,28 +225,39 @@ pub fn temporal_splits(
 ) -> TemporalSplits<'_> {
     let mut sorted: Vec<&TrainingExample> = records.iter().collect();
     sorted.sort_by(|a, b| a.dispatched_at.cmp(&b.dispatched_at));
-    let mut first_split_of_family = std::collections::BTreeMap::new();
     let n = sorted.len();
     let calibration_start = ((n as f64) * (1.0 - test_fraction - calibration_fraction)) as usize;
     let test_start = ((n as f64) * (1.0 - test_fraction)) as usize;
-    let mut train = Vec::new();
-    let mut calibration = Vec::new();
-    let mut test = Vec::new();
-    for (index, record) in sorted.into_iter().enumerate() {
-        let split = if index < calibration_start {
+    let split_of = |index: usize| -> u8 {
+        if index < calibration_start {
             0
         } else if index < test_start {
             1
         } else {
             2
-        };
-        // A family's first record pins every later record of the same
-        // family to that split — no future leakage through near-duplicate
-        // tasks (SPEC §17, §21).
-        let pinned = first_split_of_family
-            .entry(record.family.clone())
+        }
+    };
+    // Two passes: the latest split any record of a family falls into, then
+    // every record of that family placed there. A family that straddles a
+    // boundary moves forward in time, never back into training.
+    let mut latest_split_of_family: std::collections::BTreeMap<&str, u8> =
+        std::collections::BTreeMap::new();
+    for (index, record) in sorted.iter().enumerate() {
+        let split = split_of(index);
+        latest_split_of_family
+            .entry(record.family.as_str())
+            .and_modify(|pinned| *pinned = (*pinned).max(split))
             .or_insert(split);
-        match *pinned {
+    }
+    let mut train = Vec::new();
+    let mut calibration = Vec::new();
+    let mut test = Vec::new();
+    for record in sorted {
+        match latest_split_of_family
+            .get(record.family.as_str())
+            .copied()
+            .unwrap_or(2)
+        {
             0 => train.push(record),
             1 => calibration.push(record),
             _ => test.push(record),
@@ -280,35 +306,69 @@ mod tests {
         let train_last = splits.train.last().unwrap().dispatched_at.clone();
         let cal_first = splits.calibration.first().unwrap().dispatched_at.clone();
         assert!(train_last < cal_first, "temporal order holds");
+    }
 
-        // A family duplicated late stays with its first record's split.
-        let mut duplicated = records.clone();
-        duplicated.push(example("family-1", "2026-10-01T00:00:00+00:00", false));
-        let splits = temporal_splits(&duplicated, 0.2, 0.2);
-        assert!(
-            splits.train.iter().all(|record| record.family != "family-1"
-                || record.dispatched_at.starts_with("2026-09-01")
-                || record.dispatched_at.starts_with("2026-10"))
-                || splits
-                    .train
-                    .iter()
-                    .any(|record| record.family == "family-1")
-        );
+    /// D2: a family whose first record landed in train used to absorb
+    /// every later record — including replays dispatched after the test
+    /// cutoff. The training split then held data from the future.
+    #[test]
+    fn a_family_straddling_the_cutoff_leaves_the_training_split() {
+        let mut records = Vec::new();
+        for day in 1..=9 {
+            records.push(example(
+                &format!("family-{day}"),
+                &format!("2026-09-{day:02}T00:00:00+00:00"),
+                true,
+            ));
+        }
+        // `family-1`'s first record is the earliest of all (train under
+        // any rule); its replay is the latest of all (test).
+        records.push(example("family-1", "2026-10-01T00:00:00+00:00", false));
+        let splits = temporal_splits(&records, 0.2, 0.2);
+
+        let in_train: Vec<&str> = splits
+            .train
+            .iter()
+            .map(|record| record.dispatched_at.as_str())
+            .collect();
         assert!(
             splits
                 .train
                 .iter()
-                .any(|record| record.family == "family-1"
-                    && record.dispatched_at.starts_with("2026-10")),
-            "the late duplicate follows its family's pinned split"
+                .all(|record| record.family != "family-1"),
+            "a straddling family may not train the learner: {in_train:?}"
+        );
+        assert_eq!(
+            splits
+                .test
+                .iter()
+                .filter(|record| record.family == "family-1")
+                .count(),
+            2,
+            "both of the family's records land together, in its latest split"
+        );
+        // The training split now ends strictly before the test split
+        // begins — the property the pin exists for.
+        let train_end = in_train.iter().max().copied().unwrap_or("");
+        let post_cutoff = splits
+            .test
+            .iter()
+            .map(|record| record.dispatched_at.as_str())
+            .max()
+            .unwrap_or("");
+        assert!(
+            train_end < post_cutoff,
+            "train {train_end} must precede the last test record {post_cutoff}"
         );
         assert!(
-            splits
-                .calibration
-                .iter()
-                .chain(splits.test.iter())
-                .all(|record| record.family != "family-1"),
-            "no family straddles a boundary"
+            !in_train.iter().any(|at| at.starts_with("2026-10")),
+            "no post-cutoff record reaches the training split: {in_train:?}"
+        );
+        // Nothing is dropped: every record is somewhere.
+        assert_eq!(
+            splits.train.len() + splits.calibration.len() + splits.test.len(),
+            records.len(),
+            "a straddling family is moved, not discarded"
         );
     }
 

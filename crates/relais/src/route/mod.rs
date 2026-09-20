@@ -198,6 +198,62 @@ impl From<&crate::policy::RecipeSpec> for Recipe {
     }
 }
 
+/// Is every path matched by `scope` also matched by `cover`? This is
+/// CONTAINMENT, not overlap, and it is deliberately incomplete: glob
+/// containment in general is not something to decide inside a routing
+/// function, so anything this cannot decide is "not contained".
+///
+/// `scope_could_touch` answers a different question — could these two
+/// patterns share a path — and using it here made a recipe "fully cover"
+/// a task it covered almost none of: a contract scoped `**` overlaps a
+/// `docs/**` recipe, so the whole repository was routed by the docs
+/// recipe's tier (finding B13). The two predicates are not
+/// interchangeable in either direction: overlap is symmetric and
+/// containment is not.
+///
+/// Decidable cases:
+/// - `cover` is `**`: it matches every path, so anything is contained.
+/// - `cover` ends in `/**` and its leading segments are all literal:
+///   `scope` is contained when its own segments begin with exactly those
+///   literals and it has at least one segment more.
+/// - the two patterns are identical.
+///
+/// Everything else — a wildcard anywhere in the cover's prefix
+/// (`**/trust/**`, `docs/*/**`), a cover with no trailing `**`, a scope
+/// shorter than the cover's prefix — is undecidable here and answers
+/// false, which costs a recipe and never grants one.
+pub(crate) fn scope_contained_in(scope: &str, cover: &str) -> bool {
+    let segments = |glob: &str| -> Vec<String> {
+        glob.trim_start_matches("./")
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let scope = segments(scope);
+    let cover = segments(cover);
+    if cover.is_empty() {
+        return false;
+    }
+    if cover.len() == 1 && cover[0] == "**" {
+        return true;
+    }
+    if scope == cover {
+        return true;
+    }
+    let Some((last, prefix)) = cover.split_last() else {
+        return false;
+    };
+    if last != "**" || prefix.is_empty() {
+        return false;
+    }
+    let wild = |segment: &String| segment.contains(['*', '?', '[']);
+    if prefix.iter().any(wild) {
+        return false;
+    }
+    scope.len() > prefix.len() && scope.starts_with(prefix)
+}
+
 fn recipe_covers(contract: &TaskContract, recipe: &Recipe) -> bool {
     if let Some(kind) = recipe.kind {
         if contract.kind != kind {
@@ -207,13 +263,16 @@ fn recipe_covers(contract: &TaskContract, recipe: &Recipe) -> bool {
     if recipe.scope_within.is_empty() {
         return true;
     }
+    // FULLY covers (SPEC §6.3): every pattern the contract may write must
+    // be contained in some recipe pattern.
     contract.write_scope.as_deref().is_some_and(|scopes| {
-        scopes.iter().all(|scope| {
-            recipe
-                .scope_within
-                .iter()
-                .any(|cover| scope_could_touch(scope, cover))
-        })
+        !scopes.is_empty()
+            && scopes.iter().all(|scope| {
+                recipe
+                    .scope_within
+                    .iter()
+                    .any(|cover| scope_contained_in(scope, cover))
+            })
     })
 }
 
@@ -963,5 +1022,65 @@ mod tests {
         let straddling = change_contract(&["docs/**", "crates/**"]);
         let d = route_with(&straddling, &repo, &machine);
         assert_eq!(d.routed_by, RoutedBy::ConservativeBaseline);
+    }
+
+    /// B13: coverage was tested with `scope_could_touch`, a symmetric
+    /// could-intersect predicate, so a contract that may write ANYWHERE
+    /// was "fully covered" by a recipe scoped to `docs/**`.
+    #[test]
+    fn recipe_coverage_is_containment_not_overlap() {
+        assert!(
+            !scope_contained_in("**", "docs/**"),
+            "a scope over the whole repository is not inside docs/"
+        );
+        assert!(scope_contained_in("docs/a/**", "docs/**"));
+        assert!(
+            !scope_contained_in("docs/**", "docs/a/**"),
+            "containment is not symmetric"
+        );
+        assert!(scope_contained_in("docs/guide.md", "docs/**"));
+        assert!(scope_contained_in("./docs/guide.md", "docs/**"));
+        assert!(scope_contained_in("anything/at/all", "**"));
+        assert!(scope_contained_in("docs/**", "docs/**"));
+        // The cover's own wildcards make containment undecidable here.
+        assert!(!scope_contained_in("crates/amont/trust/x", "**/trust/**"));
+        assert!(!scope_contained_in("docs/a/b", "docs/*/**"));
+        // A cover that is not a directory glob covers only itself.
+        assert!(!scope_contained_in("docs/guide.md", "docs"));
+        assert!(!scope_contained_in("docs", "docs/**"));
+        assert!(!scope_contained_in("docsets/guide.md", "docs/**"));
+        // The old overlap predicate said yes to the first two.
+        assert!(scope_could_touch("**", "docs/**"));
+        assert!(scope_could_touch("docs/**", "docs/a/**"));
+    }
+
+    #[test]
+    fn a_whole_repository_scope_is_not_covered_by_a_docs_recipe() {
+        let mut repo = repo_policy();
+        repo.recipes.push(crate::policy::RecipeSpec {
+            name: "docs-only".into(),
+            kind: Some(Kind::Change),
+            scope_within: vec!["docs/**".into()],
+            // A tier that IS eligible for a change, so nothing but the
+            // coverage test can keep the recipe from being chosen.
+            tier: Tier::Escalation,
+        });
+        let machine = machine_for(&repo);
+        let everything = change_contract(&["**"]);
+        let d = route_with(&everything, &repo, &machine);
+        assert_eq!(
+            d.routed_by,
+            RoutedBy::ConservativeBaseline,
+            "a `**` contract is not covered by a docs recipe"
+        );
+        assert_eq!(
+            d.tier,
+            Some(Tier::Implementation),
+            "it takes the conservative floor for a change, not the recipe's tier"
+        );
+        // The same recipe still covers what it really covers.
+        let docs = change_contract(&["docs/api/**"]);
+        let d = route_with(&docs, &repo, &machine);
+        assert_eq!(d.routed_by, RoutedBy::DeterministicRecipe);
     }
 }

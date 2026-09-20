@@ -37,6 +37,9 @@ pub struct EvalReport {
     pub train_records: usize,
     pub calibration_records: usize,
     pub test_records: usize,
+    /// The calibration curve, measured on the TEST split — records the
+    /// temperature was NOT fitted on. The calibration split fits; the test
+    /// split reports.
     pub calibration_bins: Vec<CalibrationBin>,
     pub test_acceptance_rate: Option<f64>,
     /// Baseline: the conservative configured route (the floor tier) —
@@ -117,17 +120,23 @@ pub fn train_and_evaluate(
             (
                 standardization.apply(&record.sparse),
                 record.complete_cost.to_micros() as f64,
-                cohort_of(record.tier).to_string(),
+                record.task.cohort().to_string(),
             )
         })
         .collect();
     let (cost, _cost_report) = if cost_examples.is_empty() {
         (
+            // Fitted on nothing: the empty observed range supports no
+            // prediction and there is no cohort mean to abstain to, so
+            // this model prices no tier at all. A zero here would have
+            // made every tier look free, and the cheapest.
             CostModel {
                 dim: feature_dim(&schema),
                 weights: vec![0.0; feature_dim(&schema)],
                 bias: 0.0,
                 cohort_means: vec![],
+                observed_log_min: f64::INFINITY,
+                observed_log_max: f64::NEG_INFINITY,
             },
             super::learner::FitReport {
                 iterations: 0,
@@ -161,11 +170,17 @@ pub fn train_and_evaluate(
         calibrate(&mut acceptance, &standardization, &calibration);
     }
 
-    // Evaluation on the test split.
+    // The reported calibration curve is measured on the TEST split, which
+    // the temperature above was not fitted on. Reporting it on the
+    // calibration split measured the fit against the data it was fitted
+    // to: a curve that looks calibrated by construction and says nothing
+    // about a future task (SPEC §17: "keep the final test set out of
+    // tuning", report calibration on held-out data). The calibration
+    // split's one job is fitting the temperature.
     let mut calibration_bins = Vec::new();
-    if !calibration.is_empty() {
+    if !test.is_empty() {
         let mut bins = vec![(0.0f64, 0usize, 0usize); 5];
-        for record in &calibration {
+        for record in &test {
             let probability = acceptance.predict_proba(&standardization.apply(&record.sparse));
             let bin = ((probability * 5.0) as usize).min(4);
             bins[bin].0 += probability;
@@ -191,6 +206,8 @@ pub fn train_and_evaluate(
     // evidence for that policy only when its observed tier IS the
     // selection; a record at another tier says nothing about it. The
     // baseline is what cold-start routing does: the floor tier.
+    // A tier the cost model cannot price is not a candidate — the router
+    // skips it too, rather than treating an absent price as free.
     let select = |record: &TrainingExample| -> Option<Tier> {
         tiers
             .iter()
@@ -203,8 +220,11 @@ pub fn train_and_evaluate(
                     &schema,
                 ));
                 let probability = acceptance.predict_proba(&features);
-                (probability >= quality_floor)
-                    .then(|| (*tier, cost.predict(&features, Some(cohort_of(*tier)))))
+                if probability < quality_floor {
+                    return None;
+                }
+                cost.predict(&features, Some(record.task.cohort()))
+                    .map(|cost| (*tier, cost))
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(tier, _)| tier)
@@ -302,15 +322,6 @@ pub fn train_and_evaluate(
     })
 }
 
-/// The cost cohort a tier's strategy is compared against.
-fn cohort_of(tier: Tier) -> &'static str {
-    match tier {
-        Tier::Escalation => "escalation",
-        Tier::Implementation => "change",
-        Tier::Research => "inspect",
-    }
-}
-
 fn calibrate(
     acceptance: &mut LogisticModel,
     standardization: &Standardization,
@@ -381,7 +392,7 @@ impl EvalReport {
         ));
         for bin in &self.calibration_bins {
             out.push_str(&format!(
-                "calibration: predicted {:.2} → observed {:.2} (n={})\n",
+                "calibration (held-out test split): predicted {:.2} → observed {:.2} (n={})\n",
                 bin.predicted_mid, bin.observed, bin.count
             ));
         }
@@ -529,6 +540,57 @@ mod tests {
         assert!(
             !outcome.report.gates.gates_passed,
             "a policy failing the quality requirement cannot pass promotion"
+        );
+    }
+
+    /// D3: the reported bins were computed on the very records the
+    /// temperature had just been fitted on, so the curve was in-sample by
+    /// construction. Here the calibration split is all-accepted and the
+    /// test split all-rejected: bins measured on the fitting set would
+    /// report an observed frequency of 1.0 in every bin.
+    #[test]
+    fn calibration_bins_are_reported_on_records_the_fit_never_saw() {
+        let mut records = Vec::new();
+        // 20 records: indices 0..11 train, 12..15 calibration, 16..19 test
+        // under the 0.2/0.2 split. Labels: train mixed (so the learner is
+        // not degenerate), calibration all accepted, test all rejected.
+        for day in 1..=20u32 {
+            let accepted = match day {
+                1..=12 => day % 2 == 0,
+                13..=16 => true,
+                _ => false,
+            };
+            records.push(record(
+                &format!("f{day}"),
+                &format!("2026-09-{day:02}"),
+                accepted,
+                Tier::Implementation,
+            ));
+        }
+        let dataset = Dataset {
+            version: crate::learn::dataset::DATASET_VERSION,
+            records,
+            exclusions: vec![],
+            fingerprint: "f".into(),
+            built_at: "now".into(),
+        };
+        let outcome =
+            train_and_evaluate(&dataset, SolverSettings::default(), 0.75, 5).expect("trains");
+        let report = &outcome.report;
+        assert_eq!(report.calibration_records, 4);
+        assert_eq!(report.test_records, 4);
+        let binned: usize = report.calibration_bins.iter().map(|bin| bin.count).sum();
+        assert_eq!(
+            binned, report.test_records,
+            "every binned record is a test record, and every test record is binned"
+        );
+        assert!(
+            report
+                .calibration_bins
+                .iter()
+                .all(|bin| bin.observed == 0.0),
+            "the test split is all-rejected; an in-sample curve would read 1.0: {:?}",
+            report.calibration_bins
         );
     }
 

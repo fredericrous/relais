@@ -95,15 +95,24 @@ pub fn estimate_from_registry(
     }
     let mut acceptance = Vec::new();
     let mut costs = Vec::new();
+    // The cohort is this contract's KIND — the same token the dataset
+    // recorded when it was trained. It used to be the literal "change"
+    // for every task, so an `inspect` contract that fell back to the
+    // empirical baseline was priced with the cost of changing code.
+    let cohort = super::features::cohort_of_kind(contract.kind);
     for (tier, features) in &inputs {
         if !artifact.tiers_supported.contains(tier) {
             continue;
         }
         let standardized = artifact.standardization.apply(features);
         let probability = artifact.acceptance.predict_proba(&standardized);
-        let cost = artifact.cost.predict(&standardized, Some("change"));
         acceptance.push((tier.as_str().to_string(), probability));
-        costs.push((tier.as_str().to_string(), cost.max(0.0) as i64));
+        // A tier the cost model cannot price is left out of `cost_micros`
+        // rather than priced at zero: the router skips a tier with no cost
+        // estimate instead of treating it as the cheapest one.
+        if let Some(cost) = artifact.cost.predict(&standardized, Some(cohort)) {
+            costs.push((tier.as_str().to_string(), cost.max(0.0) as i64));
+        }
     }
     if acceptance.is_empty() {
         return abstain(format!(
@@ -257,6 +266,44 @@ mod tests {
         .expect("contract")
     }
 
+    /// An artifact whose arrays cover the WHOLE feature space, as a
+    /// trained one's do. The registry used to accept an eight-weight
+    /// artifact here and predict over three hundred dimensions with it
+    /// (D1); `validate` now refuses that, so the fixture is honest.
+    fn artifact_over_the_whole_feature_space() -> Artifact {
+        let schema = FeatureSchema::standard();
+        let dim = feature_dim(&schema);
+        Artifact {
+            schema_version: super::super::registry::ARTIFACT_SCHEMA_VERSION,
+            artifact_id: "art-test".into(),
+            feature_schema: schema,
+            standardization: Standardization::fit(
+                &[crate::learn::features::SparseVec(vec![(0, 1.0)])],
+                dim,
+            ),
+            acceptance: crate::learn::learner::LogisticModel {
+                dim,
+                weights: vec![0.01; dim],
+                bias: 0.0,
+            },
+            cost: crate::learn::learner::CostModel {
+                dim,
+                weights: vec![0.01; dim],
+                bias: 3.0,
+                cohort_means: vec![("change".into(), 500.0), ("inspect".into(), 70.0)],
+                observed_log_min: 1.0,
+                observed_log_max: 8.0,
+            },
+            tiers_supported: vec![Tier::Implementation],
+            cohorts: vec!["change".into(), "inspect".into()],
+            dataset_fingerprint: "f".into(),
+            solver: crate::learn::learner::SolverSettings::default(),
+            trained_at: "now".into(),
+            relais_version: crate::version().into(),
+            evaluation: None,
+        }
+    }
+
     fn authority() -> EffectiveAuthority {
         let repo = repo_policy();
         let machine =
@@ -303,37 +350,7 @@ mod tests {
             std::thread::current().id()
         ));
         let registry = Registry::open(&dir).expect("registry");
-        let mut artifact = Artifact {
-            schema_version: super::super::registry::ARTIFACT_SCHEMA_VERSION,
-            artifact_id: "art-test".into(),
-            feature_schema: FeatureSchema::standard(),
-            standardization: Standardization {
-                means: vec![0.0; 8],
-                stds: vec![1.0; 8],
-            },
-            acceptance: crate::learn::learner::LogisticModel {
-                dim: 8,
-                weights: vec![0.1; 8],
-                bias: 0.0,
-            },
-            cost: crate::learn::learner::CostModel {
-                dim: 8,
-                weights: vec![0.01; 8],
-                bias: 3.0,
-                cohort_means: vec![("change".into(), 500.0)],
-            },
-            tiers_supported: vec![Tier::Implementation],
-            cohorts: vec!["change".into()],
-            dataset_fingerprint: "f".into(),
-            solver: crate::learn::learner::SolverSettings::default(),
-            trained_at: "now".into(),
-            relais_version: crate::version().into(),
-            evaluation: None,
-        };
-        artifact.standardization = Standardization::fit(
-            &[crate::learn::features::SparseVec(vec![(0, 1.0)])],
-            feature_dim(&FeatureSchema::standard()),
-        );
+        let artifact = artifact_over_the_whole_feature_space();
         registry.store(&artifact).expect("store");
         // Promotion needs the evaluator's report; write the active pointer
         // the way the registry does after a real promotion.
@@ -358,6 +375,121 @@ mod tests {
             .estimate(&task, &auth, &[Tier::Escalation])
             .is_none());
         let _ = BTreeMap::<Tier, f64>::new();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D4: the cohort handed to the cost model was the literal `"change"`
+    /// for every contract, so an `inspect` task that fell back to the
+    /// empirical baseline was priced as a code change.
+    #[test]
+    fn the_cost_cohort_is_the_contracts_own_kind() {
+        let dir = std::env::temp_dir().join(format!(
+            "relais-predict-3-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let registry = Registry::open(&dir).expect("registry");
+        let mut artifact = artifact_over_the_whole_feature_space();
+        // A cost model that can only extrapolate: every prediction lands
+        // far outside the range it was fitted on, so every answer is the
+        // cohort's empirical mean and the cohort is observable.
+        artifact.cost.weights = vec![0.0; artifact.cost.dim];
+        artifact.cost.bias = 20.0;
+        artifact.cost.observed_log_min = 0.0;
+        artifact.cost.observed_log_max = 0.0;
+        registry.store(&artifact).expect("store");
+        std::fs::write(
+            dir.join("active.json"),
+            serde_json::json!({ "artifact_id": artifact.artifact_id }).to_string(),
+        )
+        .expect("activate");
+
+        let repo = repo_policy();
+        let auth = authority();
+        let inspect = TaskContract::from_json_str(
+            &serde_json::json!({
+                "schema_version": 1, "kind": "inspect",
+                "objective": "Explain how routing picks a tier",
+                "base_ref": "HEAD",
+                "acceptance": ["names the deciding function"],
+                "verification_profile": "default",
+            })
+            .to_string(),
+        )
+        .expect("contract");
+
+        let change_cost = estimate_from_registry(
+            &registry,
+            &contract(),
+            &repo,
+            &auth,
+            &[Tier::Implementation],
+            None,
+        )
+        .cost_micros;
+        let inspect_cost = estimate_from_registry(
+            &registry,
+            &inspect,
+            &repo,
+            &auth,
+            &[Tier::Implementation],
+            None,
+        )
+        .cost_micros;
+        assert_eq!(change_cost, vec![("implementation".to_string(), 500)]);
+        assert_eq!(
+            inspect_cost,
+            vec![("implementation".to_string(), 70)],
+            "an inspection is priced from the inspect cohort, not the change cohort"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A tier the cost model cannot price at all is reported with no cost
+    /// entry — never with a zero, which would make it the cheapest tier.
+    #[test]
+    fn an_unpriceable_tier_carries_no_cost_estimate() {
+        let dir = std::env::temp_dir().join(format!(
+            "relais-predict-4-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let registry = Registry::open(&dir).expect("registry");
+        let mut artifact = artifact_over_the_whole_feature_space();
+        artifact.cost.weights = vec![0.0; artifact.cost.dim];
+        artifact.cost.bias = 20.0;
+        artifact.cost.observed_log_min = 0.0;
+        artifact.cost.observed_log_max = 0.0;
+        artifact.cost.cohort_means = vec![("inspect".into(), 70.0)];
+        registry.store(&artifact).expect("store");
+        std::fs::write(
+            dir.join("active.json"),
+            serde_json::json!({ "artifact_id": artifact.artifact_id }).to_string(),
+        )
+        .expect("activate");
+
+        let repo = repo_policy();
+        let auth = authority();
+        let result = estimate_from_registry(
+            &registry,
+            &contract(),
+            &repo,
+            &auth,
+            &[Tier::Implementation],
+            None,
+        );
+        assert_eq!(result.acceptance.len(), 1, "acceptance is still estimated");
+        assert!(
+            result.cost_micros.is_empty(),
+            "no observed support for the change cohort: no price, not a free tier"
+        );
+        // The router consumes it through the predictor and, with nothing
+        // priced, selects nothing (D5).
+        let predictor = RegistryPredictor::new(&registry, &repo, None);
+        let estimates = predictor
+            .estimate(&contract(), &auth, &[Tier::Implementation])
+            .expect("acceptance is available");
+        assert!(estimates.cost.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

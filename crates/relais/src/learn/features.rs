@@ -89,6 +89,19 @@ impl TaskFeatures {
         }
     }
 
+    /// The cost cohort this task belongs to. Cohorts are task KINDS — the
+    /// unit the registry advertises in `cohorts` and the one a cohort mean
+    /// is an honest baseline for — not tiers: a tier is what the router
+    /// chooses, and pricing a cohort by the choice under test would make
+    /// the baseline a function of the decision it is meant to check.
+    pub fn cohort(&self) -> &'static str {
+        if self.kind_inspect > 0.0 {
+            "inspect"
+        } else {
+            "change"
+        }
+    }
+
     pub fn dense(&self) -> [f64; TASK_FEATURE_COUNT] {
         [
             self.kind_change,
@@ -103,6 +116,15 @@ impl TaskFeatures {
             self.architecture_keys,
             self.objective_len,
         ]
+    }
+}
+
+/// The cost cohort a contract belongs to: its kind, so training and
+/// inference name the same cohorts (SPEC §16 "supported cohorts").
+pub fn cohort_of_kind(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Change => "change",
+        Kind::Inspect => "inspect",
     }
 }
 
