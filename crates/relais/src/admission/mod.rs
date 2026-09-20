@@ -13,7 +13,7 @@
 //! takes `now`, and liveness is a callback. That is what makes the §23
 //! concurrency scenarios testable without three real Claude Code tabs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,29 @@ pub const LEASE_GRACE: Duration = Duration::from_secs(300);
 /// verifying, and reaping it early is exactly the bug that killed
 /// in-flight runs. The proper end of a run is `finish_run`.
 pub const RUN_ABANDON_GRACE: Duration = Duration::from_secs(3600);
+
+/// A lease that is past grace and has never had a process bound is kept
+/// and re-checked for this many grace periods. After that it is
+/// provably unbindable — the launcher died between `Granted` and the
+/// bind, or never reached `bind` at all — and its seat is freed.
+///
+/// The seat is real and the worker is not: nothing can ever arrive to
+/// claim it, because a bind only happens in the same call that launched
+/// the process. Three killed runs used to take half the seats for the
+/// life of the daemon (C2).
+pub const UNBINDABLE_AFTER: u32 = 3;
+
+/// How long a cancelled worker has to honour `terminate` before the
+/// coordinator escalates to a hard kill. One grace period, once; after
+/// the kill nothing more is sent (C5: the old reconcile re-sent SIGTERM
+/// to the same PID every 15 s, for ever, with no escalation).
+pub const CANCEL_ESCALATE_AFTER: Duration = LEASE_GRACE;
+
+/// How many settled dispatch IDs are remembered so a repeat is refused
+/// rather than admitted a second time (C8). Bounded and FIFO: a
+/// coordinator that runs for days cannot grow this without limit, and
+/// forgetting the oldest is what a restart would do anyway.
+pub const TERMINAL_MEMORY: usize = 4096;
 
 /// Resource classes are scheduled separately: a lightweight remote
 /// research agent does not consume the class a compiler or test
@@ -120,6 +143,9 @@ pub enum Refusal {
     RunAgentCap,
     /// The reservation does not fit the run's remaining root budget.
     BudgetExceeded,
+    /// This dispatch ID already ran and settled. Admitting it again
+    /// would launch a second agent for work that is over (C8).
+    AlreadyFinished,
 }
 
 impl Refusal {
@@ -130,6 +156,7 @@ impl Refusal {
             Self::DepthExceeded => "depth_exceeded",
             Self::RunAgentCap => "run_agent_cap",
             Self::BudgetExceeded => "budget_exceeded",
+            Self::AlreadyFinished => "already_finished",
         }
     }
 }
@@ -172,8 +199,27 @@ pub struct StatusSnapshot {
     pub sessions: Vec<String>,
     pub runs: BTreeMap<String, RunStatus>,
     /// Active seats beyond a cap, from parents that resumed after
-    /// waiting: bounded by the number of waiters, and visible.
+    /// waiting: bounded by the number of waiters, by `max_over_admitted`,
+    /// and visible.
     pub over_admitted: u32,
+    /// Exclusive write leases by worktree path, each naming its holder
+    /// (SPEC §23). Root verification waits for the relevant ones to be
+    /// gone.
+    #[serde(default)]
+    pub write_leases: BTreeMap<String, String>,
+}
+
+/// What the caller should send a cancelled worker. The state machine
+/// never signals anything itself — it decides, the coordinator sends
+/// (`procs::terminate` / `procs::kill`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Signal {
+    /// Ask the worker to stop. Sent once per cancelled dispatch.
+    Terminate,
+    /// It ignored the request for a whole grace period. Sent once,
+    /// and nothing is sent after it.
+    Kill,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -182,9 +228,56 @@ pub struct ReconcileReport {
     pub dropped: Vec<String>,
     /// Past grace with no process to check; kept, flagged.
     pub stale: Vec<String>,
+    /// Leases freed because they were past grace with no process bound
+    /// for `UNBINDABLE_AFTER` grace periods: nothing can bind them now
+    /// (C2). Reported separately from `dropped`, which had a corpse.
+    pub unbindable: Vec<String>,
     /// Bound processes of cancelled dispatches that the caller should
-    /// signal; the state machine never signals anything itself.
-    pub to_signal: Vec<(String, u32)>,
+    /// signal, and with what; each dispatch appears at most twice in its
+    /// life — once to terminate, once to kill.
+    pub to_signal: Vec<(String, u32, Signal)>,
+}
+
+/// What `bind` did. A bind is the one moment the coordinator can check
+/// that the PID a client claims is a process that exists (C6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindOutcome {
+    Bound,
+    /// No such dispatch: nothing was bound.
+    UnknownDispatch,
+    /// The PID is not a live process. Binding it would make the lease
+    /// reconcilable against a process that never existed, or worse,
+    /// against whatever the OS gives that number next.
+    PidNotAlive,
+}
+
+impl BindOutcome {
+    pub fn bound(self) -> bool {
+        self == Self::Bound
+    }
+}
+
+/// What `resume` did for a parent whose children finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeOutcome {
+    Resumed,
+    UnknownDispatch,
+    /// Resuming would take the class more than `max_over_admitted` seats
+    /// beyond its cap. The parent stays waiting and polls again; the
+    /// alternative — granting every resume — is how a cap becomes
+    /// advisory under enough nesting (C8).
+    OverAdmitted {
+        over: u32,
+        max: u32,
+    },
+}
+
+impl ResumeOutcome {
+    pub fn resumed(self) -> bool {
+        self == Self::Resumed
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +291,10 @@ struct Dispatch {
     reserved: i64,
     /// Seat given back while awaiting children (SPEC §23).
     waiting: bool,
+    /// When the seat was given back. A waiting parent is a claim the
+    /// coordinator cannot verify — see `mark_waiting` — so the moment it
+    /// was made is recorded and shown.
+    waiting_since: Option<Instant>,
     /// A caller has received `Granted` for this ID.
     claimed: bool,
     /// The seat is released; the entry lingers only until settlement.
@@ -206,9 +303,30 @@ struct Dispatch {
     /// only until release.
     settled: bool,
     pid: Option<u32>,
+    /// When the PID was bound, and checked alive. The window in which a
+    /// PID could have been recycled starts here; nothing portable can
+    /// close it (see `procs::alive`).
+    bound_at: Option<Instant>,
     agent_id: Option<String>,
     last_heartbeat: Instant,
+    /// How many consecutive reconciles found this lease past grace with
+    /// no process bound (C2).
+    unbound_rounds: u32,
     cancelled: bool,
+    cancelled_at: Option<Instant>,
+    /// A `terminate` has been handed to the caller for this dispatch.
+    terminate_sent: bool,
+    /// The escalation has been handed over; nothing more will be.
+    kill_sent: bool,
+}
+
+/// One worktree's exclusive write lease (SPEC §23: "concurrent writers
+/// need separate worktrees or explicitly non-overlapping write leases;
+/// scope checks alone are not filesystem isolation").
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WriteLease {
+    holder: String,
+    since: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -251,21 +369,48 @@ pub struct AdmissionState {
     runs: BTreeMap<String, Run>,
     dispatches: BTreeMap<String, Dispatch>,
     queue: Vec<Queued>,
+    /// Dispatch IDs that reached a terminal state, newest last, capped
+    /// at `TERMINAL_MEMORY`. Kept as a queue for the eviction order and
+    /// a set for the lookup; the two always hold the same IDs.
+    finished_order: VecDeque<String>,
+    finished: BTreeSet<String>,
+    /// Exclusive write leases by worktree path (SPEC §23).
+    write_leases: BTreeMap<String, WriteLease>,
+    /// Ceiling on seats held beyond a class cap by resumed parents.
+    max_over_admitted: Option<u32>,
 }
 
 impl AdmissionState {
     pub fn new(limits: ConcurrencyLimits) -> Self {
         Self {
+            // A resumed parent may overshoot its class cap; by default no
+            // more than one cap's worth of seats over, which keeps the
+            // published limit a limit rather than a suggestion.
+            max_over_admitted: limits.max_active_agents,
             limits,
             sessions: BTreeMap::new(),
             runs: BTreeMap::new(),
             dispatches: BTreeMap::new(),
             queue: Vec::new(),
+            finished_order: VecDeque::new(),
+            finished: BTreeSet::new(),
+            write_leases: BTreeMap::new(),
         }
     }
 
     pub fn limits(&self) -> &ConcurrencyLimits {
         &self.limits
+    }
+
+    /// Configure the over-admission ceiling. `None` = no ceiling (the
+    /// pre-C8 behaviour: every resume is granted). Machine settings own
+    /// this; `new` defaults it to `max_active_agents`.
+    pub fn set_max_over_admitted(&mut self, max: Option<u32>) {
+        self.max_over_admitted = max;
+    }
+
+    pub fn max_over_admitted(&self) -> Option<u32> {
+        self.max_over_admitted
     }
 
     /// Idempotent (SPEC §23: joins/resumes register idempotently).
@@ -312,6 +457,20 @@ impl AdmissionState {
     /// exactly once, whether it was admitted directly or drained from
     /// the queue; every later call returns `AlreadyAdmitted`.
     pub fn request(&mut self, request: &DispatchRequest, now: Instant) -> Decision {
+        // Idempotency does not end at settlement (C8): a dispatch ID that
+        // already ran is refused, not re-admitted. `AlreadyAdmitted` is
+        // the answer while the entry lives; once it is gone, the entry
+        // cannot say so, and the terminal set does.
+        if self.finished.contains(&request.dispatch_id) {
+            return Decision::Refused {
+                code: Refusal::AlreadyFinished,
+                detail: format!(
+                    "dispatch {} already ran and settled; re-admitting it would launch a second \
+                     agent for finished work (the last {} settled IDs are remembered)",
+                    request.dispatch_id, TERMINAL_MEMORY
+                ),
+            };
+        }
         if let Some(existing) = self.dispatches.get_mut(&request.dispatch_id) {
             if existing.claimed {
                 return Decision::AlreadyAdmitted;
@@ -523,13 +682,19 @@ impl AdmissionState {
                 class: request.resource,
                 reserved: request.reserve_micros.max(0),
                 waiting: false,
+                waiting_since: None,
                 claimed,
                 released: false,
                 settled: false,
                 pid: None,
+                bound_at: None,
                 agent_id: None,
                 last_heartbeat: now,
+                unbound_rounds: 0,
                 cancelled: false,
+                cancelled_at: None,
+                terminate_sent: false,
+                kill_sent: false,
             },
         );
     }
@@ -571,7 +736,49 @@ impl AdmissionState {
 
     /// Bind the harness agent/session identity and process to the
     /// reservation once the launch happened (SPEC §23).
-    pub fn bind(&mut self, dispatch_id: &str, agent_id: Option<&str>, pid: Option<u32>) -> bool {
+    ///
+    /// The PID arrives over a socket, from a client that is trusted to
+    /// name its own child and nothing else. It is checked against the
+    /// process table here (C6): binding a PID that is not running would
+    /// give the lease a reconciliation target that is either nothing at
+    /// all or, once the OS reuses the number, an unrelated process the
+    /// coordinator would later terminate as a cancelled worker.
+    ///
+    /// What this does NOT prove: that the live PID is the client's own
+    /// child, or that it is still the same process later in the lease.
+    /// Both need a process start time, which has no portable API (see
+    /// `procs::alive`); `bound_at` records when the check was true so
+    /// the window is at least visible.
+    pub fn bind(
+        &mut self,
+        dispatch_id: &str,
+        agent_id: Option<&str>,
+        pid: Option<u32>,
+        now: Instant,
+        alive: &dyn Fn(u32) -> bool,
+    ) -> BindOutcome {
+        if !self.dispatches.contains_key(dispatch_id) {
+            return BindOutcome::UnknownDispatch;
+        }
+        if let Some(pid) = pid {
+            if !alive(pid) {
+                return BindOutcome::PidNotAlive;
+            }
+        }
+        self.bind_checked(dispatch_id, agent_id, pid, now);
+        BindOutcome::Bound
+    }
+
+    /// The bind itself, for a PID this coordinator already established
+    /// is live: adoption from the ledger, which checks liveness before
+    /// adopting at all.
+    fn bind_checked(
+        &mut self,
+        dispatch_id: &str,
+        agent_id: Option<&str>,
+        pid: Option<u32>,
+        now: Instant,
+    ) -> bool {
         let Some(dispatch) = self.dispatches.get_mut(dispatch_id) else {
             return false;
         };
@@ -580,6 +787,8 @@ impl AdmissionState {
         }
         if pid.is_some() {
             dispatch.pid = pid;
+            dispatch.bound_at = Some(now);
+            dispatch.unbound_rounds = 0;
         }
         true
     }
@@ -588,6 +797,9 @@ impl AdmissionState {
         match self.dispatches.get_mut(dispatch_id) {
             Some(dispatch) => {
                 dispatch.last_heartbeat = now;
+                // Somebody is alive on the other end of this lease, so
+                // the unbindable count starts over (C2).
+                dispatch.unbound_rounds = 0;
                 let run_cancelled = self
                     .runs
                     .get(&dispatch.run_id)
@@ -606,27 +818,77 @@ impl AdmissionState {
 
     /// A parent blocked awaiting its children gives its seat back so the
     /// children can run (SPEC §23: no all-waiters deadlock).
-    pub fn mark_waiting(&mut self, dispatch_id: &str, now: Instant) -> bool {
-        let Some(dispatch) = self.dispatches.get_mut(dispatch_id) else {
+    ///
+    /// SPEC §23 relinquishes the seat "where waiting can be reliably
+    /// observed". It cannot be, here: no harness reports "this agent is
+    /// blocked on a child", and a self-report over a socket is a claim,
+    /// not an observation — a client that says "waiting" while it keeps
+    /// burning a core gets its seat back for free. What IS checkable is
+    /// that the claimant is a real, live, bound process, so that is what
+    /// is required (C8): a dispatch with no bound PID, or one whose PID
+    /// is gone, cannot mark itself waiting. The moment of the claim is
+    /// recorded in `waiting_since` and shown in status, so a "waiting"
+    /// parent that never resumes is visible rather than free.
+    pub fn mark_waiting(
+        &mut self,
+        dispatch_id: &str,
+        now: Instant,
+        alive: &dyn Fn(u32) -> bool,
+    ) -> bool {
+        let Some(dispatch) = self.dispatches.get(dispatch_id) else {
             return false;
         };
+        let Some(pid) = dispatch.pid else {
+            return false;
+        };
+        if !alive(pid) {
+            return false;
+        }
+        let dispatch = self
+            .dispatches
+            .get_mut(dispatch_id)
+            .expect("checked just above");
         dispatch.waiting = true;
+        dispatch.waiting_since = Some(now);
         dispatch.last_heartbeat = now;
         self.drain(now);
         true
     }
 
     /// The waiting parent's children finished: it takes its seat back
-    /// immediately. A resumed parent may overshoot a cap; the overshoot
-    /// is bounded by the number of waiters and shown in status, which is
-    /// the deliberate trade against re-queueing an admitted parent.
-    pub fn resume(&mut self, dispatch_id: &str, now: Instant) -> bool {
-        let Some(dispatch) = self.dispatches.get_mut(dispatch_id) else {
-            return false;
+    /// immediately, rather than re-queueing behind the work it is
+    /// waiting on — which is what would deadlock.
+    ///
+    /// That overshoots the class cap by design, and the overshoot is
+    /// bounded twice over: by the number of waiters, and by
+    /// `max_over_admitted` (default: one cap's worth), beyond which the
+    /// resume is REFUSED and the parent stays waiting (C8). Status shows
+    /// `over_admitted` either way.
+    pub fn resume(&mut self, dispatch_id: &str, now: Instant) -> ResumeOutcome {
+        let Some(dispatch) = self.dispatches.get(dispatch_id) else {
+            return ResumeOutcome::UnknownDispatch;
         };
+        if dispatch.waiting {
+            let class = dispatch.class;
+            let over = self.class_cap(class).map_or(0, |cap| {
+                self.active_count(class, None)
+                    .saturating_add(1)
+                    .saturating_sub(cap)
+            });
+            if let Some(max) = self.max_over_admitted {
+                if over > max {
+                    return ResumeOutcome::OverAdmitted { over, max };
+                }
+            }
+        }
+        let dispatch = self
+            .dispatches
+            .get_mut(dispatch_id)
+            .expect("checked just above");
         dispatch.waiting = false;
+        dispatch.waiting_since = None;
         dispatch.last_heartbeat = now;
-        true
+        ResumeOutcome::Resumed
     }
 
     /// Free the seat. The reservation stays until settled, so a release
@@ -703,7 +965,77 @@ impl AdmissionState {
             .is_some_and(|dispatch| dispatch.released && dispatch.settled);
         if gone {
             self.dispatches.remove(dispatch_id);
+            // A worker that is over does not still hold a worktree
+            // (SPEC §23: verification waits for write leases to be
+            // released, and a lease nobody can release never is).
+            self.write_leases
+                .retain(|_, lease| lease.holder != dispatch_id);
+            self.remember_terminal(dispatch_id);
         }
+    }
+
+    /// Remember a settled dispatch ID, evicting the oldest past the cap.
+    fn remember_terminal(&mut self, dispatch_id: &str) {
+        if !self.finished.insert(dispatch_id.to_string()) {
+            return;
+        }
+        self.finished_order.push_back(dispatch_id.to_string());
+        while self.finished_order.len() > TERMINAL_MEMORY {
+            if let Some(oldest) = self.finished_order.pop_front() {
+                self.finished.remove(&oldest);
+            }
+        }
+    }
+
+    /// Take the exclusive write lease on a worktree for a dispatch
+    /// (SPEC §23: "concurrent writers need separate worktrees or
+    /// explicitly non-overlapping write leases"). Idempotent for the
+    /// holder; false when somebody else holds it.
+    ///
+    /// Nothing in the runner calls this yet — the workspace layer still
+    /// gives every writing attempt its own worktree, which is the
+    /// stronger guarantee. This is the coordinator-side half, so that
+    /// "verification waits for write leases" has something to wait on.
+    pub fn acquire_write(&mut self, worktree: &str, dispatch_id: &str, now: Instant) -> bool {
+        match self.write_leases.get(worktree) {
+            Some(lease) => lease.holder == dispatch_id,
+            None => {
+                self.write_leases.insert(
+                    worktree.to_string(),
+                    WriteLease {
+                        holder: dispatch_id.to_string(),
+                        since: now,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    /// Release a write lease. Only its holder can: another dispatch
+    /// asking is a bug or a race, and silently freeing somebody else's
+    /// lease is how two writers end up in one worktree.
+    pub fn release_write(&mut self, worktree: &str, dispatch_id: &str) -> bool {
+        match self.write_leases.get(worktree) {
+            Some(lease) if lease.holder == dispatch_id => {
+                self.write_leases.remove(worktree);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// How many dispatches are writing this worktree: what root
+    /// verification waits to reach zero (SPEC §23).
+    pub fn writers_active(&self, worktree: &str) -> u32 {
+        u32::from(self.write_leases.contains_key(worktree))
+    }
+
+    /// Who holds a worktree's write lease, and since when.
+    pub fn write_lease_holder(&self, worktree: &str) -> Option<(&str, Instant)> {
+        self.write_leases
+            .get(worktree)
+            .map(|lease| (lease.holder.as_str(), lease.since))
     }
 
     fn descendants(&self, root: &str) -> Vec<String> {
@@ -729,8 +1061,11 @@ impl AdmissionState {
         let mut to_signal = Vec::new();
         for id in &subtree {
             if let Some(dispatch) = self.dispatches.get_mut(id) {
-                dispatch.cancelled = true;
+                mark_cancelled(dispatch, now);
                 if let Some(pid) = dispatch.pid {
+                    // The caller sends this one; reconcile must not send
+                    // it again, only escalate past it (C5).
+                    dispatch.terminate_sent = true;
                     to_signal.push((id.clone(), pid));
                 }
             }
@@ -757,8 +1092,9 @@ impl AdmissionState {
         }
         for (id, dispatch) in self.dispatches.iter_mut() {
             if dispatch.run_id == run_id {
-                dispatch.cancelled = true;
+                mark_cancelled(dispatch, now);
                 if let Some(pid) = dispatch.pid {
+                    dispatch.terminate_sent = true;
                     to_signal.push((id.clone(), pid));
                 }
             }
@@ -807,11 +1143,17 @@ impl AdmissionState {
         self.release(dispatch_id, now)
     }
 
-    /// Lease reconciliation. `alive(pid)` is the process table. A stale
-    /// lease with a dead bound process is dropped (its reservation
-    /// settles as unknown); a stale lease with no process to check is
-    /// kept and flagged; cancelled dispatches with bound processes are
-    /// handed back to be signalled.
+    /// Lease reconciliation. `alive(pid)` is the process table.
+    ///
+    /// - A stale lease with a dead bound process is dropped; its
+    ///   reservation settles as unknown.
+    /// - A stale lease with no process bound is kept and flagged — for
+    ///   `UNBINDABLE_AFTER` grace periods. Nothing can bind it after the
+    ///   launcher died, so it is then freed and reported `unbindable`
+    ///   (C2), instead of holding a seat for the daemon's lifetime.
+    /// - A cancelled dispatch with a live process is handed back to be
+    ///   signalled: `Terminate` once, `Kill` once a grace period later,
+    ///   then nothing (C5). The state machine sends neither.
     pub fn reconcile(&mut self, now: Instant, alive: &dyn Fn(u32) -> bool) -> ReconcileReport {
         let mut report = ReconcileReport::default();
         let ids: Vec<String> = self.dispatches.keys().cloned().collect();
@@ -825,13 +1167,16 @@ impl AdmissionState {
                 )
             };
             if cancelled {
-                if let Some(pid) = pid {
-                    if alive(pid) {
-                        report.to_signal.push((id.clone(), pid));
+                if let Some(pid) = pid.filter(|pid| alive(*pid)) {
+                    if let Some(signal) = self.escalate(&id, now) {
+                        report.to_signal.push((id.clone(), pid, signal));
                     }
                 }
             }
             if !stale {
+                if let Some(dispatch) = self.dispatches.get_mut(&id) {
+                    dispatch.unbound_rounds = 0;
+                }
                 continue;
             }
             match pid {
@@ -841,11 +1186,48 @@ impl AdmissionState {
                     report.dropped.push(id);
                 }
                 Some(_) => {}
-                None => report.stale.push(id),
+                None => {
+                    let rounds = match self.dispatches.get_mut(&id) {
+                        Some(dispatch) => {
+                            dispatch.unbound_rounds = dispatch.unbound_rounds.saturating_add(1);
+                            dispatch.unbound_rounds
+                        }
+                        None => continue,
+                    };
+                    if rounds >= UNBINDABLE_AFTER {
+                        // Past grace, never bound, and a bind only ever
+                        // happens in the call that launched the process:
+                        // there is no worker to find and none can arrive.
+                        self.settle(&id, None, now);
+                        self.release(&id, now);
+                        report.unbindable.push(id);
+                    } else {
+                        report.stale.push(id);
+                    }
+                }
             }
         }
         self.reap_runs(now);
         report
+    }
+
+    /// The next signal a cancelled dispatch has coming, and `None` once
+    /// the ladder is used up.
+    fn escalate(&mut self, dispatch_id: &str, now: Instant) -> Option<Signal> {
+        let dispatch = self.dispatches.get_mut(dispatch_id)?;
+        if !dispatch.terminate_sent {
+            dispatch.terminate_sent = true;
+            return Some(Signal::Terminate);
+        }
+        if dispatch.kill_sent {
+            return None;
+        }
+        let since = dispatch.cancelled_at?;
+        if now.saturating_duration_since(since) < CANCEL_ESCALATE_AFTER {
+            return None;
+        }
+        dispatch.kill_sent = true;
+        Some(Signal::Kill)
     }
 
     /// Drop run rows that hold nothing: a terminal run with no dispatch
@@ -897,7 +1279,10 @@ impl AdmissionState {
             });
         }
         self.admit(request.clone(), now, true);
-        self.bind(&request.dispatch_id, agent_id, pid);
+        // The adopter checked this PID against the process table before
+        // adopting at all (`Coordinator::start`): re-checking here would
+        // only widen the window, not narrow it.
+        self.bind_checked(&request.dispatch_id, agent_id, pid, now);
     }
 
     pub fn status(&self, now: Instant) -> StatusSnapshot {
@@ -978,6 +1363,11 @@ impl AdmissionState {
             sessions: self.sessions.keys().cloned().collect(),
             runs,
             over_admitted,
+            write_leases: self
+                .write_leases
+                .iter()
+                .map(|(worktree, lease)| (worktree.clone(), lease.holder.clone()))
+                .collect(),
         }
     }
 
@@ -1016,6 +1406,14 @@ impl AdmissionState {
     }
 }
 
+/// Mark a dispatch cancelled, keeping the first cancellation's moment:
+/// the escalation clock starts when the cancellation did, not when a
+/// later cancel of the same subtree passed through.
+fn mark_cancelled(dispatch: &mut Dispatch, now: Instant) {
+    dispatch.cancelled = true;
+    dispatch.cancelled_at.get_or_insert(now);
+}
+
 fn min_opt(a: Option<u32>, b: Option<u32>) -> Option<u32> {
     match (a, b) {
         (Some(a), Some(b)) => Some(a.min(b)),
@@ -1046,6 +1444,14 @@ pub trait Gate {
         pid: Option<u32>,
     ) -> Result<(), GateError>;
     fn heartbeat(&self, dispatch_id: &str) -> Result<HeartbeatStatus, GateError>;
+    /// The worker saw `cancelled` on a heartbeat and is stopping. The
+    /// seat and the reservation go now, instead of waiting out the lease
+    /// grace with a worker that is already leaving (C5). Idempotent, and
+    /// a no-op by default so a gate that tracks no lifetime still
+    /// compiles.
+    fn acknowledge_cancel(&self, _dispatch_id: &str) -> Result<(), GateError> {
+        Ok(())
+    }
     fn mark_waiting(&self, dispatch_id: &str) -> Result<(), GateError>;
     fn resume(&self, dispatch_id: &str) -> Result<(), GateError>;
     fn release(&self, dispatch_id: &str) -> Result<(), GateError>;
@@ -1127,11 +1533,19 @@ impl Gate for LocalGate {
         agent_id: Option<&str>,
         pid: Option<u32>,
     ) -> Result<(), GateError> {
-        self.state
-            .lock()
-            .expect("admission lock")
-            .bind(dispatch_id, agent_id, pid);
-        Ok(())
+        match self.state.lock().expect("admission lock").bind(
+            dispatch_id,
+            agent_id,
+            pid,
+            Instant::now(),
+            &crate::procs::alive,
+        ) {
+            BindOutcome::PidNotAlive => Err(GateError(format!(
+                "pid {} is not a live process; refusing to bind it to dispatch {dispatch_id}",
+                pid.unwrap_or(0)
+            ))),
+            _ => Ok(()),
+        }
     }
 
     fn heartbeat(&self, dispatch_id: &str) -> Result<HeartbeatStatus, GateError> {
@@ -1142,20 +1556,36 @@ impl Gate for LocalGate {
             .heartbeat(dispatch_id, Instant::now()))
     }
 
-    fn mark_waiting(&self, dispatch_id: &str) -> Result<(), GateError> {
+    fn acknowledge_cancel(&self, dispatch_id: &str) -> Result<(), GateError> {
         self.state
             .lock()
             .expect("admission lock")
-            .mark_waiting(dispatch_id, Instant::now());
+            .acknowledge_cancel(dispatch_id, Instant::now());
+        Ok(())
+    }
+
+    fn mark_waiting(&self, dispatch_id: &str) -> Result<(), GateError> {
+        self.state.lock().expect("admission lock").mark_waiting(
+            dispatch_id,
+            Instant::now(),
+            &crate::procs::alive,
+        );
         Ok(())
     }
 
     fn resume(&self, dispatch_id: &str) -> Result<(), GateError> {
-        self.state
+        match self
+            .state
             .lock()
             .expect("admission lock")
-            .resume(dispatch_id, Instant::now());
-        Ok(())
+            .resume(dispatch_id, Instant::now())
+        {
+            ResumeOutcome::OverAdmitted { over, max } => Err(GateError(format!(
+                "resuming {dispatch_id} would hold {over} seats beyond the cap, past the \
+                 configured maximum of {max}; it stays waiting"
+            ))),
+            _ => Ok(()),
+        }
     }
 
     fn release(&self, dispatch_id: &str) -> Result<(), GateError> {
@@ -1254,6 +1684,31 @@ mod tests {
 
     fn granted(decision: Decision) -> bool {
         decision == Decision::Granted
+    }
+
+    /// A process table that says yes. Liveness is a callback precisely so
+    /// the §23 scenarios need no real processes.
+    fn alive(_pid: u32) -> bool {
+        true
+    }
+
+    /// Bind a live process to a dispatch. `mark_waiting` needs one (C8),
+    /// and so does anything that reconciles against the process table.
+    fn bind_live(state: &mut AdmissionState, dispatch_id: &str, pid: u32, now: Instant) {
+        assert_eq!(
+            state.bind(dispatch_id, None, Some(pid), now, &alive),
+            BindOutcome::Bound,
+            "{dispatch_id} binds"
+        );
+    }
+
+    /// Claim the waiting seat-back, with the bind it now requires.
+    fn wait_bound(state: &mut AdmissionState, dispatch_id: &str, pid: u32, now: Instant) {
+        bind_live(state, dispatch_id, pid, now);
+        assert!(
+            state.mark_waiting(dispatch_id, now, &alive),
+            "{dispatch_id} waits"
+        );
     }
 
     // SPEC §23 acceptance: three simultaneous sessions, multiple agents
@@ -1387,7 +1842,7 @@ mod tests {
         let mut root = req("root", "run-a", "tab-a");
         root.reserve_micros = 600;
         assert!(granted(state.request(&root, t0)));
-        state.mark_waiting("root", t0);
+        wait_bound(&mut state, "root", 101, t0);
         let mut kid = child("kid", "run-a", "tab-a", "root", 1);
         kid.reserve_micros = 300;
         assert!(granted(state.request(&kid, t0)));
@@ -1498,9 +1953,10 @@ mod tests {
         for kid in &children {
             assert!(matches!(state.request(kid, t0), Decision::Queued { .. }));
         }
-        for tab in ["a", "b"] {
+        for (index, tab) in ["a", "b"].into_iter().enumerate() {
             for n in 0..2 {
-                state.mark_waiting(&format!("p-{tab}-{n}"), t0);
+                let pid = 700 + (index as u32) * 10 + n;
+                wait_bound(&mut state, &format!("p-{tab}-{n}"), pid, t0);
             }
         }
         // Every child now runs: the waiters gave their seats back.
@@ -1519,14 +1975,115 @@ mod tests {
         // back at once, and any overshoot is visible.
         state.release("c-a-0", t0);
         state.settle("c-a-0", Some(0), t0);
-        state.resume("p-a-0", t0);
+        assert_eq!(state.resume("p-a-0", t0), ResumeOutcome::Resumed);
         assert_eq!(state.status(t0).over_admitted, 0);
-        state.resume("p-a-1", t0);
+        assert_eq!(state.resume("p-a-1", t0), ResumeOutcome::Resumed);
         assert_eq!(
             state.status(t0).over_admitted,
             1,
             "overshoot is shown, not hidden"
         );
+    }
+
+    // C8: the overshoot a resumed parent takes is bounded. Past the
+    // ceiling the resume is refused and the parent stays waiting, which
+    // is what keeps a published cap a cap under deep nesting.
+    #[test]
+    fn resuming_past_the_over_admission_ceiling_is_refused() {
+        let mut state = state();
+        let t0 = Instant::now();
+        state.set_max_over_admitted(Some(1));
+        // Four parents fill the global cap (4) and all wait.
+        for (index, tab) in ["a", "b"].into_iter().enumerate() {
+            for n in 0..2 {
+                let id = format!("p-{tab}-{n}");
+                assert!(granted(state.request(
+                    &req(&id, &format!("run-{tab}"), &format!("tab-{tab}")),
+                    t0
+                )));
+                wait_bound(&mut state, &id, 800 + (index as u32) * 10 + n, t0);
+            }
+        }
+        // Four children take the seats the parents gave back.
+        for (index, tab) in ["a", "b"].into_iter().enumerate() {
+            for n in 0..2 {
+                let kid = child(
+                    &format!("c-{tab}-{n}"),
+                    &format!("run-{tab}"),
+                    &format!("tab-{tab}"),
+                    &format!("p-{tab}-{n}"),
+                    1,
+                );
+                assert!(granted(state.request(&kid, t0)), "{index}");
+            }
+        }
+        assert_eq!(state.status(t0).active_by_class["model_work"], 4);
+        // The first parent back overshoots by one: allowed, and shown.
+        assert_eq!(state.resume("p-a-0", t0), ResumeOutcome::Resumed);
+        assert_eq!(state.status(t0).over_admitted, 1);
+        // The second would make it two, past the ceiling of one.
+        assert_eq!(
+            state.resume("p-a-1", t0),
+            ResumeOutcome::OverAdmitted { over: 2, max: 1 }
+        );
+        assert_eq!(state.status(t0).over_admitted, 1, "the cap held");
+        assert_eq!(state.status(t0).waiting, 3, "it is still waiting");
+        // A seat frees: the same poll now succeeds. Refusal is a delay,
+        // never a lost parent.
+        state.release("c-b-0", t0);
+        state.settle("c-b-0", Some(0), t0);
+        assert_eq!(state.resume("p-a-1", t0), ResumeOutcome::Resumed);
+        assert_eq!(state.resume("nobody", t0), ResumeOutcome::UnknownDispatch);
+    }
+
+    // C8: a seat is given back on a claim the coordinator can at least
+    // partly check — a live, bound process — and never on a bare word.
+    #[test]
+    fn waiting_needs_a_live_bound_process() {
+        let mut state = state();
+        let t0 = Instant::now();
+        assert!(granted(state.request(&req("d1", "run-a", "tab-a"), t0)));
+        assert!(
+            !state.mark_waiting("d1", t0, &alive),
+            "nothing is bound: the claim is unverifiable"
+        );
+        assert_eq!(state.status(t0).waiting, 0);
+        bind_live(&mut state, "d1", 4242, t0);
+        assert!(
+            !state.mark_waiting("d1", t0, &|_pid| false),
+            "the bound process is gone: it is not waiting, it is over"
+        );
+        assert!(state.mark_waiting("d1", t0, &alive));
+        assert_eq!(state.status(t0).waiting, 1);
+        assert!(!state.mark_waiting("nobody", t0, &alive));
+    }
+
+    // C6: a PID off the wire is checked against the process table at
+    // bind, which is the one moment the check means anything.
+    #[test]
+    fn a_bind_takes_only_a_live_pid() {
+        let mut state = state();
+        let t0 = Instant::now();
+        assert!(granted(state.request(&req("d1", "run-a", "tab-a"), t0)));
+        assert_eq!(
+            state.bind("d1", Some("agent"), Some(4242), t0, &|_pid| false),
+            BindOutcome::PidNotAlive,
+            "a PID nothing is running is refused"
+        );
+        assert_eq!(
+            state.bind("nobody", None, Some(4242), t0, &alive),
+            BindOutcome::UnknownDispatch
+        );
+        // Refused: the lease still has no process, so reconcile treats it
+        // as unbound rather than chasing a number.
+        let stale = t0 + LEASE_GRACE + Duration::from_secs(1);
+        assert_eq!(state.reconcile(stale, &alive).stale, vec!["d1".to_string()]);
+        // An agent ID with no PID binds: identity and process are
+        // separate facts and only the second is checkable.
+        assert!(state
+            .bind("d1", Some("agent"), None, t0, &|_pid| false)
+            .bound());
+        assert!(state.bind("d1", None, Some(4242), t0, &alive).bound());
     }
 
     // SPEC §23 acceptance: simultaneous dispatches cannot reserve the
@@ -1583,14 +2140,14 @@ mod tests {
         let mut state = state();
         let t0 = Instant::now();
         assert!(granted(state.request(&req("root-a", "run-a", "tab-a"), t0)));
-        state.mark_waiting("root-a", t0);
+        wait_bound(&mut state, "root-a", 4141, t0);
         assert!(granted(
             state.request(&child("kid-1", "run-a", "tab-a", "root-a", 1), t0)
         ));
         assert!(granted(
             state.request(&child("kid-2", "run-a", "tab-a", "root-a", 1), t0)
         ));
-        state.bind("kid-1", Some("agent-1"), Some(4242));
+        bind_live(&mut state, "kid-1", 4242, t0);
         assert!(matches!(
             state.request(&child("grandkid", "run-a", "tab-a", "kid-1", 2), t0),
             Decision::Queued { .. }
@@ -1643,7 +2200,9 @@ mod tests {
         assert_eq!(state.request(&orphan, t0), Decision::AlreadyAdmitted);
 
         // Duplicate lifecycle events are harmless.
-        assert!(state.bind("orphan", Some("agent-7"), Some(7777)));
+        assert!(state
+            .bind("orphan", Some("agent-7"), Some(7777), t0, &alive)
+            .bound());
         assert!(state.heartbeat("orphan", t0).known);
         assert!(state.heartbeat("orphan", t0).known);
 
@@ -1666,6 +2225,306 @@ mod tests {
         assert!(!state.heartbeat("orphan", stale).known);
         assert_eq!(state.status(stale).runs["run-a"].uncertain_settlements, 1);
         let _ = state.depth_of("unbound");
+    }
+
+    // C2: a lease that never got a process is not a worker. It used to
+    // hold its seat for the life of the daemon — three killed runs took
+    // half the seats, permanently.
+    #[test]
+    fn a_lease_that_can_never_be_bound_is_freed_and_reported() {
+        let mut state = state();
+        let t0 = Instant::now();
+        assert!(granted(
+            state.request(&req("unbound", "run-a", "tab-a"), t0)
+        ));
+        assert!(granted(state.request(&req("bound", "run-a", "tab-a"), t0)));
+        bind_live(&mut state, "bound", 4242, t0);
+
+        // Past grace once: kept and flagged. Expiry never proves death.
+        let mut now = t0 + LEASE_GRACE + Duration::from_secs(1);
+        let report = state.reconcile(now, &alive);
+        assert_eq!(report.stale, vec!["unbound".to_string()]);
+        assert!(report.unbindable.is_empty());
+        assert_eq!(state.status(now).active_by_class["model_work"], 2);
+        // A heartbeat restarts the count: a live worker that simply has
+        // no PID to report is not unbindable.
+        state.heartbeat("unbound", now);
+        now += LEASE_GRACE + Duration::from_secs(1);
+
+        // `UNBINDABLE_AFTER` (3) consecutive stale reconciles with
+        // nothing bound: nothing can arrive to claim the seat, because a
+        // bind only happens in the call that launched the process.
+        assert_eq!(state.reconcile(now, &alive).stale, vec!["unbound"]);
+        now += LEASE_GRACE;
+        assert_eq!(state.reconcile(now, &alive).stale, vec!["unbound"]);
+        assert_eq!(UNBINDABLE_AFTER, 3, "the count this test walks");
+        now += LEASE_GRACE;
+        let report = state.reconcile(now, &alive);
+        assert_eq!(report.unbindable, vec!["unbound".to_string()]);
+        assert!(report.stale.is_empty());
+        assert_eq!(
+            state.status(now).active_by_class["model_work"],
+            1,
+            "the seat came back"
+        );
+        assert_eq!(
+            state.status(now).runs["run-a"].uncertain_settlements,
+            1,
+            "its usage is unknown, not zero"
+        );
+        // The bound one is untouched: it has a live process.
+        assert!(state.heartbeat("bound", now).known);
+    }
+
+    // C5: a cancelled worker is asked once, told once, and then left
+    // alone. The old reconcile re-sent the same signal every 15 s for as
+    // long as the process lived, and never escalated.
+    #[test]
+    fn a_cancelled_dispatch_is_terminated_once_then_killed_once() {
+        let mut state = state();
+        let t0 = Instant::now();
+        assert!(granted(state.request(&req("d1", "run-a", "tab-a"), t0)));
+        // Cancelled before anything is bound: the caller has no PID to
+        // signal, so reconcile owns the first signal too.
+        state.cancel_dispatch("d1", t0);
+        assert!(state.reconcile(t0, &alive).to_signal.is_empty());
+        bind_live(&mut state, "d1", 4242, t0);
+
+        let first = state.reconcile(t0 + Duration::from_secs(15), &alive);
+        assert_eq!(
+            first.to_signal,
+            vec![("d1".to_string(), 4242, Signal::Terminate)]
+        );
+        // It is still running, but it has been asked: nothing is re-sent
+        // while the grace period runs.
+        for tick in 1..5 {
+            let report = state.reconcile(t0 + Duration::from_secs(15 * tick), &alive);
+            assert!(report.to_signal.is_empty(), "no re-sending at tick {tick}");
+        }
+        // A whole grace period ignored: once, harder.
+        let escalation = t0 + CANCEL_ESCALATE_AFTER + Duration::from_secs(1);
+        assert_eq!(
+            state.reconcile(escalation, &alive).to_signal,
+            vec![("d1".to_string(), 4242, Signal::Kill)]
+        );
+        // And then never again, whatever the process does.
+        for tick in 1..5 {
+            let later = escalation + Duration::from_secs(15 * tick);
+            assert!(
+                state.reconcile(later, &alive).to_signal.is_empty(),
+                "the ladder ends"
+            );
+        }
+        // When the process does go, the lease is freed like any other.
+        let dead = escalation + LEASE_GRACE + Duration::from_secs(1);
+        assert_eq!(
+            state.reconcile(dead, &|pid| pid != 4242).dropped,
+            vec!["d1".to_string()]
+        );
+    }
+
+    // C5: the worker that saw the cancellation and is stopping gives the
+    // seat back now, instead of holding it until lease grace.
+    #[test]
+    fn acknowledging_a_cancellation_frees_the_seat_at_once() {
+        let mut state = state();
+        let t0 = Instant::now();
+        let mut first = req("d1", "run-a", "tab-a");
+        first.reserve_micros = 5;
+        assert!(granted(state.request(&first, t0)));
+        bind_live(&mut state, "d1", 4242, t0);
+        state.cancel_dispatch("d1", t0);
+        assert!(state.heartbeat("d1", t0).cancelled);
+
+        assert!(state.acknowledge_cancel("d1", t0));
+        assert!(
+            !state.heartbeat("d1", t0).known,
+            "the lease is gone, not waiting out five minutes of grace"
+        );
+        let status = state.status(t0);
+        assert_eq!(status.active_by_class.get("model_work"), None);
+        assert_eq!(status.runs["run-a"].reserved_micros, 0);
+        assert_eq!(
+            status.runs["run-a"].uncertain_settlements, 1,
+            "a cancelled worker's usage is unknown, never zero"
+        );
+        // Nothing is left to signal, and the ID cannot come back.
+        assert!(state.reconcile(t0, &alive).to_signal.is_empty());
+        assert!(!state.acknowledge_cancel("d1", t0));
+        assert!(matches!(
+            state.request(&first, t0),
+            Decision::Refused {
+                code: Refusal::AlreadyFinished,
+                ..
+            }
+        ));
+    }
+
+    // C8: idempotency used to lapse the moment a dispatch settled — the
+    // entry was dropped, and the very same ID could be admitted again.
+    #[test]
+    fn a_settled_dispatch_id_is_refused_not_re_admitted() {
+        let mut state = state();
+        let t0 = Instant::now();
+        assert!(granted(state.request(&req("d1", "run-a", "tab-a"), t0)));
+        state.release("d1", t0);
+        state.settle("d1", Some(7), t0);
+        assert!(matches!(
+            state.request(&req("d1", "run-a", "tab-a"), t0),
+            Decision::Refused {
+                code: Refusal::AlreadyFinished,
+                ..
+            }
+        ));
+        assert_eq!(
+            state.status(t0).runs["run-a"].admitted_total,
+            1,
+            "the refusal admitted nothing"
+        );
+        // The memory is bounded and FIFO: past the cap the oldest IDs are
+        // forgotten, which is what a coordinator restart does anyway.
+        for n in 0..TERMINAL_MEMORY {
+            state.remember_terminal(&format!("filler-{n}"));
+        }
+        assert_eq!(state.finished.len(), TERMINAL_MEMORY);
+        assert!(
+            !state.finished.contains("d1"),
+            "the oldest fell out of the window"
+        );
+        assert!(state
+            .finished
+            .contains(&format!("filler-{}", TERMINAL_MEMORY - 1)));
+    }
+
+    // C9: parentage has no production caller yet, so the properties it
+    // has to have are asserted at the level that does: admission.
+    #[test]
+    fn a_child_inherits_depth_and_budget_and_a_waiting_less_parent_cannot_deadlock() {
+        let mut state = AdmissionState::new(limits());
+        let t0 = Instant::now();
+        state.register_run(&RunRegistration {
+            run_id: "run-a".into(),
+            session_id: "tab-a".into(),
+            budget_micros: Some(1_000),
+            max_agents: Some(10),
+            max_depth: Some(3),
+        });
+        let mut root = req("root", "run-a", "tab-a");
+        root.reserve_micros = 400;
+        assert!(granted(state.request(&root, t0)));
+        assert_eq!(state.depth_of("root"), Some(0));
+
+        // The child names its parent and lies about its depth; what is
+        // recorded is derived from the parent, and its reservation comes
+        // out of the same root budget.
+        let mut kid = child("kid", "run-a", "tab-a", "root", 0);
+        kid.reserve_micros = 400;
+        assert!(granted(state.request(&kid, t0)));
+        assert_eq!(state.depth_of("kid"), Some(1), "derived from the parent");
+        assert_eq!(state.parentage("kid"), Some(Some(("root".into(), true))));
+        assert_eq!(
+            state.status(t0).runs["run-a"].reserved_micros,
+            800,
+            "one budget, not one per generation"
+        );
+        let mut greedy = child("greedy", "run-a", "tab-a", "kid", 2);
+        greedy.reserve_micros = 400;
+        assert!(
+            matches!(
+                state.request(&greedy, t0),
+                Decision::Refused {
+                    code: Refusal::BudgetExceeded,
+                    ..
+                }
+            ),
+            "the third generation cannot spend what the first two hold"
+        );
+
+        // The parent never says it is waiting — it may not be able to.
+        // Its children queue behind the per-session cap (2), the parent
+        // keeps its seat, and the scheduler neither spins nor panics.
+        let grandkids: Vec<DispatchRequest> = (0..4)
+            .map(|n| child(&format!("g{n}"), "run-a", "tab-a", "kid", 2))
+            .collect();
+        for grandkid in &grandkids {
+            let decision = state.request(grandkid, t0);
+            assert!(matches!(decision, Decision::Queued { .. }), "{decision:?}");
+        }
+        let status = state.status(t0);
+        assert_eq!(status.active_by_class["model_work"], 2, "the cap holds");
+        assert_eq!(status.queued, 4);
+        assert_eq!(status.waiting, 0, "nobody claimed to be waiting");
+        // Polling the queue over and over changes nothing and costs
+        // nothing: no progress is not a deadlock to panic over, it is
+        // work waiting for a seat.
+        for _ in 0..3 {
+            for grandkid in &grandkids {
+                assert!(matches!(
+                    state.request(grandkid, t0),
+                    Decision::Queued { .. }
+                ));
+            }
+        }
+        assert_eq!(state.status(t0).queued, 4);
+        // The parent finishes, and the queue moves.
+        state.release("kid", t0);
+        state.settle("kid", Some(0), t0);
+        assert_eq!(state.status(t0).queued, 3);
+    }
+
+    // C9 / SPEC §23: "concurrent writers need separate worktrees or
+    // explicitly non-overlapping write leases", and root verification
+    // waits for the relevant leases to be released. The runner does not
+    // take these yet — it gives every writing attempt its own worktree —
+    // so this is the coordinator-side half, tested on its own.
+    #[test]
+    fn a_worktree_has_one_writer_and_verification_can_see_it() {
+        let mut state = state();
+        let t0 = Instant::now();
+        assert!(granted(state.request(&req("w1", "run-a", "tab-a"), t0)));
+        assert!(granted(state.request(&req("w2", "run-b", "tab-b"), t0)));
+
+        assert_eq!(state.writers_active("/wt/alpha"), 0);
+        assert!(state.acquire_write("/wt/alpha", "w1", t0));
+        assert!(
+            state.acquire_write("/wt/alpha", "w1", t0),
+            "the holder asking again is not a second writer"
+        );
+        assert!(
+            !state.acquire_write("/wt/alpha", "w2", t0),
+            "two writers in one worktree is the thing this prevents"
+        );
+        assert_eq!(state.writers_active("/wt/alpha"), 1);
+        assert_eq!(
+            state.write_lease_holder("/wt/alpha").map(|held| held.0),
+            Some("w1")
+        );
+        assert_eq!(
+            state.write_lease_holder("/wt/alpha").map(|held| held.1),
+            Some(t0),
+            "and since when"
+        );
+        // A different worktree is a different lease: writers in their own
+        // worktrees do not contend at all.
+        assert!(state.acquire_write("/wt/beta", "w2", t0));
+        assert_eq!(state.status(t0).write_leases.len(), 2);
+
+        assert!(
+            !state.release_write("/wt/alpha", "w2"),
+            "releasing somebody else's lease is how two writers happen"
+        );
+        assert!(state.release_write("/wt/alpha", "w1"));
+        assert_eq!(state.writers_active("/wt/alpha"), 0);
+        assert!(!state.release_write("/wt/alpha", "w1"));
+
+        // A writer that ends without releasing does not hold a worktree
+        // for ever: settlement drops its leases.
+        assert!(state.acquire_write("/wt/gamma", "w2", t0));
+        state.release("w2", t0);
+        state.settle("w2", Some(0), t0);
+        assert_eq!(state.writers_active("/wt/gamma"), 0);
+        assert_eq!(state.writers_active("/wt/beta"), 0);
+        assert!(state.status(t0).write_leases.is_empty());
     }
 
     #[test]
@@ -1707,11 +2566,11 @@ mod tests {
         // limits(): max_agent_depth = 2. Parents wait so the session cap
         // does not queue their children.
         assert!(granted(state.request(&req("root", "run-a", "tab-a"), t0)));
-        state.mark_waiting("root", t0);
+        wait_bound(&mut state, "root", 501, t0);
         assert!(granted(
             state.request(&child("kid", "run-a", "tab-a", "root", 1), t0)
         ));
-        state.mark_waiting("kid", t0);
+        wait_bound(&mut state, "kid", 502, t0);
         assert_eq!(state.depth_of("kid"), Some(1));
         assert!(granted(
             state.request(&child("deep", "run-a", "tab-a", "kid", 2), t0)
@@ -1856,13 +2715,29 @@ mod tests {
             gate.admit(&req("d1", "run-a", "tab-a")).expect("admit"),
             Decision::Granted
         );
-        gate.bind("d1", Some("agent"), None).expect("bind");
+        // A real, live PID: the gate binds through the real process
+        // table, and waiting requires one (C6/C8).
+        gate.bind("d1", Some("agent"), Some(std::process::id()))
+            .expect("bind");
+        assert!(
+            gate.bind("d1", None, Some(u32::MAX - 7)).is_err(),
+            "a PID nothing is running is refused at the gate too"
+        );
         assert!(gate.heartbeat("d1").expect("heartbeat").known);
         gate.mark_waiting("d1").expect("waiting");
         gate.resume("d1").expect("resume");
         gate.release("d1").expect("release");
         gate.settle("d1", Some(5)).expect("settle");
         assert_eq!(gate.status().runs["run-a"].settled_micros, 5);
+        // A worker that saw its cancellation and is stopping: the seat
+        // and the reservation go now, with usage unknown (C5).
+        assert_eq!(
+            gate.admit(&req("d2", "run-a", "tab-a")).expect("admit"),
+            Decision::Granted
+        );
+        gate.acknowledge_cancel("d2").expect("ack");
+        assert_eq!(gate.status().runs["run-a"].uncertain_settlements, 1);
+        assert_eq!(gate.status().runs["run-a"].active, 0);
         gate.cancel_run("run-a");
         assert_eq!(gate.enforcement(), "managed (in-process)");
     }

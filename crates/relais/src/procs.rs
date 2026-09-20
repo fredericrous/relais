@@ -8,10 +8,20 @@
 //! and a Toolhelp snapshot. Nothing above this module spells them at all.
 
 use std::io;
+use std::path::Path;
 use std::process::{Child, Command};
 
 /// Is there a live process with this PID? Never a signal that could
 /// terminate anything (SPEC §23: lease expiry does not prove death).
+///
+/// "Alive" means a process with this PID exists, not that it is the
+/// process the caller bound. A PID the OS reused between the bind and
+/// the question reads as alive, and nothing portable distinguishes it:
+/// the process start time that would is `/proc` on Linux, `sysctl` on
+/// macOS and a `GetProcessTimes` handle on Windows — three bindings and
+/// no shared vocabulary. So the coordinator checks liveness AT BIND
+/// (`AdmissionState::bind`), keeps the binding time, and treats reuse
+/// within a lease's lifetime as undetected: the documented limit of C6.
 pub fn alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -26,6 +36,17 @@ pub fn terminate(pid: u32) {
         return;
     }
     imp::terminate(pid);
+}
+
+/// Stop a worker that ignored `terminate`: SIGKILL on Unix, the same
+/// `TerminateProcess` on Windows, which is already unblockable. The
+/// coordinator escalates to this exactly once per cancelled dispatch,
+/// one grace period after the polite request (SPEC §23 cancellation).
+pub fn kill(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    imp::kill(pid);
 }
 
 /// The parent of this process, when the platform can say.
@@ -45,6 +66,55 @@ pub fn kill_tree(child: &mut Child) -> io::Result<()> {
     imp::kill_tree(child)
 }
 
+/// An exclusive lock the KERNEL holds on a file for as long as the
+/// holder lives, and releases however it dies — SIGKILL, a panic, a
+/// power cut. `flock(LOCK_EX|LOCK_NB)` on Unix, `LockFile` on Windows,
+/// which locks a byte range exclusively and fails immediately rather
+/// than waiting — the same contract, spelled twice.
+///
+/// This is what makes coordinator election atomic (SPEC §23: "atomically
+/// elect one coordinator"). A PID written into a file is not: after a
+/// SIGKILL the file stays, the PID gets recycled by an unrelated
+/// process, and every later `relais run` reads a live PID and refuses to
+/// elect until somebody deletes the file by hand. With the lock, the
+/// file's content is informational and the question "is a coordinator
+/// serving?" is answered by the kernel.
+#[derive(Debug)]
+pub struct LockFile {
+    file: std::fs::File,
+}
+
+impl LockFile {
+    /// Take the lock without blocking. `Ok(None)` = somebody else holds
+    /// it (a live coordinator); `Err` = the file could not be opened or
+    /// locked at all. The lock is released when the returned value is
+    /// dropped, and by the kernel if this process dies holding it.
+    pub fn try_acquire(path: &Path) -> io::Result<Option<Self>> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
+        if imp::try_lock_exclusive(&file)? {
+            Ok(Some(Self { file }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Record who holds it. Informational only — `relais coordinator
+    /// status` and a human reading the state directory — never the
+    /// election's evidence.
+    pub fn write_pid(&mut self) -> io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        write!(self.file, "{}", std::process::id())?;
+        self.file.flush()
+    }
+}
+
 #[cfg(unix)]
 mod imp {
     use std::io;
@@ -53,7 +123,14 @@ mod imp {
 
     pub fn alive(pid: u32) -> bool {
         // SAFETY: signal 0 performs error checking only; no signal is sent.
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+            return true;
+        }
+        // EPERM: the process EXISTS and belongs to someone else. Reading
+        // that as dead let the coordinator free a lease whose worker was
+        // running, and it is the honest reading Windows already gives for
+        // ERROR_ACCESS_DENIED. Only ESRCH means gone.
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 
     pub fn terminate(pid: u32) {
@@ -61,6 +138,29 @@ mod imp {
         // bound its own PID to the reservation.
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
+
+    pub fn kill(pid: u32) {
+        // SAFETY: SIGKILL to a process this user owns, after SIGTERM was
+        // ignored for a whole grace period.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+
+    pub fn try_lock_exclusive(file: &std::fs::File) -> io::Result<bool> {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: an advisory lock on a descriptor this process owns; the
+        // kernel drops it when the descriptor closes or the process dies.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        // EWOULDBLOCK (== EAGAIN here) is the whole point: somebody holds it.
+        match error.raw_os_error() {
+            Some(libc::EWOULDBLOCK) => Ok(false),
+            _ => Err(error),
         }
     }
 
@@ -95,6 +195,7 @@ mod imp {
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, ERROR_ACCESS_DENIED, INVALID_HANDLE_VALUE, STILL_ACTIVE,
     };
+    use windows_sys::Win32::Storage::FileSystem::LockFile;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
@@ -131,6 +232,32 @@ mod imp {
             }
             TerminateProcess(handle, 1);
             CloseHandle(handle);
+        }
+    }
+
+    /// Windows has one way to stop another process and it is already
+    /// unblockable, so the escalation is the same call.
+    pub fn kill(pid: u32) {
+        terminate(pid);
+    }
+
+    pub fn try_lock_exclusive(file: &std::fs::File) -> io::Result<bool> {
+        use std::os::windows::io::AsRawHandle;
+        // SAFETY: an exclusive byte-range lock over the whole file on a
+        // handle this process owns. `LockFile` never blocks — it fails
+        // immediately when any part of the range is already locked, which
+        // is `LOCK_NB` — and the lock goes when the handle closes,
+        // including on process death.
+        let locked = unsafe { LockFile(file.as_raw_handle() as _, 0, 0, u32::MAX, u32::MAX) };
+        if locked != 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        // ERROR_LOCK_VIOLATION (33) is "somebody holds it", the Windows
+        // spelling of EWOULDBLOCK; anything else is a real failure.
+        match error.raw_os_error() {
+            Some(33) => Ok(false),
+            _ => Err(error),
         }
     }
 
@@ -201,6 +328,59 @@ mod tests {
     fn the_parent_is_known() {
         let parent = parent_pid().expect("the platform names a parent");
         assert_ne!(parent, std::process::id());
+    }
+
+    // C7: the lock the kernel releases on any death, including SIGKILL.
+    #[test]
+    fn an_exclusive_lock_is_held_once_and_released_on_drop() {
+        let dir = std::env::temp_dir().join(format!("rl-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("coordinator.lock");
+        let mut held = LockFile::try_acquire(&path)
+            .expect("acquire")
+            .expect("nobody holds it");
+        held.write_pid().expect("pid");
+        assert!(
+            LockFile::try_acquire(&path).expect("probe").is_none(),
+            "a second holder is refused while the first lives"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read").trim(),
+            std::process::id().to_string(),
+            "the PID is written, as information"
+        );
+        drop(held);
+        assert!(
+            LockFile::try_acquire(&path).expect("acquire").is_some(),
+            "the lock goes with its holder, leaving the file behind"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // C5: the escalation the coordinator reaches for one grace period
+    // after a cancelled worker ignored `terminate`.
+    #[test]
+    fn kill_ends_a_process_that_ignores_terminate() {
+        let mut command = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "ping -n 60 127.0.0.1 > NUL"]);
+            c
+        } else {
+            // SIGTERM ignored: only the hard kill ends this one.
+            let mut c = Command::new("sh");
+            c.args(["-c", "trap '' TERM; sleep 60"]);
+            c
+        };
+        let mut child = command.spawn().expect("spawn");
+        let pid = child.id();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        terminate(pid);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        #[cfg(unix)]
+        assert!(alive(pid), "the worker ignored the polite request");
+        kill(pid);
+        let _ = child.wait();
+        assert!(!alive(pid));
     }
 
     #[test]
