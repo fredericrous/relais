@@ -74,6 +74,10 @@ impl World {
     /// amont on PATH) and a check that is green only once src/main.rs is
     /// gone — the fix-the-failing-state shape the fake worker knows.
     fn write_policy(&self, max_attempts: u32) -> String {
+        self.write_policy_with_wall(max_attempts, 120)
+    }
+
+    fn write_policy_with_wall(&self, max_attempts: u32, max_wall_seconds: u64) -> String {
         let policy = format!(
             r#"schema_version = 1
 
@@ -89,7 +93,7 @@ id = "fable"
 [execution]
 max_attempts = {max_attempts}
 max_repairs_before_escalation = 1
-max_wall_seconds = 120
+max_wall_seconds = {max_wall_seconds}
 
 [integrations]
 aval = "off"
@@ -120,15 +124,30 @@ timeout_seconds = 30
     }
 
     fn write_task(&self, name: &str, review: &str) -> PathBuf {
+        self.write_task_for(name, "Remove the obsolete entry point", review)
+    }
+
+    /// The objective is what carries a prompt marker to the fake worker.
+    fn write_task_for(&self, name: &str, objective: &str, review: &str) -> PathBuf {
+        self.write_task_scoped(name, objective, review, &["src/**"])
+    }
+
+    fn write_task_scoped(
+        &self,
+        name: &str,
+        objective: &str,
+        review: &str,
+        write_scope: &[&str],
+    ) -> PathBuf {
         let path = self.root.join(name);
         std::fs::write(
             &path,
             serde_json::json!({
                 "schema_version": 1,
                 "kind": "change",
-                "objective": "Remove the obsolete entry point",
+                "objective": objective,
                 "base_ref": "HEAD",
-                "write_scope": ["src/**"],
+                "write_scope": write_scope,
                 "acceptance": ["src/main.rs no longer exists"],
                 "verification_profile": "default",
                 "review": review,
@@ -161,6 +180,46 @@ timeout_seconds = 30
             .find_map(|line| line.strip_prefix("run:"))
             .map(|id| id.trim().to_string())
             .expect("run id line")
+    }
+
+    /// How many times the fake harness was launched for a prompt. The
+    /// probe calls (`--version`, `--help`) exit before counting.
+    fn worker_launches(&self) -> usize {
+        std::fs::read_to_string(self.root.join("invocations.log"))
+            .map(|log| log.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// The run's own artifact directory.
+    fn run_dir(&self, run_id: &str) -> PathBuf {
+        self.state.join("runs").join(run_id)
+    }
+
+    /// The single run this world has made. Outcomes other than
+    /// `accepted` print no run-id line on stdout, and the directory is
+    /// the same identity the ledger uses.
+    fn only_run_id(&self) -> String {
+        let mut ids: Vec<String> = std::fs::read_dir(self.state.join("runs"))
+            .expect("runs directory")
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(ids.len(), 1, "exactly one run: {ids:?}");
+        ids.pop().expect("one")
+    }
+
+    /// Wait for a path to appear, up to `seconds`. Used to prove a
+    /// worker's background write really happened before asserting that
+    /// the candidate does not contain it.
+    fn wait_for(path: &Path, seconds: u64) -> bool {
+        for _ in 0..(seconds * 20) {
+            if path.exists() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        false
     }
 }
 
@@ -195,15 +254,25 @@ fn text(bytes: &[u8]) -> String {
 /// The fake harness: answers --version/--help like Claude Code, and on
 /// `-p` reads the prompt from stdin and acts by model and prompt.
 /// sonnet churns (a new file each time, never the fix); fable fixes;
-/// the reviewer answers FINDINGS: none. A prompt mentioning
-/// "blockage-please" makes the worker claim blockage. Usage is
-/// reported as Claude Code does, so cost accounting is actual.
+/// the reviewer answers FINDINGS: none. Usage is reported as Claude Code
+/// does, so cost accounting is actual.
+///
+/// Prompt markers select misbehaviour, so one script covers every
+/// scenario: "blockage-please" claims blockage; "sleep-please" outlives
+/// the run's wall clock and is killed; "policy-edit-please" edits the
+/// repository's own `relais.toml`; "late-write-please" writes a file in
+/// the background AFTER printing its terminal result.
+///
+/// Every `-p` launch appends a line to `invocations.log`, which is how a
+/// scenario proves that no second worker was started.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 case "$1" in
   --version) echo "fake-claude 9.9.9"; exit 0 ;;
   --help) echo "usage: claude -p --model <model> --effort <level> --output-format <format> --max-budget-usd <amount> --disallowed-tools <tools...> --settings <file-or-json>"; exit 0 ;;
 esac
-printf '%s\n' "$@" > "$(dirname "$0")/argv-last.log"
+here=$(dirname "$0")
+printf '%s\n' "$@" > "$here/argv-last.log"
+echo launch >> "$here/invocations.log"
 prompt=$(cat)
 model=""
 while [ $# -gt 0 ]; do
@@ -218,6 +287,26 @@ if printf '%s' "$prompt" | grep -q "semantic reviewer"; then
 fi
 if printf '%s' "$prompt" | grep -q "blockage-please"; then
   printf '{"result":"relais-blocked: the vendored crate is missing","session_id":"w-b","total_cost_usd":0.001,"modelUsage":{"%s":{"outputTokens":2}},"permission_denials":[],"usage":{"input_tokens":10,"output_tokens":2}}\n' "$model"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "sleep-please"; then
+  # Outlive the run's wall clock: the runner kills the process group and
+  # the attempt has no terminal result.
+  sleep 60
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "policy-edit-please"; then
+  printf '\n[execution]\nmax_attempts = 99\n' >> relais.toml
+  rm -f src/main.rs
+  printf '{"result":"DONE","session_id":"w-p","total_cost_usd":0.01,"modelUsage":{"%s":{"outputTokens":10}},"permission_denials":[],"usage":{"input_tokens":100,"output_tokens":10}}\n' "$model"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "late-write-please"; then
+  # stdout is redirected away so the pipe closes when this script exits:
+  # otherwise the runner would still be reading it when the write lands.
+  ( sleep 2; echo late > src/late.txt ) >/dev/null 2>&1 &
+  rm -f src/main.rs
+  printf '{"result":"DONE","session_id":"w-l","total_cost_usd":0.01,"modelUsage":{"%s":{"outputTokens":10}},"permission_denials":[],"usage":{"input_tokens":100,"output_tokens":10}}\n' "$model"
   exit 0
 fi
 if printf '%s' "$prompt" | grep -q "an easy one"; then
@@ -764,4 +853,149 @@ fn launch_argv_carries_machine_permissions_and_the_budget_flag() {
     // sonnet churns and never fixes; one attempt, then failed — the point
     // here is the argv, not the outcome.
     assert_ne!(run.status.code(), Some(0));
+}
+
+// SPEC §14: interrupted execution resumes without duplicate live workers
+// or blind command replay. A worker that outlives the run's wall clock is
+// killed with no terminal result: the run is `interrupted`, and `resume`
+// reconciles it without starting a second worker.
+#[test]
+fn an_interrupted_worker_is_reconciled_by_resume_without_a_second_worker() {
+    let world = World::new("intr");
+    // Six seconds is long enough to reach the dispatch and far short of
+    // the fake worker's sixty-second sleep.
+    let hash = world.write_policy_with_wall(3, 6);
+    world.write_machine(&hash, "");
+    let task = world.write_task_for(
+        "task.json",
+        "Remove the obsolete entry point (sleep-please)",
+        "off",
+    );
+
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    let stderr = text(&run.stderr);
+    assert_eq!(run.status.code(), Some(4), "{stderr}");
+    assert!(stderr.starts_with("interrupted:"), "{stderr}");
+    let run_id = world.only_run_id();
+    assert!(
+        stderr.contains(&format!("relais resume {run_id}")),
+        "the run says how to reconcile itself: {stderr}"
+    );
+    assert_eq!(
+        world.worker_launches(),
+        1,
+        "one worker was launched and killed"
+    );
+
+    // Resume reconciles what is provably dead and reports the state; it
+    // never re-dispatches, and it never replays a command whose side
+    // effects are unknown.
+    let resume = world.relais(&["resume", &run_id]);
+    let resumed = text(&resume.stdout);
+    assert!(
+        resumed.contains("interrupted"),
+        "resume reports the reconciled state: {resumed}"
+    );
+    assert_eq!(
+        world.worker_launches(),
+        1,
+        "resume must not launch a second worker"
+    );
+    // The evidence is preserved, not cleaned up behind the failure.
+    assert!(world.run_dir(&run_id).join("manifest.json").is_file());
+}
+
+// SPEC §14: a worker cannot obtain acceptance by modifying policy. The
+// repository's own relais.toml is protected: a candidate that touches it
+// is needs_decision, and the run is judged with the policy loaded from
+// the original checkout, never the worker's edit.
+#[test]
+fn a_worker_editing_the_policy_cannot_obtain_acceptance() {
+    let world = World::new("policy");
+    let hash = world.write_policy(3);
+    world.write_machine(&hash, "");
+    // A scope broad enough to match the policy file on its own terms:
+    // the point is that even an in-scope edit to protected repository
+    // configuration is refused, not merely an out-of-scope one.
+    let task = world.write_task_scoped(
+        "task.json",
+        "Remove the obsolete entry point (policy-edit-please)",
+        "off",
+        &["src/**", "*.toml"],
+    );
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    let stderr = text(&run.stderr);
+    assert_eq!(run.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("needs_decision"), "{stderr}");
+    assert!(
+        stderr.contains("relais.toml (protected repository configuration)"),
+        "the edit is named as the protected file it is: {stderr}"
+    );
+    // The user's own checkout still holds the policy that was reviewed.
+    let policy = std::fs::read_to_string(world.repo.join("relais.toml")).expect("policy");
+    assert!(
+        !policy.contains("max_attempts = 99"),
+        "the worker's edit never reached the original checkout"
+    );
+    let run_id = world.only_run_id();
+    assert!(
+        !world.run_dir(&run_id).join("receipt.json").exists(),
+        "a policy edit is not an acceptance"
+    );
+}
+
+// SPEC §14: a worker cannot obtain acceptance by changing files after
+// verification. The candidate is a snapshot taken when the worker's
+// terminal result arrives; anything written afterwards is outside it,
+// and the run is judged on the snapshot.
+#[test]
+fn files_written_after_the_result_are_not_in_the_candidate() {
+    let world = World::new("late");
+    let hash = world.write_policy(3);
+    world.write_machine(&hash, "");
+    let task = world.write_task_for(
+        "task.json",
+        "Remove the obsolete entry point (late-write-please)",
+        "off",
+    );
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    let stdout = text(&run.stdout);
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "{stdout}\n{}",
+        text(&run.stderr)
+    );
+    let run_id = World::run_id_of(&stdout);
+    let receipt: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(world.run_dir(&run_id).join("receipt.json")).expect("receipt"),
+    )
+    .expect("json");
+    let candidate = receipt["candidate_sha"].as_str().expect("candidate");
+
+    // The background write really happened — otherwise the assertions
+    // below would hold for the wrong reason.
+    let late = world.run_dir(&run_id).join("worktree").join("src/late.txt");
+    assert!(
+        World::wait_for(&late, 10),
+        "the worker's background write never landed in {}",
+        late.display()
+    );
+
+    let tree = git(&world.repo, &["ls-tree", "-r", "--name-only", candidate]);
+    assert!(
+        !tree.contains("src/late.txt"),
+        "a file written after the terminal result is not in the candidate: {tree}"
+    );
+    assert!(
+        !tree.contains("src/main.rs"),
+        "the change the worker did make before finishing IS in the candidate: {tree}"
+    );
+    let patch =
+        std::fs::read_to_string(world.run_dir(&run_id).join("candidate-1.patch")).expect("patch");
+    assert!(!patch.contains("late.txt"), "{patch}");
+    assert_eq!(
+        receipt["verification"]["candidate_sha"], candidate,
+        "the verdict is bound to the snapshot, not to the worktree as it is now"
+    );
 }

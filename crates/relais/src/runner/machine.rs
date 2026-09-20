@@ -583,8 +583,12 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
                     "wall clock for the run is exhausted".to_string(),
                     serde_json::json!({ "limit": "wall_clock" }),
                 ),
+                // Both rendered amounts name themselves ("$0.02 per run",
+                // "$0.03 today"): there is more than one spending
+                // ceiling, and a receipt must say which one stopped the
+                // run.
                 Limit::Spend { spent, ceiling } => (
-                    format!("per-run spend ceiling reached ({spent} of {ceiling})"),
+                    format!("spend ceiling reached ({spent} of {ceiling})"),
                     serde_json::json!({ "limit": "spend", "spent": spent, "ceiling": ceiling }),
                 ),
                 Limit::Admission { code, detail } => (

@@ -188,6 +188,11 @@ pub fn build_argv(spec: &LaunchSpec, caps: &Capabilities) -> Result<Vec<String>,
             );
         }
     }
+    // A turn ceiling only reaches the harness when the harness has a flag
+    // for it; Claude Code 2.1.x has none. The capability is reported
+    // (`Capabilities::turn_ceiling`) so nothing downstream claims a
+    // ceiling that was never applied — SPEC §11's turn ceiling is not
+    // deliverable on this harness, and a receipt says so.
     if let Some(max_turns) = spec.max_turns {
         if caps.supports_max_turns {
             argv.push("--max-turns".into());
@@ -550,6 +555,22 @@ mod tests {
         assert!(!old.supports_budget, "`--budget` is not the budget flag");
         assert!(old.supports_max_turns);
         assert!(!old.supports_disallowed_tools);
+    }
+
+    #[test]
+    fn the_turn_ceiling_capability_is_reported_not_assumed() {
+        use crate::adapter::TurnCeiling;
+        assert_eq!(
+            capabilities_from_help("2.1.278".into(), HELP_2_1).turn_ceiling(),
+            TurnCeiling::Unavailable,
+            "SPEC §11 promises a turn ceiling this harness cannot take"
+        );
+        assert_eq!(
+            capabilities_from_help("1.0".into(), "--model --max-turns").turn_ceiling(),
+            TurnCeiling::Harness
+        );
+        assert_eq!(TurnCeiling::Unavailable.as_str(), "unavailable");
+        assert_eq!(TurnCeiling::Harness.as_str(), "harness");
     }
 
     #[test]

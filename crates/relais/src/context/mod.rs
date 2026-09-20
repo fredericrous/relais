@@ -18,8 +18,10 @@ use crate::contract::TaskContract;
 use crate::ids::sha256_hex;
 use crate::policy::RepoPolicy;
 
-/// How much context a worker prompt may carry. Sizing problems are
-/// explicit; nothing is silently truncated (SPEC §7).
+/// How much context a worker prompt may carry when `relais.toml` says
+/// nothing. Repositories override it with `[context] budget_bytes`, which
+/// is part of the hashed authority. Sizing problems are explicit;
+/// nothing is silently truncated (SPEC §7).
 pub const DEFAULT_CONTEXT_BUDGET_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -291,6 +293,18 @@ pub struct ContextManifest {
     /// the sizing problem is observable before dispatch.
     pub constraints: Vec<String>,
     pub budget_bytes: usize,
+    /// What the worker actually receives, measured: objective,
+    /// acceptance criteria, constraints and entry points together. The
+    /// budget is checked against this, not against the constraints
+    /// alone, so a sizing problem is raised on the real prompt.
+    #[serde(default)]
+    pub package_bytes: usize,
+    /// Whether a turn ceiling was enforceable on this run's harness
+    /// ("harness" or "unavailable"). SPEC §11 lists turns among the
+    /// ceilings; Claude Code 2.1.x takes no turn flag, so the receipt
+    /// records which it was instead of implying one was applied.
+    #[serde(default)]
+    pub turn_ceiling: String,
 }
 
 pub struct ContextInputs<'a> {
@@ -301,6 +315,9 @@ pub struct ContextInputs<'a> {
     pub policy_hash: &'a str,
     pub fingerprints: Vec<FileFingerprint>,
     pub tool_versions: ToolVersions,
+    /// Whether the harness this run will dispatch on can take a turn
+    /// ceiling (`crate::adapter::TurnCeiling`).
+    pub turn_ceiling: crate::adapter::TurnCeiling,
     /// Resolve function, so tests can supply verdicts without invoking
     /// the real binary.
     pub resolver: &'a dyn Fn(&str, Option<&str>) -> AvalVerdict,
@@ -319,6 +336,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         policy_hash,
         fingerprints,
         tool_versions,
+        turn_ceiling,
         resolver,
     } = inputs;
 
@@ -384,6 +402,29 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         })
         .collect();
 
+    // The budget bounds the package the worker receives (SPEC §7:
+    // "the objective, acceptance criteria, necessary constraints, a
+    // small set of entry points"), not the constraints alone — an
+    // objective or an acceptance list that alone overruns the budget is
+    // just as much a sizing problem, and counting a subset raised it on
+    // the wrong number. Large files and logs are referenced by path, so
+    // they are not part of this sum by design.
+    let package_bytes = contract.objective.len()
+        + contract
+            .acceptance
+            .iter()
+            .map(|criterion| criterion.len())
+            .sum::<usize>()
+        + constraints
+            .iter()
+            .map(|constraint| constraint.len())
+            .sum::<usize>()
+        + contract
+            .read_hints
+            .iter()
+            .map(|hint| hint.len())
+            .sum::<usize>();
+
     let manifest = ContextManifest {
         contract_hash: contract_hash.to_string(),
         base_sha: base_sha.to_string(),
@@ -393,13 +434,14 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         architecture: ArchitectureEvidence { resolved },
         verification_profile: contract.verification_profile.clone(),
         constraints: constraints.clone(),
-        budget_bytes: DEFAULT_CONTEXT_BUDGET_BYTES,
+        budget_bytes: repo.context.budget_bytes,
+        package_bytes,
+        turn_ceiling: turn_ceiling.as_str().to_string(),
     };
 
-    let required: usize = manifest.constraints.iter().map(|c| c.len()).sum();
-    if required > manifest.budget_bytes {
+    if manifest.package_bytes > manifest.budget_bytes {
         return Err(ContextError::SizingProblem {
-            required_bytes: required,
+            required_bytes: manifest.package_bytes,
             budget_bytes: manifest.budget_bytes,
         });
     }
@@ -467,6 +509,7 @@ mod tests {
                 amont: Some("1.36.0".into()),
                 claude_code: None,
             },
+            turn_ceiling: crate::adapter::TurnCeiling::Unavailable,
             resolver,
         }
     }
@@ -630,6 +673,38 @@ mod tests {
             matches!(err, ContextError::SizingProblem { required_bytes, budget_bytes }
                 if required_bytes > budget_bytes),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn the_budget_is_repo_policy_and_bounds_the_whole_package() {
+        let mut c = contract(&[]);
+        c.objective = "x".repeat(200);
+        let mut r = repo();
+        // Smaller than the objective alone: the old check counted only
+        // constraints, of which this task has none, and passed.
+        r.context.budget_bytes = 64;
+        let err = assemble(inputs(&c, &r, &active)).unwrap_err();
+        assert_eq!(
+            err,
+            ContextError::SizingProblem {
+                required_bytes: c.objective.len()
+                    + c.acceptance.iter().map(String::len).sum::<usize>()
+                    + c.read_hints.iter().map(String::len).sum::<usize>(),
+                budget_bytes: 64,
+            },
+            "the objective alone overruns the configured budget"
+        );
+
+        // The same task fits under a budget the repository raised, and
+        // the manifest carries both numbers as evidence.
+        r.context.budget_bytes = 4096;
+        let manifest = assemble(inputs(&c, &r, &active)).expect("assembles");
+        assert_eq!(manifest.budget_bytes, 4096);
+        assert!(manifest.package_bytes >= c.objective.len());
+        assert_eq!(
+            manifest.turn_ceiling, "unavailable",
+            "a receipt says which turn ceiling the harness could take"
         );
     }
 }

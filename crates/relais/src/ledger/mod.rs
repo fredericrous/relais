@@ -1031,6 +1031,28 @@ impl Ledger {
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
+
+    /// Everything this machine has spent since `since` (RFC3339), across
+    /// every run — what a per-day ceiling is a ceiling on. Unknown usage
+    /// is NULL and `SUM` skips it, so this is a lower bound: a daily
+    /// ceiling is best effort in exactly the way SPEC §11 says a dollar
+    /// control is. Children attributed to an inclusive parent are
+    /// excluded on the same rule as `run_own_cost`, so a provider total
+    /// that already contains its subagents is counted once.
+    pub fn spend_since(&self, since: &str) -> Result<MicroUsd> {
+        let micros: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(cost_micros), 0) FROM usage_events
+             WHERE at >= ?1
+               AND NOT EXISTS (
+                     SELECT 1 FROM usage_events parent
+                     WHERE parent.run_id = usage_events.run_id
+                       AND parent.event_id = usage_events.parent_event_id
+                       AND parent.inclusive = 1)",
+            [since],
+            |row| row.get(0),
+        )?;
+        Ok(MicroUsd::from_micros(micros))
+    }
 }
 
 #[cfg(test)]
@@ -1524,6 +1546,48 @@ mod tests {
         let (stored, hash) = ledger.receipt("run-r").expect("receipt").expect("present");
         assert_eq!(stored["outcome"], "accepted");
         assert_eq!(hash, "hash123");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spend_since_sums_the_day_across_runs_and_skips_unknown() {
+        let (ledger, dir) = temp_ledger();
+        for run in ["run-a", "run-b"] {
+            ledger.insert_run(run, "/r", None).expect("run");
+        }
+        let mut yesterday = event("old", "run-a", 5_000);
+        yesterday.at = "2026-09-19T23:59:59+00:00".into();
+        ledger.record_usage(&yesterday).expect("old");
+        let mut early = event("early", "run-a", 700);
+        early.at = "2026-09-20T00:00:00+00:00".into();
+        ledger.record_usage(&early).expect("early");
+        // Another run on the same machine, same day: a daily ceiling is
+        // the machine's, not one run's.
+        let mut other = event("other", "run-b", 300);
+        other.at = "2026-09-20T09:00:00+00:00".into();
+        ledger.record_usage(&other).expect("other");
+        // Usage the provider never reported is NULL, not zero: the sum
+        // skips it and the day's figure is a lower bound.
+        let mut unknown = event("unknown", "run-b", 0);
+        unknown.at = "2026-09-20T10:00:00+00:00".into();
+        unknown.cost = None;
+        unknown.completeness = CostCompleteness::Unknown;
+        ledger.record_usage(&unknown).expect("unknown");
+
+        assert_eq!(
+            ledger
+                .spend_since("2026-09-20T00:00:00+00:00")
+                .expect("spend"),
+            MicroUsd::from_micros(1_000),
+            "today only, both runs, unknown left out"
+        );
+        assert_eq!(
+            ledger
+                .spend_since("2026-09-21T00:00:00+00:00")
+                .expect("spend"),
+            MicroUsd::ZERO,
+            "a fresh day starts at zero"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

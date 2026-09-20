@@ -211,6 +211,25 @@ fn default_max_agents_total() -> u32 {
     24
 }
 
+/// How much context a worker prompt may carry (SPEC §7). Repository
+/// policy, not a machine setting: what a task needs to be told is a
+/// property of the repository's decisions and entry points, and it is
+/// hashed into the authority so raising the budget needs the same review
+/// as changing a verification command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ContextPolicy {
+    pub budget_bytes: usize,
+}
+
+impl Default for ContextPolicy {
+    fn default() -> Self {
+        Self {
+            budget_bytes: crate::context::DEFAULT_CONTEXT_BUDGET_BYTES,
+        }
+    }
+}
+
 /// Repository policy, `relais.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -220,6 +239,8 @@ pub struct RepoPolicy {
     pub models: BTreeMap<Tier, ModelProfile>,
     #[serde(default)]
     pub execution: ExecutionPolicy,
+    #[serde(default)]
+    pub context: ContextPolicy,
     #[serde(default)]
     pub integrations: Integrations,
     #[serde(default)]
@@ -272,17 +293,20 @@ impl RepoPolicy {
         Ok(())
     }
 
-    /// Hash over the executable authority: models, execution limits,
-    /// verification profiles, integration modes, risk rules, recipes and
-    /// architecture mappings. Machine trust grants are content-bound to
-    /// this hash — a changed declaration invalidates them (SPEC §5).
-    /// Recipes are executable authority: one that covers a task picks its
-    /// tier outright, ahead of the learner, so a grant must not survive
-    /// an edit to them.
+    /// Hash over the executable authority: models, execution limits, the
+    /// context budget, verification profiles, integration modes, risk
+    /// rules, recipes and architecture mappings. Machine trust grants are
+    /// content-bound to this hash — a changed declaration invalidates
+    /// them (SPEC §5). Recipes are executable authority: one that covers
+    /// a task picks its tier outright, ahead of the learner, so a grant
+    /// must not survive an edit to them. The context budget belongs here
+    /// for the same reason: raising it is what turns a sizing problem
+    /// into a dispatch, so it is reviewed, not slipped in.
     pub fn authority_hash(&self) -> String {
         let value = serde_json::json!({
             "models": self.models,
             "execution": self.execution,
+            "context": self.context,
             "verification": self.verification,
             "integrations": self.integrations,
             "risk": self.risk,
@@ -349,6 +373,12 @@ pub struct SpendingCeilings {
     /// Per-run API spend ceiling in micro-USD. Best effort across
     /// in-flight requests; never advertised as an exact cap (SPEC §11).
     pub per_run_micros: Option<i64>,
+    /// Machine-wide ceiling for one UTC day, in micro-USD, checked at
+    /// the runner's loop top against every usage event recorded that day
+    /// — this run's and every other run's on this machine. Best effort
+    /// for the same reasons as the per-run ceiling, and a lower bound
+    /// besides: usage the provider never reported is NULL in the ledger
+    /// and no sum can include it.
     pub per_day_micros: Option<i64>,
 }
 
@@ -415,9 +445,19 @@ pub struct ConcurrencyLimits {
 /// Authorized experimentation envelope (SPEC §13, §17). Automatic trials
 /// and promotion stay inside it; anything wider needs an explicit policy
 /// edit. Risk floors and required checks are never trainable parameters.
+///
+/// NOT IMPLEMENTED IN THIS RELEASE. §17's comparative evidence needs a
+/// replay command or randomized assignment with logged propensities, and
+/// this release ships neither: nothing reads these fields, so
+/// `enabled = true` changes no behaviour whatsoever. The struct stays
+/// because `MachineSettings` denies unknown fields — deleting it would
+/// turn a machine.toml that already sets `[trials]` into a parse error
+/// on upgrade — and `doctor` prints a `!` line whenever the flag is on,
+/// so nobody believes a trial is running.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct TrialEnvelope {
+    /// Inert: see the struct's note. Kept parseable, reported by doctor.
     pub enabled: bool,
     pub max_daily_trials: Option<u32>,
     pub max_trial_cost_micros: Option<i64>,
@@ -752,8 +792,17 @@ allow_nested_agents = true
 max_agent_depth = 3
 max_agents_total = 24
 
+# How much context one worker prompt may carry: objective, acceptance
+# criteria, architectural constraints and entry points together. A task
+# whose package does not fit is a sizing problem — split it — and never a
+# silently truncated prompt (SPEC §7). This is executable authority: it
+# is hashed into the trust grant, so raising it is reviewed.
+# [context]
+# budget_bytes = 65536
+
 # required blocks execution when missing; optional gaps are reported and
-# never counted as passed checks.
+# never counted as passed checks. `off` is not checked at all, and
+# `relais doctor` says which of the three each one is.
 [integrations]
 aval = "required"
 amont = "required"
@@ -1046,6 +1095,28 @@ keys = ["output.contract"]
         let machine =
             MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo))).expect("parses");
         assert!(!effective_authority(&with_recipe, &machine, &contract()).trust_granted);
+    }
+
+    #[test]
+    fn the_context_budget_is_repo_policy_and_part_of_the_authority() {
+        let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        assert_eq!(
+            repo.context.budget_bytes,
+            crate::context::DEFAULT_CONTEXT_BUDGET_BYTES,
+            "a policy that says nothing keeps the shipped budget"
+        );
+        let wider =
+            RepoPolicy::from_toml_str(&format!("{REPO_TOML}\n[context]\nbudget_bytes = 131072\n"))
+                .expect("parses");
+        assert_eq!(wider.context.budget_bytes, 131_072);
+        assert_ne!(
+            repo.authority_hash(),
+            wider.authority_hash(),
+            "raising the budget is what turns a sizing problem into a dispatch: an authority change"
+        );
+        let machine =
+            MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo))).expect("parses");
+        assert!(!effective_authority(&wider, &machine, &contract()).trust_granted);
     }
 
     #[test]

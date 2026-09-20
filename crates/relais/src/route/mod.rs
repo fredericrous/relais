@@ -518,6 +518,7 @@ mod tests {
     fn repo_policy() -> RepoPolicy {
         RepoPolicy {
             schema_version: 1,
+            context: Default::default(),
             models: BTreeMap::from([
                 (
                     Tier::Research,
