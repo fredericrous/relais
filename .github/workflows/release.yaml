@@ -1,0 +1,497 @@
+name: Release
+
+# Cutting a release means: a tag, prebuilt binaries for every platform the
+# siblings (amont, aval) ship to, and checksums. The shape is aval's release
+# workflow, job for job, minus the npm and crates.io channels: `relais` is a
+# working name whose package availability has not been checked (SPEC.md). Until this existed the only install path was
+# `git clone` into a specific config directory — a 2015 install story for a Rust
+# binary, and the reason `curl | sh` and `brew install` were impossible.
+#
+# Triggered by the TAG, never by a branch push. The tag is the decision.
+
+on:
+  push:
+    tags: ["v*"]
+  # So a release can be rehearsed end to end without publishing one.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (dry run — no release is published)"
+        required: false
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # The tag and the manifest must agree BEFORE anything is built.
+  #
+  # This is the footgun that motivated the whole job: a commit-msg hook rejects
+  # a commit, the shell carries on to `git tag`, and the tag lands on the OLD
+  # head — so CI builds and publishes the new version number from stale code.
+  # Registries are immutable; the wrong bytes under a version cannot be
+  # replaced, only superseded. Checking costs four lines and runs first.
+  guard:
+    name: the tag says what the manifest says
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      dry_run: ${{ steps.v.outputs.dry_run }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          set -euo pipefail
+          manifest=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            dry=false
+          else
+            tag="${{ inputs.tag }}"
+            tag="${tag#v}"
+            [ -n "$tag" ] || tag="$manifest"
+            dry=true
+          fi
+          echo "manifest=$manifest tag=$tag dry_run=$dry"
+          if [ "$manifest" != "$tag" ]; then
+            echo "::error::tag v$tag does not match [workspace.package] version $manifest."
+            echo "::error::Commit the version bump FIRST, confirm HEAD moved, then tag."
+            exit 1
+          fi
+          # The same bargain as the version check: the release notes lead
+          # with CHANGELOG.md's section for this version, so a missing
+          # section would publish a release that opens with nothing. Refuse
+          # now, while writing it costs one commit instead of a re-release.
+          if ! awk -v ver="v$manifest" '$1 == "##" && $2 == ver { found = 1 } END { exit !found }' CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## v$manifest' section."
+            echo "::error::Write what the upgrader gets, then tag."
+            exit 1
+          fi
+          echo "version=$manifest" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$dry" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.target }}
+    needs: guard
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      # One broken target must not hide the others: a partial release is
+      # something to see in full, not to discover one platform at a time.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          # Static, so it runs on distros older than the runner's glibc — the
+          # usual reason a "linux" binary fails for somebody.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            packages: musl-tools
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            packages: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain for ${{ matrix.target }}
+        run: rustup target add ${{ matrix.target }}
+      - name: Install cross-compilation packages
+        if: matrix.packages != ''
+        # An apt mirror hanging `apt-get update` has cost releases on both
+        # sides now. amont pinned the canonical archive because the Azure
+        # mirror stalled; relais's first release then failed because
+        # archive.ubuntu.com was the one stalling — two targets timed out
+        # after five minutes of `Ign:` lines.
+        #
+        # So do not pick a winner. Try the runner's own mirror first, and only
+        # rewrite to the canonical archive if that fails. Whichever one is
+        # healthy gets used, and the step says which.
+        timeout-minutes: 12
+        run: |
+          set -uo pipefail
+          APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+
+          attempt() {
+            # shellcheck disable=SC2086
+            sudo apt-get $APT_OPTS update && \
+            sudo apt-get $APT_OPTS install -y ${{ matrix.packages }}
+          }
+
+          if timeout 300 bash -c "$(declare -f attempt); attempt"; then
+            echo "installed via the runner's default mirror"
+            exit 0
+          fi
+
+          echo "::warning::the default apt mirror did not answer — falling back to archive.ubuntu.com"
+          # The runner routes apt through `mirror+file:/etc/apt/apt-mirrors.txt`,
+          # so rewriting the sources files alone still leaves every fetch
+          # starting at the default mirror. Rewrite the mirror LIST, which is
+          # the knob the image actually reads.
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            printf 'http://archive.ubuntu.com/ubuntu\tpriority:1\n' | sudo tee /etc/apt/apt-mirrors.txt
+          fi
+          sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+
+          if timeout 300 bash -c "$(declare -f attempt); attempt"; then
+            echo "installed via archive.ubuntu.com"
+            exit 0
+          fi
+
+          echo "::error::both apt mirrors failed to serve ${{ matrix.packages }}"
+          exit 1
+      - name: Point cargo at the cross linker
+        if: matrix.linker != ''
+        run: |
+          target_upper=$(echo "${{ matrix.target }}" | tr 'a-z-' 'A-Z_')
+          echo "CARGO_TARGET_${target_upper}_LINKER=${{ matrix.linker }}" >> "$GITHUB_ENV"
+
+      - run: cargo build --release --target ${{ matrix.target }} --bin relais
+
+      - name: Archive
+        id: archive
+        run: |
+          set -euo pipefail
+          version="${{ needs.guard.outputs.version }}"
+          name="relais-${version}-${{ matrix.target }}"
+          staging="dist/$name"
+          mkdir -p "$staging"
+          # SPEC.md travels WITH the binary. It is the normative spec, and a
+          # release that shipped only the executable would leave the reader
+          # with an exit code and nothing that says what it means.
+          cp README.md LICENSE docs/SPEC.md "$staging/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/relais.exe" "$staging/"
+            (cd dist && 7z a "$name.zip" "$name" > /dev/null)
+            echo "asset=dist/$name.zip" >> "$GITHUB_OUTPUT"
+          else
+            cp "target/${{ matrix.target }}/release/relais" "$staging/"
+            (cd dist && tar czf "$name.tar.gz" "$name")
+            echo "asset=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Prove the thing we are about to hand people actually runs. A release
+      # asset that cannot execute is the one defect no amount of `cargo test`
+      # catches, because tests never touch the packaged artifact.
+      - name: The packaged binary runs
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-pc-windows-msvc'
+        run: |
+          set -euo pipefail
+          version="${{ needs.guard.outputs.version }}"
+          bin="dist/relais-${version}-${{ matrix.target }}/relais"
+          # An `if`, not `[ … ] && …`: under `set -e` a false test as the last
+          # command of a line is a FAILING step, so the short form would abort
+          # every non-Windows target here.
+          if [ "${{ runner.os }}" = "Windows" ]; then bin="$bin.exe"; fi
+          "$bin" --help | grep -q 'doctor'
+          "$bin" --version | grep -q "$version"
+          echo "the packaged binary answers --help and --version"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ steps.archive.outputs.asset }}
+          if-no-files-found: error
+
+  # The blocking twin of ci.yaml's advisory audit — same parsing, opposite
+  # stakes. On a PR an advisory is information; on a TAG it is about to be
+  # compiled into six binaries and served to installers, so:
+  #
+  #   - a VULNERABILITY fails the release (the advisory ids decide, exactly
+  #     as in ci.yaml — the exit code alone conflates findings with fetch
+  #     failures);
+  #   - warning-class advisories (unmaintained/unsound) stay named
+  #     annotations: the tree carries two today in the fleet's TUI stack,
+  #     and a gate nothing can pass is a gate people learn to delete;
+  #   - a fetch failure ALSO fails, unlike ci.yaml: "could not check" is not
+  #     "clean", and an unchecked tree does not ship. On a PR you retry
+  #     tomorrow; a release published today is immutable today.
+  audit:
+    name: no known vulnerabilities ship
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ runner.os }}
+      - name: Install cargo-audit
+        run: command -v cargo-audit > /dev/null || cargo install --locked cargo-audit
+      - name: Audit the resolved tree
+        # `-e` is deliberately ABSENT from this shell, and the default one has
+        # it. GitHub runs `bash --noprofile --norc -e -o pipefail`, so the step
+        # aborted on the first non-zero exit and none of the logic below ever
+        # ran — the logic whose entire purpose is to tell "found
+        # vulnerabilities" apart from "could not check".
+        #
+        # It failed on the GOOD case. `grep` exits 1 when it matches nothing,
+        # `pipefail` makes the assignment inherit that, and `-e` killed the
+        # step. A clean tree was the one input that could not pass. amont does
+        # not hit this only because its tree carries two warning-class
+        # advisories, so its grep always matches; the bug is latent there.
+        shell: bash --noprofile --norc -uo pipefail {0}
+        run: |
+          set -uo pipefail
+          cargo audit --color never 2>&1 | tee /tmp/audit.log
+          rc=${PIPESTATUS[0]}
+          # `|| true` because no advisories is the outcome we hope for, and
+          # grep reports it as failure.
+          ids=$(grep -Eo 'RUSTSEC-[0-9]{4}-[0-9]{4}' /tmp/audit.log | sort -u || true)
+
+          if [ -z "$ids" ]; then
+            if [ "$rc" -eq 0 ]; then
+              echo "no advisories against the locked tree"
+              exit 0
+            fi
+            echo "::error::cargo audit could not complete — the tree was NOT checked, and an unchecked tree does not ship"
+            exit 1
+          fi
+
+          if [ "$rc" -eq 0 ]; then
+            echo "::warning::advisories against the locked tree (warnings — unmaintained/unsound); named below, not blocking"
+            printf '%s\n' "$ids" | while read -r id; do
+              echo "::warning::$id  https://rustsec.org/advisories/$id"
+            done
+            exit 0
+          fi
+
+          echo "::error::VULNERABILITIES against the locked tree — refusing to release"
+          printf '%s\n' "$ids" | while read -r id; do
+            echo "::error::$id  https://rustsec.org/advisories/$id"
+          done
+          exit 1
+
+  publish:
+    name: publish the release
+    needs: [guard, build, audit]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -la
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      # A dry run stops here, having built and checksummed everything. The only
+      # step it skips is the irreversible one.
+      - name: Publish
+        if: needs.guard.outputs.dry_run == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Idempotent, because re-running a release is a normal thing to want.
+          # `gh release create` fails outright on "a release with the same tag
+          # name already exists", which took down the whole run — and with it
+          # `publish-tap`, which needs this job. That is precisely backwards:
+          # the reason to re-run is usually that a LATER step failed.
+          if gh release view "${GITHUB_REF_NAME}" > /dev/null 2>&1; then
+            echo "release ${GITHUB_REF_NAME} already exists — refreshing its assets"
+            gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+          else
+            # Notes an upgrader can read, then the generated PR list. Bare
+            # --generate-notes published this repository's PR titles as the
+            # whole story, and they are written for the history, not for
+            # somebody deciding whether to upgrade. The guard job already
+            # proved the CHANGELOG section exists. Matching on $2 rather
+            # than a prefix so extracting v1.0.2 can never grab v1.0.21.
+            notes=$(mktemp)
+            awk -v ver="${GITHUB_REF_NAME}" '
+              $1 == "##" && $2 == ver { grab = 1; next }
+              $1 == "##" && grab      { exit }
+              grab                    { print }
+            ' CHANGELOG.md > "$notes"
+            printf '\n---\n\n' >> "$notes"
+            gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+              -f tag_name="${GITHUB_REF_NAME}" --jq .body >> "$notes"
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file "$notes" \
+              dist/*
+          fi
+      - name: Dry run summary
+        if: needs.guard.outputs.dry_run == 'true'
+        run: |
+          echo "### Dry run — nothing published" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat dist/SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # An unarmed channel must be VISIBLE. A release that quietly shipped to
+      # one of four places, because three variables were never set, is the
+      # silent-success shape this whole project is arranged against.
+      - name: Which channels are armed
+        run: |
+          set -euo pipefail
+          {
+            echo "### Publication channels"
+            echo
+            echo "| channel | armed | needs |"
+            echo "|---|---|---|"
+            echo "| GitHub release | yes | nothing |"
+            echo "| crates.io, npm | not built | \`relais\` is a working name; package availability is unchecked (SPEC.md) |"
+            echo "| homebrew tap | ${{ vars.PUBLISH_TAP == 'true' && 'yes' || 'NO' }} | \`PUBLISH_TAP\` + \`TAP_DEPLOY_KEY\` + a seeded \`Formula/relais.rb\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The release's last manual step, retired. The tap formula was bumped by
+  # hand four times in three days — copy a version, copy four sha256 lines,
+  # push — and a transcription error there ships a formula brew refuses, or
+  # worse, accepts. A release is not published until `brew upgrade` can see
+  # it, so the release publishes it.
+  #
+  # Auth is a deploy key that can write to the TAP REPOSITORY and nothing
+  # else (secret TAP_DEPLOY_KEY; the tap holds the matching public key) —
+  # narrower than any PAT. The rewrite itself is scripts/bump-tap.py, which
+  # asserts on every surprise rather than sedding hopefully, and `ruby -c`
+  # proves the result is at least a formula before anything is pushed.
+  publish-tap:
+    name: publish to the homebrew tap
+    needs: [guard, publish]
+    # Keyed on the ref being a TAG, so a workflow_dispatch against an
+    # existing tag can resume this too. The
+    # push step's nothing-to-commit path makes that resume a no-op when the
+    # tap already carries the version.
+    #
+    # NOTE: seed `Formula/relais.rb` in the tap before arming this. bump-tap.py
+    # REWRITES a formula; it does not create one, and it asserts four url/sha
+    # pairs are present rather than hoping a sed matched.
+    # Gated on a repository VARIABLE, not just the tag, because this repository
+    # does not yet carry the credential this job needs. A release that failed
+    # three jobs on a missing secret would read as a broken release rather than
+    # as an unarmed channel. Set the variable when the secret is in place:
+    #     gh variable set PUBLISH_TAP -R fredericrous/relais --body true
+    if: github.ref_type == 'tag' && vars.PUBLISH_TAP == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.guard.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # From the PUBLISHED release, not from this run's artifacts: the
+      # formula must name the bytes an installer will actually download,
+      # and reading them back from the release asserts they are there.
+      - name: Download the published checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "v$VERSION" --pattern SHA256SUMS
+
+      - name: Clone the tap
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$TAP_DEPLOY_KEY" > ~/.ssh/tap_key
+          chmod 600 ~/.ssh/tap_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          echo "GIT_SSH_COMMAND=ssh -i ~/.ssh/tap_key -o IdentitiesOnly=yes" >> "$GITHUB_ENV"
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/tap_key -o IdentitiesOnly=yes" \
+            git clone --depth 1 git@github.com:fredericrous/homebrew-tap.git tap
+
+      - name: Rewrite the formula
+        run: |
+          set -euo pipefail
+          python3 scripts/bump-tap.py "$VERSION" SHA256SUMS tap/Formula/relais.rb
+          ruby -c tap/Formula/relais.rb
+
+      - name: Push
+        run: |
+          set -euo pipefail
+          cd tap
+          if git diff --quiet; then
+            echo "the tap already carries $VERSION — nothing to publish"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/relais.rb
+          git commit -m "chore: relais $VERSION"
+          git push origin HEAD
+          echo "### Published to the homebrew tap" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`brew upgrade fredericrous/tap/relais\` — v$VERSION" >> "$GITHUB_STEP_SUMMARY"
+
+  # The only thing anywhere that runs the formula.
+  #
+  # `publish-tap` above proves the file PARSES (`ruby -c`) and that its
+  # checksums match the release. Neither is the question a user asks, which
+  # is "does `brew install` work" — and the gap between those is not
+  # theoretical: this formula carried `bin.install "relais-agent"` for three
+  # releases after that binary left the archive in 1.20.0. `bin.install` on a
+  # file that is not there aborts the whole formula, so every `brew install`
+  # and `brew upgrade` failed outright:
+  #
+  #     Errno::ENOENT: No such file or directory - relais-agent
+  #
+  # Every one of those releases was green. The checksums matched, the syntax
+  # was valid, and `bump-tap.py` rewrites only the version and the four
+  # url/sha pairs, so nothing it touched would ever notice a stale install
+  # line. It was found by a human running `brew upgrade` by hand.
+  #
+  # This job FAILS the run rather than warning. The release is already
+  # published by the time it runs and cannot be unpublished, so the point is
+  # not to prevent it — it is to make a broken install path impossible to
+  # miss. A warning here would reproduce exactly the condition that let this
+  # ship: a green release and a broken `brew install`.
+  verify-brew:
+    name: brew can install what was published
+    needs: [guard, publish-tap]
+    if: github.ref_type == 'tag' && vars.PUBLISH_TAP == 'true'
+    # macOS because that is where nearly every brew user of this tool is, and
+    # because the bottle-less formula builds from the darwin release asset —
+    # the same bytes an actual user downloads.
+    runs-on: macos-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.guard.outputs.version }}
+    steps:
+      # No checkout: this must see only what a stranger sees — the tap and
+      # the published release. Anything read out of the repository would be
+      # testing the thing we already know.
+      - name: Install from the tap
+        run: |
+          set -euo pipefail
+          brew tap fredericrous/tap
+          brew install fredericrous/tap/relais
+
+      - name: The installed binaries are the version just published
+        run: |
+          set -euo pipefail
+          relais --version | tee /tmp/v
+          grep -qx "relais $VERSION" /tmp/v
+
+      # The formula's own test block, which is the only place the INSTALLED
+      # artifact is exercised — and which referenced the departed binary too,
+      # so it would have failed for the same reason had anyone run it.
+      - name: brew test
+        run: brew test fredericrous/tap/relais
+
+      - name: Say so
+        run: |
+          echo "### brew install verified" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`brew install fredericrous/tap/relais\` produces v$VERSION" >> "$GITHUB_STEP_SUMMARY"
