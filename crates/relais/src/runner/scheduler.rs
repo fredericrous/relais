@@ -318,6 +318,26 @@ pub(crate) fn run_decomposed(
             }
         }
         engine.state = State::Verifying;
+        // Root verification waits for every relevant write lease: the
+        // integration tree's and each package worker's (SPEC §23). The
+        // packages ran to completion and gave their leases back with
+        // their processes; a holder here is a straggler, and the
+        // integrated candidate is not verified over it.
+        let mut relevant = vec![integration.path.clone()];
+        for (child_run, package_id, _) in engine.config.ledger.child_runs(&engine.run_id)? {
+            relevant.push(
+                crate::runner::worktree_root(&engine.artifacts.join("packages").join(&package_id))
+                    .join(&child_run)
+                    .join("task"),
+            );
+        }
+        for path in &relevant {
+            if let Some(holder) = engine.wait_for_writers(path, root.deadline)? {
+                return Ok(Decomposed::Outcome(
+                    engine.stop_on_held_lease(path, &holder)?,
+                ));
+            }
+        }
         let label = 900 + integration_repairs;
         let verify::Verified {
             checks,
@@ -899,6 +919,8 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         remaining_budget.unwrap_or(0),
         root.deadline,
         &budget,
+        // The planner reads; it writes no worktree and takes no lease.
+        None,
     )? {
         Ok(result) => result,
         Err(outcome) => {

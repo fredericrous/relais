@@ -315,6 +315,15 @@ impl<'a> RunEngine<'a> {
     /// against the run's wall clock; refusals on budget, depth or the
     /// aggregate agent cap are budget exhaustion, and a run cancelled
     /// while queued or running ends cancelled with its evidence kept.
+    ///
+    /// `write_lease` names the worktree this dispatch will write, when it
+    /// writes one: the lease is taken after admission and before the
+    /// process exists, and given back when the process has ended. A
+    /// worktree somebody else is writing refuses the launch outright —
+    /// two writers in one tree is the one thing scope checks cannot
+    /// catch (SPEC §23: "scope checks alone are not filesystem
+    /// isolation"). Readers — the reviewer, the planner — pass `None`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn managed_launch(
         &mut self,
         mut spec: LaunchSpec,
@@ -323,6 +332,7 @@ impl<'a> RunEngine<'a> {
         reserve_micros: i64,
         deadline: Instant,
         budget: &Budget,
+        write_lease: Option<&Path>,
     ) -> Result<Launched, RunError> {
         // The dispatch is `launched` in the ledger BEFORE the process
         // exists (SPEC §12): a runner crash from here on leaves a live
@@ -417,6 +427,37 @@ impl<'a> RunEngine<'a> {
             }
         }
 
+        let lease_key = write_lease.map(|path| path.to_string_lossy().into_owned());
+        if let Some(key) = lease_key.as_deref() {
+            match gate.acquire_write(&spec.dispatch_id, key) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let holder = gate
+                        .write_lease_holder(key)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| "another dispatch".to_string());
+                    let _ = gate.withdraw(&spec.dispatch_id);
+                    return Ok(Err(self.block(
+                        Reason::AdmissionRefused,
+                        BlockCode::AdmissionRefused,
+                        format!(
+                            "worktree {key} is being written by {holder}; a second writer is \
+                             never launched into one tree (SPEC §23)"
+                        ),
+                    )?));
+                }
+                Err(e) => {
+                    let _ = gate.withdraw(&spec.dispatch_id);
+                    return Ok(Err(self.block(
+                        Reason::AdmissionUnavailable,
+                        BlockCode::AdmissionUnavailable,
+                        format!("{e}; the write lease could not be taken and nothing was launched"),
+                    )?));
+                }
+            }
+        }
+
         let cancel = Arc::new(AtomicBool::new(false));
         let pid_slot = Arc::new(AtomicU32::new(0));
         spec.cancel = Some(Arc::clone(&cancel));
@@ -468,6 +509,12 @@ impl<'a> RunEngine<'a> {
             result
         });
 
+        // The process has ended: whatever it wrote is written. The lease
+        // goes back before the seat, so verification never waits on a
+        // writer that is already gone (SPEC §23).
+        if let Some(key) = lease_key.as_deref() {
+            let _ = gate.release_write(&spec.dispatch_id, key);
+        }
         let result = match launched {
             Ok(result) => result,
             Err(e) => {
@@ -993,6 +1040,7 @@ impl<'a> RunEngine<'a> {
                 remaining_budget.unwrap_or(0),
                 deadline,
                 &progress.budget,
+                Some(&worktree_path),
             )? {
                 Ok(result) => result,
                 Err(outcome) => {
@@ -1113,6 +1161,20 @@ impl<'a> RunEngine<'a> {
                     &progress.budget,
                     Observation::WorkerBlockage(result.result_text.unwrap_or_default()),
                 );
+            }
+
+            // Nothing is snapshotted from a tree still being written: the
+            // worker's own lease went back when its process ended, so
+            // any holder here is a straggler another tab or run owns
+            // (SPEC §23).
+            if let Some(holder) = self.wait_for_writers(&worktree_path, deadline)? {
+                ledger.finish_attempt(
+                    attempt_id,
+                    State::Interrupted,
+                    Some(worktree_path.to_string_lossy().as_ref()),
+                    None,
+                )?;
+                return self.stop_on_held_lease(&worktree_path, &holder);
             }
 
             // The candidate snapshot is recorded outside model control,
@@ -1616,6 +1678,77 @@ impl<'a> RunEngine<'a> {
         Ok(())
     }
 
+    /// Wait for a worktree's write lease to be gone before it is
+    /// snapshotted or verified (SPEC §23: "root verification waits for
+    /// all relevant write leases to be released"; §10: "after all
+    /// candidate-writing descendants have stopped or relinquished their
+    /// write leases"). `Ok(None)` = nobody writes it; `Ok(Some(holder))`
+    /// = the clock ran out with the holder still there. A wait that
+    /// actually happened is a transition on the run. Unmanaged execution
+    /// has no leases and waits for nothing.
+    pub(crate) fn wait_for_writers(
+        &mut self,
+        worktree: &Path,
+        deadline: Instant,
+    ) -> Result<Option<String>, RunError> {
+        let Some(gate) = self.config.gate else {
+            return Ok(None);
+        };
+        let key = worktree.to_string_lossy().into_owned();
+        let started = Instant::now();
+        let mut waited = false;
+        loop {
+            match gate.write_lease_holder(&key) {
+                Ok(None) => {
+                    if waited {
+                        self.transition(
+                            State::Verifying,
+                            Reason::WriteLeaseWait,
+                            serde_json::json!({
+                                "worktree": key,
+                                "waited_ms": started.elapsed().as_millis() as u64,
+                            }),
+                        )?;
+                    }
+                    return Ok(None);
+                }
+                Ok(Some(holder)) => {
+                    if Instant::now() >= deadline {
+                        return Ok(Some(holder));
+                    }
+                    waited = true;
+                    std::thread::sleep(ADMISSION_POLL);
+                }
+                Err(e) => {
+                    return Err(RunError::Other(format!(
+                        "the write lease on {key} could not be queried: {e}"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// The run ends interrupted because a worktree is still being
+    /// written: nothing is snapshotted from a tree in motion, and the
+    /// tree is preserved for whoever holds it (SPEC §23).
+    pub(crate) fn stop_on_held_lease(
+        &mut self,
+        worktree: &Path,
+        holder: &str,
+    ) -> Result<RunOutcome, RunError> {
+        let key = worktree.to_string_lossy().into_owned();
+        self.finish(
+            Reason::WriteLeaseHeld,
+            serde_json::json!({ "worktree": key, "holder": holder }),
+            Terminal::Interrupted {
+                detail: format!(
+                    "worktree {key} is still being written by {holder} at the run's deadline; \
+                     no candidate was snapshotted and the worktree is preserved"
+                ),
+            },
+        )
+    }
+
     /// Verify the immutable candidate copy: a throwaway worktree at the
     /// candidate SHA, profile commands with logged, hashed evidence, and
     /// amont's inventory when the integration is on.
@@ -1874,6 +2007,7 @@ impl<'a> RunEngine<'a> {
             remaining_budget.unwrap_or(0),
             deadline,
             &budget,
+            None,
         ) {
             Ok(Ok(result)) => result,
             Ok(Err(outcome)) => {
@@ -3657,6 +3791,134 @@ mod tests {
     }
 
     // -- managed dispatch (SPEC §23) -------------------------------------
+
+    // SPEC §23: a candidate-writing dispatch holds its worktree's write
+    // lease for exactly the life of its process, and nothing is
+    // snapshotted or verified while somebody else holds it.
+    #[test]
+    fn a_writing_dispatch_holds_the_worktree_lease_while_it_runs_and_gives_it_back() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let machine = fixture.machine_for(&repo);
+        let gate = std::sync::Arc::new(crate::admission::LocalGate::new(
+            ConcurrencyLimits::default(),
+        ));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let observer = std::sync::Arc::clone(&gate);
+        let record = std::sync::Arc::clone(&seen);
+        let backend = MockBackend::new(move |spec| {
+            if spec.prompt.contains("semantic reviewer") {
+                // The reviewer reads: no lease, and the worker's is gone.
+                assert!(observer.status().write_leases.is_empty());
+                return MockOutcome {
+                    result_text: Some("FINDINGS: none".into()),
+                    exit_code: Some(0),
+                    ..Default::default()
+                };
+            }
+            let leases = observer.status().write_leases;
+            record.lock().unwrap().push(
+                leases
+                    .get(spec.work_dir.to_string_lossy().as_ref())
+                    .cloned()
+                    .unwrap_or_else(|| "NO LEASE".into()),
+            );
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute_managed(
+            &fixture.contract(Review::Required),
+            &repo,
+            &machine,
+            &backend,
+            gate.as_ref(),
+        );
+        assert!(
+            matches!(outcome.terminal, Terminal::Accepted(_)),
+            "expected acceptance, got {outcome:?}"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0].starts_with("disp-"),
+            "the worker's own dispatch held the lease while it ran: {seen:?}"
+        );
+        assert!(
+            gate.status().write_leases.is_empty(),
+            "the lease went back with the process"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_straggling_writer_holds_up_the_snapshot_until_the_clock_runs_out() {
+        let fixture = Fixture::new();
+        let mut repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        // Short clock: the wait ends at the run's deadline, interrupted.
+        repo.execution.max_wall_seconds = 3;
+        let machine = fixture.machine_for(&repo);
+        let gate = std::sync::Arc::new(crate::admission::LocalGate::new(
+            ConcurrencyLimits::default(),
+        ));
+        let intruder = std::sync::Arc::clone(&gate);
+        let backend = MockBackend::new(move |spec| {
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            // Another tab's dispatch takes the tree while this worker
+            // runs, and never lets go. Deterministically: the worker's
+            // own lease is handed over here, inside the launch, so by
+            // the time the runner looks the intruder is the holder and
+            // the worker's own release (holder-only) is a no-op.
+            let key = spec.work_dir.to_string_lossy().into_owned();
+            assert!(
+                !intruder.acquire_write("intruder", &key).expect("gate"),
+                "the worker holds the lease, so the intruder is refused now"
+            );
+            intruder
+                .release_write(&spec.dispatch_id, &key)
+                .expect("gate");
+            assert!(
+                intruder.acquire_write("intruder", &key).expect("gate"),
+                "the tree is free for a moment, and the intruder takes it"
+            );
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute_managed(
+            &fixture.contract(Review::Optional),
+            &repo,
+            &machine,
+            &backend,
+            gate.as_ref(),
+        );
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Interrupted { detail },
+        } = outcome
+        else {
+            panic!("a tree still being written is not snapshotted, got {outcome:?}");
+        };
+        assert!(detail.contains("intruder"), "{detail}");
+        let transitions = fixture.ledger.transitions(&run_id).expect("history");
+        assert_eq!(
+            transitions.last().unwrap().reason,
+            Reason::WriteLeaseHeld.as_str()
+        );
+        let run_dir = fixture.artifacts.join(&run_id);
+        assert!(
+            !run_dir.join("candidate-1.patch").exists(),
+            "no candidate was exported from a tree in motion"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
 
     #[test]
     fn managed_run_registers_admits_and_settles_through_the_gate() {
