@@ -3235,6 +3235,7 @@ mod tests {
     /// The runner's own machinery failing — here, the run directory made
     /// unwritable under it — ends the run as `interrupted` with the error
     /// on record, not as a panic with nothing on record (SPEC §12).
+    #[cfg(unix)]
     #[test]
     fn a_runner_failure_is_recorded_as_interrupted_not_panicked() {
         use std::os::unix::fs::PermissionsExt;

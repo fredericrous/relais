@@ -23,9 +23,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-
 use serde::{Deserialize, Serialize};
 
 use crate::money::{CostCompleteness, MicroUsd};
@@ -312,11 +309,11 @@ pub fn wait_for_exit(
             break (false, false);
         }
         if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
-            let _ = kill_process_group(child);
+            let _ = crate::procs::kill_tree(child);
             break (false, true);
         }
         if started.elapsed() >= wall_timeout {
-            let _ = kill_process_group(child);
+            let _ = crate::procs::kill_tree(child);
             break (true, false);
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -328,32 +325,13 @@ pub fn wait_for_exit(
 /// Put a command in its own process group so a kill reaches everything it
 /// spawned. Every subprocess relais waits on goes through here.
 pub fn own_process_group(command: &mut Command) {
-    #[cfg(unix)]
-    command.process_group(0);
+    crate::procs::own_process_group(command);
 }
 
 fn read_to_end(mut pipe: impl std::io::Read) -> Vec<u8> {
     let mut buffer = Vec::new();
     let _ = std::io::Read::read_to_end(&mut pipe, &mut buffer);
     buffer
-}
-
-#[cfg(unix)]
-fn kill_process_group(child: &mut std::process::Child) -> std::io::Result<()> {
-    // The whole group: a harness that spawned its own children must not
-    // survive the kill (SPEC §23 cancellation).
-    let pgid = child.id() as i32;
-    let result = unsafe { libc::kill(-pgid, libc::SIGKILL) };
-    if result == -1 {
-        child.kill()
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_process_group(child: &mut std::process::Child) -> std::io::Result<()> {
-    child.kill()
 }
 
 /// A stub backend for tests and `relais doctor --dry`: a shell command

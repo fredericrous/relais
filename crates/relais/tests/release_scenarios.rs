@@ -4,6 +4,10 @@
 //! would call it. The library-level tests exercise the same paths with
 //! mock backends; these prove the wiring — config files, trust grants,
 //! the lazily started coordinator, exit codes and artifacts.
+//!
+//! Unix only: the fake `claude` is a `sh` script. The library-level
+//! tests, including the coordinator's endpoint, run on Windows too.
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

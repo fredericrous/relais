@@ -1,7 +1,9 @@
 //! The shared per-user coordinator (SPEC §23).
 //!
 //! One coordinator per OS user, started lazily by the CLI, elected
-//! atomically over a permission-restricted Unix socket. It serves the
+//! atomically over a permission-restricted local endpoint (`crate::ipc`:
+//! a Unix socket, or its loopback-and-nonce equivalent on Windows). It
+//! serves the
 //! admission state machine in `crate::admission`: registrations,
 //! admission, resource leases and aggregate budget reservations. A CLI
 //! process exiting never cancels an ongoing run; the coordinator holds no
@@ -13,8 +15,6 @@
 //! runner blocks, preserving the request (SPEC §23).
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -25,8 +25,13 @@ use crate::admission::{
     AdmissionState, Decision, DispatchRequest, Gate, GateError, HeartbeatStatus, ResourceClass,
     RunRegistration, StatusSnapshot,
 };
+use crate::ipc::{Listener, Stream};
 use crate::ledger::Ledger;
 use crate::policy::ConcurrencyLimits;
+/// Liveness without a signal that could terminate anything (SPEC §23:
+/// lease expiry never proves a worker died). Re-exported for `resume`.
+pub use crate::procs::alive as process_alive;
+use crate::procs::terminate;
 
 /// Defaults when machine settings name no limit. Illustrative sizing
 /// (SPEC §23), not benchmark-derived.
@@ -147,7 +152,7 @@ pub struct Coordinator {
 /// winner's PID. A stale lock (dead PID) is taken over; simultaneous
 /// startups never create independent schedulers. Returns the listener
 /// and the lock path the winner must remove on exit.
-pub fn elect(socket_path: &Path) -> Result<(UnixListener, PathBuf), CoordinatorError> {
+pub fn elect(socket_path: &Path) -> Result<(Listener, PathBuf), CoordinatorError> {
     let state_dir = socket_path.parent().expect("socket has a parent");
     std::fs::create_dir_all(state_dir).map_err(|e| CoordinatorError(e.to_string()))?;
     let lock_path = state_dir.join("coordinator.lock");
@@ -184,47 +189,19 @@ pub fn elect(socket_path: &Path) -> Result<(UnixListener, PathBuf), CoordinatorE
     }
 }
 
-fn finish_election(socket_path: &Path) -> Result<UnixListener, CoordinatorError> {
+fn finish_election(socket_path: &Path) -> Result<Listener, CoordinatorError> {
     if socket_path.exists() {
-        // A leftover socket from a crashed coordinator: prove it is dead
+        // A leftover endpoint from a crashed coordinator: prove it is dead
         // by attempting a connect before removing it.
-        if UnixStream::connect(socket_path).is_ok() {
+        if Stream::connect(socket_path).is_ok() {
             return Err(CoordinatorError(
                 "a live coordinator answered on the socket; not taking over".into(),
             ));
         }
         std::fs::remove_file(socket_path).map_err(|e| CoordinatorError(e.to_string()))?;
     }
-    let listener = UnixListener::bind(socket_path).map_err(|e| CoordinatorError(e.to_string()))?;
-    // Permission-restricted local socket (SPEC §23): the owner only.
-    let mut permissions = std::fs::metadata(socket_path)
-        .map_err(|e| CoordinatorError(e.to_string()))?
-        .permissions();
-    permissions.set_mode(0o600);
-    std::fs::set_permissions(socket_path, permissions)
-        .map_err(|e| CoordinatorError(e.to_string()))?;
-    Ok(listener)
-}
-
-/// `kill(pid, 0)`: liveness without a signal that could terminate
-/// anything. Lease expiry never proves a worker died (SPEC §23).
-pub fn process_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    // SAFETY: signal 0 performs error checking only; no signal is sent.
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-}
-
-fn terminate(pid: u32) {
-    if pid == 0 {
-        return;
-    }
-    // SAFETY: SIGTERM to a process this user owns; a cancelled dispatch
-    // bound its own PID to the reservation.
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGTERM);
-    }
+    // Permission-restricted (SPEC §23): the endpoint binds owner-only.
+    Listener::bind(socket_path).map_err(|e| CoordinatorError(e.to_string()))
 }
 
 impl Coordinator {
@@ -235,7 +212,7 @@ impl Coordinator {
         socket_path: &Path,
         limits: ConcurrencyLimits,
         ledger: Option<&Ledger>,
-    ) -> Result<(Self, UnixListener), CoordinatorError> {
+    ) -> Result<(Self, Listener), CoordinatorError> {
         let (listener, lock_path) = elect(socket_path)?;
         let mut state = AdmissionState::new(limits);
         if let Some(ledger) = ledger {
@@ -277,7 +254,7 @@ impl Coordinator {
     /// Serve until shutdown or idle exit. A reconcile thread checks
     /// leases against the process table and signals cancelled workers;
     /// the accept loop handles one short request per connection.
-    pub fn serve(self, listener: UnixListener) -> Result<(), CoordinatorError> {
+    pub fn serve(self, listener: Listener) -> Result<(), CoordinatorError> {
         let reconcile_state = Arc::clone(&self.state);
         let reconcile_shutdown = Arc::clone(&self.shutdown);
         let socket_for_exit = self.socket_path.clone();
@@ -342,7 +319,7 @@ fn lock_state(state: &Mutex<AdmissionState>) -> std::sync::MutexGuard<'_, Admiss
 }
 
 fn handle_connection(
-    stream: UnixStream,
+    stream: Stream,
     state: &Mutex<AdmissionState>,
     shutdown: &std::sync::atomic::AtomicBool,
 ) -> Result<(), String> {
@@ -483,7 +460,7 @@ impl Client {
 
     pub fn request(&self, request: &Request) -> Result<Response, CoordinatorError> {
         let mut stream =
-            UnixStream::connect(&self.socket).map_err(|e| CoordinatorError(e.to_string()))?;
+            Stream::connect(&self.socket).map_err(|e| CoordinatorError(e.to_string()))?;
         stream
             .set_read_timeout(Some(REQUEST_TIMEOUT))
             .map_err(|e| CoordinatorError(e.to_string()))?;
@@ -658,9 +635,10 @@ pub fn session_id() -> String {
             return id;
         }
     }
-    // SAFETY: getppid has no failure mode and touches no memory.
-    let parent = unsafe { libc::getppid() };
-    format!("unattributed-ppid-{parent}")
+    match crate::procs::parent_pid() {
+        Some(parent) => format!("unattributed-ppid-{parent}"),
+        None => format!("unattributed-pid-{}", std::process::id()),
+    }
 }
 
 /// Connect to the user's coordinator, starting one lazily when none
@@ -678,11 +656,9 @@ pub fn ensure_running(socket_path: &Path) -> Result<Client, CoordinatorError> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    // Detached from this CLI's group (Unix) or console group (Windows),
+    // so the CLI exiting cannot take the coordinator down.
+    crate::procs::own_process_group(&mut command);
     command
         .spawn()
         .map_err(|e| CoordinatorError(format!("cannot start the coordinator: {e}")))?;
@@ -741,8 +717,13 @@ mod tests {
     fn temp_dir(tag: &str) -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         // Unix socket paths are short (104 bytes on macOS): /tmp, not the
-        // deep per-user temp dir.
-        let dir = PathBuf::from("/tmp").join(format!(
+        // deep per-user temp dir. Windows has no /tmp and no such limit.
+        let base = if cfg!(unix) {
+            PathBuf::from("/tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let dir = base.join(format!(
             "rl-{tag}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
@@ -794,8 +775,16 @@ mod tests {
             elect(&socket).is_err(),
             "simultaneous startup does not double-elect"
         );
-        let mode = std::fs::metadata(&socket).expect("socket").permissions();
-        assert_eq!(mode.mode() & 0o777, 0o600, "permission-restricted");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&socket).expect("socket").permissions();
+            assert_eq!(mode.mode() & 0o777, 0o600, "permission-restricted");
+        }
+        assert!(
+            socket.exists(),
+            "the endpoint is at the path on every platform"
+        );
         drop(listener);
         // A lock naming a dead PID is taken over; a leftover socket that
         // nobody answers is removed on the way.
@@ -844,7 +833,7 @@ mod tests {
         assert_eq!(gate.enforcement(), "managed (coordinator)");
 
         // An unknown method is a loud error, not a silent no-op.
-        let mut stream = UnixStream::connect(&socket).expect("connect");
+        let mut stream = Stream::connect(&socket).expect("connect");
         writeln!(stream, r#"{{"method":"bogus"}}"#).expect("write");
         let mut line = String::new();
         BufReader::new(stream).read_line(&mut line).expect("read");
@@ -852,7 +841,7 @@ mod tests {
 
         // C4: a request with no newline in sight is answered with an
         // error at the cap instead of growing the daemon's memory.
-        let stream = UnixStream::connect(&socket).expect("connect");
+        let stream = Stream::connect(&socket).expect("connect");
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("timeout");

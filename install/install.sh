@@ -67,7 +67,12 @@ target() {
             esac
             ;;
         MINGW*|MSYS*|CYGWIN*)
-            die "Windows is not supported yet: the coordinator needs a Unix socket (SPEC.md §23)"
+            # Reachable: this runs under Git Bash, which every Git for Windows
+            # install ships. Point at the PowerShell installer rather than the
+            # releases page, because there IS a one-liner for this platform.
+            die "on Windows, use PowerShell:
+    irm https://raw.githubusercontent.com/$REPO/main/install/install.ps1 | iex
+  or download the .zip from https://github.com/$REPO/releases"
             ;;
         *) die "unsupported OS: $os" ;;
     esac
