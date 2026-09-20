@@ -72,6 +72,11 @@ pub fn kill_tree(child: &mut Child) -> io::Result<()> {
 /// which locks a byte range exclusively and fails immediately rather
 /// than waiting — the same contract, spelled twice.
 ///
+/// The file's CONTENT is never locked, on either platform: the Windows
+/// lock covers one byte far past end-of-file, because its byte-range
+/// locks are mandatory and a lock over the content would stop anybody
+/// else reading the PID written there.
+///
 /// One caveat, and it is the kernel's: the lock belongs to the open
 /// file description, and `fork` copies it. A process spawned while the
 /// lock is held owns a copy of the descriptor until it `exec`s, which
@@ -252,12 +257,18 @@ mod imp {
 
     pub fn try_lock_exclusive(file: &std::fs::File) -> io::Result<bool> {
         use std::os::windows::io::AsRawHandle;
-        // SAFETY: an exclusive byte-range lock over the whole file on a
-        // handle this process owns. `LockFile` never blocks — it fails
-        // immediately when any part of the range is already locked, which
-        // is `LOCK_NB` — and the lock goes when the handle closes,
-        // including on process death.
-        let locked = unsafe { LockFile(file.as_raw_handle() as _, 0, 0, u32::MAX, u32::MAX) };
+        // ONE byte, four gigabytes past anything the file will ever
+        // hold. Windows byte-range locks are MANDATORY, not advisory
+        // like `flock`: a lock over the file's actual content would stop
+        // every other process READING the PID inside it, which is the
+        // one thing that content is for. A range nothing reads is a
+        // pure token, and locking past end-of-file is legal.
+        const TOKEN_OFFSET_HIGH: u32 = 1;
+        // SAFETY: an exclusive byte-range lock on a handle this process
+        // owns. `LockFile` never blocks — it fails immediately when the
+        // range is already locked, which is `LOCK_NB` — and the lock
+        // goes when the handle closes, including on process death.
+        let locked = unsafe { LockFile(file.as_raw_handle() as _, 0, TOKEN_OFFSET_HIGH, 1, 0) };
         if locked != 0 {
             return Ok(true);
         }
