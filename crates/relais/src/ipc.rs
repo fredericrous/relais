@@ -69,6 +69,16 @@ impl Stream {
     pub fn try_clone(&self) -> io::Result<Self> {
         self.inner.try_clone().map(|inner| Self { inner })
     }
+
+    /// Half-close: this side sends nothing more, and the peer sees the
+    /// end of the answer. Dropping the stream instead is a full close,
+    /// and a full close with data still unread in the receive queue is a
+    /// RESET on Windows — which throws away the reply already queued for
+    /// the peer. A server that answers and hangs up (the over-long
+    /// request path) needs this, and the drain that goes with it.
+    pub fn shutdown_write(&self) -> io::Result<()> {
+        self.inner.shutdown(std::net::Shutdown::Write)
+    }
 }
 
 impl Read for Stream {

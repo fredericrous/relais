@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::admission::{
-    AdmissionState, Decision, DispatchRequest, Gate, GateError, HeartbeatStatus, ResourceClass,
-    RunRegistration, StatusSnapshot,
+    AdmissionState, BindOutcome, Decision, DispatchRequest, Gate, GateError, HeartbeatStatus,
+    ResourceClass, ResumeOutcome, RunRegistration, Signal, StatusSnapshot,
 };
 use crate::ipc::{Listener, Stream};
 use crate::ledger::Ledger;
@@ -31,7 +31,7 @@ use crate::policy::ConcurrencyLimits;
 /// Liveness without a signal that could terminate anything (SPEC §23:
 /// lease expiry never proves a worker died). Re-exported for `resume`.
 pub use crate::procs::alive as process_alive;
-use crate::procs::terminate;
+use crate::procs::{kill, terminate, LockFile};
 
 /// Defaults when machine settings name no limit. Illustrative sizing
 /// (SPEC §23), not benchmark-derived.
@@ -91,6 +91,13 @@ pub enum Request {
     Heartbeat {
         dispatch_id: String,
     },
+    /// The worker saw its cancellation on a heartbeat and is stopping:
+    /// the seat and the reservation go now rather than at lease grace
+    /// (C5). Without this on the wire, `acknowledge_cancel` existed and
+    /// nothing could ever call it.
+    AcknowledgeCancel {
+        dispatch_id: String,
+    },
     MarkWaiting {
         dispatch_id: String,
     },
@@ -131,13 +138,34 @@ pub enum Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
-    Ok { known: bool },
-    Error { detail: String },
-    Pong { pid: u32, version: String },
-    Decision { decision: Decision },
-    Heartbeat { status: HeartbeatStatus },
-    Cancelled { dispatches: Vec<String> },
-    Status { snapshot: StatusSnapshot },
+    /// `known` = the coordinator had the dispatch or run. `detail` says
+    /// why a call that was understood was nevertheless not applied — a
+    /// refused bind, a refused resume — so the caller gets a reason and
+    /// not just a false.
+    Ok {
+        known: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    Error {
+        detail: String,
+    },
+    Pong {
+        pid: u32,
+        version: String,
+    },
+    Decision {
+        decision: Decision,
+    },
+    Heartbeat {
+        status: HeartbeatStatus,
+    },
+    Cancelled {
+        dispatches: Vec<String>,
+    },
+    Status {
+        snapshot: StatusSnapshot,
+    },
 }
 
 /// The elected coordinator's runtime state.
@@ -145,48 +173,48 @@ pub struct Coordinator {
     pub state: Arc<Mutex<AdmissionState>>,
     socket_path: PathBuf,
     lock_path: PathBuf,
+    /// Held for the daemon's whole life. Dropping it — or dying, in any
+    /// way at all — is what lets the next coordinator elect.
+    lock: LockFile,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// Atomic election (SPEC §23): an exclusive lock file carrying the
-/// winner's PID. A stale lock (dead PID) is taken over; simultaneous
-/// startups never create independent schedulers. Returns the listener
-/// and the lock path the winner must remove on exit.
-pub fn elect(socket_path: &Path) -> Result<(Listener, PathBuf), CoordinatorError> {
+/// Atomic election (SPEC §23): an OS lock on `coordinator.lock`, held
+/// for the winner's lifetime. Simultaneous startups never create
+/// independent schedulers, and a coordinator that dies — cleanly, by
+/// panic, or by SIGKILL — releases the lock at the kernel, so the next
+/// `relais run` elects without anybody deleting a file.
+///
+/// The PID inside the file is informational. It used to be the election
+/// itself (`create_new` plus a liveness check on the content), and after
+/// a SIGKILL that PID got recycled by some unrelated process: every
+/// later election read a live PID, concluded a coordinator was serving,
+/// and refused — for ever (C7). The kernel does not confuse a recycled
+/// PID for a lock holder.
+///
+/// Returns the listener and the lock, which the winner must keep.
+pub fn elect(socket_path: &Path) -> Result<(Listener, LockFile), CoordinatorError> {
     let state_dir = socket_path.parent().expect("socket has a parent");
     std::fs::create_dir_all(state_dir).map_err(|e| CoordinatorError(e.to_string()))?;
     let lock_path = state_dir.join("coordinator.lock");
-    let pid = std::process::id().to_string();
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock_path)
-    {
-        Ok(mut file) => {
-            file.write_all(pid.as_bytes())
-                .map_err(|e| CoordinatorError(e.to_string()))?;
-            finish_election(socket_path).map(|listener| (listener, lock_path))
+    let mut lock = match LockFile::try_acquire(&lock_path) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            return Err(CoordinatorError(
+                "another coordinator is already serving this user".into(),
+            ))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let held = std::fs::read_to_string(&lock_path)
-                .ok()
-                .and_then(|text| text.trim().parse::<u32>().ok());
-            match held {
-                Some(held_pid) if held_pid != std::process::id() && !process_alive(held_pid) => {
-                    std::fs::write(&lock_path, &pid)
-                        .map_err(|e| CoordinatorError(e.to_string()))?;
-                    finish_election(socket_path).map(|listener| (listener, lock_path))
-                }
-                Some(_) => Err(CoordinatorError(
-                    "another coordinator is already serving this user".into(),
-                )),
-                None => Err(CoordinatorError(
-                    "lock file exists but is unreadable; refusing to double-elect".into(),
-                )),
-            }
+        Err(e) => {
+            return Err(CoordinatorError(format!(
+                "cannot take the coordinator lock at {}: {e}",
+                lock_path.display()
+            )))
         }
-        Err(e) => Err(CoordinatorError(e.to_string())),
-    }
+    };
+    // Who holds it, for a human reading the state directory. A failure
+    // here is not an election failure: the lock is already ours.
+    let _ = lock.write_pid();
+    finish_election(socket_path).map(|listener| (listener, lock))
 }
 
 fn finish_election(socket_path: &Path) -> Result<Listener, CoordinatorError> {
@@ -213,17 +241,31 @@ impl Coordinator {
         limits: ConcurrencyLimits,
         ledger: Option<&Ledger>,
     ) -> Result<(Self, Listener), CoordinatorError> {
-        let (listener, lock_path) = elect(socket_path)?;
+        let (listener, lock) = elect(socket_path)?;
+        let lock_path = socket_path
+            .parent()
+            .expect("socket has a parent")
+            .join("coordinator.lock");
         let mut state = AdmissionState::new(limits);
         if let Some(ledger) = ledger {
             let now = Instant::now();
             for (dispatch_id, run_id, pid) in ledger.live_dispatches().unwrap_or_default() {
-                let pid = pid.and_then(|pid| u32::try_from(pid).ok());
+                let Some(pid) = pid.and_then(|pid| u32::try_from(pid).ok()) else {
+                    // A `launched` row with no PID is a dispatch the
+                    // runner recorded before the process existed (SPEC
+                    // §12). Adopting it took a seat for a worker that
+                    // may never have started and that nothing can ever
+                    // bind — three killed runs used to take half the
+                    // seats at every start (C2). It is `relais resume`'s
+                    // to reconcile against the ledger, not a live lease.
+                    continue;
+                };
                 // A dead recorded process is not adopted: its ledger row
                 // is the runner's to reconcile, not a live seat.
-                if pid.is_some_and(|pid| !process_alive(pid)) {
+                if !process_alive(pid) {
                     continue;
                 }
+                let pid = Some(pid);
                 state.adopt(
                     &DispatchRequest {
                         dispatch_id,
@@ -245,6 +287,7 @@ impl Coordinator {
                 state: Arc::new(Mutex::new(state)),
                 socket_path: socket_path.to_path_buf(),
                 lock_path,
+                lock,
                 shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
             listener,
@@ -271,13 +314,22 @@ impl Coordinator {
                     let mut state = lock_state(&reconcile_state);
                     (state.reconcile(now, &process_alive), state.is_idle())
                 };
-                for (_dispatch, pid) in report.to_signal {
-                    terminate(pid);
+                // The state machine decided; sending is this side's job,
+                // and each dispatch is signalled at most twice in its
+                // life: once politely, once not (C5).
+                for (_dispatch, pid, signal) in report.to_signal {
+                    match signal {
+                        Signal::Terminate => terminate(pid),
+                        Signal::Kill => kill(pid),
+                    }
                 }
                 match (idle, idle_since) {
                     (false, _) => idle_since = None,
                     (true, None) => idle_since = Some(now),
                     (true, Some(since)) if now.saturating_duration_since(since) >= IDLE_EXIT => {
+                        // The endpoint goes first: a coordinator starting
+                        // in this window finds no answer on the socket
+                        // and waits for the lock, which exiting releases.
                         let _ = std::fs::remove_file(&socket_for_exit);
                         let _ = std::fs::remove_file(&lock_for_exit);
                         std::process::exit(0);
@@ -302,6 +354,11 @@ impl Coordinator {
             });
         }
         let _ = std::fs::remove_file(&self.socket_path);
+        // Release the lock before unlinking the file it is held on:
+        // Windows refuses to remove a file this process still has open,
+        // and a released lock with the file gone is what the next
+        // election expects on either platform.
+        drop(self.lock);
         let _ = std::fs::remove_file(&self.lock_path);
         Ok(())
     }
@@ -348,7 +405,7 @@ fn handle_connection(
         match serde_json::from_str::<Request>(line.trim()) {
             Ok(Request::Shutdown) => {
                 shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
-                Response::Ok { known: true }
+                ok(true)
             }
             Ok(request) => handle(request, &mut lock_state(state)),
             Err(e) => Response::Error {
@@ -358,7 +415,61 @@ fn handle_connection(
     };
     let payload = serde_json::to_string(&response).map_err(|e| e.to_string())?;
     writeln!(writer, "{payload}").map_err(|e| e.to_string())?;
+    writer.flush().map_err(|e| e.to_string())?;
+    if oversized {
+        // The answer is written, but the client is still sending the
+        // rest of its over-long request. Dropping the stream now closes
+        // a socket with unread data in its receive queue, which on
+        // Windows is a RESET: the reply this thread just wrote is
+        // discarded and the client sees "connection reset" instead of
+        // the reason it was refused. So: half-close, read what is left
+        // to a bound and throw it away, then let the stream drop. The
+        // cap is not buffered — it is read into an 8 KiB scratch and
+        // forgotten, which is what C4 is about.
+        let _ = writer.shutdown_write();
+        drain_and_discard(&writer);
+    }
     Ok(())
+}
+
+/// Briefly read and throw away whatever the peer is still sending, so
+/// the close that follows is a clean end of stream. Bounded twice —
+/// by bytes and by a short timeout — because the peer may be hostile,
+/// slow, or gone.
+fn drain_and_discard(stream: &Stream) {
+    const DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+    const DRAIN_LIMIT: u64 = 4 * MAX_REQUEST_BYTES;
+    let Ok(mut stream) = stream.try_clone() else {
+        return;
+    };
+    if stream.set_read_timeout(Some(DRAIN_TIMEOUT)).is_err() {
+        return;
+    }
+    let mut scratch = [0u8; 8 * 1024];
+    let mut left = DRAIN_LIMIT;
+    while left > 0 {
+        match stream.read(&mut scratch) {
+            Ok(0) | Err(_) => return,
+            Ok(read) => left = left.saturating_sub(read as u64),
+        }
+    }
+}
+
+/// `Ok` with no further explanation: the call applied, or the
+/// coordinator does not know the subject.
+fn ok(known: bool) -> Response {
+    Response::Ok {
+        known,
+        detail: None,
+    }
+}
+
+/// `Ok` for a call that was understood and deliberately not applied.
+fn ok_with(known: bool, detail: String) -> Response {
+    Response::Ok {
+        known,
+        detail: Some(detail),
+    }
 }
 
 /// Pure dispatch of one request against the state; the unit the socket
@@ -372,11 +483,11 @@ pub fn handle(request: Request, state: &mut AdmissionState) -> Response {
         },
         Request::RegisterSession { session_id } => {
             state.register_session(&session_id);
-            Response::Ok { known: true }
+            ok(true)
         }
         Request::RegisterRun { registration } => {
             state.register_run(&registration);
-            Response::Ok { known: true }
+            ok(true)
         }
         Request::RequestAdmission { request } => Response::Decision {
             decision: state.request(&request, now),
@@ -385,33 +496,61 @@ pub fn handle(request: Request, state: &mut AdmissionState) -> Response {
             dispatch_id,
             agent_id,
             pid,
-        } => Response::Ok {
-            known: state.bind(&dispatch_id, agent_id.as_deref(), pid),
+        } => match state.bind(&dispatch_id, agent_id.as_deref(), pid, now, &process_alive) {
+            BindOutcome::Bound => ok(true),
+            BindOutcome::UnknownDispatch => ok(false),
+            // C6: the PID comes off the wire. One that is not running
+            // cannot be this client's worker, and once the OS reuses the
+            // number it would be somebody else's process — which
+            // reconcile would later terminate as a cancelled worker.
+            BindOutcome::PidNotAlive => ok_with(
+                false,
+                format!(
+                    "pid {} is not a live process; dispatch {dispatch_id} keeps no process binding",
+                    pid.unwrap_or(0)
+                ),
+            ),
         },
         Request::Heartbeat { dispatch_id } => Response::Heartbeat {
             status: state.heartbeat(&dispatch_id, now),
         },
-        Request::MarkWaiting { dispatch_id } => Response::Ok {
-            known: state.mark_waiting(&dispatch_id, now),
+        Request::AcknowledgeCancel { dispatch_id } => {
+            ok(state.acknowledge_cancel(&dispatch_id, now))
+        }
+        Request::MarkWaiting { dispatch_id } => {
+            let marked = state.mark_waiting(&dispatch_id, now, &process_alive);
+            if marked {
+                ok(true)
+            } else {
+                // C8: waiting is a self-report. The least it has to be is
+                // a live, bound process making it.
+                ok_with(
+                    false,
+                    format!(
+                        "dispatch {dispatch_id} is unknown, or has no live bound process to be \
+                         waiting; the seat is not given back on an unverifiable claim"
+                    ),
+                )
+            }
+        }
+        Request::Resume { dispatch_id } => match state.resume(&dispatch_id, now) {
+            ResumeOutcome::Resumed => ok(true),
+            ResumeOutcome::UnknownDispatch => ok(false),
+            ResumeOutcome::OverAdmitted { over, max } => ok_with(
+                false,
+                format!(
+                    "resuming {dispatch_id} would hold {over} seats beyond the class cap, past \
+                     the configured maximum of {max}; it stays waiting and can poll again"
+                ),
+            ),
         },
-        Request::Resume { dispatch_id } => Response::Ok {
-            known: state.resume(&dispatch_id, now),
-        },
-        Request::Release { dispatch_id } => Response::Ok {
-            known: state.release(&dispatch_id, now),
-        },
+        Request::Release { dispatch_id } => ok(state.release(&dispatch_id, now)),
         Request::Settle {
             dispatch_id,
             spent_micros,
-        } => Response::Ok {
-            known: state.settle(&dispatch_id, spent_micros, now),
-        },
-        Request::Withdraw { dispatch_id } => Response::Ok {
-            known: state.withdraw(&dispatch_id, now),
-        },
-        Request::FinishRun { run_id } => Response::Ok {
-            known: state.finish_run(&run_id),
-        },
+        } => ok(state.settle(&dispatch_id, spent_micros, now)),
+        Request::Withdraw { dispatch_id } => ok(state.withdraw(&dispatch_id, now)),
+        Request::FinishRun { run_id } => ok(state.finish_run(&run_id)),
         Request::CancelDispatch { dispatch_id } => {
             let signalled = state.cancel_dispatch(&dispatch_id, now);
             for (_, pid) in &signalled {
@@ -442,7 +581,7 @@ pub fn handle(request: Request, state: &mut AdmissionState) -> Response {
         Request::Status => Response::Status {
             snapshot: state.status(now),
         },
-        Request::Shutdown => Response::Ok { known: true },
+        Request::Shutdown => ok(true),
     }
 }
 
@@ -549,12 +688,19 @@ impl Gate for RemoteGate {
         agent_id: Option<&str>,
         pid: Option<u32>,
     ) -> Result<(), GateError> {
-        self.call(Request::Bind {
+        match self.call(Request::Bind {
             dispatch_id: dispatch_id.into(),
             agent_id: agent_id.map(str::to_string),
             pid,
-        })
-        .map(|_| ())
+        })? {
+            // A bind the coordinator understood and refused (a PID it
+            // cannot see running) is an error to the caller, not silence.
+            Response::Ok {
+                detail: Some(detail),
+                ..
+            } => Err(GateError(detail)),
+            _ => Ok(()),
+        }
     }
 
     fn heartbeat(&self, dispatch_id: &str) -> Result<HeartbeatStatus, GateError> {
@@ -566,18 +712,37 @@ impl Gate for RemoteGate {
         }
     }
 
-    fn mark_waiting(&self, dispatch_id: &str) -> Result<(), GateError> {
-        self.call(Request::MarkWaiting {
+    fn acknowledge_cancel(&self, dispatch_id: &str) -> Result<(), GateError> {
+        self.call(Request::AcknowledgeCancel {
             dispatch_id: dispatch_id.into(),
         })
         .map(|_| ())
     }
 
-    fn resume(&self, dispatch_id: &str) -> Result<(), GateError> {
-        self.call(Request::Resume {
+    fn mark_waiting(&self, dispatch_id: &str) -> Result<(), GateError> {
+        match self.call(Request::MarkWaiting {
             dispatch_id: dispatch_id.into(),
-        })
-        .map(|_| ())
+        })? {
+            Response::Ok {
+                detail: Some(detail),
+                ..
+            } => Err(GateError(detail)),
+            _ => Ok(()),
+        }
+    }
+
+    fn resume(&self, dispatch_id: &str) -> Result<(), GateError> {
+        match self.call(Request::Resume {
+            dispatch_id: dispatch_id.into(),
+        })? {
+            // Over the over-admission ceiling: the parent stays waiting
+            // and the caller polls again (C8).
+            Response::Ok {
+                detail: Some(detail),
+                ..
+            } => Err(GateError(detail)),
+            _ => Ok(()),
+        }
     }
 
     fn release(&self, dispatch_id: &str) -> Result<(), GateError> {
@@ -744,6 +909,25 @@ mod tests {
         }
     }
 
+    /// Elect, allowing for the window in which a process another test
+    /// spawned still holds an inherited copy of a released lock
+    /// descriptor (see `procs::LockFile`). Production answers the same
+    /// window by retrying: `ensure_running` pings until the daemon
+    /// answers.
+    fn elect_within(
+        socket: &Path,
+        patience: Duration,
+    ) -> Result<(Listener, LockFile), CoordinatorError> {
+        let deadline = Instant::now() + patience;
+        loop {
+            match elect(socket) {
+                Ok(won) => return Ok(won),
+                Err(e) if Instant::now() >= deadline => return Err(e),
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
     fn registration(run: &str, session: &str) -> RunRegistration {
         RunRegistration {
             run_id: run.into(),
@@ -770,6 +954,7 @@ mod tests {
     fn election_is_atomic_and_socket_is_owner_only() {
         let dir = temp_dir("elect");
         let socket = dir.join("relais.sock");
+        let lock_path = dir.join("coordinator.lock");
         let (listener, lock) = elect(&socket).expect("first coordinator wins");
         assert!(
             elect(&socket).is_err(),
@@ -785,12 +970,47 @@ mod tests {
             socket.exists(),
             "the endpoint is at the path on every platform"
         );
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).expect("lock").trim(),
+            std::process::id().to_string(),
+            "the holder is named in the file, for a human"
+        );
         drop(listener);
-        // A lock naming a dead PID is taken over; a leftover socket that
-        // nobody answers is removed on the way.
-        std::fs::write(&lock, "999999999").expect("stale lock");
-        let (listener, _) = elect(&socket).expect("stale lock is taken over");
+        drop(lock);
+        let (listener, lock) =
+            elect_within(&socket, Duration::from_secs(5)).expect("a released lock is taken");
         drop(listener);
+        drop(lock);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // C7: the wedge. A lock file left behind by a SIGKILLed coordinator,
+    // whose PID content has since been recycled by an unrelated LIVE
+    // process, used to refuse every election until somebody deleted the
+    // file by hand. The kernel knows nobody holds the lock.
+    #[test]
+    fn a_lock_file_with_a_live_foreign_pid_and_no_holder_is_taken_over() {
+        let dir = temp_dir("wedge");
+        let socket = dir.join("relais.sock");
+        let lock_path = dir.join("coordinator.lock");
+        // This very process: unquestionably alive, unquestionably not a
+        // coordinator serving this socket.
+        std::fs::write(&lock_path, std::process::id().to_string()).expect("stale lock");
+        // And a leftover endpoint nobody answers, from the same death.
+        std::fs::write(&socket, "leftover").expect("stale endpoint");
+        let (listener, lock) =
+            elect_within(&socket, Duration::from_secs(5)).expect("no holder: the lock is free");
+        assert!(socket.exists(), "the stale endpoint was replaced, not kept");
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).expect("lock").trim(),
+            std::process::id().to_string()
+        );
+        assert!(
+            elect(&socket).is_err(),
+            "and now it really is held: nobody else elects"
+        );
+        drop(listener);
+        drop(lock);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -847,20 +1067,33 @@ mod tests {
             .expect("timeout");
         let mut writer = stream.try_clone().expect("clone");
         let flood = std::thread::spawn(move || {
-            // The server stops reading at the cap and closes: the tail of
-            // this write is expected to fail, which is the point.
+            // The server stops reading at the cap: the tail of this
+            // write may or may not land, which is the point.
             let _ = writer.write_all(&vec![b'a'; MAX_REQUEST_BYTES as usize + 64]);
         });
         let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line).expect("read");
-        assert!(line.contains("exceeds"), "{line}");
+        // The server answers at the cap, half-closes and drains the rest
+        // rather than resetting the connection, so the answer survives
+        // the flood on every platform. A read that fails anyway is a
+        // transport verdict, not a buffered daemon — assert the thing
+        // C4 is about, and say which happened.
+        match BufReader::new(stream).read_line(&mut line) {
+            Ok(_) => assert!(line.contains("exceeds"), "{line}"),
+            // Windows resets a connection whose receive queue still holds
+            // bytes at close, and a flooding client can always leave one
+            // more packet in flight than the drain waited for. A reset
+            // there still proves the daemon refused at the cap instead of
+            // buffering; anything else, on any platform, is a failure.
+            Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(e) => panic!("the refusal was lost to the transport: {e}"),
+        }
         let _ = flood.join();
 
         // Shutdown removes the socket and lock; a state snapshot taken
         // through the shared handle still reflects the served run.
         assert!(matches!(
             client.request(&Request::Shutdown).expect("shutdown"),
-            Response::Ok { known: true }
+            Response::Ok { known: true, .. }
         ));
         // The accept loop needs one more connection to observe the flag.
         let _ = Client::new(socket.clone()).ping();
@@ -871,6 +1104,110 @@ mod tests {
             state.lock().expect("lock").status(Instant::now()).runs["run-1"].admitted_total,
             2
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // C9: every other "simultaneous" test is sequential calls on the
+    // state machine. This one drives the real socket from twelve
+    // threads at once — the shape SPEC §23 actually describes — and
+    // asserts the caps hold under a genuine race, not a script.
+    #[test]
+    fn twelve_threads_racing_the_socket_see_exactly_the_cap_granted() {
+        const THREADS: usize = 12;
+        let dir = temp_dir("race");
+        let socket = dir.join("relais.sock");
+        let limits = ConcurrencyLimits {
+            max_active_agents: Some(4),
+            // Per-session and per-run caps out of the way: the global cap
+            // is the one under test.
+            max_active_agents_per_session: Some(THREADS as u32),
+            max_heavy_commands: Some(1),
+            max_training_jobs: Some(1),
+            max_agent_depth: Some(3),
+            max_agents_per_run: Some(64),
+            training_when_idle: false,
+        };
+        let (coordinator, listener) = Coordinator::start(&socket, limits, None).expect("start");
+        let server = std::thread::spawn(move || coordinator.serve(listener));
+        let client = Client::new(socket.clone());
+        client
+            .request(&Request::RegisterRun {
+                registration: registration("run-race", "tab-race"),
+            })
+            .expect("register");
+
+        // Everybody blocks on the same gate, then asks at once.
+        let start = Arc::new(std::sync::Barrier::new(THREADS));
+        let workers: Vec<_> = (0..THREADS)
+            .map(|n| {
+                let socket = socket.clone();
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    let gate = RemoteGate::new(socket);
+                    start.wait();
+                    gate.admit(&request(&format!("d-{n}"), "run-race", "tab-race"))
+                        .expect("admit")
+                })
+            })
+            .collect();
+        let decisions: Vec<Decision> = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker"))
+            .collect();
+        let granted = decisions
+            .iter()
+            .filter(|decision| **decision == Decision::Granted)
+            .count();
+        let queued = decisions
+            .iter()
+            .filter(|decision| matches!(decision, Decision::Queued { .. }))
+            .count();
+        assert_eq!(granted, 4, "exactly the cap was granted: {decisions:?}");
+        assert_eq!(queued, THREADS - 4, "the rest queued: {decisions:?}");
+        let snapshot = client.status().expect("status");
+        assert_eq!(snapshot.active_by_class["model_work"], 4);
+        assert_eq!(snapshot.queued as usize, THREADS - 4);
+        assert_eq!(snapshot.over_admitted, 0);
+
+        // Drain the whole queue by releasing what is admitted, four at a
+        // time, and polling with the same IDs. Nothing is granted twice.
+        let gate = RemoteGate::new(socket.clone());
+        let mut served: std::collections::BTreeSet<String> = (0..THREADS)
+            .zip(decisions.iter())
+            .filter(|(_, decision)| **decision == Decision::Granted)
+            .map(|(n, _)| format!("d-{n}"))
+            .collect();
+        let mut holding: Vec<String> = served.iter().cloned().collect();
+        let mut rounds = 0;
+        while served.len() < THREADS {
+            rounds += 1;
+            assert!(rounds <= THREADS, "the queue drains");
+            for id in holding.drain(..) {
+                gate.release(&id).expect("release");
+                gate.settle(&id, Some(0)).expect("settle");
+            }
+            for n in 0..THREADS {
+                let id = format!("d-{n}");
+                if served.contains(&id) {
+                    continue;
+                }
+                if gate
+                    .admit(&request(&id, "run-race", "tab-race"))
+                    .expect("poll")
+                    == Decision::Granted
+                {
+                    served.insert(id.clone());
+                    holding.push(id);
+                }
+            }
+        }
+        let snapshot = client.status().expect("status");
+        assert_eq!(snapshot.queued, 0, "every request was served");
+        assert_eq!(snapshot.runs["run-race"].admitted_total, THREADS as u32);
+
+        let _ = client.request(&Request::Shutdown);
+        let _ = Client::new(socket.clone()).ping();
+        server.join().expect("server thread").expect("serve");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -892,6 +1229,15 @@ mod tests {
         ledger
             .attach_dispatch_process("dead", Some(999_999_999), None)
             .expect("attach");
+        // C2: `launched`, no PID — the row managed_launch writes BEFORE
+        // the process exists. Adopting it took a seat nothing could ever
+        // bind or free; `relais resume` reconciles it against the ledger.
+        ledger
+            .record_dispatch_intent("pidless", "run-x", None, &serde_json::json!({}), 0)
+            .expect("intent");
+        ledger
+            .attach_dispatch_process("pidless", None, Some("sess"))
+            .expect("attach");
         ledger
             .record_dispatch_intent("finished", "run-x", None, &serde_json::json!({}), 0)
             .expect("intent");
@@ -903,7 +1249,11 @@ mod tests {
         drop(listener);
         let state = coordinator.state.lock().expect("lock");
         let snapshot = state.status(Instant::now());
-        assert_eq!(snapshot.active_by_class.get("model_work"), Some(&1));
+        assert_eq!(
+            snapshot.active_by_class.get("model_work"),
+            Some(&1),
+            "only the live, bound dispatch is adopted"
+        );
         assert_eq!(snapshot.runs["run-x"].admitted_total, 1);
         drop(state);
         std::fs::remove_file(&socket).ok();

@@ -363,6 +363,14 @@ impl<'a> RunEngine<'a> {
                             BlockCode::AdmissionRefused,
                             detail,
                         )?,
+                        // C8: this dispatch ID already ran and settled.
+                        // Launching it again duplicates an agent, so it
+                        // ends exactly where `AlreadyAdmitted` does.
+                        Refusal::AlreadyFinished => self.finish(
+                            Reason::DuplicateDispatch,
+                            serde_json::json!({ "dispatch_id": spec.dispatch_id }),
+                            Terminal::Interrupted { detail },
+                        )?,
                     }));
                 }
             }
@@ -405,6 +413,9 @@ impl<'a> RunEngine<'a> {
                         if let Ok(status) = gate.heartbeat(&dispatch_id) {
                             if status.cancelled {
                                 cancel.store(true, Ordering::SeqCst);
+                                // The seat and the reservation go now,
+                                // not at lease grace (C5).
+                                let _ = gate.acknowledge_cancel(&dispatch_id);
                             }
                         }
                     }
