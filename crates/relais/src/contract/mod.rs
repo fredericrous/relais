@@ -416,6 +416,18 @@ fn is_valid_package_id(id: &str) -> bool {
 /// bound; the prompt's fence is the second line of defence.
 pub const MAX_PACKAGE_OBJECTIVE_CHARS: usize = 2000;
 
+/// The largest `limits.max_packages` a plan may declare. A plan is a
+/// bounded decomposition (SPEC §19), and the effective authority's own
+/// agent cap is what actually governs — this is the outer bound that
+/// keeps the scheduler's `packages x attempts` arithmetic in range
+/// whatever a contract or a planner asks for.
+pub const MAX_PLAN_PACKAGES: u32 = 64;
+
+/// The largest `limits.attempts_per_package` a plan may declare. The
+/// run's own attempt ceiling is usually far lower and the scheduler
+/// checks against it too.
+pub const MAX_ATTEMPTS_PER_PACKAGE: u32 = 16;
+
 fn is_valid_package_objective(objective: &str) -> bool {
     objective.chars().count() <= MAX_PACKAGE_OBJECTIVE_CHARS && !objective.contains(['\n', '\r'])
 }
@@ -437,6 +449,26 @@ impl WorkPlan {
         }
         if self.limits.attempts_per_package < 1 {
             return Err(ContractError::BadAttempts(self.limits.attempts_per_package));
+        }
+        // Both limits are contract-supplied, and under
+        // `"decomposition": "propose"` the whole plan is model output.
+        // The scheduler multiplies them to size the worst case against
+        // the agent cap; unbounded, that product is what overflows
+        // (R11). Bounding each factor here means the plan is refused
+        // with a message naming the field, before anything is dispatched.
+        if self.limits.max_packages > MAX_PLAN_PACKAGES {
+            return Err(ContractError::PlanLimitTooLarge {
+                field: "max_packages",
+                value: self.limits.max_packages,
+                max: MAX_PLAN_PACKAGES,
+            });
+        }
+        if self.limits.attempts_per_package > MAX_ATTEMPTS_PER_PACKAGE {
+            return Err(ContractError::PlanLimitTooLarge {
+                field: "attempts_per_package",
+                value: self.limits.attempts_per_package,
+                max: MAX_ATTEMPTS_PER_PACKAGE,
+            });
         }
         if self.integration_acceptance.is_empty() {
             return Err(ContractError::PlanMissingIntegrationAcceptance);
@@ -573,6 +605,13 @@ pub enum ContractError {
     DecompositionOnInspect,
     PlanTooSmall(usize),
     PlanTooLarge(usize, u32),
+    /// A plan's own limit is beyond what a bounded decomposition may
+    /// declare, whoever wrote it.
+    PlanLimitTooLarge {
+        field: &'static str,
+        value: u32,
+        max: u32,
+    },
     PlanMissingIntegrationAcceptance,
     PlanDuplicatePackage(String),
     PlanBadPackageId(String),
@@ -620,6 +659,11 @@ impl std::fmt::Display for ContractError {
             Self::PlanTooLarge(n, max) => {
                 write!(f, "work plan has {n} packages, more than its limit {max}")
             }
+            Self::PlanLimitTooLarge { field, value, max } => write!(
+                f,
+                "work plan limits.{field} is {value}, more than the {max} a bounded \
+                 decomposition may declare"
+            ),
             Self::PlanMissingIntegrationAcceptance => write!(
                 f,
                 "work plan needs integration_acceptance: independent receipts are not final acceptance"
@@ -997,6 +1041,49 @@ mod tests {
             integration_acceptance: vec!["the whole thing builds".into()],
             limits: PlanLimits::default(),
         }
+    }
+
+    /// R11: the scheduler sizes a plan's worst case as `packages x
+    /// attempts_per_package`. Both factors are contract-supplied — and
+    /// under `"decomposition": "propose"` they are model output — so a
+    /// plan that declares limits beyond a bounded decomposition is
+    /// refused here, before anything multiplies them.
+    #[test]
+    fn a_plans_own_limits_are_bounded() {
+        let mut plan = plan_with_ids("api", "web");
+        plan.limits.attempts_per_package = u32::MAX;
+        let err = plan.validate().expect_err("an unbounded attempt count");
+        assert!(
+            matches!(
+                err,
+                ContractError::PlanLimitTooLarge {
+                    field: "attempts_per_package",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(err.to_string().contains("attempts_per_package"), "{err}");
+
+        let mut plan = plan_with_ids("api", "web");
+        plan.limits.max_packages = u32::MAX;
+        let err = plan.validate().expect_err("an unbounded package count");
+        assert!(
+            matches!(
+                err,
+                ContractError::PlanLimitTooLarge {
+                    field: "max_packages",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+
+        // The defaults, and the outer bounds themselves, are fine.
+        let mut plan = plan_with_ids("api", "web");
+        plan.limits.max_packages = MAX_PLAN_PACKAGES;
+        plan.limits.attempts_per_package = MAX_ATTEMPTS_PER_PACKAGE;
+        plan.validate().expect("the bounds themselves are allowed");
     }
 
     // SPEC §19 + the scheduler: a package id is a directory name on disk,

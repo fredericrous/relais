@@ -232,6 +232,68 @@ stopped (`relais coordinator stop`) before the first command of this version.
 
 ### Runner
 
+- **A decomposed run no longer spends its ceiling twice.** The reviewer of
+  an assembled candidate was handed a spend of zero, so a run whose work
+  packages had already used the whole `per_run` ceiling still bought a
+  review on top of it — a 100-micro ceiling could spend 200. The review is
+  now judged against what the run has actually spent, read from the ledger,
+  and a run past its ceiling ends `needs_review` with the reviewer never
+  dispatched.
+- **A repair worker the harness refused says which tools to grant.**
+  "The worker produced nothing" was measured against the BASE revision, so
+  from the second attempt on the previous attempt's changes made a refused
+  worker look productive: the run reported a recurring failure and bought a
+  stronger model, instead of `blocked` with the missing permission named.
+  It is now measured against the previous attempt's candidate.
+- **A write lease the coordinator will not take back no longer strands an
+  acceptable candidate.** Leases have no expiry, so one dropped socket call
+  left the run's own finished dispatch on record as the worktree's writer
+  and verification waited for it until the wall clock ran out — reporting a
+  passing candidate as `interrupted`. The release is retried once, a
+  failure is recorded as a `write_lease_not_released` transition, and
+  verification never waits on a lease this run holds itself.
+- **A coordinator that stops answering heartbeats ends the run instead of
+  being ignored.** Cancellation reaches a worker only on the heartbeat, so
+  a coordinator restart quietly made `relais cancel` a no-op for as long as
+  the worker ran. Three consecutive unanswered heartbeats now end the run
+  `interrupted` with reason `coordinator_unreachable`, evidence preserved.
+- **The reviewer of an assembled candidate is sent to a patch that
+  exists.** Its prompt named `candidate-latest.patch`, which only the
+  single-worker path writes; a decomposed run exports
+  `candidate-integrated.patch`. The patch to read is now part of the review
+  request rather than a path assumed at the far end.
+- **`verifying` appears in a run's history.** The state was assigned
+  directly to the runner's own field, so the ledger never recorded entering
+  it and the next row claimed to come from a state no row named.
+- **An accepted decomposed run releases its integration worktree.** One
+  permanent entry in `git worktree list` was left behind per accepted run.
+  It is released under the same three conditions a task worktree is — the
+  patch is exported, a ref names the revision, and the tree still holds
+  exactly it — and kept, on the record, otherwise. A decomposed run that
+  ended without integrating anything releases it too.
+- **A receipt names every model the run paid for.** The planner's model was
+  folded into `models_used` only when the assembled candidate happened to
+  need a review, so a receipt could bill a model it did not name.
+- **A review verdict is the reviewer's last word.** "findings: none"
+  anywhere in the last five lines counted as a pass, so a reviewer quoting
+  the phrase inside a finding was read as clean; and an answer with no
+  verdict at all was reported as findings by default. The verdict is now
+  the last non-empty line, and an answer that carries none ends the run
+  `needs_review` saying so, never `accepted`.
+- **An integration that cannot be read is an error, not an empty
+  revision.** `git rev-parse HEAD` went unchecked after a fast-forward, so
+  a failure produced `Ok("")` that travelled on as the integrated revision.
+- **A work plan's own limits are bounded.** `packages x
+  attempts_per_package` — both contract-supplied, and model output under
+  `"decomposition": "propose"` — was an unchecked multiplication. The
+  product saturates and each factor is now validated where the plan is.
+- **A run that cannot record its evidence does not accept.** The review
+  artifact was written best-effort and then hashed with the failure
+  discarded, and check-log evidence rows were dropped silently. Writing an
+  artifact and recording the evidence row that points at it are one
+  fallible operation; a failure ends the run `needs_review` or
+  `interrupted`, never `accepted` with evidence nobody can find.
+
 ### Adapter, verification and workspace
 
 - **A worker that backgrounds something no longer holds the run open.**
