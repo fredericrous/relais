@@ -48,6 +48,10 @@ jobs:
           key: cargo-lint-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
+      # The third command of `make lint`: the module graph is acyclic and
+      # `policy` is pure. Python 3 is on the runner image and on the
+      # workstation; nothing else is installed for this.
+      - run: python3 scripts/check-module-cycles.py
 
   # `make test`: the library suite plus the release scenarios, which drive
   # the real binary against a fake `claude`, a temporary repository and a
