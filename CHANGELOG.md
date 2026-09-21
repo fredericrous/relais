@@ -624,6 +624,9 @@ unknown run 2 → 10, and "nothing to train on yet" 2 → 14.
   ambient environment, so the test asserted the fallback only when
   neither happened to be set. The lookup is injected the way
   `paths::resolve_home` is, and every branch is asserted unconditionally.
+- **`relais plan` names a blocker once.** `Blocked::explain` lists every
+  blocker with its code on stdout, and `plan` then repeated the whole
+  list on stderr — so a plan blocked by one thing reported it twice.
 - **The review this release came out of is in the repository.**
   `docs/REVIEW-2026-09-21.md` carries every finding against `f231b7f`,
   with a status column naming the pull request that fixed each one or the

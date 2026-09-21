@@ -315,9 +315,16 @@ fn plan_without_a_trust_grant_is_blocked_and_prints_the_grant() {
     assert!(stdout.contains("[trust.\""), "{stdout}");
     assert!(stdout.contains("reviewed_by = \"<your name>\""), "{stdout}");
     assert!(stdout.contains("granted_at = "), "{stdout}");
+    // The blocker's code appears exactly once: `explain` lists it, and
+    // `plan` used to repeat the whole list on stderr as well.
+    assert_eq!(
+        stdout.matches("missing_trust_grant").count(),
+        1,
+        "the refusal is named once, with its code: {stdout}"
+    );
     assert!(
-        text(&plan.stderr).contains("missing_trust_grant"),
-        "and the block code says which refusal it was: {}",
+        !text(&plan.stderr).contains("missing_trust_grant"),
+        "and not a second time on stderr: {}",
         text(&plan.stderr)
     );
     // Nothing was executed and no run exists.

@@ -1326,10 +1326,10 @@ fn plan_command(task: &Path) -> Result<CliOutcome, CliError> {
             Ok(CliOutcome::Accepted)
         }
         route::Routed::Blocked(blocked) => {
+            // `explain` already lists every blocker with its code; this
+            // used to print them a second time on stderr, so a plan
+            // blocked by one thing reported it twice.
             print!("{}", blocked.explain());
-            for blocker in blocked.blockers() {
-                eprintln!("blocked: {} — {}", blocker.code, blocker.detail);
-            }
             Ok(CliOutcome::Blocked)
         }
     }
