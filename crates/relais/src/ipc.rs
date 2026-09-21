@@ -611,7 +611,7 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap();
-        let server = std::thread::spawn(move || listener.incoming().next().expect("one"));
+        let server = std::thread::spawn(move || listener.accept());
         let mut raw = TcpStream::connect(("127.0.0.1", port)).expect("tcp");
         let junk = [b'0'; 65];
         raw.write_all(&junk).expect("write");
@@ -620,6 +620,6 @@ mod tests {
             accepted.unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
-        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(path.parent().expect("dir")).ok();
     }
 }
