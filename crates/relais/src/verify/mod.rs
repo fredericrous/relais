@@ -106,10 +106,10 @@ pub fn run_command(
         .current_dir(dir)
         .stdout(log_file.try_clone()?)
         .stderr(log_file);
-    crate::adapter::own_process_group(&mut command);
+    crate::procs::own_process_group(&mut command);
     let mut child = command.spawn()?;
     let timeout = Duration::from_secs(spec.timeout_seconds.max(1));
-    let (status, timed_out, _cancelled) = crate::adapter::wait_for_exit(&mut child, timeout, None)?;
+    let (status, timed_out, _cancelled) = crate::procs::wait_for_exit(&mut child, timeout, None)?;
     let log_bytes = std::fs::read(&log_path)?;
     Ok(CheckOutcome {
         label: label.to_string(),

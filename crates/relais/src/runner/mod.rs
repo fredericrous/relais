@@ -24,8 +24,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::adapter::{Backend, LaunchResult, LaunchSpec};
 use crate::admission::{Decision, DispatchRequest, Gate, Refusal, ResourceClass, RunRegistration};
+use crate::backend::{Backend, LaunchResult, LaunchSpec};
 use crate::context::{self, AvalVerdict, ContextError, ContextManifest};
 use crate::contract::{Review, TaskContract};
 use crate::ids::{DispatchId, RunId};
@@ -720,7 +720,7 @@ impl<'a> RunEngine<'a> {
             // enforceable at all on this harness (SPEC §11).
             turn_ceiling: capabilities
                 .as_ref()
-                .map(crate::adapter::Capabilities::turn_ceiling)
+                .map(crate::backend::Capabilities::turn_ceiling)
                 .unwrap_or_default(),
             resolver: &resolver,
         }) {
@@ -1095,7 +1095,7 @@ impl<'a> RunEngine<'a> {
             if let Some(effective) = result
                 .effective_model
                 .as_deref()
-                .filter(|model| !crate::adapter::model_matches(&model_profile.id, model))
+                .filter(|model| !crate::backend::model_matches(&model_profile.id, model))
             {
                 return self.stop(
                     &progress.budget,
@@ -2609,8 +2609,8 @@ mod tests {
         }
     }
 
-    fn usage(cost_micros: i64) -> crate::adapter::UsageReport {
-        crate::adapter::UsageReport {
+    fn usage(cost_micros: i64) -> crate::backend::UsageReport {
+        crate::backend::UsageReport {
             input_tokens: Some(100),
             output_tokens: Some(10),
             cache_read_tokens: None,
@@ -3596,7 +3596,7 @@ mod tests {
                 result_text: Some("DONE".into()),
                 exit_code: Some(0),
                 // The harness said nothing about cost.
-                usage: Some(crate::adapter::UsageReport::unknown()),
+                usage: Some(crate::backend::UsageReport::unknown()),
                 ..Default::default()
             }
         });
@@ -4863,7 +4863,7 @@ mod tests {
             constraints,
             budget_bytes: 100_000,
             package_bytes: 0,
-            turn_ceiling: crate::adapter::TurnCeiling::Unavailable.as_str().into(),
+            turn_ceiling: crate::backend::TurnCeiling::Unavailable.as_str().into(),
         }
     }
 

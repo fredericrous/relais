@@ -14,7 +14,7 @@
 use serde::Serialize;
 use std::path::Path;
 
-use crate::adapter::{Backend, Capabilities};
+use crate::backend::{Backend, Capabilities};
 use crate::policy::{Dependency, DependencyMode, MachineSettings, RepoPolicy};
 use crate::{ledger::Ledger, paths};
 

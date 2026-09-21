@@ -1,4 +1,4 @@
-//! A mock backend for tests and dry runs: behavior is a closure over the
+//! A mock backend for the crate's own tests: behavior is a closure over the
 //! launch spec, so scenario tests can act as a scripted worker — creating
 //! files in the worktree, claiming blockage, crashing, or substituting a
 //! different effective model. It advertises exactly what it enforces
@@ -7,9 +7,9 @@
 
 use std::sync::Arc;
 
-use super::{
-    Backend, Capabilities, LaunchResult, LaunchSpec, PermissionEnforcement, SandboxCapability,
-    UsageReport,
+use crate::backend::{
+    claims_blockage, Backend, BackendError, Capabilities, LaunchResult, LaunchSpec,
+    PermissionEnforcement, SandboxCapability, UsageReport,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -58,7 +58,7 @@ impl Backend for MockBackend {
         })
     }
 
-    fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, super::BackendError> {
+    fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError> {
         let outcome = (self.behavior)(spec);
         Ok(LaunchResult {
             dispatch_id: spec.dispatch_id.clone(),
@@ -74,10 +74,7 @@ impl Backend for MockBackend {
             session_id: outcome.session_id,
             effective_model: outcome.effective_model.or(Some(spec.model.clone())),
             usage: outcome.usage.unwrap_or(UsageReport::unknown()),
-            worker_claims_blockage: outcome
-                .result_text
-                .as_deref()
-                .is_some_and(super::claims_blockage),
+            worker_claims_blockage: outcome.result_text.as_deref().is_some_and(claims_blockage),
             cancelled: spec
                 .cancel
                 .as_ref()

@@ -21,7 +21,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::adapter::LaunchSpec;
+use crate::backend::LaunchSpec;
 use crate::context::ContextManifest;
 use crate::contract::{Decomposition, DecompositionMode, Kind, TaskContract, WorkPlan};
 use crate::contract::{Review, WorkPackage};

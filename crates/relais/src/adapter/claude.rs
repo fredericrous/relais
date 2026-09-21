@@ -12,11 +12,12 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use super::{
-    run_with_timeout, Backend, BackendError, Capabilities, LaunchResult, LaunchSpec,
+use crate::backend::{
+    claims_blockage, Backend, BackendError, Capabilities, LaunchResult, LaunchSpec,
     PermissionEnforcement, SandboxCapability, UsageReport,
 };
 use crate::money::{CostCompleteness, MicroUsd};
+use crate::procs::{run_with_timeout, ProcessEnd};
 
 pub struct ClaudeBackend {
     binary: PathBuf,
@@ -103,10 +104,7 @@ impl Backend for ClaudeBackend {
         )?;
 
         let parsed = parse_result_json(&end.stdout, &spec.model);
-        let worker_claims_blockage = parsed
-            .result_text
-            .as_deref()
-            .is_some_and(super::claims_blockage);
+        let worker_claims_blockage = parsed.result_text.as_deref().is_some_and(claims_blockage);
         // A harness that exited non-zero, reported an error, or printed
         // something the adapter cannot read did not complete an attempt:
         // the result is missing, never an empty candidate (SPEC §9).
@@ -238,7 +236,7 @@ fn budget_dollars(micros: i64) -> String {
     }
 }
 
-fn failure_detail(end: &super::ProcessEnd, parsed: &ParsedClaudeResult) -> String {
+fn failure_detail(end: &ProcessEnd, parsed: &ParsedClaudeResult) -> String {
     let mut parts = Vec::new();
     match end.exit_code {
         Some(code) => parts.push(format!("exit {code}")),
@@ -496,8 +494,8 @@ mod tests {
     fn substitution_is_detectable_because_the_effective_model_surfaces() {
         let parsed = parse_result_json(SAMPLE, "haiku");
         let effective = parsed.effective_model.expect("model surfaces");
-        assert!(!super::super::model_matches("haiku", &effective));
-        assert!(super::super::model_matches("sonnet", &effective));
+        assert!(!crate::backend::model_matches("haiku", &effective));
+        assert!(crate::backend::model_matches("sonnet", &effective));
     }
 
     #[test]
@@ -559,7 +557,7 @@ mod tests {
 
     #[test]
     fn the_turn_ceiling_capability_is_reported_not_assumed() {
-        use crate::adapter::TurnCeiling;
+        use crate::backend::TurnCeiling;
         assert_eq!(
             capabilities_from_help("2.1.278".into(), HELP_2_1).turn_ceiling(),
             TurnCeiling::Unavailable,

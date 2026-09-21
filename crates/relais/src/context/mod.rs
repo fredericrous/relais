@@ -18,12 +18,6 @@ use crate::contract::TaskContract;
 use crate::ids::sha256_hex;
 use crate::policy::RepoPolicy;
 
-/// How much context a worker prompt may carry when `relais.toml` says
-/// nothing. Repositories override it with `[context] budget_bytes`, which
-/// is part of the hashed authority. Sizing problems are explicit;
-/// nothing is silently truncated (SPEC §7).
-pub const DEFAULT_CONTEXT_BUDGET_BYTES: usize = 64 * 1024;
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AvalVerdict {
@@ -316,8 +310,8 @@ pub struct ContextInputs<'a> {
     pub fingerprints: Vec<FileFingerprint>,
     pub tool_versions: ToolVersions,
     /// Whether the harness this run will dispatch on can take a turn
-    /// ceiling (`crate::adapter::TurnCeiling`).
-    pub turn_ceiling: crate::adapter::TurnCeiling,
+    /// ceiling (`crate::backend::TurnCeiling`).
+    pub turn_ceiling: crate::backend::TurnCeiling,
     /// Resolve function, so tests can supply verdicts without invoking
     /// the real binary.
     pub resolver: &'a dyn Fn(&str, Option<&str>) -> AvalVerdict,
@@ -509,7 +503,7 @@ mod tests {
                 amont: Some("1.36.0".into()),
                 claude_code: None,
             },
-            turn_ceiling: crate::adapter::TurnCeiling::Unavailable,
+            turn_ceiling: crate::backend::TurnCeiling::Unavailable,
             resolver,
         }
     }

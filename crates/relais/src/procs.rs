@@ -8,8 +8,11 @@
 //! and a Toolhelp snapshot. Nothing above this module spells them at all.
 
 use std::io;
+use std::io::Write;
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 /// Is there a live process with this PID? Never a signal that could
 /// terminate anything (SPEC §23: lease expiry does not prove death).
@@ -127,6 +130,144 @@ impl LockFile {
         write!(self.file, "{}", std::process::id())?;
         self.file.flush()
     }
+}
+
+/// Why a supervised run could not be carried out. A process that RAN
+/// and failed is a `ProcessEnd` with a non-zero status; this is the
+/// launch itself going wrong, which is never a worker's fault.
+#[derive(Debug)]
+pub enum RunError {
+    Spawn(io::Error),
+    Wait(io::Error),
+    /// The thread draining this pipe panicked; the output is lost, so
+    /// the run cannot be reported as a completed attempt.
+    ReaderPanicked(&'static str),
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(e) => write!(f, "spawn: {e}"),
+            Self::Wait(e) => write!(f, "wait: {e}"),
+            Self::ReaderPanicked(pipe) => write!(f, "{pipe} reader panicked"),
+        }
+    }
+}
+
+impl std::error::Error for RunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Spawn(e) | Self::Wait(e) => Some(e),
+            Self::ReaderPanicked(_) => None,
+        }
+    }
+}
+
+/// How a process run ended, beyond its exit code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessEnd {
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub timed_out: bool,
+    pub cancelled: bool,
+}
+
+/// Runs a command with a wall timeout, streaming stdout+stderr into one
+/// captured buffer. Reader threads own the pipes (a blocking read in the
+/// wait loop would stall the timeout until the child spoke again); on
+/// timeout the whole process group is killed: the launch counts as
+/// interrupted, never as a completed attempt.
+pub fn run_with_timeout(
+    mut command: Command,
+    wall_timeout: Duration,
+    stdin_bytes: Option<Vec<u8>>,
+    cancel: Option<&AtomicBool>,
+    pid_slot: Option<&AtomicU32>,
+) -> Result<ProcessEnd, RunError> {
+    command.stdin(
+        stdin_bytes
+            .as_ref()
+            .map_or(Stdio::null(), |_| Stdio::piped()),
+    );
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    own_process_group(&mut command);
+    let mut child = command.spawn().map_err(RunError::Spawn)?;
+    if let Some(slot) = pid_slot {
+        slot.store(child.id(), Ordering::SeqCst);
+    }
+
+    if let Some(bytes) = stdin_bytes {
+        let mut stdin = child.stdin.take().expect("stdin is piped when bytes exist");
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&bytes);
+        });
+    }
+
+    let stdout_pipe = child.stdout.take().expect("stdout piped");
+    let stderr_pipe = child.stderr.take().expect("stderr piped");
+    let stdout = std::thread::spawn(move || read_to_end(stdout_pipe));
+    let stderr = std::thread::spawn(move || read_to_end(stderr_pipe));
+
+    let (status, timed_out, cancelled) =
+        wait_for_exit(&mut child, wall_timeout, cancel).map_err(RunError::Wait)?;
+    let stdout = stdout
+        .join()
+        .map_err(|_| RunError::ReaderPanicked("stdout"))?;
+    let stderr = stderr
+        .join()
+        .map_err(|_| RunError::ReaderPanicked("stderr"))?;
+    Ok(ProcessEnd {
+        // A killed process has no exit code: interrupted, never a
+        // completed attempt. Decided here, not read from the status —
+        // Windows reports a terminated process as exit 1, and 1 is a
+        // usage error, not a kill.
+        exit_code: if cancelled || timed_out {
+            None
+        } else {
+            status.code()
+        },
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        timed_out,
+        cancelled,
+    })
+}
+
+/// Wait for a child under a wall clock and an optional cancel flag,
+/// killing its WHOLE process group when either fires. The one loop every
+/// subprocess in relais waits in — the verification runner used to have
+/// its own copy that killed only the direct child and left `cargo test`
+/// grandchildren running in a worktree about to be removed.
+pub fn wait_for_exit(
+    child: &mut std::process::Child,
+    wall_timeout: Duration,
+    cancel: Option<&AtomicBool>,
+) -> std::io::Result<(std::process::ExitStatus, bool, bool)> {
+    let started = Instant::now();
+    let (timed_out, cancelled) = loop {
+        if child.try_wait()?.is_some() {
+            break (false, false);
+        }
+        if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            let _ = kill_tree(child);
+            break (false, true);
+        }
+        if started.elapsed() >= wall_timeout {
+            let _ = kill_tree(child);
+            break (true, false);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let status = child.wait()?;
+    Ok((status, timed_out, cancelled))
+}
+
+fn read_to_end(mut pipe: impl std::io::Read) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut pipe, &mut buffer);
+    buffer
 }
 
 #[cfg(unix)]
@@ -334,7 +475,98 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+
+    /// A child that prints, then outlives any test timeout, in the
+    /// platform's own shell: the point is the kill, not the script.
+    fn slow_child() -> Command {
+        if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.args([
+                "/C",
+                "echo start && ping -n 60 127.0.0.1 > NUL && echo done",
+            ]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", "echo start; sleep 30; echo done"]);
+            command
+        }
+    }
+
+    #[test]
+    fn run_with_timeout_kills_slow_children() {
+        let command = slow_child();
+        let started = Instant::now();
+        let pid_slot = AtomicU32::new(0);
+        let end = run_with_timeout(
+            command,
+            Duration::from_millis(300),
+            None,
+            None,
+            Some(&pid_slot),
+        )
+        .expect("runs");
+        assert_ne!(pid_slot.load(Ordering::SeqCst), 0, "the PID was published");
+        assert!(
+            end.timed_out,
+            "must be marked interrupted by the wall clock"
+        );
+        assert!(!end.cancelled);
+        assert_eq!(end.exit_code, None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            end.stdout.contains("start"),
+            "output before the kill is kept: {}",
+            end.stdout
+        );
+    }
+
+    #[test]
+    fn cancellation_kills_the_child_and_is_not_a_timeout() {
+        let command = slow_child();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let end = run_with_timeout(command, Duration::from_secs(30), None, Some(&cancel), None)
+            .expect("runs");
+        assert!(end.cancelled);
+        assert!(!end.timed_out);
+        assert_eq!(
+            end.exit_code, None,
+            "a cancelled run has no terminal result"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn run_with_timeout_feeds_stdin_and_captures_output() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "cat; echo processed"]);
+        let end = run_with_timeout(
+            command,
+            Duration::from_secs(10),
+            Some(b"prompt-bytes".to_vec()),
+            None,
+            None,
+        )
+        .expect("runs");
+        assert_eq!(end.exit_code, Some(0));
+        assert!(!end.timed_out);
+        assert!(end.stdout.contains("prompt-bytes"));
+        assert!(
+            end.stdout.contains("processed"),
+            "{} {}",
+            end.stdout,
+            end.stderr
+        );
+    }
 
     #[test]
     fn this_process_is_alive_and_a_dead_pid_is_not() {

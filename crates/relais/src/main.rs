@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use relais::adapter::Backend;
+use relais::backend::Backend;
 use relais::context::AvalVerdict;
 use relais::contract::TaskContract;
 use relais::learn::predict::RegistryPredictor;

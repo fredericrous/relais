@@ -18,6 +18,12 @@ use crate::ids::canonical_json_hash;
 
 pub const POLICY_SCHEMA_VERSION: u64 = 1;
 
+/// How much context a worker prompt may carry when `relais.toml` says
+/// nothing. Repositories override it with `[context] budget_bytes`, which
+/// is part of the hashed authority. Sizing problems are explicit;
+/// nothing is silently truncated (SPEC §7).
+pub const DEFAULT_CONTEXT_BUDGET_BYTES: usize = 64 * 1024;
+
 /// Routing tiers, ordered: research < implementation < escalation. Also
 /// the `[models.*]` table keys, so a profile's tier is its identity in
 /// policy and reports.
@@ -232,7 +238,7 @@ pub struct ContextPolicy {
 impl Default for ContextPolicy {
     fn default() -> Self {
         Self {
-            budget_bytes: crate::context::DEFAULT_CONTEXT_BUDGET_BYTES,
+            budget_bytes: DEFAULT_CONTEXT_BUDGET_BYTES,
         }
     }
 }
@@ -1231,8 +1237,7 @@ keys = ["output.contract"]
     fn the_context_budget_is_repo_policy_and_part_of_the_authority() {
         let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
         assert_eq!(
-            repo.context.budget_bytes,
-            crate::context::DEFAULT_CONTEXT_BUDGET_BYTES,
+            repo.context.budget_bytes, DEFAULT_CONTEXT_BUDGET_BYTES,
             "a policy that says nothing keeps the shipped budget"
         );
         let wider =
