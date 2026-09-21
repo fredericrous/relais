@@ -72,19 +72,45 @@ def strip_comments_and_strings(line: str) -> str:
     return "".join(out)
 
 
+class LayoutProblem(Exception):
+    """The file does not put its test code where this script can see it."""
+
+
 def production_lines(path: Path) -> list[str]:
     """The file's non-test lines, comments and string literals removed.
 
     A top-level `#[cfg(test)]` opens the in-file test module, which every
     file in this crate puts last; everything from there on is test code.
+    That convention is what makes the cut safe, so it is checked rather
+    than assumed: a second one, or one on anything but a `mod`, would
+    hide real code from the graph and turn this whole script into a
+    green light that proves nothing.
     """
-    lines = []
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        code = strip_comments_and_strings(raw)
-        if code.startswith("#[cfg(test)]"):
-            break
-        lines.append(code)
-    return lines
+    code_lines = [
+        strip_comments_and_strings(raw)
+        for raw in path.read_text(encoding="utf-8").splitlines()
+    ]
+    marks = [i for i, line in enumerate(code_lines) if line.startswith("#[cfg(test)]")]
+    if not marks:
+        return code_lines
+    if len(marks) > 1:
+        raise LayoutProblem(
+            f"{path.name}: {len(marks)} top-level `#[cfg(test)]` items; this "
+            "script reads everything after the first as test code, so put "
+            "test-only code in the one trailing `mod tests`"
+        )
+    first = marks[0]
+    follows = next(
+        (line for line in code_lines[first + 1 :] if line.strip()),
+        "",
+    )
+    if not follows.startswith("mod "):
+        raise LayoutProblem(
+            f"{path.name}: the top-level `#[cfg(test)]` is on `{follows.strip()}`, "
+            "not on the trailing `mod tests`; this script would read the rest of "
+            "the file as test code"
+        )
+    return code_lines[:first]
 
 
 def module_of(path: Path) -> str:
@@ -201,7 +227,12 @@ def purity_failures() -> list[str]:
 
 
 def main() -> int:
-    graph = build_graph()
+    try:
+        graph = build_graph()
+        impure = purity_failures()
+    except LayoutProblem as problem:
+        print(problem, file=sys.stderr)
+        return 1
     problems = 0
 
     for group in strongly_connected(graph):
@@ -210,7 +241,7 @@ def main() -> int:
         for line in cycle_edges(graph, group):
             print(line, file=sys.stderr)
 
-    for failure in purity_failures():
+    for failure in impure:
         problems += 1
         print(failure, file=sys.stderr)
 

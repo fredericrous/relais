@@ -189,14 +189,6 @@ impl Ended {
         matches!(self, Self::Exited(0))
     }
 
-    /// The reported status, when there is one.
-    pub fn code(self) -> Option<i32> {
-        match self {
-            Self::Exited(code) => Some(code),
-            Self::TimedOut | Self::Cancelled | Self::Signalled => None,
-        }
-    }
-
     /// How it ended, for a log line or a receipt.
     pub fn describe(self) -> String {
         match self {

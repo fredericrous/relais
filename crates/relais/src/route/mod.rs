@@ -66,6 +66,9 @@ pub struct RouteReason {
 }
 
 impl RouteReason {
+    /// One reason: the id the ledger and the tests match on, and the
+    /// sentence `explain` prints for it. Both, always — that is the
+    /// point of the type.
     pub fn new(id: impl Into<String>, text: impl Into<String>) -> Self {
         Self {
             id: id.into(),
