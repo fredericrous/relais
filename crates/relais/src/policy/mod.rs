@@ -707,9 +707,9 @@ pub fn effective_authority(
         repo.risk
             .iter()
             .filter(|rule| {
-                rule.paths
-                    .iter()
-                    .any(|pattern| crate::route::write_scope_could_touch(contract, pattern))
+                rule.paths.iter().any(|pattern| {
+                    crate::contract::scope::write_scope_could_touch(contract, pattern)
+                })
             })
             .map(|rule| rule.review.unwrap_or(Review::Off))
             .max()

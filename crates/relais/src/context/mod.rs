@@ -453,7 +453,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
 fn scope_could_touch(scope: &str, mapping_paths: &[String]) -> bool {
     mapping_paths
         .iter()
-        .any(|pattern| crate::route::scope_could_touch(scope, pattern))
+        .any(|pattern| crate::contract::scope::scope_could_touch(scope, pattern))
 }
 
 /// Hash a context manifest for the ledger: content-addressed evidence.

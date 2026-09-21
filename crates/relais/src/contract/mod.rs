@@ -11,6 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod scope;
+
 use crate::ids::canonical_json_hash;
 
 pub const SCHEMA_VERSION: u64 = 1;
