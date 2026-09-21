@@ -147,7 +147,7 @@ pub fn aval_resolve(repo_dir: &Path, key: &str, scope: Option<&str>) -> AvalVerd
 
 /// Architecture evidence assembled for a contract: explicit keys from the
 /// contract plus repo path-to-key mappings whose paths the declared scope
-/// could touch. Unlisted keys never block unrelated work (SPEC §4).
+/// could touch. Unlisted keys never block unrelated work (SPEC §7).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArchitectureEvidence {
     pub resolved: Vec<(String, AvalVerdict)>,
@@ -295,7 +295,7 @@ pub struct ContextManifest {
     pub package_bytes: usize,
     /// Whether a turn ceiling was enforceable on this run's harness
     /// ("harness" or "unavailable"). SPEC §11 lists turns among the
-    /// ceilings; Claude Code 2.1.x takes no turn flag, so the receipt
+    /// ceilings; Claude Code 2.1.x takes no turn flag, so this manifest
     /// records which it was instead of implying one was applied.
     #[serde(default)]
     pub turn_ceiling: String,

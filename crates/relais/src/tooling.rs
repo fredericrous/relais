@@ -59,8 +59,8 @@ pub fn integration_available(name: &str) -> bool {
 }
 
 /// `<tool> --version`'s first line, or `None` when the tool is absent or
-/// will not answer — recorded in the context manifest so a receipt names
-/// the toolchain it was verified with.
+/// will not answer — recorded in the context manifest, which is where a
+/// run names the toolchain it was verified with.
 pub fn integration_version(name: &str) -> Option<String> {
     let output = std::process::Command::new(default_bin(name))
         .arg("--version")

@@ -125,8 +125,8 @@ pub struct RunConfig<'a> {
     pub aval_resolver: &'a dyn Fn(&str, Option<&str>) -> AvalVerdict,
     pub predictor: Option<&'a dyn RoutePredictor>,
     /// Managed dispatch (SPEC §23): every launch is admitted, heartbeat
-    /// and settled through this gate. `None` = unmanaged execution,
-    /// which the receipt labels as such; `relais run` always sets one.
+    /// and settled through this gate. `None` = unmanaged execution;
+    /// `relais run` always sets one.
     pub gate: Option<&'a (dyn Gate + Sync)>,
     /// The interactive session this run belongs to, for fair scheduling
     /// and attribution.

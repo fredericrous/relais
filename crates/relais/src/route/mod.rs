@@ -188,7 +188,8 @@ fn risk_floor(contract: &TaskContract, repo: &RepoPolicy) -> (Option<Tier>, Vec<
 }
 
 /// An explicitly configured deterministic recipe, used only when it FULLY
-/// covers the task (SPEC §6.3). Recipes are never inferred from prose.
+/// covers the task (SPEC §6, step 3). Recipes are never inferred from
+/// prose.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recipe {
     pub name: String,
@@ -218,7 +219,7 @@ fn recipe_covers(contract: &TaskContract, recipe: &Recipe) -> bool {
     if recipe.scope_within.is_empty() {
         return true;
     }
-    // FULLY covers (SPEC §6.3): every pattern the contract may write must
+    // FULLY covers (SPEC §6, step 3): every pattern the contract may write must
     // be contained in some recipe pattern.
     contract.write_scope.as_deref().is_some_and(|scopes| {
         !scopes.is_empty()

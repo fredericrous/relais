@@ -188,7 +188,7 @@ pub fn build_argv(spec: &LaunchSpec, caps: &Capabilities) -> Result<Vec<String>,
     // for it; Claude Code 2.1.x has none. The capability is reported
     // (`Capabilities::turn_ceiling`) so nothing downstream claims a
     // ceiling that was never applied — SPEC §11's turn ceiling is not
-    // deliverable on this harness, and a receipt says so.
+    // deliverable on this harness, and the context manifest says so.
     if let Some(max_turns) = spec.max_turns {
         if caps.supports_max_turns {
             argv.push("--max-turns".into());

@@ -740,7 +740,7 @@ fn open_ledger() -> Ledger {
 /// ledger is external state — locked by another relais, truncated by a
 /// crash, or written by a newer version — so a failed read prints one
 /// `relais: …` line and exits non-zero; `status`, `explain`, `resume`,
-/// `evaluate` and `report` never abort on a panic instead (SPEC §12).
+/// `evaluate` and `report` never abort on a panic instead.
 fn or_exit<T, E: std::fmt::Display>(result: std::result::Result<T, E>, what: &str) -> T {
     result.unwrap_or_else(|e| {
         eprintln!("relais {what}: {e}");

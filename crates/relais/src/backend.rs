@@ -116,8 +116,8 @@ pub enum TurnCeiling {
 }
 
 impl TurnCeiling {
-    /// The value recorded in the context manifest, so a receipt says
-    /// which it was for that run.
+    /// The value recorded in the context manifest, which is where a
+    /// run says which of the two it was.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Harness => "harness",

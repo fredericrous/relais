@@ -262,7 +262,8 @@ pub struct RepoPolicy {
     pub risk: Vec<RiskRule>,
     #[serde(default)]
     pub architecture: ArchitectureConfig,
-    /// Explicitly configured deterministic recipes (SPEC §6.3). Used only
+    /// Explicitly configured deterministic recipes (SPEC §6, step 3). Used
+    /// only
     /// when one fully covers the task; never inferred from prose.
     #[serde(default)]
     pub recipes: Vec<RecipeSpec>,
