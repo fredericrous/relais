@@ -24,6 +24,7 @@ pub mod policy;
 pub mod procs;
 pub mod repo;
 pub mod report;
+pub mod resume;
 pub mod rng;
 pub mod route;
 pub mod runner;

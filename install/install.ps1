@@ -95,12 +95,21 @@ try {
     # with your credentials inside your repositories; verifying what it is
     # before putting it in that position is the argument the project makes
     # about workers, applied to itself.
+    #
+    # So an UNVERIFIABLE download is fatal, not a warning, exactly as in
+    # install.sh: RELAIS_SKIP_CHECKSUM=1 is the explicit way to accept an
+    # unverified binary, and there is no implicit one.
+    $skipChecksum = ($env:RELAIS_SKIP_CHECKSUM -eq '1')
     $sums = Join-Path $tmp 'SHA256SUMS'
     try {
         Invoke-WebRequest -Uri "$base/SHA256SUMS" -OutFile $sums -UseBasicParsing
     } catch {
         $sums = $null
-        Write-Warn 'no SHA256SUMS published for this release - the download was NOT verified'
+        if ($skipChecksum) {
+            Write-Warn 'no SHA256SUMS for this release - installing UNVERIFIED because RELAIS_SKIP_CHECKSUM=1'
+        } else {
+            Fail "no SHA256SUMS published for this release - refusing to install an unverified binary.`n         Set RELAIS_SKIP_CHECKSUM=1 to accept that risk deliberately."
+        }
     }
 
     if ($sums) {
@@ -122,6 +131,11 @@ try {
     $upgrading = Test-Path (Join-Path $BinDir 'relais.exe')
     New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
 
+    # An archive with no relais.exe in it is a failed install, not a quiet
+    # one: the sh sibling dies on exactly this, and printing the "here is
+    # what to run next" epilogue after installing nothing sent people
+    # looking for a binary that was never written (C8).
+    $installed = 0
     foreach ($exe in @('relais.exe')) {
         $from = Join-Path $src $exe
         if (Test-Path $from) {
@@ -134,7 +148,11 @@ try {
             Copy-Item -Path $from -Destination $staged -Force
             Move-Item -Path $staged -Destination $to -Force
             Write-Ok "installed $to"
+            $installed++
         }
+    }
+    if ($installed -eq 0) {
+        Fail "$name archive holds no relais.exe - nothing was installed"
     }
 } finally {
     Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue

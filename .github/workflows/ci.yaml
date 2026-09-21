@@ -1,9 +1,11 @@
 name: CI
 
-# `make check` — toolchain, lint, test, msrv — on every push to main and
-# every pull request, so a green check on the PR means what a green
-# `make check` means on the workstation. The jobs mirror the Makefile
-# targets one for one; change a flag in one place, change it in the other.
+# `make check` — toolchain, lint, test, msrv, audit — on every push to
+# main and every pull request, so a green check on the PR means what a
+# green `make check` means on the workstation. The jobs mirror the
+# Makefile targets one for one; change a flag in one place, change it in
+# the other. The msrv floor and the audit command are READ from the
+# repository (Cargo.toml, the Makefile) rather than restated here.
 
 on:
   push:
@@ -89,28 +91,38 @@ jobs:
   # against. Without this, `rust-version` is a string nothing tests.
   msrv:
     # Literal, not `${{ env.MSRV }}`: the env context is unavailable in a
-    # job's name and renders empty rather than erroring.
-    name: msrv (the crate builds on 1.88)
+    # job's name and renders empty rather than erroring. The version
+    # itself is READ from Cargo.toml below, never restated here — a
+    # hardcoded floor drifts from the one the crate claims, and the job
+    # then proves the wrong thing (C12).
+    name: msrv (the crate builds on the declared floor)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      # Keep in step with [workspace.package] rust-version in Cargo.toml.
-      MSRV: "1.88.0"
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install "$MSRV" --profile minimal --no-self-update
-      - run: cargo "+$MSRV" build
+      - id: floor
+        run: |
+          set -euo pipefail
+          msrv=$(sed -n 's/^[[:space:]]*rust-version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          [ -n "$msrv" ] || { echo "::error::Cargo.toml declares no rust-version"; exit 1; }
+          echo "declared floor: $msrv"
+          echo "msrv=$msrv" >> "$GITHUB_OUTPUT"
+      - run: rustup toolchain install "${{ steps.floor.outputs.msrv }}" --profile minimal --no-self-update
+      - run: cargo "+${{ steps.floor.outputs.msrv }}" build
 
-  # The dependency tree, watched. `cargo install --locked cargo-audit`, not
-  # a marketplace action: pulling an unaudited third-party action into the
-  # job whose purpose is supply-chain hygiene is self-defeating.
+  # The dependency tree, watched. `make audit` — the same target a
+  # workstation runs, so `make check` and CI cannot drift (C12).
+  # `cargo install --locked cargo-audit`, not a marketplace action:
+  # pulling an unaudited third-party action into the job whose purpose is
+  # supply-chain hygiene is self-defeating.
   #
   # NON-BLOCKING, deliberately: an advisory is information about a
   # dependency, not a defect in the change under review, and a scheduled
   # run that goes red on somebody else's disclosure trains people to
-  # ignore red. Findings surface as ::warning:: annotations.
+  # ignore red. Findings surface as ::warning:: annotations. The RELEASE
+  # workflow's own audit job does block on a vulnerability.
   audit:
-    name: cargo audit (advisory, non-blocking)
+    name: make audit (advisory, non-blocking)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     continue-on-error: true
@@ -125,9 +137,7 @@ jobs:
       - name: Audit the resolved tree
         run: |
           set -euo pipefail
-          if ! cargo audit --color never > audit.txt 2>&1; then
-            cat audit.txt
+          make audit 2>&1 | tee audit.txt
+          if grep -Eq 'RUSTSEC-[0-9]{4}-[0-9]{4}' audit.txt; then
             echo "::warning::cargo audit reported findings (advisory; see the job log)"
-          else
-            cat audit.txt
           fi

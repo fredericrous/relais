@@ -53,20 +53,12 @@ fn resolve_home(var: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, HomeU
         .ok_or(HomeUnset)
 }
 
-/// The home directory, or the reason there is none.
-pub fn home_dir_checked() -> Result<PathBuf, HomeUnset> {
+/// The home directory, or the reason there is none. Fallible all the way
+/// up: a library that exits the process leaves its caller no way to
+/// report the cause, and `doctor` has to be able to print this as a
+/// finding rather than die printing it (C10).
+pub fn home_dir() -> Result<PathBuf, HomeUnset> {
     resolve_home(|name| std::env::var_os(name))
-}
-
-/// The home directory for callers that have nowhere to return an error
-/// to (the CLI's own path constructors). An unset `HOME` leaves relais
-/// with no directory to read or write, so it is a diagnosed exit rather
-/// than a panic with a backtrace.
-pub fn home_dir() -> PathBuf {
-    home_dir_checked().unwrap_or_else(|e| {
-        eprintln!("relais: {e}");
-        std::process::exit(2);
-    })
 }
 
 /// The directory an environment variable relocates, when it does. An
@@ -78,29 +70,41 @@ pub fn dir_override(var: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-pub fn config_dir() -> PathBuf {
-    dir_override(CONFIG_DIR_ENV).unwrap_or_else(|| home_dir().join(".config").join("relais"))
+/// Where machine-owned settings live: the override when one is set, and
+/// otherwise a directory under `$HOME`, which is why this is fallible.
+pub fn config_dir() -> Result<PathBuf, HomeUnset> {
+    match dir_override(CONFIG_DIR_ENV) {
+        Some(dir) => Ok(dir),
+        None => Ok(home_dir()?.join(".config").join("relais")),
+    }
 }
 
-pub fn machine_settings_path() -> PathBuf {
-    config_dir().join("machine.toml")
+/// The machine authority: trust grants, spending ceilings, permissions.
+pub fn machine_settings_path() -> Result<PathBuf, HomeUnset> {
+    Ok(config_dir()?.join("machine.toml"))
 }
 
-pub fn state_dir() -> PathBuf {
-    dir_override(STATE_DIR_ENV)
-        .unwrap_or_else(|| home_dir().join(".local").join("state").join("relais"))
+/// Where mutable state lives: the ledger, the registry, run artifacts.
+pub fn state_dir() -> Result<PathBuf, HomeUnset> {
+    match dir_override(STATE_DIR_ENV) {
+        Some(dir) => Ok(dir),
+        None => Ok(home_dir()?.join(".local").join("state").join("relais")),
+    }
 }
 
-pub fn ledger_path() -> PathBuf {
-    state_dir().join("ledger.sqlite")
+/// The SQLite ledger (SPEC §12).
+pub fn ledger_path() -> Result<PathBuf, HomeUnset> {
+    Ok(state_dir()?.join("ledger.sqlite"))
 }
 
-pub fn registry_dir() -> PathBuf {
-    state_dir().join("registry")
+/// The learned-artifact registry (SPEC §17).
+pub fn registry_dir() -> Result<PathBuf, HomeUnset> {
+    Ok(state_dir()?.join("registry"))
 }
 
-pub fn runs_dir() -> PathBuf {
-    state_dir().join("runs")
+/// One directory per run: receipts, patches, evidence.
+pub fn runs_dir() -> Result<PathBuf, HomeUnset> {
+    Ok(state_dir()?.join("runs"))
 }
 
 #[cfg(test)]

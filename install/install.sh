@@ -117,6 +117,14 @@ main() {
     # with your credentials inside your repositories; verifying what it is
     # before putting it in that position is the whole argument the project
     # makes about workers, applied to itself.
+    #
+    # So an UNVERIFIABLE download is fatal, not a warning: no SHA256SUMS,
+    # no sha256 tool, no matching entry — each of them means nobody
+    # checked what is about to run with your credentials, and the comment
+    # above would otherwise be describing something the code does not do.
+    # RELAIS_SKIP_CHECKSUM=1 is the explicit, typed-out way to say "I
+    # accept an unverified binary"; there is no implicit one.
+    skip_checksum="${RELAIS_SKIP_CHECKSUM:-}"
     if fetch_to "$base/SHA256SUMS" "$tmp/SHA256SUMS" 2> /dev/null; then
         if command -v sha256sum > /dev/null 2>&1; then
             got=$(sha256sum "$tmp/${name}.tar.gz" | cut -d' ' -f1)
@@ -132,11 +140,17 @@ main() {
     expected $want
     got      $got"
             ok "checksum verified"
+        elif [ "$skip_checksum" = "1" ]; then
+            warn "no sha256 tool found — installing UNVERIFIED because RELAIS_SKIP_CHECKSUM=1"
         else
-            warn "no sha256 tool found — the download was NOT verified"
+            die "no sha256 tool found (install coreutils or perl) — refusing to install an
+    unverified binary. Set RELAIS_SKIP_CHECKSUM=1 to accept that risk deliberately."
         fi
+    elif [ "$skip_checksum" = "1" ]; then
+        warn "no SHA256SUMS for this release — installing UNVERIFIED because RELAIS_SKIP_CHECKSUM=1"
     else
-        warn "no SHA256SUMS published for this release — the download was NOT verified"
+        die "no SHA256SUMS published for this release — refusing to install an unverified
+    binary. Set RELAIS_SKIP_CHECKSUM=1 to accept that risk deliberately."
     fi
 
     tar xzf "$tmp/${name}.tar.gz" -C "$tmp"
