@@ -519,6 +519,9 @@ impl TrustGrant {
     /// When this grant was recorded. Both spellings machine.toml uses
     /// are accepted; a plain date is read as midnight UTC.
     pub fn granted_at(&self) -> Result<chrono::DateTime<chrono::FixedOffset>, String> {
+        // Two accepted spellings, tried in turn: a full timestamp that
+        // will not parse is not an error here, it is the plain-date
+        // case below, which reports the failure for both.
         if let Ok(at) = chrono::DateTime::parse_from_rfc3339(&self.granted_at) {
             return Ok(at);
         }

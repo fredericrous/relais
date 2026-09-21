@@ -277,18 +277,7 @@ mod tests {
     /// enough: two tests in one process shared it, and the second opened
     /// the first's ledger.
     fn temp_dir(name: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "relais-report-{name}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        // Best effort: usually absent, and `create_dir_all` below reports
-        // anything that keeps it from being made.
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        dir
+        crate::test_support::temp_dir(&format!("report-{name}"))
     }
 
     /// The detail line is reviewer prose: a fixed BYTE slice at 120 in a

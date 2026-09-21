@@ -189,7 +189,7 @@ fn risk_floor(contract: &TaskContract, repo: &RepoPolicy) -> (Option<Tier>, Vec<
             ));
             floor = Some(match floor {
                 Some(current) if current >= rule.minimum_tier => current,
-                _ => rule.minimum_tier,
+                Some(_) | None => rule.minimum_tier,
             });
         }
     }
@@ -1287,6 +1287,61 @@ mod tests {
                     prop_assert!(!(clears && estimates.cost.contains_key(tier)));
                 }
             }
+        }
+
+        /// `eligible_tiers` never offers a tier below the floor its
+        /// KIND implies, whatever the scope is and whatever risk rules
+        /// fire: a risk rule may only raise the floor. An inspection
+        /// that could be routed at research must never become a change,
+        /// and a change must never fall back to research (SPEC §6).
+        #[test]
+        fn eligibility_never_falls_below_the_kind_floor(
+            scope in proptest::collection::vec(
+                proptest::sample::select(vec![
+                    "src/**".to_string(),
+                    "docs/**".to_string(),
+                    "crates/relais/src/policy/**".to_string(),
+                    "**".to_string(),
+                    "Cargo.toml".to_string(),
+                ]),
+                1..4,
+            ),
+            inspect in proptest::bool::ANY,
+            configured_mask in 0u8..8,
+        ) {
+            use proptest::prelude::*;
+            let repo = repo_policy();
+            let ladder = [Tier::Research, Tier::Implementation, Tier::Escalation];
+            let configured: BTreeMap<Tier, ModelProfile> = ladder
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| configured_mask & (1 << index) != 0)
+                .map(|(_, tier)| (*tier, repo.models[tier].clone()))
+                .collect();
+            let contract = if inspect {
+                inspect_contract()
+            } else {
+                let borrowed: Vec<&str> = scope.iter().map(String::as_str).collect();
+                change_contract(&borrowed)
+            };
+            let eligibility = eligible_tiers(&contract, &repo, &configured);
+            let kind_floor = kind_floor(contract.kind());
+            prop_assert!(
+                eligibility.floor >= kind_floor,
+                "a risk rule may only RAISE the floor: {:?} < {:?}",
+                eligibility.floor,
+                kind_floor
+            );
+            for tier in &eligibility.tiers {
+                prop_assert!(*tier >= eligibility.floor, "{:?}", eligibility);
+                prop_assert!(*tier >= kind_floor, "{:?}", eligibility);
+                prop_assert!(configured.contains_key(tier), "{:?}", eligibility);
+            }
+            prop_assert!(
+                eligibility.tiers.windows(2).all(|pair| pair[0] < pair[1]),
+                "cheapest first, no repeats: {:?}",
+                eligibility.tiers
+            );
         }
 
         /// Eligibility itself is bounded: every tier it offers is

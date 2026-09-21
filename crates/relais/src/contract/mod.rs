@@ -518,7 +518,7 @@ impl WorkPlan {
             self.packages
                 .iter()
                 .position(|p| p.id == id)
-                .expect("known")
+                .expect("every depends_on entry names a listed package: checked above")
         };
         let mut indegree: Vec<usize> = self.packages.iter().map(|p| p.depends_on.len()).collect();
         let mut wave: Vec<u32> = vec![0; self.packages.len()];

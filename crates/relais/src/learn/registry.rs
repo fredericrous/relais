@@ -265,6 +265,10 @@ impl Registry {
 
     pub fn list(&self) -> Vec<String> {
         let mut ids = Vec::new();
+        // The artifacts directory is created by the first promote, so
+        // "not there yet" and "there and empty" are the same answer to
+        // this question. Every operation that needs one artifact opens
+        // it by name through `load`, which reports its own failure.
         if let Ok(entries) = std::fs::read_dir(self.artifacts_dir()) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
@@ -519,16 +523,7 @@ mod tests {
     /// is reused the moment a thread ends, so two tests in one run shared
     /// a registry — and one of them saw the other's active pointer.
     fn temp_registry(name: &str) -> (Registry, PathBuf) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "relais-registry-{name}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        // Best effort: usually absent, and `Registry::open` reports any
-        // directory it cannot create.
-        std::fs::remove_dir_all(&dir).ok();
+        let dir = crate::test_support::temp_dir(&format!("registry-{name}"));
         let registry = Registry::open(&dir).expect("registry");
         (registry, dir)
     }

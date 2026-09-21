@@ -9,10 +9,18 @@ their head:
    between two modules of one crate; nothing else notices that `policy`
    and `route` each reach into the other until a reader tries to
    understand either one alone.
-2. `policy` is pure (fleet constraint `architecture.dependency-rule`):
-   it decides authority from parsed documents and never touches the
-   filesystem, the process table or the environment. PATH probes live in
-   `tooling`, repository files in `repo`.
+2. The pure modules are pure (fleet constraint
+   `architecture.dependency-rule`, and `effects.no-ambient-access`):
+   they decide from parsed documents and values handed in, and never
+   touch the filesystem, the process table or the environment. PATH
+   probes live in `tooling`, repository files in `repo`, the clock is a
+   parameter. `policy` is the one the audit caught; the rest are listed
+   so the property is enforced rather than re-checked by hand.
+3. Exactly one module names a platform API (fleet constraint
+   `boundaries.own-the-interface`): `libc::` and `windows_sys::` appear
+   in `procs.rs` and nowhere else, tests included. `ipc` used to spell
+   `umask` and `EMFILE` itself, so the `unsafe` and the errno tables
+   lived in two places at once.
 
 The graph is built from `use crate::X` and `crate::X::` in non-test code:
 test modules may reach anywhere, since a cycle through a test is not a
@@ -42,7 +50,22 @@ IMPURE = {
     "std::env": "the environment",
 }
 # Modules whose non-test code must stay free of the operations above.
-PURE_MODULES = {"policy"}
+# `policy` decides authority; `contract` and `route` decide from it;
+# `money`, `ids`, `lifecycle` and `resume` are leaf calculations whose
+# inputs — including the clock — are parameters.
+PURE_MODULES = {
+    "contract",
+    "ids",
+    "lifecycle",
+    "money",
+    "policy",
+    "resume",
+    "route",
+}
+
+# Platform APIs, and the one module allowed to name them.
+PLATFORM_CRATES = ("libc::", "windows_sys::")
+PLATFORM_MODULE = "procs"
 
 
 def strip_comments_and_strings(line: str) -> str:
@@ -226,10 +249,36 @@ def purity_failures() -> list[str]:
     return failures
 
 
+def platform_failures() -> list[str]:
+    """`libc` and `windows_sys` outside `procs`.
+
+    Whole files, test code included: a test that spells an errno itself
+    is a second copy of the table the module is supposed to own, and it
+    is how the first copy got there.
+    """
+    failures = []
+    for path in sorted(SRC.rglob("*.rs")):
+        if module_of(path) == PLATFORM_MODULE:
+            continue
+        for number, raw in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            line = strip_comments_and_strings(raw)
+            for needle in PLATFORM_CRATES:
+                if needle in line:
+                    failures.append(
+                        f"{path.relative_to(SRC)}:{number}: names `{needle}` "
+                        f"outside `{PLATFORM_MODULE}.rs`, the one module that "
+                        "owns a platform API"
+                    )
+    return failures
+
+
 def main() -> int:
     try:
         graph = build_graph()
         impure = purity_failures()
+        platform = platform_failures()
     except LayoutProblem as problem:
         print(problem, file=sys.stderr)
         return 1
@@ -241,7 +290,7 @@ def main() -> int:
         for line in cycle_edges(graph, group):
             print(line, file=sys.stderr)
 
-    for failure in impure:
+    for failure in impure + platform:
         problems += 1
         print(failure, file=sys.stderr)
 
@@ -252,7 +301,11 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"module graph: {len(graph)} modules, no cycles; policy is pure")
+    print(
+        f"module graph: {len(graph)} modules, no cycles; "
+        f"{len(PURE_MODULES)} pure modules touch no ambient state; "
+        f"only {PLATFORM_MODULE}.rs names a platform API"
+    )
     return 0
 
 

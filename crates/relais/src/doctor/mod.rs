@@ -14,7 +14,7 @@
 use serde::Serialize;
 use std::path::Path;
 
-use crate::backend::{Backend, Capabilities};
+use crate::backend::Capabilities;
 use crate::policy::{Dependency, DependencyMode, MachineSettings, RepoPolicy};
 use crate::{ledger::Ledger, paths};
 
@@ -393,13 +393,15 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
             level: Level::Fail,
             detail: e.to_string(),
         }),
-        Ok(backend) => match backend.probe() {
-            None => findings.push(Finding {
+        Ok(backend) => match backend.probe_report() {
+            // A probe that errored says so: "did not answer" and
+            // "answered and refused" are different things to fix.
+            Err(failure) => findings.push(Finding {
                 component: "claude-code",
                 level: Level::Fail,
-                detail: "claude --version did not answer".into(),
+                detail: failure.to_string(),
             }),
-            Some(caps) => findings.push(claude_code_finding(&caps)),
+            Ok(caps) => findings.push(claude_code_finding(&caps)),
         },
     }
 

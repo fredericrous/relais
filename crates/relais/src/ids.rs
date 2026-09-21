@@ -69,8 +69,9 @@ impl std::error::Error for IdError {}
 
 /// Where identifiers get their uniqueness: a clock, a process id and a
 /// sequence, all supplied rather than read from the ambient process.
-/// One is built at a boundary (`IdSource::of_this_process` in `main`)
-/// and passed to everything that mints ids.
+/// One is built at a boundary (`main::id_source`) and passed to
+/// everything that mints ids; this module names neither the clock nor
+/// the process table (`effects.no-ambient-access`).
 pub struct IdSource {
     clock: Box<dyn Fn() -> SystemTime + Send + Sync>,
     process: u32,
@@ -78,12 +79,6 @@ pub struct IdSource {
 }
 
 impl IdSource {
-    /// This process's source: the wall clock and this process's id.
-    /// The one place in the crate that reads either.
-    pub fn of_this_process() -> Self {
-        Self::new(SystemTime::now, std::process::id())
-    }
-
     /// A source on a supplied clock and process id — what a test uses to
     /// make minted identifiers a value it can assert on.
     pub fn new(clock: impl Fn() -> SystemTime + Send + Sync + 'static, process: u32) -> Self {
@@ -255,7 +250,7 @@ mod tests {
 
     #[test]
     fn run_ids_are_unique_within_a_source() {
-        let ids = IdSource::of_this_process();
+        let ids = IdSource::new(SystemTime::now, std::process::id());
         let a = ids.run_id().expect("run id");
         let b = ids.run_id().expect("run id");
         assert_ne!(a, b);
@@ -297,5 +292,58 @@ mod tests {
         assert_eq!(Pid::stored(4242).map(Pid::get), Some(4242));
         assert_eq!(Pid::stored(-1), None, "no process has a negative id");
         assert_eq!(Pid::stored(i64::from(u32::MAX) + 1), None);
+    }
+
+    proptest::proptest! {
+        /// A contract hash is a function of the VALUE, not of the order
+        /// the keys happened to arrive in: `serde_json::Value` sorts its
+        /// maps, so the same document written two ways hashes alike.
+        /// This is what makes a trust grant content-bound (SPEC §5).
+        #[test]
+        fn canonical_hashing_ignores_key_order_at_every_depth(
+            keys in proptest::collection::vec("[a-z]{1,6}", 1..6),
+            values in proptest::collection::vec(0i64..1000, 1..6),
+            depth in 0usize..4,
+        ) {
+            use proptest::prelude::*;
+            // Distinct keys: a document that names one key twice is not
+            // one document written two ways, it is two documents.
+            let mut seen = std::collections::BTreeSet::new();
+            let pairs: Vec<(String, i64)> = keys
+                .iter()
+                .cloned()
+                .zip(values.iter().copied())
+                .filter(|(key, _)| seen.insert(key.clone()))
+                .collect();
+            let build = |order: &mut dyn Iterator<Item = &(String, i64)>| {
+                let mut map = serde_json::Map::new();
+                for (key, value) in order {
+                    map.insert(key.clone(), serde_json::json!(value));
+                }
+                serde_json::Value::Object(map)
+            };
+            let forwards = build(&mut pairs.iter());
+            let backwards = build(&mut pairs.iter().rev());
+            // …and nested that many levels deep, which is where a
+            // hand-written canonicalizer would have stopped sorting.
+            let nest = |mut inner: serde_json::Value| {
+                for level in 0..depth {
+                    inner = serde_json::json!({ format!("level{level}"): inner });
+                }
+                inner
+            };
+            prop_assert_eq!(
+                canonical_json_hash(&nest(forwards)),
+                canonical_json_hash(&nest(backwards))
+            );
+        }
+
+        /// And it separates: a different value is a different hash.
+        #[test]
+        fn a_different_document_hashes_differently(left in 0i64..1000, right in 0i64..1000) {
+            use proptest::prelude::*;
+            let hash = |n: i64| canonical_json_hash(&serde_json::json!({ "n": n }));
+            prop_assert_eq!(hash(left) == hash(right), left == right);
+        }
     }
 }

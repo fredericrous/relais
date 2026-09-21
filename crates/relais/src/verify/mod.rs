@@ -206,7 +206,7 @@ pub fn command_timeout(spec: &CommandSpec) -> Result<Duration, VerifyError> {
 pub fn check_label(spec: &CommandSpec) -> String {
     let identity = sha256_hex(
         serde_json::to_string(&spec.argv)
-            .expect("argv serializes")
+            .expect("an argv is a vector of owned strings")
             .as_bytes(),
     );
     format!(
@@ -473,18 +473,71 @@ impl AmontStatus {
     }
 }
 
-pub fn parse_amont_list(stdout: &str) -> Option<AmontInventory> {
-    let value: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+/// Why a run has no check inventory.
+///
+/// Every variant is fail-closed at the gate — [`amont_gaps`] turns any of
+/// them into a gap for every required check, never into a pass — but
+/// *which* it was is the operator's only clue, so it is carried rather
+/// than dropped (`errors.never-swallowed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InventoryError {
+    /// Nothing was asked: the amont integration is off for this run, the
+    /// verification worktree was not created, or a fixture names none.
+    NotAsked,
+    /// `amont list` could not be started, timed out, or was cancelled.
+    NotRun { detail: String },
+    /// It ran and did not exit 0.
+    Refused { ended: String },
+    /// It exited 0 and what it printed is not an `amont-list-v1`
+    /// envelope this relais can read.
+    Unreadable { detail: String },
+}
+
+impl std::fmt::Display for InventoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAsked => write!(f, "no check inventory was asked for"),
+            Self::NotRun { detail } => write!(f, "`amont list --json` did not run: {detail}"),
+            Self::Refused { ended } => write!(f, "`amont list --json` {ended}"),
+            Self::Unreadable { detail } => {
+                write!(
+                    f,
+                    "`amont list --json` printed no readable inventory: {detail}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for InventoryError {}
+
+/// Read an `amont-list-v1` envelope. A shape this relais cannot read is
+/// [`InventoryError::Unreadable`] naming what was wrong with it — never
+/// an empty inventory, which would read as "nothing is enforced".
+pub fn parse_amont_list(stdout: &str) -> Result<AmontInventory, InventoryError> {
+    let unreadable = |detail: String| InventoryError::Unreadable { detail };
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).map_err(|e| unreadable(format!("not JSON: {e}")))?;
     match value.get("format").and_then(|f| f.as_str()) {
         Some("amont-list-v1") => {}
         other => {
-            let _ = other;
-            return None;
+            return Err(unreadable(format!(
+                "envelope format is {}, not `amont-list-v1`",
+                other.unwrap_or("absent")
+            )))
         }
     }
     let mut checks = Vec::new();
-    for check in value.get("checks")?.as_array()? {
-        let id = check.get("id").and_then(|id| id.as_str())?.to_string();
+    let listed = value
+        .get("checks")
+        .and_then(|checks| checks.as_array())
+        .ok_or_else(|| unreadable("no `checks` array".to_string()))?;
+    for check in listed {
+        let id = check
+            .get("id")
+            .and_then(|id| id.as_str())
+            .ok_or_else(|| unreadable(format!("a check has no `id`: {check}")))?
+            .to_string();
         checks.push(AmontCheck {
             id,
             stage: check
@@ -516,7 +569,7 @@ pub fn parse_amont_list(stdout: &str) -> Option<AmontInventory> {
             .map(|entries| entries.iter().map(|entry| entry.to_string()).collect())
             .unwrap_or_default()
     };
-    Some(AmontInventory {
+    Ok(AmontInventory {
         checks,
         bypasses: strings("bypasses"),
         downgrades: strings("downgrades"),
@@ -544,10 +597,10 @@ pub const INVENTORY_TIMEOUT: Duration = Duration::from_secs(30);
 /// The effective check inventory, as a port relais owns. The runner asks
 /// a `HookInventory`; only `AmontCli` knows the binary's name.
 pub trait HookInventory {
-    /// The inventory for `dir`. `None` is no inventory — which
+    /// The inventory for `dir`, or why there is none — which
     /// `amont_gaps` turns into a gap for every required check, never
     /// into a pass.
-    fn list(&self, dir: &Path, stage: Stage) -> Option<AmontInventory>;
+    fn list(&self, dir: &Path, stage: Stage) -> Result<AmontInventory, InventoryError>;
 }
 
 /// The `amont` binary on this machine — the one place it is spawned.
@@ -570,28 +623,32 @@ impl AmontCli {
 }
 
 impl HookInventory for AmontCli {
-    fn list(&self, dir: &Path, stage: Stage) -> Option<AmontInventory> {
+    fn list(&self, dir: &Path, stage: Stage) -> Result<AmontInventory, InventoryError> {
         amont_list(dir, stage, self.cancel.as_deref())
     }
 }
 
 /// A fixed answer, for tests and for a run whose policy has the
-/// integration off.
+/// integration off. `None` is [`InventoryError::NotAsked`]: nothing was
+/// asked, as opposed to something asked that would not answer.
 #[derive(Debug, Default)]
 pub struct FixedInventory(pub Option<AmontInventory>);
 
 impl HookInventory for FixedInventory {
-    fn list(&self, _dir: &Path, _stage: Stage) -> Option<AmontInventory> {
-        self.0.clone()
+    fn list(&self, _dir: &Path, _stage: Stage) -> Result<AmontInventory, InventoryError> {
+        self.0.clone().ok_or(InventoryError::NotAsked)
     }
 }
 
-/// Run `amont list --json` in a directory, bounded and cancellable.
+/// Run `amont list --json` in a directory, bounded and cancellable. A
+/// probe that could not run, would not exit 0, or answered something
+/// unreadable says which it was: all three fail the gate, and an
+/// operator reading the gap list needs to know what to fix.
 pub fn amont_list(
     repo_dir: &Path,
     stage: Stage,
     cancel: Option<&AtomicBool>,
-) -> Option<AmontInventory> {
+) -> Result<AmontInventory, InventoryError> {
     let mut command = Command::new("amont");
     command.arg("list").arg("--json").current_dir(repo_dir);
     match stage {
@@ -600,10 +657,14 @@ pub fn amont_list(
         }
         Stage::Local => {}
     }
-    let end =
-        crate::procs::run_with_timeout(command, INVENTORY_TIMEOUT, None, cancel, None).ok()?;
+    let end = crate::procs::run_with_timeout(command, INVENTORY_TIMEOUT, None, cancel, None)
+        .map_err(|e| InventoryError::NotRun {
+            detail: e.to_string(),
+        })?;
     if end.ended != Ended::Exited(0) {
-        return None;
+        return Err(InventoryError::Refused {
+            ended: end.ended.describe(),
+        });
     }
     parse_amont_list(&end.stdout)
 }
@@ -611,12 +672,20 @@ pub fn amont_list(
 /// Gaps among the checks the run depends on: required amont checks that
 /// are inert, skipped, unavailable or of unknown status are gaps, and a
 /// check the inventory does not list at all is a gap too (SPEC §10).
-pub fn amont_gaps(inventory: Option<&AmontInventory>, required_ids: &[String]) -> Vec<String> {
-    let Some(inventory) = inventory else {
-        return required_ids
-            .iter()
-            .map(|id| format!("{id}: inventory unavailable"))
-            .collect();
+/// No inventory at all is a gap for every required check, naming why
+/// there is none.
+pub fn amont_gaps(
+    inventory: Result<&AmontInventory, &InventoryError>,
+    required_ids: &[String],
+) -> Vec<String> {
+    let inventory = match inventory {
+        Ok(inventory) => inventory,
+        Err(e) => {
+            return required_ids
+                .iter()
+                .map(|id| format!("{id}: inventory unavailable ({e})"))
+                .collect()
+        }
     };
     let mut gaps = Vec::new();
     for required in required_ids {
@@ -662,8 +731,14 @@ pub fn waived_id(entry: &str) -> String {
 /// required check is a gap, not a pass" — makes that a gap unless the
 /// profile names the check in `amont_waivers`, which is the "waiver
 /// already in policy" the same section allows.
-pub fn amont_waiver_gaps(inventory: Option<&AmontInventory>, waivers: &[String]) -> Vec<String> {
-    let Some(inventory) = inventory else {
+pub fn amont_waiver_gaps(
+    inventory: Result<&AmontInventory, &InventoryError>,
+    waivers: &[String],
+) -> Vec<String> {
+    // No inventory declares no bypass and no downgrade. The missing
+    // inventory is not lost here: `amont_gaps` has already turned it
+    // into a gap for every required check, with the reason.
+    let Ok(inventory) = inventory else {
         return Vec::new();
     };
     let mut gaps = Vec::new();
@@ -818,6 +893,9 @@ impl BaselineCache {
         }
     }
 
+    /// A cached baseline, or `None`. This is a cache: a miss and an
+    /// unreadable entry have the same consequence — the baseline is
+    /// re-run — so neither is an error to report.
     pub fn get(&self, key: &str) -> Option<Vec<String>> {
         let text = std::fs::read_to_string(self.dir.join(format!("{key}.json"))).ok()?;
         serde_json::from_str(&text).ok()
@@ -827,9 +905,11 @@ impl BaselineCache {
         if std::fs::create_dir_all(&self.dir).is_err() {
             return;
         }
+        // Best effort: an entry that cannot be written is a cache miss
+        // next time, which costs one baseline run and nothing else.
         let _ = std::fs::write(
             self.dir.join(format!("{key}.json")),
-            serde_json::to_string(failures).expect("serializes"),
+            serde_json::to_string(failures).expect("a list of owned strings serializes"),
         );
     }
 }
@@ -997,7 +1077,7 @@ mod tests {
 
     #[test]
     fn passing_and_failing_commands_are_recorded_with_log_hashes() {
-        let dir = std::env::temp_dir().join(format!("relais-verify-{}", std::process::id()));
+        let dir = temp_dir("cmd");
         let logs = dir.join("logs");
         let pass = run_command(
             &dir,
@@ -1027,7 +1107,7 @@ mod tests {
 
     #[test]
     fn timeouts_kill_the_check_and_count_as_failures() {
-        let dir = std::env::temp_dir().join(format!("relais-verify-t-{}", std::process::id()));
+        let dir = temp_dir("timeout");
         let logs = dir.join("logs");
         let hung = run_command(
             &dir,
@@ -1044,7 +1124,7 @@ mod tests {
 
     #[test]
     fn labels_are_stable_across_baseline_and_candidate_runs() {
-        let dir = std::env::temp_dir().join(format!("relais-verify-l-{}", std::process::id()));
+        let dir = temp_dir("labels");
         let logs = dir.join("logs");
         let profile = VerificationProfile {
             commands: vec![command(&["sh", "-c", "true"], 10)],
@@ -1196,11 +1276,7 @@ mod tests {
     /// one-second check.
     #[test]
     fn a_command_with_a_zero_timeout_is_refused() {
-        let dir = std::env::temp_dir().join(format!(
-            "relais-zero-{}-{}",
-            std::process::id(),
-            next_fixture()
-        ));
+        let dir = temp_dir("zero");
         let error = run_command(
             &dir,
             &command(&["sh", "-c", "true"], 0),
@@ -1236,12 +1312,7 @@ mod tests {
     /// "failed at the base too".
     #[test]
     fn the_baseline_key_moves_with_the_compiler_that_runs_the_checks() {
-        let dir = std::env::temp_dir().join(format!(
-            "relais-bcache-{}-{}",
-            std::process::id(),
-            next_fixture()
-        ));
-        std::fs::remove_dir_all(&dir).ok();
+        let dir = temp_dir("bcache");
         let cache = BaselineCache::new(&dir);
         let profile = VerificationProfile {
             commands: vec![command(&["cargo", "test"], 10)],
@@ -1353,9 +1424,8 @@ mod tests {
     }
 
     /// Unique fixture directories under parallel test threads.
-    fn next_fixture() -> u64 {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        crate::test_support::temp_dir(&format!("verify-{tag}"))
     }
 
     const AMONT_SAMPLE: &str = r#"{
@@ -1376,7 +1446,7 @@ mod tests {
         assert_eq!(inventory.checks.len(), 2);
         assert_eq!(inventory.downgrades.len(), 1);
         let gaps = amont_gaps(
-            Some(&inventory),
+            Ok(&inventory),
             &[
                 "pre-commit-lint-shell".to_string(),
                 "declared-rubocop".to_string(),
@@ -1395,14 +1465,14 @@ mod tests {
     #[test]
     fn bypasses_and_downgrades_are_gaps_unless_the_profile_waives_them() {
         let inventory = parse_amont_list(AMONT_SAMPLE).expect("envelope parses");
-        let gaps = amont_waiver_gaps(Some(&inventory), &[]);
+        let gaps = amont_waiver_gaps(Ok(&inventory), &[]);
         assert_eq!(gaps.len(), 1, "one downgrade, no bypasses: {gaps:?}");
         assert!(
             gaps[0].starts_with("pre-push-cargo-test: downgraded"),
             "{gaps:?}"
         );
         assert!(
-            amont_waiver_gaps(Some(&inventory), &["pre-push-cargo-test".to_string()]).is_empty(),
+            amont_waiver_gaps(Ok(&inventory), &["pre-push-cargo-test".to_string()]).is_empty(),
             "an explicit policy waiver is the one thing that clears it"
         );
         // A bypass is a bare string in the envelope; its id is the
@@ -1411,11 +1481,11 @@ mod tests {
             r#"{"format":"amont-list-v1","checks":[],"bypasses":["pre-commit-fmt"],"downgrades":[]}"#,
         )
         .expect("parses");
-        let gaps = amont_waiver_gaps(Some(&bypassed), &[]);
+        let gaps = amont_waiver_gaps(Ok(&bypassed), &[]);
         assert!(gaps[0].starts_with("pre-commit-fmt: bypassed"), "{gaps:?}");
-        assert!(amont_waiver_gaps(Some(&bypassed), &["pre-commit-fmt".to_string()]).is_empty());
+        assert!(amont_waiver_gaps(Ok(&bypassed), &["pre-commit-fmt".to_string()]).is_empty());
         assert!(
-            amont_waiver_gaps(None, &[]).is_empty(),
+            amont_waiver_gaps(Err(&InventoryError::NotAsked), &[]).is_empty(),
             "no inventory is the missing-inventory gap's business, not this one"
         );
     }
@@ -1430,7 +1500,7 @@ mod tests {
         );
         // …and requiring it is what turns an inert check into a gap.
         assert!(
-            !amont_gaps(Some(&inventory), &default_required_checks(&inventory))
+            !amont_gaps(Ok(&inventory), &default_required_checks(&inventory))
                 .iter()
                 .any(|gap| gap.contains("pre-commit-lint-shell"))
         );
@@ -1438,12 +1508,7 @@ mod tests {
 
     #[test]
     fn a_verification_worktree_releases_itself_when_its_checks_are_done() {
-        let dir = std::env::temp_dir().join(format!(
-            "relais-vwt-{}-{}",
-            std::process::id(),
-            next_fixture()
-        ));
-        std::fs::remove_dir_all(&dir).ok();
+        let dir = temp_dir("worktree");
         let repo = dir.join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir");
         let no_hooks = dir.join("no-hooks");
@@ -1496,14 +1561,26 @@ mod tests {
 
     #[test]
     fn wrong_amont_envelope_is_rejected_not_guessed() {
-        assert!(parse_amont_list(r#"{"format": "something-else-v9"}"#).is_none());
-        assert!(parse_amont_list("not json").is_none());
+        assert!(parse_amont_list(r#"{"format": "something-else-v9"}"#).is_err());
+        assert!(parse_amont_list("not json").is_err());
     }
 
     #[test]
     fn missing_inventory_means_every_required_check_is_a_gap() {
-        let gaps = amont_gaps(None, &["pre-push-cargo-test".to_string()]);
-        assert_eq!(gaps, vec!["pre-push-cargo-test: inventory unavailable"]);
+        let gaps = amont_gaps(
+            Err(&InventoryError::NotRun {
+                detail: "no such file or directory".to_string(),
+            }),
+            &["pre-push-cargo-test".to_string()],
+        );
+        assert_eq!(
+            gaps,
+            vec![
+                "pre-push-cargo-test: inventory unavailable (`amont list --json` did not run: no \
+                 such file or directory)"
+            ],
+            "and it names WHY there is no inventory, not just that there is none"
+        );
     }
 
     #[test]

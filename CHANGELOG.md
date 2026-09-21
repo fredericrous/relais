@@ -9,11 +9,16 @@ missing here.
 ## v0.2.0
 
 A review of the whole crate against the fleet's decision records (2026-09-21)
-found ninety defects; this release fixes them. Two are breaking: a trust
+found ninety defects; this release fixes them. Three are breaking: a trust
 grant is now bound to the repository as well as the policy, so every
-`[trust."…"]` block in `machine.toml` must be re-issued from `relais plan`,
-and the coordinator wire protocol changed, so a running coordinator must be
-stopped (`relais coordinator stop`) before the first command of this version.
+`[trust."…"]` block in `machine.toml` must be re-issued from `relais plan`;
+the coordinator wire protocol changed, so a running coordinator must be
+stopped (`relais coordinator stop`) before the first command of this
+version; and the exit codes moved, so anything branching on relais's exit
+status needs updating against [the table in
+README.md](README.md#exit-codes) — `needs_decision` 2 → 8, `needs_review`
+2 → 9, `budget_exhausted` 4 → 5, `interrupted` 4 → 6, `cancelled` 4 → 7,
+unknown run 2 → 10, and "nothing to train on yet" 2 → 14.
 
 ### Architecture
 
@@ -443,8 +448,10 @@ stopped (`relais coordinator stop`) before the first command of this version.
   through the same atomic temp-and-rename as the active one, and
   inference's abstention carries the reason.
 - **`relais train` exits with a code that says which way it failed** — no
-  training records (3), no tier with enough coverage (4), a solver that
-  diverged (5) — instead of a single stringly error. The solver's
+  training records (14), no tier with enough coverage (15), a solver that
+  diverged (16), and "no dataset has been built yet" is 14 too rather than
+  the invalid-invocation 2 it used to share with a malformed command line
+  — instead of a single stringly error. The solver's
   convergence test no longer chases a shrinking loss, so a fit that has
   stopped making material progress is recognized as converged rather than
   burning its whole iteration budget.
@@ -548,6 +555,82 @@ stopped (`relais coordinator stop`) before the first command of this version.
   `amont.conf` gate runs `aval check` at commit.
 
 ### Tests and documentation
+
+- **`relais doctor` tells a harness that would not answer from one that is
+  not installed.** A capability probe that failed — the binary gone
+  mid-probe, a timeout, a non-zero exit, an empty answer — was reported as
+  `claude --version did not answer`, the same line a missing CLI produced,
+  and a launch blocked on it said no more. The probe now carries its
+  failure, so `doctor` and a blocked launch both name which of the four it
+  was and which flag was being asked about.
+- **A check inventory that could not be read says why.** `amont list`
+  failing to run, exiting non-zero, or printing something that is not an
+  `amont-list-v1` envelope all became the same silent "no inventory"; the
+  gate failed closed either way, but the gap line read
+  `<check>: inventory unavailable` with nothing to act on. Each gap now
+  carries the reason, and an inventory that could not be read is reported
+  even when the profile names no check of its own — a run must never read
+  "no inventory" as "nothing to enforce".
+- **`relais plan` and the coordinator say when they fall back.** A learned
+  registry that would not open silently disabled learned routing, an
+  unreadable ledger let the coordinator start adopting no live dispatch,
+  and `plan` printed no harness identity without saying whether the
+  harness was absent or merely unresponsive. All three now print one line
+  naming the cause before falling back.
+- **A corrupt dispatch-intent row is a corrupt row.** `first_dispatch_intent`
+  read a column that is not JSON as "there is no intent", so
+  `relais dataset build` excluded the run for "no dispatch intent naming a
+  model" and the real fault was never named.
+- **Release scenarios that need no worker run on Windows too.** The
+  integration suite was `#![cfg(unix)]` in one piece because the fake
+  `claude` it drives is a `sh` script — so `init`, `install`/`uninstall`,
+  `doctor`, a `plan` blocked on a missing trust grant, `coordinator
+  status` with no daemon and the exit-code table were proved on one of the
+  two platforms the release builds for, which is how the Windows PATH
+  lookup shipped broken. Those six scenarios are now
+  `crates/relais/tests/portable_scenarios.rs`, with no shell and no fake
+  worker anywhere; the seven that drive a worker stay unix-only.
+- **The architecture gate checks three properties, not two.**
+  `scripts/check-module-cycles.py` already refused a module cycle and an
+  impure `policy`; it now also refuses ambient state (`std::fs`,
+  `std::process`, `std::env`) in `contract`, `route`, `money`, `ids`,
+  `lifecycle` and `resume`, and refuses `libc::` or `windows_sys::`
+  anywhere but `procs.rs` — tests included, since a test that spells an
+  errno itself is a second copy of the table. `ipc`'s own `umask` guard
+  and `EMFILE` table moved into `procs` behind `narrow_umask`,
+  `peer_uid(&UnixStream)` and `out_of_descriptors`. `make lint` and CI run
+  it, as before.
+- **Property tests for the invariants examples cannot cover.**
+  `rng::shuffle` is a permutation for any seed and length and is a
+  function of the seed alone; `contract::scope::globs_overlap` is
+  symmetric and reflexive and `**` overlaps everything; `MicroUsd`
+  addition and subtraction saturate and never wrap and a remaining budget
+  is never negative; `ids::canonical_json_hash` is invariant under key
+  reordering at any nesting depth and separates different documents;
+  every `lifecycle::State` and `Reason` round-trips through `as_str` and
+  `parse` while an unknown spelling is refused; and `route::eligible_tiers`
+  never offers a tier below the floor its kind implies.
+- **The test suite no longer waits on a guess.** The signal-escalation
+  test slept 200 ms twice and hoped the child's `TERM` trap was installed
+  in between; the child now writes a readiness file and the test polls,
+  bounded, for it and for each state after the signal. The candidate
+  identity test slept 1.1 s to cross a clock second; it asserts the fixed
+  author and committer stamp instead, which is the thing that actually
+  makes identity independent of time. One `#[cfg(test)] test_support`
+  module owns the temp-directory rule — unique per process AND per call,
+  pre-cleaned — for the seventeen places that each wrote their own.
+- **The session-id test cannot be weakened by the developer's shell.**
+  `session_id` read `RELAIS_SESSION_ID` and `CLAUDE_SESSION_ID` from the
+  ambient environment, so the test asserted the fallback only when
+  neither happened to be set. The lookup is injected the way
+  `paths::resolve_home` is, and every branch is asserted unconditionally.
+- **`relais plan` names a blocker once.** `Blocked::explain` lists every
+  blocker with its code on stdout, and `plan` then repeated the whole
+  list on stderr — so a plan blocked by one thing reported it twice.
+- **The review this release came out of is in the repository.**
+  `docs/REVIEW-2026-09-21.md` carries every finding against `f231b7f`,
+  with a status column naming the pull request that fixed each one or the
+  reason it was kept, and a scorecard re-measured after v0.2.0.
 
 ## v0.1.6
 

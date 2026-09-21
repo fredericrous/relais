@@ -201,4 +201,56 @@ mod tests {
         assert!(scope_could_touch("**", "docs/**"));
         assert!(scope_could_touch("docs/**", "docs/a/**"));
     }
+
+    proptest::proptest! {
+        /// Overlap is a relation between two scopes, so it cannot depend
+        /// on which one was passed first: `a` may write where `b` does
+        /// exactly when `b` may write where `a` does. A one-sided answer
+        /// would let two decomposed packages be handed the same file.
+        #[test]
+        fn overlap_is_symmetric_and_reflexive(
+            left in glob_segments(),
+            right in glob_segments(),
+        ) {
+            use proptest::prelude::*;
+            prop_assert_eq!(
+                globs_overlap(&left, &right),
+                globs_overlap(&right, &left),
+                "{:?} vs {:?}",
+                left,
+                right
+            );
+            prop_assert!(globs_overlap(&left, &left), "{:?} overlaps itself", left);
+            prop_assert!(globs_overlap(&right, &right), "{:?} overlaps itself", right);
+        }
+
+        /// And `**` swallows everything: a scope of `**` overlaps any
+        /// other scope, which is why a `**` package is refused rather
+        /// than scheduled beside anything.
+        #[test]
+        fn a_double_star_scope_overlaps_everything(other in glob_segments()) {
+            use proptest::prelude::*;
+            let everything = vec!["**".to_string()];
+            prop_assert!(globs_overlap(&everything, &other), "{:?}", other);
+            prop_assert!(globs_overlap(&other, &everything), "{:?}", other);
+        }
+    }
+
+    /// Path segments a scope is made of: literals, wildcards, `**`, and
+    /// the extension patterns a real `write_scope` carries.
+    fn glob_segments() -> impl proptest::strategy::Strategy<Value = Vec<String>> {
+        proptest::collection::vec(
+            proptest::sample::select(vec![
+                "src".to_string(),
+                "tests".to_string(),
+                "docs".to_string(),
+                "*".to_string(),
+                "**".to_string(),
+                "*.rs".to_string(),
+                "main.rs".to_string(),
+                "mod*".to_string(),
+            ]),
+            0..5,
+        )
+    }
 }

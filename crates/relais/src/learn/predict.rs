@@ -76,7 +76,7 @@ pub fn estimate_from_registry(
         .collect();
     let input_hash = crate::ids::sha256_hex(
         serde_json::to_string(&inputs.iter().map(|(_, sparse)| sparse).collect::<Vec<_>>())
-            .expect("serializes")
+            .expect("a vector of sparse f64 features serializes: no map keys, no NaN")
             .as_bytes(),
     );
 
@@ -219,6 +219,9 @@ pub fn profile_identity(
     ProfileIdentity {
         model: profile.id.clone(),
         effort: profile.effort.map(|effort| {
+            // An owned fieldless enum always serializes to a string; the
+            // Debug spelling below is the same token in the same case,
+            // so neither branch can produce a different identity.
             serde_json::to_value(effort)
                 .ok()
                 .and_then(|value| value.as_str().map(str::to_string))
@@ -266,7 +269,8 @@ impl RoutePredictor for RegistryPredictor<'_> {
             return None;
         }
         let input_hash = result.input_hash.clone();
-        let raw = serde_json::to_value(&result).expect("serializes");
+        let raw = serde_json::to_value(&result)
+            .expect("an InferenceResult serializes: owned strings, integers and finite f64");
         let mut acceptance = std::collections::BTreeMap::new();
         let mut cost = std::collections::BTreeMap::new();
         for (tier, probability) in result.acceptance {
@@ -331,17 +335,7 @@ mod tests {
     /// pid, the counter orders the directories within it. A thread id is
     /// reused the moment a thread ends.
     fn temp_dir(name: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "relais-predict-{name}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        // Best effort: usually absent; `Registry::open` reports what it
-        // cannot create.
-        std::fs::remove_dir_all(&dir).ok();
-        dir
+        crate::test_support::temp_dir(&format!("predict-{name}"))
     }
 
     /// The identity the implementation tier dispatches with under the

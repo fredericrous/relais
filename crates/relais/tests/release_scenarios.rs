@@ -5,8 +5,11 @@
 //! mock backends; these prove the wiring — config files, trust grants,
 //! the lazily started coordinator, exit codes and artifacts.
 //!
-//! Unix only: the fake `claude` is a `sh` script. The library-level
-//! tests, including the coordinator's endpoint, run on Windows too.
+//! Unix only: every scenario here drives the fake `claude`, which is a
+//! `sh` script. The ones that need no worker — `init`, `install`,
+//! `uninstall`, `doctor`, a blocked `plan`, `coordinator status` with
+//! no daemon, and the exit-code table — are in `portable_scenarios.rs`
+//! and run on Windows too, along with the library-level tests.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
@@ -670,44 +673,6 @@ fn out_of_scope_edits_and_misspelled_controls_are_refused() {
     );
 }
 
-// SPEC §14: installation and uninstall preserve unrelated configuration
-// and modified owned files.
-#[test]
-fn install_is_preview_first_and_uninstall_keeps_foreign_and_modified_files() {
-    let world = World::new("install");
-    let preview = world.relais(&["install", "--claude"]);
-    assert_eq!(preview.status.code(), Some(0));
-    assert!(text(&preview.stdout).contains("preview only"));
-    assert!(!world.repo.join(".claude/skills/relais/SKILL.md").exists());
-    std::fs::create_dir_all(world.repo.join(".claude/agents")).expect("mkdir");
-    std::fs::write(world.repo.join(".claude/agents/custom.md"), "# mine\n").expect("foreign");
-    let write = world.relais(&["install", "--claude", "--write"]);
-    assert_eq!(write.status.code(), Some(0), "{}", text(&write.stderr));
-    let skill = world.repo.join(".claude/skills/relais/SKILL.md");
-    assert!(skill.exists());
-    assert!(world
-        .repo
-        .join(".claude/agents/relais-research.md")
-        .exists());
-    std::fs::write(&skill, "# edited by the user\n").expect("modify");
-    let uninstall = world.relais(&["uninstall", "--claude", "--write"]);
-    assert_eq!(
-        uninstall.status.code(),
-        Some(0),
-        "{}",
-        text(&uninstall.stderr)
-    );
-    assert!(skill.exists(), "a modified owned file is kept");
-    assert!(!world
-        .repo
-        .join(".claude/agents/relais-research.md")
-        .exists());
-    assert!(
-        world.repo.join(".claude/agents/custom.md").exists(),
-        "foreign files are kept"
-    );
-}
-
 // SPEC §17, §21: execute → verify → label → build dataset → train →
 // evaluate → promote → route. The loop closes: a promoted artifact is
 // what `plan` and `run` consult, and it says so.
@@ -811,18 +776,6 @@ fn the_learning_loop_closes_from_runs_to_a_learned_route() {
         "{}",
         text(&plan.stdout)
     );
-}
-
-#[test]
-fn init_writes_a_valid_policy_once() {
-    let world = World::new("init");
-    let first = world.relais(&["init"]);
-    assert_eq!(first.status.code(), Some(0));
-    let policy = std::fs::read_to_string(world.repo.join("relais.toml")).expect("policy");
-    RepoPolicy::from_toml_str(&policy).expect("the template is a valid policy");
-    let second = world.relais(&["init"]);
-    assert_eq!(second.status.code(), Some(2));
-    assert!(text(&second.stderr).contains("never overwrites"));
 }
 
 // SPEC §23: cancelling one run through the coordinator leaves the

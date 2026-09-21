@@ -212,4 +212,41 @@ mod tests {
         assert!(MicroUsd::from_micros(-1).is_negative());
         assert!(!MicroUsd::ZERO.is_negative());
     }
+
+    proptest::proptest! {
+        /// Money saturates at the extremes and never wraps. A ceiling
+        /// minus a spend that wrapped to a positive number would read as
+        /// an unlimited budget, which is P7.
+        #[test]
+        fn addition_and_subtraction_saturate_and_never_wrap(
+            left in proptest::num::i64::ANY,
+            right in proptest::num::i64::ANY,
+        ) {
+            use proptest::prelude::*;
+            let a = MicroUsd::from_micros(left);
+            let b = MicroUsd::from_micros(right);
+            prop_assert_eq!((a + b).to_micros(), left.saturating_add(right));
+            prop_assert_eq!((a - b).to_micros(), left.saturating_sub(right));
+            prop_assert_eq!(a.saturating_add(b).to_micros(), left.saturating_add(right));
+            prop_assert_eq!(a.saturating_sub(b).to_micros(), left.saturating_sub(right));
+            let mut assigned = a;
+            assigned += b;
+            prop_assert_eq!(assigned.to_micros(), left.saturating_add(right));
+        }
+
+        /// What is left of a ceiling is never negative, whatever was
+        /// spent: a budget is exhausted, not owed.
+        #[test]
+        fn a_remaining_budget_is_never_negative(
+            ceiling in proptest::num::i64::ANY,
+            // A spend is an amount paid: never negative, which is what
+            // makes the upper bound below meaningful.
+            spent in 0i64..=i64::MAX,
+        ) {
+            use proptest::prelude::*;
+            let left = MicroUsd::from_micros(ceiling).remaining_after(MicroUsd::from_micros(spent));
+            prop_assert!(left.to_micros() >= 0, "{left:?}");
+            prop_assert!(left.to_micros() <= ceiling.max(0));
+        }
+    }
 }

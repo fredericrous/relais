@@ -160,9 +160,75 @@ pub fn uid() -> u32 {
 /// The uid on the other end of a connected Unix socket — `SO_PEERCRED`
 /// on Linux, `getpeereid` on macOS and the BSDs. The kernel answers, not
 /// the peer, so it is evidence rather than a claim.
+///
+/// Takes the stream, not a descriptor: the raw fd is this module's to
+/// handle, like every other platform detail here
+/// (`boundaries.own-the-interface`).
 #[cfg(unix)]
-pub fn peer_uid(fd: std::os::unix::io::RawFd) -> io::Result<u32> {
-    imp::peer_uid(fd)
+pub fn peer_uid(stream: &std::os::unix::net::UnixStream) -> io::Result<u32> {
+    use std::os::unix::io::AsRawFd;
+    imp::peer_uid(stream.as_raw_fd())
+}
+
+/// The process umask, narrowed to `mask` for as long as the returned
+/// value lives.
+///
+/// `umask(2)` is a property of the whole process, so the guard also
+/// serialises: two threads narrowing at once would restore each other's
+/// value. A file another thread creates inside the window comes out
+/// more private than it asked for, which is the harmless direction, and
+/// the window is one syscall long.
+///
+/// Used to close the moment between `bind(2)` creating a socket inode
+/// with the ambient umask applied and the explicit `set_permissions`
+/// that follows (A8).
+#[cfg(unix)]
+pub fn narrow_umask(mask: Mode) -> UmaskGuard {
+    let serialised = UMASK_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    UmaskGuard {
+        previous: imp::set_umask(mask),
+        _serialised: serialised,
+    }
+}
+
+/// The file-mode type this platform's `umask(2)` speaks — `u32` on
+/// Linux, `u16` on the BSDs. Aliased here so nothing above `procs`
+/// names `libc`, and so neither width needs a cast one of the two
+/// platforms calls unnecessary.
+#[cfg(unix)]
+pub use imp::Mode;
+
+/// Serialises the window in [`narrow_umask`]: the umask is process-wide,
+/// so two threads narrowing at once would restore each other's value.
+#[cfg(unix)]
+static UMASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// What [`narrow_umask`] returns: the previous umask is restored when
+/// this is dropped, and nothing else may narrow it in the meantime.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct UmaskGuard {
+    previous: Mode,
+    _serialised: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(unix)]
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        imp::set_umask(self.previous);
+    }
+}
+
+/// Has this process run out of file descriptors?
+///
+/// The one accept failure that does not pass on a retry: retrying at
+/// full speed is a hot loop that starves the very handlers trying to
+/// close theirs (A9). Everything else — a peer that went away, an
+/// interrupted syscall — is transient.
+pub fn out_of_descriptors(error: &io::Error) -> bool {
+    imp::out_of_descriptors(error)
 }
 
 /// The parent of this process, when the platform can say.
@@ -691,6 +757,22 @@ mod imp {
         unsafe { libc::getuid() }
     }
 
+    pub type Mode = libc::mode_t;
+
+    /// Set the process umask, answering the one it replaced.
+    pub fn set_umask(mask: Mode) -> Mode {
+        // SAFETY: `umask` cannot fail and touches no memory; it returns
+        // the previous value, which is what the caller restores.
+        unsafe { libc::umask(mask) }
+    }
+
+    pub fn out_of_descriptors(error: &io::Error) -> bool {
+        matches!(
+            error.raw_os_error(),
+            Some(code) if code == libc::EMFILE || code == libc::ENFILE
+        )
+    }
+
     #[cfg(target_os = "linux")]
     pub fn peer_uid(fd: std::os::unix::io::RawFd) -> io::Result<u32> {
         // SAFETY: `getsockopt` fills a `ucred` whose size is passed in
@@ -872,6 +954,12 @@ mod imp {
         }
     }
 
+    /// WSAEMFILE, and the Win32 "too many open files" a socket call can
+    /// surface. Neither passes on a retry.
+    pub fn out_of_descriptors(error: &io::Error) -> bool {
+        matches!(error.raw_os_error(), Some(10024) | Some(4))
+    }
+
     pub fn parent_pid() -> Option<u32> {
         let me = std::process::id();
         // SAFETY: a process snapshot walked with the documented entry
@@ -938,6 +1026,32 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
+    // A9: a persistent accept failure the loop cannot make progress on
+    // has to be told from one the next accept is unaffected by, or the
+    // coordinator's accept loop spins at full speed on `EMFILE` and
+    // starves the handlers trying to close a descriptor.
+    #[test]
+    fn descriptor_exhaustion_is_told_from_a_peer_that_went_away() {
+        #[cfg(unix)]
+        {
+            assert!(out_of_descriptors(&io::Error::from_raw_os_error(
+                libc::EMFILE
+            )));
+            assert!(out_of_descriptors(&io::Error::from_raw_os_error(
+                libc::ENFILE
+            )));
+            assert!(!out_of_descriptors(&io::Error::from_raw_os_error(
+                libc::ECONNABORTED
+            )));
+            assert!(!out_of_descriptors(&io::Error::from_raw_os_error(
+                libc::EINTR
+            )));
+        }
+        assert!(!out_of_descriptors(&io::Error::from(
+            io::ErrorKind::WouldBlock
+        )));
+    }
+
     use std::sync::Arc;
 
     use super::*;
@@ -1158,8 +1272,7 @@ mod tests {
     // C7: the lock the kernel releases on any death, including SIGKILL.
     #[test]
     fn an_exclusive_lock_is_held_once_and_released_on_drop() {
-        let dir = std::env::temp_dir().join(format!("rl-lock-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dir = crate::test_support::temp_dir("lock");
         let path = dir.join("coordinator.lock");
         let mut held = LockFile::try_acquire(&path)
             .expect("acquire")
@@ -1205,23 +1318,61 @@ mod tests {
     // after a cancelled worker ignored `terminate`.
     #[test]
     fn kill_ends_a_process_that_ignores_terminate() {
-        let mut command = if cfg!(windows) {
-            let mut c = Command::new("cmd");
-            c.args(["/C", "ping -n 60 127.0.0.1 > NUL"]);
-            c
-        } else {
-            // SIGTERM ignored: only the hard kill ends this one.
+        use crate::test_support::wait_until;
+        let dir = crate::test_support::temp_dir("ignores-term");
+        #[cfg(unix)]
+        let ready = dir.join("ready");
+        #[cfg(unix)]
+        let mut command = {
+            // SIGTERM ignored: only the hard kill ends this one. The
+            // child says when the trap is installed rather than the test
+            // sleeping long enough to assume it — the polite request
+            // must not arrive first, or the test proves the opposite of
+            // what it claims.
             let mut c = Command::new("sh");
-            c.args(["-c", "trap '' TERM; sleep 60"]);
+            c.args([
+                "-c",
+                &format!(
+                    "trap '' TERM; echo ready > '{}'; sleep 60",
+                    ready.to_string_lossy()
+                ),
+            ]);
+            c
+        };
+        #[cfg(windows)]
+        let mut command = {
+            // No trap to install: Windows has one way to stop another
+            // process and it is already unblockable. So there is nothing
+            // for the child to announce, and no shell either — `cmd /C`
+            // re-parses the quoting `Command` applies, which is how the
+            // readiness file it was told to write never appeared.
+            let mut c = Command::new("ping");
+            c.args(["-n", "60", "127.0.0.1"]);
+            c.stdout(Stdio::null());
             c
         };
         let mut child = command.spawn().expect("spawn");
         let pid = child.id();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        terminate(pid).expect("the polite request is delivered");
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Readiness, bounded, on both: the trap on unix, the process
+        // table on Windows.
         #[cfg(unix)]
-        assert!(alive(pid), "the worker ignored the polite request");
+        assert!(
+            wait_until(std::time::Duration::from_secs(10), || ready.exists()),
+            "the child never said its trap was installed"
+        );
+        #[cfg(windows)]
+        assert!(
+            wait_until(std::time::Duration::from_secs(10), || alive(pid)),
+            "the child never reached the process table"
+        );
+        terminate(pid).expect("the polite request is delivered");
+        // The property is that NOTHING happened: sampled across a
+        // window, not read once at an arbitrary moment.
+        #[cfg(unix)]
+        assert!(
+            crate::test_support::stays(std::time::Duration::from_millis(300), || alive(pid)),
+            "the worker ignored the polite request"
+        );
         match kill(pid) {
             Ok(()) => {}
             // Windows has one way to stop another process and it is
@@ -1240,7 +1391,11 @@ mod tests {
             }
         }
         let _ = child.wait();
-        assert!(!alive(pid));
+        assert!(
+            wait_until(std::time::Duration::from_secs(10), || !alive(pid)),
+            "the hard kill ends it"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // A7: the delivery was discarded, so the coordinator recorded a
@@ -1287,9 +1442,8 @@ mod tests {
     fn the_uid_we_serve_is_the_one_we_run_as() {
         let me = uid();
         let (here, there) = std::os::unix::net::UnixStream::pair().expect("socketpair");
-        use std::os::unix::io::AsRawFd;
-        assert_eq!(peer_uid(here.as_raw_fd()).expect("peer"), me);
-        assert_eq!(peer_uid(there.as_raw_fd()).expect("peer"), me);
+        assert_eq!(peer_uid(&here).expect("peer"), me);
+        assert_eq!(peer_uid(&there).expect("peer"), me);
     }
 
     #[test]

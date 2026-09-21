@@ -16,6 +16,17 @@ use std::process::Command;
 use crate::contract::TaskContract;
 use crate::ids::sha256_hex;
 
+/// The author and committer date every candidate snapshot is stamped
+/// with, and the unix seconds that is.
+///
+/// Fixed, because `commit-tree` otherwise puts the wall clock into the
+/// object and gives the same tree a new identity every second — and
+/// candidate identity is exactly what the same-failure recurrence check
+/// compares (SPEC §9). Named so the test can assert the stamp instead
+/// of sleeping across a clock second to observe it.
+pub const SNAPSHOT_DATE: &str = "2000-01-01T00:00:00Z";
+pub const SNAPSHOT_DATE_UNIX: i64 = 946_684_800;
+
 #[derive(Debug)]
 pub enum WorkspaceError {
     Git(String),
@@ -309,10 +320,10 @@ impl TaskWorktree {
             ])
             .env("GIT_AUTHOR_NAME", "relais")
             .env("GIT_AUTHOR_EMAIL", "relais@localhost")
-            .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z")
+            .env("GIT_AUTHOR_DATE", SNAPSHOT_DATE)
             .env("GIT_COMMITTER_NAME", "relais")
             .env("GIT_COMMITTER_EMAIL", "relais@localhost")
-            .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", SNAPSHOT_DATE)
             .output()
             .map_err(|e| WorkspaceError::Git(format!("commit-tree: {e}")))?;
         if !commit.status.success() {
@@ -595,17 +606,7 @@ mod tests {
     use super::*;
 
     fn temp_repo() -> (PathBuf, PathBuf) {
-        // Unique per test: pid alone is shared across parallel test
-        // threads, and clock nanos can collide under load, which once made
-        // two tests stomp the same fixture repo. The counter is monotonic.
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "relais-ws-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dir = crate::test_support::temp_dir("ws");
         let repo = dir.join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir");
         // The machine's global hooksPath is amont's; test repos point at
@@ -881,7 +882,16 @@ mod tests {
         let wt = create_worktree(&repo, &sha, &wt_path).expect("worktree");
         std::fs::write(wt_path.join("src/main.rs"), "fn main() { v2 }\n").expect("edit");
         let first = wt.snapshot_candidate("attempt-1").expect("snapshot");
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // What makes identity independent of time is the FIXED stamp,
+        // so that is what is asserted — instantly, on every run. The
+        // 1.1 s sleep this replaces only ever observed the property
+        // indirectly, and only if the suite happened to cross a second.
+        let stamps = git(&wt_path, &["show", "-s", "--format=%at %ct", &first]).expect("show");
+        assert_eq!(
+            stamps.trim(),
+            format!("{SNAPSHOT_DATE_UNIX} {SNAPSHOT_DATE_UNIX}"),
+            "author and committer dates are the fixed stamp, not the wall clock"
+        );
         let second = wt.snapshot_candidate("attempt-2").expect("snapshot");
         assert_eq!(
             first, second,

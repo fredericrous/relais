@@ -573,6 +573,24 @@ impl Binding {
     }
 }
 
+/// Where a dispatch sits in its run's agent tree.
+///
+/// `Option<Option<(String, bool)>>` said the same thing and no caller
+/// could read it: three states spelled as two nested `Option`s and a
+/// flag (`types.variants-as-unions`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Parentage {
+    /// It named no parent: the run's first agent.
+    Root,
+    /// It named a parent this coordinator holds, so the depth and the
+    /// budget it inherits are evidence.
+    Known { parent: String },
+    /// It named a parent this coordinator has never seen — an adopted
+    /// orphan, or a parent that settled before the child bound. The
+    /// depth it claims cannot be checked against anything.
+    Unrecognised { parent: String },
+}
+
 #[derive(Debug, Clone)]
 struct Dispatch {
     session_id: String,
@@ -1758,14 +1776,16 @@ impl AdmissionState {
         }
     }
 
-    /// Parent evidence for a dispatch: `None` = unknown dispatch,
-    /// `Some(None)` = root, `Some(Some((parent, known)))` otherwise.
-    pub fn parentage(&self, dispatch_id: &str) -> Option<Option<(String, bool)>> {
+    /// Parent evidence for a dispatch. `None` is a dispatch this
+    /// coordinator does not hold; the three states of a dispatch it does
+    /// are [`Parentage`]'s variants.
+    pub fn parentage(&self, dispatch_id: &str) -> Option<Parentage> {
         self.dispatches.get(dispatch_id).map(|dispatch| {
-            dispatch
-                .parent
-                .clone()
-                .map(|parent| (parent, dispatch.parent_known))
+            match (dispatch.parent.clone(), dispatch.parent_known) {
+                (None, _) => Parentage::Root,
+                (Some(parent), true) => Parentage::Known { parent },
+                (Some(parent), false) => Parentage::Unrecognised { parent },
+            }
         })
     }
 
@@ -2377,7 +2397,12 @@ mod tests {
         let mut kid = child("kid", "run-a", "tab-a", "root", 1);
         kid.reserve_micros = 300;
         assert!(granted(state.request(&kid, t0)));
-        assert_eq!(state.parentage("kid"), Some(Some(("root".into(), true))));
+        assert_eq!(
+            state.parentage("kid"),
+            Some(Parentage::Known {
+                parent: "root".into()
+            })
+        );
         // A grandchild that would overspend the ROOT budget is refused:
         // children cannot independently spend the same allowance.
         let mut grandkid = child("grandkid", "run-a", "tab-a", "kid", 2);
@@ -2743,7 +2768,9 @@ mod tests {
         assert_eq!(state.status(t0).active_by_class["model_work"], 1);
         assert_eq!(
             state.parentage("orphan"),
-            Some(Some(("gone-parent".into(), false)))
+            Some(Parentage::Unrecognised {
+                parent: "gone-parent".into()
+            })
         );
         assert_eq!(state.request(&orphan, t0), Decision::AlreadyAdmitted);
 
@@ -2975,7 +3002,12 @@ mod tests {
         kid.reserve_micros = 400;
         assert!(granted(state.request(&kid, t0)));
         assert_eq!(state.depth_of("kid"), Some(1), "derived from the parent");
-        assert_eq!(state.parentage("kid"), Some(Some(("root".into(), true))));
+        assert_eq!(
+            state.parentage("kid"),
+            Some(Parentage::Known {
+                parent: "root".into()
+            })
+        );
         assert_eq!(
             state.status(t0).runs["run-a"].reserved_micros,
             800,

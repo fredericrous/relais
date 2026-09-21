@@ -30,13 +30,49 @@ use crate::money::MicroUsd;
 use crate::procs::{run_with_timeout, Ended, ProcessEnd};
 use crate::tooling::PROBE_TIMEOUT;
 
+/// Why a capability probe produced no capabilities.
+///
+/// A probe that could not be run is not the same fact as a CLI that ran
+/// and does not support a flag, and reading the first as the second is
+/// how an unavailable harness reads as an unsupported one. Every
+/// variant blocks the launch; which it was is what `doctor` prints
+/// (`errors.never-swallowed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeFailure {
+    /// The probe process could not be started, timed out, or was
+    /// cancelled.
+    NotRun { args: String, detail: String },
+    /// It ran and did not exit 0.
+    Refused { args: String, ended: String },
+    /// It exited 0 with nothing on either stream.
+    Silent { args: String },
+}
+
+impl std::fmt::Display for ProbeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotRun { args, detail } => {
+                write!(f, "`claude {args}` did not run: {detail}")
+            }
+            Self::Refused { args, ended } => write!(f, "`claude {args}` {ended}"),
+            Self::Silent { args } => {
+                write!(f, "`claude {args}` exited 0 and printed nothing")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProbeFailure {}
+
 #[derive(Debug)]
 pub struct ClaudeBackend {
     binary: PathBuf,
     /// Probed on first use and kept: `--version` and `--help` are facts
     /// about an installed CLI, and asking again before every dispatch
     /// spent two processes per launch to learn the same thing (audit V6).
-    capabilities: OnceLock<Option<Capabilities>>,
+    /// The failure is kept too, so a probe that errored is reported as
+    /// an error rather than as a CLI without the flags.
+    capabilities: OnceLock<Result<Capabilities, ProbeFailure>>,
 }
 
 impl ClaudeBackend {
@@ -87,37 +123,64 @@ impl ClaudeBackend {
         &self.binary
     }
 
-    /// The probe, cached. `cancel` aborts a probe that hangs; the timeout
-    /// bounds one that merely takes its time.
-    fn capabilities(&self, cancel: Option<&AtomicBool>) -> Option<Capabilities> {
-        self.capabilities
-            .get_or_init(|| self.probe_now(cancel))
-            .clone()
+    /// The probe, cached, with the reason it failed when it did.
+    /// `cancel` aborts a probe that hangs; the timeout bounds one that
+    /// merely takes its time.
+    fn capability_report(
+        &self,
+        cancel: Option<&AtomicBool>,
+    ) -> &Result<Capabilities, ProbeFailure> {
+        self.capabilities.get_or_init(|| self.probe_now(cancel))
     }
 
-    fn probe_now(&self, cancel: Option<&AtomicBool>) -> Option<Capabilities> {
+    /// What the installed CLI can be asked to do, or why that could not
+    /// be established — the answer `doctor` reports.
+    pub fn probe_report(&self) -> Result<Capabilities, ProbeFailure> {
+        self.capability_report(None).clone()
+    }
+
+    fn capabilities(&self, cancel: Option<&AtomicBool>) -> Option<Capabilities> {
+        // The failure is not dropped here: `launch` re-reads the report
+        // below to put it in the `BackendError`, and `probe_report` is
+        // what `doctor` prints. This is the `Backend::probe` shape.
+        self.capability_report(cancel).clone().ok()
+    }
+
+    fn probe_now(&self, cancel: Option<&AtomicBool>) -> Result<Capabilities, ProbeFailure> {
         let version = self.ask(&["--version"], cancel)?;
         // A CLI that answers `--version` but not `--help` cannot have its
         // flags checked, and a launch may not assume them: no
         // capabilities means no backend, which blocks (SPEC §6).
         let help = self.ask(&["--help"], cancel)?;
-        Some(capabilities_from_help(
+        Ok(capabilities_from_help(
             version.trim().to_string(),
             help.trim(),
         ))
     }
 
-    /// One probe call: bounded, cancellable, and `None` unless the CLI
+    /// One probe call: bounded, cancellable, and an error unless the CLI
     /// exited successfully with something to say.
-    fn ask(&self, args: &[&str], cancel: Option<&AtomicBool>) -> Option<String> {
+    fn ask(&self, args: &[&str], cancel: Option<&AtomicBool>) -> Result<String, ProbeFailure> {
         let mut command = Command::new(&self.binary);
         command.args(args);
-        let end = run_with_timeout(command, PROBE_TIMEOUT, None, cancel, None).ok()?;
+        let named = args.join(" ");
+        let end = run_with_timeout(command, PROBE_TIMEOUT, None, cancel, None).map_err(|e| {
+            ProbeFailure::NotRun {
+                args: named.clone(),
+                detail: e.to_string(),
+            }
+        })?;
         if end.ended != Ended::Exited(0) {
-            return None;
+            return Err(ProbeFailure::Refused {
+                args: named,
+                ended: end.ended.describe(),
+            });
         }
         let answer = format!("{}{}", end.stdout, end.stderr);
-        (!answer.trim().is_empty()).then_some(answer)
+        if answer.trim().is_empty() {
+            return Err(ProbeFailure::Silent { args: named });
+        }
+        Ok(answer)
     }
 }
 
@@ -131,12 +194,16 @@ impl Backend for ClaudeBackend {
     }
 
     fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError> {
-        let caps = self.capabilities(spec.cancel.as_deref()).ok_or_else(|| {
-            BackendError::MissingBinary(format!(
-                "{}: it did not answer `--version` and `--help` within {PROBE_TIMEOUT:?}, so its                  launch controls cannot be checked",
-                self.binary.display()
-            ))
-        })?;
+        let caps = self
+            .capability_report(spec.cancel.as_deref())
+            .clone()
+            .map_err(|failure| {
+                BackendError::MissingBinary(format!(
+                    "{}: its launch controls cannot be checked — {failure} (probes are bounded \
+                     at {PROBE_TIMEOUT:?})",
+                    self.binary.display()
+                ))
+            })?;
         let argv = build_argv(spec, &caps)?;
 
         let mut command = Command::new(&self.binary);
@@ -731,12 +798,7 @@ mod tests {
             "{error}: {error:?}"
         );
 
-        let dir = std::env::temp_dir().join(format!(
-            "relais-claude-bin-{}-{}",
-            std::process::id(),
-            NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        std::fs::remove_dir_all(&dir).ok();
+        let dir = crate::test_support::temp_dir("claude-bin");
         std::fs::create_dir_all(dir.join("bin")).expect("mkdir");
         let binary = dir.join("bin/claude");
         std::fs::write(&binary, "#!/bin/sh\nexit 0\n").expect("write");
@@ -753,8 +815,4 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).ok();
     }
-
-    /// Unique fixture directories: the pid is shared by parallel test
-    /// threads, the counter is not.
-    static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 }

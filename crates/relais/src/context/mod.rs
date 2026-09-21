@@ -563,9 +563,18 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
                     format!("`{key}` ({adr}): {choice} — because {reason}")
                 }
                 (Some(choice), None) => format!("`{key}` ({adr}): {choice}"),
-                _ => format!("`{key}` is decided by {adr} (run `aval show {adr}` for the text)"),
+                (None, Some(_) | None) => {
+                    format!("`{key}` is decided by {adr} (run `aval show {adr}` for the text)")
+                }
             }),
-            _ => None,
+            // Only an Active verdict carries a constraint: Undecided and
+            // Unknown decide nothing, Retired decides nothing any more,
+            // and Contradiction/ToolFailure were already refused above.
+            AvalVerdict::Undecided
+            | AvalVerdict::Unknown
+            | AvalVerdict::Retired { .. }
+            | AvalVerdict::Contradiction { .. }
+            | AvalVerdict::ToolFailure { .. } => None,
         })
         .collect();
 

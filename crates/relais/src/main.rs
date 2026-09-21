@@ -356,8 +356,11 @@ impl CliError {
             CliError::Locate(_)
             | CliError::Read { .. }
             | CliError::Invalid { .. }
-            | CliError::Usage { .. }
-            | CliError::NoDataset { .. } => CliOutcome::InvalidInput,
+            | CliError::Usage { .. } => CliOutcome::InvalidInput,
+            // "No dataset has been built yet" IS "nothing to train on
+            // yet", which the table already has a code for; exit 2 told
+            // a caller its invocation was wrong when it was not.
+            CliError::NoDataset { .. } => CliOutcome::NoTrainingRecords,
             CliError::Operational { .. } => CliOutcome::OperationalFailure,
         }
     }
@@ -512,24 +515,69 @@ fn uninstall_command(write: bool, user: bool) -> Result<CliOutcome, CliError> {
 /// missing or unreadable registry is the conservative baseline, not an
 /// error (SPEC §21: missing trained evidence produces conservative
 /// execution without disabling the rest of the product).
+///
+/// "Unreadable" is not "absent", though, and the difference is the
+/// operator's to act on: a registry that will not open is said so on
+/// stderr before routing falls back.
 fn learned_registry(machine: &MachineSettings) -> Option<relais::learn::registry::Registry> {
     if !machine.routing.learned_enabled {
         return None;
     }
-    let dir = paths::registry_dir().ok()?;
-    relais::learn::registry::Registry::open(&dir).ok()
+    let dir = match paths::registry_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!(
+                "relais: learned routing is on and the registry directory is unavailable ({e}); \
+                 routing falls back to the policy rules"
+            );
+            return None;
+        }
+    };
+    match relais::learn::registry::Registry::open(&dir) {
+        Ok(registry) => Some(registry),
+        Err(e) => {
+            eprintln!(
+                "relais: learned routing is on and the registry at {} is unreadable ({e}); \
+                 routing falls back to the policy rules",
+                dir.display()
+            );
+            None
+        }
+    }
 }
 
 /// `<backend> <version>` for `plan`, which must not need the harness to
-/// answer: unknown when it is not installed.
+/// answer: unknown when it is not installed. Which of "not installed"
+/// and "installed and would not answer" it was goes to stderr — the
+/// plan is still printed either way.
 fn harness_identity() -> Option<String> {
-    let backend = relais::adapter::claude::ClaudeBackend::discover().ok()?;
-    let capabilities = backend.probe()?;
+    let backend = match relais::adapter::claude::ClaudeBackend::discover() {
+        Ok(backend) => backend,
+        Err(e) => {
+            eprintln!("relais plan: the harness is unknown ({e})");
+            return None;
+        }
+    };
+    let capabilities = match backend.probe_report() {
+        Ok(capabilities) => capabilities,
+        Err(failure) => {
+            eprintln!("relais plan: the harness is unknown ({failure})");
+            return None;
+        }
+    };
     Some(format!(
         "{} {}",
         backend.name(),
         capabilities.version.as_deref().unwrap_or("?")
     ))
+}
+
+/// The identifier source this process mints with: the wall clock and
+/// this process's id, read once, here, at the boundary. `ids` itself
+/// takes both as parameters (`effects.no-ambient-access`), which is
+/// what lets a test assert on a minted identifier.
+fn id_source() -> IdSource {
+    IdSource::new(std::time::SystemTime::now, std::process::id())
 }
 
 fn registry() -> Result<relais::learn::registry::Registry, CliError> {
@@ -701,7 +749,10 @@ fn train_command() -> Result<CliOutcome, CliError> {
         solver: settings.solver,
         trained_at: relais::ledger::now_rfc3339(),
         relais_version: relais::version().into(),
-        evaluation: Some(serde_json::to_value(&outcome.report).expect("serializes")),
+        evaluation: Some(
+            serde_json::to_value(&outcome.report)
+                .expect("an EvalReport serializes: owned strings and finite f64"),
+        ),
     };
     let reg = registry()?;
     operational(reg.store(&artifact), "train")?;
@@ -978,9 +1029,27 @@ fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome, CliError> 
                     }
                 },
             };
-            let ledger = paths::ledger_path()
-                .ok()
-                .and_then(|path| Ledger::open(&path).ok());
+            // The daemon serves without a ledger, but it then adopts no
+            // live dispatch at election: an unreadable ledger is said
+            // so, rather than looking like a machine with no runs.
+            let ledger = match paths::ledger_path().map(|path| (Ledger::open(&path), path)) {
+                Ok((Ok(ledger), _)) => Some(ledger),
+                Ok((Err(e), path)) => {
+                    eprintln!(
+                        "relais coordinator: the ledger at {} is unreadable ({e}); serving \
+                         without it means no dispatch is adopted at election",
+                        path.display()
+                    );
+                    None
+                }
+                Err(e) => {
+                    eprintln!(
+                        "relais coordinator: the ledger path is unavailable ({e}); serving \
+                         without it means no dispatch is adopted at election"
+                    );
+                    None
+                }
+            };
             match coordinator::run_daemon(&socket, limits, ledger.as_ref()) {
                 Ok(()) => Ok(CliOutcome::Accepted),
                 Err(e) => {
@@ -1257,10 +1326,10 @@ fn plan_command(task: &Path) -> Result<CliOutcome, CliError> {
             Ok(CliOutcome::Accepted)
         }
         route::Routed::Blocked(blocked) => {
+            // `explain` already lists every blocker with its code; this
+            // used to print them a second time on stderr, so a plan
+            // blocked by one thing reported it twice.
             print!("{}", blocked.explain());
-            for blocker in blocked.blockers() {
-                eprintln!("blocked: {} — {}", blocker.code, blocker.detail);
-            }
             Ok(CliOutcome::Blocked)
         }
     }
@@ -1310,7 +1379,7 @@ fn run_command(task: &Path) -> Result<CliOutcome, CliError> {
     let predictor = registry
         .as_ref()
         .map(|registry| RegistryPredictor::new(registry, &repo, harness.as_deref()));
-    let ids = IdSource::of_this_process();
+    let ids = id_source();
     let outcome = match execute(&RunConfig {
         repo_dir: &root,
         contract: &contract,
