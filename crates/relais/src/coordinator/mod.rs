@@ -22,8 +22,10 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::admission::{
-    AdmissionState, BindOutcome, Decision, DispatchRequest, Gate, GateError, HeartbeatStatus,
-    ResourceClass, ResumeOutcome, RunRegistration, Signal, StatusSnapshot,
+    AdmissionState, BindOutcome, Decision, DispatchRequest, Enforcement, Gate, GateError,
+    HeartbeatStatus, LifecycleOutcome, PendingSignal, ReleaseWriteOutcome, ResourceClass,
+    ResumeOutcome, RunRegistration, Signal, StatusSnapshot, WaitOutcome, WithdrawOutcome,
+    WriteLeaseOutcome,
 };
 use crate::ipc::{Listener, Stream};
 use crate::ledger::Ledger;
@@ -55,17 +57,129 @@ const RECONCILE_EVERY: Duration = Duration::from_secs(15);
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const START_TIMEOUT: Duration = Duration::from_secs(5);
+/// How many connections are served at once. Every request is short and
+/// capped by `REQUEST_TIMEOUT`, so a small pool is enough; what it
+/// prevents is one thread per connection, unjoined, for as many
+/// connections as anybody cares to open (A9).
+const HANDLER_THREADS: usize = 8;
+/// Connections accepted and waiting for a handler. Past this the accept
+/// loop blocks, which leaves the backlog where the kernel can bound it.
+const ACCEPT_BACKLOG: usize = 64;
+/// How often the accept loop wakes to check the shutdown flag when
+/// nothing is connecting.
+const ACCEPT_POLL: Duration = Duration::from_millis(50);
+/// How long to wait out a descriptor exhaustion before trying again, and
+/// how many times before giving up and letting the next CLI call elect a
+/// fresh daemon.
+const DESCRIPTOR_BACKOFF: Duration = Duration::from_millis(250);
+const DESCRIPTOR_RETRIES: u32 = 20;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CoordinatorError(pub String);
+/// The wire protocol this build speaks, independent of the crate
+/// version: bumped whenever a request or a response changes shape.
+///
+/// A daemon left running from an older install answers perfectly well
+/// and means something different by the same words — v1 said
+/// `{"kind":"ok","known":false}` for "I have never heard of that
+/// dispatch", which a v1 client read as success. A `Pong` carries this
+/// number so the skew is named at the first call instead of becoming a
+/// worker with no seat (A2).
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Why a coordinator call, election or startup failed. Every variant
+/// names the operation and the entity it was about, so a caller can tell
+/// an unreachable daemon from one that answered and refused.
+#[derive(Debug)]
+pub enum CoordinatorError {
+    /// The endpoint could not be reached or bound: no daemon, a stale
+    /// socket, a path that cannot be created.
+    Connect {
+        socket: PathBuf,
+        cause: std::io::Error,
+    },
+    /// An I/O failure on an established connection, or while serving.
+    Io {
+        operation: &'static str,
+        cause: std::io::Error,
+    },
+    /// The bytes on the wire were not something this version speaks.
+    Protocol {
+        operation: &'static str,
+        detail: String,
+    },
+    /// The daemon on the other end speaks a different wire protocol.
+    /// Stopping it (`relais coordinator stop`) is the whole fix.
+    VersionSkew {
+        socket: PathBuf,
+        ours: u32,
+        theirs: u32,
+        daemon_version: String,
+    },
+    /// The coordinator answered, and refused.
+    Rejected { detail: String },
+    /// The coordinator is on its way out and applied nothing. The caller
+    /// retries, which starts a fresh daemon (A11).
+    ShuttingDown { socket: PathBuf },
+    /// Another coordinator holds the election lock, or the lock could
+    /// not be taken at all.
+    Election { detail: String },
+    /// The set of dispatches the ledger records as live could not be
+    /// read. A coordinator that cannot see what is already running must
+    /// not start granting seats: every seat would be handed out twice
+    /// and every reservation lost (A1).
+    LiveSetUnreadable { cause: crate::ledger::LedgerError },
+}
 
 impl std::fmt::Display for CoordinatorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "coordinator: {}", self.0)
+        match self {
+            Self::Connect { socket, cause } => {
+                write!(f, "coordinator: endpoint {}: {cause}", socket.display())
+            }
+            Self::Io { operation, cause } => write!(f, "coordinator: {operation}: {cause}"),
+            Self::Protocol { operation, detail } => {
+                write!(f, "coordinator: {operation}: {detail}")
+            }
+            Self::VersionSkew {
+                socket,
+                ours,
+                theirs,
+                daemon_version,
+            } => write!(
+                f,
+                "coordinator: the daemon on {} (relais {daemon_version}) speaks wire protocol \
+                 {theirs} and this relais speaks {ours}; stop it with `relais coordinator stop` \
+                 and the next command starts one that matches",
+                socket.display()
+            ),
+            Self::Rejected { detail } => write!(f, "coordinator: {detail}"),
+            Self::ShuttingDown { socket } => write!(
+                f,
+                "coordinator: the daemon on {} is shutting down and applied nothing; retry",
+                socket.display()
+            ),
+            Self::Election { detail } => write!(f, "coordinator: election: {detail}"),
+            Self::LiveSetUnreadable { cause } => write!(
+                f,
+                "coordinator: the ledger's live dispatches could not be read ({cause}); a \
+                 coordinator that cannot see what is running will not start"
+            ),
+        }
     }
 }
 
-impl std::error::Error for CoordinatorError {}
+impl std::error::Error for CoordinatorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Connect { cause, .. } | Self::Io { cause, .. } => Some(cause),
+            Self::LiveSetUnreadable { cause } => Some(cause),
+            Self::Protocol { .. }
+            | Self::VersionSkew { .. }
+            | Self::Rejected { .. }
+            | Self::ShuttingDown { .. }
+            | Self::Election { .. } => None,
+        }
+    }
+}
 
 /// Wire protocol: one JSON request per line, one JSON response per
 /// line, one request per connection. Unknown methods are rejected so a
@@ -151,24 +265,106 @@ pub enum Request {
     Shutdown,
 }
 
+/// What a call names, when the coordinator has never heard of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Entity {
+    Dispatch,
+    Run,
+}
+
+/// A call the coordinator understood and deliberately did not apply.
+/// Each variant carries what the caller needs to decide what to do next
+/// — retry, stay waiting, or stop — instead of a sentence to match on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "refusal", rename_all = "snake_case")]
+pub enum Refused {
+    /// C6: the PID came off the wire and is not a live process, so
+    /// nothing was bound to the lease.
+    PidNotAlive { pid: Option<u32>, detail: String },
+    /// C8: waiting is a self-report, and this one has no live bound
+    /// process behind it. The seat is not given back.
+    UnverifiableWait { detail: String },
+    /// C8: resuming would hold more seats beyond the cap than the
+    /// ceiling allows. The parent stays waiting and can poll again.
+    OverAdmitted { over: u32, max: u32 },
+    /// The dispatch has already ended; there is nothing to relinquish.
+    DispatchEnded,
+    /// SPEC §23: another dispatch is writing that worktree.
+    WorktreeHeld { worktree: String, holder: String },
+    /// Only a lease's holder can release it.
+    NotTheLeaseHolder { worktree: String },
+    /// The caller already received `Granted` for this dispatch: its
+    /// launch may be in flight, so the request cannot be abandoned.
+    AlreadyClaimed,
+}
+
+impl Refused {
+    fn describe(&self) -> String {
+        match self {
+            Self::PidNotAlive { detail, .. } | Self::UnverifiableWait { detail } => detail.clone(),
+            Self::OverAdmitted { over, max } => format!(
+                "resuming would hold {over} seats beyond the class cap, past the configured \
+                 maximum of {max}; it stays waiting and can poll again"
+            ),
+            Self::DispatchEnded => {
+                "the dispatch has already ended; there is nothing to relinquish".to_string()
+            }
+            Self::WorktreeHeld { worktree, holder } => {
+                format!("worktree {worktree} is being written by dispatch {holder}")
+            }
+            Self::NotTheLeaseHolder { worktree } => {
+                format!("this dispatch does not hold the write lease on {worktree}")
+            }
+            Self::AlreadyClaimed => {
+                "the dispatch was already granted to a caller; its launch may be in flight"
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// One answer per request, and every outcome a handler can produce has
+/// its own variant.
+///
+/// v1 had a single `Ok { known: bool, detail: Option<String> }`, and
+/// every caller matched it with a `_ =>` that read "I have never heard
+/// of that dispatch" as success. A worker could bind after a
+/// re-election, get `known: false`, and run with no seat, no reservation
+/// and no PID on record (A2). The union below has no such arm: a caller
+/// that ignores an outcome fails to compile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
-    /// `known` = the coordinator had the dispatch or run. `detail` says
-    /// why a call that was understood was nevertheless not applied — a
-    /// refused bind, a refused resume — so the caller gets a reason and
-    /// not just a false.
-    Ok {
-        known: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        detail: Option<String>,
+    /// The call applied.
+    Ack,
+    /// The coordinator does not know the dispatch or run named. Never
+    /// success: after a re-election this is what a live worker's own
+    /// lease looks like.
+    Unknown {
+        entity: Entity,
+        id: String,
     },
+    /// Understood, and deliberately not applied.
+    Refused {
+        refusal: Refused,
+    },
+    /// The request itself could not be served — unparseable, too long,
+    /// a method this daemon does not have.
     Error {
         detail: String,
     },
+    /// The daemon is on its way out and applied nothing (A11). The
+    /// caller retries and starts a fresh one.
+    ShuttingDown,
     Pong {
         pid: u32,
         version: String,
+        /// The wire protocol this daemon speaks (`PROTOCOL_VERSION`).
+        /// Absent from a v1 daemon, which is exactly what makes it
+        /// detectable.
+        #[serde(default)]
+        protocol: u32,
     },
     Decision {
         decision: Decision,
@@ -183,7 +379,7 @@ pub enum Response {
         dispatches: Vec<String>,
     },
     Status {
-        snapshot: StatusSnapshot,
+        snapshot: Box<StatusSnapshot>,
     },
 }
 
@@ -214,24 +410,35 @@ pub struct Coordinator {
 /// Returns the listener and the lock, which the winner must keep.
 pub fn elect(socket_path: &Path) -> Result<(Listener, LockFile), CoordinatorError> {
     let state_dir = socket_path.parent().expect("socket has a parent");
-    std::fs::create_dir_all(state_dir).map_err(|e| CoordinatorError(e.to_string()))?;
+    std::fs::create_dir_all(state_dir).map_err(|cause| CoordinatorError::Connect {
+        socket: socket_path.to_path_buf(),
+        cause,
+    })?;
+    // The endpoint's directory is the second half of the permission
+    // restriction SPEC §23 asks for: a 0600 socket inside a
+    // world-readable directory is still a name everybody can see and a
+    // path somebody else could replace. Owner-only, verified.
+    crate::ipc::restrict_directory(state_dir).map_err(|cause| CoordinatorError::Io {
+        operation: "restricting the coordinator state directory",
+        cause,
+    })?;
     let lock_path = state_dir.join("coordinator.lock");
     let mut lock = match LockFile::try_acquire(&lock_path) {
         Ok(Some(lock)) => lock,
         Ok(None) => {
-            return Err(CoordinatorError(
-                "another coordinator is already serving this user".into(),
-            ))
+            return Err(CoordinatorError::Election {
+                detail: "another coordinator is already serving this user".into(),
+            })
         }
         Err(e) => {
-            return Err(CoordinatorError(format!(
-                "cannot take the coordinator lock at {}: {e}",
-                lock_path.display()
-            )))
+            return Err(CoordinatorError::Election {
+                detail: format!("cannot take the lock at {}: {e}", lock_path.display()),
+            })
         }
     };
     // Who holds it, for a human reading the state directory. A failure
-    // here is not an election failure: the lock is already ours.
+    // here is not an election failure: the lock is already ours, and the
+    // file's content was never the election's evidence (C7).
     let _ = lock.write_pid();
     finish_election(socket_path).map(|listener| (listener, lock))
 }
@@ -241,14 +448,20 @@ fn finish_election(socket_path: &Path) -> Result<Listener, CoordinatorError> {
         // A leftover endpoint from a crashed coordinator: prove it is dead
         // by attempting a connect before removing it.
         if Stream::connect(socket_path).is_ok() {
-            return Err(CoordinatorError(
-                "a live coordinator answered on the socket; not taking over".into(),
-            ));
+            return Err(CoordinatorError::Election {
+                detail: "a live coordinator answered on the socket; not taking over".into(),
+            });
         }
-        std::fs::remove_file(socket_path).map_err(|e| CoordinatorError(e.to_string()))?;
+        std::fs::remove_file(socket_path).map_err(|cause| CoordinatorError::Connect {
+            socket: socket_path.to_path_buf(),
+            cause,
+        })?;
     }
     // Permission-restricted (SPEC §23): the endpoint binds owner-only.
-    Listener::bind(socket_path).map_err(|e| CoordinatorError(e.to_string()))
+    Listener::bind(socket_path).map_err(|cause| CoordinatorError::Connect {
+        socket: socket_path.to_path_buf(),
+        cause,
+    })
 }
 
 impl Coordinator {
@@ -260,15 +473,28 @@ impl Coordinator {
         limits: ConcurrencyLimits,
         ledger: Option<&Ledger>,
     ) -> Result<(Self, Listener), CoordinatorError> {
+        // Read the live set BEFORE electing: not `unwrap_or_default()`,
+        // because an empty live set and an unreadable one look identical
+        // and mean the opposite things. On `SQLITE_BUSY` the old code
+        // adopted nothing, re-granted every seat that was already taken
+        // and lost every reservation with it (A1). A coordinator that
+        // cannot see what is running does not start — and failing before
+        // the election leaves no endpoint and no lock behind.
+        let live = match ledger {
+            Some(ledger) => ledger
+                .live_dispatches()
+                .map_err(|cause| CoordinatorError::LiveSetUnreadable { cause })?,
+            None => Vec::new(),
+        };
         let (listener, lock) = elect(socket_path)?;
         let lock_path = socket_path
             .parent()
             .expect("socket has a parent")
             .join("coordinator.lock");
         let mut state = AdmissionState::new(limits);
-        if let Some(ledger) = ledger {
+        {
             let now = Instant::now();
-            for (dispatch_id, run_id, pid) in ledger.live_dispatches().unwrap_or_default() {
+            for (dispatch_id, run_id, pid) in live {
                 let Some(pid) = pid.and_then(|pid| u32::try_from(pid).ok()) else {
                     // A `launched` row with no PID is a dispatch the
                     // runner recorded before the process existed (SPEC
@@ -313,65 +539,59 @@ impl Coordinator {
         ))
     }
 
-    /// Serve until shutdown or idle exit. A reconcile thread checks
-    /// leases against the process table and signals cancelled workers;
-    /// the accept loop handles one short request per connection.
+    /// Serve until shutdown or idle exit.
+    ///
+    /// A reconcile thread checks leases against the process table and
+    /// signals cancelled workers. The accept loop hands each connection
+    /// to a fixed pool of handler threads, which are joined before this
+    /// returns: nothing is fire-and-forget, and a flood of connections
+    /// costs a bounded queue rather than a thread apiece.
+    ///
+    /// Shutdown — asked for, or decided by the idle timer — is one path:
+    /// the flag goes up, the accept loop sees it BEFORE its next accept,
+    /// every connection already in flight is answered `shutting down`
+    /// rather than dropped mid-request (A11), and only then is the
+    /// endpoint unlinked and the lock released (A5).
     pub fn serve(self, listener: Listener) -> Result<(), CoordinatorError> {
         let reconcile_state = Arc::clone(&self.state);
         let reconcile_shutdown = Arc::clone(&self.shutdown);
-        let socket_for_exit = self.socket_path.clone();
-        let lock_for_exit = self.lock_path.clone();
-        std::thread::spawn(move || {
-            let mut idle_since: Option<Instant> = None;
-            loop {
-                std::thread::sleep(RECONCILE_EVERY);
-                if reconcile_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
-                    return;
-                }
-                let now = Instant::now();
-                let (report, idle) = {
-                    let mut state = lock_state(&reconcile_state);
-                    (state.reconcile(now, &process_alive), state.is_idle())
-                };
-                // The state machine decided; sending is this side's job,
-                // and each dispatch is signalled at most twice in its
-                // life: once politely, once not (C5).
-                for (_dispatch, pid, signal) in report.to_signal {
-                    match signal {
-                        Signal::Terminate => terminate(pid),
-                        Signal::Kill => kill(pid),
-                    }
-                }
-                match (idle, idle_since) {
-                    (false, _) => idle_since = None,
-                    (true, None) => idle_since = Some(now),
-                    (true, Some(since)) if now.saturating_duration_since(since) >= IDLE_EXIT => {
-                        // The endpoint goes first: a coordinator starting
-                        // in this window finds no answer on the socket
-                        // and waits for the lock, which exiting releases.
-                        let _ = std::fs::remove_file(&socket_for_exit);
-                        let _ = std::fs::remove_file(&lock_for_exit);
-                        std::process::exit(0);
-                    }
-                    _ => {}
-                }
-            }
+        let reconciler = std::thread::spawn(move || {
+            reconcile_loop(&reconcile_state, &reconcile_shutdown);
         });
 
-        listener
-            .set_nonblocking(false)
-            .map_err(|e| CoordinatorError(e.to_string()))?;
-        for stream in listener.incoming() {
-            if self.shutdown.load(std::sync::atomic::Ordering::SeqCst) {
-                break;
-            }
-            let Ok(stream) = stream else { continue };
+        let (work, queue) = std::sync::mpsc::sync_channel::<Stream>(ACCEPT_BACKLOG);
+        let queue = Arc::new(Mutex::new(queue));
+        let mut handlers = Vec::with_capacity(HANDLER_THREADS);
+        for _ in 0..HANDLER_THREADS {
+            let queue = Arc::clone(&queue);
             let state = Arc::clone(&self.state);
             let shutdown = Arc::clone(&self.shutdown);
-            std::thread::spawn(move || {
-                let _ = handle_connection(stream, &state, &shutdown);
-            });
+            handlers.push(std::thread::spawn(move || {
+                handler_loop(&queue, &state, &shutdown);
+            }));
         }
+
+        let accepting = self.accept_loop(&listener, &work);
+        // Dropping the last sender ends every handler's `recv`, so the
+        // pool drains what is queued and stops. The listener goes with
+        // it: nothing new is accepted while the pool finishes.
+        drop(work);
+        drop(listener);
+        for handler in handlers {
+            // A handler that panicked has already lost its connection;
+            // the pool is being torn down either way, and a panic here
+            // must not skip the unlink below.
+            let _ = handler.join();
+        }
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = reconciler.join();
+
+        // Only now that nothing is being served does the endpoint go.
+        // Unlinking it while a connection was still in flight was the C1
+        // failure this code claims to have fixed (A5).
+        // Best-effort removal: a socket that cannot be unlinked is
+        // probed and replaced by the next election anyway.
         let _ = std::fs::remove_file(&self.socket_path);
         // Release the lock before unlinking the file it is held on:
         // Windows refuses to remove a file this process still has open,
@@ -379,7 +599,206 @@ impl Coordinator {
         // election expects on either platform.
         drop(self.lock);
         let _ = std::fs::remove_file(&self.lock_path);
-        Ok(())
+        accepting
+    }
+
+    /// Accept connections until the shutdown flag goes up or accepting
+    /// itself stops working.
+    fn accept_loop(
+        &self,
+        listener: &Listener,
+        work: &std::sync::mpsc::SyncSender<Stream>,
+    ) -> Result<(), CoordinatorError> {
+        // Non-blocking so the flag is read BEFORE each accept: a
+        // blocking accept could only observe shutdown by consuming the
+        // connection that woke it, which was then dropped unanswered and
+        // read at the client as "EOF while parsing" (A11).
+        listener
+            .set_nonblocking(true)
+            .map_err(|cause| CoordinatorError::Io {
+                operation: "setting the listener non-blocking",
+                cause,
+            })?;
+        let mut exhausted = 0u32;
+        loop {
+            if self.shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(());
+            }
+            match listener.accept() {
+                Ok(Some(stream)) => {
+                    exhausted = 0;
+                    // Blocks once `ACCEPT_BACKLOG` connections are
+                    // queued: back-pressure on the kernel's own accept
+                    // queue, which is a bounded wait rather than a
+                    // thread per connection (A9).
+                    if work.send(stream).is_err() {
+                        return Ok(());
+                    }
+                }
+                Ok(None) => std::thread::sleep(ACCEPT_POLL),
+                Err(e) if crate::ipc::out_of_descriptors(&e) => {
+                    // EMFILE/ENFILE: every accept fails the same way
+                    // until a descriptor frees, and retrying at full
+                    // speed is a hot loop that starves the handlers
+                    // trying to close theirs. Back off, then give up:
+                    // the next CLI call elects a fresh daemon.
+                    exhausted += 1;
+                    if exhausted > DESCRIPTOR_RETRIES {
+                        return Err(CoordinatorError::Io {
+                            operation: "accepting a connection",
+                            cause: e,
+                        });
+                    }
+                    std::thread::sleep(DESCRIPTOR_BACKOFF);
+                }
+                Err(_) => {
+                    // A peer that went away between the connection and
+                    // the accept (ECONNABORTED), or an interrupted
+                    // syscall (EINTR): there is nothing to serve and the
+                    // next accept is unaffected.
+                    std::thread::sleep(ACCEPT_POLL);
+                }
+            }
+        }
+    }
+}
+
+/// One tick of lease reconciliation: what the state machine decided is
+/// delivered after the guard is gone, and the idle decision is made and
+/// acted on under one guard (A5).
+fn reconcile_loop(state: &Mutex<AdmissionState>, shutdown: &std::sync::atomic::AtomicBool) {
+    let mut idle_since: Option<Instant> = None;
+    while wait_for_tick(shutdown) {
+        let now = Instant::now();
+        let report = {
+            let mut state = lock_state(state);
+            let report = state.reconcile(now, &process_alive);
+            match idle_step(state.is_idle(), idle_since, now) {
+                IdleStep::Busy => idle_since = None,
+                IdleStep::Idle { since } => idle_since = Some(since),
+                IdleStep::Exit => {
+                    // Decided and acted on under the SAME guard: a
+                    // registration served between the decision and the
+                    // flag would otherwise be accepted by a daemon
+                    // already on its way out, and lost with it (A5).
+                    // From here every connection is answered
+                    // `shutting down`; `serve` unlinks nothing until
+                    // the pool has drained.
+                    shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+            }
+            report
+        };
+        // The state machine decided; sending is this side's job, out
+        // from under the admission lock (A6), and each dispatch is
+        // signalled at most twice in its life: once politely, once not
+        // (C5).
+        deliver_signals(state, report.to_signal);
+    }
+}
+
+/// Wait one reconcile period, in slices, and say whether there is still
+/// work to do. `serve` joins this thread before it unlinks anything, so
+/// a single fifteen-second sleep would make every `relais coordinator
+/// stop` take fifteen seconds to come back.
+fn wait_for_tick(shutdown: &std::sync::atomic::AtomicBool) -> bool {
+    let deadline = Instant::now() + RECONCILE_EVERY;
+    loop {
+        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        if Instant::now() >= deadline {
+            return true;
+        }
+        std::thread::sleep(ACCEPT_POLL);
+    }
+}
+
+/// What a reconcile tick does about idleness. Pure, so the decision the
+/// A5 race is about can be tested without a daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleStep {
+    /// Something is registered, active or queued.
+    Busy,
+    /// Idle since this moment, and not for long enough yet.
+    Idle { since: Instant },
+    /// Idle past `IDLE_EXIT`: stop serving.
+    Exit,
+}
+
+fn idle_step(idle: bool, idle_since: Option<Instant>, now: Instant) -> IdleStep {
+    match (idle, idle_since) {
+        (false, _) => IdleStep::Busy,
+        (true, None) => IdleStep::Idle { since: now },
+        (true, Some(since)) => {
+            if now.saturating_duration_since(since) >= IDLE_EXIT {
+                IdleStep::Exit
+            } else {
+                IdleStep::Idle { since }
+            }
+        }
+    }
+}
+
+/// Deliver the signals the state machine handed over, re-checking
+/// liveness first.
+///
+/// The PID was checked alive when it was bound and the age of that check
+/// travels with the signal, but nothing portable proves the number still
+/// names the same process (C6, `procs::alive`). Checking again here is
+/// the only narrowing of that window there is, and it is what `reconcile`
+/// already did — the cancel path did not (A6).
+///
+/// A delivery the OS would not take for a reason that could pass —
+/// anything but "gone" or "not ours" — gives the ladder step back, so
+/// the next reconcile offers it again instead of the dispatch silently
+/// never being asked to stop (A7).
+fn deliver_signals(state: &Mutex<AdmissionState>, signals: Vec<PendingSignal>) {
+    for pending in signals {
+        if !process_alive(pending.pid) {
+            continue;
+        }
+        let sent = match pending.signal {
+            Signal::Terminate => terminate(pending.pid),
+            Signal::Kill => kill(pending.pid),
+        };
+        if let Err(e) = sent {
+            if e.could_pass() {
+                lock_state(state).signal_undelivered(&pending.dispatch_id, pending.signal);
+            }
+            eprintln!(
+                "relais coordinator: {} for dispatch {} (bound {}s ago): {e}",
+                pending.signal.as_str(),
+                pending.dispatch_id,
+                pending.bound_at.elapsed().as_secs()
+            );
+        }
+    }
+}
+
+/// One handler thread: take connections off the queue until the queue's
+/// last sender is gone.
+fn handler_loop(
+    queue: &Mutex<std::sync::mpsc::Receiver<Stream>>,
+    state: &Mutex<AdmissionState>,
+    shutdown: &std::sync::atomic::AtomicBool,
+) {
+    loop {
+        // The guard is held only to take one connection, never across
+        // serving it: the pool is parallel, the queue is not.
+        let next = {
+            let queue = queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            queue.recv()
+        };
+        let Ok(stream) = next else { return };
+        if let Err(e) = handle_connection(stream, state, shutdown) {
+            // The connection is gone and there is nobody left to tell;
+            // the daemon keeps serving every other one.
+            eprintln!("relais coordinator: connection: {e}");
+        }
     }
 }
 
@@ -398,24 +817,30 @@ fn handle_connection(
     stream: Stream,
     state: &Mutex<AdmissionState>,
     shutdown: &std::sync::atomic::AtomicBool,
-) -> Result<(), String> {
+) -> Result<(), CoordinatorError> {
+    let io = |operation: &'static str| {
+        move |cause: std::io::Error| CoordinatorError::Io { operation, cause }
+    };
     stream
         .set_read_timeout(Some(REQUEST_TIMEOUT))
-        .map_err(|e| e.to_string())?;
+        .map_err(io("setting the read timeout"))?;
     stream
         .set_write_timeout(Some(REQUEST_TIMEOUT))
-        .map_err(|e| e.to_string())?;
+        .map_err(io("setting the write timeout"))?;
     // Capped read: a client that never sends a newline used to grow this
     // buffer without bound, one thread per connection.
-    let mut reader =
-        BufReader::new(stream.try_clone().map_err(|e| e.to_string())?).take(MAX_REQUEST_BYTES);
+    let mut reader = BufReader::new(stream.try_clone().map_err(io("cloning the stream"))?)
+        .take(MAX_REQUEST_BYTES);
     let mut writer = stream;
     let mut line = String::new();
-    let read = reader.read_line(&mut line).map_err(|e| e.to_string())?;
+    let read = reader
+        .read_line(&mut line)
+        .map_err(io("reading the request"))?;
     if read == 0 {
         return Ok(());
     }
     let oversized = read as u64 == MAX_REQUEST_BYTES && !line.ends_with('\n');
+    let mut signals = Vec::new();
     let response = if oversized {
         Response::Error {
             detail: format!("request exceeds {MAX_REQUEST_BYTES} bytes"),
@@ -424,17 +849,33 @@ fn handle_connection(
         match serde_json::from_str::<Request>(line.trim()) {
             Ok(Request::Shutdown) => {
                 shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
-                ok(true)
+                Response::Ack
             }
-            Ok(request) => handle(request, &mut lock_state(state)),
+            // The flag went up while this connection was in flight. It
+            // is answered, not dropped: a daemon that stops mid-request
+            // reads at the client as "EOF while parsing" and loses
+            // whatever the call was about (A11).
+            Ok(_) if shutdown.load(std::sync::atomic::Ordering::SeqCst) => Response::ShuttingDown,
+            Ok(request) => {
+                let (response, pending) = handle(request, &mut lock_state(state), Instant::now());
+                signals = pending;
+                response
+            }
             Err(e) => Response::Error {
                 detail: format!("unparseable request: {e}"),
             },
         }
     };
-    let payload = serde_json::to_string(&response).map_err(|e| e.to_string())?;
-    writeln!(writer, "{payload}").map_err(|e| e.to_string())?;
-    writer.flush().map_err(|e| e.to_string())?;
+    // Out from under the admission guard (A6): every other connection
+    // would otherwise wait on a signal being delivered to a process that
+    // may be stopped.
+    deliver_signals(state, signals);
+    let payload = serde_json::to_string(&response).map_err(|e| CoordinatorError::Protocol {
+        operation: "serializing the response",
+        detail: e.to_string(),
+    })?;
+    writeln!(writer, "{payload}").map_err(io("writing the response"))?;
+    writer.flush().map_err(io("flushing the response"))?;
     if oversized {
         // The answer is written, but the client is still sending the
         // rest of its over-long request. Dropping the stream now closes
@@ -474,39 +915,54 @@ fn drain_and_discard(stream: &Stream) {
     }
 }
 
-/// `Ok` with no further explanation: the call applied, or the
-/// coordinator does not know the subject.
-fn ok(known: bool) -> Response {
-    Response::Ok {
-        known,
-        detail: None,
+/// A lifecycle answer: applied, or the coordinator has no such subject.
+fn lifecycle(outcome: LifecycleOutcome, entity: Entity, id: &str) -> Response {
+    match outcome {
+        LifecycleOutcome::Applied => Response::Ack,
+        LifecycleOutcome::Unknown => Response::Unknown {
+            entity,
+            id: id.to_string(),
+        },
     }
 }
 
-/// `Ok` for a call that was understood and deliberately not applied.
-fn ok_with(known: bool, detail: String) -> Response {
-    Response::Ok {
-        known,
-        detail: Some(detail),
-    }
+/// The cancellation answer: which dispatches were cancelled, and the
+/// signals their caller must deliver.
+fn cancelled(signals: Vec<PendingSignal>) -> (Response, Vec<PendingSignal>) {
+    let dispatches = signals
+        .iter()
+        .map(|pending| pending.dispatch_id.clone())
+        .collect();
+    (Response::Cancelled { dispatches }, signals)
 }
 
-/// Pure dispatch of one request against the state; the unit the socket
-/// tests and the in-process tests share.
-pub fn handle(request: Request, state: &mut AdmissionState) -> Response {
-    let now = Instant::now();
-    match request {
+/// Dispatch one request against the state, and say what has to be
+/// signalled afterwards.
+///
+/// It sends nothing itself. Signalling under the admission guard held
+/// every other connection for the length of a syscall on a process that
+/// may be stopped, and skipped the liveness check `reconcile` does (A6),
+/// so the decision comes back as a list and the caller delivers it once
+/// the guard is gone. The clock is a parameter; the only ambient fact
+/// read here is this process's own PID, which a `Pong` is about.
+pub fn handle(
+    request: Request,
+    state: &mut AdmissionState,
+    now: Instant,
+) -> (Response, Vec<PendingSignal>) {
+    let response = match request {
         Request::Ping => Response::Pong {
             pid: std::process::id(),
             version: crate::version().to_string(),
+            protocol: PROTOCOL_VERSION,
         },
         Request::RegisterSession { session_id } => {
             state.register_session(&session_id);
-            ok(true)
+            Response::Ack
         }
         Request::RegisterRun { registration } => {
-            state.register_run(&registration);
-            ok(true)
+            state.register_run(&registration, now);
+            Response::Ack
         }
         Request::RequestAdmission { request } => Response::Decision {
             decision: state.request(&request, now),
@@ -516,118 +972,126 @@ pub fn handle(request: Request, state: &mut AdmissionState) -> Response {
             agent_id,
             pid,
         } => match state.bind(&dispatch_id, agent_id.as_deref(), pid, now, &process_alive) {
-            BindOutcome::Bound => ok(true),
-            BindOutcome::UnknownDispatch => ok(false),
+            BindOutcome::Bound => Response::Ack,
+            BindOutcome::UnknownDispatch => Response::Unknown {
+                entity: Entity::Dispatch,
+                id: dispatch_id,
+            },
             // C6: the PID comes off the wire. One that is not running
             // cannot be this client's worker, and once the OS reuses the
             // number it would be somebody else's process — which
             // reconcile would later terminate as a cancelled worker.
-            BindOutcome::PidNotAlive => ok_with(
-                false,
-                format!(
-                    "pid {} is not a live process; dispatch {dispatch_id} keeps no process binding",
-                    pid.unwrap_or(0)
-                ),
-            ),
+            BindOutcome::PidNotAlive => Response::Refused {
+                refusal: Refused::PidNotAlive {
+                    pid,
+                    detail: format!(
+                        "pid {} is not a live process; dispatch {dispatch_id} keeps no process \
+                         binding",
+                        pid.unwrap_or(0)
+                    ),
+                },
+            },
         },
         Request::Heartbeat { dispatch_id } => Response::Heartbeat {
             status: state.heartbeat(&dispatch_id, now),
         },
-        Request::AcknowledgeCancel { dispatch_id } => {
-            ok(state.acknowledge_cancel(&dispatch_id, now))
-        }
+        Request::AcknowledgeCancel { dispatch_id } => lifecycle(
+            state.acknowledge_cancel(&dispatch_id, now),
+            Entity::Dispatch,
+            &dispatch_id,
+        ),
         Request::MarkWaiting { dispatch_id } => {
-            let marked = state.mark_waiting(&dispatch_id, now, &process_alive);
-            if marked {
-                ok(true)
-            } else {
+            match state.mark_waiting(&dispatch_id, now, &process_alive) {
+                WaitOutcome::Waiting => Response::Ack,
+                WaitOutcome::UnknownDispatch => Response::Unknown {
+                    entity: Entity::Dispatch,
+                    id: dispatch_id,
+                },
                 // C8: waiting is a self-report. The least it has to be is
                 // a live, bound process making it.
-                ok_with(
-                    false,
-                    format!(
-                        "dispatch {dispatch_id} is unknown, or has no live bound process to be \
-                         waiting; the seat is not given back on an unverifiable claim"
-                    ),
-                )
+                WaitOutcome::NoLiveProcess => Response::Refused {
+                    refusal: Refused::UnverifiableWait {
+                        detail: format!(
+                            "dispatch {dispatch_id} has no live bound process to be waiting; the \
+                             seat is not given back on an unverifiable claim"
+                        ),
+                    },
+                },
+                WaitOutcome::Ended => Response::Refused {
+                    refusal: Refused::DispatchEnded,
+                },
             }
         }
         Request::Resume { dispatch_id } => match state.resume(&dispatch_id, now) {
-            ResumeOutcome::Resumed => ok(true),
-            ResumeOutcome::UnknownDispatch => ok(false),
-            ResumeOutcome::OverAdmitted { over, max } => ok_with(
-                false,
-                format!(
-                    "resuming {dispatch_id} would hold {over} seats beyond the class cap, past \
-                     the configured maximum of {max}; it stays waiting and can poll again"
-                ),
-            ),
+            ResumeOutcome::Resumed => Response::Ack,
+            ResumeOutcome::UnknownDispatch => Response::Unknown {
+                entity: Entity::Dispatch,
+                id: dispatch_id,
+            },
+            ResumeOutcome::OverAdmitted { over, max } => Response::Refused {
+                refusal: Refused::OverAdmitted { over, max },
+            },
         },
-        Request::Release { dispatch_id } => ok(state.release(&dispatch_id, now)),
+        Request::Release { dispatch_id } => lifecycle(
+            state.release(&dispatch_id, now),
+            Entity::Dispatch,
+            &dispatch_id,
+        ),
         Request::Settle {
             dispatch_id,
             spent_micros,
-        } => ok(state.settle(&dispatch_id, spent_micros, now)),
-        Request::Withdraw { dispatch_id } => ok(state.withdraw(&dispatch_id, now)),
-        Request::FinishRun { run_id } => ok(state.finish_run(&run_id)),
+        } => lifecycle(
+            state.settle(&dispatch_id, spent_micros, now),
+            Entity::Dispatch,
+            &dispatch_id,
+        ),
+        Request::Withdraw { dispatch_id } => match state.withdraw(&dispatch_id, now) {
+            WithdrawOutcome::Withdrawn => Response::Ack,
+            WithdrawOutcome::UnknownDispatch => Response::Unknown {
+                entity: Entity::Dispatch,
+                id: dispatch_id,
+            },
+            WithdrawOutcome::Claimed => Response::Refused {
+                refusal: Refused::AlreadyClaimed,
+            },
+        },
+        Request::FinishRun { run_id } => lifecycle(state.finish_run(&run_id), Entity::Run, &run_id),
         Request::AcquireWrite {
             dispatch_id,
             worktree,
-        } => {
-            if state.acquire_write(&worktree, &dispatch_id, now) {
-                ok(true)
-            } else {
-                let holder = state
-                    .write_lease_holder(&worktree)
-                    .map(|(holder, _)| holder.to_string())
-                    .unwrap_or_default();
-                ok_with(
-                    false,
-                    format!("worktree {worktree} is being written by dispatch {holder}"),
-                )
-            }
-        }
+        } => match state.acquire_write(&worktree, &dispatch_id, now) {
+            WriteLeaseOutcome::Taken => Response::Ack,
+            WriteLeaseOutcome::HeldBy { holder } => Response::Refused {
+                refusal: Refused::WorktreeHeld { worktree, holder },
+            },
+        },
         Request::ReleaseWrite {
             dispatch_id,
             worktree,
-        } => ok(state.release_write(&worktree, &dispatch_id)),
+        } => match state.release_write(&worktree, &dispatch_id) {
+            ReleaseWriteOutcome::Released => Response::Ack,
+            ReleaseWriteOutcome::NotTheHolder => Response::Refused {
+                refusal: Refused::NotTheLeaseHolder { worktree },
+            },
+        },
         Request::WriteLeaseHolder { worktree } => Response::WriteLease {
             holder: state
                 .write_lease_holder(&worktree)
                 .map(|(holder, _)| holder.to_string()),
         },
         Request::CancelDispatch { dispatch_id } => {
-            let signalled = state.cancel_dispatch(&dispatch_id, now);
-            for (_, pid) in &signalled {
-                terminate(*pid);
-            }
-            Response::Cancelled {
-                dispatches: signalled.into_iter().map(|(id, _)| id).collect(),
-            }
+            return cancelled(state.cancel_dispatch(&dispatch_id, now))
         }
-        Request::CancelRun { run_id } => {
-            let signalled = state.cancel_run(&run_id, now);
-            for (_, pid) in &signalled {
-                terminate(*pid);
-            }
-            Response::Cancelled {
-                dispatches: signalled.into_iter().map(|(id, _)| id).collect(),
-            }
-        }
+        Request::CancelRun { run_id } => return cancelled(state.cancel_run(&run_id, now)),
         Request::CancelSession { session_id } => {
-            let signalled = state.cancel_session(&session_id, now);
-            for (_, pid) in &signalled {
-                terminate(*pid);
-            }
-            Response::Cancelled {
-                dispatches: signalled.into_iter().map(|(id, _)| id).collect(),
-            }
+            return cancelled(state.cancel_session(&session_id, now))
         }
         Request::Status => Response::Status {
-            snapshot: state.status(now),
+            snapshot: Box::new(state.status(now)),
         },
-        Request::Shutdown => ok(true),
-    }
+        Request::Shutdown => Response::Ack,
+    };
+    (response, Vec::new())
 }
 
 /// The CLI-side client: connect, send one line, read one line, close.
@@ -643,48 +1107,82 @@ impl Client {
     }
 
     pub fn request(&self, request: &Request) -> Result<Response, CoordinatorError> {
-        let mut stream =
-            Stream::connect(&self.socket).map_err(|e| CoordinatorError(e.to_string()))?;
+        let connect = |cause| CoordinatorError::Connect {
+            socket: self.socket.clone(),
+            cause,
+        };
+        let io = |operation: &'static str| {
+            move |cause: std::io::Error| CoordinatorError::Io { operation, cause }
+        };
+        let mut stream = Stream::connect(&self.socket).map_err(connect)?;
         stream
             .set_read_timeout(Some(REQUEST_TIMEOUT))
-            .map_err(|e| CoordinatorError(e.to_string()))?;
+            .map_err(io("setting the read timeout"))?;
         stream
             .set_write_timeout(Some(REQUEST_TIMEOUT))
-            .map_err(|e| CoordinatorError(e.to_string()))?;
-        let payload =
-            serde_json::to_string(request).map_err(|e| CoordinatorError(e.to_string()))?;
-        writeln!(stream, "{payload}").map_err(|e| CoordinatorError(e.to_string()))?;
-        stream
-            .flush()
-            .map_err(|e| CoordinatorError(e.to_string()))?;
+            .map_err(io("setting the write timeout"))?;
+        let payload = serde_json::to_string(request).map_err(|e| CoordinatorError::Protocol {
+            operation: "serializing the request",
+            detail: e.to_string(),
+        })?;
+        writeln!(stream, "{payload}").map_err(io("writing the request"))?;
+        stream.flush().map_err(io("flushing the request"))?;
         let mut line = String::new();
         BufReader::new(stream)
             .read_line(&mut line)
-            .map_err(|e| CoordinatorError(e.to_string()))?;
+            .map_err(io("reading the response"))?;
         match serde_json::from_str::<Response>(line.trim()) {
-            Ok(Response::Error { detail }) => Err(CoordinatorError(detail)),
+            Ok(Response::Error { detail }) => Err(CoordinatorError::Rejected { detail }),
+            Ok(Response::ShuttingDown) => Err(CoordinatorError::ShuttingDown {
+                socket: self.socket.clone(),
+            }),
             Ok(response) => Ok(response),
-            Err(e) => Err(CoordinatorError(format!(
-                "unparseable coordinator response: {e}"
-            ))),
+            // A daemon from another install answers in a shape this
+            // build cannot read. That is the point of failing here
+            // rather than guessing (A2).
+            Err(e) => Err(CoordinatorError::Protocol {
+                operation: "reading the response",
+                detail: format!("unparseable coordinator response: {e}"),
+            }),
         }
     }
 
+    /// The daemon's PID, and proof that it speaks this wire protocol.
+    /// A version skew is named here — at the first call of every CLI
+    /// command — instead of turning into calls that are understood as
+    /// something else (A2).
     pub fn ping(&self) -> Result<u32, CoordinatorError> {
         match self.request(&Request::Ping)? {
-            Response::Pong { pid, .. } => Ok(pid),
-            other => Err(CoordinatorError(format!(
-                "unexpected reply to ping: {other:?}"
-            ))),
+            Response::Pong {
+                pid,
+                version,
+                protocol,
+            } => {
+                if protocol == PROTOCOL_VERSION {
+                    Ok(pid)
+                } else {
+                    Err(CoordinatorError::VersionSkew {
+                        socket: self.socket.clone(),
+                        ours: PROTOCOL_VERSION,
+                        theirs: protocol,
+                        daemon_version: version,
+                    })
+                }
+            }
+            other => Err(CoordinatorError::Protocol {
+                operation: "ping",
+                detail: format!("unexpected reply: {other:?}"),
+            }),
         }
     }
 
     pub fn status(&self) -> Result<StatusSnapshot, CoordinatorError> {
         match self.request(&Request::Status)? {
-            Response::Status { snapshot } => Ok(snapshot),
-            other => Err(CoordinatorError(format!(
-                "unexpected reply to status: {other:?}"
-            ))),
+            Response::Status { snapshot } => Ok(*snapshot),
+            other => Err(CoordinatorError::Protocol {
+                operation: "status",
+                detail: format!("unexpected reply: {other:?}"),
+            }),
         }
     }
 }
@@ -703,27 +1201,71 @@ impl RemoteGate {
         }
     }
 
-    fn call(&self, request: Request) -> Result<Response, GateError> {
-        self.client
-            .request(&request)
-            .map_err(|e| GateError(e.to_string()))
+    fn call(&self, operation: &'static str, request: Request) -> Result<Response, GateError> {
+        self.client.request(&request).map_err(|e| match e {
+            // The coordinator answered and refused the request itself —
+            // an unknown method, an over-long line. That is a protocol
+            // disagreement, not an outage.
+            CoordinatorError::Rejected { detail } | CoordinatorError::Protocol { detail, .. } => {
+                GateError::Protocol { operation, detail }
+            }
+            other => GateError::Unavailable {
+                operation,
+                socket: self.client.socket.display().to_string(),
+                cause: Box::new(other),
+            },
+        })
+    }
+
+    /// An answer this call cannot act on.
+    fn unexpected(operation: &'static str, response: &Response) -> GateError {
+        GateError::Protocol {
+            operation,
+            detail: format!("unexpected reply: {response:?}"),
+        }
+    }
+
+    /// A refusal, as an error naming what was refused and why.
+    fn refused(operation: &'static str, entity: &str, refusal: &Refused) -> GateError {
+        GateError::Refused {
+            operation,
+            entity: entity.to_string(),
+            detail: refusal.describe(),
+        }
     }
 }
 
+/// Every reply is matched exhaustively, and `Unknown` is never one of
+/// the arms that mean success: a worker that binds after a re-election
+/// gets an outcome its caller has to handle, not a silent `Ok(())` (A2).
 impl Gate for RemoteGate {
     fn register_run(&self, registration: &RunRegistration) -> Result<(), GateError> {
-        self.call(Request::RegisterRun {
-            registration: registration.clone(),
-        })
-        .map(|_| ())
+        let run_id = registration.run_id.clone();
+        match self.call(
+            "register_run",
+            Request::RegisterRun {
+                registration: registration.clone(),
+            },
+        )? {
+            Response::Ack => Ok(()),
+            Response::Refused { refusal } => Err(Self::refused(
+                "register_run",
+                &format!("run {run_id}"),
+                &refusal,
+            )),
+            other => Err(Self::unexpected("register_run", &other)),
+        }
     }
 
     fn admit(&self, request: &DispatchRequest) -> Result<Decision, GateError> {
-        match self.call(Request::RequestAdmission {
-            request: request.clone(),
-        })? {
+        match self.call(
+            "admit",
+            Request::RequestAdmission {
+                request: request.clone(),
+            },
+        )? {
             Response::Decision { decision } => Ok(decision),
-            other => Err(GateError(format!("unexpected admission reply: {other:?}"))),
+            other => Err(Self::unexpected("admit", &other)),
         }
     }
 
@@ -732,126 +1274,252 @@ impl Gate for RemoteGate {
         dispatch_id: &str,
         agent_id: Option<&str>,
         pid: Option<u32>,
-    ) -> Result<(), GateError> {
-        match self.call(Request::Bind {
-            dispatch_id: dispatch_id.into(),
-            agent_id: agent_id.map(str::to_string),
-            pid,
-        })? {
-            // A bind the coordinator understood and refused (a PID it
-            // cannot see running) is an error to the caller, not silence.
-            Response::Ok {
-                detail: Some(detail),
-                ..
-            } => Err(GateError(detail)),
-            _ => Ok(()),
+    ) -> Result<BindOutcome, GateError> {
+        match self.call(
+            "bind",
+            Request::Bind {
+                dispatch_id: dispatch_id.into(),
+                agent_id: agent_id.map(str::to_string),
+                pid,
+            },
+        )? {
+            Response::Ack => Ok(BindOutcome::Bound),
+            // The coordinator has no such dispatch: this worker holds no
+            // seat and no reservation. The caller decides what that
+            // means; it is never success.
+            Response::Unknown { .. } => Ok(BindOutcome::UnknownDispatch),
+            Response::Refused {
+                refusal: Refused::PidNotAlive { .. },
+            } => Ok(BindOutcome::PidNotAlive),
+            Response::Refused { refusal } => Err(Self::refused(
+                "bind",
+                &format!("dispatch {dispatch_id}"),
+                &refusal,
+            )),
+            other => Err(Self::unexpected("bind", &other)),
         }
     }
 
     fn heartbeat(&self, dispatch_id: &str) -> Result<HeartbeatStatus, GateError> {
-        match self.call(Request::Heartbeat {
-            dispatch_id: dispatch_id.into(),
-        })? {
+        match self.call(
+            "heartbeat",
+            Request::Heartbeat {
+                dispatch_id: dispatch_id.into(),
+            },
+        )? {
             Response::Heartbeat { status } => Ok(status),
-            other => Err(GateError(format!("unexpected heartbeat reply: {other:?}"))),
+            other => Err(Self::unexpected("heartbeat", &other)),
         }
     }
 
-    fn acknowledge_cancel(&self, dispatch_id: &str) -> Result<(), GateError> {
-        self.call(Request::AcknowledgeCancel {
-            dispatch_id: dispatch_id.into(),
-        })
-        .map(|_| ())
+    fn acknowledge_cancel(&self, dispatch_id: &str) -> Result<LifecycleOutcome, GateError> {
+        self.lifecycle_call(
+            "acknowledge_cancel",
+            dispatch_id,
+            Request::AcknowledgeCancel {
+                dispatch_id: dispatch_id.into(),
+            },
+        )
     }
 
-    fn mark_waiting(&self, dispatch_id: &str) -> Result<(), GateError> {
-        match self.call(Request::MarkWaiting {
-            dispatch_id: dispatch_id.into(),
-        })? {
-            Response::Ok {
-                detail: Some(detail),
-                ..
-            } => Err(GateError(detail)),
-            _ => Ok(()),
+    fn mark_waiting(&self, dispatch_id: &str) -> Result<WaitOutcome, GateError> {
+        match self.call(
+            "mark_waiting",
+            Request::MarkWaiting {
+                dispatch_id: dispatch_id.into(),
+            },
+        )? {
+            Response::Ack => Ok(WaitOutcome::Waiting),
+            Response::Unknown { .. } => Ok(WaitOutcome::UnknownDispatch),
+            Response::Refused {
+                refusal: Refused::UnverifiableWait { .. },
+            } => Ok(WaitOutcome::NoLiveProcess),
+            Response::Refused {
+                refusal: Refused::DispatchEnded,
+            } => Ok(WaitOutcome::Ended),
+            Response::Refused { refusal } => Err(Self::refused(
+                "mark_waiting",
+                &format!("dispatch {dispatch_id}"),
+                &refusal,
+            )),
+            other => Err(Self::unexpected("mark_waiting", &other)),
         }
     }
 
-    fn resume(&self, dispatch_id: &str) -> Result<(), GateError> {
-        match self.call(Request::Resume {
-            dispatch_id: dispatch_id.into(),
-        })? {
+    fn resume(&self, dispatch_id: &str) -> Result<ResumeOutcome, GateError> {
+        match self.call(
+            "resume",
+            Request::Resume {
+                dispatch_id: dispatch_id.into(),
+            },
+        )? {
+            Response::Ack => Ok(ResumeOutcome::Resumed),
+            Response::Unknown { .. } => Ok(ResumeOutcome::UnknownDispatch),
             // Over the over-admission ceiling: the parent stays waiting
-            // and the caller polls again (C8).
-            Response::Ok {
-                detail: Some(detail),
-                ..
-            } => Err(GateError(detail)),
-            _ => Ok(()),
+            // and the caller polls again (C8). A delay, and the caller
+            // can tell it from an outage.
+            Response::Refused {
+                refusal: Refused::OverAdmitted { over, max },
+            } => Ok(ResumeOutcome::OverAdmitted { over, max }),
+            Response::Refused { refusal } => Err(Self::refused(
+                "resume",
+                &format!("dispatch {dispatch_id}"),
+                &refusal,
+            )),
+            other => Err(Self::unexpected("resume", &other)),
         }
     }
 
-    fn release(&self, dispatch_id: &str) -> Result<(), GateError> {
-        self.call(Request::Release {
-            dispatch_id: dispatch_id.into(),
-        })
-        .map(|_| ())
+    fn release(&self, dispatch_id: &str) -> Result<LifecycleOutcome, GateError> {
+        self.lifecycle_call(
+            "release",
+            dispatch_id,
+            Request::Release {
+                dispatch_id: dispatch_id.into(),
+            },
+        )
     }
 
-    fn settle(&self, dispatch_id: &str, spent_micros: Option<i64>) -> Result<(), GateError> {
-        self.call(Request::Settle {
-            dispatch_id: dispatch_id.into(),
-            spent_micros,
-        })
-        .map(|_| ())
+    fn settle(
+        &self,
+        dispatch_id: &str,
+        spent_micros: Option<i64>,
+    ) -> Result<LifecycleOutcome, GateError> {
+        self.lifecycle_call(
+            "settle",
+            dispatch_id,
+            Request::Settle {
+                dispatch_id: dispatch_id.into(),
+                spent_micros,
+            },
+        )
     }
 
-    fn withdraw(&self, dispatch_id: &str) -> Result<(), GateError> {
-        self.call(Request::Withdraw {
-            dispatch_id: dispatch_id.into(),
-        })
-        .map(|_| ())
-    }
-
-    fn finish_run(&self, run_id: &str) -> Result<(), GateError> {
-        self.call(Request::FinishRun {
-            run_id: run_id.into(),
-        })
-        .map(|_| ())
-    }
-
-    fn acquire_write(&self, dispatch_id: &str, worktree: &str) -> Result<bool, GateError> {
-        match self.call(Request::AcquireWrite {
-            dispatch_id: dispatch_id.into(),
-            worktree: worktree.into(),
-        })? {
-            Response::Ok { known, .. } => Ok(known),
-            other => Err(GateError(format!(
-                "unexpected write-lease reply: {other:?}"
-            ))),
+    fn withdraw(&self, dispatch_id: &str) -> Result<WithdrawOutcome, GateError> {
+        match self.call(
+            "withdraw",
+            Request::Withdraw {
+                dispatch_id: dispatch_id.into(),
+            },
+        )? {
+            Response::Ack => Ok(WithdrawOutcome::Withdrawn),
+            Response::Unknown { .. } => Ok(WithdrawOutcome::UnknownDispatch),
+            Response::Refused {
+                refusal: Refused::AlreadyClaimed,
+            } => Ok(WithdrawOutcome::Claimed),
+            Response::Refused { refusal } => Err(Self::refused(
+                "withdraw",
+                &format!("dispatch {dispatch_id}"),
+                &refusal,
+            )),
+            other => Err(Self::unexpected("withdraw", &other)),
         }
     }
 
-    fn release_write(&self, dispatch_id: &str, worktree: &str) -> Result<(), GateError> {
-        self.call(Request::ReleaseWrite {
-            dispatch_id: dispatch_id.into(),
-            worktree: worktree.into(),
-        })
-        .map(|_| ())
+    fn finish_run(&self, run_id: &str) -> Result<LifecycleOutcome, GateError> {
+        match self.call(
+            "finish_run",
+            Request::FinishRun {
+                run_id: run_id.into(),
+            },
+        )? {
+            Response::Ack => Ok(LifecycleOutcome::Applied),
+            Response::Unknown { .. } => Ok(LifecycleOutcome::Unknown),
+            Response::Refused { refusal } => Err(Self::refused(
+                "finish_run",
+                &format!("run {run_id}"),
+                &refusal,
+            )),
+            other => Err(Self::unexpected("finish_run", &other)),
+        }
+    }
+
+    fn acquire_write(
+        &self,
+        dispatch_id: &str,
+        worktree: &str,
+    ) -> Result<WriteLeaseOutcome, GateError> {
+        match self.call(
+            "acquire_write",
+            Request::AcquireWrite {
+                dispatch_id: dispatch_id.into(),
+                worktree: worktree.into(),
+            },
+        )? {
+            Response::Ack => Ok(WriteLeaseOutcome::Taken),
+            Response::Refused {
+                refusal: Refused::WorktreeHeld { holder, .. },
+            } => Ok(WriteLeaseOutcome::HeldBy { holder }),
+            Response::Refused { refusal } => Err(Self::refused(
+                "acquire_write",
+                &format!("worktree {worktree}"),
+                &refusal,
+            )),
+            other => Err(Self::unexpected("acquire_write", &other)),
+        }
+    }
+
+    fn release_write(
+        &self,
+        dispatch_id: &str,
+        worktree: &str,
+    ) -> Result<ReleaseWriteOutcome, GateError> {
+        match self.call(
+            "release_write",
+            Request::ReleaseWrite {
+                dispatch_id: dispatch_id.into(),
+                worktree: worktree.into(),
+            },
+        )? {
+            Response::Ack => Ok(ReleaseWriteOutcome::Released),
+            Response::Refused {
+                refusal: Refused::NotTheLeaseHolder { .. },
+            } => Ok(ReleaseWriteOutcome::NotTheHolder),
+            Response::Refused { refusal } => Err(Self::refused(
+                "release_write",
+                &format!("worktree {worktree}"),
+                &refusal,
+            )),
+            other => Err(Self::unexpected("release_write", &other)),
+        }
     }
 
     fn write_lease_holder(&self, worktree: &str) -> Result<Option<String>, GateError> {
-        match self.call(Request::WriteLeaseHolder {
-            worktree: worktree.into(),
-        })? {
+        match self.call(
+            "write_lease_holder",
+            Request::WriteLeaseHolder {
+                worktree: worktree.into(),
+            },
+        )? {
             Response::WriteLease { holder } => Ok(holder),
-            other => Err(GateError(format!(
-                "unexpected write-lease reply: {other:?}"
-            ))),
+            other => Err(Self::unexpected("write_lease_holder", &other)),
         }
     }
 
-    fn enforcement(&self) -> &'static str {
-        "managed (coordinator)"
+    fn enforcement(&self) -> Enforcement {
+        Enforcement::Coordinator
+    }
+}
+
+impl RemoteGate {
+    /// The three lifecycle calls that answer `Ack` or `Unknown` and
+    /// nothing else.
+    fn lifecycle_call(
+        &self,
+        operation: &'static str,
+        dispatch_id: &str,
+        request: Request,
+    ) -> Result<LifecycleOutcome, GateError> {
+        match self.call(operation, request)? {
+            Response::Ack => Ok(LifecycleOutcome::Applied),
+            Response::Unknown { .. } => Ok(LifecycleOutcome::Unknown),
+            Response::Refused { refusal } => Err(Self::refused(
+                operation,
+                &format!("dispatch {dispatch_id}"),
+                &refusal,
+            )),
+            other => Err(Self::unexpected(operation, &other)),
+        }
     }
 }
 
@@ -887,10 +1555,18 @@ pub fn session_id() -> String {
 /// this CLI process so its exit cannot take the coordinator down.
 pub fn ensure_running(socket_path: &Path) -> Result<Client, CoordinatorError> {
     let client = Client::new(socket_path.to_path_buf());
-    if client.ping().is_ok() {
-        return Ok(client);
+    match client.ping() {
+        Ok(_) => return Ok(client),
+        // A daemon is serving and speaks another protocol. Starting a
+        // second one cannot help — it would lose the election to the
+        // first — so say which it is instead of timing out (A2).
+        Err(skew @ CoordinatorError::VersionSkew { .. }) => return Err(skew),
+        Err(_) => {}
     }
-    let exe = std::env::current_exe().map_err(|e| CoordinatorError(e.to_string()))?;
+    let exe = std::env::current_exe().map_err(|cause| CoordinatorError::Io {
+        operation: "finding the relais executable",
+        cause,
+    })?;
     let mut command = std::process::Command::new(exe);
     command
         .args(["coordinator", "daemon"])
@@ -900,19 +1576,23 @@ pub fn ensure_running(socket_path: &Path) -> Result<Client, CoordinatorError> {
     // Detached from this CLI's group (Unix) or console group (Windows),
     // so the CLI exiting cannot take the coordinator down.
     crate::procs::own_process_group(&mut command);
-    command
-        .spawn()
-        .map_err(|e| CoordinatorError(format!("cannot start the coordinator: {e}")))?;
+    command.spawn().map_err(|cause| CoordinatorError::Io {
+        operation: "starting the coordinator",
+        cause,
+    })?;
     let started = Instant::now();
     while started.elapsed() < START_TIMEOUT {
-        if client.ping().is_ok() {
-            return Ok(client);
+        match client.ping() {
+            Ok(_) => return Ok(client),
+            Err(skew @ CoordinatorError::VersionSkew { .. }) => return Err(skew),
+            Err(_) => {}
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    Err(CoordinatorError(
-        "the coordinator did not answer within the start timeout".into(),
-    ))
+    Err(CoordinatorError::Protocol {
+        operation: "starting the coordinator",
+        detail: "it did not answer within the start timeout".into(),
+    })
 }
 
 /// Foreground daemon entry used by `relais coordinator daemon`.
@@ -969,6 +1649,10 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
+        // Pre-cleaned: a directory left by a killed run of this suite
+        // with the same pid would otherwise hand the test a socket or a
+        // lock it did not create.
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir
     }
@@ -1123,10 +1807,16 @@ mod tests {
         gate.resume("d1").expect("resume");
         // Write leases over the wire: exclusive, named, released by the
         // holder only, gone with settlement.
-        assert!(gate.acquire_write("d1", "/wt/one").expect("acquire"));
-        assert!(
-            !gate.acquire_write("d2", "/wt/one").expect("acquire"),
-            "a second writer is refused"
+        assert!(gate
+            .acquire_write("d1", "/wt/one")
+            .expect("acquire")
+            .taken());
+        assert_eq!(
+            gate.acquire_write("d2", "/wt/one").expect("acquire"),
+            WriteLeaseOutcome::HeldBy {
+                holder: "d1".into()
+            },
+            "a second writer is refused, and told who is writing"
         );
         assert_eq!(
             gate.write_lease_holder("/wt/one")
@@ -1149,7 +1839,7 @@ mod tests {
         let snapshot = client.status().expect("status");
         assert_eq!(snapshot.runs["run-1"].uncertain_settlements, 1);
         assert_eq!(snapshot.sessions, vec!["tab-a".to_string()]);
-        assert_eq!(gate.enforcement(), "managed (coordinator)");
+        assert_eq!(gate.enforcement(), Enforcement::Coordinator);
 
         // An unknown method is a loud error, not a silent no-op.
         let mut stream = Stream::connect(&socket).expect("connect");
@@ -1192,7 +1882,7 @@ mod tests {
         // through the shared handle still reflects the served run.
         assert!(matches!(
             client.request(&Request::Shutdown).expect("shutdown"),
-            Response::Ok { known: true, .. }
+            Response::Ack
         ));
         // The accept loop needs one more connection to observe the flag.
         let _ = Client::new(socket.clone()).ping();
@@ -1361,21 +2051,28 @@ mod tests {
 
     // C3/C4: one request thread panicking must not wedge every later
     // connection — a poisoned admission lock is recovered, not rethrown.
+    //
+    // The panic happens in a thread of its own rather than behind a
+    // swapped panic hook: the hook is process-global, and taking it away
+    // for the length of this test silenced (and briefly un-silenced)
+    // every other test running beside it. The stderr line this prints is
+    // the expected panic.
     #[test]
     fn a_poisoned_admission_lock_does_not_wedge_the_daemon() {
         let state = Mutex::new(AdmissionState::new(limits()));
-        let hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = state.lock().expect("lock");
-            panic!("a request thread died holding the admission lock");
-        }));
-        std::panic::set_hook(hook);
+        let died = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = state.lock().expect("lock");
+                    panic!("a request thread died holding the admission lock (expected)");
+                })
+                .join()
+        });
         assert!(died.is_err());
         assert!(state.is_poisoned());
 
         let mut recovered = lock_state(&state);
-        recovered.register_run(&registration("run-1", "tab-a"));
+        recovered.register_run(&registration("run-1", "tab-a"), Instant::now());
         assert!(
             !recovered.is_idle(),
             "the state machine keeps serving after a poisoned lock"
@@ -1384,11 +2081,179 @@ mod tests {
 
     #[test]
     fn remote_gate_reports_an_absent_coordinator_as_unavailable() {
-        let gate = RemoteGate::new(PathBuf::from("/tmp/relais-no-such-socket.sock"));
+        // Its own path: a fixed one is shared with every other run of
+        // this suite on the machine, including one that might have a
+        // daemon on it.
+        let dir = temp_dir("absent");
+        let gate = RemoteGate::new(dir.join("relais.sock"));
         let err = gate
             .admit(&request("d", "r", "s"))
             .expect_err("no coordinator");
-        assert!(err.to_string().starts_with("admission unavailable"));
+        assert!(err.unavailable(), "{err}");
+        assert!(
+            err.to_string().starts_with("admission unavailable"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A2: the hole the union closes. v1 answered "I have never heard of
+    // that dispatch" as `Ok { known: false }`, and every `_ =>` arm read
+    // it as success — a worker that bound after a re-election ran with
+    // no seat, no reservation and no PID on record.
+    #[test]
+    fn a_reply_that_means_unknown_cannot_be_read_as_success() {
+        // The v1 wire shape does not parse at all now, so there is no
+        // arm left that could mistake it.
+        let legacy = r#"{"kind":"ok","known":false}"#;
+        assert!(
+            serde_json::from_str::<Response>(legacy).is_err(),
+            "the old ambiguous shape is not a response this build accepts"
+        );
+        // And the shape that replaced it is an outcome the caller has to
+        // handle, never `Ok(())`.
+        let unknown = Response::Unknown {
+            entity: Entity::Dispatch,
+            id: "d1".into(),
+        };
+        let round_tripped: Response =
+            serde_json::from_str(&serde_json::to_string(&unknown).expect("serialize"))
+                .expect("parse");
+        assert_eq!(round_tripped, unknown);
+    }
+
+    // A2: a daemon left running from another install answers perfectly
+    // well and means something else by the same words. A `Pong` carries
+    // the wire protocol so the skew is named at the first call.
+    #[test]
+    fn a_daemon_on_another_wire_protocol_is_named_not_guessed() {
+        let dir = temp_dir("skew");
+        let socket = dir.join("relais.sock");
+        let listener = Listener::bind(&socket).expect("bind");
+        let server = std::thread::spawn(move || {
+            let stream = listener.accept().expect("accept").expect("a connection");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read");
+            let mut writer = stream;
+            // What a v1 daemon says: a pong with no protocol field.
+            writeln!(writer, r#"{{"kind":"pong","pid":1,"version":"0.1.6"}}"#).expect("write");
+        });
+        let err = Client::new(socket.clone())
+            .ping()
+            .expect_err("a v1 daemon is not this protocol");
+        assert!(
+            matches!(
+                err,
+                CoordinatorError::VersionSkew {
+                    ours: PROTOCOL_VERSION,
+                    theirs: 0,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(err.to_string().contains("coordinator stop"), "{err}");
+        server.join().expect("server");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A11: a daemon that is shutting down answers the connection it has
+    // already accepted. Dropping it read at the client as "EOF while
+    // parsing" and lost whatever the call was about.
+    #[test]
+    fn a_connection_accepted_while_shutting_down_is_answered() {
+        let dir = temp_dir("draining");
+        let socket = dir.join("relais.sock");
+        let listener = Listener::bind(&socket).expect("bind");
+        let state = Mutex::new(AdmissionState::new(limits()));
+        let shutdown = std::sync::atomic::AtomicBool::new(true);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let stream = listener.accept().expect("accept").expect("a connection");
+                handle_connection(stream, &state, &shutdown).expect("answered");
+            });
+            let err = Client::new(socket.clone())
+                .request(&Request::RegisterRun {
+                    registration: registration("run-1", "tab-a"),
+                })
+                .expect_err("nothing was applied");
+            assert!(
+                matches!(err, CoordinatorError::ShuttingDown { .. }),
+                "{err}"
+            );
+        });
+        assert!(
+            lock_state(&state).status(Instant::now()).runs.is_empty(),
+            "and the registration really was not applied"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A5: idle-exit decided under the lock and acted after it, so a
+    // registration served in between was accepted by a daemon already
+    // unlinking its socket. The decision is a value now, applied while
+    // the guard is still held.
+    #[test]
+    fn idle_exit_is_decided_before_the_guard_is_dropped() {
+        let t0 = Instant::now();
+        assert_eq!(idle_step(false, None, t0), IdleStep::Busy);
+        assert_eq!(
+            idle_step(false, Some(t0 - IDLE_EXIT * 2), t0),
+            IdleStep::Busy,
+            "one busy tick forgets how long it was idle before it"
+        );
+        assert_eq!(idle_step(true, None, t0), IdleStep::Idle { since: t0 });
+        let later = t0 + IDLE_EXIT - Duration::from_secs(1);
+        assert_eq!(
+            idle_step(true, Some(t0), later),
+            IdleStep::Idle { since: t0 },
+            "the clock runs from the first idle tick, not the latest"
+        );
+        assert_eq!(idle_step(true, Some(t0), t0 + IDLE_EXIT), IdleStep::Exit);
+    }
+
+    // A1: `SQLITE_BUSY` used to read as "nothing is running", so the
+    // coordinator adopted nothing, re-granted every seat already taken
+    // and lost every reservation with it. A coordinator that cannot see
+    // the live set does not start — and leaves no endpoint behind.
+    #[test]
+    fn a_coordinator_that_cannot_read_the_live_set_does_not_start() {
+        let dir = temp_dir("liveset");
+        let socket = dir.join("relais.sock");
+        let ledger_path = dir.join("ledger.sqlite");
+        let ledger = Ledger::open(&ledger_path).expect("ledger");
+        ledger.insert_run("run-x", "/repo", None).expect("run");
+        ledger
+            .record_dispatch_intent("live", "run-x", None, &serde_json::json!({}), 0)
+            .expect("intent");
+        ledger
+            .attach_dispatch_process("live", Some(std::process::id()), Some("sess"))
+            .expect("attach");
+        // The table the live set is read from, gone under it. Any read
+        // failure is the same failure to see what is running — a busy
+        // database is the one that happens in the field, and it is not
+        // something a test can produce on demand.
+        rusqlite::Connection::open(&ledger_path)
+            .expect("second connection")
+            .execute("DROP TABLE dispatches", [])
+            .expect("drop");
+        let error = Coordinator::start(&socket, limits(), Some(&ledger))
+            .err()
+            .expect("start refuses");
+        assert!(
+            matches!(error, CoordinatorError::LiveSetUnreadable { .. }),
+            "{error}"
+        );
+        assert!(
+            !socket.exists(),
+            "and no endpoint was left for a client to find"
+        );
+        assert!(
+            !dir.join("coordinator.lock").exists(),
+            "nor a lock nobody holds"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

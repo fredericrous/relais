@@ -55,6 +55,82 @@ stopped (`relais coordinator stop`) before the first command of this version.
 
 ### Coordinator and admission
 
+- **The coordinator wire protocol is a union, and a stale daemon is now
+  detected instead of misunderstood.** Every answer used to be the same
+  `ok` with a `known` flag, and "I have never heard of that dispatch"
+  looked exactly like "done" to every caller: a worker that bound after
+  the daemon re-elected ran on with no seat, no reservation and no PID on
+  record. Each outcome is its own reply now, no caller has a catch-all
+  arm left, and a `ping` carries the protocol version — so a daemon left
+  running from an older install is named at the first call, with the
+  `relais coordinator stop` that fixes it, rather than answering in a
+  shape this version reads as success. **This is the breaking change in
+  the release: stop any running coordinator before the first command of
+  this version.**
+- **A coordinator that cannot see what is already running refuses to
+  start.** It adopted the ledger's live dispatches with
+  `unwrap_or_default()`, so a busy database read as "nothing is running":
+  every seat was granted a second time and every reservation was lost. It
+  now reports the ledger error and starts nothing, leaving no endpoint
+  and no lock behind for a client to find.
+- **Heavy local commands and indexing share one limit again.** Both come
+  out of `max_heavy_commands`, but they were counted separately, so each
+  could fill the limit on its own and the machine ran twice the load
+  configured — with the overshoot only half reported in
+  `relais coordinator status`. Caps are enforced and reported per group
+  now, and a `max_heavy_commands = 2` really is two.
+- **A run cancelled while a dispatch waited in the queue no longer
+  launches it.** A queued request that reached the front while its caller
+  was polling was granted without re-checking cancellation. The seat and
+  the reservation now come back the moment the caller asks.
+- **Idle-exit and shutdown stop mid-flight work being dropped.** The
+  daemon decided it was idle under its lock and unlinked its socket after
+  releasing it, so a registration served in that window was accepted and
+  lost; and the shutdown flag was only read after a connection had been
+  accepted, which then got no answer at all ("EOF while parsing"). The
+  decision and the flag are now one step, every connection already
+  accepted is answered "shutting down" so the caller retries, and the
+  socket and the lock go only once nothing is being served.
+- **Cancelled workers are signalled off the admission lock, and only if
+  their process is still alive.** Cancelling a run sent `SIGTERM` from
+  inside the lock, without the liveness check lease reconciliation
+  already did — so a recycled PID could be signalled and every other tab
+  waited on the syscall. `relais coordinator status` now also lists each
+  bound process and how old the check behind it is, which is the closest
+  thing to proof that a PID is still the worker it was.
+- **A signal the operating system refuses is no longer recorded as
+  sent.** `terminate` and `kill` discarded their result, so a cancelled
+  dispatch could be marked as asked to stop when nothing had been
+  delivered, and a PID that had been recycled (`EPERM`) exhausted the
+  escalation ladder and was reported as cancelled. A delivery that could
+  succeed later is retried on the next reconcile; one that never can —
+  the process is gone, or it is not ours — stops there and says which.
+- **The endpoint is never world-connectable, not even for a syscall, and
+  only this user may talk to it.** The socket was created with the
+  process umask applied (0755 by default) and narrowed a moment later, in
+  a window where a protocol carrying `shutdown` and `cancel_run` was
+  reachable. It is now bound owner-only, its directory is owner-only and
+  verified, and the uid on the other end of every connection is checked
+  with the kernel before a byte of the request is read.
+- **A flood of connections costs a bounded queue instead of a thread
+  each.** The accept loop spawned an unjoined thread per connection and
+  could spin at full speed on an accept error that would never pass
+  (`EMFILE`); it now hands work to a fixed pool that is joined on exit,
+  backs off and stands down when descriptors run out, and skips the
+  failures a retry does fix.
+- **A run blocked by admission says whether the coordinator was
+  unreachable or simply said no.** Every failed admission call was
+  reported as `admission_unavailable`, which sent operators looking for a
+  dead daemon that was answering perfectly well. Admission errors are
+  typed now, and a refusal is reported as `admission_refused`.
+- **A worker whose bind the coordinator does not recognise ends the
+  attempt instead of finishing unmanaged.** Its usage is settled and
+  recorded first, and the run is blocked with the reason.
+- **A withdrawn request no longer costs a run one of its agents.**
+  Abandoning a request that had been admitted but never launched settled
+  it as a finished dispatch, which spent an aggregate agent slot for the
+  rest of the run and made the same dispatch ID unusable.
+
 ### Ledger, policy and contracts
 
 ### Runner

@@ -9,9 +9,11 @@
 //! waiting on children relinquish active-execution capacity so all slots
 //! cannot be held by waiters.
 //!
-//! Nothing here touches a socket, a clock or a process table: every method
-//! takes `now`, and liveness is a callback. That is what makes the §23
-//! concurrency scenarios testable without three real Claude Code tabs.
+//! The state machine touches no socket, no clock and no process table:
+//! every method takes `now`, and liveness is a callback. That is what makes
+//! the §23 concurrency scenarios testable without three real Claude Code
+//! tabs. The gate implementations at the end of the file are the boundary
+//! that supplies both.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -82,6 +84,36 @@ impl ResourceClass {
             Self::Training => "training",
         }
     }
+
+    /// The cap this class is scheduled against.
+    fn cap_group(self) -> CapGroup {
+        match self {
+            Self::ModelWork => CapGroup::Remote,
+            Self::HeavyLocal | Self::Indexing => CapGroup::Local,
+            Self::Training => CapGroup::Training,
+        }
+    }
+}
+
+/// Classes that share one machine limit are scheduled as ONE group. A
+/// cap is a cap on the group, never on each member separately: heavy
+/// local commands and indexing both come out of `max_heavy_commands`,
+/// and counting them apart admitted twice the configured number (A3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CapGroup {
+    /// Remote model work: `max_active_agents`, and the only group with a
+    /// per-session cap.
+    Remote,
+    /// Local machine load — compilers, test containers, index builds:
+    /// `max_heavy_commands`.
+    Local,
+    /// Training jobs: `max_training_jobs`.
+    Training,
+}
+
+impl CapGroup {
+    /// Every group, for the totals a status snapshot reports.
+    const ALL: [CapGroup; 3] = [CapGroup::Remote, CapGroup::Local, CapGroup::Training];
 }
 
 /// What a root runner registers before its first dispatch. Limits and
@@ -202,11 +234,29 @@ pub struct StatusSnapshot {
     /// waiting: bounded by the number of waiters, by `max_over_admitted`,
     /// and visible.
     pub over_admitted: u32,
+    /// Every dispatch with a process bound to it, and how old the
+    /// liveness check behind that binding is (A13). Nothing portable
+    /// proves a PID still names the process it named at bind time (see
+    /// `procs::alive`), so the age of the evidence is what can honestly
+    /// be shown — and a signal is only ever sent to a PID that is still
+    /// alive now.
+    #[serde(default)]
+    pub bound_processes: BTreeMap<String, BoundProcess>,
     /// Exclusive write leases by worktree path, each naming its holder
     /// (SPEC §23). Root verification waits for the relevant ones to be
     /// gone.
     #[serde(default)]
     pub write_leases: BTreeMap<String, String>,
+}
+
+/// A process bound to a dispatch, and how stale the check that bound it
+/// is (C6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundProcess {
+    pub pid: u32,
+    /// Seconds since this PID was checked alive and recorded. The window
+    /// in which the OS could have recycled the number starts there.
+    pub bound_for_secs: u64,
 }
 
 /// What the caller should send a cancelled worker. The state machine
@@ -222,7 +272,33 @@ pub enum Signal {
     Kill,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+impl Signal {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Terminate => "terminate",
+            Self::Kill => "kill",
+        }
+    }
+}
+
+/// A signal the state machine decided on, for the caller to deliver
+/// once it has let go of the admission lock. Signalling under the lock
+/// blocks every other connection for the length of a syscall on a
+/// process that may be stopped (A6).
+///
+/// `bound_at` is when that PID was last checked alive: the age of the
+/// evidence the signal rests on. The deliverer re-checks liveness before
+/// sending, which is the only portable narrowing of the C6 window there
+/// is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSignal {
+    pub dispatch_id: String,
+    pub pid: u32,
+    pub signal: Signal,
+    pub bound_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReconcileReport {
     /// Leases freed because their process is provably gone.
     pub dropped: Vec<String>,
@@ -235,7 +311,7 @@ pub struct ReconcileReport {
     /// Bound processes of cancelled dispatches that the caller should
     /// signal, and with what; each dispatch appears at most twice in its
     /// life — once to terminate, once to kill.
-    pub to_signal: Vec<(String, u32, Signal)>,
+    pub to_signal: Vec<PendingSignal>,
 }
 
 /// What `bind` did. A bind is the one moment the coordinator can check
@@ -280,6 +356,223 @@ impl ResumeOutcome {
     }
 }
 
+/// What `mark_waiting` did. A seat is given back on a claim the
+/// coordinator can at least partly check, and never on a bare word (C8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitOutcome {
+    Waiting,
+    UnknownDispatch,
+    /// Nothing is bound, or the bound process is gone: it is not
+    /// waiting, it is over.
+    NoLiveProcess,
+    /// The dispatch has already reached an end — its seat is back, or
+    /// its usage has settled — so there is nothing to relinquish.
+    Ended,
+}
+
+impl WaitOutcome {
+    pub fn waiting(self) -> bool {
+        self == Self::Waiting
+    }
+}
+
+/// What a lifecycle call — `release`, `settle`, `acknowledge_cancel`,
+/// `finish_run` — did. Either it applied to the subject it named, or the
+/// coordinator has no such subject; there is no partial application, and
+/// duplicate lifecycle events are harmless (SPEC §23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleOutcome {
+    Applied,
+    /// No such dispatch or run. Worth knowing: after a coordinator
+    /// re-election this is what a worker's own lease looks like.
+    Unknown,
+}
+
+impl LifecycleOutcome {
+    pub fn applied(self) -> bool {
+        self == Self::Applied
+    }
+}
+
+/// What `withdraw` did with a request its caller gave up on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WithdrawOutcome {
+    /// Dropped from the queue, or — for an entry drained in while the
+    /// caller was polling — freed with nothing admitted and nothing
+    /// spent (A14).
+    Withdrawn,
+    /// The caller already received `Granted` for this ID: its launch may
+    /// be in flight, so abandoning the reservation would leave a worker
+    /// running against nothing.
+    Claimed,
+    UnknownDispatch,
+}
+
+/// What `acquire_write` did (SPEC §23: one writer per worktree).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum WriteLeaseOutcome {
+    Taken,
+    /// Somebody else is writing that tree, and is named: the caller must
+    /// not launch a second writer into it.
+    HeldBy {
+        holder: String,
+    },
+}
+
+impl WriteLeaseOutcome {
+    pub fn taken(&self) -> bool {
+        matches!(self, Self::Taken)
+    }
+}
+
+/// What `release_write` did. Only a lease's holder can release it:
+/// silently freeing somebody else's is how two writers end up in one
+/// worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseWriteOutcome {
+    Released,
+    /// Nobody holds that worktree, or somebody else does.
+    NotTheHolder,
+}
+
+/// What a gate can actually enforce, for reports (SPEC §23: observed-only
+/// paths are labelled, never claimed as guarantees).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Enforcement {
+    /// One process holds the state: caps bind within this process, and
+    /// say nothing about a second tab.
+    InProcess,
+    /// The shared per-user coordinator: caps bind across every tab of
+    /// this OS user.
+    Coordinator,
+}
+
+impl Enforcement {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InProcess => "managed (in-process)",
+            Self::Coordinator => "managed (coordinator)",
+        }
+    }
+}
+
+impl std::fmt::Display for Enforcement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Where a dispatch is between admission and oblivion.
+///
+/// The two ends — the seat coming back and the usage settling — arrive
+/// in either order and independently, so they are one state with two
+/// spellings rather than two booleans: a dispatch that has reached BOTH
+/// is removed, which is why "released and settled" has no variant here.
+/// Every combination the old eight booleans could spell but never meant
+/// (`released && !claimed`, `settled && !released`, `waiting` with no
+/// moment) is now unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lifecycle {
+    /// Admitted — drained from the queue — but no caller has received
+    /// `Granted` for it yet. It holds a seat and can still be withdrawn.
+    Unclaimed,
+    /// A caller holds the grant and the seat.
+    Claimed,
+    /// Awaiting children, with the seat given back (SPEC §23). A waiting
+    /// parent is a claim the coordinator cannot verify — see
+    /// `mark_waiting` — so the moment it was made is kept and shown.
+    Waiting { since: Instant },
+    /// The seat is back; the reservation stands until usage settles.
+    SeatFreed,
+    /// Usage has settled; the seat is held until the caller frees it.
+    UsageSettled,
+}
+
+impl Lifecycle {
+    /// Does this dispatch occupy a seat in its cap group?
+    fn holds_seat(self) -> bool {
+        match self {
+            Self::Unclaimed | Self::Claimed | Self::UsageSettled => true,
+            Self::Waiting { .. } | Self::SeatFreed => false,
+        }
+    }
+
+    /// Has a caller been told to launch?
+    fn claimed(self) -> bool {
+        match self {
+            Self::Unclaimed => false,
+            Self::Claimed | Self::Waiting { .. } | Self::SeatFreed | Self::UsageSettled => true,
+        }
+    }
+
+    fn waiting(self) -> bool {
+        matches!(self, Self::Waiting { .. })
+    }
+
+    fn released(self) -> bool {
+        matches!(self, Self::SeatFreed)
+    }
+
+    fn settled(self) -> bool {
+        matches!(self, Self::UsageSettled)
+    }
+}
+
+/// How far a cancellation has got. The ladder is walked once and only
+/// forwards, so `kill_sent && !terminate_sent` — and a cancellation
+/// moment on a dispatch nobody cancelled — cannot be spelled (C5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cancellation {
+    None,
+    /// Cancelled at `since`; nothing has been handed to the caller yet.
+    Requested {
+        since: Instant,
+    },
+    /// A `Terminate` was handed over. The escalation grace runs from
+    /// `since` — when the cancellation happened, not when the signal
+    /// went — so a slow reconcile cannot extend it.
+    Terminated {
+        since: Instant,
+    },
+    /// The escalation was handed over. Nothing more will be.
+    Killed {
+        since: Instant,
+    },
+}
+
+impl Cancellation {
+    fn cancelled(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// What the coordinator knows about a dispatch's process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Binding {
+    /// No process bound. `rounds` counts consecutive reconciles that
+    /// found the lease past grace with nothing to check (C2).
+    Unbound { rounds: u32 },
+    /// A PID that was a live process when it was bound. The window in
+    /// which the OS could have recycled the number starts at `at`, and
+    /// nothing portable closes it (see `procs::alive`).
+    Bound { pid: u32, at: Instant },
+}
+
+impl Binding {
+    fn pid(self) -> Option<u32> {
+        match self {
+            Self::Unbound { .. } => None,
+            Self::Bound { pid, .. } => Some(pid),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Dispatch {
     session_id: String,
@@ -289,35 +582,11 @@ struct Dispatch {
     depth: u32,
     class: ResourceClass,
     reserved: i64,
-    /// Seat given back while awaiting children (SPEC §23).
-    waiting: bool,
-    /// When the seat was given back. A waiting parent is a claim the
-    /// coordinator cannot verify — see `mark_waiting` — so the moment it
-    /// was made is recorded and shown.
-    waiting_since: Option<Instant>,
-    /// A caller has received `Granted` for this ID.
-    claimed: bool,
-    /// The seat is released; the entry lingers only until settlement.
-    released: bool,
-    /// Usage has been settled (actual or unknown); the entry lingers
-    /// only until release.
-    settled: bool,
-    pid: Option<u32>,
-    /// When the PID was bound, and checked alive. The window in which a
-    /// PID could have been recycled starts here; nothing portable can
-    /// close it (see `procs::alive`).
-    bound_at: Option<Instant>,
+    lifecycle: Lifecycle,
+    binding: Binding,
+    cancellation: Cancellation,
     agent_id: Option<String>,
     last_heartbeat: Instant,
-    /// How many consecutive reconciles found this lease past grace with
-    /// no process bound (C2).
-    unbound_rounds: u32,
-    cancelled: bool,
-    cancelled_at: Option<Instant>,
-    /// A `terminate` has been handed to the caller for this dispatch.
-    terminate_sent: bool,
-    /// The escalation has been handed over; nothing more will be.
-    kill_sent: bool,
 }
 
 /// One worktree's exclusive write lease (SPEC §23: "concurrent writers
@@ -420,8 +689,11 @@ impl AdmissionState {
             .or_insert(Session { last_served: None });
     }
 
-    /// Idempotent; a repeat can only narrow limits and budget.
-    pub fn register_run(&mut self, registration: &RunRegistration) {
+    /// Idempotent; a repeat can only narrow limits and budget. Takes the
+    /// clock like every other mutator: the abandonment backstop is timed
+    /// from `last_activity`, and a state machine that reads the clock
+    /// itself cannot have that backstop tested (A10).
+    pub fn register_run(&mut self, registration: &RunRegistration, now: Instant) {
         self.register_session(&registration.session_id);
         match self.runs.get_mut(&registration.run_id) {
             Some(run) => {
@@ -430,7 +702,7 @@ impl AdmissionState {
                 run.max_depth = min_opt(run.max_depth, registration.max_depth);
                 // A resumed run is live again, whatever it was before.
                 run.terminal = false;
-                run.last_activity = Instant::now();
+                run.last_activity = now;
             }
             None => {
                 self.runs.insert(
@@ -445,7 +717,7 @@ impl AdmissionState {
                         max_depth: registration.max_depth,
                         cancelled: false,
                         terminal: false,
-                        last_activity: Instant::now(),
+                        last_activity: now,
                     },
                 );
             }
@@ -471,11 +743,36 @@ impl AdmissionState {
                 ),
             };
         }
-        if let Some(existing) = self.dispatches.get_mut(&request.dispatch_id) {
-            if existing.claimed {
+        if let Some(existing) = self.dispatches.get(&request.dispatch_id) {
+            if existing.lifecycle.claimed() {
                 return Decision::AlreadyAdmitted;
             }
-            existing.claimed = true;
+            // Drained from the queue while the caller was polling. The
+            // hard limits were checked when it queued and are NOT
+            // re-checked here, so cancellation has to be (A4): between
+            // the drain and this poll the run can have been cancelled,
+            // and handing out `Granted` would launch a worker for a run
+            // that is over.
+            let run_cancelled = self
+                .runs
+                .get(&existing.run_id)
+                .is_some_and(|run| run.cancelled);
+            if run_cancelled || existing.cancellation.cancelled() {
+                // It was never claimed, so nothing can be in flight: give
+                // the seat and the reservation back now rather than
+                // waiting out lease grace on a worker that never existed.
+                self.discard_unclaimed(&request.dispatch_id, now);
+                return Decision::Refused {
+                    code: Refusal::RunCancelled,
+                    detail: format!(
+                        "dispatch {} was cancelled while it waited for a seat; nothing is launched",
+                        request.dispatch_id
+                    ),
+                };
+            }
+            if let Some(existing) = self.dispatches.get_mut(&request.dispatch_id) {
+                existing.lifecycle = Lifecycle::Claimed;
+            }
             return Decision::Granted;
         }
         if let Some(position) = self
@@ -503,7 +800,7 @@ impl AdmissionState {
         }
         self.register_session(&request.session_id);
         if self.admissible(request) {
-            self.admit(request.clone(), now, true);
+            self.admit(request.clone(), now, Lifecycle::Claimed);
             return Decision::Granted;
         }
         self.queue.push(Queued {
@@ -615,39 +912,41 @@ impl AdmissionState {
             })
     }
 
-    fn active_count(&self, class: ResourceClass, session: Option<&str>) -> u32 {
+    /// Seats held in a cap GROUP: every class the cap covers, counted
+    /// together. Counting one class at a time let `heavy_local` and
+    /// `indexing` each fill `max_heavy_commands` on their own, and the
+    /// machine ran twice the configured load (A3).
+    fn active_count(&self, group: CapGroup, session: Option<&str>) -> u32 {
         self.dispatches
             .values()
             .filter(|dispatch| {
-                dispatch.class == class
-                    && !dispatch.waiting
-                    && !dispatch.released
+                dispatch.class.cap_group() == group
+                    && dispatch.lifecycle.holds_seat()
                     && session.is_none_or(|session| dispatch.session_id == session)
             })
             .count() as u32
     }
 
-    fn class_cap(&self, class: ResourceClass) -> Option<u32> {
-        match class {
-            ResourceClass::ModelWork => self.limits.max_active_agents,
-            ResourceClass::HeavyLocal | ResourceClass::Indexing => self.limits.max_heavy_commands,
-            ResourceClass::Training => self.limits.max_training_jobs,
+    fn group_cap(&self, group: CapGroup) -> Option<u32> {
+        match group {
+            CapGroup::Remote => self.limits.max_active_agents,
+            CapGroup::Local => self.limits.max_heavy_commands,
+            CapGroup::Training => self.limits.max_training_jobs,
         }
     }
 
     /// Capacity caps only; hard limits were checked before queueing.
     fn admissible(&self, request: &DispatchRequest) -> bool {
+        let group = request.resource.cap_group();
         if self
-            .class_cap(request.resource)
-            .is_some_and(|cap| self.active_count(request.resource, None) >= cap)
+            .group_cap(group)
+            .is_some_and(|cap| self.active_count(group, None) >= cap)
         {
             return false;
         }
-        if request.resource == ResourceClass::ModelWork {
+        if group == CapGroup::Remote {
             if let Some(per_session) = self.limits.max_active_agents_per_session {
-                if self.active_count(ResourceClass::ModelWork, Some(&request.session_id))
-                    >= per_session
-                {
+                if self.active_count(group, Some(&request.session_id)) >= per_session {
                     return false;
                 }
             }
@@ -655,7 +954,7 @@ impl AdmissionState {
         true
     }
 
-    fn admit(&mut self, request: DispatchRequest, now: Instant, claimed: bool) {
+    fn admit(&mut self, request: DispatchRequest, now: Instant, lifecycle: Lifecycle) {
         let parent_known = request
             .parent_dispatch
             .as_ref()
@@ -681,22 +980,31 @@ impl AdmissionState {
                 depth,
                 class: request.resource,
                 reserved: request.reserve_micros.max(0),
-                waiting: false,
-                waiting_since: None,
-                claimed,
-                released: false,
-                settled: false,
-                pid: None,
-                bound_at: None,
+                lifecycle,
+                binding: Binding::Unbound { rounds: 0 },
+                cancellation: Cancellation::None,
                 agent_id: None,
                 last_heartbeat: now,
-                unbound_rounds: 0,
-                cancelled: false,
-                cancelled_at: None,
-                terminate_sent: false,
-                kill_sent: false,
             },
         );
+    }
+
+    /// Drop a dispatch that was admitted but never claimed, giving back
+    /// everything it took: the seat, the reservation and the agent-tree
+    /// slot. Nothing settles and nothing is remembered as finished,
+    /// because nothing ran — a withdrawn request that consumed a run's
+    /// agent cap for ever was A14.
+    fn discard_unclaimed(&mut self, dispatch_id: &str, now: Instant) {
+        let Some(dispatch) = self.dispatches.remove(dispatch_id) else {
+            return;
+        };
+        if let Some(run) = self.runs.get_mut(&dispatch.run_id) {
+            run.admitted_total = run.admitted_total.saturating_sub(1);
+            run.last_activity = now;
+        }
+        self.write_leases
+            .retain(|_, lease| lease.holder != dispatch_id);
+        self.drain(now);
     }
 
     /// Fair drain: among admissible queued entries, an aged entry goes
@@ -730,7 +1038,7 @@ impl AdmissionState {
             if let Some(Decision::Refused { .. }) = self.check_hard_limits(&queued.request) {
                 continue;
             }
-            self.admit(queued.request, now, false);
+            self.admit(queued.request, now, Lifecycle::Unclaimed);
         }
     }
 
@@ -747,8 +1055,10 @@ impl AdmissionState {
     /// What this does NOT prove: that the live PID is the client's own
     /// child, or that it is still the same process later in the lease.
     /// Both need a process start time, which has no portable API (see
-    /// `procs::alive`); `bound_at` records when the check was true so
-    /// the window is at least visible.
+    /// `procs::alive`). So the moment the check was true is recorded,
+    /// reported in `StatusSnapshot::bound_processes` and carried on every
+    /// `PendingSignal`: the window cannot be closed, but its age is on
+    /// the record rather than implied (A13).
     pub fn bind(
         &mut self,
         dispatch_id: &str,
@@ -785,10 +1095,8 @@ impl AdmissionState {
         if agent_id.is_some() {
             dispatch.agent_id = agent_id.map(str::to_string);
         }
-        if pid.is_some() {
-            dispatch.pid = pid;
-            dispatch.bound_at = Some(now);
-            dispatch.unbound_rounds = 0;
+        if let Some(pid) = pid {
+            dispatch.binding = Binding::Bound { pid, at: now };
         }
         true
     }
@@ -799,14 +1107,16 @@ impl AdmissionState {
                 dispatch.last_heartbeat = now;
                 // Somebody is alive on the other end of this lease, so
                 // the unbindable count starts over (C2).
-                dispatch.unbound_rounds = 0;
+                if let Binding::Unbound { rounds } = &mut dispatch.binding {
+                    *rounds = 0;
+                }
                 let run_cancelled = self
                     .runs
                     .get(&dispatch.run_id)
                     .is_some_and(|run| run.cancelled);
                 HeartbeatStatus {
                     known: true,
-                    cancelled: dispatch.cancelled || run_cancelled,
+                    cancelled: dispatch.cancellation.cancelled() || run_cancelled,
                 }
             }
             None => HeartbeatStatus {
@@ -834,25 +1144,30 @@ impl AdmissionState {
         dispatch_id: &str,
         now: Instant,
         alive: &dyn Fn(u32) -> bool,
-    ) -> bool {
+    ) -> WaitOutcome {
         let Some(dispatch) = self.dispatches.get(dispatch_id) else {
-            return false;
+            return WaitOutcome::UnknownDispatch;
         };
-        let Some(pid) = dispatch.pid else {
-            return false;
+        let Some(pid) = dispatch.binding.pid() else {
+            return WaitOutcome::NoLiveProcess;
         };
         if !alive(pid) {
-            return false;
+            return WaitOutcome::NoLiveProcess;
         }
-        let dispatch = self
-            .dispatches
-            .get_mut(dispatch_id)
-            .expect("checked just above");
-        dispatch.waiting = true;
-        dispatch.waiting_since = Some(now);
+        // A dispatch that already gave its seat back, or whose seat is
+        // gone for good, has nothing to relinquish.
+        match dispatch.lifecycle {
+            Lifecycle::Unclaimed | Lifecycle::Claimed => {}
+            Lifecycle::Waiting { .. } => return WaitOutcome::Waiting,
+            Lifecycle::SeatFreed | Lifecycle::UsageSettled => return WaitOutcome::Ended,
+        }
+        let Some(dispatch) = self.dispatches.get_mut(dispatch_id) else {
+            return WaitOutcome::UnknownDispatch;
+        };
+        dispatch.lifecycle = Lifecycle::Waiting { since: now };
         dispatch.last_heartbeat = now;
         self.drain(now);
-        true
+        WaitOutcome::Waiting
     }
 
     /// The waiting parent's children finished: it takes its seat back
@@ -868,10 +1183,10 @@ impl AdmissionState {
         let Some(dispatch) = self.dispatches.get(dispatch_id) else {
             return ResumeOutcome::UnknownDispatch;
         };
-        if dispatch.waiting {
-            let class = dispatch.class;
-            let over = self.class_cap(class).map_or(0, |cap| {
-                self.active_count(class, None)
+        if dispatch.lifecycle.waiting() {
+            let group = dispatch.class.cap_group();
+            let over = self.group_cap(group).map_or(0, |cap| {
+                self.active_count(group, None)
                     .saturating_add(1)
                     .saturating_sub(cap)
             });
@@ -881,40 +1196,57 @@ impl AdmissionState {
                 }
             }
         }
-        let dispatch = self
-            .dispatches
-            .get_mut(dispatch_id)
-            .expect("checked just above");
-        dispatch.waiting = false;
-        dispatch.waiting_since = None;
+        let Some(dispatch) = self.dispatches.get_mut(dispatch_id) else {
+            return ResumeOutcome::UnknownDispatch;
+        };
+        // A dispatch that is not waiting has nothing to take back, and a
+        // duplicate resume is harmless (SPEC §23). One that has already
+        // ended keeps its end.
+        if dispatch.lifecycle.waiting() {
+            dispatch.lifecycle = Lifecycle::Claimed;
+        }
         dispatch.last_heartbeat = now;
         ResumeOutcome::Resumed
     }
 
     /// Free the seat. The reservation stays until settled, so a release
-    /// before settlement cannot let a sibling spend the same money.
-    pub fn release(&mut self, dispatch_id: &str, now: Instant) -> bool {
+    /// before settlement cannot let a sibling spend the same money; the
+    /// entry itself goes when both ends have arrived.
+    pub fn release(&mut self, dispatch_id: &str, now: Instant) -> LifecycleOutcome {
         let Some(dispatch) = self.dispatches.get_mut(dispatch_id) else {
-            return false;
+            return LifecycleOutcome::Unknown;
         };
-        dispatch.released = true;
-        self.forget_if_settled(dispatch_id);
+        // Usage already settled: this is the second end, so the entry is
+        // over once the seat is back.
+        let both_ends = dispatch.lifecycle.settled();
+        dispatch.lifecycle = Lifecycle::SeatFreed;
+        if both_ends {
+            self.forget_settled(dispatch_id);
+        }
         self.drain(now);
-        true
+        LifecycleOutcome::Applied
     }
 
     /// Settle a reservation with actual spend. `None` = unknown usage:
     /// the reservation stands in as a lower bound and the run is marked
     /// uncertain; never zero (SPEC §23).
-    pub fn settle(&mut self, dispatch_id: &str, spent_micros: Option<i64>, now: Instant) -> bool {
+    pub fn settle(
+        &mut self,
+        dispatch_id: &str,
+        spent_micros: Option<i64>,
+        now: Instant,
+    ) -> LifecycleOutcome {
         let Some(dispatch) = self.dispatches.get_mut(dispatch_id) else {
-            return false;
+            return LifecycleOutcome::Unknown;
         };
-        if dispatch.settled {
+        if dispatch.lifecycle.settled() {
             // Duplicate lifecycle events are harmless (SPEC §23).
-            return true;
+            return LifecycleOutcome::Applied;
         }
-        dispatch.settled = true;
+        // The seat is already back: settling is the second end, so the
+        // entry goes once the money is booked.
+        let both_ends = dispatch.lifecycle.released();
+        dispatch.lifecycle = Lifecycle::UsageSettled;
         let reserved = std::mem::take(&mut dispatch.reserved);
         let run_id = dispatch.run_id.clone();
         if let Some(run) = self.runs.get_mut(&run_id) {
@@ -930,48 +1262,48 @@ impl AdmissionState {
             }
             run.last_activity = now;
         }
-        self.forget_if_settled(dispatch_id);
+        if both_ends {
+            self.forget_settled(dispatch_id);
+        }
         self.drain(now);
-        true
+        LifecycleOutcome::Applied
     }
 
     /// The caller gave up on a request it never launched: drop it from
     /// the queue, or, if it was drained meanwhile but never claimed,
-    /// free the seat with nothing spent. A claimed dispatch is not
+    /// give back everything it took. A claimed dispatch is not
     /// withdrawable — its launch may be in flight.
-    pub fn withdraw(&mut self, dispatch_id: &str, now: Instant) -> bool {
+    ///
+    /// A withdrawn request never ran, so it is not a settlement and not
+    /// a finished dispatch ID: it does not consume one of the run's
+    /// agent-tree slots, and the same ID may be requested again (A14).
+    pub fn withdraw(&mut self, dispatch_id: &str, now: Instant) -> WithdrawOutcome {
         let before = self.queue.len();
         self.queue
             .retain(|queued| queued.request.dispatch_id != dispatch_id);
         if self.queue.len() != before {
-            return true;
+            return WithdrawOutcome::Withdrawn;
         }
-        let unclaimed = self
-            .dispatches
-            .get(dispatch_id)
-            .is_some_and(|dispatch| !dispatch.claimed);
-        if unclaimed {
-            self.settle(dispatch_id, Some(0), now);
-            self.release(dispatch_id, now);
-            return true;
+        match self.dispatches.get(dispatch_id) {
+            None => WithdrawOutcome::UnknownDispatch,
+            Some(dispatch) if dispatch.lifecycle.claimed() => WithdrawOutcome::Claimed,
+            Some(_) => {
+                self.discard_unclaimed(dispatch_id, now);
+                WithdrawOutcome::Withdrawn
+            }
         }
-        false
     }
 
-    fn forget_if_settled(&mut self, dispatch_id: &str) {
-        let gone = self
-            .dispatches
-            .get(dispatch_id)
-            .is_some_and(|dispatch| dispatch.released && dispatch.settled);
-        if gone {
-            self.dispatches.remove(dispatch_id);
-            // A worker that is over does not still hold a worktree
-            // (SPEC §23: verification waits for write leases to be
-            // released, and a lease nobody can release never is).
-            self.write_leases
-                .retain(|_, lease| lease.holder != dispatch_id);
-            self.remember_terminal(dispatch_id);
-        }
+    /// Both ends have arrived: the entry goes, its worktree leases with
+    /// it, and its ID is remembered as finished.
+    fn forget_settled(&mut self, dispatch_id: &str) {
+        self.dispatches.remove(dispatch_id);
+        // A worker that is over does not still hold a worktree
+        // (SPEC §23: verification waits for write leases to be
+        // released, and a lease nobody can release never is).
+        self.write_leases
+            .retain(|_, lease| lease.holder != dispatch_id);
+        self.remember_terminal(dispatch_id);
     }
 
     /// Remember a settled dispatch ID, evicting the oldest past the cap.
@@ -999,9 +1331,17 @@ impl AdmissionState {
     /// Each writing attempt still gets its own worktree — the lease is
     /// the coordinator-side record that lets a second writer be refused
     /// and a straggler be waited for, across tabs.
-    pub fn acquire_write(&mut self, worktree: &str, dispatch_id: &str, now: Instant) -> bool {
+    pub fn acquire_write(
+        &mut self,
+        worktree: &str,
+        dispatch_id: &str,
+        now: Instant,
+    ) -> WriteLeaseOutcome {
         match self.write_leases.get(worktree) {
-            Some(lease) => lease.holder == dispatch_id,
+            Some(lease) if lease.holder == dispatch_id => WriteLeaseOutcome::Taken,
+            Some(lease) => WriteLeaseOutcome::HeldBy {
+                holder: lease.holder.clone(),
+            },
             None => {
                 self.write_leases.insert(
                     worktree.to_string(),
@@ -1010,7 +1350,7 @@ impl AdmissionState {
                         since: now,
                     },
                 );
-                true
+                WriteLeaseOutcome::Taken
             }
         }
     }
@@ -1018,13 +1358,13 @@ impl AdmissionState {
     /// Release a write lease. Only its holder can: another dispatch
     /// asking is a bug or a race, and silently freeing somebody else's
     /// lease is how two writers end up in one worktree.
-    pub fn release_write(&mut self, worktree: &str, dispatch_id: &str) -> bool {
+    pub fn release_write(&mut self, worktree: &str, dispatch_id: &str) -> ReleaseWriteOutcome {
         match self.write_leases.get(worktree) {
             Some(lease) if lease.holder == dispatch_id => {
                 self.write_leases.remove(worktree);
-                true
+                ReleaseWriteOutcome::Released
             }
-            _ => false,
+            Some(_) | None => ReleaseWriteOutcome::NotTheHolder,
         }
     }
 
@@ -1059,17 +1399,14 @@ impl AdmissionState {
     /// Cancel one agent subtree: the dispatch, its managed descendants
     /// and their queued requests. Siblings, other runs and other tabs are
     /// untouched. Returns the bound processes to signal.
-    pub fn cancel_dispatch(&mut self, dispatch_id: &str, now: Instant) -> Vec<(String, u32)> {
+    pub fn cancel_dispatch(&mut self, dispatch_id: &str, now: Instant) -> Vec<PendingSignal> {
         let subtree = self.descendants(dispatch_id);
         let mut to_signal = Vec::new();
         for id in &subtree {
             if let Some(dispatch) = self.dispatches.get_mut(id) {
                 mark_cancelled(dispatch, now);
-                if let Some(pid) = dispatch.pid {
-                    // The caller sends this one; reconcile must not send
-                    // it again, only escalate past it (C5).
-                    dispatch.terminate_sent = true;
-                    to_signal.push((id.clone(), pid));
+                if let Some(pending) = hand_over_terminate(id, dispatch) {
+                    to_signal.push(pending);
                 }
             }
         }
@@ -1087,7 +1424,7 @@ impl AdmissionState {
 
     /// Cancel one run: every dispatch of that run, queued or active. Other
     /// runs in the same session stay operational (SPEC §23).
-    pub fn cancel_run(&mut self, run_id: &str, now: Instant) -> Vec<(String, u32)> {
+    pub fn cancel_run(&mut self, run_id: &str, now: Instant) -> Vec<PendingSignal> {
         let mut to_signal = Vec::new();
         if let Some(run) = self.runs.get_mut(run_id) {
             run.cancelled = true;
@@ -1096,9 +1433,8 @@ impl AdmissionState {
         for (id, dispatch) in self.dispatches.iter_mut() {
             if dispatch.run_id == run_id {
                 mark_cancelled(dispatch, now);
-                if let Some(pid) = dispatch.pid {
-                    dispatch.terminate_sent = true;
-                    to_signal.push((id.clone(), pid));
+                if let Some(pending) = hand_over_terminate(id, dispatch) {
+                    to_signal.push(pending);
                 }
             }
         }
@@ -1108,7 +1444,7 @@ impl AdmissionState {
     }
 
     /// Cancel one session's runs, never another tab's.
-    pub fn cancel_session(&mut self, session_id: &str, now: Instant) -> Vec<(String, u32)> {
+    pub fn cancel_session(&mut self, session_id: &str, now: Instant) -> Vec<PendingSignal> {
         let runs: Vec<String> = self
             .runs
             .iter()
@@ -1126,21 +1462,21 @@ impl AdmissionState {
     /// whatever: no further dispatch is coming. Nothing is signalled and
     /// nothing is cancelled; the run simply stops holding the daemon
     /// open. Returns false for a run this coordinator does not know.
-    pub fn finish_run(&mut self, run_id: &str) -> bool {
+    pub fn finish_run(&mut self, run_id: &str) -> LifecycleOutcome {
         match self.runs.get_mut(run_id) {
             Some(run) => {
                 run.terminal = true;
-                true
+                LifecycleOutcome::Applied
             }
-            None => false,
+            None => LifecycleOutcome::Unknown,
         }
     }
 
     /// A cancelled dispatch whose caller acknowledged the cancellation:
     /// freed with unknown usage unless settled.
-    pub fn acknowledge_cancel(&mut self, dispatch_id: &str, now: Instant) -> bool {
+    pub fn acknowledge_cancel(&mut self, dispatch_id: &str, now: Instant) -> LifecycleOutcome {
         if !self.dispatches.contains_key(dispatch_id) {
-            return false;
+            return LifecycleOutcome::Unknown;
         }
         self.settle(dispatch_id, None, now);
         self.release(dispatch_id, now)
@@ -1161,24 +1497,34 @@ impl AdmissionState {
         let mut report = ReconcileReport::default();
         let ids: Vec<String> = self.dispatches.keys().cloned().collect();
         for id in ids {
-            let (stale, pid, cancelled) = {
+            let (stale, binding, cancelled) = {
                 let dispatch = &self.dispatches[&id];
                 (
                     now.saturating_duration_since(dispatch.last_heartbeat) >= LEASE_GRACE,
-                    dispatch.pid,
-                    dispatch.cancelled,
+                    dispatch.binding,
+                    dispatch.cancellation.cancelled(),
                 )
             };
+            let pid = binding.pid();
             if cancelled {
-                if let Some(pid) = pid.filter(|pid| alive(*pid)) {
-                    if let Some(signal) = self.escalate(&id, now) {
-                        report.to_signal.push((id.clone(), pid, signal));
+                if let Binding::Bound { pid, at } = binding {
+                    if alive(pid) {
+                        if let Some(signal) = self.escalate(&id, now) {
+                            report.to_signal.push(PendingSignal {
+                                dispatch_id: id.clone(),
+                                pid,
+                                signal,
+                                bound_at: at,
+                            });
+                        }
                     }
                 }
             }
             if !stale {
                 if let Some(dispatch) = self.dispatches.get_mut(&id) {
-                    dispatch.unbound_rounds = 0;
+                    if let Binding::Unbound { rounds } = &mut dispatch.binding {
+                        *rounds = 0;
+                    }
                 }
                 continue;
             }
@@ -1192,8 +1538,11 @@ impl AdmissionState {
                 None => {
                     let rounds = match self.dispatches.get_mut(&id) {
                         Some(dispatch) => {
-                            dispatch.unbound_rounds = dispatch.unbound_rounds.saturating_add(1);
-                            dispatch.unbound_rounds
+                            let Binding::Unbound { rounds } = &mut dispatch.binding else {
+                                continue;
+                            };
+                            *rounds = rounds.saturating_add(1);
+                            *rounds
                         }
                         None => continue,
                     };
@@ -1215,22 +1564,47 @@ impl AdmissionState {
     }
 
     /// The next signal a cancelled dispatch has coming, and `None` once
-    /// the ladder is used up.
+    /// the ladder is used up. Walking the ladder is what records it: the
+    /// step is marked handed over here and given back by
+    /// `signal_undelivered` if the OS would not take it.
     fn escalate(&mut self, dispatch_id: &str, now: Instant) -> Option<Signal> {
         let dispatch = self.dispatches.get_mut(dispatch_id)?;
-        if !dispatch.terminate_sent {
-            dispatch.terminate_sent = true;
-            return Some(Signal::Terminate);
+        match dispatch.cancellation {
+            Cancellation::None => None,
+            Cancellation::Requested { since } => {
+                dispatch.cancellation = Cancellation::Terminated { since };
+                Some(Signal::Terminate)
+            }
+            Cancellation::Terminated { since } => {
+                if now.saturating_duration_since(since) < CANCEL_ESCALATE_AFTER {
+                    return None;
+                }
+                dispatch.cancellation = Cancellation::Killed { since };
+                Some(Signal::Kill)
+            }
+            Cancellation::Killed { .. } => None,
         }
-        if dispatch.kill_sent {
-            return None;
-        }
-        let since = dispatch.cancelled_at?;
-        if now.saturating_duration_since(since) < CANCEL_ESCALATE_AFTER {
-            return None;
-        }
-        dispatch.kill_sent = true;
-        Some(Signal::Kill)
+    }
+
+    /// The caller could not deliver a signal the ladder handed it, and
+    /// the failure was one that could succeed later: the step is given
+    /// back so the next reconcile offers it again.
+    ///
+    /// A process that is GONE, or one that answers `EPERM` because the
+    /// PID now belongs to somebody else, is NOT given back: there is
+    /// nothing left to deliver to in either case, and retrying would
+    /// mean signalling a stranger every fifteen seconds for ever.
+    pub fn signal_undelivered(&mut self, dispatch_id: &str, signal: Signal) {
+        let Some(dispatch) = self.dispatches.get_mut(dispatch_id) else {
+            return;
+        };
+        dispatch.cancellation = match (dispatch.cancellation, signal) {
+            (Cancellation::Terminated { since }, Signal::Terminate) => {
+                Cancellation::Requested { since }
+            }
+            (Cancellation::Killed { since }, Signal::Kill) => Cancellation::Terminated { since },
+            (other, _) => other,
+        };
     }
 
     /// Drop run rows that hold nothing: a terminal run with no dispatch
@@ -1273,15 +1647,18 @@ impl AdmissionState {
             return;
         }
         if !self.runs.contains_key(&request.run_id) {
-            self.register_run(&RunRegistration {
-                run_id: request.run_id.clone(),
-                session_id: request.session_id.clone(),
-                budget_micros: None,
-                max_agents: None,
-                max_depth: None,
-            });
+            self.register_run(
+                &RunRegistration {
+                    run_id: request.run_id.clone(),
+                    session_id: request.session_id.clone(),
+                    budget_micros: None,
+                    max_agents: None,
+                    max_depth: None,
+                },
+                now,
+            );
         }
-        self.admit(request.clone(), now, true);
+        self.admit(request.clone(), now, Lifecycle::Claimed);
         // The adopter checked this PID against the process table before
         // adopting at all (`Coordinator::start`): re-checking here would
         // only widen the window, not narrow it.
@@ -1290,13 +1667,23 @@ impl AdmissionState {
 
     pub fn status(&self, now: Instant) -> StatusSnapshot {
         let mut active_by_class: BTreeMap<String, u32> = BTreeMap::new();
+        let mut bound_processes: BTreeMap<String, BoundProcess> = BTreeMap::new();
         let mut waiting = 0;
         let mut stale_leases = 0;
-        for dispatch in self.dispatches.values() {
-            if dispatch.released {
+        for (id, dispatch) in &self.dispatches {
+            if let Binding::Bound { pid, at } = dispatch.binding {
+                bound_processes.insert(
+                    id.clone(),
+                    BoundProcess {
+                        pid,
+                        bound_for_secs: now.saturating_duration_since(at).as_secs(),
+                    },
+                );
+            }
+            if dispatch.lifecycle.released() {
                 continue;
             }
-            if dispatch.waiting {
+            if dispatch.lifecycle.waiting() {
                 waiting += 1;
                 continue;
             }
@@ -1304,23 +1691,22 @@ impl AdmissionState {
                 .entry(dispatch.class.as_str().to_string())
                 .or_default() += 1;
             if now.saturating_duration_since(dispatch.last_heartbeat) >= LEASE_GRACE
-                && dispatch.pid.is_none()
+                && dispatch.binding.pid().is_none()
             {
                 stale_leases += 1;
             }
         }
-        let over_admitted = [
-            ResourceClass::ModelWork,
-            ResourceClass::HeavyLocal,
-            ResourceClass::Training,
-        ]
-        .into_iter()
-        .map(|class| {
-            let active = self.active_count(class, None);
-            self.class_cap(class)
-                .map_or(0, |cap| active.saturating_sub(cap))
-        })
-        .sum();
+        // Per cap GROUP, not per class: two classes sharing one cap
+        // overshoot it together, and counting them apart hid half of it
+        // (A3).
+        let over_admitted = CapGroup::ALL
+            .into_iter()
+            .map(|group| {
+                let active = self.active_count(group, None);
+                self.group_cap(group)
+                    .map_or(0, |cap| active.saturating_sub(cap))
+            })
+            .sum();
         let runs = self
             .runs
             .iter()
@@ -1341,12 +1727,9 @@ impl AdmissionState {
                         admitted_total: run.admitted_total,
                         active: dispatches
                             .iter()
-                            .filter(|d| !d.waiting && !d.released)
+                            .filter(|d| d.lifecycle.holds_seat())
                             .count() as u32,
-                        waiting: dispatches
-                            .iter()
-                            .filter(|d| d.waiting && !d.released)
-                            .count() as u32,
+                        waiting: dispatches.iter().filter(|d| d.lifecycle.waiting()).count() as u32,
                         queued: self
                             .queue
                             .iter()
@@ -1366,6 +1749,7 @@ impl AdmissionState {
             sessions: self.sessions.keys().cloned().collect(),
             runs,
             over_admitted,
+            bound_processes,
             write_leases: self
                 .write_leases
                 .iter()
@@ -1413,8 +1797,32 @@ impl AdmissionState {
 /// the escalation clock starts when the cancellation did, not when a
 /// later cancel of the same subtree passed through.
 fn mark_cancelled(dispatch: &mut Dispatch, now: Instant) {
-    dispatch.cancelled = true;
-    dispatch.cancelled_at.get_or_insert(now);
+    if !dispatch.cancellation.cancelled() {
+        dispatch.cancellation = Cancellation::Requested { since: now };
+    }
+}
+
+/// Hand the first `Terminate` of a cancellation to the caller that
+/// requested it, if there is a process to send it to. Reconcile must not
+/// send it a second time, only escalate past it (C5), so the ladder step
+/// is recorded here.
+fn hand_over_terminate(dispatch_id: &str, dispatch: &mut Dispatch) -> Option<PendingSignal> {
+    let Binding::Bound { pid, at } = dispatch.binding else {
+        return None;
+    };
+    match dispatch.cancellation {
+        Cancellation::Requested { since } => {
+            dispatch.cancellation = Cancellation::Terminated { since };
+            Some(PendingSignal {
+                dispatch_id: dispatch_id.to_string(),
+                pid,
+                signal: Signal::Terminate,
+                bound_at: at,
+            })
+        }
+        // Already asked, already killed, or not cancelled at all.
+        Cancellation::None | Cancellation::Terminated { .. } | Cancellation::Killed { .. } => None,
+    }
 }
 
 fn min_opt(a: Option<u32>, b: Option<u32>) -> Option<u32> {
@@ -1440,47 +1848,64 @@ fn min_opt_i64(a: Option<i64>, b: Option<i64>) -> Option<i64> {
 pub trait Gate {
     fn register_run(&self, registration: &RunRegistration) -> Result<(), GateError>;
     fn admit(&self, request: &DispatchRequest) -> Result<Decision, GateError>;
+    /// Bind the agent identity and the launched process to the
+    /// reservation. The outcome is the caller's to act on: a bind the
+    /// coordinator does not recognise means this worker holds no seat
+    /// and no reservation — after a re-election, for instance — and
+    /// running on is exactly the unmanaged launch SPEC §23 forbids.
     fn bind(
         &self,
         dispatch_id: &str,
         agent_id: Option<&str>,
         pid: Option<u32>,
-    ) -> Result<(), GateError>;
+    ) -> Result<BindOutcome, GateError>;
     fn heartbeat(&self, dispatch_id: &str) -> Result<HeartbeatStatus, GateError>;
     /// The worker saw `cancelled` on a heartbeat and is stopping. The
     /// seat and the reservation go now, instead of waiting out the lease
     /// grace with a worker that is already leaving (C5). Idempotent, and
     /// a no-op by default so a gate that tracks no lifetime still
     /// compiles.
-    fn acknowledge_cancel(&self, _dispatch_id: &str) -> Result<(), GateError> {
-        Ok(())
+    fn acknowledge_cancel(&self, _dispatch_id: &str) -> Result<LifecycleOutcome, GateError> {
+        Ok(LifecycleOutcome::Applied)
     }
-    fn mark_waiting(&self, dispatch_id: &str) -> Result<(), GateError>;
-    fn resume(&self, dispatch_id: &str) -> Result<(), GateError>;
-    fn release(&self, dispatch_id: &str) -> Result<(), GateError>;
-    fn settle(&self, dispatch_id: &str, spent_micros: Option<i64>) -> Result<(), GateError>;
+    fn mark_waiting(&self, dispatch_id: &str) -> Result<WaitOutcome, GateError>;
+    fn resume(&self, dispatch_id: &str) -> Result<ResumeOutcome, GateError>;
+    fn release(&self, dispatch_id: &str) -> Result<LifecycleOutcome, GateError>;
+    fn settle(
+        &self,
+        dispatch_id: &str,
+        spent_micros: Option<i64>,
+    ) -> Result<LifecycleOutcome, GateError>;
     /// Abandon a request that was never launched.
-    fn withdraw(&self, dispatch_id: &str) -> Result<(), GateError>;
+    fn withdraw(&self, dispatch_id: &str) -> Result<WithdrawOutcome, GateError>;
     /// The run reached an end state and will dispatch nothing more. Until
     /// a root runner says so, a registered run keeps the coordinator from
     /// idling out (see `AdmissionState::is_idle`), so a runner that owns a
     /// run's lifecycle should call this on every terminal path. The
     /// default is a no-op for gates that do not track run lifetime.
-    fn finish_run(&self, _run_id: &str) -> Result<(), GateError> {
-        Ok(())
+    fn finish_run(&self, _run_id: &str) -> Result<LifecycleOutcome, GateError> {
+        Ok(LifecycleOutcome::Applied)
     }
     /// Take the exclusive write lease on a worktree for a dispatch that
-    /// is about to write it (SPEC §23). `Ok(false)` = somebody else holds
-    /// it; the caller must not launch a second writer into that tree.
-    /// Gates that track no leases grant every request.
-    fn acquire_write(&self, _dispatch_id: &str, _worktree: &str) -> Result<bool, GateError> {
-        Ok(true)
+    /// is about to write it (SPEC §23). `HeldBy` names the other writer;
+    /// the caller must not launch a second one into that tree. Gates that
+    /// track no leases grant every request.
+    fn acquire_write(
+        &self,
+        _dispatch_id: &str,
+        _worktree: &str,
+    ) -> Result<WriteLeaseOutcome, GateError> {
+        Ok(WriteLeaseOutcome::Taken)
     }
     /// The dispatch has stopped writing the worktree. Only the holder can
-    /// release; a mismatched release is ignored, never somebody else's
-    /// lease freed.
-    fn release_write(&self, _dispatch_id: &str, _worktree: &str) -> Result<(), GateError> {
-        Ok(())
+    /// release; a mismatched release frees nothing and says so, rather
+    /// than somebody else's lease being freed.
+    fn release_write(
+        &self,
+        _dispatch_id: &str,
+        _worktree: &str,
+    ) -> Result<ReleaseWriteOutcome, GateError> {
+        Ok(ReleaseWriteOutcome::Released)
     }
     /// Who holds a worktree's write lease, if anyone: what verification
     /// waits to become `None` before it snapshots (SPEC §23: "root
@@ -1490,19 +1915,97 @@ pub trait Gate {
     }
     /// What this gate can enforce, for reports (SPEC §23: observed-only
     /// paths are labelled, never claimed as guarantees).
-    fn enforcement(&self) -> &'static str;
+    fn enforcement(&self) -> Enforcement;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GateError(pub String);
+/// Why an admission call produced no answer this caller can act on.
+///
+/// The distinction that matters to a run is whether the coordinator was
+/// REACHABLE: an outage means the request is preserved and nothing was
+/// launched, and a refusal is a decision the run can report as such.
+/// Reporting a refusal as "admission unavailable" sends the operator
+/// looking for a dead daemon that is answering perfectly well (A12).
+#[derive(Debug)]
+pub enum GateError {
+    /// The coordinator could not be reached, or the call failed in
+    /// transit: no daemon answering, a stale endpoint, a timeout.
+    Unavailable {
+        operation: &'static str,
+        socket: String,
+        cause: Box<dyn std::error::Error + Send + Sync>,
+    },
+    /// The coordinator answered and deliberately did not apply the call.
+    Refused {
+        operation: &'static str,
+        entity: String,
+        detail: String,
+    },
+    /// Resuming would hold more seats beyond a cap than the ceiling
+    /// allows. A delay, not a failure: the parent stays waiting and
+    /// polls again (C8).
+    OverCeiling { entity: String, over: u32, max: u32 },
+    /// The reply was not one this version of relais can act on — a
+    /// daemon left running from another install, or a corrupted line.
+    Protocol {
+        operation: &'static str,
+        detail: String,
+    },
+}
 
-impl std::fmt::Display for GateError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "admission unavailable: {}", self.0)
+impl GateError {
+    /// Was the coordinator out of reach? A caller that blocks a run on
+    /// `admission_unavailable` should say so only when this is true.
+    pub fn unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable { .. })
+    }
+
+    /// Which admission call this is about.
+    pub fn operation(&self) -> &'static str {
+        match self {
+            Self::Unavailable { operation, .. }
+            | Self::Refused { operation, .. }
+            | Self::Protocol { operation, .. } => operation,
+            Self::OverCeiling { .. } => "resume",
+        }
     }
 }
 
-impl std::error::Error for GateError {}
+impl std::fmt::Display for GateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable {
+                operation,
+                socket,
+                cause,
+            } => write!(
+                f,
+                "admission unavailable: {operation} could not reach the coordinator at {socket}: {cause}"
+            ),
+            Self::Refused {
+                operation,
+                entity,
+                detail,
+            } => write!(f, "admission refused: {operation} on {entity}: {detail}"),
+            Self::OverCeiling { entity, over, max } => write!(
+                f,
+                "admission refused: resuming {entity} would hold {over} seats beyond the class \
+                 cap, past the configured maximum of {max}; it stays waiting and can poll again"
+            ),
+            Self::Protocol { operation, detail } => {
+                write!(f, "admission protocol: {operation}: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Unavailable { cause, .. } => Some(cause.as_ref()),
+            Self::Refused { .. } | Self::OverCeiling { .. } | Self::Protocol { .. } => None,
+        }
+    }
+}
 
 /// In-process gate over a shared state: tests, and single-process
 /// scheduling that does not need cross-tab coordination.
@@ -1517,36 +2020,35 @@ impl LocalGate {
         }
     }
 
-    pub fn status(&self) -> StatusSnapshot {
+    /// The admission state, recovering a lock a panicking caller
+    /// poisoned instead of propagating it. One failed call must not
+    /// wedge every later one: the state machine mutates one field at a
+    /// time and every write path is total, so the worst a recovered lock
+    /// carries is one half-applied lifecycle event — against a gate that
+    /// answers nothing at all. The coordinator recovers the same way.
+    fn admission(&self) -> std::sync::MutexGuard<'_, AdmissionState> {
         self.state
             .lock()
-            .expect("admission lock")
-            .status(Instant::now())
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn status(&self) -> StatusSnapshot {
+        self.admission().status(Instant::now())
     }
 
     pub fn cancel_run(&self, run_id: &str) {
-        self.state
-            .lock()
-            .expect("admission lock")
-            .cancel_run(run_id, Instant::now());
+        self.admission().cancel_run(run_id, Instant::now());
     }
 }
 
 impl Gate for LocalGate {
     fn register_run(&self, registration: &RunRegistration) -> Result<(), GateError> {
-        self.state
-            .lock()
-            .expect("admission lock")
-            .register_run(registration);
+        self.admission().register_run(registration, Instant::now());
         Ok(())
     }
 
     fn admit(&self, request: &DispatchRequest) -> Result<Decision, GateError> {
-        Ok(self
-            .state
-            .lock()
-            .expect("admission lock")
-            .request(request, Instant::now()))
+        Ok(self.admission().request(request, Instant::now()))
     }
 
     fn bind(
@@ -1554,122 +2056,88 @@ impl Gate for LocalGate {
         dispatch_id: &str,
         agent_id: Option<&str>,
         pid: Option<u32>,
-    ) -> Result<(), GateError> {
-        match self.state.lock().expect("admission lock").bind(
+    ) -> Result<BindOutcome, GateError> {
+        // Every outcome comes back as an outcome, exactly as it does
+        // over the socket: what a refused bind means is the caller's to
+        // decide, and the two gates must not disagree about it.
+        Ok(self.admission().bind(
             dispatch_id,
             agent_id,
             pid,
             Instant::now(),
             &crate::procs::alive,
-        ) {
-            BindOutcome::PidNotAlive => Err(GateError(format!(
-                "pid {} is not a live process; refusing to bind it to dispatch {dispatch_id}",
-                pid.unwrap_or(0)
-            ))),
-            _ => Ok(()),
-        }
-    }
-
-    fn heartbeat(&self, dispatch_id: &str) -> Result<HeartbeatStatus, GateError> {
-        Ok(self
-            .state
-            .lock()
-            .expect("admission lock")
-            .heartbeat(dispatch_id, Instant::now()))
-    }
-
-    fn acknowledge_cancel(&self, dispatch_id: &str) -> Result<(), GateError> {
-        self.state
-            .lock()
-            .expect("admission lock")
-            .acknowledge_cancel(dispatch_id, Instant::now());
-        Ok(())
-    }
-
-    fn mark_waiting(&self, dispatch_id: &str) -> Result<(), GateError> {
-        self.state.lock().expect("admission lock").mark_waiting(
-            dispatch_id,
-            Instant::now(),
-            &crate::procs::alive,
-        );
-        Ok(())
-    }
-
-    fn resume(&self, dispatch_id: &str) -> Result<(), GateError> {
-        match self
-            .state
-            .lock()
-            .expect("admission lock")
-            .resume(dispatch_id, Instant::now())
-        {
-            ResumeOutcome::OverAdmitted { over, max } => Err(GateError(format!(
-                "resuming {dispatch_id} would hold {over} seats beyond the cap, past the \
-                 configured maximum of {max}; it stays waiting"
-            ))),
-            _ => Ok(()),
-        }
-    }
-
-    fn release(&self, dispatch_id: &str) -> Result<(), GateError> {
-        self.state
-            .lock()
-            .expect("admission lock")
-            .release(dispatch_id, Instant::now());
-        Ok(())
-    }
-
-    fn settle(&self, dispatch_id: &str, spent_micros: Option<i64>) -> Result<(), GateError> {
-        self.state.lock().expect("admission lock").settle(
-            dispatch_id,
-            spent_micros,
-            Instant::now(),
-        );
-        Ok(())
-    }
-
-    fn withdraw(&self, dispatch_id: &str) -> Result<(), GateError> {
-        self.state
-            .lock()
-            .expect("admission lock")
-            .withdraw(dispatch_id, Instant::now());
-        Ok(())
-    }
-
-    fn finish_run(&self, run_id: &str) -> Result<(), GateError> {
-        self.state
-            .lock()
-            .expect("admission lock")
-            .finish_run(run_id);
-        Ok(())
-    }
-
-    fn acquire_write(&self, dispatch_id: &str, worktree: &str) -> Result<bool, GateError> {
-        Ok(self.state.lock().expect("admission lock").acquire_write(
-            worktree,
-            dispatch_id,
-            Instant::now(),
         ))
     }
 
-    fn release_write(&self, dispatch_id: &str, worktree: &str) -> Result<(), GateError> {
-        self.state
-            .lock()
-            .expect("admission lock")
-            .release_write(worktree, dispatch_id);
-        Ok(())
+    fn heartbeat(&self, dispatch_id: &str) -> Result<HeartbeatStatus, GateError> {
+        Ok(self.admission().heartbeat(dispatch_id, Instant::now()))
+    }
+
+    fn acknowledge_cancel(&self, dispatch_id: &str) -> Result<LifecycleOutcome, GateError> {
+        Ok(self
+            .admission()
+            .acknowledge_cancel(dispatch_id, Instant::now()))
+    }
+
+    fn mark_waiting(&self, dispatch_id: &str) -> Result<WaitOutcome, GateError> {
+        Ok(self
+            .admission()
+            .mark_waiting(dispatch_id, Instant::now(), &crate::procs::alive))
+    }
+
+    fn resume(&self, dispatch_id: &str) -> Result<ResumeOutcome, GateError> {
+        Ok(self.admission().resume(dispatch_id, Instant::now()))
+    }
+
+    fn release(&self, dispatch_id: &str) -> Result<LifecycleOutcome, GateError> {
+        Ok(self.admission().release(dispatch_id, Instant::now()))
+    }
+
+    fn settle(
+        &self,
+        dispatch_id: &str,
+        spent_micros: Option<i64>,
+    ) -> Result<LifecycleOutcome, GateError> {
+        Ok(self
+            .admission()
+            .settle(dispatch_id, spent_micros, Instant::now()))
+    }
+
+    fn withdraw(&self, dispatch_id: &str) -> Result<WithdrawOutcome, GateError> {
+        Ok(self.admission().withdraw(dispatch_id, Instant::now()))
+    }
+
+    fn finish_run(&self, run_id: &str) -> Result<LifecycleOutcome, GateError> {
+        Ok(self.admission().finish_run(run_id))
+    }
+
+    fn acquire_write(
+        &self,
+        dispatch_id: &str,
+        worktree: &str,
+    ) -> Result<WriteLeaseOutcome, GateError> {
+        Ok(self
+            .admission()
+            .acquire_write(worktree, dispatch_id, Instant::now()))
+    }
+
+    fn release_write(
+        &self,
+        dispatch_id: &str,
+        worktree: &str,
+    ) -> Result<ReleaseWriteOutcome, GateError> {
+        Ok(self.admission().release_write(worktree, dispatch_id))
     }
 
     fn write_lease_holder(&self, worktree: &str) -> Result<Option<String>, GateError> {
         Ok(self
-            .state
-            .lock()
-            .expect("admission lock")
+            .admission()
             .write_lease_holder(worktree)
             .map(|(holder, _)| holder.to_string()))
     }
 
-    fn enforcement(&self) -> &'static str {
-        "managed (in-process)"
+    fn enforcement(&self) -> Enforcement {
+        Enforcement::InProcess
     }
 }
 
@@ -1692,13 +2160,16 @@ mod tests {
     fn state() -> AdmissionState {
         let mut state = AdmissionState::new(limits());
         for (run, session) in [("run-a", "tab-a"), ("run-b", "tab-b"), ("run-c", "tab-c")] {
-            state.register_run(&RunRegistration {
-                run_id: run.into(),
-                session_id: session.into(),
-                budget_micros: None,
-                max_agents: None,
-                max_depth: None,
-            });
+            state.register_run(
+                &RunRegistration {
+                    run_id: run.into(),
+                    session_id: session.into(),
+                    budget_micros: None,
+                    max_agents: None,
+                    max_depth: None,
+                },
+                Instant::now(),
+            );
         }
         state
     }
@@ -1739,6 +2210,15 @@ mod tests {
         true
     }
 
+    /// What a reconcile handed over to signal, as a comparable triple.
+    fn signalled(report: &ReconcileReport) -> Vec<(String, u32, Signal)> {
+        report
+            .to_signal
+            .iter()
+            .map(|pending| (pending.dispatch_id.clone(), pending.pid, pending.signal))
+            .collect()
+    }
+
     /// Bind a live process to a dispatch. `mark_waiting` needs one (C8),
     /// and so does anything that reconciles against the process table.
     fn bind_live(state: &mut AdmissionState, dispatch_id: &str, pid: u32, now: Instant) {
@@ -1752,8 +2232,9 @@ mod tests {
     /// Claim the waiting seat-back, with the bind it now requires.
     fn wait_bound(state: &mut AdmissionState, dispatch_id: &str, pid: u32, now: Instant) {
         bind_live(state, dispatch_id, pid, now);
-        assert!(
+        assert_eq!(
             state.mark_waiting(dispatch_id, now, &alive),
+            WaitOutcome::Waiting,
             "{dispatch_id} waits"
         );
     }
@@ -1879,13 +2360,16 @@ mod tests {
     fn nested_agents_keep_parentage_and_share_the_root_budget() {
         let mut state = AdmissionState::new(limits());
         let t0 = Instant::now();
-        state.register_run(&RunRegistration {
-            run_id: "run-a".into(),
-            session_id: "tab-a".into(),
-            budget_micros: Some(1_000),
-            max_agents: Some(10),
-            max_depth: Some(3),
-        });
+        state.register_run(
+            &RunRegistration {
+                run_id: "run-a".into(),
+                session_id: "tab-a".into(),
+                budget_micros: Some(1_000),
+                max_agents: Some(10),
+                max_depth: Some(3),
+            },
+            t0,
+        );
         let mut root = req("root", "run-a", "tab-a");
         root.reserve_micros = 600;
         assert!(granted(state.request(&root, t0)));
@@ -1915,13 +2399,16 @@ mod tests {
         assert_eq!(run.reserved_micros, 800);
         assert_eq!(run.admitted_total, 3);
         // A re-registration cannot enlarge the budget.
-        state.register_run(&RunRegistration {
-            run_id: "run-a".into(),
-            session_id: "tab-a".into(),
-            budget_micros: Some(1_000_000),
-            max_agents: Some(1_000),
-            max_depth: Some(99),
-        });
+        state.register_run(
+            &RunRegistration {
+                run_id: "run-a".into(),
+                session_id: "tab-a".into(),
+                budget_micros: Some(1_000_000),
+                max_agents: Some(1_000),
+                max_depth: Some(99),
+            },
+            t0,
+        );
         assert_eq!(state.status(t0).runs["run-a"].budget_micros, Some(1_000));
     }
 
@@ -2090,19 +2577,24 @@ mod tests {
         let mut state = state();
         let t0 = Instant::now();
         assert!(granted(state.request(&req("d1", "run-a", "tab-a"), t0)));
-        assert!(
-            !state.mark_waiting("d1", t0, &alive),
+        assert_eq!(
+            state.mark_waiting("d1", t0, &alive),
+            WaitOutcome::NoLiveProcess,
             "nothing is bound: the claim is unverifiable"
         );
         assert_eq!(state.status(t0).waiting, 0);
         bind_live(&mut state, "d1", 4242, t0);
-        assert!(
-            !state.mark_waiting("d1", t0, &|_pid| false),
+        assert_eq!(
+            state.mark_waiting("d1", t0, &|_pid| false),
+            WaitOutcome::NoLiveProcess,
             "the bound process is gone: it is not waiting, it is over"
         );
-        assert!(state.mark_waiting("d1", t0, &alive));
+        assert!(state.mark_waiting("d1", t0, &alive).waiting());
         assert_eq!(state.status(t0).waiting, 1);
-        assert!(!state.mark_waiting("nobody", t0, &alive));
+        assert_eq!(
+            state.mark_waiting("nobody", t0, &alive),
+            WaitOutcome::UnknownDispatch
+        );
     }
 
     // C6: a PID off the wire is checked against the process table at
@@ -2139,13 +2631,16 @@ mod tests {
     fn reservations_are_exclusive_and_unknown_usage_stays_uncertain() {
         let mut state = AdmissionState::new(limits());
         let t0 = Instant::now();
-        state.register_run(&RunRegistration {
-            run_id: "run-a".into(),
-            session_id: "tab-a".into(),
-            budget_micros: Some(100),
-            max_agents: None,
-            max_depth: None,
-        });
+        state.register_run(
+            &RunRegistration {
+                run_id: "run-a".into(),
+                session_id: "tab-a".into(),
+                budget_micros: Some(100),
+                max_agents: None,
+                max_depth: None,
+            },
+            t0,
+        );
         let mut first = req("d1", "run-a", "tab-a");
         first.reserve_micros = 60;
         let mut second = req("d2", "run-a", "tab-b");
@@ -2202,7 +2697,13 @@ mod tests {
         assert!(granted(state.request(&req("root-b", "run-b", "tab-b"), t0)));
 
         let to_signal = state.cancel_dispatch("kid-1", t0);
-        assert_eq!(to_signal, vec![("kid-1".to_string(), 4242)]);
+        assert_eq!(
+            to_signal
+                .iter()
+                .map(|pending| (pending.dispatch_id.as_str(), pending.pid, pending.signal))
+                .collect::<Vec<_>>(),
+            vec![("kid-1", 4242, Signal::Terminate)]
+        );
         assert!(state.heartbeat("kid-1", t0).cancelled);
         assert!(!state.heartbeat("kid-2", t0).cancelled, "the sibling lives");
         assert!(
@@ -2339,7 +2840,7 @@ mod tests {
 
         let first = state.reconcile(t0 + Duration::from_secs(15), &alive);
         assert_eq!(
-            first.to_signal,
+            signalled(&first),
             vec![("d1".to_string(), 4242, Signal::Terminate)]
         );
         // It is still running, but it has been asked: nothing is re-sent
@@ -2351,7 +2852,7 @@ mod tests {
         // A whole grace period ignored: once, harder.
         let escalation = t0 + CANCEL_ESCALATE_AFTER + Duration::from_secs(1);
         assert_eq!(
-            state.reconcile(escalation, &alive).to_signal,
+            signalled(&state.reconcile(escalation, &alive)),
             vec![("d1".to_string(), 4242, Signal::Kill)]
         );
         // And then never again, whatever the process does.
@@ -2383,7 +2884,7 @@ mod tests {
         state.cancel_dispatch("d1", t0);
         assert!(state.heartbeat("d1", t0).cancelled);
 
-        assert!(state.acknowledge_cancel("d1", t0));
+        assert!(state.acknowledge_cancel("d1", t0).applied());
         assert!(
             !state.heartbeat("d1", t0).known,
             "the lease is gone, not waiting out five minutes of grace"
@@ -2397,7 +2898,10 @@ mod tests {
         );
         // Nothing is left to signal, and the ID cannot come back.
         assert!(state.reconcile(t0, &alive).to_signal.is_empty());
-        assert!(!state.acknowledge_cancel("d1", t0));
+        assert_eq!(
+            state.acknowledge_cancel("d1", t0),
+            LifecycleOutcome::Unknown
+        );
         assert!(matches!(
             state.request(&first, t0),
             Decision::Refused {
@@ -2449,13 +2953,16 @@ mod tests {
     fn a_child_inherits_depth_and_budget_and_a_waiting_less_parent_cannot_deadlock() {
         let mut state = AdmissionState::new(limits());
         let t0 = Instant::now();
-        state.register_run(&RunRegistration {
-            run_id: "run-a".into(),
-            session_id: "tab-a".into(),
-            budget_micros: Some(1_000),
-            max_agents: Some(10),
-            max_depth: Some(3),
-        });
+        state.register_run(
+            &RunRegistration {
+                run_id: "run-a".into(),
+                session_id: "tab-a".into(),
+                budget_micros: Some(1_000),
+                max_agents: Some(10),
+                max_depth: Some(3),
+            },
+            t0,
+        );
         let mut root = req("root", "run-a", "tab-a");
         root.reserve_micros = 400;
         assert!(granted(state.request(&root, t0)));
@@ -2532,13 +3039,16 @@ mod tests {
         assert!(granted(state.request(&req("w2", "run-b", "tab-b"), t0)));
 
         assert_eq!(state.writers_active("/wt/alpha"), 0);
-        assert!(state.acquire_write("/wt/alpha", "w1", t0));
+        assert!(state.acquire_write("/wt/alpha", "w1", t0).taken());
         assert!(
-            state.acquire_write("/wt/alpha", "w1", t0),
+            state.acquire_write("/wt/alpha", "w1", t0).taken(),
             "the holder asking again is not a second writer"
         );
-        assert!(
-            !state.acquire_write("/wt/alpha", "w2", t0),
+        assert_eq!(
+            state.acquire_write("/wt/alpha", "w2", t0),
+            WriteLeaseOutcome::HeldBy {
+                holder: "w1".into()
+            },
             "two writers in one worktree is the thing this prevents"
         );
         assert_eq!(state.writers_active("/wt/alpha"), 1);
@@ -2553,20 +3063,27 @@ mod tests {
         );
         // A different worktree is a different lease: writers in their own
         // worktrees do not contend at all.
-        assert!(state.acquire_write("/wt/beta", "w2", t0));
+        assert!(state.acquire_write("/wt/beta", "w2", t0).taken());
         assert_eq!(state.status(t0).write_leases.len(), 2);
 
-        assert!(
-            !state.release_write("/wt/alpha", "w2"),
+        assert_eq!(
+            state.release_write("/wt/alpha", "w2"),
+            ReleaseWriteOutcome::NotTheHolder,
             "releasing somebody else's lease is how two writers happen"
         );
-        assert!(state.release_write("/wt/alpha", "w1"));
+        assert_eq!(
+            state.release_write("/wt/alpha", "w1"),
+            ReleaseWriteOutcome::Released
+        );
         assert_eq!(state.writers_active("/wt/alpha"), 0);
-        assert!(!state.release_write("/wt/alpha", "w1"));
+        assert_eq!(
+            state.release_write("/wt/alpha", "w1"),
+            ReleaseWriteOutcome::NotTheHolder
+        );
 
         // A writer that ends without releasing does not hold a worktree
         // for ever: settlement drops its leases.
-        assert!(state.acquire_write("/wt/gamma", "w2", t0));
+        assert!(state.acquire_write("/wt/gamma", "w2", t0).taken());
         state.release("w2", t0);
         state.settle("w2", Some(0), t0);
         assert_eq!(state.writers_active("/wt/gamma"), 0);
@@ -2584,7 +3101,7 @@ mod tests {
             state.request(&req("a3", "run-a", "tab-a"), t0),
             Decision::Queued { .. }
         ));
-        assert!(state.withdraw("a3", t0));
+        assert_eq!(state.withdraw("a3", t0), WithdrawOutcome::Withdrawn);
         assert_eq!(state.status(t0).queued, 0);
         // Drained-but-unclaimed is withdrawable too, and frees the seat.
         assert!(matches!(
@@ -2598,10 +3115,14 @@ mod tests {
             2,
             "a4 drained in"
         );
-        assert!(state.withdraw("a4", t0));
+        assert_eq!(state.withdraw("a4", t0), WithdrawOutcome::Withdrawn);
         assert_eq!(state.status(t0).active_by_class["model_work"], 1);
         // A claimed dispatch cannot be withdrawn: its launch may be live.
-        assert!(!state.withdraw("a2", t0));
+        assert_eq!(
+            state.withdraw("a2", t0),
+            WithdrawOutcome::Claimed,
+            "a claimed dispatch cannot be withdrawn: its launch may be live"
+        );
         assert_eq!(state.status(t0).runs["run-a"].settled_micros, 0);
     }
 
@@ -2643,13 +3164,16 @@ mod tests {
     fn a_hostile_reservation_cannot_wrap_or_credit_the_budget() {
         let mut state = AdmissionState::new(limits());
         let t0 = Instant::now();
-        state.register_run(&RunRegistration {
-            run_id: "run-a".into(),
-            session_id: "tab-a".into(),
-            budget_micros: Some(1_000),
-            max_agents: Some(10),
-            max_depth: Some(3),
-        });
+        state.register_run(
+            &RunRegistration {
+                run_id: "run-a".into(),
+                session_id: "tab-a".into(),
+                budget_micros: Some(1_000),
+                max_agents: Some(10),
+                max_depth: Some(3),
+            },
+            t0,
+        );
         let mut negative = req("negative", "run-a", "tab-a");
         negative.reserve_micros = -1_000_000;
         assert!(
@@ -2702,23 +3226,26 @@ mod tests {
             "run-a is registered and unfinished: it is verifying, not absent"
         );
         // The root runner reports the run over; now the daemon may exit.
-        assert!(state.finish_run("run-a"));
-        assert!(state.finish_run("run-b"));
-        assert!(state.finish_run("run-c"));
-        assert!(!state.finish_run("run-unknown"));
+        assert!(state.finish_run("run-a").applied());
+        assert!(state.finish_run("run-b").applied());
+        assert!(state.finish_run("run-c").applied());
+        assert_eq!(state.finish_run("run-unknown"), LifecycleOutcome::Unknown);
         assert!(state.is_idle());
         // Reconcile reaps the terminal rows; a cancelled run is terminal.
         state.reconcile(t0, &|_pid| true);
         assert!(state.status(t0).runs.is_empty());
         // A run that never reports finished still stops holding the
         // daemon open once its root runner has been silent long enough.
-        state.register_run(&RunRegistration {
-            run_id: "run-z".into(),
-            session_id: "tab-z".into(),
-            budget_micros: None,
-            max_agents: None,
-            max_depth: None,
-        });
+        state.register_run(
+            &RunRegistration {
+                run_id: "run-z".into(),
+                session_id: "tab-z".into(),
+                budget_micros: None,
+                max_agents: None,
+                max_depth: None,
+            },
+            t0,
+        );
         assert!(!state.is_idle());
         state.reconcile(t0 + RUN_ABANDON_GRACE + Duration::from_secs(60), &|_pid| {
             true
@@ -2747,6 +3274,202 @@ mod tests {
         assert!(!state.is_idle());
     }
 
+    // A3: `heavy_local` and `indexing` come out of ONE cap. Counting
+    // them apart let each fill `max_heavy_commands` on its own, so the
+    // machine ran twice the configured local load and `over_admitted`
+    // never mentioned indexing at all.
+    #[test]
+    fn classes_that_share_a_cap_are_counted_against_it_together() {
+        let mut state = AdmissionState::new(ConcurrencyLimits {
+            max_heavy_commands: Some(2),
+            ..limits()
+        });
+        let t0 = Instant::now();
+        for (run, session) in [("run-a", "tab-a"), ("run-b", "tab-b")] {
+            state.register_run(
+                &RunRegistration {
+                    run_id: run.into(),
+                    session_id: session.into(),
+                    budget_micros: None,
+                    max_agents: None,
+                    max_depth: None,
+                },
+                t0,
+            );
+        }
+        let local = |id: &str, class: ResourceClass| DispatchRequest {
+            resource: class,
+            ..req(id, "run-a", "tab-a")
+        };
+        // Two heavy commands fill the cap of two.
+        assert!(granted(
+            state.request(&local("h1", ResourceClass::HeavyLocal), t0)
+        ));
+        assert!(granted(
+            state.request(&local("h2", ResourceClass::HeavyLocal), t0)
+        ));
+        // Indexing shares that cap, so the next two queue — they do not
+        // get a second cap's worth of the same machine.
+        assert!(matches!(
+            state.request(&local("i1", ResourceClass::Indexing), t0),
+            Decision::Queued { .. }
+        ));
+        assert!(matches!(
+            state.request(&local("i2", ResourceClass::Indexing), t0),
+            Decision::Queued { .. }
+        ));
+        let status = state.status(t0);
+        assert_eq!(status.active_by_class["heavy_local"], 2);
+        assert_eq!(status.active_by_class.get("indexing"), None);
+        assert_eq!(status.queued, 2);
+        assert_eq!(status.over_admitted, 0);
+        // One heavy command ends and an indexing job takes its place —
+        // one in, one out, the group total unchanged.
+        state.release("h1", t0);
+        state.settle("h1", Some(0), t0);
+        assert_eq!(
+            state.request(&local("i1", ResourceClass::Indexing), t0),
+            Decision::Granted
+        );
+        let status = state.status(t0);
+        assert_eq!(status.active_by_class["heavy_local"], 1);
+        assert_eq!(status.active_by_class["indexing"], 1);
+        assert_eq!(status.over_admitted, 0);
+        // And a cap that IS exceeded counts both classes towards the
+        // overshoot, instead of showing half of it.
+        state.set_max_over_admitted(None);
+        bind_live(&mut state, "i1", 6001, t0);
+        assert_eq!(
+            state.mark_waiting("i1", t0, &alive),
+            WaitOutcome::Waiting,
+            "the seat comes back and the queued job takes it"
+        );
+        let status = state.status(t0);
+        assert_eq!(status.active_by_class["heavy_local"], 1);
+        assert_eq!(
+            status.active_by_class["indexing"], 1,
+            "the queued indexing job took the waiting one's seat"
+        );
+        assert_eq!(status.queued, 0);
+        assert_eq!(state.resume("i1", t0), ResumeOutcome::Resumed);
+        assert_eq!(
+            state.status(t0).over_admitted,
+            1,
+            "the resumed indexing job overshoots the group's cap, and it shows"
+        );
+    }
+
+    // A4: a dispatch drained from the queue holds a seat before anybody
+    // claims it. The hard limits are not re-checked when the caller
+    // finally polls, so cancellation has to be: a cancelled run used to
+    // get `Granted` and launch a worker.
+    #[test]
+    fn a_dispatch_cancelled_while_it_waited_for_a_seat_is_not_granted() {
+        let mut state = state();
+        let t0 = Instant::now();
+        assert!(granted(state.request(&req("a1", "run-a", "tab-a"), t0)));
+        assert!(granted(state.request(&req("a2", "run-a", "tab-a"), t0)));
+        assert!(matches!(
+            state.request(&req("a3", "run-a", "tab-a"), t0),
+            Decision::Queued { .. }
+        ));
+        // A seat frees, so a3 is drained in — admitted, unclaimed.
+        state.release("a1", t0);
+        state.settle("a1", Some(0), t0);
+        assert_eq!(state.status(t0).active_by_class["model_work"], 2);
+        // The run is cancelled before its caller polls again.
+        state.cancel_run("run-a", t0);
+        assert!(matches!(
+            state.request(&req("a3", "run-a", "tab-a"), t0),
+            Decision::Refused {
+                code: Refusal::RunCancelled,
+                ..
+            }
+        ));
+        // And the seat it was holding came back with it.
+        assert_eq!(
+            state.status(t0).active_by_class.get("model_work"),
+            Some(&1),
+            "the unclaimed seat is freed, not left for lease grace"
+        );
+    }
+
+    // A14: a request that was never launched is not a dispatch that ran.
+    // Withdrawing a drained-but-unclaimed one used to settle it, which
+    // spent one of the run's aggregate agent slots for ever and
+    // remembered the ID as finished so it could never be asked for again.
+    #[test]
+    fn withdrawing_an_unclaimed_dispatch_gives_back_its_agent_slot() {
+        let mut state = state();
+        let t0 = Instant::now();
+        assert!(granted(state.request(&req("a1", "run-a", "tab-a"), t0)));
+        assert!(granted(state.request(&req("a2", "run-a", "tab-a"), t0)));
+        assert!(matches!(
+            state.request(&req("a3", "run-a", "tab-a"), t0),
+            Decision::Queued { .. }
+        ));
+        state.release("a1", t0);
+        state.settle("a1", Some(0), t0);
+        let admitted = state.status(t0).runs["run-a"].admitted_total;
+        assert_eq!(admitted, 3, "a3 drained in and counted");
+        assert_eq!(state.withdraw("a3", t0), WithdrawOutcome::Withdrawn);
+        let run = &state.status(t0).runs["run-a"];
+        assert_eq!(
+            run.admitted_total, 2,
+            "a request nobody launched does not spend an agent slot"
+        );
+        assert_eq!(run.settled_micros, 0, "and settles nothing");
+        // The ID is free again: it was never a dispatch that ran.
+        assert_eq!(
+            state.request(&req("a3", "run-a", "tab-a"), t0),
+            Decision::Granted
+        );
+    }
+
+    // A13: the moment a PID was checked alive is evidence with an age,
+    // and both the snapshot and every signal handed over carry it.
+    #[test]
+    fn a_bound_process_is_visible_with_the_age_of_its_liveness_check() {
+        let mut state = state();
+        let t0 = Instant::now();
+        assert!(granted(state.request(&req("d1", "run-a", "tab-a"), t0)));
+        assert!(state.status(t0).bound_processes.is_empty());
+        bind_live(&mut state, "d1", 4242, t0);
+        let later = t0 + Duration::from_secs(30);
+        assert_eq!(
+            state.status(later).bound_processes["d1"],
+            BoundProcess {
+                pid: 4242,
+                bound_for_secs: 30
+            }
+        );
+        let signals = state.cancel_dispatch("d1", later);
+        assert_eq!(signals[0].bound_at, t0, "the signal names its evidence");
+    }
+
+    // A7: the ladder only advances on a delivery the OS took. A step the
+    // caller could not deliver comes back, so the dispatch is asked
+    // again instead of being recorded as asked and never told.
+    #[test]
+    fn an_undelivered_signal_is_offered_again_next_reconcile() {
+        let mut state = state();
+        let t0 = Instant::now();
+        assert!(granted(state.request(&req("d1", "run-a", "tab-a"), t0)));
+        bind_live(&mut state, "d1", 4242, t0);
+        state.cancel_dispatch("d1", t0);
+        // Nothing is re-sent while the grace period runs...
+        assert!(state.reconcile(t0, &alive).to_signal.is_empty());
+        // ...unless the terminate never actually went.
+        state.signal_undelivered("d1", Signal::Terminate);
+        assert_eq!(
+            signalled(&state.reconcile(t0, &alive)),
+            vec![("d1".to_string(), 4242, Signal::Terminate)]
+        );
+        // Giving back a step nobody is on changes nothing.
+        state.signal_undelivered("d1", Signal::Kill);
+        assert!(state.reconcile(t0, &alive).to_signal.is_empty());
+    }
+
     #[test]
     fn local_gate_round_trips_through_the_trait() {
         let gate = LocalGate::new(limits());
@@ -2766,8 +3489,9 @@ mod tests {
         // table, and waiting requires one (C6/C8).
         gate.bind("d1", Some("agent"), Some(std::process::id()))
             .expect("bind");
-        assert!(
-            gate.bind("d1", None, Some(u32::MAX - 7)).is_err(),
+        assert_eq!(
+            gate.bind("d1", None, Some(u32::MAX - 7)).expect("bind"),
+            BindOutcome::PidNotAlive,
             "a PID nothing is running is refused at the gate too"
         );
         assert!(gate.heartbeat("d1").expect("heartbeat").known);
@@ -2786,6 +3510,6 @@ mod tests {
         assert_eq!(gate.status().runs["run-a"].uncertain_settlements, 1);
         assert_eq!(gate.status().runs["run-a"].active, 0);
         gate.cancel_run("run-a");
-        assert_eq!(gate.enforcement(), "managed (in-process)");
+        assert_eq!(gate.enforcement(), Enforcement::InProcess);
     }
 }
