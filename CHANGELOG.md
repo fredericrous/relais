@@ -63,6 +63,79 @@ stopped (`relais coordinator stop`) before the first command of this version.
 
 ### Learning and routing
 
+- **A run that is still running is no longer a training failure.** The
+  dataset labelled every state it did not name explicitly as "the tier
+  failed", so runs that were merely prepared, running, verifying,
+  repairing or escalating — and runs whose budget ran out before the
+  reasoning was ever tested — taught the learner that their tier does not
+  work. Only an accepted or failed run is a reasoning outcome now;
+  everything else is excluded with the reason printed by
+  `relais dataset build`, and every lifecycle state is answered for by
+  name, so a new one cannot fall into the negative class by default.
+- **`relais dataset build` fails loudly instead of building nothing.** A
+  ledger that could not be read — a busy database, a permissions problem
+  — produced an empty dataset, exit 0 and the advice to "collect outcomes
+  first". Each read now says which run and which query failed, and the
+  command exits non-zero. A run with no recorded contract, state,
+  transition or dispatch intent is still an exclusion, because absence is
+  not failure: what changed is that the two are told apart. A run whose
+  dispatch never named a model is excluded rather than credited to an
+  empty profile.
+- **The evaluator measures the route the router would actually take.** It
+  used to choose among every trained tier with no floor, no risk rules
+  and no check that policy configures a model there, and to compare the
+  result against a "baseline" that pooled research and implementation
+  records regardless of each task's own floor. Eligibility and selection
+  are now the router's own functions, applied per record to the routing
+  floor that record was dispatched under — which the dataset records, so
+  datasets must be rebuilt (`relais dataset build`) before training.
+- **Promotion needs enough evidence to be evidence.** One supported test
+  record could pass the quality gate and the abstention rate was computed
+  and never used. Promotion now also requires a minimum number of
+  held-out records observed at the tier the artifact selects
+  (`routing.min_supported_test_records`, 20 by default) and an abstention
+  rate at or below `routing.max_abstention_rate` (0.5), both settable in
+  `machine.toml`. An artifact whose solver did not converge, or whose
+  calibration temperature came out anti-predictive, fails the gates and
+  says so instead of being quietly floored to a weak positive. The report
+  prints both fit reports, the temperature and the supported-record
+  count, and names every gate that did not hold.
+- **`relais promote` verifies the evidence rather than believing it.** The
+  evaluation report now carries the artifact id, the dataset fingerprint
+  and its schema version, and promotion checks all three and RECOMPUTES
+  the verdict from the report's own numbers — a stored `gates_passed`
+  edited to `true` no longer promotes anything. "Evaluated" is a type only
+  the registry can build, so nothing can promote an id and a hopeful blob.
+- **A model swap starts with no evidence.** Coverage was keyed by tier, so
+  changing the model, effort or harness behind a tier inherited the old
+  profile's acceptance record. Artifacts now carry the profile identities
+  training observed per tier, and inference abstains for a tier whose
+  current identity is not among them, naming it. Artifacts trained before
+  this release are refused by version; retrain.
+- **An unreadable artifact says so.** A registry pointer that could not be
+  read was treated as "nothing is promoted": inference reported a
+  schema-incompatible artifact as an absent one, and promotion overwrote
+  the rollback pointer, so one `rollback` went two artifacts back. Only a
+  missing pointer is an absence now, the rollback pointer is written
+  through the same atomic temp-and-rename as the active one, and
+  inference's abstention carries the reason.
+- **`relais train` exits with a code that says which way it failed** — no
+  training records (3), no tier with enough coverage (4), a solver that
+  diverged (5) — instead of a single stringly error. The solver's
+  convergence test no longer chases a shrinking loss, so a fit that has
+  stopped making material progress is recognized as converged rather than
+  burning its whole iteration budget.
+- **A risk rule with no paths no longer governs every task.** An empty
+  `paths` list was compared against the declared scope as the empty
+  pattern, which a `**` scope matches — so a malformed rule raised the
+  floor of exactly the broadest tasks. Policy validation already refuses
+  such a rule; routing no longer honours one either.
+- **`relais report` counts states, not strings.** A run's status is parsed
+  into the lifecycle state it names (an unknown one is a corrupt-row
+  error, not a silently uncounted run), and the runs awaiting a person —
+  `needs_review`, `needs_decision`, `interrupted` — are now what the field
+  documents.
+
 ### CLI, doctor, install and release
 
 ### Tests and documentation
