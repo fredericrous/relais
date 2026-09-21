@@ -69,6 +69,12 @@ pub enum ArtifactError {
     },
     NonFinite,
     Io(std::io::Error),
+    /// No artifact with this id in the registry. Distinct from `Io`: a
+    /// mistyped id used to surface as a bare "No such file or directory"
+    /// with nothing to act on.
+    Unknown {
+        artifact: String,
+    },
     /// The artifact carries no evaluation report at all.
     NoEvidence {
         artifact: String,
@@ -114,6 +120,11 @@ impl std::fmt::Display for ArtifactError {
             ),
             Self::NonFinite => write!(f, "artifact contains non-finite values"),
             Self::Io(e) => write!(f, "{e}"),
+            Self::Unknown { artifact } => write!(
+                f,
+                "no artifact {artifact} in this registry; `relais train` writes a candidate and \
+                 names it"
+            ),
             Self::NoEvidence { artifact } => write!(
                 f,
                 "artifact {artifact} has no evaluation report; promotion requires evidence"
@@ -243,7 +254,12 @@ impl Registry {
 
     pub fn load(&self, artifact_id: &str) -> std::result::Result<Artifact, ArtifactError> {
         let path = self.artifacts_dir().join(format!("{artifact_id}.json"));
-        let text = std::fs::read_to_string(path).map_err(ArtifactError::Io)?;
+        let text = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => ArtifactError::Unknown {
+                artifact: artifact_id.to_string(),
+            },
+            _ => ArtifactError::Io(e),
+        })?;
         Artifact::from_json(&text)
     }
 
@@ -820,6 +836,13 @@ mod tests {
         assert!(
             registry.rollback().expect("no previous pointer").is_none(),
             "nothing to roll back to is not an error either"
+        );
+        assert!(
+            matches!(
+                registry.load("art-never-trained"),
+                Err(ArtifactError::Unknown { .. })
+            ),
+            "a mistyped id names itself instead of reporting a bare errno"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
