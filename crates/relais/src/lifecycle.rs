@@ -85,6 +85,17 @@ pub enum Reason {
     /// Verification had to wait for a worktree's writer to relinquish
     /// its lease before snapshotting (SPEC §23).
     WriteLeaseWait,
+    /// A dispatch of this run could not give back the write lease it
+    /// took: the coordinator refused or was unreachable twice. The lease
+    /// is this run's own, so verification does not wait on it.
+    WriteLeaseNotReleased,
+    /// Verification of a candidate started: the tree is snapshotted, in
+    /// scope, and the profile's checks are about to run (SPEC §10).
+    VerificationStarted,
+    /// The coordinator stopped answering heartbeats while a worker ran.
+    /// Cancellation travels on the heartbeat, so a run that cannot hear
+    /// it is no longer supervised (SPEC §23).
+    CoordinatorUnreachable,
     /// A writer still held the worktree when the run's clock ran out:
     /// nothing was snapshotted, the tree is preserved.
     WriteLeaseHeld,
@@ -133,6 +144,9 @@ impl Reason {
             Self::ReviewerSameTier => "reviewer_same_tier",
             Self::WorktreeNotReleased => "worktree_not_released",
             Self::WriteLeaseWait => "write_lease_wait",
+            Self::WriteLeaseNotReleased => "write_lease_not_released",
+            Self::VerificationStarted => "verification_started",
+            Self::CoordinatorUnreachable => "coordinator_unreachable",
             Self::WriteLeaseHeld => "write_lease_held",
             Self::RunnerFailure => "runner_failure",
         }

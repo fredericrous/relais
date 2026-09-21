@@ -25,8 +25,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::admission::{
-    BindOutcome, Decision, DispatchRequest, Gate, GateError, Refusal, ResourceClass,
-    RunRegistration, WriteLeaseOutcome,
+    BindOutcome, Decision, DispatchRequest, Gate, GateError, Refusal, ReleaseWriteOutcome,
+    ResourceClass, RunRegistration, WriteLeaseOutcome,
 };
 use crate::backend::{Backend, LaunchResult, LaunchSpec};
 use crate::context::{self, ContextError, ContextManifest};
@@ -38,9 +38,9 @@ use crate::policy::{
     effective_authority, BlockCode, EffectiveAuthority, MachineSettings, RepoPolicy, Tier,
 };
 use crate::procs::Ended;
-use crate::route::{route, RouteInputs, RoutePredictor, Routed};
+use crate::route::{route, Route, RouteInputs, RoutePredictor, Routed};
 use crate::verify::{self, amont_gaps, Receipt, VerificationReport};
-use crate::workspace::{self, TaskWorktree, WorkspaceError};
+use crate::workspace::{self, Disposition, TaskWorktree, WorkspaceError};
 
 pub mod machine;
 pub mod scheduler;
@@ -171,6 +171,16 @@ pub struct RunConfig<'a> {
 /// Poll period while queued for admission.
 const ADMISSION_POLL: Duration = Duration::from_millis(250);
 
+/// How many consecutive unanswered heartbeats make a coordinator
+/// unreachable rather than slow (R6). Cancellation travels on the
+/// heartbeat, so a run that has missed this many is no longer
+/// supervised and ends rather than carrying on unheard.
+const HEARTBEAT_FAILURES_ALLOWED: u32 = 3;
+
+/// How many times a finished dispatch asks for its write lease to be
+/// taken back before the failure goes on the record (R3).
+const RELEASE_WRITE_TRIES: u32 = 2;
+
 /// How a failed admission call is reported. An unreachable coordinator
 /// is an outage — the request is preserved and nothing was launched — and
 /// anything else is a decision the coordinator made and answered with.
@@ -225,6 +235,25 @@ fn state_sibling(artifacts_dir: &Path, name: &str) -> PathBuf {
     artifacts_dir.parent().unwrap_or(artifacts_dir).join(name)
 }
 
+/// The revision a worktree currently has checked out.
+///
+/// Through `workspace::git_command` and not `Command::new("git")`: an
+/// inherited `GIT_DIR` would answer about another repository, and this
+/// answer decides whether a directory is removed (audit B15).
+fn head_revision(worktree_path: &Path) -> Result<String, WorkspaceError> {
+    let output = workspace::git_command(worktree_path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|e| WorkspaceError::Git(format!("rev-parse HEAD: {e}")))?;
+    if !output.status.success() {
+        return Err(WorkspaceError::Git(format!(
+            "rev-parse HEAD: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// The supervised execution path (SPEC §3): preflight, route, then a
 /// bounded sequence of attempts the runner — not a model — owns.
 pub fn execute(config: &RunConfig<'_>) -> Result<RunOutcome, RunError> {
@@ -259,6 +288,25 @@ fn finished(config: &RunConfig<'_>, outcome: RunOutcome) -> RunOutcome {
 /// end when admission or the launch itself decided it.
 pub(crate) type Launched = Result<LaunchResult, RunOutcome>;
 
+/// One dispatch as admission and the launch need it: the spec, its place
+/// in the agent tree, what it may spend and how long it has.
+pub(crate) struct ManagedDispatch<'d> {
+    pub(crate) spec: LaunchSpec,
+    /// Depth in the agent tree; a root dispatch is 0 (SPEC §23).
+    pub(crate) depth: u32,
+    /// The dispatch that asked for this one, when one did.
+    pub(crate) parent: Option<&'d str>,
+    /// What the coordinator reserves for it.
+    pub(crate) reserve_micros: i64,
+    /// The run's wall clock: a queue wait counts against it.
+    pub(crate) deadline: Instant,
+    /// The budget an admission refusal is judged against.
+    pub(crate) budget: &'d Budget,
+    /// The worktree this dispatch writes, when it writes one. Readers
+    /// pass `None` and take no lease.
+    pub(crate) write_lease: Option<&'d Path>,
+}
+
 pub(crate) struct RunEngine<'a> {
     pub(crate) config: &'a RunConfig<'a>,
     pub(crate) run_id: RunId,
@@ -274,6 +322,185 @@ pub(crate) struct RunEngine<'a> {
     parent: Option<(RunId, PackageId)>,
     /// `<backend> <version>` as probed at run start; unknown = `None`.
     pub(crate) harness: Option<String>,
+    /// Write leases this run's own dispatches took and could not give
+    /// back (R3). Verification never waits on one of these: the process
+    /// that held it has ended, so the tree is still, and waiting would
+    /// be the run waiting on itself until its own deadline.
+    own_write_leases: std::collections::BTreeSet<String>,
+}
+
+/// What a run has spent so far, and how well that figure is known.
+///
+/// One value rather than two out-parameters: every place that folds a
+/// dispatch's cost in also folds its completeness, and passing them
+/// separately is how the decomposed path came to pass a fresh zero as
+/// the spend while keeping the real completeness (R1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RunSpend {
+    pub(crate) total: MicroUsd,
+    pub(crate) completeness: CostCompleteness,
+}
+
+impl RunSpend {
+    /// Nothing spent, and that is an exact figure.
+    pub(crate) fn zero() -> Self {
+        Self {
+            total: MicroUsd::ZERO,
+            completeness: CostCompleteness::Actual,
+        }
+    }
+
+    /// Fold one dispatch's usage in. Unknown cost is not zero: the total
+    /// stays what was reported and the completeness says it is a lower
+    /// bound (SPEC §11).
+    pub(crate) fn fold(&mut self, cost: Option<MicroUsd>, completeness: CostCompleteness) {
+        if let Some(cost) = cost {
+            self.total += cost;
+        }
+        self.completeness = self.completeness.max(completeness);
+    }
+}
+
+/// What one phase of a run hands the next — or the end it reached
+/// instead. Every phase can finish the run (a blocked preflight, an
+/// unusable baseline, a cancelled attempt), and saying so in the type
+/// is what lets each phase be a function of its own.
+pub(crate) enum Phase<T> {
+    Ready(T),
+    Ended(RunOutcome),
+}
+
+/// What the attempt loop does next.
+enum Step {
+    /// Dispatch another attempt.
+    Again,
+    /// The run ended.
+    Ended(RunOutcome),
+}
+
+/// What preflight established: fixed for the whole run, and the same for
+/// every attempt of it.
+struct Preflight {
+    authority: EffectiveAuthority,
+    /// Optional integrations that are not installed; they ride in the
+    /// receipt and are never passes (SPEC §5).
+    integration_gaps: Vec<String>,
+    base_sha: String,
+    contract_hash: String,
+    /// The contract revision row every attempt of this run belongs to.
+    revision_id: i64,
+    manifest: ContextManifest,
+    decision: Route,
+}
+
+/// What the base revision's own verification established (SPEC §10).
+struct Baseline {
+    /// Check labels that already fail at the base.
+    failures: Vec<String>,
+    /// The base's outcomes when the commands actually ran: a candidate
+    /// carrying the base tree has exactly these, without spending them
+    /// again. `None` when the verdict came from the cache.
+    checks: Option<Vec<verify::CheckOutcome>>,
+    /// The verdict came from the baseline cache (SPEC §18).
+    cached: bool,
+    /// Why the baseline could not be cached, when it could not (V2).
+    cache_refused: Option<verify::CacheRefused>,
+    /// Where this run's check logs are written.
+    logs_dir: PathBuf,
+}
+
+/// Everything the attempt loop reads and never changes.
+struct AttemptContext<'c> {
+    preflight: &'c Preflight,
+    baseline: &'c Baseline,
+    /// The run's one owned worktree, at the base revision.
+    worktree: &'c TaskWorktree,
+    worktree_path: &'c Path,
+    /// The run's wall clock.
+    deadline: Instant,
+}
+
+/// One attempt that reached a worker and came back.
+struct Dispatched {
+    attempt_id: i64,
+    index: u32,
+    tier: Tier,
+    result: LaunchResult,
+}
+
+/// An attempt's candidate: snapshotted, named, exported and in scope.
+struct Candidate {
+    attempt_id: i64,
+    index: u32,
+    /// The tier that wrote it — which the reviewer must not be.
+    tier: Tier,
+    sha: String,
+    /// The ref keeping the candidate commit reachable, when one could
+    /// be written.
+    reference: Option<String>,
+    patch_path: PathBuf,
+    /// The copy a reviewer's prompt names.
+    latest_patch: PathBuf,
+    /// Tools the harness refused during the attempt.
+    permission_denials: Vec<String>,
+}
+
+/// What the profile's checks established about a candidate that passed
+/// them, and whether a semantic review is still owed.
+struct Verified {
+    checks: Vec<verify::CheckOutcome>,
+    gaps: Vec<String>,
+    amont_bypasses: Vec<String>,
+    amont_downgrades: Vec<String>,
+    verification_inputs_changed: Vec<String>,
+    review_required: bool,
+}
+
+/// How one verification's artifacts are named: its throwaway worktree
+/// and the stem of every check log it writes. A single-worker run
+/// labels by attempt; a decomposed run labels the assembled candidate,
+/// which used to be `900 + repairs` — a number with no meaning at the
+/// place it was read (audit style note).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttemptLabel {
+    /// The nth attempt of a single-worker run.
+    Attempt(u32),
+    /// The assembled candidate of a decomposed run, after n integration
+    /// repairs.
+    Integration(u32),
+}
+
+/// How a worktree is shown to still hold exactly the candidate that was
+/// accepted from it — the check SPEC §8's "never force-cleans a worktree
+/// containing unexported changes" asks for, which is not the same
+/// question in the two trees relais owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TreeIdentity {
+    /// A task worktree, whose base is the run's base: snapshot it again
+    /// and compare candidate identities.
+    Resnapshot,
+    /// The integration worktree, whose head has moved past the run's
+    /// base as packages were fast-forwarded in: compare `HEAD`, and let
+    /// the release itself insist the tree is clean.
+    CheckedOut,
+}
+
+impl AttemptLabel {
+    /// The suffix of the throwaway verification worktree.
+    fn worktree_suffix(self) -> String {
+        match self {
+            Self::Attempt(index) => index.to_string(),
+            Self::Integration(repairs) => format!("integration-{repairs}"),
+        }
+    }
+
+    /// The stem every check log of this verification is named after.
+    fn log_prefix(self) -> String {
+        match self {
+            Self::Attempt(index) => format!("attempt{index}"),
+            Self::Integration(repairs) => format!("integration{repairs}"),
+        }
+    }
 }
 
 /// The per-attempt bookkeeping the loop threads through the machine.
@@ -282,8 +509,7 @@ struct Progress {
     kind: AttemptKind,
     last_failures: Option<Vec<String>>,
     last_candidate: Option<String>,
-    total_cost: MicroUsd,
-    cost_completeness: CostCompleteness,
+    spend: RunSpend,
     models_used: Vec<String>,
 }
 
@@ -305,6 +531,7 @@ impl<'a> RunEngine<'a> {
             state: State::Prepared,
             parent,
             harness: None,
+            own_write_leases: std::collections::BTreeSet::new(),
         })
     }
 
@@ -383,24 +610,27 @@ impl<'a> RunEngine<'a> {
     /// aggregate agent cap are budget exhaustion, and a run cancelled
     /// while queued or running ends cancelled with its evidence kept.
     ///
-    /// `write_lease` names the worktree this dispatch will write, when it
-    /// writes one: the lease is taken after admission and before the
-    /// process exists, and given back when the process has ended. A
-    /// worktree somebody else is writing refuses the launch outright —
-    /// two writers in one tree is the one thing scope checks cannot
-    /// catch (SPEC §23: "scope checks alone are not filesystem
-    /// isolation"). Readers — the reviewer, the planner — pass `None`.
-    #[allow(clippy::too_many_arguments)]
+    /// `ManagedDispatch::write_lease` names the worktree this dispatch
+    /// will write, when it writes one: the lease is taken after
+    /// admission and before the process exists, and given back when the
+    /// process has ended. A worktree somebody else is writing refuses
+    /// the launch outright — two writers in one tree is the one thing
+    /// scope checks cannot catch (SPEC §23: "scope checks alone are not
+    /// filesystem isolation"). Readers — the reviewer, the planner —
+    /// pass `None`.
     pub(crate) fn managed_launch(
         &mut self,
-        mut spec: LaunchSpec,
-        depth: u32,
-        parent: Option<&str>,
-        reserve_micros: i64,
-        deadline: Instant,
-        budget: &Budget,
-        write_lease: Option<&Path>,
+        dispatch: ManagedDispatch<'_>,
     ) -> Result<Launched, RunError> {
+        let ManagedDispatch {
+            mut spec,
+            depth,
+            parent,
+            reserve_micros,
+            deadline,
+            budget,
+            write_lease,
+        } = dispatch;
         // The dispatch is `launched` in the ledger BEFORE the process
         // exists (SPEC §12): a runner crash from here on leaves a live
         // dispatch for `resume` to reconcile, never a silent gap.
@@ -455,6 +685,9 @@ impl<'a> RunEngine<'a> {
                 }
                 Ok(Decision::Queued { position }) => {
                     if Instant::now() >= deadline {
+                        // Best effort: nothing was launched, and a
+                        // request the coordinator still holds expires
+                        // with the queue entry it never granted.
                         let _ = gate.withdraw(&spec.dispatch_id);
                         return Ok(Err(self.stop(
                             budget,
@@ -498,8 +731,13 @@ impl<'a> RunEngine<'a> {
         let lease_key = write_lease.map(|path| path.to_string_lossy().into_owned());
         if let Some(key) = lease_key.as_deref() {
             match gate.acquire_write(&spec.dispatch_id, key) {
-                Ok(WriteLeaseOutcome::Taken) => {}
+                Ok(WriteLeaseOutcome::Taken) => {
+                    self.own_write_leases.insert(spec.dispatch_id.clone());
+                }
                 Ok(WriteLeaseOutcome::HeldBy { holder }) => {
+                    // Best effort: the seat is given back so the refusal
+                    // does not hold one, and an unwithdrawn request
+                    // expires on its own.
                     let _ = gate.withdraw(&spec.dispatch_id);
                     return Ok(Err(self.block(
                         Reason::AdmissionRefused,
@@ -511,6 +749,8 @@ impl<'a> RunEngine<'a> {
                     )?));
                 }
                 Err(e) => {
+                    // Best effort, and to the same coordinator that just
+                    // failed: the run is ending on that failure anyway.
                     let _ = gate.withdraw(&spec.dispatch_id);
                     let (reason, code) = admission_block(&e);
                     return Ok(Err(self.block(
@@ -535,15 +775,22 @@ impl<'a> RunEngine<'a> {
         // instance. The heartbeat thread cannot end the run, so it says
         // so here and the launch path reports it (A2).
         let seat_lost: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        // Cancellation reaches a worker only on the heartbeat (SPEC §23).
+        // A coordinator that stops answering therefore makes `relais
+        // cancel` a no-op, silently, for as long as the worker runs —
+        // so the errors are counted and the run ends on the record (R6).
+        let heartbeat_lost: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
         let launched = std::thread::scope(|scope| {
             let dispatch_id = spec.dispatch_id.clone();
             let cancel = Arc::clone(&cancel);
             let pid_slot = Arc::clone(&pid_slot);
             let stop = &stop;
             let seat_lost = &seat_lost;
+            let heartbeat_lost = &heartbeat_lost;
             scope.spawn(move || {
                 let mut last: Option<Instant> = None;
                 let mut bound_pid = false;
+                let mut heartbeat_errors: u32 = 0;
                 while !stop.load(Ordering::SeqCst) {
                     let pid = pid_slot.load(Ordering::SeqCst);
                     if !bound_pid && pid != 0 {
@@ -575,6 +822,10 @@ impl<'a> RunEngine<'a> {
                             Err(e) if e.unavailable() => {}
                             Err(e) => record_lost_seat(seat_lost, e.to_string()),
                         }
+                        // Best effort, on this thread's own connection:
+                        // the pid is diagnostic detail on a row the
+                        // runner already wrote, and `resume` reconciles
+                        // a dispatch with no pid from the process table.
                         if let Ok(ledger) = Ledger::open(&ledger_path) {
                             let _ = ledger.attach_dispatch_process(
                                 &DispatchId::from_stored(dispatch_id.clone()),
@@ -585,12 +836,32 @@ impl<'a> RunEngine<'a> {
                     }
                     if last.is_none_or(|last| last.elapsed() >= heartbeat_every) {
                         last = Some(Instant::now());
-                        if let Ok(status) = gate.heartbeat(&dispatch_id) {
-                            if status.cancelled {
-                                cancel.store(true, Ordering::SeqCst);
-                                // The seat and the reservation go now,
-                                // not at lease grace (C5).
-                                let _ = gate.acknowledge_cancel(&dispatch_id);
+                        match gate.heartbeat(&dispatch_id) {
+                            Ok(status) => {
+                                // One answer clears the count: a single
+                                // dropped call is a blip, not an outage.
+                                heartbeat_errors = 0;
+                                if status.cancelled {
+                                    cancel.store(true, Ordering::SeqCst);
+                                    // The seat and the reservation go
+                                    // now, not at lease grace (C5).
+                                    // Best effort: the worker is already
+                                    // stopping and the coordinator reaps
+                                    // the seat on its own lease grace.
+                                    let _ = gate.acknowledge_cancel(&dispatch_id);
+                                }
+                            }
+                            Err(e) => {
+                                heartbeat_errors += 1;
+                                if heartbeat_errors >= HEARTBEAT_FAILURES_ALLOWED {
+                                    record_lost_seat(
+                                        heartbeat_lost,
+                                        format!(
+                                            "{HEARTBEAT_FAILURES_ALLOWED} consecutive heartbeats \
+                                             for dispatch {dispatch_id} went unanswered ({e})"
+                                        ),
+                                    );
+                                }
                             }
                         }
                     }
@@ -606,11 +877,14 @@ impl<'a> RunEngine<'a> {
         // goes back before the seat, so verification never waits on a
         // writer that is already gone (SPEC §23).
         if let Some(key) = lease_key.as_deref() {
-            let _ = gate.release_write(&spec.dispatch_id, key);
+            self.release_write_lease(gate, &spec.dispatch_id, key)?;
         }
         let result = match launched {
             Ok(result) => result,
             Err(e) => {
+                // Best effort: the launch never produced a process, and
+                // the coordinator reaps an unbound seat and its
+                // reservation on its own lease grace.
                 let _ = gate.release(&spec.dispatch_id);
                 let _ = gate.settle(&spec.dispatch_id, None);
                 return Ok(Err(self.block(
@@ -637,7 +911,76 @@ impl<'a> RunEngine<'a> {
                 format!("{detail}; the attempt is not a managed dispatch (SPEC §23)"),
             )?));
         }
+        // The worker ran unheard: whatever it produced is on disk and in
+        // the ledger, but nothing could have stopped it, so the run ends
+        // interrupted rather than judging a candidate it could not
+        // supervise (R6).
+        if let Some(detail) = heartbeat_lost
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            return Ok(Err(self.finish(
+                Reason::CoordinatorUnreachable,
+                serde_json::json!({
+                    "dispatch_id": spec.dispatch_id,
+                    "detail": detail,
+                }),
+                Terminal::Interrupted {
+                    detail: format!(
+                        "{detail}; a cancellation could not have reached the worker, so the run \
+                         is not supervised and its evidence is preserved"
+                    ),
+                },
+            )?));
+        }
         Ok(Ok(result))
+    }
+
+    /// Give a worktree's write lease back when the process that held it
+    /// has ended.
+    ///
+    /// A discarded failure here is not cosmetic: leases have no expiry
+    /// (`admission`), so this run's own dispatch stays on record as the
+    /// writer and `wait_for_writers` waits for it until the run's wall
+    /// clock runs out — an acceptable candidate ending `interrupted`
+    /// because of one dropped socket call (R3). One retry, then the
+    /// failure goes on the record and the lease is remembered as this
+    /// run's own so verification does not wait on itself.
+    fn release_write_lease(
+        &mut self,
+        gate: &(dyn Gate + Sync),
+        dispatch_id: &str,
+        key: &str,
+    ) -> Result<(), RunError> {
+        let mut failure = None;
+        for _ in 0..RELEASE_WRITE_TRIES {
+            match gate.release_write(dispatch_id, key) {
+                // Released, or somebody else holds the tree (or nobody
+                // does): our lease is not there to give back either
+                // way, and a real holder is exactly what verification
+                // must wait for.
+                Ok(ReleaseWriteOutcome::Released | ReleaseWriteOutcome::NotTheHolder) => {
+                    self.own_write_leases.remove(dispatch_id);
+                    return Ok(());
+                }
+                Err(e) => failure = Some(e),
+            }
+        }
+        let detail = failure.map_or_else(
+            || "the write lease could not be released".to_string(),
+            |e| e.to_string(),
+        );
+        self.transition(
+            self.state,
+            Reason::WriteLeaseNotReleased,
+            serde_json::json!({
+                "worktree": key,
+                "dispatch_id": dispatch_id,
+                "error": detail,
+                "detail": "the lease is this run's own and its process has ended, so \
+                           verification treats the tree as still",
+            }),
+        )
     }
 
     /// Observe something terminal, record the machine's decision and end
@@ -682,7 +1025,82 @@ impl<'a> RunEngine<'a> {
         }
     }
 
+    /// The run, by phase: preflight, baseline, then either the
+    /// decomposed path or one owned worktree and a bounded attempt loop
+    /// (SPEC §3, §9). Each phase either hands the next one what it
+    /// established, or ends the run.
     fn run_inner(&mut self) -> Result<RunOutcome, RunError> {
+        let preflight = match self.preflight()? {
+            Phase::Ended(outcome) => return Ok(outcome),
+            Phase::Ready(preflight) => preflight,
+        };
+        let baseline = match self.baseline(&preflight)? {
+            Phase::Ended(outcome) => return Ok(outcome),
+            Phase::Ready(baseline) => baseline,
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(preflight.authority.max_wall_seconds);
+        // The harness identity every dispatch of this run records, probed
+        // once (SPEC §16: model/effort/harness identity are features).
+        self.harness = self.config.backend.probe().map(|capabilities| {
+            format!(
+                "{} {}",
+                self.config.backend.name(),
+                capabilities.version.as_deref().unwrap_or("?")
+            )
+        });
+
+        // Bounded decomposition (SPEC §19): work packages as runs of their
+        // own, an assembled candidate verified independently. A planner
+        // may answer "single worker", in which case the ordinary path
+        // continues below.
+        if let Some(decomposition) = &self.config.contract.decomposition {
+            let root = scheduler::RootContext {
+                authority: &preflight.authority,
+                base_sha: &preflight.base_sha,
+                contract_hash: &preflight.contract_hash,
+                manifest: &preflight.manifest,
+                decision: &preflight.decision,
+                baseline_failures: &baseline.failures,
+                integration_gaps: &preflight.integration_gaps,
+                baseline_cached: baseline.cached,
+                baseline_cache_refused: &baseline.cache_refused,
+                logs_dir: &baseline.logs_dir,
+                deadline,
+            };
+            match scheduler::run_decomposed(self, &root, decomposition)? {
+                scheduler::Decomposed::Outcome(outcome) => return Ok(outcome),
+                scheduler::Decomposed::SingleWorker => {}
+            }
+        }
+
+        // One owned worktree for the whole run: repairs continue from a
+        // candidate whose scope and integrity passed; a scope violation
+        // stops everything (SPEC §8, §9).
+        let worktree_path = self.worktrees.join("task");
+        let worktree = match workspace::create_worktree(
+            self.config.repo_dir,
+            &preflight.base_sha,
+            &worktree_path,
+        ) {
+            Ok(worktree) => worktree,
+            Err(e) => return self.fail_preflight(BlockCode::WorktreeUnavailable, e.to_string()),
+        };
+        self.attempt_loop(&AttemptContext {
+            preflight: &preflight,
+            baseline: &baseline,
+            worktree: &worktree,
+            worktree_path: &worktree_path,
+            deadline,
+        })
+    }
+
+    /// Everything that must hold before a single worker is launched
+    /// (SPEC §4–§7): the run is on record, the base is clean and
+    /// resolved, authority and integrations allow the work, the
+    /// coordinator knows the run's budget, the context package is
+    /// assembled and the route is decided.
+    fn preflight(&mut self) -> Result<Phase<Preflight>, RunError> {
         std::fs::create_dir_all(&self.artifacts)?;
         let ledger = self.config.ledger;
         match &self.parent {
@@ -709,22 +1127,22 @@ impl<'a> RunEngine<'a> {
         match workspace::dirty_paths(self.config.repo_dir) {
             Ok(dirty) if dirty.is_empty() => {}
             Ok(dirty) => {
-                return self.fail_preflight(
+                return Ok(Phase::Ended(self.fail_preflight(
                     BlockCode::DirtyBase,
                     format!(
                         "working tree has uncommitted changes ({}); commit or stash first",
                         dirty.join(", ")
                     ),
-                );
+                )?));
             }
             Err(e) => {
-                return self.fail_preflight(
+                return Ok(Phase::Ended(self.fail_preflight(
                     BlockCode::DirtyBase,
                     format!(
                         "the working tree's status could not be read ({e}); relais cannot show \
                          that the base is clean and will not run against a tree it cannot see"
                     ),
-                );
+                )?));
             }
         }
 
@@ -741,12 +1159,14 @@ impl<'a> RunEngine<'a> {
             &repo_identity,
         );
         if let Some(first) = authority.blockers.first() {
-            return self.fail_preflight(first.code, first.detail.clone());
+            let (code, detail) = (first.code, first.detail.clone());
+            return Ok(Phase::Ended(self.fail_preflight(code, detail)?));
         }
         // Integrations (SPEC §5): a missing required one blocks execution;
         // optional gaps travel in the receipt and are never passes.
         if let Some(blocker) = crate::tooling::probe_integrations(self.config.repo_policy).first() {
-            return self.fail_preflight(blocker.code, blocker.detail.clone());
+            let (code, detail) = (blocker.code, blocker.detail.clone());
+            return Ok(Phase::Ended(self.fail_preflight(code, detail)?));
         }
         let integration_gaps = verify::integration_gaps(
             &self.config.repo_policy.integrations,
@@ -770,7 +1190,11 @@ impl<'a> RunEngine<'a> {
             };
             if let Err(e) = gate.register_run(&registration) {
                 let (reason, code) = admission_block(&e);
-                return self.block(reason, code, format!("{e}; nothing was launched"));
+                return Ok(Phase::Ended(self.block(
+                    reason,
+                    code,
+                    format!("{e}; nothing was launched"),
+                )?));
             }
         }
 
@@ -778,7 +1202,11 @@ impl<'a> RunEngine<'a> {
         let base_sha =
             match workspace::resolve_base(self.config.repo_dir, &self.config.contract.base_ref) {
                 Ok(sha) => sha,
-                Err(e) => return self.fail_preflight(BlockCode::BaseUnresolvable, e.to_string()),
+                Err(e) => {
+                    return Ok(Phase::Ended(
+                        self.fail_preflight(BlockCode::BaseUnresolvable, e.to_string())?,
+                    ))
+                }
             };
 
         let contract_hash = self.config.contract.hash();
@@ -791,8 +1219,65 @@ impl<'a> RunEngine<'a> {
             Some(&base_sha),
         )?;
 
-        // Context: verdicts and tool failures are distinct, contradictions
-        // block, missing answers gate dependents only (SPEC §7).
+        let manifest = match self.assemble_context(&authority, &contract_hash, &base_sha)? {
+            Phase::Ended(outcome) => return Ok(Phase::Ended(outcome)),
+            Phase::Ready(manifest) => manifest,
+        };
+
+        // Route (SPEC §6).
+        let decision = match route(RouteInputs {
+            contract: self.config.contract,
+            repo: self.config.repo_policy,
+            machine: self.config.machine,
+            authority: &authority,
+            predictor: self.config.predictor,
+        }) {
+            Routed::Route(route) => route,
+            Routed::Blocked(blocked) => {
+                let first = blocked.first();
+                let (code, detail) = (first.code, first.detail.clone());
+                return Ok(Phase::Ended(self.fail_preflight(code, detail)?));
+            }
+        };
+        if let Some(estimates) = &decision.estimates {
+            ledger.record_prediction(
+                &self.run_id,
+                &estimates.artifact_id,
+                &estimates.input_hash,
+                &estimates.raw,
+            )?;
+        }
+        std::fs::write(
+            self.artifacts.join("route.txt"),
+            decision.explain(
+                authority
+                    .models
+                    .get(&decision.tier)
+                    .map(|profile| profile.id.as_str()),
+            ),
+        )?;
+
+        Ok(Phase::Ready(Preflight {
+            authority,
+            integration_gaps,
+            base_sha,
+            contract_hash,
+            revision_id,
+            manifest,
+            decision,
+        }))
+    }
+
+    /// Context: verdicts and tool failures are distinct, contradictions
+    /// block, missing answers gate dependents only (SPEC §7). The
+    /// assembled package is evidence, written next to the run and
+    /// referenced by hash (SPEC §7, §12).
+    fn assemble_context(
+        &mut self,
+        authority: &EffectiveAuthority,
+        contract_hash: &str,
+        base_sha: &str,
+    ) -> Result<Phase<ContextManifest>, RunError> {
         // One probe: the version and the turn-ceiling capability are the
         // same answer about the same installed harness.
         let capabilities = self.config.backend.probe();
@@ -802,20 +1287,22 @@ impl<'a> RunEngine<'a> {
         let fingerprints = match context::fingerprint_hints(
             self.config.git,
             self.config.repo_dir,
-            &base_sha,
+            base_sha,
             &self.config.contract.read_hints,
         ) {
             Ok(fingerprints) => fingerprints,
             Err(unresolvable) => {
-                return self
-                    .fail_preflight(BlockCode::ReadHintUnresolvable, unresolvable.to_string())
+                return Ok(Phase::Ended(self.fail_preflight(
+                    BlockCode::ReadHintUnresolvable,
+                    unresolvable.to_string(),
+                )?))
             }
         };
-        let manifest = match context::assemble(context::ContextInputs {
+        let assembled = context::assemble(context::ContextInputs {
             contract: self.config.contract,
             repo: self.config.repo_policy,
-            contract_hash: &contract_hash,
-            base_sha: &base_sha,
+            contract_hash,
+            base_sha,
             policy_hash: &authority.authority_hash,
             fingerprints,
             tool_versions: context::ToolVersions {
@@ -834,91 +1321,56 @@ impl<'a> RunEngine<'a> {
                 .unwrap_or_default(),
             worker_env: &self.config.worker_env,
             resolver: self.config.aval_resolver,
-        }) {
+        });
+        match assembled {
             Ok(manifest) => {
-                // The context package is evidence: written next to the run
-                // and referenced by hash (SPEC §7, §12).
                 let manifest_path = self.artifacts.join("manifest.json");
                 std::fs::write(
                     &manifest_path,
                     serde_json::to_string_pretty(&manifest).expect("a manifest serializes"),
                 )?;
-                ledger.record_evidence(
+                self.config.ledger.record_evidence(
                     &self.run_id,
                     None,
                     "context_manifest",
                     &manifest_path,
                     Some(&context::manifest_hash(&manifest)),
                 )?;
-                manifest
+                Ok(Phase::Ready(manifest))
             }
             Err(ContextError::ContradictionBlocked { key, heads }) => {
-                return self.block(
+                Ok(Phase::Ended(self.block(
                     Reason::ArchitectureContradiction,
                     BlockCode::ArchitectureContradiction,
                     format!("aval contradiction on `{key}` ({heads} heads)"),
-                );
+                )?))
             }
             Err(ContextError::NeedsDecision { key, verdict }) => {
                 let detail = format!("the task depends on `{key}` but aval answers {verdict:?}");
-                return self.finish(
+                Ok(Phase::Ended(self.finish(
                     Reason::ArchitectureUnresolved,
                     serde_json::json!({ "key": key, "verdict": format!("{verdict:?}") }),
                     Terminal::NeedsDecision {
                         reason: Reason::ArchitectureUnresolved,
                         detail,
                     },
-                );
+                )?))
             }
-            Err(ContextError::ToolFailure { key, detail }) => {
-                return self
-                    .fail_preflight(BlockCode::AvalToolFailure, format!("`{key}`: {detail}"));
-            }
-            Err(ContextError::SizingProblem { .. }) => {
-                return self.fail_preflight(
-                    BlockCode::ContextSizing,
-                    "required context exceeds the budget".to_string(),
-                );
-            }
-        };
-
-        // Route (SPEC §6).
-        let decision = route(RouteInputs {
-            contract: self.config.contract,
-            repo: self.config.repo_policy,
-            machine: self.config.machine,
-            authority: &authority,
-            predictor: self.config.predictor,
-        });
-        let decision = match decision {
-            Routed::Route(route) => route,
-            Routed::Blocked(blocked) => {
-                let first = blocked.first();
-                return self.fail_preflight(first.code, first.detail.clone());
-            }
-        };
-        let initial_tier = decision.tier;
-        if let Some(estimates) = &decision.estimates {
-            ledger.record_prediction(
-                &self.run_id,
-                &estimates.artifact_id,
-                &estimates.input_hash,
-                &estimates.raw,
-            )?;
+            Err(ContextError::ToolFailure { key, detail }) => Ok(Phase::Ended(
+                self.fail_preflight(BlockCode::AvalToolFailure, format!("`{key}`: {detail}"))?,
+            )),
+            Err(ContextError::SizingProblem { .. }) => Ok(Phase::Ended(self.fail_preflight(
+                BlockCode::ContextSizing,
+                "required context exceeds the budget".to_string(),
+            )?)),
         }
-        std::fs::write(
-            self.artifacts.join("route.txt"),
-            decision.explain(
-                authority
-                    .models
-                    .get(&initial_tier)
-                    .map(|profile| profile.id.as_str()),
-            ),
-        )?;
+    }
 
-        // Baseline verification at the base SHA: pre-existing failures are
-        // visible from the start (SPEC §10); cached only when the profile
-        // opts in (SPEC §18).
+    /// Baseline verification at the base SHA: pre-existing failures are
+    /// visible from the start (SPEC §10); cached only when the profile
+    /// opts in (SPEC §18).
+    fn baseline(&mut self, preflight: &Preflight) -> Result<Phase<Baseline>, RunError> {
+        let authority = &preflight.authority;
         let logs_dir = self.artifacts.join("logs");
         let baseline_cache = verify::BaselineCache::new(
             &self
@@ -938,28 +1390,28 @@ impl<'a> RunEngine<'a> {
         });
         let baseline_key = match &toolchain {
             Ok(toolchain) => Some(verify::baseline_key(
-                &base_sha,
+                &preflight.base_sha,
                 &authority.verification_profile,
-                &manifest.tool_versions,
+                &preflight.manifest.tool_versions,
                 toolchain,
             )),
             Err(_) => None,
         };
-        let baseline_cache_refused = toolchain.err();
+        let cache_refused = toolchain.err();
         let cacheable = authority.verification_profile.cache_baseline;
-        let cached_baseline = match (cacheable, &baseline_key) {
+        let cached = match (cacheable, &baseline_key) {
             (true, Some(key)) => baseline_cache.get(key),
             _ => None,
         };
-        let baseline_cached = cached_baseline.is_some();
+        let was_cached = cached.is_some();
         // The baseline's check outcomes are kept: a candidate identical to
         // the base has exactly these results, without re-running them.
-        let (baseline_failures, baseline_checks) = match cached_baseline {
+        let (failures, checks) = match cached {
             Some(failures) => (failures, None),
             None => match verify::verification_worktree(
                 self.config.git,
                 self.config.repo_dir,
-                &base_sha,
+                &preflight.base_sha,
                 &self.verify_dir.join("verify-base"),
             ) {
                 Ok(mut baseline) => {
@@ -978,694 +1430,767 @@ impl<'a> RunEngine<'a> {
                         baseline_cache.put(key, &failures);
                     }
                     if let Err(e) = baseline.release() {
+                        // Best effort: the verdict is already in hand and
+                        // the throwaway tree holds nothing but a checkout
+                        // of the base revision.
                         eprintln!("relais: {e}");
                     }
                     (failures, Some(checks))
                 }
                 Err(e) => {
-                    return self
-                        .fail_preflight(BlockCode::BaselineVerificationFailed, e.to_string());
+                    return Ok(Phase::Ended(self.fail_preflight(
+                        BlockCode::BaselineVerificationFailed,
+                        e.to_string(),
+                    )?));
                 }
             },
         };
+        Ok(Phase::Ready(Baseline {
+            failures,
+            checks,
+            cached: was_cached,
+            cache_refused,
+            logs_dir,
+        }))
+    }
 
-        let deadline = Instant::now() + Duration::from_secs(authority.max_wall_seconds);
-        // The harness identity every dispatch of this run records, probed
-        // once (SPEC §16: model/effort/harness identity are features).
-        self.harness = self.config.backend.probe().map(|capabilities| {
-            format!(
-                "{} {}",
-                self.config.backend.name(),
-                capabilities.version.as_deref().unwrap_or("?")
-            )
-        });
-
-        // Bounded decomposition (SPEC §19): work packages as runs of their
-        // own, an assembled candidate verified independently. A planner
-        // may answer "single worker", in which case the ordinary path
-        // continues below.
-        if let Some(decomposition) = &self.config.contract.decomposition {
-            let root = scheduler::RootContext {
-                authority: &authority,
-                base_sha: &base_sha,
-                contract_hash: &contract_hash,
-                manifest: &manifest,
-                decision: &decision,
-                baseline_failures: &baseline_failures,
-                integration_gaps: &integration_gaps,
-                baseline_cached,
-                baseline_cache_refused: &baseline_cache_refused,
-                logs_dir: &logs_dir,
-                deadline,
-            };
-            match scheduler::run_decomposed(self, &root, decomposition)? {
-                scheduler::Decomposed::Outcome(outcome) => return Ok(outcome),
-                scheduler::Decomposed::SingleWorker => {}
-            }
-        }
-
-        // One owned worktree for the whole run: repairs continue from a
-        // candidate whose scope and integrity passed; a scope violation
-        // stops everything (SPEC §8, §9).
-        let worktree_path = self.worktrees.join("task");
-        let worktree =
-            match workspace::create_worktree(self.config.repo_dir, &base_sha, &worktree_path) {
-                Ok(worktree) => worktree,
-                Err(e) => {
-                    return self.fail_preflight(BlockCode::WorktreeUnavailable, e.to_string())
-                }
-            };
-
+    /// The bounded sequence of attempts the runner — not a model — owns
+    /// (SPEC §9): ceilings first, then one dispatch, its candidate, and
+    /// the machine's verdict on it.
+    fn attempt_loop(&mut self, ctx: &AttemptContext<'_>) -> Result<RunOutcome, RunError> {
+        let authority = &ctx.preflight.authority;
+        let decision = &ctx.preflight.decision;
         let mut progress = Progress {
             budget: Budget {
                 attempts_used: 0,
                 max_attempts: authority.max_attempts,
                 repairs_used: 0,
                 max_repairs: authority.max_repairs_before_escalation,
-                tier: initial_tier,
+                tier: decision.tier,
                 escalation_tier: decision.escalation_tier,
             },
             kind: AttemptKind::Initial,
             last_failures: None,
             last_candidate: None,
-            total_cost: MicroUsd::ZERO,
-            cost_completeness: CostCompleteness::Actual,
+            spend: RunSpend::zero(),
             models_used: Vec::new(),
         };
 
         loop {
-            // Budget ceilings are checked BEFORE admitting more work
-            // (SPEC §9, §11).
-            if progress.budget.attempts_used >= progress.budget.max_attempts {
-                return self.stop(
-                    &progress.budget,
-                    Observation::LimitReached(Limit::Attempts {
-                        max: progress.budget.max_attempts,
-                        last_failures: progress.last_failures.clone().unwrap_or_default(),
-                    }),
-                );
+            if let Some(outcome) = self.ceiling_reached(&progress, ctx.deadline)? {
+                return Ok(outcome);
             }
-            if Instant::now() >= deadline {
-                return self.stop(
-                    &progress.budget,
-                    Observation::LimitReached(Limit::WallClock),
-                );
-            }
-            if let Some(ceiling) = self.config.machine.spending.per_run_micros {
-                if progress.total_cost >= ceiling {
-                    return self.stop(
-                        &progress.budget,
-                        Observation::LimitReached(spend_limit(
-                            progress.total_cost,
-                            ceiling,
-                            Ceiling::PerRun,
-                        )),
-                    );
-                }
-            }
-            // The machine's day, not this run's (SPEC §11: stop admitting
-            // work once the dollar control is exhausted). Every settled
-            // attempt of this run is already a usage row, so the day's
-            // recorded spend includes it — adding the run's own total
-            // again would count it twice.
-            if let Some(ceiling) = self.config.machine.spending.per_day_micros {
-                let today = self.spent_today(ledger)?;
-                if today >= ceiling {
-                    return self.stop(
-                        &progress.budget,
-                        Observation::LimitReached(spend_limit(today, ceiling, Ceiling::PerDay)),
-                    );
-                }
-            }
-
-            progress.budget.attempts_used += 1;
-            let attempt_index = progress.budget.attempts_used;
-            let tier = progress.budget.tier;
-            let kind = progress.kind;
-            let attempt_id = ledger.insert_attempt(
-                &self.run_id,
-                revision_id,
-                attempt_index as i64,
-                tier.as_str(),
-                kind.as_str(),
-            )?;
-
-            let model_profile = &authority.models[&tier];
-            let prompt = build_prompt(
-                self.config.contract,
-                &manifest,
-                authority.verification_profile.commands.len(),
-                progress.last_failures.as_deref(),
-                kind,
-            );
-
-            // Dispatch intent is persisted BEFORE the process exists
-            // (SPEC §12), keyed so retries cannot duplicate agents.
-            let dispatch_id = self.config.ids.dispatch_id()?;
-            ledger.record_dispatch_intent(
-                &dispatch_id,
-                &self.run_id,
-                Some(attempt_id),
-                &serde_json::json!({
-                    "model": model_profile.id,
-                    "effort": model_profile.effort,
-                    "harness": self.harness,
-                    "tier": tier.as_str(),
-                    "kind": kind.as_str(),
-                    "prompt_bytes": prompt.len(),
-                }),
-                0,
-            )?;
-            ledger.record_features(
-                &dispatch_id,
-                &serde_json::json!({
-                    "attempt_index": attempt_index,
-                    "tier": tier.as_str(),
-                    "model": model_profile.id,
-                    "kind": kind.as_str(),
-                }),
-            )?;
-
-            let remaining_wall = deadline
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_secs(1));
-            // What this attempt may still spend, not the whole ceiling
-            // again: the budget is the run's, not the attempt's.
-            // Saturating: a wrapped remainder would read as a budget
-            // nothing bounds (P7).
-            let remaining_budget = self
-                .config
-                .machine
-                .spending
-                .per_run_micros
-                .map(|ceiling| ceiling.remaining_after(progress.total_cost).to_micros());
-            let spec = LaunchSpec {
-                dispatch_id: dispatch_id.as_str().to_string(),
-                prompt,
-                model: model_profile.id.clone(),
-                effort: model_profile.effort,
-                max_turns: None,
-                budget_micros: remaining_budget,
-                disallowed_tools: authority.disallowed_tools.clone(),
-                allowed_tools: authority.allowed_tools.clone(),
-                work_dir: worktree_path.clone(),
-                env: self.config.worker_env.clone(),
-                wall_timeout: remaining_wall,
-                cancel: None,
-                pid_slot: None,
+            let dispatched = match self.dispatch_attempt(ctx, &mut progress)? {
+                Phase::Ended(outcome) => return Ok(outcome),
+                Phase::Ready(dispatched) => dispatched,
             };
+            let candidate = match self.snapshot_attempt(ctx, &progress, dispatched)? {
+                Phase::Ended(outcome) => return Ok(outcome),
+                Phase::Ready(candidate) => candidate,
+            };
+            match self.judge_candidate(ctx, &mut progress, candidate)? {
+                Step::Again => continue,
+                Step::Ended(outcome) => return Ok(outcome),
+            }
+        }
+    }
 
-            let result = match self.managed_launch(
-                spec,
-                0,
-                None,
-                remaining_budget.unwrap_or(0),
-                deadline,
+    /// Budget ceilings are checked BEFORE admitting more work (SPEC §9,
+    /// §11). `Some(outcome)` means one was reached and the run ended.
+    fn ceiling_reached(
+        &mut self,
+        progress: &Progress,
+        deadline: Instant,
+    ) -> Result<Option<RunOutcome>, RunError> {
+        if progress.budget.attempts_used >= progress.budget.max_attempts {
+            return Ok(Some(self.stop(
                 &progress.budget,
-                Some(&worktree_path),
-            )? {
-                Ok(result) => result,
-                Err(outcome) => {
-                    ledger.finish_dispatch(&dispatch_id, "launch_failed")?;
-                    ledger.finish_attempt(attempt_id, outcome.state(), None, None)?;
-                    return Ok(outcome);
-                }
-            };
-            ledger.finish_dispatch(&dispatch_id, "completed")?;
-
-            // Usage is recorded even when the attempt went nowhere: all
-            // recorded cost, failed runs included (SPEC §11).
-            let usage = &result.usage;
-            let event = UsageEvent {
-                event_id: dispatch_id.as_str().to_string(),
-                run_id: self.run_id.clone(),
-                attempt_id: Some(attempt_id),
-                parent_event_id: None,
-                model: result.effective_model.clone(),
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cache_read_tokens: usage.cache_read_tokens,
-                cache_write_tokens: usage.cache_write_tokens,
-                cost: usage.cost.micros(),
-                cost_kind: CostKind::ApiSpend,
-                completeness: usage.cost.completeness(),
-                inclusive: usage.cost.inclusive(),
-                at: self.config.ledger.now(),
-            };
-            ledger.record_usage(&event)?;
-            // Unknown is not zero: the total stays what was reported, and
-            // the completeness folded below says it is a lower bound.
-            if let Some(cost) = event.cost {
-                progress.total_cost += cost;
-            }
-            progress.cost_completeness = progress.cost_completeness.max(usage.cost.completeness());
-            if let Some(model) = &result.effective_model {
-                if !progress.models_used.contains(model) {
-                    progress.models_used.push(model.clone());
-                }
-            }
-
-            // An unapproved substitution stops further dispatch and
-            // invalidates any claim that the requested route was tested
-            // (SPEC §6). A harness that named NO model leaves the
-            // question open, which is a recorded gap and stops dispatch
-            // just the same: the run cannot say the route was tested
-            // (audit V3).
-            match crate::backend::verify_model(&model_profile.id, result.effective_model.as_deref())
-            {
-                crate::backend::ModelVerification::Matches => {}
-                crate::backend::ModelVerification::Substituted {
-                    requested,
-                    effective,
-                } => {
-                    return self.stop(
-                        &progress.budget,
-                        Observation::UnapprovedSubstitution {
-                            requested,
-                            effective,
-                        },
-                    );
-                }
-                // A dispatch that produced no terminal result — killed by
-                // the wall clock, cancelled, crashed — could not have
-                // reported a model either. The interruption below is the
-                // outcome; calling it an unverified model would hide it.
-                crate::backend::ModelVerification::Unverified { .. }
-                    if result.terminal_result_missing() => {}
-                crate::backend::ModelVerification::Unverified { requested } => {
-                    return self.block(
-                        Reason::UnapprovedSubstitution,
-                        BlockCode::ModelUnverified,
-                        format!(
-                            "the harness reported no effective model, so nothing establishes that \
-                             `{requested}` ran; dispatch stops rather than assume it"
-                        ),
-                    );
-                }
-            }
-
-            // Cancelled through the coordinator: the worktree and
-            // evidence stay; nothing else is dispatched (SPEC §23).
-            if result.ended == Ended::Cancelled {
-                ledger.finish_attempt(
-                    attempt_id,
-                    State::Cancelled,
-                    Some(worktree_path.to_string_lossy().as_ref()),
-                    None,
-                )?;
-                return self.stop(
+                Observation::LimitReached(Limit::Attempts {
+                    max: progress.budget.max_attempts,
+                    last_failures: progress.last_failures.clone().unwrap_or_default(),
+                }),
+            )?));
+        }
+        if Instant::now() >= deadline {
+            return Ok(Some(self.stop(
+                &progress.budget,
+                Observation::LimitReached(Limit::WallClock),
+            )?));
+        }
+        if let Some(ceiling) = self.config.machine.spending.per_run_micros {
+            if progress.spend.total >= ceiling {
+                return Ok(Some(self.stop(
                     &progress.budget,
-                    Observation::Cancelled(
-                        "the dispatch was cancelled through the coordinator; the worktree is preserved"
-                            .into(),
+                    Observation::LimitReached(spend_limit(
+                        progress.spend.total,
+                        ceiling,
+                        Ceiling::PerRun,
+                    )),
+                )?));
+            }
+        }
+        // The machine's day, not this run's (SPEC §11: stop admitting
+        // work once the dollar control is exhausted). Every settled
+        // attempt of this run is already a usage row, so the day's
+        // recorded spend includes it — adding the run's own total
+        // again would count it twice.
+        if let Some(ceiling) = self.config.machine.spending.per_day_micros {
+            let today = self.spent_today(self.config.ledger)?;
+            if today >= ceiling {
+                return Ok(Some(self.stop(
+                    &progress.budget,
+                    Observation::LimitReached(spend_limit(today, ceiling, Ceiling::PerDay)),
+                )?));
+            }
+        }
+        Ok(None)
+    }
+
+    /// One attempt: its ledger row, its prompt, its managed dispatch and
+    /// the accounting that follows — usage, cost and the model the
+    /// harness actually ran (SPEC §6, §11, §12).
+    fn dispatch_attempt(
+        &mut self,
+        ctx: &AttemptContext<'_>,
+        progress: &mut Progress,
+    ) -> Result<Phase<Dispatched>, RunError> {
+        let ledger = self.config.ledger;
+        let authority = &ctx.preflight.authority;
+        progress.budget.attempts_used += 1;
+        let index = progress.budget.attempts_used;
+        let tier = progress.budget.tier;
+        let kind = progress.kind;
+        let attempt_id = ledger.insert_attempt(
+            &self.run_id,
+            ctx.preflight.revision_id,
+            index as i64,
+            tier.as_str(),
+            kind.as_str(),
+        )?;
+
+        let model_profile = &authority.models[&tier];
+        let prompt = build_prompt(
+            self.config.contract,
+            &ctx.preflight.manifest,
+            authority.verification_profile.commands.len(),
+            progress.last_failures.as_deref(),
+            kind,
+        );
+
+        // Dispatch intent is persisted BEFORE the process exists
+        // (SPEC §12), keyed so retries cannot duplicate agents.
+        let dispatch_id = self.config.ids.dispatch_id()?;
+        ledger.record_dispatch_intent(
+            &dispatch_id,
+            &self.run_id,
+            Some(attempt_id),
+            &serde_json::json!({
+                "model": model_profile.id,
+                "effort": model_profile.effort,
+                "harness": self.harness,
+                "tier": tier.as_str(),
+                "kind": kind.as_str(),
+                "prompt_bytes": prompt.len(),
+            }),
+            0,
+        )?;
+        ledger.record_features(
+            &dispatch_id,
+            &serde_json::json!({
+                "attempt_index": index,
+                "tier": tier.as_str(),
+                "model": model_profile.id,
+                "kind": kind.as_str(),
+            }),
+        )?;
+
+        let remaining_wall = ctx
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_secs(1));
+        // What this attempt may still spend, not the whole ceiling
+        // again: the budget is the run's, not the attempt's.
+        // Saturating: a wrapped remainder would read as a budget
+        // nothing bounds (P7).
+        let remaining_budget = self
+            .config
+            .machine
+            .spending
+            .per_run_micros
+            .map(|ceiling| ceiling.remaining_after(progress.spend.total).to_micros());
+        let spec = LaunchSpec {
+            dispatch_id: dispatch_id.as_str().to_string(),
+            prompt,
+            model: model_profile.id.clone(),
+            effort: model_profile.effort,
+            max_turns: None,
+            budget_micros: remaining_budget,
+            disallowed_tools: authority.disallowed_tools.clone(),
+            allowed_tools: authority.allowed_tools.clone(),
+            work_dir: ctx.worktree_path.to_path_buf(),
+            env: self.config.worker_env.clone(),
+            wall_timeout: remaining_wall,
+            cancel: None,
+            pid_slot: None,
+        };
+
+        let requested_model = model_profile.id.clone();
+        let result = match self.managed_launch(ManagedDispatch {
+            spec,
+            depth: 0,
+            parent: None,
+            reserve_micros: remaining_budget.unwrap_or(0),
+            deadline: ctx.deadline,
+            budget: &progress.budget,
+            write_lease: Some(ctx.worktree_path),
+        })? {
+            Ok(result) => result,
+            Err(outcome) => {
+                ledger.finish_dispatch(&dispatch_id, "launch_failed")?;
+                ledger.finish_attempt(attempt_id, outcome.state(), None, None)?;
+                return Ok(Phase::Ended(outcome));
+            }
+        };
+        ledger.finish_dispatch(&dispatch_id, "completed")?;
+
+        // Usage is recorded even when the attempt went nowhere: all
+        // recorded cost, failed runs included (SPEC §11).
+        let usage = &result.usage;
+        let event = UsageEvent {
+            event_id: dispatch_id.as_str().to_string(),
+            run_id: self.run_id.clone(),
+            attempt_id: Some(attempt_id),
+            parent_event_id: None,
+            model: result.effective_model.clone(),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
+            cost: usage.cost.micros(),
+            cost_kind: CostKind::ApiSpend,
+            completeness: usage.cost.completeness(),
+            inclusive: usage.cost.inclusive(),
+            at: self.config.ledger.now(),
+        };
+        ledger.record_usage(&event)?;
+        progress.spend.fold(event.cost, usage.cost.completeness());
+        if let Some(model) = &result.effective_model {
+            if !progress.models_used.contains(model) {
+                progress.models_used.push(model.clone());
+            }
+        }
+
+        // An unapproved substitution stops further dispatch and
+        // invalidates any claim that the requested route was tested
+        // (SPEC §6). A harness that named NO model leaves the
+        // question open, which is a recorded gap and stops dispatch
+        // just the same: the run cannot say the route was tested
+        // (audit V3).
+        match crate::backend::verify_model(&requested_model, result.effective_model.as_deref()) {
+            crate::backend::ModelVerification::Matches => {}
+            crate::backend::ModelVerification::Substituted {
+                requested,
+                effective,
+            } => {
+                return Ok(Phase::Ended(self.stop(
+                    &progress.budget,
+                    Observation::UnapprovedSubstitution {
+                        requested,
+                        effective,
+                    },
+                )?));
+            }
+            // A dispatch that produced no terminal result — killed by
+            // the wall clock, cancelled, crashed — could not have
+            // reported a model either. The interruption below is the
+            // outcome; calling it an unverified model would hide it.
+            crate::backend::ModelVerification::Unverified { .. }
+                if result.terminal_result_missing() => {}
+            crate::backend::ModelVerification::Unverified { requested } => {
+                return Ok(Phase::Ended(self.block(
+                    Reason::UnapprovedSubstitution,
+                    BlockCode::ModelUnverified,
+                    format!(
+                        "the harness reported no effective model, so nothing establishes that \
+                         `{requested}` ran; dispatch stops rather than assume it"
                     ),
-                );
+                )?));
             }
+        }
+        Ok(Phase::Ready(Dispatched {
+            attempt_id,
+            index,
+            tier,
+            result,
+        }))
+    }
 
-            // Missing terminal result = interrupted, not failed (SPEC §9).
-            if result.terminal_result_missing() {
-                ledger.finish_attempt(
-                    attempt_id,
-                    State::Interrupted,
-                    Some(worktree_path.to_string_lossy().as_ref()),
-                    None,
-                )?;
-                return self.stop(
-                    &progress.budget,
-                    Observation::TerminalResultMissing {
-                        timed_out: result.ended == Ended::TimedOut,
-                        detail: result.failure_detail.clone().unwrap_or_default(),
-                    },
-                );
+    /// What the worker left behind, turned into a candidate: the
+    /// immutable snapshot, its name, its patch and its scope (SPEC §8).
+    /// The ways an attempt ends without one — cancelled, interrupted,
+    /// blocked, a tree still being written, a scope violation — end the
+    /// run here.
+    fn snapshot_attempt(
+        &mut self,
+        ctx: &AttemptContext<'_>,
+        progress: &Progress,
+        dispatched: Dispatched,
+    ) -> Result<Phase<Candidate>, RunError> {
+        let ledger = self.config.ledger;
+        let Dispatched {
+            attempt_id,
+            index,
+            tier,
+            result,
+        } = dispatched;
+        let worktree_path = ctx.worktree_path;
+        let held_worktree = worktree_path.to_string_lossy().into_owned();
+
+        // Cancelled through the coordinator: the worktree and
+        // evidence stay; nothing else is dispatched (SPEC §23).
+        if result.ended == Ended::Cancelled {
+            ledger.finish_attempt(attempt_id, State::Cancelled, Some(&held_worktree), None)?;
+            return Ok(Phase::Ended(self.stop(
+                &progress.budget,
+                Observation::Cancelled(
+                    "the dispatch was cancelled through the coordinator; the worktree is preserved"
+                        .into(),
+                ),
+            )?));
+        }
+
+        // Missing terminal result = interrupted, not failed (SPEC §9).
+        if result.terminal_result_missing() {
+            ledger.finish_attempt(attempt_id, State::Interrupted, Some(&held_worktree), None)?;
+            return Ok(Phase::Ended(self.stop(
+                &progress.budget,
+                Observation::TerminalResultMissing {
+                    timed_out: result.ended == Ended::TimedOut,
+                    detail: result.failure_detail.clone().unwrap_or_default(),
+                },
+            )?));
+        }
+
+        // The worker's answer is evidence — for an inspect task it is
+        // the whole deliverable (SPEC §4) — recorded before anything
+        // is judged about it.
+        if let Some(text) = result.result_text.as_deref() {
+            let result_path = self.artifacts.join(format!("attempt-{index}-result.txt"));
+            self.record_artifact(Some(attempt_id), "worker_result", &result_path, text)?;
+        }
+
+        // A worker blockage proposal is recorded as evidence and the
+        // runner assigns blocked — the environment is never escalated
+        // to a stronger model (SPEC §9).
+        if result.worker_claims_blockage {
+            ledger.finish_attempt(attempt_id, State::Blocked, None, None)?;
+            return Ok(Phase::Ended(self.stop(
+                &progress.budget,
+                Observation::WorkerBlockage(result.result_text.unwrap_or_default()),
+            )?));
+        }
+
+        // Nothing is snapshotted from a tree still being written: the
+        // worker's own lease went back when its process ended, so
+        // any holder here is a straggler another tab or run owns
+        // (SPEC §23).
+        if let Some(holder) = self.wait_for_writers(worktree_path, ctx.deadline)? {
+            ledger.finish_attempt(attempt_id, State::Interrupted, Some(&held_worktree), None)?;
+            return Ok(Phase::Ended(
+                self.stop_on_held_lease(worktree_path, &holder)?,
+            ));
+        }
+
+        // The candidate snapshot is recorded outside model control,
+        // added files included (SPEC §8).
+        let sha = match ctx
+            .worktree
+            .snapshot_candidate(&format!("run {} attempt {index}", self.run_id))
+        {
+            Ok(sha) => sha,
+            Err(e) => {
+                ledger.finish_attempt(attempt_id, State::Interrupted, None, None)?;
+                return Ok(Phase::Ended(
+                    self.fail_preflight(BlockCode::SnapshotFailed, e.to_string())?,
+                ));
             }
+        };
+        // `commit-tree` leaves a dangling object: the candidate the
+        // receipt names, the patch's other side and the worktree's
+        // history would all go in the next `git gc`. A ref under
+        // `refs/relais/candidates/` keeps it reachable without
+        // putting a branch in the user's namespace (audit B15).
+        // A ref that could not be written is not fatal — the object
+        // exists and this run can verify it — but the worktree is
+        // then the only thing keeping it alive, so it is not
+        // released below.
+        let reference =
+            workspace::name_candidate(self.config.repo_dir, self.run_id.as_str(), index, &sha).ok();
+        ledger.finish_attempt(
+            attempt_id,
+            State::Verifying,
+            Some(&held_worktree),
+            Some(&sha),
+        )?;
+        std::fs::write(self.artifacts.join(format!("candidate-{index}.sha")), &sha)?;
+        let patch_path = self.artifacts.join(format!("candidate-{index}.patch"));
+        ctx.worktree.export_patch(&sha, &patch_path)?;
+        // The reviewer's prompt names `candidate-latest.patch`, so the
+        // copy is part of producing the candidate, not a convenience:
+        // a failure here stops the run instead of handing a reviewer a
+        // path that is not there (R4).
+        let latest_patch = self.artifacts.join("candidate-latest.patch");
+        std::fs::copy(&patch_path, &latest_patch)?;
+        ledger.record_evidence(
+            &self.run_id,
+            Some(attempt_id),
+            "candidate_patch",
+            &patch_path,
+            Some(&workspace::sha256_file(&patch_path)?),
+        )?;
 
-            // The worker's answer is evidence — for an inspect task it is
-            // the whole deliverable (SPEC §4) — recorded before anything
-            // is judged about it.
-            if let Some(text) = result.result_text.as_deref() {
-                let result_path = self
-                    .artifacts
-                    .join(format!("attempt-{attempt_index}-result.txt"));
-                std::fs::write(&result_path, text)?;
-                ledger.record_evidence(
-                    &self.run_id,
-                    Some(attempt_id),
-                    "worker_result",
-                    &result_path,
-                    workspace::sha256_file(&result_path).ok().as_deref(),
-                )?;
+        // Write scope is checked on the actual diff; a violation can
+        // never be accepted (SPEC §8, §9).
+        match workspace::check_scope(ctx.worktree, &sha, self.config.contract) {
+            Ok(_) => {}
+            Err(WorkspaceError::ScopeViolation(paths)) => {
+                ledger.finish_attempt(attempt_id, State::NeedsDecision, None, Some(&sha))?;
+                return Ok(Phase::Ended(
+                    self.stop(&progress.budget, Observation::ScopeViolation(paths))?,
+                ));
             }
-
-            // A worker blockage proposal is recorded as evidence and the
-            // runner assigns blocked — the environment is never escalated
-            // to a stronger model (SPEC §9).
-            if result.worker_claims_blockage {
-                ledger.finish_attempt(attempt_id, State::Blocked, None, None)?;
-                return self.stop(
-                    &progress.budget,
-                    Observation::WorkerBlockage(result.result_text.unwrap_or_default()),
-                );
+            Err(e) => {
+                return Ok(Phase::Ended(
+                    self.fail_preflight(BlockCode::ScopeCheckFailed, e.to_string())?,
+                ));
             }
+        }
 
-            // Nothing is snapshotted from a tree still being written: the
-            // worker's own lease went back when its process ended, so
-            // any holder here is a straggler another tab or run owns
-            // (SPEC §23).
-            if let Some(holder) = self.wait_for_writers(&worktree_path, deadline)? {
-                ledger.finish_attempt(
-                    attempt_id,
-                    State::Interrupted,
-                    Some(worktree_path.to_string_lossy().as_ref()),
-                    None,
-                )?;
-                return self.stop_on_held_lease(&worktree_path, &holder);
-            }
+        Ok(Phase::Ready(Candidate {
+            attempt_id,
+            index,
+            tier,
+            sha,
+            reference,
+            patch_path,
+            latest_patch,
+            permission_denials: result.permission_denials,
+        }))
+    }
 
-            // The candidate snapshot is recorded outside model control,
-            // added files included (SPEC §8).
-            let candidate_sha = match worktree
-                .snapshot_candidate(&format!("run {} attempt {attempt_index}", self.run_id))
-            {
-                Ok(sha) => sha,
-                Err(e) => {
-                    ledger.finish_attempt(attempt_id, State::Interrupted, None, None)?;
-                    return self.fail_preflight(BlockCode::SnapshotFailed, e.to_string());
-                }
-            };
-            // `commit-tree` leaves a dangling object: the candidate the
-            // receipt names, the patch's other side and the worktree's
-            // history would all go in the next `git gc`. A ref under
-            // `refs/relais/candidates/` keeps it reachable without
-            // putting a branch in the user's namespace (audit B15).
-            // A ref that could not be written is not fatal — the object
-            // exists and this run can verify it — but the worktree is
-            // then the only thing keeping it alive, so it is not
-            // released below.
-            let candidate_ref = workspace::name_candidate(
-                self.config.repo_dir,
-                self.run_id.as_str(),
-                attempt_index,
-                &candidate_sha,
-            )
-            .ok();
+    /// Judge one candidate (SPEC §9, §10): what it changes about
+    /// verification, whether the worker could act at all, the profile's
+    /// checks, and what the machine says about the failures.
+    fn judge_candidate(
+        &mut self,
+        ctx: &AttemptContext<'_>,
+        progress: &mut Progress,
+        candidate: Candidate,
+    ) -> Result<Step, RunError> {
+        let ledger = self.config.ledger;
+        let authority = &ctx.preflight.authority;
+        let worktree_path = ctx.worktree_path;
+        let held_worktree = worktree_path.to_string_lossy().into_owned();
+
+        // A candidate that changes what verification IS gets neither
+        // a silent pass nor one uniform answer (SPEC §9, §10).
+        // Editing the profile's own inputs — build manifests,
+        // lockfiles, the commands' programs — is "changes protected
+        // verification": §9's table sends that to the user as
+        // `needs_decision`, because no reviewer can decide on the
+        // user's behalf that a loosened build is what was wanted.
+        // Editing the TEST TREE is work §10 explicitly invites, so
+        // it stays what it was: explicit review, whatever the route
+        // said (audit B8).
+        let touched_inputs = verify::classify_verification_inputs(
+            &authority.verification_profile,
+            &ctx.worktree.changed_paths_in(&candidate.sha)?,
+        )?;
+        if !touched_inputs.policy.is_empty() {
+            let detail = format!(
+                "the candidate changes what verification is: {}; these are the profile's own \
+                 inputs, so passing its checks would not mean what the policy says it means. \
+                 This is yours to decide, not a reviewer's — the candidate and its patch are \
+                 preserved",
+                touched_inputs.policy.join(", ")
+            );
             ledger.finish_attempt(
-                attempt_id,
+                candidate.attempt_id,
+                State::NeedsDecision,
+                Some(&held_worktree),
+                Some(&candidate.sha),
+            )?;
+            return Ok(Step::Ended(self.finish(
+                Reason::VerificationInputsChanged,
+                serde_json::json!({
+                    "paths": touched_inputs.policy,
+                    "candidate": candidate.sha,
+                }),
+                Terminal::NeedsDecision {
+                    reason: Reason::VerificationInputsChanged,
+                    detail,
+                },
+            )?));
+        }
+        let verification_inputs_changed = touched_inputs.tests;
+        let review_required = ctx.preflight.decision.review >= Review::Required
+            || !verification_inputs_changed.is_empty();
+        if !verification_inputs_changed.is_empty()
+            && ctx.preflight.decision.review < Review::Required
+        {
+            self.transition(
                 State::Verifying,
-                Some(worktree_path.to_string_lossy().as_ref()),
-                Some(&candidate_sha),
+                Reason::VerificationInputsChanged,
+                serde_json::json!({ "paths": verification_inputs_changed }),
             )?;
-            std::fs::write(
-                self.artifacts
-                    .join(format!("candidate-{attempt_index}.sha")),
-                &candidate_sha,
-            )?;
-            let patch_path = self
-                .artifacts
-                .join(format!("candidate-{attempt_index}.patch"));
-            worktree.export_patch(&candidate_sha, &patch_path)?;
-            // The reviewer's prompt names this path; it must exist.
-            std::fs::copy(&patch_path, self.artifacts.join("candidate-latest.patch"))?;
-            ledger.record_evidence(
-                &self.run_id,
-                Some(attempt_id),
-                "candidate_patch",
-                &patch_path,
-                workspace::sha256_file(&patch_path).ok().as_deref(),
-            )?;
+        }
 
-            // Write scope is checked on the actual diff; a violation can
-            // never be accepted (SPEC §8, §9).
-            match workspace::check_scope(&worktree, &candidate_sha, self.config.contract) {
-                Ok(_) => {}
-                Err(WorkspaceError::ScopeViolation(paths)) => {
-                    ledger.finish_attempt(
-                        attempt_id,
-                        State::NeedsDecision,
-                        None,
-                        Some(&candidate_sha),
-                    )?;
-                    return self.stop(&progress.budget, Observation::ScopeViolation(paths));
-                }
-                Err(e) => {
-                    return self.fail_preflight(BlockCode::ScopeCheckFailed, e.to_string());
-                }
+        // Verification against an immutable copy of the candidate
+        // (SPEC §10). Entering `verifying` is a transition like every
+        // other: assigned straight to the field, the ledger never
+        // showed the state it then recorded as the next row's origin
+        // (R7).
+        self.transition(
+            State::Verifying,
+            Reason::VerificationStarted,
+            serde_json::json!({ "candidate": candidate.sha, "attempt": candidate.index }),
+        )?;
+        // A candidate that carries the base tree has the baseline's
+        // results by identity: the commands are not spent again, and
+        // the receipt says so.
+        let identical = match ctx.worktree.same_tree_as_base(&candidate.sha) {
+            Ok(same) => same,
+            Err(e) => {
+                return Ok(Step::Ended(
+                    self.fail_preflight(BlockCode::SnapshotFailed, e.to_string())?,
+                ));
             }
-
-            // A candidate that changes what verification IS gets neither
-            // a silent pass nor one uniform answer (SPEC §9, §10).
-            // Editing the profile's own inputs — build manifests,
-            // lockfiles, the commands' programs — is "changes protected
-            // verification": §9's table sends that to the user as
-            // `needs_decision`, because no reviewer can decide on the
-            // user's behalf that a loosened build is what was wanted.
-            // Editing the TEST TREE is work §10 explicitly invites, so
-            // it stays what it was: explicit review, whatever the route
-            // said (audit B8).
-            let touched_inputs = verify::classify_verification_inputs(
-                &authority.verification_profile,
-                &worktree.changed_paths_in(&candidate_sha)?,
-            )?;
-            if !touched_inputs.policy.is_empty() {
-                let detail = format!(
-                    "the candidate changes what verification is: {}; these are the profile's own \
-                     inputs, so passing its checks would not mean what the policy says it means. \
-                     This is yours to decide, not a reviewer's — the candidate and its patch are \
-                     preserved",
-                    touched_inputs.policy.join(", ")
-                );
+        };
+        // Tools the harness refused. A worker that produced nothing
+        // while being refused could not act: blocked, and a stronger
+        // model is not bought for a missing permission (SPEC §8, §9).
+        // A worker that delivered a candidate anyway was refused
+        // something it did not need; that is evidence on the run,
+        // and the candidate is judged like any other.
+        //
+        // "Produced nothing" is measured against the attempt before it
+        // once there is one: from attempt 2 the previous attempt's work
+        // is already in the tree, so comparing to the BASE says every
+        // refused repair worker produced something (R2).
+        let produced_nothing = match progress.last_candidate.as_deref() {
+            Some(previous) => previous == candidate.sha,
+            None => identical,
+        };
+        if !candidate.permission_denials.is_empty() {
+            if produced_nothing {
                 ledger.finish_attempt(
-                    attempt_id,
-                    State::NeedsDecision,
-                    Some(worktree_path.to_string_lossy().as_ref()),
-                    Some(&candidate_sha),
+                    candidate.attempt_id,
+                    State::Blocked,
+                    Some(&held_worktree),
+                    Some(&candidate.sha),
                 )?;
-                return self.finish(
-                    Reason::VerificationInputsChanged,
-                    serde_json::json!({
-                        "paths": touched_inputs.policy,
-                        "candidate": candidate_sha,
-                    }),
-                    Terminal::NeedsDecision {
-                        reason: Reason::VerificationInputsChanged,
-                        detail,
-                    },
-                );
-            }
-            let verification_inputs_changed = touched_inputs.tests;
-            let review_required =
-                decision.review >= Review::Required || !verification_inputs_changed.is_empty();
-            if !verification_inputs_changed.is_empty() && decision.review < Review::Required {
-                self.transition(
-                    State::Verifying,
-                    Reason::VerificationInputsChanged,
-                    serde_json::json!({ "paths": verification_inputs_changed }),
-                )?;
-            }
-
-            // Verification against an immutable copy of the candidate
-            // (SPEC §10). A candidate that carries the base tree has the
-            // baseline's results by identity: the commands are not spent
-            // again, and the receipt says so.
-            self.state = State::Verifying;
-            let identical = match worktree.same_tree_as_base(&candidate_sha) {
-                Ok(same) => same,
-                Err(e) => {
-                    return self.fail_preflight(BlockCode::SnapshotFailed, e.to_string());
-                }
-            };
-            // Tools the harness refused. A worker that produced nothing
-            // while being refused could not act: blocked, and a stronger
-            // model is not bought for a missing permission (SPEC §8, §9).
-            // A worker that delivered a candidate anyway was refused
-            // something it did not need; that is evidence on the run,
-            // and the candidate is judged like any other.
-            if !result.permission_denials.is_empty() {
-                if identical {
-                    ledger.finish_attempt(
-                        attempt_id,
-                        State::Blocked,
-                        Some(worktree_path.to_string_lossy().as_ref()),
-                        Some(&candidate_sha),
-                    )?;
-                    return self.stop(
-                        &progress.budget,
-                        Observation::PermissionDenied(result.permission_denials.clone()),
-                    );
-                }
-                self.transition(
-                    State::Verifying,
-                    Reason::PermissionDenied,
-                    serde_json::json!({
-                        "tools": result.permission_denials,
-                        "candidate": candidate_sha,
-                        "note": "refused during the attempt; the candidate was still produced",
-                    }),
-                )?;
-            }
-            let reuse = if identical {
-                self.transition(
-                    State::Verifying,
-                    Reason::CandidateIdenticalToBase,
-                    serde_json::json!({ "candidate": candidate_sha }),
-                )?;
-                baseline_checks.as_deref()
-            } else {
-                None
-            };
-            let verify::Verified {
-                checks,
-                gaps,
-                amont_bypasses,
-                amont_downgrades,
-            } = match self.verify_candidate(
-                &worktree,
-                &candidate_sha,
-                &authority,
-                &logs_dir,
-                attempt_index,
-                reuse,
-            ) {
-                Ok(result) => result,
-                Err(e) => {
-                    return self.fail_preflight(BlockCode::VerificationUnavailable, e);
-                }
-            };
-            if !gaps.is_empty() {
-                return self.stop(&progress.budget, Observation::VerificationGap(gaps));
-            }
-            let mut failures: Vec<String> = checks
-                .iter()
-                .filter(|check| check.failed())
-                .map(|check| check.label.clone())
-                .collect();
-            // A change task whose candidate changes nothing has not met
-            // its objective, whatever the baseline says: a behavioural
-            // failure the worker can repair, never an acceptance.
-            if identical && self.config.contract.kind() == crate::contract::Kind::Change {
-                failures.push("empty_candidate".into());
-            }
-
-            if !failures.is_empty() {
-                let unchanged_candidate =
-                    progress.last_candidate.as_deref() == Some(candidate_sha.as_str());
-                let same_failures = progress.last_failures.as_deref() == Some(failures.as_slice());
-                progress.last_candidate = Some(candidate_sha.clone());
-                let all_preexisting = failures
-                    .iter()
-                    .all(|label| baseline_failures.contains(label));
-                progress.last_failures = Some(failures.clone());
-                match self.decide(
+                return Ok(Step::Ended(self.stop(
                     &progress.budget,
-                    Observation::VerificationFailed {
-                        failures,
-                        unchanged_candidate,
-                        same_failures,
-                        all_preexisting,
-                    },
-                )? {
-                    Next::Attempt { kind, tier } => {
-                        if kind == AttemptKind::Repair {
-                            progress.budget.repairs_used += 1;
-                        }
-                        progress.kind = kind;
-                        progress.budget.tier = tier;
-                        continue;
-                    }
-                    Next::Accept => {
-                        return Err(RunError::Other(
-                            "the machine accepted a failing candidate".into(),
-                        ))
-                    }
-                    Next::Stop(terminal) => {
-                        return Ok(RunOutcome {
-                            run_id: self.run_id.clone(),
-                            terminal,
-                        })
-                    }
-                }
+                    Observation::PermissionDenied(candidate.permission_denials.clone()),
+                )?));
             }
+            self.transition(
+                State::Verifying,
+                Reason::PermissionDenied,
+                serde_json::json!({
+                    "tools": candidate.permission_denials,
+                    "candidate": candidate.sha,
+                    "note": "refused during the attempt; the candidate was still produced",
+                }),
+            )?;
+        }
+        let reuse = if identical {
+            self.transition(
+                State::Verifying,
+                Reason::CandidateIdenticalToBase,
+                serde_json::json!({ "candidate": candidate.sha }),
+            )?;
+            ctx.baseline.checks.as_deref()
+        } else {
+            None
+        };
+        let verify::Verified {
+            checks,
+            gaps,
+            amont_bypasses,
+            amont_downgrades,
+        } = match self.verify_candidate(
+            &candidate.sha,
+            authority,
+            &ctx.baseline.logs_dir,
+            AttemptLabel::Attempt(candidate.index),
+            reuse,
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                return Ok(Step::Ended(
+                    self.fail_preflight(BlockCode::VerificationUnavailable, e)?,
+                ));
+            }
+        };
+        if !gaps.is_empty() {
+            return Ok(Step::Ended(
+                self.stop(&progress.budget, Observation::VerificationGap(gaps))?,
+            ));
+        }
+        let mut failures: Vec<String> = checks
+            .iter()
+            .filter(|check| check.failed())
+            .map(|check| check.label.clone())
+            .collect();
+        // A change task whose candidate changes nothing has not met
+        // its objective, whatever the baseline says: a behavioural
+        // failure the worker can repair, never an acceptance.
+        if identical && self.config.contract.kind() == crate::contract::Kind::Change {
+            failures.push("empty_candidate".into());
+        }
 
-            // Checks pass. Semantic review is risk-dependent (SPEC §10).
-            if review_required {
-                let review = self.review_candidate(
-                    &manifest,
-                    &authority,
-                    &candidate_sha,
-                    tier,
-                    &verification_inputs_changed,
-                    &mut progress.total_cost,
-                    &mut progress.cost_completeness,
-                    deadline,
-                );
-                match review {
-                    ReviewOutcome::NoFindings => {}
-                    ReviewOutcome::Findings(detail) => {
-                        return self.stop(&progress.budget, Observation::ReviewFindings(detail));
+        if !failures.is_empty() {
+            let same_failures = progress.last_failures.as_deref() == Some(failures.as_slice());
+            progress.last_candidate = Some(candidate.sha.clone());
+            let all_preexisting = failures
+                .iter()
+                .all(|label| ctx.baseline.failures.contains(label));
+            progress.last_failures = Some(failures.clone());
+            return match self.decide(
+                &progress.budget,
+                Observation::VerificationFailed {
+                    failures,
+                    unchanged_candidate: produced_nothing,
+                    same_failures,
+                    all_preexisting,
+                },
+            )? {
+                Next::Attempt { kind, tier } => {
+                    if kind == AttemptKind::Repair {
+                        progress.budget.repairs_used += 1;
                     }
-                    ReviewOutcome::Unavailable(detail) => {
-                        return self.stop(&progress.budget, Observation::ReviewUnavailable(detail));
-                    }
+                    progress.kind = kind;
+                    progress.budget.tier = tier;
+                    Ok(Step::Again)
                 }
-            }
+                Next::Accept => Err(RunError::Other(
+                    "the machine accepted a failing candidate".into(),
+                )),
+                Next::Stop(terminal) => Ok(Step::Ended(RunOutcome {
+                    run_id: self.run_id.clone(),
+                    terminal,
+                })),
+            };
+        }
 
-            // Accepted: a receipt bound to this candidate (SPEC §10, §12).
-            match self.decide(&progress.budget, Observation::ChecksAndReviewPassed)? {
-                Next::Accept => {}
-                other => {
-                    return Err(RunError::Other(format!(
-                        "the machine answered {other:?} to a passing candidate"
-                    )))
-                }
-            }
-            let report = VerificationReport {
-                candidate_sha: candidate_sha.clone(),
-                base_sha: base_sha.clone(),
-                contract_hash: contract_hash.clone(),
-                policy_hash: authority.authority_hash.clone(),
+        self.accept_candidate(
+            ctx,
+            progress,
+            &candidate,
+            Verified {
                 checks,
                 gaps,
-                baseline_failures,
                 amont_bypasses,
                 amont_downgrades,
                 verification_inputs_changed,
-                integration_gaps: integration_gaps.clone(),
-                baseline_cached,
-                baseline_cache_refused: baseline_cache_refused.clone(),
-            };
-            let receipt = Receipt {
-                run_id: self.run_id.as_str().to_string(),
-                candidate_sha: candidate_sha.clone(),
-                base_sha,
-                contract_hash,
-                policy_hash: authority.authority_hash,
-                outcome: State::Accepted.as_str().to_string(),
-                verification: report,
-                models_used: progress.models_used,
-                attempts: attempt_index,
-                cost_completeness: progress.cost_completeness,
-                cost: progress.total_cost,
-            };
-            self.seal(
-                &receipt,
-                Some(attempt_id),
-                Some(&worktree_path),
-                &candidate_sha,
-            )?;
-            // The patch is exported and the candidate is named: what the
-            // user integrates no longer depends on this directory —
-            // unless something wrote to it since, which the release
-            // check is what notices.
-            self.release_task_worktree(
-                &worktree,
-                &candidate_sha,
-                &patch_path,
-                candidate_ref.as_deref(),
+                review_required,
+            },
+        )
+        .map(Step::Ended)
+    }
+
+    /// Checks pass: semantic review where the risk asks for it, then a
+    /// receipt bound to this candidate (SPEC §10, §12).
+    fn accept_candidate(
+        &mut self,
+        ctx: &AttemptContext<'_>,
+        progress: &mut Progress,
+        candidate: &Candidate,
+        verified: Verified,
+    ) -> Result<RunOutcome, RunError> {
+        let preflight = ctx.preflight;
+        if verified.review_required {
+            let review = self.review_candidate(
+                &ReviewRequest {
+                    manifest: &preflight.manifest,
+                    authority: &preflight.authority,
+                    candidate_sha: &candidate.sha,
+                    candidate_tier: candidate.tier,
+                    verification_inputs_changed: &verified.verification_inputs_changed,
+                    patch_path: candidate.latest_patch.clone(),
+                    deadline: ctx.deadline,
+                },
+                &mut progress.spend,
             );
-            return Ok(RunOutcome {
-                run_id: self.run_id.clone(),
-                terminal: Terminal::Accepted(Box::new(receipt)),
-            });
+            match review {
+                ReviewOutcome::NoFindings => {}
+                ReviewOutcome::Findings(detail) => {
+                    return self.stop(&progress.budget, Observation::ReviewFindings(detail));
+                }
+                ReviewOutcome::Unavailable(detail) => {
+                    return self.stop(&progress.budget, Observation::ReviewUnavailable(detail));
+                }
+            }
         }
+
+        match self.decide(&progress.budget, Observation::ChecksAndReviewPassed)? {
+            Next::Accept => {}
+            other => {
+                return Err(RunError::Other(format!(
+                    "the machine answered {other:?} to a passing candidate"
+                )))
+            }
+        }
+        let report = VerificationReport {
+            candidate_sha: candidate.sha.clone(),
+            base_sha: preflight.base_sha.clone(),
+            contract_hash: preflight.contract_hash.clone(),
+            policy_hash: preflight.authority.authority_hash.clone(),
+            checks: verified.checks,
+            gaps: verified.gaps,
+            baseline_failures: ctx.baseline.failures.clone(),
+            amont_bypasses: verified.amont_bypasses,
+            amont_downgrades: verified.amont_downgrades,
+            verification_inputs_changed: verified.verification_inputs_changed,
+            integration_gaps: preflight.integration_gaps.clone(),
+            baseline_cached: ctx.baseline.cached,
+            baseline_cache_refused: ctx.baseline.cache_refused.clone(),
+        };
+        let receipt = Receipt {
+            run_id: self.run_id.as_str().to_string(),
+            candidate_sha: candidate.sha.clone(),
+            base_sha: preflight.base_sha.clone(),
+            contract_hash: preflight.contract_hash.clone(),
+            policy_hash: preflight.authority.authority_hash.clone(),
+            outcome: State::Accepted.as_str().to_string(),
+            verification: report,
+            models_used: std::mem::take(&mut progress.models_used),
+            attempts: candidate.index,
+            cost_completeness: progress.spend.completeness,
+            cost: progress.spend.total,
+        };
+        self.seal(
+            &receipt,
+            Some(candidate.attempt_id),
+            Some(ctx.worktree_path),
+            &candidate.sha,
+        )?;
+        // The patch is exported and the candidate is named: what the
+        // user integrates no longer depends on this directory —
+        // unless something wrote to it since, which the release
+        // check is what notices.
+        self.release_exported_worktree(
+            ctx.worktree,
+            TreeIdentity::Resnapshot,
+            &candidate.sha,
+            &candidate.patch_path,
+            candidate.reference.as_deref(),
+        )?;
+        Ok(RunOutcome {
+            run_id: self.run_id.clone(),
+            terminal: Terminal::Accepted(Box::new(receipt)),
+        })
     }
 
     /// Is a spending ceiling already reached, so the review must not be
@@ -1733,14 +2258,18 @@ impl<'a> RunEngine<'a> {
         self.config.repo_dir.to_path_buf()
     }
 
-    /// Release an ACCEPTED run's task worktree.
+    /// Release a worktree whose content is already durable elsewhere:
+    /// an accepted run's task worktree, or the integration worktree of
+    /// an accepted decomposed run.
     ///
-    /// SPEC §8's "retained worktree" is what a run that did not accept
-    /// leaves behind: the unfinished work lives there and nowhere else.
-    /// An accepted run's content lives in two durable places already —
-    /// the exported patch and the named candidate commit — so keeping
-    /// its worktree only grows `git worktree list` by one entry per
-    /// accepted run (audit B15).
+    /// SPEC §8 lists a "retained worktree" among what SUCCESSFUL
+    /// execution delivers. Relais deviates deliberately: an accepted
+    /// run's content lives in two durable places already — the exported
+    /// patch and the named candidate commit — and the directory adds
+    /// nothing to them while adding one permanent entry to `git
+    /// worktree list` per accepted run (audit B15). A run that did NOT
+    /// accept keeps its worktree, because there the unfinished work
+    /// lives nowhere else.
     ///
     /// Released only when all three hold: the patch exists, the ref
     /// names the candidate, and the tree STILL holds exactly that
@@ -1749,57 +2278,118 @@ impl<'a> RunEngine<'a> {
     /// theoretical: a descendant that outlived the worker's result
     /// writes into this directory after the snapshot, and that content
     /// is in no patch. Anything unaccounted for keeps the worktree, on
-    /// the record. A failure here never touches the outcome; the
-    /// receipt is already written.
-    pub(crate) fn release_task_worktree(
+    /// the record.
+    pub(crate) fn release_exported_worktree(
         &self,
         worktree: &TaskWorktree,
+        identity: TreeIdentity,
         candidate_sha: &str,
         patch_path: &Path,
         candidate_ref: Option<&str>,
-    ) {
+    ) -> Result<(), RunError> {
         if candidate_ref.is_none() || !patch_path.is_file() {
-            return;
+            return self.keep_worktree(serde_json::json!({
+                "worktree": worktree.path.to_string_lossy(),
+                "candidate": candidate_sha,
+                "named": candidate_ref.is_some(),
+                "patch": patch_path.to_string_lossy(),
+                "detail": "the candidate is not both named by a ref and exported as a patch, so \
+                           the worktree is the only place it lives",
+            }));
         }
-        let keep = |detail: serde_json::Value| {
-            let _ = self.config.ledger.record_transition(&Transition {
-                run_id: self.run_id.clone(),
-                attempt_id: None,
-                from_state: Some(State::Accepted),
-                to_state: State::Accepted,
-                reason: Reason::WorktreeNotReleased.as_str().to_string(),
-                detail: Some(detail),
-                at: self.config.ledger.now(),
-            });
+        let disposition = match identity {
+            // Re-snapshotting is the comparison: the candidate identity
+            // is a pure function of (tree, base), so an equal SHA means
+            // every byte is in the patch and the ref.
+            TreeIdentity::Resnapshot => match worktree.snapshot_candidate("release check") {
+                Ok(now) if now == candidate_sha => Disposition::Exported,
+                Ok(now) => {
+                    return self.keep_worktree(serde_json::json!({
+                        "worktree": worktree.path.to_string_lossy(),
+                        "accepted_candidate": candidate_sha,
+                        "tree_now": now,
+                        "detail": "the tree changed after the accepted candidate was snapshotted; \
+                                   the worktree is kept, because those changes are in no patch",
+                    }));
+                }
+                Err(e) => {
+                    return self.keep_worktree(serde_json::json!({
+                        "worktree": worktree.path.to_string_lossy(),
+                        "error": e.to_string(),
+                        "detail": "the tree could not be compared to the accepted candidate",
+                    }));
+                }
+            },
+            // A checked-out tree is shown to hold the candidate by its
+            // HEAD; `MustBeClean` then answers the other half — nothing
+            // uncommitted — inside the release itself.
+            TreeIdentity::CheckedOut => match head_revision(&worktree.path) {
+                Ok(head) if head == candidate_sha => Disposition::MustBeClean,
+                Ok(head) => {
+                    return self.keep_worktree(serde_json::json!({
+                        "worktree": worktree.path.to_string_lossy(),
+                        "accepted_candidate": candidate_sha,
+                        "head_now": head,
+                        "detail": "the worktree no longer holds the accepted revision",
+                    }));
+                }
+                Err(e) => {
+                    return self.keep_worktree(serde_json::json!({
+                        "worktree": worktree.path.to_string_lossy(),
+                        "error": e.to_string(),
+                        "detail": "the worktree's head could not be read",
+                    }));
+                }
+            },
         };
-        // Re-snapshotting is the comparison: the candidate identity is a
-        // pure function of the tree, so an equal SHA means every byte is
-        // in the patch and the ref.
-        match worktree.snapshot_candidate("release check") {
-            Ok(now) if now == candidate_sha => {}
-            Ok(now) => {
-                return keep(serde_json::json!({
-                    "worktree": worktree.path.to_string_lossy(),
-                    "accepted_candidate": candidate_sha,
-                    "tree_now": now,
-                    "detail": "the tree changed after the accepted candidate was snapshotted; \
-                               the worktree is kept, because those changes are in no patch",
-                }));
-            }
-            Err(e) => {
-                return keep(serde_json::json!({
-                    "worktree": worktree.path.to_string_lossy(),
-                    "error": e.to_string(),
-                    "detail": "the tree could not be compared to the accepted candidate",
-                }));
-            }
-        }
-        if let Err(e) = workspace::release_worktree(self.config.repo_dir, &worktree.path, true) {
-            keep(serde_json::json!({
+        if let Err(e) =
+            workspace::release_worktree(self.config.repo_dir, &worktree.path, disposition)
+        {
+            return self.keep_worktree(serde_json::json!({
                 "worktree": worktree.path.to_string_lossy(),
                 "error": e.to_string(),
             }));
         }
+        Ok(())
+    }
+
+    /// Record that a worktree was kept and why. The run is accepted
+    /// either way — its content is in the patch and the candidate ref —
+    /// but a directory relais decided not to remove says so on the
+    /// record rather than nowhere.
+    fn keep_worktree(&self, detail: serde_json::Value) -> Result<(), RunError> {
+        self.config.ledger.record_transition(&Transition {
+            run_id: self.run_id.clone(),
+            attempt_id: None,
+            from_state: Some(State::Accepted),
+            to_state: State::Accepted,
+            reason: Reason::WorktreeNotReleased.as_str().to_string(),
+            detail: Some(detail),
+            at: self.config.ledger.now(),
+        })?;
+        Ok(())
+    }
+
+    /// Write one artifact next to the run and record its evidence row —
+    /// one fallible operation, because an artifact the ledger does not
+    /// point at is not evidence, and evidence pointing at a file that
+    /// was never written is worse (X5).
+    pub(crate) fn record_artifact(
+        &self,
+        attempt_id: Option<i64>,
+        kind: &str,
+        path: &Path,
+        body: &str,
+    ) -> Result<(), RunError> {
+        std::fs::write(path, body)?;
+        self.config.ledger.record_evidence(
+            &self.run_id,
+            attempt_id,
+            kind,
+            path,
+            Some(&workspace::sha256_file(path)?),
+        )?;
+        Ok(())
     }
 
     /// Store a receipt in the ledger and next to the run, with its
@@ -1851,6 +2441,11 @@ impl<'a> RunEngine<'a> {
     /// = the clock ran out with the holder still there. A wait that
     /// actually happened is a transition on the run. Unmanaged execution
     /// has no leases and waits for nothing.
+    ///
+    /// A lease this run's OWN dispatch still holds is treated as gone:
+    /// that process has ended — the lease outlived it only because the
+    /// coordinator refused the release (R3) — so the tree is still, and
+    /// waiting would be the run waiting on itself to its own deadline.
     pub(crate) fn wait_for_writers(
         &mut self,
         worktree: &Path,
@@ -1875,6 +2470,19 @@ impl<'a> RunEngine<'a> {
                             }),
                         )?;
                     }
+                    return Ok(None);
+                }
+                Ok(Some(holder)) if self.own_write_leases.contains(&holder) => {
+                    self.transition(
+                        State::Verifying,
+                        Reason::WriteLeaseNotReleased,
+                        serde_json::json!({
+                            "worktree": key,
+                            "holder": holder,
+                            "detail": "the lease is this run's own and its process has ended; \
+                                       verification does not wait on itself",
+                        }),
+                    )?;
                     return Ok(None);
                 }
                 Ok(Some(holder)) => {
@@ -1919,11 +2527,10 @@ impl<'a> RunEngine<'a> {
     /// amont's inventory when the integration is on.
     pub(crate) fn verify_candidate(
         &self,
-        _worktree: &TaskWorktree,
         candidate_sha: &str,
         authority: &EffectiveAuthority,
         logs_dir: &Path,
-        attempt_index: u32,
+        label: AttemptLabel,
         reuse: Option<&[verify::CheckOutcome]>,
     ) -> Result<verify::Verified, String> {
         // amont's effective inventory (SPEC §10): consulted whenever the
@@ -1946,7 +2553,9 @@ impl<'a> RunEngine<'a> {
         let mut holder = match (reuse.is_none(), amont_on) {
             (false, false) => None,
             _ => {
-                let verify_path = self.verify_dir.join(format!("verify-{attempt_index}"));
+                let verify_path = self
+                    .verify_dir
+                    .join(format!("verify-{}", label.worktree_suffix()));
                 Some(
                     verify::verification_worktree(
                         self.config.git,
@@ -1966,21 +2575,26 @@ impl<'a> RunEngine<'a> {
                 holder.path(),
                 &authority.verification_profile,
                 logs_dir,
-                &format!("attempt{attempt_index}"),
+                &label.log_prefix(),
             )
             .map_err(|e| e.to_string())?,
             (None, None) => {
                 return Err("a candidate to verify but no worktree to verify it in".to_string())
             }
         };
+        // A check log the ledger cannot point at is a check nobody can
+        // audit, and acceptance rests on these (X5).
         for check in &checks {
-            let _ = self.config.ledger.record_evidence(
-                &self.run_id,
-                None,
-                "check_log",
-                Path::new(&check.log_path),
-                Some(&check.log_sha256),
-            );
+            self.config
+                .ledger
+                .record_evidence(
+                    &self.run_id,
+                    None,
+                    "check_log",
+                    Path::new(&check.log_path),
+                    Some(&check.log_sha256),
+                )
+                .map_err(|e| format!("the ledger refused a check-log evidence row: {e}"))?;
         }
         let inventory = match (amont_on, holder.as_ref()) {
             (true, Some(holder)) => self.config.hooks.list(holder.path(), verify::Stage::Local),
@@ -2038,19 +2652,18 @@ impl<'a> RunEngine<'a> {
     /// and "no findings" is recorded as evidence, not proof. A reviewer
     /// the runner cannot dispatch or record is `Unavailable`: the run
     /// ends needs_review, not accepted.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Four steps, each its own function: who reviews and what they are
+    /// asked (`review_prompt`), the dispatch, the accounting and the
+    /// evidence, and the verdict read out of the answer.
     pub(crate) fn review_candidate(
         &mut self,
-        manifest: &ContextManifest,
-        authority: &EffectiveAuthority,
-        candidate_sha: &str,
-        candidate_tier: Tier,
-        verification_inputs_changed: &[String],
-        total_cost: &mut MicroUsd,
-        cost_completeness: &mut CostCompleteness,
-        deadline: Instant,
+        request: &ReviewRequest<'_>,
+        spend: &mut RunSpend,
     ) -> ReviewOutcome {
-        let Some((reviewer_tier, same_tier)) = reviewer_tier(authority, candidate_tier) else {
+        let Some((reviewer_tier, same_tier)) =
+            reviewer_tier(request.authority, request.candidate_tier)
+        else {
             return ReviewOutcome::Unavailable(
                 "no reviewer model is configured at any tier".into(),
             );
@@ -2062,10 +2675,10 @@ impl<'a> RunEngine<'a> {
         // looked: without this the reviewer launched with a budget of
         // zero and the run was accepted on a review nobody paid for
         // (SPEC §11: stop admitting work once the ceiling is reached).
-        if let Some(exhausted) = self.review_spend_blocked(*total_cost) {
+        if let Some(exhausted) = self.review_spend_blocked(spend.total) {
             return ReviewOutcome::Unavailable(exhausted);
         }
-        let Some(profile) = authority.models.get(&reviewer_tier).cloned() else {
+        let Some(profile) = request.authority.models.get(&reviewer_tier).cloned() else {
             return ReviewOutcome::Unavailable(format!(
                 "no reviewer model configured at the {} tier",
                 reviewer_tier.as_str()
@@ -2085,7 +2698,7 @@ impl<'a> RunEngine<'a> {
                 serde_json::json!({
                     "reviewer_same_tier": true,
                     "tier": reviewer_tier.as_str(),
-                    "candidate": candidate_sha,
+                    "candidate": request.candidate_sha,
                 }),
             ) {
                 return ReviewOutcome::Unavailable(format!(
@@ -2093,7 +2706,40 @@ impl<'a> RunEngine<'a> {
                 ));
             }
         }
-        let patch_path = self.artifacts.join("candidate-latest.patch");
+        let review_dir = self.review_dir();
+        let prompt = self.review_prompt(request, &review_dir);
+        let result = match self.dispatch_reviewer(
+            request,
+            &profile,
+            reviewer_tier,
+            prompt,
+            review_dir,
+            spend,
+        ) {
+            Ok(result) => result,
+            Err(unavailable) => return unavailable,
+        };
+        let text = result.result_text.unwrap_or_default();
+        // The artifact and its evidence row are one operation: a review
+        // the run cannot record is a review it cannot show, and a run
+        // that cannot show its review does not accept (X5).
+        if let Err(e) = self.record_artifact(
+            None,
+            "review_result",
+            &self.artifacts.join("review.txt"),
+            &text,
+        ) {
+            return ReviewOutcome::Unavailable(format!(
+                "the review could not be recorded as evidence: {e}"
+            ));
+        }
+        review_verdict(&text)
+    }
+
+    /// What the reviewer is asked. Every piece of project text — the
+    /// objective, the criteria, the constraints, the changed paths — is
+    /// quoted as data, never as instructions (SPEC §16).
+    fn review_prompt(&self, request: &ReviewRequest<'_>, review_dir: &Path) -> String {
         let mut prompt = String::from(
             "You are a semantic reviewer. You cannot edit or waive checks; you report findings only.\n\
              Report each finding with file/range, the violated acceptance criterion, evidence, and suggested verification.\n\
@@ -2105,13 +2751,13 @@ impl<'a> RunEngine<'a> {
             "acceptance criteria",
             &self.config.contract.acceptance,
         ));
-        if !manifest.constraints.is_empty() {
+        if !request.manifest.constraints.is_empty() {
             prompt.push_str(&data_list_block(
                 "architectural constraints",
-                &manifest.constraints,
+                &request.manifest.constraints,
             ));
         }
-        if !verification_inputs_changed.is_empty() {
+        if !request.verification_inputs_changed.is_empty() {
             prompt.push_str(
                 "this candidate CHANGES THE TEST TREE (tests or fixtures the checks execute). \
                  Adding regression tests is expected work; judge whether each change weakens \
@@ -2122,29 +2768,43 @@ impl<'a> RunEngine<'a> {
             // quoted like every other piece the runner did not write.
             prompt.push_str(&data_list_block(
                 "changed verification inputs",
-                verification_inputs_changed,
+                request.verification_inputs_changed,
             ));
         }
-        prompt.push_str(&format!("\ncandidate commit: {candidate_sha}\n"));
+        prompt.push_str(&format!("\ncandidate commit: {}\n", request.candidate_sha));
         prompt.push_str(&format!(
             "candidate patch (read it): {}\n",
-            patch_path.display()
+            request.patch_path.display()
         ));
-        let review_dir = self.review_dir();
         prompt.push_str(&format!("source to inspect: {}\n", review_dir.display()));
+        prompt
+    }
 
+    /// The review as a managed dispatch with its own seat, and the
+    /// accounting that follows it: its cost is the run's (SPEC §9, §11).
+    /// `Err` carries the `Unavailable` the caller returns — every way a
+    /// reviewer fails to produce an answer the runner can record.
+    fn dispatch_reviewer(
+        &mut self,
+        request: &ReviewRequest<'_>,
+        profile: &crate::policy::ModelProfile,
+        reviewer_tier: Tier,
+        prompt: String,
+        review_dir: PathBuf,
+        spend: &mut RunSpend,
+    ) -> Result<LaunchResult, ReviewOutcome> {
         // A reviewer the runner cannot even name is a reviewer it
         // cannot dispatch: `Unavailable`, never a silent acceptance.
         let dispatch_id = match self.config.ids.dispatch_id() {
             Ok(id) => id,
-            Err(e) => return ReviewOutcome::Unavailable(e.to_string()),
+            Err(e) => return Err(ReviewOutcome::Unavailable(e.to_string())),
         };
         let remaining_budget = self
             .config
             .machine
             .spending
             .per_run_micros
-            .map(|ceiling| ceiling.remaining_after(*total_cost).to_micros());
+            .map(|ceiling| ceiling.remaining_after(spend.total).to_micros());
         let spec = LaunchSpec {
             dispatch_id: dispatch_id.as_str().to_string(),
             prompt,
@@ -2152,12 +2812,13 @@ impl<'a> RunEngine<'a> {
             effort: profile.effort,
             max_turns: None,
             budget_micros: remaining_budget,
-            disallowed_tools: authority.disallowed_tools.clone(),
+            disallowed_tools: request.authority.disallowed_tools.clone(),
             // The reviewer reports; it gets no allowlist.
             allowed_tools: Vec::new(),
             work_dir: review_dir,
             env: self.config.worker_env.clone(),
-            wall_timeout: deadline
+            wall_timeout: request
+                .deadline
                 .saturating_duration_since(Instant::now())
                 .max(Duration::from_secs(1)),
             cancel: None,
@@ -2177,45 +2838,51 @@ impl<'a> RunEngine<'a> {
             remaining_budget.unwrap_or(0),
         );
         if let Err(e) = recorded {
-            return ReviewOutcome::Unavailable(format!(
+            return Err(ReviewOutcome::Unavailable(format!(
                 "the ledger refused the review intent: {e}"
-            ));
+            )));
         }
-        // The review is one separate managed call with its own seat;
-        // its cost is the run's (SPEC §9, §11). A review dispatch ends
-        // the run only through `Unavailable`, so the budget it observes
-        // with is nominal.
+        // A review dispatch ends the run only through `Unavailable`, so
+        // the budget it observes with is nominal.
         let budget = Budget {
             attempts_used: 0,
-            max_attempts: authority.max_attempts,
+            max_attempts: request.authority.max_attempts,
             repairs_used: 0,
             max_repairs: 0,
             tier: reviewer_tier,
             escalation_tier: None,
         };
-        let result = match self.managed_launch(
+        let result = match self.managed_launch(ManagedDispatch {
             spec,
-            0,
-            None,
-            remaining_budget.unwrap_or(0),
-            deadline,
-            &budget,
-            None,
-        ) {
+            depth: 0,
+            parent: None,
+            reserve_micros: remaining_budget.unwrap_or(0),
+            deadline: request.deadline,
+            budget: &budget,
+            // The reviewer reads; it writes no worktree and takes no
+            // lease.
+            write_lease: None,
+        }) {
             Ok(Ok(result)) => result,
             Ok(Err(outcome)) => {
-                let _ = self
+                let closed = self
                     .config
                     .ledger
                     .finish_dispatch(&dispatch_id, "launch_failed");
-                return ReviewOutcome::Unavailable(format!(
-                    "reviewer dispatch ended {}: {}",
+                let detail = match closed {
+                    Ok(()) => String::new(),
+                    Err(e) => format!("; the ledger also refused the dispatch record: {e}"),
+                };
+                return Err(ReviewOutcome::Unavailable(format!(
+                    "reviewer dispatch ended {}: {}{detail}",
                     outcome.state(),
                     outcome.detail()
-                ));
+                )));
             }
             Err(e) => {
-                return ReviewOutcome::Unavailable(format!("reviewer dispatch failed: {e}"));
+                return Err(ReviewOutcome::Unavailable(format!(
+                    "reviewer dispatch failed: {e}"
+                )));
             }
         };
         if let Err(e) = self
@@ -2223,9 +2890,9 @@ impl<'a> RunEngine<'a> {
             .ledger
             .finish_dispatch(&dispatch_id, "completed")
         {
-            return ReviewOutcome::Unavailable(format!(
+            return Err(ReviewOutcome::Unavailable(format!(
                 "the ledger refused the review record: {e}"
-            ));
+            )));
         }
         let event = UsageEvent {
             event_id: dispatch_id.as_str().to_string(),
@@ -2244,39 +2911,70 @@ impl<'a> RunEngine<'a> {
             at: self.config.ledger.now(),
         };
         if let Err(e) = self.config.ledger.record_usage(&event) {
-            return ReviewOutcome::Unavailable(format!("the ledger refused the review usage: {e}"));
+            return Err(ReviewOutcome::Unavailable(format!(
+                "the ledger refused the review usage: {e}"
+            )));
         }
-        if let Some(cost) = event.cost {
-            *total_cost += cost;
-        }
-        *cost_completeness = (*cost_completeness).max(result.usage.cost.completeness());
+        spend.fold(event.cost, result.usage.cost.completeness());
         if result.terminal_result_missing() {
-            return ReviewOutcome::Unavailable(
+            return Err(ReviewOutcome::Unavailable(
                 "the reviewer ended without a terminal result".into(),
-            );
+            ));
         }
-        let text = result.result_text.unwrap_or_default();
-        let review_path = self.artifacts.join("review.txt");
-        let _ = std::fs::write(&review_path, &text);
-        let _ = self.config.ledger.record_evidence(
-            &self.run_id,
-            None,
-            "review_result",
-            &review_path,
-            workspace::sha256_file(&review_path).ok().as_deref(),
-        );
-        if text
-            .lines()
-            .rev()
-            .take(5)
-            .any(|line| line.trim().eq_ignore_ascii_case("findings: none"))
-        {
-            ReviewOutcome::NoFindings
-        } else if text.contains("FINDINGS") {
-            ReviewOutcome::Findings(text)
-        } else {
-            ReviewOutcome::Findings(format!("reviewer output without a clear verdict:\n{text}"))
+        Ok(result)
+    }
+}
+
+/// What a reviewer is asked about one candidate.
+pub(crate) struct ReviewRequest<'r> {
+    pub(crate) manifest: &'r ContextManifest,
+    pub(crate) authority: &'r EffectiveAuthority,
+    pub(crate) candidate_sha: &'r str,
+    /// The tier that WROTE the candidate: the reviewer is a different
+    /// one wherever policy configures one (SPEC §10).
+    pub(crate) candidate_tier: Tier,
+    /// Test-tree paths the candidate changes, which the reviewer is
+    /// asked to judge rather than waive.
+    pub(crate) verification_inputs_changed: &'r [String],
+    /// The patch the prompt tells the reviewer to read. The caller owns
+    /// it, because the single-worker and the decomposed path export
+    /// different files and the reviewer used to be sent to the one the
+    /// decomposed path never writes (R4).
+    pub(crate) patch_path: PathBuf,
+    pub(crate) deadline: Instant,
+}
+
+/// The verdict, read from the LAST non-empty line of a reviewer's
+/// answer.
+///
+/// The prompt asks for `FINDINGS: none` as the last line, so that is
+/// where the verdict is looked for: scanning the last few lines for the
+/// phrase accepted a candidate whose reviewer merely quoted it, and a
+/// footer after the verdict line turned a clean review into findings
+/// (R10). Anything that is not a verdict is `Unavailable` — the run
+/// ends needs_review with the reviewer's text preserved, never accepted
+/// on a sentence nobody parsed.
+pub(crate) fn review_verdict(text: &str) -> ReviewOutcome {
+    let is_verdict = |line: &str| {
+        line.trim_start()
+            .to_ascii_uppercase()
+            .starts_with("FINDINGS")
+    };
+    let none = |line: &str| line.trim().eq_ignore_ascii_case("findings: none");
+    let last = text.lines().rev().find(|line| !line.trim().is_empty());
+    match last {
+        Some(line) if none(line) => ReviewOutcome::NoFindings,
+        // The reviewer's last word names findings: that is the verdict.
+        Some(line) if is_verdict(line) => ReviewOutcome::Findings(text.to_string()),
+        // Not the last line, but the answer does declare findings
+        // somewhere: reported as findings rather than waved through.
+        _ if text.lines().any(|line| is_verdict(line) && !none(line)) => {
+            ReviewOutcome::Findings(text.to_string())
         }
+        _ => ReviewOutcome::Unavailable(format!(
+            "the reviewer's answer has no verdict line: the last line is not `FINDINGS: none` \
+             and no findings are declared. The answer is preserved:\n{text}"
+        )),
     }
 }
 
@@ -4758,19 +5456,45 @@ mod tests {
         );
         assert_eq!(receipt.models_used, vec!["sonnet".to_string()]);
         // The integrated candidate carries both packages and is what the
-        // receipt names.
+        // receipt names. It lives in the patch and under a ref: the
+        // integration worktree is released like an accepted run's task
+        // worktree, instead of staying on disk for ever (R8).
         let integration = worktree_root(&fixture.artifacts)
             .join(run_id.as_str())
             .join("integration");
-        assert!(integration.join("src/a/lib.rs").exists());
-        assert!(integration.join("src/b/lib.rs").exists());
-        let head = git(&integration, &["rev-parse", "HEAD"]).trim().to_string();
-        assert_eq!(receipt.candidate_sha, head);
-        assert!(fixture
-            .artifacts
-            .join(run_id.as_str())
-            .join("candidate-integrated.patch")
-            .exists());
+        assert!(
+            !integration.exists(),
+            "the integration worktree is released once its content is exported"
+        );
+        assert!(!git(&fixture.repo, &["worktree", "list"]).contains("integration"));
+        let named = git(
+            &fixture.repo,
+            &[
+                "rev-parse",
+                &crate::workspace::candidate_ref(run_id.as_str(), 0),
+            ],
+        )
+        .trim()
+        .to_string();
+        assert_eq!(
+            named, receipt.candidate_sha,
+            "the assembled revision is named by a ref, so `git gc` cannot take it"
+        );
+        let tree = git(
+            &fixture.repo,
+            &["ls-tree", "-r", "--name-only", &receipt.candidate_sha],
+        );
+        assert!(tree.contains("src/a/lib.rs"), "{tree}");
+        assert!(tree.contains("src/b/lib.rs"), "{tree}");
+        let patch = std::fs::read_to_string(
+            fixture
+                .artifacts
+                .join(run_id.as_str())
+                .join("candidate-integrated.patch"),
+        )
+        .expect("the assembled patch");
+        assert!(patch.contains("src/a/lib.rs"), "{patch}");
+        assert!(patch.contains("src/b/lib.rs"), "{patch}");
         assert!(fixture
             .artifacts
             .join(run_id.as_str())
@@ -5450,6 +6174,531 @@ mod tests {
             prompt.contains("verification profile: profile (2 command(s) judge the result)"),
             "the number is the profile's commands, not the attempt ceiling: {prompt}"
         );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    // -- fix regression tests (review R1–R11, X5) --------------------------
+
+    /// Which call a `FaultyGate` refuses. A coordinator that is
+    /// answering badly is not the same thing as one that is not
+    /// answering at all, and both are worth a test.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Fault {
+        /// Every attempt to give a write lease back is refused.
+        ReleaseWrite,
+        /// Every heartbeat is refused, so cancellation cannot arrive.
+        Heartbeat,
+    }
+
+    /// A gate that answers like a `LocalGate` on every call but one.
+    struct FaultyGate {
+        inner: crate::admission::LocalGate,
+        fault: Fault,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FaultyGate {
+        fn new(fault: Fault) -> Self {
+            Self {
+                inner: crate::admission::LocalGate::new(ConcurrencyLimits::default()),
+                fault,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn refusals(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn refuse(&self, operation: &'static str, entity: &str) -> GateError {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            GateError::Refused {
+                operation,
+                entity: entity.to_string(),
+                detail: "the scripted coordinator refuses this call".into(),
+            }
+        }
+    }
+
+    impl Gate for FaultyGate {
+        fn register_run(&self, registration: &RunRegistration) -> Result<(), GateError> {
+            self.inner.register_run(registration)
+        }
+        fn admit(&self, request: &DispatchRequest) -> Result<Decision, GateError> {
+            self.inner.admit(request)
+        }
+        fn bind(
+            &self,
+            dispatch_id: &str,
+            agent_id: Option<&str>,
+            pid: Option<u32>,
+        ) -> Result<BindOutcome, GateError> {
+            self.inner.bind(dispatch_id, agent_id, pid)
+        }
+        fn heartbeat(
+            &self,
+            dispatch_id: &str,
+        ) -> Result<crate::admission::HeartbeatStatus, GateError> {
+            match self.fault {
+                Fault::Heartbeat => Err(self.refuse("heartbeat", dispatch_id)),
+                Fault::ReleaseWrite => self.inner.heartbeat(dispatch_id),
+            }
+        }
+        fn mark_waiting(
+            &self,
+            dispatch_id: &str,
+        ) -> Result<crate::admission::WaitOutcome, GateError> {
+            self.inner.mark_waiting(dispatch_id)
+        }
+        fn resume(&self, dispatch_id: &str) -> Result<crate::admission::ResumeOutcome, GateError> {
+            self.inner.resume(dispatch_id)
+        }
+        fn release(
+            &self,
+            dispatch_id: &str,
+        ) -> Result<crate::admission::LifecycleOutcome, GateError> {
+            self.inner.release(dispatch_id)
+        }
+        fn settle(
+            &self,
+            dispatch_id: &str,
+            spent_micros: Option<i64>,
+        ) -> Result<crate::admission::LifecycleOutcome, GateError> {
+            self.inner.settle(dispatch_id, spent_micros)
+        }
+        fn withdraw(
+            &self,
+            dispatch_id: &str,
+        ) -> Result<crate::admission::WithdrawOutcome, GateError> {
+            self.inner.withdraw(dispatch_id)
+        }
+        fn acquire_write(
+            &self,
+            dispatch_id: &str,
+            worktree: &str,
+        ) -> Result<WriteLeaseOutcome, GateError> {
+            self.inner.acquire_write(dispatch_id, worktree)
+        }
+        fn release_write(
+            &self,
+            dispatch_id: &str,
+            worktree: &str,
+        ) -> Result<ReleaseWriteOutcome, GateError> {
+            match self.fault {
+                Fault::ReleaseWrite => Err(self.refuse("release_write", worktree)),
+                Fault::Heartbeat => self.inner.release_write(dispatch_id, worktree),
+            }
+        }
+        fn write_lease_holder(&self, worktree: &str) -> Result<Option<String>, GateError> {
+            self.inner.write_lease_holder(worktree)
+        }
+        fn enforcement(&self) -> crate::admission::Enforcement {
+            self.inner.enforcement()
+        }
+    }
+
+    /// R3: a write lease the coordinator will not take back is this
+    /// run's own, and its process has ended. Verification must not wait
+    /// for it — the run used to spin to its wall clock and report an
+    /// acceptable candidate as `interrupted`.
+    #[test]
+    fn a_lease_this_run_could_not_give_back_is_not_waited_on() {
+        let fixture = Fixture::new();
+        let mut repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        // Short clock: if the run waits on its own lease at all, it
+        // ends interrupted here rather than making the suite slow.
+        repo.execution.max_wall_seconds = 3;
+        let machine = fixture.machine_for(&repo);
+        let gate = FaultyGate::new(Fault::ReleaseWrite);
+        let backend = conditional_worker("relais task");
+        let outcome = fixture.execute_managed(
+            &fixture.contract(Review::Off),
+            &repo,
+            &machine,
+            &backend,
+            &gate,
+        );
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Accepted(_),
+        } = outcome
+        else {
+            panic!("a run does not wait on its own finished dispatch, got {outcome:?}");
+        };
+        assert!(gate.refusals() >= 2, "the release was retried once");
+        let reasons: Vec<String> = fixture
+            .ledger
+            .transitions(&run_id)
+            .expect("transitions")
+            .into_iter()
+            .map(|t| t.reason)
+            .collect();
+        assert!(
+            reasons.contains(&Reason::WriteLeaseNotReleased.as_str().to_string()),
+            "the refused release is on the record: {reasons:?}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// R6: cancellation only reaches a worker on the heartbeat, so a
+    /// coordinator that stops answering leaves the run unsupervised.
+    /// After three unanswered heartbeats the run ends interrupted
+    /// instead of looping silently.
+    #[test]
+    fn a_coordinator_that_stops_answering_heartbeats_ends_the_run() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let machine = fixture.machine_for(&repo);
+        let gate = Arc::new(FaultyGate::new(Fault::Heartbeat));
+        let watched = Arc::clone(&gate);
+        let backend = MockBackend::new(move |_spec| {
+            // The worker stays alive until the heartbeat thread has
+            // been refused enough times to make the outage certain —
+            // a condition, not a fixed wait.
+            let started = Instant::now();
+            while watched.refusals() < 3 && started.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute_managed(
+            &fixture.contract(Review::Off),
+            &repo,
+            &machine,
+            &backend,
+            gate.as_ref(),
+        );
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Interrupted { detail },
+        } = outcome
+        else {
+            panic!("an unheard run is interrupted, got {outcome:?}");
+        };
+        assert!(detail.contains("heartbeats"), "{detail}");
+        assert!(detail.contains("not supervised"), "{detail}");
+        let transitions = fixture.ledger.transitions(&run_id).expect("transitions");
+        assert_eq!(
+            transitions.last().map(|t| t.reason.as_str()),
+            Some(Reason::CoordinatorUnreachable.as_str())
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// R2: from the second attempt on, "the worker produced nothing"
+    /// means nothing since the PREVIOUS attempt. Measured against the
+    /// base, a repair worker the harness refused looked productive —
+    /// because attempt 1's changes were still in the tree — and the run
+    /// reported a recurring failure instead of the missing permission.
+    #[test]
+    fn a_refused_repair_worker_is_blocked_not_a_failure_recurrence() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let backend = MockBackend::new(move |spec| {
+            if spec.prompt.contains("[repair addendum]") {
+                // Refused every tool: nothing new reaches the tree, but
+                // attempt 1's file is still there.
+                return MockOutcome {
+                    result_text: Some("I could not edit anything".into()),
+                    exit_code: Some(0),
+                    usage: Some(usage(100)),
+                    permission_denials: vec!["Edit".into()],
+                    ..Default::default()
+                };
+            }
+            std::fs::write(spec.work_dir.join("src/first.rs"), "// attempt one\n").expect("write");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Blocked { code, detail },
+        } = outcome
+        else {
+            panic!("a worker that could not act is blocked, got {outcome:?}");
+        };
+        assert_eq!(code, BlockCode::PermissionDenied);
+        assert!(detail.contains("Edit"), "{detail}");
+        assert!(detail.contains("permissions allowlist"), "{detail}");
+        assert_eq!(
+            fixture.ledger.run_status(&run_id).expect("status"),
+            Some(State::Blocked)
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// R7: `verifying` is a state the ledger shows, not one the runner
+    /// assigns to itself and then records as the next row's origin.
+    #[test]
+    fn an_accepted_runs_history_passes_through_verifying() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let backend = conditional_worker("relais task");
+        let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Accepted(_),
+        } = outcome
+        else {
+            panic!("expected acceptance, got {outcome:?}");
+        };
+        let transitions = fixture.ledger.transitions(&run_id).expect("transitions");
+        assert!(
+            transitions.iter().any(|t| t.to_state == State::Verifying
+                && t.reason == Reason::VerificationStarted.as_str()),
+            "entering verification is a recorded transition: {:?}",
+            transitions
+                .iter()
+                .map(|t| (t.to_state, t.reason.clone()))
+                .collect::<Vec<_>>()
+        );
+        // And the row that follows it says it came FROM verifying,
+        // which is only honest because the row above exists.
+        let accepted = transitions
+            .iter()
+            .find(|t| t.to_state == State::Accepted)
+            .expect("an accepted row");
+        assert_eq!(accepted.from_state, Some(State::Verifying));
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A policy whose risk rules demand review of anything that could
+    /// touch `src/c/**`. The ROOT contract's scope (`src/**`) could;
+    /// the packages' scopes (`src/a/**`, `src/b/**`) could not — so the
+    /// assembled candidate is reviewed and the packages are not, which
+    /// is what isolates the root's own review in a test.
+    fn repo_policy_reviewing_only_the_root(fixture: &Fixture) -> RepoPolicy {
+        let mut repo = fixture.repo_policy(vec![passing_check()], 3);
+        repo.risk = vec![RiskRule {
+            paths: vec!["src/c/**".into()],
+            minimum_tier: Tier::Implementation,
+            review: Some(Review::Required),
+        }];
+        repo
+    }
+
+    /// R1: the decomposed path handed the reviewer a spend of zero, so
+    /// a run whose packages had already spent the whole ceiling bought
+    /// a review on top of it. The reviewer is not dispatched at all.
+    #[test]
+    fn packages_that_spent_the_ceiling_buy_no_review() {
+        let fixture = Fixture::new();
+        let repo = repo_policy_reviewing_only_the_root(&fixture);
+        let mut machine = fixture.machine_for(&repo);
+        // Two packages at 100 each; the ceiling is reached by the time
+        // the assembled candidate is ready.
+        machine.spending.per_run_micros = Some(MicroUsd::from_micros(150));
+        let reviews = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&reviews);
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker = package_worker(Arc::clone(&launches));
+        let backend = MockBackend::new(move |spec| {
+            if spec.prompt.contains("semantic reviewer") {
+                counted.fetch_add(1, Ordering::SeqCst);
+                return MockOutcome {
+                    result_text: Some("FINDINGS: none".into()),
+                    exit_code: Some(0),
+                    ..Default::default()
+                };
+            }
+            (worker.behavior)(spec)
+        });
+        let contract = decomposed_contract(&fixture, plan_json(false));
+        let outcome = fixture.execute_with_machine(&contract, &repo, &machine, &backend);
+        let RunOutcome {
+            terminal: Terminal::NeedsReview { detail },
+            ..
+        } = outcome
+        else {
+            panic!("an exhausted run is unreviewed, not accepted: {outcome:?}");
+        };
+        assert!(detail.contains("spend ceiling was reached"), "{detail}");
+        assert_eq!(
+            reviews.load(Ordering::SeqCst),
+            0,
+            "no reviewer was dispatched past the ceiling"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// R4: the reviewer of an assembled candidate was told to read
+    /// `candidate-latest.patch`, which only the single-worker path
+    /// writes. The prompt names the patch this run actually exported.
+    #[test]
+    fn a_decomposed_review_names_the_patch_that_exists() {
+        let fixture = Fixture::new();
+        let repo = repo_policy_reviewing_only_the_root(&fixture);
+        let named = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let record = Arc::clone(&named);
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker = package_worker(Arc::clone(&launches));
+        let backend = MockBackend::new(move |spec| {
+            if spec.prompt.contains("semantic reviewer") {
+                let path = spec
+                    .prompt
+                    .lines()
+                    .find_map(|line| line.strip_prefix("candidate patch (read it): "))
+                    .expect("the reviewer is told which patch to read")
+                    .to_string();
+                record.lock().unwrap().push(path);
+                return MockOutcome {
+                    result_text: Some("FINDINGS: none".into()),
+                    exit_code: Some(0),
+                    ..Default::default()
+                };
+            }
+            (worker.behavior)(spec)
+        });
+        let contract = decomposed_contract(&fixture, plan_json(false));
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        assert!(
+            matches!(outcome.terminal, Terminal::Accepted(_)),
+            "{outcome:?}"
+        );
+        let named = named.lock().unwrap();
+        assert_eq!(named.len(), 1, "one review of the assembled candidate");
+        let patch = Path::new(&named[0]);
+        assert!(
+            patch.is_file(),
+            "the reviewer is sent to a file that exists: {}",
+            patch.display()
+        );
+        assert_eq!(
+            patch.file_name().and_then(|name| name.to_str()),
+            Some("candidate-integrated.patch")
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// R9: the planner is a dispatch of the root run and its cost is
+    /// the run's, so the receipt names its model — whether or not the
+    /// assembled candidate happened to need a review.
+    #[test]
+    fn the_planners_model_is_named_by_the_receipt_with_review_off() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let plan = plan_json(false).to_string();
+        let backend = MockBackend::new(move |spec| {
+            if spec.prompt.contains("bounded planner") {
+                assert_eq!(spec.model, "haiku", "the planner runs at the research tier");
+                return MockOutcome {
+                    result_text: Some(format!("here is the plan:\n{plan}")),
+                    exit_code: Some(0),
+                    usage: Some(usage(7)),
+                    ..Default::default()
+                };
+            }
+            if spec.prompt.contains("work package `a`") {
+                std::fs::create_dir_all(spec.work_dir.join("src/a")).expect("mkdir");
+                std::fs::write(spec.work_dir.join("src/a/lib.rs"), "pub fn a() {}\n")
+                    .expect("write");
+            } else if spec.prompt.contains("work package `b`") {
+                std::fs::create_dir_all(spec.work_dir.join("src/b")).expect("mkdir");
+                std::fs::write(spec.work_dir.join("src/b/lib.rs"), "pub fn b() {}\n")
+                    .expect("write");
+            }
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        });
+        let contract = decomposed_contract(&fixture, serde_json::json!("propose"));
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        let RunOutcome {
+            terminal: Terminal::Accepted(receipt),
+            ..
+        } = outcome
+        else {
+            panic!("expected acceptance, got {outcome:?}");
+        };
+        assert!(
+            receipt.models_used.contains(&"haiku".to_string()),
+            "the planner's model is billed, so it is named: {:?}",
+            receipt.models_used
+        );
+        assert!(
+            receipt.models_used.contains(&"sonnet".to_string()),
+            "{:?}",
+            receipt.models_used
+        );
+        assert_eq!(
+            receipt.cost.to_micros(),
+            207,
+            "the planner's 7 and the two packages' 100 each"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// R10: the verdict is the reviewer's LAST word. Scanning the last
+    /// few lines for the phrase accepted a candidate whose reviewer had
+    /// merely quoted it, and a footer after a clean verdict was read as
+    /// findings.
+    #[test]
+    fn the_review_verdict_is_the_last_non_empty_line() {
+        assert!(matches!(
+            review_verdict("looks fine\nFINDINGS: none"),
+            ReviewOutcome::NoFindings
+        ));
+        assert!(matches!(
+            review_verdict("looks fine\nFINDINGS: none\n\n"),
+            ReviewOutcome::NoFindings
+        ));
+        // A footer after the clean verdict: the last line is no longer
+        // a verdict, so the run does not accept on it.
+        assert!(
+            matches!(
+                review_verdict("FINDINGS: none\n\n-- reviewed by a tool --"),
+                ReviewOutcome::Unavailable(_)
+            ),
+            "a verdict that is not the last line is not a verdict"
+        );
+        // A footer after real findings still reports findings.
+        assert!(matches!(
+            review_verdict("FINDINGS: 1\n- src/a.rs:3 misses a case\n\n-- reviewed by a tool --"),
+            ReviewOutcome::Findings(_)
+        ));
+        // The phrase quoted inside a finding is not a verdict.
+        assert!(matches!(
+            review_verdict(
+                "FINDINGS: 1\n- the prompt asks the worker to end with `FINDINGS: none`, which it did not"
+            ),
+            ReviewOutcome::Findings(_)
+        ));
+        // Nothing that reads as a verdict at all.
+        let ReviewOutcome::Unavailable(detail) = review_verdict("I had a look and it seems okay")
+        else {
+            panic!("an answer with no verdict is unavailable, never findings by default");
+        };
+        assert!(detail.contains("no verdict line"), "{detail}");
+    }
+
+    /// R5/R8: reading a worktree's head is a fallible git call, and a
+    /// `rev-parse` whose status went unread answered `Ok("")` — which
+    /// then travelled on as a revision.
+    #[test]
+    fn a_head_that_cannot_be_read_is_an_error_not_an_empty_revision() {
+        let fixture = Fixture::new();
+        let outside = fixture.dir.join("not-a-repo");
+        std::fs::create_dir_all(&outside).expect("mkdir");
+        let err = head_revision(&outside).expect_err("a directory outside a repository");
+        assert!(
+            err.to_string().contains("rev-parse"),
+            "the error names the call: {err}"
+        );
+        let head = head_revision(&fixture.repo).expect("the fixture repo has a head");
+        assert_eq!(head.len(), 40, "a full object name: {head}");
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
