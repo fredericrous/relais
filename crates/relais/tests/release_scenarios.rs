@@ -691,7 +691,15 @@ fn install_is_preview_first_and_uninstall_keeps_foreign_and_modified_files() {
 fn the_learning_loop_closes_from_runs_to_a_learned_route() {
     let world = World::new("learn");
     let hash = world.write_policy(3);
-    world.write_machine(&hash, "");
+    // Twelve runs is a scenario, not a corpus: the shipped promotion
+    // gates want twenty held-out records supporting the selected route
+    // before they call an artifact evidence-backed. This scenario proves
+    // the LOOP closes, so it lowers that threshold explicitly — which is
+    // also what makes the setting visible as the knob it is.
+    world.write_machine(
+        &hash,
+        "[routing]\nmin_supported_test_records = 1\nmax_abstention_rate = 1.0\n",
+    );
     // Twelve distinct easy tasks the cheap tier solves outright: twelve
     // families, all accepted without escalation.
     for n in 0..12 {
@@ -769,7 +777,10 @@ fn the_learning_loop_closes_from_runs_to_a_learned_route() {
         "{planned}"
     );
     // Learned routing can be switched off without touching anything else.
-    world.write_machine(&hash, "[routing]\nlearned_enabled = false\n");
+    world.write_machine(
+        &hash,
+        "[routing]\nlearned_enabled = false\nmin_supported_test_records = 1\n",
+    );
     let plan = world.relais(&["plan", "--task", task.to_str().unwrap()]);
     assert!(
         text(&plan.stdout).contains("cold start"),

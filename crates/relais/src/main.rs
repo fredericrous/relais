@@ -339,19 +339,32 @@ fn latest_dataset() -> Result<relais::learn::dataset::Dataset, i32> {
 fn dataset_build_command() -> i32 {
     let (_, repo) = load_repo_policy().unwrap_or_else(|code| std::process::exit(code));
     let ledger = open_ledger();
-    let contract_of = |run_id: &str| -> Option<(TaskContract, String, String)> {
-        ledger
-            .run_contract_and_tier(run_id)
-            .ok()
-            .flatten()
-            .and_then(|(contract_json, objective, tier)| {
-                TaskContract::from_json_str(&contract_json)
-                    .ok()
-                    .map(|contract| (contract, objective, tier))
-            })
+    // A stored contract revision that does not parse is a corrupt ledger
+    // row, not a run without a contract: dataset construction must see
+    // the difference, or a version skew silently empties the dataset.
+    let contract_of = |run_id: &str| -> Result<
+        Option<(TaskContract, String, String)>,
+        relais::ledger::LedgerError,
+    > {
+        let Some((contract_json, objective, tier)) = ledger.run_contract_and_tier(run_id)? else {
+            return Ok(None);
+        };
+        let contract = TaskContract::from_json_str(&contract_json).map_err(|e| {
+            relais::ledger::LedgerError::Corrupt {
+                what: format!("contract revision of run {run_id}"),
+                detail: e.to_string(),
+            }
+        })?;
+        Ok(Some((contract, objective, tier)))
     };
-    let dataset = relais::learn::dataset::build(&ledger, &contract_of, &repo);
-    let (_, positives, negatives) = dataset.acceptance_labels();
+    let dataset = match relais::learn::dataset::build(&ledger, &contract_of, &repo) {
+        Ok(dataset) => dataset,
+        Err(e) => {
+            eprintln!("relais dataset build: {e}");
+            return 2;
+        }
+    };
+    let distribution = dataset.acceptance_labels();
     let dir = datasets_dir();
     or_exit(std::fs::create_dir_all(&dir), "dataset build");
     let path = dir.join(format!(
@@ -372,9 +385,7 @@ fn dataset_build_command() -> i32 {
     );
     println!(
         "records: {} ({} accepted-without-escalation, {} not)",
-        dataset.records.len(),
-        positives,
-        negatives
+        distribution.records, distribution.accepted_without_escalation, distribution.other
     );
     println!("coverage: {}", {
         let mut coverage: std::collections::BTreeMap<String, usize> =
@@ -406,25 +417,41 @@ fn train_command() -> i32 {
         Ok(dataset) => dataset,
         Err(code) => return code,
     };
-    let settings = relais::learn::learner::SolverSettings::default();
+    // Gate thresholds are machine settings; without a machine.toml the
+    // conservative defaults apply, as they do for routing.
+    let routing = load_machine()
+        .map(|machine| machine.routing)
+        .unwrap_or_default();
+    let artifact_id = format!("artifact-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"));
+    let settings = relais::learn::evaluate::EvalSettings {
+        artifact_id: artifact_id.clone(),
+        solver: relais::learn::learner::SolverSettings::default(),
+        quality_floor: routing
+            .quality_floor
+            .unwrap_or(relais::learn::evaluate::DEFAULT_QUALITY_FLOOR),
+        min_records_per_tier: relais::learn::evaluate::DEFAULT_MIN_RECORDS_PER_TIER,
+        min_supported_test_records: routing.min_supported_test_records,
+        max_abstention_rate: routing.max_abstention_rate,
+    };
     println!(
         "training on {} record(s) (seed {})",
         dataset.records.len(),
-        settings.seed
+        settings.solver.seed
     );
-    let outcome = match relais::learn::evaluate::train_and_evaluate(
-        &dataset,
-        settings,
-        0.75,
-        relais::learn::evaluate::DEFAULT_MIN_RECORDS_PER_TIER,
-    ) {
+    let outcome = match relais::learn::evaluate::train_and_evaluate(&dataset, &settings) {
         Ok(outcome) => outcome,
         Err(e) => {
             eprintln!("relais train: {e}");
-            return 2;
+            // Distinct causes, distinct codes: a scheduler retrying a
+            // build cares whether there is nothing yet (3), not enough of
+            // one tier (4), or a solver that ran away (5).
+            return match e {
+                relais::learn::evaluate::TrainError::NoTrainingRecords { .. } => 3,
+                relais::learn::evaluate::TrainError::NoTierCoverage { .. } => 4,
+                relais::learn::evaluate::TrainError::SolverDiverged { .. } => 5,
+            };
         }
     };
-    let artifact_id = format!("artifact-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"));
     let artifact = relais::learn::registry::Artifact {
         schema_version: relais::learn::registry::ARTIFACT_SCHEMA_VERSION,
         artifact_id: artifact_id.clone(),
@@ -433,9 +460,10 @@ fn train_command() -> i32 {
         acceptance: outcome.acceptance,
         cost: outcome.cost,
         tiers_supported: outcome.tiers_supported,
+        observed_identities: outcome.observed_identities,
         cohorts: vec!["change".into(), "inspect".into()],
         dataset_fingerprint: dataset.fingerprint,
-        solver: settings,
+        solver: settings.solver,
         trained_at: relais::ledger::now_rfc3339(),
         relais_version: relais::version().into(),
         evaluation: Some(serde_json::to_value(&outcome.report).expect("serializes")),
@@ -487,16 +515,31 @@ fn evaluate_command(artifact_id: &str) -> i32 {
         "trained at: {} with relais {}",
         artifact.trained_at, artifact.relais_version
     );
-    if report.gates.gates_passed {
+    let failures = report.gates.failures();
+    if failures.is_empty() {
         0
     } else {
+        // The verdict is recomputed here too: a stored `gates_passed` is
+        // a claim, and `promote` will check it the same way.
+        for failure in failures {
+            eprintln!("relais evaluate: gate: {failure}");
+        }
         2
     }
 }
 
 fn promote_command(artifact_id: &str) -> i32 {
     let reg = registry();
-    match reg.promote(artifact_id) {
+    // The registry checks the evidence and hands back a type that says so;
+    // `promote` cannot be called with anything else.
+    let evaluated = match reg.evaluated(artifact_id) {
+        Ok(evaluated) => evaluated,
+        Err(e) => {
+            eprintln!("relais promote: {e}");
+            return 2;
+        }
+    };
+    match reg.promote(&evaluated) {
         Ok(()) => {
             println!(
                 "promoted {artifact_id}; the previous artifact stays for `relais promote` rollback"
