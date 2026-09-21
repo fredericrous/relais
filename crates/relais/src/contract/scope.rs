@@ -12,7 +12,7 @@
 //! `policy` and `context` can ask the question without either one
 //! depending on the router that used to own it.
 
-use super::TaskContract;
+use super::{TaskContract, WriteScope};
 
 /// Could one path match BOTH globs? Routing happens before any diff
 /// exists, so floors are computed from the DECLARED scope patterns
@@ -78,11 +78,20 @@ fn segments_overlap(a: &str, b: &str) -> bool {
     prefixes && suffixes
 }
 
+/// Could any pattern of this declared scope share a path with `pattern`?
+pub fn scope_could_touch_any(scope: &WriteScope, pattern: &str) -> bool {
+    scope
+        .patterns()
+        .iter()
+        .any(|declared| scope_could_touch(declared, pattern))
+}
+
+/// The same question about a contract: an inspect contract declares no
+/// scope and so touches nothing.
 pub fn write_scope_could_touch(contract: &TaskContract, pattern: &str) -> bool {
     contract
-        .write_scope
-        .as_deref()
-        .is_some_and(|scopes| scopes.iter().any(|scope| scope_could_touch(scope, pattern)))
+        .write_scope()
+        .is_some_and(|scope| scope_could_touch_any(scope, pattern))
 }
 
 /// Is every path matched by `scope` also matched by `cover`? This is

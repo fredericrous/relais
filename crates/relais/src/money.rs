@@ -36,6 +36,24 @@ impl MicroUsd {
     pub fn saturating_add(self, other: Self) -> Self {
         Self(self.0.saturating_add(other.0))
     }
+
+    /// What is left of `self` after `other`, clamped at the extremes
+    /// instead of wrapping. A ceiling minus what a run already spent is
+    /// exactly this subtraction, and `i64::MIN - 1` wrapping to a
+    /// positive number would read as an unlimited budget (P7).
+    pub fn saturating_sub(self, other: Self) -> Self {
+        Self(self.0.saturating_sub(other.0))
+    }
+
+    /// The same subtraction, never below zero: a remaining budget is
+    /// never negative, it is exhausted.
+    pub fn remaining_after(self, spent: Self) -> Self {
+        Self(self.0.saturating_sub(spent.0).max(0))
+    }
+
+    pub fn is_negative(self) -> bool {
+        self.0 < 0
+    }
 }
 
 impl std::ops::Add for MicroUsd {
@@ -166,5 +184,32 @@ mod tests {
     fn sums_saturate_instead_of_overflowing() {
         let max = MicroUsd::from_micros(i64::MAX);
         assert_eq!(max + MicroUsd::from_micros(1), max);
+    }
+
+    /// P7: `ceiling - spent` on raw `i64` wraps near the extremes, and a
+    /// wrapped remainder reads as a budget nothing bounds.
+    #[test]
+    fn differences_saturate_and_a_remaining_budget_never_goes_negative() {
+        let floor = MicroUsd::from_micros(i64::MIN);
+        assert_eq!(
+            floor.saturating_sub(MicroUsd::from_micros(1)),
+            floor,
+            "no wrap into a huge positive remainder"
+        );
+        assert_eq!(
+            floor.remaining_after(MicroUsd::from_micros(1)),
+            MicroUsd::ZERO
+        );
+        assert_eq!(
+            MicroUsd::from_micros(100).remaining_after(MicroUsd::from_micros(250)),
+            MicroUsd::ZERO,
+            "an overspent run has nothing left, not a negative budget"
+        );
+        assert_eq!(
+            MicroUsd::from_micros(250).remaining_after(MicroUsd::from_micros(100)),
+            MicroUsd::from_micros(150)
+        );
+        assert!(MicroUsd::from_micros(-1).is_negative());
+        assert!(!MicroUsd::ZERO.is_negative());
     }
 }

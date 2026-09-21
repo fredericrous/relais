@@ -113,11 +113,15 @@ timeout_seconds = 30
             .authority_hash()
     }
 
+    /// A trust grant is bound to the declaration AND to the repository
+    /// it was reviewed for, so the key is the pair (P2), and every grant
+    /// names its reviewer (P10).
     fn write_machine(&self, authority_hash: &str, extra: &str) {
+        let key = relais::policy::grant_key(authority_hash, &relais::repo::identity(&self.repo));
         std::fs::write(
             self.config.join("machine.toml"),
             format!(
-                "schema_version = 1\n{extra}\n[trust.\"{authority_hash}\"]\ngranted_at = \"2026-09-18\"\n"
+                "schema_version = 1\n{extra}\n[trust.\"{key}\"]\n                 granted_at = \"2026-09-18\"\nreviewed_by = \"the release suite\"\n"
             ),
         )
         .expect("machine");

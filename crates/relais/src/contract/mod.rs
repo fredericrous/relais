@@ -41,40 +41,285 @@ pub enum Review {
     Required,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// What is wrong with one declared write-scope pattern. A scope is
+/// untrusted input — it arrives in a contract file, or from a planner
+/// model under `"decomposition": "propose"` — so every pattern is
+/// validated where the contract is parsed, not where a diff is checked
+/// after a worker has already run and been paid for (P5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeProblem {
+    /// Not a glob `globset` can compile; the detail is its message.
+    NotAGlob(String),
+    /// Absolute. A write scope names paths inside the repository, and an
+    /// absolute pattern would be judged against repository-relative diff
+    /// paths — matching nothing, silently.
+    Absolute,
+    /// Carries a `..` segment, which names something outside whatever it
+    /// appears to bound.
+    LeavesTheScope,
+    /// Empty or whitespace only.
+    Empty,
+}
+
+impl std::fmt::Display for ScopeProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAGlob(detail) => write!(f, "is not a valid glob: {detail}"),
+            Self::Absolute => write!(
+                f,
+                "is absolute; a write scope names paths relative to the repository root"
+            ),
+            Self::LeavesTheScope => write!(f, "has a `..` segment, which leaves what it bounds"),
+            Self::Empty => write!(f, "is empty"),
+        }
+    }
+}
+
+/// A validated, compiled write scope: the declared patterns and the
+/// matcher built from them. Constructing one is the only way to get a
+/// `Task::Change`, so a scope that reaches the runner has already been
+/// judged — a bad glob is a contract error naming the pattern, not a
+/// `WorkspaceError::Git` after the attempt (P5).
+#[derive(Debug, Clone)]
+pub struct WriteScope {
+    patterns: Vec<String>,
+    matcher: globset::GlobSet,
+}
+
+/// Two scopes are the same when they declare the same patterns; the
+/// matcher is derived from them.
+impl PartialEq for WriteScope {
+    fn eq(&self, other: &Self) -> bool {
+        self.patterns == other.patterns
+    }
+}
+
+impl Eq for WriteScope {}
+
+impl WriteScope {
+    /// Validate and compile the declared patterns. Every pattern is
+    /// checked, and the first problem names the pattern it is about.
+    pub fn compile(patterns: Vec<String>) -> Result<Self, ContractError> {
+        let mut builder = globset::GlobSetBuilder::new();
+        for pattern in &patterns {
+            let problem = Self::problem_with(pattern);
+            if let Some(problem) = problem {
+                return Err(ContractError::BadWriteScopePattern {
+                    pattern: pattern.clone(),
+                    problem,
+                });
+            }
+            match globset::GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .build()
+            {
+                Ok(glob) => {
+                    builder.add(glob);
+                }
+                Err(e) => {
+                    return Err(ContractError::BadWriteScopePattern {
+                        pattern: pattern.clone(),
+                        problem: ScopeProblem::NotAGlob(e.to_string()),
+                    })
+                }
+            }
+        }
+        let matcher = builder
+            .build()
+            .map_err(|e| ContractError::BadWriteScopePattern {
+                pattern: patterns.join(", "),
+                problem: ScopeProblem::NotAGlob(e.to_string()),
+            })?;
+        Ok(Self { patterns, matcher })
+    }
+
+    fn problem_with(pattern: &str) -> Option<ScopeProblem> {
+        if pattern.trim().is_empty() {
+            return Some(ScopeProblem::Empty);
+        }
+        if pattern.starts_with('/') || std::path::Path::new(pattern).is_absolute() {
+            return Some(ScopeProblem::Absolute);
+        }
+        if pattern.split(['/', '\\']).any(|segment| segment == "..") {
+            return Some(ScopeProblem::LeavesTheScope);
+        }
+        None
+    }
+
+    /// The patterns as the contract declared them, in order. This is the
+    /// text a prompt quotes and a report prints.
+    pub fn patterns(&self) -> &[String] {
+        &self.patterns
+    }
+
+    /// Is this repository-relative path inside the declared scope?
+    pub fn is_match(&self, path: &str) -> bool {
+        self.matcher.is_match(path)
+    }
+}
+
+/// What a contract asks for, and what that implies about a write scope
+/// (SPEC §4). A `change` carries a bounded scope; an `inspect` produces
+/// evidence and no patch — and cannot be given a scope at all, because
+/// there is no constructor that would take one (P11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Task {
+    Change { write_scope: WriteScope },
+    Inspect,
+}
+
+impl Task {
+    /// A change bounded by these patterns. Refuses an empty scope and a
+    /// pattern that is not a relative, compilable glob.
+    pub fn change(patterns: Vec<String>) -> Result<Self, ContractError> {
+        if patterns.is_empty() {
+            return Err(ContractError::MissingWriteScope);
+        }
+        Ok(Task::Change {
+            write_scope: WriteScope::compile(patterns)?,
+        })
+    }
+
+    pub fn kind(&self) -> Kind {
+        match self {
+            Task::Change { .. } => Kind::Change,
+            Task::Inspect => Kind::Inspect,
+        }
+    }
+
+    pub fn write_scope(&self) -> Option<&WriteScope> {
+        match self {
+            Task::Change { write_scope } => Some(write_scope),
+            Task::Inspect => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskContract {
     /// SPEC §4 calls the required field "version"; the example spells it
     /// `schema_version`. Both are accepted, one canonical name is written.
-    #[serde(alias = "version")]
     pub schema_version: u64,
-    pub kind: Kind,
+    /// The kind and, for a change, its bounded write scope. One field,
+    /// because an inspect with a scope and a change without one are both
+    /// unrepresentable.
+    pub task: Task,
     pub objective: String,
     pub base_ref: String,
-    /// Bounded write scope. Required and non-empty for `change`, must be
-    /// absent for `inspect`.
-    #[serde(default)]
-    pub write_scope: Option<Vec<String>>,
-    #[serde(default)]
     pub read_hints: Vec<String>,
     /// Acceptance criteria; for `inspect` these are evidence criteria.
     pub acceptance: Vec<String>,
     pub verification_profile: String,
-    #[serde(default)]
     pub architecture: Architecture,
-    #[serde(default)]
     pub risk_hints: Vec<String>,
-    #[serde(default)]
     pub limits: Limits,
-    #[serde(default)]
     pub review: Review,
     /// Bounded decomposition into work packages (SPEC §19): an explicit
     /// plan, or `"propose"` to let a bounded planner suggest one that
     /// deterministic validation then accepts or rejects. Absent for the
     /// ordinary single-worker run; omitted from the canonical form when
     /// absent so existing contract hashes are unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decomposition: Option<Decomposition>,
+}
+
+/// The contract exactly as it is written and stored: flat `kind` and
+/// `write_scope` fields, unknown fields refused (SPEC §4). It exists so
+/// the in-memory model can be an enum without changing one byte of the
+/// wire format — every stored contract hash stays what it was.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContractWire {
+    #[serde(alias = "version")]
+    schema_version: u64,
+    kind: Kind,
+    objective: String,
+    base_ref: String,
+    #[serde(default)]
+    write_scope: Option<Vec<String>>,
+    #[serde(default)]
+    read_hints: Vec<String>,
+    acceptance: Vec<String>,
+    verification_profile: String,
+    #[serde(default)]
+    architecture: Architecture,
+    #[serde(default)]
+    risk_hints: Vec<String>,
+    #[serde(default)]
+    limits: Limits,
+    #[serde(default)]
+    review: Review,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decomposition: Option<Decomposition>,
+}
+
+impl From<&TaskContract> for ContractWire {
+    fn from(contract: &TaskContract) -> Self {
+        Self {
+            schema_version: contract.schema_version,
+            kind: contract.task.kind(),
+            objective: contract.objective.clone(),
+            base_ref: contract.base_ref.clone(),
+            // `null` for an inspect, exactly as it has always been
+            // written, so the canonical form and its hash are unchanged.
+            write_scope: contract
+                .task
+                .write_scope()
+                .map(|scope| scope.patterns().to_vec()),
+            read_hints: contract.read_hints.clone(),
+            acceptance: contract.acceptance.clone(),
+            verification_profile: contract.verification_profile.clone(),
+            architecture: contract.architecture.clone(),
+            risk_hints: contract.risk_hints.clone(),
+            limits: contract.limits.clone(),
+            review: contract.review,
+            decomposition: contract.decomposition.clone(),
+        }
+    }
+}
+
+impl TryFrom<ContractWire> for TaskContract {
+    type Error = ContractError;
+
+    fn try_from(wire: ContractWire) -> Result<Self, ContractError> {
+        let task = match wire.kind {
+            Kind::Change => Task::change(wire.write_scope.unwrap_or_default())?,
+            Kind::Inspect => {
+                if wire.write_scope.is_some_and(|scope| !scope.is_empty()) {
+                    return Err(ContractError::WriteScopeOnInspect);
+                }
+                Task::Inspect
+            }
+        };
+        let contract = TaskContract {
+            schema_version: wire.schema_version,
+            task,
+            objective: wire.objective,
+            base_ref: wire.base_ref,
+            read_hints: wire.read_hints,
+            acceptance: wire.acceptance,
+            verification_profile: wire.verification_profile,
+            architecture: wire.architecture,
+            risk_hints: wire.risk_hints,
+            limits: wire.limits,
+            review: wire.review,
+            decomposition: wire.decomposition,
+        };
+        contract.validate()?;
+        Ok(contract)
+    }
+}
+
+impl Serialize for TaskContract {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        ContractWire::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskContract {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = ContractWire::deserialize(deserializer)?;
+        TaskContract::try_from(wire).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,6 +559,11 @@ pub enum ContractError {
     EmptyAcceptance,
     MissingWriteScope,
     WriteScopeOnInspect,
+    /// One declared write-scope pattern cannot be used as a bound.
+    BadWriteScopePattern {
+        pattern: String,
+        problem: ScopeProblem,
+    },
     DuplicateAcceptanceCriterion(String),
     BadAttempts(u32),
     BadWallSeconds(u64),
@@ -349,6 +599,9 @@ impl std::fmt::Display for ContractError {
             Self::EmptyAcceptance => write!(f, "acceptance needs at least one criterion"),
             Self::MissingWriteScope => write!(f, "kind=change requires a non-empty write_scope"),
             Self::WriteScopeOnInspect => write!(f, "kind=inspect cannot declare a write_scope"),
+            Self::BadWriteScopePattern { pattern, problem } => {
+                write!(f, "write_scope pattern `{pattern}` {problem}")
+            }
             Self::DuplicateAcceptanceCriterion(c) => {
                 write!(f, "duplicate acceptance criterion: {c}")
             }
@@ -406,7 +659,10 @@ impl TaskContract {
                 return Err(ContractError::UnsupportedSchemaVersion(0));
             }
         }
-        let contract: TaskContract = serde_json::from_value(value).map_err(|e| {
+        // Through the wire struct rather than `TaskContract`'s own
+        // `Deserialize`, so a bad write-scope pattern comes back as the
+        // `ContractError` that names it instead of a serde message.
+        let wire: ContractWire = serde_json::from_value(value).map_err(|e| {
             let msg = e.to_string();
             if let Some(field) = msg
                 .split("unknown field `")
@@ -417,10 +673,31 @@ impl TaskContract {
             }
             ContractError::MalformedJson(msg)
         })?;
-        contract.validate()?;
-        Ok(contract)
+        TaskContract::try_from(wire)
     }
 
+    /// What this contract asks for: `change` or `inspect`.
+    pub fn kind(&self) -> Kind {
+        self.task.kind()
+    }
+
+    /// The declared write scope, or `None` for an inspect contract.
+    pub fn write_scope(&self) -> Option<&WriteScope> {
+        self.task.write_scope()
+    }
+
+    /// The declared scope patterns, empty for an inspect contract — the
+    /// reading most callers want, since "no scope" and "an empty scope"
+    /// mean the same thing to them.
+    pub fn scope_patterns(&self) -> &[String] {
+        self.task
+            .write_scope()
+            .map_or(&[], |scope| scope.patterns())
+    }
+
+    /// Everything a contract must satisfy beyond what its types already
+    /// guarantee. The kind/scope agreement is not checked here: it is
+    /// unrepresentable (see [`Task`]).
     pub fn validate(&self) -> Result<(), ContractError> {
         if self.schema_version != SCHEMA_VERSION {
             return Err(ContractError::UnsupportedSchemaVersion(self.schema_version));
@@ -451,16 +728,9 @@ impl TaskContract {
                 ));
             }
         }
-        match self.kind {
-            Kind::Change => {
-                if self.write_scope.as_deref().is_none_or(|s| s.is_empty()) {
-                    return Err(ContractError::MissingWriteScope);
-                }
-            }
-            Kind::Inspect => {
-                if self.write_scope.as_deref().is_some_and(|s| !s.is_empty()) {
-                    return Err(ContractError::WriteScopeOnInspect);
-                }
+        match self.task {
+            Task::Change { .. } => {}
+            Task::Inspect => {
                 if self.decomposition.is_some() {
                     return Err(ContractError::DecompositionOnInspect);
                 }
@@ -490,6 +760,10 @@ impl TaskContract {
 /// revision-forcing controls (objective, scope, acceptance, budget) are
 /// distinguished from advisory fields so callers can require renewed
 /// verification for the former (SPEC §4).
+///
+/// `scope` covers the declared write scope AND the decomposition: a work
+/// plan partitions that scope among packages, so replacing the plan
+/// changes what may be written and by whom (P13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ChangedControls {
     pub objective: bool,
@@ -513,12 +787,11 @@ impl ChangedControls {
 pub fn changed_controls(old: &TaskContract, new: &TaskContract) -> ChangedControls {
     ChangedControls {
         objective: old.objective != new.objective,
-        scope: old.write_scope != new.write_scope,
+        scope: old.task != new.task || old.decomposition != new.decomposition,
         acceptance: old.acceptance != new.acceptance,
         budget: old.limits != new.limits,
         base: old.base_ref != new.base_ref,
-        other: old.kind != new.kind
-            || old.verification_profile != new.verification_profile
+        other: old.verification_profile != new.verification_profile
             || old.review != new.review
             || old.architecture != new.architecture
             || old.risk_hints != new.risk_hints
@@ -552,15 +825,71 @@ mod tests {
     #[test]
     fn parses_the_spec_example() {
         let c = TaskContract::from_json_str(EXAMPLE).expect("spec example parses");
-        assert_eq!(c.kind, Kind::Change);
+        assert_eq!(c.kind(), Kind::Change);
         assert_eq!(c.review, Review::Required);
         assert_eq!(c.limits.attempts, 3);
         assert_eq!(
-            c.write_scope.as_deref().unwrap(),
+            c.scope_patterns(),
             ["crates/amont-runtime/**", "crates/amont/**"]
         );
         assert!(c.architecture.keys.is_empty());
         assert_eq!(c.architecture.scope, None);
+    }
+
+    /// P5: a scope is untrusted input. A pattern that cannot bound
+    /// anything is refused where the contract is parsed, naming the
+    /// pattern — not after a worker ran, as a git error.
+    #[test]
+    fn a_scope_pattern_that_cannot_bound_anything_is_refused_by_name() {
+        let with_scope = |scope: &str| {
+            EXAMPLE.replace(
+                "[\"crates/amont-runtime/**\", \"crates/amont/**\"]",
+                &format!("[{scope}]"),
+            )
+        };
+        for (scope, problem) in [
+            ("\"/etc/**\"", ScopeProblem::Absolute),
+            ("\"../other-repo/**\"", ScopeProblem::LeavesTheScope),
+            ("\"src/../../x\"", ScopeProblem::LeavesTheScope),
+            ("\"   \"", ScopeProblem::Empty),
+        ] {
+            let error = TaskContract::from_json_str(&with_scope(scope)).unwrap_err();
+            let ContractError::BadWriteScopePattern {
+                pattern,
+                problem: found,
+            } = &error
+            else {
+                panic!("scope {scope} must be refused, got {error:?}");
+            };
+            assert_eq!(found, &problem);
+            assert!(
+                scope.contains(pattern.as_str()),
+                "the error names the pattern: {error}"
+            );
+        }
+        // A glob globset cannot compile.
+        let error = TaskContract::from_json_str(&with_scope("\"src/[unclosed/**\"")).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ContractError::BadWriteScopePattern {
+                    problem: ScopeProblem::NotAGlob(_),
+                    ..
+                }
+            ),
+            "got {error:?}"
+        );
+        assert!(error.to_string().contains("src/[unclosed/**"), "{error}");
+    }
+
+    #[test]
+    fn a_compiled_scope_matches_repository_relative_paths() {
+        let scope =
+            WriteScope::compile(vec!["crates/**".into(), "Cargo.toml".into()]).expect("compiles");
+        assert!(scope.is_match("crates/relais/src/main.rs"));
+        assert!(scope.is_match("Cargo.toml"));
+        assert!(!scope.is_match("docs/x.md"));
+        assert_eq!(scope.patterns(), ["crates/**", "Cargo.toml"]);
     }
 
     #[test]
@@ -603,15 +932,20 @@ mod tests {
         );
     }
 
+    /// P11: an inspect with a scope is not something `validate` catches,
+    /// it is something no constructor produces. The wire form is still
+    /// refused by name, for a contract file that spells it.
     #[test]
     fn inspect_rejects_write_scope() {
-        let mut c = TaskContract::from_json_str(EXAMPLE).expect("parses");
-        c.kind = Kind::Inspect;
+        let bad = EXAMPLE.replace("\"kind\": \"change\"", "\"kind\": \"inspect\"");
         assert_eq!(
-            c.validate().unwrap_err(),
+            TaskContract::from_json_str(&bad).unwrap_err(),
             ContractError::WriteScopeOnInspect
         );
-        c.write_scope = None;
+        let mut c = TaskContract::from_json_str(EXAMPLE).expect("parses");
+        c.task = Task::Inspect;
+        assert_eq!(c.write_scope(), None);
+        assert!(c.scope_patterns().is_empty());
         c.validate().expect("inspect without write scope validates");
     }
 
@@ -714,5 +1048,22 @@ mod tests {
         new = base.clone();
         new.base_ref = "main".into();
         assert!(changed_controls(&base, &new).requires_new_revision());
+    }
+
+    /// P13: a work plan partitions the declared scope among packages, so
+    /// replacing it changes who may write what. It used to land in no
+    /// group at all, and the revision read as unchanged.
+    #[test]
+    fn a_changed_decomposition_is_a_scope_change() {
+        let base = TaskContract::from_json_str(EXAMPLE).expect("parses");
+        let mut new = base.clone();
+        new.decomposition = Some(Decomposition::Mode(DecompositionMode::Propose));
+        let changed = changed_controls(&base, &new);
+        assert!(changed.scope, "a new decomposition is a scope change");
+        assert!(changed.requires_new_revision());
+
+        let mut narrowed = base.clone();
+        narrowed.task = Task::change(vec!["crates/amont/**".into()]).expect("compiles");
+        assert!(changed_controls(&base, &narrowed).scope);
     }
 }

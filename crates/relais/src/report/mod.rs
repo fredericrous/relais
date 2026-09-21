@@ -52,10 +52,11 @@ pub struct Report {
 pub fn runs_report(ledger: &Ledger, since: &str) -> Result<Report, crate::ledger::LedgerError> {
     let mut runs = Vec::new();
     for (run_id, _repo, status, _created) in ledger.runs_since(since)? {
-        let status = State::parse(&status).ok_or_else(|| crate::ledger::LedgerError::Corrupt {
-            what: format!("status of run {run_id}"),
-            detail: format!("`{status}` is not a lifecycle state this relais knows"),
-        })?;
+        let status =
+            State::parse(&status).map_err(|unknown| crate::ledger::LedgerError::Corrupt {
+                what: format!("status of run {run_id}"),
+                detail: unknown.to_string(),
+            })?;
         let transitions = ledger.transitions(&run_id)?;
         let attempts = ledger.attempt_count(&run_id)?;
         let cost = ledger.run_cost(&run_id)?;
@@ -77,7 +78,7 @@ pub fn runs_report(ledger: &Ledger, since: &str) -> Result<Report, crate::ledger
                     .map(|transition| transition.reason.clone())
             });
         runs.push(RunLine {
-            run_id,
+            run_id: run_id.to_string(),
             status,
             attempts,
             cost,
@@ -338,11 +339,12 @@ mod tests {
             ("run-a", State::Accepted, 100i64),
             ("run-b", State::Failed, 50),
         ] {
-            ledger.insert_run(run_id, "/repo", None).expect("run");
+            let run = crate::ids::RunId::from_stored(run_id);
+            ledger.insert_run(&run, "/repo", None).expect("run");
             ledger
                 .record_usage(&crate::ledger::UsageEvent {
                     event_id: format!("e-{run_id}"),
-                    run_id: run_id.into(),
+                    run_id: run.clone(),
                     attempt_id: None,
                     parent_event_id: None,
                     model: Some("sonnet".into()),
@@ -359,7 +361,7 @@ mod tests {
                 .expect("usage");
             ledger
                 .record_transition(&Transition {
-                    run_id: run_id.into(),
+                    run_id: run.clone(),
                     attempt_id: None,
                     from_state: Some(State::Prepared),
                     to_state: status,
@@ -384,10 +386,11 @@ mod tests {
     fn pending_decisions_and_labels() {
         let dir = temp_dir("pending");
         let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
-        ledger.insert_run("run-1", "/repo", None).expect("run");
+        let run = crate::ids::RunId::from_stored("run-1");
+        ledger.insert_run(&run, "/repo", None).expect("run");
         ledger
             .record_transition(&Transition {
-                run_id: "run-1".into(),
+                run_id: run.clone(),
                 attempt_id: None,
                 from_state: Some(State::Prepared),
                 to_state: State::NeedsDecision,
