@@ -29,6 +29,10 @@ pub struct InferenceResult {
     pub acceptance: Vec<(String, f64)>,
     pub cost_micros: Vec<(String, i64)>,
     pub supported_cohorts: Vec<String>,
+    /// Eligible tiers the artifact declined to estimate for, and why —
+    /// recorded as evidence even when other tiers were estimated, so a
+    /// route can be read back against the profile that was in force.
+    pub declined: Vec<(String, String)>,
     pub abstention_reason: Option<String>,
 }
 
@@ -84,24 +88,51 @@ pub fn estimate_from_registry(
         acceptance: Vec::new(),
         cost_micros: Vec::new(),
         supported_cohorts: Vec::new(),
+        declined: Vec::new(),
         abstention_reason: Some(reason),
     };
 
-    let Ok(Some(artifact)) = registry.active() else {
-        return abstain("no active learned artifact".into());
+    // An unreadable active pointer is not an absent one: reporting a
+    // schema-incompatible or unreadable artifact as "none promoted" hid
+    // every reason a promoted artifact had stopped being used.
+    let artifact = match registry.active() {
+        Ok(Some(artifact)) => artifact,
+        Ok(None) => return abstain("no active learned artifact".into()),
+        Err(e) => return abstain(format!("active artifact unusable: {e}")),
     };
     if artifact.feature_schema != schema {
         return abstain("feature schema mismatch".into());
     }
     let mut acceptance = Vec::new();
     let mut costs = Vec::new();
+    let mut declined: Vec<(String, String)> = Vec::new();
     // The cohort is this contract's KIND — the same token the dataset
     // recorded when it was trained. It used to be the literal "change"
     // for every task, so an `inspect` contract that fell back to the
     // empirical baseline was priced with the cost of changing code.
-    let cohort = super::features::cohort_of_kind(contract.kind);
+    let cohort = super::features::cohort_of_kind(contract.kind());
     for (tier, features) in &inputs {
         if !artifact.tiers_supported.contains(tier) {
+            declined.push((
+                tier.as_str().to_string(),
+                "no trained coverage for this tier".to_string(),
+            ));
+            continue;
+        }
+        // Evidence belongs to the profile that produced it (SPEC §17). A
+        // tier whose model, effort or harness has changed since training
+        // is a profile the artifact never observed: it gets no estimate,
+        // rather than the previous model's acceptance record.
+        let identity = identity_of(*tier);
+        if !observed_identity(&artifact, *tier, &identity) {
+            declined.push((
+                tier.as_str().to_string(),
+                format!(
+                    "profile identity {} was not observed in training; a model swap inherits no \
+                     evidence",
+                    describe(&identity)
+                ),
+            ));
             continue;
         }
         let standardized = artifact.standardization.apply(features);
@@ -115,13 +146,28 @@ pub fn estimate_from_registry(
         }
     }
     if acceptance.is_empty() {
-        return abstain(format!(
-            "no trained coverage for {:?}",
-            eligible
-                .iter()
-                .map(|tier| tier.as_str())
-                .collect::<Vec<_>>()
-        ));
+        let why = declined
+            .iter()
+            .map(|(tier, reason)| format!("{tier}: {reason}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        // The per-tier reasons ride along with the abstention: "no
+        // trained coverage" and "that profile was never observed" are
+        // different facts about the artifact, and the route records both.
+        return InferenceResult {
+            declined,
+            ..abstain(if why.is_empty() {
+                format!(
+                    "no trained coverage for {:?}",
+                    eligible
+                        .iter()
+                        .map(|tier| tier.as_str())
+                        .collect::<Vec<_>>()
+                )
+            } else {
+                why
+            })
+        };
     }
     InferenceResult {
         artifact_id: artifact.artifact_id,
@@ -131,8 +177,36 @@ pub fn estimate_from_registry(
         acceptance,
         cost_micros: costs,
         supported_cohorts: artifact.cohorts.clone(),
+        declined,
         abstention_reason: None,
     }
+}
+
+/// Whether the artifact observed this exact profile identity at this tier
+/// while training. An artifact that lists no identity for a tier observed
+/// none: it cannot vouch for any profile there.
+fn observed_identity(
+    artifact: &super::registry::Artifact,
+    tier: Tier,
+    identity: &ProfileIdentity,
+) -> bool {
+    artifact
+        .observed_identities
+        .iter()
+        .find(|(observed_tier, _)| *observed_tier == tier)
+        .is_some_and(|(_, identities)| identities.contains(identity))
+}
+
+/// A profile identity as a reason line reads it.
+fn describe(identity: &ProfileIdentity) -> String {
+    let mut text = identity.model.clone();
+    if let Some(effort) = &identity.effort {
+        text.push_str(&format!("/{effort}"));
+    }
+    if let Some(harness) = &identity.harness {
+        text.push_str(&format!(" on {harness}"));
+    }
+    text
 }
 
 /// One profile's identity tokens, as the runner records them in the
@@ -196,12 +270,12 @@ impl RoutePredictor for RegistryPredictor<'_> {
         let mut acceptance = std::collections::BTreeMap::new();
         let mut cost = std::collections::BTreeMap::new();
         for (tier, probability) in result.acceptance {
-            if let Some(tier) = Tier::from_name(&tier) {
+            if let Some(tier) = Tier::parse(&tier) {
                 acceptance.insert(tier, probability);
             }
         }
         for (tier, cost_micros) in result.cost_micros {
-            if let Some(tier) = Tier::from_name(&tier) {
+            if let Some(tier) = Tier::parse(&tier) {
                 cost.insert(tier, MicroUsd::from_micros(cost_micros));
             }
         }
@@ -252,6 +326,36 @@ mod tests {
         RepoPolicy::from_toml_str(crate::policy::INIT_TEMPLATE).expect("policy")
     }
 
+    /// A test directory nobody else can collide with, pre-cleaned so a
+    /// crashed earlier run cannot decide this one: the process owns the
+    /// pid, the counter orders the directories within it. A thread id is
+    /// reused the moment a thread ends.
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "relais-predict-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        // Best effort: usually absent; `Registry::open` reports what it
+        // cannot create.
+        std::fs::remove_dir_all(&dir).ok();
+        dir
+    }
+
+    /// The identity the implementation tier dispatches with under the
+    /// template policy and no harness — what the fixture artifact
+    /// observed in training.
+    fn identity_under_test() -> ProfileIdentity {
+        let repo = repo_policy();
+        let profile = repo
+            .models
+            .get(&Tier::Implementation)
+            .expect("the template configures an implementation model");
+        profile_identity(profile, None)
+    }
+
     fn contract() -> TaskContract {
         TaskContract::from_json_str(
             &serde_json::json!({
@@ -295,6 +399,7 @@ mod tests {
                 observed_log_max: 8.0,
             },
             tiers_supported: vec![Tier::Implementation],
+            observed_identities: vec![(Tier::Implementation, vec![identity_under_test()])],
             cohorts: vec!["change".into(), "inspect".into()],
             dataset_fingerprint: "f".into(),
             solver: crate::learn::learner::SolverSettings::default(),
@@ -308,16 +413,17 @@ mod tests {
         let repo = repo_policy();
         let machine =
             crate::policy::MachineSettings::from_toml_str("schema_version = 1").expect("machine");
-        crate::policy::effective_authority(&repo, &machine, &contract())
+        crate::policy::effective_authority(
+            &repo,
+            &machine,
+            &contract(),
+            &crate::policy::RepoIdentity::new(std::path::Path::new("/repos/relais"), None),
+        )
     }
 
     #[test]
     fn abstains_without_an_active_artifact() {
-        let dir = std::env::temp_dir().join(format!(
-            "relais-predict-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let dir = temp_dir("1");
         let registry = Registry::open(&dir).expect("registry");
         let repo = repo_policy();
         let task = contract();
@@ -344,11 +450,7 @@ mod tests {
 
     #[test]
     fn estimates_with_coverage_and_abstains_without_it() {
-        let dir = std::env::temp_dir().join(format!(
-            "relais-predict-2-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let dir = temp_dir("2");
         let registry = Registry::open(&dir).expect("registry");
         let artifact = artifact_over_the_whole_feature_space();
         registry.store(&artifact).expect("store");
@@ -363,7 +465,7 @@ mod tests {
         let repo = repo_policy();
         let task = contract();
         let auth = authority();
-        let predictor = RegistryPredictor::new(&registry, &repo, Some("claude-code 2.1"));
+        let predictor = RegistryPredictor::new(&registry, &repo, None);
         let estimates = predictor
             .estimate(&task, &auth, &[Tier::Implementation])
             .expect("implementation is covered");
@@ -378,16 +480,106 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// L8: coverage is keyed by the PROFILE identity, not the tier. The
+    /// same model under a different harness is a profile the artifact
+    /// never observed, and it inherits none of its evidence (SPEC §17).
+    #[test]
+    fn a_profile_identity_training_never_saw_gets_no_estimate() {
+        let dir = temp_dir("identity");
+        let registry = Registry::open(&dir).expect("registry");
+        registry
+            .store(&artifact_over_the_whole_feature_space())
+            .expect("store");
+        std::fs::write(
+            dir.join("active.json"),
+            serde_json::json!({ "artifact_id": "art-test" }).to_string(),
+        )
+        .expect("activate");
+
+        let repo = repo_policy();
+        let auth = authority();
+        let observed = estimate_from_registry(
+            &registry,
+            &contract(),
+            &repo,
+            &auth,
+            &[Tier::Implementation],
+            None,
+        );
+        assert_eq!(
+            observed.abstention_reason, None,
+            "the observed profile estimates"
+        );
+
+        let swapped = estimate_from_registry(
+            &registry,
+            &contract(),
+            &repo,
+            &auth,
+            &[Tier::Implementation],
+            Some("another-harness 9.9"),
+        );
+        assert!(
+            swapped
+                .abstention_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("was not observed in training")),
+            "{:?}",
+            swapped.abstention_reason
+        );
+        assert!(swapped.acceptance.is_empty());
+        assert_eq!(
+            swapped.declined.len(),
+            1,
+            "the declined tier is recorded as evidence: {:?}",
+            swapped.declined
+        );
+        // The router sees an abstention, not a guess.
+        let predictor = RegistryPredictor::new(&registry, &repo, Some("another-harness 9.9"));
+        assert!(predictor
+            .estimate(&contract(), &auth, &[Tier::Implementation])
+            .is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// L7: an artifact that exists but cannot be read is not "none
+    /// promoted"; the reason reaches the abstention.
+    #[test]
+    fn an_unreadable_active_artifact_says_so() {
+        let dir = temp_dir("unreadable");
+        let registry = Registry::open(&dir).expect("registry");
+        std::fs::write(
+            dir.join("active.json"),
+            serde_json::json!({ "artifact_id": "art-missing" }).to_string(),
+        )
+        .expect("activate");
+        let repo = repo_policy();
+        let auth = authority();
+        let result = estimate_from_registry(
+            &registry,
+            &contract(),
+            &repo,
+            &auth,
+            &[Tier::Implementation],
+            None,
+        );
+        assert!(
+            result
+                .abstention_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("active artifact unusable:")),
+            "{:?}",
+            result.abstention_reason
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// D4: the cohort handed to the cost model was the literal `"change"`
     /// for every contract, so an `inspect` task that fell back to the
     /// empirical baseline was priced as a code change.
     #[test]
     fn the_cost_cohort_is_the_contracts_own_kind() {
-        let dir = std::env::temp_dir().join(format!(
-            "relais-predict-3-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let dir = temp_dir("3");
         let registry = Registry::open(&dir).expect("registry");
         let mut artifact = artifact_over_the_whole_feature_space();
         // A cost model that can only extrapolate: every prediction lands
@@ -449,11 +641,7 @@ mod tests {
     /// entry — never with a zero, which would make it the cheapest tier.
     #[test]
     fn an_unpriceable_tier_carries_no_cost_estimate() {
-        let dir = std::env::temp_dir().join(format!(
-            "relais-predict-4-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let dir = temp_dir("4");
         let registry = Registry::open(&dir).expect("registry");
         let mut artifact = artifact_over_the_whole_feature_space();
         artifact.cost.weights = vec![0.0; artifact.cost.dim];

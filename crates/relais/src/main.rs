@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use relais::backend::Backend;
 use relais::context::AvalVerdict;
 use relais::contract::TaskContract;
+use relais::ids::{IdSource, RunId};
 use relais::learn::predict::RegistryPredictor;
 use relais::policy::{effective_authority, MachineSettings, RepoPolicy};
 use relais::runner::{execute, Reason, RunConfig, State, Terminal};
@@ -339,19 +340,30 @@ fn latest_dataset() -> Result<relais::learn::dataset::Dataset, i32> {
 fn dataset_build_command() -> i32 {
     let (_, repo) = load_repo_policy().unwrap_or_else(|code| std::process::exit(code));
     let ledger = open_ledger();
-    let contract_of = |run_id: &str| -> Option<(TaskContract, String, String)> {
-        ledger
-            .run_contract_and_tier(run_id)
-            .ok()
-            .flatten()
-            .and_then(|(contract_json, objective, tier)| {
-                TaskContract::from_json_str(&contract_json)
-                    .ok()
-                    .map(|contract| (contract, objective, tier))
-            })
+    // A stored contract revision that does not parse is a corrupt ledger
+    // row, not a run without a contract: dataset construction must see
+    // the difference, or a version skew silently empties the dataset.
+    // The ledger parses both the contract and the tier now, so what
+    // arrives here is already a value or already an error.
+    let contract_of = |run_id: &str| -> Result<
+        Option<(TaskContract, String, String)>,
+        relais::ledger::LedgerError,
+    > {
+        let run = RunId::from_stored(run_id);
+        let Some((contract, tier)) = ledger.run_contract_and_tier(&run)? else {
+            return Ok(None);
+        };
+        let objective = contract.objective.clone();
+        Ok(Some((contract, objective, tier.as_str().to_string())))
     };
-    let dataset = relais::learn::dataset::build(&ledger, &contract_of, &repo);
-    let (_, positives, negatives) = dataset.acceptance_labels();
+    let dataset = match relais::learn::dataset::build(&ledger, &contract_of, &repo) {
+        Ok(dataset) => dataset,
+        Err(e) => {
+            eprintln!("relais dataset build: {e}");
+            return 2;
+        }
+    };
+    let distribution = dataset.acceptance_labels();
     let dir = datasets_dir();
     or_exit(std::fs::create_dir_all(&dir), "dataset build");
     let path = dir.join(format!(
@@ -372,9 +384,7 @@ fn dataset_build_command() -> i32 {
     );
     println!(
         "records: {} ({} accepted-without-escalation, {} not)",
-        dataset.records.len(),
-        positives,
-        negatives
+        distribution.records, distribution.accepted_without_escalation, distribution.other
     );
     println!("coverage: {}", {
         let mut coverage: std::collections::BTreeMap<String, usize> =
@@ -406,25 +416,41 @@ fn train_command() -> i32 {
         Ok(dataset) => dataset,
         Err(code) => return code,
     };
-    let settings = relais::learn::learner::SolverSettings::default();
+    // Gate thresholds are machine settings; without a machine.toml the
+    // conservative defaults apply, as they do for routing.
+    let routing = load_machine()
+        .map(|machine| machine.routing)
+        .unwrap_or_default();
+    let artifact_id = format!("artifact-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"));
+    let settings = relais::learn::evaluate::EvalSettings {
+        artifact_id: artifact_id.clone(),
+        solver: relais::learn::learner::SolverSettings::default(),
+        quality_floor: routing
+            .quality_floor
+            .unwrap_or(relais::learn::evaluate::DEFAULT_QUALITY_FLOOR),
+        min_records_per_tier: relais::learn::evaluate::DEFAULT_MIN_RECORDS_PER_TIER,
+        min_supported_test_records: routing.min_supported_test_records,
+        max_abstention_rate: routing.max_abstention_rate,
+    };
     println!(
         "training on {} record(s) (seed {})",
         dataset.records.len(),
-        settings.seed
+        settings.solver.seed
     );
-    let outcome = match relais::learn::evaluate::train_and_evaluate(
-        &dataset,
-        settings,
-        0.75,
-        relais::learn::evaluate::DEFAULT_MIN_RECORDS_PER_TIER,
-    ) {
+    let outcome = match relais::learn::evaluate::train_and_evaluate(&dataset, &settings) {
         Ok(outcome) => outcome,
         Err(e) => {
             eprintln!("relais train: {e}");
-            return 2;
+            // Distinct causes, distinct codes: a scheduler retrying a
+            // build cares whether there is nothing yet (3), not enough of
+            // one tier (4), or a solver that ran away (5).
+            return match e {
+                relais::learn::evaluate::TrainError::NoTrainingRecords { .. } => 3,
+                relais::learn::evaluate::TrainError::NoTierCoverage { .. } => 4,
+                relais::learn::evaluate::TrainError::SolverDiverged { .. } => 5,
+            };
         }
     };
-    let artifact_id = format!("artifact-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"));
     let artifact = relais::learn::registry::Artifact {
         schema_version: relais::learn::registry::ARTIFACT_SCHEMA_VERSION,
         artifact_id: artifact_id.clone(),
@@ -433,9 +459,10 @@ fn train_command() -> i32 {
         acceptance: outcome.acceptance,
         cost: outcome.cost,
         tiers_supported: outcome.tiers_supported,
+        observed_identities: outcome.observed_identities,
         cohorts: vec!["change".into(), "inspect".into()],
         dataset_fingerprint: dataset.fingerprint,
-        solver: settings,
+        solver: settings.solver,
         trained_at: relais::ledger::now_rfc3339(),
         relais_version: relais::version().into(),
         evaluation: Some(serde_json::to_value(&outcome.report).expect("serializes")),
@@ -487,16 +514,31 @@ fn evaluate_command(artifact_id: &str) -> i32 {
         "trained at: {} with relais {}",
         artifact.trained_at, artifact.relais_version
     );
-    if report.gates.gates_passed {
+    let failures = report.gates.failures();
+    if failures.is_empty() {
         0
     } else {
+        // The verdict is recomputed here too: a stored `gates_passed` is
+        // a claim, and `promote` will check it the same way.
+        for failure in failures {
+            eprintln!("relais evaluate: gate: {failure}");
+        }
         2
     }
 }
 
 fn promote_command(artifact_id: &str) -> i32 {
     let reg = registry();
-    match reg.promote(artifact_id) {
+    // The registry checks the evidence and hands back a type that says so;
+    // `promote` cannot be called with anything else.
+    let evaluated = match reg.evaluated(artifact_id) {
+        Ok(evaluated) => evaluated,
+        Err(e) => {
+            eprintln!("relais promote: {e}");
+            return 2;
+        }
+    };
+    match reg.promote(&evaluated) {
         Ok(()) => {
             println!(
                 "promoted {artifact_id}; the previous artifact stays for `relais promote` rollback"
@@ -515,13 +557,33 @@ fn coordinator_command(cmd: CoordinatorCommand) -> i32 {
     let socket = coordinator::socket_path();
     match cmd {
         CoordinatorCommand::Daemon => {
-            // Absent machine settings are not an error for the daemon:
+            // ABSENT machine settings are not an error for the daemon:
             // the defaults apply and the grant check stays with `run`.
-            let limits = std::fs::read_to_string(paths::machine_settings_path())
-                .ok()
-                .and_then(|text| MachineSettings::from_toml_str(&text).ok())
-                .map(|machine| coordinator::effective_limits(&machine.concurrency))
-                .unwrap_or_else(|| coordinator::effective_limits(&Default::default()));
+            // A machine.toml that exists and does not parse is a
+            // different thing entirely — the concurrency limits it
+            // states would silently become the defaults, which are
+            // wider (X5) — so it stops the daemon instead.
+            let path = paths::machine_settings_path();
+            let limits = match std::fs::read_to_string(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    coordinator::effective_limits(&Default::default())
+                }
+                Err(e) => {
+                    eprintln!("relais coordinator: cannot read {}: {e}", path.display());
+                    return 1;
+                }
+                Ok(text) => match MachineSettings::from_toml_str(&text) {
+                    Ok(machine) => coordinator::effective_limits(&machine.concurrency),
+                    Err(e) => {
+                        eprintln!(
+                            "relais coordinator: {} is invalid: {e}; refusing to serve with \
+                             default limits in place of the ones it states",
+                            path.display()
+                        );
+                        return 1;
+                    }
+                },
+            };
             let ledger = Ledger::open(&paths::ledger_path()).ok();
             match coordinator::run_daemon(&socket, limits, ledger.as_ref()) {
                 Ok(()) => 0,
@@ -721,11 +783,20 @@ fn load_repo_policy() -> Result<(PathBuf, RepoPolicy), i32> {
 
 fn load_machine() -> Result<MachineSettings, i32> {
     let path = paths::machine_settings_path();
-    let text = std::fs::read_to_string(&path).map_err(|_| {
-        eprintln!(
-            "relais: machine settings {} do not exist; runs stay blocked on the trust grant",
-            path.display()
-        );
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            eprintln!(
+                "relais: machine settings {} do not exist; runs stay blocked on the trust grant",
+                path.display()
+            );
+        } else {
+            // Unreadable is not absent: ceilings and grants the file
+            // states would silently not apply.
+            eprintln!(
+                "relais: cannot read machine settings {}: {e}",
+                path.display()
+            );
+        }
         2
     })?;
     MachineSettings::from_toml_str(&text).map_err(|e| {
@@ -840,7 +911,8 @@ fn plan_command(task: &Path) -> i32 {
             return 3;
         }
     };
-    let authority = effective_authority(&repo, &machine, &contract);
+    let repo_identity = relais::repo::identity(&root);
+    let authority = effective_authority(&repo, &machine, &contract, &repo_identity);
     let harness = harness_identity();
     let registry = learned_registry(&machine);
     let predictor = registry
@@ -857,7 +929,26 @@ fn plan_command(task: &Path) -> i32 {
     });
     println!("contract hash: {}", contract.hash());
     println!("policy hash: {}", authority.authority_hash);
+    println!("repository: {}", repo_identity.label());
     println!("base: {} ({})", base_sha, contract.base_ref);
+    if authority.trust_granted {
+        println!("trust grant: {} (in machine.toml)", authority.grant_key);
+    } else {
+        println!(
+            "trust grant: MISSING for {}. Review the execution declaration, then paste this \n\
+             into {}:\n\n\
+             [trust.\"{}\"]\n\
+             granted_at = \"{}\"\n\
+             reviewed_by = \"<your name>\"\n\
+             repo = \"{}\"\n\
+             note = \"<what you reviewed>\"\n",
+            authority.grant_key,
+            paths::machine_settings_path().display(),
+            authority.grant_key,
+            chrono::Utc::now().format("%Y-%m-%d"),
+            repo_identity.label(),
+        );
+    }
     match &decision {
         route::Routed::Route(routed) => {
             let model = authority
@@ -920,12 +1011,14 @@ fn run_command(task: &Path) -> i32 {
     let predictor = registry
         .as_ref()
         .map(|registry| RegistryPredictor::new(registry, &repo, harness.as_deref()));
-    let outcome = execute(&RunConfig {
+    let ids = IdSource::of_this_process();
+    let outcome = match execute(&RunConfig {
         repo_dir: &root,
         contract: &contract,
         repo_policy: &repo,
         machine: &machine,
         ledger: &ledger,
+        ids: &ids,
         backend: backend.as_ref(),
         artifacts_dir: paths::runs_dir(),
         aval_resolver: &aval_resolver,
@@ -935,7 +1028,13 @@ fn run_command(task: &Path) -> i32 {
         gate: Some(&gate),
         session_id: relais::coordinator::session_id(),
         heartbeat_every: std::time::Duration::from_secs(30),
-    });
+    }) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            eprintln!("relais run: {e}");
+            return 1;
+        }
+    };
     let run_dir = paths::runs_dir().join(outcome.run_id());
     match &outcome.terminal {
         Terminal::Accepted(receipt) => {
@@ -1004,6 +1103,7 @@ fn run_command(task: &Path) -> i32 {
 
 fn status_command(run_id: Option<&str>) -> i32 {
     let ledger = open_ledger();
+    let run_id = run_id.map(RunId::from_stored);
     match run_id {
         None => {
             let report = or_exit(
@@ -1014,12 +1114,12 @@ fn status_command(run_id: Option<&str>) -> i32 {
             0
         }
         Some(run_id) => {
-            let Some(state) = or_exit(ledger.run_status(run_id), "status") else {
+            let Some(state) = or_exit(ledger.run_status(&run_id), "status") else {
                 eprintln!("relais status: unknown run {run_id}");
                 return 2;
             };
-            let cost = or_exit(ledger.run_cost(run_id), "status");
-            let attempts = or_exit(ledger.attempt_count(run_id), "status");
+            let cost = or_exit(ledger.run_cost(&run_id), "status");
+            let attempts = or_exit(ledger.attempt_count(&run_id), "status");
             println!("{run_id}: {state} (attempts: {attempts}, cost: {cost})");
             0
         }
@@ -1028,7 +1128,8 @@ fn status_command(run_id: Option<&str>) -> i32 {
 
 fn explain_command(run_id: &str) -> i32 {
     let ledger = open_ledger();
-    let transitions = or_exit(ledger.transitions(run_id), "explain");
+    let run = RunId::from_stored(run_id);
+    let transitions = or_exit(ledger.transitions(&run), "explain");
     if transitions.is_empty() {
         eprintln!("relais explain: unknown run {run_id}");
         return 2;
@@ -1059,21 +1160,24 @@ fn explain_command(run_id: &str) -> i32 {
             println!("      {detail}");
         }
     }
-    let children = or_exit(ledger.child_runs(run_id), "explain");
+    let children = or_exit(ledger.child_runs(&run), "explain");
     if !children.is_empty() {
         println!("work packages (SPEC §19; each a run of its own, costed into this one):");
-        for (child, package, status) in &children {
+        for child in &children {
             println!(
-                "  {package}: {child} {status} (attempts: {}, cost: {})",
-                or_exit(ledger.attempt_count(child), "explain"),
-                or_exit(ledger.run_cost(child), "explain")
+                "  {}: {} {} (attempts: {}, cost: {})",
+                child.package,
+                child.run,
+                child.status,
+                or_exit(ledger.attempt_count(&child.run), "explain"),
+                or_exit(ledger.run_cost(&child.run), "explain")
             );
         }
     }
-    let cost = or_exit(ledger.run_cost(run_id), "explain");
-    let completeness = or_exit(ledger.run_cost_completeness(run_id), "explain");
+    let cost = or_exit(ledger.run_cost(&run), "explain");
+    let completeness = or_exit(ledger.run_cost_completeness(&run), "explain");
     println!("cost: {}", report::cost_line(cost, completeness));
-    if let Some((receipt, _hash)) = or_exit(ledger.receipt(run_id), "explain") {
+    if let Some((receipt, _hash)) = or_exit(ledger.receipt(&run), "explain") {
         println!(
             "receipt: candidate {} ({} attempt(s), [{}])",
             receipt["candidate_sha"].as_str().unwrap_or("?"),
@@ -1093,7 +1197,8 @@ fn explain_command(run_id: &str) -> i32 {
 
 fn resume_command(run_id: &str) -> i32 {
     let ledger = open_ledger();
-    let Some(state) = or_exit(ledger.run_status(run_id), "resume") else {
+    let run = RunId::from_stored(run_id);
+    let Some(state) = or_exit(ledger.run_status(&run), "resume") else {
         eprintln!("relais resume: unknown run {run_id}");
         return 2;
     };
@@ -1107,7 +1212,7 @@ fn resume_command(run_id: &str) -> i32 {
     // what is provably dead interrupted and preserves everything.
     let live: Vec<_> = or_exit(ledger.live_dispatches(), "resume")
         .into_iter()
-        .filter(|(_dispatch, run, _pid)| run == run_id)
+        .filter(|live| live.run == run)
         .collect();
     let coordinator_view = relais::coordinator::Client::new(relais::coordinator::socket_path())
         .status()
@@ -1116,9 +1221,10 @@ fn resume_command(run_id: &str) -> i32 {
     let mut still_live = Vec::new();
     let mut dead = Vec::new();
     let mut uncertain = Vec::new();
-    for (dispatch, _run, pid) in &live {
-        match pid.and_then(|pid| u32::try_from(pid).ok()) {
-            Some(pid) if relais::coordinator::process_alive(pid) => {
+    for live in &live {
+        let dispatch = &live.dispatch;
+        match live.pid {
+            Some(pid) if relais::coordinator::process_alive(pid.get()) => {
                 still_live.push(format!("{dispatch} (pid {pid})"));
             }
             Some(pid) => {
@@ -1132,7 +1238,7 @@ fn resume_command(run_id: &str) -> i32 {
                 Some(run) if run.active > 0 || run.waiting > 0 => {
                     still_live.push(format!("{dispatch} (coordinator holds a lease)"));
                 }
-                _ => uncertain.push(dispatch.clone()),
+                _ => uncertain.push(dispatch.to_string()),
             },
         }
     }
@@ -1156,7 +1262,7 @@ fn resume_command(run_id: &str) -> i32 {
     };
     or_exit(
         ledger.record_transition(&relais::ledger::Transition {
-            run_id: run_id.to_string(),
+            run_id: run.clone(),
             attempt_id: None,
             from_state: Some(state),
             to_state: State::Interrupted,
@@ -1195,7 +1301,8 @@ fn report_command(since: Option<&str>, json: bool) -> i32 {
 
 fn feedback_command(run_id: &str, outcome: FeedbackOutcome) -> i32 {
     let ledger = open_ledger();
-    let state = or_exit(ledger.run_status(run_id), "feedback");
+    let run = RunId::from_stored(run_id);
+    let state = or_exit(ledger.run_status(&run), "feedback");
     if state.is_none() {
         eprintln!("relais feedback: unknown run {run_id}");
         return 2;
@@ -1217,7 +1324,7 @@ fn feedback_command(run_id: &str, outcome: FeedbackOutcome) -> i32 {
         FeedbackOutcome::Reverted => "reverted",
         FeedbackOutcome::Regression => "confirmed_regression",
     };
-    or_exit(ledger.record_outcome(run_id, kind, None), "feedback");
+    or_exit(ledger.record_outcome(&run, kind, None), "feedback");
     println!("recorded {kind} for {run_id}");
     let _ = AvalVerdict::Unknown;
     0

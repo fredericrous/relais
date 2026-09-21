@@ -19,7 +19,11 @@ use crate::money::{CostCompleteness, MicroUsd};
 #[derive(Debug, Clone, Serialize)]
 pub struct RunLine {
     pub run_id: String,
-    pub status: String,
+    /// The run's lifecycle state, parsed out of the ledger row: a state
+    /// this binary does not know is a `LedgerError`, not a string nobody
+    /// matches. Counting states by string literal is how `accepted` and
+    /// `needs_review` drifted apart from the states the runner writes.
+    pub status: State,
     pub attempts: usize,
     pub cost: MicroUsd,
     pub cost_completeness: CostCompleteness,
@@ -35,9 +39,12 @@ pub struct Report {
     pub total_cost: MicroUsd,
     pub cost_per_accepted: Option<MicroUsd>,
     pub acceptance_rate: Option<f64>,
-    /// Runs that ended in needs_review or needs_decision: neither
-    /// accepted nor failed — the quality bar held, a human is owed a
-    /// look.
+    /// Runs whose outcome is owed to a person rather than settled by the
+    /// runner: `needs_review` and `needs_decision` (the quality bar held
+    /// and a human is owed a look) plus `interrupted` (the run's state is
+    /// uncertain and is never retried on its own, SPEC §12). Accepted,
+    /// failed, blocked, cancelled and budget-exhausted runs are settled;
+    /// a run still in flight is not counted either.
     pub pending_decisions: usize,
     pub cost_completeness: CostCompleteness,
 }
@@ -45,6 +52,11 @@ pub struct Report {
 pub fn runs_report(ledger: &Ledger, since: &str) -> Result<Report, crate::ledger::LedgerError> {
     let mut runs = Vec::new();
     for (run_id, _repo, status, _created) in ledger.runs_since(since)? {
+        let status =
+            State::parse(&status).map_err(|unknown| crate::ledger::LedgerError::Corrupt {
+                what: format!("status of run {run_id}"),
+                detail: unknown.to_string(),
+            })?;
         let transitions = ledger.transitions(&run_id)?;
         let attempts = ledger.attempt_count(&run_id)?;
         let cost = ledger.run_cost(&run_id)?;
@@ -66,7 +78,7 @@ pub fn runs_report(ledger: &Ledger, since: &str) -> Result<Report, crate::ledger
                     .map(|transition| transition.reason.clone())
             });
         runs.push(RunLine {
-            run_id,
+            run_id: run_id.to_string(),
             status,
             attempts,
             cost,
@@ -77,17 +89,12 @@ pub fn runs_report(ledger: &Ledger, since: &str) -> Result<Report, crate::ledger
     }
     let accepted = runs
         .iter()
-        .filter(|run| run.status == State::Accepted.as_str())
+        .filter(|run| run.status == State::Accepted)
         .count();
     let total_cost = runs.iter().fold(MicroUsd::ZERO, |acc, run| acc + run.cost);
     let pending_decisions = runs
         .iter()
-        .filter(|run| {
-            matches!(
-                run.status.as_str(),
-                "needs_review" | "needs_decision" | "interrupted"
-            )
-        })
+        .filter(|run| awaits_a_person(run.status))
         .count();
     let cost_completeness = CostCompleteness::worst(runs.iter().map(|run| run.cost_completeness));
     let cost_per_accepted = if accepted > 0 {
@@ -130,7 +137,7 @@ impl Report {
             out.push_str(&format!(
                 "{}  {:<16} attempts {:<3} {}  [{}]\n",
                 run.run_id,
-                run.status,
+                run.status.as_str(),
                 run.attempts,
                 cost_line(run.cost, run.cost_completeness),
                 if run.models.is_empty() {
@@ -171,6 +178,25 @@ impl Report {
             ));
         }
         out
+    }
+}
+
+/// Whether a run's final state leaves a person something to do. Total
+/// over `State`, so a new state is a decision made here rather than a
+/// silent omission from the count.
+fn awaits_a_person(state: State) -> bool {
+    match state {
+        State::NeedsReview | State::NeedsDecision | State::Interrupted => true,
+        State::Prepared
+        | State::Running
+        | State::Verifying
+        | State::Repairing
+        | State::Escalating
+        | State::Accepted
+        | State::Blocked
+        | State::Failed
+        | State::BudgetExhausted
+        | State::Cancelled => false,
     }
 }
 
@@ -246,6 +272,25 @@ mod tests {
     use super::*;
     use crate::ledger::{now_rfc3339, Transition};
 
+    /// A test directory nobody else can collide with, pre-cleaned so a
+    /// crashed earlier run cannot decide this one. The pid alone is not
+    /// enough: two tests in one process shared it, and the second opened
+    /// the first's ledger.
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "relais-report-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        // Best effort: usually absent, and `create_dir_all` below reports
+        // anything that keeps it from being made.
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
     /// The detail line is reviewer prose: a fixed BYTE slice at 120 in a
     /// sentence whose 121st byte lands inside an em dash panics.
     #[test]
@@ -257,7 +302,7 @@ mod tests {
             since: "2026-09-01".into(),
             runs: vec![RunLine {
                 run_id: "run-a".into(),
-                status: "accepted".into(),
+                status: State::Accepted,
                 attempts: 1,
                 cost: MicroUsd::from_micros(10),
                 cost_completeness: CostCompleteness::Actual,
@@ -287,23 +332,19 @@ mod tests {
 
     #[test]
     fn cost_per_accepted_counts_failed_runs_in_the_numerator() {
-        let dir = std::env::temp_dir().join(format!(
-            "relais-report-aggr-{}-{}",
-            std::process::id(),
-            now_rfc3339().replace(':', "")
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dir = temp_dir("aggr");
         let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
         // Two runs: one accepted at 100, one failed at 50.
         for (run_id, status, cost) in [
             ("run-a", State::Accepted, 100i64),
             ("run-b", State::Failed, 50),
         ] {
-            ledger.insert_run(run_id, "/repo", None).expect("run");
+            let run = crate::ids::RunId::from_stored(run_id);
+            ledger.insert_run(&run, "/repo", None).expect("run");
             ledger
                 .record_usage(&crate::ledger::UsageEvent {
                     event_id: format!("e-{run_id}"),
-                    run_id: run_id.into(),
+                    run_id: run.clone(),
                     attempt_id: None,
                     parent_event_id: None,
                     model: Some("sonnet".into()),
@@ -320,7 +361,7 @@ mod tests {
                 .expect("usage");
             ledger
                 .record_transition(&Transition {
-                    run_id: run_id.into(),
+                    run_id: run.clone(),
                     attempt_id: None,
                     from_state: Some(State::Prepared),
                     to_state: status,
@@ -343,13 +384,13 @@ mod tests {
 
     #[test]
     fn pending_decisions_and_labels() {
-        let dir = std::env::temp_dir().join(format!("relais-report-pd-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dir = temp_dir("pending");
         let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
-        ledger.insert_run("run-1", "/repo", None).expect("run");
+        let run = crate::ids::RunId::from_stored("run-1");
+        ledger.insert_run(&run, "/repo", None).expect("run");
         ledger
             .record_transition(&Transition {
-                run_id: "run-1".into(),
+                run_id: run.clone(),
                 attempt_id: None,
                 from_state: Some(State::Prepared),
                 to_state: State::NeedsDecision,

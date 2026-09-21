@@ -16,7 +16,7 @@ use super::features::{
     expand, FeatureSchema, ProfileIdentity, SparseVec, TaskFeatures, TrainingExample,
 };
 use crate::ids::sha256_hex;
-use crate::ledger::Ledger;
+use crate::ledger::{Ledger, LedgerError};
 use crate::lifecycle::State;
 use crate::policy::{RepoPolicy, Tier};
 
@@ -24,7 +24,112 @@ use crate::policy::{RepoPolicy, Tier};
 /// construction consumes them.
 pub type ContractMaterial = (crate::contract::TaskContract, String, String);
 
-pub const DATASET_VERSION: u32 = 1;
+/// How dataset construction reads a run's contract revision: `Ok(None)` is
+/// a run with no revision recorded (an exclusion), `Err` a ledger that
+/// could not be read (an error). The two were one `Option` and a failing
+/// read was indistinguishable from a run that never recorded a contract.
+pub type ContractLookup<'a> = dyn Fn(&str) -> Result<Option<ContractMaterial>, LedgerError> + 'a;
+
+/// Version 2 records, per example, the routing FLOOR its contract had at
+/// dispatch time (SPEC §6): the evaluator's baseline is the route the
+/// router would have taken for that task, which a version-1 dataset does
+/// not carry. Rebuild with `relais dataset build` to train again.
+pub const DATASET_VERSION: u32 = 2;
+
+/// The window dataset construction reads: every run the ledger holds.
+/// Far enough in the past that no relais ledger predates it.
+const EPOCH: &str = "2000-01-01T00:00:00+00:00";
+
+/// Dataset construction failed against the ledger. A failed read is never
+/// an empty dataset and never an exclusion: silently training on nothing
+/// after `SQLITE_BUSY` looked exactly like "collect outcomes first".
+#[derive(Debug)]
+pub enum DatasetError {
+    /// The run list itself could not be read.
+    RunList { since: String, cause: LedgerError },
+    /// A per-run read failed. `query` names what was being read.
+    LedgerRead {
+        run: String,
+        query: &'static str,
+        cause: LedgerError,
+    },
+}
+
+impl std::fmt::Display for DatasetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RunList { since, cause } => {
+                write!(f, "dataset: cannot list runs since {since}: {cause}")
+            }
+            Self::LedgerRead { run, query, cause } => {
+                write!(f, "dataset: cannot read the {query} of run {run}: {cause}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DatasetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RunList { cause, .. } | Self::LedgerRead { cause, .. } => Some(cause),
+        }
+    }
+}
+
+/// A ledger read for one run: a failure names the run and the query, and
+/// stops dataset construction. Absence is the caller's business.
+fn read_of<T>(
+    run: &crate::ids::RunId,
+    query: &'static str,
+    result: Result<T, LedgerError>,
+) -> Result<T, DatasetError> {
+    result.map_err(|cause| DatasetError::LedgerRead {
+        run: run.as_str().to_string(),
+        query,
+        cause,
+    })
+}
+
+/// What a run's recorded state means for the dataset: an evidence-backed
+/// reasoning outcome, or an exclusion and the reason for it (SPEC §17).
+///
+/// Only a run that reached a reasoning verdict is labelled. Everything
+/// else — a run still in flight, one the environment blocked, one whose
+/// budget ran out before the reasoning was tested, one waiting on a person
+/// — is excluded and counted in `exclusions`. They used to fall through a
+/// `_ => {}` arm into the NEGATIVE class: every running task in the ledger
+/// taught the learner that its tier fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Labelling {
+    /// The run was accepted: positive unless escalation was attempted.
+    Accepted,
+    /// The run failed after the ladder ran out: a negative label.
+    Failed,
+    /// Not a reasoning outcome, with the reason it is excluded.
+    Excluded(&'static str),
+}
+
+/// The labelling a lifecycle state earns. Total over `State` on purpose:
+/// a new state is a compile error here, not a silent negative label.
+pub fn labelling_of(state: State) -> Labelling {
+    match state {
+        State::Accepted => Labelling::Accepted,
+        State::Failed => Labelling::Failed,
+        State::Prepared
+        | State::Running
+        | State::Verifying
+        | State::Repairing
+        | State::Escalating => Labelling::Excluded("still in flight; the outcome is not known yet"),
+        State::BudgetExhausted => {
+            Labelling::Excluded("budget exhausted before the reasoning was tested")
+        }
+        State::Blocked => Labelling::Excluded("blocked environment, not a reasoning label"),
+        State::Interrupted => Labelling::Excluded("interrupted, outcome unknown"),
+        State::NeedsReview => Labelling::Excluded("needs_review, no evidence-backed label yet"),
+        State::NeedsDecision => Labelling::Excluded("needs_decision, no evidence-backed label yet"),
+        State::Cancelled => Labelling::Excluded("cancelled, no evidence-backed label yet"),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Dataset {
@@ -35,18 +140,31 @@ pub struct Dataset {
     pub built_at: String,
 }
 
+/// How the labels fall: the numbers a person needs to see before trusting
+/// anything fitted on them. Two bare `usize`s in a tuple were read in the
+/// wrong order once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClassDistribution {
+    pub records: usize,
+    /// Records labelled "the first-choice tier succeeded on its own".
+    pub accepted_without_escalation: usize,
+    /// Records labelled otherwise: failed, or rescued by escalation.
+    pub other: usize,
+}
+
 impl Dataset {
-    pub fn acceptance_labels(&self) -> (Vec<&TrainingExample>, usize, usize) {
-        let positives = self
+    /// The class distribution of the acceptance label.
+    pub fn acceptance_labels(&self) -> ClassDistribution {
+        let accepted_without_escalation = self
             .records
             .iter()
             .filter(|record| record.accepted_without_escalation)
             .count();
-        (
-            self.records.iter().collect(),
-            positives,
-            self.records.len() - positives,
-        )
+        ClassDistribution {
+            records: self.records.len(),
+            accepted_without_escalation,
+            other: self.records.len() - accepted_without_escalation,
+        }
     }
 }
 
@@ -55,46 +173,45 @@ impl Dataset {
 /// The objective text is read back from the stored contract, and the
 /// task-level features plus tier/model identity are the ONLY inputs —
 /// outcomes, patch sizes and later failures never enter (SPEC §21).
+///
+/// Every ledger read is fallible and every failure stops the build: an
+/// unreadable ledger produces an error a person sees, never a smaller
+/// dataset that looks like a quiet week.
 pub fn build(
     ledger: &Ledger,
-    contract_of: &dyn Fn(&str) -> Option<ContractMaterial>,
+    contract_of: &ContractLookup<'_>,
     repo_policy: &RepoPolicy,
-) -> Dataset {
+) -> Result<Dataset, DatasetError> {
     let schema = FeatureSchema::standard();
     let mut records = Vec::new();
     let mut exclusions = Vec::new();
     let runs = ledger
-        .runs_since("2000-01-01T00:00:00+00:00")
-        .unwrap_or_default();
+        .runs_since(EPOCH)
+        .map_err(|cause| DatasetError::RunList {
+            since: EPOCH.to_string(),
+            cause,
+        })?;
     for (run_id, _repo, _status, _created) in runs {
-        let Some((contract, objective, tier_name)) = contract_of(&run_id) else {
+        let material = read_of(&run_id, "contract revision", contract_of(run_id.as_str()))?;
+        let Some((contract, objective, tier_name)) = material else {
             exclusions.push(format!("{run_id}: no contract revision recorded"));
             continue;
         };
-        let Some(state) = ledger.run_status(&run_id).unwrap_or(None) else {
+        let Some(state) = read_of(&run_id, "state", ledger.run_status(&run_id))? else {
             exclusions.push(format!("{run_id}: no state recorded"));
             continue;
         };
         // Infrastructure and unresolved outcomes are excluded, not
         // relabelled (SPEC §17).
-        match state {
-            State::Blocked => {
-                exclusions.push(format!(
-                    "{run_id}: blocked environment, not a reasoning label"
-                ));
+        let accepted = match labelling_of(state) {
+            Labelling::Accepted => true,
+            Labelling::Failed => false,
+            Labelling::Excluded(why) => {
+                exclusions.push(format!("{run_id}: {state}: {why}"));
                 continue;
             }
-            State::Interrupted => {
-                exclusions.push(format!("{run_id}: interrupted, outcome unknown"));
-                continue;
-            }
-            State::NeedsDecision | State::NeedsReview | State::Cancelled => {
-                exclusions.push(format!("{run_id}: {state}, no evidence-backed label yet"));
-                continue;
-            }
-            _ => {}
-        }
-        let Some(tier) = Tier::from_name(&tier_name) else {
+        };
+        let Some(tier) = Tier::parse(&tier_name) else {
             exclusions.push(format!("{run_id}: unknown tier `{tier_name}`"));
             continue;
         };
@@ -103,36 +220,47 @@ pub fn build(
         // ladder moved; the set of models seen does NOT — a reviewer at
         // the escalation tier is not an escalation, and counting it as
         // one labelled every reviewed run a failure of its worker.
-        let escalated = ledger.escalation_attempted(&run_id).unwrap_or(true);
-        let accepted_without_escalation = state == State::Accepted && !escalated;
-        let cost = ledger
-            .run_cost(&run_id)
-            .unwrap_or(crate::money::MicroUsd::ZERO);
-        let completeness = ledger
-            .run_cost_completeness(&run_id)
-            .unwrap_or(crate::money::CostCompleteness::Unknown);
+        let escalated = read_of(
+            &run_id,
+            "escalation attempts",
+            ledger.escalation_attempted(&run_id),
+        )?;
+        let accepted_without_escalation = accepted && !escalated;
+        let cost = read_of(&run_id, "cost", ledger.run_cost(&run_id))?;
+        let completeness = read_of(
+            &run_id,
+            "cost completeness",
+            ledger.run_cost_completeness(&run_id),
+        )?;
         let cost_complete = completeness == crate::money::CostCompleteness::Actual;
         let task = TaskFeatures::extract(&contract, repo_policy);
-        let identity = ledger
-            .first_dispatch_intent(&run_id)
-            .ok()
-            .flatten()
-            .map(|intent| ProfileIdentity {
-                model: intent["model"].as_str().unwrap_or("unknown").to_string(),
-                effort: intent["effort"].as_str().map(str::to_string),
-                harness: intent["harness"].as_str().map(str::to_string),
-            })
-            .unwrap_or_default();
+        // The identity that actually ran. Without a dispatch intent there
+        // is no model to attribute the outcome to, and a default identity
+        // would credit the empty model with this run's evidence.
+        let intent = read_of(
+            &run_id,
+            "first dispatch intent",
+            ledger.first_dispatch_intent(&run_id),
+        )?;
+        let Some(identity) = intent.as_ref().and_then(identity_of_intent) else {
+            exclusions.push(format!(
+                "{run_id}: no dispatch intent naming a model; the outcome cannot be attributed"
+            ));
+            continue;
+        };
         let sparse: SparseVec = expand(&task, tier, &objective, &identity, &schema);
-        let dispatched_at = ledger
-            .transitions(&run_id)
-            .unwrap_or_default()
-            .first()
-            .map(|transition| transition.at.clone())
-            .unwrap_or_default();
+        let transitions = read_of(&run_id, "transitions", ledger.transitions(&run_id))?;
+        let Some(dispatched_at) = transitions.first().map(|transition| transition.at.clone())
+        else {
+            // An empty timestamp sorts before every real one, so such a
+            // record would land in the training split whatever its date.
+            exclusions.push(format!("{run_id}: no transition recorded; undatable"));
+            continue;
+        };
         records.push(TrainingExample {
             family: task_family(&contract),
             tier,
+            floor: crate::route::eligible_tiers(&contract, repo_policy, &repo_policy.models).floor,
             task,
             objective: objective.clone(),
             identity,
@@ -143,15 +271,37 @@ pub fn build(
             dispatched_at,
         });
     }
-    let fingerprint_source = serde_json::to_string(&records).unwrap_or_default();
+    // The records are owned structs of numbers, strings and vectors:
+    // serialization has no failure mode, and a fingerprint over
+    // `unwrap_or_default()`'s empty string would have been the SAME hash
+    // for every dataset that failed to serialize.
+    let fingerprint_source =
+        serde_json::to_string(&records).expect("training examples are plain owned data");
     let fingerprint = sha256_hex(fingerprint_source.as_bytes());
-    Dataset {
+    Ok(Dataset {
         version: DATASET_VERSION,
         records,
         exclusions,
         fingerprint,
         built_at: crate::ledger::now_rfc3339(),
-    }
+    })
+}
+
+/// The profile identity a dispatch intent records, or `None` when it names
+/// no model. Reading with `intent["model"]` returned JSON null for a
+/// malformed intent, which became the model literally called "unknown".
+fn identity_of_intent(intent: &serde_json::Value) -> Option<ProfileIdentity> {
+    let text = |key: &str| {
+        intent
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    };
+    Some(ProfileIdentity {
+        model: text("model")?,
+        effort: text("effort"),
+        harness: text("harness"),
+    })
 }
 
 /// The family a contract belongs to, for split grouping (SPEC §17:
@@ -160,36 +310,22 @@ pub fn build(
 /// — not its exact text, so a re-worded retry of the same task stays with
 /// the original, while a different task on the same scope does not.
 pub fn task_family(contract: &crate::contract::TaskContract) -> String {
-    let mut tokens: Vec<String> = contract
-        .objective
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(|t| t.to_lowercase())
-        .collect();
+    // The feature tokenizer, not a second spelling of it: a family must
+    // group the tasks whose features the learner cannot tell apart.
+    let mut tokens: Vec<String> = super::features::tokenize(&contract.objective);
     tokens.sort();
     tokens.dedup();
-    let mut scope = contract.write_scope.clone().unwrap_or_default();
+    let mut scope = contract.scope_patterns().to_vec();
     scope.sort();
     sha256_hex(
         serde_json::json!({
-            "kind": contract.kind,
+            "kind": contract.kind(),
             "scope": scope,
             "tokens": tokens,
         })
         .to_string()
         .as_bytes(),
     )
-}
-
-impl Tier {
-    pub fn from_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "research" => Tier::Research,
-            "implementation" => Tier::Implementation,
-            "escalation" => Tier::Escalation,
-            _ => return None,
-        })
-    }
 }
 
 /// Splits are TEMPORAL and family-aware (SPEC §17): records are ordered by
@@ -274,10 +410,35 @@ pub fn temporal_splits(
 mod tests {
     use super::*;
 
+    fn run_id(id: &str) -> crate::ids::RunId {
+        crate::ids::RunId::from_stored(id)
+    }
+
+    /// A test directory nobody else can collide with, pre-cleaned so a
+    /// crashed earlier run cannot make this one pass or fail: the process
+    /// owns the pid, and the counter orders the directories within it.
+    /// A thread id is reused the moment a thread ends, which made two
+    /// tests in one run share a ledger.
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "relais-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        // Best effort: the directory usually does not exist, and if it
+        // cannot be removed `create_dir_all` below reports why.
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
     fn example(family: &str, at: &str, accepted: bool) -> TrainingExample {
         TrainingExample {
             family: family.into(),
             tier: Tier::Implementation,
+            floor: Tier::Implementation,
             task: TaskFeatures::extract(&contract(), &repo_policy()),
             objective: "objective".into(),
             identity: ProfileIdentity::default(),
@@ -393,110 +554,277 @@ argv = ["true"]
         .expect("policy")
     }
 
-    #[test]
-    fn a_reviewed_run_is_not_labelled_as_escalated() {
-        use crate::ledger::{Ledger, Transition, UsageEvent};
-        use crate::money::{CostCompleteness, CostKind, MicroUsd};
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "relais-dataset-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
-        let contract = contract();
-        let contract_json = serde_json::to_string(&contract.canonical_value()).expect("json");
-        let usage = |event: &str, run: &str, model: &str| UsageEvent {
-            event_id: event.into(),
-            run_id: run.into(),
-            attempt_id: None,
-            parent_event_id: None,
-            model: Some(model.into()),
-            input_tokens: None,
-            output_tokens: None,
-            cache_read_tokens: None,
-            cache_write_tokens: None,
-            cost: Some(MicroUsd::from_micros(10)),
-            cost_kind: CostKind::ApiSpend,
-            completeness: CostCompleteness::Actual,
-            inclusive: false,
-            at: crate::ledger::now_rfc3339(),
-        };
-        let accept = |run: &str| {
-            ledger
-                .record_transition(&Transition {
-                    run_id: run.into(),
+    /// Everything a dataset-worthy run records: a contract revision, an
+    /// attempt, a dispatch intent naming the model, and usage.
+    struct LedgerFixture {
+        ledger: crate::ledger::Ledger,
+        contract: crate::contract::TaskContract,
+        contract_json: String,
+        dir: std::path::PathBuf,
+    }
+
+    impl LedgerFixture {
+        fn open(name: &str) -> Self {
+            let dir = temp_dir(name);
+            let ledger = crate::ledger::Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+            let contract = contract();
+            let contract_json = serde_json::to_string(&contract.canonical_value()).expect("json");
+            Self {
+                ledger,
+                contract,
+                contract_json,
+                dir,
+            }
+        }
+
+        fn dispatched(&self, run: &str, tier: &str, phase: &str) -> i64 {
+            self.ledger
+                .insert_run(&run_id(run), "/r", None)
+                .expect("run");
+            let revision = self
+                .ledger
+                .insert_contract_revision(
+                    &run_id(run),
+                    &self.contract.hash(),
+                    &self.contract_json,
+                    "HEAD",
+                    None,
+                )
+                .expect("revision");
+            let attempt = self
+                .ledger
+                .insert_attempt(&run_id(run), revision, 1, tier, phase)
+                .expect("attempt");
+            self.ledger
+                .record_dispatch_intent(
+                    &crate::ids::DispatchId::from_stored(format!("{run}-d1")),
+                    &run_id(run),
+                    Some(attempt),
+                    &serde_json::json!({"model": "sonnet", "effort": "medium"}),
+                    0,
+                )
+                .expect("intent");
+            revision
+        }
+
+        fn usage(&self, event: &str, run: &str, model: &str) {
+            use crate::money::{CostCompleteness, CostKind, MicroUsd};
+            self.ledger
+                .record_usage(&crate::ledger::UsageEvent {
+                    event_id: event.into(),
+                    run_id: run_id(run),
+                    attempt_id: None,
+                    parent_event_id: None,
+                    model: Some(model.into()),
+                    input_tokens: None,
+                    output_tokens: None,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    cost: Some(MicroUsd::from_micros(10)),
+                    cost_kind: CostKind::ApiSpend,
+                    completeness: CostCompleteness::Actual,
+                    inclusive: false,
+                    at: crate::ledger::now_rfc3339(),
+                })
+                .expect("usage");
+        }
+
+        fn settle(&self, run: &str, state: State) {
+            self.ledger
+                .record_transition(&crate::ledger::Transition {
+                    run_id: run_id(run),
                     attempt_id: None,
                     from_state: Some(State::Verifying),
-                    to_state: State::Accepted,
-                    reason: "checks_and_review_passed".into(),
+                    to_state: state,
+                    reason: "test".into(),
                     detail: None,
                     at: crate::ledger::now_rfc3339(),
                 })
                 .expect("transition");
-        };
-        let contract_of = |run_id: &str| {
-            ledger
-                .run_contract_and_tier(run_id)
-                .ok()
-                .flatten()
-                .and_then(|(json, objective, tier)| {
-                    crate::contract::TaskContract::from_json_str(&json)
-                        .ok()
-                        .map(|c| (c, objective, tier))
-                })
-        };
+        }
+
+        fn build(&self) -> Dataset {
+            let contract_of = |run: &str| {
+                let Some((contract, tier)) = self.ledger.run_contract_and_tier(&run_id(run))?
+                else {
+                    return Ok(None);
+                };
+                let objective = contract.objective.clone();
+                Ok(Some((contract, objective, tier.as_str().to_string())))
+            };
+            build(&self.ledger, &contract_of, &repo_policy()).expect("dataset builds")
+        }
+    }
+
+    impl Drop for LedgerFixture {
+        fn drop(&mut self) {
+            // Best effort: a leftover temp directory costs nothing, and
+            // the next run of this test pre-cleans its own.
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
+    #[test]
+    fn a_reviewed_run_is_not_labelled_as_escalated() {
+        let fixture = LedgerFixture::open("dataset");
         // Run A: one sonnet attempt, reviewed by fable. Two models, no
         // escalation.
-        ledger.insert_run("run-a", "/r", None).expect("run");
-        let revision = ledger
-            .insert_contract_revision("run-a", &contract.hash(), &contract_json, "HEAD", None)
-            .expect("revision");
-        ledger
-            .insert_attempt("run-a", revision, 1, "implementation", "initial")
-            .expect("attempt");
-        ledger
-            .record_usage(&usage("a-worker", "run-a", "sonnet"))
-            .expect("usage");
-        ledger
-            .record_usage(&usage("a-review", "run-a", "fable"))
-            .expect("usage");
-        accept("run-a");
-        let (_, positives, negatives) =
-            build(&ledger, &contract_of, &repo_policy()).acceptance_labels();
+        fixture.dispatched("run-a", "implementation", "initial");
+        fixture.usage("a-worker", "run-a", "sonnet");
+        fixture.usage("a-review", "run-a", "fable");
+        fixture.settle("run-a", State::Accepted);
         assert_eq!(
-            (positives, negatives),
-            (1, 0),
+            fixture.build().acceptance_labels(),
+            ClassDistribution {
+                records: 1,
+                accepted_without_escalation: 1,
+                other: 0
+            },
             "a reviewer on another model is not an escalation"
         );
         // Run B: sonnet failed, fable rescued it. Escalated.
-        ledger.insert_run("run-b", "/r", None).expect("run");
-        let revision = ledger
-            .insert_contract_revision("run-b", &contract.hash(), &contract_json, "HEAD", None)
-            .expect("revision");
-        ledger
-            .insert_attempt("run-b", revision, 1, "implementation", "initial")
+        let revision = fixture.dispatched("run-b", "implementation", "initial");
+        fixture
+            .ledger
+            .insert_attempt(&run_id("run-b"), revision, 2, "escalation", "escalation")
             .expect("attempt");
-        ledger
-            .insert_attempt("run-b", revision, 2, "escalation", "escalation")
-            .expect("attempt");
-        ledger
-            .record_usage(&usage("b-worker", "run-b", "sonnet"))
-            .expect("usage");
-        ledger
-            .record_usage(&usage("b-fable", "run-b", "fable"))
-            .expect("usage");
-        accept("run-b");
-        let (_, positives, negatives) =
-            build(&ledger, &contract_of, &repo_policy()).acceptance_labels();
+        fixture.usage("b-worker", "run-b", "sonnet");
+        fixture.usage("b-fable", "run-b", "fable");
+        fixture.settle("run-b", State::Accepted);
         assert_eq!(
-            (positives, negatives),
-            (1, 1),
+            fixture.build().acceptance_labels(),
+            ClassDistribution {
+                records: 2,
+                accepted_without_escalation: 1,
+                other: 1
+            },
             "a rescue by the stronger tier is"
         );
-        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// L1: every non-terminal state, and every terminal one that is not a
+    /// reasoning verdict, is EXCLUDED with a reason. They used to fall
+    /// through a `_ => {}` arm into the negative class, so a run that was
+    /// merely still running taught the learner that its tier fails.
+    #[test]
+    fn only_a_reasoning_verdict_is_labelled() {
+        for state in [
+            State::Prepared,
+            State::Running,
+            State::Verifying,
+            State::Repairing,
+            State::Escalating,
+            State::BudgetExhausted,
+            State::Blocked,
+            State::Interrupted,
+            State::NeedsReview,
+            State::NeedsDecision,
+            State::Cancelled,
+        ] {
+            assert!(
+                matches!(labelling_of(state), Labelling::Excluded(_)),
+                "{state} is not an evidence-backed reasoning label"
+            );
+            let fixture = LedgerFixture::open("dataset-state");
+            fixture.dispatched("run-x", "implementation", "initial");
+            fixture.settle("run-x", state);
+            let dataset = fixture.build();
+            assert!(
+                dataset.records.is_empty(),
+                "{state} produced a training record"
+            );
+            assert_eq!(dataset.exclusions.len(), 1, "{state} is excluded silently");
+            assert!(
+                dataset.exclusions[0].contains(&state.to_string()),
+                "the exclusion names the state: {}",
+                dataset.exclusions[0]
+            );
+        }
+        assert_eq!(labelling_of(State::Accepted), Labelling::Accepted);
+        assert_eq!(labelling_of(State::Failed), Labelling::Failed);
+    }
+
+    /// L4: a failing ledger read is an error, never an empty dataset. The
+    /// closure stands in for the ledger going away mid-build.
+    #[test]
+    fn a_failed_contract_read_stops_the_build() {
+        let fixture = LedgerFixture::open("dataset-err");
+        fixture.dispatched("run-a", "implementation", "initial");
+        fixture.settle("run-a", State::Accepted);
+        let failing = |run_id: &str| -> Result<Option<ContractMaterial>, LedgerError> {
+            Err(LedgerError::Corrupt {
+                what: format!("contract of {run_id}"),
+                detail: "disk gave up".into(),
+            })
+        };
+        let error = build(&fixture.ledger, &failing, &repo_policy()).expect_err("refuses");
+        assert!(
+            matches!(
+                &error,
+                DatasetError::LedgerRead {
+                    run,
+                    query: "contract revision",
+                    ..
+                } if run == "run-a"
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains("disk gave up"), "{error}");
+    }
+
+    /// L4/L8: a run with no dispatch intent has no model to attribute its
+    /// outcome to. It is excluded, not credited to the default identity.
+    #[test]
+    fn a_run_without_a_dispatch_intent_is_excluded() {
+        let fixture = LedgerFixture::open("dataset-nointent");
+        fixture
+            .ledger
+            .insert_run(&run_id("run-a"), "/r", None)
+            .expect("run");
+        let revision = fixture
+            .ledger
+            .insert_contract_revision(
+                &run_id("run-a"),
+                &fixture.contract.hash(),
+                &fixture.contract_json,
+                "HEAD",
+                None,
+            )
+            .expect("revision");
+        fixture
+            .ledger
+            .insert_attempt(&run_id("run-a"), revision, 1, "implementation", "initial")
+            .expect("attempt");
+        fixture.settle("run-a", State::Accepted);
+        let dataset = fixture.build();
+        assert!(dataset.records.is_empty());
+        assert!(
+            dataset.exclusions[0].contains("no dispatch intent"),
+            "{:?}",
+            dataset.exclusions
+        );
+    }
+
+    /// The floor recorded per record is the route the conservative
+    /// baseline would have taken for that contract (SPEC §6).
+    #[test]
+    fn each_record_carries_its_own_routing_floor() {
+        let fixture = LedgerFixture::open("dataset-floor");
+        fixture.dispatched("run-a", "implementation", "initial");
+        fixture.usage("a-worker", "run-a", "sonnet");
+        fixture.settle("run-a", State::Accepted);
+        let dataset = fixture.build();
+        assert_eq!(dataset.version, DATASET_VERSION);
+        assert_eq!(dataset.records.len(), 1);
+        assert_eq!(dataset.records[0].floor, Tier::Implementation);
+        assert_eq!(
+            dataset.records[0].identity,
+            ProfileIdentity {
+                model: "sonnet".into(),
+                effort: Some("medium".into()),
+                harness: None,
+            }
+        );
     }
 
     #[test]
@@ -509,14 +837,14 @@ argv = ["true"]
         other.objective = "Add a --json flag".into();
         assert_ne!(task_family(&base), task_family(&other));
         let mut elsewhere = base.clone();
-        elsewhere.write_scope = Some(vec!["docs/**".into()]);
+        elsewhere.task = crate::contract::Task::change(vec!["docs/**".into()]).expect("compiles");
         assert_ne!(task_family(&base), task_family(&elsewhere));
     }
 
     #[test]
     fn tier_names_round_trip() {
-        assert_eq!(Tier::from_name("escalation"), Some(Tier::Escalation));
-        assert_eq!(Tier::from_name("nonsense"), None);
+        assert_eq!(Tier::parse("escalation"), Some(Tier::Escalation));
+        assert_eq!(Tier::parse("nonsense"), None);
     }
 
     #[test]
@@ -531,7 +859,13 @@ argv = ["true"]
             fingerprint: "f".into(),
             built_at: "now".into(),
         };
-        let (_, positives, negatives) = dataset.acceptance_labels();
-        assert_eq!((positives, negatives), (1, 1));
+        assert_eq!(
+            dataset.acceptance_labels(),
+            ClassDistribution {
+                records: 2,
+                accepted_without_escalation: 1,
+                other: 1
+            }
+        );
     }
 }

@@ -133,11 +133,181 @@ stopped (`relais coordinator stop`) before the first command of this version.
 
 ### Ledger, policy and contracts
 
+- **BREAKING: a trust grant is bound to the repository, not just to the
+  policy text.** A grant used to be keyed by the hash of `relais.toml`
+  alone, so any other repository whose policy hashed the same — and the
+  policy `relais init` writes is public and identical everywhere — ran
+  its verification commands under a grant nobody had reviewed for it. The
+  key is now a hash of the pair (authority hash, repository), where the
+  repository is its canonical root path plus its `origin` remote URL when
+  git reports one. Every existing `[trust."…"]` block stops matching and
+  must be re-issued: `relais plan` prints the block to review and paste,
+  including a new optional `repo = "…"` field that says which repository
+  the grant is for, and `relais doctor` now has a `trust` line saying
+  whether this repository is granted and what the other grants on the
+  machine are for.
+- **BREAKING: a trust grant must name its reviewer.** `reviewed_by` was
+  optional and never read, so a grant nobody had signed counted as
+  reviewed. It is required, and `granted_at` is parsed at the boundary
+  (RFC3339, or a plain `YYYY-MM-DD`) rather than stored as whatever text
+  was there; an invalid grant is a named error from `run`, `plan` and
+  `doctor` instead of a valid-looking one.
+- **The deny floor is a floor.** The permissions documentation promised
+  that a worker cannot commit, merge, push or publish whatever else is
+  configured. `disallowed_tools = []` in `machine.toml` quietly replaced
+  that list with nothing. The shipped denials are now merged into
+  whatever the machine adds, so naming `disallowed_tools` can only widen
+  the deny list, never shorten it.
+- **The authority hash covers the whole policy by construction.** It
+  enumerated its fields by hand, so a new `relais.toml` control was
+  executable authority outside the hash and a grant reviewed before it
+  survived. It is now taken over the serialized policy minus an explicit
+  exclusion list (the schema version), with a test asserting exactly
+  that.
+- **A migration is all-or-nothing, and two first runs no longer race.**
+  Each schema step ran as loose statements with no transaction: a crash
+  in the middle of the v3 rebuild left a half-built table that made every
+  later `relais` command fail with "table already exists", and two
+  processes opening a fresh ledger could both decide a step was
+  unapplied. Each step is now one immediate transaction covering its DDL
+  and the row that records it, re-checked inside the lock.
+- **Two relais processes can open the ledger at the same moment.**
+  `PRAGMA journal_mode = WAL` takes a lock SQLite refuses without
+  consulting the busy handler, and it ran before the busy timeout was
+  even set, so one of two simultaneous openers died with "database is
+  locked" before reading a row — the coordinator starting alongside a
+  run is exactly that case. The timeout is set first and the mode change
+  is retried against the mode actually in force.
+- **A transition and the run status it implies are one write.** They were
+  two; a process killed between them left a run whose history said
+  `accepted` while its status still said `verifying`, and `relais resume`
+  then overwrote the accepted run as `interrupted`.
+- **A declared write scope is validated where the contract is read.** The
+  globs were kept as plain strings and compiled only after a worker had
+  run and been paid for, so a mistyped pattern surfaced as a git error at
+  the end of an attempt. A scope is now compiled at parse time, and an
+  absolute pattern, a `..` segment or a glob that will not compile is a
+  contract error naming the pattern. A contract also carries its kind and
+  its scope as one value, so an `inspect` with a write scope and a
+  `change` without one cannot be built at all.
+- **Spending ceilings are money, and the arithmetic saturates.** They
+  were raw integers, unvalidated, and the per-package budget was computed
+  as `ceiling - spent`, which near the extremes wraps into a number that
+  reads as an unlimited budget. Ceilings are parsed into checked amounts,
+  a negative one is refused by name, and every remaining-budget
+  subtraction saturates at zero.
+- **Ledger rows leave the adapter as values.** The stored contract came
+  back as raw JSON with an unparseable one silently becoming an empty
+  objective, a run's packages came back as untyped status strings, and
+  live dispatches as three-element tuples with a bare integer pid. They
+  are now a parsed `TaskContract` and tier, a typed child-run record, and
+  a dispatch record with real identifiers — and a row this version cannot
+  read is reported as corrupt rather than quietly dropped. `relais
+  dataset build` now says which runs it could not read instead of leaving
+  them out in silence.
+- **Identifiers take their inputs.** Run and dispatch ids read the wall
+  clock, the process id and a process-global counter from wherever they
+  were called, and a clock before 1970 aborted the process. They are
+  minted from a source built once at start-up, and a clock that far wrong
+  is a reported error. The id format is unchanged.
+- **A malformed `machine.toml` stops the coordinator instead of becoming
+  the defaults.** `relais coordinator daemon` read the file best-effort
+  and fell back to default concurrency limits — which are wider than any
+  file would state — when it would not parse. An absent file still means
+  defaults; an unreadable or invalid one is now an error.
+- **A stored state or reason this version does not know says so.**
+  `State::parse` and `Reason::parse` return an error naming what was read
+  and what was found, rather than an empty option a caller can mistake
+  for "nothing recorded".
+- **An inclusive cost total covers its whole subtree.** The
+  double-counting guard looked one generation up, so a grandchild of a
+  provider total that already included it was added again. It now walks
+  the ancestor chain, in `relais report` and in the daily ceiling alike.
+- **A replaced contract revision is recorded as replaced.** The
+  `superseded_by` column existed and nothing ever wrote it; a new
+  revision now closes the ones it supersedes in the same transaction that
+  records it. `changed_controls` also counts a changed decomposition as a
+  scope change — a work plan partitions the declared scope, so replacing
+  it changes what may be written and by whom.
+
 ### Runner
 
 ### Adapter, verification and workspace
 
 ### Learning and routing
+
+- **A run that is still running is no longer a training failure.** The
+  dataset labelled every state it did not name explicitly as "the tier
+  failed", so runs that were merely prepared, running, verifying,
+  repairing or escalating — and runs whose budget ran out before the
+  reasoning was ever tested — taught the learner that their tier does not
+  work. Only an accepted or failed run is a reasoning outcome now;
+  everything else is excluded with the reason printed by
+  `relais dataset build`, and every lifecycle state is answered for by
+  name, so a new one cannot fall into the negative class by default.
+- **`relais dataset build` fails loudly instead of building nothing.** A
+  ledger that could not be read — a busy database, a permissions problem
+  — produced an empty dataset, exit 0 and the advice to "collect outcomes
+  first". Each read now says which run and which query failed, and the
+  command exits non-zero. A run with no recorded contract, state,
+  transition or dispatch intent is still an exclusion, because absence is
+  not failure: what changed is that the two are told apart. A run whose
+  dispatch never named a model is excluded rather than credited to an
+  empty profile.
+- **The evaluator measures the route the router would actually take.** It
+  used to choose among every trained tier with no floor, no risk rules
+  and no check that policy configures a model there, and to compare the
+  result against a "baseline" that pooled research and implementation
+  records regardless of each task's own floor. Eligibility and selection
+  are now the router's own functions, applied per record to the routing
+  floor that record was dispatched under — which the dataset records, so
+  datasets must be rebuilt (`relais dataset build`) before training.
+- **Promotion needs enough evidence to be evidence.** One supported test
+  record could pass the quality gate and the abstention rate was computed
+  and never used. Promotion now also requires a minimum number of
+  held-out records observed at the tier the artifact selects
+  (`routing.min_supported_test_records`, 20 by default) and an abstention
+  rate at or below `routing.max_abstention_rate` (0.5), both settable in
+  `machine.toml`. An artifact whose solver did not converge, or whose
+  calibration temperature came out anti-predictive, fails the gates and
+  says so instead of being quietly floored to a weak positive. The report
+  prints both fit reports, the temperature and the supported-record
+  count, and names every gate that did not hold.
+- **`relais promote` verifies the evidence rather than believing it.** The
+  evaluation report now carries the artifact id, the dataset fingerprint
+  and its schema version, and promotion checks all three and RECOMPUTES
+  the verdict from the report's own numbers — a stored `gates_passed`
+  edited to `true` no longer promotes anything. "Evaluated" is a type only
+  the registry can build, so nothing can promote an id and a hopeful blob.
+- **A model swap starts with no evidence.** Coverage was keyed by tier, so
+  changing the model, effort or harness behind a tier inherited the old
+  profile's acceptance record. Artifacts now carry the profile identities
+  training observed per tier, and inference abstains for a tier whose
+  current identity is not among them, naming it. Artifacts trained before
+  this release are refused by version; retrain.
+- **An unreadable artifact says so.** A registry pointer that could not be
+  read was treated as "nothing is promoted": inference reported a
+  schema-incompatible artifact as an absent one, and promotion overwrote
+  the rollback pointer, so one `rollback` went two artifacts back. Only a
+  missing pointer is an absence now, the rollback pointer is written
+  through the same atomic temp-and-rename as the active one, and
+  inference's abstention carries the reason.
+- **`relais train` exits with a code that says which way it failed** — no
+  training records (3), no tier with enough coverage (4), a solver that
+  diverged (5) — instead of a single stringly error. The solver's
+  convergence test no longer chases a shrinking loss, so a fit that has
+  stopped making material progress is recognized as converged rather than
+  burning its whole iteration budget.
+- **A risk rule with no paths no longer governs every task.** An empty
+  `paths` list was compared against the declared scope as the empty
+  pattern, which a `**` scope matches — so a malformed rule raised the
+  floor of exactly the broadest tasks. Policy validation already refuses
+  such a rule; routing no longer honours one either.
+- **`relais report` counts states, not strings.** A run's status is parsed
+  into the lifecycle state it names (an unknown one is a corrupt-row
+  error, not a silently uncounted run), and the runs awaiting a person —
+  `needs_review`, `needs_decision`, `interrupted` — are now what the field
+  documents.
 
 ### CLI, doctor, install and release
 

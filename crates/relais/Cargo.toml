@@ -52,3 +52,11 @@ windows-sys = { version = "0.61", features = [
     # releases however the daemon dies (C7).
     "Win32_Storage_FileSystem",
 ] }
+
+[dev-dependencies]
+# Property tests for the pure invariants the learner rests on: the
+# feature transform is a function of the record SET, standardization is
+# invertible on the data it was fitted to, and selection never returns a
+# tier eligibility did not offer. Examples prove a case; these prove the
+# rule over generated inputs.
+proptest = "1.11"

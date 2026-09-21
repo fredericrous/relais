@@ -57,22 +57,18 @@ pub const TIER_COUNT: usize = 3;
 
 impl TaskFeatures {
     pub fn extract(contract: &TaskContract, repo: &RepoPolicy) -> Self {
-        let scope_patterns = contract
-            .write_scope
-            .as_deref()
-            .is_some_and(|s| !s.is_empty()) as u64 as f64;
+        let scope_patterns = !contract.scope_patterns().is_empty() as u64 as f64;
         let scope_wildcards = contract
-            .write_scope
-            .as_deref()
-            .map(|patterns| patterns.iter().any(|pattern| pattern.contains('*')) as u64 as f64)
-            .unwrap_or(0.0);
+            .scope_patterns()
+            .iter()
+            .any(|pattern| pattern.contains('*')) as u64 as f64;
         let profile = repo
             .verification
             .profiles
             .get(&contract.verification_profile);
         TaskFeatures {
-            kind_change: (contract.kind == Kind::Change) as u64 as f64,
-            kind_inspect: (contract.kind == Kind::Inspect) as u64 as f64,
+            kind_change: (contract.kind() == Kind::Change) as u64 as f64,
+            kind_inspect: (contract.kind() == Kind::Inspect) as u64 as f64,
             scope_patterns,
             scope_wildcards,
             read_hints: contract.read_hints.len().min(16) as f64,
@@ -173,7 +169,11 @@ fn tier_offset(tier: Tier) -> usize {
 /// Tokenizer: lowercase, split on non-alphanumeric, tokens capped at 24
 /// chars. Frozen with FEATURE_SCHEMA_VERSION; changing it is a new
 /// schema version, never a silent edit.
-fn tokenize(text: &str) -> Vec<String> {
+///
+/// The one tokenizer in the crate: dataset families are grouped by the
+/// tokens of their objective, and a family built with a second spelling of
+/// "lowercase" would group tasks the features treat as different.
+pub fn tokenize(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     for ch in text.chars() {
@@ -334,7 +334,15 @@ impl Standardization {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrainingExample {
     pub family: String,
+    /// The tier this task was actually dispatched to.
     pub tier: Tier,
+    /// The routing floor the contract had at dispatch time: the tier the
+    /// conservative baseline would have taken (SPEC §6). Recorded per
+    /// example because it is the ONLY honest baseline for it — the
+    /// evaluator used to pool research and implementation records whatever
+    /// the task's own floor was, and compare a selection against a mixture
+    /// no route ever produces.
+    pub floor: Tier,
     /// The dispatch-time inputs, kept so an evaluator can ask what the
     /// artifact would have chosen among OTHER tiers for this task —
     /// `sparse` alone is the expansion for the observed tier only.
@@ -502,5 +510,78 @@ mod tests {
         let weights = vec![1.0; 4];
         let features = SparseVec(vec![(0, 2.0), (9, 5.0)]);
         assert_eq!(dot(&features, &weights), 2.0);
+    }
+
+    /// Sparse vectors over a small fixed space, with values a cost or a
+    /// count could plausibly take.
+    fn sparse_vectors() -> impl proptest::strategy::Strategy<Value = Vec<SparseVec>> {
+        use proptest::prelude::*;
+        proptest::collection::vec(
+            proptest::collection::btree_map(0usize..8, -1_000.0f64..1_000.0, 0..8)
+                .prop_map(|entries| SparseVec(entries.into_iter().collect())),
+            1..12,
+        )
+    }
+
+    proptest::proptest! {
+        /// The fitted transform is a function of the record SET: shuffling
+        /// the corpus may not change a coefficient. Training reads records
+        /// in whatever order the ledger returns them, and a transform that
+        /// depended on that order would make the artifact a function of
+        /// something its fingerprint does not record.
+        ///
+        /// Equality here is to within floating-point summation error, not
+        /// bit-exact: adding the same f64s in another order differs in the
+        /// last place. The rule being checked is that nothing but the
+        /// multiset of values decides — a "first record wins" or a running
+        /// index would move the answer by far more than an ulp.
+        #[test]
+        fn standardization_does_not_depend_on_record_order(
+            samples in sparse_vectors(),
+            rotation in 0usize..12,
+        ) {
+            use proptest::prelude::*;
+            let close = |left: &[f64], right: &[f64]| -> bool {
+                left.len() == right.len()
+                    && left.iter().zip(right).all(|(left, right)| {
+                        (left - right).abs() <= 1e-12 * left.abs().max(1.0)
+                    })
+            };
+            let fitted = Standardization::fit(&samples, 8);
+            let mut rotated = samples.clone();
+            rotated.rotate_right(rotation % samples.len().max(1));
+            let refitted = Standardization::fit(&rotated, 8);
+            prop_assert!(close(&fitted.stds, &refitted.stds), "{:?}", refitted.stds);
+            prop_assert_eq!(&fitted.means, &refitted.means);
+            let mut reversed = samples.clone();
+            reversed.reverse();
+            let rebuilt = Standardization::fit(&reversed, 8);
+            prop_assert!(close(&fitted.stds, &rebuilt.stds), "{:?}", rebuilt.stds);
+        }
+
+        /// Scaling is invertible on the data it was fitted to: multiplying
+        /// a standardized coordinate by its own scale returns the original
+        /// value. Nothing is centred, dropped or clamped on the way
+        /// through — which is what lets train and inference share it.
+        #[test]
+        fn standardization_is_invertible_on_its_training_set(samples in sparse_vectors()) {
+            let fitted = Standardization::fit(&samples, 8);
+            for sample in &samples {
+                let applied = fitted.apply(sample);
+                proptest::prop_assert_eq!(applied.0.len(), sample.0.len());
+                for ((index, original), (applied_index, scaled)) in
+                    sample.0.iter().zip(applied.0.iter())
+                {
+                    proptest::prop_assert_eq!(index, applied_index);
+                    let restored = scaled * fitted.stds[*index];
+                    proptest::prop_assert!(
+                        (restored - original).abs() <= 1e-9 * original.abs().max(1.0),
+                        "{} did not survive the round trip: {}",
+                        original,
+                        restored
+                    );
+                }
+            }
+        }
     }
 }

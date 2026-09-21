@@ -113,11 +113,15 @@ timeout_seconds = 30
             .authority_hash()
     }
 
+    /// A trust grant is bound to the declaration AND to the repository
+    /// it was reviewed for, so the key is the pair (P2), and every grant
+    /// names its reviewer (P10).
     fn write_machine(&self, authority_hash: &str, extra: &str) {
+        let key = relais::policy::grant_key(authority_hash, &relais::repo::identity(&self.repo));
         std::fs::write(
             self.config.join("machine.toml"),
             format!(
-                "schema_version = 1\n{extra}\n[trust.\"{authority_hash}\"]\ngranted_at = \"2026-09-18\"\n"
+                "schema_version = 1\n{extra}\n[trust.\"{key}\"]\n                 granted_at = \"2026-09-18\"\nreviewed_by = \"the release suite\"\n"
             ),
         )
         .expect("machine");
@@ -691,7 +695,15 @@ fn install_is_preview_first_and_uninstall_keeps_foreign_and_modified_files() {
 fn the_learning_loop_closes_from_runs_to_a_learned_route() {
     let world = World::new("learn");
     let hash = world.write_policy(3);
-    world.write_machine(&hash, "");
+    // Twelve runs is a scenario, not a corpus: the shipped promotion
+    // gates want twenty held-out records supporting the selected route
+    // before they call an artifact evidence-backed. This scenario proves
+    // the LOOP closes, so it lowers that threshold explicitly — which is
+    // also what makes the setting visible as the knob it is.
+    world.write_machine(
+        &hash,
+        "[routing]\nmin_supported_test_records = 1\nmax_abstention_rate = 1.0\n",
+    );
     // Twelve distinct easy tasks the cheap tier solves outright: twelve
     // families, all accepted without escalation.
     for n in 0..12 {
@@ -769,7 +781,10 @@ fn the_learning_loop_closes_from_runs_to_a_learned_route() {
         "{planned}"
     );
     // Learned routing can be switched off without touching anything else.
-    world.write_machine(&hash, "[routing]\nlearned_enabled = false\n");
+    world.write_machine(
+        &hash,
+        "[routing]\nlearned_enabled = false\nmin_supported_test_records = 1\n",
+    );
     let plan = world.relais(&["plan", "--task", task.to_str().unwrap()]);
     assert!(
         text(&plan.stdout).contains("cold start"),
