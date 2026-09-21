@@ -220,6 +220,36 @@ jobs:
   #   - a fetch failure ALSO fails, unlike ci.yaml: "could not check" is not
   #     "clean", and an unchecked tree does not ship. On a PR you retry
   #     tomorrow; a release published today is immutable today.
+  # The suite, on the TAGGED commit. CI runs on pushes to main and on pull
+  # requests, and on neither of those events does it see a tag — so until
+  # this job existed, nothing between "the tag was pushed" and "binaries
+  # were published" ever ran `cargo test` against the bytes being shipped
+  # (C13). A tag on an unmerged or amended commit published untested code.
+  #
+  # One leg, ubuntu, mirroring ci.yaml's `test` job command for command:
+  # the matrix belongs on the pull request, where a broken platform can
+  # still be fixed. Here it is the last gate before something immutable.
+  test:
+    name: the suite passes on the tagged commit
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-test-release-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      # The scenarios commit in a temporary repository; git wants an
+      # identity. Hooks are disabled per fixture, not here.
+      - run: |
+          git config --global user.email "ci@relais.invalid"
+          git config --global user.name "relais ci"
+      - run: cargo test
+
   audit:
     name: no known vulnerabilities ship
     needs: guard
@@ -282,7 +312,8 @@ jobs:
 
   publish:
     name: publish the release
-    needs: [guard, build, audit]
+    # `test` as well as `build`: compiling is not passing.
+    needs: [guard, test, build, audit]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
