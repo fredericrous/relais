@@ -22,10 +22,12 @@ pub mod money;
 pub mod paths;
 pub mod policy;
 pub mod procs;
+pub mod repo;
 pub mod report;
 pub mod rng;
 pub mod route;
 pub mod runner;
+pub mod tooling;
 pub mod verify;
 pub mod workspace;
 

@@ -647,12 +647,12 @@ impl<'a> RunEngine<'a> {
         }
         // Integrations (SPEC §5): a missing required one blocks execution;
         // optional gaps travel in the receipt and are never passes.
-        if let Some(blocker) = crate::policy::probe_integrations(self.config.repo_policy).first() {
+        if let Some(blocker) = crate::tooling::probe_integrations(self.config.repo_policy).first() {
             return self.fail_preflight(blocker.code, blocker.detail.clone());
         }
         let integration_gaps = verify::integration_gaps(
             &self.config.repo_policy.integrations,
-            &crate::policy::binary_available,
+            &crate::tooling::binary_available,
         );
 
         // Managed runs register their root budget and agent-tree limits
@@ -710,8 +710,8 @@ impl<'a> RunEngine<'a> {
             ),
             tool_versions: context::ToolVersions {
                 relais: crate::version().to_string(),
-                aval: crate::policy::integration_version("aval"),
-                amont: crate::policy::integration_version("amont"),
+                aval: crate::tooling::integration_version("aval"),
+                amont: crate::tooling::integration_version("amont"),
                 claude_code: capabilities
                     .as_ref()
                     .and_then(|capabilities| capabilities.version.clone()),
@@ -1807,7 +1807,7 @@ impl<'a> RunEngine<'a> {
             .amont
             .as_ref()
             .is_some_and(|dependency| dependency.mode() != crate::policy::DependencyMode::Off)
-            && crate::policy::integration_available("amont");
+            && crate::tooling::integration_available("amont");
         let inventory = if amont_on {
             verify::amont_list(self.config.repo_dir, None, false)
         } else {

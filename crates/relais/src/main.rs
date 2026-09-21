@@ -672,9 +672,9 @@ fn cwd() -> PathBuf {
 /// (where `init` belongs); failing that, the cwd itself. Never an error:
 /// `doctor`, `init` and `install` report what they find there.
 fn project_dir() -> PathBuf {
-    match relais::policy::locate_repo_root(&cwd()) {
-        Ok(root) | Err(relais::policy::LocateError::RepoWithoutPolicy(root)) => root,
-        Err(relais::policy::LocateError::NotInRepository(start)) => start,
+    match relais::repo::locate_repo_root(&cwd()) {
+        Ok(root) | Err(relais::repo::LocateError::RepoWithoutPolicy(root)) => root,
+        Err(relais::repo::LocateError::NotInRepository(start)) => start,
     }
 }
 
@@ -684,7 +684,7 @@ fn project_dir() -> PathBuf {
 /// on the repository's policy; a directory outside any repository is
 /// refused by name rather than guessed at.
 fn load_repo_policy() -> Result<(PathBuf, RepoPolicy), i32> {
-    let root = relais::policy::locate_repo_root(&cwd()).map_err(|e| {
+    let root = relais::repo::locate_repo_root(&cwd()).map_err(|e| {
         eprintln!("relais: {e}");
         2
     })?;
@@ -769,7 +769,7 @@ fn init_command() -> i32 {
     // At the repository root, not the shell's cwd: a policy written in a
     // subdirectory would govern nothing.
     let path = project_dir().join("relais.toml");
-    match relais::policy::write_init_template(&path) {
+    match relais::repo::write_init_template(&path) {
         Ok(true) => {
             println!(
                 "wrote {} (edit the model IDs and verification profile, then add a trust grant in machine.toml)",

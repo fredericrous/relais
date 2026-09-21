@@ -402,8 +402,8 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
                     name,
                     component,
                     dependency,
-                    &|bin| crate::policy::binary_available(bin),
-                    &|bin| crate::policy::integration_version(bin),
+                    &|bin| crate::tooling::binary_available(bin),
+                    &|bin| crate::tooling::integration_version(bin),
                 ));
             }
         }
