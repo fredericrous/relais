@@ -61,6 +61,94 @@ stopped (`relais coordinator stop`) before the first command of this version.
 
 ### Adapter, verification and workspace
 
+- **A worker that backgrounds something no longer holds the run open.**
+  When a dispatch ended, its whole process group is now killed before its
+  pipes are drained, on every path including a clean exit: a `npm run dev &`
+  or an MCP server left behind inherits the worker's stdout, and reading
+  that pipe used to block until THAT process ended — past the wall clock,
+  with the write lease and the worktree still held. The result of the kill
+  travels with the launch ("nothing left", "survivors killed", or the
+  refusal), draining is bounded, and a file a descendant writes after the
+  terminal result can no longer land in the tree at all. The same applies
+  to verification commands, so a `cargo test` grandchild is never left
+  running in a worktree about to be removed.
+- **A prompt that did not reach the worker fails the launch.** The prompt
+  was written by a detached thread whose result nobody read, so a harness
+  that exited early read a truncated task and its answer was still
+  recorded as a completed attempt. A partial write is now an interrupted
+  attempt naming the write error — except when relais itself killed the
+  process, where the cancellation or timeout stays the outcome.
+- **An unreported model is a gap, not an agreement.** The adapter used to
+  fill in the requested model when the harness named none, which made the
+  substitution check structurally unable to fail. The effective model is
+  now absent when the harness reports nothing, and a completed dispatch
+  that cannot say which model ran blocks with `model_unverified` instead
+  of being credited to the route it was supposed to test.
+- **The worker gets an explicit environment.** Every launch starts from a
+  cleared environment and receives an allowlist: the machine's own
+  variables, the Anthropic, Bedrock, Vertex and Foundry credentials Claude
+  Code documents, and proxy/CA settings. An ambient `GIT_DIR`,
+  `GIT_WORK_TREE` or `GIT_INDEX_FILE` — inherited from a rebase or a hook
+  shell — can no longer redirect the worker's commits into the user's own
+  repository, and the context manifest records which variables (names
+  only, never values) reached the worker.
+- **`git`, `aval` and `amont` each have one home.** They are now ports the
+  crate owns (`workspace::Git`, `context::DecisionResolver`,
+  `verify::HookInventory`) with a single production implementation each
+  and a fake for tests, so the `ls-tree` that fingerprints a read hint no
+  longer bypasses the `GIT_*` scrubbing the rest of the crate does, and a
+  run can be tested without any of the three installed.
+- **Probes are bounded, cancellable and asked once.** `claude --version`,
+  `claude --help`, `aval resolve` and `amont list` run under a timeout and
+  the run's cancel flag instead of blocking forever, and the harness is
+  probed once per process rather than twice per dispatch.
+- **The baseline cache key names the toolchain that produces the verdict.**
+  It used to hash relais, aval, amont and Claude Code — none of which
+  decides whether `cargo test` passes — so after a `rustup update` a real
+  regression came back as "it failed at the base too". The key now carries
+  each program the profile runs, its resolved path and reported version,
+  plus the machine's OS and architecture; a program that cannot be
+  versioned refuses caching for that profile, with the reason in the
+  receipt.
+- **`.relais/` is recognised when `relais.toml` sits below the git root.**
+  `git status` prints paths relative to the git root, so with the policy in
+  `crates/relais` the contract the run was written for was reported as the
+  user's uncommitted work and refused the run it described.
+- **Protected configuration is protected at any depth.** `src/CLAUDE.md`,
+  `src/.claude/settings.json` and a nested `AGENTS.md`, `.relais/`,
+  `relais.toml`, `amont.conf`, `.adr.yaml` or `.gitignore` are refused
+  inside an ordinary `src/**` scope, as the root ones already were —
+  Claude Code loads the nested files just the same. `.forgejo/workflows/`,
+  `.gitea/workflows/` and `.gitlab-ci.yml` join `.github/workflows/`.
+- **Manifests and lockfiles count wherever they live.** A monorepo
+  candidate editing `apps/web/package.json`, `services/api/go.mod` or a
+  nested `pyproject.toml`, `Makefile`, `justfile` or lockfile now needs a
+  decision from the user, instead of being accepted because the list was
+  anchored to the repository root.
+- **A verification-input pattern that will not compile blocks the run.**
+  It used to be dropped silently, leaving the input it was written to
+  protect unguarded, while a write scope with the same mistake was
+  refused. The error names the pattern. A verification command declaring
+  `timeout_seconds = 0` is likewise refused instead of quietly becoming a
+  one-second check.
+- **amont's inventory is read in the verification worktree.** It was read
+  in the user's mutable checkout, so the receipt could bind a candidate to
+  an inventory of a different tree; the stage is now an explicit
+  `Local`/`Pushed` rather than a bare `true`/`false` at the call site.
+- **The Claude binary is resolved to an absolute path.** A relative
+  `RELAIS_CLAUDE_BIN` is refused, and a PATH hit is canonicalised, so the
+  binary that was probed is the binary that runs — the launch's working
+  directory is the worker's worktree, which could otherwise resolve a
+  repository-committed `node_modules/.bin/claude`.
+- **A read hint that names nothing is a preflight problem.** It used to
+  produce no fingerprints and no word about it; the run now blocks with
+  `read_hint_unresolvable` naming each hint, and a hint whose listing hits
+  the fingerprint cap is flagged as truncated instead of having a sentence
+  written into a fingerprint's path field.
+- **A verification worktree that cannot be released says so.** The runner
+  releases it and reports what git said, with `Drop` as the last resort
+  rather than the only path; both git results used to be discarded.
+
 ### Learning and routing
 
 ### CLI, doctor, install and release

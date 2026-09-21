@@ -588,6 +588,12 @@ pub enum BlockCode {
     /// permissions are a blocked result, never a worker that chose to do
     /// nothing (SPEC §8).
     PermissionDenied,
+    /// The harness reported no effective model, so nothing establishes
+    /// that the routed model ran. Unverified is not approved (SPEC §6).
+    ModelUnverified,
+    /// A contract read hint names nothing at the base revision: the
+    /// worker would be pointed at a path this tree does not have.
+    ReadHintUnresolvable,
 }
 
 impl BlockCode {
@@ -614,6 +620,8 @@ impl BlockCode {
             Self::ArchitectureContradiction => "architecture_contradiction",
             Self::DecompositionKind => "decomposition_kind",
             Self::PermissionDenied => "permission_denied",
+            Self::ModelUnverified => "model_unverified",
+            Self::ReadHintUnresolvable => "read_hint_unresolvable",
         }
     }
 }

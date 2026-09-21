@@ -876,9 +876,15 @@ fn run_command(task: &Path) -> i32 {
             return 3;
         }
     };
-    let aval_root = root.clone();
-    let aval_resolver =
-        move |key: &str, scope: Option<&str>| relais::context::aval_resolve(&aval_root, key, scope);
+    // The three tools a run talks to, each behind the port this crate
+    // owns: git, the decision corpus and the check inventory.
+    let git = relais::workspace::SystemGit;
+    let aval_resolver = relais::context::AvalCli::new(root.clone());
+    let hooks = relais::verify::AmontCli::new();
+    // What every worker this run dispatches will have in its
+    // environment: an allowlist of this process's own, never the whole
+    // of it (SPEC §8).
+    let worker_env = relais::backend::LaunchEnv::from_process_env();
     // Managed dispatch is the only path `relais run` takes: a missing
     // coordinator blocks the run rather than launching unmanaged
     // (SPEC §23).
@@ -908,6 +914,9 @@ fn run_command(task: &Path) -> i32 {
         machine: &machine,
         ledger: &ledger,
         backend: backend.as_ref(),
+        git: &git,
+        hooks: &hooks,
+        worker_env,
         artifacts_dir: paths::runs_dir(),
         aval_resolver: &aval_resolver,
         predictor: predictor

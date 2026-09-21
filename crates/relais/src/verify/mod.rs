@@ -13,6 +13,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -21,6 +23,60 @@ use crate::ids::{canonical_json_hash, sha256_hex};
 use crate::money::{CostCompleteness, MicroUsd};
 use crate::policy::{CommandSpec, DependencyMode, Integrations, VerificationProfile};
 use crate::procs::Ended;
+use crate::tooling::{ProgramVersion, VersionUnknown};
+use crate::workspace::{Git, WorkspaceError};
+
+/// Why verification could not be carried out as the policy declares it.
+/// Distinct from a check that RAN and failed: this is the plan itself
+/// being unusable, which blocks rather than fails (SPEC §10).
+#[derive(Debug)]
+pub enum VerifyError {
+    /// A verification-input pattern is not a glob. Named, and blocking —
+    /// the same treatment `check_scope` gives a malformed write scope,
+    /// because a pattern nobody can compile protects nothing (audit V8).
+    BadPattern {
+        pattern: String,
+        detail: String,
+    },
+    /// A command declares a timeout of zero. A check that is given no
+    /// time is not a check; it was quietly rounded up to one second.
+    ZeroTimeout {
+        argv: Vec<String>,
+    },
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadPattern { pattern, detail } => write!(
+                f,
+                "verification input pattern `{pattern}` is not a valid glob: {detail}"
+            ),
+            Self::ZeroTimeout { argv } => write!(
+                f,
+                "the verification command `{}` declares timeout_seconds = 0; give it a time or remove it",
+                argv.join(" ")
+            ),
+            Self::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for VerifyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::BadPattern { .. } | Self::ZeroTimeout { .. } => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for VerifyError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CheckOutcome {
@@ -68,6 +124,10 @@ pub struct VerificationReport {
     /// fresh run at the base.
     #[serde(default)]
     pub baseline_cached: bool,
+    /// Why the baseline was not cacheable, when the profile asked for
+    /// caching and the toolchain could not be identified (audit V2).
+    #[serde(default)]
+    pub baseline_cache_refused: Option<CacheRefused>,
 }
 impl VerificationReport {
     pub fn accepted(&self) -> bool {
@@ -95,7 +155,8 @@ pub fn run_command(
     logs_dir: &Path,
     label: &str,
     log_stem: &str,
-) -> std::io::Result<CheckOutcome> {
+) -> Result<CheckOutcome, VerifyError> {
+    let timeout = command_timeout(spec)?;
     std::fs::create_dir_all(logs_dir)?;
     let log_path = logs_dir.join(format!("{log_stem}.log"));
     let log_file = std::fs::OpenOptions::new()
@@ -111,16 +172,31 @@ pub fn run_command(
         .stderr(log_file);
     crate::procs::own_process_group(&mut command);
     let mut child = command.spawn()?;
-    let timeout = Duration::from_secs(spec.timeout_seconds.max(1));
-    let ended = crate::procs::wait_for_exit(&mut child, timeout, None)?;
+    // The whole process group goes when the check ends, however it ends:
+    // a `cargo test` grandchild left running in a worktree that is about
+    // to be removed corrupts the next thing that reads it (audit V1).
+    let supervised = crate::procs::wait_for_exit(&mut child, timeout, None)?;
     let log_bytes = std::fs::read(&log_path)?;
     Ok(CheckOutcome {
         label: label.to_string(),
         argv: spec.argv.clone(),
-        ended,
+        ended: supervised.ended,
         log_path: log_path.to_string_lossy().into_owned(),
         log_sha256: sha256_hex(&log_bytes),
     })
+}
+
+/// A command's wall clock. Zero is refused rather than rounded up to a
+/// second: a policy that gives a check no time is a policy mistake, and
+/// silently running it for one second made the mistake invisible
+/// (style, audit §2).
+pub fn command_timeout(spec: &CommandSpec) -> Result<Duration, VerifyError> {
+    if spec.timeout_seconds == 0 {
+        return Err(VerifyError::ZeroTimeout {
+            argv: spec.argv.clone(),
+        });
+    }
+    Ok(Duration::from_secs(spec.timeout_seconds))
 }
 
 /// A check's label: the command's own identity (`make check@1a2b3c4d`),
@@ -148,7 +224,7 @@ pub fn run_profile(
     profile: &VerificationProfile,
     logs_dir: &Path,
     prefix: &str,
-) -> std::io::Result<Vec<CheckOutcome>> {
+) -> Result<Vec<CheckOutcome>, VerifyError> {
     let mut outcomes = Vec::new();
     for (index, command) in profile.commands.iter().enumerate() {
         let label = check_label(command);
@@ -166,23 +242,55 @@ pub fn run_profile(
 /// described. SPEC §9 puts that in the user's hands ("changes protected
 /// verification → needs_decision"): no model review can settle whether
 /// relaxing a lockfile or a build flag is what the task wanted.
+/// Matched by BASENAME at any depth: a monorepo keeps its manifests in
+/// `apps/web/package.json` and `services/api/go.mod`, and a root-anchored
+/// list left a candidate free to edit those and be accepted without the
+/// user ever deciding on it (audit V9). The bare spellings are kept
+/// beside the `**/` ones so a root-level file matches whatever a glob
+/// engine does with a leading `**/`.
 pub const POLICY_VERIFICATION_INPUTS: &[&str] = &[
     "Makefile",
     "makefile",
     "GNUmakefile",
     "justfile",
+    "**/Makefile",
+    "**/makefile",
+    "**/GNUmakefile",
+    "**/justfile",
     "Cargo.toml",
     "Cargo.lock",
-    "**/Cargo.toml",
     "rust-toolchain.toml",
+    "rust-toolchain",
+    "**/Cargo.toml",
+    "**/Cargo.lock",
+    "**/rust-toolchain.toml",
+    "**/rust-toolchain",
     "package.json",
     "package-lock.json",
     "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
     "yarn.lock",
+    "**/package.json",
+    "**/package-lock.json",
+    "**/pnpm-lock.yaml",
+    "**/pnpm-workspace.yaml",
+    "**/yarn.lock",
     "pyproject.toml",
     "requirements*.txt",
+    "uv.lock",
+    "poetry.lock",
+    "**/pyproject.toml",
+    "**/requirements*.txt",
+    "**/uv.lock",
+    "**/poetry.lock",
     "go.mod",
     "go.sum",
+    "**/go.mod",
+    "**/go.sum",
+    "Gemfile",
+    "Gemfile.lock",
+    "**/Gemfile",
+    "**/Gemfile.lock",
     "**/pytest.ini",
     "**/tox.ini",
 ];
@@ -254,17 +362,26 @@ impl TouchedInputs {
     }
 }
 
-fn matcher(patterns: &[String]) -> Option<globset::GlobSet> {
+/// Compile a pattern list. A pattern that will not compile BLOCKS, with
+/// its own text in the message: dropping it silently left the input it
+/// was written to protect unprotected, while `check_scope` refuses the
+/// very same mistake in a write scope (audit V8).
+pub fn matcher(patterns: &[String]) -> Result<globset::GlobSet, VerifyError> {
     let mut builder = globset::GlobSetBuilder::new();
     for pattern in patterns {
-        if let Ok(glob) = globset::GlobBuilder::new(pattern)
+        let glob = globset::GlobBuilder::new(pattern)
             .literal_separator(true)
             .build()
-        {
-            builder.add(glob);
-        }
+            .map_err(|e| VerifyError::BadPattern {
+                pattern: pattern.clone(),
+                detail: e.to_string(),
+            })?;
+        builder.add(glob);
     }
-    builder.build().ok()
+    builder.build().map_err(|e| VerifyError::BadPattern {
+        pattern: patterns.join(", "),
+        detail: e.to_string(),
+    })
 }
 
 /// Which of `changed` are verification inputs, and of which class. A
@@ -273,29 +390,23 @@ fn matcher(patterns: &[String]) -> Option<globset::GlobSet> {
 pub fn classify_verification_inputs(
     profile: &VerificationProfile,
     changed: &[String],
-) -> TouchedInputs {
-    let policy_set = matcher(&verification_inputs(profile));
+) -> Result<TouchedInputs, VerifyError> {
+    let policy_set = matcher(&verification_inputs(profile))?;
     let test_set = matcher(
         &TEST_TREE_INPUTS
             .iter()
             .map(|p| p.to_string())
             .collect::<Vec<_>>(),
-    );
+    )?;
     let mut touched = TouchedInputs::default();
     for path in changed {
-        if policy_set
-            .as_ref()
-            .is_some_and(|set| set.is_match(path.as_str()))
-        {
+        if policy_set.is_match(path.as_str()) {
             touched.policy.push(path.clone());
-        } else if test_set
-            .as_ref()
-            .is_some_and(|set| set.is_match(path.as_str()))
-        {
+        } else if test_set.is_match(path.as_str()) {
             touched.tests.push(path.clone());
         }
     }
-    touched
+    Ok(touched)
 }
 
 /// The effective check inventory from `amont list --json`
@@ -412,20 +523,89 @@ pub fn parse_amont_list(stdout: &str) -> Option<AmontInventory> {
     })
 }
 
-pub fn amont_list(repo_dir: &Path, stage: Option<&str>, pushed: bool) -> Option<AmontInventory> {
+/// Which side of a push the inventory is asked about. An enum, not a
+/// `pushed: bool` at a call site where `false` says nothing about what
+/// was meant (audit V14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// The checks as they stand for this working tree: what a commit
+    /// here would run.
+    Local,
+    /// The checks a push would run.
+    Pushed,
+}
+
+/// How long `amont list` may take. An inventory is a question about a
+/// repository, so it is bounded and cancellable like every other probe
+/// (audit V6) — generously, because it walks the repository's own
+/// declarations.
+pub const INVENTORY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The effective check inventory, as a port relais owns. The runner asks
+/// a `HookInventory`; only `AmontCli` knows the binary's name.
+pub trait HookInventory {
+    /// The inventory for `dir`. `None` is no inventory — which
+    /// `amont_gaps` turns into a gap for every required check, never
+    /// into a pass.
+    fn list(&self, dir: &Path, stage: Stage) -> Option<AmontInventory>;
+}
+
+/// The `amont` binary on this machine — the one place it is spawned.
+#[derive(Debug, Default)]
+pub struct AmontCli {
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+impl AmontCli {
+    pub fn new() -> Self {
+        Self { cancel: None }
+    }
+
+    /// The same, stopping with the run.
+    pub fn watching(cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            cancel: Some(cancel),
+        }
+    }
+}
+
+impl HookInventory for AmontCli {
+    fn list(&self, dir: &Path, stage: Stage) -> Option<AmontInventory> {
+        amont_list(dir, stage, self.cancel.as_deref())
+    }
+}
+
+/// A fixed answer, for tests and for a run whose policy has the
+/// integration off.
+#[derive(Debug, Default)]
+pub struct FixedInventory(pub Option<AmontInventory>);
+
+impl HookInventory for FixedInventory {
+    fn list(&self, _dir: &Path, _stage: Stage) -> Option<AmontInventory> {
+        self.0.clone()
+    }
+}
+
+/// Run `amont list --json` in a directory, bounded and cancellable.
+pub fn amont_list(
+    repo_dir: &Path,
+    stage: Stage,
+    cancel: Option<&AtomicBool>,
+) -> Option<AmontInventory> {
     let mut command = Command::new("amont");
     command.arg("list").arg("--json").current_dir(repo_dir);
-    if let Some(stage) = stage {
-        command.arg("--stage").arg(stage);
+    match stage {
+        Stage::Pushed => {
+            command.arg("--pushed");
+        }
+        Stage::Local => {}
     }
-    if pushed {
-        command.arg("--pushed");
-    }
-    let output = command.output().ok()?;
-    if !output.status.success() {
+    let end =
+        crate::procs::run_with_timeout(command, INVENTORY_TIMEOUT, None, cancel, None).ok()?;
+    if end.ended != Ended::Exited(0) {
         return None;
     }
-    parse_amont_list(&String::from_utf8_lossy(&output.stdout))
+    parse_amont_list(&end.stdout)
 }
 
 /// Gaps among the checks the run depends on: required amont checks that
@@ -533,20 +713,91 @@ pub struct Verified {
     pub amont_downgrades: Vec<String>,
 }
 
+/// The toolchain a profile's commands actually run on: for every program
+/// the argv names, where it resolved and what version it reports, plus
+/// the machine's declared identity.
+///
+/// `ToolVersions` names relais, aval, amont and Claude Code — none of
+/// which decides whether `cargo test` passes. After a `rustup update` or
+/// a new `make`, the old key still matched and a real regression came
+/// back as "failed at the base too" (audit V2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Toolchain {
+    pub programs: Vec<ProgramVersion>,
+    pub os: String,
+    pub arch: String,
+}
+
+/// Why a baseline verdict may not be cached for this profile. Recorded
+/// in the receipt: a run that could not cache says why, rather than
+/// quietly re-running (or quietly reusing) the baseline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheRefused {
+    pub reason: String,
+}
+
+impl std::fmt::Display for CacheRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+/// Resolve every program the profile's commands run. The probe is a
+/// parameter, so this stays a pure function over what the machine
+/// answered. A program that cannot be versioned refuses the cache for
+/// the whole profile: a key that cannot name the toolchain cannot say
+/// two runs shared one.
+pub fn resolve_toolchain(
+    profile: &VerificationProfile,
+    probe: &dyn Fn(&str) -> Result<ProgramVersion, VersionUnknown>,
+) -> Result<Toolchain, CacheRefused> {
+    let mut programs: Vec<ProgramVersion> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for command in &profile.commands {
+        let Some(program) = command.argv.first() else {
+            continue;
+        };
+        if seen.contains(program) {
+            continue;
+        }
+        seen.push(program.clone());
+        match probe(program) {
+            Ok(resolved) => programs.push(resolved),
+            Err(unknown) => {
+                return Err(CacheRefused {
+                    reason: format!(
+                        "the baseline cannot be cached: {unknown}, so the key cannot say which \
+                         toolchain produced the verdict"
+                    ),
+                })
+            }
+        }
+    }
+    programs.sort_by(|a, b| a.program.cmp(&b.program));
+    Ok(Toolchain {
+        programs,
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+    })
+}
+
 /// The baseline cache key: everything the base verdict is a function of
 /// that relais can observe (SPEC §18: "candidate content, dependency
 /// lockfiles, toolchain, command, configuration"). Lockfiles are part of
-/// the base tree; the toolchain is the recorded tool versions.
+/// the base tree; the toolchain is the resolved programs the commands
+/// run, on the machine identity they run on.
 pub fn baseline_key(
     base_sha: &str,
     profile: &VerificationProfile,
     tools: &crate::context::ToolVersions,
+    toolchain: &Toolchain,
 ) -> String {
     sha256_hex(
         serde_json::json!({
             "base": base_sha,
             "profile": profile,
             "tools": tools,
+            "toolchain": toolchain,
         })
         .to_string()
         .as_bytes(),
@@ -612,66 +863,86 @@ impl Receipt {
 /// touch: a throwaway worktree checked out at the candidate commit, then
 /// removed. If creation fails the outcome is blocked, not a pass.
 pub fn verification_worktree<'a>(
+    git: &'a dyn Git,
     repo_dir: &Path,
     candidate_sha: &str,
     path: &Path,
-) -> Result<VerificationWorktree<'a>, std::io::Error> {
+) -> Result<VerificationWorktree<'a>, WorkspaceError> {
     std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))?;
-    let output = crate::workspace::git_command(repo_dir)
-        .args([
+    git.run(
+        repo_dir,
+        &[
             "worktree",
             "add",
             "--detach",
             &path.to_string_lossy(),
             candidate_sha,
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(std::io::Error::other(format!(
-            "git worktree add failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
+        ],
+    )?;
     Ok(VerificationWorktree {
+        git,
         repo_dir: repo_dir.to_path_buf(),
         path: path.to_path_buf(),
-        _marker: std::marker::PhantomData,
+        released: false,
     })
 }
 
+/// A throwaway worktree at one candidate SHA. The lifetime is the
+/// borrowed git port's, not a phantom: this value really does hold the
+/// thing it needs to release itself.
 pub struct VerificationWorktree<'a> {
+    git: &'a dyn Git,
     repo_dir: PathBuf,
     path: PathBuf,
-    _marker: std::marker::PhantomData<&'a ()>,
+    released: bool,
 }
 
 impl VerificationWorktree<'_> {
     pub fn path(&self) -> &Path {
         &self.path
     }
-}
 
-impl Drop for VerificationWorktree<'_> {
-    fn drop(&mut self) {
-        // A verification worktree is throwaway by design: it exists for
-        // the length of one profile run, and nothing is ever integrated
-        // from it. Releasing it here — rather than leaving it for a
-        // cleanup command nobody runs — is what keeps `git worktree
-        // list` from growing an entry per attempt and per run. Failure
-        // to clean never blocks acceptance either way, but the
-        // administrative entry is pruned too, so a directory removed
-        // from underneath us does not leave a stale registration.
-        let _ = crate::workspace::git_command(&self.repo_dir)
-            .args([
+    /// Remove the worktree and prune its registration, reporting what
+    /// git said. A verification worktree is throwaway by design — it
+    /// exists for the length of one profile run and nothing is ever
+    /// integrated from it — so releasing it is what keeps `git worktree
+    /// list` from growing an entry per attempt; but a release that FAILS
+    /// leaves a directory and a registration behind, and the caller is
+    /// the only one who can put that in the run's record.
+    pub fn release(&mut self) -> Result<(), WorkspaceError> {
+        if self.released {
+            return Ok(());
+        }
+        self.released = true;
+        let removed = self.git.run(
+            &self.repo_dir,
+            &[
                 "worktree",
                 "remove",
                 "--force",
                 &self.path.to_string_lossy(),
-            ])
-            .output();
-        let _ = crate::workspace::git_command(&self.repo_dir)
-            .args(["worktree", "prune"])
-            .output();
+            ],
+        );
+        // Prune whatever the removal left, including the administrative
+        // entry for a directory that vanished from underneath us, and
+        // report the first failure rather than the last.
+        let pruned = self.git.run(&self.repo_dir, &["worktree", "prune"]);
+        removed.and(pruned).map(|_| ())
+    }
+}
+
+impl Drop for VerificationWorktree<'_> {
+    fn drop(&mut self) {
+        // Last resort: `release` is the way this is meant to end, and
+        // the runner calls it. Reaching here means an early return or a
+        // panic got there first, so the failure has nobody left to
+        // return to — it is reported on stderr rather than discarded.
+        if let Err(e) = self.release() {
+            eprintln!(
+                "relais: the verification worktree {} could not be released: {e}",
+                self.path.display()
+            );
+        }
     }
 }
 
@@ -697,14 +968,17 @@ pub fn integration_gaps(
             continue;
         };
         let bin = dependency.bin().unwrap_or(default_bin);
+        let installed = available(bin);
         match dependency.mode() {
-            DependencyMode::Required if !available(bin) => {
+            DependencyMode::Required if !installed => {
                 gaps.push(format!("{name}: required integration unavailable"))
             }
-            DependencyMode::Optional if !available(bin) => gaps.push(format!(
+            DependencyMode::Optional if !installed => gaps.push(format!(
                 "{name}: optional integration not installed (reported, not passed)"
             )),
-            _ => {}
+            // Present, or switched off in policy: an integration the run
+            // does not consult is not a gap in the run.
+            DependencyMode::Required | DependencyMode::Optional | DependencyMode::Off => {}
         }
     }
     gaps
@@ -831,7 +1105,8 @@ mod tests {
                 "ci/lint.yml".into(),
                 "docs/README.md".into(),
             ],
-        );
+        )
+        .expect("the built-in patterns compile");
         assert_eq!(
             touched.policy,
             vec![
@@ -848,7 +1123,99 @@ mod tests {
             "the test tree is work SPEC §10 invites, not a policy change"
         );
         assert_eq!(touched.all().len(), 7);
-        assert!(classify_verification_inputs(&profile, &["src/lib.rs".into()]).is_empty());
+        assert!(
+            classify_verification_inputs(&profile, &["src/lib.rs".into()])
+                .expect("compiles")
+                .is_empty()
+        );
+    }
+
+    /// V9: a monorepo keeps its manifests below the root. Editing
+    /// `apps/web/package.json` changes what the checks build as surely
+    /// as editing the root one, and the root-anchored list accepted it
+    /// without the user deciding anything.
+    #[test]
+    fn a_nested_manifest_is_a_policy_change_at_any_depth() {
+        let profile = VerificationProfile::default();
+        let touched = classify_verification_inputs(
+            &profile,
+            &[
+                "apps/web/package.json".into(),
+                "services/api/go.mod".into(),
+                "libs/py/pyproject.toml".into(),
+                "libs/py/requirements-dev.txt".into(),
+                "tools/Makefile".into(),
+                "crates/x/rust-toolchain.toml".into(),
+                "apps/web/pnpm-lock.yaml".into(),
+                "package.json".into(),
+                "Makefile".into(),
+                "apps/web/src/index.ts".into(),
+            ],
+        )
+        .expect("the built-in patterns compile");
+        assert_eq!(
+            touched.policy,
+            vec![
+                "apps/web/package.json",
+                "services/api/go.mod",
+                "libs/py/pyproject.toml",
+                "libs/py/requirements-dev.txt",
+                "tools/Makefile",
+                "crates/x/rust-toolchain.toml",
+                "apps/web/pnpm-lock.yaml",
+                "package.json",
+                "Makefile",
+            ],
+            "manifests and lockfiles are policy wherever they live"
+        );
+        assert!(touched.tests.is_empty());
+    }
+
+    /// V8: a pattern nobody can compile protects nothing. Dropping it
+    /// silently left the input it was written for unguarded, while
+    /// `check_scope` refuses the same mistake in a write scope.
+    #[test]
+    fn a_malformed_input_pattern_blocks_and_names_itself() {
+        let profile = VerificationProfile {
+            commands: Vec::new(),
+            amont_checks: Vec::new(),
+            amont_waivers: Vec::new(),
+            inputs: vec!["ci/[unclosed".into()],
+            cache_baseline: false,
+        };
+        let error = classify_verification_inputs(&profile, &["ci/lint.yml".into()])
+            .expect_err("a pattern that will not compile blocks the run");
+        assert!(
+            matches!(&error, VerifyError::BadPattern { pattern, .. } if pattern == "ci/[unclosed"),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("ci/[unclosed"), "{error}");
+    }
+
+    /// A check with no time to run in is a policy mistake, not a
+    /// one-second check.
+    #[test]
+    fn a_command_with_a_zero_timeout_is_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "relais-zero-{}-{}",
+            std::process::id(),
+            next_fixture()
+        ));
+        let error = run_command(
+            &dir,
+            &command(&["sh", "-c", "true"], 0),
+            &dir.join("logs"),
+            "cmd0",
+            "x-cmd0",
+        )
+        .expect_err("zero seconds is refused");
+        assert!(matches!(error, VerifyError::ZeroTimeout { .. }), "{error}");
+        assert!(error.to_string().contains("timeout_seconds = 0"), "{error}");
+        assert_eq!(
+            command_timeout(&command(&["sh"], 12)).expect("a real timeout"),
+            Duration::from_secs(12)
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A path both classes could claim is judged by the stricter one:
@@ -856,17 +1223,28 @@ mod tests {
     #[test]
     fn a_manifest_in_the_test_tree_is_a_policy_change() {
         let profile = VerificationProfile::default();
-        let touched = classify_verification_inputs(&profile, &["tests/fixtures/Cargo.toml".into()]);
+        let touched = classify_verification_inputs(&profile, &["tests/fixtures/Cargo.toml".into()])
+            .expect("compiles");
         assert_eq!(touched.policy, vec!["tests/fixtures/Cargo.toml"]);
         assert!(touched.tests.is_empty());
     }
 
+    /// V2: the key must move when the TOOLCHAIN moves. `ToolVersions`
+    /// names relais, aval, amont and Claude Code, none of which decides
+    /// whether `cargo test` passes: after a `rustup update` the old key
+    /// still matched and a genuine regression came back as
+    /// "failed at the base too".
     #[test]
-    fn baseline_cache_is_keyed_on_base_profile_and_tools() {
-        let dir = std::env::temp_dir().join(format!("relais-bcache-{}", std::process::id()));
+    fn the_baseline_key_moves_with_the_compiler_that_runs_the_checks() {
+        let dir = std::env::temp_dir().join(format!(
+            "relais-bcache-{}-{}",
+            std::process::id(),
+            next_fixture()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
         let cache = BaselineCache::new(&dir);
         let profile = VerificationProfile {
-            commands: vec![command(&["make", "check"], 10)],
+            commands: vec![command(&["cargo", "test"], 10)],
             amont_checks: Vec::new(),
             amont_waivers: Vec::new(),
             inputs: Vec::new(),
@@ -878,25 +1256,106 @@ mod tests {
             amont: Some("amont 1.36.1".into()),
             claude_code: None,
         };
-        let key = baseline_key("abc", &profile, &tools);
+        let toolchain = Toolchain {
+            programs: vec![ProgramVersion {
+                program: "cargo".into(),
+                path: "/usr/local/bin/cargo".into(),
+                version: "cargo 1.88.0".into(),
+            }],
+            os: "linux".into(),
+            arch: "x86_64".into(),
+        };
+        let key = baseline_key("abc", &profile, &tools, &toolchain);
         assert_eq!(cache.get(&key), None, "a miss reruns the checks");
-        cache.put(&key, &["make@deadbeef".to_string()]);
-        assert_eq!(cache.get(&key), Some(vec!["make@deadbeef".to_string()]));
-        let other_tools = crate::context::ToolVersions {
-            amont: Some("amont 1.37.0".into()),
-            ..tools.clone()
+        cache.put(&key, &["cargo@deadbeef".to_string()]);
+        assert_eq!(cache.get(&key), Some(vec!["cargo@deadbeef".to_string()]));
+
+        let updated = Toolchain {
+            programs: vec![ProgramVersion {
+                version: "cargo 1.90.0".into(),
+                ..toolchain.programs[0].clone()
+            }],
+            ..toolchain.clone()
         };
         assert_ne!(
             key,
-            baseline_key("abc", &profile, &other_tools),
-            "toolchain is in the key"
+            baseline_key("abc", &profile, &tools, &updated),
+            "a compiler update is a different baseline"
+        );
+        let elsewhere = Toolchain {
+            programs: vec![ProgramVersion {
+                path: "/home/dev/.cargo/bin/cargo".into(),
+                ..toolchain.programs[0].clone()
+            }],
+            ..toolchain.clone()
+        };
+        assert_ne!(
+            key,
+            baseline_key("abc", &profile, &tools, &elsewhere),
+            "the same version from another path is another toolchain"
+        );
+        let other_machine = Toolchain {
+            arch: "aarch64".into(),
+            ..toolchain.clone()
+        };
+        assert_ne!(
+            key,
+            baseline_key("abc", &profile, &tools, &other_machine),
+            "os and arch are part of the environment identity"
         );
         assert_ne!(
             key,
-            baseline_key("abd", &profile, &tools),
+            baseline_key("abd", &profile, &tools, &toolchain),
             "base is in the key"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A program the machine cannot version refuses the cache, with the
+    /// reason the receipt records — rather than a key that quietly says
+    /// nothing about what ran.
+    #[test]
+    fn a_profile_whose_programs_cannot_be_versioned_refuses_the_cache() {
+        let profile = VerificationProfile {
+            commands: vec![
+                command(&["make", "check"], 10),
+                command(&["make", "lint"], 10),
+            ],
+            amont_checks: Vec::new(),
+            amont_waivers: Vec::new(),
+            inputs: Vec::new(),
+            cache_baseline: true,
+        };
+        let resolved = resolve_toolchain(&profile, &|program| {
+            Ok(ProgramVersion {
+                program: program.to_string(),
+                path: format!("/usr/bin/{program}"),
+                version: format!("{program} 4.4"),
+            })
+        })
+        .expect("every program answered");
+        assert_eq!(
+            resolved.programs.len(),
+            1,
+            "one entry per distinct program, not per command"
+        );
+        assert_eq!(resolved.os, std::env::consts::OS);
+
+        let refused = resolve_toolchain(&profile, &|program| {
+            Err(VersionUnknown::NoAnswer {
+                program: program.to_string(),
+                detail: "it printed nothing".into(),
+            })
+        })
+        .expect_err("a program that will not say its version refuses the cache");
+        assert!(refused.reason.contains("make"), "{refused}");
+        assert!(refused.reason.contains("cannot be cached"), "{refused}");
+    }
+
+    /// Unique fixture directories under parallel test threads.
+    fn next_fixture() -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     const AMONT_SAMPLE: &str = r#"{
@@ -979,7 +1438,11 @@ mod tests {
 
     #[test]
     fn a_verification_worktree_releases_itself_when_its_checks_are_done() {
-        let dir = std::env::temp_dir().join(format!("relais-vwt-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "relais-vwt-{}-{}",
+            std::process::id(),
+            next_fixture()
+        ));
         std::fs::remove_dir_all(&dir).ok();
         let repo = dir.join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir");
@@ -1002,17 +1465,32 @@ mod tests {
         git(&["add", "-A"]);
         git(&["commit", "-q", "-m", "base"]);
         let head = git(&["rev-parse", "HEAD"]);
+        let system = crate::workspace::SystemGit;
         let path = dir.join("verify/verify-1");
         {
-            let holder = verification_worktree(&repo, &head, &path).expect("worktree");
+            // The caller releases it and sees what git said; releasing
+            // twice is not an error, and `Drop` has nothing left to do.
+            let mut holder = verification_worktree(&system, &repo, &head, &path).expect("worktree");
             assert!(holder.path().join("f.txt").is_file());
             assert!(git(&["worktree", "list"]).contains("verify-1"));
+            holder.release().expect("released, and git said so");
+            assert!(!path.exists(), "release is what removes it");
+            holder.release().expect("releasing twice is not an error");
         }
         assert!(
             !git(&["worktree", "list"]).contains("verify-1"),
             "the throwaway worktree is gone, administrative entry included"
         );
-        assert!(!path.exists());
+
+        // And a holder nobody releases is still cleaned up by `Drop`:
+        // the last resort, not the way it is meant to end.
+        let dropped = dir.join("verify/verify-2");
+        {
+            let _holder = verification_worktree(&system, &repo, &head, &dropped).expect("worktree");
+            assert!(git(&["worktree", "list"]).contains("verify-2"));
+        }
+        assert!(!dropped.exists());
+        assert!(!git(&["worktree", "list"]).contains("verify-2"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1049,6 +1527,7 @@ mod tests {
             verification_inputs_changed: Vec::new(),
             integration_gaps: Vec::new(),
             baseline_cached: false,
+            baseline_cache_refused: None,
         };
         assert!(report.accepted());
         assert!(report.new_failures().is_empty());
@@ -1082,6 +1561,7 @@ mod tests {
             verification_inputs_changed: Vec::new(),
             integration_gaps: Vec::new(),
             baseline_cached: false,
+            baseline_cache_refused: None,
         };
         assert!(!report.accepted(), "baseline failures are not auto-waived");
         assert!(
@@ -1112,6 +1592,7 @@ mod tests {
                 verification_inputs_changed: Vec::new(),
                 integration_gaps: Vec::new(),
                 baseline_cached: false,
+                baseline_cache_refused: None,
             },
             models_used: vec!["sonnet".into()],
             attempts: 1,

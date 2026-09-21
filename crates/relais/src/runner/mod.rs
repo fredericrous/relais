@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use crate::admission::{Decision, DispatchRequest, Gate, Refusal, ResourceClass, RunRegistration};
 use crate::backend::{Backend, LaunchResult, LaunchSpec};
-use crate::context::{self, AvalVerdict, ContextError, ContextManifest};
+use crate::context::{self, ContextError, ContextManifest};
 use crate::contract::{Review, TaskContract};
 use crate::ids::{DispatchId, RunId};
 use crate::ledger::{Ledger, LedgerError, Transition, UsageEvent};
@@ -78,6 +78,9 @@ pub enum RunError {
     Ledger(LedgerError),
     Io(std::io::Error),
     Workspace(WorkspaceError),
+    /// The verification plan itself could not be carried out: a pattern
+    /// that will not compile, a command with no time to run in.
+    Verify(verify::VerifyError),
     Other(String),
 }
 
@@ -87,8 +90,15 @@ impl std::fmt::Display for RunError {
             Self::Ledger(e) => write!(f, "ledger: {e}"),
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Workspace(e) => write!(f, "workspace: {e}"),
+            Self::Verify(e) => write!(f, "verification: {e}"),
             Self::Other(detail) => f.write_str(detail),
         }
+    }
+}
+
+impl From<verify::VerifyError> for RunError {
+    fn from(e: verify::VerifyError) -> Self {
+        Self::Verify(e)
     }
 }
 
@@ -119,10 +129,18 @@ pub struct RunConfig<'a> {
     pub machine: &'a MachineSettings,
     pub ledger: &'a Ledger,
     pub backend: &'a dyn Backend,
+    /// Git, as a port: every repository fact a run reads goes through
+    /// it, so a test supplies one and production supplies
+    /// `workspace::SystemGit`.
+    pub git: &'a dyn workspace::Git,
+    /// The check inventory (`amont`), as a port.
+    pub hooks: &'a dyn verify::HookInventory,
+    /// The environment every worker this run dispatches will run with.
+    pub worker_env: crate::backend::LaunchEnv,
     pub artifacts_dir: PathBuf,
     /// aval resolution, injectable so runs are testable without the real
-    /// corpus; production wiring calls `context::aval_resolve`.
-    pub aval_resolver: &'a dyn Fn(&str, Option<&str>) -> AvalVerdict,
+    /// corpus; production wiring passes a `context::AvalCli`.
+    pub aval_resolver: &'a dyn context::DecisionResolver,
     pub predictor: Option<&'a dyn RoutePredictor>,
     /// Managed dispatch (SPEC §23): every launch is admitted, heartbeat
     /// and settled through this gate. `None` = unmanaged execution;
@@ -690,21 +708,31 @@ impl<'a> RunEngine<'a> {
 
         // Context: verdicts and tool failures are distinct, contradictions
         // block, missing answers gate dependents only (SPEC §7).
-        let resolver = |key: &str, scope: Option<&str>| (self.config.aval_resolver)(key, scope);
         // One probe: the version and the turn-ceiling capability are the
         // same answer about the same installed harness.
         let capabilities = self.config.backend.probe();
+        // Read hints are fingerprinted from the base tree; one that
+        // resolves to nothing would point the worker at a path this
+        // revision does not have, which is a preflight problem (V15).
+        let fingerprints = match context::fingerprint_hints(
+            self.config.git,
+            self.config.repo_dir,
+            &base_sha,
+            &self.config.contract.read_hints,
+        ) {
+            Ok(fingerprints) => fingerprints,
+            Err(unresolvable) => {
+                return self
+                    .fail_preflight(BlockCode::ReadHintUnresolvable, unresolvable.to_string())
+            }
+        };
         let manifest = match context::assemble(context::ContextInputs {
             contract: self.config.contract,
             repo: self.config.repo_policy,
             contract_hash: &contract_hash,
             base_sha: &base_sha,
             policy_hash: &authority.authority_hash,
-            fingerprints: context::fingerprint_hints(
-                self.config.repo_dir,
-                &base_sha,
-                &self.config.contract.read_hints,
-            ),
+            fingerprints,
             tool_versions: context::ToolVersions {
                 relais: crate::version().to_string(),
                 aval: crate::tooling::integration_version("aval"),
@@ -719,7 +747,8 @@ impl<'a> RunEngine<'a> {
                 .as_ref()
                 .map(crate::backend::Capabilities::turn_ceiling)
                 .unwrap_or_default(),
-            resolver: &resolver,
+            worker_env: &self.config.worker_env,
+            resolver: self.config.aval_resolver,
         }) {
             Ok(manifest) => {
                 // The context package is evidence: written next to the run
@@ -814,27 +843,41 @@ impl<'a> RunEngine<'a> {
                 .unwrap_or(&self.config.artifacts_dir)
                 .join("baseline-cache"),
         );
-        let baseline_key = verify::baseline_key(
-            &base_sha,
-            &authority.verification_profile,
-            &manifest.tool_versions,
-        );
-        let cached_baseline = authority
-            .verification_profile
-            .cache_baseline
-            .then(|| baseline_cache.get(&baseline_key))
-            .flatten();
+        // The key names the toolchain the checks actually run on: a
+        // `rustup update` changes the verdict, and the old key would
+        // have reported a real regression as pre-existing (SPEC §18,
+        // audit V2). A toolchain that cannot be identified refuses the
+        // cache and says so in the receipt.
+        let toolchain = verify::resolve_toolchain(&authority.verification_profile, &|program| {
+            crate::tooling::program_version(program, None)
+        });
+        let baseline_key = match &toolchain {
+            Ok(toolchain) => Some(verify::baseline_key(
+                &base_sha,
+                &authority.verification_profile,
+                &manifest.tool_versions,
+                toolchain,
+            )),
+            Err(_) => None,
+        };
+        let baseline_cache_refused = toolchain.err();
+        let cacheable = authority.verification_profile.cache_baseline;
+        let cached_baseline = match (cacheable, &baseline_key) {
+            (true, Some(key)) => baseline_cache.get(key),
+            _ => None,
+        };
         let baseline_cached = cached_baseline.is_some();
         // The baseline's check outcomes are kept: a candidate identical to
         // the base has exactly these results, without re-running them.
         let (baseline_failures, baseline_checks) = match cached_baseline {
             Some(failures) => (failures, None),
             None => match verify::verification_worktree(
+                self.config.git,
                 self.config.repo_dir,
                 &base_sha,
                 &self.verify_dir.join("verify-base"),
             ) {
-                Ok(baseline) => {
+                Ok(mut baseline) => {
                     let checks = verify::run_profile(
                         baseline.path(),
                         &authority.verification_profile,
@@ -846,8 +889,11 @@ impl<'a> RunEngine<'a> {
                         .filter(|outcome| outcome.failed())
                         .map(|outcome| outcome.label.clone())
                         .collect();
-                    if authority.verification_profile.cache_baseline {
-                        baseline_cache.put(&baseline_key, &failures);
+                    if let (true, Some(key)) = (cacheable, &baseline_key) {
+                        baseline_cache.put(key, &failures);
+                    }
+                    if let Err(e) = baseline.release() {
+                        eprintln!("relais: {e}");
                     }
                     (failures, Some(checks))
                 }
@@ -883,6 +929,7 @@ impl<'a> RunEngine<'a> {
                 baseline_failures: &baseline_failures,
                 integration_gaps: &integration_gaps,
                 baseline_cached,
+                baseline_cache_refused: &baseline_cache_refused,
                 logs_dir: &logs_dir,
                 deadline,
             };
@@ -1035,6 +1082,7 @@ impl<'a> RunEngine<'a> {
                 disallowed_tools: authority.disallowed_tools.clone(),
                 allowed_tools: authority.allowed_tools.clone(),
                 work_dir: worktree_path.clone(),
+                env: self.config.worker_env.clone(),
                 wall_timeout: remaining_wall,
                 cancel: None,
                 pid_slot: None,
@@ -1092,19 +1140,41 @@ impl<'a> RunEngine<'a> {
 
             // An unapproved substitution stops further dispatch and
             // invalidates any claim that the requested route was tested
-            // (SPEC §6).
-            if let Some(effective) = result
-                .effective_model
-                .as_deref()
-                .filter(|model| !crate::backend::model_matches(&model_profile.id, model))
+            // (SPEC §6). A harness that named NO model leaves the
+            // question open, which is a recorded gap and stops dispatch
+            // just the same: the run cannot say the route was tested
+            // (audit V3).
+            match crate::backend::verify_model(&model_profile.id, result.effective_model.as_deref())
             {
-                return self.stop(
-                    &progress.budget,
-                    Observation::UnapprovedSubstitution {
-                        requested: model_profile.id.clone(),
-                        effective: effective.to_string(),
-                    },
-                );
+                crate::backend::ModelVerification::Matches => {}
+                crate::backend::ModelVerification::Substituted {
+                    requested,
+                    effective,
+                } => {
+                    return self.stop(
+                        &progress.budget,
+                        Observation::UnapprovedSubstitution {
+                            requested,
+                            effective,
+                        },
+                    );
+                }
+                // A dispatch that produced no terminal result — killed by
+                // the wall clock, cancelled, crashed — could not have
+                // reported a model either. The interruption below is the
+                // outcome; calling it an unverified model would hide it.
+                crate::backend::ModelVerification::Unverified { .. }
+                    if result.terminal_result_missing() => {}
+                crate::backend::ModelVerification::Unverified { requested } => {
+                    return self.block(
+                        Reason::UnapprovedSubstitution,
+                        BlockCode::ModelUnverified,
+                        format!(
+                            "the harness reported no effective model, so nothing establishes that \
+                             `{requested}` ran; dispatch stops rather than assume it"
+                        ),
+                    );
+                }
             }
 
             // Cancelled through the coordinator: the worktree and
@@ -1267,7 +1337,7 @@ impl<'a> RunEngine<'a> {
             let touched_inputs = verify::classify_verification_inputs(
                 &authority.verification_profile,
                 &worktree.changed_paths_in(&candidate_sha)?,
-            );
+            )?;
             if !touched_inputs.policy.is_empty() {
                 let detail = format!(
                     "the candidate changes what verification is: {}; these are the profile's own \
@@ -1473,6 +1543,7 @@ impl<'a> RunEngine<'a> {
                 verification_inputs_changed,
                 integration_gaps: integration_gaps.clone(),
                 baseline_cached,
+                baseline_cache_refused: baseline_cache_refused.clone(),
             };
             let receipt = Receipt {
                 run_id: self.run_id.clone(),
@@ -1768,36 +1839,6 @@ impl<'a> RunEngine<'a> {
         attempt_index: u32,
         reuse: Option<&[verify::CheckOutcome]>,
     ) -> Result<verify::Verified, String> {
-        let checks = match reuse {
-            // The candidate is the base tree: the baseline's outcomes are
-            // its outcomes, by identity.
-            Some(outcomes) => outcomes.to_vec(),
-            None => {
-                let verify_path = self.verify_dir.join(format!("verify-{attempt_index}"));
-                let holder = verify::verification_worktree(
-                    self.config.repo_dir,
-                    candidate_sha,
-                    &verify_path,
-                )
-                .map_err(|e| e.to_string())?;
-                verify::run_profile(
-                    holder.path(),
-                    &authority.verification_profile,
-                    logs_dir,
-                    &format!("attempt{attempt_index}"),
-                )
-                .map_err(|e| e.to_string())?
-            }
-        };
-        for check in &checks {
-            let _ = self.config.ledger.record_evidence(
-                &self.run_id,
-                None,
-                "check_log",
-                Path::new(&check.log_path),
-                Some(&check.log_sha256),
-            );
-        }
         // amont's effective inventory (SPEC §10): consulted whenever the
         // integration is on, for the bypasses and downgrades it declares
         // and for the gaps among the checks this profile requires.
@@ -1809,10 +1850,54 @@ impl<'a> RunEngine<'a> {
             .as_ref()
             .is_some_and(|dependency| dependency.mode() != crate::policy::DependencyMode::Off)
             && crate::tooling::integration_available("amont");
-        let inventory = if amont_on {
-            verify::amont_list(self.config.repo_dir, None, false)
-        } else {
-            None
+        // The inventory is read INSIDE the immutable copy the receipt
+        // binds to, never in the user's checkout — a hook the candidate
+        // adds or removes must be seen as the candidate has it, and the
+        // checkout can change under the run (audit V11). So the
+        // throwaway worktree is created whenever either the checks or
+        // the inventory needs it.
+        let mut holder = match (reuse.is_none(), amont_on) {
+            (false, false) => None,
+            _ => {
+                let verify_path = self.verify_dir.join(format!("verify-{attempt_index}"));
+                Some(
+                    verify::verification_worktree(
+                        self.config.git,
+                        self.config.repo_dir,
+                        candidate_sha,
+                        &verify_path,
+                    )
+                    .map_err(|e| e.to_string())?,
+                )
+            }
+        };
+        let checks = match (reuse, holder.as_ref()) {
+            // The candidate is the base tree: the baseline's outcomes are
+            // its outcomes, by identity.
+            (Some(outcomes), _) => outcomes.to_vec(),
+            (None, Some(holder)) => verify::run_profile(
+                holder.path(),
+                &authority.verification_profile,
+                logs_dir,
+                &format!("attempt{attempt_index}"),
+            )
+            .map_err(|e| e.to_string())?,
+            (None, None) => {
+                return Err("a candidate to verify but no worktree to verify it in".to_string())
+            }
+        };
+        for check in &checks {
+            let _ = self.config.ledger.record_evidence(
+                &self.run_id,
+                None,
+                "check_log",
+                Path::new(&check.log_path),
+                Some(&check.log_sha256),
+            );
+        }
+        let inventory = match (amont_on, holder.as_ref()) {
+            (true, Some(holder)) => self.config.hooks.list(holder.path(), verify::Stage::Local),
+            _ => None,
         };
         // A profile that names no checks is not a profile that depends
         // on none: what it depends on is whatever amont is enforcing,
@@ -1839,6 +1924,14 @@ impl<'a> RunEngine<'a> {
             inventory.as_ref(),
             &authority.verification_profile.amont_waivers,
         ));
+        // The throwaway worktree has done its work. Releasing it here —
+        // rather than leaving it to `Drop` — is what gives the failure
+        // somewhere to be reported.
+        if let Some(holder) = holder.as_mut() {
+            if let Err(e) = holder.release() {
+                eprintln!("relais: {e}");
+            }
+        }
         Ok(verify::Verified {
             checks,
             gaps,
@@ -1971,6 +2064,7 @@ impl<'a> RunEngine<'a> {
             // The reviewer reports; it gets no allowlist.
             allowed_tools: Vec::new(),
             work_dir: review_dir,
+            env: self.config.worker_env.clone(),
             wall_timeout: deadline
                 .saturating_duration_since(Instant::now())
                 .max(Duration::from_secs(1)),
@@ -2299,6 +2393,7 @@ fn build_prompt(
 mod tests {
     use super::*;
     use crate::adapter::{MockBackend, MockOutcome};
+    use crate::context::AvalVerdict;
     use crate::policy::{
         CommandSpec, ConcurrencyLimits, Dependency, DependencyMode, ExecutionPolicy, ModelProfile,
         RiskRule, TrialEnvelope, VerificationPolicy, VerificationProfile,
@@ -2495,6 +2590,9 @@ mod tests {
                 machine: &machine,
                 ledger: &self.ledger,
                 backend,
+                git: &crate::workspace::SystemGit,
+                hooks: &crate::verify::FixedInventory(None),
+                worker_env: crate::backend::LaunchEnv::default(),
                 artifacts_dir: self.artifacts.clone(),
                 aval_resolver: &resolver,
                 predictor: None,
@@ -2523,6 +2621,9 @@ mod tests {
                 machine,
                 ledger: &self.ledger,
                 backend,
+                git: &crate::workspace::SystemGit,
+                hooks: &crate::verify::FixedInventory(None),
+                worker_env: crate::backend::LaunchEnv::default(),
                 artifacts_dir: self.artifacts.clone(),
                 aval_resolver: &resolver,
                 predictor: None,
@@ -2552,6 +2653,9 @@ mod tests {
                 machine,
                 ledger: &self.ledger,
                 backend,
+                git: &crate::workspace::SystemGit,
+                hooks: &crate::verify::FixedInventory(None),
+                worker_env: crate::backend::LaunchEnv::default(),
                 artifacts_dir: self.artifacts.clone(),
                 aval_resolver: &resolver,
                 predictor: None,
@@ -3050,6 +3154,9 @@ mod tests {
             machine: &machine,
             ledger: &fixture.ledger,
             backend: &backend,
+            git: &crate::workspace::SystemGit,
+            hooks: &crate::verify::FixedInventory(None),
+            worker_env: crate::backend::LaunchEnv::default(),
             artifacts_dir: fixture.artifacts.clone(),
             aval_resolver: &resolver,
             predictor: None,
@@ -4851,6 +4958,8 @@ mod tests {
             contract_hash: "contract".into(),
             base_sha: "base".into(),
             policy_hash: "policy".into(),
+            truncated_hints: Vec::new(),
+            worker_env: Vec::new(),
             tool_versions: crate::context::ToolVersions {
                 relais: crate::version().into(),
                 aval: None,
@@ -5176,6 +5285,8 @@ mod tests {
                 claude_code: None,
             },
             fingerprints: Vec::new(),
+            truncated_hints: Vec::new(),
+            worker_env: Vec::new(),
             architecture: context::ArchitectureEvidence {
                 resolved: Vec::new(),
             },

@@ -982,22 +982,21 @@ fn files_written_after_the_result_are_not_in_the_candidate() {
     .expect("json");
     let candidate = receipt["candidate_sha"].as_str().expect("candidate");
 
-    // The background write really happened — otherwise the assertions
-    // below would hold for the wrong reason. The marker is outside the
-    // worktree on purpose: an accepted run releases its task worktree
-    // once the tree still equals the exported candidate, so where the
-    // late write lands is not knowable, and whether it lands at all is
-    // not what this scenario is about.
+    // The background write never gets to happen: when the worker exits,
+    // relais kills its whole process group before draining its pipes, so
+    // the descendant that would have written after the terminal result
+    // is gone (audit V1). The marker is outside the worktree, so its
+    // absence is the descendant's death and not a released worktree.
     let marker = world.root.join("late-write.log");
     assert!(
-        World::wait_for(&marker, 10),
-        "the worker's background write never ran ({})",
+        !World::wait_for(&marker, 5),
+        "a descendant that outlived the worker wrote after the result ({})",
         marker.display()
     );
     let late = world.worktree(&run_id).join("src/late.txt");
     assert!(
-        !world.worktree(&run_id).exists() || late.exists(),
-        "a surviving worktree holds the late write; a released one holds nothing"
+        !late.exists(),
+        "nothing was written into the worktree after the candidate was snapshotted"
     );
 
     let tree = git(&world.repo, &["ls-tree", "-r", "--name-only", candidate]);

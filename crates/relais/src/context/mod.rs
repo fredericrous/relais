@@ -12,11 +12,14 @@
 //! only tasks that depend on it.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use crate::contract::TaskContract;
 use crate::ids::sha256_hex;
 use crate::policy::RepoPolicy;
+use crate::workspace::Git;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -111,10 +114,65 @@ pub fn parse_aval_output(exit_code: i32, stdout: &str) -> AvalVerdict {
     }
 }
 
+/// What the decision corpus currently says. The interface belongs to
+/// relais — the runner asks a `DecisionResolver`, never `aval` — so a
+/// test supplies verdicts without a corpus on disk and a second corpus
+/// tool would cost nobody a change of import (boundaries.own-the-interface).
+pub trait DecisionResolver {
+    /// Resolve one decision key, optionally within a scope.
+    fn resolve(&self, key: &str, scope: Option<&str>) -> AvalVerdict;
+}
+
+/// A closure is a resolver: the shape tests and the CLI both already use.
+impl<F> DecisionResolver for F
+where
+    F: Fn(&str, Option<&str>) -> AvalVerdict,
+{
+    fn resolve(&self, key: &str, scope: Option<&str>) -> AvalVerdict {
+        self(key, scope)
+    }
+}
+
+/// The `aval` binary on this machine — the one place it is spawned.
+pub struct AvalCli {
+    root: PathBuf,
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+impl AvalCli {
+    /// Resolve decisions for the corpus rooted at `root`.
+    pub fn new(root: PathBuf) -> Self {
+        Self { root, cancel: None }
+    }
+
+    /// The same, with the run's cancel flag: a corpus tool that hangs
+    /// stops when the run does (audit V6).
+    pub fn watching(root: PathBuf, cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            root,
+            cancel: Some(cancel),
+        }
+    }
+}
+
+impl DecisionResolver for AvalCli {
+    fn resolve(&self, key: &str, scope: Option<&str>) -> AvalVerdict {
+        aval_resolve(&self.root, key, scope, self.cancel.as_deref())
+    }
+}
+
 /// Invoke `aval resolve KEY --json` in a repository. The exit-code contract
 /// is part of aval's stable interface: 0 active, 4 undecided,
 /// 5 contradiction, 6 retired, 7 unknown, 1/2/3 tool or corpus failure.
-pub fn aval_resolve(repo_dir: &Path, key: &str, scope: Option<&str>) -> AvalVerdict {
+///
+/// Bounded and cancellable: a corpus tool that never answers is a tool
+/// failure, not a run that waits out its wall clock (audit V6).
+pub fn aval_resolve(
+    repo_dir: &Path,
+    key: &str,
+    scope: Option<&str>,
+    cancel: Option<&AtomicBool>,
+) -> AvalVerdict {
     // aval takes no `--` separator, so a key that looks like a flag would
     // be parsed as one. Such a key is a mapping error, reported as the
     // tool failure it would otherwise become in a less legible form.
@@ -133,11 +191,15 @@ pub fn aval_resolve(repo_dir: &Path, key: &str, scope: Option<&str>) -> AvalVerd
     if let Some(scope) = scope {
         command.arg("--scope").arg(scope);
     }
-    match command.output() {
-        Ok(output) => parse_aval_output(
-            output.status.code().unwrap_or(-1),
-            &String::from_utf8_lossy(&output.stdout),
-        ),
+    match crate::procs::run_with_timeout(command, crate::tooling::PROBE_TIMEOUT, None, cancel, None)
+    {
+        Ok(end) => match end.ended {
+            crate::procs::Ended::Exited(code) => parse_aval_output(code, &end.stdout),
+            other => AvalVerdict::ToolFailure {
+                exit: -1,
+                detail: format!("aval did not answer: {}", other.describe()),
+            },
+        },
         Err(e) => AvalVerdict::ToolFailure {
             exit: -1,
             detail: format!("aval could not be launched: {e}"),
@@ -219,25 +281,106 @@ pub struct FileFingerprint {
 /// growing without bound.
 pub const FINGERPRINT_CAP: usize = 400;
 
+/// One read hint's outcome: the blobs it resolved to, and whether the
+/// cap cut the listing short. Truncation is a FLAG, not a fingerprint
+/// row with a sentence where a path belongs — a consumer reading the
+/// manifest had no way to tell that row from a file (style, audit §2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HintFingerprints {
+    pub hint: String,
+    pub files: Vec<FileFingerprint>,
+    /// `FINGERPRINT_CAP` was reached: the hint points at more than the
+    /// manifest records.
+    pub truncated: bool,
+}
+
+/// A read hint the repository cannot resolve at the base revision — a
+/// path that does not exist there, or a `git` that would not answer.
+/// The worker would be pointed at nothing, so this is a preflight
+/// problem, not an empty fingerprint list (audit V15).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnresolvableHint {
+    pub hint: String,
+    pub detail: String,
+}
+
+/// Every read hint that could not be resolved, named.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnresolvableHints(pub Vec<UnresolvableHint>);
+
+impl std::fmt::Display for UnresolvableHints {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let listed: Vec<String> = self
+            .0
+            .iter()
+            .map(|hint| format!("`{}` ({})", hint.hint, hint.detail))
+            .collect();
+        write!(
+            f,
+            "the contract's read hints do not resolve at the base revision: {}",
+            listed.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for UnresolvableHints {}
+
+/// What the read hints resolved to, hint by hint.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Fingerprinted {
+    pub hints: Vec<HintFingerprints>,
+}
+
+impl Fingerprinted {
+    /// Every fingerprint, in hint order.
+    pub fn files(&self) -> Vec<FileFingerprint> {
+        self.hints
+            .iter()
+            .flat_map(|hint| hint.files.iter().cloned())
+            .collect()
+    }
+
+    /// The hints the cap cut short, by name.
+    pub fn truncated_hints(&self) -> Vec<String> {
+        self.hints
+            .iter()
+            .filter(|hint| hint.truncated)
+            .map(|hint| hint.hint.clone())
+            .collect()
+    }
+}
+
 /// Fingerprint the files under each read hint at `base_sha`, from the
 /// tree itself (`git ls-tree`), so what the worker was pointed at is
 /// recorded exactly as it was — whatever the working tree does later.
+/// Git is the injected port, which is also what keeps the `GIT_*`
+/// scrubbing `workspace::git_command` does on this path (audit V7).
 pub fn fingerprint_hints(
+    git: &dyn Git,
     repo_dir: &Path,
     base_sha: &str,
     hints: &[String],
-) -> Vec<FileFingerprint> {
-    let mut out = Vec::new();
+) -> Result<Fingerprinted, UnresolvableHints> {
+    let mut resolved = Vec::new();
+    let mut unresolvable = Vec::new();
+    let mut counted = 0usize;
     for hint in hints {
-        let output = std::process::Command::new("git")
-            .args(["ls-tree", "-r", base_sha, "--", hint.trim_end_matches('/')])
-            .current_dir(repo_dir)
-            .output();
-        let Ok(output) = output else { continue };
-        if !output.status.success() {
-            continue;
-        }
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let listing = match git.run(
+            repo_dir,
+            &["ls-tree", "-r", base_sha, "--", hint.trim_end_matches('/')],
+        ) {
+            Ok(listing) => listing,
+            Err(e) => {
+                unresolvable.push(UnresolvableHint {
+                    hint: hint.clone(),
+                    detail: e.to_string(),
+                });
+                continue;
+            }
+        };
+        let mut files = Vec::new();
+        let mut truncated = false;
+        for line in listing.lines() {
             // `<mode> <type> <object>\t<path>`
             let Some((meta, path)) = line.split_once('\t') else {
                 continue;
@@ -247,22 +390,40 @@ pub fn fingerprint_hints(
             if kind != Some("blob") {
                 continue;
             }
-            if let Some(object) = object {
-                out.push(FileFingerprint {
-                    path: path.to_string(),
-                    blob: object.to_string(),
-                });
-            }
-            if out.len() >= FINGERPRINT_CAP {
-                out.push(FileFingerprint {
-                    path: format!("{hint}: truncated at {FINGERPRINT_CAP} files"),
-                    blob: String::new(),
-                });
-                return out;
+            let Some(object) = object else { continue };
+            files.push(FileFingerprint {
+                path: path.to_string(),
+                blob: object.to_string(),
+            });
+            counted += 1;
+            if counted >= FINGERPRINT_CAP {
+                truncated = true;
+                break;
             }
         }
+        // A hint that names nothing in the tree points the worker at
+        // nothing: said so, rather than silently contributing no rows.
+        if files.is_empty() && !truncated {
+            unresolvable.push(UnresolvableHint {
+                hint: hint.clone(),
+                detail: format!("no file under it exists at {base_sha}"),
+            });
+            continue;
+        }
+        resolved.push(HintFingerprints {
+            hint: hint.clone(),
+            files,
+            truncated,
+        });
+        if counted >= FINGERPRINT_CAP {
+            break;
+        }
     }
-    out
+    if unresolvable.is_empty() {
+        Ok(Fingerprinted { hints: resolved })
+    } else {
+        Err(UnresolvableHints(unresolvable))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -281,6 +442,15 @@ pub struct ContextManifest {
     pub policy_hash: String,
     pub tool_versions: ToolVersions,
     pub fingerprints: Vec<FileFingerprint>,
+    /// Read hints whose listing hit `FINGERPRINT_CAP`: the worker was
+    /// pointed at more than this manifest records.
+    #[serde(default)]
+    pub truncated_hints: Vec<String>,
+    /// The environment variables the worker process was given, by NAME.
+    /// Never their values — several of them are credentials — but which
+    /// ones reached the worker is part of what the run was (audit V4).
+    #[serde(default)]
+    pub worker_env: Vec<String>,
     pub architecture: ArchitectureEvidence,
     pub verification_profile: String,
     /// Constraints included verbatim; the manifest reports their size so
@@ -307,14 +477,17 @@ pub struct ContextInputs<'a> {
     pub contract_hash: &'a str,
     pub base_sha: &'a str,
     pub policy_hash: &'a str,
-    pub fingerprints: Vec<FileFingerprint>,
+    pub fingerprints: Fingerprinted,
     pub tool_versions: ToolVersions,
     /// Whether the harness this run will dispatch on can take a turn
     /// ceiling (`crate::backend::TurnCeiling`).
     pub turn_ceiling: crate::backend::TurnCeiling,
-    /// Resolve function, so tests can supply verdicts without invoking
-    /// the real binary.
-    pub resolver: &'a dyn Fn(&str, Option<&str>) -> AvalVerdict,
+    /// The environment the worker will run with: its variable names go
+    /// into the manifest.
+    pub worker_env: &'a crate::backend::LaunchEnv,
+    /// The decision corpus, as a port, so tests supply verdicts without
+    /// invoking the real binary.
+    pub resolver: &'a dyn DecisionResolver,
 }
 
 /// Assemble the context manifest. Fails on contradiction (blocked), on
@@ -331,6 +504,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         fingerprints,
         tool_versions,
         turn_ceiling,
+        worker_env,
         resolver,
     } = inputs;
 
@@ -350,7 +524,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
 
     let mut resolved = Vec::new();
     for key in &keys {
-        let verdict = resolver(key, contract.architecture.scope.as_deref());
+        let verdict = resolver.resolve(key, contract.architecture.scope.as_deref());
         match &verdict {
             AvalVerdict::Contradiction { heads } => {
                 return Err(ContextError::ContradictionBlocked {
@@ -424,7 +598,9 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         base_sha: base_sha.to_string(),
         policy_hash: policy_hash.to_string(),
         tool_versions,
-        fingerprints,
+        fingerprints: fingerprints.files(),
+        truncated_hints: fingerprints.truncated_hints(),
+        worker_env: worker_env.names(),
         architecture: ArchitectureEvidence { resolved },
         verification_profile: contract.verification_profile.clone(),
         constraints: constraints.clone(),
@@ -482,10 +658,20 @@ mod tests {
         RepoPolicy::from_toml_str(crate::policy::INIT_TEMPLATE).expect("policy parses")
     }
 
+    /// The environment a worker in these tests would run with.
+    fn worker_env() -> crate::backend::LaunchEnv {
+        crate::backend::LaunchEnv::from_ambient(&[
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("ANTHROPIC_API_KEY".to_string(), "sk-not-real".to_string()),
+            ("GIT_DIR".to_string(), "/elsewhere/.git".to_string()),
+        ])
+    }
+
     fn inputs<'a>(
         contract: &'a TaskContract,
         repo: &'a RepoPolicy,
-        resolver: &'a dyn Fn(&str, Option<&str>) -> AvalVerdict,
+        resolver: &'a dyn DecisionResolver,
+        env: &'a crate::backend::LaunchEnv,
     ) -> ContextInputs<'a> {
         ContextInputs {
             contract,
@@ -493,10 +679,16 @@ mod tests {
             contract_hash: "chash",
             base_sha: "deadbeef",
             policy_hash: "phash",
-            fingerprints: vec![FileFingerprint {
-                path: "crates/amont/src/main.rs".into(),
-                blob: "abc".into(),
-            }],
+            fingerprints: Fingerprinted {
+                hints: vec![HintFingerprints {
+                    hint: "crates/amont/src".into(),
+                    files: vec![FileFingerprint {
+                        path: "crates/amont/src/main.rs".into(),
+                        blob: "abc".into(),
+                    }],
+                    truncated: false,
+                }],
+            },
             tool_versions: ToolVersions {
                 relais: "0.1.0".into(),
                 aval: Some("1.3.2".into()),
@@ -504,6 +696,7 @@ mod tests {
                 claude_code: None,
             },
             turn_ceiling: crate::backend::TurnCeiling::Unavailable,
+            worker_env: env,
             resolver,
         }
     }
@@ -578,7 +771,7 @@ mod tests {
     fn active_decisions_assemble_into_constraints() {
         let c = contract(&["storage.object-store"]);
         let r = repo();
-        let manifest = assemble(inputs(&c, &r, &active)).expect("assembles");
+        let manifest = assemble(inputs(&c, &r, &active, &worker_env())).expect("assembles");
         assert_eq!(manifest.architecture.resolved.len(), 1);
         assert_eq!(manifest.constraints.len(), 1);
         assert_eq!(manifest.base_sha, "deadbeef");
@@ -592,7 +785,7 @@ mod tests {
         let c = contract(&["api.gateway"]);
         let r = repo();
         let contradiction = |_: &str, _: Option<&str>| AvalVerdict::Contradiction { heads: 2 };
-        let err = assemble(inputs(&c, &r, &contradiction)).unwrap_err();
+        let err = assemble(inputs(&c, &r, &contradiction, &worker_env())).unwrap_err();
         assert_eq!(
             err,
             ContextError::ContradictionBlocked {
@@ -608,10 +801,10 @@ mod tests {
         let r = repo();
         // No keys: an unrelated undecided key cannot block anything.
         let undecided = |_: &str, _: Option<&str>| AvalVerdict::Undecided;
-        assemble(inputs(&c, &r, &undecided)).expect("no keys means no dependency");
+        assemble(inputs(&c, &r, &undecided, &worker_env())).expect("no keys means no dependency");
 
         let dependent = contract(&["api.gateway"]);
-        let err = assemble(inputs(&dependent, &r, &undecided)).unwrap_err();
+        let err = assemble(inputs(&dependent, &r, &undecided, &worker_env())).unwrap_err();
         assert!(matches!(err, ContextError::NeedsDecision { .. }), "{err:?}");
     }
 
@@ -623,7 +816,7 @@ mod tests {
             exit: 3,
             detail: "unreadable".into(),
         };
-        let err = assemble(inputs(&c, &r, &broken)).unwrap_err();
+        let err = assemble(inputs(&c, &r, &broken, &worker_env())).unwrap_err();
         assert!(matches!(err, ContextError::ToolFailure { .. }), "{err:?}");
     }
 
@@ -638,7 +831,7 @@ mod tests {
             }],
         };
         let c = contract(&[]);
-        let manifest = assemble(inputs(&c, &r, &active)).expect("assembles");
+        let manifest = assemble(inputs(&c, &r, &active, &worker_env())).expect("assembles");
         assert_eq!(
             manifest.architecture.resolved[0].0, "output.contract",
             "mapping keys are resolved when the declared scope could touch their paths"
@@ -662,7 +855,7 @@ mod tests {
             choice: None,
             reason: None,
         };
-        let err = assemble(inputs(&c, &r, &big)).unwrap_err();
+        let err = assemble(inputs(&c, &r, &big, &worker_env())).unwrap_err();
         assert!(
             matches!(err, ContextError::SizingProblem { required_bytes, budget_bytes }
                 if required_bytes > budget_bytes),
@@ -678,7 +871,7 @@ mod tests {
         // Smaller than the objective alone: the old check counted only
         // constraints, of which this task has none, and passed.
         r.context.budget_bytes = 64;
-        let err = assemble(inputs(&c, &r, &active)).unwrap_err();
+        let err = assemble(inputs(&c, &r, &active, &worker_env())).unwrap_err();
         assert_eq!(
             err,
             ContextError::SizingProblem {
@@ -693,12 +886,87 @@ mod tests {
         // The same task fits under a budget the repository raised, and
         // the manifest carries both numbers as evidence.
         r.context.budget_bytes = 4096;
-        let manifest = assemble(inputs(&c, &r, &active)).expect("assembles");
+        let manifest = assemble(inputs(&c, &r, &active, &worker_env())).expect("assembles");
         assert_eq!(manifest.budget_bytes, 4096);
         assert!(manifest.package_bytes >= c.objective.len());
         assert_eq!(
             manifest.turn_ceiling, "unavailable",
             "a receipt says which turn ceiling the harness could take"
+        );
+    }
+
+    /// V4: which variables reached the worker is part of what the run
+    /// was — and the manifest carries the names, never the values.
+    #[test]
+    fn the_manifest_names_the_environment_the_worker_was_given() {
+        let c = contract(&[]);
+        let r = repo();
+        let manifest = assemble(inputs(&c, &r, &active, &worker_env())).expect("assembles");
+        assert_eq!(
+            manifest.worker_env,
+            vec!["ANTHROPIC_API_KEY".to_string(), "PATH".to_string()],
+            "the allowlisted names, and the ambient GIT_DIR is not among them"
+        );
+        let rendered = serde_json::to_string(&manifest).expect("serializes");
+        assert!(
+            !rendered.contains("sk-not-real"),
+            "a manifest records names, never credentials"
+        );
+    }
+
+    /// V15: a read hint that resolves to nothing used to contribute no
+    /// rows and no word about it, so the worker was pointed at a path
+    /// the base revision does not have and nothing said so.
+    #[test]
+    fn an_unresolvable_read_hint_is_a_preflight_problem() {
+        let git = crate::workspace::FakeGit::new(|_dir, args| {
+            match args.last().copied() {
+                Some("src") => Ok("100644 blob abc123\tsrc/main.rs\n".to_string()),
+                // `ls-tree` on a path that is not in the tree prints
+                // nothing and exits 0; a git that fails is an error.
+                Some("gone") => Ok(String::new()),
+                _ => Err(crate::workspace::WorkspaceError::Git(
+                    "fatal: not a tree object".to_string(),
+                )),
+            }
+        });
+        let resolved = fingerprint_hints(&git, Path::new("."), "base", &["src".to_string()])
+            .expect("the hint resolves");
+        assert_eq!(resolved.hints.len(), 1);
+        assert_eq!(resolved.files().len(), 1);
+        assert_eq!(resolved.files()[0].blob, "abc123");
+        assert!(resolved.truncated_hints().is_empty());
+
+        let missing = fingerprint_hints(
+            &git,
+            Path::new("."),
+            "base",
+            &["src".to_string(), "gone".to_string(), "boom".to_string()],
+        )
+        .expect_err("hints that name nothing are reported");
+        assert_eq!(missing.0.len(), 2, "{missing}");
+        assert_eq!(missing.0[0].hint, "gone");
+        assert!(missing.to_string().contains("`boom`"), "{missing}");
+    }
+
+    /// The cap is a flag on the hint, not a fingerprint row whose `path`
+    /// is a sentence about truncation.
+    #[test]
+    fn a_hint_over_the_cap_is_flagged_not_faked() {
+        let listing: String = (0..FINGERPRINT_CAP + 10)
+            .map(|i| format!("100644 blob deadbeef{i}\tsrc/file{i}.rs\n"))
+            .collect();
+        let git = crate::workspace::FakeGit::new(move |_dir, _args| Ok(listing.clone()));
+        let resolved = fingerprint_hints(&git, Path::new("."), "base", &["src".to_string()])
+            .expect("resolves");
+        assert_eq!(resolved.files().len(), FINGERPRINT_CAP);
+        assert_eq!(resolved.truncated_hints(), vec!["src".to_string()]);
+        assert!(
+            resolved
+                .files()
+                .iter()
+                .all(|file| !file.blob.is_empty() && file.path.starts_with("src/")),
+            "every row is a real file"
         );
     }
 }

@@ -4,12 +4,22 @@
 //! budget controls, prompt via stdin, arguments as an argv array, output
 //! as structured JSON. Every flag is capability-checked against the
 //! installed version's `--help` output before use — nothing is assumed
-//! from documentation. The result JSON is parsed leniently: absent fields
-//! are unknown, never zero, and the effective model is surfaced so an
-//! unapproved substitution is detectable (SPEC §6).
+//! from documentation, and the installed CLI is probed once per process,
+//! not once per launch. The result JSON is parsed leniently: absent
+//! fields are unknown, never zero — including the model, which stays
+//! UNREPORTED when the harness names none, because reading silence as
+//! agreement is what made an unapproved substitution undetectable
+//! (SPEC §6).
+//!
+//! The worker's environment is the one `LaunchSpec::env` names and
+//! nothing else: the process starts from a cleared environment, so an
+//! ambient `GIT_DIR` or `GIT_INDEX_FILE` from a rebase shell cannot
+//! point its commits at the user's repository.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::backend::{
@@ -17,10 +27,16 @@ use crate::backend::{
     PermissionEnforcement, SandboxCapability, UsageReport,
 };
 use crate::money::MicroUsd;
-use crate::procs::{run_with_timeout, ProcessEnd};
+use crate::procs::{run_with_timeout, Ended, ProcessEnd};
+use crate::tooling::PROBE_TIMEOUT;
 
+#[derive(Debug)]
 pub struct ClaudeBackend {
     binary: PathBuf,
+    /// Probed on first use and kept: `--version` and `--help` are facts
+    /// about an installed CLI, and asking again before every dispatch
+    /// spent two processes per launch to learn the same thing (audit V6).
+    capabilities: OnceLock<Option<Capabilities>>,
 }
 
 impl ClaudeBackend {
@@ -28,43 +44,80 @@ impl ClaudeBackend {
     /// binary is a blocked outcome, never a fallback (SPEC §6).
     pub fn discover() -> Result<Self, BackendError> {
         if let Some(explicit) = std::env::var_os("RELAIS_CLAUDE_BIN") {
-            let path = PathBuf::from(explicit);
-            if path.is_file() {
-                return Ok(Self { binary: path });
-            }
-            return Err(BackendError::MissingBinary(path.to_string_lossy().into()));
+            return Self::with_binary(PathBuf::from(explicit));
         }
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join("claude");
-            if candidate.is_file() {
-                return Ok(Self { binary: candidate });
-            }
-        }
-        Err(BackendError::MissingBinary("claude".into()))
+        let found = crate::tooling::which("claude")
+            .ok_or_else(|| BackendError::MissingBinary("claude".into()))?;
+        Self::with_binary(found)
     }
 
-    pub fn with_binary(binary: PathBuf) -> Self {
-        Self { binary }
+    /// A backend at a named binary, resolved to an absolute path.
+    ///
+    /// The path is canonicalised because the launch runs with the task
+    /// worktree as its working directory: a relative one is probed
+    /// against relais's cwd and executed against the worker's, so a
+    /// repository that ships `node_modules/.bin/claude` could have its
+    /// own binary run in place of the operator's (audit V13). A relative
+    /// `RELAIS_CLAUDE_BIN` is refused outright rather than resolved,
+    /// since nothing can say which directory the operator meant.
+    pub fn with_binary(binary: PathBuf) -> Result<Self, BackendError> {
+        if binary.is_relative() {
+            return Err(BackendError::MissingBinary(format!(
+                "{}: the Claude Code binary must be named by an absolute path — a relative one \
+                 resolves against relais's working directory and runs against the worker's",
+                binary.display()
+            )));
+        }
+        let resolved = binary
+            .canonicalize()
+            .map_err(|e| BackendError::MissingBinary(format!("{}: {e}", binary.display())))?;
+        if !resolved.is_file() {
+            return Err(BackendError::MissingBinary(
+                resolved.to_string_lossy().into(),
+            ));
+        }
+        Ok(Self {
+            binary: resolved,
+            capabilities: OnceLock::new(),
+        })
     }
 
-    fn run_version(&self) -> Option<String> {
-        let output = Command::new(&self.binary).arg("--version").output().ok()?;
-        if !output.status.success() {
+    /// The binary this backend launches.
+    pub fn binary(&self) -> &Path {
+        &self.binary
+    }
+
+    /// The probe, cached. `cancel` aborts a probe that hangs; the timeout
+    /// bounds one that merely takes its time.
+    fn capabilities(&self, cancel: Option<&AtomicBool>) -> Option<Capabilities> {
+        self.capabilities
+            .get_or_init(|| self.probe_now(cancel))
+            .clone()
+    }
+
+    fn probe_now(&self, cancel: Option<&AtomicBool>) -> Option<Capabilities> {
+        let version = self.ask(&["--version"], cancel)?;
+        // A CLI that answers `--version` but not `--help` cannot have its
+        // flags checked, and a launch may not assume them: no
+        // capabilities means no backend, which blocks (SPEC §6).
+        let help = self.ask(&["--help"], cancel)?;
+        Some(capabilities_from_help(
+            version.trim().to_string(),
+            help.trim(),
+        ))
+    }
+
+    /// One probe call: bounded, cancellable, and `None` unless the CLI
+    /// exited successfully with something to say.
+    fn ask(&self, args: &[&str], cancel: Option<&AtomicBool>) -> Option<String> {
+        let mut command = Command::new(&self.binary);
+        command.args(args);
+        let end = run_with_timeout(command, PROBE_TIMEOUT, None, cancel, None).ok()?;
+        if end.ended != Ended::Exited(0) {
             return None;
         }
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    }
-
-    fn run_help(&self) -> String {
-        Command::new(&self.binary)
-            .arg("--help")
-            .output()
-            .map(|output| {
-                String::from_utf8_lossy(&output.stdout).to_string()
-                    + &String::from_utf8_lossy(&output.stderr)
-            })
-            .unwrap_or_default()
+        let answer = format!("{}{}", end.stdout, end.stderr);
+        (!answer.trim().is_empty()).then_some(answer)
     }
 }
 
@@ -74,14 +127,12 @@ impl Backend for ClaudeBackend {
     }
 
     fn probe(&self) -> Option<Capabilities> {
-        let version = self.run_version()?;
-        let help = self.run_help();
-        Some(capabilities_from_help(version, &help))
+        self.capabilities(None)
     }
 
     fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError> {
         let caps = self
-            .probe()
+            .capabilities(spec.cancel.as_deref())
             .ok_or_else(|| BackendError::MissingBinary(self.binary.to_string_lossy().into()))?;
         let argv = build_argv(spec, &caps)?;
 
@@ -89,11 +140,15 @@ impl Backend for ClaudeBackend {
         command
             .args(&argv)
             .current_dir(&spec.work_dir)
-            .env_remove("CLAUDE_CODE_EXTRA_BUDGET")
-            // The worker must not reach the machine authority a nested
-            // `relais` would read; the defaults are the real ones.
-            .env_remove("RELAIS_CONFIG_DIR")
-            .env_remove("RELAIS_STATE_DIR");
+            // The worker's environment is the spec's, entire. Clearing
+            // first is what removes the ambient `GIT_*` variables that
+            // override a working directory, the machine authority a
+            // nested `relais` would read, and every credential the task
+            // was never given (SPEC §8, audit V4).
+            .env_clear();
+        for (name, value) in spec.env.vars() {
+            command.env(name, value);
+        }
         let wall = spec.wall_timeout.max(Duration::from_secs(1));
         let end = run_with_timeout(
             command,
@@ -103,7 +158,7 @@ impl Backend for ClaudeBackend {
             spec.pid_slot.as_deref(),
         )?;
 
-        let parsed = parse_result_json(&end.stdout, &spec.model);
+        let parsed = parse_result_json(&end.stdout);
         let worker_claims_blockage = parsed.result_text.as_deref().is_some_and(claims_blockage);
         // A harness that exited non-zero, reported an error, or printed
         // something the adapter cannot read did not complete an attempt:
@@ -239,6 +294,15 @@ fn failure_detail(end: &ProcessEnd, parsed: &ParsedClaudeResult) -> String {
     if parsed.is_error {
         parts.push("the harness reported an error".to_string());
     }
+    // What the supervision itself found: a descendant that outlived the
+    // worker, or output that never finished arriving, both explain an
+    // unreadable result (audit V1).
+    if let crate::procs::GroupKill::Refused { .. } = &end.group {
+        parts.push(end.group.describe());
+    }
+    if let crate::procs::Captured::Partial { detail } = &end.captured {
+        parts.push(detail.clone());
+    }
     if let Some(text) = parsed
         .result_text
         .as_deref()
@@ -272,6 +336,11 @@ fn head(text: &str) -> String {
 pub struct ParsedClaudeResult {
     pub result_text: Option<String>,
     pub session_id: Option<String>,
+    /// The model the harness named, and `None` when it named none. Not
+    /// the requested model: a harness that reports nothing has not
+    /// confirmed anything, and echoing the request back made
+    /// `verify_model` structurally unable to see a substitution
+    /// (audit V3).
     pub effective_model: Option<String>,
     pub usage: UsageReport,
     /// `is_error` as the harness reported it.
@@ -280,12 +349,12 @@ pub struct ParsedClaudeResult {
     pub permission_denials: Vec<String>,
 }
 
-pub fn parse_result_json(stdout: &str, requested_model: &str) -> ParsedClaudeResult {
+pub fn parse_result_json(stdout: &str) -> ParsedClaudeResult {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
         return ParsedClaudeResult {
             result_text: None,
             session_id: None,
-            effective_model: Some(requested_model.to_string()),
+            effective_model: None,
             usage: UsageReport::unknown(),
             is_error: false,
             permission_denials: Vec::new(),
@@ -357,7 +426,7 @@ pub fn parse_result_json(stdout: &str, requested_model: &str) -> ParsedClaudeRes
             .get("session_id")
             .and_then(|id| id.as_str())
             .map(|id| id.to_string()),
-        effective_model: effective_model(&value).or_else(|| Some(requested_model.to_string())),
+        effective_model: effective_model(&value),
         usage,
         is_error: value
             .get("is_error")
@@ -445,6 +514,10 @@ mod tests {
             disallowed_tools: vec!["Bash(git push:*)".into()],
             allowed_tools: vec!["Edit".into(), "Bash(cargo test:*)".into()],
             work_dir: PathBuf::from("."),
+            env: crate::backend::LaunchEnv::from_ambient(&[(
+                "PATH".to_string(),
+                "/usr/bin".to_string(),
+            )]),
             wall_timeout: Duration::from_secs(10),
             cancel: None,
             pid_slot: None,
@@ -453,7 +526,7 @@ mod tests {
 
     #[test]
     fn parses_documented_result_fields() {
-        let parsed = parse_result_json(SAMPLE, "sonnet");
+        let parsed = parse_result_json(SAMPLE);
         assert_eq!(
             parsed.result_text.as_deref(),
             Some("done: fixed the escaping")
@@ -477,24 +550,42 @@ mod tests {
 
     #[test]
     fn absent_usage_stays_unknown_never_zero() {
-        let parsed = parse_result_json(r#"{"result": "no usage here"}"#, "sonnet");
+        let parsed = parse_result_json(r#"{"result": "no usage here"}"#);
         assert_eq!(parsed.usage.input_tokens, None);
         assert_eq!(parsed.usage.cost, Cost::Unknown);
         assert_eq!(parsed.usage.cost.micros(), None);
         assert!(!parsed.usage.cost.inclusive());
     }
 
+    /// V3: output the adapter cannot read says nothing about which model
+    /// ran, and must not be read as confirmation that it was the one
+    /// asked for.
     #[test]
-    fn unparseable_output_falls_back_to_requested_model_and_unknown_usage() {
-        let parsed = parse_result_json("not json", "sonnet");
+    fn unreadable_output_leaves_the_model_unreported_and_the_usage_unknown() {
+        let parsed = parse_result_json("not json");
         assert_eq!(parsed.result_text, None);
-        assert_eq!(parsed.effective_model.as_deref(), Some("sonnet"));
+        assert_eq!(parsed.effective_model, None);
         assert_eq!(parsed.usage.cost, Cost::Unknown);
+        assert_eq!(
+            crate::backend::verify_model("sonnet", parsed.effective_model.as_deref()),
+            crate::backend::ModelVerification::Unverified {
+                requested: "sonnet".into()
+            },
+            "an unreported model is a gap the runner must act on, not a match"
+        );
+    }
+
+    /// A result document that names no model at all — the older shapes,
+    /// and any harness that simply does not say.
+    #[test]
+    fn a_result_naming_no_model_reports_none() {
+        let parsed = parse_result_json(r#"{"result":"done","session_id":"s"}"#);
+        assert_eq!(parsed.effective_model, None);
     }
 
     #[test]
     fn substitution_is_detectable_because_the_effective_model_surfaces() {
-        let parsed = parse_result_json(SAMPLE, "haiku");
+        let parsed = parse_result_json(SAMPLE);
         let effective = parsed.effective_model.expect("model surfaces");
         assert!(!crate::backend::model_matches("haiku", &effective));
         assert!(crate::backend::model_matches("sonnet", &effective));
@@ -506,7 +597,7 @@ mod tests {
             "claude-haiku-4-5":{"outputTokens":5000,"canonicalModel":"claude-haiku-4-5"},
             "claude-sonnet-5":{"outputTokens":12000}},
             "subagent_stats":{"spawned":2},"total_cost_usd":0.5}"#;
-        let parsed = parse_result_json(json, "sonnet");
+        let parsed = parse_result_json(json);
         assert_eq!(parsed.effective_model.as_deref(), Some("claude-sonnet-5"));
         assert!(
             parsed.usage.cost.inclusive(),
@@ -520,21 +611,19 @@ mod tests {
             "permission_denials":[{"tool_name":"Edit","tool_use_id":"a"},
                                   {"tool_name":"Edit","tool_use_id":"b"},
                                   {"tool_name":"Bash","tool_use_id":"c","tool_input":{"command":"git diff --stat"}}]}"#;
-        let parsed = parse_result_json(json, "sonnet");
+        let parsed = parse_result_json(json);
         assert_eq!(
             parsed.permission_denials,
             vec!["Edit", "Bash(git diff --stat)"]
         );
-        let parsed = parse_result_json(r#"{"result":"boom","is_error":true}"#, "sonnet");
+        let parsed = parse_result_json(r#"{"result":"boom","is_error":true}"#);
         assert!(parsed.is_error);
     }
 
     #[test]
     fn blockage_claims_are_detected_from_the_result_text() {
-        let parsed = parse_result_json(
-            r#"{"result": "relais-blocked: required dependency missing"}"#,
-            "sonnet",
-        );
+        let parsed =
+            parse_result_json(r#"{"result": "relais-blocked: required dependency missing"}"#);
         let claims = parsed
             .result_text
             .as_deref()
@@ -625,4 +714,44 @@ mod tests {
         let argv = build_argv(&no_deny, &caps).expect("nothing left to refuse");
         assert!(!argv.iter().any(|arg| arg == "--max-budget-usd"));
     }
+
+    /// V13: the launch runs with the worker's worktree as its working
+    /// directory, so a binary named relatively is probed in one place and
+    /// executed in another. It is refused, and an absolute one is
+    /// canonicalised so both halves name the same file.
+    #[test]
+    fn the_backend_binary_is_absolute_or_refused() {
+        let error = ClaudeBackend::with_binary(PathBuf::from("node_modules/.bin/claude"))
+            .expect_err("a relative binary is refused");
+        assert!(
+            error.to_string().contains("absolute path"),
+            "{error}: {error:?}"
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "relais-claude-bin-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("bin")).expect("mkdir");
+        let binary = dir.join("bin/claude");
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").expect("write");
+        let backend = ClaudeBackend::with_binary(dir.join("bin/../bin/claude"))
+            .expect("an absolute binary resolves");
+        assert_eq!(
+            backend.binary(),
+            binary.canonicalize().expect("canonical").as_path(),
+            "the path the probe used is the path the launch runs"
+        );
+        assert!(
+            ClaudeBackend::with_binary(dir.join("bin/absent")).is_err(),
+            "a binary that is not there is a missing binary, never a fallback"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Unique fixture directories: the pid is shared by parallel test
+    /// threads, the counter is not.
+    static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 }

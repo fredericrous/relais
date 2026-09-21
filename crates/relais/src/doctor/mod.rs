@@ -57,11 +57,11 @@ impl DoctorReport {
     }
 }
 
+/// One PATH lookup for the whole crate, so `doctor` agrees with the
+/// backend's own discovery about what is installed — extension suffixes
+/// on Windows included (audit C2).
 fn binary_on_path(name: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
+    crate::tooling::which(name)
 }
 
 fn check_command(name: &str, args: &[&str], findings: &mut Vec<Finding>, component: &'static str) {
