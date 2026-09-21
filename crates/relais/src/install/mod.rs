@@ -268,7 +268,14 @@ runner. The parent does not supervise intermediate turns.
 
 ## Steps
 
-1. Write a contract at `.relais/task.json`:
+1. Work from the repository the task changes — its task worktree when
+   one exists. Every command below runs with that directory as cwd
+   (`cd <root> && …`); the session's own cwd may be anywhere else.
+   `relais` finds `relais.toml` upward from cwd to the repository root,
+   so a subdirectory is fine, but a directory outside the repository is
+   refused, never guessed.
+
+2. Write a contract at `<root>/.relais/task.json`:
 
 ```json
 {
@@ -287,13 +294,13 @@ runner. The parent does not supervise intermediate turns.
 Use `"kind": "inspect"` with evidence criteria for investigations that
 must not edit files.
 
-2. Preflight without spending: `relais plan --task .relais/task.json`
+3. Preflight without spending: `relais plan --task .relais/task.json`
 
-3. Execute, naming this session so the coordinator's per-session limits
+4. Execute, naming this session so the coordinator's per-session limits
    and attribution are per TAB rather than per shell (SPEC §23):
    `RELAIS_SESSION_ID="${CLAUDE_SESSION_ID:-$$}" relais run --task .relais/task.json`
 
-4. Read the outcome: accepted (receipt + patch), needs_decision,
+5. Read the outcome: accepted (receipt + patch), needs_decision,
 needs_review, blocked, failed, budget_exhausted or interrupted. The
 artifacts path is printed on every terminal state.
 

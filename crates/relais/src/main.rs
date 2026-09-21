@@ -217,7 +217,7 @@ fn install_command(write: bool, user: bool) -> i32 {
     let root = if user {
         relais::install::InstallRoot::user()
     } else {
-        relais::install::InstallRoot::project(&cwd())
+        relais::install::InstallRoot::project(&project_dir())
     };
     let plan = root.plan();
     println!(
@@ -245,7 +245,7 @@ fn uninstall_command(write: bool, user: bool) -> i32 {
     let root = if user {
         relais::install::InstallRoot::user()
     } else {
-        relais::install::InstallRoot::project(&cwd())
+        relais::install::InstallRoot::project(&project_dir())
     };
     let plan = root.uninstall_plan();
     println!(
@@ -337,7 +337,7 @@ fn latest_dataset() -> Result<relais::learn::dataset::Dataset, i32> {
 }
 
 fn dataset_build_command() -> i32 {
-    let repo = load_repo_policy().unwrap_or_else(|code| std::process::exit(code));
+    let (_, repo) = load_repo_policy().unwrap_or_else(|code| std::process::exit(code));
     let ledger = open_ledger();
     let contract_of = |run_id: &str| -> Option<(TaskContract, String, String)> {
         ledger
@@ -667,19 +667,37 @@ fn cwd() -> PathBuf {
     std::env::current_dir().expect("current directory")
 }
 
-fn load_repo_policy() -> Result<RepoPolicy, i32> {
-    let path = cwd().join("relais.toml");
-    let text = std::fs::read_to_string(&path).map_err(|_| {
-        eprintln!(
-            "relais: no relais.toml in {} — run `relais init`",
-            cwd().display()
-        );
+/// The directory a repository-level command acts on: the root whose
+/// `relais.toml` governs the cwd; failing that, the repository root
+/// (where `init` belongs); failing that, the cwd itself. Never an error:
+/// `doctor`, `init` and `install` report what they find there.
+fn project_dir() -> PathBuf {
+    match relais::policy::locate_repo_root(&cwd()) {
+        Ok(root) | Err(relais::policy::LocateError::RepoWithoutPolicy(root)) => root,
+        Err(relais::policy::LocateError::NotInRepository(start)) => start,
+    }
+}
+
+/// The repository root and its policy. `relais.toml` is looked up from
+/// the cwd upward to the nearest `.git`, so a Claude Code session whose
+/// cwd is a subdirectory, or the shell's `cd repo && relais …`, both land
+/// on the repository's policy; a directory outside any repository is
+/// refused by name rather than guessed at.
+fn load_repo_policy() -> Result<(PathBuf, RepoPolicy), i32> {
+    let root = relais::policy::locate_repo_root(&cwd()).map_err(|e| {
+        eprintln!("relais: {e}");
         2
     })?;
-    RepoPolicy::from_toml_str(&text).map_err(|e| {
-        eprintln!("relais: relais.toml is invalid: {e}");
+    let path = root.join("relais.toml");
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        eprintln!("relais: cannot read {}: {e}", path.display());
         2
-    })
+    })?;
+    let policy = RepoPolicy::from_toml_str(&text).map_err(|e| {
+        eprintln!("relais: {} is invalid: {e}", path.display());
+        2
+    })?;
+    Ok((root, policy))
 }
 
 fn load_machine() -> Result<MachineSettings, i32> {
@@ -731,7 +749,7 @@ fn or_exit<T, E: std::fmt::Display>(result: std::result::Result<T, E>, what: &st
 }
 
 fn doctor_command(json: bool) -> i32 {
-    let report = doctor::doctor(&cwd());
+    let report = doctor::doctor(&project_dir());
     if json {
         print!(
             "{}",
@@ -748,13 +766,22 @@ fn doctor_command(json: bool) -> i32 {
 }
 
 fn init_command() -> i32 {
-    match relais::policy::write_init_template(std::path::Path::new("relais.toml")) {
+    // At the repository root, not the shell's cwd: a policy written in a
+    // subdirectory would govern nothing.
+    let path = project_dir().join("relais.toml");
+    match relais::policy::write_init_template(&path) {
         Ok(true) => {
-            println!("wrote relais.toml (edit the model IDs and verification profile, then add a trust grant in machine.toml)");
+            println!(
+                "wrote {} (edit the model IDs and verification profile, then add a trust grant in machine.toml)",
+                path.display()
+            );
             0
         }
         Ok(false) => {
-            eprintln!("relais init: relais.toml already exists; init never overwrites");
+            eprintln!(
+                "relais init: {} already exists; init never overwrites",
+                path.display()
+            );
             2
         }
         Err(e) => {
@@ -765,7 +792,7 @@ fn init_command() -> i32 {
 }
 
 fn plan_command(task: &Path) -> i32 {
-    let Ok(repo) = load_repo_policy() else {
+    let Ok((root, repo)) = load_repo_policy() else {
         return 2;
     };
     let Ok(machine) = load_machine() else {
@@ -775,7 +802,7 @@ fn plan_command(task: &Path) -> i32 {
         return 2;
     };
 
-    if let Ok(dirty) = workspace::dirty_paths(&cwd()) {
+    if let Ok(dirty) = workspace::dirty_paths(&root) {
         if !dirty.is_empty() {
             eprintln!(
                 "relais plan: working tree is dirty ({}); commit or stash first",
@@ -784,7 +811,7 @@ fn plan_command(task: &Path) -> i32 {
             return 3;
         }
     }
-    let base_sha = match workspace::resolve_base(&cwd(), &contract.base_ref) {
+    let base_sha = match workspace::resolve_base(&root, &contract.base_ref) {
         Ok(sha) => sha,
         Err(e) => {
             eprintln!(
@@ -828,7 +855,7 @@ fn plan_command(task: &Path) -> i32 {
 }
 
 fn run_command(task: &Path) -> i32 {
-    let Ok(repo) = load_repo_policy() else {
+    let Ok((root, repo)) = load_repo_policy() else {
         return 2;
     };
     let Ok(machine) = load_machine() else {
@@ -845,8 +872,9 @@ fn run_command(task: &Path) -> i32 {
             return 3;
         }
     };
+    let aval_root = root.clone();
     let aval_resolver =
-        move |key: &str, scope: Option<&str>| relais::context::aval_resolve(&cwd(), key, scope);
+        move |key: &str, scope: Option<&str>| relais::context::aval_resolve(&aval_root, key, scope);
     // Managed dispatch is the only path `relais run` takes: a missing
     // coordinator blocks the run rather than launching unmanaged
     // (SPEC §23).
@@ -870,7 +898,7 @@ fn run_command(task: &Path) -> i32 {
         .as_ref()
         .map(|registry| RegistryPredictor::new(registry, &repo, harness.as_deref()));
     let outcome = execute(&RunConfig {
-        repo_dir: &cwd(),
+        repo_dir: &root,
         contract: &contract,
         repo_policy: &repo,
         machine: &machine,

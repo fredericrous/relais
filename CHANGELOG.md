@@ -6,6 +6,26 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## v0.1.6
+
+### Fixed
+
+- **`relais.toml` is found from anywhere inside the repository.** `plan`,
+  `run`, `doctor`, `init` and project-level `install` read the policy of
+  the nearest ancestor holding one, stopping at the repository root (the
+  nearest `.git`, a directory or a worktree's file). Before, only the
+  exact cwd was tried, so a Claude Code session started in a parent
+  folder, or a shell sitting in `crates/`, was told to `relais init`
+  a policy the repository already had. A nested repository never
+  inherits the policy of the one containing it; a directory outside any
+  repository is refused by name. `init` writes at the repository root,
+  never in a subdirectory where a policy would govern nothing.
+- **The `/relais` skill says where to stand.** Its first step is now the
+  repository (or task worktree) root as cwd for every command, so a
+  session run from a workspace folder that holds many repositories
+  routes to the right one instead of failing on the folder itself.
+  `relais install --claude --write` updates the installed skill.
+
 ## v0.1.5
 
 ### Fixed
