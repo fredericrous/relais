@@ -6,6 +6,67 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## v0.2.0
+
+A review of the whole crate against the fleet's decision records (2026-09-21)
+found ninety defects; this release fixes them. Two are breaking: a trust
+grant is now bound to the repository as well as the policy, so every
+`[trust."…"]` block in `machine.toml` must be re-issued from `relais plan`,
+and the coordinator wire protocol changed, so a running coordinator must be
+stopped (`relais coordinator stop`) before the first command of this version.
+
+### Architecture
+
+- **The module graph has no cycles, and a check keeps it that way.**
+  `policy`, `route`, `context` and `adapter` each reached into the next
+  and back again, as did `ledger` and `runner`, so none of the six could
+  be read or tested on its own. The lifecycle's `State` and `Reason` now
+  live in a leaf `lifecycle` module the ledger, the report and the
+  learning dataset can name without depending on the runner; the glob
+  predicates over a contract's write scope live beside the contract; the
+  default context budget belongs to `policy`, which hashes it.
+  `make lint` and CI run `scripts/check-module-cycles.py`, which fails on
+  any cycle and names the files that close it.
+- **Policy decides, and touches nothing.** Deciding what a run is
+  authorized to do was mixed in with scanning `$PATH`, running
+  `<tool> --version`, walking the filesystem for a `relais.toml` and
+  writing the init template. Those effects moved to two modules named for
+  what they answer — `tooling` for what is installed on this machine,
+  `repo` for the policy file on disk — and the same check asserts that
+  `policy` names no filesystem, process or environment API.
+- **The backend contract belongs to relais, not to its Claude adapter.**
+  The `Backend` trait and everything crossing it (`LaunchSpec`,
+  `LaunchResult`, `UsageReport`, `Capabilities`, `TurnCeiling`) are a
+  `backend` module a second provider can implement without touching the
+  adapter, and the generic process supervision sits in `procs` with the
+  rest of the platform vocabulary.
+- **A route, a launch and a check each report one outcome instead of a
+  bag of flags.** Routing returns a route or a refusal carrying at least
+  one blocker, so a blocked task can no longer be reported with nothing
+  blocking it — and it now prints its reasons rather than only its codes,
+  as does a route whose model policy does not name. A process reports
+  `Exited(code)`, `TimedOut`, `Cancelled` or `Signalled`, so a check
+  killed by the clock is no longer indistinguishable from one killed by a
+  signal, and a dispatch's cost is either a reported figure (with whether
+  it already covers subagents) or unknown — never an inclusive nothing.
+- **`ScriptBackend` is gone.** A public, process-spawning backend that
+  nothing referenced, documented against a `relais doctor --dry` flag
+  that does not exist.
+
+### Coordinator and admission
+
+### Ledger, policy and contracts
+
+### Runner
+
+### Adapter, verification and workspace
+
+### Learning and routing
+
+### CLI, doctor, install and release
+
+### Tests and documentation
+
 ## v0.1.6
 
 ### Fixed

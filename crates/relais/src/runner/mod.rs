@@ -24,8 +24,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::adapter::{Backend, LaunchResult, LaunchSpec};
 use crate::admission::{Decision, DispatchRequest, Gate, Refusal, ResourceClass, RunRegistration};
+use crate::backend::{Backend, LaunchResult, LaunchSpec};
 use crate::context::{self, AvalVerdict, ContextError, ContextManifest};
 use crate::contract::{Review, TaskContract};
 use crate::ids::{DispatchId, RunId};
@@ -34,14 +34,21 @@ use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::policy::{
     effective_authority, BlockCode, EffectiveAuthority, MachineSettings, RepoPolicy, Tier,
 };
-use crate::route::{route, RouteInputs, RoutePredictor};
+use crate::procs::Ended;
+use crate::route::{route, RouteInputs, RoutePredictor, Routed};
 use crate::verify::{self, amont_gaps, Receipt, VerificationReport};
 use crate::workspace::{self, TaskWorktree, WorkspaceError};
 
 pub mod machine;
 pub mod scheduler;
 
-pub use machine::{decide, AttemptKind, Budget, Limit, Next, Observation, Reason, State, Terminal};
+pub use machine::{decide, AttemptKind, Budget, Limit, Next, Observation, Terminal};
+
+/// The lifecycle vocabulary lives in `crate::lifecycle`, a leaf module
+/// the ledger, the report and the learning dataset can name without
+/// depending on the runner. Re-exported here because a run's states and
+/// reasons read as the runner's own from a caller's side.
+pub use crate::lifecycle::{Reason, State};
 
 /// One executed run's terminal result, carrying the run identity so the
 /// CLI can point at the ledger and artifacts.
@@ -118,8 +125,8 @@ pub struct RunConfig<'a> {
     pub aval_resolver: &'a dyn Fn(&str, Option<&str>) -> AvalVerdict,
     pub predictor: Option<&'a dyn RoutePredictor>,
     /// Managed dispatch (SPEC §23): every launch is admitted, heartbeat
-    /// and settled through this gate. `None` = unmanaged execution,
-    /// which the receipt labels as such; `relais run` always sets one.
+    /// and settled through this gate. `None` = unmanaged execution;
+    /// `relais run` always sets one.
     pub gate: Option<&'a (dyn Gate + Sync)>,
     /// The interactive session this run belongs to, for fair scheduling
     /// and attribution.
@@ -532,11 +539,7 @@ impl<'a> RunEngine<'a> {
         // the coordinator's to reconcile; the work already happened.
         let _ = gate.bind(&spec.dispatch_id, result.session_id.as_deref(), None);
         let _ = gate.release(&spec.dispatch_id);
-        let spent = if result.usage.cost_completeness == CostCompleteness::Unknown {
-            None
-        } else {
-            result.usage.cost.map(MicroUsd::to_micros)
-        };
+        let spent = result.usage.cost.micros().map(MicroUsd::to_micros);
         let _ = gate.settle(&spec.dispatch_id, spent);
         Ok(Ok(result))
     }
@@ -641,12 +644,12 @@ impl<'a> RunEngine<'a> {
         }
         // Integrations (SPEC §5): a missing required one blocks execution;
         // optional gaps travel in the receipt and are never passes.
-        if let Some(blocker) = crate::policy::probe_integrations(self.config.repo_policy).first() {
+        if let Some(blocker) = crate::tooling::probe_integrations(self.config.repo_policy).first() {
             return self.fail_preflight(blocker.code, blocker.detail.clone());
         }
         let integration_gaps = verify::integration_gaps(
             &self.config.repo_policy.integrations,
-            &crate::policy::binary_available,
+            &crate::tooling::binary_available,
         );
 
         // Managed runs register their root budget and agent-tree limits
@@ -704,8 +707,8 @@ impl<'a> RunEngine<'a> {
             ),
             tool_versions: context::ToolVersions {
                 relais: crate::version().to_string(),
-                aval: crate::policy::integration_version("aval"),
-                amont: crate::policy::integration_version("amont"),
+                aval: crate::tooling::integration_version("aval"),
+                amont: crate::tooling::integration_version("amont"),
                 claude_code: capabilities
                     .as_ref()
                     .and_then(|capabilities| capabilities.version.clone()),
@@ -714,7 +717,7 @@ impl<'a> RunEngine<'a> {
             // enforceable at all on this harness (SPEC §11).
             turn_ceiling: capabilities
                 .as_ref()
-                .map(crate::adapter::Capabilities::turn_ceiling)
+                .map(crate::backend::Capabilities::turn_ceiling)
                 .unwrap_or_default(),
             resolver: &resolver,
         }) {
@@ -773,10 +776,14 @@ impl<'a> RunEngine<'a> {
             authority: &authority,
             predictor: self.config.predictor,
         });
-        let Some(initial_tier) = decision.tier else {
-            let first = &decision.blocked[0];
-            return self.fail_preflight(first.code, first.detail.clone());
+        let decision = match decision {
+            Routed::Route(route) => route,
+            Routed::Blocked(blocked) => {
+                let first = blocked.first();
+                return self.fail_preflight(first.code, first.detail.clone());
+            }
         };
+        let initial_tier = decision.tier;
         if let Some(estimates) = &decision.estimates {
             ledger.record_prediction(
                 &self.run_id,
@@ -1064,10 +1071,10 @@ impl<'a> RunEngine<'a> {
                 output_tokens: usage.output_tokens,
                 cache_read_tokens: usage.cache_read_tokens,
                 cache_write_tokens: usage.cache_write_tokens,
-                cost: usage.cost,
+                cost: usage.cost.micros(),
                 cost_kind: CostKind::ApiSpend,
-                completeness: usage.cost_completeness,
-                inclusive: usage.inclusive,
+                completeness: usage.cost.completeness(),
+                inclusive: usage.cost.inclusive(),
                 at: self.config.ledger.now(),
             };
             ledger.record_usage(&event)?;
@@ -1076,7 +1083,7 @@ impl<'a> RunEngine<'a> {
             if let Some(cost) = event.cost {
                 progress.total_cost += cost;
             }
-            progress.cost_completeness = progress.cost_completeness.max(usage.cost_completeness);
+            progress.cost_completeness = progress.cost_completeness.max(usage.cost.completeness());
             if let Some(model) = &result.effective_model {
                 if !progress.models_used.contains(model) {
                     progress.models_used.push(model.clone());
@@ -1089,7 +1096,7 @@ impl<'a> RunEngine<'a> {
             if let Some(effective) = result
                 .effective_model
                 .as_deref()
-                .filter(|model| !crate::adapter::model_matches(&model_profile.id, model))
+                .filter(|model| !crate::backend::model_matches(&model_profile.id, model))
             {
                 return self.stop(
                     &progress.budget,
@@ -1102,7 +1109,7 @@ impl<'a> RunEngine<'a> {
 
             // Cancelled through the coordinator: the worktree and
             // evidence stay; nothing else is dispatched (SPEC §23).
-            if result.cancelled {
+            if result.ended == Ended::Cancelled {
                 ledger.finish_attempt(
                     attempt_id,
                     State::Cancelled,
@@ -1129,7 +1136,7 @@ impl<'a> RunEngine<'a> {
                 return self.stop(
                     &progress.budget,
                     Observation::TerminalResultMissing {
-                        timed_out: result.timed_out,
+                        timed_out: result.ended == Ended::TimedOut,
                         detail: result.failure_detail.clone().unwrap_or_default(),
                     },
                 );
@@ -1801,7 +1808,7 @@ impl<'a> RunEngine<'a> {
             .amont
             .as_ref()
             .is_some_and(|dependency| dependency.mode() != crate::policy::DependencyMode::Off)
-            && crate::policy::integration_available("amont");
+            && crate::tooling::integration_available("amont");
         let inventory = if amont_on {
             verify::amont_list(self.config.repo_dir, None, false)
         } else {
@@ -2044,10 +2051,10 @@ impl<'a> RunEngine<'a> {
             output_tokens: result.usage.output_tokens,
             cache_read_tokens: result.usage.cache_read_tokens,
             cache_write_tokens: result.usage.cache_write_tokens,
-            cost: result.usage.cost,
+            cost: result.usage.cost.micros(),
             cost_kind: CostKind::ApiSpend,
-            completeness: result.usage.cost_completeness,
-            inclusive: result.usage.inclusive,
+            completeness: result.usage.cost.completeness(),
+            inclusive: result.usage.cost.inclusive(),
             at: self.config.ledger.now(),
         };
         if let Err(e) = self.config.ledger.record_usage(&event) {
@@ -2056,7 +2063,7 @@ impl<'a> RunEngine<'a> {
         if let Some(cost) = event.cost {
             *total_cost += cost;
         }
-        *cost_completeness = (*cost_completeness).max(result.usage.cost_completeness);
+        *cost_completeness = (*cost_completeness).max(result.usage.cost.completeness());
         if result.terminal_result_missing() {
             return ReviewOutcome::Unavailable(
                 "the reviewer ended without a terminal result".into(),
@@ -2603,15 +2610,16 @@ mod tests {
         }
     }
 
-    fn usage(cost_micros: i64) -> crate::adapter::UsageReport {
-        crate::adapter::UsageReport {
+    fn usage(cost_micros: i64) -> crate::backend::UsageReport {
+        crate::backend::UsageReport {
             input_tokens: Some(100),
             output_tokens: Some(10),
             cache_read_tokens: None,
             cache_write_tokens: None,
-            cost: Some(MicroUsd::from_micros(cost_micros)),
-            cost_completeness: CostCompleteness::Actual,
-            inclusive: false,
+            cost: crate::backend::Cost::Reported {
+                micros: MicroUsd::from_micros(cost_micros),
+                inclusive: false,
+            },
         }
     }
 
@@ -3590,7 +3598,7 @@ mod tests {
                 result_text: Some("DONE".into()),
                 exit_code: Some(0),
                 // The harness said nothing about cost.
-                usage: Some(crate::adapter::UsageReport::unknown()),
+                usage: Some(crate::backend::UsageReport::unknown()),
                 ..Default::default()
             }
         });
@@ -4857,7 +4865,7 @@ mod tests {
             constraints,
             budget_bytes: 100_000,
             package_bytes: 0,
-            turn_ceiling: crate::adapter::TurnCeiling::Unavailable.as_str().into(),
+            turn_ceiling: crate::backend::TurnCeiling::Unavailable.as_str().into(),
         }
     }
 

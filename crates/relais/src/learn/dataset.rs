@@ -17,8 +17,8 @@ use super::features::{
 };
 use crate::ids::sha256_hex;
 use crate::ledger::Ledger;
+use crate::lifecycle::State;
 use crate::policy::{RepoPolicy, Tier};
-use crate::runner::State;
 
 /// The stored contract and first-attempt tier for a run, as dataset
 /// construction consumes them.

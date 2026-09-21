@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::contract::scope::{scope_contained_in, write_scope_could_touch};
 use crate::contract::{Kind, Review, TaskContract};
 use crate::money::MicroUsd;
 use crate::policy::{BlockCode, Blocker, EffectiveAuthority, MachineSettings, RepoPolicy, Tier};
@@ -52,22 +53,99 @@ pub struct RouteInputs<'a> {
     pub predictor: Option<&'a dyn RoutePredictor>,
 }
 
+/// One reason the router gives for what it did: a stable id the ledger
+/// and the tests match on, and the sentence a person reads. They were
+/// two parallel `Vec<String>`s pushed in different places, and they
+/// drifted — the risk floor pushed ids with no text, a recipe pushed
+/// text with no id — so neither list could be read as an explanation of
+/// the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteReason {
+    pub id: String,
+    pub text: String,
+}
+
+impl RouteReason {
+    /// One reason: the id the ledger and the tests match on, and the
+    /// sentence `explain` prints for it. Both, always — that is the
+    /// point of the type.
+    pub fn new(id: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            text: text.into(),
+        }
+    }
+}
+
+/// What the router decided: a route, or a refusal to route. There is no
+/// third state and no combination of the two — a decision with no tier
+/// used to carry a `blocked` list the caller indexed at `[0]` and hoped
+/// was there.
 #[derive(Debug, Clone, PartialEq)]
-pub struct RouteDecision {
-    /// None when routing is blocked before any dispatch.
-    pub tier: Option<Tier>,
-    pub reason_ids: Vec<String>,
-    pub reasons: Vec<String>,
+pub enum Routed {
+    Route(Route),
+    Blocked(Blocked),
+}
+
+/// A task that will be dispatched, and on what terms (SPEC §6).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Route {
+    pub tier: Tier,
+    /// The stronger tier a failure may escalate to, when policy
+    /// authorizes one.
+    pub escalation_tier: Option<Tier>,
     pub review: Review,
     pub max_attempts: u32,
     pub max_repairs_before_escalation: u32,
-    pub escalation_tier: Option<Tier>,
-    pub blocked: Vec<Blocker>,
     /// Whether a learned artifact actually chose the tier (vs. baseline).
     pub routed_by: RoutedBy,
     /// What the artifact estimated, when one was consulted — recorded by
     /// the runner as a prediction row whatever it decided.
     pub estimates: Option<Estimates>,
+    pub reasons: Vec<RouteReason>,
+}
+
+/// A task that will not be dispatched at all, and why. At least one
+/// blocker, by construction: a blocked route with nothing blocking it
+/// is not a state this crate can build.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Blocked {
+    blockers: Vec<Blocker>,
+    pub review: Review,
+    pub reasons: Vec<RouteReason>,
+}
+
+impl Blocked {
+    /// The first blocker is the one the run reports; `rest` is whatever
+    /// else preflight found. Taking the first one by value is what makes
+    /// the list non-empty.
+    pub fn new(
+        first: Blocker,
+        rest: Vec<Blocker>,
+        review: Review,
+        reasons: Vec<RouteReason>,
+    ) -> Self {
+        let mut blockers = Vec::with_capacity(1 + rest.len());
+        blockers.push(first);
+        blockers.extend(rest);
+        Self {
+            blockers,
+            review,
+            reasons,
+        }
+    }
+
+    /// Every blocker preflight found, first one first.
+    pub fn blockers(&self) -> &[Blocker] {
+        &self.blockers
+    }
+
+    /// The blocker the run ends on.
+    pub fn first(&self) -> &Blocker {
+        self.blockers
+            .first()
+            .expect("Blocked::new always stores the first blocker")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,82 +160,11 @@ pub enum RoutedBy {
     ConservativeBaseline,
 }
 
-/// Could one path match BOTH globs? Routing happens before any diff
-/// exists, so floors are computed from the DECLARED scope patterns
-/// (SPEC §6). The answer is exact for `**` (zero or more segments) and
-/// conservative inside a segment (a `*` segment is judged by its literal
-/// prefix and suffix only), so an over-approximation costs an escalation
-/// tier while an under-approximation would route a sensitive write to a
-/// cheap model — the failure the spec forbids.
-///
-/// It used to answer "yes" to anything when either side began with `**`,
-/// which made the init template's `**/trust/**` rule floor a contract
-/// scoped to `docs/README.md`. A directory scope such as `src/**` still
-/// takes that floor, correctly: `src/trust/x` matches both.
-pub(crate) fn scope_could_touch(scope: &str, pattern: &str) -> bool {
-    let segments = |glob: &str| -> Vec<String> {
-        glob.trim_start_matches("./")
-            .split('/')
-            .filter(|segment| !segment.is_empty())
-            .map(str::to_string)
-            .collect()
-    };
-    globs_overlap(&segments(scope), &segments(pattern))
-}
-
-fn globs_overlap(a: &[String], b: &[String]) -> bool {
-    match (a.first(), b.first()) {
-        (None, None) => true,
-        (Some(x), _) if x == "**" => {
-            globs_overlap(&a[1..], b) || (!b.is_empty() && globs_overlap(a, &b[1..]))
-        }
-        (_, Some(y)) if y == "**" => {
-            globs_overlap(a, &b[1..]) || (!a.is_empty() && globs_overlap(&a[1..], b))
-        }
-        (Some(x), Some(y)) => segments_overlap(x, y) && globs_overlap(&a[1..], &b[1..]),
-        _ => false,
-    }
-}
-
-/// Two single segments: equal, or wildcarded with compatible literal
-/// prefix and suffix. `*.rs` and `main.rs` overlap; `a*` and `b*` do not.
-fn segments_overlap(a: &str, b: &str) -> bool {
-    if a == b {
-        return true;
-    }
-    let wild = |s: &str| s.contains('*') || s.contains('?') || s.contains('[');
-    if !wild(a) && !wild(b) {
-        return false;
-    }
-    // A literal segment is its own prefix AND suffix; a wildcarded one
-    // contributes the text before its first and after its last wildcard.
-    let literal = |s: &str| -> (String, String) {
-        if !wild(s) {
-            return (s.to_string(), s.to_string());
-        }
-        let first = s.find(['*', '?', '[']).unwrap_or(s.len());
-        let last = s.rfind(['*', '?', ']']).map_or(s.len(), |i| i + 1);
-        (s[..first].to_string(), s[last.max(first)..].to_string())
-    };
-    let (pa, sa) = literal(a);
-    let (pb, sb) = literal(b);
-    let prefixes = pa.starts_with(&pb) || pb.starts_with(&pa);
-    let suffixes = sa.ends_with(&sb) || sb.ends_with(&sa);
-    prefixes && suffixes
-}
-
-pub fn write_scope_could_touch(contract: &TaskContract, pattern: &str) -> bool {
-    contract
-        .write_scope
-        .as_deref()
-        .is_some_and(|scopes| scopes.iter().any(|scope| scope_could_touch(scope, pattern)))
-}
-
 /// The risk floor from declared scope and repository rules: the highest
 /// minimum tier among rules whose paths the declared scope could touch.
-fn risk_floor(contract: &TaskContract, repo: &RepoPolicy) -> (Option<Tier>, Vec<String>) {
+fn risk_floor(contract: &TaskContract, repo: &RepoPolicy) -> (Option<Tier>, Vec<RouteReason>) {
     let mut floor: Option<Tier> = None;
-    let mut rule_ids = Vec::new();
+    let mut fired = Vec::new();
     for (index, rule) in repo.risk.iter().enumerate() {
         let touches =
             write_scope_could_touch(contract, rule.paths.first().unwrap_or(&String::new()))
@@ -166,18 +173,26 @@ fn risk_floor(contract: &TaskContract, repo: &RepoPolicy) -> (Option<Tier>, Vec<
                     .iter()
                     .any(|pattern| write_scope_could_touch(contract, pattern));
         if touches {
-            rule_ids.push(format!("risk[{}]:{}", index, rule.minimum_tier.as_str()));
+            fired.push(RouteReason::new(
+                format!("risk[{}]:{}", index, rule.minimum_tier.as_str()),
+                format!(
+                    "risk rule {index} ({}) requires at least the {} tier",
+                    rule.paths.join(", "),
+                    rule.minimum_tier.as_str()
+                ),
+            ));
             floor = Some(match floor {
                 Some(current) if current >= rule.minimum_tier => current,
                 _ => rule.minimum_tier,
             });
         }
     }
-    (floor, rule_ids)
+    (floor, fired)
 }
 
 /// An explicitly configured deterministic recipe, used only when it FULLY
-/// covers the task (SPEC §6.3). Recipes are never inferred from prose.
+/// covers the task (SPEC §6, step 3). Recipes are never inferred from
+/// prose.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recipe {
     pub name: String,
@@ -198,62 +213,6 @@ impl From<&crate::policy::RecipeSpec> for Recipe {
     }
 }
 
-/// Is every path matched by `scope` also matched by `cover`? This is
-/// CONTAINMENT, not overlap, and it is deliberately incomplete: glob
-/// containment in general is not something to decide inside a routing
-/// function, so anything this cannot decide is "not contained".
-///
-/// `scope_could_touch` answers a different question — could these two
-/// patterns share a path — and using it here made a recipe "fully cover"
-/// a task it covered almost none of: a contract scoped `**` overlaps a
-/// `docs/**` recipe, so the whole repository was routed by the docs
-/// recipe's tier (finding B13). The two predicates are not
-/// interchangeable in either direction: overlap is symmetric and
-/// containment is not.
-///
-/// Decidable cases:
-/// - `cover` is `**`: it matches every path, so anything is contained.
-/// - `cover` ends in `/**` and its leading segments are all literal:
-///   `scope` is contained when its own segments begin with exactly those
-///   literals and it has at least one segment more.
-/// - the two patterns are identical.
-///
-/// Everything else — a wildcard anywhere in the cover's prefix
-/// (`**/trust/**`, `docs/*/**`), a cover with no trailing `**`, a scope
-/// shorter than the cover's prefix — is undecidable here and answers
-/// false, which costs a recipe and never grants one.
-pub(crate) fn scope_contained_in(scope: &str, cover: &str) -> bool {
-    let segments = |glob: &str| -> Vec<String> {
-        glob.trim_start_matches("./")
-            .split('/')
-            .filter(|segment| !segment.is_empty())
-            .map(str::to_string)
-            .collect()
-    };
-    let scope = segments(scope);
-    let cover = segments(cover);
-    if cover.is_empty() {
-        return false;
-    }
-    if cover.len() == 1 && cover[0] == "**" {
-        return true;
-    }
-    if scope == cover {
-        return true;
-    }
-    let Some((last, prefix)) = cover.split_last() else {
-        return false;
-    };
-    if last != "**" || prefix.is_empty() {
-        return false;
-    }
-    let wild = |segment: &String| segment.contains(['*', '?', '[']);
-    if prefix.iter().any(wild) {
-        return false;
-    }
-    scope.len() > prefix.len() && scope.starts_with(prefix)
-}
-
 fn recipe_covers(contract: &TaskContract, recipe: &Recipe) -> bool {
     if let Some(kind) = recipe.kind {
         if contract.kind != kind {
@@ -263,7 +222,7 @@ fn recipe_covers(contract: &TaskContract, recipe: &Recipe) -> bool {
     if recipe.scope_within.is_empty() {
         return true;
     }
-    // FULLY covers (SPEC §6.3): every pattern the contract may write must
+    // FULLY covers (SPEC §6, step 3): every pattern the contract may write must
     // be contained in some recipe pattern.
     contract.write_scope.as_deref().is_some_and(|scopes| {
         !scopes.is_empty()
@@ -276,7 +235,7 @@ fn recipe_covers(contract: &TaskContract, recipe: &Recipe) -> bool {
     })
 }
 
-pub fn route(inputs: RouteInputs<'_>) -> RouteDecision {
+pub fn route(inputs: RouteInputs<'_>) -> Routed {
     let RouteInputs {
         contract,
         repo,
@@ -286,24 +245,20 @@ pub fn route(inputs: RouteInputs<'_>) -> RouteDecision {
     } = inputs;
 
     let mut reasons = Vec::new();
-    let mut reason_ids = Vec::new();
 
-    if !authority.blockers.is_empty() {
-        return RouteDecision {
-            tier: None,
-            reason_ids: vec!["preflight_blockers".into()],
-            reasons: vec![format!(
-                "blocked before dispatch by {} authority blocker(s)",
-                authority.blockers.len()
+    if let Some((first, rest)) = authority.blockers.split_first() {
+        return Routed::Blocked(Blocked::new(
+            first.clone(),
+            rest.to_vec(),
+            authority.review_floor,
+            vec![RouteReason::new(
+                "preflight_blockers",
+                format!(
+                    "blocked before dispatch by {} authority blocker(s)",
+                    authority.blockers.len()
+                ),
             )],
-            review: authority.review_floor,
-            max_attempts: 0,
-            max_repairs_before_escalation: 0,
-            escalation_tier: None,
-            blocked: authority.blockers.clone(),
-            routed_by: RoutedBy::ConservativeBaseline,
-            estimates: None,
-        };
+        ));
     }
 
     // Complexity and consequence are separate (SPEC §6): a change starts
@@ -313,23 +268,26 @@ pub fn route(inputs: RouteInputs<'_>) -> RouteDecision {
         Kind::Inspect => Tier::Research,
     };
     match contract.kind {
-        Kind::Change => {
-            reasons.push("bounded change; conservative route floor is implementation".into());
-            reason_ids.push("kind_change_floor".into());
-        }
-        Kind::Inspect => {
-            reasons.push("inspection task; research tier eligible".into());
-            reason_ids.push("kind_inspect_floor".into());
-        }
+        Kind::Change => reasons.push(RouteReason::new(
+            "kind_change_floor",
+            "bounded change; conservative route floor is implementation",
+        )),
+        Kind::Inspect => reasons.push(RouteReason::new(
+            "kind_inspect_floor",
+            "inspection task; research tier eligible",
+        )),
     }
 
-    let (rule_floor, rule_ids) = risk_floor(contract, repo);
-    reason_ids.extend(rule_ids);
+    let (rule_floor, fired_rules) = risk_floor(contract, repo);
+    reasons.extend(fired_rules);
     if let Some(rule_floor) = rule_floor {
         if rule_floor > floor {
-            reasons.push(format!(
-                "risk floor: scope touches configured high-risk paths ({} required)",
-                rule_floor.as_str()
+            reasons.push(RouteReason::new(
+                "risk_floor",
+                format!(
+                    "risk floor: scope touches configured high-risk paths ({} required)",
+                    rule_floor.as_str()
+                ),
             ));
             floor = rule_floor;
         }
@@ -340,14 +298,16 @@ pub fn route(inputs: RouteInputs<'_>) -> RouteDecision {
     // validated artifact can — but they do force review.
     let mut review = authority.review_floor;
     if !contract.risk_hints.is_empty() {
-        reason_ids.push("risk_hints".into());
-        reasons.push(format!(
-            "risk hints supplied: {}",
-            contract.risk_hints.join(", ")
+        reasons.push(RouteReason::new(
+            "risk_hints",
+            format!("risk hints supplied: {}", contract.risk_hints.join(", ")),
         ));
         if review < Review::Required {
             review = Review::Required;
-            reasons.push("risk hints raise review to required".into());
+            reasons.push(RouteReason::new(
+                "risk_hints_review",
+                "risk hints raise review to required",
+            ));
         }
     }
 
@@ -357,40 +317,42 @@ pub fn route(inputs: RouteInputs<'_>) -> RouteDecision {
         .filter(|tier| *tier >= floor && authority.models.contains_key(tier))
         .collect();
 
-    if eligible.is_empty() {
-        return RouteDecision {
-            tier: None,
-            reason_ids: vec!["model_unavailable".into()],
-            reasons: vec![format!(
+    let Some(&cheapest_eligible) = eligible.first() else {
+        reasons.push(RouteReason::new(
+            "model_unavailable",
+            format!(
                 "no model configured at or above the {} floor; no silent fallback is allowed",
                 floor.as_str()
-            )],
-            review,
-            max_attempts: 0,
-            max_repairs_before_escalation: 0,
-            escalation_tier: None,
-            blocked: vec![Blocker {
+            ),
+        ));
+        return Routed::Blocked(Blocked::new(
+            Blocker {
                 code: BlockCode::ModelUnavailable,
                 detail: format!(
                     "no model configured at or above the {} floor",
                     floor.as_str()
                 ),
-            }],
-            routed_by: RoutedBy::ConservativeBaseline,
-            estimates: None,
-        };
-    }
+            },
+            Vec::new(),
+            review,
+            reasons,
+        ));
+    };
 
-    // Deterministic recipes win when they fully cover the task (SPEC §6.3).
+    // Deterministic recipes win when they fully cover the task
+    // (SPEC §6, step 3).
     let mut estimates_seen: Option<Estimates> = None;
     let recipe_recipes: Vec<Recipe> = repo.recipes.iter().map(Recipe::from).collect();
     let selected: (Tier, RoutedBy) = if let Some(recipe) = recipe_recipes
         .iter()
         .find(|recipe| eligible.contains(&recipe.tier) && recipe_covers(contract, recipe))
     {
-        reasons.push(format!(
-            "deterministic recipe `{}` fully covers the task",
-            recipe.name
+        reasons.push(RouteReason::new(
+            "deterministic_recipe",
+            format!(
+                "deterministic recipe `{}` fully covers the task",
+                recipe.name
+            ),
         ));
         (recipe.tier, RoutedBy::DeterministicRecipe)
     } else if let (true, Some(predictor)) = (machine.routing.learned_enabled, predictor) {
@@ -401,31 +363,41 @@ pub fn route(inputs: RouteInputs<'_>) -> RouteDecision {
                 estimates_seen = Some(estimates.clone());
                 match selection {
                     Some(tier) => {
-                        reasons.push(format!(
-                            "learned artifact {} estimated acceptance/cost and selected {}",
-                            estimates.artifact_id,
-                            tier.as_str()
+                        reasons.push(RouteReason::new(
+                            "learned_artifact",
+                            format!(
+                                "learned artifact {} estimated acceptance/cost and selected {}",
+                                estimates.artifact_id,
+                                tier.as_str()
+                            ),
                         ));
                         (tier, RoutedBy::LearnedArtifact)
                     }
                     None => {
-                        reasons.push(
-                                "learned estimates did not clear the quality floor; conservative baseline".into(),
-                            );
-                        (eligible[0], RoutedBy::ConservativeBaseline)
+                        reasons.push(RouteReason::new(
+                            "below_quality_floor",
+                            "learned estimates did not clear the quality floor; conservative \
+                             baseline",
+                        ));
+                        (cheapest_eligible, RoutedBy::ConservativeBaseline)
                     }
                 }
             }
             None => {
-                reasons.push(
-                        "no supported trained coverage; conservative baseline while outcomes are collected".into(),
-                    );
-                (eligible[0], RoutedBy::ConservativeBaseline)
+                reasons.push(RouteReason::new(
+                    "no_trained_coverage",
+                    "no supported trained coverage; conservative baseline while outcomes are \
+                     collected",
+                ));
+                (cheapest_eligible, RoutedBy::ConservativeBaseline)
             }
         }
     } else {
-        reasons.push("cold start: conservative configured baseline".into());
-        (eligible[0], RoutedBy::ConservativeBaseline)
+        reasons.push(RouteReason::new(
+            "cold_start",
+            "cold start: conservative configured baseline",
+        ));
+        (cheapest_eligible, RoutedBy::ConservativeBaseline)
     };
 
     let escalation_tier = eligible
@@ -434,20 +406,16 @@ pub fn route(inputs: RouteInputs<'_>) -> RouteDecision {
         .find(|tier| **tier > selected.0)
         .copied();
 
-    let max_attempts = authority.max_attempts;
-
-    RouteDecision {
-        tier: Some(selected.0),
-        reason_ids,
-        reasons,
-        review,
-        max_attempts,
-        max_repairs_before_escalation: authority.max_repairs_before_escalation,
+    Routed::Route(Route {
+        tier: selected.0,
         escalation_tier,
-        blocked: Vec::new(),
+        review,
+        max_attempts: authority.max_attempts,
+        max_repairs_before_escalation: authority.max_repairs_before_escalation,
         routed_by: selected.1,
         estimates: estimates_seen,
-    }
+        reasons,
+    })
 }
 
 fn select_learned(estimates: &Estimates, eligible: &[Tier], quality_floor: f64) -> Option<Tier> {
@@ -469,41 +437,68 @@ fn select_learned(estimates: &Estimates, eligible: &[Tier], quality_floor: f64) 
         .map(|(tier, _)| *tier)
 }
 
-impl RouteDecision {
-    /// The explanation block (SPEC §6 example shape). Reasons are joined;
-    /// blocked routes list their codes instead of a route line.
+impl Routed {
+    /// The explanation block (SPEC §6 example shape), whichever this is.
     pub fn explain(&self, model: Option<&str>) -> String {
-        let mut out = String::new();
-        match (self.tier, model) {
-            (Some(tier), Some(model)) => {
-                out.push_str(&format!("route: {} / {}\n", tier.as_str(), model));
-                out.push_str(&format!("reason: {}\n", self.reasons.join("; ")));
-                match self.review {
-                    Review::Required => out.push_str("review: required\n"),
-                    Review::Optional => out.push_str("review: optional\n"),
-                    Review::Off => out.push_str("review: off\n"),
-                }
-                let repairs = self.max_repairs_before_escalation;
-                match self.escalation_tier {
-                    Some(escalation) => out.push_str(&format!(
-                        "on failure: {repairs} repair(s), then escalation to {}\n",
-                        escalation.as_str()
-                    )),
-                    None => out.push_str(&format!(
-                        "on failure: {repairs} repair(s), then fail (no stronger tier authorized)\n"
-                    )),
-                }
-                out.push_str(&format!("max attempts: {}\n", self.max_attempts));
-            }
-            _ => {
-                out.push_str("route: blocked\n");
-                for blocker in &self.blocked {
-                    out.push_str(&format!("blocked: {} — {}\n", blocker.code, blocker.detail));
-                }
-            }
+        match self {
+            Self::Route(route) => route.explain(model),
+            Self::Blocked(blocked) => blocked.explain(),
+        }
+    }
+}
+
+impl Route {
+    /// The route's terms, in the shape SPEC §6 gives as an example. The
+    /// model is the one policy names for the selected tier; when nothing
+    /// names one the tier still prints, because the tuple match this
+    /// replaces fell through to the blocked arm and reported a perfectly
+    /// good route as blocked.
+    pub fn explain(&self, model: Option<&str>) -> String {
+        let mut out = match model {
+            Some(model) => format!("route: {} / {model}\n", self.tier.as_str()),
+            None => format!("route: {}\n", self.tier.as_str()),
+        };
+        out.push_str(&format!("reason: {}\n", joined(&self.reasons)));
+        match self.review {
+            Review::Required => out.push_str("review: required\n"),
+            Review::Optional => out.push_str("review: optional\n"),
+            Review::Off => out.push_str("review: off\n"),
+        }
+        let repairs = self.max_repairs_before_escalation;
+        match self.escalation_tier {
+            Some(escalation) => out.push_str(&format!(
+                "on failure: {repairs} repair(s), then escalation to {}\n",
+                escalation.as_str()
+            )),
+            None => out.push_str(&format!(
+                "on failure: {repairs} repair(s), then fail (no stronger tier authorized)\n"
+            )),
+        }
+        out.push_str(&format!("max attempts: {}\n", self.max_attempts));
+        out
+    }
+}
+
+impl Blocked {
+    /// Why nothing will be dispatched: the reasons first, then every
+    /// blocker. The reasons used to be dropped here, so a blocked task
+    /// printed codes and no explanation of them.
+    pub fn explain(&self) -> String {
+        let mut out = String::from("route: blocked\n");
+        out.push_str(&format!("reason: {}\n", joined(&self.reasons)));
+        for blocker in self.blockers() {
+            out.push_str(&format!("blocked: {} — {}\n", blocker.code, blocker.detail));
         }
         out
     }
+}
+
+fn joined(reasons: &[RouteReason]) -> String {
+    reasons
+        .iter()
+        .map(|reason| reason.text.as_str())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 #[cfg(test)]
@@ -626,11 +621,7 @@ mod tests {
         .expect("contract parses")
     }
 
-    fn route_with(
-        contract: &TaskContract,
-        repo: &RepoPolicy,
-        machine: &MachineSettings,
-    ) -> RouteDecision {
+    fn decide(contract: &TaskContract, repo: &RepoPolicy, machine: &MachineSettings) -> Routed {
         let authority = effective_authority(repo, machine, contract);
         route(RouteInputs {
             contract,
@@ -639,6 +630,27 @@ mod tests {
             authority: &authority,
             predictor: None,
         })
+    }
+
+    /// The route these inputs produce, or a failure naming what blocked.
+    fn route_with(contract: &TaskContract, repo: &RepoPolicy, machine: &MachineSettings) -> Route {
+        expect_route(decide(contract, repo, machine))
+    }
+
+    fn expect_route(decision: Routed) -> Route {
+        match decision {
+            Routed::Route(route) => route,
+            Routed::Blocked(blocked) => {
+                panic!("expected a route, blocked by {:?}", blocked.blockers())
+            }
+        }
+    }
+
+    fn expect_blocked(decision: Routed) -> Blocked {
+        match decision {
+            Routed::Blocked(blocked) => blocked,
+            Routed::Route(route) => panic!("expected blockers, routed to {:?}", route.tier),
+        }
     }
 
     #[test]
@@ -653,8 +665,7 @@ mod tests {
         let repo = repo_policy();
         let machine = machine_for(&repo);
         let d = route_with(&change_contract(&["crates/amont/**"]), &repo, &machine);
-        assert_eq!(d.tier, Some(Tier::Implementation));
-        assert!(d.blocked.is_empty());
+        assert_eq!(d.tier, Tier::Implementation);
         assert_eq!(d.routed_by, RoutedBy::ConservativeBaseline);
         assert_eq!(d.max_attempts, 3);
         assert_eq!(d.escalation_tier, Some(Tier::Escalation));
@@ -665,7 +676,7 @@ mod tests {
         let repo = repo_policy();
         let machine = machine_for(&repo);
         let d = route_with(&inspect_contract(), &repo, &machine);
-        assert_eq!(d.tier, Some(Tier::Research));
+        assert_eq!(d.tier, Tier::Research);
     }
 
     #[test]
@@ -682,11 +693,11 @@ mod tests {
             &repo,
             &machine,
         );
-        assert_eq!(d.tier, Some(Tier::Escalation));
+        assert_eq!(d.tier, Tier::Escalation);
         assert!(d
-            .reason_ids
+            .reasons
             .iter()
-            .any(|id| id.starts_with("risk[0]:escalation")));
+            .any(|reason| reason.id.starts_with("risk[0]:escalation")));
         assert_eq!(d.review, Review::Required);
     }
 
@@ -703,27 +714,9 @@ mod tests {
         let d = route_with(&change_contract(&["crates/**"]), &repo, &machine);
         assert_eq!(
             d.tier,
-            Some(Tier::Escalation),
+            Tier::Escalation,
             "declared scope that COULD touch a rule area must take the floor"
         );
-    }
-
-    #[test]
-    fn overlap_is_exact_for_double_star_and_conservative_within_a_segment() {
-        // The init template's rule against a single-file scope elsewhere.
-        assert!(!scope_could_touch("docs/README.md", "**/trust/**"));
-        assert!(!scope_could_touch("src/main.rs", "**/trust/**"));
-        // …and against directory scopes that genuinely could reach it.
-        assert!(scope_could_touch("src/**", "**/trust/**"));
-        assert!(scope_could_touch("crates/amont/trust/**", "**/trust/**"));
-        assert!(scope_could_touch("**", "crates/other/**"));
-        assert!(!scope_could_touch("**/trust/**", "src/main.rs"));
-        assert!(scope_could_touch("**/*.rs", "src/main.rs"));
-        assert!(!scope_could_touch("**/*.rs", "src/main.py"));
-        assert!(!scope_could_touch("crates/a/**", "crates/b/**"));
-        assert!(scope_could_touch("crates/a*/**", "crates/ab/**"));
-        assert!(!scope_could_touch("crates/a*/**", "crates/b/**"));
-        assert!(scope_could_touch("./src/**", "src/lib.rs"));
     }
 
     #[test]
@@ -736,7 +729,7 @@ mod tests {
         });
         let machine = machine_for(&repo);
         let d = route_with(&change_contract(&["docs/README.md"]), &repo, &machine);
-        assert_eq!(d.tier, Some(Tier::Implementation));
+        assert_eq!(d.tier, Tier::Implementation);
         assert_eq!(
             d.review,
             Review::Optional,
@@ -754,7 +747,7 @@ mod tests {
         });
         let machine = machine_for(&repo);
         let d = route_with(&change_contract(&["crates/amont/**"]), &repo, &machine);
-        assert_eq!(d.tier, Some(Tier::Implementation));
+        assert_eq!(d.tier, Tier::Implementation);
     }
 
     #[test]
@@ -764,11 +757,7 @@ mod tests {
         let mut c = change_contract(&["crates/amont/**"]);
         c.risk_hints = vec!["public-output-contract".into()];
         let d = route_with(&c, &repo, &machine);
-        assert_eq!(
-            d.tier,
-            Some(Tier::Implementation),
-            "hints cannot buy escalation"
-        );
+        assert_eq!(d.tier, Tier::Implementation, "hints cannot buy escalation");
         assert_eq!(d.review, Review::Required);
     }
 
@@ -789,12 +778,16 @@ mod tests {
                 note: None,
             },
         );
-        let d = route_with(&change_contract(&["crates/amont/**"]), &repo, &machine);
+        let d = expect_blocked(decide(
+            &change_contract(&["crates/amont/**"]),
+            &repo,
+            &machine,
+        ));
         assert!(d
-            .blocked
+            .blockers()
             .iter()
             .any(|b| b.code == BlockCode::ModelUnavailable));
-        assert_eq!(d.tier, None);
+        assert_eq!(d.first().code, BlockCode::ModelUnavailable);
     }
 
     #[test]
@@ -810,12 +803,15 @@ mod tests {
             trials: Default::default(),
             routing: Default::default(),
         };
-        let d = route_with(&change_contract(&["crates/amont/**"]), &repo, &machine);
+        let d = expect_blocked(decide(
+            &change_contract(&["crates/amont/**"]),
+            &repo,
+            &machine,
+        ));
         assert!(d
-            .blocked
+            .blockers()
             .iter()
             .any(|b| b.code == BlockCode::MissingTrustGrant));
-        assert_eq!(d.tier, None);
     }
 
     struct FixedPredictor(Vec<(Tier, f64, i64)>);
@@ -866,14 +862,14 @@ mod tests {
             (Tier::Implementation, 0.9, 400),
             (Tier::Escalation, 0.95, 4000),
         ]);
-        let d = route(RouteInputs {
+        let d = expect_route(route(RouteInputs {
             contract: &change_contract(&["crates/amont/**"]),
             repo: &repo,
             machine: &machine,
             authority: &authority,
             predictor: Some(&predictor),
-        });
-        assert_eq!(d.tier, Some(Tier::Implementation));
+        }));
+        assert_eq!(d.tier, Tier::Implementation);
         assert_eq!(d.routed_by, RoutedBy::LearnedArtifact);
     }
 
@@ -887,14 +883,14 @@ mod tests {
             (Tier::Implementation, 0.40, 300),
             (Tier::Escalation, 0.40, 900),
         ]);
-        let d = route(RouteInputs {
+        let d = expect_route(route(RouteInputs {
             contract: &change_contract(&["crates/amont/**"]),
             repo: &repo,
             machine: &machine,
             authority: &authority,
             predictor: Some(&predictor),
-        });
-        assert_eq!(d.tier, Some(Tier::Implementation));
+        }));
+        assert_eq!(d.tier, Tier::Implementation);
         assert_eq!(d.routed_by, RoutedBy::ConservativeBaseline);
     }
 
@@ -953,14 +949,14 @@ mod tests {
         let machine = machine_for(&repo);
         let authority =
             effective_authority(&repo, &machine, &change_contract(&["crates/amont/**"]));
-        let d = route(RouteInputs {
+        let d = expect_route(route(RouteInputs {
             contract: &change_contract(&["crates/amont/**"]),
             repo: &repo,
             machine: &machine,
             authority: &authority,
             predictor: Some(&Abstainer),
-        });
-        assert_eq!(d.tier, Some(Tier::Implementation));
+        }));
+        assert_eq!(d.tier, Tier::Implementation);
         assert_eq!(d.routed_by, RoutedBy::ConservativeBaseline);
     }
 
@@ -991,9 +987,17 @@ mod tests {
             trials: Default::default(),
             routing: Default::default(),
         };
-        let d = route_with(&change_contract(&["crates/amont/**"]), &repo, &machine);
-        let text = d.explain(None);
+        let d = expect_blocked(decide(
+            &change_contract(&["crates/amont/**"]),
+            &repo,
+            &machine,
+        ));
+        let text = d.explain();
         assert!(text.starts_with("route: blocked\n"), "{text}");
+        assert!(
+            text.contains("reason: blocked before dispatch by"),
+            "a blocked route says why, not only which code: {text}"
+        );
         assert!(text.contains("blocked: missing_trust_grant"));
     }
 
@@ -1018,42 +1022,12 @@ mod tests {
         let docs = change_contract(&["docs/guide.md"]);
         let d = route_with(&docs, &repo, &machine);
         assert_eq!(d.routed_by, RoutedBy::DeterministicRecipe);
-        assert_eq!(d.tier, Some(Tier::Implementation));
+        assert_eq!(d.tier, Tier::Implementation);
 
         // Scope reaching outside the recipe does not count as coverage.
         let straddling = change_contract(&["docs/**", "crates/**"]);
         let d = route_with(&straddling, &repo, &machine);
         assert_eq!(d.routed_by, RoutedBy::ConservativeBaseline);
-    }
-
-    /// B13: coverage was tested with `scope_could_touch`, a symmetric
-    /// could-intersect predicate, so a contract that may write ANYWHERE
-    /// was "fully covered" by a recipe scoped to `docs/**`.
-    #[test]
-    fn recipe_coverage_is_containment_not_overlap() {
-        assert!(
-            !scope_contained_in("**", "docs/**"),
-            "a scope over the whole repository is not inside docs/"
-        );
-        assert!(scope_contained_in("docs/a/**", "docs/**"));
-        assert!(
-            !scope_contained_in("docs/**", "docs/a/**"),
-            "containment is not symmetric"
-        );
-        assert!(scope_contained_in("docs/guide.md", "docs/**"));
-        assert!(scope_contained_in("./docs/guide.md", "docs/**"));
-        assert!(scope_contained_in("anything/at/all", "**"));
-        assert!(scope_contained_in("docs/**", "docs/**"));
-        // The cover's own wildcards make containment undecidable here.
-        assert!(!scope_contained_in("crates/amont/trust/x", "**/trust/**"));
-        assert!(!scope_contained_in("docs/a/b", "docs/*/**"));
-        // A cover that is not a directory glob covers only itself.
-        assert!(!scope_contained_in("docs/guide.md", "docs"));
-        assert!(!scope_contained_in("docs", "docs/**"));
-        assert!(!scope_contained_in("docsets/guide.md", "docs/**"));
-        // The old overlap predicate said yes to the first two.
-        assert!(scope_could_touch("**", "docs/**"));
-        assert!(scope_could_touch("docs/**", "docs/a/**"));
     }
 
     #[test]
@@ -1077,7 +1051,7 @@ mod tests {
         );
         assert_eq!(
             d.tier,
-            Some(Tier::Implementation),
+            Tier::Implementation,
             "it takes the conservative floor for a change, not the recipe's tier"
         );
         // The same recipe still covers what it really covers.

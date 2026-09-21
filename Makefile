@@ -11,6 +11,8 @@ all: check
 
 ## Everything CI runs, in the order it runs it. No `deps` target: the
 ## std-only gate the sibling repos carry does not apply here (SPEC §13).
+## `lint` ends with the architecture gates, which the compiler cannot
+## state: a cycle between two modules of one crate compiles happily.
 check: toolchain lint test msrv
 
 ## Say which toolchain is about to be used, so a mismatch is visible.
@@ -20,6 +22,7 @@ toolchain:
 lint:
 	$(CARGO) fmt --all --check
 	$(CARGO) clippy --all-targets -- -D warnings
+	python3 scripts/check-module-cycles.py
 
 test:
 	$(CARGO) test

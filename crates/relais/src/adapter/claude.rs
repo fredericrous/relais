@@ -12,11 +12,12 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use super::{
-    run_with_timeout, Backend, BackendError, Capabilities, LaunchResult, LaunchSpec,
+use crate::backend::{
+    claims_blockage, Backend, BackendError, Capabilities, Cost, LaunchResult, LaunchSpec,
     PermissionEnforcement, SandboxCapability, UsageReport,
 };
-use crate::money::{CostCompleteness, MicroUsd};
+use crate::money::MicroUsd;
+use crate::procs::{run_with_timeout, ProcessEnd};
 
 pub struct ClaudeBackend {
     binary: PathBuf,
@@ -103,14 +104,11 @@ impl Backend for ClaudeBackend {
         )?;
 
         let parsed = parse_result_json(&end.stdout, &spec.model);
-        let worker_claims_blockage = parsed
-            .result_text
-            .as_deref()
-            .is_some_and(super::claims_blockage);
+        let worker_claims_blockage = parsed.result_text.as_deref().is_some_and(claims_blockage);
         // A harness that exited non-zero, reported an error, or printed
         // something the adapter cannot read did not complete an attempt:
         // the result is missing, never an empty candidate (SPEC §9).
-        let completed = !end.timed_out && !end.cancelled && end.exit_code == Some(0);
+        let completed = end.ended.succeeded();
         let usable = completed && parsed.result_text.is_some() && !parsed.is_error;
         let failure_detail = if usable {
             None
@@ -119,16 +117,14 @@ impl Backend for ClaudeBackend {
         };
         Ok(LaunchResult {
             dispatch_id: spec.dispatch_id.clone(),
-            exit_code: end.exit_code,
+            ended: end.ended,
             stdout: end.stdout,
             stderr: end.stderr,
-            timed_out: end.timed_out,
             result_text: if usable { parsed.result_text } else { None },
             session_id: parsed.session_id,
             effective_model: parsed.effective_model,
             usage: parsed.usage,
             worker_claims_blockage,
-            cancelled: end.cancelled,
             permission_denials: parsed.permission_denials,
             failure_detail,
         })
@@ -192,7 +188,7 @@ pub fn build_argv(spec: &LaunchSpec, caps: &Capabilities) -> Result<Vec<String>,
     // for it; Claude Code 2.1.x has none. The capability is reported
     // (`Capabilities::turn_ceiling`) so nothing downstream claims a
     // ceiling that was never applied — SPEC §11's turn ceiling is not
-    // deliverable on this harness, and a receipt says so.
+    // deliverable on this harness, and the context manifest says so.
     if let Some(max_turns) = spec.max_turns {
         if caps.supports_max_turns {
             argv.push("--max-turns".into());
@@ -238,12 +234,8 @@ fn budget_dollars(micros: i64) -> String {
     }
 }
 
-fn failure_detail(end: &super::ProcessEnd, parsed: &ParsedClaudeResult) -> String {
-    let mut parts = Vec::new();
-    match end.exit_code {
-        Some(code) => parts.push(format!("exit {code}")),
-        None => parts.push("no exit status".to_string()),
-    }
+fn failure_detail(end: &ProcessEnd, parsed: &ParsedClaudeResult) -> String {
+    let mut parts = vec![end.ended.describe()];
     if parsed.is_error {
         parts.push("the harness reported an error".to_string());
     }
@@ -315,16 +307,17 @@ pub fn parse_result_json(stdout: &str, requested_model: &str) -> ParsedClaudeRes
         output_tokens: get_i64(&["usage", "output_tokens"]),
         cache_read_tokens: get_i64(&["usage", "cache_read_input_tokens"]),
         cache_write_tokens: get_i64(&["usage", "cache_creation_input_tokens"]),
-        cost: value
+        cost: match value
             .get("total_cost_usd")
             .and_then(|cost| cost.as_f64())
-            .map(MicroUsd::from_dollars),
-        cost_completeness: if value.get("total_cost_usd").is_some() {
-            CostCompleteness::Actual
-        } else {
-            CostCompleteness::Unknown
+            .map(MicroUsd::from_dollars)
+        {
+            Some(micros) => Cost::Reported {
+                micros,
+                inclusive: spawned_subagents,
+            },
+            None => Cost::Unknown,
         },
-        inclusive: spawned_subagents,
     };
     let permission_denials = value
         .get("permission_denials")
@@ -408,6 +401,7 @@ fn effective_model(value: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::money::CostCompleteness;
 
     /// A result document as Claude Code 2.1.278 prints it (trimmed).
     const SAMPLE: &str = r#"{
@@ -469,9 +463,14 @@ mod tests {
         assert_eq!(parsed.usage.input_tokens, Some(1200));
         assert_eq!(parsed.usage.output_tokens, Some(300));
         assert_eq!(parsed.usage.cache_read_tokens, Some(800));
-        assert_eq!(parsed.usage.cost, Some(MicroUsd::from_micros(12_300)));
-        assert_eq!(parsed.usage.cost_completeness, CostCompleteness::Actual);
-        assert!(!parsed.usage.inclusive);
+        assert_eq!(
+            parsed.usage.cost,
+            Cost::Reported {
+                micros: MicroUsd::from_micros(12_300),
+                inclusive: false,
+            }
+        );
+        assert_eq!(parsed.usage.cost.completeness(), CostCompleteness::Actual);
         assert!(!parsed.is_error);
         assert!(parsed.permission_denials.is_empty());
     }
@@ -480,8 +479,9 @@ mod tests {
     fn absent_usage_stays_unknown_never_zero() {
         let parsed = parse_result_json(r#"{"result": "no usage here"}"#, "sonnet");
         assert_eq!(parsed.usage.input_tokens, None);
-        assert_eq!(parsed.usage.cost, None);
-        assert_eq!(parsed.usage.cost_completeness, CostCompleteness::Unknown);
+        assert_eq!(parsed.usage.cost, Cost::Unknown);
+        assert_eq!(parsed.usage.cost.micros(), None);
+        assert!(!parsed.usage.cost.inclusive());
     }
 
     #[test]
@@ -489,15 +489,15 @@ mod tests {
         let parsed = parse_result_json("not json", "sonnet");
         assert_eq!(parsed.result_text, None);
         assert_eq!(parsed.effective_model.as_deref(), Some("sonnet"));
-        assert_eq!(parsed.usage.cost_completeness, CostCompleteness::Unknown);
+        assert_eq!(parsed.usage.cost, Cost::Unknown);
     }
 
     #[test]
     fn substitution_is_detectable_because_the_effective_model_surfaces() {
         let parsed = parse_result_json(SAMPLE, "haiku");
         let effective = parsed.effective_model.expect("model surfaces");
-        assert!(!super::super::model_matches("haiku", &effective));
-        assert!(super::super::model_matches("sonnet", &effective));
+        assert!(!crate::backend::model_matches("haiku", &effective));
+        assert!(crate::backend::model_matches("sonnet", &effective));
     }
 
     #[test]
@@ -509,7 +509,7 @@ mod tests {
         let parsed = parse_result_json(json, "sonnet");
         assert_eq!(parsed.effective_model.as_deref(), Some("claude-sonnet-5"));
         assert!(
-            parsed.usage.inclusive,
+            parsed.usage.cost.inclusive(),
             "a session total with subagents is inclusive"
         );
     }
@@ -559,7 +559,7 @@ mod tests {
 
     #[test]
     fn the_turn_ceiling_capability_is_reported_not_assumed() {
-        use crate::adapter::TurnCeiling;
+        use crate::backend::TurnCeiling;
         assert_eq!(
             capabilities_from_help("2.1.278".into(), HELP_2_1).turn_ceiling(),
             TurnCeiling::Unavailable,

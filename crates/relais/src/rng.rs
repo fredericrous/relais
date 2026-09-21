@@ -1,9 +1,11 @@
 //! Seeded SplitMix64 PRNG.
 //!
-//! Used for seeded data ordering and controlled routing trials, so
-//! reproducibility is "record seed and settings", not "hope the platform's
-//! RNG agrees". Not cryptographic; nothing that must be unpredictable goes
-//! through it.
+//! Used to shuffle the training set between epochs of the learner's
+//! warm start, so reproducibility is "record seed and settings", not
+//! "hope the platform's RNG agrees". Not cryptographic; nothing that
+//! must be unpredictable goes through it. Routing trials are
+//! configurable but not implemented (`doctor` reports the gap), so
+//! nothing here serves one.
 
 pub struct SplitMix64 {
     state: u64,

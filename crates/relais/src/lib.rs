@@ -7,6 +7,7 @@
 
 pub mod adapter;
 pub mod admission;
+pub mod backend;
 pub mod context;
 pub mod contract;
 pub mod coordinator;
@@ -16,14 +17,17 @@ pub mod install;
 pub mod ipc;
 pub mod learn;
 pub mod ledger;
+pub mod lifecycle;
 pub mod money;
 pub mod paths;
 pub mod policy;
 pub mod procs;
+pub mod repo;
 pub mod report;
 pub mod rng;
 pub mod route;
 pub mod runner;
+pub mod tooling;
 pub mod verify;
 pub mod workspace;
 

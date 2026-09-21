@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use relais::adapter::Backend;
+use relais::backend::Backend;
 use relais::context::AvalVerdict;
 use relais::contract::TaskContract;
 use relais::learn::predict::RegistryPredictor;
@@ -672,9 +672,9 @@ fn cwd() -> PathBuf {
 /// (where `init` belongs); failing that, the cwd itself. Never an error:
 /// `doctor`, `init` and `install` report what they find there.
 fn project_dir() -> PathBuf {
-    match relais::policy::locate_repo_root(&cwd()) {
-        Ok(root) | Err(relais::policy::LocateError::RepoWithoutPolicy(root)) => root,
-        Err(relais::policy::LocateError::NotInRepository(start)) => start,
+    match relais::repo::locate_repo_root(&cwd()) {
+        Ok(root) | Err(relais::repo::LocateError::RepoWithoutPolicy(root)) => root,
+        Err(relais::repo::LocateError::NotInRepository(start)) => start,
     }
 }
 
@@ -684,7 +684,7 @@ fn project_dir() -> PathBuf {
 /// on the repository's policy; a directory outside any repository is
 /// refused by name rather than guessed at.
 fn load_repo_policy() -> Result<(PathBuf, RepoPolicy), i32> {
-    let root = relais::policy::locate_repo_root(&cwd()).map_err(|e| {
+    let root = relais::repo::locate_repo_root(&cwd()).map_err(|e| {
         eprintln!("relais: {e}");
         2
     })?;
@@ -740,7 +740,7 @@ fn open_ledger() -> Ledger {
 /// ledger is external state — locked by another relais, truncated by a
 /// crash, or written by a newer version — so a failed read prints one
 /// `relais: …` line and exits non-zero; `status`, `explain`, `resume`,
-/// `evaluate` and `report` never abort on a panic instead (SPEC §12).
+/// `evaluate` and `report` never abort on a panic instead.
 fn or_exit<T, E: std::fmt::Display>(result: std::result::Result<T, E>, what: &str) -> T {
     result.unwrap_or_else(|e| {
         eprintln!("relais {what}: {e}");
@@ -769,7 +769,7 @@ fn init_command() -> i32 {
     // At the repository root, not the shell's cwd: a policy written in a
     // subdirectory would govern nothing.
     let path = project_dir().join("relais.toml");
-    match relais::policy::write_init_template(&path) {
+    match relais::repo::write_init_template(&path) {
         Ok(true) => {
             println!(
                 "wrote {} (edit the model IDs and verification profile, then add a trust grant in machine.toml)",
@@ -839,18 +839,22 @@ fn plan_command(task: &Path) -> i32 {
     println!("contract hash: {}", contract.hash());
     println!("policy hash: {}", authority.authority_hash);
     println!("base: {} ({})", base_sha, contract.base_ref);
-    let model = decision
-        .tier
-        .and_then(|tier| authority.models.get(&tier))
-        .map(|profile| profile.id.as_str());
-    print!("{}", decision.explain(model));
-    if decision.tier.is_none() {
-        for blocker in &decision.blocked {
-            eprintln!("blocked: {} — {}", blocker.code, blocker.detail);
+    match &decision {
+        route::Routed::Route(routed) => {
+            let model = authority
+                .models
+                .get(&routed.tier)
+                .map(|profile| profile.id.as_str());
+            print!("{}", routed.explain(model));
+            0
         }
-        3
-    } else {
-        0
+        route::Routed::Blocked(blocked) => {
+            print!("{}", blocked.explain());
+            for blocker in blocked.blockers() {
+                eprintln!("blocked: {} — {}", blocker.code, blocker.detail);
+            }
+            3
+        }
     }
 }
 

@@ -21,7 +21,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::adapter::LaunchSpec;
+use crate::backend::LaunchSpec;
 use crate::context::ContextManifest;
 use crate::contract::{Decomposition, DecompositionMode, Kind, TaskContract, WorkPlan};
 use crate::contract::{Review, WorkPackage};
@@ -29,7 +29,8 @@ use crate::ids::DispatchId;
 use crate::ledger::UsageEvent;
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::policy::{BlockCode, EffectiveAuthority, MachineSettings, Tier};
-use crate::route::RouteDecision;
+use crate::procs::Ended;
+use crate::route::Route;
 use crate::verify::{self, Receipt, VerificationReport};
 use crate::workspace::{self, WorkspaceError};
 
@@ -44,7 +45,7 @@ pub(crate) struct RootContext<'a> {
     pub base_sha: &'a str,
     pub contract_hash: &'a str,
     pub manifest: &'a ContextManifest,
-    pub decision: &'a RouteDecision,
+    pub decision: &'a Route,
     pub baseline_failures: &'a [String],
     pub integration_gaps: &'a [String],
     pub baseline_cached: bool,
@@ -299,7 +300,7 @@ pub(crate) fn run_decomposed(
         max_attempts: root.authority.max_attempts,
         repairs_used: 0,
         max_repairs: 0,
-        tier: root.decision.tier.unwrap_or(Tier::Implementation),
+        tier: root.decision.tier,
         escalation_tier: None,
     };
     let mut integration_repairs: u32 = 0;
@@ -475,7 +476,7 @@ fn run_package(
         max_attempts: root.authority.max_attempts,
         repairs_used: 0,
         max_repairs: 0,
-        tier: root.decision.tier.unwrap_or(Tier::Implementation),
+        tier: root.decision.tier,
         escalation_tier: None,
     };
 
@@ -720,7 +721,7 @@ fn accept_integrated(
         max_attempts: root.authority.max_attempts,
         repairs_used: 0,
         max_repairs: 0,
-        tier: root.decision.tier.unwrap_or(Tier::Implementation),
+        tier: root.decision.tier,
         escalation_tier: None,
     };
     // The assembled candidate is judged like any other (SPEC §19):
@@ -751,7 +752,7 @@ fn accept_integrated(
             root.manifest,
             root.authority,
             head,
-            root.decision.tier.unwrap_or(Tier::Implementation),
+            root.decision.tier,
             &verification_inputs_changed,
             &mut review_cost,
             &mut review_completeness,
@@ -946,13 +947,13 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         output_tokens: result.usage.output_tokens,
         cache_read_tokens: result.usage.cache_read_tokens,
         cache_write_tokens: result.usage.cache_write_tokens,
-        cost: result.usage.cost,
+        cost: result.usage.cost.micros(),
         cost_kind: CostKind::ApiSpend,
-        completeness: result.usage.cost_completeness,
-        inclusive: result.usage.inclusive,
+        completeness: result.usage.cost.completeness(),
+        inclusive: result.usage.cost.inclusive(),
         at: engine.config.ledger.now(),
     })?;
-    if result.cancelled {
+    if result.ended == Ended::Cancelled {
         return Ok(Proposal::Failed(engine.stop(
             &budget,
             Observation::Cancelled("cancelled while planning".into()),
