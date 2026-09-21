@@ -120,7 +120,20 @@ pub fn dirty_paths(repo_dir: &Path) -> Result<Vec<String>> {
     Ok(status
         .lines()
         .filter_map(|line| line.get(3..).map(|path| path.trim().to_string()))
+        // `.relais/` is where the /relais skill writes the task contract
+        // it is about to hand over. It is relais's own scratch, never part
+        // of a candidate — the worktree is created from the base SHA, so
+        // nothing in it is copied — and a contract that dirtied the tree
+        // it describes would refuse every run it was written for.
+        .filter(|path| !is_relais_scratch(path))
         .collect())
+}
+
+/// The one untracked path relais never counts as the user's uncommitted
+/// work: its own contract directory.
+pub fn is_relais_scratch(path: &str) -> bool {
+    let path = path.trim_matches('"');
+    path == ".relais" || path == ".relais/" || path.starts_with(".relais/")
 }
 
 /// Owned worktree at an exact SHA. Detached: the run owns no branch
@@ -473,6 +486,26 @@ mod tests {
             .to_string(),
         )
         .expect("contract parses")
+    }
+
+    #[test]
+    fn the_contract_directory_never_counts_as_dirty() {
+        let (_dir, repo) = temp_repo();
+        std::fs::create_dir_all(repo.join(".relais")).expect("mkdir");
+        std::fs::write(repo.join(".relais/task.json"), "{}").expect("contract");
+        assert!(
+            dirty_paths(&repo).expect("status").is_empty(),
+            "the /relais skill's own contract file must not refuse the run it describes"
+        );
+        std::fs::write(repo.join("file.txt"), "dirty\n").expect("dirty");
+        assert_eq!(
+            dirty_paths(&repo).expect("status"),
+            vec!["file.txt".to_string()],
+            "everything else still counts"
+        );
+        assert!(is_relais_scratch(".relais/task.json"));
+        assert!(is_relais_scratch(r#"".relais/t\303\242che.json""#));
+        assert!(!is_relais_scratch(".relais-notes.md"));
     }
 
     #[test]

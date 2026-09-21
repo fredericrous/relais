@@ -6,6 +6,25 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## v0.1.5
+
+### Fixed
+
+- **The installed skill and agents are readable by Claude Code.** The
+  ownership marker was written as an HTML comment above the YAML
+  frontmatter, and Claude Code reads frontmatter only when `---` is the
+  first line — so the whole comment became the skill's description and
+  the agents had no name. The marker now sits under the opener as a YAML
+  comment (`# relais:begin <sha>`); the end marker stays an HTML comment.
+  `relais install --claude --write` migrates a file installed with the
+  old layout as an ordinary update, and uninstall removes a wholly-owned
+  file instead of leaving a `---` stub.
+- **The `/relais` skill's own contract no longer refuses the run it
+  describes.** The skill writes `.relais/task.json` in the repository,
+  and `plan`/`run` refused the tree as dirty because of it. `.relais/` is
+  relais's own scratch: never part of a candidate (the worktree is created
+  from the base SHA) and never counted as uncommitted work.
+
 ## v0.1.4
 
 ### Added

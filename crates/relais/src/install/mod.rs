@@ -20,22 +20,58 @@ use std::path::{Path, PathBuf};
 use crate::ids::sha256_hex;
 
 pub const BEGIN_MARKER: &str = "<!-- relais:begin";
+/// The begin marker's spelling INSIDE YAML frontmatter. Claude Code reads
+/// a skill's or an agent's frontmatter only when `---` is the file's
+/// first line, so an HTML comment above it turns the whole comment into
+/// the description and loses the name. A YAML comment on the line after
+/// the opener is invisible to the frontmatter parser and still names the
+/// block and its sha.
+pub const YAML_BEGIN_MARKER: &str = "# relais:begin";
 pub const END_MARKER: &str = "<!-- relais:end -->";
+const FRONTMATTER_OPENER: &str = "---\n";
+
+/// A template split into the part that must stay first in the file (the
+/// frontmatter opener, or nothing) and the part the block owns and hashes.
+fn split_template(content: &str) -> (&'static str, &str) {
+    match content.strip_prefix(FRONTMATTER_OPENER) {
+        Some(rest) => (FRONTMATTER_OPENER, rest.trim_end_matches('\n')),
+        None => ("", content.trim_end_matches('\n')),
+    }
+}
+
+/// The sha a marker records for this template: of the owned part only,
+/// so the reader and the writer describe the same bytes.
+fn template_sha(content: &str) -> String {
+    sha256_hex(split_template(content).1.as_bytes())
+}
 
 /// The marked block alone, with the sha of the content as installed.
 /// Trailing newlines are trimmed before hashing AND before writing, so
 /// the sha always describes exactly the bytes `read_block` reads back.
+/// A template with frontmatter gets the YAML spelling of the begin
+/// marker; the caller keeps the opener above it.
 fn owned_block_for(content: &str) -> String {
-    let content = content.trim_end_matches('\n');
-    format!(
-        "{BEGIN_MARKER} {sha} -->\n{content}\n{END_MARKER}",
-        sha = sha256_hex(content.as_bytes())
-    )
+    let (opener, body) = split_template(content);
+    let sha = sha256_hex(body.as_bytes());
+    if opener.is_empty() {
+        format!("{BEGIN_MARKER} {sha} -->\n{body}\n{END_MARKER}")
+    } else {
+        format!("{YAML_BEGIN_MARKER} {sha}\n{body}\n{END_MARKER}")
+    }
 }
 
-/// A whole file relais owns end to end: the block and nothing else.
+/// A whole file relais owns end to end: the opener (when the template
+/// has one), the block, and nothing else.
 fn owned_file(content: &str) -> String {
-    format!("{}\n", owned_block_for(content))
+    let (opener, _) = split_template(content);
+    format!("{opener}{}\n", owned_block_for(content))
+}
+
+/// Text outside the block that is nothing but the frontmatter opener is
+/// ours too — it is the one line the YAML marker cannot sit above.
+fn is_only_opener(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.is_empty() || trimmed == "---"
 }
 
 /// A marked block found in a file: where it sits, the sha its marker
@@ -76,23 +112,45 @@ enum BlockRead {
 /// `find(BEGIN)` on a reordered pair, and slicing that reversed range
 /// panics the preview.
 fn read_block(text: &str) -> BlockRead {
-    let Some(start) = text.find(BEGIN_MARKER) else {
-        return BlockRead::Absent;
+    // Either spelling of the begin marker: the HTML comment, or the YAML
+    // comment that sits on the line after a frontmatter opener.
+    let html = text.find(BEGIN_MARKER);
+    let yaml = if text.starts_with(YAML_BEGIN_MARKER) {
+        Some(0)
+    } else {
+        text.find(&format!("\n{YAML_BEGIN_MARKER}"))
+            .map(|at| at + 1)
+    };
+    let (start, is_yaml) = match (html, yaml) {
+        (Some(h), Some(y)) if y < h => (y, true),
+        (Some(h), _) => (h, false),
+        (None, Some(y)) => (y, true),
+        (None, None) => return BlockRead::Absent,
     };
     let Some(end_offset) = text[start..].find(END_MARKER) else {
         return BlockRead::Malformed;
     };
     let end_start = start + end_offset;
     let end = end_start + END_MARKER.len();
-    // The header is `<!-- relais:begin <sha> -->`, and it must close
-    // before the end marker begins.
-    let Some(header_offset) = text[start..end_start].find("-->") else {
-        return BlockRead::Malformed;
+    // The header is `<!-- relais:begin <sha> -->` or `# relais:begin
+    // <sha>` up to the end of its line; either way it must close before
+    // the end marker begins.
+    let (header_end, sha_span_end, marker_len) = if is_yaml {
+        let Some(line_end) = text[start..end_start].find('\n') else {
+            return BlockRead::Malformed;
+        };
+        (start + line_end, start + line_end, YAML_BEGIN_MARKER.len())
+    } else {
+        let Some(header_offset) = text[start..end_start].find("-->") else {
+            return BlockRead::Malformed;
+        };
+        (
+            start + header_offset + "-->".len(),
+            start + header_offset,
+            BEGIN_MARKER.len(),
+        )
     };
-    let header_end = start + header_offset + "-->".len();
-    let recorded_sha = text[start + BEGIN_MARKER.len()..start + header_offset]
-        .trim()
-        .to_string();
+    let recorded_sha = text[start + marker_len..sha_span_end].trim().to_string();
     if recorded_sha.is_empty() {
         return BlockRead::Malformed;
     }
@@ -332,7 +390,7 @@ impl InstallRoot {
                         // Ours, but the user changed the block since: never
                         // clobbered, whatever the template says today.
                         actions.push(Action::Conflict { relative });
-                    } else if block.recorded_sha != sha256_hex(content.as_bytes()) {
+                    } else if block.recorded_sha != template_sha(&content) {
                         // Untouched since install, and the shipped
                         // template has moved on: this is the upgrade.
                         actions.push(Action::Update { relative });
@@ -372,10 +430,25 @@ impl InstallRoot {
             match std::fs::read_to_string(&path) {
                 Ok(text) => match read_block(&text) {
                     BlockRead::Found(block) if block.is_unchanged() => {
-                        let mut updated = String::with_capacity(text.len() + content.len());
-                        updated.push_str(&text[..block.start]);
-                        updated.push_str(&owned_block_for(&content));
-                        updated.push_str(&text[block.end..]);
+                        let before = &text[..block.start];
+                        let after = &text[block.end..];
+                        let updated = if is_only_opener(before) && after.trim().is_empty() {
+                            // Wholly ours: lay the file out afresh. This is
+                            // also how a file installed with the marker
+                            // above its frontmatter migrates to the layout
+                            // Claude Code can read.
+                            owned_file(&content)
+                        } else {
+                            let (opener, _) = split_template(&content);
+                            let mut updated = String::with_capacity(text.len() + content.len());
+                            updated.push_str(before);
+                            if !opener.is_empty() && !before.ends_with(opener) {
+                                updated.push_str(opener);
+                            }
+                            updated.push_str(&owned_block_for(&content));
+                            updated.push_str(after);
+                            updated
+                        };
                         std::fs::write(&path, updated)?;
                     }
                     // The file changed under us between plan and apply:
@@ -429,7 +502,10 @@ impl InstallRoot {
                         let mut remaining = String::with_capacity(text.len());
                         remaining.push_str(&text[..block.start]);
                         remaining.push_str(&text[block.end..]);
-                        if !remaining.trim().is_empty() {
+                        // The frontmatter opener above a YAML marker is ours
+                        // as much as the block: a file holding nothing else
+                        // goes away whole rather than leaving a `---` stub.
+                        if !is_only_opener(&remaining) {
                             std::fs::write(&path, remaining)?;
                             applied.push(action.clone());
                             continue;
@@ -600,7 +676,10 @@ mod tests {
             remaining.contains("user note"),
             "user content survives uninstall: {remaining}"
         );
-        assert!(!remaining.contains(BEGIN_MARKER), "the owned block is gone");
+        assert!(
+            !remaining.contains(BEGIN_MARKER) && !remaining.contains(YAML_BEGIN_MARKER),
+            "the owned block is gone"
+        );
         assert!(
             root.claude_dir.join("agents/custom.md").is_file(),
             "foreign file is kept"
@@ -640,7 +719,7 @@ mod tests {
             "the current template is installed: {after}"
         );
         assert!(
-            after.contains(&sha256_hex(agent_research().as_bytes())),
+            after.contains(&template_sha(&agent_research())),
             "the marker records the sha of the content as installed"
         );
         // Applying twice is a no-op: the block is now current.
@@ -819,12 +898,68 @@ mod tests {
     fn owned_content_carries_verifiable_markers() {
         for (relative, content) in owned_files() {
             let file = owned_file(&content);
+            // Every shipped template carries frontmatter, and Claude Code
+            // reads it only when `---` is the FIRST line: the marker sits
+            // under it as a YAML comment, never above it.
             assert!(
-                file.starts_with(BEGIN_MARKER),
-                "{relative:?} must be marked"
+                file.starts_with("---\n# relais:begin "),
+                "{relative:?}: frontmatter first, marker under it:\n{file}"
             );
-            assert!(file.contains(&sha256_hex(content.as_bytes())));
+            let second_line_end = file[4..].find('\n').expect("marker line") + 4;
+            let frontmatter_body = &file[second_line_end + 1..];
+            assert!(
+                frontmatter_body.starts_with("name: "),
+                "{relative:?}: the frontmatter's own keys follow the marker"
+            );
+            assert!(file.contains(&template_sha(&content)));
             assert!(file.trim_end().ends_with(END_MARKER));
+            // The block the reader sees is exactly what the writer hashed.
+            let BlockRead::Found(block) = read_block(&file) else {
+                panic!("{relative:?}: the marker must read back");
+            };
+            assert!(block.is_unchanged());
+            assert_eq!(block.start, 4, "the block starts right after `---`");
         }
+    }
+
+    #[test]
+    fn a_marker_installed_above_the_frontmatter_migrates_under_it() {
+        let (root, dir) = temp_root();
+        // What relais 0.1.4 wrote: an HTML marker as line 1, the whole
+        // template (opener included) inside the block.
+        let skill = root.claude_dir.join("skills/relais/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).expect("mkdir");
+        let content = skill_relais();
+        let old_layout = format!(
+            "{BEGIN_MARKER} {} -->\n{}\n{END_MARKER}\n",
+            sha256_hex(content.trim_end_matches('\n').as_bytes()),
+            content.trim_end_matches('\n')
+        );
+        std::fs::write(&skill, &old_layout).expect("write");
+        let plan = root.plan();
+        assert!(
+            plan.actions.iter().any(|action| matches!(
+                action,
+                Action::Update { relative } if relative.ends_with("SKILL.md")
+            )),
+            "an untouched old-layout file is an upgrade, not a conflict: {plan:?}"
+        );
+        root.apply(&plan).expect("apply");
+        let migrated = std::fs::read_to_string(&skill).expect("read");
+        assert!(
+            migrated.starts_with("---\nname: relais\n")
+                || migrated.starts_with("---\n# relais:begin ")
+        );
+        assert!(
+            migrated.starts_with("---\n"),
+            "Claude Code needs the opener first:\n{migrated}"
+        );
+        assert!(!migrated.contains(BEGIN_MARKER), "the HTML marker is gone");
+        // Uninstall removes the whole file: the opener above the marker
+        // is not user text.
+        let uninstall = root.uninstall_plan();
+        root.apply_uninstall(&uninstall).expect("uninstall");
+        assert!(!skill.exists(), "no `---` stub is left behind");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
