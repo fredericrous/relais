@@ -13,8 +13,8 @@
 use serde::Serialize;
 
 use crate::ledger::Ledger;
+use crate::lifecycle::State;
 use crate::money::{CostCompleteness, MicroUsd};
-use crate::runner::State;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RunLine {

@@ -41,7 +41,13 @@ use crate::workspace::{self, TaskWorktree, WorkspaceError};
 pub mod machine;
 pub mod scheduler;
 
-pub use machine::{decide, AttemptKind, Budget, Limit, Next, Observation, Reason, State, Terminal};
+pub use machine::{decide, AttemptKind, Budget, Limit, Next, Observation, Terminal};
+
+/// The lifecycle vocabulary lives in `crate::lifecycle`, a leaf module
+/// the ledger, the report and the learning dataset can name without
+/// depending on the runner. Re-exported here because a run's states and
+/// reasons read as the runner's own from a caller's side.
+pub use crate::lifecycle::{Reason, State};
 
 /// One executed run's terminal result, carrying the run identity so the
 /// CLI can point at the ledger and artifacts.

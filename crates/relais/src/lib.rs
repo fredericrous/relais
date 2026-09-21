@@ -16,6 +16,7 @@ pub mod install;
 pub mod ipc;
 pub mod learn;
 pub mod ledger;
+pub mod lifecycle;
 pub mod money;
 pub mod paths;
 pub mod policy;

@@ -15,8 +15,8 @@ use std::path::Path;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use crate::lifecycle::State;
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
-use crate::runner::State;
 
 pub const LEDGER_SCHEMA_VERSION: u64 = 3;
 
@@ -1519,7 +1519,7 @@ mod tests {
                 attempt_id: None,
                 from_state: Some(State::Prepared),
                 to_state: State::Blocked,
-                reason: crate::runner::Reason::BlockedPreflight.as_str().into(),
+                reason: crate::lifecycle::Reason::BlockedPreflight.as_str().into(),
                 detail: Some(serde_json::json!({"code": "missing_trust_grant"})),
                 at: now_rfc3339(),
             })
