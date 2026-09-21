@@ -58,7 +58,15 @@ impl std::error::Error for BackendError {
 
 impl From<RunError> for BackendError {
     fn from(e: RunError) -> Self {
-        Self::Process(e)
+        match e {
+            // The worker was handed something other than the prompt: the
+            // launch failed, and the attempt is interrupted rather than
+            // completed over a truncated task (audit V12).
+            RunError::PromptWrite(io) => {
+                Self::Launch(format!("the prompt did not reach the worker: {io}"))
+            }
+            other => Self::Process(other),
+        }
     }
 }
 
@@ -156,6 +164,153 @@ pub enum SandboxCapability {
     Unknown,
 }
 
+/// The variables a worker process keeps, by exact name. Everything else
+/// is cleared, which is what removes `GIT_DIR`, `GIT_WORK_TREE`,
+/// `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` and
+/// `GIT_ALTERNATE_OBJECT_DIRECTORIES`: inherited from a rebase or a hook
+/// shell they override the working directory, and the worker's `git
+/// commit` lands in the user's repository instead of the owned worktree
+/// (audit V4, the same variables `workspace::git_command` strips).
+///
+/// The list is what `claude -p` needs to start and to reach a provider,
+/// read off Claude Code's own environment-variable and authentication
+/// documentation (code.claude.com/docs/en/env-vars, /authentication,
+/// /network-config) and checked against 2.1.278 with a cleared
+/// environment. A variable that only tunes behaviour is deliberately
+/// absent — the machine's policy decides those, not the operator's shell.
+///
+/// `USER` earns its place the hard way: on macOS, a session signed in
+/// with `/login` keeps its credential in the Keychain, and without
+/// `USER` the CLI reports "Not logged in · Please run /login" however
+/// much of `HOME` and `PATH` it is given.
+pub const WORKER_ENV_ALLOWLIST: &[&str] = &[
+    // The machine, without which nothing runs.
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TMPDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    // Windows spellings of the same thing. `SYSTEMROOT` is required for
+    // Node's own crypto and socket startup.
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "USERPROFILE",
+    "TEMP",
+    "TMP",
+    // Reaching the provider through a corporate network. Node does not
+    // honour `SSL_CERT_FILE`; `NODE_EXTRA_CA_CERTS` is the documented
+    // way to add a CA, and no variable that DISABLES verification is
+    // passed through.
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "NODE_EXTRA_CA_CERTS",
+    // Google Cloud's own spellings, which carry no common prefix.
+    "GCLOUD_PROJECT",
+    "CLOUDSDK_CONFIG",
+];
+
+/// Credential families passed through by prefix: Anthropic's own
+/// (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
+/// `ANTHROPIC_CUSTOM_HEADERS`, the federation variables), Claude Code's
+/// own configuration (`CLAUDE_CODE_USE_BEDROCK`,
+/// `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`), and the clouds
+/// Claude Code can be pointed at (`AWS_*`, `GOOGLE_*`, `CLOUD_ML_REGION`,
+/// `VERTEX_REGION_CLAUDE_*`). A prefix, because which member of a family
+/// is set depends on how the operator signs in, and a worker that cannot
+/// authenticate produces a blocked run nobody can act on.
+pub const WORKER_ENV_PREFIXES: &[&str] = &[
+    "ANTHROPIC_",
+    "CLAUDE_CODE_",
+    "CLAUDE_CONFIG_",
+    "AWS_",
+    "GOOGLE_",
+    "CLOUD_ML_",
+    "VERTEX_",
+];
+
+/// Names that match a passed-through prefix but are still removed: the
+/// worker must not inherit relais's own authority or a budget override
+/// the machine did not set.
+pub const WORKER_ENV_DENIED: &[&str] = &[
+    "CLAUDE_CODE_EXTRA_BUDGET",
+    "RELAIS_CONFIG_DIR",
+    "RELAIS_STATE_DIR",
+    "RELAIS_CLAUDE_BIN",
+];
+
+/// The environment one dispatch runs with — the whole of it. A launch
+/// clears the ambient environment and sets exactly these, so what the
+/// worker inherits is a decision recorded in the context manifest rather
+/// than whatever shell the operator happened to start relais from.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LaunchEnv {
+    passed: Vec<(String, String)>,
+}
+
+impl LaunchEnv {
+    /// Select the allowed variables out of an environment. Pure: the
+    /// ambient environment is a parameter, so what a worker would
+    /// inherit is testable without touching this process's own.
+    pub fn from_ambient(ambient: &[(String, String)]) -> Self {
+        let mut passed: Vec<(String, String)> = ambient
+            .iter()
+            .filter(|(name, _)| Self::is_allowed(name))
+            .cloned()
+            .collect();
+        passed.sort();
+        passed.dedup_by(|a, b| a.0 == b.0);
+        Self { passed }
+    }
+
+    /// The same selection over this process's real environment: the one
+    /// boundary call, made by the adapter at launch time.
+    pub fn from_process_env() -> Self {
+        Self::from_ambient(&std::env::vars().collect::<Vec<_>>())
+    }
+
+    /// Is this variable one a worker keeps?
+    pub fn is_allowed(name: &str) -> bool {
+        if WORKER_ENV_DENIED.contains(&name) {
+            return false;
+        }
+        WORKER_ENV_ALLOWLIST.contains(&name)
+            || WORKER_ENV_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+    }
+
+    /// Name and value, for the launch itself.
+    pub fn vars(&self) -> &[(String, String)] {
+        &self.passed
+    }
+
+    /// The NAMES only — what the context manifest records. A value here
+    /// is a credential; the manifest says which variables reached the
+    /// worker, never what was in them.
+    pub fn names(&self) -> Vec<String> {
+        self.passed.iter().map(|(name, _)| name.clone()).collect()
+    }
+}
+
 /// One model dispatch. The prompt travels via stdin; arguments are an
 /// argv array; the working directory is the owned task worktree.
 #[derive(Debug, Clone)]
@@ -172,6 +327,10 @@ pub struct LaunchSpec {
     /// bypass: a tool outside this list is still denied (SPEC §8).
     pub allowed_tools: Vec<String>,
     pub work_dir: PathBuf,
+    /// Everything the worker process's environment will contain. The
+    /// adapter clears the ambient environment and sets these; an empty
+    /// one is a worker with no environment at all, never an inherited one.
+    pub env: LaunchEnv,
     pub wall_timeout: Duration,
     /// Set by the runner when the coordinator cancels this dispatch; the
     /// adapter kills the process group and reports `cancelled`
@@ -304,6 +463,40 @@ pub fn model_matches(requested: &str, effective: &str) -> bool {
     is_alias && effective.contains(&requested)
 }
 
+/// What a dispatch established about the model that ran. Three answers,
+/// not two: a harness that reports no model leaves the question OPEN,
+/// and reading that as agreement is how an unreported substitution used
+/// to pass (audit V3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelVerification {
+    /// The harness named a model that satisfies the route's request.
+    Matches,
+    /// It named a different one: an unapproved substitution (SPEC §6).
+    Substituted {
+        requested: String,
+        effective: String,
+    },
+    /// It named none. The run cannot claim the requested route was
+    /// tested, so dispatch stops here rather than on an assumption.
+    Unverified { requested: String },
+}
+
+/// Check the model the harness reported against the one the route asked
+/// for. `None` is the harness reporting nothing, which is a gap, never a
+/// match.
+pub fn verify_model(requested: &str, effective: Option<&str>) -> ModelVerification {
+    match effective {
+        Some(effective) if model_matches(requested, effective) => ModelVerification::Matches,
+        Some(effective) => ModelVerification::Substituted {
+            requested: requested.to_string(),
+            effective: effective.to_string(),
+        },
+        None => ModelVerification::Unverified {
+            requested: requested.to_string(),
+        },
+    }
+}
+
 /// Does a worker's terminal text PROPOSE blockage? The marker must open a
 /// line: a worker that merely mentions the protocol ("do not write
 /// relais-blocked: unless…") is not claiming it. The runner, not the
@@ -418,5 +611,88 @@ mod tests {
         ));
         assert!(!model_matches("haiku", "claude-sonnet-5"));
         assert!(!model_matches("sonnet", "claude-haiku-4-5"));
+    }
+
+    /// V3: an unreported model is an open question. It used to be
+    /// answered by echoing the request back, which made the substitution
+    /// check unable to fail.
+    #[test]
+    fn an_unreported_model_is_unverified_not_a_match() {
+        assert_eq!(
+            verify_model("sonnet", Some("claude-sonnet-5")),
+            ModelVerification::Matches
+        );
+        assert_eq!(
+            verify_model("sonnet", Some("claude-haiku-4-5")),
+            ModelVerification::Substituted {
+                requested: "sonnet".into(),
+                effective: "claude-haiku-4-5".into(),
+            }
+        );
+        assert_eq!(
+            verify_model("sonnet", None),
+            ModelVerification::Unverified {
+                requested: "sonnet".into()
+            }
+        );
+    }
+
+    /// V4: the worker's environment is chosen, not inherited. The git
+    /// variables that redirect a commit into the user's repository are
+    /// gone because nothing but the allowlist survives.
+    #[test]
+    fn a_worker_keeps_the_allowlist_and_nothing_else() {
+        let ambient: Vec<(String, String)> = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/dev"),
+            ("ANTHROPIC_API_KEY", "sk-secret"),
+            ("CLAUDE_CODE_USE_BEDROCK", "1"),
+            ("AWS_PROFILE", "work"),
+            ("HTTPS_PROXY", "http://proxy:3128"),
+            ("GIT_DIR", "/elsewhere/.git"),
+            ("GIT_INDEX_FILE", "/elsewhere/.git/index"),
+            ("GIT_WORK_TREE", "/elsewhere"),
+            ("CLAUDE_CODE_EXTRA_BUDGET", "999"),
+            ("RELAIS_STATE_DIR", "/run/relais"),
+            ("MY_SECRET_TOKEN", "hunter2"),
+        ]
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+
+        let env = LaunchEnv::from_ambient(&ambient);
+        let names = env.names();
+        for kept in [
+            "PATH",
+            "HOME",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "AWS_PROFILE",
+            "HTTPS_PROXY",
+        ] {
+            assert!(names.contains(&kept.to_string()), "{kept} in {names:?}");
+        }
+        for removed in [
+            "GIT_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_WORK_TREE",
+            "CLAUDE_CODE_EXTRA_BUDGET",
+            "RELAIS_STATE_DIR",
+            "MY_SECRET_TOKEN",
+        ] {
+            assert!(
+                !names.contains(&removed.to_string()),
+                "{removed} must not reach the worker: {names:?}"
+            );
+        }
+        assert_eq!(
+            env.vars().len(),
+            names.len(),
+            "every passed variable carries its value"
+        );
+        assert!(
+            LaunchEnv::from_ambient(&[]).names().is_empty(),
+            "an empty environment passes nothing, rather than falling back to the ambient one"
+        );
     }
 }

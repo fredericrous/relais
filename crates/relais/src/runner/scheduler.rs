@@ -48,6 +48,8 @@ pub(crate) struct RootContext<'a> {
     pub baseline_failures: &'a [String],
     pub integration_gaps: &'a [String],
     pub baseline_cached: bool,
+    /// Why the baseline could not be cached, when it could not (V2).
+    pub baseline_cache_refused: &'a Option<crate::verify::CacheRefused>,
     pub logs_dir: &'a Path,
     pub deadline: Instant,
 }
@@ -378,7 +380,7 @@ pub(crate) fn run_decomposed(
             let touched_inputs = verify::classify_verification_inputs(
                 &root.authority.verification_profile,
                 &integration.changed_paths_in(&head)?,
-            );
+            )?;
             return Ok(Decomposed::Outcome(accept_integrated(
                 engine,
                 root,
@@ -578,6 +580,9 @@ fn run_package(
         machine: &child_machine,
         ledger,
         backend: engine.config.backend,
+        git: engine.config.git,
+        hooks: engine.config.hooks,
+        worker_env: engine.config.worker_env.clone(),
         // The package's artifacts hang off the root run's; its
         // worktrees hang off THEIR parent, so a package worker's tree
         // sits under `packages/worktrees/<child-run>/` and no package's
@@ -812,6 +817,7 @@ fn accept_integrated(
         verification_inputs_changed,
         integration_gaps: root.integration_gaps.to_vec(),
         baseline_cached: root.baseline_cached,
+        baseline_cache_refused: root.baseline_cache_refused.clone(),
     };
     let receipt = Receipt {
         run_id: engine.run_id.as_str().to_string(),
@@ -911,6 +917,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         // The planner reads; it gets no allowlist.
         allowed_tools: Vec::new(),
         work_dir: engine.config.repo_dir.to_path_buf(),
+        env: engine.config.worker_env.clone(),
         wall_timeout: root
             .deadline
             .saturating_duration_since(Instant::now())

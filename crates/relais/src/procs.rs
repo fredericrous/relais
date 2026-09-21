@@ -179,7 +179,77 @@ pub fn own_process_group(command: &mut Command) {
 /// Kill the child and everything it spawned: a harness that started its
 /// own children must not survive the kill (SPEC §23 cancellation).
 pub fn kill_tree(child: &mut Child) -> io::Result<()> {
-    imp::kill_tree(child)
+    match kill_group(child.id()) {
+        GroupKill::Killed | GroupKill::NothingLeft => Ok(()),
+        // The group refused the signal; the direct child is still ours
+        // to stop, and its failure is the caller's to see.
+        GroupKill::Refused { detail } => child
+            .kill()
+            .map_err(|e| io::Error::new(e.kind(), format!("process group: {detail}; child: {e}"))),
+    }
+}
+
+/// Kill a whole process group by its id — which, for everything relais
+/// spawns, is the child's own PID (`own_process_group`). Reported rather
+/// than returned as a bare `io::Result` because "there was nothing left
+/// to kill" is the ordinary outcome, not an error.
+///
+/// The leader may already have been reaped when this is called: a group
+/// outlives its leader for as long as any member is in it, which is the
+/// whole point — a backgrounded grandchild holding the stdout pipe is
+/// exactly what this reaches. The reaped PID could in principle be
+/// recycled AND made a group leader by an unrelated process between the
+/// reap and this call; that window is microseconds wide and is the same
+/// documented limit as `alive` (C6).
+pub fn kill_group(pgid: u32) -> GroupKill {
+    if pgid == 0 {
+        return GroupKill::NothingLeft;
+    }
+    imp::kill_group(pgid)
+}
+
+/// What killing the worker's process group found. Recorded on the
+/// `ProcessEnd`: a survivor relais could not stop is a fact about the
+/// machine the run happened on, not something to discard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupKill {
+    /// The group was empty: the child took everything it spawned with it.
+    NothingLeft,
+    /// Survivors were signalled — a backgrounded grandchild, an MCP
+    /// server, a `npm run dev &`.
+    Killed,
+    /// The kill itself failed. Any survivor is still running.
+    Refused { detail: String },
+}
+
+impl GroupKill {
+    /// One line for a receipt or a log.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::NothingLeft => "process group: nothing left to kill".to_string(),
+            Self::Killed => "process group: survivors killed".to_string(),
+            Self::Refused { detail } => format!("process group: kill refused ({detail})"),
+        }
+    }
+}
+
+/// Whether everything the child wrote was captured.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Captured {
+    /// Both pipes reached end of file: this is everything that was written.
+    Complete,
+    /// A pipe was still open after the process group was killed and the
+    /// drain grace elapsed — something inherited it and survived — or a
+    /// read failed. What was read is kept; the rest is lost.
+    Partial { detail: String },
+}
+
+impl Captured {
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete)
+    }
 }
 
 /// An exclusive lock the KERNEL holds on a file for as long as the
@@ -255,6 +325,10 @@ pub enum RunError {
     /// The thread draining this pipe panicked; the output is lost, so
     /// the run cannot be reported as a completed attempt.
     ReaderPanicked(&'static str),
+    /// The prompt could not be handed to the process in full. The worker
+    /// ran on something other than what it was asked to do, so the
+    /// attempt is interrupted — never completed (SPEC §9).
+    PromptWrite(io::Error),
 }
 
 impl std::fmt::Display for RunError {
@@ -263,6 +337,7 @@ impl std::fmt::Display for RunError {
             Self::Spawn(e) => write!(f, "spawn: {e}"),
             Self::Wait(e) => write!(f, "wait: {e}"),
             Self::ReaderPanicked(pipe) => write!(f, "{pipe} reader panicked"),
+            Self::PromptWrite(e) => write!(f, "the prompt was not written in full: {e}"),
         }
     }
 }
@@ -270,7 +345,7 @@ impl std::fmt::Display for RunError {
 impl std::error::Error for RunError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Spawn(e) | Self::Wait(e) => Some(e),
+            Self::Spawn(e) | Self::Wait(e) | Self::PromptWrite(e) => Some(e),
             Self::ReaderPanicked(_) => None,
         }
     }
@@ -317,13 +392,26 @@ pub struct ProcessEnd {
     pub ended: Ended,
     pub stdout: String,
     pub stderr: String,
+    /// What killing the process group after the child ended found: a
+    /// backgrounded grandchild is a fact about this launch, and the
+    /// result of stopping it is recorded rather than discarded.
+    pub group: GroupKill,
+    /// Whether the pipes reached end of file within the drain grace.
+    pub captured: Captured,
 }
+
+/// How long a pipe may keep being drained after the child ended and its
+/// process group was killed. Readers stop at end of file, which normally
+/// arrives the instant the last writer goes; a descendant that survived
+/// the kill and holds the pipe open must not hold the run open with it.
+const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// Runs a command with a wall timeout, streaming stdout+stderr into one
 /// captured buffer. Reader threads own the pipes (a blocking read in the
-/// wait loop would stall the timeout until the child spoke again); on
-/// timeout the whole process group is killed: the launch counts as
-/// interrupted, never as a completed attempt.
+/// wait loop would stall the timeout until the child spoke again); the
+/// whole process group is killed once the child has ended, however it
+/// ended, before the pipes are drained. On timeout or cancellation the
+/// launch counts as interrupted, never as a completed attempt.
 pub fn run_with_timeout(
     mut command: Command,
     wall_timeout: Duration,
@@ -344,64 +432,184 @@ pub fn run_with_timeout(
         slot.store(child.id(), Ordering::SeqCst);
     }
 
-    if let Some(bytes) = stdin_bytes {
+    let prompt = stdin_bytes.map(|bytes| {
         let mut stdin = child.stdin.take().expect("stdin is piped when bytes exist");
+        let (sent, done) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = stdin.write_all(&bytes);
+            let written = stdin.write_all(&bytes).and_then(|()| stdin.flush());
+            // The receiver is gone only if the run gave up waiting, which
+            // it already recorded; there is nobody left to tell.
+            let _ = sent.send(written);
         });
+        done
+    });
+
+    let stdout = drain(child.stdout.take().expect("stdout piped"), "stdout");
+    let stderr = drain(child.stderr.take().expect("stderr piped"), "stderr");
+
+    let supervised = wait_for_exit(&mut child, wall_timeout, cancel).map_err(RunError::Wait)?;
+    // The group is already dead (`wait_for_exit` kills it before reaping),
+    // so a pipe still open is held by a survivor: give it the grace, then
+    // take what was read.
+    let stdout = stdout.collect()?;
+    let stderr = stderr.collect()?;
+    let captured = match (stdout.captured, stderr.captured) {
+        (Captured::Complete, Captured::Complete) => Captured::Complete,
+        (Captured::Partial { detail }, Captured::Complete)
+        | (Captured::Complete, Captured::Partial { detail }) => Captured::Partial { detail },
+        (Captured::Partial { detail }, Captured::Partial { detail: other }) => Captured::Partial {
+            detail: format!("{detail}; {other}"),
+        },
+    };
+    if let Some(done) = prompt {
+        prompt_delivered(done, supervised.ended)?;
     }
-
-    let stdout_pipe = child.stdout.take().expect("stdout piped");
-    let stderr_pipe = child.stderr.take().expect("stderr piped");
-    let stdout = std::thread::spawn(move || read_to_end(stdout_pipe));
-    let stderr = std::thread::spawn(move || read_to_end(stderr_pipe));
-
-    let ended = wait_for_exit(&mut child, wall_timeout, cancel).map_err(RunError::Wait)?;
-    let stdout = stdout
-        .join()
-        .map_err(|_| RunError::ReaderPanicked("stdout"))?;
-    let stderr = stderr
-        .join()
-        .map_err(|_| RunError::ReaderPanicked("stderr"))?;
     Ok(ProcessEnd {
-        ended,
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        ended: supervised.ended,
+        stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
+        group: supervised.group,
+        captured,
     })
 }
 
-/// Wait for a child under a wall clock and an optional cancel flag,
-/// killing its WHOLE process group when either fires. The one loop every
-/// subprocess in relais waits in — the verification runner used to have
-/// its own copy that killed only the direct child and left `cargo test`
-/// grandchildren running in a worktree about to be removed.
+/// Did the whole prompt reach the process? A write that failed or never
+/// finished means the worker read something other than the prompt, which
+/// interrupts the attempt (SPEC §9) — except when the process was killed,
+/// where a broken pipe is the kill and the kill is already the outcome.
+fn prompt_delivered(
+    done: std::sync::mpsc::Receiver<io::Result<()>>,
+    ended: Ended,
+) -> Result<(), RunError> {
+    let outcome = match done.recv_timeout(PIPE_DRAIN_GRACE) {
+        Ok(written) => written,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("the process never read it (waited {PIPE_DRAIN_GRACE:?} after it ended)"),
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(RunError::ReaderPanicked("stdin"))
+        }
+    };
+    match (outcome, ended) {
+        (Ok(()), _) => Ok(()),
+        (Err(e), Ended::Exited(_) | Ended::Signalled) => Err(RunError::PromptWrite(e)),
+        // Killed by the wall clock or a cancellation: the pipe broke
+        // because relais stopped the process, and that is the outcome
+        // already being reported.
+        (Err(_), Ended::TimedOut | Ended::Cancelled) => Ok(()),
+    }
+}
+
+/// A pipe being drained by its own thread, with the bytes read so far
+/// reachable even if the thread is still blocked on a survivor.
+struct Draining {
+    name: &'static str,
+    bytes: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    done: std::sync::mpsc::Receiver<io::Result<()>>,
+}
+
+/// What one pipe yielded.
+struct Drained {
+    bytes: Vec<u8>,
+    captured: Captured,
+}
+
+fn drain(pipe: impl std::io::Read + Send + 'static, name: &'static str) -> Draining {
+    let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let into = std::sync::Arc::clone(&bytes);
+    let (sent, done) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let read = read_to_end(pipe, &into);
+        // Nobody to tell is nobody to tell: the run already gave this
+        // pipe up as partial and recorded it.
+        let _ = sent.send(read);
+    });
+    Draining { name, bytes, done }
+}
+
+impl Draining {
+    /// Wait out the drain grace, then take whatever was read. A reader
+    /// that panicked loses its pipe entirely, which is a runner failure.
+    fn collect(self) -> Result<Drained, RunError> {
+        let captured = match self.done.recv_timeout(PIPE_DRAIN_GRACE) {
+            Ok(Ok(())) => Captured::Complete,
+            Ok(Err(e)) => Captured::Partial {
+                detail: format!("{} could not be read in full: {e}", self.name),
+            },
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Captured::Partial {
+                detail: format!(
+                    "{} was still open {PIPE_DRAIN_GRACE:?} after the process group was killed; \
+                     a surviving descendant holds it",
+                    self.name
+                ),
+            },
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(RunError::ReaderPanicked(self.name))
+            }
+        };
+        // Poisoning means the reader panicked mid-write; the bytes it did
+        // append are still the child's output, and the panic is reported
+        // by the disconnected channel above, not hidden here.
+        let bytes = match self.bytes.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        Ok(Drained { bytes, captured })
+    }
+}
+
+/// How a supervised child ended, and what became of the group it led.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Supervised {
+    pub ended: Ended,
+    pub group: GroupKill,
+}
+
+/// Wait for a child under a wall clock and an optional cancel flag, then
+/// kill its WHOLE process group — on every path, including a clean exit.
+/// The one loop every subprocess in relais waits in.
+///
+/// The group kill is unconditional because a child that exits leaves its
+/// descendants behind: a backgrounded `npm run dev &`, an MCP server, a
+/// `cargo test` grandchild. They inherit the pipes, so draining stdout
+/// would block until THEY end — past the wall clock, holding a write
+/// lease and a worktree (audit V1) — and a `cargo test` left running in a
+/// worktree about to be removed is a corrupted verification.
+///
+/// The kill happens before the child is reaped wherever possible, so the
+/// group id is still the pid the OS has reserved for it.
 pub fn wait_for_exit(
     child: &mut std::process::Child,
     wall_timeout: Duration,
     cancel: Option<&AtomicBool>,
-) -> std::io::Result<Ended> {
+) -> std::io::Result<Supervised> {
     enum Stopped {
         OnItsOwn,
         Cancelled,
         TimedOut,
     }
     let started = Instant::now();
+    let mut reaped = None;
     let stopped = loop {
-        if child.try_wait()?.is_some() {
+        if let Some(status) = child.try_wait()? {
+            reaped = Some(status);
             break Stopped::OnItsOwn;
         }
         if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
-            let _ = kill_tree(child);
             break Stopped::Cancelled;
         }
         if started.elapsed() >= wall_timeout {
-            let _ = kill_tree(child);
             break Stopped::TimedOut;
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let status = child.wait()?;
-    Ok(match stopped {
+    let group = kill_group(child.id());
+    let status = match reaped {
+        Some(status) => status,
+        None => child.wait()?,
+    };
+    let ended = match stopped {
         // A killed process has no usable status: interrupted, never a
         // completed attempt. Decided here, not read from the status —
         // Windows reports a terminated process as exit 1, and 1 is a
@@ -412,20 +620,33 @@ pub fn wait_for_exit(
             Some(code) => Ended::Exited(code),
             None => Ended::Signalled,
         },
-    })
+    };
+    Ok(Supervised { ended, group })
 }
 
-fn read_to_end(mut pipe: impl std::io::Read) -> Vec<u8> {
-    let mut buffer = Vec::new();
-    let _ = std::io::Read::read_to_end(&mut pipe, &mut buffer);
-    buffer
+/// Read a pipe to end of file, appending as it goes so a caller that
+/// stops waiting still has what arrived.
+fn read_to_end(mut pipe: impl std::io::Read, into: &std::sync::Mutex<Vec<u8>>) -> io::Result<()> {
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = pipe.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(());
+        }
+        match into.lock() {
+            Ok(mut buffer) => buffer.extend_from_slice(&chunk[..read]),
+            Err(poisoned) => poisoned.into_inner().extend_from_slice(&chunk[..read]),
+        }
+    }
 }
 
 #[cfg(unix)]
 mod imp {
     use std::io;
     use std::os::unix::process::CommandExt;
-    use std::process::{Child, Command};
+    use std::process::Command;
+
+    use super::GroupKill;
 
     pub fn alive(pid: u32) -> bool {
         // SAFETY: signal 0 performs error checking only; no signal is sent.
@@ -529,15 +750,20 @@ mod imp {
         command.process_group(0);
     }
 
-    pub fn kill_tree(child: &mut Child) -> io::Result<()> {
-        // The whole group, which `own_process_group` made the child lead.
-        let pgid = child.id() as i32;
-        // SAFETY: SIGKILL to a process group this process created.
-        let result = unsafe { libc::kill(-pgid, libc::SIGKILL) };
-        if result == -1 {
-            child.kill()
-        } else {
-            Ok(())
+    pub fn kill_group(pgid: u32) -> GroupKill {
+        // SAFETY: SIGKILL to a process group this process created, named
+        // by the negative pid of the leader `own_process_group` made.
+        if unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGKILL) } == 0 {
+            return GroupKill::Killed;
+        }
+        let error = io::Error::last_os_error();
+        // ESRCH: no member left — the ordinary outcome for a child that
+        // spawned nothing and ended on its own.
+        match error.raw_os_error() {
+            Some(libc::ESRCH) => GroupKill::NothingLeft,
+            _ => GroupKill::Refused {
+                detail: error.to_string(),
+            },
         }
     }
 }
@@ -546,7 +772,9 @@ mod imp {
 mod imp {
     use std::io;
     use std::os::windows::process::CommandExt;
-    use std::process::{Child, Command};
+    use std::process::Command;
+
+    use super::GroupKill;
 
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER,
@@ -678,19 +906,32 @@ mod imp {
         command.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
 
-    pub fn kill_tree(child: &mut Child) -> io::Result<()> {
+    pub fn kill_group(pgid: u32) -> GroupKill {
         // `taskkill /T` walks the tree by parent PID and forces every
         // member, which is what a process-group SIGKILL does on Unix. A
         // job object would be tighter, but `taskkill` ships with every
         // Windows and needs no handle plumbing through `Command`.
+        //
+        // The documented limit: Windows re-parents a process whose parent
+        // exits, so a descendant of a worker that has ALREADY ended is no
+        // longer in the tree this walks and survives. The drain grace in
+        // `run_with_timeout` is what bounds the wait there; the launch
+        // reports its output as partial rather than hanging.
         let status = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .args(["/T", "/F", "/PID", &pgid.to_string()])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
         match status {
-            Ok(status) if status.success() => Ok(()),
-            _ => child.kill(),
+            Ok(status) if status.success() => GroupKill::Killed,
+            // 128: "the process is not running" — nothing was left.
+            Ok(status) if status.code() == Some(128) => GroupKill::NothingLeft,
+            Ok(status) => GroupKill::Refused {
+                detail: format!("taskkill: {status}"),
+            },
+            Err(e) => GroupKill::Refused {
+                detail: format!("taskkill could not be launched: {e}"),
+            },
         }
     }
 }
@@ -763,6 +1004,119 @@ mod tests {
             "a cancelled run has no terminal result"
         );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// V1: a child that backgrounds something and exits leaves a
+    /// descendant holding the stdout pipe. Draining it would block until
+    /// THAT descendant ended — thirty seconds here, and in production
+    /// past the wall clock, with the lease and the worktree still held.
+    ///
+    /// Unix only, because the guarantee is: a process GROUP outlives its
+    /// leader and one signal reaches every member. Windows has no such
+    /// thing — see the sibling test for what it can promise.
+    #[cfg(unix)]
+    #[test]
+    fn a_backgrounded_grandchild_does_not_hold_the_launch_open() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo started; sleep 30 & exit 0"]);
+        let started = Instant::now();
+        let end =
+            run_with_timeout(command, Duration::from_secs(120), None, None, None).expect("runs");
+        assert_eq!(end.ended, Ended::Exited(0), "the child itself succeeded");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the launch returned promptly: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            end.group,
+            GroupKill::Killed,
+            "the surviving grandchild was killed, and that is recorded"
+        );
+        assert!(end.captured.is_complete(), "{:?}", end.captured);
+        assert!(end.stdout.contains("started"), "{}", end.stdout);
+    }
+
+    /// Windows re-parents a process whose parent exits, and `taskkill /T`
+    /// walks the tree by parent: a descendant of an EXITED worker is out
+    /// of reach, so it can still hold the pipe. What is promised there is
+    /// the bound — the drain grace ends the wait and says the output is
+    /// partial, instead of the launch hanging on a process nobody can
+    /// name.
+    #[cfg(windows)]
+    #[test]
+    fn a_surviving_descendant_cannot_hold_a_windows_launch_open_forever() {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "echo started & start /b ping -n 60 127.0.0.1 > NUL"]);
+        let started = Instant::now();
+        let end =
+            run_with_timeout(command, Duration::from_secs(120), None, None, None).expect("runs");
+        assert_eq!(end.ended, Ended::Exited(0), "the child itself succeeded");
+        assert!(
+            started.elapsed() < PIPE_DRAIN_GRACE * 4,
+            "the drain grace bounds the wait: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(55),
+            "and it does not wait for the descendant: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A child that spawns nothing leaves an empty group: recorded as
+    /// such, not as a failed kill.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_spawned_nothing_leaves_an_empty_group() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 0"]);
+        let end =
+            run_with_timeout(command, Duration::from_secs(10), None, None, None).expect("runs");
+        assert_eq!(end.ended, Ended::Exited(0));
+        assert_eq!(end.group, GroupKill::NothingLeft);
+        assert!(end.group.describe().contains("nothing left"));
+    }
+
+    /// V12: the prompt is the task. A process that ends before reading it
+    /// ran on something else, so the launch fails instead of reporting a
+    /// completed attempt over a truncated prompt.
+    #[test]
+    fn a_prompt_the_process_never_read_fails_the_launch() {
+        let mut command = Command::new("sh");
+        // Exits at once without reading stdin; the payload is far larger
+        // than any pipe buffer, so the write cannot complete.
+        command.args(["-c", "exit 0"]);
+        let prompt = vec![b'x'; 4 * 1024 * 1024];
+        let error = run_with_timeout(command, Duration::from_secs(30), Some(prompt), None, None)
+            .expect_err("a prompt that was not delivered is a failed launch");
+        assert!(
+            matches!(error, RunError::PromptWrite(_)),
+            "{error}: {error:?}"
+        );
+    }
+
+    /// …but a broken pipe caused by relais's own kill is the kill, not a
+    /// prompt failure: the cancellation stays the outcome.
+    #[test]
+    fn a_cancelled_launch_reports_the_cancellation_not_the_broken_prompt() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let end = run_with_timeout(
+            command,
+            Duration::from_secs(30),
+            Some(vec![b'y'; 4 * 1024 * 1024]),
+            Some(&cancel),
+            None,
+        )
+        .expect("a cancelled run is reported, not failed");
+        assert_eq!(end.ended, Ended::Cancelled);
     }
 
     #[test]

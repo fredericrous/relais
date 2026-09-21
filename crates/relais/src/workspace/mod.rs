@@ -81,6 +81,57 @@ pub fn git_command(dir: &Path) -> Command {
     command
 }
 
+/// Git, as this crate uses it: a subcommand run in a directory, its
+/// stdout captured, a non-zero status an error.
+///
+/// The interface belongs to relais, not to the modules that happen to
+/// need a repository fact: `context` fingerprints a read hint with
+/// `ls-tree` and `verify` creates a throwaway worktree, and both used to
+/// spawn their own `git` — one of them without the `GIT_*` scrubbing
+/// `git_command` does, which is how a run could fingerprint one
+/// repository and verify another (audit V7). Every `git` process relais
+/// starts is now behind this trait, and `SystemGit` is its one
+/// production implementation.
+pub trait Git {
+    /// Run `git <args>` in `dir`. Stdout is returned untrimmed: a
+    /// porcelain format encodes meaning in its leading and trailing
+    /// bytes.
+    fn run(&self, dir: &Path, args: &[&str]) -> Result<String>;
+}
+
+/// The git on this machine's PATH.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemGit;
+
+impl Git for SystemGit {
+    fn run(&self, dir: &Path, args: &[&str]) -> Result<String> {
+        git_raw(dir, args)
+    }
+}
+
+/// What a scripted git answers to one invocation.
+type GitAnswer = dyn Fn(&Path, &[&str]) -> Result<String> + Send + Sync;
+
+/// A scripted git for tests, so a caller's handling of a failing or
+/// surprising git can be tested without a repository on disk.
+pub struct FakeGit {
+    answer: Box<GitAnswer>,
+}
+
+impl FakeGit {
+    pub fn new(answer: impl Fn(&Path, &[&str]) -> Result<String> + Send + Sync + 'static) -> Self {
+        Self {
+            answer: Box::new(answer),
+        }
+    }
+}
+
+impl Git for FakeGit {
+    fn run(&self, dir: &Path, args: &[&str]) -> Result<String> {
+        (self.answer)(dir, args)
+    }
+}
+
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     git_raw(dir, args).map(|output| output.trim().to_string())
 }
@@ -115,7 +166,14 @@ pub fn resolve_base(repo_dir: &Path, base_ref: &str) -> Result<String> {
 
 /// Explicit dirty-tree handling (SPEC §8, §14): every uncommitted path is
 /// reported, because relais will not silently ignore or copy them.
+///
+/// `repo_dir` is the policy root — where `relais.toml` sits, which since
+/// the upward search is not necessarily the git root. `git status`
+/// prints paths relative to the GIT root whatever directory it runs in,
+/// so the scratch directory is recognised through the policy root's own
+/// position in the repository (audit V5).
 pub fn dirty_paths(repo_dir: &Path) -> Result<Vec<String>> {
+    let scratch = ScratchPrefix::resolve(&SystemGit, repo_dir)?;
     let status = git_raw(repo_dir, &["status", "--porcelain"])?;
     Ok(status
         .lines()
@@ -125,15 +183,58 @@ pub fn dirty_paths(repo_dir: &Path) -> Result<Vec<String>> {
         // of a candidate — the worktree is created from the base SHA, so
         // nothing in it is copied — and a contract that dirtied the tree
         // it describes would refuse every run it was written for.
-        .filter(|path| !is_relais_scratch(path))
+        .filter(|path| !scratch.covers(path))
         .collect())
 }
 
-/// The one untracked path relais never counts as the user's uncommitted
-/// work: its own contract directory.
-pub fn is_relais_scratch(path: &str) -> bool {
-    let path = path.trim_matches('"');
-    path == ".relais" || path == ".relais/" || path.starts_with(".relais/")
+/// Where relais's scratch directory sits as `git status` prints paths:
+/// the policy root's path relative to the git root, plus `.relais/`.
+/// With `relais.toml` at the git root this is just `.relais/`; with it in
+/// `crates/relais`, an untracked contract prints as
+/// `crates/relais/.relais/task.json`, which the root-anchored test read
+/// as the user's uncommitted work and refused the run it described.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScratchPrefix {
+    /// `""` at the git root, otherwise `"crates/relais/"`.
+    prefix: String,
+}
+
+impl ScratchPrefix {
+    /// Ask git once where the top level is, and where the policy root
+    /// sits inside it.
+    pub fn resolve(git: &dyn Git, policy_root: &Path) -> Result<Self> {
+        let answer = git.run(
+            policy_root,
+            &["rev-parse", "--show-toplevel", "--show-prefix"],
+        )?;
+        // `--show-toplevel` first, then `--show-prefix`: the prefix is
+        // the policy root's own path under that top level, which is
+        // exactly the frame `git status` prints paths in. An empty
+        // second line is the top level itself.
+        let prefix = answer.lines().nth(1).unwrap_or("").trim();
+        Ok(Self::under(prefix))
+    }
+
+    /// The prefix as git spells it (`""` or `"crates/relais/"`).
+    pub fn under(prefix: &str) -> Self {
+        let prefix = prefix.trim().trim_start_matches('/');
+        let prefix = match prefix {
+            "" => String::new(),
+            other if other.ends_with('/') => other.to_string(),
+            other => format!("{other}/"),
+        };
+        Self { prefix }
+    }
+
+    /// Is this status path inside relais's scratch directory? Paths with
+    /// non-ASCII bytes arrive C-quoted, which the quotes are stripped for.
+    pub fn covers(&self, status_path: &str) -> bool {
+        let path = status_path.trim_matches('"');
+        let Some(rest) = path.strip_prefix(&self.prefix) else {
+            return false;
+        };
+        rest == ".relais" || rest == ".relais/" || rest.starts_with(".relais/")
+    }
 }
 
 /// Owned worktree at an exact SHA. Detached: the run owns no branch
@@ -280,33 +381,72 @@ impl TaskWorktree {
 
 /// Protected repository configuration (SPEC §8): changes here are rejected
 /// unless the contract explicitly includes them in its write scope. The
-/// policy file itself, the check gate's trust declaration, Claude Code
-/// project settings, the aval registry, CI, the project instructions a
+/// policy file itself, relais's own scratch, the check gate's trust
+/// declaration, Claude Code project settings, the aval registry, CI on
+/// every forge relais runs against, the project instructions a
 /// reviewer's session loads, and the ignore file (an unprotected
 /// `.gitignore` lets a worker hide files from the diff, the snapshot and
 /// the exported patch) are all positions a worker could use to widen its
 /// own authority or narrow what is seen.
+///
+/// Matched on any path COMPONENT, not as a root-anchored prefix:
+/// `src/CLAUDE.md` and `src/.claude/settings.json` are loaded by a Claude
+/// Code session exactly as the root ones are, and a root-anchored test
+/// left them writable inside an ordinary `src/**` scope (audit V10).
 pub const PROTECTED_PATH_PREFIXES: &[&str] = &[
     "relais.toml",
     "amont.conf",
     ".adr.yaml",
     ".claude/",
+    ".relais/",
     ".github/workflows/",
+    ".forgejo/workflows/",
+    ".gitea/workflows/",
+    ".gitlab-ci.yml",
     ".gitignore",
     "CLAUDE.md",
     "AGENTS.md",
 ];
 
-/// The protected prefix a path falls under, if any.
+/// A path or pattern's components, ignoring leading and trailing
+/// separators.
+fn path_components(path: &str) -> Vec<&str> {
+    path.split('/').filter(|part| !part.is_empty()).collect()
+}
+
+/// Does `components` contain the protected area's components, in order,
+/// starting at some component boundary? `src/.claude/settings.json`
+/// contains `.claude`; `src/myclaude/x` does not, because a component is
+/// matched whole.
+fn contains_components(components: &[&str], protected: &str) -> bool {
+    let needle = path_components(protected);
+    if needle.is_empty() || needle.len() > components.len() {
+        return false;
+    }
+    components
+        .windows(needle.len())
+        .any(|window| window == needle.as_slice())
+}
+
+/// The protected area a path falls under, if any.
 pub fn protected_prefix(path: &str) -> Option<&'static str> {
+    let components = path_components(path);
     PROTECTED_PATH_PREFIXES
         .iter()
         .copied()
-        .find(|prefix| path == prefix.trim_end_matches('/') || path.starts_with(prefix))
+        .find(|protected| contains_components(&components, protected))
 }
 
 pub fn is_protected_path(path: &str) -> bool {
     protected_prefix(path).is_some()
+}
+
+/// Does a write-scope pattern NAME this protected area, as opposed to
+/// merely matching it? `.claude/**`, `src/.claude/**` and `**/CLAUDE.md`
+/// all name one; `**` and `src/**` name none, which is the whole point of
+/// SPEC §8's "explicitly within an approved contract".
+pub fn pattern_names_protected(pattern: &str, protected: &str) -> bool {
+    contains_components(&path_components(pattern), protected)
 }
 
 /// Check the candidate's diff against the declared scope. A path is in
@@ -328,12 +468,17 @@ pub fn check_scope(
     for path in worktree.changed_paths_in(candidate_sha)? {
         let in_scope = scope.is_some_and(|scope| scope.is_match(&path));
         // "Explicitly within an approved contract" (SPEC §8) means the
-        // scope names THIS protected area — a pattern that starts with
-        // the prefix the path falls under — not a blanket `**` that
-        // happens to match it, and not some other protected prefix.
+        // scope NAMES this protected area — a pattern carrying its
+        // components, at the depth the file lives — not a blanket `**`
+        // that happens to match it, and not some other protected area.
         let explicitly_allowed = match protected_prefix(&path) {
             None => true,
-            Some(prefix) => in_scope && patterns.iter().any(|pattern| pattern.starts_with(prefix)),
+            Some(protected) => {
+                in_scope
+                    && patterns
+                        .iter()
+                        .any(|pattern| pattern_names_protected(pattern, protected))
+            }
         };
         if !in_scope || !explicitly_allowed {
             violations.push(if in_scope {
@@ -492,9 +637,101 @@ mod tests {
             vec!["file.txt".to_string()],
             "everything else still counts"
         );
-        assert!(is_relais_scratch(".relais/task.json"));
-        assert!(is_relais_scratch(r#"".relais/t\303\242che.json""#));
-        assert!(!is_relais_scratch(".relais-notes.md"));
+        let root = ScratchPrefix::under("");
+        assert!(root.covers(".relais/task.json"));
+        assert!(root.covers(r#"".relais/t\303\242che.json""#));
+        assert!(!root.covers(".relais-notes.md"));
+    }
+
+    /// V5: `relais.toml` may sit below the git root, and `git status`
+    /// prints paths relative to the GIT root wherever it runs. The
+    /// root-anchored test saw `crates/relais/.relais/task.json` as the
+    /// user's uncommitted work and refused every run the contract in it
+    /// described.
+    #[test]
+    fn the_contract_directory_is_found_under_a_subdirectory_policy_root() {
+        let (_dir, repo) = temp_repo();
+        let policy_root = repo.join("crates/relais");
+        std::fs::create_dir_all(policy_root.join(".relais")).expect("mkdir");
+        std::fs::write(policy_root.join("relais.toml"), "schema_version = 1\n").expect("policy");
+        std::fs::write(policy_root.join(".relais/task.json"), "{}").expect("contract");
+        git(&repo, &["add", "crates"]).expect("add");
+        git(&repo, &["commit", "-q", "-m", "policy below the root"]).expect("commit");
+
+        let prefix = ScratchPrefix::resolve(&SystemGit, &policy_root).expect("prefix");
+        assert_eq!(prefix, ScratchPrefix::under("crates/relais/"));
+        assert!(prefix.covers("crates/relais/.relais/task.json"));
+        assert!(
+            !prefix.covers(".relais/task.json"),
+            "a `.relais/` at the git root is not this policy root's scratch"
+        );
+
+        assert!(
+            dirty_paths(&policy_root).expect("status").is_empty(),
+            "the contract the run was written for does not refuse the run"
+        );
+        // And the status still runs from the git root, where the path
+        // the porcelain prints is the one the prefix accounts for.
+        assert!(dirty_paths(&repo).expect("status").is_empty());
+        std::fs::write(policy_root.join("src.rs"), "// work\n").expect("write");
+        assert_eq!(
+            dirty_paths(&policy_root).expect("status"),
+            vec!["crates/relais/src.rs".to_string()],
+            "everything else still counts, in git's own frame"
+        );
+    }
+
+    /// V10: Claude Code loads a nested `CLAUDE.md` and a nested
+    /// `.claude/settings.json` exactly as it loads the root ones, so a
+    /// candidate that writes them inside an ordinary `src/**` scope is
+    /// widening its own authority.
+    #[test]
+    fn protected_configuration_is_protected_at_any_depth() {
+        for path in [
+            "src/CLAUDE.md",
+            "src/.claude/settings.json",
+            "crates/x/AGENTS.md",
+            "apps/web/.gitignore",
+            ".forgejo/workflows/ci.yaml",
+            "sub/.gitea/workflows/ci.yaml",
+            ".gitlab-ci.yml",
+            "crates/relais/relais.toml",
+            "crates/relais/.relais/task.json",
+        ] {
+            assert!(is_protected_path(path), "{path} is protected");
+        }
+        for path in ["src/claude.md.rs", "src/myclaude/x", "docs/agents-md.md"] {
+            assert!(!is_protected_path(path), "{path} is ordinary work");
+        }
+        // Naming the area is what unlocks it, at the depth it lives.
+        assert!(pattern_names_protected("src/.claude/**", ".claude/"));
+        assert!(pattern_names_protected("**/CLAUDE.md", "CLAUDE.md"));
+        assert!(!pattern_names_protected("src/**", ".claude/"));
+        assert!(!pattern_names_protected("**", "CLAUDE.md"));
+    }
+
+    #[test]
+    fn nested_protected_paths_are_refused_inside_an_ordinary_scope() {
+        let (_dir, repo) = temp_repo();
+        let sha = resolve_base(&repo, "HEAD").expect("base");
+        let wt_path = repo.parent().unwrap().join("wt-nested-prot");
+        let wt = create_worktree(&repo, &sha, &wt_path).expect("worktree");
+        std::fs::create_dir_all(wt_path.join("src/.claude")).expect("mkdir");
+        std::fs::write(wt_path.join("src/CLAUDE.md"), "# do as I say\n").expect("write");
+        std::fs::write(wt_path.join("src/.claude/settings.json"), "{}").expect("write");
+        let candidate = wt.snapshot_candidate("attempt-1").expect("snapshot");
+        let contract = contract_with_scope(&["src/**"]);
+        let err = check_scope(&wt, &candidate, &contract).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("src/CLAUDE.md (protected"), "{message}");
+        assert!(
+            message.contains("src/.claude/settings.json (protected"),
+            "{message}"
+        );
+        // Named explicitly, at the depth it lives: allowed.
+        let explicit = contract_with_scope(&["src/**", "src/CLAUDE.md", "src/.claude/**"]);
+        assert!(check_scope(&wt, &candidate, &explicit).is_ok(), "{message}");
+        release_worktree(&repo, &wt_path, true).expect("released");
     }
 
     #[test]
