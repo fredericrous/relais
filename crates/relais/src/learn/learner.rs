@@ -43,7 +43,7 @@ impl Default for SolverSettings {
         Self {
             lambda: 0.01,
             max_iterations: 2_000,
-            tolerance: 1e-6,
+            tolerance: 1e-4,
             seed: 0,
         }
     }
@@ -159,9 +159,16 @@ fn warm_start(objective: &Objective<'_>, dim: usize, seed: u64) -> (Vec<f64>, f6
 
 /// Full-batch gradient descent with backtracking line search over a
 /// fixed dimension, bounded iterations, and convergence declared only
-/// when the gradient norm or the relative loss change falls below
-/// tolerance. The starting point is the seeded warm-up above; from there
-/// the path is a function of the recorded settings alone.
+/// when the gradient norm or the loss change falls below tolerance. The
+/// starting point is the seeded warm-up above; from there the path is a
+/// function of the recorded settings alone.
+///
+/// The loss-change test is relative OR absolute, whichever is looser. A
+/// purely relative one shrinks with the loss: on a separable corpus the
+/// loss falls towards zero, so the threshold chases it down and the
+/// descent never stalls — the fit runs out of iterations instead, and an
+/// unconverged fit cannot be promoted. Below a loss of 1 the absolute
+/// tolerance decides.
 fn descend(
     objective: &Objective<'_>,
     dim: usize,
@@ -202,8 +209,7 @@ fn descend(
             step *= 0.5;
         }
         let current = objective.value(&weights, bias);
-        if !accepted || (previous - current).abs() < settings.tolerance * previous.abs().max(1e-12)
-        {
+        if !accepted || (previous - current).abs() < settings.tolerance * previous.abs().max(1.0) {
             report.converged = accepted;
             break;
         }
