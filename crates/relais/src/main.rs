@@ -553,7 +553,7 @@ fn promote_command(artifact_id: &str) -> i32 {
 }
 
 fn coordinator_command(cmd: CoordinatorCommand) -> i32 {
-    use relais::coordinator::{self, Request, Response};
+    use relais::coordinator::{self, CoordinatorError, Request, Response};
     let socket = coordinator::socket_path();
     match cmd {
         CoordinatorCommand::Daemon => {
@@ -597,6 +597,13 @@ fn coordinator_command(cmd: CoordinatorCommand) -> i32 {
             let client = coordinator::Client::new(socket.clone());
             let snapshot = match client.status() {
                 Ok(snapshot) => snapshot,
+                // A daemon IS serving and speaks another wire protocol:
+                // reporting that as "no coordinator" would send the
+                // operator looking for one that is right there.
+                Err(skew @ CoordinatorError::VersionSkew { .. }) => {
+                    eprintln!("relais coordinator status: {skew}");
+                    return 3;
+                }
                 Err(_) => {
                     println!(
                         "no coordinator is serving this user ({}); one starts on the first managed dispatch",
@@ -636,6 +643,18 @@ fn coordinator_command(cmd: CoordinatorCommand) -> i32 {
                 snapshot.over_admitted
             );
             println!("sessions: {}", snapshot.sessions.join(", "));
+            if !snapshot.bound_processes.is_empty() {
+                // How old the liveness check behind each binding is: the
+                // window in which the OS could have recycled the number
+                // cannot be closed, so it is shown (SPEC §23, C6).
+                println!("bound processes:");
+                for (dispatch, bound) in &snapshot.bound_processes {
+                    println!(
+                        "  {dispatch} -> pid {} (checked alive {}s ago)",
+                        bound.pid, bound.bound_for_secs
+                    );
+                }
+            }
             if !snapshot.write_leases.is_empty() {
                 println!("write leases:");
                 for (worktree, holder) in &snapshot.write_leases {

@@ -41,12 +41,41 @@ impl Listener {
         self.inner.set_nonblocking(nonblocking)
     }
 
-    /// Connections as they arrive. On Windows a connection that does not
-    /// present the nonce within the request timeout is an `Err` item,
-    /// which the accept loop skips like any failed accept.
-    pub fn incoming(&self) -> impl Iterator<Item = io::Result<Stream>> + '_ {
-        std::iter::from_fn(move || Some(self.inner.accept().map(|inner| Stream { inner })))
+    /// Accept one connection, or `Ok(None)` when a non-blocking listener
+    /// has none waiting. The accepted stream is always blocking,
+    /// whatever the listener is: whether a socket inherits the flag from
+    /// the listener that accepted it differs between platforms, and one
+    /// short request per connection is a blocking read either way.
+    ///
+    /// The peer is checked before a byte of the request is read: its uid
+    /// on Unix, the endpoint nonce on Windows. A connection that fails
+    /// either is `Err(PermissionDenied)` and nothing is served on it.
+    pub fn accept(&self) -> io::Result<Option<Stream>> {
+        match self.inner.accept() {
+            Ok(inner) => Ok(Some(Stream { inner })),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
     }
+}
+
+/// Is this accept failure the process running out of file descriptors?
+///
+/// `EMFILE`/`ENFILE` do not pass: every later accept fails identically
+/// until a descriptor frees, so an accept loop that retries at full
+/// speed is a hot loop that starves the very handlers trying to close
+/// theirs (A9). Everything else — a peer that went away, an interrupted
+/// syscall — is transient and the next accept is unaffected.
+pub fn out_of_descriptors(error: &io::Error) -> bool {
+    imp::out_of_descriptors(error)
+}
+
+/// Make a directory owner-only, and prove it. A 0600 endpoint inside a
+/// world-writable directory is not permission-restricted: the path can
+/// be replaced under it. On platforms with no POSIX mode this is the
+/// user profile's ACL and there is nothing to set.
+pub fn restrict_directory(path: &Path) -> io::Result<()> {
+    imp::restrict_directory(path)
 }
 
 impl Stream {
@@ -79,6 +108,15 @@ impl Stream {
     pub fn shutdown_write(&self) -> io::Result<()> {
         self.inner.shutdown(std::net::Shutdown::Write)
     }
+
+    /// The uid on the other end of this connection, as the kernel has
+    /// it. `Listener::accept` has already refused anything but the
+    /// coordinator's own uid; this is for reporting who that was.
+    #[cfg(unix)]
+    pub fn peer_uid(&self) -> io::Result<u32> {
+        use std::os::unix::io::AsRawFd;
+        crate::procs::peer_uid(self.inner.as_raw_fd())
+    }
 }
 
 impl Read for Stream {
@@ -101,20 +139,84 @@ impl Write for Stream {
 mod imp {
     use std::io;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::AsRawFd;
     use std::path::Path;
+    use std::sync::Mutex;
 
     pub type Stream = std::os::unix::net::UnixStream;
+
+    /// Serialises the umask window below. `umask(2)` is a property of
+    /// the whole process, so two threads binding at once could restore
+    /// each other's value; one binds at a time and the window is a
+    /// syscall long.
+    ///
+    /// It is still process-wide for that syscall: a file another thread
+    /// creates inside the window comes out owner-only. The daemon binds
+    /// once, at startup, before it has other threads — and a file that
+    /// is briefly too private is the harmless direction to be wrong in.
+    static UMASK: Mutex<()> = Mutex::new(());
+
+    /// The process umask, narrowed for as long as this value lives.
+    struct Umask {
+        previous: libc::mode_t,
+        _serialised: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Umask {
+        fn narrow(mask: libc::mode_t) -> Self {
+            let serialised = UMASK.lock().unwrap_or_else(|p| p.into_inner());
+            // SAFETY: `umask` cannot fail and touches no memory; it
+            // returns the previous value, which the drop below restores.
+            let previous = unsafe { libc::umask(mask) };
+            Self {
+                previous,
+                _serialised: serialised,
+            }
+        }
+    }
+
+    impl Drop for Umask {
+        fn drop(&mut self) {
+            // SAFETY: as above, restoring what `narrow` took.
+            unsafe { libc::umask(self.previous) };
+        }
+    }
 
     #[derive(Debug)]
     pub struct Listener(std::os::unix::net::UnixListener);
 
     impl Listener {
         pub fn bind(path: &Path) -> io::Result<Self> {
-            let listener = std::os::unix::net::UnixListener::bind(path)?;
+            // `bind` creates the socket inode with the process umask
+            // applied, so a default 0022 umask made it 0755 — world
+            // connectable — until the `set_permissions` below. A
+            // protocol carrying `shutdown` and `cancel_run` was
+            // reachable in that window (A8). Narrowing the umask around
+            // the bind closes it: the socket is never created with more
+            // than owner access, and the explicit mode afterwards is
+            // what proves it on platforms where the umask does not
+            // apply to sockets.
+            // 0o077, not 0o177: the umask is process-wide, so anything
+            // else this process creates during the window is affected
+            // too, and clearing the owner's execute bit would make a
+            // directory created in another thread unenterable. Clearing
+            // group and other entirely is what the socket needs — its
+            // base mode is 0666, so the inode is 0600 either way.
+            let listener = {
+                let _mask = Umask::narrow(0o077);
+                std::os::unix::net::UnixListener::bind(path)?
+            };
             // Permission-restricted local socket (SPEC §23): the owner only.
             let mut permissions = std::fs::metadata(path)?.permissions();
             permissions.set_mode(0o600);
             std::fs::set_permissions(path, permissions)?;
+            let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("the endpoint is mode {mode:o}, not 0600"),
+                ));
+            }
             Ok(Self(listener))
         }
 
@@ -123,8 +225,55 @@ mod imp {
         }
 
         pub fn accept(&self) -> io::Result<Stream> {
-            self.0.accept().map(|(stream, _)| stream)
+            let (stream, _) = self.0.accept()?;
+            // Whether an accepted socket inherits the listener's
+            // non-blocking flag is platform-defined; the request read
+            // that follows is blocking under a timeout either way.
+            stream.set_nonblocking(false)?;
+            // One coordinator per OS user (SPEC §23), so a connection
+            // from another uid is never this coordinator's business —
+            // and the protocol it would be speaking includes `shutdown`
+            // and `cancel_run` (A8). Checked before a byte is read.
+            check_peer(
+                crate::procs::peer_uid(stream.as_raw_fd())?,
+                crate::procs::uid(),
+            )?;
+            Ok(stream)
         }
+    }
+
+    /// The uid that may talk to this coordinator is the one running it,
+    /// and only that one — root included, which is somebody else's
+    /// session with somebody else's runs.
+    pub fn check_peer(peer: u32, me: u32) -> io::Result<()> {
+        if peer == me {
+            return Ok(());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("connection from uid {peer}; this coordinator serves uid {me} only"),
+        ))
+    }
+
+    pub fn out_of_descriptors(error: &io::Error) -> bool {
+        matches!(
+            error.raw_os_error(),
+            Some(code) if code == libc::EMFILE || code == libc::ENFILE
+        )
+    }
+
+    pub fn restrict_directory(path: &Path) -> io::Result<()> {
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(path, permissions)?;
+        let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+        if mode != 0o700 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is mode {mode:o}, not 0700", path.display()),
+            ));
+        }
+        Ok(())
     }
 
     pub fn connect(path: &Path) -> io::Result<Stream> {
@@ -186,6 +335,10 @@ mod imp {
         /// why, without a byte of the request being read.
         pub fn accept(&self) -> io::Result<Stream> {
             let (mut stream, peer) = self.listener.accept()?;
+            // A non-blocking listener can hand back a non-blocking
+            // socket; the nonce handshake below is a blocking read under
+            // a timeout.
+            stream.set_nonblocking(false)?;
             if !peer.ip().is_loopback() {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -230,10 +383,31 @@ mod imp {
         Ok(stream)
     }
 
+    pub fn out_of_descriptors(error: &io::Error) -> bool {
+        // WSAEMFILE, and the Win32 "too many open files" a socket call
+        // can surface. Neither passes on a retry.
+        matches!(error.raw_os_error(), Some(10024) | Some(4))
+    }
+
+    /// Windows has no POSIX mode: the endpoint file's restriction is the
+    /// ACL its directory inherits from the user profile, which relais
+    /// does not set and must not replace with a weaker one.
+    pub fn restrict_directory(_path: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Unpredictable bytes from the OS-seeded hasher state — the same
-    /// entropy `HashMap` is randomised with. The nonce guards a loopback
-    /// port whose endpoint file the user's ACL already protects; it is
-    /// defence in depth, not the only wall.
+    /// entropy `HashMap` is randomised with.
+    ///
+    /// Why not a CSPRNG: the standard library exposes none on stable,
+    /// this crate is std-only by decision (SPEC §13), and `RandomState`
+    /// is the one OS-seeded source std does expose. Its seed is taken
+    /// from the platform's secure random source once per thread, and
+    /// each `RandomState::new()` mixes a fresh key into a SipHash whose
+    /// output is what is used here — so the 32 bytes carry that seed's
+    /// entropy, not a counter's. The nonce is also not the only wall:
+    /// it guards a loopback-only port whose endpoint file sits under the
+    /// user's profile ACL, and it is compared in constant time.
     fn fresh_nonce() -> [u8; NONCE_BYTES] {
         use std::collections::hash_map::RandomState;
         use std::hash::{BuildHasher, Hasher};
@@ -263,6 +437,7 @@ mod tests {
     use std::io::{BufRead, BufReader};
 
     fn endpoint(tag: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = if cfg!(unix) {
             // Unix socket paths are short (104 bytes on macOS): /tmp, not
             // the deep per-user temp dir.
@@ -270,7 +445,14 @@ mod tests {
         } else {
             std::env::temp_dir()
         };
-        let dir = dir.join(format!("rl-ipc-{tag}-{}", std::process::id()));
+        let dir = dir.join(format!(
+            "rl-ipc-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        // Pre-cleaned: a directory left behind by a killed run of this
+        // suite with the same pid would hand the test somebody's socket.
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir.join("endpoint")
     }
@@ -280,7 +462,7 @@ mod tests {
         let path = endpoint("rt");
         let listener = Listener::bind(&path).expect("bind");
         let server = std::thread::spawn(move || {
-            let stream = listener.incoming().next().expect("one").expect("accepted");
+            let stream = listener.accept().expect("accepted").expect("a connection");
             let mut reader = BufReader::new(stream.try_clone().expect("clone"));
             let mut line = String::new();
             reader.read_line(&mut line).expect("read");
@@ -312,6 +494,110 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    // A8: the socket carries `shutdown` and `cancel_run`, and `bind`
+    // created it with the process umask applied — 0755 with a default
+    // umask — until a `set_permissions` a syscall later. It is never
+    // created wider than the owner now, and the mode is proved.
+    #[cfg(unix)]
+    #[test]
+    fn the_endpoint_is_owner_only_from_the_moment_it_exists() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = endpoint("mode");
+        let mode_of = |file: &std::path::Path| {
+            std::fs::metadata(file)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let listener = Listener::bind(&path).expect("bind");
+        assert_eq!(mode_of(&path), 0o600, "permission-restricted (SPEC §23)");
+        // The umask window is restored, so a second bind in the same
+        // process is not relying on the first having left it narrowed.
+        let again = path.with_extension("again");
+        let second = Listener::bind(&again).expect("bind");
+        assert_eq!(mode_of(&again), 0o600);
+        drop(second);
+        drop(listener);
+        std::fs::remove_dir_all(path.parent().expect("dir")).ok();
+    }
+
+    // A8: one coordinator per OS user (SPEC §23), so the uid on the
+    // other end is checked — by the kernel, not by the peer — before a
+    // byte of the request is read.
+    #[cfg(unix)]
+    #[test]
+    fn the_peer_of_a_connection_is_checked_against_our_own_uid() {
+        let path = endpoint("peer");
+        let listener = Listener::bind(&path).expect("bind");
+        let connecting = std::thread::spawn({
+            let path = path.clone();
+            move || Stream::connect(&path).expect("connect")
+        });
+        let accepted = listener.accept().expect("accept").expect("a connection");
+        assert!(accepted.peer_uid().expect("peer uid") == crate::procs::uid());
+        drop(connecting.join().expect("client"));
+        // And the rule itself: our own uid passes, anything else does
+        // not — root included, which is somebody else's session.
+        assert!(imp::check_peer(7, 7).is_ok());
+        let refused = imp::check_peer(0, 501).expect_err("a foreign uid is refused");
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        assert!(refused.to_string().contains("uid 0"), "{refused}");
+        drop(listener);
+        std::fs::remove_dir_all(path.parent().expect("dir")).ok();
+    }
+
+    // A9: a persistent accept failure the loop cannot make progress on
+    // has to be told from one the next accept is unaffected by, or the
+    // loop spins at full speed on `EMFILE` and starves the handlers
+    // trying to close a descriptor.
+    #[test]
+    fn descriptor_exhaustion_is_told_from_a_peer_that_went_away() {
+        #[cfg(unix)]
+        {
+            assert!(out_of_descriptors(&io::Error::from_raw_os_error(
+                libc::EMFILE
+            )));
+            assert!(out_of_descriptors(&io::Error::from_raw_os_error(
+                libc::ENFILE
+            )));
+            assert!(!out_of_descriptors(&io::Error::from_raw_os_error(
+                libc::ECONNABORTED
+            )));
+            assert!(!out_of_descriptors(&io::Error::from_raw_os_error(
+                libc::EINTR
+            )));
+        }
+        assert!(!out_of_descriptors(&io::Error::from(
+            io::ErrorKind::WouldBlock
+        )));
+    }
+
+    #[test]
+    fn a_non_blocking_listener_says_when_nothing_is_waiting() {
+        let path = endpoint("nonblocking");
+        let listener = Listener::bind(&path).expect("bind");
+        listener.set_nonblocking(true).expect("non-blocking");
+        assert!(
+            listener.accept().expect("no error").is_none(),
+            "nothing is connecting, and that is not a failure"
+        );
+        let mut client = Stream::connect(&path).expect("connect");
+        let accepted = loop {
+            if let Some(stream) = listener.accept().expect("accept") {
+                break stream;
+            }
+        };
+        // Accepted from a non-blocking listener and blocking anyway: the
+        // request read that follows is one short line under a timeout.
+        writeln!(client, "hello").expect("write");
+        let mut line = String::new();
+        BufReader::new(accepted).read_line(&mut line).expect("read");
+        assert_eq!(line.trim(), "hello");
+        drop(listener);
+        std::fs::remove_dir_all(path.parent().expect("dir")).ok();
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_connection_without_the_nonce_is_dropped_unread() {
@@ -325,7 +611,7 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap();
-        let server = std::thread::spawn(move || listener.incoming().next().expect("one"));
+        let server = std::thread::spawn(move || listener.accept());
         let mut raw = TcpStream::connect(("127.0.0.1", port)).expect("tcp");
         let junk = [b'0'; 65];
         raw.write_all(&junk).expect("write");
@@ -334,6 +620,6 @@ mod tests {
             accepted.unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
-        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(path.parent().expect("dir")).ok();
     }
 }

@@ -24,7 +24,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::admission::{Decision, DispatchRequest, Gate, Refusal, ResourceClass, RunRegistration};
+use crate::admission::{
+    BindOutcome, Decision, DispatchRequest, Gate, GateError, Refusal, ResourceClass,
+    RunRegistration, WriteLeaseOutcome,
+};
 use crate::backend::{Backend, LaunchResult, LaunchSpec};
 use crate::context::{self, ContextError, ContextManifest};
 use crate::contract::{Review, TaskContract};
@@ -167,6 +170,30 @@ pub struct RunConfig<'a> {
 
 /// Poll period while queued for admission.
 const ADMISSION_POLL: Duration = Duration::from_millis(250);
+
+/// How a failed admission call is reported. An unreachable coordinator
+/// is an outage — the request is preserved and nothing was launched — and
+/// anything else is a decision the coordinator made and answered with.
+/// Reporting a refusal as `admission_unavailable` sent the operator
+/// looking for a dead daemon that was answering perfectly well (A12).
+fn admission_block(error: &GateError) -> (Reason, BlockCode) {
+    if error.unavailable() {
+        (
+            Reason::AdmissionUnavailable,
+            BlockCode::AdmissionUnavailable,
+        )
+    } else {
+        (Reason::AdmissionRefused, BlockCode::AdmissionRefused)
+    }
+}
+
+/// Record the first reason this dispatch lost its seat. The first is the
+/// one that explains the rest, and a poisoned slot is recovered rather
+/// than turning a lost seat into a second panic.
+fn record_lost_seat(slot: &std::sync::Mutex<Option<String>>, detail: String) {
+    let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    slot.get_or_insert(detail);
+}
 
 /// Where a run's git worktrees live: a SIBLING of the artifact
 /// directory, never inside it (audit B6).
@@ -404,9 +431,10 @@ impl<'a> RunEngine<'a> {
         loop {
             match gate.admit(&request) {
                 Err(e) => {
+                    let (reason, code) = admission_block(&e);
                     return Ok(Err(self.block(
-                        Reason::AdmissionUnavailable,
-                        BlockCode::AdmissionUnavailable,
+                        reason,
+                        code,
                         format!("{e}; the request is preserved and nothing was launched"),
                     )?));
                 }
@@ -470,13 +498,8 @@ impl<'a> RunEngine<'a> {
         let lease_key = write_lease.map(|path| path.to_string_lossy().into_owned());
         if let Some(key) = lease_key.as_deref() {
             match gate.acquire_write(&spec.dispatch_id, key) {
-                Ok(true) => {}
-                Ok(false) => {
-                    let holder = gate
-                        .write_lease_holder(key)
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| "another dispatch".to_string());
+                Ok(WriteLeaseOutcome::Taken) => {}
+                Ok(WriteLeaseOutcome::HeldBy { holder }) => {
                     let _ = gate.withdraw(&spec.dispatch_id);
                     return Ok(Err(self.block(
                         Reason::AdmissionRefused,
@@ -489,9 +512,10 @@ impl<'a> RunEngine<'a> {
                 }
                 Err(e) => {
                     let _ = gate.withdraw(&spec.dispatch_id);
+                    let (reason, code) = admission_block(&e);
                     return Ok(Err(self.block(
-                        Reason::AdmissionUnavailable,
-                        BlockCode::AdmissionUnavailable,
+                        reason,
+                        code,
                         format!("{e}; the write lease could not be taken and nothing was launched"),
                     )?));
                 }
@@ -506,11 +530,17 @@ impl<'a> RunEngine<'a> {
         let heartbeat_every = self.config.heartbeat_every;
         let ledger_path = self.config.ledger.path().to_path_buf();
         let session_id = self.config.session_id.clone();
+        // A bind the coordinator does not recognise means this worker
+        // holds no seat and no reservation — after a re-election, for
+        // instance. The heartbeat thread cannot end the run, so it says
+        // so here and the launch path reports it (A2).
+        let seat_lost: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
         let launched = std::thread::scope(|scope| {
             let dispatch_id = spec.dispatch_id.clone();
             let cancel = Arc::clone(&cancel);
             let pid_slot = Arc::clone(&pid_slot);
             let stop = &stop;
+            let seat_lost = &seat_lost;
             scope.spawn(move || {
                 let mut last: Option<Instant> = None;
                 let mut bound_pid = false;
@@ -521,7 +551,30 @@ impl<'a> RunEngine<'a> {
                         // on its own connection: the runner's is busy
                         // blocking on the launch.
                         bound_pid = true;
-                        let _ = gate.bind(&dispatch_id, None, Some(pid));
+                        match gate.bind(&dispatch_id, None, Some(pid)) {
+                            Ok(BindOutcome::Bound) => {}
+                            // The coordinator has no such dispatch: this
+                            // worker holds no seat, no reservation and
+                            // no PID on record, which is the unmanaged
+                            // launch SPEC §23 forbids (A2).
+                            Ok(BindOutcome::UnknownDispatch) => record_lost_seat(
+                                seat_lost,
+                                format!(
+                                    "the coordinator does not know dispatch {dispatch_id}, so \
+                                     pid {pid} holds no seat and no reservation"
+                                ),
+                            ),
+                            // The process was gone before the bind
+                            // reached the coordinator: a worker that
+                            // finished faster than its own heartbeat.
+                            // The lease is still ours and the release
+                            // below ends it.
+                            Ok(BindOutcome::PidNotAlive) => {}
+                            // Unreachable, not disagreeing: the lease
+                            // stands and the reconcile loop owns it.
+                            Err(e) if e.unavailable() => {}
+                            Err(e) => record_lost_seat(seat_lost, e.to_string()),
+                        }
                         if let Ok(ledger) = Ledger::open(&ledger_path) {
                             let _ = ledger.attach_dispatch_process(
                                 &DispatchId::from_stored(dispatch_id.clone()),
@@ -569,11 +622,21 @@ impl<'a> RunEngine<'a> {
         };
         // Bind, free the seat, settle the reservation: unknown usage
         // settles as unknown, never zero (SPEC §23). Failures here are
-        // the coordinator's to reconcile; the work already happened.
+        // the coordinator's to reconcile; the work already happened and
+        // an agent ID it cannot attach costs nothing.
         let _ = gate.bind(&spec.dispatch_id, result.session_id.as_deref(), None);
         let _ = gate.release(&spec.dispatch_id);
         let spent = result.usage.cost.micros().map(MicroUsd::to_micros);
         let _ = gate.settle(&spec.dispatch_id, spent);
+        // The worker ran without a seat: its usage is now on the record
+        // and the run stops rather than pretending it was managed.
+        if let Some(detail) = seat_lost.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            return Ok(Err(self.block(
+                Reason::AdmissionRefused,
+                BlockCode::AdmissionRefused,
+                format!("{detail}; the attempt is not a managed dispatch (SPEC §23)"),
+            )?));
+        }
         Ok(Ok(result))
     }
 
@@ -706,11 +769,8 @@ impl<'a> RunEngine<'a> {
                 max_depth: Some(authority.max_agent_depth),
             };
             if let Err(e) = gate.register_run(&registration) {
-                return self.block(
-                    Reason::AdmissionUnavailable,
-                    BlockCode::AdmissionUnavailable,
-                    format!("{e}; nothing was launched"),
-                );
+                let (reason, code) = admission_block(&e);
+                return self.block(reason, code, format!("{e}; nothing was launched"));
             }
         }
 
@@ -4059,14 +4119,20 @@ mod tests {
             // the worker's own release (holder-only) is a no-op.
             let key = spec.work_dir.to_string_lossy().into_owned();
             assert!(
-                !intruder.acquire_write("intruder", &key).expect("gate"),
+                !intruder
+                    .acquire_write("intruder", &key)
+                    .expect("gate")
+                    .taken(),
                 "the worker holds the lease, so the intruder is refused now"
             );
             intruder
                 .release_write(&spec.dispatch_id, &key)
                 .expect("gate");
             assert!(
-                intruder.acquire_write("intruder", &key).expect("gate"),
+                intruder
+                    .acquire_write("intruder", &key)
+                    .expect("gate")
+                    .taken(),
                 "the tree is free for a moment, and the intruder takes it"
             );
             MockOutcome {
@@ -4175,9 +4241,10 @@ mod tests {
                 ..Default::default()
             }
         });
-        let gate = crate::coordinator::RemoteGate::new(PathBuf::from(
-            "/tmp/relais-test-no-coordinator.sock",
-        ));
+        // Its own socket path: a fixed one is shared with every other
+        // run of this suite on the machine, and a stray daemon on it
+        // would make this test pass for the wrong reason.
+        let gate = crate::coordinator::RemoteGate::new(fixture.dir.join("no-coordinator.sock"));
         let outcome = fixture.execute_managed(
             &fixture.contract(Review::Off),
             &repo,
