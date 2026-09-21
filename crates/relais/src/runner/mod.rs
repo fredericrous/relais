@@ -2760,10 +2760,15 @@ mod tests {
     /// for. Caching a baseline verdict requires identifying the
     /// toolchain that produced it (SPEC §18), and `sh` is dash on
     /// Debian, which answers nothing to `--version` — so a profile
-    /// running `sh` refuses the cache, by design.
+    /// running `sh` there refuses the cache, by design.
     fn versionable_main_gone_check() -> CommandSpec {
+        // On Windows it is the other way round: `sh` is the one git
+        // ships, which is bash and says so, while `bash` on `PATH` is
+        // `System32\bash.exe` — the WSL launcher, which fails outright
+        // on a machine with no distribution installed.
+        let shell = if cfg!(windows) { "sh" } else { "bash" };
         CommandSpec {
-            argv: vec!["bash".into(), "-c".into(), "test ! -f src/main.rs".into()],
+            argv: vec![shell.into(), "-c".into(), "test ! -f src/main.rs".into()],
             timeout_seconds: 30,
         }
     }
