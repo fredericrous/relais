@@ -66,8 +66,11 @@ impl Listener {
 /// speed is a hot loop that starves the very handlers trying to close
 /// theirs (A9). Everything else — a peer that went away, an interrupted
 /// syscall — is transient and the next accept is unaffected.
+///
+/// The errno spellings belong to `procs`, the one module that names a
+/// platform API (`boundaries.own-the-interface`).
 pub fn out_of_descriptors(error: &io::Error) -> bool {
-    imp::out_of_descriptors(error)
+    crate::procs::out_of_descriptors(error)
 }
 
 /// Make a directory owner-only, and prove it. A 0600 endpoint inside a
@@ -114,8 +117,7 @@ impl Stream {
     /// coordinator's own uid; this is for reporting who that was.
     #[cfg(unix)]
     pub fn peer_uid(&self) -> io::Result<u32> {
-        use std::os::unix::io::AsRawFd;
-        crate::procs::peer_uid(self.inner.as_raw_fd())
+        crate::procs::peer_uid(&self.inner)
     }
 }
 
@@ -139,48 +141,9 @@ impl Write for Stream {
 mod imp {
     use std::io;
     use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::io::AsRawFd;
     use std::path::Path;
-    use std::sync::Mutex;
 
     pub type Stream = std::os::unix::net::UnixStream;
-
-    /// Serialises the umask window below. `umask(2)` is a property of
-    /// the whole process, so two threads binding at once could restore
-    /// each other's value; one binds at a time and the window is a
-    /// syscall long.
-    ///
-    /// It is still process-wide for that syscall: a file another thread
-    /// creates inside the window comes out owner-only. The daemon binds
-    /// once, at startup, before it has other threads — and a file that
-    /// is briefly too private is the harmless direction to be wrong in.
-    static UMASK: Mutex<()> = Mutex::new(());
-
-    /// The process umask, narrowed for as long as this value lives.
-    struct Umask {
-        previous: libc::mode_t,
-        _serialised: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl Umask {
-        fn narrow(mask: libc::mode_t) -> Self {
-            let serialised = UMASK.lock().unwrap_or_else(|p| p.into_inner());
-            // SAFETY: `umask` cannot fail and touches no memory; it
-            // returns the previous value, which the drop below restores.
-            let previous = unsafe { libc::umask(mask) };
-            Self {
-                previous,
-                _serialised: serialised,
-            }
-        }
-    }
-
-    impl Drop for Umask {
-        fn drop(&mut self) {
-            // SAFETY: as above, restoring what `narrow` took.
-            unsafe { libc::umask(self.previous) };
-        }
-    }
 
     #[derive(Debug)]
     pub struct Listener(std::os::unix::net::UnixListener);
@@ -203,7 +166,7 @@ mod imp {
             // group and other entirely is what the socket needs — its
             // base mode is 0666, so the inode is 0600 either way.
             let listener = {
-                let _mask = Umask::narrow(0o077);
+                let _mask = crate::procs::narrow_umask(0o077);
                 std::os::unix::net::UnixListener::bind(path)?
             };
             // Permission-restricted local socket (SPEC §23): the owner only.
@@ -234,10 +197,7 @@ mod imp {
             // from another uid is never this coordinator's business —
             // and the protocol it would be speaking includes `shutdown`
             // and `cancel_run` (A8). Checked before a byte is read.
-            check_peer(
-                crate::procs::peer_uid(stream.as_raw_fd())?,
-                crate::procs::uid(),
-            )?;
+            check_peer(crate::procs::peer_uid(&stream)?, crate::procs::uid())?;
             Ok(stream)
         }
     }
@@ -253,13 +213,6 @@ mod imp {
             io::ErrorKind::PermissionDenied,
             format!("connection from uid {peer}; this coordinator serves uid {me} only"),
         ))
-    }
-
-    pub fn out_of_descriptors(error: &io::Error) -> bool {
-        matches!(
-            error.raw_os_error(),
-            Some(code) if code == libc::EMFILE || code == libc::ENFILE
-        )
     }
 
     pub fn restrict_directory(path: &Path) -> io::Result<()> {
@@ -383,12 +336,6 @@ mod imp {
         Ok(stream)
     }
 
-    pub fn out_of_descriptors(error: &io::Error) -> bool {
-        // WSAEMFILE, and the Win32 "too many open files" a socket call
-        // can surface. Neither passes on a retry.
-        matches!(error.raw_os_error(), Some(10024) | Some(4))
-    }
-
     /// Windows has no POSIX mode: the endpoint file's restriction is the
     /// ACL its directory inherits from the user profile, which relais
     /// does not set and must not replace with a weaker one.
@@ -437,24 +384,7 @@ mod tests {
     use std::io::{BufRead, BufReader};
 
     fn endpoint(tag: &str) -> std::path::PathBuf {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = if cfg!(unix) {
-            // Unix socket paths are short (104 bytes on macOS): /tmp, not
-            // the deep per-user temp dir.
-            std::path::PathBuf::from("/tmp")
-        } else {
-            std::env::temp_dir()
-        };
-        let dir = dir.join(format!(
-            "rl-ipc-{tag}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        // Pre-cleaned: a directory left behind by a killed run of this
-        // suite with the same pid would hand the test somebody's socket.
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        dir.join("endpoint")
+        crate::test_support::short_temp_dir(&format!("ipc-{tag}")).join("endpoint")
     }
 
     #[test]
@@ -547,27 +477,10 @@ mod tests {
         std::fs::remove_dir_all(path.parent().expect("dir")).ok();
     }
 
-    // A9: a persistent accept failure the loop cannot make progress on
-    // has to be told from one the next accept is unaffected by, or the
-    // loop spins at full speed on `EMFILE` and starves the handlers
-    // trying to close a descriptor.
+    // The errno spellings live with the syscall, in `procs`; the test
+    // that pins them went with them.
     #[test]
-    fn descriptor_exhaustion_is_told_from_a_peer_that_went_away() {
-        #[cfg(unix)]
-        {
-            assert!(out_of_descriptors(&io::Error::from_raw_os_error(
-                libc::EMFILE
-            )));
-            assert!(out_of_descriptors(&io::Error::from_raw_os_error(
-                libc::ENFILE
-            )));
-            assert!(!out_of_descriptors(&io::Error::from_raw_os_error(
-                libc::ECONNABORTED
-            )));
-            assert!(!out_of_descriptors(&io::Error::from_raw_os_error(
-                libc::EINTR
-            )));
-        }
+    fn a_transient_accept_failure_is_not_descriptor_exhaustion() {
         assert!(!out_of_descriptors(&io::Error::from(
             io::ErrorKind::WouldBlock
         )));

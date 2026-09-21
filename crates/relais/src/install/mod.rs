@@ -115,6 +115,8 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
         return Err(e);
     }
     if let Err(e) = std::fs::rename(&temp, path) {
+        // Same: the error to report is the rename's; a staging file
+        // that cannot be removed is named by this call alone.
         let _ = std::fs::remove_file(&temp);
         return Err(e);
     }
@@ -844,16 +846,7 @@ mod tests {
     use super::*;
 
     fn temp_root() -> (InstallRoot, PathBuf) {
-        // A counter, not the thread id: thread ids are reused within a
-        // test binary, and two tests sharing a directory would read each
-        // other's files.
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "relais-install-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dir = crate::test_support::temp_dir("install");
         let root = InstallRoot {
             claude_dir: dir.join("project").join(".claude"),
         };

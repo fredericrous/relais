@@ -2598,13 +2598,16 @@ impl<'a> RunEngine<'a> {
         }
         let inventory = match (amont_on, holder.as_ref()) {
             (true, Some(holder)) => self.config.hooks.list(holder.path(), verify::Stage::Local),
-            _ => None,
+            _ => Err(verify::InventoryError::NotAsked),
         };
         // A profile that names no checks is not a profile that depends
         // on none: what it depends on is whatever amont is enforcing,
         // so the in-force blocking checks are the default required set
         // (audit B10).
         let required = if authority.verification_profile.amont_checks.is_empty() {
+            // No inventory means no default required set to derive; the
+            // failure itself is reported by `amont_waiver_gaps` below
+            // and by the profile's own named checks when it has any.
             inventory
                 .as_ref()
                 .map(verify::default_required_checks)
@@ -2625,6 +2628,15 @@ impl<'a> RunEngine<'a> {
             inventory.as_ref(),
             &authority.verification_profile.amont_waivers,
         ));
+        // amont was asked and would not answer, and the profile names no
+        // check for `amont_gaps` to hang the reason on. Reported anyway:
+        // a run must never read "no inventory" as "nothing to enforce"
+        // (SPEC §10).
+        if let Err(e) = &inventory {
+            if required.is_empty() && !matches!(e, verify::InventoryError::NotAsked) {
+                gaps.push(format!("amont inventory: {e}"));
+            }
+        }
         // The throwaway worktree has done its work. Releasing it here —
         // rather than leaving it to `Drop` — is what gives the failure
         // somewhere to be reported.
@@ -3213,12 +3225,7 @@ mod tests {
         /// ceiling measured over "today" is assertable rather than
         /// whenever the suite happened to run.
         fn with_clock(clock: Box<dyn crate::ledger::Clock>) -> Self {
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            let dir = std::env::temp_dir().join(format!(
-                "relais-run-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
+            let dir = crate::test_support::temp_dir("run");
             let repo = dir.join("repo");
             std::fs::create_dir_all(&repo).expect("mkdir");
             let no_hooks = dir.join("no-hooks");
@@ -3243,7 +3250,7 @@ mod tests {
                 repo,
                 artifacts,
                 ledger,
-                ids: crate::ids::IdSource::of_this_process(),
+                ids: crate::ids::IdSource::new(std::time::SystemTime::now, std::process::id()),
             }
         }
 

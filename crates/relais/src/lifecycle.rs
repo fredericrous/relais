@@ -106,6 +106,55 @@ pub enum Reason {
 }
 
 impl Reason {
+    /// Every variant, for a caller that has to enumerate them — the
+    /// round-trip property test, and anything rendering a legend.
+    ///
+    /// The length is fixed, so a variant added to the enum without being
+    /// added here does not compile the `match` that walks it.
+    pub const ALL: [Self; 41] = [
+        Self::ChecksAndReviewPassed,
+        Self::BehavioralFailure,
+        Self::RepairExhausted,
+        Self::AmbiguousDiagnosis,
+        Self::SameFailureRecurrence,
+        Self::EnvMissing,
+        Self::ArchitectureUnresolved,
+        Self::ScopeExceeded,
+        Self::ReviewUnavailable,
+        Self::LimitReached,
+        Self::ProcessCrash,
+        Self::CancelledByUser,
+        Self::ReconciledInterrupted,
+        Self::BlockedPreflight,
+        Self::EscalationNotAuthorized,
+        Self::ModelUnavailable,
+        Self::UnapprovedSubstitution,
+        Self::ArchitectureContradiction,
+        Self::VerificationGap,
+        Self::BaselineFailureNotWaived,
+        Self::ReviewFindings,
+        Self::VerificationInputsChanged,
+        Self::AdmissionUnavailable,
+        Self::PlanAccepted,
+        Self::PlanRejected,
+        Self::PackageStarted,
+        Self::PackageFinished,
+        Self::IntegrationConflict,
+        Self::IntegrationFailed,
+        Self::AdmissionRefused,
+        Self::DuplicateDispatch,
+        Self::PermissionDenied,
+        Self::CandidateIdenticalToBase,
+        Self::ReviewerSameTier,
+        Self::WorktreeNotReleased,
+        Self::WriteLeaseWait,
+        Self::WriteLeaseNotReleased,
+        Self::VerificationStarted,
+        Self::CoordinatorUnreachable,
+        Self::WriteLeaseHeld,
+        Self::RunnerFailure,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ChecksAndReviewPassed => "checks_and_review_passed",
@@ -192,6 +241,27 @@ pub enum State {
 }
 
 impl State {
+    /// Every variant, for a caller that has to enumerate them — the
+    /// round-trip property test, and anything rendering a legend.
+    ///
+    /// The length is fixed, so a variant added to the enum without being
+    /// added here does not compile the `match` that walks it.
+    pub const ALL: [Self; 13] = [
+        Self::Prepared,
+        Self::Running,
+        Self::Verifying,
+        Self::Repairing,
+        Self::Escalating,
+        Self::Accepted,
+        Self::NeedsReview,
+        Self::NeedsDecision,
+        Self::Blocked,
+        Self::Failed,
+        Self::BudgetExhausted,
+        Self::Cancelled,
+        Self::Interrupted,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Prepared => "prepared",
@@ -273,5 +343,36 @@ mod tests {
         assert!(error.to_string().contains("hibernating"), "{error}");
         let error = Reason::parse("nope").expect_err("not a known reason");
         assert_eq!(error.what, "transition reason");
+    }
+
+    proptest::proptest! {
+        /// Every state and every reason survives the round trip through
+        /// the ledger: `as_str` writes the row, `parse` reads it back,
+        /// and a variant that lost its spelling would come back as a
+        /// corrupt row on a ledger this binary wrote itself.
+        #[test]
+        fn every_state_round_trips_through_its_stored_spelling(index in 0usize..State::ALL.len()) {
+            use proptest::prelude::*;
+            let state = State::ALL[index];
+            prop_assert_eq!(State::parse(state.as_str()).expect("its own spelling"), state);
+        }
+
+        #[test]
+        fn every_reason_round_trips_through_its_stored_spelling(index in 0usize..Reason::ALL.len()) {
+            use proptest::prelude::*;
+            let reason = Reason::ALL[index];
+            prop_assert_eq!(Reason::parse(reason.as_str()).expect("its own spelling"), reason);
+        }
+
+        /// …and a spelling no variant has is refused, never guessed into
+        /// the nearest one.
+        #[test]
+        fn an_unknown_spelling_is_refused(text in "[a-z_]{0,24}") {
+            use proptest::prelude::*;
+            let known_state = State::ALL.iter().any(|state| state.as_str() == text);
+            prop_assert_eq!(State::parse(&text).is_ok(), known_state, "{}", text);
+            let known_reason = Reason::ALL.iter().any(|reason| reason.as_str() == text);
+            prop_assert_eq!(Reason::parse(&text).is_ok(), known_reason, "{}", text);
+        }
     }
 }

@@ -1208,15 +1208,7 @@ mod tests {
     /// travels on as a revision.
     #[test]
     fn a_failing_fast_forward_is_a_typed_git_error() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "relais-ff-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dir = crate::test_support::temp_dir("ff");
         let err = fast_forward(&dir, "0000000000000000000000000000000000000000")
             .expect_err("a directory that is not a repository");
         let WorkspaceError::Git(detail) = &err else {

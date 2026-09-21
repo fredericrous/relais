@@ -131,7 +131,14 @@ impl FixedClock {
 
 impl Clock for FixedClock {
     fn now_rfc3339(&self) -> String {
-        let mut guard = self.times.lock().expect("clock lock");
+        // A poisoned clock is still a list of times: the panic that
+        // poisoned it is the caller's to report, not this clock's to
+        // re-raise on every later read (the coordinator's `lock_state`
+        // recovers its admission lock the same way).
+        let mut guard = self
+            .times
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (times, index) = &mut *guard;
         let now = times[(*index).min(times.len() - 1)].clone();
         *index += 1;
@@ -970,6 +977,11 @@ impl Ledger {
                         from_state: from_state.as_deref().map(parse_state).transpose()?,
                         to_state: parse_state(&to_state)?,
                         reason,
+                        // Free-form diagnostic JSON a transition carried.
+                        // Nothing reads it back as a value — it is
+                        // printed — so a row that will not parse is
+                        // reported as "no detail", not as a read failure
+                        // that would hide the transition itself.
                         detail: detail.and_then(|d| serde_json::from_str(&d).ok()),
                         at,
                     })
@@ -1216,7 +1228,16 @@ impl Ledger {
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(text.and_then(|text| serde_json::from_str(&text).ok()))
+        // An intent column that is not JSON is a corrupt row, not an
+        // absent intent: read as `None` the dataset would exclude the
+        // run for "no dispatch intent" and never name the real fault.
+        text.map(|text| {
+            serde_json::from_str(&text).map_err(|e| LedgerError::Corrupt {
+                what: format!("the dispatch intent of run {run_id}"),
+                detail: e.to_string(),
+            })
+        })
+        .transpose()
     }
 
     /// What a learned artifact estimated for a run at routing time, so a
@@ -1334,16 +1355,7 @@ mod tests {
     /// these in parallel threads of one process, so a pid-only name is
     /// one directory two tests share (P12).
     fn temp_dir(label: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "relais-ledger-{label}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        dir
+        crate::test_support::temp_dir(&format!("ledger-{label}"))
     }
 
     fn temp_ledger() -> (Ledger, std::path::PathBuf) {
@@ -1408,8 +1420,7 @@ mod tests {
 
     #[test]
     fn v3_turns_the_zeros_that_stood_for_unknown_into_null() {
-        let dir = std::env::temp_dir().join(format!("relais-ledger-v3-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dir = temp_dir("v3");
         let path = dir.join("ledger.sqlite");
         // A v2 ledger, as 0.1.1 wrote it: NOT NULL cost, unknown stored as 0.
         {
@@ -1708,14 +1719,7 @@ mod tests {
 
     #[test]
     fn an_injected_clock_stamps_every_record() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "relais-ledger-clock-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dir = temp_dir("clock");
         let ledger = Ledger::open_with_clock(
             &dir.join("ledger.sqlite"),
             Box::new(FixedClock::new([

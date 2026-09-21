@@ -409,7 +409,17 @@ pub struct Coordinator {
 ///
 /// Returns the listener and the lock, which the winner must keep.
 pub fn elect(socket_path: &Path) -> Result<(Listener, LockFile), CoordinatorError> {
-    let state_dir = socket_path.parent().expect("socket has a parent");
+    // `--socket /` is the only path with no directory to hold it: a
+    // refusal, not a panic, because the path is operator input.
+    let state_dir = socket_path
+        .parent()
+        .ok_or_else(|| CoordinatorError::Connect {
+            socket: socket_path.to_path_buf(),
+            cause: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the socket path names no directory to hold the coordinator's state",
+            ),
+        })?;
     std::fs::create_dir_all(state_dir).map_err(|cause| CoordinatorError::Connect {
         socket: socket_path.to_path_buf(),
         cause,
@@ -487,9 +497,11 @@ impl Coordinator {
             None => Vec::new(),
         };
         let (listener, lock) = elect(socket_path)?;
+        // `elect` above refused a socket path with no parent, so this
+        // one has one; asked again rather than threaded through.
         let lock_path = socket_path
             .parent()
-            .expect("socket has a parent")
+            .unwrap_or_else(|| Path::new("."))
             .join("coordinator.lock");
         let mut state = AdmissionState::new(limits);
         {
@@ -585,6 +597,8 @@ impl Coordinator {
         }
         self.shutdown
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Same: the reconciler is a background thread with no result
+        // to return, and the daemon is going down either way.
         let _ = reconciler.join();
 
         // Only now that nothing is being served does the endpoint go.
@@ -673,7 +687,12 @@ fn reconcile_loop(state: &Mutex<AdmissionState>, shutdown: &std::sync::atomic::A
         let report = {
             let mut state = lock_state(state);
             let report = state.reconcile(now, &process_alive);
-            match idle_step(state.is_idle(), idle_since, now) {
+            let occupancy = if state.is_idle() {
+                Occupancy::Idle
+            } else {
+                Occupancy::Busy
+            };
+            match idle_step(occupancy, idle_since, now) {
                 IdleStep::Busy => idle_since = None,
                 IdleStep::Idle { since } => idle_since = Some(since),
                 IdleStep::Exit => {
@@ -727,11 +746,22 @@ enum IdleStep {
     Exit,
 }
 
-fn idle_step(idle: bool, idle_since: Option<Instant>, now: Instant) -> IdleStep {
-    match (idle, idle_since) {
-        (false, _) => IdleStep::Busy,
-        (true, None) => IdleStep::Idle { since: now },
-        (true, Some(since)) => {
+/// Whether the daemon has anything to serve. A named pair rather than a
+/// `bool` parameter: at the call site `idle_step(true, ..)` said nothing
+/// about which way round it was (`functions.no-flag-arguments`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Occupancy {
+    /// Something is registered, active or queued.
+    Busy,
+    /// Nothing is.
+    Idle,
+}
+
+fn idle_step(occupancy: Occupancy, idle_since: Option<Instant>, now: Instant) -> IdleStep {
+    match (occupancy, idle_since) {
+        (Occupancy::Busy, _) => IdleStep::Busy,
+        (Occupancy::Idle, None) => IdleStep::Idle { since: now },
+        (Occupancy::Idle, Some(since)) => {
             if now.saturating_duration_since(since) >= IDLE_EXIT {
                 IdleStep::Exit
             } else {
@@ -1535,21 +1565,37 @@ pub fn socket_path() -> Result<PathBuf, crate::paths::HomeUnset> {
 /// variable when present; otherwise the parent PID names the tab and
 /// the attribution is labelled as such rather than guessed.
 pub fn session_id() -> String {
-    if let Some(id) = std::env::var_os("RELAIS_SESSION_ID") {
-        let id = id.to_string_lossy().trim().to_string();
-        if !id.is_empty() {
-            return id;
+    resolve_session_id(
+        |name| std::env::var_os(name),
+        crate::procs::parent_pid(),
+        std::process::id(),
+    )
+}
+
+/// The rule behind [`session_id`], with the lookup and the process facts
+/// handed in.
+///
+/// Injected the way `paths::resolve_home` is: read from the ambient
+/// environment, the fallback branch could only be asserted when the
+/// developer's own shell happened not to export either variable, and the
+/// test quietly weakened to `assert!(!id.is_empty())` when it did
+/// (`tests.first-properties`).
+fn resolve_session_id(
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+    parent: Option<u32>,
+    own: u32,
+) -> String {
+    for name in ["RELAIS_SESSION_ID", "CLAUDE_SESSION_ID"] {
+        if let Some(id) = var(name) {
+            let id = id.to_string_lossy().trim().to_string();
+            if !id.is_empty() {
+                return id;
+            }
         }
     }
-    if let Some(id) = std::env::var_os("CLAUDE_SESSION_ID") {
-        let id = id.to_string_lossy().trim().to_string();
-        if !id.is_empty() {
-            return id;
-        }
-    }
-    match crate::procs::parent_pid() {
+    match parent {
         Some(parent) => format!("unattributed-ppid-{parent}"),
-        None => format!("unattributed-pid-{}", std::process::id()),
+        None => format!("unattributed-pid-{own}"),
     }
 }
 
@@ -1637,28 +1683,9 @@ pub fn effective_limits(configured: &ConcurrencyLimits) -> ConcurrencyLimits {
 mod tests {
     use super::*;
     use crate::ids::{DispatchId, Pid, RunId};
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn temp_dir(tag: &str) -> PathBuf {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        // Unix socket paths are short (104 bytes on macOS): /tmp, not the
-        // deep per-user temp dir. Windows has no /tmp and no such limit.
-        let base = if cfg!(unix) {
-            PathBuf::from("/tmp")
-        } else {
-            std::env::temp_dir()
-        };
-        let dir = base.join(format!(
-            "rl-{tag}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        // Pre-cleaned: a directory left by a killed run of this suite
-        // with the same pid would otherwise hand the test a socket or a
-        // lock it did not create.
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        dir
+        crate::test_support::short_temp_dir(tag)
     }
 
     fn limits() -> ConcurrencyLimits {
@@ -2239,20 +2266,26 @@ mod tests {
         // epoch is recent enough that `now - 10min` overflows.
         let t0 = Instant::now();
         let long_after = t0 + IDLE_EXIT * 2;
-        assert_eq!(idle_step(false, None, t0), IdleStep::Busy);
+        assert_eq!(idle_step(Occupancy::Busy, None, t0), IdleStep::Busy);
         assert_eq!(
-            idle_step(false, Some(t0), long_after),
+            idle_step(Occupancy::Busy, Some(t0), long_after),
             IdleStep::Busy,
             "one busy tick forgets how long it was idle before it"
         );
-        assert_eq!(idle_step(true, None, t0), IdleStep::Idle { since: t0 });
+        assert_eq!(
+            idle_step(Occupancy::Idle, None, t0),
+            IdleStep::Idle { since: t0 }
+        );
         let later = t0 + IDLE_EXIT - Duration::from_secs(1);
         assert_eq!(
-            idle_step(true, Some(t0), later),
+            idle_step(Occupancy::Idle, Some(t0), later),
             IdleStep::Idle { since: t0 },
             "the clock runs from the first idle tick, not the latest"
         );
-        assert_eq!(idle_step(true, Some(t0), t0 + IDLE_EXIT), IdleStep::Exit);
+        assert_eq!(
+            idle_step(Occupancy::Idle, Some(t0), t0 + IDLE_EXIT),
+            IdleStep::Exit
+        );
     }
 
     // A1: `SQLITE_BUSY` used to read as "nothing is running", so the
@@ -2324,12 +2357,40 @@ mod tests {
 
     #[test]
     fn session_id_is_env_or_labelled_unattributed() {
-        let id = session_id();
-        assert!(!id.is_empty());
-        if std::env::var_os("RELAIS_SESSION_ID").is_none()
-            && std::env::var_os("CLAUDE_SESSION_ID").is_none()
-        {
-            assert!(id.starts_with("unattributed-ppid-"));
+        let none = |_: &str| None;
+        fn set(
+            name: &'static str,
+            value: &'static str,
+        ) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+            move |asked: &str| (asked == name).then(|| std::ffi::OsString::from(value))
         }
+        // Every branch asserted unconditionally: the developer's own
+        // shell cannot weaken this into `assert!(!id.is_empty())`.
+        assert_eq!(
+            resolve_session_id(set("RELAIS_SESSION_ID", "  sess-1  "), Some(7), 9),
+            "sess-1",
+            "relais's own variable wins, trimmed"
+        );
+        assert_eq!(
+            resolve_session_id(set("CLAUDE_SESSION_ID", "sess-2"), Some(7), 9),
+            "sess-2",
+            "the harness's variable is the fallback"
+        );
+        assert_eq!(
+            resolve_session_id(set("RELAIS_SESSION_ID", "   "), Some(7), 9),
+            "unattributed-ppid-7",
+            "a blank value is no value"
+        );
+        assert_eq!(
+            resolve_session_id(none, Some(7), 9),
+            "unattributed-ppid-7",
+            "no variable: the parent names the tab, labelled as a guess"
+        );
+        assert_eq!(
+            resolve_session_id(none, None, 9),
+            "unattributed-pid-9",
+            "no parent either: this process, still labelled"
+        );
+        assert!(!session_id().is_empty(), "and the ambient call answers");
     }
 }

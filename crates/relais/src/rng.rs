@@ -97,4 +97,40 @@ mod tests {
             assert!(rng.below(10) < 10);
         }
     }
+
+    proptest::proptest! {
+        /// A shuffle rearranges; it never loses, duplicates or invents an
+        /// element. The training order rests on this for every seed, not
+        /// for the three a unit test happens to name.
+        #[test]
+        fn shuffle_is_a_permutation_for_any_seed_and_length(
+            seed in proptest::num::u64::ANY,
+            length in 0usize..64,
+        ) {
+            use proptest::prelude::*;
+            let original: Vec<usize> = (0..length).collect();
+            let mut shuffled = original.clone();
+            SplitMix64::new(seed).shuffle(&mut shuffled);
+            prop_assert_eq!(shuffled.len(), original.len());
+            let mut sorted = shuffled.clone();
+            sorted.sort_unstable();
+            prop_assert_eq!(sorted, original, "same multiset, different order");
+        }
+
+        /// And it is a function of the seed alone: two runs of the same
+        /// seed order the same list the same way, which is what makes a
+        /// training split reproducible.
+        #[test]
+        fn a_seed_orders_the_same_list_the_same_way(
+            seed in proptest::num::u64::ANY,
+            length in 0usize..64,
+        ) {
+            use proptest::prelude::*;
+            let mut first: Vec<usize> = (0..length).collect();
+            let mut second = first.clone();
+            SplitMix64::new(seed).shuffle(&mut first);
+            SplitMix64::new(seed).shuffle(&mut second);
+            prop_assert_eq!(first, second);
+        }
+    }
 }

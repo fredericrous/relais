@@ -121,15 +121,7 @@ mod tests {
     /// file run in parallel threads of one process, and a pid-only name
     /// makes them share a directory (P12).
     fn temp_dir(label: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "relais-{label}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::remove_dir_all(&dir).ok();
-        dir
+        crate::test_support::temp_dir(label)
     }
 
     #[test]

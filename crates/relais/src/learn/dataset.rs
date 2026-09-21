@@ -420,18 +420,7 @@ mod tests {
     /// A thread id is reused the moment a thread ends, which made two
     /// tests in one run share a ledger.
     fn temp_dir(name: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "relais-{name}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        // Best effort: the directory usually does not exist, and if it
-        // cannot be removed `create_dir_all` below reports why.
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        dir
+        crate::test_support::temp_dir(name)
     }
 
     fn example(family: &str, at: &str, accepted: bool) -> TrainingExample {

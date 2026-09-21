@@ -28,6 +28,8 @@ pub mod resume;
 pub mod rng;
 pub mod route;
 pub mod runner;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod tooling;
 pub mod verify;
 pub mod workspace;
