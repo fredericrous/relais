@@ -159,7 +159,7 @@ if ($upgrading) {
     Write-Host ''
     Write-Host '    relais doctor                      # what is installed and what is missing'
     Write-Host '    relais init                        # write relais.toml, then commit it'
-    Write-Host '    relais plan --task task.json       # the route, and the authority hash to trust'
+    Write-Host '    relais plan --task task.json       # the route, and the trust grant to paste'
     Write-Host ''
     Write-Host '  The trust grant and the worker permission allowlist live in'
     Write-Host '  ~\.config\relais\machine.toml - see the README.'

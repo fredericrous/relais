@@ -57,6 +57,103 @@ stopped (`relais coordinator stop`) before the first command of this version.
 
 ### Ledger, policy and contracts
 
+- **BREAKING: a trust grant is bound to the repository, not just to the
+  policy text.** A grant used to be keyed by the hash of `relais.toml`
+  alone, so any other repository whose policy hashed the same — and the
+  policy `relais init` writes is public and identical everywhere — ran
+  its verification commands under a grant nobody had reviewed for it. The
+  key is now a hash of the pair (authority hash, repository), where the
+  repository is its canonical root path plus its `origin` remote URL when
+  git reports one. Every existing `[trust."…"]` block stops matching and
+  must be re-issued: `relais plan` prints the block to review and paste,
+  including a new optional `repo = "…"` field that says which repository
+  the grant is for, and `relais doctor` now has a `trust` line saying
+  whether this repository is granted and what the other grants on the
+  machine are for.
+- **BREAKING: a trust grant must name its reviewer.** `reviewed_by` was
+  optional and never read, so a grant nobody had signed counted as
+  reviewed. It is required, and `granted_at` is parsed at the boundary
+  (RFC3339, or a plain `YYYY-MM-DD`) rather than stored as whatever text
+  was there; an invalid grant is a named error from `run`, `plan` and
+  `doctor` instead of a valid-looking one.
+- **The deny floor is a floor.** The permissions documentation promised
+  that a worker cannot commit, merge, push or publish whatever else is
+  configured. `disallowed_tools = []` in `machine.toml` quietly replaced
+  that list with nothing. The shipped denials are now merged into
+  whatever the machine adds, so naming `disallowed_tools` can only widen
+  the deny list, never shorten it.
+- **The authority hash covers the whole policy by construction.** It
+  enumerated its fields by hand, so a new `relais.toml` control was
+  executable authority outside the hash and a grant reviewed before it
+  survived. It is now taken over the serialized policy minus an explicit
+  exclusion list (the schema version), with a test asserting exactly
+  that.
+- **A migration is all-or-nothing, and two first runs no longer race.**
+  Each schema step ran as loose statements with no transaction: a crash
+  in the middle of the v3 rebuild left a half-built table that made every
+  later `relais` command fail with "table already exists", and two
+  processes opening a fresh ledger could both decide a step was
+  unapplied. Each step is now one immediate transaction covering its DDL
+  and the row that records it, re-checked inside the lock.
+- **Two relais processes can open the ledger at the same moment.**
+  `PRAGMA journal_mode = WAL` takes a lock SQLite refuses without
+  consulting the busy handler, and it ran before the busy timeout was
+  even set, so one of two simultaneous openers died with "database is
+  locked" before reading a row — the coordinator starting alongside a
+  run is exactly that case. The timeout is set first and the mode change
+  is retried against the mode actually in force.
+- **A transition and the run status it implies are one write.** They were
+  two; a process killed between them left a run whose history said
+  `accepted` while its status still said `verifying`, and `relais resume`
+  then overwrote the accepted run as `interrupted`.
+- **A declared write scope is validated where the contract is read.** The
+  globs were kept as plain strings and compiled only after a worker had
+  run and been paid for, so a mistyped pattern surfaced as a git error at
+  the end of an attempt. A scope is now compiled at parse time, and an
+  absolute pattern, a `..` segment or a glob that will not compile is a
+  contract error naming the pattern. A contract also carries its kind and
+  its scope as one value, so an `inspect` with a write scope and a
+  `change` without one cannot be built at all.
+- **Spending ceilings are money, and the arithmetic saturates.** They
+  were raw integers, unvalidated, and the per-package budget was computed
+  as `ceiling - spent`, which near the extremes wraps into a number that
+  reads as an unlimited budget. Ceilings are parsed into checked amounts,
+  a negative one is refused by name, and every remaining-budget
+  subtraction saturates at zero.
+- **Ledger rows leave the adapter as values.** The stored contract came
+  back as raw JSON with an unparseable one silently becoming an empty
+  objective, a run's packages came back as untyped status strings, and
+  live dispatches as three-element tuples with a bare integer pid. They
+  are now a parsed `TaskContract` and tier, a typed child-run record, and
+  a dispatch record with real identifiers — and a row this version cannot
+  read is reported as corrupt rather than quietly dropped. `relais
+  dataset build` now says which runs it could not read instead of leaving
+  them out in silence.
+- **Identifiers take their inputs.** Run and dispatch ids read the wall
+  clock, the process id and a process-global counter from wherever they
+  were called, and a clock before 1970 aborted the process. They are
+  minted from a source built once at start-up, and a clock that far wrong
+  is a reported error. The id format is unchanged.
+- **A malformed `machine.toml` stops the coordinator instead of becoming
+  the defaults.** `relais coordinator daemon` read the file best-effort
+  and fell back to default concurrency limits — which are wider than any
+  file would state — when it would not parse. An absent file still means
+  defaults; an unreadable or invalid one is now an error.
+- **A stored state or reason this version does not know says so.**
+  `State::parse` and `Reason::parse` return an error naming what was read
+  and what was found, rather than an empty option a caller can mistake
+  for "nothing recorded".
+- **An inclusive cost total covers its whole subtree.** The
+  double-counting guard looked one generation up, so a grandchild of a
+  provider total that already included it was added again. It now walks
+  the ancestor chain, in `relais report` and in the daily ceiling alike.
+- **A replaced contract revision is recorded as replaced.** The
+  `superseded_by` column existed and nothing ever wrote it; a new
+  revision now closes the ones it supersedes in the same transaction that
+  records it. `changed_controls` also counts a changed decomposition as a
+  scope change — a work plan partitions the declared scope, so replacing
+  it changes what may be written and by whom.
+
 ### Runner
 
 ### Adapter, verification and workspace

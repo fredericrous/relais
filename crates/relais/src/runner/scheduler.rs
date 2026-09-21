@@ -25,7 +25,6 @@ use crate::backend::LaunchSpec;
 use crate::context::ContextManifest;
 use crate::contract::{Decomposition, DecompositionMode, Kind, TaskContract, WorkPlan};
 use crate::contract::{Review, WorkPackage};
-use crate::ids::DispatchId;
 use crate::ledger::UsageEvent;
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::policy::{BlockCode, EffectiveAuthority, MachineSettings, Tier};
@@ -76,9 +75,7 @@ pub fn check_plan(
         Err(e) => return vec![e.to_string()],
     };
     let root_scope: Vec<&str> = contract
-        .write_scope
-        .as_deref()
-        .unwrap_or_default()
+        .scope_patterns()
         .iter()
         .map(String::as_str)
         .collect();
@@ -188,7 +185,7 @@ pub(crate) fn run_decomposed(
     decomposition: &Decomposition,
 ) -> Result<Decomposed, RunError> {
     let contract = engine.config.contract;
-    if contract.kind != Kind::Change {
+    if contract.kind() != Kind::Change {
         return Ok(Decomposed::Outcome(engine.fail_preflight(
             BlockCode::DecompositionKind,
             "only kind=change can be decomposed".into(),
@@ -327,11 +324,16 @@ pub(crate) fn run_decomposed(
         // their processes; a holder here is a straggler, and the
         // integrated candidate is not verified over it.
         let mut relevant = vec![integration.path.clone()];
-        for (child_run, package_id, _) in engine.config.ledger.child_runs(&engine.run_id)? {
+        for child in engine.config.ledger.child_runs(&engine.run_id)? {
             relevant.push(
-                crate::runner::worktree_root(&engine.artifacts.join("packages").join(&package_id))
-                    .join(&child_run)
-                    .join("task"),
+                crate::runner::worktree_root(
+                    &engine
+                        .artifacts
+                        .join("packages")
+                        .join(child.package.as_str()),
+                )
+                .join(child.run.as_str())
+                .join("task"),
             );
         }
         for path in &relevant {
@@ -415,7 +417,7 @@ pub(crate) fn run_decomposed(
                  change pass without changing what the packages delivered",
                 failures.join(", ")
             ),
-            write_scope: contract.write_scope.clone().unwrap_or_default(),
+            write_scope: contract.scope_patterns().to_vec(),
             depends_on: plan.packages.iter().map(|p| p.id.clone()).collect(),
             acceptance: plan.integration_acceptance.clone(),
         };
@@ -490,26 +492,29 @@ fn run_package(
         ));
     }
     let spent = ledger.run_cost(&engine.run_id)?;
+    // Saturating money arithmetic, not `ceiling - spent` on raw
+    // integers: a remainder that wrapped would read as a budget nothing
+    // bounds (P7).
     let remaining_budget = engine
         .config
         .machine
         .spending
         .per_run_micros
-        .map(|ceiling| ceiling - spent.to_micros());
+        .map(|ceiling| ceiling.remaining_after(spent));
     if let Some(ceiling) = engine.config.machine.spending.per_run_micros {
-        if remaining_budget.is_some_and(|remaining| remaining <= 0) {
+        if remaining_budget.is_some_and(|remaining| remaining == MicroUsd::ZERO) {
             return Ok(PackageEnd::Stop(engine.stop(
                 &budget,
                 Observation::LimitReached(Limit::Spend {
                     spent: spent.to_string(),
-                    ceiling: MicroUsd::from_micros(ceiling).to_string(),
+                    ceiling: ceiling.to_string(),
                 }),
             )?));
         }
     }
     let mut dispatched: u32 = ledger.dispatch_count(&engine.run_id)?;
-    for (run_id, _, _) in ledger.child_runs(&engine.run_id)? {
-        dispatched += ledger.dispatch_count(&run_id)?;
+    for child in ledger.child_runs(&engine.run_id)? {
+        dispatched += ledger.dispatch_count(&child.run)?;
     }
     let remaining_agents = root.authority.max_agents_total.saturating_sub(dispatched);
     if remaining_agents == 0 {
@@ -534,13 +539,19 @@ fn run_package(
     // to the child's objective, and `build_prompt` quotes it as data.
     let child_contract = TaskContract {
         schema_version: contract.schema_version,
-        kind: Kind::Change,
+        // Through the constructor: the package scope is compiled and
+        // judged here, before a worker is launched against it (P5).
+        task: crate::contract::Task::change(package.write_scope.clone()).map_err(|e| {
+            RunError::Other(format!(
+                "work package `{}` declares a scope that cannot bound anything: {e}",
+                package.id
+            ))
+        })?,
         objective: format!(
             "{}\n\n(work package `{}` of: {})",
             package.objective, package.id, contract.objective
         ),
         base_ref: input_sha.to_string(),
-        write_scope: Some(package.write_scope.clone()),
         read_hints: contract.read_hints.clone(),
         acceptance: package.acceptance.clone(),
         verification_profile: contract.verification_profile.clone(),
@@ -562,6 +573,7 @@ fn run_package(
             .map_or(remaining_agents, |cap| cap.min(remaining_agents)),
     );
     let child_config = RunConfig {
+        ids: engine.config.ids,
         repo_dir: engine.config.repo_dir,
         contract: &child_contract,
         repo_policy: engine.config.repo_policy,
@@ -587,8 +599,12 @@ fn run_package(
         Reason::PackageStarted,
         serde_json::json!({ "package": package.id, "wave": wave, "input": input_sha }),
     )?;
-    let outcome = execute_child(&child_config, &engine.run_id, &package.id);
-    let child_run = outcome.run_id().to_string();
+    let outcome = execute_child(
+        &child_config,
+        &engine.run_id,
+        &crate::ids::PackageId::from_stored(package.id.clone()),
+    )?;
+    let child_run = outcome.run_id.clone();
     *attempts_total += ledger.attempt_count(&child_run)? as u32;
     for model in ledger.models_used(&child_run)? {
         if !models_used.contains(&model) {
@@ -804,7 +820,7 @@ fn accept_integrated(
         baseline_cache_refused: root.baseline_cache_refused.clone(),
     };
     let receipt = Receipt {
-        run_id: engine.run_id.clone(),
+        run_id: engine.run_id.as_str().to_string(),
         candidate_sha: head.to_string(),
         base_sha: root.base_sha.to_string(),
         contract_hash: root.contract_hash.to_string(),
@@ -861,24 +877,21 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
     // project text, not instructions to the planner (SPEC §16): each one
     // is quoted inside its own labelled fence.
     prompt.push_str(&data_block("objective", &contract.objective));
-    prompt.push_str(&format!(
-        "write_scope: {:?}\n",
-        contract.write_scope.as_deref().unwrap_or_default()
-    ));
+    prompt.push_str(&format!("write_scope: {:?}\n", contract.scope_patterns()));
     prompt.push_str(&data_list_block("acceptance", &contract.acceptance));
     if !root.manifest.constraints.is_empty() {
         prompt.push_str(&data_list_block("constraints", &root.manifest.constraints));
     }
-    let dispatch_id = DispatchId::generate();
-    let spent = engine.config.ledger.run_cost(&engine.run_id)?.to_micros();
+    let dispatch_id = engine.config.ids.dispatch_id()?;
+    let spent = engine.config.ledger.run_cost(&engine.run_id)?;
     let remaining_budget = engine
         .config
         .machine
         .spending
         .per_run_micros
-        .map(|ceiling| (ceiling - spent).max(0));
+        .map(|ceiling| ceiling.remaining_after(spent).to_micros());
     engine.config.ledger.record_dispatch_intent(
-        dispatch_id.as_str(),
+        &dispatch_id,
         &engine.run_id,
         None,
         &serde_json::json!({
@@ -935,14 +948,14 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
             engine
                 .config
                 .ledger
-                .finish_dispatch(dispatch_id.as_str(), "launch_failed")?;
+                .finish_dispatch(&dispatch_id, "launch_failed")?;
             return Ok(Proposal::Failed(outcome));
         }
     };
     engine
         .config
         .ledger
-        .finish_dispatch(dispatch_id.as_str(), "completed")?;
+        .finish_dispatch(&dispatch_id, "completed")?;
     // Planning overhead is the run's cost (SPEC §19).
     engine.config.ledger.record_usage(&UsageEvent {
         event_id: dispatch_id.as_str().to_string(),

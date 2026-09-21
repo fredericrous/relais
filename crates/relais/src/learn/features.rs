@@ -57,22 +57,18 @@ pub const TIER_COUNT: usize = 3;
 
 impl TaskFeatures {
     pub fn extract(contract: &TaskContract, repo: &RepoPolicy) -> Self {
-        let scope_patterns = contract
-            .write_scope
-            .as_deref()
-            .is_some_and(|s| !s.is_empty()) as u64 as f64;
+        let scope_patterns = !contract.scope_patterns().is_empty() as u64 as f64;
         let scope_wildcards = contract
-            .write_scope
-            .as_deref()
-            .map(|patterns| patterns.iter().any(|pattern| pattern.contains('*')) as u64 as f64)
-            .unwrap_or(0.0);
+            .scope_patterns()
+            .iter()
+            .any(|pattern| pattern.contains('*')) as u64 as f64;
         let profile = repo
             .verification
             .profiles
             .get(&contract.verification_profile);
         TaskFeatures {
-            kind_change: (contract.kind == Kind::Change) as u64 as f64,
-            kind_inspect: (contract.kind == Kind::Inspect) as u64 as f64,
+            kind_change: (contract.kind() == Kind::Change) as u64 as f64,
+            kind_inspect: (contract.kind() == Kind::Inspect) as u64 as f64,
             scope_patterns,
             scope_wildcards,
             read_hints: contract.read_hints.len().min(16) as f64,

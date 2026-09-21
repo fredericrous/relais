@@ -74,7 +74,7 @@ milliseconds.
 
 ```sh
 cd the-repo && relais init          # writes relais.toml; edit models + profile, commit it
-relais plan --task task.json        # prints the authority hash; blocked until trusted
+relais plan --task task.json        # prints the grant block to paste; blocked until trusted
 ```
 
 Every command finds `relais.toml` upward from the cwd to the repository
@@ -82,11 +82,16 @@ root, so a subdirectory (or a task worktree, which carries its own copy)
 works; a directory outside any repository is refused by name.
 
 Machine-owned settings live in `~/.config/relais/machine.toml` and are
-never written by a run. The trust grant is keyed by the authority hash
-`plan` printed; editing `relais.toml` changes the hash and voids the
-grant. A print-mode worker cannot ask for permission, so the tools it may
-use are an explicit machine-owned allowlist — nothing is granted
-implicitly, and no permission-mode flag is ever passed:
+never written by a run. A trust grant is keyed by the PAIR of the
+repository's authority hash and the repository itself (its canonical root
+and, when git reports one, its `origin` URL), so editing `relais.toml`
+voids the grant and the same declaration in another repository needs its
+own review. `relais plan` prints the exact block to paste. A print-mode
+worker cannot ask for permission, so the tools it may use are an explicit
+machine-owned allowlist — nothing is granted implicitly, and no
+permission-mode flag is ever passed. `disallowed_tools` here only ADDS to
+the shipped deny floor (commit, merge, push, rebase, reset, tag and the
+wrappers around them); it cannot shorten it:
 
 ```toml
 schema_version = 1
@@ -97,9 +102,10 @@ per_run_micros = 3000000            # $3 per run, best effort (SPEC §11)
 [permissions]
 allowed_tools = ["Edit", "Write", "Bash(cargo test:*)", "Bash(make test:*)"]
 
-[trust."<authority hash from relais plan>"]
-granted_at = "2026-09-20T00:00:00Z"
-reviewed_by = "you"
+[trust."<grant key from relais plan>"]
+granted_at = "2026-09-20T00:00:00Z"   # RFC3339, or a plain 2026-09-20
+reviewed_by = "you"                   # required
+repo = "git@github.com:me/the-repo.git"   # what plan filled in, for readers
 ```
 
 Then `relais run --task task.json`. A worker refused a tool ends the run

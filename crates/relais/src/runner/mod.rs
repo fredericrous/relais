@@ -28,7 +28,7 @@ use crate::admission::{Decision, DispatchRequest, Gate, Refusal, ResourceClass, 
 use crate::backend::{Backend, LaunchResult, LaunchSpec};
 use crate::context::{self, ContextError, ContextManifest};
 use crate::contract::{Review, TaskContract};
-use crate::ids::{DispatchId, RunId};
+use crate::ids::{DispatchId, PackageId, Pid, RunId};
 use crate::ledger::{Ledger, LedgerError, Transition, UsageEvent};
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::policy::{
@@ -54,13 +54,13 @@ pub use crate::lifecycle::{Reason, State};
 /// CLI can point at the ledger and artifacts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunOutcome {
-    pub run_id: String,
+    pub run_id: RunId,
     pub terminal: Terminal,
 }
 
 impl RunOutcome {
     pub fn run_id(&self) -> &str {
-        &self.run_id
+        self.run_id.as_str()
     }
 
     pub fn state(&self) -> State {
@@ -81,6 +81,8 @@ pub enum RunError {
     /// The verification plan itself could not be carried out: a pattern
     /// that will not compile, a command with no time to run in.
     Verify(verify::VerifyError),
+    /// No identifier could be minted for a run or a dispatch.
+    Id(crate::ids::IdError),
     Other(String),
 }
 
@@ -91,6 +93,7 @@ impl std::fmt::Display for RunError {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Workspace(e) => write!(f, "workspace: {e}"),
             Self::Verify(e) => write!(f, "verification: {e}"),
+            Self::Id(e) => write!(f, "{e}"),
             Self::Other(detail) => f.write_str(detail),
         }
     }
@@ -122,12 +125,21 @@ impl From<WorkspaceError> for RunError {
     }
 }
 
+impl From<crate::ids::IdError> for RunError {
+    fn from(e: crate::ids::IdError) -> Self {
+        Self::Id(e)
+    }
+}
+
 pub struct RunConfig<'a> {
     pub repo_dir: &'a Path,
     pub contract: &'a TaskContract,
     pub repo_policy: &'a RepoPolicy,
     pub machine: &'a MachineSettings,
     pub ledger: &'a Ledger,
+    /// Where run and dispatch identifiers come from (clock, process id,
+    /// sequence), built once at a boundary and passed in.
+    pub ids: &'a crate::ids::IdSource,
     pub backend: &'a dyn Backend,
     /// Git, as a port: every repository fact a run reads goes through
     /// it, so a test supplies one and production supplies
@@ -188,21 +200,21 @@ fn state_sibling(artifacts_dir: &Path, name: &str) -> PathBuf {
 
 /// The supervised execution path (SPEC §3): preflight, route, then a
 /// bounded sequence of attempts the runner — not a model — owns.
-pub fn execute(config: &RunConfig<'_>) -> RunOutcome {
-    finished(config, RunEngine::new(config, None).run())
+pub fn execute(config: &RunConfig<'_>) -> Result<RunOutcome, RunError> {
+    Ok(finished(config, RunEngine::new(config, None)?.run()))
 }
 
 /// A work package's run (SPEC §19): the same lifecycle, attributed to
 /// its root run in the ledger.
-pub fn execute_child(config: &RunConfig<'_>, parent_run: &str, package_id: &str) -> RunOutcome {
-    finished(
+pub fn execute_child(
+    config: &RunConfig<'_>,
+    parent_run: &RunId,
+    package_id: &PackageId,
+) -> Result<RunOutcome, RunError> {
+    Ok(finished(
         config,
-        RunEngine::new(
-            config,
-            Some((parent_run.to_string(), package_id.to_string())),
-        )
-        .run(),
-    )
+        RunEngine::new(config, Some((parent_run.clone(), package_id.clone())))?.run(),
+    ))
 }
 
 /// Tell the coordinator the run is over, whatever its end: a registered
@@ -222,7 +234,7 @@ pub(crate) type Launched = Result<LaunchResult, RunOutcome>;
 
 pub(crate) struct RunEngine<'a> {
     pub(crate) config: &'a RunConfig<'a>,
-    pub(crate) run_id: String,
+    pub(crate) run_id: RunId,
     pub(crate) artifacts: PathBuf,
     /// This run's worktrees, outside the artifact directory (B6): the
     /// task worktree the worker gets, or the scheduler's integration
@@ -232,7 +244,7 @@ pub(crate) struct RunEngine<'a> {
     /// This run's throwaway verification worktrees.
     pub(crate) verify_dir: PathBuf,
     pub(crate) state: State,
-    parent: Option<(String, String)>,
+    parent: Option<(RunId, PackageId)>,
     /// `<backend> <version>` as probed at run start; unknown = `None`.
     pub(crate) harness: Option<String>,
 }
@@ -249,21 +261,24 @@ struct Progress {
 }
 
 impl<'a> RunEngine<'a> {
-    fn new(config: &'a RunConfig<'a>, parent: Option<(String, String)>) -> Self {
-        let run_id = RunId::generate();
+    fn new(
+        config: &'a RunConfig<'a>,
+        parent: Option<(RunId, PackageId)>,
+    ) -> Result<Self, RunError> {
+        let run_id = config.ids.run_id()?;
         let artifacts = config.artifacts_dir.join(run_id.as_str());
         let worktrees = worktree_root(&config.artifacts_dir).join(run_id.as_str());
         let verify_dir = verify_root(&config.artifacts_dir).join(run_id.as_str());
-        Self {
+        Ok(Self {
             config,
-            run_id: run_id.to_string(),
+            run_id,
             artifacts,
             worktrees,
             verify_dir,
             state: State::Prepared,
             parent,
             harness: None,
-        }
+        })
     }
 
     /// Record a transition. The ledger is the record; a transition it
@@ -363,7 +378,7 @@ impl<'a> RunEngine<'a> {
         // exists (SPEC §12): a runner crash from here on leaves a live
         // dispatch for `resume` to reconcile, never a silent gap.
         self.config.ledger.attach_dispatch_process(
-            &spec.dispatch_id,
+            &DispatchId::from_stored(spec.dispatch_id.clone()),
             None,
             Some(&self.config.session_id),
         )?;
@@ -379,7 +394,7 @@ impl<'a> RunEngine<'a> {
         };
         let request = DispatchRequest {
             dispatch_id: spec.dispatch_id.clone(),
-            run_id: self.run_id.clone(),
+            run_id: self.run_id.as_str().to_string(),
             session_id: self.config.session_id.clone(),
             parent_dispatch: parent.map(str::to_string),
             depth,
@@ -509,8 +524,8 @@ impl<'a> RunEngine<'a> {
                         let _ = gate.bind(&dispatch_id, None, Some(pid));
                         if let Ok(ledger) = Ledger::open(&ledger_path) {
                             let _ = ledger.attach_dispatch_process(
-                                &dispatch_id,
-                                Some(pid),
+                                &DispatchId::from_stored(dispatch_id.clone()),
+                                Some(Pid::new(pid)),
                                 Some(&session_id),
                             );
                         }
@@ -652,10 +667,15 @@ impl<'a> RunEngine<'a> {
 
         // Effective authority is the intersection; blockers stop dispatch
         // (SPEC §5, §6).
+        // The repository a trust grant must have been reviewed for
+        // (P2), resolved here because this is where the run meets the
+        // disk; `policy` decides from the value and looks at nothing.
+        let repo_identity = crate::repo::identity(self.config.repo_dir);
         let authority = effective_authority(
             self.config.repo_policy,
             self.config.machine,
             self.config.contract,
+            &repo_identity,
         );
         if let Some(first) = authority.blockers.first() {
             return self.fail_preflight(first.code, first.detail.clone());
@@ -674,9 +694,14 @@ impl<'a> RunEngine<'a> {
         // before any dispatch; children can only narrow them (SPEC §23).
         if let Some(gate) = self.config.gate {
             let registration = RunRegistration {
-                run_id: self.run_id.clone(),
+                run_id: self.run_id.as_str().to_string(),
                 session_id: self.config.session_id.clone(),
-                budget_micros: self.config.machine.spending.per_run_micros,
+                budget_micros: self
+                    .config
+                    .machine
+                    .spending
+                    .per_run_micros
+                    .map(MicroUsd::to_micros),
                 max_agents: Some(authority.max_agents_total),
                 max_depth: Some(authority.max_agent_depth),
             };
@@ -987,7 +1012,7 @@ impl<'a> RunEngine<'a> {
                 );
             }
             if let Some(ceiling) = self.config.machine.spending.per_run_micros {
-                if progress.total_cost.to_micros() >= ceiling {
+                if progress.total_cost >= ceiling {
                     return self.stop(
                         &progress.budget,
                         Observation::LimitReached(spend_limit(
@@ -1005,7 +1030,7 @@ impl<'a> RunEngine<'a> {
             // again would count it twice.
             if let Some(ceiling) = self.config.machine.spending.per_day_micros {
                 let today = self.spent_today(ledger)?;
-                if today.to_micros() >= ceiling {
+                if today >= ceiling {
                     return self.stop(
                         &progress.budget,
                         Observation::LimitReached(spend_limit(today, ceiling, Ceiling::PerDay)),
@@ -1036,9 +1061,9 @@ impl<'a> RunEngine<'a> {
 
             // Dispatch intent is persisted BEFORE the process exists
             // (SPEC §12), keyed so retries cannot duplicate agents.
-            let dispatch_id = DispatchId::generate();
+            let dispatch_id = self.config.ids.dispatch_id()?;
             ledger.record_dispatch_intent(
-                dispatch_id.as_str(),
+                &dispatch_id,
                 &self.run_id,
                 Some(attempt_id),
                 &serde_json::json!({
@@ -1052,7 +1077,7 @@ impl<'a> RunEngine<'a> {
                 0,
             )?;
             ledger.record_features(
-                dispatch_id.as_str(),
+                &dispatch_id,
                 &serde_json::json!({
                     "attempt_index": attempt_index,
                     "tier": tier.as_str(),
@@ -1066,12 +1091,14 @@ impl<'a> RunEngine<'a> {
                 .max(Duration::from_secs(1));
             // What this attempt may still spend, not the whole ceiling
             // again: the budget is the run's, not the attempt's.
+            // Saturating: a wrapped remainder would read as a budget
+            // nothing bounds (P7).
             let remaining_budget = self
                 .config
                 .machine
                 .spending
                 .per_run_micros
-                .map(|ceiling| (ceiling - progress.total_cost.to_micros()).max(0));
+                .map(|ceiling| ceiling.remaining_after(progress.total_cost).to_micros());
             let spec = LaunchSpec {
                 dispatch_id: dispatch_id.as_str().to_string(),
                 prompt,
@@ -1099,12 +1126,12 @@ impl<'a> RunEngine<'a> {
             )? {
                 Ok(result) => result,
                 Err(outcome) => {
-                    ledger.finish_dispatch(dispatch_id.as_str(), "launch_failed")?;
+                    ledger.finish_dispatch(&dispatch_id, "launch_failed")?;
                     ledger.finish_attempt(attempt_id, outcome.state(), None, None)?;
                     return Ok(outcome);
                 }
             };
-            ledger.finish_dispatch(dispatch_id.as_str(), "completed")?;
+            ledger.finish_dispatch(&dispatch_id, "completed")?;
 
             // Usage is recorded even when the attempt went nowhere: all
             // recorded cost, failed runs included (SPEC §11).
@@ -1276,7 +1303,7 @@ impl<'a> RunEngine<'a> {
             // released below.
             let candidate_ref = workspace::name_candidate(
                 self.config.repo_dir,
-                &self.run_id,
+                self.run_id.as_str(),
                 attempt_index,
                 &candidate_sha,
             )
@@ -1454,7 +1481,7 @@ impl<'a> RunEngine<'a> {
             // A change task whose candidate changes nothing has not met
             // its objective, whatever the baseline says: a behavioural
             // failure the worker can repair, never an acceptance.
-            if identical && self.config.contract.kind == crate::contract::Kind::Change {
+            if identical && self.config.contract.kind() == crate::contract::Kind::Change {
                 failures.push("empty_candidate".into());
             }
 
@@ -1546,7 +1573,7 @@ impl<'a> RunEngine<'a> {
                 baseline_cache_refused: baseline_cache_refused.clone(),
             };
             let receipt = Receipt {
-                run_id: self.run_id.clone(),
+                run_id: self.run_id.as_str().to_string(),
                 candidate_sha: candidate_sha.clone(),
                 base_sha,
                 contract_hash,
@@ -1587,7 +1614,7 @@ impl<'a> RunEngine<'a> {
     pub(crate) fn review_spend_blocked(&self, total_cost: MicroUsd) -> Option<String> {
         let spending = &self.config.machine.spending;
         if let Some(ceiling) = spending.per_run_micros {
-            if total_cost.to_micros() >= ceiling {
+            if total_cost >= ceiling {
                 let (spent, ceiling) = Ceiling::PerRun.render(total_cost, ceiling);
                 return Some(format!(
                     "the spend ceiling was reached before the review could be dispatched \
@@ -1600,7 +1627,7 @@ impl<'a> RunEngine<'a> {
                 Ok(today) => today,
                 Err(e) => return Some(format!("the day's spend could not be read: {e}")),
             };
-            if today.to_micros() >= ceiling {
+            if today >= ceiling {
                 let (spent, ceiling) = Ceiling::PerDay.render(today, ceiling);
                 return Some(format!(
                     "the spend ceiling was reached before the review could be dispatched \
@@ -2046,13 +2073,18 @@ impl<'a> RunEngine<'a> {
         let review_dir = self.review_dir();
         prompt.push_str(&format!("source to inspect: {}\n", review_dir.display()));
 
-        let dispatch_id = DispatchId::generate();
+        // A reviewer the runner cannot even name is a reviewer it
+        // cannot dispatch: `Unavailable`, never a silent acceptance.
+        let dispatch_id = match self.config.ids.dispatch_id() {
+            Ok(id) => id,
+            Err(e) => return ReviewOutcome::Unavailable(e.to_string()),
+        };
         let remaining_budget = self
             .config
             .machine
             .spending
             .per_run_micros
-            .map(|ceiling| (ceiling - total_cost.to_micros()).max(0));
+            .map(|ceiling| ceiling.remaining_after(*total_cost).to_micros());
         let spec = LaunchSpec {
             dispatch_id: dispatch_id.as_str().to_string(),
             prompt,
@@ -2072,7 +2104,7 @@ impl<'a> RunEngine<'a> {
             pid_slot: None,
         };
         let recorded = self.config.ledger.record_dispatch_intent(
-            dispatch_id.as_str(),
+            &dispatch_id,
             &self.run_id,
             None,
             &serde_json::json!({
@@ -2115,7 +2147,7 @@ impl<'a> RunEngine<'a> {
                 let _ = self
                     .config
                     .ledger
-                    .finish_dispatch(dispatch_id.as_str(), "launch_failed");
+                    .finish_dispatch(&dispatch_id, "launch_failed");
                 return ReviewOutcome::Unavailable(format!(
                     "reviewer dispatch ended {}: {}",
                     outcome.state(),
@@ -2129,7 +2161,7 @@ impl<'a> RunEngine<'a> {
         if let Err(e) = self
             .config
             .ledger
-            .finish_dispatch(dispatch_id.as_str(), "completed")
+            .finish_dispatch(&dispatch_id, "completed")
         {
             return ReviewOutcome::Unavailable(format!(
                 "the ledger refused the review record: {e}"
@@ -2258,8 +2290,7 @@ pub(crate) enum Ceiling {
 }
 
 impl Ceiling {
-    fn render(self, spent: MicroUsd, ceiling_micros: i64) -> (String, String) {
-        let ceiling = MicroUsd::from_micros(ceiling_micros);
+    fn render(self, spent: MicroUsd, ceiling: MicroUsd) -> (String, String) {
         match self {
             Self::PerRun => (spent.to_string(), format!("{ceiling} per run")),
             Self::PerDay => (format!("{spent} today"), format!("{ceiling} per day")),
@@ -2267,8 +2298,8 @@ impl Ceiling {
     }
 }
 
-pub(crate) fn spend_limit(spent: MicroUsd, ceiling_micros: i64, which: Ceiling) -> Limit {
-    let (spent, ceiling) = which.render(spent, ceiling_micros);
+pub(crate) fn spend_limit(spent: MicroUsd, ceiling: MicroUsd, which: Ceiling) -> Limit {
+    let (spent, ceiling) = which.render(spent, ceiling);
     Limit::Spend { spent, ceiling }
 }
 
@@ -2335,7 +2366,8 @@ fn build_prompt(
             &manifest.constraints,
         ));
     }
-    if let Some(scope) = contract.write_scope.as_deref() {
+    let scope = contract.scope_patterns();
+    if !scope.is_empty() {
         prompt.push_str(&format!(
             "write scope (stay within): {}\n",
             scope.join(", ")
@@ -2408,6 +2440,10 @@ mod tests {
         repo: PathBuf,
         artifacts: PathBuf,
         ledger: Ledger,
+        /// The identifiers this fixture's runs mint: the real clock and
+        /// this process, one source per fixture so two fixtures never
+        /// share a sequence.
+        ids: crate::ids::IdSource,
     }
 
     impl Fixture {
@@ -2449,17 +2485,20 @@ mod tests {
                 repo,
                 artifacts,
                 ledger,
+                ids: crate::ids::IdSource::of_this_process(),
             }
         }
 
         /// The run's task worktree — a sibling of the artifact tree, not
         /// a child of it (audit B6).
-        fn worktree(&self, run_id: &str) -> PathBuf {
-            worktree_root(&self.artifacts).join(run_id).join("task")
+        fn worktree(&self, run_id: &RunId) -> PathBuf {
+            worktree_root(&self.artifacts)
+                .join(run_id.as_str())
+                .join("task")
         }
 
-        fn verify_dir(&self, run_id: &str) -> PathBuf {
-            verify_root(&self.artifacts).join(run_id)
+        fn verify_dir(&self, run_id: &RunId) -> PathBuf {
+            verify_root(&self.artifacts).join(run_id.as_str())
         }
 
         fn contract(&self, review: Review) -> TaskContract {
@@ -2552,11 +2591,15 @@ mod tests {
         fn machine_for(&self, repo: &RepoPolicy) -> MachineSettings {
             let mut trust = BTreeMap::new();
             trust.insert(
-                repo.authority_hash(),
+                crate::policy::grant_key(
+                    &repo.authority_hash(),
+                    &crate::repo::identity(&self.repo),
+                ),
                 crate::policy::TrustGrant {
                     granted_at: "2026-09-18".into(),
-                    reviewed_by: None,
+                    reviewed_by: "the test".into(),
                     note: None,
+                    repo: None,
                 },
             );
             MachineSettings {
@@ -2589,6 +2632,7 @@ mod tests {
                 repo_policy: repo,
                 machine: &machine,
                 ledger: &self.ledger,
+                ids: &self.ids,
                 backend,
                 git: &crate::workspace::SystemGit,
                 hooks: &crate::verify::FixedInventory(None),
@@ -2600,6 +2644,7 @@ mod tests {
                 session_id: "test-session".into(),
                 heartbeat_every: Duration::from_millis(50),
             })
+            .expect("the fixture's id source mints identifiers")
         }
 
         fn execute_with_machine(
@@ -2620,6 +2665,7 @@ mod tests {
                 repo_policy: repo,
                 machine,
                 ledger: &self.ledger,
+                ids: &self.ids,
                 backend,
                 git: &crate::workspace::SystemGit,
                 hooks: &crate::verify::FixedInventory(None),
@@ -2631,6 +2677,7 @@ mod tests {
                 session_id: "test-session".into(),
                 heartbeat_every: Duration::from_millis(50),
             })
+            .expect("the fixture's id source mints identifiers")
         }
 
         fn execute_managed(
@@ -2652,6 +2699,7 @@ mod tests {
                 repo_policy: repo,
                 machine,
                 ledger: &self.ledger,
+                ids: &self.ids,
                 backend,
                 git: &crate::workspace::SystemGit,
                 hooks: &crate::verify::FixedInventory(None),
@@ -2663,6 +2711,7 @@ mod tests {
                 session_id: "test-session".into(),
                 heartbeat_every: Duration::from_millis(50),
             })
+            .expect("the fixture's id source mints identifiers")
         }
     }
 
@@ -2825,14 +2874,14 @@ mod tests {
             !fixture.worktree(&run_id).exists(),
             "released on acceptance"
         );
-        let run_dir = fixture.artifacts.join(&run_id);
+        let run_dir = fixture.artifacts.join(run_id.as_str());
         let patch = run_dir.join("candidate-1.patch");
         assert!(patch.is_file());
         let named = git(
             &fixture.repo,
             &[
                 "rev-parse",
-                &workspace::candidate_ref(&run_id, receipt.attempts),
+                &workspace::candidate_ref(run_id.as_str(), receipt.attempts),
             ],
         );
         assert_eq!(
@@ -2842,7 +2891,7 @@ mod tests {
         );
         let worktrees = git(&fixture.repo, &["worktree", "list"]);
         assert!(
-            !worktrees.contains(&run_id),
+            !worktrees.contains(run_id.as_str()),
             "no worktree entry survives an accepted run: {worktrees}"
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
@@ -2879,19 +2928,20 @@ mod tests {
             }
         });
         let outcome = fixture.execute(&fixture.contract(Review::Optional), &repo, &backend);
-        let run_id = outcome.run_id().to_string();
+        let run_id = outcome.run_id.clone();
         assert!(
             matches!(outcome.terminal, Terminal::Accepted(_)),
             "{outcome:?}"
         );
         let work_dir = seen.lock().unwrap()[0].clone();
         assert!(
-            !work_dir.starts_with(fixture.artifacts.join(&run_id)),
+            !work_dir.starts_with(fixture.artifacts.join(run_id.as_str())),
             "the worktree is outside the run's artifacts: {}",
             work_dir.display()
         );
-        let receipt = std::fs::read_to_string(fixture.artifacts.join(&run_id).join("receipt.json"))
-            .expect("the run wrote its receipt");
+        let receipt =
+            std::fs::read_to_string(fixture.artifacts.join(run_id.as_str()).join("receipt.json"))
+                .expect("the run wrote its receipt");
         assert!(
             receipt.contains("\"run_id\""),
             "the printed receipt is the runner's, not the worker's: {receipt}"
@@ -3009,7 +3059,7 @@ mod tests {
         assert!(detail.contains("unchanged candidate"), "{detail}");
         let transitions = fixture
             .ledger
-            .transitions(outcome.run_id())
+            .transitions(&outcome.run_id)
             .expect("history");
         assert_eq!(transitions.last().unwrap().to_state, State::Failed);
         assert_eq!(
@@ -3035,7 +3085,7 @@ mod tests {
         );
         let transitions = fixture
             .ledger
-            .transitions(outcome.run_id())
+            .transitions(&outcome.run_id)
             .expect("history");
         assert_eq!(
             transitions.len(),
@@ -3165,6 +3215,7 @@ mod tests {
             repo_policy: &repo,
             machine: &machine,
             ledger: &fixture.ledger,
+            ids: &fixture.ids,
             backend: &backend,
             git: &crate::workspace::SystemGit,
             hooks: &crate::verify::FixedInventory(None),
@@ -3175,7 +3226,8 @@ mod tests {
             gate: None,
             session_id: "test-session".into(),
             heartbeat_every: Duration::from_millis(50),
-        });
+        })
+        .expect("the fixture's id source mints identifiers");
         let RunOutcome {
             terminal: Terminal::Blocked { code, detail },
             ..
@@ -3223,7 +3275,7 @@ mod tests {
         let mut contract = fixture.contract_with_scope(&["src/**", "Cargo.toml"]);
         contract.review = Review::Required;
         let outcome = fixture.execute(&contract, &repo, &backend);
-        let run_id = outcome.run_id().to_string();
+        let run_id = outcome.run_id.clone();
         let RunOutcome {
             terminal:
                 Terminal::NeedsDecision {
@@ -3241,7 +3293,7 @@ mod tests {
         assert!(
             fixture
                 .artifacts
-                .join(&run_id)
+                .join(run_id.as_str())
                 .join("candidate-1.patch")
                 .is_file(),
             "the candidate is preserved for the decision"
@@ -3451,7 +3503,7 @@ mod tests {
         let mut machine = fixture.machine_for(&repo);
         // 150 sits between one attempt (100) and two (200): after the
         // repair attempt the run must refuse to admit more work.
-        machine.spending.per_run_micros = Some(150);
+        machine.spending.per_run_micros = Some(MicroUsd::from_micros(150));
         // Each attempt costs 100 micros and churns a new file: attempt 3
         // takes the run past 250 and no further dispatch is admitted.
         let backend = MockBackend::new(|spec| {
@@ -3487,7 +3539,7 @@ mod tests {
             200,
             "two attempts settled, then admission stopped"
         );
-        let run_dir = fixture.artifacts.join(run_id);
+        let run_dir = fixture.artifacts.join(run_id.as_str());
         assert!(
             run_dir.join("candidate-1.patch").is_file(),
             "patch preserved"
@@ -3855,7 +3907,7 @@ mod tests {
         else {
             panic!("expected acceptance, got {outcome:?}");
         };
-        let run_dir = fixture.artifacts.join(&run_id);
+        let run_dir = fixture.artifacts.join(run_id.as_str());
         let answer = std::fs::read_to_string(run_dir.join("attempt-1-result.txt"))
             .expect("the worker's answer is the deliverable and is kept");
         assert!(answer.contains("trust entry is stale"));
@@ -4039,7 +4091,7 @@ mod tests {
             transitions.last().unwrap().reason,
             Reason::WriteLeaseHeld.as_str()
         );
-        let run_dir = fixture.artifacts.join(&run_id);
+        let run_dir = fixture.artifacts.join(run_id.as_str());
         assert!(
             !run_dir.join("candidate-1.patch").exists(),
             "no candidate was exported from a tree in motion"
@@ -4052,7 +4104,7 @@ mod tests {
         let fixture = Fixture::new();
         let repo = fixture.repo_policy(vec![main_gone_check()], 3);
         let mut machine = fixture.machine_for(&repo);
-        machine.spending.per_run_micros = Some(1_000);
+        machine.spending.per_run_micros = Some(MicroUsd::from_micros(1_000));
         let gate = crate::admission::LocalGate::new(ConcurrencyLimits {
             max_active_agents: Some(1),
             max_active_agents_per_session: Some(1),
@@ -4074,7 +4126,7 @@ mod tests {
             panic!("expected acceptance, got {outcome:?}");
         };
         let status = gate.status();
-        let run = &status.runs[&run_id];
+        let run = &status.runs[run_id.as_str()];
         assert_eq!(run.session_id, "test-session");
         assert_eq!(
             run.budget_micros,
@@ -4144,7 +4196,7 @@ mod tests {
             "nothing was launched unmanaged"
         );
         assert_eq!(
-            fixture.ledger.run_status(outcome.run_id()).expect("status"),
+            fixture.ledger.run_status(&outcome.run_id).expect("status"),
             Some(State::Blocked)
         );
     }
@@ -4202,7 +4254,7 @@ mod tests {
             fixture.ledger.run_status(&run_id).expect("status"),
             Some(State::Cancelled)
         );
-        assert!(gate.status().runs[&run_id].cancelled);
+        assert!(gate.status().runs[run_id.as_str()].cancelled);
     }
 
     #[test]
@@ -4391,8 +4443,13 @@ mod tests {
             panic!("{outcome:?}");
         };
         let manifest: ContextManifest = serde_json::from_str(
-            &std::fs::read_to_string(fixture.artifacts.join(&run_id).join("manifest.json"))
-                .expect("manifest"),
+            &std::fs::read_to_string(
+                fixture
+                    .artifacts
+                    .join(run_id.as_str())
+                    .join("manifest.json"),
+            )
+            .expect("manifest"),
         )
         .expect("parses");
         assert_eq!(manifest.fingerprints.len(), 1);
@@ -4631,7 +4688,7 @@ mod tests {
         // The integrated candidate carries both packages and is what the
         // receipt names.
         let integration = worktree_root(&fixture.artifacts)
-            .join(&run_id)
+            .join(run_id.as_str())
             .join("integration");
         assert!(integration.join("src/a/lib.rs").exists());
         assert!(integration.join("src/b/lib.rs").exists());
@@ -4639,16 +4696,20 @@ mod tests {
         assert_eq!(receipt.candidate_sha, head);
         assert!(fixture
             .artifacts
-            .join(&run_id)
+            .join(run_id.as_str())
             .join("candidate-integrated.patch")
             .exists());
-        assert!(fixture.artifacts.join(&run_id).join("plan.json").exists());
+        assert!(fixture
+            .artifacts
+            .join(run_id.as_str())
+            .join("plan.json")
+            .exists());
         // Packages are runs of their own, attributed to the root.
         let children = fixture.ledger.child_runs(&run_id).expect("children");
         assert_eq!(
             children
                 .iter()
-                .map(|(_, package, status)| (package.as_str(), status.as_str()))
+                .map(|child| (child.package.as_str(), child.status.as_str()))
                 .collect::<Vec<_>>(),
             vec![("a", "accepted"), ("b", "accepted")]
         );
@@ -4845,7 +4906,7 @@ mod tests {
         );
         let children = fixture.ledger.child_runs(&run_id).expect("children");
         assert_eq!(children.len(), 1);
-        assert_eq!(children[0].2, "blocked");
+        assert_eq!(children[0].status, State::Blocked);
         assert_eq!(
             fixture.ledger.run_cost(&run_id).expect("cost").to_micros(),
             100
@@ -4914,7 +4975,7 @@ mod tests {
         );
         assert!(fixture
             .artifacts
-            .join(&run_id)
+            .join(run_id.as_str())
             .join("plan-proposal.txt")
             .exists());
         assert!(fixture
@@ -4960,7 +5021,7 @@ mod tests {
         assert_eq!(
             fixture
                 .ledger
-                .run_cost(outcome.run_id())
+                .run_cost(&outcome.run_id)
                 .expect("cost")
                 .to_micros(),
             5
@@ -5148,12 +5209,12 @@ mod tests {
         };
         let repo = fixture.repo_policy(vec![no_tick0], 5);
         let mut machine = fixture.machine_for(&repo);
-        machine.spending.per_day_micros = Some(150);
+        machine.spending.per_day_micros = Some(MicroUsd::from_micros(150));
         // Another run spent 120 earlier today, and 5000 yesterday. Only
         // today's counts, and it counts although it is not this run.
         fixture
             .ledger
-            .insert_run("earlier-today", "/elsewhere", None)
+            .insert_run(&RunId::from_stored("earlier-today"), "/elsewhere", None)
             .expect("run");
         for (event_id, at, micros) in [
             ("yesterday", "2026-09-19T23:00:00+00:00", 5_000),
@@ -5163,7 +5224,7 @@ mod tests {
                 .ledger
                 .record_usage(&UsageEvent {
                     event_id: event_id.into(),
-                    run_id: "earlier-today".into(),
+                    run_id: RunId::from_stored("earlier-today"),
                     attempt_id: None,
                     parent_event_id: None,
                     model: Some("sonnet".into()),
@@ -5212,7 +5273,7 @@ mod tests {
         assert!(
             fixture
                 .artifacts
-                .join(&run_id)
+                .join(run_id.as_str())
                 .join("candidate-1.patch")
                 .is_file(),
             "the patch and evidence are preserved"
@@ -5220,7 +5281,7 @@ mod tests {
         assert!(
             !fixture
                 .artifacts
-                .join(&run_id)
+                .join(run_id.as_str())
                 .join("candidate-2.patch")
                 .exists(),
             "no second dispatch"
@@ -5241,7 +5302,7 @@ mod tests {
         let mut machine = fixture.machine_for(&repo);
         // One attempt spends exactly the ceiling: the loop top admitted
         // it, and the review that follows must not be admitted.
-        machine.spending.per_run_micros = Some(100);
+        machine.spending.per_run_micros = Some(MicroUsd::from_micros(100));
         let reviews = std::sync::Arc::new(AtomicU64::new(0));
         let counted = reviews.clone();
         let backend = MockBackend::new(move |spec| {

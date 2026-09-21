@@ -79,12 +79,12 @@ impl std::error::Error for DatasetError {
 /// A ledger read for one run: a failure names the run and the query, and
 /// stops dataset construction. Absence is the caller's business.
 fn read_of<T>(
-    run: &str,
+    run: &crate::ids::RunId,
     query: &'static str,
     result: Result<T, LedgerError>,
 ) -> Result<T, DatasetError> {
     result.map_err(|cause| DatasetError::LedgerRead {
-        run: run.to_string(),
+        run: run.as_str().to_string(),
         query,
         cause,
     })
@@ -192,7 +192,7 @@ pub fn build(
             cause,
         })?;
     for (run_id, _repo, _status, _created) in runs {
-        let material = read_of(&run_id, "contract revision", contract_of(&run_id))?;
+        let material = read_of(&run_id, "contract revision", contract_of(run_id.as_str()))?;
         let Some((contract, objective, tier_name)) = material else {
             exclusions.push(format!("{run_id}: no contract revision recorded"));
             continue;
@@ -211,7 +211,7 @@ pub fn build(
                 continue;
             }
         };
-        let Some(tier) = Tier::from_name(&tier_name) else {
+        let Some(tier) = Tier::parse(&tier_name) else {
             exclusions.push(format!("{run_id}: unknown tier `{tier_name}`"));
             continue;
         };
@@ -315,28 +315,17 @@ pub fn task_family(contract: &crate::contract::TaskContract) -> String {
     let mut tokens: Vec<String> = super::features::tokenize(&contract.objective);
     tokens.sort();
     tokens.dedup();
-    let mut scope = contract.write_scope.clone().unwrap_or_default();
+    let mut scope = contract.scope_patterns().to_vec();
     scope.sort();
     sha256_hex(
         serde_json::json!({
-            "kind": contract.kind,
+            "kind": contract.kind(),
             "scope": scope,
             "tokens": tokens,
         })
         .to_string()
         .as_bytes(),
     )
-}
-
-impl Tier {
-    pub fn from_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "research" => Tier::Research,
-            "implementation" => Tier::Implementation,
-            "escalation" => Tier::Escalation,
-            _ => return None,
-        })
-    }
 }
 
 /// Splits are TEMPORAL and family-aware (SPEC §17): records are ordered by
@@ -420,6 +409,10 @@ pub fn temporal_splits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_id(id: &str) -> crate::ids::RunId {
+        crate::ids::RunId::from_stored(id)
+    }
 
     /// A test directory nobody else can collide with, pre-cleaned so a
     /// crashed earlier run cannot make this one pass or fail: the process
@@ -585,11 +578,13 @@ argv = ["true"]
         }
 
         fn dispatched(&self, run: &str, tier: &str, phase: &str) -> i64 {
-            self.ledger.insert_run(run, "/r", None).expect("run");
+            self.ledger
+                .insert_run(&run_id(run), "/r", None)
+                .expect("run");
             let revision = self
                 .ledger
                 .insert_contract_revision(
-                    run,
+                    &run_id(run),
                     &self.contract.hash(),
                     &self.contract_json,
                     "HEAD",
@@ -598,12 +593,12 @@ argv = ["true"]
                 .expect("revision");
             let attempt = self
                 .ledger
-                .insert_attempt(run, revision, 1, tier, phase)
+                .insert_attempt(&run_id(run), revision, 1, tier, phase)
                 .expect("attempt");
             self.ledger
                 .record_dispatch_intent(
-                    &format!("{run}-d1"),
-                    run,
+                    &crate::ids::DispatchId::from_stored(format!("{run}-d1")),
+                    &run_id(run),
                     Some(attempt),
                     &serde_json::json!({"model": "sonnet", "effort": "medium"}),
                     0,
@@ -617,7 +612,7 @@ argv = ["true"]
             self.ledger
                 .record_usage(&crate::ledger::UsageEvent {
                     event_id: event.into(),
-                    run_id: run.into(),
+                    run_id: run_id(run),
                     attempt_id: None,
                     parent_event_id: None,
                     model: Some(model.into()),
@@ -637,7 +632,7 @@ argv = ["true"]
         fn settle(&self, run: &str, state: State) {
             self.ledger
                 .record_transition(&crate::ledger::Transition {
-                    run_id: run.into(),
+                    run_id: run_id(run),
                     attempt_id: None,
                     from_state: Some(State::Verifying),
                     to_state: state,
@@ -649,19 +644,13 @@ argv = ["true"]
         }
 
         fn build(&self) -> Dataset {
-            let contract_of = |run_id: &str| {
-                let Some((json, objective, tier)) = self.ledger.run_contract_and_tier(run_id)?
+            let contract_of = |run: &str| {
+                let Some((contract, tier)) = self.ledger.run_contract_and_tier(&run_id(run))?
                 else {
                     return Ok(None);
                 };
-                let contract =
-                    crate::contract::TaskContract::from_json_str(&json).map_err(|e| {
-                        crate::ledger::LedgerError::Corrupt {
-                            what: format!("contract of {run_id}"),
-                            detail: e.to_string(),
-                        }
-                    })?;
-                Ok(Some((contract, objective, tier)))
+                let objective = contract.objective.clone();
+                Ok(Some((contract, objective, tier.as_str().to_string())))
             };
             build(&self.ledger, &contract_of, &repo_policy()).expect("dataset builds")
         }
@@ -697,7 +686,7 @@ argv = ["true"]
         let revision = fixture.dispatched("run-b", "implementation", "initial");
         fixture
             .ledger
-            .insert_attempt("run-b", revision, 2, "escalation", "escalation")
+            .insert_attempt(&run_id("run-b"), revision, 2, "escalation", "escalation")
             .expect("attempt");
         fixture.usage("b-worker", "run-b", "sonnet");
         fixture.usage("b-fable", "run-b", "fable");
@@ -788,11 +777,14 @@ argv = ["true"]
     #[test]
     fn a_run_without_a_dispatch_intent_is_excluded() {
         let fixture = LedgerFixture::open("dataset-nointent");
-        fixture.ledger.insert_run("run-a", "/r", None).expect("run");
+        fixture
+            .ledger
+            .insert_run(&run_id("run-a"), "/r", None)
+            .expect("run");
         let revision = fixture
             .ledger
             .insert_contract_revision(
-                "run-a",
+                &run_id("run-a"),
                 &fixture.contract.hash(),
                 &fixture.contract_json,
                 "HEAD",
@@ -801,7 +793,7 @@ argv = ["true"]
             .expect("revision");
         fixture
             .ledger
-            .insert_attempt("run-a", revision, 1, "implementation", "initial")
+            .insert_attempt(&run_id("run-a"), revision, 1, "implementation", "initial")
             .expect("attempt");
         fixture.settle("run-a", State::Accepted);
         let dataset = fixture.build();
@@ -845,14 +837,14 @@ argv = ["true"]
         other.objective = "Add a --json flag".into();
         assert_ne!(task_family(&base), task_family(&other));
         let mut elsewhere = base.clone();
-        elsewhere.write_scope = Some(vec!["docs/**".into()]);
+        elsewhere.task = crate::contract::Task::change(vec!["docs/**".into()]).expect("compiles");
         assert_ne!(task_family(&base), task_family(&elsewhere));
     }
 
     #[test]
     fn tier_names_round_trip() {
-        assert_eq!(Tier::from_name("escalation"), Some(Tier::Escalation));
-        assert_eq!(Tier::from_name("nonsense"), None);
+        assert_eq!(Tier::parse("escalation"), Some(Tier::Escalation));
+        assert_eq!(Tier::parse("nonsense"), None);
     }
 
     #[test]

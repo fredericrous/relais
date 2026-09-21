@@ -510,11 +510,10 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
 
     let mut keys: Vec<String> = contract.architecture.keys.clone();
     for mapping in &repo.architecture.mapping {
-        let touched = contract.write_scope.as_deref().is_some_and(|scopes| {
-            scopes
-                .iter()
-                .any(|scope| scope_could_touch(scope, &mapping.paths))
-        });
+        let touched = contract
+            .scope_patterns()
+            .iter()
+            .any(|scope| scope_could_touch(scope, &mapping.paths));
         if touched {
             keys.extend(mapping.keys.iter().cloned());
         }

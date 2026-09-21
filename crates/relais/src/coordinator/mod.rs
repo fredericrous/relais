@@ -268,8 +268,8 @@ impl Coordinator {
         let mut state = AdmissionState::new(limits);
         if let Some(ledger) = ledger {
             let now = Instant::now();
-            for (dispatch_id, run_id, pid) in ledger.live_dispatches().unwrap_or_default() {
-                let Some(pid) = pid.and_then(|pid| u32::try_from(pid).ok()) else {
+            for live in ledger.live_dispatches().unwrap_or_default() {
+                let Some(pid) = live.pid.map(|pid| pid.get()) else {
                     // A `launched` row with no PID is a dispatch the
                     // runner recorded before the process existed (SPEC
                     // §12). Adopting it took a seat for a worker that
@@ -287,8 +287,8 @@ impl Coordinator {
                 let pid = Some(pid);
                 state.adopt(
                     &DispatchRequest {
-                        dispatch_id,
-                        run_id,
+                        dispatch_id: live.dispatch.as_str().to_string(),
+                        run_id: live.run.as_str().to_string(),
                         session_id: "unknown".into(),
                         parent_dispatch: None,
                         depth: 0,
@@ -953,6 +953,7 @@ pub fn effective_limits(configured: &ConcurrencyLimits) -> ConcurrencyLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::{DispatchId, Pid, RunId};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -1315,33 +1316,67 @@ mod tests {
         let dir = temp_dir("adopt");
         let socket = dir.join("relais.sock");
         let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
-        ledger.insert_run("run-x", "/repo", None).expect("run");
         ledger
-            .record_dispatch_intent("live", "run-x", None, &serde_json::json!({}), 0)
+            .insert_run(&RunId::from_stored("run-x"), "/repo", None)
+            .expect("run");
+        ledger
+            .record_dispatch_intent(
+                &DispatchId::from_stored("live"),
+                &RunId::from_stored("run-x"),
+                None,
+                &serde_json::json!({}),
+                0,
+            )
             .expect("intent");
         ledger
-            .attach_dispatch_process("live", Some(std::process::id()), Some("sess"))
+            .attach_dispatch_process(
+                &DispatchId::from_stored("live"),
+                Some(Pid::new(std::process::id())),
+                Some("sess"),
+            )
             .expect("attach");
         ledger
-            .record_dispatch_intent("dead", "run-x", None, &serde_json::json!({}), 0)
+            .record_dispatch_intent(
+                &DispatchId::from_stored("dead"),
+                &RunId::from_stored("run-x"),
+                None,
+                &serde_json::json!({}),
+                0,
+            )
             .expect("intent");
         ledger
-            .attach_dispatch_process("dead", Some(999_999_999), None)
+            .attach_dispatch_process(
+                &DispatchId::from_stored("dead"),
+                Some(Pid::new(999_999_999)),
+                None,
+            )
             .expect("attach");
         // C2: `launched`, no PID — the row managed_launch writes BEFORE
         // the process exists. Adopting it took a seat nothing could ever
         // bind or free; `relais resume` reconciles it against the ledger.
         ledger
-            .record_dispatch_intent("pidless", "run-x", None, &serde_json::json!({}), 0)
+            .record_dispatch_intent(
+                &DispatchId::from_stored("pidless"),
+                &RunId::from_stored("run-x"),
+                None,
+                &serde_json::json!({}),
+                0,
+            )
             .expect("intent");
         ledger
-            .attach_dispatch_process("pidless", None, Some("sess"))
+            .attach_dispatch_process(&DispatchId::from_stored("pidless"), None, Some("sess"))
             .expect("attach");
         ledger
-            .record_dispatch_intent("finished", "run-x", None, &serde_json::json!({}), 0)
+            .record_dispatch_intent(
+                &DispatchId::from_stored("finished"),
+                &RunId::from_stored("run-x"),
+                None,
+                &serde_json::json!({}),
+                0,
+            )
             .expect("intent");
         ledger
-            .finish_dispatch("finished", "completed")
+            .finish_dispatch(&DispatchId::from_stored("finished"), "completed")
             .expect("finish");
         let (coordinator, listener) =
             Coordinator::start(&socket, limits(), Some(&ledger)).expect("start");

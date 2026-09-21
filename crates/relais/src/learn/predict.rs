@@ -110,7 +110,7 @@ pub fn estimate_from_registry(
     // recorded when it was trained. It used to be the literal "change"
     // for every task, so an `inspect` contract that fell back to the
     // empirical baseline was priced with the cost of changing code.
-    let cohort = super::features::cohort_of_kind(contract.kind);
+    let cohort = super::features::cohort_of_kind(contract.kind());
     for (tier, features) in &inputs {
         if !artifact.tiers_supported.contains(tier) {
             declined.push((
@@ -270,12 +270,12 @@ impl RoutePredictor for RegistryPredictor<'_> {
         let mut acceptance = std::collections::BTreeMap::new();
         let mut cost = std::collections::BTreeMap::new();
         for (tier, probability) in result.acceptance {
-            if let Some(tier) = Tier::from_name(&tier) {
+            if let Some(tier) = Tier::parse(&tier) {
                 acceptance.insert(tier, probability);
             }
         }
         for (tier, cost_micros) in result.cost_micros {
-            if let Some(tier) = Tier::from_name(&tier) {
+            if let Some(tier) = Tier::parse(&tier) {
                 cost.insert(tier, MicroUsd::from_micros(cost_micros));
             }
         }
@@ -413,7 +413,12 @@ mod tests {
         let repo = repo_policy();
         let machine =
             crate::policy::MachineSettings::from_toml_str("schema_version = 1").expect("machine");
-        crate::policy::effective_authority(&repo, &machine, &contract())
+        crate::policy::effective_authority(
+            &repo,
+            &machine,
+            &contract(),
+            &crate::policy::RepoIdentity::new(std::path::Path::new("/repos/relais"), None),
+        )
     }
 
     #[test]
