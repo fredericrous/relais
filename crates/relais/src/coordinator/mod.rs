@@ -1523,8 +1523,11 @@ impl RemoteGate {
     }
 }
 
-pub fn socket_path() -> PathBuf {
-    crate::paths::state_dir().join("relais.sock")
+/// The endpoint this user's coordinator serves on. Fallible for the same
+/// reason the state directory is: without a home directory and without
+/// `RELAIS_STATE_DIR` there is nowhere to put it (C10).
+pub fn socket_path() -> Result<PathBuf, crate::paths::HomeUnset> {
+    Ok(crate::paths::state_dir()?.join("relais.sock"))
 }
 
 /// The interactive session this CLI call belongs to. `RELAIS_SESSION_ID`

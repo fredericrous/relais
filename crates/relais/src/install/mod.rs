@@ -13,8 +13,15 @@
 //! the user has not touched stays ours after the template moves on, and
 //! is then an `Update`. Only the marked block is rewritten; bytes the
 //! user added outside it are theirs, on update exactly as on uninstall.
+//!
+//! Every write of an owned file goes through [`write_atomic`]: a
+//! temporary sibling, fsynced, renamed over the destination. A truncating
+//! write that dies half way (ENOSPC, a kill) would destroy the user's
+//! text around the block and leave a file relais then refuses to touch
+//! for ever (C1); a rename either happened or did not.
 
 use serde::Serialize;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::ids::sha256_hex;
@@ -65,6 +72,53 @@ fn owned_block_for(content: &str) -> String {
 fn owned_file(content: &str) -> String {
     let (opener, _) = split_template(content);
     format!("{opener}{}\n", owned_block_for(content))
+}
+
+/// Replace a file's contents so that a failed write leaves the previous
+/// contents intact: a temporary file IN THE SAME DIRECTORY (rename is
+/// only atomic within a filesystem), flushed and fsynced, then renamed
+/// over the destination. `rename(2)` replaces atomically on POSIX and
+/// `ReplaceFile`/`MoveFileEx` semantics give the same guarantee on
+/// Windows, where `std::fs::rename` overwrites an existing file.
+///
+/// The temporary file is removed on every failure path, so a full disk
+/// or a permission error leaves nothing behind but the original.
+fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    // A sibling, hidden, and unique per process and per call: two relais
+    // processes installing at once must not share a staging file.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "relais-owned".to_string());
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let temp = parent.join(format!(
+        ".{file_name}.relais-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let staged = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(contents.as_bytes())?;
+        file.flush()?;
+        // Durability, not just visibility: without this the rename can be
+        // ordered before the data on a crash, and the file comes back
+        // empty rather than old.
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = staged {
+        // Best effort: the staging file is already unreachable by name
+        // for anything but this call, and the error to report is the
+        // write's, not the cleanup's.
+        let _ = std::fs::remove_file(&temp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Text outside the block that is nothing but the frontmatter opener is
@@ -343,9 +397,172 @@ pub enum Action {
     },
 }
 
+impl Action {
+    /// The file the action is about, whatever the action is.
+    pub fn relative(&self) -> &Path {
+        match self {
+            Action::Create { relative }
+            | Action::Update { relative }
+            | Action::SkipForeign { relative }
+            | Action::Conflict { relative }
+            | Action::Malformed { relative }
+            | Action::Remove { relative } => relative,
+        }
+    }
+
+    /// Whether `apply`/`apply_uninstall` is supposed to carry this action
+    /// out. The reported-only actions (foreign, conflicted, malformed)
+    /// are deliberate no-ops; an applicable action that did not happen is
+    /// a failure the CLI exits non-zero on (C9).
+    fn is_applicable(&self) -> bool {
+        match self {
+            Action::Create { .. } | Action::Update { .. } | Action::Remove { .. } => true,
+            Action::SkipForeign { .. } | Action::Conflict { .. } | Action::Malformed { .. } => {
+                false
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct InstallPlan {
     pub actions: Vec<Action>,
+}
+
+/// What an apply pass did, and what it was supposed to do and did not.
+/// The second list is the whole point: a file that changed between the
+/// preview and `--write` is silently skipped by the writer, and a run
+/// that reports "applied 0 change(s)" and exits 0 hides it (C9).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Applied {
+    pub applied: Vec<Action>,
+    pub not_applied: Vec<Action>,
+}
+
+/// Whether the file at an owned path is there, and in what condition.
+/// A DANGLING symlink exists as a name and not as a file: `Path::exists`
+/// follows the link and says "missing", and writing to that name writes
+/// through the link into whatever it points at. Relais does not own the
+/// far end of somebody's symlink, so it is foreign, not a `Create`.
+enum Presence {
+    Missing,
+    Dangling,
+    Present,
+}
+
+fn presence(path: &Path) -> Presence {
+    match std::fs::symlink_metadata(path) {
+        Err(_) => Presence::Missing,
+        Ok(_) if path.exists() => Presence::Present,
+        // The name resolves to nothing: a broken link, left alone.
+        Ok(_) => Presence::Dangling,
+    }
+}
+
+/// Which `.claude` directory an install acts on. User level is explicit,
+/// never the default (SPEC §3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scope {
+    User,
+    Project(PathBuf),
+}
+
+/// Preview-first: `--write` is the second, explicit step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Preview,
+    Apply,
+}
+
+/// One `relais install --claude` / `relais uninstall --claude`
+/// invocation, as a value the module can plan, apply and test without a
+/// CLI around it. The home directory is a parameter of
+/// [`InstallRequest::root`] rather than read here, so a test can drive
+/// the user scope against a temporary directory without touching the
+/// process environment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstallRequest {
+    pub scope: Scope,
+    pub mode: Mode,
+}
+
+impl InstallRequest {
+    /// The directory this request acts on, given the home directory the
+    /// caller resolved.
+    pub fn root(&self, home: &Path) -> InstallRoot {
+        match &self.scope {
+            Scope::User => InstallRoot {
+                claude_dir: home.join(".claude"),
+            },
+            Scope::Project(dir) => InstallRoot::project(dir),
+        }
+    }
+
+    /// How to name this scope in output.
+    pub fn scope_label(&self) -> &'static str {
+        match self.scope {
+            Scope::User => "user level",
+            Scope::Project(_) => "project level",
+        }
+    }
+}
+
+/// The plan, and what applying it did — nothing at all in preview mode.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstallReport {
+    pub plan: InstallPlan,
+    pub mode: Mode,
+    pub applied: Vec<Action>,
+    /// Applicable actions the apply pass did NOT carry out, because the
+    /// file changed between the preview and the write.
+    pub not_applied: Vec<Action>,
+}
+
+impl InstallReport {
+    fn previewed(plan: InstallPlan) -> Self {
+        Self {
+            plan,
+            mode: Mode::Preview,
+            applied: Vec::new(),
+            not_applied: Vec::new(),
+        }
+    }
+}
+
+/// Carry out an install request against the `.claude` directory it names.
+pub fn install(request: &InstallRequest, home: &Path) -> std::io::Result<InstallReport> {
+    let root = request.root(home);
+    let plan = root.plan();
+    match request.mode {
+        Mode::Preview => Ok(InstallReport::previewed(plan)),
+        Mode::Apply => {
+            let done = root.apply(&plan)?;
+            Ok(InstallReport {
+                plan,
+                mode: Mode::Apply,
+                applied: done.applied,
+                not_applied: done.not_applied,
+            })
+        }
+    }
+}
+
+/// Carry out an uninstall request. Only owned, unchanged artifacts go.
+pub fn uninstall(request: &InstallRequest, home: &Path) -> std::io::Result<InstallReport> {
+    let root = request.root(home);
+    let plan = root.uninstall_plan();
+    match request.mode {
+        Mode::Preview => Ok(InstallReport::previewed(plan)),
+        Mode::Apply => {
+            let done = root.apply_uninstall(&plan)?;
+            Ok(InstallReport {
+                plan,
+                mode: Mode::Apply,
+                applied: done.applied,
+                not_applied: done.not_applied,
+            })
+        }
+    }
 }
 
 pub struct InstallRoot {
@@ -357,13 +574,6 @@ impl InstallRoot {
     pub fn project(project_dir: &Path) -> Self {
         Self {
             claude_dir: project_dir.join(".claude"),
-        }
-    }
-
-    /// User-level installation is explicit, not the default (SPEC §3).
-    pub fn user() -> Self {
-        Self {
-            claude_dir: crate::paths::home_dir().join(".claude"),
         }
     }
 
@@ -385,9 +595,16 @@ impl InstallRoot {
         let mut actions = Vec::new();
         for (relative, content) in owned_files() {
             let path = self.owned_path(&relative);
-            if !path.exists() {
-                actions.push(Action::Create { relative });
-                continue;
+            match presence(&path) {
+                Presence::Missing => {
+                    actions.push(Action::Create { relative });
+                    continue;
+                }
+                Presence::Dangling => {
+                    actions.push(Action::SkipForeign { relative });
+                    continue;
+                }
+                Presence::Present => {}
             }
             match Self::block_of(&path) {
                 BlockRead::Absent => actions.push(Action::SkipForeign { relative }),
@@ -410,13 +627,21 @@ impl InstallRoot {
     }
 
     /// Apply a plan: --write. Only Create and Update run; SkipForeign,
-    /// Conflict and Malformed stay untouched and are reported.
-    pub fn apply(&self, plan: &InstallPlan) -> std::io::Result<Vec<Action>> {
-        let mut applied = Vec::new();
+    /// Conflict and Malformed stay untouched and are reported. An
+    /// applicable action the file's current state refuses is returned in
+    /// `not_applied`, never swallowed.
+    pub fn apply(&self, plan: &InstallPlan) -> std::io::Result<Applied> {
+        let mut done = Applied {
+            applied: Vec::new(),
+            not_applied: Vec::new(),
+        };
         for action in &plan.actions {
             let relative = match action {
                 Action::Create { relative } | Action::Update { relative } => relative,
-                _ => continue,
+                Action::SkipForeign { .. }
+                | Action::Conflict { .. }
+                | Action::Malformed { .. }
+                | Action::Remove { .. } => continue,
             };
             let Some(content) = owned_files()
                 .into_iter()
@@ -425,6 +650,7 @@ impl InstallRoot {
             else {
                 // A plan naming a file this binary does not own is not
                 // ours to write, whoever built it.
+                done.not_applied.push(action.clone());
                 continue;
             };
             let path = self.owned_path(relative);
@@ -456,20 +682,23 @@ impl InstallRoot {
                             updated.push_str(after);
                             updated
                         };
-                        std::fs::write(&path, updated)?;
+                        write_atomic(&path, &updated)?;
                     }
                     // The file changed under us between plan and apply:
-                    // a modified or malformed block is never overwritten.
-                    BlockRead::Found(_) | BlockRead::Malformed => continue,
-                    BlockRead::Absent => continue,
+                    // a modified or malformed block is never overwritten,
+                    // and the caller is told which.
+                    BlockRead::Found(_) | BlockRead::Malformed | BlockRead::Absent => {
+                        done.not_applied.push(action.clone());
+                        continue;
+                    }
                 },
                 // Not there (the Create case, or a file removed since the
                 // preview): the whole file is ours to write.
-                Err(_) => std::fs::write(&path, owned_file(&content))?,
+                Err(_) => write_atomic(&path, &owned_file(&content))?,
             }
-            applied.push(action.clone());
+            done.applied.push(action.clone());
         }
-        Ok(applied)
+        Ok(done)
     }
 
     /// Uninstall removes only owned, UNCHANGED artifacts. A user-modified
@@ -481,8 +710,13 @@ impl InstallRoot {
         // ours to remove, so an upgrade never strands its own files.
         for (relative, _template) in owned_files() {
             let path = self.owned_path(&relative);
-            if !path.exists() {
-                continue;
+            match presence(&path) {
+                Presence::Missing => continue,
+                Presence::Dangling => {
+                    actions.push(Action::SkipForeign { relative });
+                    continue;
+                }
+                Presence::Present => {}
             }
             match Self::block_of(&path) {
                 BlockRead::Absent => actions.push(Action::SkipForeign { relative }),
@@ -496,16 +730,27 @@ impl InstallRoot {
         InstallPlan { actions }
     }
 
-    pub fn apply_uninstall(&self, plan: &InstallPlan) -> std::io::Result<Vec<Action>> {
-        let mut applied = Vec::new();
+    /// Apply an uninstall plan. Every `Remove` is re-judged against the
+    /// file as it is NOW: the preview and the write are two moments, and
+    /// a block edited in between is the user's, not ours to delete.
+    pub fn apply_uninstall(&self, plan: &InstallPlan) -> std::io::Result<Applied> {
+        let mut done = Applied {
+            applied: Vec::new(),
+            not_applied: Vec::new(),
+        };
         for action in &plan.actions {
-            if let Action::Remove { relative } = action {
-                let path = self.owned_path(relative);
-                // If the user added content outside the markers, remove
-                // only the owned block and keep their bytes; otherwise
-                // the whole file was ours and goes away.
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    if let BlockRead::Found(block) = read_block(&text) {
+            let Action::Remove { relative } = action else {
+                continue;
+            };
+            let path = self.owned_path(relative);
+            // If the user added content outside the markers, remove
+            // only the owned block and keep their bytes; otherwise
+            // the whole file was ours and goes away.
+            match std::fs::read_to_string(&path) {
+                Ok(text) => match read_block(&text) {
+                    // Re-checked here, not trusted from the plan: the
+                    // file may have been edited since the preview.
+                    BlockRead::Found(block) if block.is_unchanged() => {
                         let mut remaining = String::with_capacity(text.len());
                         remaining.push_str(&text[..block.start]);
                         remaining.push_str(&text[block.end..]);
@@ -513,36 +758,56 @@ impl InstallRoot {
                         // as much as the block: a file holding nothing else
                         // goes away whole rather than leaving a `---` stub.
                         if !is_only_opener(&remaining) {
-                            std::fs::write(&path, remaining)?;
-                            applied.push(action.clone());
+                            write_atomic(&path, &remaining)?;
+                            done.applied.push(action.clone());
                             continue;
                         }
                     }
-                }
-                std::fs::remove_file(&path)?;
-                // Clean directories we created, but never a directory we
-                // did not own end-to-end.
-                for ancestor in path.ancestors().skip(1) {
-                    if ancestor == self.claude_dir {
-                        break;
+                    BlockRead::Found(_) | BlockRead::Malformed | BlockRead::Absent => {
+                        done.not_applied.push(action.clone());
+                        continue;
                     }
-                    if std::fs::read_dir(ancestor)
-                        .map(|mut entries| entries.next().is_none())
-                        .unwrap_or(false)
-                    {
-                        let _ = std::fs::remove_dir(ancestor);
-                    } else {
-                        break;
-                    }
+                },
+                // Gone since the preview, or unreadable: nothing to
+                // remove, and nothing to claim was removed.
+                Err(_) => {
+                    done.not_applied.push(action.clone());
+                    continue;
                 }
-                applied.push(action.clone());
             }
+            std::fs::remove_file(&path)?;
+            // Clean directories we created, but never a directory we
+            // did not own end-to-end.
+            for ancestor in path.ancestors().skip(1) {
+                if ancestor == self.claude_dir {
+                    break;
+                }
+                match std::fs::read_dir(ancestor).map(|mut entries| entries.next().is_none()) {
+                    // An empty directory relais made on the way in. A
+                    // failed removal is not worth reporting: the file the
+                    // user asked to remove is gone either way.
+                    Ok(true) => {
+                        let _ = std::fs::remove_dir(ancestor);
+                    }
+                    Ok(false) | Err(_) => break,
+                }
+            }
+            done.applied.push(action.clone());
         }
-        Ok(applied)
+        Ok(done)
     }
 }
 
 impl InstallPlan {
+    /// How many of the planned actions `apply` is meant to carry out.
+    /// The rest are reported-only: foreign, conflicted or malformed.
+    pub fn applicable_count(&self) -> usize {
+        self.actions
+            .iter()
+            .filter(|action| action.is_applicable())
+            .count()
+    }
+
     pub fn render(&self) -> String {
         let mut out = String::new();
         for action in &self.actions {
@@ -607,7 +872,8 @@ mod tests {
         // Preview wrote nothing.
         assert!(!root.claude_dir.exists());
         let applied = root.apply(&plan).expect("apply");
-        assert_eq!(applied.len(), 4);
+        assert_eq!(applied.applied.len(), 4);
+        assert!(applied.not_applied.is_empty(), "{applied:?}");
         let skill = root.claude_dir.join("skills/relais/SKILL.md");
         assert!(skill.is_file());
         // Unrelated content survives untouched.
@@ -655,7 +921,10 @@ mod tests {
             "a user-modified owned block is a conflict, not an update"
         );
         let applied = root.apply(&replan).expect("apply");
-        assert!(applied.is_empty(), "conflicts are never written");
+        assert!(
+            applied.applied.is_empty(),
+            "conflicts are never written: {applied:?}"
+        );
         let after = std::fs::read_to_string(&agent).expect("read");
         assert!(after.contains("user edit"), "the user's edit survives");
         std::fs::remove_dir_all(&dir).ok();
@@ -672,7 +941,7 @@ mod tests {
         std::fs::write(&owned, format!("{original}\n<!-- user note -->\n")).expect("edit");
 
         let plan = root.uninstall_plan();
-        let applied = root.apply_uninstall(&plan).expect("uninstall");
+        let applied = root.apply_uninstall(&plan).expect("uninstall").applied;
         // The three unchanged agents are removed entirely; the skill's
         // owned block is removed but the user's note survives; the
         // foreign agent was never ours.
@@ -716,7 +985,7 @@ mod tests {
             "an untouched block whose template moved on is an update: {:?}",
             plan.actions
         );
-        let applied = root.apply(&plan).expect("apply");
+        let applied = root.apply(&plan).expect("apply").applied;
         assert!(applied
             .iter()
             .any(|action| matches!(action, Action::Update { .. })));
@@ -859,7 +1128,7 @@ mod tests {
         );
         assert!(plan.render().contains("markers are unreadable"));
         let before = std::fs::read_to_string(&agent).expect("read");
-        let applied = root.apply(&plan).expect("apply");
+        let applied = root.apply(&plan).expect("apply").applied;
         assert!(
             !applied
                 .iter()
@@ -967,6 +1236,212 @@ mod tests {
         let uninstall = root.uninstall_plan();
         root.apply_uninstall(&uninstall).expect("uninstall");
         assert!(!skill.exists(), "no `---` stub is left behind");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A write that cannot land must leave the previous bytes where they
+    /// were AND leave no staging file behind (C1). The failure is
+    /// arranged rather than simulated: renaming a file over a
+    /// non-empty DIRECTORY fails on every platform relais ships to.
+    #[test]
+    fn a_failed_write_leaves_the_old_file_and_no_temp_behind() {
+        let (_root, dir) = temp_root();
+        let target = dir.join("occupied");
+        std::fs::create_dir_all(&target).expect("mkdir");
+        std::fs::write(target.join("inside"), "the user's bytes").expect("write");
+
+        let refused = write_atomic(&target, "replacement").expect_err("a directory is not a file");
+        assert!(
+            target.is_dir(),
+            "the destination is untouched: {refused} ({refused:?})"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("inside")).expect("read"),
+            "the user's bytes"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read_dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".relais-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "staging files left behind: {leftovers:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The happy path still goes through a temp file: after the write the
+    /// directory holds the destination and nothing else.
+    #[test]
+    fn an_atomic_write_leaves_only_the_destination() {
+        let (_root, dir) = temp_root();
+        let target = dir.join("agent.md");
+        write_atomic(&target, "first").expect("write");
+        write_atomic(&target, "second").expect("rewrite");
+        assert_eq!(std::fs::read_to_string(&target).expect("read"), "second");
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read_dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["agent.md".to_string()], "{names:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A name that resolves to nothing is somebody's broken symlink, not
+    /// a missing file: writing it would write THROUGH the link.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_is_foreign_not_a_create() {
+        let (root, dir) = temp_root();
+        let agent = root.claude_dir.join("agents/relais-research.md");
+        std::fs::create_dir_all(agent.parent().expect("parent")).expect("mkdir");
+        let nowhere = dir.join("nowhere.md");
+        std::os::unix::fs::symlink(&nowhere, &agent).expect("symlink");
+
+        let plan = root.plan();
+        assert!(
+            plan.actions.iter().any(|action| matches!(
+                action,
+                Action::SkipForeign { relative } if relative == Path::new("agents/relais-research.md")
+            )),
+            "a dangling link is foreign: {:?}",
+            plan.actions
+        );
+        root.apply(&plan).expect("apply");
+        assert!(
+            !nowhere.exists(),
+            "nothing was written through the link to {}",
+            nowhere.display()
+        );
+        // Uninstall leaves it alone too.
+        let uninstall = root.uninstall_plan();
+        assert!(uninstall
+            .actions
+            .iter()
+            .any(|action| matches!(action, Action::SkipForeign { .. })));
+        assert!(
+            agent.symlink_metadata().is_ok(),
+            "the link itself is still there"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The preview and the write are two moments. A file that became
+    /// foreign in between is not written — and the caller is TOLD, so
+    /// `--write` can exit non-zero instead of claiming success (C9).
+    #[test]
+    fn an_action_the_write_cannot_carry_out_is_reported() {
+        let (root, dir) = temp_root();
+        let plan = root.plan();
+        assert_eq!(plan.applicable_count(), 4);
+        // Between plan and apply, somebody else writes one of the files.
+        let agent = root.claude_dir.join("agents/relais-review.md");
+        std::fs::create_dir_all(agent.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&agent, "# mine now\n").expect("foreign");
+
+        let done = root.apply(&plan).expect("apply");
+        assert_eq!(done.applied.len(), 3, "{done:?}");
+        assert_eq!(
+            done.not_applied
+                .iter()
+                .map(|action| action.relative().to_path_buf())
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from("agents/relais-review.md")],
+        );
+        assert_eq!(
+            std::fs::read_to_string(&agent).expect("read"),
+            "# mine now\n",
+            "the foreign file is byte-identical"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Uninstall judges the block at REMOVAL time, not at preview time.
+    #[test]
+    fn uninstall_rechecks_the_block_before_removing_it() {
+        let (root, dir) = temp_root();
+        root.apply(&root.plan()).expect("apply");
+        let plan = root.uninstall_plan();
+        assert_eq!(plan.applicable_count(), 4);
+        // The user edits inside the block after previewing the removal.
+        let agent = root.claude_dir.join("agents/relais-research.md");
+        let text = std::fs::read_to_string(&agent).expect("read");
+        std::fs::write(&agent, text.replace("advisory set", "MY set")).expect("edit inside");
+
+        let done = root.apply_uninstall(&plan).expect("uninstall");
+        assert_eq!(done.applied.len(), 3, "{done:?}");
+        assert_eq!(
+            done.not_applied
+                .iter()
+                .map(|action| action.relative().to_path_buf())
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from("agents/relais-research.md")],
+        );
+        assert!(
+            std::fs::read_to_string(&agent)
+                .expect("read")
+                .contains("MY set"),
+            "a block edited since the preview is kept"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `relais install --claude --user --write` against a home directory
+    /// the caller injects: the request is a value, so the user scope is
+    /// testable without touching the process environment.
+    #[test]
+    fn a_user_scope_request_writes_under_the_home_it_is_given() {
+        let (_root, dir) = temp_root();
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let request = InstallRequest {
+            scope: Scope::User,
+            mode: Mode::Preview,
+        };
+        assert_eq!(request.scope_label(), "user level");
+        let preview = install(&request, &home).expect("preview");
+        assert_eq!(preview.mode, Mode::Preview);
+        assert_eq!(preview.plan.applicable_count(), 4);
+        assert!(preview.applied.is_empty(), "a preview writes nothing");
+        assert!(
+            !home.join(".claude").exists(),
+            "a preview creates no directory"
+        );
+
+        let request = InstallRequest {
+            scope: Scope::User,
+            mode: Mode::Apply,
+        };
+        let written = install(&request, &home).expect("apply");
+        assert_eq!(written.applied.len(), 4, "{written:?}");
+        assert!(written.not_applied.is_empty(), "{written:?}");
+        assert!(home.join(".claude/skills/relais/SKILL.md").is_file());
+        assert!(home.join(".claude/agents/relais-research.md").is_file());
+
+        let removed = uninstall(
+            &InstallRequest {
+                scope: Scope::User,
+                mode: Mode::Apply,
+            },
+            &home,
+        )
+        .expect("uninstall");
+        assert_eq!(removed.applied.len(), 4, "{removed:?}");
+        assert!(!home.join(".claude/agents/relais-research.md").exists());
+
+        // A project request is the same shape with the directory named.
+        let project = InstallRequest {
+            scope: Scope::Project(dir.join("repo")),
+            mode: Mode::Preview,
+        };
+        assert_eq!(project.scope_label(), "project level");
+        assert_eq!(
+            project.root(&home).claude_dir,
+            dir.join("repo").join(".claude")
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

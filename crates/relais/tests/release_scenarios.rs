@@ -219,17 +219,32 @@ timeout_seconds = 30
         ids.pop().expect("one")
     }
 
-    /// Wait for a path to appear, up to `seconds`. Used to prove a
-    /// worker's background write really happened before asserting that
-    /// the candidate does not contain it.
-    fn wait_for(path: &Path, seconds: u64) -> bool {
+    /// Poll a condition until it holds, up to `seconds`. Everything in
+    /// this suite that has to wait for another process waits this way: a
+    /// fixed sleep is a guess that is either too short on a loaded CI
+    /// runner or wasted time on an idle workstation.
+    fn poll_until(condition: impl Fn() -> bool, seconds: u64) -> bool {
         for _ in 0..(seconds * 20) {
-            if path.exists() {
+            if condition() {
                 return true;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         false
+    }
+
+    /// Wait for a path to appear, up to `seconds`. Used to prove a
+    /// worker's background write really happened before asserting that
+    /// the candidate does not contain it.
+    fn wait_for(path: &Path, seconds: u64) -> bool {
+        Self::poll_until(|| path.exists(), seconds)
+    }
+
+    /// Wait for a path to go away. The coordinator unlinks its endpoint
+    /// on the way out, so this is how a test knows the daemon it asked to
+    /// stop has actually stopped.
+    fn wait_for_gone(path: &Path, seconds: u64) -> bool {
+        Self::poll_until(|| !path.exists(), seconds)
     }
 }
 
@@ -480,7 +495,9 @@ fn budget_exhaustion_preserves_evidence_and_stops_dispatch() {
     let task = world.write_task("task.json", "off");
     let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
     let stderr = text(&run.stderr);
-    assert_eq!(run.status.code(), Some(4), "{stderr}");
+    // SPEC §11 exhaustion has its own code now (main.rs's table): a
+    // caller that retries on "failed" must not retry on a spent ceiling.
+    assert_eq!(run.status.code(), Some(5), "{stderr}");
     assert!(stderr.starts_with("budget_exhausted:"), "{stderr}");
     let runs = std::fs::read_dir(world.state.join("runs"))
         .expect("runs")
@@ -628,7 +645,10 @@ fn out_of_scope_edits_and_misspelled_controls_are_refused() {
     )
     .expect("task");
     let run = world.relais(&["run", "--task", path.to_str().unwrap()]);
-    assert_eq!(run.status.code(), Some(2), "{}", text(&run.stderr));
+    // needs_decision: a human has to decide, which is a different code
+    // from "the contract you handed me is invalid" below (main.rs's
+    // exit-code table).
+    assert_eq!(run.status.code(), Some(8), "{}", text(&run.stderr));
     assert!(
         text(&run.stderr).contains("scope_exceeded"),
         "{}",
@@ -820,12 +840,31 @@ fn coordinator_cancel_and_stop_leave_state_consistent() {
     assert_eq!(cancel.status.code(), Some(0), "{}", text(&cancel.stderr));
     let stop = world.relais(&["coordinator", "stop"]);
     assert_eq!(stop.status.code(), Some(0));
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // The daemon unlinks its endpoint as it exits: wait for that rather
+    // than for a fixed 200 ms, which was both a guess and a flake (C15).
+    let socket = world.state.join("relais.sock");
+    assert!(
+        World::wait_for_gone(&socket, 10),
+        "the coordinator asked to stop should have unlinked {}",
+        socket.display()
+    );
     let status = world.relais(&["coordinator", "status"]);
     assert!(
         text(&status.stdout).contains("no coordinator"),
         "{}",
         text(&status.stdout)
+    );
+    // Under --json the absent case is a document too, with the client's
+    // own error carried in it — never an English sentence a parser would
+    // choke on (C3).
+    let json = world.relais(&["coordinator", "status", "--json"]);
+    assert_eq!(json.status.code(), Some(0), "{}", text(&json.stderr));
+    let document: serde_json::Value =
+        serde_json::from_str(text(&json.stdout).trim()).expect("stdout is JSON in every state");
+    assert_eq!(document["coordinator"], "absent", "{document}");
+    assert!(
+        document["cause"].as_str().is_some_and(|c| !c.is_empty()),
+        "the reason nothing answered is carried: {document}"
     );
     let listing = world.relais(&["status"]);
     assert!(
@@ -898,7 +937,7 @@ fn an_interrupted_worker_is_reconciled_by_resume_without_a_second_worker() {
 
     let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
     let stderr = text(&run.stderr);
-    assert_eq!(run.status.code(), Some(4), "{stderr}");
+    assert_eq!(run.status.code(), Some(6), "{stderr}");
     assert!(stderr.starts_with("interrupted:"), "{stderr}");
     let run_id = world.only_run_id();
     assert!(
@@ -949,7 +988,7 @@ fn a_worker_editing_the_policy_cannot_obtain_acceptance() {
     );
     let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
     let stderr = text(&run.stderr);
-    assert_eq!(run.status.code(), Some(2), "{stderr}");
+    assert_eq!(run.status.code(), Some(8), "{stderr}");
     assert!(stderr.contains("needs_decision"), "{stderr}");
     assert!(
         stderr.contains("relais.toml (protected repository configuration)"),
