@@ -183,24 +183,41 @@ pub fn peer_uid(stream: &std::os::unix::net::UnixStream) -> io::Result<u32> {
 /// with the ambient umask applied and the explicit `set_permissions`
 /// that follows (A8).
 #[cfg(unix)]
-pub fn narrow_umask(mask: u32) -> UmaskGuard {
-    UmaskGuard(imp::Umask::narrow(mask as imp::Mode))
+pub fn narrow_umask(mask: Mode) -> UmaskGuard {
+    let serialised = UMASK_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    UmaskGuard {
+        previous: imp::set_umask(mask),
+        _serialised: serialised,
+    }
 }
 
+/// The file-mode type this platform's `umask(2)` speaks — `u32` on
+/// Linux, `u16` on the BSDs. Aliased here so nothing above `procs`
+/// names `libc`, and so neither width needs a cast one of the two
+/// platforms calls unnecessary.
+#[cfg(unix)]
+pub use imp::Mode;
+
+/// Serialises the window in [`narrow_umask`]: the umask is process-wide,
+/// so two threads narrowing at once would restore each other's value.
+#[cfg(unix)]
+static UMASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// What [`narrow_umask`] returns: the previous umask is restored when
-/// this is dropped.
+/// this is dropped, and nothing else may narrow it in the meantime.
 #[cfg(unix)]
 #[derive(Debug)]
-pub struct UmaskGuard(imp::Umask);
+pub struct UmaskGuard {
+    previous: Mode,
+    _serialised: std::sync::MutexGuard<'static, ()>,
+}
 
 #[cfg(unix)]
-impl UmaskGuard {
-    /// The umask that was in force before this guard narrowed it, and
-    /// that its `Drop` restores.
-    pub fn previous(&self) -> u32 {
-        // `mode_t` is u16 on the BSDs and u32 on Linux; `From` covers
-        // both without a cast clippy calls unnecessary on one of them.
-        u32::from(self.0.previous())
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        imp::set_umask(self.previous);
     }
 }
 
@@ -742,41 +759,11 @@ mod imp {
 
     pub type Mode = libc::mode_t;
 
-    /// Serialises the umask window: `umask(2)` is process-wide, so two
-    /// threads narrowing at once could restore each other's value.
-    static UMASK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// The process umask, narrowed for as long as this value lives.
-    #[derive(Debug)]
-    pub struct Umask {
-        previous: libc::mode_t,
-        _serialised: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl Umask {
-        pub fn narrow(mask: libc::mode_t) -> Self {
-            let serialised = UMASK.lock().unwrap_or_else(|p| p.into_inner());
-            // SAFETY: `umask` cannot fail and touches no memory; it
-            // returns the previous value, which the drop below restores.
-            let previous = unsafe { libc::umask(mask) };
-            Self {
-                previous,
-                _serialised: serialised,
-            }
-        }
-    }
-
-    impl Umask {
-        pub fn previous(&self) -> libc::mode_t {
-            self.previous
-        }
-    }
-
-    impl Drop for Umask {
-        fn drop(&mut self) {
-            // SAFETY: as above, restoring what `narrow` took.
-            unsafe { libc::umask(self.previous) };
-        }
+    /// Set the process umask, answering the one it replaced.
+    pub fn set_umask(mask: Mode) -> Mode {
+        // SAFETY: `umask` cannot fail and touches no memory; it returns
+        // the previous value, which is what the caller restores.
+        unsafe { libc::umask(mask) }
     }
 
     pub fn out_of_descriptors(error: &io::Error) -> bool {
