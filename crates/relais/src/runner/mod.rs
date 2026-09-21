@@ -35,7 +35,7 @@ use crate::policy::{
     effective_authority, BlockCode, EffectiveAuthority, MachineSettings, RepoPolicy, Tier,
 };
 use crate::procs::Ended;
-use crate::route::{route, RouteInputs, RoutePredictor};
+use crate::route::{route, RouteInputs, RoutePredictor, Routed};
 use crate::verify::{self, amont_gaps, Receipt, VerificationReport};
 use crate::workspace::{self, TaskWorktree, WorkspaceError};
 
@@ -776,10 +776,14 @@ impl<'a> RunEngine<'a> {
             authority: &authority,
             predictor: self.config.predictor,
         });
-        let Some(initial_tier) = decision.tier else {
-            let first = &decision.blocked[0];
-            return self.fail_preflight(first.code, first.detail.clone());
+        let decision = match decision {
+            Routed::Route(route) => route,
+            Routed::Blocked(blocked) => {
+                let first = blocked.first();
+                return self.fail_preflight(first.code, first.detail.clone());
+            }
         };
+        let initial_tier = decision.tier;
         if let Some(estimates) = &decision.estimates {
             ledger.record_prediction(
                 &self.run_id,
