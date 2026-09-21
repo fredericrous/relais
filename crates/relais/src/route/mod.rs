@@ -15,7 +15,9 @@ use std::collections::BTreeMap;
 use crate::contract::scope::{scope_contained_in, write_scope_could_touch};
 use crate::contract::{Kind, Review, TaskContract};
 use crate::money::MicroUsd;
-use crate::policy::{BlockCode, Blocker, EffectiveAuthority, MachineSettings, RepoPolicy, Tier};
+use crate::policy::{
+    BlockCode, Blocker, EffectiveAuthority, MachineSettings, ModelProfile, RepoPolicy, Tier,
+};
 
 /// Estimates from an owned, Relais-trained artifact (SPEC §16). The
 /// predictor abstains (returns `None`) when it has no supported coverage
@@ -162,16 +164,20 @@ pub enum RoutedBy {
 
 /// The risk floor from declared scope and repository rules: the highest
 /// minimum tier among rules whose paths the declared scope could touch.
+///
+/// A rule with no paths touches nothing. It used to fire on any contract
+/// whose scope was `**`, through a `paths.first().unwrap_or(&String::new())`
+/// disjunct that asked whether the scope could touch the empty pattern —
+/// a rule nobody wrote, applied to the one scope that matches everything.
+/// Policy validation rejects a pathless rule outright.
 fn risk_floor(contract: &TaskContract, repo: &RepoPolicy) -> (Option<Tier>, Vec<RouteReason>) {
     let mut floor: Option<Tier> = None;
     let mut fired = Vec::new();
     for (index, rule) in repo.risk.iter().enumerate() {
-        let touches =
-            write_scope_could_touch(contract, rule.paths.first().unwrap_or(&String::new()))
-                || rule
-                    .paths
-                    .iter()
-                    .any(|pattern| write_scope_could_touch(contract, pattern));
+        let touches = rule
+            .paths
+            .iter()
+            .any(|pattern| write_scope_could_touch(contract, pattern));
         if touches {
             fired.push(RouteReason::new(
                 format!("risk[{}]:{}", index, rule.minimum_tier.as_str()),
@@ -210,6 +216,88 @@ impl From<&crate::policy::RecipeSpec> for Recipe {
             scope_within: spec.scope_within.clone(),
             tier: spec.tier,
         }
+    }
+}
+
+/// The tiers a task may be dispatched to, and the floor they start at.
+///
+/// One answer, used by the router when it dispatches and by the evaluator
+/// when it asks what the router WOULD have done: an evaluator with its own
+/// notion of eligibility measures a policy nothing will ever run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Eligibility {
+    /// The lowest tier the task may run at: its kind's conservative floor,
+    /// raised by any risk rule the declared scope could touch.
+    pub floor: Tier,
+    /// Every configured tier at or above the floor, cheapest first. Empty
+    /// when policy configures no model there — the router blocks rather
+    /// than falling back silently.
+    pub tiers: Vec<Tier>,
+    /// Why the floor is where it is, in the router's own words.
+    pub reasons: Vec<RouteReason>,
+}
+
+/// The conservative floor a task's KIND implies (SPEC §6): complexity and
+/// consequence are separate, so a change starts at the implementation tier
+/// even when the diff will be one line.
+pub fn kind_floor(kind: Kind) -> Tier {
+    match kind {
+        Kind::Change => Tier::Implementation,
+        Kind::Inspect => Tier::Research,
+    }
+}
+
+/// Every configured tier at or above `floor`, cheapest first. The ladder
+/// is fixed (research < implementation < escalation); `configured` says
+/// which rungs policy names a model for.
+pub fn tiers_at_or_above(floor: Tier, configured: &[Tier]) -> Vec<Tier> {
+    [Tier::Research, Tier::Implementation, Tier::Escalation]
+        .into_iter()
+        .filter(|tier| *tier >= floor && configured.contains(tier))
+        .collect()
+}
+
+/// Eligibility for a contract under a repository's rules: the kind floor,
+/// raised by the risk rules its declared scope could touch, intersected
+/// with the tiers `configured` names a model for. Pure: the caller passes
+/// the model table it means — the router the effective authority's,
+/// dataset construction the repository policy's.
+pub fn eligible_tiers(
+    contract: &TaskContract,
+    repo: &RepoPolicy,
+    configured: &std::collections::BTreeMap<Tier, ModelProfile>,
+) -> Eligibility {
+    let mut reasons = Vec::new();
+    let mut floor = kind_floor(contract.kind);
+    match contract.kind {
+        Kind::Change => reasons.push(RouteReason::new(
+            "kind_change_floor",
+            "bounded change; conservative route floor is implementation",
+        )),
+        Kind::Inspect => reasons.push(RouteReason::new(
+            "kind_inspect_floor",
+            "inspection task; research tier eligible",
+        )),
+    }
+    let (rule_floor, fired_rules) = risk_floor(contract, repo);
+    reasons.extend(fired_rules);
+    if let Some(rule_floor) = rule_floor {
+        if rule_floor > floor {
+            reasons.push(RouteReason::new(
+                "risk_floor",
+                format!(
+                    "risk floor: scope touches configured high-risk paths ({} required)",
+                    rule_floor.as_str()
+                ),
+            ));
+            floor = rule_floor;
+        }
+    }
+    let keys: Vec<Tier> = configured.keys().copied().collect();
+    Eligibility {
+        floor,
+        tiers: tiers_at_or_above(floor, &keys),
+        reasons,
     }
 }
 
@@ -261,37 +349,16 @@ pub fn route(inputs: RouteInputs<'_>) -> Routed {
         ));
     }
 
-    // Complexity and consequence are separate (SPEC §6): a change starts
-    // at the implementation tier even when the diff will be one line.
-    let mut floor = match contract.kind {
-        Kind::Change => Tier::Implementation,
-        Kind::Inspect => Tier::Research,
-    };
-    match contract.kind {
-        Kind::Change => reasons.push(RouteReason::new(
-            "kind_change_floor",
-            "bounded change; conservative route floor is implementation",
-        )),
-        Kind::Inspect => reasons.push(RouteReason::new(
-            "kind_inspect_floor",
-            "inspection task; research tier eligible",
-        )),
-    }
-
-    let (rule_floor, fired_rules) = risk_floor(contract, repo);
-    reasons.extend(fired_rules);
-    if let Some(rule_floor) = rule_floor {
-        if rule_floor > floor {
-            reasons.push(RouteReason::new(
-                "risk_floor",
-                format!(
-                    "risk floor: scope touches configured high-risk paths ({} required)",
-                    rule_floor.as_str()
-                ),
-            ));
-            floor = rule_floor;
-        }
-    }
+    // Eligibility — the kind's floor, raised by risk rules, intersected
+    // with the configured models — is computed by the same function the
+    // evaluator uses, so a promoted artifact is measured over the tiers
+    // the router would actually have offered it.
+    let Eligibility {
+        floor,
+        tiers: eligible,
+        reasons: eligibility_reasons,
+    } = eligible_tiers(contract, repo, &authority.models);
+    reasons.extend(eligibility_reasons);
 
     // Worker-supplied risk hints increase caution, never lower floors
     // (SPEC §4). They cannot lift a tier — only the evidence of a
@@ -310,12 +377,6 @@ pub fn route(inputs: RouteInputs<'_>) -> Routed {
             ));
         }
     }
-
-    // Eligible tiers: floor and everything above it that is configured.
-    let eligible: Vec<Tier> = [Tier::Research, Tier::Implementation, Tier::Escalation]
-        .into_iter()
-        .filter(|tier| *tier >= floor && authority.models.contains_key(tier))
-        .collect();
 
     let Some(&cheapest_eligible) = eligible.first() else {
         reasons.push(RouteReason::new(
@@ -418,7 +479,15 @@ pub fn route(inputs: RouteInputs<'_>) -> Routed {
     })
 }
 
-fn select_learned(estimates: &Estimates, eligible: &[Tier], quality_floor: f64) -> Option<Tier> {
+/// The tier a learned artifact selects: the cheapest ELIGIBLE tier whose
+/// estimated acceptance clears the quality floor and that the artifact can
+/// price. `None` abstains to the conservative baseline. The evaluator calls
+/// this too, so what it measures is what the router will do.
+pub fn select_learned(
+    estimates: &Estimates,
+    eligible: &[Tier],
+    quality_floor: f64,
+) -> Option<Tier> {
     eligible
         .iter()
         .filter(|tier| {
@@ -750,6 +819,78 @@ mod tests {
         assert_eq!(d.tier, Tier::Implementation);
     }
 
+    /// L15: a rule with no paths used to fire on every `**` contract,
+    /// through a disjunct that tested the declared scope against the empty
+    /// pattern. A rule that names no path governs no path. Policy
+    /// validation refuses such a rule (`PolicyError::EmptyRiskPaths`);
+    /// this is the second line of that defence, for a policy built in
+    /// memory rather than parsed.
+    #[test]
+    fn a_risk_rule_with_no_paths_never_fires() {
+        assert!(
+            matches!(
+                RepoPolicy::from_toml_str(
+                    "schema_version = 1\n[[risk]]\npaths = []\nminimum_tier = \"escalation\"\n"
+                ),
+                Err(crate::policy::PolicyError::EmptyRiskPaths)
+            ),
+            "a pathless risk rule is refused at the policy boundary"
+        );
+        let mut repo = repo_policy();
+        repo.risk.push(RiskRule {
+            paths: Vec::new(),
+            minimum_tier: Tier::Escalation,
+            review: None,
+        });
+        let machine = machine_for(&repo);
+        let everything = route_with(&change_contract(&["**"]), &repo, &machine);
+        assert_eq!(
+            everything.tier,
+            Tier::Implementation,
+            "a pathless rule may not raise the floor of a whole-repository scope"
+        );
+        assert!(
+            !everything
+                .reasons
+                .iter()
+                .any(|reason| reason.id.starts_with("risk[")),
+            "no rule fired: {:?}",
+            everything.reasons
+        );
+    }
+
+    /// The evaluator and the router must agree on what is eligible; both
+    /// go through `eligible_tiers`.
+    #[test]
+    fn eligibility_is_the_floor_and_every_configured_tier_above_it() {
+        let mut repo = repo_policy();
+        repo.risk.push(RiskRule {
+            paths: vec!["**/trust/**".into()],
+            minimum_tier: Tier::Escalation,
+            review: None,
+        });
+        let machine = machine_for(&repo);
+        let contract = change_contract(&["crates/amont/trust/**"]);
+        let authority = effective_authority(&repo, &machine, &contract);
+        let eligibility = eligible_tiers(&contract, &repo, &authority.models);
+        assert_eq!(eligibility.floor, Tier::Escalation);
+        assert_eq!(eligibility.tiers, vec![Tier::Escalation]);
+
+        let inspect = inspect_contract();
+        let authority = effective_authority(&repo, &machine, &inspect);
+        let eligibility = eligible_tiers(&inspect, &repo, &authority.models);
+        assert_eq!(eligibility.floor, Tier::Research);
+        assert_eq!(
+            eligibility.tiers,
+            vec![Tier::Research, Tier::Implementation, Tier::Escalation]
+        );
+        assert_eq!(
+            tiers_at_or_above(Tier::Implementation, &[Tier::Research, Tier::Escalation]),
+            vec![Tier::Escalation],
+            "an unconfigured tier is not eligible, and nothing below the floor is"
+        );
+    }
+
     #[test]
     fn risk_hints_raise_review_but_never_lower_floors() {
         let repo = repo_policy();
@@ -1058,5 +1199,101 @@ mod tests {
         let docs = change_contract(&["docs/api/**"]);
         let d = route_with(&docs, &repo, &machine);
         assert_eq!(d.routed_by, RoutedBy::DeterministicRecipe);
+    }
+
+    proptest::proptest! {
+        /// Selection is bounded by eligibility: whatever the estimates
+        /// say, the router may only pick a tier the floor and the
+        /// configured models left on the table — and only one that clears
+        /// the quality floor and carries a price. The evaluator measures
+        /// through this same function, so the bound holds for what a
+        /// promotion claims as well as for what a run does.
+        #[test]
+        fn selection_never_leaves_eligibility(
+            estimates in proptest::collection::vec(
+                (0usize..3, 0.0f64..1.0, proptest::option::of(0i64..1_000_000)),
+                0..6,
+            ),
+            eligible_mask in 0u8..8,
+            quality_floor in 0.0f64..1.0,
+        ) {
+            use proptest::prelude::*;
+            let ladder = [Tier::Research, Tier::Implementation, Tier::Escalation];
+            let eligible: Vec<Tier> = ladder
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| eligible_mask & (1 << index) != 0)
+                .map(|(_, tier)| *tier)
+                .collect();
+            let mut acceptance = BTreeMap::new();
+            let mut cost = BTreeMap::new();
+            for (index, probability, price) in estimates {
+                acceptance.insert(ladder[index], probability);
+                if let Some(price) = price {
+                    cost.insert(ladder[index], MicroUsd::from_micros(price));
+                }
+            }
+            let estimates = Estimates {
+                artifact_id: "artifact-property".into(),
+                input_hash: "in".into(),
+                acceptance,
+                cost,
+                raw: serde_json::Value::Null,
+            };
+            let selected = select_learned(&estimates, &eligible, quality_floor);
+            if let Some(tier) = selected {
+                prop_assert!(eligible.contains(&tier), "{tier:?} is not eligible");
+                prop_assert!(estimates.acceptance[&tier] >= quality_floor);
+                prop_assert!(estimates.cost.contains_key(&tier), "an unpriced tier won");
+                // And it is the cheapest such tier: nothing eligible that
+                // clears the floor is priced below it.
+                let chosen = estimates.cost[&tier];
+                for other in &eligible {
+                    let clears = estimates
+                        .acceptance
+                        .get(other)
+                        .is_some_and(|value| *value >= quality_floor);
+                    if clears {
+                        if let Some(price) = estimates.cost.get(other) {
+                            prop_assert!(*price >= chosen);
+                        }
+                    }
+                }
+            } else {
+                // Abstention means nothing eligible was both good enough
+                // and priced.
+                for tier in &eligible {
+                    let clears = estimates
+                        .acceptance
+                        .get(tier)
+                        .is_some_and(|value| *value >= quality_floor);
+                    prop_assert!(!(clears && estimates.cost.contains_key(tier)));
+                }
+            }
+        }
+
+        /// Eligibility itself is bounded: every tier it offers is
+        /// configured and at or above the floor it reports.
+        #[test]
+        fn eligibility_offers_only_configured_tiers_above_its_floor(
+            configured_mask in 0u8..8,
+            floor_index in 0usize..3,
+        ) {
+            use proptest::prelude::*;
+            let ladder = [Tier::Research, Tier::Implementation, Tier::Escalation];
+            let configured: Vec<Tier> = ladder
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| configured_mask & (1 << index) != 0)
+                .map(|(_, tier)| *tier)
+                .collect();
+            let floor = ladder[floor_index];
+            let tiers = tiers_at_or_above(floor, &configured);
+            for tier in &tiers {
+                prop_assert!(*tier >= floor);
+                prop_assert!(configured.contains(tier));
+            }
+            prop_assert!(tiers.windows(2).all(|pair| pair[0] < pair[1]));
+        }
     }
 }
