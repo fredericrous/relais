@@ -59,7 +59,25 @@ review = "required"
 
 # Path-to-aval-key mappings. aval resolves exact keys; it has no
 # source-impact analysis, so the mapping lives here (SPEC §7).
-# [[architecture.mapping]]
-# paths = ["crates/**"]
-# keys = ["storage.object-store"]
-# scope = "default"
+#
+# The corpus these resolve against is vendored at `.adr/packs/decisions.pack`
+# (see `.adr.yaml`): relais declares no decisions of its own, and every key
+# below is a FLEET decision. A worker changing this crate gets the paradigm
+# and the two code canons in its context package, which is the same service
+# relais offers the repositories it runs in.
+[[architecture.mapping]]
+paths = ["crates/**"]
+keys = ["code.paradigm", "code.practice-canon", "code.functional-canon"]
+
+# The workflows and the Makefile are where the CI and release decisions are
+# actually implemented, so a change to them resolves those.
+[[architecture.mapping]]
+paths = [".github/workflows/**", "Makefile"]
+keys = [
+    "ci.presence",
+    "ci.system",
+    "ci.test-gate-stage",
+    "build.toolchain-source",
+    "release.trigger",
+    "release.version-scheme",
+]

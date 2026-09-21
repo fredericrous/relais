@@ -1,0 +1,27 @@
+# The decision registry for relais.
+#
+# This repository declares no architectural questions of its own yet: every
+# decision it lives under is a FLEET decision, made once in the `decisions`
+# repository and vendored below (the code paradigm and canons, CI from the
+# first commit, releases on a version tag, SemVer, the guidance block). A
+# record here deciding one of their slots would be a contradiction, not an
+# override.
+#
+# relais is also a CONSUMER of this corpus at runtime: `[[architecture.mapping]]`
+# in relais.toml maps paths to keys, and every run resolves them through
+# `aval` for the worker's context package (SPEC §7). Until this file existed,
+# `[integrations] aval = "required"` was satisfied by the binary being on
+# PATH and nothing more — the tool relais makes workers consult had no
+# corpus to consult in relais itself.
+#
+# `aval add github:fredericrous/decisions` refreshes the pack; nothing tells
+# this repository when a fleet decision changes, so `aval add --check` asks.
+
+packs:
+  - .adr/packs/decisions.pack
+
+# No scopes and no keys of this repository's own: everything answerable here
+# comes from the pack. Declare a key here the day relais has a question the
+# fleet does not answer.
+scopes: []
+keys:
