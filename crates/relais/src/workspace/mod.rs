@@ -318,26 +318,15 @@ pub fn check_scope(
     candidate_sha: &str,
     contract: &TaskContract,
 ) -> std::result::Result<Vec<String>, WorkspaceError> {
-    let patterns: &[String] = match contract.write_scope.as_deref() {
-        Some(patterns) if !patterns.is_empty() => patterns,
-        _ => &[],
-    };
-    let mut matcher = globset::GlobSet::builder();
-    for pattern in patterns {
-        matcher.add(
-            globset::GlobBuilder::new(pattern)
-                .literal_separator(true)
-                .build()
-                .map_err(|e| WorkspaceError::Git(format!("bad scope pattern `{pattern}`: {e}")))?,
-        );
-    }
-    let matcher = matcher
-        .build()
-        .map_err(|e| WorkspaceError::Git(format!("bad scope patterns: {e}")))?;
+    // The scope arrives compiled: `TaskContract::from_json_str` judged
+    // every pattern before the worker ran (P5), so there is nothing to
+    // fail here and no glob error to report as a git failure.
+    let scope = contract.write_scope();
+    let patterns: &[String] = scope.map_or(&[], |scope| scope.patterns());
 
     let mut violations = Vec::new();
     for path in worktree.changed_paths_in(candidate_sha)? {
-        let in_scope = matcher.is_match(&path);
+        let in_scope = scope.is_some_and(|scope| scope.is_match(&path));
         // "Explicitly within an approved contract" (SPEC §8) means the
         // scope names THIS protected area — a pattern that starts with
         // the prefix the path falls under — not a blanket `**` that

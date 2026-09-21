@@ -10,6 +10,31 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A stored name that is not one of this binary's variants: a value a
+/// newer relais wrote, a truncated write, a hand edit. Parsing a stored
+/// name is fallible, so callers say what they do about it — the ledger
+/// turns it into `LedgerError::Corrupt` rather than reading it as "no
+/// such run".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownVariant {
+    /// What was being read: `run state`, `transition reason`.
+    pub what: &'static str,
+    /// The name as it was stored.
+    pub found: String,
+}
+
+impl std::fmt::Display for UnknownVariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "`{}` is not a {} this relais knows",
+            self.found, self.what
+        )
+    }
+}
+
+impl std::error::Error for UnknownVariant {}
+
 /// Why a transition happened. Stored by name in the ledger, so the
 /// spelling is the wire format and `parse` is its inverse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -113,8 +138,16 @@ impl Reason {
         }
     }
 
-    pub fn parse(text: &str) -> Option<Self> {
-        serde_json::from_value(serde_json::Value::String(text.to_string())).ok()
+    /// The inverse of [`Reason::as_str`]. A name this binary does not
+    /// know is an error the caller must decide about, never a silently
+    /// dropped reason.
+    pub fn parse(text: &str) -> Result<Self, UnknownVariant> {
+        serde_json::from_value(serde_json::Value::String(text.to_string())).map_err(|_| {
+            UnknownVariant {
+                what: "transition reason",
+                found: text.to_string(),
+            }
+        })
     }
 }
 
@@ -163,8 +196,15 @@ impl State {
         }
     }
 
-    pub fn parse(text: &str) -> Option<Self> {
-        serde_json::from_value(serde_json::Value::String(text.to_string())).ok()
+    /// The inverse of [`State::as_str`]. A stored name this binary does
+    /// not know is a corrupt row, and the ledger reports it as one.
+    pub fn parse(text: &str) -> Result<Self, UnknownVariant> {
+        serde_json::from_value(serde_json::Value::String(text.to_string())).map_err(|_| {
+            UnknownVariant {
+                what: "run state",
+                found: text.to_string(),
+            }
+        })
     }
 
     pub fn is_terminal(self) -> bool {
@@ -200,12 +240,24 @@ mod tests {
             Reason::VerificationInputsChanged,
             Reason::RunnerFailure,
         ] {
-            assert_eq!(Reason::parse(reason.as_str()), Some(reason));
+            assert_eq!(Reason::parse(reason.as_str()), Ok(reason));
         }
-        assert_eq!(Reason::parse("nope"), None);
         for state in [State::Prepared, State::NeedsDecision, State::Interrupted] {
-            assert_eq!(State::parse(state.as_str()), Some(state));
+            assert_eq!(State::parse(state.as_str()), Ok(state));
         }
         assert!(State::Accepted.is_terminal() && !State::Verifying.is_terminal());
+    }
+
+    /// X5: a name this binary does not know is an error that names what
+    /// was read and what was found — not a `None` a caller can mistake
+    /// for "nothing recorded".
+    #[test]
+    fn an_unknown_name_is_a_typed_error_naming_it() {
+        let error = State::parse("hibernating").expect_err("not a known state");
+        assert_eq!(error.what, "run state");
+        assert_eq!(error.found, "hibernating");
+        assert!(error.to_string().contains("hibernating"), "{error}");
+        let error = Reason::parse("nope").expect_err("not a known reason");
+        assert_eq!(error.what, "transition reason");
     }
 }

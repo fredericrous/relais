@@ -206,6 +206,70 @@ pub(crate) fn claude_code_finding(caps: &Capabilities) -> Finding {
     }
 }
 
+/// Whether THIS repository's declaration is granted, and what the grants
+/// on this machine are for when it is not.
+///
+/// A grant is bound to the pair (declaration, repository), so a key that
+/// does not match is not a broken grant — it is a grant for something
+/// else, and saying which is the difference between "add a grant" and
+/// "you already reviewed this, somewhere else" (P2).
+pub(crate) fn trust_finding(
+    policy: Option<&RepoPolicy>,
+    settings: &MachineSettings,
+    root: &std::path::Path,
+) -> Finding {
+    let Some(policy) = policy else {
+        return Finding {
+            component: "trust",
+            ok: false,
+            level: "warn",
+            detail: "no readable relais.toml, so this repository has no declaration to grant"
+                .into(),
+        };
+    };
+    let identity = crate::repo::identity(root);
+    let key = crate::policy::grant_key(&policy.authority_hash(), &identity);
+    match settings.trust.get(&key) {
+        Some(grant) => Finding {
+            component: "trust",
+            ok: true,
+            level: "ok",
+            detail: format!(
+                "granted for {} by {} on {}",
+                identity.label(),
+                grant.reviewed_by,
+                grant.granted_at
+            ),
+        },
+        None => {
+            let others: Vec<String> = settings
+                .trust
+                .values()
+                .filter_map(|grant| grant.repo.clone())
+                .collect();
+            Finding {
+                component: "trust",
+                ok: false,
+                level: "warn",
+                detail: format!(
+                    "no grant for this declaration in {} (key {key}); `relais plan` prints the \
+                     block to review and paste. {}",
+                    identity.label(),
+                    if others.is_empty() {
+                        format!(
+                            "{} grant(s) on this machine are for other declarations or \
+                             repositories",
+                            settings.trust.len()
+                        )
+                    } else {
+                        format!("the grants on this machine are for: {}", others.join(", "))
+                    }
+                ),
+            }
+        }
+    }
+}
+
 /// `[trials] enabled = true` promises randomized assignment with logged
 /// propensities (SPEC §17). This release ships no replay command and no
 /// propensity logging, so the flag does nothing at all. Saying so is the
@@ -428,6 +492,9 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
                 machine_path.display()
             ),
         }),
+        // `from_toml_str` validates the ceilings and every grant's
+        // reviewer and date (P10), so an invalid grant is named here
+        // rather than counted among the valid ones.
         Ok(text) => match MachineSettings::from_toml_str(&text) {
             Ok(settings) => {
                 findings.push(Finding {
@@ -436,6 +503,7 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
                     level: "ok",
                     detail: format!("valid; {} trust grant(s)", settings.trust.len()),
                 });
+                findings.push(trust_finding(policy.as_ref(), &settings, repo_dir));
                 if let Some(trials) = trials_finding(&settings) {
                     findings.push(trials);
                 }

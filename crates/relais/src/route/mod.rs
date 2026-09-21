@@ -268,8 +268,8 @@ pub fn eligible_tiers(
     configured: &std::collections::BTreeMap<Tier, ModelProfile>,
 ) -> Eligibility {
     let mut reasons = Vec::new();
-    let mut floor = kind_floor(contract.kind);
-    match contract.kind {
+    let mut floor = kind_floor(contract.kind());
+    match contract.kind() {
         Kind::Change => reasons.push(RouteReason::new(
             "kind_change_floor",
             "bounded change; conservative route floor is implementation",
@@ -303,7 +303,7 @@ pub fn eligible_tiers(
 
 fn recipe_covers(contract: &TaskContract, recipe: &Recipe) -> bool {
     if let Some(kind) = recipe.kind {
-        if contract.kind != kind {
+        if contract.kind() != kind {
             return false;
         }
     }
@@ -312,15 +312,14 @@ fn recipe_covers(contract: &TaskContract, recipe: &Recipe) -> bool {
     }
     // FULLY covers (SPEC §6, step 3): every pattern the contract may write must
     // be contained in some recipe pattern.
-    contract.write_scope.as_deref().is_some_and(|scopes| {
-        !scopes.is_empty()
-            && scopes.iter().all(|scope| {
-                recipe
-                    .scope_within
-                    .iter()
-                    .any(|cover| scope_contained_in(scope, cover))
-            })
-    })
+    let scopes = contract.scope_patterns();
+    !scopes.is_empty()
+        && scopes.iter().all(|scope| {
+            recipe
+                .scope_within
+                .iter()
+                .any(|cover| scope_contained_in(scope, cover))
+        })
 }
 
 pub fn route(inputs: RouteInputs<'_>) -> Routed {
@@ -648,11 +647,12 @@ mod tests {
             routing: Default::default(),
         };
         machine.trust.insert(
-            repo.authority_hash(),
+            crate::policy::grant_key(&repo.authority_hash(), &identity()),
             crate::policy::TrustGrant {
                 granted_at: "2026-09-18".into(),
-                reviewed_by: None,
+                reviewed_by: "a reviewer".into(),
                 note: None,
+                repo: None,
             },
         );
         machine
@@ -690,8 +690,12 @@ mod tests {
         .expect("contract parses")
     }
 
+    fn identity() -> crate::policy::RepoIdentity {
+        crate::policy::RepoIdentity::new(std::path::Path::new("/repos/relais"), None)
+    }
+
     fn decide(contract: &TaskContract, repo: &RepoPolicy, machine: &MachineSettings) -> Routed {
-        let authority = effective_authority(repo, machine, contract);
+        let authority = effective_authority(repo, machine, contract, &identity());
         route(RouteInputs {
             contract,
             repo,
@@ -725,7 +729,7 @@ mod tests {
     #[test]
     fn inspect_contracts_parse_without_write_scope() {
         let c = inspect_contract();
-        assert_eq!(c.kind, Kind::Inspect);
+        assert_eq!(c.kind(), Kind::Inspect);
         let _ = ContractError::EmptyObjective;
     }
 
@@ -871,13 +875,13 @@ mod tests {
         });
         let machine = machine_for(&repo);
         let contract = change_contract(&["crates/amont/trust/**"]);
-        let authority = effective_authority(&repo, &machine, &contract);
+        let authority = effective_authority(&repo, &machine, &contract, &identity());
         let eligibility = eligible_tiers(&contract, &repo, &authority.models);
         assert_eq!(eligibility.floor, Tier::Escalation);
         assert_eq!(eligibility.tiers, vec![Tier::Escalation]);
 
         let inspect = inspect_contract();
-        let authority = effective_authority(&repo, &machine, &inspect);
+        let authority = effective_authority(&repo, &machine, &inspect, &identity());
         let eligibility = eligible_tiers(&inspect, &repo, &authority.models);
         assert_eq!(eligibility.floor, Tier::Research);
         assert_eq!(
@@ -912,11 +916,12 @@ mod tests {
         let mut machine = machine;
         machine.allowed_models = None;
         machine.trust.insert(
-            repo.authority_hash(),
+            crate::policy::grant_key(&repo.authority_hash(), &identity()),
             crate::policy::TrustGrant {
                 granted_at: "2026-09-18".into(),
-                reviewed_by: None,
+                reviewed_by: "a reviewer".into(),
                 note: None,
+                repo: None,
             },
         );
         let d = expect_blocked(decide(
@@ -993,8 +998,12 @@ mod tests {
     fn learned_artifact_selects_the_cheapest_tier_that_clears_quality() {
         let repo = repo_policy();
         let machine = machine_for(&repo);
-        let authority =
-            effective_authority(&repo, &machine, &change_contract(&["crates/amont/**"]));
+        let authority = effective_authority(
+            &repo,
+            &machine,
+            &change_contract(&["crates/amont/**"]),
+            &identity(),
+        );
         // Research clears the floor and is cheaper; implementation clears it
         // too but costs more. The change-task floor is implementation, so
         // research is NOT eligible despite the estimate.
@@ -1018,8 +1027,12 @@ mod tests {
     fn learned_artifact_below_quality_floor_falls_back_to_baseline() {
         let repo = repo_policy();
         let machine = machine_for(&repo);
-        let authority =
-            effective_authority(&repo, &machine, &change_contract(&["crates/amont/**"]));
+        let authority = effective_authority(
+            &repo,
+            &machine,
+            &change_contract(&["crates/amont/**"]),
+            &identity(),
+        );
         let predictor = FixedPredictor(vec![
             (Tier::Implementation, 0.40, 300),
             (Tier::Escalation, 0.40, 900),
@@ -1088,8 +1101,12 @@ mod tests {
         }
         let repo = repo_policy();
         let machine = machine_for(&repo);
-        let authority =
-            effective_authority(&repo, &machine, &change_contract(&["crates/amont/**"]));
+        let authority = effective_authority(
+            &repo,
+            &machine,
+            &change_contract(&["crates/amont/**"]),
+            &identity(),
+        );
         let d = expect_route(route(RouteInputs {
             contract: &change_contract(&["crates/amont/**"]),
             repo: &repo,

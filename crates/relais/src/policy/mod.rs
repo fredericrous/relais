@@ -5,9 +5,10 @@
 //! models, permissions and trust grants. Effective authority is the
 //! intersection of repo policy, machine settings and per-run contract
 //! limits — a contract can narrow a grant but nothing broadens one, and
-//! there is no last-writer-wins override. Trust grants are content-bound
-//! to the reviewed execution profile; a changed declaration invalidates
-//! them.
+//! there is no last-writer-wins override. Trust grants are bound to the
+//! reviewed execution profile AND to the repository it was reviewed for;
+//! a changed declaration, or the same declaration in another repository,
+//! invalidates them.
 
 use std::collections::BTreeMap;
 
@@ -15,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::contract::{Review, TaskContract};
 use crate::ids::canonical_json_hash;
+use crate::money::MicroUsd;
 
 pub const POLICY_SCHEMA_VERSION: u64 = 1;
 
@@ -42,6 +44,17 @@ impl Tier {
             Tier::Implementation => "implementation",
             Tier::Escalation => "escalation",
         }
+    }
+
+    /// The inverse of [`Tier::as_str`], for a tier read back from the
+    /// ledger or a dataset. `None` is a name this relais does not know.
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "research" => Tier::Research,
+            "implementation" => Tier::Implementation,
+            "escalation" => Tier::Escalation,
+            _ => return None,
+        })
     }
 }
 
@@ -307,28 +320,91 @@ impl RepoPolicy {
         Ok(())
     }
 
+    /// The policy as the hash sees it: everything the serialized policy
+    /// carries except [`AUTHORITY_EXCLUSIONS`].
+    ///
+    /// Derived from the struct rather than enumerated by hand, so a new
+    /// `RepoPolicy` field is inside the hash by construction. The hand
+    /// written list it replaced had the opposite property: a field added
+    /// without touching this function was executable authority outside
+    /// the hash, and a grant reviewed before it survived (P4).
+    fn authority_value(&self) -> serde_json::Value {
+        let mut value =
+            serde_json::to_value(self).expect("RepoPolicy serializes: string map keys, no floats");
+        if let serde_json::Value::Object(map) = &mut value {
+            for excluded in AUTHORITY_EXCLUSIONS {
+                map.remove(*excluded);
+            }
+        }
+        value
+    }
+
     /// Hash over the executable authority: models, execution limits, the
     /// context budget, verification profiles, integration modes, risk
-    /// rules, recipes and architecture mappings. Machine trust grants are
-    /// content-bound to this hash — a changed declaration invalidates
-    /// them (SPEC §5). Recipes are executable authority: one that covers
-    /// a task picks its tier outright, ahead of the learner, so a grant
-    /// must not survive an edit to them. The context budget belongs here
-    /// for the same reason: raising it is what turns a sizing problem
-    /// into a dispatch, so it is reviewed, not slipped in.
+    /// rules, recipes and architecture mappings — every field of the
+    /// policy but the schema version. A trust grant is bound to this
+    /// hash and to the repository (see [`grant_key`]), so a changed
+    /// declaration invalidates it (SPEC §5). Recipes are executable
+    /// authority: one that covers a task picks its tier outright, ahead
+    /// of the learner, so a grant must not survive an edit to them. The
+    /// context budget belongs here for the same reason: raising it is
+    /// what turns a sizing problem into a dispatch, so it is reviewed,
+    /// not slipped in.
     pub fn authority_hash(&self) -> String {
-        let value = serde_json::json!({
-            "models": self.models,
-            "execution": self.execution,
-            "context": self.context,
-            "verification": self.verification,
-            "integrations": self.integrations,
-            "risk": self.risk,
-            "recipes": self.recipes,
-            "architecture": self.architecture,
-        });
-        canonical_json_hash(&value)
+        canonical_json_hash(&self.authority_value())
     }
+}
+
+/// Policy fields that are NOT executable authority, and so stay outside
+/// the hash. The schema version identifies the format, not what runs;
+/// bumping it would otherwise invalidate every grant on upgrade.
+pub const AUTHORITY_EXCLUSIONS: &[&str] = &["schema_version"];
+
+/// Which repository a trust grant was reviewed for.
+///
+/// A grant used to be bound to the policy's content alone, so any other
+/// repository whose `relais.toml` hashed the same — the public `relais
+/// init` template does — ran its `make check` under a grant nobody had
+/// reviewed for it (P2). The identity is the repository root as
+/// `repo::locate_repo_root` resolved it, plus the `origin` remote URL
+/// when git reports one. Built at a boundary and passed in: this module
+/// decides, it does not look at disks or run git.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepoIdentity {
+    /// The canonical path of the directory whose `relais.toml` governs
+    /// the run.
+    root: String,
+    /// The `origin` remote URL, when the repository has one.
+    origin: Option<String>,
+}
+
+impl RepoIdentity {
+    /// The identity of the repository rooted at `root`, with `origin` as
+    /// git reported it (`None` when there is no such remote).
+    pub fn new(root: &std::path::Path, origin: Option<String>) -> Self {
+        Self {
+            root: root.to_string_lossy().into_owned(),
+            origin: origin.filter(|url| !url.trim().is_empty()),
+        }
+    }
+
+    /// What a human reads in a grant's `repo = "…"` field: the origin
+    /// URL when there is one, otherwise the root path. Informational —
+    /// the binding itself is in the key.
+    pub fn label(&self) -> &str {
+        self.origin.as_deref().unwrap_or(&self.root)
+    }
+}
+
+/// The key a trust grant is recorded under in machine.toml: the
+/// execution declaration AND the repository it was reviewed for. The
+/// same declaration in a second repository hashes to a different key,
+/// so it needs its own review (P2).
+pub fn grant_key(authority_hash: &str, repo: &RepoIdentity) -> String {
+    canonical_json_hash(&serde_json::json!({
+        "authority": authority_hash,
+        "repo": repo,
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,6 +413,19 @@ pub enum PolicyError {
     MalformedToml(String),
     EmptyRiskPaths,
     EmptyCommandArgv,
+    /// A spending ceiling below zero. A negative ceiling is not a tight
+    /// one: every comparison against it is already past, and the
+    /// remaining-budget subtraction would go somewhere nobody meant.
+    NegativeCeiling {
+        field: &'static str,
+        micros: i64,
+    },
+    /// A `[trust."…"]` block that is not a reviewed grant: no reviewer
+    /// named, or a `granted_at` that is not a date this relais can read.
+    InvalidTrustGrant {
+        key: String,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for PolicyError {
@@ -349,6 +438,13 @@ impl std::fmt::Display for PolicyError {
             Self::MalformedToml(detail) => write!(f, "policy file is not valid TOML: {detail}"),
             Self::EmptyRiskPaths => write!(f, "a [[risk]] rule needs at least one path pattern"),
             Self::EmptyCommandArgv => write!(f, "a verification command needs a non-empty argv"),
+            Self::NegativeCeiling { field, micros } => write!(
+                f,
+                "[spending] {field} is {micros}; a ceiling is a number of micro-USD and cannot be negative"
+            ),
+            Self::InvalidTrustGrant { key, detail } => {
+                write!(f, "trust grant [trust.\"{key}\"]: {detail}")
+            }
         }
     }
 }
@@ -368,7 +464,8 @@ pub struct MachineSettings {
     pub allowed_models: Option<Vec<String>>,
     #[serde(default)]
     pub spending: SpendingCeilings,
-    /// Content-bound trust grants, keyed by repo authority hash.
+    /// Trust grants, keyed by [`grant_key`]: the repository's authority
+    /// hash together with the repository's own identity.
     #[serde(default)]
     pub trust: BTreeMap<String, TrustGrant>,
     #[serde(default)]
@@ -384,34 +481,87 @@ pub struct MachineSettings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct SpendingCeilings {
-    /// Per-run API spend ceiling in micro-USD. Best effort across
-    /// in-flight requests; never advertised as an exact cap (SPEC §11).
-    pub per_run_micros: Option<i64>,
-    /// Machine-wide ceiling for one UTC day, in micro-USD, checked at
-    /// the runner's loop top against every usage event recorded that day
-    /// — this run's and every other run's on this machine. Best effort
-    /// for the same reasons as the per-run ceiling, and a lower bound
-    /// besides: usage the provider never reported is NULL in the ledger
-    /// and no sum can include it.
-    pub per_day_micros: Option<i64>,
+    /// Per-run API spend ceiling. Best effort across in-flight requests;
+    /// never advertised as an exact cap (SPEC §11). Money, not a bare
+    /// integer: the remaining-budget subtraction saturates (P7).
+    pub per_run_micros: Option<MicroUsd>,
+    /// Machine-wide ceiling for one UTC day, checked at the runner's
+    /// loop top against every usage event recorded that day — this run's
+    /// and every other run's on this machine. Best effort for the same
+    /// reasons as the per-run ceiling, and a lower bound besides: usage
+    /// the provider never reported is NULL in the ledger and no sum can
+    /// include it.
+    pub per_day_micros: Option<MicroUsd>,
 }
 
+/// One reviewed grant. The key it is recorded under carries the binding
+/// (see [`grant_key`]); these fields are the audit trail.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrustGrant {
+    /// An RFC3339 timestamp or a plain `YYYY-MM-DD` date. Parsed at the
+    /// boundary by [`MachineSettings::validate`], so a grant stamped
+    /// `"yesterday"` is refused rather than counted as valid (P10).
     pub granted_at: String,
-    #[serde(default)]
-    pub reviewed_by: Option<String>,
+    /// Who reviewed the declaration. Required: a grant with nobody's
+    /// name on it is not a reviewed grant.
+    pub reviewed_by: String,
     #[serde(default)]
     pub note: Option<String>,
+    /// Which repository this grant was issued for, as `relais plan`
+    /// prints it. Informational — the binding is in the key — but it is
+    /// what makes a machine.toml readable.
+    #[serde(default)]
+    pub repo: Option<String>,
 }
 
-/// Tool profile for workers. Workers cannot commit, merge, push or publish
-/// through the normal allowed tool profile (SPEC §8); the default list is
-/// the floor, and repo policy may extend it — never shorten it.
+impl TrustGrant {
+    /// When this grant was recorded. Both spellings machine.toml uses
+    /// are accepted; a plain date is read as midnight UTC.
+    pub fn granted_at(&self) -> Result<chrono::DateTime<chrono::FixedOffset>, String> {
+        if let Ok(at) = chrono::DateTime::parse_from_rfc3339(&self.granted_at) {
+            return Ok(at);
+        }
+        let date = chrono::NaiveDate::parse_from_str(&self.granted_at, "%Y-%m-%d")
+            .map_err(|e| format!("granted_at `{}` is not a date: {e}", self.granted_at))?;
+        date.and_hms_opt(0, 0, 0)
+            .and_then(|at| {
+                at.and_local_timezone(chrono::FixedOffset::east_opt(0)?)
+                    .single()
+            })
+            .ok_or_else(|| format!("granted_at `{}` is not a date", self.granted_at))
+    }
+
+    fn validate(&self, key: &str) -> Result<(), PolicyError> {
+        if self.reviewed_by.trim().is_empty() {
+            return Err(PolicyError::InvalidTrustGrant {
+                key: key.to_string(),
+                detail: "reviewed_by is empty; name who reviewed the declaration".into(),
+            });
+        }
+        self.granted_at()
+            .map(|_| ())
+            .map_err(|detail| PolicyError::InvalidTrustGrant {
+                key: key.to_string(),
+                detail,
+            })
+    }
+}
+
+/// Tool profile for workers. Workers cannot commit, merge, push or
+/// publish through the normal allowed tool profile (SPEC §8).
+///
+/// Both lists are machine-owned; repository policy has no permissions
+/// field at all, so a repository can neither widen nor narrow what its
+/// own workers may do. What machine.toml writes here can only ADD to
+/// the deny floor: [`effective_disallowed_tools`] unions the two, so
+/// `disallowed_tools = []` still denies commit, merge, push, rebase,
+/// reset and tag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Permissions {
+    /// Extra denials, on top of [`default_disallowed_tools`]. Never
+    /// read on its own — read [`effective_disallowed_tools`].
     #[serde(default = "default_disallowed_tools")]
     pub disallowed_tools: Vec<String>,
     /// Claude Code permission rules the worker is granted, passed via
@@ -447,7 +597,7 @@ pub struct Permissions {
 /// and never integrates anything — a worker that did manage to commit
 /// has changed nothing about what gets accepted. Strong confinement
 /// needs the separately configured OS/container backend §8 describes.
-fn default_disallowed_tools() -> Vec<String> {
+pub fn default_disallowed_tools() -> Vec<String> {
     vec![
         // The operations themselves.
         "Bash(git commit:*)".into(),
@@ -484,6 +634,23 @@ impl Default for Permissions {
             allowed_tools: Vec::new(),
         }
     }
+}
+
+/// The deny list a worker actually runs under: the shipped floor, plus
+/// whatever machine.toml added, in that order and without duplicates.
+///
+/// A union, never an override. The doc above `default_disallowed_tools`
+/// has always called that list a floor; until this function existed it
+/// was not one, because `disallowed_tools = []` in machine.toml replaced
+/// it wholesale and nothing else re-added the commit/merge/push denials.
+pub fn effective_disallowed_tools(permissions: &Permissions) -> Vec<String> {
+    let mut tools = default_disallowed_tools();
+    for tool in &permissions.disallowed_tools {
+        if !tools.contains(tool) {
+            tools.push(tool.clone());
+        }
+    }
+    tools
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -562,7 +729,33 @@ impl MachineSettings {
                 settings.schema_version,
             ));
         }
+        settings.validate()?;
         Ok(settings)
+    }
+
+    /// Everything about machine.toml that serde's types cannot state:
+    /// ceilings are non-negative amounts of money, and every trust grant
+    /// names a reviewer and a date that parses. Run from
+    /// [`MachineSettings::from_toml_str`], so nothing downstream has to
+    /// re-check it, and `doctor` reports the failure by name.
+    pub fn validate(&self) -> Result<(), PolicyError> {
+        for (field, ceiling) in [
+            ("per_run_micros", self.spending.per_run_micros),
+            ("per_day_micros", self.spending.per_day_micros),
+        ] {
+            if let Some(ceiling) = ceiling {
+                if ceiling.is_negative() {
+                    return Err(PolicyError::NegativeCeiling {
+                        field,
+                        micros: ceiling.to_micros(),
+                    });
+                }
+            }
+        }
+        for (key, grant) in &self.trust {
+            grant.validate(key)?;
+        }
+        Ok(())
     }
 }
 
@@ -663,15 +856,27 @@ pub struct EffectiveAuthority {
     /// `--settings`. Repo policy contributes nothing: authority here only
     /// narrows, and a repository cannot broaden its own workers' reach.
     pub allowed_tools: Vec<String>,
+    /// The hash of the repository's executable declaration.
     pub authority_hash: String,
+    /// The machine.toml key a grant for THIS declaration in THIS
+    /// repository is recorded under; what `relais plan` prints to paste.
+    pub grant_key: String,
     pub trust_granted: bool,
     pub blockers: Vec<Blocker>,
 }
 
+/// The authority a run may execute under.
+///
+/// `repo_identity` is which repository this is, built at a boundary
+/// (`repo::identity`) and passed in. A grant is bound to the pair
+/// (declaration, repository), so the public `relais init` template
+/// hashing the same in two repositories no longer lets one borrow the
+/// other's review (P2).
 pub fn effective_authority(
     repo: &RepoPolicy,
     machine: &MachineSettings,
     contract: &TaskContract,
+    repo_identity: &RepoIdentity,
 ) -> EffectiveAuthority {
     let mut blockers = Vec::new();
 
@@ -703,12 +908,16 @@ pub fn effective_authority(
         });
 
     let authority_hash = repo.authority_hash();
-    let trust_granted = machine.trust.contains_key(&authority_hash);
+    let grant_key = grant_key(&authority_hash, repo_identity);
+    let trust_granted = machine.trust.contains_key(&grant_key);
     if !trust_granted {
         blockers.push(Blocker {
             code: BlockCode::MissingTrustGrant,
             detail: format!(
-                "no content-bound trust grant for this execution declaration (authority hash {authority_hash}); grants are recorded in machine.toml after review"
+                "no trust grant for this execution declaration (authority hash \
+                 {authority_hash}) in this repository ({}); `relais plan` prints the \
+                 [trust.\"{grant_key}\"] block to review and paste into machine.toml",
+                repo_identity.label()
             ),
         });
     }
@@ -757,9 +966,10 @@ pub fn effective_authority(
         max_agents_total,
         verification_profile: profile,
         review_floor,
-        disallowed_tools: machine.permissions.disallowed_tools.clone(),
+        disallowed_tools: effective_disallowed_tools(&machine.permissions),
         allowed_tools: machine.permissions.allowed_tools.clone(),
         authority_hash,
+        grant_key,
         trust_granted,
         blockers,
     }
@@ -917,9 +1127,24 @@ keys = ["output.contract"]
         format!("schema_version = 1\n{}\n", extra)
     }
 
+    fn identity() -> RepoIdentity {
+        RepoIdentity::new(
+            std::path::Path::new("/repos/relais"),
+            Some("git@example.invalid:me/relais.git".into()),
+        )
+    }
+
     fn grant_for(policy: &RepoPolicy) -> String {
-        let hash = policy.authority_hash();
-        format!("[trust.\"{hash}\"]\ngranted_at = \"2026-09-18\"\n")
+        grant_for_repo(policy, &identity())
+    }
+
+    fn grant_for_repo(policy: &RepoPolicy, repo: &RepoIdentity) -> String {
+        let key = grant_key(&policy.authority_hash(), repo);
+        format!("[trust.\"{key}\"]\ngranted_at = \"2026-09-18\"\nreviewed_by = \"me\"\n")
+    }
+
+    fn authority(repo: &RepoPolicy, machine: &MachineSettings) -> EffectiveAuthority {
+        effective_authority(repo, machine, &contract(), &identity())
     }
 
     #[test]
@@ -966,19 +1191,19 @@ keys = ["output.contract"]
             .expect("machine parses");
         let mut c = contract();
 
-        let a = effective_authority(&repo, &machine, &c);
+        let a = effective_authority(&repo, &machine, &c, &identity());
         assert!(a.trust_granted);
         assert!(a.blockers.is_empty(), "{:?}", a.blockers);
         assert_eq!(a.max_attempts, 3);
 
         c.limits.attempts = 1;
-        let a = effective_authority(&repo, &machine, &c);
+        let a = effective_authority(&repo, &machine, &c, &identity());
         assert_eq!(a.max_attempts, 1, "contract limits narrow authority");
         c.limits.attempts = 3;
 
         let mut machine_restricted = machine.clone();
         machine_restricted.allowed_models = Some(vec!["haiku".into()]);
-        let a = effective_authority(&repo, &machine_restricted, &c);
+        let a = effective_authority(&repo, &machine_restricted, &c, &identity());
         assert_eq!(
             a.models.keys().collect::<Vec<_>>(),
             [&Tier::Research],
@@ -990,7 +1215,7 @@ keys = ["output.contract"]
     fn missing_grant_blocks() {
         let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
         let machine = MachineSettings::from_toml_str(&machine_toml("")).expect("machine parses");
-        let a = effective_authority(&repo, &machine, &contract());
+        let a = authority(&repo, &machine);
         assert!(!a.trust_granted);
         assert!(a
             .blockers
@@ -1010,7 +1235,7 @@ keys = ["output.contract"]
             changed.authority_hash(),
             "changing executable authority must change the hash"
         );
-        let a = effective_authority(&changed, &machine, &contract());
+        let a = effective_authority(&changed, &machine, &contract(), &identity());
         assert!(!a.trust_granted);
     }
 
@@ -1021,7 +1246,7 @@ keys = ["output.contract"]
             MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo))).expect("parses");
         let mut c = contract();
         c.verification_profile = "not-a-profile".into();
-        let a = effective_authority(&repo, &machine, &c);
+        let a = effective_authority(&repo, &machine, &c, &identity());
         assert!(a
             .blockers
             .iter()
@@ -1033,7 +1258,7 @@ keys = ["output.contract"]
         let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
         let machine =
             MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo))).expect("parses");
-        let a = effective_authority(&repo, &machine, &contract());
+        let a = authority(&repo, &machine);
         assert_eq!(a.review_floor, Review::Required);
     }
 
@@ -1044,6 +1269,198 @@ keys = ["output.contract"]
             .permissions
             .disallowed_tools
             .contains(&"Bash(git push:*)".to_string()));
+    }
+
+    /// The deny floor is a floor. `disallowed_tools = []` in machine.toml
+    /// used to replace the shipped list wholesale, and nothing else
+    /// re-added the commit/merge/push denials the doc promised.
+    #[test]
+    fn an_empty_machine_deny_list_cannot_remove_the_floor() {
+        let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        let machine = MachineSettings::from_toml_str(&machine_toml(&format!(
+            "{}\n[permissions]\ndisallowed_tools = []\n",
+            grant_for(&repo)
+        )))
+        .expect("parses");
+        assert!(
+            machine.permissions.disallowed_tools.is_empty(),
+            "machine.toml says what it says"
+        );
+        let a = authority(&repo, &machine);
+        for denied in [
+            "Bash(git commit:*)",
+            "Bash(git merge:*)",
+            "Bash(git push:*)",
+            "Bash(git rebase:*)",
+            "Bash(git reset:*)",
+            "Bash(git tag:*)",
+        ] {
+            assert!(
+                a.disallowed_tools.contains(&denied.to_string()),
+                "{denied} survives an empty machine deny list"
+            );
+        }
+    }
+
+    #[test]
+    fn a_machine_deny_list_adds_to_the_floor_without_duplicating_it() {
+        let extra = Permissions {
+            disallowed_tools: vec!["Bash(git push:*)".into(), "WebFetch".into()],
+            allowed_tools: Vec::new(),
+        };
+        let effective = effective_disallowed_tools(&extra);
+        assert_eq!(
+            effective
+                .iter()
+                .filter(|t| *t == "Bash(git push:*)")
+                .count(),
+            1,
+            "a rule already on the floor is not repeated"
+        );
+        assert!(effective.contains(&"WebFetch".to_string()));
+        assert!(effective.len() > default_disallowed_tools().len());
+    }
+
+    /// P4: the hash is derived from the struct, so a field added to
+    /// `RepoPolicy` without touching `authority_hash` is inside it.
+    #[test]
+    fn the_hashed_value_is_the_whole_policy_minus_the_exclusions() {
+        let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        let serialized = serde_json::to_value(&repo).expect("serializes");
+        let all: std::collections::BTreeSet<&str> = serialized
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let authority = repo.authority_value();
+        let hashed: std::collections::BTreeSet<&str> = authority
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected: std::collections::BTreeSet<&str> = all
+            .iter()
+            .copied()
+            .filter(|key| !AUTHORITY_EXCLUSIONS.contains(key))
+            .collect();
+        assert_eq!(hashed, expected);
+        assert!(all.contains("schema_version") && !hashed.contains("schema_version"));
+    }
+
+    /// P2: the same declaration in a second repository is a second
+    /// review. A grant issued for one must not open the other.
+    #[test]
+    fn a_grant_is_bound_to_the_repository_as_well_as_the_declaration() {
+        let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        let elsewhere = RepoIdentity::new(
+            std::path::Path::new("/repos/someone-elses"),
+            Some("git@example.invalid:someone/else.git".into()),
+        );
+        assert_ne!(
+            grant_key(&repo.authority_hash(), &identity()),
+            grant_key(&repo.authority_hash(), &elsewhere),
+            "identical policy text, different repository, different key"
+        );
+        let machine =
+            MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo))).expect("parses");
+        assert!(authority(&repo, &machine).trust_granted);
+        assert!(
+            !effective_authority(&repo, &machine, &contract(), &elsewhere).trust_granted,
+            "the other repository runs unreviewed until it is reviewed"
+        );
+        // A repository with no origin is still identified, by its root.
+        let no_origin = RepoIdentity::new(std::path::Path::new("/repos/relais"), None);
+        assert_ne!(
+            grant_key(&repo.authority_hash(), &no_origin),
+            grant_key(&repo.authority_hash(), &identity())
+        );
+        assert_eq!(no_origin.label(), "/repos/relais");
+        assert_eq!(identity().label(), "git@example.invalid:me/relais.git");
+    }
+
+    #[test]
+    fn the_missing_grant_blocker_names_the_key_to_paste() {
+        let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        let machine = MachineSettings::from_toml_str(&machine_toml("")).expect("parses");
+        let a = authority(&repo, &machine);
+        let blocker = a
+            .blockers
+            .iter()
+            .find(|b| b.code == BlockCode::MissingTrustGrant)
+            .expect("blocked on the grant");
+        assert!(blocker.detail.contains(&a.grant_key), "{}", blocker.detail);
+        assert!(blocker.detail.contains("git@example.invalid:me/relais.git"));
+    }
+
+    /// P7 and P10 at the machine boundary: a ceiling is a non-negative
+    /// amount of money and a grant names a reviewer and a real date.
+    #[test]
+    fn machine_settings_validate_ceilings_and_grants() {
+        assert_eq!(
+            MachineSettings::from_toml_str(&machine_toml("[spending]\nper_run_micros = -1\n"))
+                .unwrap_err(),
+            PolicyError::NegativeCeiling {
+                field: "per_run_micros",
+                micros: -1
+            }
+        );
+        assert_eq!(
+            MachineSettings::from_toml_str(&machine_toml("[spending]\nper_day_micros = -5\n"))
+                .unwrap_err(),
+            PolicyError::NegativeCeiling {
+                field: "per_day_micros",
+                micros: -5
+            }
+        );
+        let ok = MachineSettings::from_toml_str(&machine_toml(
+            "[spending]\nper_run_micros = 2500\nper_day_micros = 10000\n",
+        ))
+        .expect("non-negative ceilings parse");
+        assert_eq!(
+            ok.spending.per_run_micros,
+            Some(MicroUsd::from_micros(2500))
+        );
+
+        // granted_at must be a date this relais can read.
+        let bad = MachineSettings::from_toml_str(&machine_toml(
+            "[trust.\"k\"]\ngranted_at = \"yesterday\"\nreviewed_by = \"me\"\n",
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(&bad, PolicyError::InvalidTrustGrant { key, .. } if key == "k"),
+            "{bad}"
+        );
+        assert!(bad.to_string().contains("yesterday"), "{bad}");
+        // …and reviewed_by is required, not an optional nicety.
+        let missing = MachineSettings::from_toml_str(&machine_toml(
+            "[trust.\"k\"]\ngranted_at = \"2026-09-18\"\n",
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(missing, PolicyError::MalformedToml(_)),
+            "{missing}"
+        );
+        let empty = MachineSettings::from_toml_str(&machine_toml(
+            "[trust.\"k\"]\ngranted_at = \"2026-09-18\"\nreviewed_by = \"  \"\n",
+        ))
+        .unwrap_err();
+        assert!(matches!(empty, PolicyError::InvalidTrustGrant { .. }));
+
+        // Both date spellings machine.toml uses are read.
+        let both = MachineSettings::from_toml_str(&machine_toml(
+            "[trust.\"a\"]\ngranted_at = \"2026-09-18\"\nreviewed_by = \"me\"\n\
+             [trust.\"b\"]\ngranted_at = \"2026-09-18T10:00:00+02:00\"\nreviewed_by = \"me\"\n\
+             repo = \"git@example.invalid:me/relais.git\"\n",
+        ))
+        .expect("parses");
+        assert!(both.trust["a"].granted_at().is_ok());
+        assert!(both.trust["b"].granted_at().is_ok());
+        assert_eq!(
+            both.trust["b"].repo.as_deref(),
+            Some("git@example.invalid:me/relais.git")
+        );
     }
 
     /// The rules match a command-line prefix, so denying the verb is not
@@ -1074,7 +1491,7 @@ keys = ["output.contract"]
         let machine =
             MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo))).expect("parses");
         assert!(machine.permissions.allowed_tools.is_empty());
-        let a = effective_authority(&repo, &machine, &contract());
+        let a = authority(&repo, &machine);
         assert!(a.allowed_tools.is_empty(), "no grant, no tools");
 
         let granted = MachineSettings::from_toml_str(&machine_toml(&format!(
@@ -1082,7 +1499,7 @@ keys = ["output.contract"]
             grant_for(&repo)
         )))
         .expect("parses");
-        let a = effective_authority(&repo, &granted, &contract());
+        let a = authority(&repo, &granted);
         assert_eq!(a.allowed_tools, ["Edit", "Write", "Bash(cargo test:*)"]);
         assert!(
             a.disallowed_tools.contains(&"Bash(git push:*)".to_string()),
@@ -1106,7 +1523,9 @@ keys = ["output.contract"]
         // A grant bound to the recipe-less declaration does not carry over.
         let machine =
             MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo))).expect("parses");
-        assert!(!effective_authority(&with_recipe, &machine, &contract()).trust_granted);
+        assert!(
+            !effective_authority(&with_recipe, &machine, &contract(), &identity()).trust_granted
+        );
     }
 
     #[test]
@@ -1127,7 +1546,7 @@ keys = ["output.contract"]
         );
         let machine =
             MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo))).expect("parses");
-        assert!(!effective_authority(&wider, &machine, &contract()).trust_granted);
+        assert!(!effective_authority(&wider, &machine, &contract(), &identity()).trust_granted);
     }
 
     #[test]
