@@ -2707,6 +2707,18 @@ mod tests {
         }
     }
 
+    /// The same check through a shell this machine can name a version
+    /// for. Caching a baseline verdict requires identifying the
+    /// toolchain that produced it (SPEC §18), and `sh` is dash on
+    /// Debian, which answers nothing to `--version` — so a profile
+    /// running `sh` refuses the cache, by design.
+    fn versionable_main_gone_check() -> CommandSpec {
+        CommandSpec {
+            argv: vec!["bash".into(), "-c".into(), "test ! -f src/main.rs".into()],
+            timeout_seconds: 30,
+        }
+    }
+
     fn passing_check() -> CommandSpec {
         CommandSpec {
             argv: vec!["sh".into(), "-c".into(), "true".into()],
@@ -4398,7 +4410,7 @@ mod tests {
     #[test]
     fn baseline_results_are_cached_only_when_the_profile_opts_in() {
         let fixture = Fixture::new();
-        let mut repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let mut repo = fixture.repo_policy(vec![versionable_main_gone_check()], 3);
         let backend = conditional_worker("relais task");
         let first = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
         let RunOutcome {
@@ -4437,9 +4449,13 @@ mod tests {
         else {
             panic!("{third:?}");
         };
+        assert_eq!(
+            receipt.verification.baseline_cache_refused, None,
+            "this profile's program can be versioned, so the key names a toolchain"
+        );
         assert!(
             receipt.verification.baseline_cached,
-            "the same base, profile and tools hit"
+            "the same base, profile and toolchain hit"
         );
         assert_eq!(
             receipt.verification.baseline_failures.len(),

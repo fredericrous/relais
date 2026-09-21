@@ -729,6 +729,12 @@ mod imp {
         // member, which is what a process-group SIGKILL does on Unix. A
         // job object would be tighter, but `taskkill` ships with every
         // Windows and needs no handle plumbing through `Command`.
+        //
+        // The documented limit: Windows re-parents a process whose parent
+        // exits, so a descendant of a worker that has ALREADY ended is no
+        // longer in the tree this walks and survives. The drain grace in
+        // `run_with_timeout` is what bounds the wait there; the launch
+        // reports its output as partial rather than hanging.
         let status = Command::new("taskkill")
             .args(["/T", "/F", "/PID", &pgid.to_string()])
             .stdout(std::process::Stdio::null())
@@ -822,6 +828,11 @@ mod tests {
     /// descendant holding the stdout pipe. Draining it would block until
     /// THAT descendant ended — thirty seconds here, and in production
     /// past the wall clock, with the lease and the worktree still held.
+    ///
+    /// Unix only, because the guarantee is: a process GROUP outlives its
+    /// leader and one signal reaches every member. Windows has no such
+    /// thing — see the sibling test for what it can promise.
+    #[cfg(unix)]
     #[test]
     fn a_backgrounded_grandchild_does_not_hold_the_launch_open() {
         let mut command = Command::new("sh");
@@ -844,8 +855,36 @@ mod tests {
         assert!(end.stdout.contains("started"), "{}", end.stdout);
     }
 
+    /// Windows re-parents a process whose parent exits, and `taskkill /T`
+    /// walks the tree by parent: a descendant of an EXITED worker is out
+    /// of reach, so it can still hold the pipe. What is promised there is
+    /// the bound — the drain grace ends the wait and says the output is
+    /// partial, instead of the launch hanging on a process nobody can
+    /// name.
+    #[cfg(windows)]
+    #[test]
+    fn a_surviving_descendant_cannot_hold_a_windows_launch_open_forever() {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "echo started & start /b ping -n 60 127.0.0.1 > NUL"]);
+        let started = Instant::now();
+        let end =
+            run_with_timeout(command, Duration::from_secs(120), None, None, None).expect("runs");
+        assert_eq!(end.ended, Ended::Exited(0), "the child itself succeeded");
+        assert!(
+            started.elapsed() < PIPE_DRAIN_GRACE * 4,
+            "the drain grace bounds the wait: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(55),
+            "and it does not wait for the descendant: {:?}",
+            started.elapsed()
+        );
+    }
+
     /// A child that spawns nothing leaves an empty group: recorded as
     /// such, not as a failed kill.
+    #[cfg(unix)]
     #[test]
     fn a_child_that_spawned_nothing_leaves_an_empty_group() {
         let mut command = Command::new("sh");
