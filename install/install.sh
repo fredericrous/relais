@@ -168,7 +168,7 @@ main() {
     printf '  Nothing runs yet, on purpose. In a repository:\n\n'
     printf '    relais doctor                      # what is installed and what is missing\n'
     printf '    relais init                        # write relais.toml, then commit it\n'
-    printf '    relais plan --task task.json       # the route, and the authority hash to trust\n\n'
+    printf '    relais plan --task task.json       # the route, and the trust grant to paste\n\n'
     printf '  The trust grant and the worker permission allowlist live in\n'
     printf '  ~/.config/relais/machine.toml — see the README.\n\n'
 }
