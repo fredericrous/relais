@@ -531,6 +531,15 @@ pub struct RoutingSettings {
     /// Minimum estimated acceptance a profile needs to be selected over
     /// the conservative baseline.
     pub quality_floor: Option<f64>,
+    /// Promotion gate (SPEC §17): the minimum number of held-out TEST
+    /// records observed at the tier the artifact selects. Below it, the
+    /// measured acceptance rate is a handful of tasks and promotion is
+    /// refused — one supported record used to be enough.
+    pub min_supported_test_records: usize,
+    /// Promotion gate: the largest share of held-out test tasks the
+    /// artifact may abstain on and still be promoted. An artifact that
+    /// abstains on most tasks is the baseline wearing a model's name.
+    pub max_abstention_rate: f64,
 }
 
 impl Default for RoutingSettings {
@@ -538,6 +547,8 @@ impl Default for RoutingSettings {
         Self {
             learned_enabled: true,
             quality_floor: Some(0.75),
+            min_supported_test_records: 20,
+            max_abstention_rate: 0.5,
         }
     }
 }
