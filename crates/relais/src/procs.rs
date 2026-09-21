@@ -198,7 +198,9 @@ impl UmaskGuard {
     /// The umask that was in force before this guard narrowed it, and
     /// that its `Drop` restores.
     pub fn previous(&self) -> u32 {
-        self.0.previous() as u32
+        // `mode_t` is u16 on the BSDs and u32 on Linux; `From` covers
+        // both without a cast clippy calls unnecessary on one of them.
+        u32::from(self.0.previous())
     }
 }
 
@@ -1329,42 +1331,59 @@ mod tests {
     // after a cancelled worker ignored `terminate`.
     #[test]
     fn kill_ends_a_process_that_ignores_terminate() {
-        use crate::test_support::{stays, temp_dir, wait_until};
-        // The child says when it is ready, rather than the test
-        // sleeping long enough to assume it: the trap has to be
-        // installed BEFORE the polite request arrives, or the test
-        // proves the opposite of what it claims.
-        let dir = temp_dir("ignores-term");
+        use crate::test_support::wait_until;
+        let dir = crate::test_support::temp_dir("ignores-term");
+        #[cfg(unix)]
         let ready = dir.join("ready");
-        let mark = ready.to_string_lossy().into_owned();
-        let mut command = if cfg!(windows) {
-            let mut c = Command::new("cmd");
-            c.args([
-                "/C",
-                &format!("echo ready > \"{mark}\" & ping -n 60 127.0.0.1 > NUL"),
-            ]);
-            c
-        } else {
-            // SIGTERM ignored: only the hard kill ends this one.
+        #[cfg(unix)]
+        let mut command = {
+            // SIGTERM ignored: only the hard kill ends this one. The
+            // child says when the trap is installed rather than the test
+            // sleeping long enough to assume it — the polite request
+            // must not arrive first, or the test proves the opposite of
+            // what it claims.
             let mut c = Command::new("sh");
             c.args([
                 "-c",
-                &format!("trap '' TERM; echo ready > '{mark}'; sleep 60"),
+                &format!(
+                    "trap '' TERM; echo ready > '{}'; sleep 60",
+                    ready.to_string_lossy()
+                ),
             ]);
+            c
+        };
+        #[cfg(windows)]
+        let mut command = {
+            // No trap to install: Windows has one way to stop another
+            // process and it is already unblockable. So there is nothing
+            // for the child to announce, and no shell either — `cmd /C`
+            // re-parses the quoting `Command` applies, which is how the
+            // readiness file it was told to write never appeared.
+            let mut c = Command::new("ping");
+            c.args(["-n", "60", "127.0.0.1"]);
+            c.stdout(Stdio::null());
             c
         };
         let mut child = command.spawn().expect("spawn");
         let pid = child.id();
+        // Readiness, bounded, on both: the trap on unix, the process
+        // table on Windows.
+        #[cfg(unix)]
         assert!(
             wait_until(std::time::Duration::from_secs(10), || ready.exists()),
             "the child never said its trap was installed"
+        );
+        #[cfg(windows)]
+        assert!(
+            wait_until(std::time::Duration::from_secs(10), || alive(pid)),
+            "the child never reached the process table"
         );
         terminate(pid).expect("the polite request is delivered");
         // The property is that NOTHING happened: sampled across a
         // window, not read once at an arbitrary moment.
         #[cfg(unix)]
         assert!(
-            stays(std::time::Duration::from_millis(300), || alive(pid)),
+            crate::test_support::stays(std::time::Duration::from_millis(300), || alive(pid)),
             "the worker ignored the polite request"
         );
         match kill(pid) {
