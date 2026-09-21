@@ -77,6 +77,10 @@ cd the-repo && relais init          # writes relais.toml; edit models + profile,
 relais plan --task task.json        # prints the authority hash; blocked until trusted
 ```
 
+Every command finds `relais.toml` upward from the cwd to the repository
+root, so a subdirectory (or a task worktree, which carries its own copy)
+works; a directory outside any repository is refused by name.
+
 Machine-owned settings live in `~/.config/relais/machine.toml` and are
 never written by a run. The trust grant is keyed by the authority hash
 `plan` printed; editing `relais.toml` changes the hash and voids the

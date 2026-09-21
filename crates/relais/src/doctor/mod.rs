@@ -322,7 +322,7 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
                 ok: false,
                 level: "fail",
                 detail: format!(
-                    "no relais.toml in {} — run `relais init`",
+                    "no relais.toml in {} (searched upward to the repository root) — run `relais init` there",
                     repo_dir.display()
                 ),
             });
