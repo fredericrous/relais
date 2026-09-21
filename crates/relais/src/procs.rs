@@ -146,7 +146,7 @@ fn deliver(pid: u32, signal: SignalKind) -> Result<(), SignalError> {
     imp::signal(pid, signal).map_err(|source| SignalError {
         pid,
         signal,
-        cause: imp::classify(&source),
+        cause: imp::classify(pid, &source),
         source,
     })
 }
@@ -454,7 +454,10 @@ mod imp {
         Err(io::Error::last_os_error())
     }
 
-    pub fn classify(error: &io::Error) -> super::SignalFailure {
+    /// `kill(2)` says exactly which it was, so the process table is not
+    /// consulted: `ESRCH` is gone and `EPERM` is a process that exists
+    /// and belongs to somebody else.
+    pub fn classify(_pid: u32, error: &io::Error) -> super::SignalFailure {
         match error.raw_os_error() {
             Some(code) if code == libc::ESRCH => super::SignalFailure::Gone,
             Some(code) if code == libc::EPERM => super::SignalFailure::NotOurs,
@@ -597,10 +600,18 @@ mod imp {
         }
     }
 
-    pub fn classify(error: &io::Error) -> super::SignalFailure {
+    /// Windows reports `ERROR_ACCESS_DENIED` for BOTH a process that
+    /// belongs to somebody else and one that has already exited —
+    /// `TerminateProcess` on an exited process is an access violation,
+    /// not a no-op. The error alone therefore cannot tell the two
+    /// apart, so the process table is asked: if nothing is running with
+    /// that PID, the signal had nowhere to go.
+    pub fn classify(pid: u32, error: &io::Error) -> super::SignalFailure {
+        if !alive(pid) {
+            return super::SignalFailure::Gone;
+        }
         match error.raw_os_error().map(|code| code as u32) {
-            // ERROR_INVALID_PARAMETER is what `OpenProcess` reports for
-            // a PID that no longer exists.
+            // What `OpenProcess` reports for a PID that never existed.
             Some(ERROR_INVALID_PARAMETER) => super::SignalFailure::Gone,
             Some(ERROR_ACCESS_DENIED) => super::SignalFailure::NotOurs,
             _ => super::SignalFailure::Refused,
@@ -857,7 +868,23 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
         #[cfg(unix)]
         assert!(alive(pid), "the worker ignored the polite request");
-        kill(pid).expect("the escalation is delivered");
+        match kill(pid) {
+            Ok(()) => {}
+            // Windows has one way to stop another process and it is
+            // already unblockable: the polite request ended it, so the
+            // escalation finds nothing left to deliver to. That is a
+            // delivery failure that must NOT be retried, which is the
+            // property under test here.
+            Err(e) => {
+                let unblockable_terminate = cfg!(windows);
+                assert!(
+                    unblockable_terminate,
+                    "the escalation was not delivered: {e}"
+                );
+                assert_eq!(e.cause, SignalFailure::Gone, "{e}");
+                assert!(!e.could_pass(), "{e}");
+            }
+        }
         let _ = child.wait();
         assert!(!alive(pid));
     }

@@ -2196,10 +2196,14 @@ mod tests {
     // the guard is still held.
     #[test]
     fn idle_exit_is_decided_before_the_guard_is_dropped() {
+        // Built by adding, never by subtracting from `now`: an `Instant`
+        // is monotonic from an arbitrary epoch, and on Windows that
+        // epoch is recent enough that `now - 10min` overflows.
         let t0 = Instant::now();
+        let long_after = t0 + IDLE_EXIT * 2;
         assert_eq!(idle_step(false, None, t0), IdleStep::Busy);
         assert_eq!(
-            idle_step(false, Some(t0 - IDLE_EXIT * 2), t0),
+            idle_step(false, Some(t0), long_after),
             IdleStep::Busy,
             "one busy tick forgets how long it was idle before it"
         );
