@@ -14,6 +14,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 /// Is there a live process with this PID? Never a signal that could
 /// terminate anything (SPEC §23: lease expiry does not prove death).
 ///
@@ -163,14 +165,55 @@ impl std::error::Error for RunError {
     }
 }
 
-/// How a process run ended, beyond its exit code.
+/// How a supervised process ended — one answer, not three booleans and
+/// an `Option` that had to be read together. `exit_code: None,
+/// timed_out: false, cancelled: false` used to mean "died on a signal",
+/// which every caller had to know and two of them got wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Ended {
+    /// Ran to completion and reported this status.
+    Exited(i32),
+    /// The wall clock ran out and the process group was killed.
+    TimedOut,
+    /// A cancellation request arrived and the process group was killed.
+    Cancelled,
+    /// Died on a signal without reporting a status.
+    Signalled,
+}
+
+impl Ended {
+    /// Did it run to completion and report success? The only end that
+    /// can carry a usable result.
+    pub fn succeeded(self) -> bool {
+        matches!(self, Self::Exited(0))
+    }
+
+    /// The reported status, when there is one.
+    pub fn code(self) -> Option<i32> {
+        match self {
+            Self::Exited(code) => Some(code),
+            Self::TimedOut | Self::Cancelled | Self::Signalled => None,
+        }
+    }
+
+    /// How it ended, for a log line or a receipt.
+    pub fn describe(self) -> String {
+        match self {
+            Self::Exited(code) => format!("exit {code}"),
+            Self::TimedOut => "timed out".to_string(),
+            Self::Cancelled => "cancelled".to_string(),
+            Self::Signalled => "no exit status".to_string(),
+        }
+    }
+}
+
+/// How a process run ended, with everything it wrote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessEnd {
-    pub exit_code: Option<i32>,
+    pub ended: Ended,
     pub stdout: String,
     pub stderr: String,
-    pub timed_out: bool,
-    pub cancelled: bool,
 }
 
 /// Runs a command with a wall timeout, streaming stdout+stderr into one
@@ -210,8 +253,7 @@ pub fn run_with_timeout(
     let stdout = std::thread::spawn(move || read_to_end(stdout_pipe));
     let stderr = std::thread::spawn(move || read_to_end(stderr_pipe));
 
-    let (status, timed_out, cancelled) =
-        wait_for_exit(&mut child, wall_timeout, cancel).map_err(RunError::Wait)?;
+    let ended = wait_for_exit(&mut child, wall_timeout, cancel).map_err(RunError::Wait)?;
     let stdout = stdout
         .join()
         .map_err(|_| RunError::ReaderPanicked("stdout"))?;
@@ -219,19 +261,9 @@ pub fn run_with_timeout(
         .join()
         .map_err(|_| RunError::ReaderPanicked("stderr"))?;
     Ok(ProcessEnd {
-        // A killed process has no exit code: interrupted, never a
-        // completed attempt. Decided here, not read from the status —
-        // Windows reports a terminated process as exit 1, and 1 is a
-        // usage error, not a kill.
-        exit_code: if cancelled || timed_out {
-            None
-        } else {
-            status.code()
-        },
+        ended,
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        timed_out,
-        cancelled,
     })
 }
 
@@ -244,24 +276,40 @@ pub fn wait_for_exit(
     child: &mut std::process::Child,
     wall_timeout: Duration,
     cancel: Option<&AtomicBool>,
-) -> std::io::Result<(std::process::ExitStatus, bool, bool)> {
+) -> std::io::Result<Ended> {
+    enum Stopped {
+        OnItsOwn,
+        Cancelled,
+        TimedOut,
+    }
     let started = Instant::now();
-    let (timed_out, cancelled) = loop {
+    let stopped = loop {
         if child.try_wait()?.is_some() {
-            break (false, false);
+            break Stopped::OnItsOwn;
         }
         if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
             let _ = kill_tree(child);
-            break (false, true);
+            break Stopped::Cancelled;
         }
         if started.elapsed() >= wall_timeout {
             let _ = kill_tree(child);
-            break (true, false);
+            break Stopped::TimedOut;
         }
         std::thread::sleep(Duration::from_millis(20));
     };
     let status = child.wait()?;
-    Ok((status, timed_out, cancelled))
+    Ok(match stopped {
+        // A killed process has no usable status: interrupted, never a
+        // completed attempt. Decided here, not read from the status —
+        // Windows reports a terminated process as exit 1, and 1 is a
+        // usage error, not a kill.
+        Stopped::Cancelled => Ended::Cancelled,
+        Stopped::TimedOut => Ended::TimedOut,
+        Stopped::OnItsOwn => match status.code() {
+            Some(code) => Ended::Exited(code),
+            None => Ended::Signalled,
+        },
+    })
 }
 
 fn read_to_end(mut pipe: impl std::io::Read) -> Vec<u8> {
@@ -510,12 +558,11 @@ mod tests {
         )
         .expect("runs");
         assert_ne!(pid_slot.load(Ordering::SeqCst), 0, "the PID was published");
-        assert!(
-            end.timed_out,
+        assert_eq!(
+            end.ended,
+            Ended::TimedOut,
             "must be marked interrupted by the wall clock"
         );
-        assert!(!end.cancelled);
-        assert_eq!(end.exit_code, None);
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(
             end.stdout.contains("start"),
@@ -536,10 +583,9 @@ mod tests {
         let started = Instant::now();
         let end = run_with_timeout(command, Duration::from_secs(30), None, Some(&cancel), None)
             .expect("runs");
-        assert!(end.cancelled);
-        assert!(!end.timed_out);
         assert_eq!(
-            end.exit_code, None,
+            end.ended,
+            Ended::Cancelled,
             "a cancelled run has no terminal result"
         );
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -557,8 +603,7 @@ mod tests {
             None,
         )
         .expect("runs");
-        assert_eq!(end.exit_code, Some(0));
-        assert!(!end.timed_out);
+        assert_eq!(end.ended, Ended::Exited(0));
         assert!(end.stdout.contains("prompt-bytes"));
         assert!(
             end.stdout.contains("processed"),

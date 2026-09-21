@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::money::{CostCompleteness, MicroUsd};
 use crate::policy::Effort;
-use crate::procs::RunError;
+use crate::procs::{Ended, RunError};
 
 #[derive(Debug)]
 pub enum BackendError {
@@ -183,6 +183,54 @@ pub struct LaunchSpec {
     pub pid_slot: Option<Arc<AtomicU32>>,
 }
 
+/// What the harness said one dispatch cost. `inclusive` describes a
+/// figure, so it exists only where a figure does: the struct this
+/// replaces could hold `cost: None, inclusive: true`, which says
+/// nothing, and `cost: Some(..), cost_completeness: Unknown`, which the
+/// settlement path silently read as no cost at all.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Cost {
+    /// A total the harness reported for this dispatch.
+    Reported {
+        micros: MicroUsd,
+        /// True when the total already includes descendants (an
+        /// inclusive parent: SPEC §11), so it is never summed with them.
+        inclusive: bool,
+    },
+    /// The harness reported no cost. Unknown, never zero (SPEC §11).
+    #[default]
+    Unknown,
+}
+
+impl Cost {
+    /// The figure, when one was reported.
+    pub fn micros(self) -> Option<MicroUsd> {
+        match self {
+            Self::Reported { micros, .. } => Some(micros),
+            Self::Unknown => None,
+        }
+    }
+
+    /// How complete the figure is: what the harness reported is actual,
+    /// and what it did not report is unknown rather than zero.
+    pub fn completeness(self) -> CostCompleteness {
+        match self {
+            Self::Reported { .. } => CostCompleteness::Actual,
+            Self::Unknown => CostCompleteness::Unknown,
+        }
+    }
+
+    /// Does the figure already cover descendants? An unreported cost
+    /// covers nothing.
+    pub fn inclusive(self) -> bool {
+        match self {
+            Self::Reported { inclusive, .. } => inclusive,
+            Self::Unknown => false,
+        }
+    }
+}
+
 /// Provider-reported usage as extracted from one terminal result.
 /// Everything absent is `None` — unknown, never zero (SPEC §11).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -191,30 +239,24 @@ pub struct UsageReport {
     pub output_tokens: Option<i64>,
     pub cache_read_tokens: Option<i64>,
     pub cache_write_tokens: Option<i64>,
-    pub cost: Option<MicroUsd>,
-    pub cost_completeness: CostCompleteness,
-    /// True when the reported total already includes descendants
-    /// (an inclusive parent: SPEC §11).
-    pub inclusive: bool,
+    pub cost: Cost,
 }
 
 impl UsageReport {
+    /// A dispatch whose usage the harness did not report at all.
     pub fn unknown() -> Self {
-        Self {
-            cost_completeness: CostCompleteness::Unknown,
-            ..Self::default()
-        }
+        Self::default()
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LaunchResult {
     pub dispatch_id: String,
-    /// Exit code of the backend process; None when killed by signal.
-    pub exit_code: Option<i32>,
+    /// How the backend process ended: a status, the wall clock, a
+    /// cancellation or a signal. Exactly one of them.
+    pub ended: Ended,
     pub stdout: String,
     pub stderr: String,
-    pub timed_out: bool,
     /// The result payload the worker proposed (text). Evidence only; the
     /// runner owns state.
     pub result_text: Option<String>,
@@ -225,9 +267,6 @@ pub struct LaunchResult {
     pub effective_model: Option<String>,
     pub usage: UsageReport,
     pub worker_claims_blockage: bool,
-    /// Killed on a cancellation request, not on the wall clock.
-    #[serde(default)]
-    pub cancelled: bool,
     /// Tools the harness refused the worker, as it reported them. A
     /// worker that could not act is not a worker that chose not to:
     /// missing permissions produce a blocked result (SPEC §8).
@@ -245,7 +284,7 @@ impl LaunchResult {
     /// could read as a result: interrupted, not failed, and never a
     /// completed attempt with an empty candidate (SPEC §9).
     pub fn terminal_result_missing(&self) -> bool {
-        self.timed_out || self.cancelled || self.exit_code != Some(0) || self.result_text.is_none()
+        !self.ended.succeeded() || self.result_text.is_none()
     }
 }
 
@@ -305,43 +344,66 @@ mod tests {
     fn missing_terminal_result_is_interrupted_not_failed() {
         let result = LaunchResult {
             dispatch_id: "disp-1".into(),
-            exit_code: None,
+            ended: Ended::TimedOut,
             stdout: String::new(),
             stderr: String::new(),
-            timed_out: true,
             result_text: None,
             session_id: None,
             effective_model: None,
             usage: UsageReport::unknown(),
             worker_claims_blockage: false,
-            cancelled: false,
             permission_denials: Vec::new(),
             failure_detail: None,
         };
         assert!(result.terminal_result_missing());
         let completed = LaunchResult {
-            timed_out: false,
-            exit_code: Some(0),
+            ended: Ended::Exited(0),
             result_text: Some("DONE".into()),
             ..result.clone()
         };
         assert!(!completed.terminal_result_missing());
-        // A non-zero exit or an unreadable result is not a completed
-        // attempt with an empty candidate; it is a missing result.
+        // A non-zero exit, a signal, a cancellation or an unreadable
+        // result is not a completed attempt with an empty candidate; it
+        // is a missing result.
         let usage_error = LaunchResult {
-            timed_out: false,
-            exit_code: Some(1),
+            ended: Ended::Exited(1),
             result_text: Some(String::new()),
             ..result.clone()
         };
         assert!(usage_error.terminal_result_missing());
+        for ended in [Ended::Signalled, Ended::Cancelled] {
+            let killed = LaunchResult {
+                ended,
+                result_text: Some("DONE".into()),
+                ..result.clone()
+            };
+            assert!(killed.terminal_result_missing());
+        }
         let unreadable = LaunchResult {
-            timed_out: false,
-            exit_code: Some(0),
+            ended: Ended::Exited(0),
             result_text: None,
             ..result
         };
         assert!(unreadable.terminal_result_missing());
+    }
+
+    /// `inclusive` described a cost, so it meant nothing without one,
+    /// and a reported figure with `Unknown` completeness was dropped
+    /// from the settlement without a word. Neither state exists now.
+    #[test]
+    fn an_unreported_cost_carries_no_inclusiveness_and_no_completeness() {
+        assert_eq!(Cost::Unknown.micros(), None);
+        assert!(!Cost::Unknown.inclusive());
+        assert_eq!(Cost::Unknown.completeness(), CostCompleteness::Unknown);
+
+        let reported = Cost::Reported {
+            micros: MicroUsd::from_micros(12_300),
+            inclusive: true,
+        };
+        assert_eq!(reported.micros(), Some(MicroUsd::from_micros(12_300)));
+        assert!(reported.inclusive());
+        assert_eq!(reported.completeness(), CostCompleteness::Actual);
+        assert_eq!(UsageReport::unknown().cost, Cost::Unknown);
     }
 
     #[test]

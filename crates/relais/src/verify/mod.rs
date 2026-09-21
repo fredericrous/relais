@@ -20,20 +20,23 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{canonical_json_hash, sha256_hex};
 use crate::money::{CostCompleteness, MicroUsd};
 use crate::policy::{CommandSpec, DependencyMode, Integrations, VerificationProfile};
+use crate::procs::Ended;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CheckOutcome {
     pub label: String,
     pub argv: Vec<String>,
-    pub exit: Option<i32>,
-    pub timed_out: bool,
+    /// How the check's process ended. A status of zero is the only pass;
+    /// a timeout, a cancellation and a signal are each a distinct
+    /// failure, which `exit: None, timed_out: false` could not say.
+    pub ended: Ended,
     pub log_path: String,
     pub log_sha256: String,
 }
 
 impl CheckOutcome {
     pub fn failed(&self) -> bool {
-        self.timed_out || self.exit != Some(0)
+        !self.ended.succeeded()
     }
 }
 
@@ -109,13 +112,12 @@ pub fn run_command(
     crate::procs::own_process_group(&mut command);
     let mut child = command.spawn()?;
     let timeout = Duration::from_secs(spec.timeout_seconds.max(1));
-    let (status, timed_out, _cancelled) = crate::procs::wait_for_exit(&mut child, timeout, None)?;
+    let ended = crate::procs::wait_for_exit(&mut child, timeout, None)?;
     let log_bytes = std::fs::read(&log_path)?;
     Ok(CheckOutcome {
         label: label.to_string(),
         argv: spec.argv.clone(),
-        exit: status.code(),
-        timed_out,
+        ended,
         log_path: log_path.to_string_lossy().into_owned(),
         log_sha256: sha256_hex(&log_bytes),
     })
@@ -732,7 +734,7 @@ mod tests {
         )
         .expect("run");
         assert!(!pass.failed());
-        assert_eq!(pass.exit, Some(0));
+        assert_eq!(pass.ended, Ended::Exited(0));
         assert_eq!(pass.log_sha256.len(), 64);
         let fail = run_command(
             &dir,
@@ -743,7 +745,7 @@ mod tests {
         )
         .expect("run");
         assert!(fail.failed());
-        assert_eq!(fail.exit, Some(1));
+        assert_eq!(fail.ended, Ended::Exited(1));
         let log = std::fs::read_to_string(&fail.log_path).expect("log exists");
         assert!(log.contains("bad"), "stderr is captured into the log");
         std::fs::remove_dir_all(&dir).ok();
@@ -761,7 +763,7 @@ mod tests {
             "x-cmd0",
         )
         .expect("run");
-        assert!(hung.timed_out);
+        assert_eq!(hung.ended, Ended::TimedOut);
         assert!(hung.failed());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1036,8 +1038,7 @@ mod tests {
             checks: vec![CheckOutcome {
                 label: "cmd0".into(),
                 argv: vec!["make".into(), "check".into()],
-                exit: Some(0),
-                timed_out: false,
+                ended: Ended::Exited(0),
                 log_path: "x.log".into(),
                 log_sha256: "h".into(),
             }],
@@ -1064,8 +1065,7 @@ mod tests {
         let failing_check = CheckOutcome {
             label: "flaky".into(),
             argv: vec![],
-            exit: Some(1),
-            timed_out: false,
+            ended: Ended::Exited(1),
             log_path: "f.log".into(),
             log_sha256: "h".into(),
         };

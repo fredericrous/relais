@@ -11,6 +11,7 @@ use crate::backend::{
     claims_blockage, Backend, BackendError, Capabilities, LaunchResult, LaunchSpec,
     PermissionEnforcement, SandboxCapability, UsageReport,
 };
+use crate::procs::Ended;
 
 #[derive(Debug, Clone, Default)]
 pub struct MockOutcome {
@@ -60,12 +61,23 @@ impl Backend for MockBackend {
 
     fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError> {
         let outcome = (self.behavior)(spec);
+        // A cancellation outranks whatever the script said: the runner
+        // reads a cancelled dispatch before it reads a missing result.
+        let cancelled = spec
+            .cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst));
+        let ended = match (cancelled, outcome.timed_out, outcome.exit_code) {
+            (true, _, _) => Ended::Cancelled,
+            (false, true, _) => Ended::TimedOut,
+            (false, false, Some(code)) => Ended::Exited(code),
+            (false, false, None) => Ended::Signalled,
+        };
         Ok(LaunchResult {
             dispatch_id: spec.dispatch_id.clone(),
-            exit_code: outcome.exit_code,
+            ended,
             stdout: outcome.result_text.clone().unwrap_or_default(),
             stderr: String::new(),
-            timed_out: outcome.timed_out,
             result_text: if outcome.timed_out {
                 None
             } else {
@@ -75,10 +87,6 @@ impl Backend for MockBackend {
             effective_model: outcome.effective_model.or(Some(spec.model.clone())),
             usage: outcome.usage.unwrap_or(UsageReport::unknown()),
             worker_claims_blockage: outcome.result_text.as_deref().is_some_and(claims_blockage),
-            cancelled: spec
-                .cancel
-                .as_ref()
-                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)),
             permission_denials: outcome.permission_denials,
             failure_detail: None,
         })

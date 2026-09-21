@@ -29,6 +29,7 @@ use crate::ids::DispatchId;
 use crate::ledger::UsageEvent;
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::policy::{BlockCode, EffectiveAuthority, MachineSettings, Tier};
+use crate::procs::Ended;
 use crate::route::RouteDecision;
 use crate::verify::{self, Receipt, VerificationReport};
 use crate::workspace::{self, WorkspaceError};
@@ -946,13 +947,13 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         output_tokens: result.usage.output_tokens,
         cache_read_tokens: result.usage.cache_read_tokens,
         cache_write_tokens: result.usage.cache_write_tokens,
-        cost: result.usage.cost,
+        cost: result.usage.cost.micros(),
         cost_kind: CostKind::ApiSpend,
-        completeness: result.usage.cost_completeness,
-        inclusive: result.usage.inclusive,
+        completeness: result.usage.cost.completeness(),
+        inclusive: result.usage.cost.inclusive(),
         at: engine.config.ledger.now(),
     })?;
-    if result.cancelled {
+    if result.ended == Ended::Cancelled {
         return Ok(Proposal::Failed(engine.stop(
             &budget,
             Observation::Cancelled("cancelled while planning".into()),
