@@ -32,7 +32,11 @@ CI (`.github/workflows/ci.yaml`) runs the same targets on every push and
 pull request: lint (fmt, clippy `-D warnings`, the module-cycle gate) on
 **Ubuntu**; the test suite on **Ubuntu, macOS and Windows** (the
 coordinator's endpoint and process handling are a different
-implementation on Windows, and the product ships to a macOS workstation);
+implementation on Windows, and the product ships to a macOS workstation)
+— including the release scenarios in
+`crates/relais/tests/portable_scenarios.rs`, which drive the real binary
+on all three; the ones in `release_scenarios.rs` need a `sh` fake worker
+and stay unix-only;
 the msrv build on Ubuntu, against the `rust-version` it reads from
 `Cargo.toml`; and `make audit` on Ubuntu, also weekly on a schedule and
 deliberately non-blocking. The release workflow's own audit job *does*
@@ -149,7 +153,9 @@ Then `relais run --task task.json`. A worker refused a tool ends the run
 `blocked (permission_denied)` naming the tool; nothing is escalated.
 
 `docs/AUDIT-2026-09-20.md` is the audit this behaviour came out of, with
-the findings still open.
+the findings still open. `docs/REVIEW-2026-09-21.md` is the crate-wide
+review v0.2.0 answers: every finding with the pull request that fixed it
+or the reason it was kept, and a scorecard re-measured afterwards.
 
 ## Known limits
 
