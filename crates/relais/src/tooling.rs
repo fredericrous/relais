@@ -24,7 +24,12 @@ use crate::procs::{run_with_timeout, Ended};
 /// How long a `--version`/`--help` probe may take. A probe is a question
 /// about the machine, not work: an integration that will not answer in
 /// this long is an integration that is not answering (audit V6).
-pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// Generous, because the answer decides whether a run happens at all: a
+/// node-based CLI on a machine already running a build takes seconds to
+/// start, and reporting THAT as "not installed" would block a run over a
+/// busy laptop.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Availability of required integrations at run time. Kept out of
 /// `effective_authority` on purpose: the intersection stays a pure function

@@ -131,9 +131,12 @@ impl Backend for ClaudeBackend {
     }
 
     fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError> {
-        let caps = self
-            .capabilities(spec.cancel.as_deref())
-            .ok_or_else(|| BackendError::MissingBinary(self.binary.to_string_lossy().into()))?;
+        let caps = self.capabilities(spec.cancel.as_deref()).ok_or_else(|| {
+            BackendError::MissingBinary(format!(
+                "{}: it did not answer `--version` and `--help` within {PROBE_TIMEOUT:?}, so its                  launch controls cannot be checked",
+                self.binary.display()
+            ))
+        })?;
         let argv = build_argv(spec, &caps)?;
 
         let mut command = Command::new(&self.binary);
