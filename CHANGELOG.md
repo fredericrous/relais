@@ -399,6 +399,92 @@ stopped (`relais coordinator stop`) before the first command of this version.
 
 ### CLI, doctor, install and release
 
+- **Exit codes are one documented table, and the ones a caller must tell
+  apart are different numbers.** `2` used to mean "a human must decide",
+  "a human must review", "your contract is invalid" and "no such run" all
+  at once; `4` covered a failed task, a spent budget and an interrupted
+  run; `1` meant seven unrelated things and was documented nowhere. There
+  is now a single exhaustive function over a `CliOutcome` enum, printed in
+  `crates/relais/src/main.rs` and in README.md: `1` is relais's own
+  machinery failing and says nothing about the task, `2` is an invalid
+  invocation, `5` a spent ceiling, `6` an interrupted run, `8`/`9` the two
+  kinds of "a human has to look", `10` an unknown run, `11` a resume
+  refused because a worker may still be running and `12` a resume that
+  reconciled one, and `13` a `--write` that could not carry out part of
+  its plan. **Scripts that branch on relais's exit status need updating:**
+  `needs_decision` moved from 2 to 8, `needs_review` from 2 to 9,
+  `budget_exhausted` from 4 to 5, `interrupted` from 4 to 6 and
+  `cancelled` from 4 to 7.
+- **`install --claude --write` tells you when it could not apply
+  something.** A file that changed between the preview and the write was
+  skipped in silence, and the command printed `applied 0 change(s)` and
+  exited 0 — the one case where a person needed to look. It now names
+  every action it could not carry out and exits 13. The scope and the
+  preview/apply decision are a value the module owns and tests, including
+  a user-level install against an injected home directory.
+- **Every owned file relais writes is replaced atomically.** An install or
+  an update used to truncate the file and write over it, so a full disk or
+  a kill in the middle destroyed the user's own text around the block and
+  left a file relais would then refuse to touch for ever. Writes now go to
+  a temporary sibling, are fsynced and renamed into place, so a failed
+  write leaves the previous file exactly as it was. Uninstall re-reads and
+  re-judges a block before removing it, instead of trusting a preview
+  taken minutes earlier, and a dangling symlink is reported as somebody
+  else's file rather than written through.
+- **The installers refuse a download they cannot verify.** A missing
+  `SHA256SUMS`, or a machine with no sha256 tool, printed a warning and
+  installed the binary anyway — under a comment saying checksums are not
+  optional. Both `install.sh` and `install.ps1` now stop, and
+  `RELAIS_SKIP_CHECKSUM=1` is the explicit way to accept an unverified
+  binary. `install.ps1` also fails when the archive held no `relais.exe`,
+  instead of printing the "here is what to run next" epilogue having
+  installed nothing.
+- **`coordinator status --json` is a JSON document in every state.** With
+  no daemon running it printed an English sentence on stdout, exited 0 and
+  discarded the client's error, so a caller could not tell "nothing is
+  running" from a parse failure. The output is now
+  `{"coordinator":"absent","socket":…,"cause":…}`, `"serving"` with the
+  snapshot, or `"version_skew"` with both protocol versions.
+- **`relais doctor` no longer reports an unreadable ledger as a pass.** A
+  ledger that opened but could not say which schema it carried printed
+  `✓ ok` and exited 0. It is a `✗` now, with the error text. Finding
+  levels are an enum rather than a string beside a `bool` that disagreed
+  with it, so the mark a line prints and the exit code always agree — the
+  JSON report drops the redundant `ok` field and keeps `level`.
+- **`relais plan` blocks when it cannot read the working tree.** A failing
+  `git status` was treated as a clean tree and the plan went ahead; `run`
+  has blocked on exactly that since v0.1.3.
+- **Resume's reconciliation is a tested function.** Eighty lines of policy
+  in `main.rs` became `resume::reconcile`, pure and injected with the
+  liveness probe, with a test per row: a live worker refuses, a recorded
+  PID that is gone is provably dead, a dispatch with no PID recorded is
+  unknown unless the coordinator still holds a seat for the run, and
+  "unknown" is never folded together with "dead" or retried.
+- **A deleted working directory is a diagnosed exit, not a panic.**
+  Tearing down a task worktree under a running relais made
+  `current_dir()` panic with a backtrace; it is a typed error now, as the
+  unset-`HOME` case already was — and `paths::home_dir()` no longer exits
+  the process from inside the library, so `doctor` can report it.
+- **`make check` proves all four gates.** There is an `audit` target
+  (`cargo audit`, installing the tool if it is missing, or skipped with
+  `AUDIT_SKIP_OK=1`), `make msrv` now FAILS when the pinned toolchain is
+  absent instead of exiting 0 on a skip (`MSRV_SKIP_OK=1` opts out), and
+  CI's msrv job reads `rust-version` from `Cargo.toml` rather than
+  restating it. CI's audit job runs `make audit`.
+- **No release publishes untested code.** CI never runs on a tag, and the
+  release workflow had no job that ran the suite — so a tag on an
+  unmerged or amended commit built and published binaries nothing had
+  tested. `publish` now needs a `test` job that runs `cargo test` on the
+  tagged commit.
+- **relais reads the fleet decision corpus it asks workers to consult.**
+  `[integrations] aval = "required"` was satisfied by the binary being on
+  PATH and nothing else: there was no `.adr.yaml`, no vendored pack and no
+  `[[architecture.mapping]]`, so every run in this repository resolved
+  zero decisions. The corpus is vendored at `.adr/packs/decisions.pack`,
+  `relais.toml` maps `crates/**` to the code paradigm and the two code
+  canons and the workflows to the CI and release decisions, and an
+  `amont.conf` gate runs `aval check` at commit.
+
 ### Tests and documentation
 
 ## v0.1.6

@@ -24,14 +24,51 @@ section. Or from source: `cargo install --path crates/relais`.
 ## Build
 
 ```sh
-make check   # toolchain lint test msrv
+make check   # toolchain lint test msrv audit
 make build
 ```
 
 CI (`.github/workflows/ci.yaml`) runs the same targets on every push and
-pull request — lint and msrv on Linux, the test suite on Linux and macOS —
-plus a weekly, non-blocking `cargo audit`. A green check on a PR means what
-a green `make check` means on the workstation.
+pull request: lint (fmt, clippy `-D warnings`, the module-cycle gate) on
+**Ubuntu**; the test suite on **Ubuntu, macOS and Windows** (the
+coordinator's endpoint and process handling are a different
+implementation on Windows, and the product ships to a macOS workstation);
+the msrv build on Ubuntu, against the `rust-version` it reads from
+`Cargo.toml`; and `make audit` on Ubuntu, also weekly on a schedule and
+deliberately non-blocking. The release workflow's own audit job *does*
+block, and runs `cargo test` on the tagged commit before publishing
+anything.
+
+A green check on a PR means what a green `make check` means on the
+workstation. Locally, `msrv` fails rather than skipping when the pinned
+toolchain is absent (`MSRV_SKIP_OK=1` opts out), and `audit` installs
+`cargo-audit` if it is missing (`AUDIT_SKIP_OK=1` skips instead) — so a
+green `make check` means all four gates really ran.
+
+## Exit codes
+
+One table, in `crates/relais/src/main.rs`, matched exhaustively. Codes are
+split wherever a caller has to act differently.
+
+| code | meaning |
+|---|---|
+| 0 | the command did what was asked |
+| 1 | relais's own machinery failed (ledger, registry, a file it owns) — nothing is implied about the task |
+| 2 | the invocation, or a file it named, is invalid |
+| 3 | policy, trust, admission or the environment refuses; no model ran |
+| 4 | the task executed and produced no acceptable candidate |
+| 5 | the spending ceiling was reached; patch and evidence preserved |
+| 6 | the run was interrupted; `relais resume` reconciles it |
+| 7 | cancelled by request |
+| 8 | needs a human decision |
+| 9 | needs a human review |
+| 10 | the run or artifact named is not on record |
+| 11 | `resume` refused: a worker may still be running |
+| 12 | `resume` reconciled the run; nothing was replayed |
+| 13 | `--write` could not carry out part of its plan (the files are named) |
+| 14 | nothing to train on yet |
+| 15 | not enough records for one tier |
+| 16 | the learner did not converge |
 
 ## Layout
 
@@ -128,5 +165,9 @@ the findings still open.
 - Native Claude Code subagents are observed, not admitted: only managed
   dispatch through `relais run` is capped by the coordinator.
 - The local `msrv` target proves the declared floor only when that
-  toolchain is installed (`rustup toolchain install 1.88.0`); otherwise it
-  says so. CI always installs it.
+  toolchain is installed (`rustup toolchain install 1.88.0`); without it
+  `make msrv` FAILS and says so, rather than passing on a skip. Set
+  `MSRV_SKIP_OK=1` to skip deliberately. CI always installs it.
+- `install.sh` and `install.ps1` refuse to install a download they cannot
+  verify (no `SHA256SUMS`, no sha256 tool). `RELAIS_SKIP_CHECKSUM=1` is
+  the explicit way to accept an unverified binary.
