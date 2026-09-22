@@ -17,12 +17,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::contract::TaskContract;
 use crate::ids::{DispatchId, PackageId, Pid, RunId, TaskId};
-use crate::lifecycle::{Reason, State};
+use crate::lifecycle::{Reason, State, UsagePhase};
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::outcome::{Outcome, OutcomeDetail, OutcomeKind};
 use crate::policy::Tier;
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 7;
+pub const LEDGER_SCHEMA_VERSION: u64 = 8;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -566,6 +566,33 @@ const MIGRATIONS: &[(&str, &str)] = &[
      WHERE resolved_at IS NULL;
     "#,
     ),
+    (
+        // A usage event said only what it cost, never what produced it.
+        // Five columns say so: `phase` names which of the run's phases
+        // (worker attempt, review, planning, integration) spent the
+        // money — the same typed `UsagePhase` an attempt's own `phase`
+        // column already carries, so the two cannot spell the same thing
+        // differently; `duration_ms` is the dispatch's own elapsed wall
+        // time, not derived from `attempts.started_at`/`ended_at`, which
+        // are the ATTEMPT's span and do not exist at all for a reviewer
+        // or planner dispatch; `requested_model`/`requested_effort`
+        // record what the route asked for, beside `model`, which already
+        // records what the harness reported running, so a substitution
+        // is visible in the row rather than only at the moment it
+        // happened; `harness` names the identity the run probed.
+        //
+        // All nullable: a row written before this step reads them as
+        // absent, never as a default that would misreport an attempt
+        // this binary never measured.
+        "v8",
+        r#"
+    ALTER TABLE usage_events ADD COLUMN phase TEXT;
+    ALTER TABLE usage_events ADD COLUMN duration_ms INTEGER;
+    ALTER TABLE usage_events ADD COLUMN requested_model TEXT;
+    ALTER TABLE usage_events ADD COLUMN requested_effort TEXT;
+    ALTER TABLE usage_events ADD COLUMN harness TEXT;
+    "#,
+    ),
 ];
 
 pub struct Ledger {
@@ -735,6 +762,56 @@ pub struct UsageEvent {
     /// so it is ready for one at any depth.
     pub inclusive: bool,
     pub at: String,
+    /// Which phase of the run spent this money — a worker attempt at one
+    /// of its three kinds, the reviewer, the planner, or a package's
+    /// integration. `None` for a row written before this column existed,
+    /// never a guess (SPEC §11: absent is absent).
+    pub phase: Option<UsagePhase>,
+    /// The dispatch's own elapsed wall time, measured with a monotonic
+    /// clock around the launch that produced this event — not derived
+    /// from any stored timestamp, and not the run's own elapsed time.
+    pub duration_ms: Option<i64>,
+    /// The model the route asked for, beside `model` (what the harness
+    /// reported running): a substitution is visible in the row, not only
+    /// at the moment it happened.
+    pub requested_model: Option<String>,
+    /// The effort the route asked for.
+    pub requested_effort: Option<String>,
+    /// The harness identity the run probed.
+    pub harness: Option<String>,
+}
+
+/// One phase's contribution to a run's cost (SPEC §11): what
+/// [`Ledger::run_cost_by_phase`] returns, one entry per distinct phase
+/// seen plus the `None` unattributed bucket when any row predates the
+/// `phase` column.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PhaseCost {
+    pub phase: Option<UsagePhase>,
+    pub cost: MicroUsd,
+    pub completeness: CostCompleteness,
+}
+
+/// Add one usage row's cost and completeness into a phase's running
+/// total, or open a new entry for a phase not yet seen. Unknown cost
+/// (`cost_micros: None`) contributes nothing to the sum but still folds
+/// its completeness in, the same null-skip `SUM` gives `run_own_cost`.
+fn fold_phase_cost(
+    totals: &mut Vec<(Option<UsagePhase>, MicroUsd, Vec<CostCompleteness>)>,
+    phase: Option<UsagePhase>,
+    cost_micros: Option<i64>,
+    completeness: CostCompleteness,
+) {
+    let cost = cost_micros.map_or(MicroUsd::ZERO, MicroUsd::from_micros);
+    match totals.iter_mut().find(|(p, ..)| *p == phase) {
+        Some((_, total, completenesses)) => {
+            if cost_micros.is_some() {
+                *total = total.saturating_add(cost);
+            }
+            completenesses.push(completeness);
+        }
+        None => totals.push((phase, cost, vec![completeness])),
+    }
 }
 
 /// A work package's run as the ledger holds it (SPEC §19). Rows leave
@@ -1194,7 +1271,7 @@ impl Ledger {
         revision_id: i64,
         attempt_index: i64,
         tier: &str,
-        phase: &str,
+        phase: UsagePhase,
     ) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO attempts
@@ -1205,7 +1282,7 @@ impl Ledger {
                 revision_id,
                 attempt_index,
                 tier,
-                phase,
+                phase.as_str(),
                 State::Running.as_str(),
                 self.now()
             ],
@@ -1537,8 +1614,10 @@ impl Ledger {
             "INSERT OR IGNORE INTO usage_events
                 (event_id, run_id, attempt_id, parent_event_id, model,
                  input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                 cost_micros, cost_kind, completeness, inclusive, at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 cost_micros, cost_kind, completeness, inclusive, at,
+                 phase, duration_ms, requested_model, requested_effort, harness)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                     ?15, ?16, ?17, ?18, ?19)",
             params![
                 event.event_id,
                 event.run_id.as_str(),
@@ -1554,6 +1633,11 @@ impl Ledger {
                 serde_json::to_string(&event.completeness).expect("completeness serializes"),
                 event.inclusive,
                 event.at,
+                event.phase.map(UsagePhase::as_str),
+                event.duration_ms,
+                event.requested_model,
+                event.requested_effort,
+                event.harness,
             ],
         )?;
         Ok(inserted == 1)
@@ -1699,6 +1783,65 @@ impl Ledger {
             // can only widen the answer (`Unknown` is the worst case).
             serde_json::from_str(value).unwrap_or(CostCompleteness::Unknown)
         })))
+    }
+
+    /// The run's spend grouped by phase (SPEC §11): which of the run's
+    /// phases — a worker attempt, the reviewer, the planner, a package's
+    /// integration — spent the money, and how complete that figure is.
+    /// `phase: None` is the unattributed bucket: a row written before
+    /// the `phase` column existed, or a child run's own unattributed
+    /// rows. Same dedup as [`Ledger::run_cost`]: an inclusive parent's
+    /// descendants are excluded so nothing is counted twice, and a
+    /// child run's (a work package's) breakdown is merged into its
+    /// parent's by phase.
+    pub fn run_cost_by_phase(&self, run_id: &RunId) -> Result<Vec<PhaseCost>> {
+        type Row = (Option<String>, Option<i64>, String);
+        let mut stmt = self.conn.prepare(&format!(
+            "{COVERED_BY_AN_INCLUSIVE_PARENT}
+             SELECT phase, cost_micros, completeness FROM usage_events
+              WHERE run_id = ?1
+                AND event_id NOT IN (SELECT event_id FROM covered)"
+        ))?;
+        let rows = stmt.query_map([run_id.as_str()], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        let rows: Vec<Row> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut totals: Vec<(Option<UsagePhase>, MicroUsd, Vec<CostCompleteness>)> = Vec::new();
+        for (phase_raw, cost_micros, completeness_raw) in rows {
+            let phase = phase_raw
+                .as_deref()
+                .map(UsagePhase::parse)
+                .transpose()
+                .map_err(|unknown| LedgerError::Corrupt {
+                    what: format!("the phase of a usage event of run {run_id}"),
+                    detail: unknown.to_string(),
+                })?;
+            // A completeness this binary cannot read IS unknown, same
+            // fold as `run_cost_completeness`.
+            let completeness: CostCompleteness =
+                serde_json::from_str(&completeness_raw).unwrap_or(CostCompleteness::Unknown);
+            fold_phase_cost(&mut totals, phase, cost_micros, completeness);
+        }
+        for child in self.child_runs(run_id)? {
+            for entry in self.run_cost_by_phase(&child.run)? {
+                fold_phase_cost(
+                    &mut totals,
+                    entry.phase,
+                    Some(entry.cost.to_micros()),
+                    entry.completeness,
+                );
+            }
+        }
+        totals.sort_by_key(|(phase, ..)| (phase.is_none(), *phase));
+        Ok(totals
+            .into_iter()
+            .map(|(phase, cost, completenesses)| PhaseCost {
+                phase,
+                cost,
+                completeness: CostCompleteness::worst(completenesses),
+            })
+            .collect())
     }
 
     pub fn store_receipt(
@@ -2227,6 +2370,11 @@ mod tests {
             completeness: CostCompleteness::Actual,
             inclusive: false,
             at: now_rfc3339(),
+            phase: None,
+            duration_ms: None,
+            requested_model: None,
+            requested_effort: None,
+            harness: None,
         }
     }
 
@@ -2607,7 +2755,10 @@ mod tests {
                          '2026-01-01T00:02:00+00:00');",
             )
             .ok();
-            for (version, sql) in MIGRATIONS.iter().take(MIGRATIONS.len() - 1) {
+            // Pinned to v6, not `MIGRATIONS.len() - 1`: a step appended
+            // after v7 must not silently move this fixture past the
+            // v6-to-v7 boundary this test exists to prove.
+            for (version, sql) in &MIGRATIONS[..6] {
                 conn.execute_batch(sql).expect("step");
                 if version == &"v1" {
                     // The run, then the wait, then the retirement that
@@ -2647,7 +2798,10 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("upgrade to v7");
-        assert_eq!(ledger.schema_version().expect("version"), 7);
+        assert_eq!(
+            ledger.schema_version().expect("version"),
+            LEDGER_SCHEMA_VERSION
+        );
         let decision = ledger
             .decision_of_run(&RunId::from_stored("run-w"))
             .expect("query")
@@ -2677,7 +2831,10 @@ mod tests {
                 );",
             )
             .expect("migrations table");
-            for (version, sql) in MIGRATIONS.iter().take(MIGRATIONS.len() - 1) {
+            // Pinned to v4, not `MIGRATIONS.len() - 1`: a step appended
+            // after v5 must not silently move this fixture past the
+            // v4-to-v5 boundary this test exists to prove.
+            for (version, sql) in &MIGRATIONS[..4] {
                 conn.execute_batch(sql).expect("step");
                 conn.execute(
                     "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
@@ -3119,7 +3276,13 @@ mod tests {
             .insert_contract_revision(&run("run-c1"), "h", contract, "HEAD", None)
             .expect("revision");
         ledger
-            .insert_attempt(&run("run-c1"), revision, 1, "implementation", "initial")
+            .insert_attempt(
+                &run("run-c1"),
+                revision,
+                1,
+                "implementation",
+                UsagePhase::Initial,
+            )
             .expect("attempt");
         let (parsed, tier) = ledger
             .run_contract_and_tier(&run("run-c1"))

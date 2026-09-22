@@ -13,7 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::lifecycle::{Reason, State};
+use crate::lifecycle::{Reason, State, UsagePhase};
 use crate::policy::{BlockCode, Tier};
 
 /// What kind of attempt is being dispatched (SPEC §9: initial, one
@@ -32,6 +32,19 @@ impl AttemptKind {
             Self::Initial => "initial",
             Self::Repair => "repair",
             Self::Escalation => "escalation",
+        }
+    }
+}
+
+/// The typed phase an attempt's kind names — so an attempt's phase and a
+/// usage event's phase are the same value, never two strings that can
+/// spell the same thing differently.
+impl From<AttemptKind> for UsagePhase {
+    fn from(kind: AttemptKind) -> Self {
+        match kind {
+            AttemptKind::Initial => Self::Initial,
+            AttemptKind::Repair => Self::Repair,
+            AttemptKind::Escalation => Self::Escalation,
         }
     }
 }

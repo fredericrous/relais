@@ -10,6 +10,16 @@ missing here.
 
 ### Added
 
+- **A usage event now says what produced it.** Every recorded dispatch —
+  a worker attempt, the reviewer, the planner — carries its phase
+  (`initial`, `repair`, `escalation`, `review`, `planning`,
+  `integration`), the dispatch's own elapsed time, the model and effort
+  the route asked for beside the one the harness actually reported
+  running, and the harness identity. `relais report` prints a run's cost
+  broken down by phase, each figure labelled with its completeness, so a
+  reviewer that outspent its worker shows up as such rather than
+  disappearing into one undifferentiated total.
+
 - **A contract limit it does not write no longer narrows anything.**
   `limits.attempts` and `limits.wall_seconds` defaulted to 3 and 1200,
   and the effective authority is the intersection of repository and

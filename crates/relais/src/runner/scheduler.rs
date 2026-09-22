@@ -26,6 +26,7 @@ use crate::context::ContextManifest;
 use crate::contract::{Decomposition, DecompositionMode, Kind, TaskContract, WorkPlan};
 use crate::contract::{Review, WorkPackage};
 use crate::ledger::UsageEvent;
+use crate::lifecycle::UsagePhase;
 use crate::money::{CostKind, MicroUsd};
 use crate::policy::{BlockCode, EffectiveAuthority, MachineSettings, Tier};
 use crate::procs::Ended;
@@ -34,9 +35,9 @@ use crate::verify::{self, Receipt, VerificationReport};
 use crate::workspace::{self, WorkspaceError};
 
 use super::{
-    data_block, data_list_block, execute_child, AttemptLabel, Budget, Limit, ManagedDispatch, Next,
-    Observation, Reason, ReviewOutcome, RunConfig, RunEngine, RunError, RunOutcome, State,
-    Terminal,
+    data_block, data_list_block, effort_str, execute_child, AttemptLabel, Budget, Limit,
+    ManagedDispatch, Next, Observation, Reason, ReviewOutcome, RunConfig, RunEngine, RunError,
+    RunOutcome, State, Terminal,
 };
 
 /// The patch an accepted decomposed run exports its assembled revision
@@ -347,6 +348,7 @@ fn execute_waves(
                 package,
                 wave: *wave,
                 input_sha: &assembly.head.clone(),
+                role: crate::runner::PackageRole::Work,
             },
             assembly,
         )? {
@@ -509,6 +511,7 @@ fn execute_waves(
                 package: &repair,
                 wave,
                 input_sha: &assembly.head.clone(),
+                role: crate::runner::PackageRole::IntegrationRepair,
             },
             assembly,
         )? {
@@ -548,6 +551,9 @@ struct PackageRun<'p> {
     /// The revision this package's worktree starts from: the assembled
     /// head, so every package sees the packages before it.
     input_sha: &'p str,
+    /// Whether this is one of the plan's packages or the repair of an
+    /// assembled candidate, which is what its spend is attributed to.
+    role: crate::runner::PackageRole,
 }
 
 /// Run one package as a child run from its input revision, under what
@@ -564,6 +570,7 @@ fn run_package(
         package,
         wave,
         input_sha,
+        role: _,
     } = *run;
     let ledger = engine.config.ledger;
     let contract = engine.config.contract;
@@ -708,6 +715,7 @@ fn run_package(
         &child_config,
         &engine.run_id,
         &crate::ids::PackageId::from_stored(package.id.clone()),
+        run.role,
     )?;
     let child_run = outcome.run_id.clone();
     assembly.attempts_total += ledger.attempt_count(&child_run)? as u32;
@@ -1081,6 +1089,8 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         tier: Tier::Research,
         escalation_tier: None,
     };
+    // Around the launch, monotonic: the dispatch's own elapsed time.
+    let dispatch_start = Instant::now();
     let result = match engine.managed_launch(ManagedDispatch {
         spec,
         depth: 0,
@@ -1120,6 +1130,11 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         completeness: result.usage.cost.completeness(),
         inclusive: result.usage.cost.inclusive(),
         at: engine.config.ledger.now(),
+        phase: Some(UsagePhase::Planning),
+        duration_ms: Some(dispatch_start.elapsed().as_millis() as i64),
+        requested_model: Some(profile.id.clone()),
+        requested_effort: effort_str(profile.effort),
+        harness: engine.harness.clone(),
     })?;
     if result.ended == Ended::Cancelled {
         return Ok(Proposal::Failed(engine.stop(

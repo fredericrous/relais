@@ -33,10 +33,11 @@ use crate::context::{self, ContextError, ContextManifest};
 use crate::contract::{Review, TaskContract};
 use crate::ids::{derive_task_id, DispatchId, PackageId, Pid, RunId};
 use crate::ledger::{Ledger, LedgerError, Transition, UsageEvent};
+use crate::lifecycle::UsagePhase;
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::policy::{
-    effective_authority, repo_key, BlockCode, EffectiveAuthority, MachineSettings, RepoPolicy,
-    Tier, VerificationProfile,
+    effective_authority, repo_key, BlockCode, EffectiveAuthority, Effort, MachineSettings,
+    RepoPolicy, Tier, VerificationProfile,
 };
 use crate::procs::Ended;
 use crate::route::{route, Route, RouteInputs, RoutePredictor, Routed};
@@ -264,15 +265,40 @@ pub fn execute(config: &RunConfig<'_>) -> Result<RunOutcome, RunError> {
 }
 
 /// A work package's run (SPEC §19): the same lifecycle, attributed to
+/// What a child run IS to its parent: an ordinary work package, or the
+/// repair of an assembled candidate that failed verification. The
+/// difference is not cosmetic — an integration repair's spend is
+/// integration spend, and typing it `initial` (which is what its
+/// attempts are, considered alone) hides it inside the packages' own
+/// first attempts and leaves the `integration` bucket always empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageRole {
+    Work,
+    IntegrationRepair,
+}
+
+impl PackageRole {
+    /// The phase an attempt of this child records. A work package's
+    /// attempts say which attempt they are; every attempt of an
+    /// integration repair is integration.
+    fn phase(self, kind: AttemptKind) -> UsagePhase {
+        match self {
+            Self::Work => UsagePhase::from(kind),
+            Self::IntegrationRepair => UsagePhase::Integration,
+        }
+    }
+}
+
 /// its root run in the ledger.
 pub fn execute_child(
     config: &RunConfig<'_>,
     parent_run: &RunId,
     package_id: &PackageId,
+    role: PackageRole,
 ) -> Result<RunOutcome, RunError> {
     Ok(finished(
         config,
-        RunEngine::new(config, Some((parent_run.clone(), package_id.clone())))?.run(),
+        RunEngine::new(config, Some((parent_run.clone(), package_id.clone(), role)))?.run(),
     ))
 }
 
@@ -322,7 +348,7 @@ pub(crate) struct RunEngine<'a> {
     /// This run's throwaway verification worktrees.
     pub(crate) verify_dir: PathBuf,
     pub(crate) state: State,
-    parent: Option<(RunId, PackageId)>,
+    parent: Option<(RunId, PackageId, PackageRole)>,
     /// `<backend> <version>` as probed at run start; unknown = `None`.
     pub(crate) harness: Option<String>,
     /// Write leases this run's own dispatches took and could not give
@@ -498,9 +524,19 @@ struct Progress {
 }
 
 impl<'a> RunEngine<'a> {
+    /// The phase an attempt of THIS run records: a root run and an
+    /// ordinary package say which attempt it is; every attempt of an
+    /// integration repair is integration, because that is what the
+    /// money bought.
+    fn attempt_phase(&self, kind: AttemptKind) -> UsagePhase {
+        self.parent
+            .as_ref()
+            .map_or(UsagePhase::from(kind), |(_, _, role)| role.phase(kind))
+    }
+
     fn new(
         config: &'a RunConfig<'a>,
-        parent: Option<(RunId, PackageId)>,
+        parent: Option<(RunId, PackageId, PackageRole)>,
     ) -> Result<Self, RunError> {
         let run_id = config.ids.run_id()?;
         let artifacts = config.artifacts_dir.join(run_id.as_str());
@@ -1137,7 +1173,7 @@ impl<'a> RunEngine<'a> {
                     &this_repo_key,
                 )?
             }
-            Some((parent_run, package_id)) => {
+            Some((parent_run, package_id, _role)) => {
                 // A work package is not a task of its own (SPEC §19): it
                 // inherits the root's, which the root's own preflight
                 // already put on record before any package is scheduled.
@@ -1650,7 +1686,7 @@ impl<'a> RunEngine<'a> {
             ctx.preflight.revision_id,
             index as i64,
             tier.as_str(),
-            kind.as_str(),
+            self.attempt_phase(kind),
         )?;
 
         let model_profile = &authority.models[&tier];
@@ -1738,6 +1774,10 @@ impl<'a> RunEngine<'a> {
         };
 
         let requested_model = model_profile.id.clone();
+        let requested_effort = effort_str(model_profile.effort);
+        // Around the launch, monotonic: the dispatch's own elapsed time,
+        // never derived from the `at` timestamps `record_usage` stamps.
+        let dispatch_start = Instant::now();
         let result = match self.managed_launch(ManagedDispatch {
             spec,
             depth: 0,
@@ -1754,6 +1794,7 @@ impl<'a> RunEngine<'a> {
                 return Ok(Phase::Ended(outcome));
             }
         };
+        let duration_ms = dispatch_start.elapsed().as_millis() as i64;
         ledger.finish_dispatch(&dispatch_id, "completed")?;
 
         // Usage is recorded even when the attempt went nowhere: all
@@ -1774,6 +1815,11 @@ impl<'a> RunEngine<'a> {
             completeness: usage.cost.completeness(),
             inclusive: usage.cost.inclusive(),
             at: self.config.ledger.now(),
+            phase: Some(self.attempt_phase(kind)),
+            duration_ms: Some(duration_ms),
+            requested_model: Some(requested_model.clone()),
+            requested_effort,
+            harness: self.harness.clone(),
         };
         ledger.record_usage(&event)?;
         progress.spend.fold(event.cost, usage.cost.completeness());
@@ -2975,6 +3021,8 @@ impl<'a> RunEngine<'a> {
             tier: reviewer_tier,
             escalation_tier: None,
         };
+        // Around the launch, monotonic: the dispatch's own elapsed time.
+        let dispatch_start = Instant::now();
         let result = match self.managed_launch(ManagedDispatch {
             spec,
             depth: 0,
@@ -3032,6 +3080,11 @@ impl<'a> RunEngine<'a> {
             completeness: result.usage.cost.completeness(),
             inclusive: result.usage.cost.inclusive(),
             at: self.config.ledger.now(),
+            phase: Some(UsagePhase::Review),
+            duration_ms: Some(dispatch_start.elapsed().as_millis() as i64),
+            requested_model: Some(profile.id.clone()),
+            requested_effort: effort_str(profile.effort),
+            harness: self.harness.clone(),
         };
         if let Err(e) = self.config.ledger.record_usage(&event) {
             return Err(ReviewOutcome::Unavailable(format!(
@@ -3222,6 +3275,12 @@ impl Ceiling {
 pub(crate) fn spend_limit(spent: MicroUsd, ceiling: MicroUsd, which: Ceiling) -> Limit {
     let (spent, ceiling) = which.render(spent, ceiling);
     Limit::Spend { spent, ceiling }
+}
+
+/// A route's requested effort, spelled the way a usage event stores it.
+/// `None` for a model without effort control — omitted, never guessed.
+pub(crate) fn effort_str(effort: Option<Effort>) -> Option<String> {
+    effort.map(Effort::as_str).map(str::to_string)
 }
 
 /// The start of the UTC day containing an RFC3339 instant, formatted the
@@ -6857,6 +6916,11 @@ mod tests {
                     completeness: CostCompleteness::Actual,
                     inclusive: false,
                     at: at.into(),
+                    phase: None,
+                    duration_ms: None,
+                    requested_model: None,
+                    requested_effort: None,
+                    harness: None,
                 })
                 .expect("usage");
         }
@@ -7739,6 +7803,34 @@ mod tests {
             "an unreadable patch is an error, not text"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An integration repair's spend is integration spend. It runs as a
+    /// child package, so considered alone its attempts are `initial` —
+    /// which would hide the money inside the packages' own first
+    /// attempts and leave the `integration` bucket permanently empty.
+    #[test]
+    fn an_integration_repairs_attempts_are_integration() {
+        use crate::runner::PackageRole;
+        assert_eq!(
+            PackageRole::Work.phase(AttemptKind::Initial),
+            UsagePhase::Initial
+        );
+        assert_eq!(
+            PackageRole::Work.phase(AttemptKind::Repair),
+            UsagePhase::Repair
+        );
+        for kind in [
+            AttemptKind::Initial,
+            AttemptKind::Repair,
+            AttemptKind::Escalation,
+        ] {
+            assert_eq!(
+                PackageRole::IntegrationRepair.phase(kind),
+                UsagePhase::Integration,
+                "every attempt of an integration repair is integration, not {kind:?}"
+            );
+        }
     }
 
     #[test]

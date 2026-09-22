@@ -12,7 +12,7 @@
 
 use serde::Serialize;
 
-use crate::ledger::{DecisionRecord, Ledger, TaskOrigin};
+use crate::ledger::{DecisionRecord, Ledger, PhaseCost, TaskOrigin};
 use crate::lifecycle::State;
 use crate::money::{CostCompleteness, MicroUsd};
 
@@ -32,6 +32,11 @@ pub struct RunLine {
     pub attempts: usize,
     pub cost: MicroUsd,
     pub cost_completeness: CostCompleteness,
+    /// The run's own spend grouped by phase (SPEC §11): which phase —
+    /// worker attempt, review, planning, integration — spent the money.
+    /// `phase: None` is the unattributed bucket: usage recorded before
+    /// this breakdown existed.
+    pub phase_costs: Vec<PhaseCost>,
     pub models: Vec<String>,
     pub final_detail: Option<String>,
     /// Accepted, and its task's latest recorded outcome (if any) has not
@@ -141,6 +146,7 @@ pub fn runs_report(ledger: &Ledger, since: &str) -> Result<Report, crate::ledger
         let attempts = ledger.attempt_count(&run_id)?;
         let cost = ledger.run_cost(&run_id)?;
         let completeness = ledger.run_cost_completeness(&run_id)?;
+        let phase_costs = ledger.run_cost_by_phase(&run_id)?;
         let models = ledger.models_used(&run_id)?;
         let final_detail = transitions
             .last()
@@ -171,6 +177,7 @@ pub fn runs_report(ledger: &Ledger, since: &str) -> Result<Report, crate::ledger
             attempts,
             cost,
             cost_completeness: completeness,
+            phase_costs,
             models,
             final_detail,
             standing,
@@ -311,6 +318,16 @@ impl Report {
                     run.models.join(",")
                 },
             ));
+            for phase_cost in &run.phase_costs {
+                out.push_str(&format!(
+                    "    {:<12} {}\n",
+                    phase_cost
+                        .phase
+                        .map(|phase| phase.as_str())
+                        .unwrap_or("unattributed"),
+                    cost_line(phase_cost.cost, phase_cost.completeness),
+                ));
+            }
             if let Some(detail) = &run.final_detail {
                 out.push_str(&format!("    {}\n", truncate_chars(detail, 120)));
             }
@@ -505,6 +522,7 @@ mod tests {
                 attempts: 1,
                 cost: MicroUsd::from_micros(10),
                 cost_completeness: CostCompleteness::Actual,
+                phase_costs: vec![],
                 models: vec!["haiku".into()],
                 final_detail: Some(detail),
                 standing: true,
@@ -579,6 +597,11 @@ mod tests {
                     completeness: CostCompleteness::Actual,
                     inclusive: false,
                     at: now_rfc3339(),
+                    phase: None,
+                    duration_ms: None,
+                    requested_model: None,
+                    requested_effort: None,
+                    harness: None,
                 })
                 .expect("usage");
             ledger
@@ -671,6 +694,11 @@ mod tests {
                     completeness: CostCompleteness::Actual,
                     inclusive: false,
                     at: now_rfc3339(),
+                    phase: None,
+                    duration_ms: None,
+                    requested_model: None,
+                    requested_effort: None,
+                    harness: None,
                 })
                 .expect("usage");
             ledger
@@ -795,6 +823,11 @@ mod tests {
                     completeness,
                     inclusive: false,
                     at: now_rfc3339(),
+                    phase: None,
+                    duration_ms: None,
+                    requested_model: None,
+                    requested_effort: None,
+                    harness: None,
                 })
                 .expect("usage");
             ledger
@@ -880,6 +913,139 @@ mod tests {
         );
         // Best effort: the fixture is a temp dir; a leftover costs
         // nothing but disk, and the next run pre-cleans it.
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A usage event now says which phase spent the money: `relais
+    /// report` prints the breakdown beneath the run's own cost line, and
+    /// a run whose reviewer cost more than its worker says so — the
+    /// review is not folded silently into an undifferentiated total.
+    #[test]
+    fn a_run_whose_reviewer_cost_more_than_its_worker_says_so() {
+        use crate::lifecycle::UsagePhase;
+
+        let dir = temp_dir("phase-breakdown");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let run = crate::ids::RunId::from_stored("run-phases");
+        let task = crate::ids::TaskId::from_stored("task-phases");
+        ledger
+            .insert_run(&run, "/repo", None, &task, "rk")
+            .expect("run");
+        let revision = ledger
+            .insert_contract_revision(&run, "h", "{}", "HEAD", None)
+            .expect("revision");
+        let attempt = ledger
+            .insert_attempt(&run, revision, 1, "implementation", UsagePhase::Initial)
+            .expect("attempt");
+        ledger
+            .record_usage(&crate::ledger::UsageEvent {
+                event_id: "worker".into(),
+                run_id: run.clone(),
+                attempt_id: Some(attempt),
+                parent_event_id: None,
+                model: Some("sonnet".into()),
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                cost: Some(MicroUsd::from_micros(100)),
+                cost_kind: crate::money::CostKind::ApiSpend,
+                completeness: CostCompleteness::Actual,
+                inclusive: false,
+                at: now_rfc3339(),
+                phase: Some(UsagePhase::Initial),
+                duration_ms: Some(500),
+                requested_model: Some("sonnet".into()),
+                requested_effort: None,
+                harness: Some("claude 1.0".into()),
+            })
+            .expect("worker usage");
+        ledger
+            .record_usage(&crate::ledger::UsageEvent {
+                event_id: "reviewer".into(),
+                run_id: run.clone(),
+                attempt_id: None,
+                parent_event_id: None,
+                model: Some("opus".into()),
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                cost: Some(MicroUsd::from_micros(900)),
+                cost_kind: crate::money::CostKind::ApiSpend,
+                completeness: CostCompleteness::Actual,
+                inclusive: false,
+                at: now_rfc3339(),
+                phase: Some(UsagePhase::Review),
+                duration_ms: Some(300),
+                requested_model: Some("opus".into()),
+                requested_effort: None,
+                harness: Some("claude 1.0".into()),
+            })
+            .expect("reviewer usage");
+        ledger
+            .record_transition(&Transition {
+                run_id: run.clone(),
+                attempt_id: None,
+                from_state: Some(State::Prepared),
+                to_state: State::Accepted,
+                reason: "t".into(),
+                detail: None,
+                at: now_rfc3339(),
+            })
+            .expect("transition");
+
+        let breakdown = ledger.run_cost_by_phase(&run).expect("phase costs");
+        let worker = breakdown
+            .iter()
+            .find(|entry| entry.phase == Some(UsagePhase::Initial))
+            .expect("worker bucket");
+        let reviewer = breakdown
+            .iter()
+            .find(|entry| entry.phase == Some(UsagePhase::Review))
+            .expect("reviewer bucket");
+        assert!(
+            reviewer.cost > worker.cost,
+            "the reviewer spent more than the worker: {reviewer:?} vs {worker:?}"
+        );
+
+        let report = runs_report(&ledger, "2000-01-01T00:00:00+00:00").expect("report");
+        let text = report.render();
+        // The FIGURES, and where they sit: a rendering that swapped the
+        // two phases, or printed them somewhere other than under the
+        // run they belong to, would pass a `contains` on the names.
+        let lines: Vec<&str> = text.lines().collect();
+        let run_line = lines
+            .iter()
+            .position(|line| line.starts_with(run.as_str()))
+            .expect("the run has a line");
+        let review_line = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("review"))
+            .expect("a review phase line");
+        let initial_line = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("initial"))
+            .expect("an initial phase line");
+        assert!(
+            review_line > run_line && initial_line > run_line,
+            "the breakdown sits beneath its run:\n{text}"
+        );
+        assert!(
+            lines[review_line].contains("$0.0009"),
+            "the reviewer's own figure: {}",
+            lines[review_line]
+        );
+        assert!(
+            lines[initial_line].contains("$0.0001"),
+            "the worker's own figure: {}",
+            lines[initial_line]
+        );
+        assert!(
+            lines[review_line].contains("actual") && lines[initial_line].contains("actual"),
+            "each figure carries its completeness:\n{text}"
+        );
+        // Best effort: a leftover temp dir costs nothing but disk.
         std::fs::remove_dir_all(&dir).ok();
     }
 }
