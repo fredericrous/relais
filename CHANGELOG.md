@@ -6,6 +6,24 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## v0.2.4
+
+### Fixed
+
+- **The reviewer reads the patch, because the patch is in its prompt.**
+  A reviewer is launched with an empty tool allowlist — it reports, it
+  does not act — and the prompt told it to read a file. The first time
+  a review mattered it spent its whole wall clock being refused and
+  answered nothing, so a run whose checks had passed ended
+  `needs_review` with the attempt already paid for. The diff now travels
+  in the prompt, fenced as data like every other thing the runner did
+  not write, bounded at 192 KiB with the truncation stated in the text
+  the reviewer reads.
+- **A review has its own wall clock.** It used to inherit whatever the
+  worker left of the run's, with a one-second floor: a worker that used
+  its twenty minutes left the reviewer a second to answer in. A review
+  is part of acceptance, so it gets five minutes of its own.
+
 ## v0.2.3
 
 ### Fixed
