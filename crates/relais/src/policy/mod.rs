@@ -379,34 +379,61 @@ pub const AUTHORITY_EXCLUSIONS: &[&str] = &["schema_version"];
 /// A grant used to be bound to the policy's content alone, so any other
 /// repository whose `relais.toml` hashed the same — the public `relais
 /// init` template does — ran its `make check` under a grant nobody had
-/// reviewed for it (P2). The identity is the repository root as
-/// `repo::locate_repo_root` resolved it, plus the `origin` remote URL
-/// when git reports one. Built at a boundary and passed in: this module
-/// decides, it does not look at disks or run git.
+/// reviewed for it (P2). The identity is the REPOSITORY, never one
+/// checkout of it: the `origin` remote URL when git reports one, else
+/// the repository's common git directory. Every worktree of one
+/// repository shares both, so a grant reviewed in the live checkout
+/// covers the task worktrees `relais run` creates from it — the
+/// checkout path used to be hashed in, and a run from a worktree
+/// blocked on a grant the user had already issued. Built at a boundary
+/// (`repo::identity`) and passed in: this module decides, it does not
+/// look at disks or run git.
+///
+/// Serialized externally tagged — `{"origin": "…"}` or
+/// `{"common_dir": "…"}` — and that shape is hashed into the grant key,
+/// so it is a wire format: a renamed variant re-keys every grant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct RepoIdentity {
-    /// The canonical path of the directory whose `relais.toml` governs
-    /// the run.
-    root: String,
-    /// The `origin` remote URL, when the repository has one.
-    origin: Option<String>,
+#[serde(rename_all = "snake_case")]
+pub enum RepoIdentity {
+    /// The `origin` remote URL, exactly as git reports it.
+    Origin(String),
+    /// The canonical path of the git common directory — the one `.git`
+    /// every worktree of the repository shares — for a repository with
+    /// no `origin`; outside any repository, the policy root itself.
+    CommonDir(String),
 }
 
 impl RepoIdentity {
-    /// The identity of the repository rooted at `root`, with `origin` as
-    /// git reported it (`None` when there is no such remote).
-    pub fn new(root: &std::path::Path, origin: Option<String>) -> Self {
-        Self {
-            root: root.to_string_lossy().into_owned(),
-            origin: origin.filter(|url| !url.trim().is_empty()),
-        }
+    /// The identity of a repository whose `origin` remote is `url`.
+    pub fn origin(url: impl Into<String>) -> Self {
+        Self::Origin(url.into())
+    }
+
+    /// The identity of a repository with no `origin`, by its common
+    /// git directory (or, outside any repository, its policy root).
+    pub fn common_dir(path: &std::path::Path) -> Self {
+        Self::CommonDir(path.to_string_lossy().into_owned())
     }
 
     /// What a human reads in a grant's `repo = "…"` field: the origin
-    /// URL when there is one, otherwise the root path. Informational —
-    /// the binding itself is in the key.
+    /// URL, or the common directory. Informational — the binding itself
+    /// is in the key.
     pub fn label(&self) -> &str {
-        self.origin.as_deref().unwrap_or(&self.root)
+        match self {
+            Self::Origin(url) | Self::CommonDir(url) => url,
+        }
+    }
+}
+
+/// How `relais plan` and `relais doctor` name the identity in use:
+/// `<url>`, or `<common-dir> (no origin)` so a reader knows which of the
+/// two bindings a grant will be keyed on.
+impl std::fmt::Display for RepoIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Origin(url) => f.write_str(url),
+            Self::CommonDir(dir) => write!(f, "{dir} (no origin)"),
+        }
     }
 }
 
@@ -951,9 +978,9 @@ pub fn effective_authority(
             code: BlockCode::MissingTrustGrant,
             detail: format!(
                 "no trust grant for this execution declaration (authority hash \
-                 {authority_hash}) in this repository ({}); `relais plan` prints the \
-                 [trust.\"{grant_key}\"] block to review and paste into machine.toml",
-                repo_identity.label()
+                 {authority_hash}) in this repository ({repo_identity}); `relais plan` \
+                 prints the [trust.\"{grant_key}\"] block to review and paste into \
+                 machine.toml"
             ),
         });
     }
@@ -1178,10 +1205,7 @@ keys = ["output.contract"]
     }
 
     fn identity() -> RepoIdentity {
-        RepoIdentity::new(
-            std::path::Path::new("/repos/relais"),
-            Some("git@example.invalid:me/relais.git".into()),
-        )
+        RepoIdentity::origin("git@example.invalid:me/relais.git")
     }
 
     fn grant_for(policy: &RepoPolicy) -> String {
@@ -1442,10 +1466,7 @@ keys = ["output.contract"]
     #[test]
     fn a_grant_is_bound_to_the_repository_as_well_as_the_declaration() {
         let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
-        let elsewhere = RepoIdentity::new(
-            std::path::Path::new("/repos/someone-elses"),
-            Some("git@example.invalid:someone/else.git".into()),
-        );
+        let elsewhere = RepoIdentity::origin("git@example.invalid:someone/else.git");
         assert_ne!(
             grant_key(&repo.authority_hash(), &identity()),
             grant_key(&repo.authority_hash(), &elsewhere),
@@ -1458,14 +1479,39 @@ keys = ["output.contract"]
             !effective_authority(&repo, &machine, &contract(), &elsewhere).trust_granted,
             "the other repository runs unreviewed until it is reviewed"
         );
-        // A repository with no origin is still identified, by its root.
-        let no_origin = RepoIdentity::new(std::path::Path::new("/repos/relais"), None);
+        // A repository with no origin is still identified, by its
+        // common git directory.
+        let no_origin = RepoIdentity::common_dir(std::path::Path::new("/repos/relais/.git"));
         assert_ne!(
             grant_key(&repo.authority_hash(), &no_origin),
             grant_key(&repo.authority_hash(), &identity())
         );
-        assert_eq!(no_origin.label(), "/repos/relais");
+        assert_eq!(no_origin.label(), "/repos/relais/.git");
+        assert_eq!(no_origin.to_string(), "/repos/relais/.git (no origin)");
         assert_eq!(identity().label(), "git@example.invalid:me/relais.git");
+        assert_eq!(identity().to_string(), "git@example.invalid:me/relais.git");
+    }
+
+    /// The identity's serialized shape is hashed into every grant key,
+    /// so it is a wire format: these two keys are what a `machine.toml`
+    /// written by this version holds, and a change here re-keys every
+    /// grant on every machine. Pinned so that is a deliberate release
+    /// note, never a surprise.
+    #[test]
+    fn the_grant_key_shape_is_pinned() {
+        assert_eq!(
+            serde_json::to_value(identity()).expect("serializes"),
+            serde_json::json!({ "origin": "git@example.invalid:me/relais.git" })
+        );
+        assert_eq!(
+            serde_json::to_value(RepoIdentity::common_dir(std::path::Path::new("/r/.git")))
+                .expect("serializes"),
+            serde_json::json!({ "common_dir": "/r/.git" })
+        );
+        assert_eq!(
+            grant_key("authority", &identity()),
+            "ff25e7845522d451e49c35865572e3a48a295dcf806caecde55b3afa345dcaa5"
+        );
     }
 
     #[test]

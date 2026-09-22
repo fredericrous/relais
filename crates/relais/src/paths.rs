@@ -102,9 +102,22 @@ pub fn registry_dir() -> Result<PathBuf, HomeUnset> {
     Ok(state_dir()?.join("registry"))
 }
 
+/// The names the state directory's layout is spelled with, so the runner
+/// that writes it and the sweep that reads it back (`resume --retire`,
+/// `doctor`) cannot disagree.
+///
+/// `runs/<run>/` holds a run's artifacts; `worktrees/<run>/<name>/` its
+/// git worktrees (`task`, `integration`), a SIBLING of the artifacts so
+/// a worker cannot reach the run's record by a relative path. Releases
+/// before that split kept the worktree at `runs/<run>/worktree/`, and a
+/// state directory may still hold some.
+pub const RUNS_DIR: &str = "runs";
+pub const WORKTREES_DIR: &str = "worktrees";
+pub const LEGACY_WORKTREE_DIR: &str = "worktree";
+
 /// One directory per run: receipts, patches, evidence.
 pub fn runs_dir() -> Result<PathBuf, HomeUnset> {
-    Ok(state_dir()?.join("runs"))
+    Ok(state_dir()?.join(RUNS_DIR))
 }
 
 #[cfg(test)]

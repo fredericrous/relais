@@ -62,37 +62,51 @@ pub fn locate_repo_root(start: &std::path::Path) -> Result<std::path::PathBuf, L
 
 /// Which repository this is, for binding a trust grant (SPEC §5).
 ///
-/// The root is canonicalized, so `.`, a relative path and a symlinked
-/// path all name one repository rather than three. When canonicalization
-/// fails — a directory that was deleted or cannot be read — the path is
-/// used as given: the identity is then narrower than it might be, which
-/// costs a review and never grants one.
+/// The REPOSITORY, never the checkout `root` happens to be: the `origin`
+/// remote URL when git reports one, otherwise the canonical git common
+/// directory (`git rev-parse --git-common-dir`), which every worktree of
+/// one repository shares. So the live checkout and each task worktree
+/// `relais run` creates from it — or a worktree the user made by hand —
+/// resolve to one identity and one grant. Outside any repository the
+/// canonical `root` stands in, since there is nothing else to name; it
+/// is canonicalized so `.`, a relative path and a symlinked path are one
+/// directory, and used as given when even that fails (a directory that
+/// was deleted or cannot be read): the identity is then narrower than it
+/// might be, which costs a review and never grants one.
 pub fn identity(root: &Path) -> RepoIdentity {
-    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    RepoIdentity::new(&canonical, origin_url(root))
+    if let Some(url) = git_answer(root, &["remote", "get-url", "origin"]) {
+        return RepoIdentity::origin(url);
+    }
+    let common_dir = git_answer(root, &["rev-parse", "--git-common-dir"])
+        // Relative when run from the main worktree (`.git`); absolute
+        // from a linked worktree. Anchored at `root` either way.
+        .map(|dir| root.join(dir))
+        .unwrap_or_else(|| root.to_path_buf());
+    let canonical = std::fs::canonicalize(&common_dir).unwrap_or(common_dir);
+    RepoIdentity::common_dir(&canonical)
 }
 
-/// The `origin` remote's URL, when git reports one.
+/// One trimmed line of git's answer, when it answers at all.
 ///
 /// Every way of not getting one — no such remote, no repository, git not
 /// installed — answers `None`, because they are the same answer to the
-/// question asked: this repository has no origin to bind to, so its
-/// identity is its root path. The failure direction is safe: a grant
-/// issued with an origin stops matching, and the run blocks on the
-/// missing grant rather than running under someone else's review.
-fn origin_url(root: &Path) -> Option<String> {
+/// question asked: git names nothing to bind to here. The failure
+/// direction is safe: a grant issued with an origin stops matching, and
+/// the run blocks on the missing grant rather than running under someone
+/// else's review.
+fn git_answer(root: &Path, args: &[&str]) -> Option<String> {
     let output = crate::workspace::git_command(root)
-        .args(["remote", "get-url", "origin"])
+        .args(args)
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if url.is_empty() {
+    let answer = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if answer.is_empty() {
         None
     } else {
-        Some(url)
+        Some(answer)
     }
 }
 
@@ -217,6 +231,7 @@ pub fn lockfiles(repo_dir: &Path) -> Vec<&'static Ecosystem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::grant_key;
 
     #[test]
     fn a_lockfile_at_the_root_names_its_installer() {
@@ -320,10 +335,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The identity a trust grant is bound to: a canonical root, and an
-    /// origin only when git actually reports one.
+    /// The identity a trust grant is bound to, outside any repository: a
+    /// canonical root, since there is nothing else to name.
     #[test]
-    fn identity_canonicalizes_the_root_and_tolerates_no_origin() {
+    fn identity_outside_a_repository_is_the_canonical_root() {
         let dir = temp_dir("identity");
         std::fs::create_dir_all(dir.join("nested")).expect("mkdir");
         let canonical = std::fs::canonicalize(&dir).expect("canonicalize");
@@ -331,10 +346,110 @@ mod tests {
         assert_eq!(
             identity(&through_dots),
             identity(&canonical),
-            "one repository, one identity"
+            "one directory, one identity"
         );
-        // No repository here, so no origin: the root alone identifies it.
-        assert_eq!(identity(&canonical).label(), canonical.to_string_lossy());
+        assert_eq!(
+            identity(&canonical),
+            RepoIdentity::common_dir(&canonical),
+            "no repository here, so no origin and no common dir: the root stands in"
+        );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = crate::workspace::git_command(dir)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The identity names the REPOSITORY: the live checkout and two
+    /// worktrees of it are one grant, with and without an origin. The
+    /// checkout path used to be hashed in, so a run started from a
+    /// worktree blocked on a grant the user had issued from the live
+    /// checkout.
+    #[test]
+    fn every_worktree_of_one_repository_has_the_repositorys_identity() {
+        let base = temp_dir("identity-wt");
+        let live = base.join("live");
+        std::fs::create_dir_all(&live).expect("mkdir");
+        let no_hooks = base.join("no-hooks");
+        std::fs::create_dir_all(&no_hooks).expect("mkdir");
+        git(&live, &["init", "-q"]);
+        git(
+            &live,
+            &["config", "core.hooksPath", &no_hooks.to_string_lossy()],
+        );
+        git(&live, &["config", "user.email", "relais@test"]);
+        git(&live, &["config", "user.name", "relais test"]);
+        std::fs::write(live.join("relais.toml"), "schema_version = 1\n").expect("policy");
+        git(&live, &["add", "-A"]);
+        git(&live, &["commit", "-q", "-m", "base"]);
+        let first = base.join("wt-1");
+        let second = base.join("wt-2");
+        git(
+            &live,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                &first.to_string_lossy(),
+                "HEAD",
+            ],
+        );
+        git(
+            &live,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                &second.to_string_lossy(),
+                "HEAD",
+            ],
+        );
+
+        // No origin: the common git directory, canonical, from every
+        // checkout — the main worktree answers `.git` relative to
+        // itself, a linked worktree answers an absolute path.
+        let common = RepoIdentity::common_dir(
+            &std::fs::canonicalize(live.join(".git")).expect("the common dir exists"),
+        );
+        for checkout in [&live, &first, &second] {
+            assert_eq!(
+                identity(checkout),
+                common,
+                "{} names the repository, not itself",
+                checkout.display()
+            );
+        }
+        assert_eq!(
+            grant_key("authority", &identity(&first)),
+            grant_key("authority", &identity(&live)),
+            "one repository, one grant"
+        );
+
+        // With an origin: the URL, from every checkout, and nothing of
+        // the path.
+        git(
+            &live,
+            &["remote", "add", "origin", "git@example.invalid:me/repo.git"],
+        );
+        let bound = RepoIdentity::origin("git@example.invalid:me/repo.git");
+        for checkout in [&live, &first, &second] {
+            assert_eq!(identity(checkout), bound, "{}", checkout.display());
+        }
+        assert_eq!(
+            grant_key("authority", &identity(&second)),
+            grant_key("authority", &identity(&live))
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 }

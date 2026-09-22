@@ -201,7 +201,7 @@ Write scope is checked on the actual diff after each attempt. A scope violation 
 
 A worker cannot commit, merge, push or publish through the normal allowed tool profile. Relais records an immutable candidate snapshot, including added files, outside model control. Sensitive repository configuration changes are rejected unless explicitly within an approved contract; they never take effect in the current worker launch.
 
-Successful execution delivers a candidate patch, base revision, retained worktree and verification receipt. Integration into the user's branch is an explicit later action. Relais never force-cleans a worktree containing unexported changes.
+Every run delivers a named candidate — a ref under `refs/relais/candidates/<run>/` and the exported patch — with its base revision, and successful execution a verification receipt as well. The task worktree is released once everything tracked in it is exported: whatever no candidate of the run holds is named `…/final` and exported first, and only then does the directory go, ignored build output included; an interrupted run keeps its worktree until `relais resume --retire` establishes that nothing may still be writing it. Integration into the user's branch is an explicit later action. Relais never force-cleans a worktree containing unexported changes.
 
 ## 9. Attempt lifecycle and escalation
 

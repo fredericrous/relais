@@ -41,12 +41,12 @@ use crate::policy::{
 use crate::procs::Ended;
 use crate::route::{route, Route, RouteInputs, RoutePredictor, Routed};
 use crate::verify::{self, amont_gaps, Receipt, VerificationReport};
-use crate::workspace::{self, Disposition, TaskWorktree, WorkspaceError};
+use crate::workspace::{self, TaskWorktree, WorkspaceError};
 
 pub mod machine;
 pub mod scheduler;
 
-pub use machine::{decide, AttemptKind, Budget, Limit, Next, Observation, Terminal};
+pub use machine::{decide, AttemptKind, Budget, Limit, Next, Observation, Terminal, WorktreeEnd};
 
 /// The lifecycle vocabulary lives in `crate::lifecycle`, a leaf module
 /// the ledger, the report and the learning dataset can name without
@@ -220,7 +220,7 @@ fn record_lost_seat(slot: &std::sync::Mutex<Option<String>>, detail: String) {
 /// too. Both roots stay under the state directory, so nothing escapes
 /// `RELAIS_STATE_DIR`.
 pub fn worktree_root(artifacts_dir: &Path) -> PathBuf {
-    state_sibling(artifacts_dir, "worktrees")
+    state_sibling(artifacts_dir, crate::paths::WORKTREES_DIR)
 }
 
 /// Where a run's throwaway verification worktrees live. Separate from
@@ -236,23 +236,19 @@ fn state_sibling(artifacts_dir: &Path, name: &str) -> PathBuf {
     artifacts_dir.parent().unwrap_or(artifacts_dir).join(name)
 }
 
-/// The revision a worktree currently has checked out.
-///
-/// Through `workspace::git_command` and not `Command::new("git")`: an
-/// inherited `GIT_DIR` would answer about another repository, and this
-/// answer decides whether a directory is removed (audit B15).
-fn head_revision(worktree_path: &Path) -> Result<String, WorkspaceError> {
-    let output = workspace::git_command(worktree_path)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .map_err(|e| WorkspaceError::Git(format!("rev-parse HEAD: {e}")))?;
-    if !output.status.success() {
-        return Err(WorkspaceError::Git(format!(
-            "rev-parse HEAD: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+/// The `worktree_retired` transition's detail: the ref and patch the
+/// final tree went to (`null` when a named candidate already held it)
+/// and the bytes the directory took.
+fn retirement_detail(worktree: &Path, retirement: &workspace::Retirement) -> serde_json::Value {
+    serde_json::json!({
+        "worktree": worktree.to_string_lossy(),
+        "reference": retirement.exported.as_ref().map(|e| e.reference.clone()),
+        "patch": retirement
+            .exported
+            .as_ref()
+            .map(|e| e.patch_path.to_string_lossy().into_owned()),
+        "bytes_reclaimed": retirement.bytes_reclaimed,
+    })
 }
 
 /// The supervised execution path (SPEC §3): preflight, route, then a
@@ -436,10 +432,6 @@ struct Candidate {
     /// The tier that wrote it — which the reviewer must not be.
     tier: Tier,
     sha: String,
-    /// The ref keeping the candidate commit reachable, when one could
-    /// be written.
-    reference: Option<String>,
-    patch_path: PathBuf,
     /// The copy a reviewer's prompt names.
     latest_patch: PathBuf,
     /// Tools the harness refused during the attempt.
@@ -469,21 +461,6 @@ pub(crate) enum AttemptLabel {
     /// The assembled candidate of a decomposed run, after n integration
     /// repairs.
     Integration(u32),
-}
-
-/// How a worktree is shown to still hold exactly the candidate that was
-/// accepted from it — the check SPEC §8's "never force-cleans a worktree
-/// containing unexported changes" asks for, which is not the same
-/// question in the two trees relais owns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TreeIdentity {
-    /// A task worktree, whose base is the run's base: snapshot it again
-    /// and compare candidate identities.
-    Resnapshot,
-    /// The integration worktree, whose head has moved past the run's
-    /// base as packages were fast-forwarded in: compare `HEAD`, and let
-    /// the release itself insist the tree is clean.
-    CheckedOut,
 }
 
 impl AttemptLabel {
@@ -1098,48 +1075,25 @@ impl<'a> RunEngine<'a> {
             "task",
         )?;
         self.record_logs(None, "setup_log", &setup)?;
-        if let Some(failed) = verify::setup_failure(&setup) {
-            let detail = setup_failure_detail(failed, "the task worktree");
-            // The worktree exists and no worker has touched it. Its
-            // disposition is the ordinary one (SPEC §8): removed when
-            // nothing in it is unaccounted for — an installed
-            // `node_modules` is ignored by the tree and counts for
-            // nothing — kept, on the record, when the setup left tracked
-            // or untracked changes that are in no patch.
-            let kept = match workspace::release_worktree(
-                self.config.repo_dir,
-                &worktree_path,
-                Disposition::MustBeClean,
-            ) {
-                Ok(()) => None,
-                Err(e) => Some(e.to_string()),
-            };
-            let outcome = self.fail_preflight(
+        let outcome = match verify::setup_failure(&setup) {
+            // The worktree exists and no worker has touched it; whatever
+            // the setup left there — an installed `node_modules` the
+            // tree ignores, or a generated file it does not — is
+            // retired like any run's tree: kept if in no patch, then gone.
+            Some(failed) => self.fail_preflight(
                 BlockCode::VerificationSetupFailed,
-                match &kept {
-                    Some(why) => format!("{detail}; the task worktree is kept: {why}"),
-                    None => detail,
-                },
-            )?;
-            if let Some(why) = kept {
-                self.keep_worktree(
-                    State::Blocked,
-                    serde_json::json!({
-                        "worktree": worktree_path.to_string_lossy(),
-                        "error": why,
-                        "detail": "the setup left changes in the task worktree that are in no patch",
-                    }),
-                )?;
-            }
-            return Ok(outcome);
-        }
-        self.attempt_loop(&AttemptContext {
-            preflight: &preflight,
-            baseline: &baseline,
-            worktree: &worktree,
-            worktree_path: &worktree_path,
-            deadline,
-        })
+                setup_failure_detail(failed, "the task worktree"),
+            )?,
+            None => self.attempt_loop(&AttemptContext {
+                preflight: &preflight,
+                baseline: &baseline,
+                worktree: &worktree,
+                worktree_path: &worktree_path,
+                deadline,
+            })?,
+        };
+        self.retire_worktree(&worktree, &outcome)?;
+        Ok(outcome)
     }
 
     /// Everything that must hold before a single worker is launched
@@ -1694,6 +1648,24 @@ impl<'a> RunEngine<'a> {
             }),
         )?;
 
+        // Every worker dispatch is a transition into `running`, whatever
+        // kind of attempt it is (SPEC §9): the chain used to skip
+        // straight from `prepared` to `verifying`, so a run ten minutes
+        // into its first attempt still read as not yet started.
+        self.transition(
+            State::Running,
+            Reason::WorkerDispatched,
+            serde_json::json!({
+                "dispatch_id": dispatch_id.as_str(),
+                "attempt_index": index,
+                "tier": tier.as_str(),
+                "kind": kind.as_str(),
+            }),
+        )?;
+        // Re-taken after `transition(&mut self)`: the shared reference the
+        // function opened with cannot outlive that mutable call.
+        let ledger = self.config.ledger;
+
         let remaining_wall = ctx
             .deadline
             .saturating_duration_since(Instant::now())
@@ -1843,7 +1815,8 @@ impl<'a> RunEngine<'a> {
             return Ok(Phase::Ended(self.stop(
                 &progress.budget,
                 Observation::Cancelled(
-                    "the dispatch was cancelled through the coordinator; the worktree is preserved"
+                    "the dispatch was cancelled through the coordinator; what the worker wrote \
+                     is kept as a named candidate"
                         .into(),
                 ),
             )?));
@@ -1910,12 +1883,11 @@ impl<'a> RunEngine<'a> {
         // history would all go in the next `git gc`. A ref under
         // `refs/relais/candidates/` keeps it reachable without
         // putting a branch in the user's namespace (audit B15).
-        // A ref that could not be written is not fatal — the object
-        // exists and this run can verify it — but the worktree is
-        // then the only thing keeping it alive, so it is not
-        // released below.
-        let reference =
-            workspace::name_candidate(self.config.repo_dir, self.run_id.as_str(), index, &sha).ok();
+        // Best effort: a ref that could not be written is not fatal —
+        // the object exists and this run verifies it from the object —
+        // and the retirement at the run's end names the tree `…/final`
+        // itself when no ref holds it, so nothing is lost either way.
+        let _ = workspace::name_candidate(self.config.repo_dir, self.run_id.as_str(), index, &sha);
         ledger.finish_attempt(
             attempt_id,
             State::Verifying,
@@ -1961,8 +1933,6 @@ impl<'a> RunEngine<'a> {
             index,
             tier,
             sha,
-            reference,
-            patch_path,
             latest_patch,
             permission_denials: result.permission_denials,
         }))
@@ -2266,17 +2236,6 @@ impl<'a> RunEngine<'a> {
             Some(ctx.worktree_path),
             &candidate.sha,
         )?;
-        // The patch is exported and the candidate is named: what the
-        // user integrates no longer depends on this directory —
-        // unless something wrote to it since, which the release
-        // check is what notices.
-        self.release_exported_worktree(
-            ctx.worktree,
-            TreeIdentity::Resnapshot,
-            &candidate.sha,
-            &candidate.patch_path,
-            candidate.reference.as_deref(),
-        )?;
         Ok(RunOutcome {
             run_id: self.run_id.clone(),
             terminal: Terminal::Accepted(Box::new(receipt)),
@@ -2348,126 +2307,52 @@ impl<'a> RunEngine<'a> {
         self.config.repo_dir.to_path_buf()
     }
 
-    /// Release a worktree whose content is already durable elsewhere:
-    /// an accepted run's task worktree, or the integration worktree of
-    /// an accepted decomposed run.
+    /// Retire the run's worktree at its terminal state (SPEC §8): a run
+    /// delivers a NAMED candidate — the ref and the patch — and the
+    /// directory goes once everything tracked is exported, which is
+    /// what `workspace::retire` guarantees before it removes anything.
+    /// An accepted run's tree is already its accepted candidate, so
+    /// nothing more is exported; a run that ended any other way keeps
+    /// whatever its last worker wrote under `…/final`. One permanent
+    /// `git worktree list` entry per run, and the build output every
+    /// worker leaves behind, are what used to accumulate (audit B15).
     ///
-    /// SPEC §8 lists a "retained worktree" among what SUCCESSFUL
-    /// execution delivers. Relais deviates deliberately: an accepted
-    /// run's content lives in two durable places already — the exported
-    /// patch and the named candidate commit — and the directory adds
-    /// nothing to them while adding one permanent entry to `git
-    /// worktree list` per accepted run (audit B15). A run that did NOT
-    /// accept keeps its worktree, because there the unfinished work
-    /// lives nowhere else.
-    ///
-    /// Released only when all three hold: the patch exists, the ref
-    /// names the candidate, and the tree STILL holds exactly that
-    /// candidate. The last one is §8's other half — "never force-cleans
-    /// a worktree containing unexported changes" — and it is not
-    /// theoretical: a descendant that outlived the worker's result
-    /// writes into this directory after the snapshot, and that content
-    /// is in no patch. Anything unaccounted for keeps the worktree, on
-    /// the record.
-    pub(crate) fn release_exported_worktree(
-        &self,
+    /// An interrupted run keeps its worktree: its state is uncertain
+    /// (SPEC §12) — a writer may still be in the tree — and `relais
+    /// resume --retire` retires it once its dispatches are provably
+    /// dead. A retirement that fails is on the record and changes
+    /// nothing about how the run ended: the directory is still there,
+    /// and so is everything in it.
+    pub(crate) fn retire_worktree(
+        &mut self,
         worktree: &TaskWorktree,
-        identity: TreeIdentity,
-        candidate_sha: &str,
-        patch_path: &Path,
-        candidate_ref: Option<&str>,
+        outcome: &RunOutcome,
     ) -> Result<(), RunError> {
-        if candidate_ref.is_none() || !patch_path.is_file() {
-            return self.keep_worktree(State::Accepted, serde_json::json!({
-                "worktree": worktree.path.to_string_lossy(),
-                "candidate": candidate_sha,
-                "named": candidate_ref.is_some(),
-                "patch": patch_path.to_string_lossy(),
-                "detail": "the candidate is not both named by a ref and exported as a patch, so \
-                           the worktree is the only place it lives",
-            }));
+        match outcome.terminal.worktree_end() {
+            WorktreeEnd::Keep => return Ok(()),
+            WorktreeEnd::Retire => {}
         }
-        let disposition =
-            match identity {
-                // Re-snapshotting is the comparison: the candidate identity
-                // is a pure function of (tree, base), so an equal SHA means
-                // every byte is in the patch and the ref.
-                TreeIdentity::Resnapshot => match worktree.snapshot_candidate("release check") {
-                    Ok(now) if now == candidate_sha => Disposition::Exported,
-                    Ok(now) => {
-                        return self.keep_worktree(State::Accepted, serde_json::json!({
-                        "worktree": worktree.path.to_string_lossy(),
-                        "accepted_candidate": candidate_sha,
-                        "tree_now": now,
-                        "detail": "the tree changed after the accepted candidate was snapshotted; \
-                                   the worktree is kept, because those changes are in no patch",
-                    }));
-                    }
-                    Err(e) => {
-                        return self.keep_worktree(State::Accepted, serde_json::json!({
-                        "worktree": worktree.path.to_string_lossy(),
-                        "error": e.to_string(),
-                        "detail": "the tree could not be compared to the accepted candidate",
-                    }));
-                    }
-                },
-                // A checked-out tree is shown to hold the candidate by its
-                // HEAD; `MustBeClean` then answers the other half — nothing
-                // uncommitted — inside the release itself.
-                TreeIdentity::CheckedOut => match head_revision(&worktree.path) {
-                    Ok(head) if head == candidate_sha => Disposition::MustBeClean,
-                    Ok(head) => {
-                        return self.keep_worktree(
-                            State::Accepted,
-                            serde_json::json!({
-                                "worktree": worktree.path.to_string_lossy(),
-                                "accepted_candidate": candidate_sha,
-                                "head_now": head,
-                                "detail": "the worktree no longer holds the accepted revision",
-                            }),
-                        );
-                    }
-                    Err(e) => {
-                        return self.keep_worktree(
-                            State::Accepted,
-                            serde_json::json!({
-                                "worktree": worktree.path.to_string_lossy(),
-                                "error": e.to_string(),
-                                "detail": "the worktree's head could not be read",
-                            }),
-                        );
-                    }
-                },
-            };
-        if let Err(e) =
-            workspace::release_worktree(self.config.repo_dir, &worktree.path, disposition)
-        {
-            return self.keep_worktree(
-                State::Accepted,
+        match workspace::retire(
+            self.config.repo_dir,
+            worktree,
+            self.run_id.as_str(),
+            &self.artifacts,
+        ) {
+            Ok(retirement) => self.transition(
+                self.state,
+                Reason::WorktreeRetired,
+                retirement_detail(&worktree.path, &retirement),
+            ),
+            Err(e) => self.transition(
+                self.state,
+                Reason::WorktreeNotReleased,
                 serde_json::json!({
                     "worktree": worktree.path.to_string_lossy(),
                     "error": e.to_string(),
+                    "detail": "the worktree could not be retired; whatever it holds is still in it",
                 }),
-            );
+            ),
         }
-        Ok(())
-    }
-
-    /// Record that a worktree was kept and why. The run is accepted
-    /// either way — its content is in the patch and the candidate ref —
-    /// but a directory relais decided not to remove says so on the
-    /// record rather than nowhere.
-    fn keep_worktree(&self, state: State, detail: serde_json::Value) -> Result<(), RunError> {
-        self.config.ledger.record_transition(&Transition {
-            run_id: self.run_id.clone(),
-            attempt_id: None,
-            from_state: Some(state),
-            to_state: state,
-            reason: Reason::WorktreeNotReleased.as_str().to_string(),
-            detail: Some(detail),
-            at: self.config.ledger.now(),
-        })?;
-        Ok(())
     }
 
     /// Record every log a setup or a profile produced as evidence, under
@@ -2918,7 +2803,9 @@ impl<'a> RunEngine<'a> {
         let mut prompt = String::from(
             "You are a semantic reviewer. You cannot edit or waive checks; you report findings only.\n\
              Report each finding with file/range, the violated acceptance criterion, evidence, and suggested verification.\n\
-             If there are no findings, end with the exact line: FINDINGS: none\n",
+             You may only run read-only commands (reading files, git log/diff/show, searching). \
+             Do not build, test or run checks: the runner has run the profile's checks already, \
+             and a command you could not run is not a finding.\n",
         );
         prompt.push('\n');
         prompt.push_str(&data_block("objective", &self.config.contract.objective));
@@ -2952,6 +2839,11 @@ impl<'a> RunEngine<'a> {
             request.patch_path.display()
         ));
         prompt.push_str(&format!("source to inspect: {}\n", review_dir.display()));
+        prompt.push_str(
+            "\nFinish your answer with exactly one of these, and nothing after it: the line \
+             `FINDINGS: none` when there are no findings, or the line `FINDINGS:` followed by \
+             the list of findings.\n",
+        );
         prompt
     }
 
@@ -3126,16 +3018,17 @@ pub(crate) struct ReviewRequest<'r> {
 /// where the verdict is looked for: scanning the last few lines for the
 /// phrase accepted a candidate whose reviewer merely quoted it, and a
 /// footer after the verdict line turned a clean review into findings
-/// (R10). Anything that is not a verdict is `Unavailable` — the run
-/// ends needs_review with the reviewer's text preserved, never accepted
-/// on a sentence nobody parsed.
+/// (R10). A block declaring findings anywhere — `FINDINGS:`, `Findings:`,
+/// a Markdown heading `**Findings**` or `## Findings`, whatever the case
+/// — is findings: a reviewer that listed three of them under a bold
+/// heading and closed with a "verified" section used to be read as
+/// having no verdict at all, and the run parked in needs_review with
+/// its findings unread. Only an answer that declares nothing is
+/// `Unavailable` — the run ends needs_review with the reviewer's text
+/// preserved, never accepted on a sentence nobody parsed.
 pub(crate) fn review_verdict(text: &str) -> ReviewOutcome {
-    let is_verdict = |line: &str| {
-        line.trim_start()
-            .to_ascii_uppercase()
-            .starts_with("FINDINGS")
-    };
-    let none = |line: &str| line.trim().eq_ignore_ascii_case("findings: none");
+    let is_verdict = |line: &str| verdict_words(line).starts_with("FINDINGS");
+    let none = |line: &str| verdict_words(line) == "FINDINGS: NONE";
     let last = text.lines().rev().find(|line| !line.trim().is_empty());
     match last {
         Some(line) if none(line) => ReviewOutcome::NoFindings,
@@ -3151,6 +3044,15 @@ pub(crate) fn review_verdict(text: &str) -> ReviewOutcome {
              and no findings are declared. The answer is preserved:\n{text}"
         )),
     }
+}
+
+/// A line with Markdown emphasis and heading marks stripped from both
+/// ends and upper-cased: what is left of `**Findings:**` or
+/// `## FINDINGS` to compare a verdict against.
+fn verdict_words(line: &str) -> String {
+    line.trim()
+        .trim_matches(|c: char| matches!(c, '*' | '_' | '#' | '`') || c.is_whitespace())
+        .to_ascii_uppercase()
 }
 
 pub(crate) enum ReviewOutcome {
@@ -3750,6 +3652,38 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).to_string()
     }
 
+    /// The transition that ended the run: the last one that is not the
+    /// worktree's retirement, which is recorded after it.
+    fn ending(transitions: &[Transition]) -> &Transition {
+        transitions
+            .iter()
+            .rev()
+            .find(|t| {
+                t.reason != Reason::WorktreeRetired.as_str()
+                    && t.reason != Reason::WorktreeNotReleased.as_str()
+            })
+            .expect("a run records how it ended")
+    }
+
+    /// The `worktree_retired` row of a run, with the ref it wrote (or
+    /// `None` when a named candidate already held the tree).
+    fn retirement(transitions: &[Transition]) -> (State, Option<String>) {
+        let retired = transitions
+            .iter()
+            .find(|t| t.reason == Reason::WorktreeRetired.as_str())
+            .unwrap_or_else(|| panic!("no retirement on the record: {transitions:?}"));
+        assert_eq!(
+            retired.from_state,
+            Some(retired.to_state),
+            "the retirement does not move the run"
+        );
+        let reference = retired
+            .detail
+            .as_ref()
+            .and_then(|d| d["reference"].as_str().map(str::to_string));
+        (retired.to_state, reference)
+    }
+
     fn count_tick_files(dir: &Path) -> usize {
         std::fs::read_dir(dir)
             .map(|entries| {
@@ -4086,10 +4020,17 @@ mod tests {
             .ledger
             .transitions(&outcome.run_id)
             .expect("history");
-        assert_eq!(transitions.last().unwrap().to_state, State::Failed);
+        assert_eq!(ending(&transitions).to_state, State::Failed);
         assert_eq!(
-            transitions.last().unwrap().reason,
+            ending(&transitions).reason,
             Reason::SameFailureRecurrence.as_str()
+        );
+        // A failed run's worktree is retired: its last candidate was
+        // named, so the tree needs no `final`, and the directory goes.
+        assert_eq!(retirement(&transitions), (State::Failed, None));
+        assert!(
+            !fixture.worktree(&outcome.run_id).exists(),
+            "a failed run keeps no worktree; its candidates are refs and patches"
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
@@ -4114,10 +4055,13 @@ mod tests {
             .expect("history");
         assert_eq!(
             transitions.len(),
-            1,
-            "no escalation is bought for the environment"
+            3,
+            "no escalation is bought for the environment: the dispatch, the block, and the \
+             worktree's retirement"
         );
-        assert_eq!(transitions[0].to_state, State::Blocked);
+        assert_eq!(transitions[0].to_state, State::Running);
+        assert_eq!(transitions[1].to_state, State::Blocked);
+        assert_eq!(transitions[2].reason, Reason::WorktreeRetired.as_str());
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
@@ -4140,7 +4084,15 @@ mod tests {
         };
         assert!(
             fixture.worktree(&run_id).is_dir(),
-            "a run that did not accept keeps SPEC §8's retained worktree"
+            "an interrupted run keeps its worktree: its tree may still be being written, and \
+             `resume --retire` retires it once the dispatch is provably dead (SPEC §8, §12)"
+        );
+        let transitions = fixture.ledger.transitions(&run_id).expect("history");
+        assert!(
+            !transitions
+                .iter()
+                .any(|t| t.reason == Reason::WorktreeRetired.as_str()),
+            "nothing was retired: {transitions:?}"
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
@@ -4324,8 +4276,13 @@ mod tests {
             "the candidate is preserved for the decision"
         );
         assert!(
-            fixture.worktree(&run_id).is_dir(),
-            "and so is its worktree: this run did not accept"
+            !fixture.worktree(&run_id).exists(),
+            "the worktree is retired: the candidate is its ref and its patch"
+        );
+        assert_eq!(
+            retirement(&fixture.ledger.transitions(&run_id).expect("history")),
+            (State::NeedsDecision, None),
+            "attempt 1 already holds the tree, so no `final` is written"
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
@@ -4890,7 +4847,7 @@ mod tests {
         );
         let transitions = fixture.ledger.transitions(&run_id).expect("history");
         assert_eq!(
-            transitions.last().unwrap().reason,
+            ending(&transitions).reason,
             Reason::SameFailureRecurrence.as_str(),
             "the second empty candidate has the FIRST one's identity"
         );
@@ -5277,10 +5234,36 @@ mod tests {
         else {
             panic!("expected cancellation, got {outcome:?}");
         };
-        assert!(detail.contains("preserved"));
+        assert!(detail.contains("named candidate"), "{detail}");
+        // Nothing was snapshotted before the cancellation, so the
+        // half-done tree is what the retirement keeps: under `final`,
+        // in a patch, and the directory goes.
+        let transitions = fixture.ledger.transitions(&run_id).expect("history");
+        let (state, reference) = retirement(&transitions);
+        assert_eq!(state, State::Cancelled);
+        let reference = reference.expect("the half-done tree was in no patch");
+        assert_eq!(
+            reference,
+            workspace::candidate_ref(run_id.as_str(), 0).replace("/0", "/final")
+        );
+        assert_eq!(
+            git(
+                &fixture.repo,
+                &["show", &format!("{reference}:src/partial.rs")]
+            ),
+            "// half done\n"
+        );
         assert!(
-            fixture.worktree(&run_id).join("src/partial.rs").exists(),
-            "the half-done worktree is kept for diagnosis"
+            fixture
+                .artifacts
+                .join(run_id.as_str())
+                .join(workspace::FINAL_PATCH)
+                .is_file(),
+            "and the patch is beside the run's evidence"
+        );
+        assert!(
+            !fixture.worktree(&run_id).exists(),
+            "the half-done worktree is a named candidate now, not a directory"
         );
         assert_eq!(
             fixture.ledger.run_status(&run_id).expect("status"),
@@ -5913,9 +5896,10 @@ mod tests {
 
     /// A setup that leaves untracked, unignored files behind and then
     /// fails has put something in the tree that is in no patch: the
-    /// worktree is kept, and the record says so from the blocked state.
+    /// retirement names it `final` and exports it before the worktree
+    /// goes, and the record says so from the blocked state.
     #[test]
-    fn setup_leaving_unexported_changes_keeps_the_worktree() {
+    fn setup_leaving_unexported_changes_names_them_before_retiring() {
         let fixture = Fixture::new();
         let repo = fixture.repo_policy_with_setup(
             vec![sh("echo generated > src/generated.rs && \
@@ -5933,18 +5917,22 @@ mod tests {
             panic!("expected blocked, got {outcome:?}");
         };
         assert_eq!(code, BlockCode::VerificationSetupFailed, "{detail}");
-        assert!(detail.contains("the task worktree is kept"), "{detail}");
-        assert!(
-            fixture.worktree(&run_id).join("src/generated.rs").exists(),
-            "the unexported file is still there"
-        );
         let transitions = fixture.ledger.transitions(&run_id).expect("history");
-        let kept = transitions
-            .iter()
-            .find(|t| t.reason == Reason::WorktreeNotReleased.as_str())
-            .unwrap_or_else(|| panic!("the kept worktree is on the record: {transitions:?}"));
-        assert_eq!(kept.from_state, Some(State::Blocked));
-        assert_eq!(kept.to_state, State::Blocked);
+        let (state, reference) = retirement(&transitions);
+        assert_eq!(state, State::Blocked);
+        let reference = reference.expect("the generated file was in no patch");
+        assert_eq!(
+            git(
+                &fixture.repo,
+                &["show", &format!("{reference}:src/generated.rs")]
+            ),
+            "generated\n",
+            "the unexported file is a named candidate"
+        );
+        assert!(
+            !fixture.worktree(&run_id).exists(),
+            "and the worktree is gone"
+        );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
@@ -6274,6 +6262,11 @@ mod tests {
         );
         assert_eq!(
             reasons.last().map(String::as_str),
+            Some(Reason::WorktreeRetired.as_str()),
+            "the integration worktree is retired last"
+        );
+        assert_eq!(
+            reasons.iter().rev().nth(1).map(String::as_str),
             Some(Reason::ChecksAndReviewPassed.as_str())
         );
     }
@@ -7207,6 +7200,53 @@ mod tests {
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
+    /// SPEC §9: a single-worker run's chain is `prepared -> running ->
+    /// verifying -> accepted` — the worker dispatch is on the record,
+    /// not a state jump the ledger never showed (P3).
+    #[test]
+    fn an_accepted_single_worker_runs_chain_is_prepared_running_verifying_accepted() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let backend = conditional_worker("relais task");
+        let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Accepted(_),
+        } = outcome
+        else {
+            panic!("expected acceptance, got {outcome:?}");
+        };
+        let transitions = fixture.ledger.transitions(&run_id).expect("transitions");
+        assert_eq!(
+            transitions.first().map(|t| t.from_state),
+            Some(Some(State::Prepared)),
+            "the chain starts from the run's initial state, `prepared`"
+        );
+        let chain: Vec<State> = transitions.iter().map(|t| t.to_state).collect();
+        assert_eq!(
+            chain,
+            vec![
+                State::Running,
+                State::Verifying,
+                State::Accepted,
+                State::Accepted
+            ],
+            "prepared is the run's initial state, never a row of its own; the recorded \
+             chain from it is running -> verifying -> accepted, then the worktree's \
+             retirement, which does not move the run"
+        );
+        assert_eq!(
+            transitions.last().map(|t| t.reason.as_str()),
+            Some(Reason::WorktreeRetired.as_str())
+        );
+        assert_eq!(
+            transitions[0].reason,
+            Reason::WorkerDispatched.as_str(),
+            "the run enters `running` because a worker was dispatched"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
     /// A policy whose risk rules demand review of anything that could
     /// touch `src/c/**`. The ROOT contract's scope (`src/**`) could;
     /// the packages' scopes (`src/a/**`, `src/b/**`) could not — so the
@@ -7419,21 +7459,101 @@ mod tests {
         assert!(detail.contains("no verdict line"), "{detail}");
     }
 
-    /// R5/R8: reading a worktree's head is a fallible git call, and a
-    /// `rev-parse` whose status went unread answered `Ok("")` — which
-    /// then travelled on as a revision.
+    /// The three shapes a reviewer's answer takes, including the one
+    /// that parked run-65c093b73a14c-87ad: findings under a bold
+    /// Markdown heading, closed by a "verified" section rather than a
+    /// `FINDINGS:` line.
     #[test]
-    fn a_head_that_cannot_be_read_is_an_error_not_an_empty_revision() {
-        let fixture = Fixture::new();
-        let outside = fixture.dir.join("not-a-repo");
-        std::fs::create_dir_all(&outside).expect("mkdir");
-        let err = head_revision(&outside).expect_err("a directory outside a repository");
+    fn a_findings_heading_in_any_markup_is_findings() {
+        let parked = "**Findings**\n\n1. **`make check` fmt gate** — `src/runner/mod.rs:6519`. \
+                      Criterion: fmt passes.\n\n2. **`run_status` is not purely a projection** — \
+                      `src/ledger/mod.rs:674`.\n\n**Verified as meeting the criteria**\n\n- \
+                      `Ledger::set_run_status` is gone.\n";
         assert!(
-            err.to_string().contains("rev-parse"),
-            "the error names the call: {err}"
+            matches!(review_verdict(parked), ReviewOutcome::Findings(_)),
+            "a bold heading declares findings; the run must not park on `no verdict`"
         );
-        let head = head_revision(&fixture.repo).expect("the fixture repo has a head");
-        assert_eq!(head.len(), 40, "a full object name: {head}");
+        for declared in [
+            "Findings:\n- src/a.rs:3 misses a case\n",
+            "## findings\n- one\n\nthanks\n",
+            "looked\n\n**FINDINGS:**\n- one\n",
+        ] {
+            assert!(
+                matches!(review_verdict(declared), ReviewOutcome::Findings(_)),
+                "{declared}"
+            );
+        }
+        // The explicit clean verdict, on the last line, in any markup.
+        for clean in [
+            "**Findings**\n\nNone worth reporting.\n\nFINDINGS: none\n",
+            "all good\n**FINDINGS: none**\n",
+        ] {
+            assert!(
+                matches!(review_verdict(clean), ReviewOutcome::NoFindings),
+                "{clean}"
+            );
+        }
+        // A heading with nothing declared under it and no closing line
+        // is findings, not an acceptance: the prompt demands the line.
+        assert!(matches!(
+            review_verdict("**Findings**\n\nNone.\n"),
+            ReviewOutcome::Findings(_)
+        ));
+        // And only a truly absent verdict is unavailable.
+        assert!(matches!(
+            review_verdict("The candidate looks reasonable to me.\n"),
+            ReviewOutcome::Unavailable(_)
+        ));
+    }
+
+    /// The reviewer is told how to end and what it may run, so a denied
+    /// build command is not reported as a finding and the verdict line
+    /// is where the runner looks for it.
+    #[test]
+    fn the_review_prompt_ends_with_the_verdict_instruction() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let prompts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&prompts);
+        let backend = MockBackend::new(move |spec| {
+            seen.lock().unwrap().push(spec.prompt.clone());
+            if spec.prompt.contains("semantic reviewer") {
+                return MockOutcome {
+                    result_text: Some("FINDINGS: none".into()),
+                    exit_code: Some(0),
+                    ..Default::default()
+                };
+            }
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &backend);
+        assert!(
+            matches!(outcome.terminal, Terminal::Accepted(_)),
+            "{outcome:?}"
+        );
+        let prompts = prompts.lock().unwrap();
+        let review = prompts
+            .iter()
+            .find(|p| p.contains("semantic reviewer"))
+            .expect("a reviewer was dispatched");
+        assert!(
+            review
+                .trim_end()
+                .ends_with("followed by the list of findings."),
+            "the verdict instruction is the last thing the reviewer reads:\n{review}"
+        );
+        assert!(review.contains("`FINDINGS: none`"), "{review}");
+        assert!(review.contains("only run read-only commands"), "{review}");
+        assert!(
+            review.contains("a command you could not run is not a finding"),
+            "{review}"
+        );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 

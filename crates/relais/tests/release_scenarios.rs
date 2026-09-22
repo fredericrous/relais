@@ -1027,6 +1027,119 @@ fn an_interrupted_worker_is_reconciled_by_resume_without_a_second_worker() {
     assert!(world.run_dir(&run_id).join("manifest.json").is_file());
 }
 
+// SPEC §8: a run that ends without acceptance keeps a NAMED candidate,
+// not a directory — the runner retires the worktree at its terminal
+// state — and a worktree left behind anyway (an older release, a
+// retirement that failed) is retired by `resume --retire`: whatever it
+// holds that no candidate does becomes `…/final` and a patch first.
+#[test]
+fn a_leftover_worktree_is_retired_by_resume_with_its_tree_named() {
+    let world = World::new("retire");
+    // One attempt, no allowance: sonnet churns once and the ceiling
+    // ends the run without a candidate anyone accepted.
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    let task = world.write_task("task.json", "off");
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    let stderr = text(&run.stderr);
+    assert_eq!(run.status.code(), Some(5), "{stderr}");
+    let run_id = world.only_run_id();
+    assert!(
+        !world.worktree(&run_id).exists(),
+        "the runner retired the worktree at the run's end"
+    );
+    assert!(
+        world.run_dir(&run_id).join("candidate-1.patch").is_file(),
+        "the attempt's candidate is its patch"
+    );
+    let explained = text(&world.relais(&["explain", &run_id]).stdout);
+    assert!(explained.contains("worktree_retired"), "{explained}");
+
+    // A leftover, as an older release left them: the run's worktree
+    // directory, holding an edit no candidate has.
+    let leftover = world.worktree(&run_id);
+    git(
+        &world.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            &leftover.to_string_lossy(),
+            "HEAD",
+        ],
+    );
+    std::fs::write(leftover.join("src/leftover.rs"), "// never exported\n").expect("write");
+    // `doctor` counts it and names the sweep; a leftover is never a
+    // blocker, so the finding is a warning.
+    let worktrees_finding = |world: &World| -> serde_json::Value {
+        let report: serde_json::Value =
+            serde_json::from_str(text(&world.relais(&["doctor", "--json"]).stdout).trim())
+                .expect("doctor --json is a document");
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .find(|f| f["component"] == "worktrees")
+            .unwrap_or_else(|| panic!("no `worktrees` finding in {report}"))
+            .clone()
+    };
+    let before = worktrees_finding(&world);
+    assert_eq!(before["level"], "warn", "{before}");
+    let detail = before["detail"].as_str().expect("detail");
+    assert!(detail.starts_with("1 run worktree(s) retained"), "{detail}");
+    assert!(detail.contains("relais resume --retire"), "{detail}");
+    let nothing_to_do = world.relais(&["resume", "--retire", "--all"]);
+    let swept = text(&nothing_to_do.stdout);
+    assert_eq!(
+        nothing_to_do.status.code(),
+        Some(0),
+        "{swept}\n{}",
+        text(&nothing_to_do.stderr)
+    );
+    let final_ref = format!("refs/relais/candidates/{run_id}/final");
+    assert!(
+        swept.contains(&format!("{run_id}: retired")) && swept.contains(&final_ref),
+        "the run, the ref and the bytes are reported: {swept}"
+    );
+    assert!(swept.contains("bytes reclaimed"), "{swept}");
+    assert!(!leftover.exists(), "the leftover is gone");
+    assert_eq!(
+        git(
+            &world.repo,
+            &["show", &format!("{final_ref}:src/leftover.rs")]
+        ),
+        "// never exported\n",
+        "and its tree survives as the run's final candidate"
+    );
+    assert!(
+        world
+            .run_dir(&run_id)
+            .join("candidate-final.patch")
+            .is_file(),
+        "with the patch beside the run's evidence"
+    );
+    let listed = git(&world.repo, &["worktree", "list"]);
+    assert!(!listed.contains(&run_id), "{listed}");
+    let after = worktrees_finding(&world);
+    assert_eq!(after["level"], "ok", "{after}");
+    // Nothing left: the sweep says so and exits 0.
+    let again = world.relais(&["resume", "--retire"]);
+    assert_eq!(again.status.code(), Some(0));
+    assert!(
+        text(&again.stdout).contains("no run worktree is retained"),
+        "{}",
+        text(&again.stdout)
+    );
+    // The single-run form answers the same way for a run with nothing
+    // retained, and keeps the existing semantics for the run itself.
+    let one = world.relais(&["resume", &run_id, "--retire"]);
+    let one_out = text(&one.stdout);
+    assert_eq!(one.status.code(), Some(0), "{one_out}");
+    assert!(one_out.contains("already terminal"), "{one_out}");
+    assert!(one_out.contains("no worktree is retained"), "{one_out}");
+}
+
 // SPEC §14: a worker cannot obtain acceptance by modifying policy. The
 // repository's own relais.toml is protected: a candidate that touches it
 // is needs_decision, and the run is judged with the policy loaded from

@@ -95,6 +95,20 @@ impl Reconciliation {
         self.refusing().is_empty()
     }
 
+    /// Whether every dispatch that was live is PROVABLY gone — the
+    /// condition under which the run's worktree may be retired: an
+    /// `Unknown` dispatch may still be writing it, so a reconciliation
+    /// that may proceed is not yet one that may remove the tree. No
+    /// live dispatch at all is trivially proven.
+    pub fn all_provably_dead(&self) -> bool {
+        self.verdicts.iter().all(|verdict| match verdict {
+            DispatchVerdict::ProvablyDead { .. } => true,
+            DispatchVerdict::StillAlive { .. }
+            | DispatchVerdict::CoordinatorHoldsASeat { .. }
+            | DispatchVerdict::Unknown { .. } => false,
+        })
+    }
+
     /// The dispatches to close as `reconciled_dead`, which the caller
     /// writes to the ledger.
     pub fn provably_dead(&self) -> Vec<&DispatchId> {
@@ -228,6 +242,7 @@ mod tests {
     fn a_recorded_pid_that_is_gone_is_provably_dead() {
         let outcome = reconcile(&[live("d1", Some(7))], None, NOTHING_IS_ALIVE);
         assert!(outcome.may_reconcile());
+        assert!(outcome.all_provably_dead(), "the worktree may be retired");
         assert_eq!(
             outcome.provably_dead(),
             vec![&DispatchId::from_stored("d1")]
@@ -261,6 +276,10 @@ mod tests {
             outcome.provably_dead().is_empty(),
             "an unknown outcome is not a dead one"
         );
+        assert!(
+            !outcome.all_provably_dead(),
+            "and a worktree an unknown dispatch may still write is not retired"
+        );
         assert!(outcome.detail().contains("uncertain, not retried"));
     }
 
@@ -293,6 +312,7 @@ mod tests {
     fn a_run_with_nothing_live_reconciles_and_says_so() {
         let outcome = reconcile(&[], None, NOTHING_IS_ALIVE);
         assert!(outcome.may_reconcile());
+        assert!(outcome.all_provably_dead());
         assert!(outcome.verdicts.is_empty());
         assert_eq!(
             outcome.detail(),

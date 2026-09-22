@@ -7,8 +7,9 @@
 //! violation cannot be accepted. This is an acceptance boundary, not
 //! filesystem isolation: tools with Bash access are not a sandbox. The
 //! runner records an immutable candidate snapshot (a commit object,
-//! including added files) outside model control, and a worktree with
-//! unexported changes is never force-cleaned.
+//! including added files) outside model control, and a worktree is
+//! retired — everything tracked named and exported first — never
+//! force-cleaned with unexported changes in it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,7 +33,6 @@ pub enum WorkspaceError {
     Git(String),
     DirtyBase(Vec<String>),
     ScopeViolation(Vec<String>),
-    UnexportedChanges(PathBuf),
     Io(std::io::Error),
 }
 
@@ -49,11 +49,6 @@ impl std::fmt::Display for WorkspaceError {
                 f,
                 "diff leaves the declared write scope: {}",
                 paths.join(", ")
-            ),
-            Self::UnexportedChanges(path) => write!(
-                f,
-                "worktree {} has unexported changes; refusing to clean it",
-                path.display()
             ),
             Self::Io(e) => write!(f, "{e}"),
         }
@@ -506,56 +501,244 @@ pub fn check_scope(
     }
 }
 
-/// What the caller knows about a worktree's content when it asks for the
-/// worktree to go. A bare `true`/`false` at the call site said nothing
-/// about which of these two it meant (audit R12).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Disposition {
-    /// Everything in the tree is already durable elsewhere: a candidate
-    /// snapshot was taken and its patch exported (SPEC §8). The caller
-    /// has established that; the release does not check again.
-    Exported,
-    /// Nothing may be in the tree that is not committed. The release
-    /// reads `git status` and refuses a tree that has anything, because
-    /// whatever it has is in no patch.
-    MustBeClean,
+/// The ref name a run's attempt candidate is kept under.
+pub fn candidate_ref(run_id: &str, attempt: u32) -> String {
+    format!("refs/relais/candidates/{run_id}/{attempt}")
 }
 
-/// Remove an owned worktree — unless it holds unexported changes. A
-/// snapshot taken and exported makes the changes exported; nothing else
-/// does (SPEC §8). A status check that cannot run is a reason to keep
-/// the worktree, never to force-remove it.
-pub fn release_worktree(
+/// The namespace every candidate ref of one run lives under, with its
+/// trailing slash.
+fn candidate_namespace(run_id: &str) -> String {
+    format!("refs/relais/candidates/{run_id}/")
+}
+
+/// The patch a retired worktree's final tree is exported to, in the
+/// run's artifact directory, beside the per-attempt `candidate-N.patch`.
+pub const FINAL_PATCH: &str = "candidate-final.patch";
+
+/// What a retired worktree's tree had to be exported as, when it held
+/// something no named candidate of the run already did: the ref that
+/// keeps the final snapshot reachable and the patch it was written to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exported {
+    pub reference: String,
+    pub patch_path: PathBuf,
+}
+
+/// What retiring a worktree did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Retirement {
+    /// `None` when the tree was already held by a named candidate of the
+    /// run (or was the base), so nothing needed exporting.
+    pub exported: Option<Exported>,
+    /// The size of the worktree directory that was removed, ignored
+    /// build output included.
+    pub bytes_reclaimed: u64,
+}
+
+/// Retire a run's worktree: keep everything tracked, then remove the
+/// directory, ignored build output and all (SPEC §8).
+///
+/// (a) The tree — tracked and untracked-but-not-ignored, exactly what
+/// [`TaskWorktree::snapshot_candidate`] snapshots — is compared, tree
+/// object to tree object, with every candidate already named under
+/// `refs/relais/candidates/<run>/` and with the base. When none of them
+/// holds it, it is snapshotted, named `…/<run>/final` (or the first
+/// free `final-N` if a differing `final` already exists, so retiring
+/// twice never overwrites what the first retirement kept) and exported
+/// to [`FINAL_PATCH`] in `artifacts_dir`. (b) The worktree is removed
+/// with `git worktree remove --force`, and the parent directory the
+/// runner made for the run's worktrees with it once it is empty.
+/// `--force` is what takes ignored output (`target/`, `node_modules/`)
+/// and the index the snapshot staged; it is acceptable here precisely
+/// because (a) has just guaranteed that nothing tracked is unexported —
+/// the guarantee §8 asks for, given by construction rather than by a
+/// status check. (c) What was done is returned for the record.
+///
+/// Idempotent: a second call on the same tree finds it under `final`
+/// and exports nothing. A worktree that is gone already is an error,
+/// not a silent success, because "retired" must mean it was seen.
+pub fn retire(
     repo_dir: &Path,
-    worktree_path: &Path,
-    disposition: Disposition,
-) -> Result<()> {
-    match disposition {
-        Disposition::Exported => {}
-        Disposition::MustBeClean => {
-            let status = git(worktree_path, &["status", "--porcelain"])?;
-            if !status.is_empty() {
-                return Err(WorkspaceError::UnexportedChanges(
-                    worktree_path.to_path_buf(),
-                ));
-            }
-        }
-    }
+    worktree: &TaskWorktree,
+    run_id: &str,
+    artifacts_dir: &Path,
+) -> Result<Retirement> {
+    let snapshot = worktree.snapshot_candidate("retirement")?;
+    let tree = tree_of(&worktree.path, &snapshot)?;
+    let base_tree = tree_of(&worktree.path, &worktree.base_sha)?;
+    let named = named_candidates(repo_dir, run_id)?;
+    let already_kept = tree == base_tree || named.iter().any(|(_, kept)| *kept == tree);
+    let exported = if already_kept {
+        None
+    } else {
+        let reference = free_final_ref(run_id, &named);
+        git(repo_dir, &["update-ref", &reference, &snapshot])?;
+        let stem = reference.rsplit('/').next().unwrap_or("final").to_string();
+        let patch_path = artifacts_dir.join(format!("candidate-{stem}.patch"));
+        worktree.export_patch(&snapshot, &patch_path)?;
+        Some(Exported {
+            reference,
+            patch_path,
+        })
+    };
+    let bytes_reclaimed = dir_size(&worktree.path)?;
     git(
         repo_dir,
         &[
             "worktree",
             "remove",
             "--force",
-            &worktree_path.to_string_lossy(),
+            &worktree.path.to_string_lossy(),
         ],
     )?;
+    remove_if_empty(worktree.path.parent())?;
+    Ok(Retirement {
+        exported,
+        bytes_reclaimed,
+    })
+}
+
+/// The tree object a commit carries.
+fn tree_of(dir: &Path, commit: &str) -> Result<String> {
+    git(dir, &["rev-parse", &format!("{commit}^{{tree}}")])
+}
+
+/// Every candidate ref of one run, as `(refname, tree)` pairs.
+fn named_candidates(repo_dir: &Path, run_id: &str) -> Result<Vec<(String, String)>> {
+    let listed = git(
+        repo_dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(tree)",
+            &format!("{}*", candidate_namespace(run_id)),
+        ],
+    )?;
+    Ok(listed
+        .lines()
+        .filter_map(|line| {
+            let (name, tree) = line.trim().split_once(' ')?;
+            Some((name.to_string(), tree.to_string()))
+        })
+        .collect())
+}
+
+/// `…/<run>/final`, or the first `final-N` not yet taken.
+fn free_final_ref(run_id: &str, named: &[(String, String)]) -> String {
+    let namespace = candidate_namespace(run_id);
+    let taken = |name: &str| named.iter().any(|(existing, _)| existing == name);
+    let first = format!("{namespace}final");
+    if !taken(&first) {
+        return first;
+    }
+    (2u32..)
+        .map(|n| format!("{namespace}final-{n}"))
+        .find(|name| !taken(name))
+        .unwrap_or(first)
+}
+
+/// Remove a directory only when it is empty — the run's worktree parent
+/// after its last worktree went. `None` and "not empty" are both
+/// nothing to do; anything else is an error.
+fn remove_if_empty(dir: Option<&Path>) -> Result<()> {
+    let Some(dir) = dir else {
+        return Ok(());
+    };
+    if std::fs::read_dir(dir)?.next().is_none() {
+        std::fs::remove_dir(dir)?;
+    }
     Ok(())
 }
 
-/// The ref name a run's attempt candidate is kept under.
-pub fn candidate_ref(run_id: &str, attempt: u32) -> String {
-    format!("refs/relais/candidates/{run_id}/{attempt}")
+/// The bytes a directory holds: every regular file and symlink under
+/// it, without following links, so a worktree's ignored build output
+/// counts and nothing outside it does.
+pub fn dir_size(path: &Path) -> std::io::Result<u64> {
+    let mut total = 0;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else {
+                total += metadata.len();
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// A run's worktree still on disk under the state directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedWorktree {
+    pub run_id: String,
+    pub path: PathBuf,
+    /// Its size, ignored build output included.
+    pub bytes: u64,
+}
+
+/// Every run worktree still under `state_dir`, in path order: each
+/// `worktrees/<run>/<name>` and each legacy `runs/<run>/worktree`
+/// (`paths`) that carries a `.git` — a directory without one is not a
+/// worktree, whatever made it. A missing `worktrees/` or `runs/` is
+/// simply no worktrees; any other read failure is an error, since a
+/// sweep that could not look is not a sweep that found nothing.
+pub fn retained_worktrees(state_dir: &Path) -> Result<Vec<RetainedWorktree>> {
+    let mut found = Vec::new();
+    for run_dir in subdirectories(&state_dir.join(crate::paths::WORKTREES_DIR))? {
+        for candidate in subdirectories(&run_dir)? {
+            push_if_worktree(&mut found, &run_dir, candidate)?;
+        }
+    }
+    for run_dir in subdirectories(&state_dir.join(crate::paths::RUNS_DIR))? {
+        let legacy = run_dir.join(crate::paths::LEGACY_WORKTREE_DIR);
+        if legacy.is_dir() {
+            push_if_worktree(&mut found, &run_dir, legacy)?;
+        }
+    }
+    found.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(found)
+}
+
+fn push_if_worktree(
+    found: &mut Vec<RetainedWorktree>,
+    run_dir: &Path,
+    path: PathBuf,
+) -> Result<()> {
+    if !path.join(".git").exists() {
+        return Ok(());
+    }
+    let run_id = run_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let bytes = dir_size(&path)?;
+    found.push(RetainedWorktree {
+        run_id,
+        path,
+        bytes,
+    });
+    Ok(())
+}
+
+/// The subdirectories of `dir`, or none when `dir` does not exist.
+fn subdirectories(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(WorkspaceError::Io(e)),
+    };
+    let mut dirs = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            dirs.push(entry.path());
+        }
+    }
+    dirs.sort();
+    Ok(dirs)
 }
 
 /// Point a ref at a candidate commit. `commit-tree` produces an object
@@ -627,6 +810,16 @@ mod tests {
         git(&repo, &["add", "-A"]).expect("add");
         git(&repo, &["commit", "-q", "-m", "base"]).expect("commit");
         (dir, repo)
+    }
+
+    /// Test cleanup: the fixture's worktree, whose content the test
+    /// has finished asserting on.
+    fn remove_worktree(repo: &Path, wt_path: &Path) {
+        git(
+            repo,
+            &["worktree", "remove", "--force", &wt_path.to_string_lossy()],
+        )
+        .expect("removed");
     }
 
     fn contract_with_scope(scope: &[&str]) -> TaskContract {
@@ -754,7 +947,7 @@ mod tests {
         // Named explicitly, at the depth it lives: allowed.
         let explicit = contract_with_scope(&["src/**", "src/CLAUDE.md", "src/.claude/**"]);
         assert!(check_scope(&wt, &candidate, &explicit).is_ok(), "{message}");
-        release_worktree(&repo, &wt_path, Disposition::Exported).expect("released");
+        remove_worktree(&repo, &wt_path);
     }
 
     #[test]
@@ -787,7 +980,7 @@ mod tests {
             main_content.contains("fn main() {}"),
             "original checkout untouched"
         );
-        release_worktree(&repo, &wt_path, Disposition::Exported).expect("released");
+        remove_worktree(&repo, &wt_path);
     }
 
     #[test]
@@ -812,7 +1005,7 @@ mod tests {
         // The artifact is what the user integrates: it must apply as is.
         git(&repo, &["apply", "--check", &patch.to_string_lossy()])
             .expect("the exported patch applies to the base checkout");
-        release_worktree(&repo, &wt_path, Disposition::Exported).expect("released");
+        remove_worktree(&repo, &wt_path);
     }
 
     #[test]
@@ -827,7 +1020,7 @@ mod tests {
         assert!(check_scope(&wt, &candidate, &contract)
             .expect("scope")
             .is_empty());
-        release_worktree(&repo, &wt_path, Disposition::Exported).expect("released");
+        remove_worktree(&repo, &wt_path);
     }
 
     #[test]
@@ -841,7 +1034,7 @@ mod tests {
         let candidate = wt.snapshot_candidate("attempt-1").expect("snapshot");
         let err = check_scope(&wt, &candidate, &contract).unwrap_err();
         assert!(matches!(err, WorkspaceError::ScopeViolation(_)), "{err}");
-        release_worktree(&repo, &wt_path, Disposition::Exported).expect("released");
+        remove_worktree(&repo, &wt_path);
     }
 
     #[test]
@@ -871,7 +1064,7 @@ mod tests {
         let candidate = wt.snapshot_candidate("attempt-2").expect("snapshot");
         let err = check_scope(&wt, &candidate, &explicit).unwrap_err();
         assert!(err.to_string().contains("relais.toml (protected"), "{err}");
-        release_worktree(&repo, &wt_path, Disposition::Exported).expect("released");
+        remove_worktree(&repo, &wt_path);
     }
 
     #[test]
@@ -901,7 +1094,7 @@ mod tests {
         std::fs::write(wt_path.join("src/main.rs"), "fn main() {}\n").expect("revert");
         let reverted = wt.snapshot_candidate("attempt-3").expect("snapshot");
         assert!(wt.same_tree_as_base(&reverted).expect("tree compare"));
-        release_worktree(&repo, &wt_path, Disposition::Exported).expect("released");
+        remove_worktree(&repo, &wt_path);
     }
 
     #[test]
@@ -925,7 +1118,7 @@ mod tests {
             err.to_string().contains("réglages.json (protected"),
             "{err}"
         );
-        release_worktree(&repo, &wt_path, Disposition::Exported).expect("released");
+        remove_worktree(&repo, &wt_path);
     }
 
     #[test]
@@ -947,7 +1140,7 @@ mod tests {
         let branches = git(&repo, &["branch", "--list"]).expect("branches");
         assert!(!branches.contains("run-42"), "{branches}");
         // Pruning everything unreachable leaves the candidate alone.
-        release_worktree(&repo, &wt_path, Disposition::Exported).expect("released");
+        remove_worktree(&repo, &wt_path);
         git(&repo, &["gc", "--prune=now", "-q"]).expect("gc");
         assert_eq!(
             git(&repo, &["rev-parse", &name]).expect("still there"),
@@ -995,19 +1188,154 @@ mod tests {
         }
     }
 
+    /// An edit no candidate holds survives retirement as a ref and a
+    /// patch; the ignored build output goes with the directory.
     #[test]
-    fn unexported_changes_are_never_force_cleaned() {
-        let (_dir, repo) = temp_repo();
+    fn retirement_keeps_an_unexported_edit_and_drops_ignored_output() {
+        let (dir, repo) = temp_repo();
+        std::fs::write(repo.join(".gitignore"), "target/\n").expect("ignore");
+        git(&repo, &["add", ".gitignore"]).expect("add");
+        git(&repo, &["commit", "-q", "-m", "ignore"]).expect("commit");
         let sha = resolve_base(&repo, "HEAD").expect("base");
-        let wt_path = repo.parent().unwrap().join("wt-keep");
+        let wt_path = dir.join("worktrees/run-7/task");
         let wt = create_worktree(&repo, &sha, &wt_path).expect("worktree");
-        std::fs::write(wt_path.join("src/main.rs"), "// unexported work\n").expect("edit");
-        let err = release_worktree(&repo, &wt_path, Disposition::MustBeClean).unwrap_err();
-        assert!(matches!(err, WorkspaceError::UnexportedChanges(_)), "{err}");
-        // After exporting a snapshot, the same cleanup succeeds.
+        // Attempt 1 was snapshotted and named; the worker then kept
+        // writing: one tracked edit and a build directory.
+        std::fs::write(wt_path.join("src/main.rs"), "fn main() { v1 }\n").expect("edit");
+        let first = wt.snapshot_candidate("attempt-1").expect("snapshot");
+        name_candidate(&repo, "run-7", 1, &first).expect("named");
+        std::fs::write(wt_path.join("src/main.rs"), "fn main() { unexported }\n").expect("edit");
+        std::fs::create_dir_all(wt_path.join("target/debug")).expect("mkdir");
+        std::fs::write(wt_path.join("target/debug/bin"), vec![0u8; 4096]).expect("build output");
+
+        let artifacts = dir.join("runs/run-7");
+        let retired = retire(&repo, &wt, "run-7", &artifacts).expect("retired");
+        let exported = retired.exported.expect("the edit was in no patch");
+        assert_eq!(exported.reference, "refs/relais/candidates/run-7/final");
+        assert_eq!(exported.patch_path, artifacts.join(FINAL_PATCH));
+        let patch = std::fs::read_to_string(&exported.patch_path).expect("patch");
+        assert!(patch.contains("+fn main() { unexported }"), "{patch}");
+        let kept = git(
+            &repo,
+            &["show", &format!("{}:src/main.rs", exported.reference)],
+        )
+        .expect("the ref resolves");
+        assert_eq!(kept, "fn main() { unexported }");
+        assert!(
+            retired.bytes_reclaimed >= 4096,
+            "the ignored output counts: {}",
+            retired.bytes_reclaimed
+        );
+        assert!(!wt_path.exists(), "the worktree is gone, target/ included");
+        assert!(
+            !wt_path.parent().unwrap().exists(),
+            "and the run's empty worktree parent with it"
+        );
+        let worktrees = git(&repo, &["worktree", "list"]).expect("list");
+        assert!(!worktrees.contains("run-7"), "{worktrees}");
+        // The patch applies to the base: it is what the user integrates.
+        git(
+            &repo,
+            &["apply", "--check", &exported.patch_path.to_string_lossy()],
+        )
+        .expect("the final patch applies");
+    }
+
+    /// A tree a named candidate already holds exports nothing, and the
+    /// worktree is still released.
+    #[test]
+    fn retirement_of_an_already_named_tree_exports_nothing() {
+        let (dir, repo) = temp_repo();
+        let sha = resolve_base(&repo, "HEAD").expect("base");
+        let wt_path = dir.join("worktrees/run-8/task");
+        let wt = create_worktree(&repo, &sha, &wt_path).expect("worktree");
+        std::fs::write(wt_path.join("src/main.rs"), "fn main() { done }\n").expect("edit");
         let candidate = wt.snapshot_candidate("attempt-1").expect("snapshot");
-        let patch = repo.parent().unwrap().join("keep.patch");
-        wt.export_patch(&candidate, &patch).expect("export");
-        release_worktree(&repo, &wt_path, Disposition::Exported).expect("released after export");
+        name_candidate(&repo, "run-8", 1, &candidate).expect("named");
+        let artifacts = dir.join("runs/run-8");
+        let retired = retire(&repo, &wt, "run-8", &artifacts).expect("retired");
+        assert_eq!(retired.exported, None, "attempt 1 already holds this tree");
+        assert!(!artifacts.join(FINAL_PATCH).exists());
+        assert!(!wt_path.exists());
+        assert!(
+            git(
+                &repo,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "refs/relais/candidates/run-8/final"
+                ]
+            )
+            .is_err(),
+            "no final ref was written"
+        );
+        // A tree identical to the base needs no ref either.
+        let wt_path = dir.join("worktrees/run-9/task");
+        let wt = create_worktree(&repo, &sha, &wt_path).expect("worktree");
+        let retired = retire(&repo, &wt, "run-9", &dir.join("runs/run-9")).expect("retired");
+        assert_eq!(retired.exported, None, "the base is durable by definition");
+        assert!(!wt_path.exists());
+    }
+
+    /// Retiring twice with a change in between never overwrites what
+    /// the first retirement kept.
+    #[test]
+    fn a_second_final_candidate_gets_its_own_name() {
+        let (dir, repo) = temp_repo();
+        let sha = resolve_base(&repo, "HEAD").expect("base");
+        let artifacts = dir.join("runs/run-10");
+        let wt_path = dir.join("worktrees/run-10/task");
+        let wt = create_worktree(&repo, &sha, &wt_path).expect("worktree");
+        std::fs::write(wt_path.join("src/main.rs"), "fn main() { one }\n").expect("edit");
+        let first = retire(&repo, &wt, "run-10", &artifacts).expect("retired");
+        let wt = create_worktree(&repo, &sha, &wt_path).expect("worktree again");
+        std::fs::write(wt_path.join("src/main.rs"), "fn main() { two }\n").expect("edit");
+        let second = retire(&repo, &wt, "run-10", &artifacts).expect("retired");
+        let first = first.exported.expect("one");
+        let second = second.exported.expect("two");
+        assert_eq!(first.reference, "refs/relais/candidates/run-10/final");
+        assert_eq!(second.reference, "refs/relais/candidates/run-10/final-2");
+        assert_eq!(second.patch_path, artifacts.join("candidate-final-2.patch"));
+        assert_eq!(
+            git(
+                &repo,
+                &["show", &format!("{}:src/main.rs", first.reference)]
+            )
+            .expect("kept"),
+            "fn main() { one }"
+        );
+        assert!(std::fs::read_to_string(&first.patch_path)
+            .expect("first patch")
+            .contains("{ one }"));
+    }
+
+    /// The sweep sees both layouts and only directories that are
+    /// worktrees.
+    #[test]
+    fn retained_worktrees_are_found_in_both_layouts() {
+        let (dir, repo) = temp_repo();
+        let state = dir.join("state");
+        assert!(
+            retained_worktrees(&state).expect("no state yet").is_empty(),
+            "a state directory that does not exist holds nothing"
+        );
+        let sha = resolve_base(&repo, "HEAD").expect("base");
+        let task = state.join("worktrees/run-a/task");
+        create_worktree(&repo, &sha, &task).expect("worktree");
+        let legacy = state.join("runs/run-b/worktree");
+        create_worktree(&repo, &sha, &legacy).expect("legacy worktree");
+        // Leftovers that are not worktrees: an emptied run directory,
+        // and a run's artifacts.
+        std::fs::create_dir_all(state.join("worktrees/run-c")).expect("mkdir");
+        std::fs::write(state.join("runs/run-b/receipt.json"), "{}").expect("artifact");
+        let found = retained_worktrees(&state).expect("scan");
+        assert_eq!(
+            found.iter().map(|w| w.run_id.as_str()).collect::<Vec<_>>(),
+            vec!["run-b", "run-a"],
+            "path order: runs/ before worktrees/: {found:?}"
+        );
+        assert_eq!(found[0].path, legacy);
+        assert_eq!(found[1].path, task);
+        assert!(found.iter().all(|w| w.bytes > 0), "{found:?}");
     }
 }

@@ -10,7 +10,7 @@
 //! held across a model call — the API makes that structural by only
 //! offering one-shot writes.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -499,6 +499,14 @@ pub struct ChildRun {
     pub status: State,
 }
 
+/// The repository a run ran in and the base it resolved, as the ledger
+/// recorded them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunWorkspace {
+    pub repo_path: PathBuf,
+    pub base_sha: Option<String>,
+}
+
 /// A dispatch that claimed to launch and never recorded a terminal
 /// state: what reconciliation looks at after a crash or restart.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -521,6 +529,16 @@ pub struct Transition {
     pub detail: Option<serde_json::Value>,
     pub at: String,
 }
+
+/// A run's status as a projection of its transition history (P3): the
+/// last transition's `to_state`, falling back to the `runs.status` column
+/// only for a row with no transition at all — an old ledger's run, written
+/// before every state change recorded a row. Every status reader selects
+/// this expression, so no reader can disagree with a chain that exists,
+/// and `runs.status` survives only as that legacy fallback.
+const PROJECTED_STATUS: &str = "COALESCE(\
+    (SELECT t.to_state FROM transitions t WHERE t.run_id = runs.id ORDER BY t.id DESC LIMIT 1), \
+    runs.status) AS status";
 
 impl Ledger {
     pub fn open(path: &Path) -> Result<Self> {
@@ -634,9 +652,9 @@ impl Ledger {
     /// already parsed (P8): a status this binary cannot read is a
     /// corrupt row here, not a string a caller compares to a literal.
     pub fn child_runs(&self, parent_run: &RunId) -> Result<Vec<ChildRun>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, package_id, status FROM runs WHERE parent_run = ?1 ORDER BY created_at, id",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, package_id, {PROJECTED_STATUS} FROM runs WHERE parent_run = ?1 ORDER BY created_at, id"
+        ))?;
         type Row = (String, String, String);
         let rows = stmt.query_map([parent_run.as_str()], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -664,24 +682,49 @@ impl Ledger {
         Ok(count as u32)
     }
 
-    pub fn set_run_status(&self, id: &RunId, status: State) -> Result<()> {
-        self.conn.execute(
-            "UPDATE runs SET status = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id.as_str(), status.as_str(), self.now()],
-        )?;
-        Ok(())
-    }
-
+    /// A run's status, projected from its transition history rather than
+    /// read from a column a writer could drift from it (P3): the last
+    /// transition's `to_state`, when the run has one. A run with none
+    /// yet — an old ledger's row, written before transitions recorded
+    /// every state change — falls back to the `runs.status` an upgrade
+    /// preserved, so status can never disagree with a chain that exists,
+    /// and a run that predates the chain still answers.
     pub fn run_status(&self, id: &RunId) -> Result<Option<State>> {
         let status: Option<String> = self
             .conn
             .query_row(
-                "SELECT status FROM runs WHERE id = ?1",
+                &format!("SELECT {PROJECTED_STATUS} FROM runs WHERE id = ?1"),
                 [id.as_str()],
                 |row| row.get(0),
             )
             .optional()?;
         status.map(|s| parse_state(&s)).transpose()
+    }
+
+    /// Where a run's worktree came from: the repository it ran in and
+    /// the base its latest contract revision resolved — what
+    /// `workspace::retire` needs to name a leftover tree against the
+    /// right base. `None` when the run is not on record; a run that
+    /// never resolved a base (blocked before preflight finished) has
+    /// `base_sha: None`.
+    pub fn run_workspace(&self, id: &RunId) -> Result<Option<RunWorkspace>> {
+        self.conn
+            .query_row(
+                "SELECT runs.repo_path,
+                        (SELECT base_sha FROM contract_revisions
+                          WHERE run_id = runs.id AND base_sha IS NOT NULL
+                          ORDER BY id DESC LIMIT 1)
+                 FROM runs WHERE id = ?1",
+                [id.as_str()],
+                |row| {
+                    Ok(RunWorkspace {
+                        repo_path: PathBuf::from(row.get::<_, String>(0)?),
+                        base_sha: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(LedgerError::from)
     }
 
     /// Record a contract revision for a run and return its id.
@@ -1298,10 +1341,10 @@ impl Ledger {
     /// Package runs are folded into their root's cost and are not listed
     /// twice.
     pub fn runs_since(&self, since: &str) -> Result<Vec<(RunId, String, String, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, repo_path, status, created_at FROM runs
-             WHERE created_at >= ?1 AND parent_run IS NULL ORDER BY created_at DESC",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, repo_path, {PROJECTED_STATUS}, created_at FROM runs
+                 WHERE created_at >= ?1 AND parent_run IS NULL ORDER BY created_at DESC"
+        ))?;
         let rows = stmt.query_map([since], |row| {
             Ok((
                 RunId::from_stored(row.get::<_, String>(0)?),
@@ -2040,6 +2083,67 @@ mod tests {
         let history = ledger.transitions(&run("run-t")).expect("history");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].to_state, State::Blocked);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// P3: `run_status` is a projection of the `transitions` table, not a
+    /// column a writer could leave behind it. A run's status is the last
+    /// transition's `to_state` even when an earlier write left the `runs`
+    /// row's own `status` column stale — there is no code path that can
+    /// do that through the public API, and this proves it: the two can
+    /// never disagree because one is derived from the other.
+    #[test]
+    fn run_status_can_never_disagree_with_the_transition_chain() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-p"), "/repo", None)
+            .expect("run");
+        ledger
+            .record_transition(&Transition {
+                run_id: run("run-p"),
+                attempt_id: None,
+                from_state: Some(State::Prepared),
+                to_state: State::Running,
+                reason: crate::lifecycle::Reason::WorkerDispatched.as_str().into(),
+                detail: None,
+                at: now_rfc3339(),
+            })
+            .expect("transition");
+        assert_eq!(
+            ledger.run_status(&run("run-p")).expect("status"),
+            Some(State::Running),
+            "status follows the last transition, not the first"
+        );
+        // Simulate the only way the column and the chain could ever
+        // differ: something wrote the `runs` row directly, bypassing
+        // `record_transition`. The chain still has the truth.
+        ledger
+            .conn
+            .execute("UPDATE runs SET status = 'prepared' WHERE id = 'run-p'", [])
+            .expect("stale column write");
+        assert_eq!(
+            ledger.run_status(&run("run-p")).expect("status"),
+            Some(State::Running),
+            "a stale `runs.status` column cannot outvote the transition chain"
+        );
+        ledger
+            .record_transition(&Transition {
+                run_id: run("run-p"),
+                attempt_id: None,
+                from_state: Some(State::Running),
+                to_state: State::Verifying,
+                reason: crate::lifecycle::Reason::VerificationStarted
+                    .as_str()
+                    .into(),
+                detail: None,
+                at: now_rfc3339(),
+            })
+            .expect("transition");
+        assert_eq!(
+            ledger.run_status(&run("run-p")).expect("status"),
+            Some(State::Verifying),
+            "status moves with every new transition, never lagging behind one"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
