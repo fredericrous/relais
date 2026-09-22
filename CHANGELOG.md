@@ -6,6 +6,30 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## v0.3.0
+
+### Added
+
+- **Every run belongs to a task.** A task is the stable identity a
+  dispatch, a re-run and a `--revise` all share — the ledger's task spine.
+  A pre-spine run gets one `task-legacy-<root run id>` task backfilled
+  onto it, so nothing on disk loses its cost attribution.
+- **`--revise` lets a run correct a task's contract** instead of starting
+  a disconnected one: the new run inherits the task's identity, and its
+  cost joins the same cohort as the attempts before it.
+- **Feedback is now typed and dataset-readable.** `relais feedback`
+  records an outcome — accepted unchanged, corrected, reverted or
+  confirmed regression — attributed to the task and the exact candidate,
+  so `relais report` can tell a still-standing acceptance from one later
+  withdrawn.
+- **`relais report` adds the per-task figure.** Alongside the existing
+  run-based numbers, the report now carries one line per task, an
+  accepted-task and standing-task count, cost per accepted task, cost per
+  standing change, a pending-feedback count and a backfilled-task count —
+  the primary metric denominated in tasks, so a task retried to
+  acceptance is not counted as several cheaper successes. The JSON
+  payload gains a `schema_version` field.
+
 ## v0.2.4
 
 ### Fixed
