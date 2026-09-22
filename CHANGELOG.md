@@ -6,6 +6,22 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## v0.4.0
+
+### Added
+
+- **`relais decide` answers a run that is waiting for a person.** A run
+  landing on `needs_review`, `needs_decision` or `interrupted` now opens
+  a decision record the moment it does — the same transaction as the
+  transition that raised it, so a run can never be waiting without one.
+  `relais decide <run> --answer <approve|reject|revise|decided|abandon>
+  --actor <who> [--note <text>] [--successor <run>]` records who decided
+  what and when, unblocking `relais report`'s "open decisions" heading
+  and giving `relais explain` the resolution and how long it waited.
+  `approve` is refused, naming the gaps, while the run's verification
+  still carries them — waiving a gap is a policy or contract change, not
+  a CLI flag.
+
 ## v0.3.0
 
 ### Added

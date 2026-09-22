@@ -114,6 +114,19 @@ pub enum Reason {
     /// own attempt — is about to execute, not because something else
     /// happened to it (SPEC §9).
     WorkerDispatched,
+    /// A person approved the run's candidate: `needs_review`'s answer.
+    DecisionApproved,
+    /// A person rejected the run's candidate: `needs_review`'s answer.
+    DecisionRejected,
+    /// A person answered a decision by revising the task; `successor_run`
+    /// on the decision row names the run that carries the revision, when
+    /// one is given.
+    DecisionRevised,
+    /// A person recorded an answer that is neither an approval, a
+    /// rejection nor a revision — the generic `decided`.
+    DecisionRecorded,
+    /// A person gave up on the run rather than answering it.
+    DecisionAbandoned,
 }
 
 impl Reason {
@@ -122,7 +135,7 @@ impl Reason {
     ///
     /// The length is fixed, so a variant added to the enum without being
     /// added here does not compile the `match` that walks it.
-    pub const ALL: [Self; 43] = [
+    pub const ALL: [Self; 48] = [
         Self::ChecksAndReviewPassed,
         Self::BehavioralFailure,
         Self::RepairExhausted,
@@ -166,6 +179,11 @@ impl Reason {
         Self::WriteLeaseHeld,
         Self::RunnerFailure,
         Self::WorkerDispatched,
+        Self::DecisionApproved,
+        Self::DecisionRejected,
+        Self::DecisionRevised,
+        Self::DecisionRecorded,
+        Self::DecisionAbandoned,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -213,6 +231,11 @@ impl Reason {
             Self::WriteLeaseHeld => "write_lease_held",
             Self::RunnerFailure => "runner_failure",
             Self::WorkerDispatched => "worker_dispatched",
+            Self::DecisionApproved => "decision_approved",
+            Self::DecisionRejected => "decision_rejected",
+            Self::DecisionRevised => "decision_revised",
+            Self::DecisionRecorded => "decision_recorded",
+            Self::DecisionAbandoned => "decision_abandoned",
         }
     }
 
@@ -319,6 +342,33 @@ impl State {
                 | Self::Interrupted
         )
     }
+
+    /// Whether a run's final state leaves a person something to do: the
+    /// quality bar held and a human is owed a look (`needs_review`,
+    /// `needs_decision`), or the run's own state is uncertain and is
+    /// never retried on its own (`interrupted`, SPEC §12). Total over
+    /// `State`, so a new state is a decision made here rather than a
+    /// silent omission — the single definition `record_transition` opens
+    /// a decision row for and `report`/`relais decide` read back.
+    pub fn awaits_a_person(self) -> bool {
+        // Spelled out, not `matches!`: that macro expands to a wildcard
+        // arm, so a state added later would answer `false` here without
+        // the compiler ever mentioning it — which is the opposite of
+        // what this function's doc promises.
+        match self {
+            Self::NeedsReview | Self::NeedsDecision | Self::Interrupted => true,
+            Self::Prepared
+            | Self::Running
+            | Self::Verifying
+            | Self::Repairing
+            | Self::Escalating
+            | Self::Accepted
+            | Self::Failed
+            | Self::Blocked
+            | Self::BudgetExhausted
+            | Self::Cancelled => false,
+        }
+    }
 }
 
 impl std::fmt::Display for State {
@@ -345,6 +395,21 @@ mod tests {
             assert_eq!(State::parse(state.as_str()), Ok(state));
         }
         assert!(State::Accepted.is_terminal() && !State::Verifying.is_terminal());
+    }
+
+    /// The states `ledger`'s decision-backfill migration names by their
+    /// stored spelling are exactly the states this answers true for —
+    /// the ledger's test asserts the converse, that the migration names
+    /// no other state.
+    #[test]
+    fn awaits_a_person_is_exactly_needs_review_needs_decision_and_interrupted() {
+        for state in State::ALL {
+            let expected = matches!(
+                state,
+                State::NeedsReview | State::NeedsDecision | State::Interrupted
+            );
+            assert_eq!(state.awaits_a_person(), expected, "{state}");
+        }
     }
 
     /// X5: a name this binary does not know is an error that names what

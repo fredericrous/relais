@@ -197,6 +197,23 @@ enum Command {
         #[command(subcommand)]
         cmd: CoordinatorCommand,
     },
+    /// Answer a run waiting on a person: who decided what and when, so
+    /// `needs_review`/`needs_decision`/`interrupted` stop being a dead end
+    Decide {
+        run_id: String,
+        /// What the person decided
+        #[arg(long = "answer")]
+        answer: DecideAnswer,
+        /// Who is recording this decision
+        #[arg(long = "actor")]
+        actor: String,
+        /// Free-form context for the decision
+        #[arg(long = "note")]
+        note: Option<String>,
+        /// The run that carries a revision this decision led to, if any
+        #[arg(long = "successor")]
+        successor: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -250,6 +267,37 @@ impl From<FeedbackOutcome> for relais::outcome::OutcomeKind {
             FeedbackOutcome::Corrected => Self::Corrected,
             FeedbackOutcome::Reverted => Self::Reverted,
             FeedbackOutcome::Regression => Self::ConfirmedRegression,
+        }
+    }
+}
+
+/// What a person answered `relais decide` with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum DecideAnswer {
+    /// The candidate is approved. Refused while the run's verification
+    /// still carries gaps — a waiver is a policy or contract change, not
+    /// a CLI flag.
+    Approve,
+    /// The candidate is rejected.
+    Reject,
+    /// The task is being revised; `--successor` names the run that
+    /// carries the revision, if one exists yet.
+    Revise,
+    /// A decision was recorded that is neither an approval, a rejection
+    /// nor a revision.
+    Decided,
+    /// The run is abandoned rather than answered further.
+    Abandon,
+}
+
+impl DecideAnswer {
+    fn resolution(self) -> Reason {
+        match self {
+            Self::Approve => Reason::DecisionApproved,
+            Self::Reject => Reason::DecisionRejected,
+            Self::Revise => Reason::DecisionRevised,
+            Self::Decided => Reason::DecisionRecorded,
+            Self::Abandon => Reason::DecisionAbandoned,
         }
     }
 }
@@ -514,6 +562,19 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             }),
         },
         Command::Coordinator { cmd } => coordinator_command(cmd),
+        Command::Decide {
+            run_id,
+            answer,
+            actor,
+            note,
+            successor,
+        } => decide_command(
+            &run_id,
+            answer,
+            &actor,
+            note.as_deref(),
+            successor.as_deref(),
+        ),
     }
 }
 
@@ -1687,6 +1748,34 @@ fn explain_command(run_id: &str) -> Result<CliOutcome, CliError> {
             );
         }
     }
+    if let Some(decision) = operational(ledger.decision_of_run(&run), "explain")? {
+        let resolved = decision
+            .resolution
+            .zip(decision.resolved_at.as_deref())
+            .zip(decision.actor.as_deref());
+        if let Some(((resolution, resolved_at), actor)) = resolved {
+            println!(
+                "decision: {} ({}) -> {} by {actor} at {resolved_at} (waited {}s){}",
+                decision.raised_state,
+                decision.raised_reason,
+                resolution.as_str(),
+                decision.waited_seconds,
+                decision
+                    .note
+                    .as_deref()
+                    .map(|note| format!(" — {note}"))
+                    .unwrap_or_default()
+            );
+        } else {
+            println!(
+                "decision: open since {} ({}: {}), waiting {}s",
+                decision.raised_at,
+                decision.raised_state,
+                decision.raised_reason,
+                decision.waited_seconds
+            );
+        }
+    }
     let cost = operational(ledger.run_cost(&run), "explain")?;
     let completeness = operational(ledger.run_cost_completeness(&run), "explain")?;
     println!("cost: {}", report::cost_line(cost, completeness));
@@ -2152,9 +2241,181 @@ fn feedback_command(request: FeedbackRequest) -> Result<CliOutcome, CliError> {
     Ok(CliOutcome::Accepted)
 }
 
+/// The verification gaps named by the transition that raised a run's
+/// still-open wait, if any: the detail `Observation::VerificationGap`
+/// records (SPEC's decision spine — `decide --answer approve` is refused
+/// while these are non-empty, because a waiver is a policy or contract
+/// change, never a CLI flag).
+fn open_verification_gaps(ledger: &Ledger, run: &RunId) -> Result<Vec<String>, CliError> {
+    // Read the transition that RAISED the open decision, found by the
+    // row's own `raised_at`, not the last transition landing on an
+    // awaiting state. A run keeps transitioning after it starts waiting:
+    // the runner retires its worktree and records that as a same-state
+    // row whose detail carries a reference and a patch and no gaps. The
+    // newest awaiting transition is therefore usually that retirement,
+    // and reading it would find no gaps and wave through exactly the run
+    // this refusal exists for.
+    let Some(decision) = operational(ledger.decision_of_run(run), "decide")? else {
+        return Ok(Vec::new());
+    };
+    let transitions = operational(ledger.transitions(run), "decide")?;
+    Ok(transitions
+        .iter()
+        .find(|transition| {
+            transition.at == decision.raised_at && transition.to_state.awaits_a_person()
+        })
+        .and_then(|transition| transition.detail.as_ref())
+        .and_then(|detail| detail.get("gaps"))
+        .and_then(|gaps| gaps.as_array())
+        .map(|gaps| {
+            gaps.iter()
+                .filter_map(|gap| gap.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+fn decide_command(
+    run_id: &str,
+    answer: DecideAnswer,
+    actor: &str,
+    note: Option<&str>,
+    successor: Option<&str>,
+) -> Result<CliOutcome, CliError> {
+    let ledger = open_ledger()?;
+    let run = RunId::from_stored(run_id);
+    let Some(state) = operational(ledger.run_status(&run), "decide")? else {
+        eprintln!("relais decide: unknown run {run_id}");
+        return Ok(CliOutcome::UnknownRun);
+    };
+    if !state.awaits_a_person() {
+        eprintln!(
+            "relais decide: run {run_id} is {state}, not waiting on a person — nothing to decide"
+        );
+        return Ok(CliOutcome::InvalidInput);
+    }
+    if answer == DecideAnswer::Approve {
+        let gaps = open_verification_gaps(&ledger, &run)?;
+        if !gaps.is_empty() {
+            eprintln!(
+                "relais decide: run {run_id} still carries verification gaps ({}) — a waiver is \
+                 a policy or contract change, never a CLI flag",
+                gaps.join("; ")
+            );
+            return Ok(CliOutcome::InvalidInput);
+        }
+    }
+    let successor_run = successor.map(RunId::from_stored);
+    let resolution = answer.resolution();
+    let resolved = operational(
+        ledger.resolve_decision(&run, resolution, actor, note, successor_run.as_ref()),
+        "decide",
+    )?;
+    if !resolved {
+        eprintln!("relais decide: run {run_id} has no open decision on record");
+        return Ok(CliOutcome::InvalidInput);
+    }
+    println!("recorded {} for {run_id} by {actor}", resolution.as_str());
+    Ok(CliOutcome::Accepted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use relais::ledger::{Ledger, Transition};
+
+    fn temp_ledger(label: &str) -> (Ledger, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "relais-main-test-{label}-{}-{}",
+            std::process::id(),
+            relais::ledger::now_rfc3339().replace([':', '.', '+'], "-")
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger opens");
+        (ledger, dir)
+    }
+
+    /// `decide --answer approve` reads the gaps a `VerificationGap`
+    /// transition recorded, not a fresh verification run: the run is
+    /// already terminal, and the detail its OWN transition into
+    /// `needs_decision` carried is the only record of what the gaps were.
+    #[test]
+    fn open_verification_gaps_reads_the_transition_that_raised_the_decision() {
+        let (ledger, dir) = temp_ledger("gaps");
+        let run = RunId::from_stored("run-gaps");
+        let task = relais::ids::TaskId::from_stored("task-gaps");
+        ledger
+            .insert_run(&run, "/repo", None, &task, "rk")
+            .expect("run");
+        ledger
+            .record_transition(&Transition {
+                run_id: run.clone(),
+                attempt_id: None,
+                from_state: Some(State::Verifying),
+                to_state: State::NeedsDecision,
+                reason: Reason::VerificationGap.as_str().into(),
+                detail: Some(serde_json::json!({ "gaps": ["declared-check: status `inert`"] })),
+                at: relais::ledger::now_rfc3339(),
+            })
+            .expect("transition");
+        // What every real run does next: the runner retires the worktree
+        // and records it as a SAME-STATE transition whose detail carries
+        // a reference and a patch and no gaps. Reading the newest
+        // awaiting transition would find that row and wave the run
+        // through — the bug this test exists to keep out.
+        ledger
+            .record_transition(&Transition {
+                run_id: run.clone(),
+                attempt_id: None,
+                from_state: Some(State::NeedsDecision),
+                to_state: State::NeedsDecision,
+                reason: Reason::WorktreeRetired.as_str().into(),
+                detail: Some(serde_json::json!({
+                    "worktree": "/state/worktrees/run-gaps/task",
+                    "reference": "refs/relais/candidates/run-gaps/final",
+                })),
+                at: relais::ledger::now_rfc3339(),
+            })
+            .expect("retirement transition");
+        let gaps = open_verification_gaps(&ledger, &run).expect("gaps read");
+        assert_eq!(
+            gaps,
+            vec!["declared-check: status `inert`".to_string()],
+            "the raising transition's gaps survive a later same-state row"
+        );
+        // Best effort: the fixture is a temp dir; a leftover costs
+        // nothing but disk, and the next run pre-cleans it.
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A decision raised for a reason that carries no `gaps` detail —
+    /// `scope_exceeded`, say — names none: `approve` is only refused when
+    /// the run's OWN wait actually carries verification gaps.
+    #[test]
+    fn open_verification_gaps_is_empty_when_the_raising_transition_names_none() {
+        let (ledger, dir) = temp_ledger("nogaps");
+        let run = RunId::from_stored("run-nogaps");
+        let task = relais::ids::TaskId::from_stored("task-nogaps");
+        ledger
+            .insert_run(&run, "/repo", None, &task, "rk")
+            .expect("run");
+        ledger
+            .record_transition(&Transition {
+                run_id: run.clone(),
+                attempt_id: None,
+                from_state: Some(State::Verifying),
+                to_state: State::NeedsDecision,
+                reason: Reason::ScopeExceeded.as_str().into(),
+                detail: Some(serde_json::json!({ "paths": ["docs/x.md"] })),
+                at: relais::ledger::now_rfc3339(),
+            })
+            .expect("transition");
+        let gaps = open_verification_gaps(&ledger, &run).expect("gaps read");
+        assert!(gaps.is_empty(), "{gaps:?}");
+        // Best effort: the fixture is a temp dir; a leftover costs
+        // nothing but disk, and the next run pre-cleans it.
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// Every outcome the table has. Listed here rather than derived,
     /// because the point of the test below is that two of them never

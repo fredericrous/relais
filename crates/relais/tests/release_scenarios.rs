@@ -998,6 +998,98 @@ fn out_of_scope_edits_and_misspelled_controls_are_refused() {
     );
 }
 
+// The decision spine (SPEC-new): a run that reaches `needs_decision` opens
+// a decision record nobody has answered, `report` lists it, `relais
+// decide` answers it by name, and `report` no longer lists it — the
+// resolution and its actor are on record for `explain` to show.
+#[test]
+fn a_run_awaiting_a_person_is_answered_by_decide_and_drops_off_the_open_list() {
+    let world = World::new("decide");
+    let hash = world.write_policy(3);
+    world.write_machine(&hash, "");
+    let path = world.root.join("narrow.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "schema_version": 1,
+            "kind": "change",
+            "objective": "Remove the entry point",
+            "base_ref": "HEAD",
+            "write_scope": ["docs/**"],
+            "acceptance": ["src/main.rs no longer exists"],
+            "verification_profile": "default",
+            "review": "off",
+        })
+        .to_string(),
+    )
+    .expect("task");
+    let run = world.relais(&["run", "--task", path.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(8), "{}", text(&run.stderr));
+    let run_id = world.only_run_id();
+
+    let report = world.relais(&["report", "--since", "2000-01-01", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&text(&report.stdout)).expect("json");
+    let open: Vec<&str> = report["open_decisions"]
+        .as_array()
+        .expect("open_decisions is an array")
+        .iter()
+        .map(|decision| decision["run"].as_str().expect("run"))
+        .collect();
+    assert!(open.contains(&run_id.as_str()), "{report}");
+
+    let decide = world.relais(&[
+        "decide",
+        &run_id,
+        "--answer",
+        "decided",
+        "--actor",
+        "the release suite",
+        "--note",
+        "the scope was intentional; the task will be revised",
+    ]);
+    assert_eq!(decide.status.code(), Some(0), "{}", text(&decide.stderr));
+
+    let report = world.relais(&["report", "--since", "2000-01-01", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&text(&report.stdout)).expect("json");
+    assert!(
+        report["open_decisions"]
+            .as_array()
+            .expect("array")
+            .is_empty(),
+        "{report}"
+    );
+
+    let explain = world.relais(&["explain", &run_id]);
+    let explained = text(&explain.stdout);
+    assert!(explained.contains("decision_recorded"), "{explained}");
+    assert!(explained.contains("the release suite"), "{explained}");
+    assert!(
+        explained.contains("the scope was intentional"),
+        "{explained}"
+    );
+
+    // The run is not waiting any more: a second answer is refused by name.
+    let redecide = world.relais(&[
+        "decide",
+        &run_id,
+        "--answer",
+        "decided",
+        "--actor",
+        "someone else",
+    ]);
+    assert_eq!(
+        redecide.status.code(),
+        Some(2),
+        "{}",
+        text(&redecide.stderr)
+    );
+    assert!(
+        text(&redecide.stderr).contains("no open decision"),
+        "{}",
+        text(&redecide.stderr)
+    );
+}
+
 // SPEC §17, §21: execute → verify → label → build dataset → train →
 // evaluate → promote → route. The loop closes: a promoted artifact is
 // what `plan` and `run` consult, and it says so.
