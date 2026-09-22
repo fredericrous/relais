@@ -167,6 +167,12 @@ pub struct RunConfig<'a> {
     pub session_id: String,
     /// Lease heartbeat period while a worker runs.
     pub heartbeat_every: Duration,
+    /// This run's task identity, already resolved and confirmed on
+    /// record by the caller (the CLI's `--revise`, or the contract's own
+    /// declared task): `None` derives a fresh one at preflight, as
+    /// before. Only consulted for a root run — a child always inherits
+    /// its parent's task regardless of this field.
+    pub task_override: Option<&'a crate::ids::TaskId>,
 }
 
 /// Poll period while queued for admission.
@@ -1114,9 +1120,15 @@ impl<'a> RunEngine<'a> {
             None => {
                 // A fresh task identity is DERIVED, not minted: the same
                 // repository and the same first contract always land on
-                // the same task, so a re-run or a future `--revise` of
-                // this task reuses the row its first run created.
-                let task = derive_task_id(&this_repo_key, &self.config.contract.hash());
+                // the same task, so a re-run of this task reuses the row
+                // its first run created. `task_override` is the CLI's
+                // already-confirmed answer to `--revise` or a declared
+                // `task_id` — set, it names the task directly rather
+                // than deriving one.
+                let task = match self.config.task_override {
+                    Some(task) => task.clone(),
+                    None => derive_task_id(&this_repo_key, &self.config.contract.hash()),
+                };
                 ledger.insert_run(
                     &self.run_id,
                     &self.config.repo_dir.to_string_lossy(),
@@ -3639,6 +3651,7 @@ mod tests {
                 gate: None,
                 session_id: "test-session".into(),
                 heartbeat_every: Duration::from_millis(50),
+                task_override: None,
             })
             .expect("the fixture's id source mints identifiers")
         }
@@ -3672,6 +3685,7 @@ mod tests {
                 gate: None,
                 session_id: "test-session".into(),
                 heartbeat_every: Duration::from_millis(50),
+                task_override: None,
             })
             .expect("the fixture's id source mints identifiers")
         }
@@ -3706,6 +3720,7 @@ mod tests {
                 gate: Some(gate),
                 session_id: "test-session".into(),
                 heartbeat_every: Duration::from_millis(50),
+                task_override: None,
             })
             .expect("the fixture's id source mints identifiers")
         }
@@ -4277,6 +4292,7 @@ mod tests {
             gate: None,
             session_id: "test-session".into(),
             heartbeat_every: Duration::from_millis(50),
+            task_override: None,
         })
         .expect("the fixture's id source mints identifiers");
         let RunOutcome {

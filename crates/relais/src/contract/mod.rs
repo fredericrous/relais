@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod scope;
 
-use crate::ids::canonical_json_hash;
+use crate::ids::{canonical_json_hash, TaskId};
 
 pub const SCHEMA_VERSION: u64 = 1;
 
@@ -220,6 +220,12 @@ pub struct TaskContract {
     /// ordinary single-worker run; omitted from the canonical form when
     /// absent so existing contract hashes are unchanged.
     pub decomposition: Option<Decomposition>,
+    /// The task this contract's run belongs to, when the contract
+    /// declares one ([`TaskLink::Declared`]). Absent for the ordinary
+    /// case, where the run's own [`crate::ids::derive_task_id`] or the
+    /// CLI's `--revise` flag decides it; omitted from the canonical form
+    /// when absent so existing contract hashes are unchanged.
+    pub task_id: Option<TaskId>,
 }
 
 /// The contract exactly as it is written and stored: flat `kind` and
@@ -250,6 +256,8 @@ struct ContractWire {
     review: Review,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     decomposition: Option<Decomposition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_id: Option<TaskId>,
 }
 
 impl From<&TaskContract> for ContractWire {
@@ -273,6 +281,7 @@ impl From<&TaskContract> for ContractWire {
             limits: contract.limits.clone(),
             review: contract.review,
             decomposition: contract.decomposition.clone(),
+            task_id: contract.task_id.clone(),
         }
     }
 }
@@ -303,6 +312,7 @@ impl TryFrom<ContractWire> for TaskContract {
             limits: wire.limits,
             review: wire.review,
             decomposition: wire.decomposition,
+            task_id: wire.task_id,
         };
         contract.validate()?;
         Ok(contract)
@@ -843,6 +853,66 @@ pub fn changed_controls(old: &TaskContract, new: &TaskContract) -> ChangedContro
     }
 }
 
+/// What decides a run's task identity (SPEC's task spine): a contract
+/// may declare one directly, a `--revise` flag may name one, or neither
+/// is given and a fresh identity is derived from the repository and the
+/// contract's own hash. A child (package) run is never linked this way —
+/// it always inherits its parent's task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskLink {
+    /// The contract's own `task_id`, with no `--revise` flag given.
+    Declared(TaskId),
+    /// A `--revise` flag, agreeing with the contract's `task_id` when
+    /// one is declared.
+    Revises(TaskId),
+    /// Neither a declared task nor a `--revise` flag: a brand new task.
+    Fresh,
+}
+
+/// A contract's declared task and a `--revise` flag name different
+/// tasks. Refused before any dispatch, naming both, rather than picking
+/// one silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskDisagreement {
+    pub declared: TaskId,
+    pub revise: TaskId,
+}
+
+impl std::fmt::Display for TaskDisagreement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the contract declares task {} but --revise names {}; a run cannot belong to both",
+            self.declared, self.revise
+        )
+    }
+}
+
+impl std::error::Error for TaskDisagreement {}
+
+/// Decide a run's [`TaskLink`] from what the contract declares and what
+/// `--revise` names. Pure: whether either id names a task that actually
+/// exists is the ledger's answer, not this function's — a caller checks
+/// that separately once a [`TaskLink::Declared`] or [`TaskLink::Revises`]
+/// comes back.
+pub fn resolve_task_link(
+    declared: Option<&TaskId>,
+    revise: Option<&TaskId>,
+) -> Result<TaskLink, TaskDisagreement> {
+    match (declared, revise) {
+        (None, None) => Ok(TaskLink::Fresh),
+        (Some(declared), None) => Ok(TaskLink::Declared(declared.clone())),
+        (None, Some(revise)) => Ok(TaskLink::Revises(revise.clone())),
+        (Some(declared), Some(revise)) if declared == revise => {
+            Ok(TaskLink::Revises(revise.clone()))
+        }
+        (Some(declared), Some(revise)) => Err(TaskDisagreement {
+            declared: declared.clone(),
+            revise: revise.clone(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1152,5 +1222,82 @@ mod tests {
         let mut narrowed = base.clone();
         narrowed.task = Task::change(vec!["crates/amont/**".into()]).expect("compiles");
         assert!(changed_controls(&base, &narrowed).scope);
+    }
+
+    /// Adding `task_id` (task-linking) must not move the canonical hash
+    /// of a contract that does not declare one: the field is omitted
+    /// from the wire form when absent, so every hash minted before this
+    /// package stays valid.
+    /// The pinned value was read off the BASE commit (2f37f80), before
+    /// this package existed: a golden hash a candidate pins from its own
+    /// output cannot tell "unchanged" from "changed and re-pinned".
+    #[test]
+    fn example_contract_hash_is_unchanged_by_task_linking() {
+        let c = TaskContract::from_json_str(EXAMPLE).expect("parses");
+        assert_eq!(
+            c.hash(),
+            "f7dc319ede171adadcff2b569e6fc88459a1884d321240d66eb10bf25efd94bd"
+        );
+    }
+
+    /// `task_id` round-trips through the wire form, and is omitted
+    /// entirely — not written as `null` — when the contract declares
+    /// none.
+    #[test]
+    fn task_id_is_omitted_when_absent_and_round_trips_when_present() {
+        let without = TaskContract::from_json_str(EXAMPLE).expect("parses");
+        assert_eq!(without.task_id, None);
+        let value = without.canonical_value();
+        assert!(
+            !value.as_object().expect("object").contains_key("task_id"),
+            "an absent task_id must not appear in the canonical form at all: {value}"
+        );
+
+        let mut with = without.clone();
+        with.task_id = Some(TaskId::from_stored("task-declared0000"));
+        let text = serde_json::to_string(&with).expect("serializes");
+        let parsed = TaskContract::from_json_str(&text).expect("round-trips");
+        assert_eq!(parsed.task_id, with.task_id);
+    }
+
+    /// The full (contract declares a task or not) x (flag given or not)
+    /// x (they agree or not) matrix `resolve_task_link` decides.
+    #[test]
+    fn resolve_task_link_covers_every_combination() {
+        let a = TaskId::from_stored("task-aaaaaaaaaaaaaaaa");
+        let b = TaskId::from_stored("task-bbbbbbbbbbbbbbbb");
+
+        // Neither declares nor revises: a fresh task.
+        assert_eq!(resolve_task_link(None, None), Ok(TaskLink::Fresh));
+
+        // Declares, no flag: the declared task.
+        assert_eq!(
+            resolve_task_link(Some(&a), None),
+            Ok(TaskLink::Declared(a.clone()))
+        );
+
+        // No declaration, a flag: revises the named task.
+        assert_eq!(
+            resolve_task_link(None, Some(&a)),
+            Ok(TaskLink::Revises(a.clone()))
+        );
+
+        // Both, and they agree: revises the (shared) task.
+        assert_eq!(
+            resolve_task_link(Some(&a), Some(&a)),
+            Ok(TaskLink::Revises(a.clone()))
+        );
+
+        // Both, and they disagree: refused, naming both.
+        let err = resolve_task_link(Some(&a), Some(&b)).unwrap_err();
+        assert_eq!(
+            err,
+            TaskDisagreement {
+                declared: a.clone(),
+                revise: b.clone(),
+            }
+        );
+        assert!(err.to_string().contains(a.as_str()));
+        assert!(err.to_string().contains(b.as_str()));
     }
 }

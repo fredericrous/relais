@@ -657,6 +657,11 @@ fn run_package(
         // exactly as the contract asks the run to be.
         review: contract.review,
         decomposition: None,
+        // A package is never linked by its own contract (P13's inverse:
+        // scope is partitioned, task identity is not) — it always
+        // inherits the root's, already on record by the time any
+        // package's preflight runs.
+        task_id: None,
     };
     let mut child_machine: MachineSettings = engine.config.machine.clone();
     child_machine.spending.per_run_micros = remaining_budget;
@@ -687,6 +692,9 @@ fn run_package(
         gate: engine.config.gate,
         session_id: engine.config.session_id.clone(),
         heartbeat_every: engine.config.heartbeat_every,
+        // Irrelevant for a child: `preflight`'s child branch inherits
+        // the root's task from the ledger unconditionally, never this.
+        task_override: None,
     };
     engine.transition(
         State::Running,
