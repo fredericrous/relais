@@ -6,6 +6,16 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## v0.2.3
+
+### Fixed
+
+- **A decomposed run's package worktrees are swept too.** They hang off
+  the root run's artifacts, under `runs/<root>/packages/worktrees/`, a
+  layout `resume --retire` and the doctor count walked past — 1.9 GB on
+  the first sweep. The scan now walks the runs tree by shape, so a
+  worktree at any depth is found, retired and counted.
+
 ## v0.2.2
 
 ### Fixed
