@@ -687,27 +687,51 @@ pub struct RetainedWorktree {
     pub bytes: u64,
 }
 
-/// Every run worktree still under `state_dir`, in path order: each
-/// `worktrees/<run>/<name>` and each legacy `runs/<run>/worktree`
-/// (`paths`) that carries a `.git` — a directory without one is not a
-/// worktree, whatever made it. A missing `worktrees/` or `runs/` is
-/// simply no worktrees; any other read failure is an error, since a
-/// sweep that could not look is not a sweep that found nothing.
+/// Every run worktree still under `state_dir`, in path order. Three
+/// layouts hold one: `worktrees/<run>/<name>` for a root run, the legacy
+/// `runs/<run>/worktree`, and — nested to any depth — a decomposed run's
+/// packages under `runs/<root>/packages/worktrees/<child>/<name>`, which
+/// hang off the root's artifacts (scheduler, B6) and were the 1.9 GB the
+/// first sweep walked past. So the walk is by shape, not by depth: every
+/// `worktrees` directory's grandchildren and every `worktree` directory
+/// under the runs tree, each carrying a `.git` — a directory without one
+/// is not a worktree, whatever made it. A missing `worktrees/` or
+/// `runs/` is simply no worktrees; any other read failure is an error,
+/// since a sweep that could not look is not a sweep that found nothing.
 pub fn retained_worktrees(state_dir: &Path) -> Result<Vec<RetainedWorktree>> {
     let mut found = Vec::new();
-    for run_dir in subdirectories(&state_dir.join(crate::paths::WORKTREES_DIR))? {
-        for candidate in subdirectories(&run_dir)? {
-            push_if_worktree(&mut found, &run_dir, candidate)?;
-        }
-    }
-    for run_dir in subdirectories(&state_dir.join(crate::paths::RUNS_DIR))? {
-        let legacy = run_dir.join(crate::paths::LEGACY_WORKTREE_DIR);
-        if legacy.is_dir() {
-            push_if_worktree(&mut found, &run_dir, legacy)?;
+    collect_worktree_runs(&mut found, &state_dir.join(crate::paths::WORKTREES_DIR))?;
+    let runs = state_dir.join(crate::paths::RUNS_DIR);
+    let mut pending = subdirectories(&runs)?;
+    while let Some(dir) = pending.pop() {
+        let name = dir.file_name().map(|n| n.to_string_lossy().into_owned());
+        match name.as_deref() {
+            Some(crate::paths::WORKTREES_DIR) => collect_worktree_runs(&mut found, &dir)?,
+            Some(crate::paths::LEGACY_WORKTREE_DIR) => {
+                let run_dir = dir.parent().unwrap_or(&runs).to_path_buf();
+                push_if_worktree(&mut found, &run_dir, dir)?;
+            }
+            // Anything else is artifacts or a package's record: descend,
+            // but never into a worktree's own checkout.
+            Some(_) | None => {
+                if !dir.join(".git").exists() {
+                    pending.extend(subdirectories(&dir)?);
+                }
+            }
         }
     }
     found.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(found)
+}
+
+/// `<worktrees>/<run>/<name>`: each run's directories that are worktrees.
+fn collect_worktree_runs(found: &mut Vec<RetainedWorktree>, worktrees: &Path) -> Result<()> {
+    for run_dir in subdirectories(worktrees)? {
+        for candidate in subdirectories(&run_dir)? {
+            push_if_worktree(found, &run_dir, candidate)?;
+        }
+    }
+    Ok(())
 }
 
 fn push_if_worktree(
@@ -1364,7 +1388,7 @@ mod tests {
     /// The sweep sees both layouts and only directories that are
     /// worktrees.
     #[test]
-    fn retained_worktrees_are_found_in_both_layouts() {
+    fn retained_worktrees_are_found_in_every_layout() {
         let (dir, repo) = temp_repo();
         let state = dir.join("state");
         assert!(
@@ -1380,14 +1404,20 @@ mod tests {
         // and a run's artifacts.
         std::fs::create_dir_all(state.join("worktrees/run-c")).expect("mkdir");
         std::fs::write(state.join("runs/run-b/receipt.json"), "{}").expect("artifact");
+        // A decomposed run's package worktree, nested under the root's
+        // artifacts — the layout the first sweep on a real machine missed.
+        let package = state.join("runs/run-d/packages/worktrees/run-d-child/task");
+        create_worktree(&repo, &sha, &package).expect("package worktree");
+        std::fs::write(state.join("runs/run-d/plan.json"), "{}").expect("artifact");
         let found = retained_worktrees(&state).expect("scan");
         assert_eq!(
             found.iter().map(|w| w.run_id.as_str()).collect::<Vec<_>>(),
-            vec!["run-b", "run-a"],
-            "path order: runs/ before worktrees/: {found:?}"
+            vec!["run-b", "run-d-child", "run-a"],
+            "path order: runs/ before worktrees/, the package by its own run id: {found:?}"
         );
         assert_eq!(found[0].path, legacy);
-        assert_eq!(found[1].path, task);
+        assert_eq!(found[1].path, package);
+        assert_eq!(found[2].path, task);
         assert!(found.iter().all(|w| w.bytes > 0), "{found:?}");
     }
 }
