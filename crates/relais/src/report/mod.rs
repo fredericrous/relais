@@ -29,6 +29,10 @@ pub struct RunLine {
     pub cost_completeness: CostCompleteness,
     pub models: Vec<String>,
     pub final_detail: Option<String>,
+    /// Accepted, and its task's latest recorded outcome (if any) has not
+    /// withdrawn the change. Always `false` for a run that never
+    /// accepted.
+    pub standing: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -36,6 +40,13 @@ pub struct Report {
     pub since: String,
     pub runs: Vec<RunLine>,
     pub accepted: usize,
+    /// Accepted runs whose task's latest recorded outcome has not
+    /// withdrawn the change (SPEC §20): `accepted` minus the accepted
+    /// runs whose task's `latest_outcome` is `reverted`. A task with no
+    /// feedback recorded counts as standing — absence of feedback is
+    /// never a negative label. The outcomes table's first reader: this
+    /// is the only place `relais report` looks at it.
+    pub standing: usize,
     pub total_cost: MicroUsd,
     pub cost_per_accepted: Option<MicroUsd>,
     pub acceptance_rate: Option<f64>,
@@ -51,6 +62,16 @@ pub struct Report {
 
 pub fn runs_report(ledger: &Ledger, since: &str) -> Result<Report, crate::ledger::LedgerError> {
     let mut runs = Vec::new();
+    // One pass over the window's outcomes instead of a `latest_outcome`
+    // per accepted run: the rows are ordered oldest first, so the last
+    // one written for a task is the one that stands. A task with no row
+    // is absent from the map and counts as standing — absence of
+    // feedback is never a negative label (SPEC §20).
+    let mut withdrawn_tasks: std::collections::BTreeMap<crate::ids::TaskId, bool> =
+        std::collections::BTreeMap::new();
+    for stored in ledger.outcomes_since(since)? {
+        withdrawn_tasks.insert(stored.task_id, stored.outcome.kind.withdraws_acceptance());
+    }
     for (run_id, _repo, status, _created) in ledger.runs_since(since)? {
         let status =
             State::parse(&status).map_err(|unknown| crate::ledger::LedgerError::Corrupt {
@@ -77,6 +98,14 @@ pub fn runs_report(ledger: &Ledger, since: &str) -> Result<Report, crate::ledger
                     .last()
                     .map(|transition| transition.reason.clone())
             });
+        let mut standing = status == State::Accepted;
+        if standing {
+            if let Some(task_id) = ledger.task_of_run(&run_id)? {
+                if let Some(withdrawn) = withdrawn_tasks.get(&task_id) {
+                    standing = !withdrawn;
+                }
+            }
+        }
         runs.push(RunLine {
             run_id: run_id.to_string(),
             status,
@@ -85,12 +114,14 @@ pub fn runs_report(ledger: &Ledger, since: &str) -> Result<Report, crate::ledger
             cost_completeness: completeness,
             models,
             final_detail,
+            standing,
         });
     }
     let accepted = runs
         .iter()
         .filter(|run| run.status == State::Accepted)
         .count();
+    let standing = runs.iter().filter(|run| run.standing).count();
     let total_cost = runs.iter().fold(MicroUsd::ZERO, |acc, run| acc + run.cost);
     let pending_decisions = runs
         .iter()
@@ -113,6 +144,7 @@ pub fn runs_report(ledger: &Ledger, since: &str) -> Result<Report, crate::ledger
         since: since.to_string(),
         runs,
         accepted,
+        standing,
         total_cost,
         cost_per_accepted,
         acceptance_rate,
@@ -171,6 +203,12 @@ impl Report {
             )),
             None => out.push_str("cost per accepted task: no accepted tasks in window\n"),
         }
+        out.push_str(&format!(
+            "still standing: {} of {} accepted ({} later reverted)\n",
+            self.standing,
+            self.accepted,
+            self.accepted.saturating_sub(self.standing)
+        ));
         if self.pending_decisions > 0 {
             out.push_str(&format!(
                 "awaiting a human: {} run(s) in needs_review/needs_decision/interrupted\n",
@@ -297,8 +335,10 @@ mod tests {
                 cost_completeness: CostCompleteness::Actual,
                 models: vec!["haiku".into()],
                 final_detail: Some(detail),
+                standing: true,
             }],
             accepted: 1,
+            standing: 1,
             total_cost: MicroUsd::from_micros(10),
             cost_per_accepted: Some(MicroUsd::from_micros(10)),
             acceptance_rate: Some(1.0),

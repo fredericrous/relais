@@ -440,7 +440,14 @@ minimum_tier = "escalation"
     let report = world.relais(&["report", "--since", "2026-01-01", "--json"]);
     let report: serde_json::Value = serde_json::from_str(&text(&report.stdout)).expect("json");
     assert_eq!(report["accepted"], 1, "{report}");
-    let feedback = world.relais(&["feedback", &run_id, "--outcome", "accepted"]);
+    let feedback = world.relais(&[
+        "feedback",
+        &run_id,
+        "--outcome",
+        "accepted",
+        "--actor",
+        "the release suite",
+    ]);
     assert_eq!(
         feedback.status.code(),
         Some(0),
@@ -460,6 +467,61 @@ minimum_tier = "escalation"
         text(&doctor.stdout).contains("answers on"),
         "{}",
         text(&doctor.stdout)
+    );
+}
+
+// SPEC §20 / the outcomes table's first reader: `relais report` counts
+// an accepted task as "standing" until feedback says the change was
+// taken back. Recording `reverted` must not touch the `accepted` count
+// — that is the historical fact that a candidate was accepted — but it
+// must drop the task out of `standing`, the count of accepted changes
+// still in the tree.
+#[test]
+fn a_reverted_outcome_leaves_accepted_unchanged_and_drops_standing() {
+    let world = World::new("revert");
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    let task = world.write_task_for("task.json", "an easy one", "optional");
+
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    let stdout = text(&run.stdout);
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "{stdout}\n{}",
+        text(&run.stderr)
+    );
+    let run_id = World::run_id_of(&stdout);
+
+    let report = world.relais(&["report", "--since", "2026-01-01", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&text(&report.stdout)).expect("json");
+    assert_eq!(report["accepted"], 1, "{report}");
+    assert_eq!(report["standing"], 1, "{report}");
+
+    let feedback = world.relais(&[
+        "feedback",
+        &run_id,
+        "--outcome",
+        "reverted",
+        "--actor",
+        "the release suite",
+    ]);
+    assert_eq!(
+        feedback.status.code(),
+        Some(0),
+        "{}",
+        text(&feedback.stderr)
+    );
+
+    let report = world.relais(&["report", "--since", "2026-01-01", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&text(&report.stdout)).expect("json");
+    assert_eq!(
+        report["accepted"], 1,
+        "a revert never un-accepts the historical fact: {report}"
+    );
+    assert_eq!(
+        report["standing"], 0,
+        "but the change is no longer standing: {report}"
     );
 }
 
