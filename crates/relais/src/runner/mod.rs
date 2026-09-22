@@ -31,12 +31,12 @@ use crate::admission::{
 use crate::backend::{Backend, LaunchResult, LaunchSpec};
 use crate::context::{self, ContextError, ContextManifest};
 use crate::contract::{Review, TaskContract};
-use crate::ids::{DispatchId, PackageId, Pid, RunId};
+use crate::ids::{derive_task_id, DispatchId, PackageId, Pid, RunId};
 use crate::ledger::{Ledger, LedgerError, Transition, UsageEvent};
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::policy::{
-    effective_authority, BlockCode, EffectiveAuthority, MachineSettings, RepoPolicy, Tier,
-    VerificationProfile,
+    effective_authority, repo_key, BlockCode, EffectiveAuthority, MachineSettings, RepoPolicy,
+    Tier, VerificationProfile,
 };
 use crate::procs::Ended;
 use crate::route::{route, Route, RouteInputs, RoutePredictor, Routed};
@@ -1104,19 +1104,49 @@ impl<'a> RunEngine<'a> {
     fn preflight(&mut self) -> Result<Phase<Preflight>, RunError> {
         std::fs::create_dir_all(&self.artifacts)?;
         let ledger = self.config.ledger;
+        // The repository half of this run's task identity (P2's
+        // `RepoIdentity`, hashed the way a trust grant is): resolved
+        // here, ahead of `insert_run`/`insert_child_run`, because both
+        // need it to place the run under its task.
+        let repo_identity = crate::repo::identity(self.config.repo_dir);
+        let this_repo_key = repo_key(&repo_identity);
         match &self.parent {
-            None => ledger.insert_run(
-                &self.run_id,
-                &self.config.repo_dir.to_string_lossy(),
-                Some(&self.config.session_id),
-            )?,
-            Some((parent_run, package_id)) => ledger.insert_child_run(
-                &self.run_id,
-                &self.config.repo_dir.to_string_lossy(),
-                Some(&self.config.session_id),
-                parent_run,
-                package_id,
-            )?,
+            None => {
+                // A fresh task identity is DERIVED, not minted: the same
+                // repository and the same first contract always land on
+                // the same task, so a re-run or a future `--revise` of
+                // this task reuses the row its first run created.
+                let task = derive_task_id(&this_repo_key, &self.config.contract.hash());
+                ledger.insert_run(
+                    &self.run_id,
+                    &self.config.repo_dir.to_string_lossy(),
+                    Some(&self.config.session_id),
+                    &task,
+                    &this_repo_key,
+                )?
+            }
+            Some((parent_run, package_id)) => {
+                // A work package is not a task of its own (SPEC §19): it
+                // inherits the root's, which the root's own preflight
+                // already put on record before any package is scheduled.
+                let task = ledger.task_of_run(parent_run)?.ok_or_else(|| {
+                    RunError::Other(format!(
+                        "run {parent_run} has no task on record; its own preflight must \
+                         complete before a work package can inherit it"
+                    ))
+                })?;
+                ledger.insert_child_run(
+                    &self.run_id,
+                    &self.config.repo_dir.to_string_lossy(),
+                    Some(&self.config.session_id),
+                    crate::ledger::ChildOf {
+                        parent_run,
+                        package_id,
+                    },
+                    &task,
+                    &this_repo_key,
+                )?
+            }
         }
 
         // Preflight: dirty base is explicit, never copied (SPEC §8). A
@@ -1148,11 +1178,10 @@ impl<'a> RunEngine<'a> {
         }
 
         // Effective authority is the intersection; blockers stop dispatch
-        // (SPEC §5, §6).
-        // The repository a trust grant must have been reviewed for
-        // (P2), resolved here because this is where the run meets the
-        // disk; `policy` decides from the value and looks at nothing.
-        let repo_identity = crate::repo::identity(self.config.repo_dir);
+        // (SPEC §5, §6). `repo_identity` is the same value the task
+        // identity above was keyed on, resolved once at the top of this
+        // function because this is where the run meets the disk; `policy`
+        // decides from the value and looks at nothing.
         let authority = effective_authority(
             self.config.repo_policy,
             self.config.machine,
@@ -6783,7 +6812,13 @@ mod tests {
         // today's counts, and it counts although it is not this run.
         fixture
             .ledger
-            .insert_run(&RunId::from_stored("earlier-today"), "/elsewhere", None)
+            .insert_run(
+                &RunId::from_stored("earlier-today"),
+                "/elsewhere",
+                None,
+                &crate::ids::TaskId::from_stored("task-earlier-today"),
+                "rk",
+            )
             .expect("run");
         for (event_id, at, micros) in [
             ("yesterday", "2026-09-19T23:00:00+00:00", 5_000),

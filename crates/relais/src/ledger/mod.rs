@@ -16,12 +16,12 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use serde::{Deserialize, Serialize};
 
 use crate::contract::TaskContract;
-use crate::ids::{DispatchId, PackageId, Pid, RunId};
+use crate::ids::{DispatchId, PackageId, Pid, RunId, TaskId};
 use crate::lifecycle::State;
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::policy::Tier;
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 3;
+pub const LEDGER_SCHEMA_VERSION: u64 = 4;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -94,6 +94,55 @@ fn parse_tier(stored: &str) -> Result<Tier> {
     Tier::parse(stored).ok_or_else(|| LedgerError::Corrupt {
         what: "attempt tier".into(),
         detail: format!("`{stored}` is not a tier this relais knows"),
+    })
+}
+
+/// How a task's row came to exist: minted for a fresh task, or
+/// reconstructed for a run that predates the task spine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskOrigin {
+    /// Minted by [`crate::ids::derive_task_id`] when a run dispatched.
+    Created,
+    /// Reconstructed by the v4 migration for a run written before tasks
+    /// existed: `task-legacy-<root run id>`, one per pre-existing tree.
+    Backfilled,
+}
+
+impl TaskOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Backfilled => "backfilled",
+        }
+    }
+
+    fn parse(stored: &str) -> Option<Self> {
+        match stored {
+            "created" => Some(Self::Created),
+            "backfilled" => Some(Self::Backfilled),
+            _ => None,
+        }
+    }
+}
+
+/// A task's row as the ledger holds it (SPEC's task spine): the stable
+/// identity a run's cost is attributed to, across contract revisions and
+/// re-runs. `origin` leaves the adapter typed (P6/P8): a value no version
+/// of this binary wrote is a corrupt row, not a silently accepted string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRow {
+    pub task_id: TaskId,
+    pub repo_key: String,
+    pub first_run: RunId,
+    pub origin: TaskOrigin,
+    pub created_at: String,
+}
+
+/// A task origin string as the ledger stored it.
+fn parse_task_origin(stored: &str) -> Result<TaskOrigin> {
+    TaskOrigin::parse(stored).ok_or_else(|| LedgerError::Corrupt {
+        what: "task origin".into(),
+        detail: format!("`{stored}` is not a task origin this relais knows"),
     })
 }
 
@@ -318,6 +367,44 @@ const MIGRATIONS: &[(&str, &str)] = &[
     CREATE INDEX idx_usage_run ON usage_events(run_id);
     "#,
     ),
+    (
+        // A task is the identity a run's cost is attributed to (SPEC's
+        // task spine): stable across a contract revision or a re-run, so
+        // cost sums per task rather than per run. Every existing run
+        // predates the spine, so each root run's tree is backfilled one
+        // `task-legacy-<root run id>` task, `origin = 'backfilled'`,
+        // propagated to every descendant by a recursive walk of
+        // `parent_run` — the same tree `run_cost` already walks.
+        "v4",
+        r#"
+    CREATE TABLE tasks (
+        task_id TEXT PRIMARY KEY,
+        repo_key TEXT NOT NULL,
+        first_run TEXT NOT NULL,
+        origin TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    ALTER TABLE runs ADD COLUMN task_id TEXT;
+    CREATE INDEX idx_runs_task ON runs(task_id);
+    -- `repo_key` is a hash of the run's repository identity everywhere a
+    -- run writes one. A migration cannot compute it: the identity comes
+    -- from git, and a legacy row carries only the path the run was
+    -- launched in, which may have been a worktree that no longer exists.
+    -- So a backfilled task says so — `legacy:<path>` is unmistakably not
+    -- a key, and grouping by `repo_key` puts each legacy task in its own
+    -- bucket instead of silently merging it with a repository's real one.
+    INSERT INTO tasks (task_id, repo_key, first_run, origin, created_at)
+        SELECT 'task-legacy-' || id, 'legacy:' || repo_path, id, 'backfilled', created_at
+          FROM runs WHERE parent_run IS NULL;
+    WITH RECURSIVE tree(id, root) AS (
+        SELECT id, id FROM runs WHERE parent_run IS NULL
+        UNION ALL
+        SELECT runs.id, tree.root FROM runs JOIN tree ON runs.parent_run = tree.id
+    )
+    UPDATE runs SET task_id = 'task-legacy-' || (SELECT root FROM tree WHERE tree.id = runs.id)
+     WHERE id IN (SELECT id FROM tree);
+    "#,
+    ),
 ];
 
 pub struct Ledger {
@@ -540,6 +627,14 @@ const PROJECTED_STATUS: &str = "COALESCE(\
     (SELECT t.to_state FROM transitions t WHERE t.run_id = runs.id ORDER BY t.id DESC LIMIT 1), \
     runs.status) AS status";
 
+/// A work package run's place in its parent's tree: the run it belongs
+/// under and the package it is. Grouped so `insert_child_run` carries one
+/// argument for both instead of two more positional ones.
+pub struct ChildOf<'a> {
+    pub parent_run: &'a RunId,
+    pub package_id: &'a PackageId,
+}
+
 impl Ledger {
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with_clock(path, Box::new(SystemClock))
@@ -600,49 +695,92 @@ impl Ledger {
         applied_count(&self.conn)
     }
 
+    /// Record a task's row, if none exists yet, and the run row that
+    /// belongs to it — one transaction (P1): a run whose task row lost a
+    /// race would have its cost silently excluded from every
+    /// `task_cost` sum. `INSERT OR IGNORE` because a task outlives one
+    /// run: the same task dispatched again, or revised, derives the same
+    /// [`TaskId`] and reuses the row its first run created.
     pub fn insert_run(
         &self,
         id: &RunId,
         repo_path: &str,
         root_session: Option<&str>,
+        task: &TaskId,
+        repo_key: &str,
     ) -> Result<()> {
         let now = self.now();
-        self.conn.execute(
-            "INSERT INTO runs (id, repo_path, status, root_session, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-            params![
-                id.as_str(),
-                repo_path,
-                State::Prepared.as_str(),
-                root_session,
-                now
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// A work package's run: its own lifecycle, attributed to the root.
-    pub fn insert_child_run(
-        &self,
-        id: &RunId,
-        repo_path: &str,
-        root_session: Option<&str>,
-        parent_run: &RunId,
-        package_id: &PackageId,
-    ) -> Result<()> {
-        let now = self.now();
-        self.conn.execute(
-            "INSERT INTO runs (id, repo_path, status, root_session, created_at, updated_at,
-                               parent_run, package_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)",
+        let tx = self.write_tx()?;
+        Self::ensure_task(&tx, task, repo_key, id, &now)?;
+        tx.execute(
+            "INSERT INTO runs (id, repo_path, status, root_session, created_at, updated_at, task_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
             params![
                 id.as_str(),
                 repo_path,
                 State::Prepared.as_str(),
                 root_session,
                 now,
-                parent_run.as_str(),
-                package_id.as_str()
+                task.as_str()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A work package's run: its own lifecycle, attributed to the root —
+    /// and to the root's task, inherited by the caller (SPEC's task
+    /// spine: a package run is not a task of its own).
+    pub fn insert_child_run(
+        &self,
+        id: &RunId,
+        repo_path: &str,
+        root_session: Option<&str>,
+        child: ChildOf<'_>,
+        task: &TaskId,
+        repo_key: &str,
+    ) -> Result<()> {
+        let now = self.now();
+        let tx = self.write_tx()?;
+        Self::ensure_task(&tx, task, repo_key, id, &now)?;
+        tx.execute(
+            "INSERT INTO runs (id, repo_path, status, root_session, created_at, updated_at,
+                               parent_run, package_id, task_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8)",
+            params![
+                id.as_str(),
+                repo_path,
+                State::Prepared.as_str(),
+                root_session,
+                now,
+                child.parent_run.as_str(),
+                child.package_id.as_str(),
+                task.as_str()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The tasks-row half of `insert_run`/`insert_child_run`: a no-op
+    /// when the task already has a row (its first run created it), an
+    /// insert with `origin = created` and `first_run = id` otherwise.
+    fn ensure_task(
+        tx: &Transaction<'_>,
+        task: &TaskId,
+        repo_key: &str,
+        first_run: &RunId,
+        now: &str,
+    ) -> Result<()> {
+        tx.execute(
+            "INSERT OR IGNORE INTO tasks (task_id, repo_key, first_run, origin, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                task.as_str(),
+                repo_key,
+                first_run.as_str(),
+                TaskOrigin::Created.as_str(),
+                now
             ],
         )?;
         Ok(())
@@ -1195,6 +1333,9 @@ impl Ledger {
             );
         }
         Ok(CostCompleteness::worst(values.iter().map(|value| {
+            // A completeness this binary cannot read IS unknown: the fold
+            // is the value's own meaning, not a swallowed error, and it
+            // can only widen the answer (`Unknown` is the worst case).
             serde_json::from_str(value).unwrap_or(CostCompleteness::Unknown)
         })))
     }
@@ -1376,6 +1517,104 @@ impl Ledger {
         )?;
         Ok(MicroUsd::from_micros(micros))
     }
+
+    /// The task a run belongs to, when one is on record. `None` only for
+    /// a row written by a binary older than schema v4 that has not yet
+    /// been migrated into this ledger — every run the migration or
+    /// `insert_run`/`insert_child_run` touched has one.
+    pub fn task_of_run(&self, run_id: &RunId) -> Result<Option<TaskId>> {
+        let task: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT task_id FROM runs WHERE id = ?1",
+                [run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(task.flatten().map(TaskId::from_stored))
+    }
+
+    /// Every run recorded under a task, in creation order — the root and
+    /// every package inherited from it, each counted once.
+    pub fn runs_of_task(&self, task_id: &TaskId) -> Result<Vec<RunId>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM runs WHERE task_id = ?1 ORDER BY created_at, id")?;
+        let rows = stmt.query_map([task_id.as_str()], |row| row.get::<_, String>(0))?;
+        Ok(rows
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(RunId::from_stored)
+            .collect())
+    }
+
+    /// A task's total cost: each of its runs' OWN usage, summed once.
+    /// Unlike [`Ledger::run_cost`] this does not also walk `child_runs` —
+    /// a decomposed run's packages already carry the same `task_id` as
+    /// their root (inherited at `insert_child_run`), so a run-by-run own
+    /// cost over every run of the task already counts the whole tree
+    /// exactly once; recursing as `run_cost` does would double it.
+    pub fn task_cost(&self, task_id: &TaskId) -> Result<MicroUsd> {
+        let mut total = MicroUsd::ZERO;
+        for run in self.runs_of_task(task_id)? {
+            total = total.saturating_add(self.run_own_cost(&run)?);
+        }
+        Ok(total)
+    }
+
+    /// Worst-case completeness across a task's runs, the same rule
+    /// [`Ledger::run_cost_completeness`] applies to one run's tree.
+    pub fn task_cost_completeness(&self, task_id: &TaskId) -> Result<CostCompleteness> {
+        let mut values = Vec::new();
+        for run in self.runs_of_task(task_id)? {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT DISTINCT completeness FROM usage_events WHERE run_id = ?1")?;
+            let rows = stmt.query_map([run.as_str()], |row| row.get::<_, String>(0))?;
+            for value in rows {
+                values.push(value?);
+            }
+        }
+        Ok(CostCompleteness::worst(values.iter().map(|value| {
+            // A completeness this binary cannot read IS unknown: the fold
+            // is the value's own meaning, not a swallowed error, and it
+            // can only widen the answer (`Unknown` is the worst case).
+            serde_json::from_str(value).unwrap_or(CostCompleteness::Unknown)
+        })))
+    }
+
+    /// Every task created at or after `since` (RFC3339), newest first —
+    /// the read side of the tasks table, typed (P6/P8): a row whose
+    /// `origin` no version of this binary wrote is a `Corrupt` result,
+    /// never a silently accepted string.
+    pub fn tasks_since(&self, since: &str) -> Result<Vec<TaskRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id, repo_key, first_run, origin, created_at FROM tasks
+             WHERE created_at >= ?1 ORDER BY created_at DESC",
+        )?;
+        type Row = (String, String, String, String, String);
+        let rows = stmt.query_map([since], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?;
+        let rows: Vec<Row> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(task_id, repo_key, first_run, origin, created_at)| {
+                Ok(TaskRow {
+                    task_id: TaskId::from_stored(task_id),
+                    repo_key,
+                    first_run: RunId::from_stored(first_run),
+                    origin: parse_task_origin(&origin)?,
+                    created_at,
+                })
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -1392,6 +1631,10 @@ mod tests {
 
     fn package(id: &str) -> PackageId {
         PackageId::from_stored(id)
+    }
+
+    fn task(id: &str) -> TaskId {
+        TaskId::from_stored(format!("task-{id}"))
     }
 
     /// Pid AND an in-process counter, pre-cleaned: the test binary runs
@@ -1430,7 +1673,9 @@ mod tests {
     #[test]
     fn unknown_usage_is_null_left_out_of_the_sum_and_poisons_completeness() {
         let (ledger, dir) = temp_ledger();
-        ledger.insert_run(&run("run-u"), "/r", None).expect("run");
+        ledger
+            .insert_run(&run("run-u"), "/r", None, &task("run-u"), "rk")
+            .expect("run");
         ledger
             .record_usage(&event("known", "run-u", 700))
             .expect("known");
@@ -1490,7 +1735,10 @@ mod tests {
             .expect("old rows");
         }
         let ledger = Ledger::open(&path).expect("migrates");
-        assert_eq!(ledger.schema_version().expect("version"), 3);
+        assert_eq!(
+            ledger.schema_version().expect("version"),
+            LEDGER_SCHEMA_VERSION
+        );
         let unknown: Option<i64> = ledger
             .conn
             .query_row(
@@ -1631,7 +1879,7 @@ mod tests {
     fn an_unknown_stored_state_is_an_error_not_a_panic() {
         let (ledger, dir) = temp_ledger();
         ledger
-            .insert_run(&run("run-future"), "/repo", None)
+            .insert_run(&run("run-future"), "/repo", None, &task("run-future"), "rk")
             .expect("run");
         ledger
             .record_transition(&Transition {
@@ -1674,7 +1922,7 @@ mod tests {
     fn an_unparseable_receipt_is_an_error_not_a_panic() {
         let (ledger, dir) = temp_ledger();
         ledger
-            .insert_run(&run("run-bad"), "/repo", None)
+            .insert_run(&run("run-bad"), "/repo", None, &task("run-bad"), "rk")
             .expect("run");
         ledger
             .conn
@@ -1760,6 +2008,180 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A v3 ledger — the shape every relais installed before the task
+    /// spine wrote — upgrades to v4 keeping every row, every run's cost,
+    /// AND gets a `task-legacy-<root run id>` task backfilled onto its
+    /// whole tree: the root and the package it decomposed into.
+    #[test]
+    fn a_v3_ledger_upgrades_to_v4_keeping_every_row_and_cost() {
+        let dir = temp_dir("v3-to-v4");
+        let path = dir.join("ledger.sqlite");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL);",
+            )
+            .expect("migrations table");
+            for (version, sql) in &MIGRATIONS[..3] {
+                conn.execute_batch(sql).expect("v1/v2/v3");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, 'then')",
+                    [version],
+                )
+                .expect("mark");
+            }
+            conn.execute_batch(
+                r#"INSERT INTO runs (id, repo_path, status, created_at, updated_at, parent_run, package_id)
+                   VALUES ('root-old', '/r', 'accepted', 't1', 't1', NULL, NULL),
+                          ('pkg-old', '/r', 'accepted', 't2', 't2', 'root-old', 'a');
+                   INSERT INTO usage_events (event_id, run_id, cost_micros, cost_kind, completeness, at)
+                   VALUES ('e-root', 'root-old', 300, '"api_spend"', '"actual"', 't1'),
+                          ('e-pkg', 'pkg-old', 700, '"api_spend"', '"actual"', 't2');"#,
+            )
+            .expect("v3 rows");
+        }
+        let root_cost_before = MicroUsd::from_micros(1000);
+        let ledger = Ledger::open(&path).expect("upgrades to v4");
+        assert_eq!(
+            ledger.schema_version().expect("version"),
+            LEDGER_SCHEMA_VERSION
+        );
+        assert_eq!(
+            ledger.run_status(&run("root-old")).expect("status"),
+            Some(State::Accepted)
+        );
+        assert_eq!(
+            ledger.run_cost(&run("root-old")).expect("cost"),
+            root_cost_before,
+            "every run's cost survives the upgrade"
+        );
+        let root_task = ledger
+            .task_of_run(&run("root-old"))
+            .expect("task")
+            .expect("backfilled");
+        assert_eq!(root_task.as_str(), "task-legacy-root-old");
+        assert_eq!(
+            ledger.task_of_run(&run("pkg-old")).expect("task"),
+            Some(root_task.clone()),
+            "the package inherits its root's backfilled task"
+        );
+        let mut runs = ledger.runs_of_task(&root_task).expect("runs of task");
+        runs.sort();
+        assert_eq!(runs, vec![run("pkg-old"), run("root-old")]);
+        let tasks = ledger
+            .tasks_since("2000-01-01T00:00:00+00:00")
+            .expect("tasks");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].task_id, root_task);
+        assert_eq!(tasks[0].origin, TaskOrigin::Backfilled);
+        assert_eq!(tasks[0].first_run, run("root-old"));
+        // A migration cannot compute a repository key, so a backfilled
+        // task says what it actually has. `legacy:` is unmistakably not
+        // a key, so grouping by `repo_key` never merges a legacy task
+        // into a repository's real bucket on the strength of a path.
+        assert!(
+            tasks[0].repo_key.starts_with("legacy:"),
+            "a backfilled task names what it has: {}",
+            tasks[0].repo_key
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// SPEC's task spine: a package run is not a task of its own, it
+    /// inherits its root's — exercised through the public `insert_run`/
+    /// `insert_child_run` API rather than a raw migration this time.
+    #[test]
+    fn a_package_run_inherits_its_roots_task() {
+        let (ledger, dir) = temp_ledger();
+        let root_task = task("shared");
+        ledger
+            .insert_run(&run("root-2"), "/r", None, &root_task, "rk")
+            .expect("root");
+        ledger
+            .insert_child_run(
+                &run("pkg-2"),
+                "/r",
+                None,
+                ChildOf {
+                    parent_run: &run("root-2"),
+                    package_id: &package("a"),
+                },
+                &root_task,
+                "rk",
+            )
+            .expect("child");
+        assert_eq!(
+            ledger.task_of_run(&run("pkg-2")).expect("task"),
+            Some(root_task.clone())
+        );
+        assert_eq!(
+            ledger.task_of_run(&run("root-2")).expect("task"),
+            Some(root_task)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `task_cost` sums a decomposed run's tree exactly once: it must
+    /// not double what `run_cost`'s own recursive walk already counts,
+    /// because every run in the tree shares the same task.
+    #[test]
+    fn task_cost_counts_a_decomposed_runs_tree_exactly_once() {
+        let (ledger, dir) = temp_ledger();
+        let the_task = task("dedup");
+        ledger
+            .insert_run(&run("root-3"), "/r", None, &the_task, "rk")
+            .expect("root");
+        ledger
+            .insert_child_run(
+                &run("pkg-3a"),
+                "/r",
+                None,
+                ChildOf {
+                    parent_run: &run("root-3"),
+                    package_id: &package("a"),
+                },
+                &the_task,
+                "rk",
+            )
+            .expect("child a");
+        ledger
+            .insert_child_run(
+                &run("pkg-3b"),
+                "/r",
+                None,
+                ChildOf {
+                    parent_run: &run("root-3"),
+                    package_id: &package("b"),
+                },
+                &the_task,
+                "rk",
+            )
+            .expect("child b");
+        ledger
+            .record_usage(&event("e-root3", "root-3", 10))
+            .expect("usage");
+        ledger
+            .record_usage(&event("e-pkg3a", "pkg-3a", 100))
+            .expect("usage");
+        ledger
+            .record_usage(&event("e-pkg3b", "pkg-3b", 1000))
+            .expect("usage");
+        assert_eq!(
+            ledger.task_cost(&the_task).expect("task cost").to_micros(),
+            1110,
+            "once per run, not once per (run_cost's own tree walk) x (task's runs)"
+        );
+        assert_eq!(
+            ledger
+                .run_cost(&run("root-3"))
+                .expect("run cost")
+                .to_micros(),
+            1110,
+            "run_cost's own tree walk agrees"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn an_injected_clock_stamps_every_record() {
         let dir = temp_dir("clock");
@@ -1773,7 +2195,9 @@ mod tests {
         .expect("ledger");
         // Migrations already consumed the first tick or two; the
         // sequence then repeats its last value.
-        ledger.insert_run(&run("run-1"), "/r", None).expect("run");
+        ledger
+            .insert_run(&run("run-1"), "/r", None, &task("run-1"), "rk")
+            .expect("run");
         ledger
             .record_transition(&Transition {
                 run_id: run("run-1"),
@@ -1800,12 +2224,34 @@ mod tests {
     #[test]
     fn a_root_run_costs_its_whole_tree_once() {
         let (ledger, dir) = temp_ledger();
-        ledger.insert_run(&run("root"), "/r", None).expect("root");
         ledger
-            .insert_child_run(&run("pkg-a"), "/r", None, &run("root"), &package("a"))
+            .insert_run(&run("root"), "/r", None, &task("root"), "rk")
+            .expect("root");
+        ledger
+            .insert_child_run(
+                &run("pkg-a"),
+                "/r",
+                None,
+                ChildOf {
+                    parent_run: &run("root"),
+                    package_id: &package("a"),
+                },
+                &task("root"),
+                "rk",
+            )
             .expect("child");
         ledger
-            .insert_child_run(&run("pkg-b"), "/r", None, &run("root"), &package("b"))
+            .insert_child_run(
+                &run("pkg-b"),
+                "/r",
+                None,
+                ChildOf {
+                    parent_run: &run("root"),
+                    package_id: &package("b"),
+                },
+                &task("root"),
+                "rk",
+            )
             .expect("child");
         ledger
             .record_usage(&event("e-root", "root", 10))
@@ -1844,7 +2290,7 @@ mod tests {
     fn duplicate_usage_events_are_deduped_not_duplicated() {
         let (ledger, dir) = temp_ledger();
         ledger
-            .insert_run(&run("run-x"), "/repo", None)
+            .insert_run(&run("run-x"), "/repo", None, &task("run-x"), "rk")
             .expect("run");
         let e = event("req-1", "run-x", 500);
         assert!(ledger.record_usage(&e).expect("first"), "first insert wins");
@@ -1863,7 +2309,7 @@ mod tests {
     fn inclusive_parent_never_double_counts_children() {
         let (ledger, dir) = temp_ledger();
         ledger
-            .insert_run(&run("run-y"), "/repo", None)
+            .insert_run(&run("run-y"), "/repo", None, &task("run-y"), "rk")
             .expect("run");
         let mut parent = event("parent", "run-y", 900);
         parent.inclusive = true;
@@ -1893,7 +2339,7 @@ mod tests {
     fn an_inclusive_ancestor_covers_its_whole_subtree() {
         let (ledger, dir) = temp_ledger();
         ledger
-            .insert_run(&run("run-deep"), "/repo", None)
+            .insert_run(&run("run-deep"), "/repo", None, &task("run-deep"), "rk")
             .expect("run");
         let mut root = event("top", "run-deep", 900);
         root.inclusive = true;
@@ -1926,7 +2372,7 @@ mod tests {
     fn a_new_contract_revision_supersedes_the_ones_before_it() {
         let (ledger, dir) = temp_ledger();
         ledger
-            .insert_run(&run("run-rev"), "/repo", None)
+            .insert_run(&run("run-rev"), "/repo", None, &task("run-rev"), "rk")
             .expect("run");
         let first = ledger
             .insert_contract_revision(&run("run-rev"), "h1", "{}", "HEAD", None)
@@ -1939,7 +2385,7 @@ mod tests {
         assert_eq!(ledger.superseded_by(second).expect("read"), None);
         // Another run's revisions are not touched.
         ledger
-            .insert_run(&run("run-other"), "/repo", None)
+            .insert_run(&run("run-other"), "/repo", None, &task("run-other"), "rk")
             .expect("run");
         let other = ledger
             .insert_contract_revision(&run("run-other"), "h3", "{}", "HEAD", None)
@@ -1959,7 +2405,7 @@ mod tests {
     fn a_run_contract_comes_back_typed_or_corrupt() {
         let (ledger, dir) = temp_ledger();
         ledger
-            .insert_run(&run("run-c1"), "/repo", None)
+            .insert_run(&run("run-c1"), "/repo", None, &task("run-c1"), "rk")
             .expect("run");
         assert_eq!(
             ledger.run_contract_and_tier(&run("run-c1")).expect("read"),
@@ -1998,7 +2444,7 @@ mod tests {
     fn completeness_degrades_to_the_worst_observed() {
         let (ledger, dir) = temp_ledger();
         ledger
-            .insert_run(&run("run-c"), "/repo", None)
+            .insert_run(&run("run-c"), "/repo", None, &task("run-c"), "rk")
             .expect("run");
         assert!(ledger.record_usage(&event("a", "run-c", 10)).expect("a"));
         assert_eq!(
@@ -2024,7 +2470,7 @@ mod tests {
     fn dispatch_intent_persists_before_the_process_exists() {
         let (ledger, dir) = temp_ledger();
         ledger
-            .insert_run(&run("run-d"), "/repo", None)
+            .insert_run(&run("run-d"), "/repo", None, &task("run-d"), "rk")
             .expect("run");
         let intent = serde_json::json!({"model": "sonnet", "effort": "medium"});
         assert!(ledger
@@ -2059,7 +2505,7 @@ mod tests {
     fn transitions_set_terminal_run_status() {
         let (ledger, dir) = temp_ledger();
         ledger
-            .insert_run(&run("run-t"), "/repo", None)
+            .insert_run(&run("run-t"), "/repo", None, &task("run-t"), "rk")
             .expect("run");
         assert_eq!(
             ledger.run_status(&run("run-t")).expect("status"),
@@ -2096,7 +2542,7 @@ mod tests {
     fn run_status_can_never_disagree_with_the_transition_chain() {
         let (ledger, dir) = temp_ledger();
         ledger
-            .insert_run(&run("run-p"), "/repo", None)
+            .insert_run(&run("run-p"), "/repo", None, &task("run-p"), "rk")
             .expect("run");
         ledger
             .record_transition(&Transition {
@@ -2151,7 +2597,7 @@ mod tests {
     fn receipts_are_stored_by_the_runner_only() {
         let (ledger, dir) = temp_ledger();
         ledger
-            .insert_run(&run("run-r"), "/repo", None)
+            .insert_run(&run("run-r"), "/repo", None, &task("run-r"), "rk")
             .expect("run");
         assert!(ledger.receipt(&run("run-r")).expect("receipt").is_none());
         let receipt = serde_json::json!({"run_id": "run-r", "outcome": "accepted"});
@@ -2172,7 +2618,13 @@ mod tests {
         let (ledger, dir) = temp_ledger();
         for run in ["run-a", "run-b"] {
             ledger
-                .insert_run(&super::RunId::from_stored(run), "/r", None)
+                .insert_run(
+                    &super::RunId::from_stored(run),
+                    "/r",
+                    None,
+                    &task(run),
+                    "rk",
+                )
                 .expect("run");
         }
         let mut yesterday = event("old", "run-a", 5_000);

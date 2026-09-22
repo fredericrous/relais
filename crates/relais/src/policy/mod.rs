@@ -448,6 +448,15 @@ pub fn grant_key(authority_hash: &str, repo: &RepoIdentity) -> String {
     }))
 }
 
+/// The repository half of a task's identity, hashed the way [`grant_key`]
+/// hashes it: the identity alone, so two repositories with the same
+/// `origin` (or the same common directory) key their tasks alike and a
+/// renamed `RepoIdentity` variant re-keys them the same way it re-keys a
+/// trust grant.
+pub fn repo_key(repo: &RepoIdentity) -> String {
+    canonical_json_hash(&serde_json::json!({ "repo": repo }))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyError {
     UnsupportedSchemaVersion(u64),
@@ -1511,6 +1520,21 @@ keys = ["output.contract"]
         assert_eq!(
             grant_key("authority", &identity()),
             "ff25e7845522d451e49c35865572e3a48a295dcf806caecde55b3afa345dcaa5"
+        );
+    }
+
+    /// `repo_key` hashes only the identity — no authority hash — so a
+    /// task stays keyed to the same repository across a policy edit that
+    /// would re-key a trust grant. It still moves when the identity's
+    /// wire shape does, for the same reason `grant_key`'s does.
+    #[test]
+    fn repo_key_is_bound_to_the_identity_alone() {
+        let elsewhere = RepoIdentity::origin("git@example.invalid:someone/else.git");
+        assert_ne!(repo_key(&identity()), repo_key(&elsewhere));
+        assert_eq!(
+            repo_key(&identity()),
+            repo_key(&identity()),
+            "pure: the same identity always hashes the same"
         );
     }
 

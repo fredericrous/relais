@@ -329,7 +329,10 @@ mod tests {
             ("run-b", State::Failed, 50),
         ] {
             let run = crate::ids::RunId::from_stored(run_id);
-            ledger.insert_run(&run, "/repo", None).expect("run");
+            let task = crate::ids::TaskId::from_stored(format!("task-{run_id}"));
+            ledger
+                .insert_run(&run, "/repo", None, &task, "rk")
+                .expect("run");
             ledger
                 .record_usage(&crate::ledger::UsageEvent {
                     event_id: format!("e-{run_id}"),
@@ -376,7 +379,15 @@ mod tests {
         let dir = temp_dir("pending");
         let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
         let run = crate::ids::RunId::from_stored("run-1");
-        ledger.insert_run(&run, "/repo", None).expect("run");
+        ledger
+            .insert_run(
+                &run,
+                "/repo",
+                None,
+                &crate::ids::TaskId::from_stored("task-run-1"),
+                "rk",
+            )
+            .expect("run");
         ledger
             .record_transition(&Transition {
                 run_id: run.clone(),

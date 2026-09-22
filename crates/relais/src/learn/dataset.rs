@@ -414,6 +414,10 @@ mod tests {
         crate::ids::RunId::from_stored(id)
     }
 
+    fn task_id(id: &str) -> crate::ids::TaskId {
+        crate::ids::TaskId::from_stored(format!("task-{id}"))
+    }
+
     /// A test directory nobody else can collide with, pre-cleaned so a
     /// crashed earlier run cannot make this one pass or fail: the process
     /// owns the pid, and the counter orders the directories within it.
@@ -568,7 +572,7 @@ argv = ["true"]
 
         fn dispatched(&self, run: &str, tier: &str, phase: &str) -> i64 {
             self.ledger
-                .insert_run(&run_id(run), "/r", None)
+                .insert_run(&run_id(run), "/r", None, &task_id(run), "rk")
                 .expect("run");
             let revision = self
                 .ledger
@@ -768,7 +772,7 @@ argv = ["true"]
         let fixture = LedgerFixture::open("dataset-nointent");
         fixture
             .ledger
-            .insert_run(&run_id("run-a"), "/r", None)
+            .insert_run(&run_id("run-a"), "/r", None, &task_id("run-a"), "rk")
             .expect("run");
         let revision = fixture
             .ledger
