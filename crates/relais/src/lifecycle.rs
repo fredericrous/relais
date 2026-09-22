@@ -103,6 +103,11 @@ pub enum Reason {
     /// ledger or filesystem failure — not because of anything a worker
     /// did (SPEC §12: uncertain state is interrupted, never retried).
     RunnerFailure,
+    /// A worker was launched: the run entered `running` because a
+    /// dispatch — initial, repair, escalation or a decomposed package's
+    /// own attempt — is about to execute, not because something else
+    /// happened to it (SPEC §9).
+    WorkerDispatched,
 }
 
 impl Reason {
@@ -111,7 +116,7 @@ impl Reason {
     ///
     /// The length is fixed, so a variant added to the enum without being
     /// added here does not compile the `match` that walks it.
-    pub const ALL: [Self; 41] = [
+    pub const ALL: [Self; 42] = [
         Self::ChecksAndReviewPassed,
         Self::BehavioralFailure,
         Self::RepairExhausted,
@@ -153,6 +158,7 @@ impl Reason {
         Self::CoordinatorUnreachable,
         Self::WriteLeaseHeld,
         Self::RunnerFailure,
+        Self::WorkerDispatched,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -198,6 +204,7 @@ impl Reason {
             Self::CoordinatorUnreachable => "coordinator_unreachable",
             Self::WriteLeaseHeld => "write_lease_held",
             Self::RunnerFailure => "runner_failure",
+            Self::WorkerDispatched => "worker_dispatched",
         }
     }
 

@@ -1694,6 +1694,24 @@ impl<'a> RunEngine<'a> {
             }),
         )?;
 
+        // Every worker dispatch is a transition into `running`, whatever
+        // kind of attempt it is (SPEC §9): the chain used to skip
+        // straight from `prepared` to `verifying`, so a run ten minutes
+        // into its first attempt still read as not yet started.
+        self.transition(
+            State::Running,
+            Reason::WorkerDispatched,
+            serde_json::json!({
+                "dispatch_id": dispatch_id.as_str(),
+                "attempt_index": index,
+                "tier": tier.as_str(),
+                "kind": kind.as_str(),
+            }),
+        )?;
+        // Re-taken after `transition(&mut self)`: the shared reference the
+        // function opened with cannot outlive that mutable call.
+        let ledger = self.config.ledger;
+
         let remaining_wall = ctx
             .deadline
             .saturating_duration_since(Instant::now())
@@ -4114,10 +4132,11 @@ mod tests {
             .expect("history");
         assert_eq!(
             transitions.len(),
-            1,
-            "no escalation is bought for the environment"
+            2,
+            "no escalation is bought for the environment: only the dispatch and the block"
         );
-        assert_eq!(transitions[0].to_state, State::Blocked);
+        assert_eq!(transitions[0].to_state, State::Running);
+        assert_eq!(transitions[1].to_state, State::Blocked);
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
@@ -7204,6 +7223,43 @@ mod tests {
             .find(|t| t.to_state == State::Accepted)
             .expect("an accepted row");
         assert_eq!(accepted.from_state, Some(State::Verifying));
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// SPEC §9: a single-worker run's chain is `prepared -> running ->
+    /// verifying -> accepted` — the worker dispatch is on the record,
+    /// not a state jump the ledger never showed (P3).
+    #[test]
+    fn an_accepted_single_worker_runs_chain_is_prepared_running_verifying_accepted() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let backend = conditional_worker("relais task");
+        let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Accepted(_),
+        } = outcome
+        else {
+            panic!("expected acceptance, got {outcome:?}");
+        };
+        let transitions = fixture.ledger.transitions(&run_id).expect("transitions");
+        assert_eq!(
+            transitions.first().map(|t| t.from_state),
+            Some(Some(State::Prepared)),
+            "the chain starts from the run's initial state, `prepared`"
+        );
+        let chain: Vec<State> = transitions.iter().map(|t| t.to_state).collect();
+        assert_eq!(
+            chain,
+            vec![State::Running, State::Verifying, State::Accepted],
+            "prepared is the run's initial state, never a row of its own; the recorded \
+             chain from it is running -> verifying -> accepted"
+        );
+        assert_eq!(
+            transitions[0].reason,
+            Reason::WorkerDispatched.as_str(),
+            "the run enters `running` because a worker was dispatched"
+        );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
