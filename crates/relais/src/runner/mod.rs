@@ -2332,12 +2332,7 @@ impl<'a> RunEngine<'a> {
             WorktreeEnd::Keep => return Ok(()),
             WorktreeEnd::Retire => {}
         }
-        match workspace::retire(
-            self.config.repo_dir,
-            worktree,
-            self.run_id.as_str(),
-            &self.artifacts,
-        ) {
+        match workspace::retire(worktree, self.run_id.as_str(), &self.artifacts) {
             Ok(retirement) => self.transition(
                 self.state,
                 Reason::WorktreeRetired,
