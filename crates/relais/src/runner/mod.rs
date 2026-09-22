@@ -4084,7 +4084,15 @@ mod tests {
         };
         assert!(
             fixture.worktree(&run_id).is_dir(),
-            "a run that did not accept keeps SPEC §8's retained worktree"
+            "an interrupted run keeps its worktree: its tree may still be being written, and \
+             `resume --retire` retires it once the dispatch is provably dead (SPEC §8, §12)"
+        );
+        let transitions = fixture.ledger.transitions(&run_id).expect("history");
+        assert!(
+            !transitions
+                .iter()
+                .any(|t| t.reason == Reason::WorktreeRetired.as_str()),
+            "nothing was retired: {transitions:?}"
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }

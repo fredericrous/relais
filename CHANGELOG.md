@@ -6,6 +6,70 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## v0.2.1
+
+The first days of running 0.2.0 from git worktrees, on a laptop, through
+the reviewer. One change to how a grant is keyed: a trust grant is now
+bound to the REPOSITORY — its `origin` URL, or its git common directory
+— rather than to one checkout's path, so every `[trust."…"]` block
+0.2.0 wrote changes key and must be re-issued from `relais plan` (0.2.0
+hashed the checkout path into every grant, the origin-bound ones too).
+`relais plan` prints the block, and prints which identity it is keyed on.
+
+### Fixed
+
+- **A run's status is a projection of its history.** `runs.status` was
+  a column every writer had to remember to set, and one that drifted
+  from the transition chain; it is now the `to_state` of the run's last
+  transition, selected by one SQL expression every reader shares, with
+  the column kept only as the fallback for a run that predates the
+  chain. Every worker dispatch — initial, repair, escalation, a
+  decomposed package's own — records a `running` transition
+  (`worker_dispatched`), so a run reads `prepared -> running ->
+  verifying -> accepted` instead of skipping the state it spends most
+  of its life in.
+- **A trust grant is bound to the repository, not the checkout.** The
+  grant key hashed the canonical path of the directory `relais.toml`
+  was found in, so a run started from a git worktree blocked on a grant
+  the user had already issued from the live checkout, and each worktree
+  asked for its own. The identity is now the `origin` remote URL when
+  git reports one, else the canonical git common directory every
+  worktree shares. `relais plan` prints `repository: <url>` or
+  `repository: <common-dir> (no origin)` and `relais doctor`'s `trust`
+  line names it the same way. Every grant 0.2.0 issued must be
+  re-issued from `relais plan`; the serialized shape is pinned by a
+  test so the next such change is a release note and not a surprise.
+- **A run retains a named candidate, not a directory.** SPEC §8 listed
+  a "retained worktree" among what a run delivers, and the runner kept
+  the worktree of every run that did not accept: twelve runs left
+  4.5 GB of `target/` and `node_modules/` under the state directory and
+  a permanent `git worktree list` entry each. Every terminal state but
+  `interrupted` now retires the worktree — the task one and a
+  decomposed run's integration one alike: whatever the tree holds that
+  no candidate of the run has named is snapshotted as
+  `refs/relais/candidates/<run>/final` and exported to
+  `candidate-final.patch` first, and only then is the directory removed,
+  ignored build output included. The `worktree_retired` transition
+  records the ref, the patch and the bytes reclaimed; a retirement that
+  fails is `worktree_not_released` and never changes the run's outcome.
+  An interrupted run keeps its worktree, because its tree may still be
+  being written. `relais resume --retire` (or `--all --retire`) retires
+  the worktrees older releases left behind, in both the
+  `worktrees/<run>/…` and the legacy `runs/<run>/worktree` layout, once
+  a run's dispatches are provably dead, and `relais resume <run>
+  --retire` does so for one run, including one it has just reconciled.
+  `relais doctor` counts what is still retained, with its size, and
+  names the sweep.
+- **A reviewer's findings under a Markdown heading are findings.** A
+  review that listed three findings under `**Findings**` and closed with
+  a "verified" section was read as having no verdict, and the run parked
+  in `needs_review` with its findings unread. A findings block in any
+  markup and any case is findings; `FINDINGS: none` on the last line is
+  the one clean verdict; only an answer that declares nothing is
+  unavailable. The reviewer is now told to end with exactly one of the
+  two, and that it may only run read-only commands — the same run's
+  reviewer had reported a denied `make check` as a finding.
+
 ## v0.2.0
 
 A review of the whole crate against the fleet's decision records (2026-09-21)
