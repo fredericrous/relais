@@ -22,7 +22,7 @@ use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::outcome::{Outcome, OutcomeDetail, OutcomeKind};
 use crate::policy::Tier;
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 6;
+pub const LEDGER_SCHEMA_VERSION: u64 = 7;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -523,6 +523,47 @@ const MIGRATIONS: &[(&str, &str)] = &[
                (SELECT t.to_state FROM transitions t WHERE t.run_id = runs.id ORDER BY t.id DESC LIMIT 1),
                runs.status
            ) IN ('needs_review', 'needs_decision', 'interrupted');
+    "#,
+    ),
+    (
+        "v7",
+        r#"
+    -- v6 backfilled each open decision from the run's LAST transition.
+    -- For a run that started waiting and then had its worktree retired,
+    -- that is the retirement row: a same-state transition whose detail
+    -- carries a reference and a patch and no gaps. So the row pointed at
+    -- the wrong moment, and `decide --answer approve` — which reads the
+    -- transition `raised_at` names — would find no gaps on a run that
+    -- has them. The raising transition is the FIRST one landing on a
+    -- state that awaits a person, which for a backfilled row is the only
+    -- wait it has ever had.
+    --
+    -- Its own step, not a correction of v6: v6 is recorded on every
+    -- ledger opened since it merged, and `apply_step` skips a version
+    -- already applied.
+    UPDATE decisions
+       SET raised_at = COALESCE(
+               (SELECT t.at FROM transitions t
+                 WHERE t.run_id = decisions.run
+                   AND t.to_state IN ('needs_review', 'needs_decision', 'interrupted')
+                 ORDER BY t.id ASC LIMIT 1),
+               decisions.raised_at
+           ),
+           raised_state = COALESCE(
+               (SELECT t.to_state FROM transitions t
+                 WHERE t.run_id = decisions.run
+                   AND t.to_state IN ('needs_review', 'needs_decision', 'interrupted')
+                 ORDER BY t.id ASC LIMIT 1),
+               decisions.raised_state
+           ),
+           raised_reason = COALESCE(
+               (SELECT t.reason FROM transitions t
+                 WHERE t.run_id = decisions.run
+                   AND t.to_state IN ('needs_review', 'needs_decision', 'interrupted')
+                 ORDER BY t.id ASC LIMIT 1),
+               decisions.raised_reason
+           )
+     WHERE resolved_at IS NULL;
     "#,
     ),
 ];
@@ -2539,6 +2580,88 @@ mod tests {
     /// `apply_step` skips them, so they existed only in tests, which
     /// always start from nothing (found in review of
     /// run-65c1620e17aec-1000062a1).
+    /// A ledger already at v6 — every machine that ran `relais decide`
+    /// before this step — has its open decisions repointed at the
+    /// transition that RAISED them. v6 backfilled from the run's last
+    /// transition, which for a retired run is the `worktree_retired`
+    /// row: `approve` reads the transition `raised_at` names, so it
+    /// would have found no gaps on a run that has them.
+    #[test]
+    fn a_v6_backfilled_decision_is_repointed_at_its_raising_transition() {
+        let dir = crate::test_support::temp_dir("ledger-v6-to-v7");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("ledger.sqlite");
+        {
+            // v6 exactly as it shipped: every step but the last.
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );",
+            )
+            .expect("migrations table");
+            conn.execute_batch(
+                "INSERT INTO runs (id, repo_path, status, created_at, updated_at)
+                 VALUES ('run-w', '/repo', 'needs_decision', '2026-01-01T00:00:00+00:00',
+                         '2026-01-01T00:02:00+00:00');",
+            )
+            .ok();
+            for (version, sql) in MIGRATIONS.iter().take(MIGRATIONS.len() - 1) {
+                conn.execute_batch(sql).expect("step");
+                if version == &"v1" {
+                    // The run, then the wait, then the retirement that
+                    // follows every real wait.
+                    conn.execute_batch(
+                        "INSERT INTO runs (id, repo_path, status, created_at, updated_at)
+                         VALUES ('run-w', '/repo', 'needs_decision',
+                                 '2026-01-01T00:00:00+00:00', '2026-01-01T00:02:00+00:00');
+                         INSERT INTO transitions (run_id, from_state, to_state, reason, detail_json, at)
+                         VALUES ('run-w', 'verifying', 'needs_decision', 'verification_gap',
+                                 '{\"gaps\":[\"declared-check: status `inert`\"]}',
+                                 '2026-01-01T00:01:00+00:00');
+                         INSERT INTO transitions (run_id, from_state, to_state, reason, detail_json, at)
+                         VALUES ('run-w', 'needs_decision', 'needs_decision', 'worktree_retired',
+                                 '{\"reference\":\"refs/relais/candidates/run-w/final\"}',
+                                 '2026-01-01T00:02:00+00:00');",
+                    )
+                    .expect("fixture rows");
+                }
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, "2026-01-01T00:00:00+00:00"],
+                )
+                .expect("record");
+            }
+            let raised: String = conn
+                .query_row(
+                    "SELECT raised_reason FROM decisions WHERE run = 'run-w'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("v6 backfilled a row");
+            assert_eq!(
+                raised, "worktree_retired",
+                "v6 read the run's LAST transition — the defect this step corrects"
+            );
+        }
+
+        let ledger = Ledger::open(&path).expect("upgrade to v7");
+        assert_eq!(ledger.schema_version().expect("version"), 7);
+        let decision = ledger
+            .decision_of_run(&RunId::from_stored("run-w"))
+            .expect("query")
+            .expect("still open");
+        assert_eq!(
+            decision.raised_reason, "verification_gap",
+            "the row now names the transition that RAISED the wait"
+        );
+        assert_eq!(decision.raised_at, "2026-01-01T00:01:00+00:00");
+        // Best effort: the fixture is a temp dir; a leftover costs
+        // nothing but disk, and the next run pre-cleans it.
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_v4_ledger_gains_the_outcome_columns() {
         let dir = crate::test_support::temp_dir("ledger-v4-to-v5");
