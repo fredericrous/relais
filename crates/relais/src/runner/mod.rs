@@ -220,7 +220,7 @@ fn record_lost_seat(slot: &std::sync::Mutex<Option<String>>, detail: String) {
 /// too. Both roots stay under the state directory, so nothing escapes
 /// `RELAIS_STATE_DIR`.
 pub fn worktree_root(artifacts_dir: &Path) -> PathBuf {
-    state_sibling(artifacts_dir, "worktrees")
+    state_sibling(artifacts_dir, crate::paths::WORKTREES_DIR)
 }
 
 /// Where a run's throwaway verification worktrees live. Separate from

@@ -79,9 +79,15 @@ pub enum Reason {
     /// Policy configures no tier but the candidate's own, so the review
     /// was not an independent opinion (SPEC §10).
     ReviewerSameTier,
-    /// An accepted run's task worktree could not be released; its
-    /// content is in the patch and the candidate ref regardless.
+    /// A run's worktree could not be retired at its terminal state: the
+    /// directory stays, and whatever it holds that no patch has is in it.
     WorktreeNotReleased,
+    /// A run's worktree was retired at its terminal state (SPEC §8):
+    /// anything tracked that no named candidate held was named
+    /// `…/final` and exported, then the directory went, ignored build
+    /// output included. The detail carries the ref, the patch and the
+    /// bytes reclaimed.
+    WorktreeRetired,
     /// Verification had to wait for a worktree's writer to relinquish
     /// its lease before snapshotting (SPEC §23).
     WriteLeaseWait,
@@ -116,7 +122,7 @@ impl Reason {
     ///
     /// The length is fixed, so a variant added to the enum without being
     /// added here does not compile the `match` that walks it.
-    pub const ALL: [Self; 42] = [
+    pub const ALL: [Self; 43] = [
         Self::ChecksAndReviewPassed,
         Self::BehavioralFailure,
         Self::RepairExhausted,
@@ -152,6 +158,7 @@ impl Reason {
         Self::CandidateIdenticalToBase,
         Self::ReviewerSameTier,
         Self::WorktreeNotReleased,
+        Self::WorktreeRetired,
         Self::WriteLeaseWait,
         Self::WriteLeaseNotReleased,
         Self::VerificationStarted,
@@ -198,6 +205,7 @@ impl Reason {
             Self::CandidateIdenticalToBase => "candidate_identical_to_base",
             Self::ReviewerSameTier => "reviewer_same_tier",
             Self::WorktreeNotReleased => "worktree_not_released",
+            Self::WorktreeRetired => "worktree_retired",
             Self::WriteLeaseWait => "write_lease_wait",
             Self::WriteLeaseNotReleased => "write_lease_not_released",
             Self::VerificationStarted => "verification_started",
