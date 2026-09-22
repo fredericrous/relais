@@ -231,30 +231,12 @@ pub(crate) fn run_decomposed(
         models_used: Vec::new(),
     };
     let outcome = execute_waves(engine, root, &plan, &integration, &mut assembly)?;
-    // One exit for the integration worktree. An accepted run released
-    // it already, against the patch and the ref it just wrote; what is
-    // left here is a run that ended some other way, and the tree is
-    // released only while it still holds nothing but the base — after
-    // that, the assembled revision exists nowhere else and §8's "never
-    // force-cleans a worktree containing unexported changes" applies
-    // (R8).
-    if !matches!(outcome.terminal, Terminal::Accepted(_)) && assembly.head == root.base_sha {
-        if let Err(e) = workspace::release_worktree(
-            engine.config.repo_dir,
-            &integration_path,
-            workspace::Disposition::MustBeClean,
-        ) {
-            engine.transition(
-                engine.state,
-                Reason::WorktreeNotReleased,
-                serde_json::json!({
-                    "worktree": integration_path.to_string_lossy(),
-                    "error": e.to_string(),
-                    "detail": "nothing was integrated, but the tree could not be removed",
-                }),
-            )?;
-        }
-    }
+    // One exit for the integration worktree, the same as a task
+    // worktree's: whatever the assembled tree holds that no candidate of
+    // this run has named — packages fast-forwarded in before the run
+    // ended some other way are named under THEIR runs, not this one —
+    // goes under `…/final` before the directory does (SPEC §8, R8).
+    engine.retire_worktree(&integration, &outcome)?;
     Ok(Decomposed::Outcome(outcome))
 }
 
@@ -477,7 +459,6 @@ fn execute_waves(
             return accept_integrated(
                 engine,
                 root,
-                integration,
                 Assembled {
                     checks,
                     amont_bypasses,
@@ -863,7 +844,6 @@ struct Assembled {
 fn accept_integrated(
     engine: &mut RunEngine<'_>,
     root: &RootContext<'_>,
-    integration: &workspace::TaskWorktree,
     assembled: Assembled,
     assembly: &mut Assembly,
 ) -> Result<RunOutcome, RunError> {
@@ -980,25 +960,16 @@ fn accept_integrated(
         cost: spend.total,
     };
     engine.seal(&receipt, None, None, &head)?;
-    // The integration worktree goes the way an accepted single-worker
-    // run's does: the assembled revision is in the patch and under a
-    // ref, so the directory adds nothing (R8). A ref that could not be
-    // written keeps the worktree, because the commit would then have
-    // nothing else holding it.
-    let reference = workspace::name_candidate(
+    // The assembled revision is named under this run so the retirement
+    // that follows finds its tree already kept. Best effort: a ref that
+    // could not be written costs nothing, because the retirement then
+    // finds the tree unnamed and names it `…/final` itself.
+    let _ = workspace::name_candidate(
         engine.config.repo_dir,
         engine.run_id.as_str(),
         INTEGRATION_ATTEMPT,
         &head,
-    )
-    .ok();
-    engine.release_exported_worktree(
-        integration,
-        crate::runner::TreeIdentity::CheckedOut,
-        &head,
-        &assembled.patch_path,
-        reference.as_deref(),
-    )?;
+    );
     Ok(RunOutcome {
         run_id: engine.run_id.clone(),
         terminal: Terminal::Accepted(Box::new(receipt)),

@@ -64,6 +64,23 @@ impl Terminal {
         }
     }
 
+    /// What becomes of the run's worktree at this end (SPEC §8, §12).
+    pub fn worktree_end(&self) -> WorktreeEnd {
+        match self {
+            // Uncertain state: a writer may still be in the tree, and
+            // nothing was snapshotted. `relais resume --retire` retires
+            // it once the dispatches are provably dead.
+            Self::Interrupted { .. } => WorktreeEnd::Keep,
+            Self::Accepted(_)
+            | Self::NeedsDecision { .. }
+            | Self::NeedsReview { .. }
+            | Self::Blocked { .. }
+            | Self::Failed { .. }
+            | Self::BudgetExhausted { .. }
+            | Self::Cancelled { .. } => WorktreeEnd::Retire,
+        }
+    }
+
     /// The human line for a non-accepted end.
     pub fn detail(&self) -> &str {
         match self {
@@ -77,6 +94,15 @@ impl Terminal {
             | Self::Cancelled { detail } => detail,
         }
     }
+}
+
+/// What becomes of a run's worktree at its end: retired — everything
+/// tracked named and exported, then the directory removed — or kept,
+/// for the one end whose tree may still be written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeEnd {
+    Retire,
+    Keep,
 }
 
 /// What the run may still do, as the runner knows it before deciding.
@@ -652,6 +678,34 @@ mod tests {
             let d = decide(&b, Observation::LimitReached(limit));
             assert_eq!(d.state, State::BudgetExhausted);
             assert_eq!(d.reason, Reason::LimitReached);
+        }
+    }
+
+    /// SPEC §8, §12: every end retires the worktree — its tree is a
+    /// named candidate — except the one whose tree may still be being
+    /// written.
+    #[test]
+    fn only_an_interrupted_end_keeps_its_worktree() {
+        let detail = || "why".to_string();
+        assert_eq!(
+            Terminal::Interrupted { detail: detail() }.worktree_end(),
+            WorktreeEnd::Keep
+        );
+        for retired in [
+            Terminal::NeedsDecision {
+                reason: Reason::ScopeExceeded,
+                detail: detail(),
+            },
+            Terminal::NeedsReview { detail: detail() },
+            Terminal::Blocked {
+                code: BlockCode::DirtyBase,
+                detail: detail(),
+            },
+            Terminal::Failed { detail: detail() },
+            Terminal::BudgetExhausted { detail: detail() },
+            Terminal::Cancelled { detail: detail() },
+        ] {
+            assert_eq!(retired.worktree_end(), WorktreeEnd::Retire, "{retired:?}");
         }
     }
 }

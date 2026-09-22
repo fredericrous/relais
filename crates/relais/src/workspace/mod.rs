@@ -7,8 +7,9 @@
 //! violation cannot be accepted. This is an acceptance boundary, not
 //! filesystem isolation: tools with Bash access are not a sandbox. The
 //! runner records an immutable candidate snapshot (a commit object,
-//! including added files) outside model control, and a worktree with
-//! unexported changes is never force-cleaned.
+//! including added files) outside model control, and a worktree is
+//! retired — everything tracked named and exported first — never
+//! force-cleaned with unexported changes in it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,7 +33,6 @@ pub enum WorkspaceError {
     Git(String),
     DirtyBase(Vec<String>),
     ScopeViolation(Vec<String>),
-    UnexportedChanges(PathBuf),
     Io(std::io::Error),
 }
 
@@ -49,11 +49,6 @@ impl std::fmt::Display for WorkspaceError {
                 f,
                 "diff leaves the declared write scope: {}",
                 paths.join(", ")
-            ),
-            Self::UnexportedChanges(path) => write!(
-                f,
-                "worktree {} has unexported changes; refusing to clean it",
-                path.display()
             ),
             Self::Io(e) => write!(f, "{e}"),
         }
@@ -506,53 +501,6 @@ pub fn check_scope(
     }
 }
 
-/// What the caller knows about a worktree's content when it asks for the
-/// worktree to go. A bare `true`/`false` at the call site said nothing
-/// about which of these two it meant (audit R12).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Disposition {
-    /// Everything in the tree is already durable elsewhere: a candidate
-    /// snapshot was taken and its patch exported (SPEC §8). The caller
-    /// has established that; the release does not check again.
-    Exported,
-    /// Nothing may be in the tree that is not committed. The release
-    /// reads `git status` and refuses a tree that has anything, because
-    /// whatever it has is in no patch.
-    MustBeClean,
-}
-
-/// Remove an owned worktree — unless it holds unexported changes. A
-/// snapshot taken and exported makes the changes exported; nothing else
-/// does (SPEC §8). A status check that cannot run is a reason to keep
-/// the worktree, never to force-remove it.
-pub fn release_worktree(
-    repo_dir: &Path,
-    worktree_path: &Path,
-    disposition: Disposition,
-) -> Result<()> {
-    match disposition {
-        Disposition::Exported => {}
-        Disposition::MustBeClean => {
-            let status = git(worktree_path, &["status", "--porcelain"])?;
-            if !status.is_empty() {
-                return Err(WorkspaceError::UnexportedChanges(
-                    worktree_path.to_path_buf(),
-                ));
-            }
-        }
-    }
-    git(
-        repo_dir,
-        &[
-            "worktree",
-            "remove",
-            "--force",
-            &worktree_path.to_string_lossy(),
-        ],
-    )?;
-    Ok(())
-}
-
 /// The ref name a run's attempt candidate is kept under.
 pub fn candidate_ref(run_id: &str, attempt: u32) -> String {
     format!("refs/relais/candidates/{run_id}/{attempt}")
@@ -864,6 +812,16 @@ mod tests {
         (dir, repo)
     }
 
+    /// Test cleanup: the fixture's worktree, whose content the test
+    /// has finished asserting on.
+    fn remove_worktree(repo: &Path, wt_path: &Path) {
+        git(
+            repo,
+            &["worktree", "remove", "--force", &wt_path.to_string_lossy()],
+        )
+        .expect("removed");
+    }
+
     fn contract_with_scope(scope: &[&str]) -> TaskContract {
         TaskContract::from_json_str(
             &serde_json::json!({
@@ -989,7 +947,7 @@ mod tests {
         // Named explicitly, at the depth it lives: allowed.
         let explicit = contract_with_scope(&["src/**", "src/CLAUDE.md", "src/.claude/**"]);
         assert!(check_scope(&wt, &candidate, &explicit).is_ok(), "{message}");
-        release_worktree(&repo, &wt_path, Disposition::Exported).expect("released");
+        remove_worktree(&repo, &wt_path);
     }
 
     #[test]
@@ -1022,7 +980,7 @@ mod tests {
             main_content.contains("fn main() {}"),
             "original checkout untouched"
         );
-        release_worktree(&repo, &wt_path, Disposition::Exported).expect("released");
+        remove_worktree(&repo, &wt_path);
     }
 
     #[test]
@@ -1047,7 +1005,7 @@ mod tests {
         // The artifact is what the user integrates: it must apply as is.
         git(&repo, &["apply", "--check", &patch.to_string_lossy()])
             .expect("the exported patch applies to the base checkout");
-        release_worktree(&repo, &wt_path, Disposition::Exported).expect("released");
+        remove_worktree(&repo, &wt_path);
     }
 
     #[test]
@@ -1062,7 +1020,7 @@ mod tests {
         assert!(check_scope(&wt, &candidate, &contract)
             .expect("scope")
             .is_empty());
-        release_worktree(&repo, &wt_path, Disposition::Exported).expect("released");
+        remove_worktree(&repo, &wt_path);
     }
 
     #[test]
@@ -1076,7 +1034,7 @@ mod tests {
         let candidate = wt.snapshot_candidate("attempt-1").expect("snapshot");
         let err = check_scope(&wt, &candidate, &contract).unwrap_err();
         assert!(matches!(err, WorkspaceError::ScopeViolation(_)), "{err}");
-        release_worktree(&repo, &wt_path, Disposition::Exported).expect("released");
+        remove_worktree(&repo, &wt_path);
     }
 
     #[test]
@@ -1106,7 +1064,7 @@ mod tests {
         let candidate = wt.snapshot_candidate("attempt-2").expect("snapshot");
         let err = check_scope(&wt, &candidate, &explicit).unwrap_err();
         assert!(err.to_string().contains("relais.toml (protected"), "{err}");
-        release_worktree(&repo, &wt_path, Disposition::Exported).expect("released");
+        remove_worktree(&repo, &wt_path);
     }
 
     #[test]
@@ -1136,7 +1094,7 @@ mod tests {
         std::fs::write(wt_path.join("src/main.rs"), "fn main() {}\n").expect("revert");
         let reverted = wt.snapshot_candidate("attempt-3").expect("snapshot");
         assert!(wt.same_tree_as_base(&reverted).expect("tree compare"));
-        release_worktree(&repo, &wt_path, Disposition::Exported).expect("released");
+        remove_worktree(&repo, &wt_path);
     }
 
     #[test]
@@ -1160,7 +1118,7 @@ mod tests {
             err.to_string().contains("réglages.json (protected"),
             "{err}"
         );
-        release_worktree(&repo, &wt_path, Disposition::Exported).expect("released");
+        remove_worktree(&repo, &wt_path);
     }
 
     #[test]
@@ -1182,7 +1140,7 @@ mod tests {
         let branches = git(&repo, &["branch", "--list"]).expect("branches");
         assert!(!branches.contains("run-42"), "{branches}");
         // Pruning everything unreachable leaves the candidate alone.
-        release_worktree(&repo, &wt_path, Disposition::Exported).expect("released");
+        remove_worktree(&repo, &wt_path);
         git(&repo, &["gc", "--prune=now", "-q"]).expect("gc");
         assert_eq!(
             git(&repo, &["rev-parse", &name]).expect("still there"),
@@ -1379,21 +1337,5 @@ mod tests {
         assert_eq!(found[0].path, legacy);
         assert_eq!(found[1].path, task);
         assert!(found.iter().all(|w| w.bytes > 0), "{found:?}");
-    }
-
-    #[test]
-    fn unexported_changes_are_never_force_cleaned() {
-        let (_dir, repo) = temp_repo();
-        let sha = resolve_base(&repo, "HEAD").expect("base");
-        let wt_path = repo.parent().unwrap().join("wt-keep");
-        let wt = create_worktree(&repo, &sha, &wt_path).expect("worktree");
-        std::fs::write(wt_path.join("src/main.rs"), "// unexported work\n").expect("edit");
-        let err = release_worktree(&repo, &wt_path, Disposition::MustBeClean).unwrap_err();
-        assert!(matches!(err, WorkspaceError::UnexportedChanges(_)), "{err}");
-        // After exporting a snapshot, the same cleanup succeeds.
-        let candidate = wt.snapshot_candidate("attempt-1").expect("snapshot");
-        let patch = repo.parent().unwrap().join("keep.patch");
-        wt.export_patch(&candidate, &patch).expect("export");
-        release_worktree(&repo, &wt_path, Disposition::Exported).expect("released after export");
     }
 }
