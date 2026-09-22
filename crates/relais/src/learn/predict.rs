@@ -411,7 +411,7 @@ mod tests {
             &repo,
             &machine,
             &contract(),
-            &crate::policy::RepoIdentity::new(std::path::Path::new("/repos/relais"), None),
+            &crate::policy::RepoIdentity::common_dir(std::path::Path::new("/repos/relais/.git")),
         )
     }
 

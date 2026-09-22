@@ -692,7 +692,7 @@ mod tests {
     }
 
     fn identity() -> crate::policy::RepoIdentity {
-        crate::policy::RepoIdentity::new(std::path::Path::new("/repos/relais"), None)
+        crate::policy::RepoIdentity::common_dir(std::path::Path::new("/repos/relais/.git"))
     }
 
     fn decide(contract: &TaskContract, repo: &RepoPolicy, machine: &MachineSettings) -> Routed {

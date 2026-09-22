@@ -79,9 +79,16 @@ impl World {
     /// scenario rather than a fact about the machine running it — and
     /// no scenario here can launch a worker by accident.
     fn relais(&self, args: &[&str]) -> Output {
+        self.relais_in(&self.repo, args)
+    }
+
+    /// The binary, run from another directory of this world — a
+    /// worktree of the repository, for the scenarios about what a
+    /// worktree resolves to.
+    fn relais_in(&self, cwd: &Path, args: &[&str]) -> Output {
         Command::new(BIN)
             .args(args)
-            .current_dir(&self.repo)
+            .current_dir(cwd)
             .env("RELAIS_STATE_DIR", &self.state)
             .env("RELAIS_CONFIG_DIR", &self.config)
             .env("RELAIS_CLAUDE_BIN", self.root.join("no-such-claude"))
@@ -315,6 +322,44 @@ fn plan_without_a_trust_grant_is_blocked_and_prints_the_grant() {
     assert!(stdout.contains("[trust.\""), "{stdout}");
     assert!(stdout.contains("reviewed_by = \"<your name>\""), "{stdout}");
     assert!(stdout.contains("granted_at = "), "{stdout}");
+    // The plan says which identity the grant is keyed on. This world's
+    // repository has no origin, so it is the common git directory — the
+    // REPOSITORY, not this checkout — and a worktree of it plans the
+    // same key, which is the whole point of a repository-bound grant.
+    let common_dir =
+        std::fs::canonicalize(world.repo.join(".git")).expect("the repository's git dir");
+    let identity_line = format!("repository: {} (no origin)", common_dir.display());
+    assert!(stdout.contains(&identity_line), "{identity_line}\n{stdout}");
+    let key_line = |stdout: &str| {
+        stdout
+            .lines()
+            .find(|line| line.starts_with("[trust.\""))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("no grant block in {stdout}"))
+    };
+    let worktree = world.root.join("wt");
+    git(
+        &world.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            &worktree.to_string_lossy(),
+            "HEAD",
+        ],
+    );
+    let from_worktree = world.relais_in(&worktree, &["plan", "--task", task.to_str().unwrap()]);
+    let worktree_stdout = text(&from_worktree.stdout);
+    assert!(
+        worktree_stdout.contains(&identity_line),
+        "a worktree names the same repository: {worktree_stdout}"
+    );
+    assert_eq!(
+        key_line(&worktree_stdout),
+        key_line(&stdout),
+        "one repository, one grant key, from every worktree"
+    );
     // The blocker's code appears exactly once: `explain` lists it, and
     // `plan` used to repeat the whole list on stderr as well.
     assert_eq!(

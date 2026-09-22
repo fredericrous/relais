@@ -262,10 +262,8 @@ pub(crate) fn trust_finding(
             component: "trust",
             level: Level::Ok,
             detail: format!(
-                "granted for {} by {} on {}",
-                identity.label(),
-                grant.reviewed_by,
-                grant.granted_at
+                "granted for {identity} by {} on {}",
+                grant.reviewed_by, grant.granted_at
             ),
         },
         None => {
@@ -278,9 +276,8 @@ pub(crate) fn trust_finding(
                 component: "trust",
                 level: Level::Warn,
                 detail: format!(
-                    "no grant for this declaration in {} (key {key}); `relais plan` prints the \
-                     block to review and paste. {}",
-                    identity.label(),
+                    "no grant for this declaration in {identity} (key {key}); `relais plan` \
+                     prints the block to review and paste. {}",
                     if others.is_empty() {
                         format!(
                             "{} grant(s) on this machine are for other declarations or \
