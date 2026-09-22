@@ -131,6 +131,14 @@ amont_agent = "required"
 argv = ["make", "check"]
 timeout_seconds = 300
 
+# A profile in a repository whose dependencies live in the tree declares
+# the step that installs them; a verification worktree holds nothing else.
+[[verification.profiles.web-change.setup]]
+argv = ["npm", "ci"]
+
+[[verification.profiles.web-change.commands]]
+argv = ["npm", "test"]
+
 [[risk]]
 paths = ["**/trust/**", "**/restore/**"]
 minimum_tier = "escalation"
@@ -140,6 +148,8 @@ review = "required"
 These patterns are examples, not verified mappings of the three repositories. Explicit IDs are recommended for reproducible policies; aliases are permitted for convenience and the effective model must be recorded. A profile can omit effort for models without that capability.
 
 Repository commands, hooks and model launch configuration are executable authority. Relais requires a content-bound machine trust grant for a reviewed execution profile and relevant configuration. It delegates amont-specific trust to amont; it does not infer trust from repository ownership. Changed execution declarations invalidate the grant. Worker changes cannot update the frozen grant or commands during a run.
+
+A verification profile may declare a setup step: the commands that install the tree's own dependencies inside a verification worktree before the profile's commands run. It is executable authority like the commands (an installer runs the repository's lifecycle scripts), hashed into the grant, and never inferred: relais may report that a lockfile is present and no setup is declared, and it never runs an installer that policy does not name.
 
 Dependencies are required, optional or off. Missing required integration blocks execution. Optional gaps appear explicitly in the report; they are never reported as passed checks.
 
@@ -221,6 +231,8 @@ Escalation uses a fresh context with the contract, candidate diff, exact verific
 Verification runs after all candidate-writing descendants have stopped or relinquished their write leases, against an immutable copy of the candidate. Record its identity, base SHA, contract hash, policy hash, commands, exit statuses, timeouts and log hashes. No concurrent worker may modify the verified candidate.
 
 Preflight captures relevant baseline failures so pre-existing failures are visible. Existing failures are not automatically waived. A waiver must already be in policy or become an explicit contract revision.
+
+A declared setup runs in every worktree the profile's commands run in — the base, the task worktree, each candidate's copy — before them, and stops at its first failure. Its logs are evidence, never checks: a setup that succeeded passed nothing. A setup that does not succeed in a worktree the run owns blocks the run before a worker is launched; at a candidate it is a verification gap, since no check ran. A baseline whose commands could not run at all (a program not found) has no verdict: the run is blocked before any dispatch, the base's logs are kept, nothing is cached, and the block names the remedy — the setup to declare, or, when one is declared and succeeded, the setup to look at rather than another install step.
 
 Use amont's effective inventory to identify checks and gaps. Run configured acceptance checks through their documented interfaces; do not assume amont check represents every pre-push gate. A skipped, inert, unavailable or untrusted required check is a gap, not a pass. Relais neither forges nor reuses amont attestations on another tree.
 
@@ -367,7 +379,7 @@ Maintain a local index linking files, symbols, decision keys, tests and previous
 
 Each finding records source fingerprints, repository revision, originating evidence, applicability and invalidation dependencies. Current aval resolution outranks remembered architectural claims. Context reuse never silently drops required constraints. Model summaries remain interpretations, with links to evidence.
 
-Cache verification only when all declared relevant inputs match: candidate content, dependency lockfiles, toolchain, command, configuration and required environment identity. Checks with undeclared external dependencies or nondeterministic behavior are not cacheable by default. Preserve amont/attest ownership and never forge attestations. Cache misses rerun checks. Targeted impact analysis supplements mandatory checks rather than removing them.
+Cache verification only when all declared relevant inputs match: candidate content, dependency lockfiles, toolchain, command, configuration and required environment identity. Checks with undeclared external dependencies or nondeterministic behavior are not cacheable by default. Preserve amont/attest ownership and never forge attestations. Cache misses rerun checks. Targeted impact analysis supplements mandatory checks rather than removing them. A profile's setup step is part of its configuration, and the programs the setup runs are part of the toolchain identity; a cached baseline skips the base's setup, not the task worktree's.
 
 ## 19. Bounded decomposition and recovery
 

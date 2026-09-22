@@ -618,6 +618,7 @@ mod tests {
                 profiles: BTreeMap::from([(
                     "rust-change".into(),
                     VerificationProfile {
+                        setup: Vec::new(),
                         commands: vec![CommandSpec {
                             argv: vec!["make".into(), "check".into()],
                             timeout_seconds: 300,

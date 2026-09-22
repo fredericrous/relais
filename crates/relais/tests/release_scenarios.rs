@@ -81,6 +81,22 @@ impl World {
     }
 
     fn write_policy_with_wall(&self, max_attempts: u32, max_wall_seconds: u64) -> String {
+        self.write_policy_verifying(
+            max_attempts,
+            max_wall_seconds,
+            "[[verification.profiles.default.commands]]\n\
+             argv = [\"sh\", \"-c\", \"test ! -f src/main.rs\"]\n\
+             timeout_seconds = 30\n",
+        )
+    }
+
+    /// A policy whose verification block the scenario writes itself.
+    fn write_policy_verifying(
+        &self,
+        max_attempts: u32,
+        max_wall_seconds: u64,
+        verification: &str,
+    ) -> String {
         let policy = format!(
             r#"schema_version = 1
 
@@ -103,10 +119,7 @@ aval = "off"
 amont = "off"
 amont_agent = "off"
 
-[[verification.profiles.default.commands]]
-argv = ["sh", "-c", "test ! -f src/main.rs"]
-timeout_seconds = 30
-"#
+{verification}"#
         );
         std::fs::write(self.repo.join("relais.toml"), &policy).expect("policy");
         git(&self.repo, &["add", "relais.toml"]);
@@ -613,6 +626,99 @@ fn blocked_outcomes_are_explicit_and_launch_nothing() {
     );
     // Every blocked run is recorded, and none of them produced a
     // candidate: nothing was accepted, nothing was snapshotted.
+    let candidates = std::fs::read_dir(world.state.join("runs"))
+        .expect("runs")
+        .flatten()
+        .filter(|entry| entry.path().join("candidate-1.patch").exists())
+        .count();
+    assert_eq!(candidates, 0, "no blocked run reached a candidate");
+}
+
+// SPEC §10: a baseline that cannot run, and a declared setup that does
+// not succeed, are blocked before a worker is launched — with the
+// remedy named, and with `relais plan` and `relais doctor` warning
+// about the missing setup ahead of the run.
+#[test]
+fn an_unrunnable_baseline_and_a_failed_setup_block_before_any_launch() {
+    let world = World::new("setup");
+    std::fs::write(world.repo.join("package-lock.json"), "{}\n").expect("lockfile");
+    git(&world.repo, &["add", "package-lock.json"]);
+    git(&world.repo, &["commit", "-q", "-m", "lockfile"]);
+    // The application-landscape shape: `npm run …` finds npm, and the
+    // script inside cannot find its tool.
+    let hash = world.write_policy_verifying(
+        3,
+        120,
+        "[[verification.profiles.default.commands]]\n\
+         argv = [\"sh\", \"-c\", \"relais-no-such-binary-4f3a --version\"]\n\
+         timeout_seconds = 30\n",
+    );
+    world.write_machine(&hash, "");
+    let task = world.write_task("task.json", "off");
+
+    let plan = world.relais(&["plan", "--task", task.to_str().unwrap()]);
+    assert_eq!(plan.status.code(), Some(0), "{}", text(&plan.stderr));
+    assert!(
+        text(&plan.stderr).contains("package-lock.json present"),
+        "plan warns about the missing setup: {}",
+        text(&plan.stderr)
+    );
+    assert!(
+        text(&plan.stderr).contains("argv = [\"npm\", \"ci\"]"),
+        "{}",
+        text(&plan.stderr)
+    );
+    let doctor = world.relais(&["doctor"]);
+    assert!(
+        text(&doctor.stdout).contains("! setup"),
+        "doctor warns too: {}",
+        text(&doctor.stdout)
+    );
+
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(3), "{}", text(&run.stderr));
+    let stderr = text(&run.stderr);
+    assert!(stderr.contains("baseline_unrunnable"), "{stderr}");
+    assert!(stderr.contains("exited 127"), "{stderr}");
+    assert!(
+        stderr.contains("[[verification.profiles.default.setup]]"),
+        "the block to declare is named: {stderr}"
+    );
+    assert_eq!(world.worker_launches(), 0, "no worker was launched");
+    let run_id = world.only_run_id();
+    assert!(
+        world.run_dir(&run_id).join("logs/base-cmd0.log").exists(),
+        "the base's log is kept as evidence"
+    );
+    assert!(
+        !world.worktree(&run_id).exists(),
+        "no task worktree was created"
+    );
+
+    // A declared setup that fails: blocked as well, still before a launch.
+    let hash = world.write_policy_verifying(
+        3,
+        120,
+        "[[verification.profiles.default.setup]]\n\
+         argv = [\"sh\", \"-c\", \"echo install failed >&2; exit 1\"]\n\
+         timeout_seconds = 30\n\n\
+         [[verification.profiles.default.commands]]\n\
+         argv = [\"sh\", \"-c\", \"test ! -f src/main.rs\"]\n\
+         timeout_seconds = 30\n",
+    );
+    world.write_machine(&hash, "");
+    let plan = world.relais(&["plan", "--task", task.to_str().unwrap()]);
+    assert!(
+        !text(&plan.stderr).contains("declares no setup"),
+        "a declared setup silences the warning: {}",
+        text(&plan.stderr)
+    );
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(3), "{}", text(&run.stderr));
+    let stderr = text(&run.stderr);
+    assert!(stderr.contains("verification_setup_failed"), "{stderr}");
+    assert!(stderr.contains("the base revision"), "{stderr}");
+    assert_eq!(world.worker_launches(), 0, "still no worker");
     let candidates = std::fs::read_dir(world.state.join("runs"))
         .expect("runs")
         .flatten()

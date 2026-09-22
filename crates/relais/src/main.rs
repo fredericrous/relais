@@ -1296,6 +1296,14 @@ fn plan_command(task: &Path) -> Result<CliOutcome, CliError> {
     println!("policy hash: {}", authority.authority_hash);
     println!("repository: {}", repo_identity.label());
     println!("base: {} ({})", base_sha, contract.base_ref);
+    // The same line `relais doctor` prints, on stderr so the plan's
+    // stdout stays what it was: a lockfile with no setup declared is
+    // worth knowing before a run spends a baseline on exit 127.
+    if let Some(finding) = relais::doctor::setup_finding(&repo, &relais::repo::lockfiles(&root)) {
+        if finding.level == relais::doctor::Level::Warn {
+            eprintln!("relais plan: warning: {}", finding.detail);
+        }
+    }
     if authority.trust_granted {
         println!("trust grant: {} (in machine.toml)", authority.grant_key);
     } else {

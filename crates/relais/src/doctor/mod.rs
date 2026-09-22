@@ -300,6 +300,74 @@ pub(crate) fn trust_finding(
 /// propensities (SPEC §17). This release ships no replay command and no
 /// propensity logging, so the flag does nothing at all. Saying so is the
 /// whole point: a silent no-op reads as a running experiment.
+/// A lockfile at the root and a profile with no setup step: the
+/// profile's commands will run in a bare worktree, where the tree's own
+/// dependencies MAY be missing — may, because a documentation profile
+/// needs none, and relais cannot tell which kind this is. So the line is
+/// a warning that names the block to declare, and never a failure, and
+/// never something relais runs uninvited (SPEC §7). Nothing is said
+/// without a lockfile: a Go or Rust repository has nothing to install,
+/// and an "ok" line there would claim knowledge relais does not have.
+/// Shared with `relais plan`, so the two say the same thing.
+pub fn setup_finding(
+    policy: &RepoPolicy,
+    lockfiles: &[&crate::repo::Ecosystem],
+) -> Option<Finding> {
+    if lockfiles.is_empty() {
+        return None;
+    }
+    let present = lockfiles
+        .iter()
+        .map(|ecosystem| ecosystem.lockfile)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let without: Vec<&String> = policy
+        .verification
+        .profiles
+        .iter()
+        .filter(|(_, profile)| profile.setup.is_empty())
+        .map(|(name, _)| name)
+        .collect();
+    if without.is_empty() {
+        return Some(Finding {
+            component: "setup",
+            level: Level::Ok,
+            detail: format!("{present} present; every profile declares a setup step"),
+        });
+    }
+    let suggested = lockfiles
+        .iter()
+        .map(|ecosystem| {
+            format!(
+                "{} → [[verification.profiles.<name>.setup]] argv = [{}]",
+                ecosystem.lockfile,
+                ecosystem
+                    .setup_argv
+                    .iter()
+                    .map(|arg| format!("{arg:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let names = without
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(Finding {
+        component: "setup",
+        level: Level::Warn,
+        detail: format!(
+            "{present} present, and profile {names} declares no setup step: its commands run \
+             in a bare worktree where the tree's dependencies may be unavailable. If they need \
+             them, declare the install step (executable authority; changes the policy hash): \
+             {suggested}"
+        ),
+    })
+}
+
 pub(crate) fn trials_finding(settings: &MachineSettings) -> Option<Finding> {
     settings.trials.enabled.then(|| Finding {
         component: "trials",
@@ -456,6 +524,9 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
                         level: Level::Fail,
                         detail: "no verification profiles; acceptance has nothing to run".into(),
                     });
+                }
+                if let Some(finding) = setup_finding(&policy, &crate::repo::lockfiles(repo_dir)) {
+                    findings.push(finding);
                 }
                 Some(policy)
             }
@@ -771,6 +842,62 @@ mod tests {
             "the config key is amont_agent, the binary amont-agent: {}",
             ok.detail
         );
+    }
+
+    /// A lockfile with no setup declared warns and names the block; a
+    /// declared setup is reported as ok; no lockfile says nothing.
+    #[test]
+    fn a_lockfile_without_a_declared_setup_is_a_warning_not_a_failure() {
+        let toml = "schema_version = 1\n\
+                    [[verification.profiles.default.commands]]\n\
+                    argv = [\"npm\", \"test\"]\n";
+        let policy = RepoPolicy::from_toml_str(toml).expect("policy parses");
+        assert!(
+            setup_finding(&policy, &[]).is_none(),
+            "a Cargo or Go repository has nothing to install and gets no line"
+        );
+        let npm = crate::repo::ECOSYSTEMS
+            .iter()
+            .find(|e| e.lockfile == "package-lock.json")
+            .expect("npm is an ecosystem");
+        let finding = setup_finding(&policy, &[npm]).expect("a line");
+        assert_eq!(finding.component, "setup");
+        assert_eq!(
+            finding.level,
+            Level::Warn,
+            "never a failure: a docs profile may need nothing"
+        );
+        assert!(
+            finding.detail.contains("package-lock.json present"),
+            "{}",
+            finding.detail
+        );
+        assert!(finding.detail.contains("`default`"), "{}", finding.detail);
+        assert!(
+            finding.detail.contains("may be unavailable"),
+            "{}",
+            finding.detail
+        );
+        assert!(
+            finding.detail.contains("argv = [\"npm\", \"ci\"]"),
+            "{}",
+            finding.detail
+        );
+        assert!(
+            !finding.detail.contains('\n'),
+            "one line: {}",
+            finding.detail
+        );
+
+        let declared = RepoPolicy::from_toml_str(&format!(
+            "schema_version = 1\n\
+             [[verification.profiles.default.setup]]\n\
+             argv = [\"npm\", \"ci\"]\n{}",
+            toml.trim_start_matches("schema_version = 1\n")
+        ))
+        .expect("policy parses");
+        let finding = setup_finding(&declared, &[npm]).expect("a line");
+        assert_eq!(finding.level, Level::Ok, "{}", finding.detail);
     }
 
     #[test]

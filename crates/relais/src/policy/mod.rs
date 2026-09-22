@@ -147,6 +147,18 @@ pub struct VerificationPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct VerificationProfile {
+    /// What the commands need installed inside a verification worktree
+    /// before they can run: `npm ci`, `uv sync --frozen`, whatever puts
+    /// the tree's own dependencies in place. A worktree is a checkout of
+    /// one revision and nothing else, so an ecosystem that keeps its
+    /// dependencies in the tree (node_modules, a virtualenv) has none
+    /// there until this runs. It runs first, in every directory the
+    /// commands run in, and stops at its first failure. It is executable
+    /// authority like the commands themselves — hashed into the trust
+    /// grant, never inferred from a lockfile (SPEC §5, §7). Its outcomes
+    /// are evidence, never checks: a setup that succeeds passes nothing.
+    #[serde(default)]
+    pub setup: Vec<CommandSpec>,
     #[serde(default)]
     pub commands: Vec<CommandSpec>,
     /// amont check IDs (from `amont list --json`) this profile requires to
@@ -311,7 +323,7 @@ impl RepoPolicy {
             }
         }
         for profile in self.verification.profiles.values() {
-            for command in &profile.commands {
+            for command in profile.setup.iter().chain(&profile.commands) {
                 if command.argv.is_empty() {
                     return Err(PolicyError::EmptyCommandArgv);
                 }
@@ -349,7 +361,9 @@ impl RepoPolicy {
     /// of the learner, so a grant must not survive an edit to them. The
     /// context budget belongs here for the same reason: raising it is
     /// what turns a sizing problem into a dispatch, so it is reviewed,
-    /// not slipped in.
+    /// not slipped in. A profile's setup step is hashed with its
+    /// commands: `npm ci` runs the repository's own lifecycle scripts,
+    /// which is exactly the kind of execution a grant is a review of.
     pub fn authority_hash(&self) -> String {
         canonical_json_hash(&self.authority_value())
     }
@@ -781,6 +795,15 @@ pub enum BlockCode {
     AvalToolFailure,
     ContextSizing,
     BaselineVerificationFailed,
+    /// The base revision's checks could not run at all — a program the
+    /// profile names was not found (exit 127) — so the base has no
+    /// verdict and no candidate can be compared to it. Not a baseline
+    /// FAILURE, which is a check that ran and said no.
+    BaselineUnrunnable,
+    /// A declared setup command did not succeed in a worktree the run
+    /// owns (the base or the task worktree), so the profile's commands
+    /// never ran there.
+    VerificationSetupFailed,
     WorktreeUnavailable,
     BackendUnavailable,
     AdmissionUnavailable,
@@ -816,6 +839,8 @@ impl BlockCode {
             Self::AvalToolFailure => "aval_tool_failure",
             Self::ContextSizing => "context_sizing",
             Self::BaselineVerificationFailed => "baseline_verification_failed",
+            Self::BaselineUnrunnable => "baseline_unrunnable",
+            Self::VerificationSetupFailed => "verification_setup_failed",
             Self::WorktreeUnavailable => "worktree_unavailable",
             Self::BackendUnavailable => "backend_unavailable",
             Self::AdmissionUnavailable => "admission_unavailable",
@@ -1028,6 +1053,20 @@ aval = "required"
 amont = "required"
 amont_agent = "required"
 
+# What the commands need installed inside a verification worktree before
+# they can run. A worktree is a checkout of one revision and nothing
+# else: an ecosystem that keeps its dependencies in the tree (npm, pnpm,
+# yarn, bun, uv, poetry, bundler, composer) has none there until this
+# runs. Go and Rust need no step — their tools fetch into shared caches.
+# It runs first, in EVERY worktree the commands run in (the base, the
+# task worktree, each candidate — five `npm ci` in a three-attempt run),
+# and it is executable authority like the commands: hashed into the
+# trust grant, never inferred from a lockfile. `relais doctor` says when
+# a lockfile is present and no setup is declared.
+# [[verification.profiles.default.setup]]
+# argv = ["npm", "ci"]
+# timeout_seconds = 600
+
 [[verification.profiles.default.commands]]
 argv = ["make", "check"]
 timeout_seconds = 300
@@ -1232,6 +1271,44 @@ keys = ["output.contract"]
             .blockers
             .iter()
             .any(|b| b.code == BlockCode::MissingTrustGrant));
+    }
+
+    /// A setup step runs the repository's own lifecycle scripts inside a
+    /// worktree relais owns: executable authority, so declaring one must
+    /// invalidate a grant reviewed without it (SPEC §5).
+    #[test]
+    fn a_declared_setup_step_changes_the_authority_hash() {
+        let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        let machine =
+            MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo))).expect("parses");
+        let with_setup = RepoPolicy::from_toml_str(&REPO_TOML.replace(
+            "[[verification.profiles.rust-change.commands]]",
+            "[[verification.profiles.rust-change.setup]]\nargv = [\"npm\", \"ci\"]\n\n\
+             [[verification.profiles.rust-change.commands]]",
+        ))
+        .expect("parses");
+        assert_eq!(
+            with_setup.verification.profiles["rust-change"].setup[0].argv,
+            vec!["npm", "ci"]
+        );
+        assert_ne!(
+            repo.authority_hash(),
+            with_setup.authority_hash(),
+            "a setup step is executable authority; declaring one must change the hash"
+        );
+        let a = effective_authority(&with_setup, &machine, &contract(), &identity());
+        assert!(!a.trust_granted, "the grant was reviewed without the setup");
+    }
+
+    #[test]
+    fn an_empty_setup_argv_is_rejected() {
+        let err = RepoPolicy::from_toml_str(&REPO_TOML.replace(
+            "[[verification.profiles.rust-change.commands]]",
+            "[[verification.profiles.rust-change.setup]]\nargv = []\n\n\
+             [[verification.profiles.rust-change.commands]]",
+        ))
+        .expect_err("an empty setup argv is a policy mistake");
+        assert!(matches!(err, PolicyError::EmptyCommandArgv), "{err}");
     }
 
     #[test]

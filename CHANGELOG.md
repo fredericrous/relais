@@ -20,6 +20,44 @@ README.md](README.md#exit-codes) — `needs_decision` 2 → 8, `needs_review`
 2 → 9, `budget_exhausted` 4 → 5, `interrupted` 4 → 6, `cancelled` 4 → 7,
 unknown run 2 → 10, and "nothing to train on yet" 2 → 14.
 
+### Added
+
+- **A verification profile can declare the setup its commands need.**
+  A verification worktree is a checkout of one revision and nothing
+  else, so in a repository whose dependencies live in the tree (npm,
+  pnpm, yarn, bun, uv, poetry, bundler, composer) the profile's commands
+  found no `node_modules` or virtualenv there and could not run at all.
+  `[[verification.profiles.<name>.setup]]` names the install step; it
+  runs first, in every worktree the commands run in — the base, the
+  task worktree, each candidate's copy — and stops at its first failure.
+  It is executable authority like the commands: hashed into the trust
+  grant, so declaring it asks for a new grant from `relais plan`, and
+  never inferred — `relais doctor` and `relais plan` warn when a
+  lockfile is at the root and a profile declares no setup, and relais
+  never runs an installer that policy does not name. The setup's
+  programs join the toolchain identity a cached baseline is keyed on, a
+  cached baseline skips the base's setup but not the task worktree's,
+  and every setup log is evidence in the ledger, never a passed check.
+  A setup that does not succeed in a worktree the run owns ends the run
+  `blocked (verification_setup_failed)` before a worker is launched; at
+  a candidate it is a verification gap and the run ends
+  `needs_decision`.
+- **A baseline that cannot run is blocked before a worker is
+  dispatched.** The first run on an npm repository spent two worker
+  attempts against `sh: react-router: command not found` — every check
+  exited 127 at the base and at each candidate alike — and ended
+  `failed: same failure on an unchanged candidate`. A check that ends
+  127 (the shell's "command not found"; a program relais itself cannot
+  find is recorded the same way, in the log and in the outcome, instead
+  of interrupting the run) is now an *unrunnable* check, not a failing
+  one. At the base that is the absence of a verdict: the run ends
+  `blocked (baseline_unrunnable)` with no worker launched, the base's
+  logs kept as evidence, nothing written to the baseline cache, and the
+  remedy named — the setup block to declare when a lockfile is present
+  and none is, or, when a setup is declared and succeeded, the setup to
+  look at rather than another install step. At a candidate, 127 stays
+  the candidate's own failure, repaired like any other.
+
 ### Architecture
 
 - **The module graph has no cycles, and a check keeps it that way.**
