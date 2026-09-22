@@ -565,30 +565,20 @@ pub struct Architecture {
     pub scope: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
 pub struct Limits {
-    #[serde(default = "default_attempts")]
-    pub attempts: u32,
-    #[serde(default = "default_wall_seconds")]
-    pub wall_seconds: u64,
-}
-
-impl Default for Limits {
-    fn default() -> Self {
-        Self {
-            attempts: default_attempts(),
-            wall_seconds: default_wall_seconds(),
-        }
-    }
-}
-
-fn default_attempts() -> u32 {
-    3
-}
-
-fn default_wall_seconds() -> u64 {
-    1200
+    /// Absent means "whatever the repository allows". A contract may
+    /// narrow a grant and never broaden one (SPEC §5) — but a DEFAULT
+    /// the author never wrote is not the author narrowing anything, and
+    /// a hard-coded one silently capped every run at its own value: a
+    /// repository that raised its wall clock to 2700 s kept watching
+    /// workers die at exactly 1200, because the intersection took the
+    /// contract's unwritten default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_seconds: Option<u64>,
 }
 
 /// Why a contract is rejected. Errors are hard validation failures at
@@ -768,11 +758,17 @@ impl TaskContract {
         if self.verification_profile.trim().is_empty() {
             return Err(ContractError::EmptyVerificationProfile);
         }
-        if self.limits.attempts < 1 {
-            return Err(ContractError::BadAttempts(self.limits.attempts));
+        // A limit the contract WRITES must still be a limit; one it does
+        // not write is the repository's to set.
+        if let Some(attempts) = self.limits.attempts {
+            if attempts < 1 {
+                return Err(ContractError::BadAttempts(attempts));
+            }
         }
-        if self.limits.wall_seconds < 1 {
-            return Err(ContractError::BadWallSeconds(self.limits.wall_seconds));
+        if let Some(wall_seconds) = self.limits.wall_seconds {
+            if wall_seconds < 1 {
+                return Err(ContractError::BadWallSeconds(wall_seconds));
+            }
         }
         let mut seen = std::collections::BTreeSet::new();
         for criterion in &self.acceptance {
@@ -941,7 +937,11 @@ mod tests {
         let c = TaskContract::from_json_str(EXAMPLE).expect("spec example parses");
         assert_eq!(c.kind(), Kind::Change);
         assert_eq!(c.review, Review::Required);
-        assert_eq!(c.limits.attempts, 3);
+        assert_eq!(
+            c.limits.attempts,
+            Some(3),
+            "the spec example writes its limits, so they narrow"
+        );
         assert_eq!(
             c.scope_patterns(),
             ["crates/amont-runtime/**", "crates/amont/**"]
@@ -1196,7 +1196,7 @@ mod tests {
         new.objective = "different".into();
         assert!(changed_controls(&base, &new).objective);
         new = base.clone();
-        new.limits.attempts = 2;
+        new.limits.attempts = Some(2);
         assert!(changed_controls(&base, &new).budget);
         new = base.clone();
         new.read_hints.push("extra".into());
