@@ -19,6 +19,7 @@ pub mod learn;
 pub mod ledger;
 pub mod lifecycle;
 pub mod money;
+pub mod outcome;
 pub mod paths;
 pub mod policy;
 pub mod procs;

@@ -139,10 +139,32 @@ enum Command {
     Promote { artifact_id: String },
     /// Record a final outcome for an accepted candidate (SPEC §20)
     Feedback {
-        run_id: String,
+        /// The run whose accepted candidate this is about; omit with
+        /// `--task` to name the task's accepted run instead
+        #[arg(required_unless_present = "task", conflicts_with = "task")]
+        run_id: Option<String>,
+        /// The task whose accepted run this is about, instead of naming
+        /// the run directly
+        #[arg(long = "task")]
+        task: Option<String>,
         /// What actually happened to the accepted change
         #[arg(long = "outcome")]
         outcome: FeedbackOutcome,
+        /// The candidate this feedback is about; verified against the
+        /// run's receipt, and refused on a mismatch
+        #[arg(long = "candidate")]
+        candidate: Option<String>,
+        /// How large the correction was; required for `corrected`,
+        /// refused for every other outcome
+        #[arg(long = "magnitude")]
+        magnitude: Option<f64>,
+        /// Evidence references (paths, URLs, run ids) supporting this
+        /// feedback
+        #[arg(long = "evidence")]
+        evidence: Vec<String>,
+        /// Who is recording this feedback
+        #[arg(long = "actor")]
+        actor: String,
     },
     /// Install the Claude Code integration; preview-first, --write applies
     /// (SPEC §3). User-level installation is explicit, not the default.
@@ -219,6 +241,17 @@ enum FeedbackOutcome {
     Reverted,
     /// A later user-reported regression was confirmed
     Regression,
+}
+
+impl From<FeedbackOutcome> for relais::outcome::OutcomeKind {
+    fn from(outcome: FeedbackOutcome) -> Self {
+        match outcome {
+            FeedbackOutcome::Accepted => Self::AcceptedUnchanged,
+            FeedbackOutcome::Corrected => Self::Corrected,
+            FeedbackOutcome::Reverted => Self::Reverted,
+            FeedbackOutcome::Regression => Self::ConfirmedRegression,
+        }
+    }
 }
 
 /// How a command ended, independent of how it is reported. Every value
@@ -443,7 +476,23 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
         Command::Train => train_command(),
         Command::Evaluate { artifact } => evaluate_command(&artifact),
         Command::Promote { artifact_id } => promote_command(&artifact_id),
-        Command::Feedback { run_id, outcome } => feedback_command(&run_id, outcome),
+        Command::Feedback {
+            run_id,
+            task,
+            outcome,
+            candidate,
+            magnitude,
+            evidence,
+            actor,
+        } => feedback_command(FeedbackRequest {
+            run_id,
+            task,
+            outcome,
+            candidate,
+            magnitude,
+            evidence,
+            actor,
+        }),
         Command::Install {
             claude,
             write,
@@ -1971,12 +2020,59 @@ fn report_command(since: Option<&str>, json: bool) -> Result<CliOutcome, CliErro
     Ok(CliOutcome::Accepted)
 }
 
-fn feedback_command(run_id: &str, outcome: FeedbackOutcome) -> Result<CliOutcome, CliError> {
+/// The run a `relais feedback` invocation is about: the one named
+/// directly, or the task's accepted run when `--task` is given instead.
+/// Exactly one of `run_id`/`task` is `Some` — clap's `conflicts_with` and
+/// `required_unless_present` on the `Feedback` variant guarantee it.
+fn feedback_run(
+    ledger: &Ledger,
+    run_id: Option<&str>,
+    task: Option<&str>,
+) -> Result<std::result::Result<RunId, CliOutcome>, CliError> {
+    if let Some(run_id) = run_id {
+        return Ok(Ok(RunId::from_stored(run_id)));
+    }
+    let task_id = TaskId::from_stored(task.expect("clap requires run_id or --task"));
+    let runs = operational(ledger.runs_of_task(&task_id), "feedback")?;
+    for candidate in runs.into_iter().rev() {
+        if operational(ledger.run_status(&candidate), "feedback")? == Some(State::Accepted) {
+            return Ok(Ok(candidate));
+        }
+    }
+    eprintln!("relais feedback: task {task_id} has no accepted run on record");
+    Ok(Err(CliOutcome::UnknownRun))
+}
+
+/// One `relais feedback` invocation's arguments, bundled so the handler
+/// takes one value rather than seven positional ones.
+struct FeedbackRequest {
+    run_id: Option<String>,
+    task: Option<String>,
+    outcome: FeedbackOutcome,
+    candidate: Option<String>,
+    magnitude: Option<f64>,
+    evidence: Vec<String>,
+    actor: String,
+}
+
+fn feedback_command(request: FeedbackRequest) -> Result<CliOutcome, CliError> {
+    let FeedbackRequest {
+        run_id,
+        task,
+        outcome,
+        candidate,
+        magnitude,
+        evidence,
+        actor,
+    } = request;
     let ledger = open_ledger()?;
-    let run = RunId::from_stored(run_id);
+    let run = match feedback_run(&ledger, run_id.as_deref(), task.as_deref())? {
+        Ok(run) => run,
+        Err(outcome) => return Ok(outcome),
+    };
     let state = operational(ledger.run_status(&run), "feedback")?;
     let Some(state) = state else {
-        eprintln!("relais feedback: unknown run {run_id}");
+        eprintln!("relais feedback: unknown run {run}");
         return Ok(CliOutcome::UnknownRun);
     };
     // SPEC §20: feedback is attributed to the candidate; absence of
@@ -1984,19 +2080,75 @@ fn feedback_command(run_id: &str, outcome: FeedbackOutcome) -> Result<CliOutcome
     // candidate whose later life is worth recording.
     if state != State::Accepted {
         eprintln!(
-            "relais feedback: run {run_id} is {state}, not accepted — final outcome feedback \
+            "relais feedback: run {run} is {state}, not accepted — final outcome feedback \
              records what happened to an ACCEPTED change"
         );
         return Ok(CliOutcome::InvalidInput);
     }
-    let kind = match outcome {
-        FeedbackOutcome::Accepted => "accepted_unchanged",
-        FeedbackOutcome::Corrected => "corrected",
-        FeedbackOutcome::Reverted => "reverted",
-        FeedbackOutcome::Regression => "confirmed_regression",
+    let Some(task_id) = operational(ledger.task_of_run(&run), "feedback")? else {
+        eprintln!("relais feedback: run {run} carries no task identity");
+        return Ok(CliOutcome::OperationalFailure);
     };
-    operational(ledger.record_outcome(&run, kind, None), "feedback")?;
-    println!("recorded {kind} for {run_id}");
+    let Some((receipt, _hash)) = operational(ledger.receipt(&run), "feedback")? else {
+        eprintln!("relais feedback: run {run} is accepted but carries no receipt");
+        return Ok(CliOutcome::OperationalFailure);
+    };
+    let Some(receipt_candidate) = receipt["candidate_sha"].as_str() else {
+        eprintln!("relais feedback: run {run}'s receipt names no candidate");
+        return Ok(CliOutcome::OperationalFailure);
+    };
+    // The candidate a caller names must be the one the run actually
+    // produced — the receipt, not the caller, is the source of truth
+    // (SPEC §20: feedback is attributed to the candidate).
+    if let Some(candidate) = candidate {
+        if candidate.as_str() != receipt_candidate {
+            eprintln!(
+                "relais feedback: --candidate {candidate} does not match run {run}'s accepted \
+                 candidate {receipt_candidate}"
+            );
+            return Ok(CliOutcome::InvalidInput);
+        }
+    }
+    // The strategy actually used is read off the ledger, never asked of
+    // the caller (SPEC §20).
+    let Some((_contract, tier)) = operational(ledger.run_contract_and_tier(&run), "feedback")?
+    else {
+        eprintln!("relais feedback: run {run} carries no recorded attempt");
+        return Ok(CliOutcome::OperationalFailure);
+    };
+    let escalated = operational(ledger.escalation_attempted(&run), "feedback")?;
+    let models = operational(ledger.models_used(&run), "feedback")?;
+    let magnitude = match magnitude {
+        Some(value) => match relais::outcome::CorrectionMagnitude::new(value) {
+            Ok(magnitude) => Some(magnitude),
+            Err(e) => {
+                eprintln!("relais feedback: {e}");
+                return Ok(CliOutcome::InvalidInput);
+            }
+        },
+        None => None,
+    };
+    let kind = outcome.into();
+    let detail = relais::outcome::OutcomeDetail {
+        candidate_sha: receipt_candidate.to_string(),
+        strategy: relais::outcome::Strategy {
+            tier,
+            models,
+            escalated,
+        },
+        correction_magnitude: magnitude,
+        evidence,
+        actor,
+    };
+    let recorded = match relais::outcome::Outcome::new(kind, detail) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            eprintln!("relais feedback: {e}");
+            return Ok(CliOutcome::InvalidInput);
+        }
+    };
+    operational(ledger.record_outcome(&run, &task_id, &recorded), "feedback")?;
+    println!("recorded {} for {run}", kind.as_str());
     Ok(CliOutcome::Accepted)
 }
 
