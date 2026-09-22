@@ -10,7 +10,7 @@
 //! held across a model call — the API makes that structural by only
 //! offering one-shot writes.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -499,6 +499,14 @@ pub struct ChildRun {
     pub status: State,
 }
 
+/// The repository a run ran in and the base it resolved, as the ledger
+/// recorded them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunWorkspace {
+    pub repo_path: PathBuf,
+    pub base_sha: Option<String>,
+}
+
 /// A dispatch that claimed to launch and never recorded a terminal
 /// state: what reconciliation looks at after a crash or restart.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -691,6 +699,32 @@ impl Ledger {
             )
             .optional()?;
         status.map(|s| parse_state(&s)).transpose()
+    }
+
+    /// Where a run's worktree came from: the repository it ran in and
+    /// the base its latest contract revision resolved — what
+    /// `workspace::retire` needs to name a leftover tree against the
+    /// right base. `None` when the run is not on record; a run that
+    /// never resolved a base (blocked before preflight finished) has
+    /// `base_sha: None`.
+    pub fn run_workspace(&self, id: &RunId) -> Result<Option<RunWorkspace>> {
+        self.conn
+            .query_row(
+                "SELECT runs.repo_path,
+                        (SELECT base_sha FROM contract_revisions
+                          WHERE run_id = runs.id AND base_sha IS NOT NULL
+                          ORDER BY id DESC LIMIT 1)
+                 FROM runs WHERE id = ?1",
+                [id.as_str()],
+                |row| {
+                    Ok(RunWorkspace {
+                        repo_path: PathBuf::from(row.get::<_, String>(0)?),
+                        base_sha: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(LedgerError::from)
     }
 
     /// Record a contract revision for a run and return its id.

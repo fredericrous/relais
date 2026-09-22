@@ -83,8 +83,22 @@ enum Command {
     /// Explain one run: route reasons, transitions, costs, decisions
     Explain { run_id: String },
     /// Reconcile interrupted state; never blindly repeats the last
-    /// command (SPEC §3)
-    Resume { run_id: String },
+    /// command (SPEC §3). With --retire, also retire the worktree of a
+    /// terminal run (SPEC §8): everything tracked that no candidate holds
+    /// is named and exported, then the directory goes
+    Resume {
+        /// The run to reconcile; omitted with --retire, every terminal
+        /// run that still holds a worktree is retired
+        #[arg(required_unless_present = "retire")]
+        run_id: Option<String>,
+        /// Retire the worktree(s) of terminal run(s) whose dispatches
+        /// are provably dead
+        #[arg(long)]
+        retire: bool,
+        /// Every run rather than one: the default when no run is named
+        #[arg(long, requires = "retire", conflicts_with = "run_id")]
+        all: bool,
+    },
     /// Cost and outcome reporting since a date (SPEC §11)
     Report {
         /// Inclusive lower bound, e.g. 2026-09-01
@@ -402,7 +416,14 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
         Command::Run { task } => run_command(&task),
         Command::Status { run_id } => status_command(run_id.as_deref()),
         Command::Explain { run_id } => explain_command(&run_id),
-        Command::Resume { run_id } => resume_command(&run_id),
+        Command::Resume {
+            run_id,
+            retire,
+            all: _,
+        } => match run_id {
+            Some(run_id) => resume_command(&run_id, Retire::from_flag(retire)),
+            None => retire_all_command(),
+        },
         Command::Report { since, json } => report_command(since.as_deref(), json),
         Command::Dataset { cmd } => match cmd {
             DatasetCommand::Build => dataset_build_command(),
@@ -1578,34 +1599,44 @@ fn explain_command(run_id: &str) -> Result<CliOutcome, CliError> {
     Ok(CliOutcome::Accepted)
 }
 
-fn resume_command(run_id: &str) -> Result<CliOutcome, CliError> {
+/// Whether `resume` also retires the worktree once the run is terminal
+/// and its dispatches provably dead. An enum, so the handler reads as
+/// what was asked rather than as a bare flag (the clap edge is where the
+/// `bool` lives).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retire {
+    Keep,
+    Retire,
+}
+
+impl Retire {
+    fn from_flag(retire: bool) -> Self {
+        if retire {
+            Self::Retire
+        } else {
+            Self::Keep
+        }
+    }
+}
+
+fn resume_command(run_id: &str, retire: Retire) -> Result<CliOutcome, CliError> {
     let ledger = open_ledger()?;
     let run = RunId::from_stored(run_id);
     let Some(state) = operational(ledger.run_status(&run), "resume")? else {
         eprintln!("relais resume: unknown run {run_id}");
         return Ok(CliOutcome::UnknownRun);
     };
-    if state.is_terminal() {
-        println!("{run_id} is already terminal: {state}");
-        return Ok(CliOutcome::Accepted);
-    }
     // An absent terminal result never means nothing executed (SPEC §12).
     // The policy is `resume::reconcile`, a pure function with a test per
     // row; this handler does the ledger write and the printing.
-    let live: Vec<_> = operational(ledger.live_dispatches(), "resume")?
-        .into_iter()
-        .filter(|live| live.run == run)
-        .collect();
-    // No coordinator answering is not evidence about the run, only the
-    // absence of evidence: `reconcile` treats it as such.
-    let coordinator_view = relais::coordinator::socket_path()
-        .ok()
-        .map(relais::coordinator::Client::new)
-        .and_then(|client| client.status().ok())
-        .and_then(|snapshot| snapshot.runs.get(run_id).cloned());
-    let reconciliation = resume::reconcile(&live, coordinator_view.as_ref(), &|pid| {
-        relais::coordinator::process_alive(pid.get())
-    });
+    let reconciliation = reconcile_run(&ledger, &run)?;
+    if state.is_terminal() {
+        println!("{run_id} is already terminal: {state}");
+        return match retire {
+            Retire::Keep => Ok(CliOutcome::Accepted),
+            Retire::Retire => retire_run(&ledger, &run, state, &reconciliation),
+        };
+    }
     if !reconciliation.may_reconcile() {
         println!(
             "{run_id} is {state} with worker(s) still live: {}. Resume does not re-dispatch \
@@ -1642,7 +1673,227 @@ fn resume_command(run_id: &str) -> Result<CliOutcome, CliError> {
             .join(run_id)
             .display()
     );
+    match retire {
+        Retire::Keep => {}
+        // The worktree goes only once every dispatch that was live is
+        // provably dead: an unknown outcome may still be writing it.
+        Retire::Retire => {
+            retire_run(&ledger, &run, State::Interrupted, &reconciliation)?;
+        }
+    }
     Ok(CliOutcome::ResumeReconciled)
+}
+
+/// Judge every dispatch the ledger still records as live for one run.
+/// No coordinator answering is not evidence about the run, only the
+/// absence of evidence: `reconcile` treats it as such.
+fn reconcile_run(ledger: &Ledger, run: &RunId) -> Result<resume::Reconciliation, CliError> {
+    let live: Vec<_> = operational(ledger.live_dispatches(), "resume")?
+        .into_iter()
+        .filter(|live| live.run == *run)
+        .collect();
+    let coordinator_view = relais::coordinator::socket_path()
+        .ok()
+        .map(relais::coordinator::Client::new)
+        .and_then(|client| client.status().ok())
+        .and_then(|snapshot| snapshot.runs.get(run.as_str()).cloned());
+    Ok(resume::reconcile(
+        &live,
+        coordinator_view.as_ref(),
+        &|pid| relais::coordinator::process_alive(pid.get()),
+    ))
+}
+
+/// `relais resume --retire` with no run named: every terminal run that
+/// still holds a worktree under the state directory — the current
+/// `worktrees/<run>/…` layout and the legacy `runs/<run>/worktree` —
+/// is retired, one line each. A run that is not terminal, not on
+/// record, or whose dispatches are not provably dead is named and
+/// kept. A retirement that fails is relais's own failure to report.
+fn retire_all_command() -> Result<CliOutcome, CliError> {
+    let ledger = open_ledger()?;
+    let state_dir = paths::state_dir().map_err(CliError::Home)?;
+    let retained = operational(
+        workspace::retained_worktrees(&state_dir),
+        "listing the retained worktrees",
+    )?;
+    if retained.is_empty() {
+        println!("no run worktree is retained under {}", state_dir.display());
+        return Ok(CliOutcome::Accepted);
+    }
+    let mut failed = false;
+    for worktree in retained {
+        let run = RunId::from_stored(worktree.run_id.clone());
+        let Some(state) = operational(ledger.run_status(&run), "resume")? else {
+            println!(
+                "{}: kept, no such run on record ({})",
+                worktree.run_id,
+                worktree.path.display()
+            );
+            continue;
+        };
+        if !state.is_terminal() {
+            println!(
+                "{}: kept, the run is {state} ({})",
+                worktree.run_id,
+                worktree.path.display()
+            );
+            continue;
+        }
+        let reconciliation = reconcile_run(&ledger, &run)?;
+        match retire_worktree(&ledger, &run, state, &reconciliation, &worktree.path)? {
+            Retired::Retired => {}
+            Retired::Kept => failed = true,
+        }
+    }
+    Ok(if failed {
+        CliOutcome::OperationalFailure
+    } else {
+        CliOutcome::Accepted
+    })
+}
+
+/// Retire every worktree one terminal run still holds.
+fn retire_run(
+    ledger: &Ledger,
+    run: &RunId,
+    state: State,
+    reconciliation: &resume::Reconciliation,
+) -> Result<CliOutcome, CliError> {
+    let state_dir = paths::state_dir().map_err(CliError::Home)?;
+    let retained: Vec<_> = operational(
+        workspace::retained_worktrees(&state_dir),
+        "listing the retained worktrees",
+    )?
+    .into_iter()
+    .filter(|worktree| worktree.run_id == run.as_str())
+    .collect();
+    if retained.is_empty() {
+        println!("{run}: no worktree is retained");
+        return Ok(CliOutcome::Accepted);
+    }
+    let mut failed = false;
+    for worktree in retained {
+        match retire_worktree(ledger, run, state, reconciliation, &worktree.path)? {
+            Retired::Retired => {}
+            Retired::Kept => failed = true,
+        }
+    }
+    Ok(if failed {
+        CliOutcome::OperationalFailure
+    } else {
+        CliOutcome::Accepted
+    })
+}
+
+/// What one retirement attempt did, for the exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retired {
+    Retired,
+    /// Not removed: a dispatch may still write it, the ledger lacks what
+    /// the retirement needs, or the retirement itself failed (recorded
+    /// as `worktree_not_released`).
+    Kept,
+}
+
+/// One worktree of a terminal run: retired once its dispatches are
+/// provably dead, with the transition the runner would have recorded,
+/// and one line printed either way.
+fn retire_worktree(
+    ledger: &Ledger,
+    run: &RunId,
+    state: State,
+    reconciliation: &resume::Reconciliation,
+    path: &Path,
+) -> Result<Retired, CliError> {
+    if !reconciliation.all_provably_dead() {
+        println!(
+            "{run}: kept, a dispatch may still write it: {} ({})",
+            reconciliation.refusal(),
+            path.display()
+        );
+        return Ok(Retired::Kept);
+    }
+    let Some(workspace) = operational(ledger.run_workspace(run), "resume")? else {
+        println!("{run}: kept, the run is not on record ({})", path.display());
+        return Ok(Retired::Kept);
+    };
+    let Some(base_sha) = workspace.base_sha else {
+        println!(
+            "{run}: kept, the run never resolved a base to name its tree against ({})",
+            path.display()
+        );
+        return Ok(Retired::Kept);
+    };
+    let worktree = workspace::TaskWorktree {
+        path: path.to_path_buf(),
+        base_sha,
+    };
+    let artifacts = paths::runs_dir()
+        .map_err(CliError::Home)?
+        .join(run.as_str());
+    let (reason, detail, retired) =
+        match workspace::retire(&workspace.repo_path, &worktree, run.as_str(), &artifacts) {
+            Ok(retirement) => {
+                match &retirement.exported {
+                    Some(exported) => println!(
+                        "{run}: retired {} — {} written, patch {}, {} bytes reclaimed",
+                        path.display(),
+                        exported.reference,
+                        exported.patch_path.display(),
+                        retirement.bytes_reclaimed
+                    ),
+                    None => println!(
+                        "{run}: retired {} — its tree was already a named candidate, {} bytes \
+                     reclaimed",
+                        path.display(),
+                        retirement.bytes_reclaimed
+                    ),
+                }
+                (
+                    Reason::WorktreeRetired,
+                    serde_json::json!({
+                        "worktree": path.to_string_lossy(),
+                        "reference": retirement.exported.as_ref().map(|e| e.reference.clone()),
+                        "patch": retirement
+                            .exported
+                            .as_ref()
+                            .map(|e| e.patch_path.to_string_lossy().into_owned()),
+                        "bytes_reclaimed": retirement.bytes_reclaimed,
+                        "by": "resume --retire",
+                    }),
+                    Retired::Retired,
+                )
+            }
+            Err(e) => {
+                eprintln!(
+                    "relais resume: {run}: kept, {} could not be retired: {e}",
+                    path.display()
+                );
+                (
+                    Reason::WorktreeNotReleased,
+                    serde_json::json!({
+                        "worktree": path.to_string_lossy(),
+                        "error": e.to_string(),
+                        "by": "resume --retire",
+                    }),
+                    Retired::Kept,
+                )
+            }
+        };
+    operational(
+        ledger.record_transition(&relais::ledger::Transition {
+            run_id: run.clone(),
+            attempt_id: None,
+            from_state: Some(state),
+            to_state: state,
+            reason: reason.as_str().to_string(),
+            detail: Some(detail),
+            at: relais::ledger::now_rfc3339(),
+        }),
+        "resume",
+    )?;
+    Ok(retired)
 }
 
 fn report_command(since: Option<&str>, json: bool) -> Result<CliOutcome, CliError> {
