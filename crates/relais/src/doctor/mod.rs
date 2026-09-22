@@ -614,6 +614,7 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
 
     findings.push(ledger_finding());
     findings.push(registry_finding());
+    findings.push(worktrees_finding_on_disk());
     findings.push(coordinator_finding());
 
     DoctorReport { findings }
@@ -664,6 +665,58 @@ pub(crate) fn ledger_schema_finding(
                 "the ledger at {} opened but its schema version could not be read: {e}",
                 path.display()
             ),
+        },
+    }
+}
+
+/// The retained run worktrees under the state directory, read from disk.
+fn worktrees_finding_on_disk() -> Finding {
+    let state_dir = match paths::state_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            return Finding {
+                component: "worktrees",
+                level: Level::Fail,
+                detail: e.to_string(),
+            }
+        }
+    };
+    worktrees_finding(crate::workspace::retained_worktrees(&state_dir))
+}
+
+/// The verdict on the retained worktrees, given what the scan found.
+///
+/// A run's worktree is retired at its end (SPEC §8), so any still on
+/// disk is an older release's, an interrupted run's, or a retirement
+/// that failed — each a directory of build output nothing reads, and
+/// one `git worktree list` entry in its repository. Never a blocker:
+/// nothing about them stops a run. A scan that could not run is a
+/// failure to say so, not a clean state.
+pub(crate) fn worktrees_finding(
+    retained: Result<Vec<crate::workspace::RetainedWorktree>, crate::workspace::WorkspaceError>,
+) -> Finding {
+    match retained {
+        Ok(retained) if retained.is_empty() => Finding {
+            component: "worktrees",
+            level: Level::Ok,
+            detail: "no run worktree is retained".into(),
+        },
+        Ok(retained) => {
+            let bytes: u64 = retained.iter().map(|worktree| worktree.bytes).sum();
+            Finding {
+                component: "worktrees",
+                level: Level::Warn,
+                detail: format!(
+                    "{} run worktree(s) retained, {bytes} bytes; `relais resume --retire` \
+                     names what no candidate holds and removes them",
+                    retained.len()
+                ),
+            }
+        }
+        Err(e) => Finding {
+            component: "worktrees",
+            level: Level::Fail,
+            detail: format!("the retained worktrees could not be listed: {e}"),
         },
     }
 }
@@ -734,6 +787,7 @@ fn coordinator_finding() -> Finding {
 mod tests {
     use super::*;
     use crate::adapter::claude::capabilities_from_help;
+    use std::path::PathBuf;
 
     const HELP_2_1: &str = "usage: claude -p --model <model> --effort <level> \
          --output-format <format> --max-budget-usd <amount> \
@@ -1017,5 +1071,37 @@ mod tests {
         let json = serde_json::to_string(&report).expect("serializes");
         assert!(json.contains("\"level\":\"ok\""), "{json}");
         assert!(json.contains("\"level\":\"warn\""), "{json}");
+    }
+
+    /// Retained worktrees are a `!` that names the sweep and the size,
+    /// never a blocker; none is a pass; a scan that could not run says so.
+    #[test]
+    fn retained_worktrees_are_a_warning_naming_the_sweep() {
+        use crate::workspace::{RetainedWorktree, WorkspaceError};
+        let none = worktrees_finding(Ok(Vec::new()));
+        assert_eq!(none.level, Level::Ok, "{}", none.detail);
+        let some = worktrees_finding(Ok(vec![
+            RetainedWorktree {
+                run_id: "run-1".into(),
+                path: PathBuf::from("/state/worktrees/run-1/task"),
+                bytes: 1000,
+            },
+            RetainedWorktree {
+                run_id: "run-2".into(),
+                path: PathBuf::from("/state/runs/run-2/worktree"),
+                bytes: 24,
+            },
+        ]));
+        assert_eq!(some.level, Level::Warn, "{}", some.detail);
+        assert!(some.detail.contains("2 run worktree(s)"), "{}", some.detail);
+        assert!(some.detail.contains("1024 bytes"), "{}", some.detail);
+        assert!(
+            some.detail.contains("relais resume --retire"),
+            "{}",
+            some.detail
+        );
+        let unscanned = worktrees_finding(Err(WorkspaceError::Git("boom".into())));
+        assert_eq!(unscanned.level, Level::Fail);
+        assert!(unscanned.detail.contains("boom"), "{}", unscanned.detail);
     }
 }

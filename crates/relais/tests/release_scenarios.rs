@@ -1070,6 +1070,25 @@ fn a_leftover_worktree_is_retired_by_resume_with_its_tree_named() {
         ],
     );
     std::fs::write(leftover.join("src/leftover.rs"), "// never exported\n").expect("write");
+    // `doctor` counts it and names the sweep; a leftover is never a
+    // blocker, so the finding is a warning.
+    let worktrees_finding = |world: &World| -> serde_json::Value {
+        let report: serde_json::Value =
+            serde_json::from_str(text(&world.relais(&["doctor", "--json"]).stdout).trim())
+                .expect("doctor --json is a document");
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .find(|f| f["component"] == "worktrees")
+            .unwrap_or_else(|| panic!("no `worktrees` finding in {report}"))
+            .clone()
+    };
+    let before = worktrees_finding(&world);
+    assert_eq!(before["level"], "warn", "{before}");
+    let detail = before["detail"].as_str().expect("detail");
+    assert!(detail.starts_with("1 run worktree(s) retained"), "{detail}");
+    assert!(detail.contains("relais resume --retire"), "{detail}");
     let nothing_to_do = world.relais(&["resume", "--retire", "--all"]);
     let swept = text(&nothing_to_do.stdout);
     assert_eq!(
@@ -1102,6 +1121,8 @@ fn a_leftover_worktree_is_retired_by_resume_with_its_tree_named() {
     );
     let listed = git(&world.repo, &["worktree", "list"]);
     assert!(!listed.contains(&run_id), "{listed}");
+    let after = worktrees_finding(&world);
+    assert_eq!(after["level"], "ok", "{after}");
     // Nothing left: the sweep says so and exits 0.
     let again = world.relais(&["resume", "--retire"]);
     assert_eq!(again.status.code(), Some(0));
