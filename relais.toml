@@ -16,7 +16,14 @@ effort = "medium"
 [execution]
 max_attempts = 3
 max_repairs_before_escalation = 1
-max_wall_seconds = 1200
+# 45 minutes, from measurement rather than taste: a package that adds a
+# ledger migration and changes a signature across five modules took 18:00
+# of a 20:00 budget on one attempt (run-65c118139b020-1000173c4) and hit
+# the ceiling on the next (run-65c1220d566ab-100012142, killed at exactly
+# 1200 s with nothing to show). A wall clock a real package fits in only
+# on a good day buys interrupted runs, and an interrupted run has already
+# paid for its worker.
+max_wall_seconds = 2700
 allow_nested_agents = true
 max_agent_depth = 3
 max_agents_total = 24
