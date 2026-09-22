@@ -1832,55 +1832,54 @@ fn retire_worktree(
     let artifacts = paths::runs_dir()
         .map_err(CliError::Home)?
         .join(run.as_str());
-    let (reason, detail, retired) =
-        match workspace::retire(&workspace.repo_path, &worktree, run.as_str(), &artifacts) {
-            Ok(retirement) => {
-                match &retirement.exported {
-                    Some(exported) => println!(
-                        "{run}: retired {} — {} written, patch {}, {} bytes reclaimed",
-                        path.display(),
-                        exported.reference,
-                        exported.patch_path.display(),
-                        retirement.bytes_reclaimed
-                    ),
-                    None => println!(
-                        "{run}: retired {} — its tree was already a named candidate, {} bytes \
+    let (reason, detail, retired) = match workspace::retire(&worktree, run.as_str(), &artifacts) {
+        Ok(retirement) => {
+            match &retirement.exported {
+                Some(exported) => println!(
+                    "{run}: retired {} — {} written, patch {}, {} bytes reclaimed",
+                    path.display(),
+                    exported.reference,
+                    exported.patch_path.display(),
+                    retirement.bytes_reclaimed
+                ),
+                None => println!(
+                    "{run}: retired {} — its tree was already a named candidate, {} bytes \
                      reclaimed",
-                        path.display(),
-                        retirement.bytes_reclaimed
-                    ),
-                }
-                (
-                    Reason::WorktreeRetired,
-                    serde_json::json!({
-                        "worktree": path.to_string_lossy(),
-                        "reference": retirement.exported.as_ref().map(|e| e.reference.clone()),
-                        "patch": retirement
-                            .exported
-                            .as_ref()
-                            .map(|e| e.patch_path.to_string_lossy().into_owned()),
-                        "bytes_reclaimed": retirement.bytes_reclaimed,
-                        "by": "resume --retire",
-                    }),
-                    Retired::Retired,
-                )
+                    path.display(),
+                    retirement.bytes_reclaimed
+                ),
             }
-            Err(e) => {
-                eprintln!(
-                    "relais resume: {run}: kept, {} could not be retired: {e}",
-                    path.display()
-                );
-                (
-                    Reason::WorktreeNotReleased,
-                    serde_json::json!({
-                        "worktree": path.to_string_lossy(),
-                        "error": e.to_string(),
-                        "by": "resume --retire",
-                    }),
-                    Retired::Kept,
-                )
-            }
-        };
+            (
+                Reason::WorktreeRetired,
+                serde_json::json!({
+                    "worktree": path.to_string_lossy(),
+                    "reference": retirement.exported.as_ref().map(|e| e.reference.clone()),
+                    "patch": retirement
+                        .exported
+                        .as_ref()
+                        .map(|e| e.patch_path.to_string_lossy().into_owned()),
+                    "bytes_reclaimed": retirement.bytes_reclaimed,
+                    "by": "resume --retire",
+                }),
+                Retired::Retired,
+            )
+        }
+        Err(e) => {
+            eprintln!(
+                "relais resume: {run}: kept, {} could not be retired: {e}",
+                path.display()
+            );
+            (
+                Reason::WorktreeNotReleased,
+                serde_json::json!({
+                    "worktree": path.to_string_lossy(),
+                    "error": e.to_string(),
+                    "by": "resume --retire",
+                }),
+                Retired::Kept,
+            )
+        }
+    };
     operational(
         ledger.record_transition(&relais::ledger::Transition {
             run_id: run.clone(),

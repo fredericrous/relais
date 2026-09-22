@@ -6,6 +6,19 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## v0.2.2
+
+### Fixed
+
+- **A leftover worktree is retired from its own `.git` link, not from
+  the directory the run was launched in.** The first `resume --retire`
+  on a real machine kept four legacy worktrees with "git could not be
+  launched": each had been launched from a task worktree removed weeks
+  earlier, and retirement ran git there. Every repository-level command
+  now runs inside the leftover itself, whose link names the repository's
+  common dir whatever became of the launch path; `retire` no longer takes
+  a repository directory at all.
+
 ## v0.2.1
 
 The first days of running 0.2.0 from git worktrees, on a laptop, through

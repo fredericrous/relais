@@ -558,12 +558,14 @@ pub struct Retirement {
 /// Idempotent: a second call on the same tree finds it under `final`
 /// and exports nothing. A worktree that is gone already is an error,
 /// not a silent success, because "retired" must mean it was seen.
-pub fn retire(
-    repo_dir: &Path,
-    worktree: &TaskWorktree,
-    run_id: &str,
-    artifacts_dir: &Path,
-) -> Result<Retirement> {
+pub fn retire(worktree: &TaskWorktree, run_id: &str, artifacts_dir: &Path) -> Result<Retirement> {
+    // Every repository-level command below runs INSIDE the worktree: its
+    // `.git` file names the repository's common dir, which is where refs
+    // and the worktree list live. The path the run was launched from is
+    // deliberately not consulted — it is often a task worktree that was
+    // removed long before the leftover is swept (the four legacy runs on
+    // the first `resume --retire`), and git answers from the link anyway.
+    let repo_dir = &worktree.path;
     let snapshot = worktree.snapshot_candidate("retirement")?;
     let tree = tree_of(&worktree.path, &snapshot)?;
     let base_tree = tree_of(&worktree.path, &worktree.base_sha)?;
@@ -583,8 +585,14 @@ pub fn retire(
         })
     };
     let bytes_reclaimed = dir_size(&worktree.path)?;
-    git(
+    // `worktree remove` cannot run from inside the directory it deletes;
+    // the common dir is where the worktree list lives, so ask git for it.
+    let common_dir = git(
         repo_dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    git(
+        Path::new(common_dir.trim()),
         &[
             "worktree",
             "remove",
@@ -1209,7 +1217,7 @@ mod tests {
         std::fs::write(wt_path.join("target/debug/bin"), vec![0u8; 4096]).expect("build output");
 
         let artifacts = dir.join("runs/run-7");
-        let retired = retire(&repo, &wt, "run-7", &artifacts).expect("retired");
+        let retired = retire(&wt, "run-7", &artifacts).expect("retired");
         let exported = retired.exported.expect("the edit was in no patch");
         assert_eq!(exported.reference, "refs/relais/candidates/run-7/final");
         assert_eq!(exported.patch_path, artifacts.join(FINAL_PATCH));
@@ -1241,6 +1249,50 @@ mod tests {
         .expect("the final patch applies");
     }
 
+    /// The path the run was launched from may be gone by the time a
+    /// leftover is swept: a task worktree removed after the run, the
+    /// case the first `resume --retire` on a real machine hit. The
+    /// leftover's own `.git` link still names the repository, and that
+    /// is what retirement runs against.
+    #[test]
+    fn retirement_survives_a_vanished_launch_directory() {
+        let (dir, repo) = temp_repo();
+        let sha = resolve_base(&repo, "HEAD").expect("base");
+        // The run was launched from a linked worktree that no longer exists.
+        let launch = dir.join("launch-wt");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                &launch.to_string_lossy(),
+                &sha,
+            ],
+        )
+        .expect("launch worktree");
+        let wt_path = dir.join("worktrees/run-9/task");
+        let wt = create_worktree(&launch, &sha, &wt_path).expect("worktree");
+        std::fs::write(wt_path.join("src/main.rs"), "fn main() { orphan }\n").expect("edit");
+        git(
+            &repo,
+            &["worktree", "remove", "--force", &launch.to_string_lossy()],
+        )
+        .expect("the launch directory vanishes");
+        assert!(!launch.exists());
+
+        let artifacts = dir.join("runs/run-9");
+        let retired = retire(&wt, "run-9", &artifacts).expect("retired from the leftover alone");
+        let exported = retired.exported.expect("the orphan edit was unexported");
+        let kept = git(
+            &repo,
+            &["show", &format!("{}:src/main.rs", exported.reference)],
+        )
+        .expect("the ref resolves in the repository");
+        assert_eq!(kept, "fn main() { orphan }");
+        assert!(!wt_path.exists(), "the leftover is gone");
+    }
+
     /// A tree a named candidate already holds exports nothing, and the
     /// worktree is still released.
     #[test]
@@ -1253,7 +1305,7 @@ mod tests {
         let candidate = wt.snapshot_candidate("attempt-1").expect("snapshot");
         name_candidate(&repo, "run-8", 1, &candidate).expect("named");
         let artifacts = dir.join("runs/run-8");
-        let retired = retire(&repo, &wt, "run-8", &artifacts).expect("retired");
+        let retired = retire(&wt, "run-8", &artifacts).expect("retired");
         assert_eq!(retired.exported, None, "attempt 1 already holds this tree");
         assert!(!artifacts.join(FINAL_PATCH).exists());
         assert!(!wt_path.exists());
@@ -1272,7 +1324,7 @@ mod tests {
         // A tree identical to the base needs no ref either.
         let wt_path = dir.join("worktrees/run-9/task");
         let wt = create_worktree(&repo, &sha, &wt_path).expect("worktree");
-        let retired = retire(&repo, &wt, "run-9", &dir.join("runs/run-9")).expect("retired");
+        let retired = retire(&wt, "run-9", &dir.join("runs/run-9")).expect("retired");
         assert_eq!(retired.exported, None, "the base is durable by definition");
         assert!(!wt_path.exists());
     }
@@ -1287,10 +1339,10 @@ mod tests {
         let wt_path = dir.join("worktrees/run-10/task");
         let wt = create_worktree(&repo, &sha, &wt_path).expect("worktree");
         std::fs::write(wt_path.join("src/main.rs"), "fn main() { one }\n").expect("edit");
-        let first = retire(&repo, &wt, "run-10", &artifacts).expect("retired");
+        let first = retire(&wt, "run-10", &artifacts).expect("retired");
         let wt = create_worktree(&repo, &sha, &wt_path).expect("worktree again");
         std::fs::write(wt_path.join("src/main.rs"), "fn main() { two }\n").expect("edit");
-        let second = retire(&repo, &wt, "run-10", &artifacts).expect("retired");
+        let second = retire(&wt, "run-10", &artifacts).expect("retired");
         let first = first.exported.expect("one");
         let second = second.exported.expect("two");
         assert_eq!(first.reference, "refs/relais/candidates/run-10/final");
