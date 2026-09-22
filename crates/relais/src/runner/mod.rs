@@ -5801,11 +5801,15 @@ mod tests {
         let fixture = Fixture::new();
         let flag = fixture.dir.join("setup-must-fail");
         let shell = if cfg!(windows) { "sh" } else { "bash" };
+        // The shell reads a backslash as an escape, so on Windows the
+        // native path would name a file that never exists and the setup
+        // would pass; git's sh accepts `C:/…` as it is.
+        let flag_for_sh = flag.to_string_lossy().replace('\\', "/");
         let setup = CommandSpec {
             argv: vec![
                 shell.into(),
                 "-c".into(),
-                format!("test ! -f {}", flag.to_string_lossy()),
+                format!("test ! -f {flag_for_sh}"),
             ],
             timeout_seconds: 30,
         };
