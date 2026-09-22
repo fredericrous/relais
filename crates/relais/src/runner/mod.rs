@@ -2803,7 +2803,9 @@ impl<'a> RunEngine<'a> {
         let mut prompt = String::from(
             "You are a semantic reviewer. You cannot edit or waive checks; you report findings only.\n\
              Report each finding with file/range, the violated acceptance criterion, evidence, and suggested verification.\n\
-             If there are no findings, end with the exact line: FINDINGS: none\n",
+             You may only run read-only commands (reading files, git log/diff/show, searching). \
+             Do not build, test or run checks: the runner has run the profile's checks already, \
+             and a command you could not run is not a finding.\n",
         );
         prompt.push('\n');
         prompt.push_str(&data_block("objective", &self.config.contract.objective));
@@ -2837,6 +2839,11 @@ impl<'a> RunEngine<'a> {
             request.patch_path.display()
         ));
         prompt.push_str(&format!("source to inspect: {}\n", review_dir.display()));
+        prompt.push_str(
+            "\nFinish your answer with exactly one of these, and nothing after it: the line \
+             `FINDINGS: none` when there are no findings, or the line `FINDINGS:` followed by \
+             the list of findings.\n",
+        );
         prompt
     }
 
@@ -3011,16 +3018,17 @@ pub(crate) struct ReviewRequest<'r> {
 /// where the verdict is looked for: scanning the last few lines for the
 /// phrase accepted a candidate whose reviewer merely quoted it, and a
 /// footer after the verdict line turned a clean review into findings
-/// (R10). Anything that is not a verdict is `Unavailable` — the run
-/// ends needs_review with the reviewer's text preserved, never accepted
-/// on a sentence nobody parsed.
+/// (R10). A block declaring findings anywhere — `FINDINGS:`, `Findings:`,
+/// a Markdown heading `**Findings**` or `## Findings`, whatever the case
+/// — is findings: a reviewer that listed three of them under a bold
+/// heading and closed with a "verified" section used to be read as
+/// having no verdict at all, and the run parked in needs_review with
+/// its findings unread. Only an answer that declares nothing is
+/// `Unavailable` — the run ends needs_review with the reviewer's text
+/// preserved, never accepted on a sentence nobody parsed.
 pub(crate) fn review_verdict(text: &str) -> ReviewOutcome {
-    let is_verdict = |line: &str| {
-        line.trim_start()
-            .to_ascii_uppercase()
-            .starts_with("FINDINGS")
-    };
-    let none = |line: &str| line.trim().eq_ignore_ascii_case("findings: none");
+    let is_verdict = |line: &str| verdict_words(line).starts_with("FINDINGS");
+    let none = |line: &str| verdict_words(line) == "FINDINGS: NONE";
     let last = text.lines().rev().find(|line| !line.trim().is_empty());
     match last {
         Some(line) if none(line) => ReviewOutcome::NoFindings,
@@ -3036,6 +3044,15 @@ pub(crate) fn review_verdict(text: &str) -> ReviewOutcome {
              and no findings are declared. The answer is preserved:\n{text}"
         )),
     }
+}
+
+/// A line with Markdown emphasis and heading marks stripped from both
+/// ends and upper-cased: what is left of `**Findings:**` or
+/// `## FINDINGS` to compare a verdict against.
+fn verdict_words(line: &str) -> String {
+    line.trim()
+        .trim_matches(|c: char| matches!(c, '*' | '_' | '#' | '`') || c.is_whitespace())
+        .to_ascii_uppercase()
 }
 
 pub(crate) enum ReviewOutcome {
@@ -7432,6 +7449,104 @@ mod tests {
             panic!("an answer with no verdict is unavailable, never findings by default");
         };
         assert!(detail.contains("no verdict line"), "{detail}");
+    }
+
+    /// The three shapes a reviewer's answer takes, including the one
+    /// that parked run-65c093b73a14c-87ad: findings under a bold
+    /// Markdown heading, closed by a "verified" section rather than a
+    /// `FINDINGS:` line.
+    #[test]
+    fn a_findings_heading_in_any_markup_is_findings() {
+        let parked = "**Findings**\n\n1. **`make check` fmt gate** — `src/runner/mod.rs:6519`. \
+                      Criterion: fmt passes.\n\n2. **`run_status` is not purely a projection** — \
+                      `src/ledger/mod.rs:674`.\n\n**Verified as meeting the criteria**\n\n- \
+                      `Ledger::set_run_status` is gone.\n";
+        assert!(
+            matches!(review_verdict(parked), ReviewOutcome::Findings(_)),
+            "a bold heading declares findings; the run must not park on `no verdict`"
+        );
+        for declared in [
+            "Findings:\n- src/a.rs:3 misses a case\n",
+            "## findings\n- one\n\nthanks\n",
+            "looked\n\n**FINDINGS:**\n- one\n",
+        ] {
+            assert!(
+                matches!(review_verdict(declared), ReviewOutcome::Findings(_)),
+                "{declared}"
+            );
+        }
+        // The explicit clean verdict, on the last line, in any markup.
+        for clean in [
+            "**Findings**\n\nNone worth reporting.\n\nFINDINGS: none\n",
+            "all good\n**FINDINGS: none**\n",
+        ] {
+            assert!(
+                matches!(review_verdict(clean), ReviewOutcome::NoFindings),
+                "{clean}"
+            );
+        }
+        // A heading with nothing declared under it and no closing line
+        // is findings, not an acceptance: the prompt demands the line.
+        assert!(matches!(
+            review_verdict("**Findings**\n\nNone.\n"),
+            ReviewOutcome::Findings(_)
+        ));
+        // And only a truly absent verdict is unavailable.
+        assert!(matches!(
+            review_verdict("The candidate looks reasonable to me.\n"),
+            ReviewOutcome::Unavailable(_)
+        ));
+    }
+
+    /// The reviewer is told how to end and what it may run, so a denied
+    /// build command is not reported as a finding and the verdict line
+    /// is where the runner looks for it.
+    #[test]
+    fn the_review_prompt_ends_with_the_verdict_instruction() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let prompts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&prompts);
+        let backend = MockBackend::new(move |spec| {
+            seen.lock().unwrap().push(spec.prompt.clone());
+            if spec.prompt.contains("semantic reviewer") {
+                return MockOutcome {
+                    result_text: Some("FINDINGS: none".into()),
+                    exit_code: Some(0),
+                    ..Default::default()
+                };
+            }
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &backend);
+        assert!(
+            matches!(outcome.terminal, Terminal::Accepted(_)),
+            "{outcome:?}"
+        );
+        let prompts = prompts.lock().unwrap();
+        let review = prompts
+            .iter()
+            .find(|p| p.contains("semantic reviewer"))
+            .expect("a reviewer was dispatched");
+        assert!(
+            review
+                .trim_end()
+                .ends_with("followed by the list of findings."),
+            "the verdict instruction is the last thing the reviewer reads:\n{review}"
+        );
+        assert!(review.contains("`FINDINGS: none`"), "{review}");
+        assert!(review.contains("only run read-only commands"), "{review}");
+        assert!(
+            review.contains("a command you could not run is not a finding"),
+            "{review}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
     #[test]
