@@ -113,9 +113,150 @@ pub fn write_init_template(path: &std::path::Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
+/// An ecosystem that keeps its dependencies inside the tree, named by
+/// the lockfile it leaves at the root, with the command that installs
+/// exactly what the lockfile says. A verification worktree is a checkout
+/// of one revision and nothing else, so a profile in such a repository
+/// usually needs a setup step before its commands can run — `usually`,
+/// because a documentation profile needs nothing, which is why relais
+/// only ever SUGGESTS the block and never runs it uninvited (SPEC §7).
+///
+/// Go and Rust are absent on purpose: `go test` and `cargo test` fetch
+/// into caches shared across worktrees, and rustup installs a pinned
+/// toolchain itself. A `Cargo.lock` calls for nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ecosystem {
+    pub name: &'static str,
+    pub lockfile: &'static str,
+    pub setup_argv: &'static [&'static str],
+}
+
+impl Ecosystem {
+    /// The `[[verification.profiles.<name>.setup]]` block that installs
+    /// this ecosystem's dependencies, as a user would paste it.
+    pub fn setup_block(&self, profile: &str) -> String {
+        let argv = self
+            .setup_argv
+            .iter()
+            .map(|arg| format!("{arg:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("[[verification.profiles.{profile}.setup]]\nargv = [{argv}]")
+    }
+}
+
+pub const ECOSYSTEMS: &[Ecosystem] = &[
+    Ecosystem {
+        name: "npm",
+        lockfile: "package-lock.json",
+        setup_argv: &["npm", "ci"],
+    },
+    Ecosystem {
+        name: "npm",
+        lockfile: "npm-shrinkwrap.json",
+        setup_argv: &["npm", "ci"],
+    },
+    Ecosystem {
+        name: "pnpm",
+        lockfile: "pnpm-lock.yaml",
+        setup_argv: &["pnpm", "install", "--frozen-lockfile"],
+    },
+    Ecosystem {
+        name: "yarn",
+        lockfile: "yarn.lock",
+        setup_argv: &["yarn", "install", "--immutable"],
+    },
+    Ecosystem {
+        name: "bun",
+        lockfile: "bun.lock",
+        setup_argv: &["bun", "install", "--frozen-lockfile"],
+    },
+    Ecosystem {
+        name: "bun",
+        lockfile: "bun.lockb",
+        setup_argv: &["bun", "install", "--frozen-lockfile"],
+    },
+    Ecosystem {
+        name: "uv",
+        lockfile: "uv.lock",
+        setup_argv: &["uv", "sync", "--frozen"],
+    },
+    Ecosystem {
+        name: "poetry",
+        lockfile: "poetry.lock",
+        setup_argv: &["poetry", "install", "--sync"],
+    },
+    Ecosystem {
+        name: "pipenv",
+        lockfile: "Pipfile.lock",
+        setup_argv: &["pipenv", "sync"],
+    },
+    Ecosystem {
+        name: "bundler",
+        lockfile: "Gemfile.lock",
+        setup_argv: &["bundle", "install"],
+    },
+    Ecosystem {
+        name: "composer",
+        lockfile: "composer.lock",
+        setup_argv: &["composer", "install"],
+    },
+];
+
+/// The ecosystems whose lockfile sits at the repository root, in table
+/// order. A repository carrying two lockfiles (a `package-lock.json`
+/// beside a `pnpm-lock.yaml`) is reported twice: relais does not know
+/// which one is live, and saying so is more honest than picking.
+pub fn lockfiles(repo_dir: &Path) -> Vec<&'static Ecosystem> {
+    ECOSYSTEMS
+        .iter()
+        .filter(|ecosystem| repo_dir.join(ecosystem.lockfile).is_file())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lockfile_at_the_root_names_its_installer() {
+        let dir = temp_dir("lockfiles");
+        assert!(
+            lockfiles(&dir).is_empty(),
+            "no lockfile, nothing to suggest"
+        );
+        std::fs::write(dir.join("package-lock.json"), "{}").expect("lockfile");
+        std::fs::write(dir.join("Cargo.lock"), "").expect("cargo lock");
+        let found = lockfiles(&dir);
+        assert_eq!(found.len(), 1, "Cargo.lock calls for no setup: {found:?}");
+        assert_eq!(found[0].setup_argv, ["npm", "ci"]);
+        assert_eq!(
+            found[0].setup_block("default"),
+            "[[verification.profiles.default.setup]]\nargv = [\"npm\", \"ci\"]"
+        );
+        std::fs::create_dir_all(dir.join("apps/web")).expect("mkdir");
+        std::fs::write(dir.join("apps/web/pnpm-lock.yaml"), "").expect("nested");
+        assert_eq!(
+            lockfiles(&dir).len(),
+            1,
+            "a nested lockfile is a workspace member's; the root's setup is the root's"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every lockfile that earns a setup suggestion is also a
+    /// verification input: a candidate that edits one changes what the
+    /// setup installs, and that is the user's decision (SPEC §10).
+    #[test]
+    fn every_ecosystem_lockfile_is_a_verification_input() {
+        for ecosystem in ECOSYSTEMS {
+            assert!(
+                crate::verify::POLICY_VERIFICATION_INPUTS.contains(&ecosystem.lockfile),
+                "{} is suggested for setup but is not a verification input",
+                ecosystem.lockfile
+            );
+        }
+    }
 
     /// Pid AND an in-process counter, pre-cleaned: two tests of this
     /// file run in parallel threads of one process, and a pid-only name

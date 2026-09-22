@@ -36,6 +36,7 @@ use crate::ledger::{Ledger, LedgerError, Transition, UsageEvent};
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::policy::{
     effective_authority, BlockCode, EffectiveAuthority, MachineSettings, RepoPolicy, Tier,
+    VerificationProfile,
 };
 use crate::procs::Ended;
 use crate::route::{route, Route, RouteInputs, RoutePredictor, Routed};
@@ -1086,6 +1087,52 @@ impl<'a> RunEngine<'a> {
             Ok(worktree) => worktree,
             Err(e) => return self.fail_preflight(BlockCode::WorktreeUnavailable, e.to_string()),
         };
+        // The same setup in the worker's own tree, so the worker can run
+        // the checks it is told to pass. This is also the one place the
+        // setup is proven when the baseline came from the cache: a
+        // cached verdict skipped the base's copy, not the machine.
+        let setup = verify::run_setup(
+            &worktree_path,
+            &preflight.authority.verification_profile,
+            &baseline.logs_dir,
+            "task",
+        )?;
+        self.record_logs(None, "setup_log", &setup)?;
+        if let Some(failed) = verify::setup_failure(&setup) {
+            let detail = setup_failure_detail(failed, "the task worktree");
+            // The worktree exists and no worker has touched it. Its
+            // disposition is the ordinary one (SPEC §8): removed when
+            // nothing in it is unaccounted for — an installed
+            // `node_modules` is ignored by the tree and counts for
+            // nothing — kept, on the record, when the setup left tracked
+            // or untracked changes that are in no patch.
+            let kept = match workspace::release_worktree(
+                self.config.repo_dir,
+                &worktree_path,
+                Disposition::MustBeClean,
+            ) {
+                Ok(()) => None,
+                Err(e) => Some(e.to_string()),
+            };
+            let outcome = self.fail_preflight(
+                BlockCode::VerificationSetupFailed,
+                match &kept {
+                    Some(why) => format!("{detail}; the task worktree is kept: {why}"),
+                    None => detail,
+                },
+            )?;
+            if let Some(why) = kept {
+                self.keep_worktree(
+                    State::Blocked,
+                    serde_json::json!({
+                        "worktree": worktree_path.to_string_lossy(),
+                        "error": why,
+                        "detail": "the setup left changes in the task worktree that are in no patch",
+                    }),
+                )?;
+            }
+            return Ok(outcome);
+        }
         self.attempt_loop(&AttemptContext {
             preflight: &preflight,
             baseline: &baseline,
@@ -1415,12 +1462,55 @@ impl<'a> RunEngine<'a> {
                 &self.verify_dir.join("verify-base"),
             ) {
                 Ok(mut baseline) => {
+                    // The declared setup first, in the base's own copy:
+                    // its logs are evidence whatever happens next, and a
+                    // setup that did not succeed leaves nothing for the
+                    // commands to run against — blocked, before any
+                    // worker is bought (SPEC §10).
+                    let setup = verify::run_setup(
+                        baseline.path(),
+                        &authority.verification_profile,
+                        &logs_dir,
+                        "base",
+                    )?;
+                    self.record_logs(None, "setup_log", &setup)?;
+                    if let Some(failed) = verify::setup_failure(&setup) {
+                        let detail = setup_failure_detail(failed, "the base revision");
+                        if let Err(e) = baseline.release() {
+                            eprintln!("relais: {e}");
+                        }
+                        return Ok(Phase::Ended(
+                            self.fail_preflight(BlockCode::VerificationSetupFailed, detail)?,
+                        ));
+                    }
                     let checks = verify::run_profile(
                         baseline.path(),
                         &authority.verification_profile,
                         &logs_dir,
                         "base",
                     )?;
+                    self.record_logs(None, "check_log", &checks)?;
+                    // A check that could not run at all (exit 127) gives
+                    // the base no verdict: nothing to compare a candidate
+                    // against, nothing to cache, and no worker can put
+                    // the missing program there. Blocked, with the
+                    // remedy named — which is not always "add a setup".
+                    let unrunnable = verify::unrunnable_checks(&checks);
+                    if !unrunnable.is_empty() {
+                        let detail = unrunnable_baseline_detail(
+                            self.config.repo_dir,
+                            &self.config.contract.verification_profile,
+                            &authority.verification_profile,
+                            &preflight.base_sha,
+                            &unrunnable,
+                        );
+                        if let Err(e) = baseline.release() {
+                            eprintln!("relais: {e}");
+                        }
+                        return Ok(Phase::Ended(
+                            self.fail_preflight(BlockCode::BaselineUnrunnable, detail)?,
+                        ));
+                    }
                     let failures: Vec<String> = checks
                         .iter()
                         .filter(|outcome| outcome.failed())
@@ -2288,7 +2378,7 @@ impl<'a> RunEngine<'a> {
         candidate_ref: Option<&str>,
     ) -> Result<(), RunError> {
         if candidate_ref.is_none() || !patch_path.is_file() {
-            return self.keep_worktree(serde_json::json!({
+            return self.keep_worktree(State::Accepted, serde_json::json!({
                 "worktree": worktree.path.to_string_lossy(),
                 "candidate": candidate_sha,
                 "named": candidate_ref.is_some(),
@@ -2297,58 +2387,68 @@ impl<'a> RunEngine<'a> {
                            the worktree is the only place it lives",
             }));
         }
-        let disposition = match identity {
-            // Re-snapshotting is the comparison: the candidate identity
-            // is a pure function of (tree, base), so an equal SHA means
-            // every byte is in the patch and the ref.
-            TreeIdentity::Resnapshot => match worktree.snapshot_candidate("release check") {
-                Ok(now) if now == candidate_sha => Disposition::Exported,
-                Ok(now) => {
-                    return self.keep_worktree(serde_json::json!({
+        let disposition =
+            match identity {
+                // Re-snapshotting is the comparison: the candidate identity
+                // is a pure function of (tree, base), so an equal SHA means
+                // every byte is in the patch and the ref.
+                TreeIdentity::Resnapshot => match worktree.snapshot_candidate("release check") {
+                    Ok(now) if now == candidate_sha => Disposition::Exported,
+                    Ok(now) => {
+                        return self.keep_worktree(State::Accepted, serde_json::json!({
                         "worktree": worktree.path.to_string_lossy(),
                         "accepted_candidate": candidate_sha,
                         "tree_now": now,
                         "detail": "the tree changed after the accepted candidate was snapshotted; \
                                    the worktree is kept, because those changes are in no patch",
                     }));
-                }
-                Err(e) => {
-                    return self.keep_worktree(serde_json::json!({
+                    }
+                    Err(e) => {
+                        return self.keep_worktree(State::Accepted, serde_json::json!({
                         "worktree": worktree.path.to_string_lossy(),
                         "error": e.to_string(),
                         "detail": "the tree could not be compared to the accepted candidate",
                     }));
-                }
-            },
-            // A checked-out tree is shown to hold the candidate by its
-            // HEAD; `MustBeClean` then answers the other half — nothing
-            // uncommitted — inside the release itself.
-            TreeIdentity::CheckedOut => match head_revision(&worktree.path) {
-                Ok(head) if head == candidate_sha => Disposition::MustBeClean,
-                Ok(head) => {
-                    return self.keep_worktree(serde_json::json!({
-                        "worktree": worktree.path.to_string_lossy(),
-                        "accepted_candidate": candidate_sha,
-                        "head_now": head,
-                        "detail": "the worktree no longer holds the accepted revision",
-                    }));
-                }
-                Err(e) => {
-                    return self.keep_worktree(serde_json::json!({
-                        "worktree": worktree.path.to_string_lossy(),
-                        "error": e.to_string(),
-                        "detail": "the worktree's head could not be read",
-                    }));
-                }
-            },
-        };
+                    }
+                },
+                // A checked-out tree is shown to hold the candidate by its
+                // HEAD; `MustBeClean` then answers the other half — nothing
+                // uncommitted — inside the release itself.
+                TreeIdentity::CheckedOut => match head_revision(&worktree.path) {
+                    Ok(head) if head == candidate_sha => Disposition::MustBeClean,
+                    Ok(head) => {
+                        return self.keep_worktree(
+                            State::Accepted,
+                            serde_json::json!({
+                                "worktree": worktree.path.to_string_lossy(),
+                                "accepted_candidate": candidate_sha,
+                                "head_now": head,
+                                "detail": "the worktree no longer holds the accepted revision",
+                            }),
+                        );
+                    }
+                    Err(e) => {
+                        return self.keep_worktree(
+                            State::Accepted,
+                            serde_json::json!({
+                                "worktree": worktree.path.to_string_lossy(),
+                                "error": e.to_string(),
+                                "detail": "the worktree's head could not be read",
+                            }),
+                        );
+                    }
+                },
+            };
         if let Err(e) =
             workspace::release_worktree(self.config.repo_dir, &worktree.path, disposition)
         {
-            return self.keep_worktree(serde_json::json!({
-                "worktree": worktree.path.to_string_lossy(),
-                "error": e.to_string(),
-            }));
+            return self.keep_worktree(
+                State::Accepted,
+                serde_json::json!({
+                    "worktree": worktree.path.to_string_lossy(),
+                    "error": e.to_string(),
+                }),
+            );
         }
         Ok(())
     }
@@ -2357,16 +2457,38 @@ impl<'a> RunEngine<'a> {
     /// either way — its content is in the patch and the candidate ref —
     /// but a directory relais decided not to remove says so on the
     /// record rather than nowhere.
-    fn keep_worktree(&self, detail: serde_json::Value) -> Result<(), RunError> {
+    fn keep_worktree(&self, state: State, detail: serde_json::Value) -> Result<(), RunError> {
         self.config.ledger.record_transition(&Transition {
             run_id: self.run_id.clone(),
             attempt_id: None,
-            from_state: Some(State::Accepted),
-            to_state: State::Accepted,
+            from_state: Some(state),
+            to_state: state,
             reason: Reason::WorktreeNotReleased.as_str().to_string(),
             detail: Some(detail),
             at: self.config.ledger.now(),
         })?;
+        Ok(())
+    }
+
+    /// Record every log a setup or a profile produced as evidence, under
+    /// one kind. Called BEFORE the outcomes are judged: a failing setup's
+    /// log, or the 127 that blocks a baseline, is the most useful
+    /// evidence the run has, and an early return must not lose it.
+    pub(crate) fn record_logs(
+        &self,
+        attempt_id: Option<i64>,
+        kind: &str,
+        outcomes: &[verify::CheckOutcome],
+    ) -> Result<(), LedgerError> {
+        for outcome in outcomes {
+            self.config.ledger.record_evidence(
+                &self.run_id,
+                attempt_id,
+                kind,
+                Path::new(&outcome.log_path),
+                Some(&outcome.log_sha256),
+            )?;
+        }
         Ok(())
     }
 
@@ -2567,21 +2689,62 @@ impl<'a> RunEngine<'a> {
                 )
             }
         };
+        let mut setup_gap: Option<String> = None;
         let checks = match (reuse, holder.as_ref()) {
             // The candidate is the base tree: the baseline's outcomes are
-            // its outcomes, by identity.
+            // its outcomes, by identity — and the base's setup already
+            // proved the setup, so it is not spent again either.
             (Some(outcomes), _) => outcomes.to_vec(),
-            (None, Some(holder)) => verify::run_profile(
-                holder.path(),
-                &authority.verification_profile,
-                logs_dir,
-                &label.log_prefix(),
-            )
-            .map_err(|e| e.to_string())?,
+            (None, Some(holder)) => {
+                let setup = verify::run_setup(
+                    holder.path(),
+                    &authority.verification_profile,
+                    logs_dir,
+                    &label.log_prefix(),
+                )
+                .map_err(|e| e.to_string())?;
+                self.record_logs(None, "setup_log", &setup)
+                    .map_err(|e| format!("the ledger refused a setup-log evidence row: {e}"))?;
+                match verify::setup_failure(&setup) {
+                    // A setup that did not complete at the candidate is a
+                    // gap, not a failure: no check ran, so nothing was
+                    // tested, and no stronger model installs
+                    // dependencies (SPEC §10). If the candidate changed
+                    // the lockfile, that is reported on its own.
+                    Some(failed) => {
+                        setup_gap = Some(format!(
+                            "verification setup did not complete: {} ({}); the profile's \
+                             commands did not run — see {}",
+                            failed.label,
+                            failed.ended.describe(),
+                            failed.log_path
+                        ));
+                        Vec::new()
+                    }
+                    None => verify::run_profile(
+                        holder.path(),
+                        &authority.verification_profile,
+                        logs_dir,
+                        &label.log_prefix(),
+                    )
+                    .map_err(|e| e.to_string())?,
+                }
+            }
             (None, None) => {
                 return Err("a candidate to verify but no worktree to verify it in".to_string())
             }
         };
+        if let Some(gap) = setup_gap {
+            if let Some(holder) = holder.as_mut() {
+                if let Err(e) = holder.release() {
+                    eprintln!("relais: {e}");
+                }
+            }
+            return Ok(verify::Verified {
+                gaps: vec![gap],
+                ..Default::default()
+            });
+        }
         // A check log the ledger cannot point at is a check nobody can
         // audit, and acceptance rests on these (X5).
         for check in &checks {
@@ -3191,6 +3354,82 @@ fn build_prompt(
     prompt
 }
 
+/// What a failed setup command says on the run's record: which command,
+/// how it ended, where its log is, and where it was tried.
+fn setup_failure_detail(failed: &verify::CheckOutcome, where_: &str) -> String {
+    format!(
+        "the declared setup `{}` did not succeed in {where_} ({}); the profile's commands \
+         did not run — see {}",
+        failed.argv.join(" "),
+        failed.ended.describe(),
+        failed.log_path
+    )
+}
+
+/// What an unrunnable baseline says, and what to do about it. The remedy
+/// depends on what was declared: with no setup and a lockfile at the
+/// root, the missing program is most likely the tree's own dependencies
+/// and the block that installs them is spelled out; with a setup that
+/// succeeded and a program still missing, adding another install step is
+/// the wrong move, and the detail says so.
+fn unrunnable_baseline_detail(
+    repo_dir: &Path,
+    profile_name: &str,
+    profile: &VerificationProfile,
+    base_sha: &str,
+    labels: &[String],
+) -> String {
+    let short = base_sha.get(..8).unwrap_or(base_sha);
+    let mut detail = format!(
+        "{} exited {} (command not found) at the base revision {short}: the base has no \
+         verdict to compare a candidate against, and no worker can put the missing program \
+         there. A verification worktree holds the repository's files and nothing else.",
+        labels.join(", "),
+        verify::COMMAND_NOT_FOUND
+    );
+    if profile.setup.is_empty() {
+        let found = crate::repo::lockfiles(repo_dir);
+        if found.is_empty() {
+            detail.push_str(
+                " The profile declares no setup; if the commands need dependencies installed \
+                 in the tree, declare the install step under \
+                 [[verification.profiles.<name>.setup]] in relais.toml (this changes the policy \
+                 hash: review it and re-grant trust from `relais plan`).",
+            );
+        } else {
+            let suggestions = found
+                .iter()
+                .map(|ecosystem| {
+                    format!(
+                        "{} is present, suggesting:\n{}",
+                        ecosystem.lockfile,
+                        ecosystem.setup_block(profile_name)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            detail.push_str(&format!(
+                " The profile declares no setup and {suggestions}\nA setup step is executable \
+                 authority: adding it changes the policy hash, so review it and re-grant trust \
+                 from `relais plan`."
+            ));
+        }
+    } else {
+        detail.push_str(&format!(
+            " The profile's declared setup ({}) succeeded and the program is still not found: \
+             the setup does not provide it, or it is not on PATH in a verification worktree. \
+             Check what the setup installs rather than adding another install step.",
+            profile
+                .setup
+                .iter()
+                .map(|command| command.argv.join(" "))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    detail
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3339,6 +3578,7 @@ mod tests {
                     profiles: BTreeMap::from([(
                         "profile".into(),
                         VerificationProfile {
+                            setup: Vec::new(),
                             commands,
                             amont_checks: Vec::new(),
                             amont_waivers: Vec::new(),
@@ -3351,6 +3591,21 @@ mod tests {
                 architecture: Default::default(),
                 recipes: Vec::new(),
             }
+        }
+
+        fn repo_policy_with_setup(
+            &self,
+            setup: Vec<CommandSpec>,
+            commands: Vec<CommandSpec>,
+            max_attempts: u32,
+        ) -> RepoPolicy {
+            let mut repo = self.repo_policy(commands, max_attempts);
+            repo.verification
+                .profiles
+                .get_mut("profile")
+                .expect("profile")
+                .setup = setup;
+            repo
         }
 
         fn machine_for(&self, repo: &RepoPolicy) -> MachineSettings {
@@ -5351,6 +5606,475 @@ mod tests {
             fixture.ledger.run_status(&run_id).expect("status"),
             Some(State::Interrupted)
         );
+    }
+
+    // -- verification setup and an unrunnable baseline (SPEC §10) ----------
+
+    fn sh(script: &str) -> CommandSpec {
+        CommandSpec {
+            argv: vec!["sh".into(), "-c".into(), script.into()],
+            timeout_seconds: 30,
+        }
+    }
+
+    /// A worker that counts its launches and never completes.
+    fn counting_worker(launches: Arc<std::sync::atomic::AtomicUsize>) -> MockBackend {
+        MockBackend::new(move |_spec| {
+            launches.fetch_add(1, Ordering::SeqCst);
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        })
+    }
+
+    fn evidence_of(fixture: &Fixture, run_id: &RunId, kind: &str) -> Vec<(String, String)> {
+        fixture
+            .ledger
+            .evidence(run_id)
+            .expect("evidence")
+            .into_iter()
+            .filter(|(k, _, _)| k == kind)
+            .map(|(_, path, sha)| (path, sha.unwrap_or_default()))
+            .collect()
+    }
+
+    /// The application-landscape failure: every command exits 127 at the
+    /// base. Two workers were bought against it. Now: blocked before any
+    /// dispatch, the base's logs on the record, the remedy named, and
+    /// nothing cached.
+    #[test]
+    fn a_baseline_whose_commands_cannot_run_blocks_before_any_worker() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.repo.join("package-lock.json"), "{}").expect("lockfile");
+        git(&fixture.repo, &["add", "-A"]);
+        git(&fixture.repo, &["commit", "-q", "-m", "lockfile"]);
+        let mut repo = fixture.repo_policy(
+            vec![
+                CommandSpec {
+                    argv: vec!["relais-no-such-binary-4f3a".into()],
+                    timeout_seconds: 30,
+                },
+                sh("relais-no-such-binary-4f3a --version"),
+            ],
+            3,
+        );
+        repo.verification
+            .profiles
+            .get_mut("profile")
+            .expect("profile")
+            .cache_baseline = true;
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = counting_worker(Arc::clone(&launches));
+        let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Blocked { code, detail },
+        } = outcome
+        else {
+            panic!("expected blocked, got {outcome:?}");
+        };
+        assert_eq!(code, BlockCode::BaselineUnrunnable, "{detail}");
+        assert_eq!(launches.load(Ordering::SeqCst), 0, "no worker was bought");
+        assert!(detail.contains("exited 127"), "{detail}");
+        assert!(
+            detail.contains("package-lock.json is present"),
+            "the lockfile is named: {detail}"
+        );
+        assert!(
+            detail.contains("[[verification.profiles.profile.setup]]\nargv = [\"npm\", \"ci\"]"),
+            "the exact block is suggested: {detail}"
+        );
+        assert!(detail.contains("re-grant trust"), "{detail}");
+        let check_logs = evidence_of(&fixture, &run_id, "check_log");
+        assert_eq!(
+            check_logs.len(),
+            2,
+            "both base logs are evidence: {check_logs:?}"
+        );
+        for (path, sha) in &check_logs {
+            assert!(path.contains("base-cmd"), "{path}");
+            let bytes = std::fs::read(path).expect("the log exists");
+            assert_eq!(sha, &crate::ids::sha256_hex(&bytes), "{path}");
+        }
+        assert!(
+            !fixture.worktree(&run_id).exists(),
+            "no task worktree was created"
+        );
+        let cache_dir = fixture.artifacts.parent().unwrap().join("baseline-cache");
+        let cached = std::fs::read_dir(&cache_dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(
+            cached, 0,
+            "an unrunnable baseline is not a verdict to cache"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// With a setup already declared and succeeded, a program still
+    /// missing is not solved by another install block: the detail points
+    /// at the setup, not at the lockfile.
+    #[test]
+    fn a_declared_setup_that_does_not_make_the_program_available_says_so() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.repo.join("package-lock.json"), "{}").expect("lockfile");
+        git(&fixture.repo, &["add", "-A"]);
+        git(&fixture.repo, &["commit", "-q", "-m", "lockfile"]);
+        let repo = fixture.repo_policy_with_setup(
+            vec![sh("true")],
+            vec![sh("relais-no-such-binary-4f3a")],
+            3,
+        );
+        let backend = conditional_worker("");
+        let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+        let RunOutcome {
+            terminal: Terminal::Blocked { code, detail },
+            ..
+        } = outcome
+        else {
+            panic!("expected blocked, got {outcome:?}");
+        };
+        assert_eq!(code, BlockCode::BaselineUnrunnable, "{detail}");
+        assert!(
+            detail.contains("declared setup (sh -c true) succeeded"),
+            "{detail}"
+        );
+        assert!(
+            !detail.contains("[[verification.profiles"),
+            "no second install block is suggested: {detail}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A setup that fails at the base blocks the run: its log is evidence
+    /// with a matching hash, and the commands never ran.
+    #[test]
+    fn a_failing_setup_at_the_base_blocks_and_launches_nothing() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy_with_setup(
+            vec![sh("echo boom >&2; exit 1"), sh("echo never")],
+            vec![passing_check()],
+            3,
+        );
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = counting_worker(Arc::clone(&launches));
+        let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Blocked { code, detail },
+        } = outcome
+        else {
+            panic!("expected blocked, got {outcome:?}");
+        };
+        assert_eq!(code, BlockCode::VerificationSetupFailed, "{detail}");
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        assert!(detail.contains("the base revision"), "{detail}");
+        assert!(detail.contains("exit 1"), "{detail}");
+        let setup_logs = evidence_of(&fixture, &run_id, "setup_log");
+        assert_eq!(setup_logs.len(), 1, "{setup_logs:?}");
+        let (path, sha) = &setup_logs[0];
+        assert!(path.ends_with("base-setup0.log"), "{path}");
+        let bytes = std::fs::read(path).expect("the failing setup's log exists");
+        assert_eq!(sha, &crate::ids::sha256_hex(&bytes));
+        assert!(String::from_utf8_lossy(&bytes).contains("boom"));
+        let logs = fixture.artifacts.join(run_id.as_str()).join("logs");
+        assert!(
+            !logs.join("base-setup1.log").exists(),
+            "stopped at the first failure"
+        );
+        assert!(
+            !logs.join("base-cmd0.log").exists(),
+            "the commands never ran"
+        );
+        assert!(evidence_of(&fixture, &run_id, "check_log").is_empty());
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A cached baseline skips the base's copy of the setup, not the
+    /// task worktree's: a setup that fails there still blocks the run
+    /// before a worker is bought.
+    #[test]
+    fn a_cache_hit_still_runs_task_setup_and_a_failure_launches_nothing() {
+        let fixture = Fixture::new();
+        let flag = fixture.dir.join("setup-must-fail");
+        let shell = if cfg!(windows) { "sh" } else { "bash" };
+        let setup = CommandSpec {
+            argv: vec![
+                shell.into(),
+                "-c".into(),
+                format!("test ! -f {}", flag.to_string_lossy()),
+            ],
+            timeout_seconds: 30,
+        };
+        let mut repo =
+            fixture.repo_policy_with_setup(vec![setup], vec![versionable_main_gone_check()], 3);
+        repo.verification
+            .profiles
+            .get_mut("profile")
+            .expect("profile")
+            .cache_baseline = true;
+        let machine = fixture.machine_for(&repo);
+        let backend = conditional_worker("relais task");
+        let first =
+            fixture.execute_with_machine(&fixture.contract(Review::Off), &repo, &machine, &backend);
+        let RunOutcome {
+            run_id: first_id,
+            terminal: Terminal::Accepted(receipt),
+        } = first
+        else {
+            panic!("{first:?}");
+        };
+        assert!(
+            !receipt.verification.baseline_cached,
+            "the first run fills the cache"
+        );
+        let first_logs = fixture.artifacts.join(first_id.as_str()).join("logs");
+        assert!(first_logs.join("base-setup0.log").exists());
+        assert!(first_logs.join("task-setup0.log").exists());
+        assert!(first_logs.join("attempt1-setup0.log").exists());
+
+        std::fs::write(&flag, "").expect("flag");
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = counting_worker(Arc::clone(&launches));
+        let second = fixture.execute_with_machine(
+            &fixture.contract(Review::Off),
+            &repo,
+            &machine,
+            &counting,
+        );
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Blocked { code, detail },
+        } = second
+        else {
+            panic!("expected blocked, got {second:?}");
+        };
+        assert_eq!(code, BlockCode::VerificationSetupFailed, "{detail}");
+        assert!(detail.contains("the task worktree"), "{detail}");
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        let logs = fixture.artifacts.join(run_id.as_str()).join("logs");
+        assert!(
+            !logs.join("base-setup0.log").exists(),
+            "the cached baseline skipped the base's setup"
+        );
+        let setup_logs = evidence_of(&fixture, &run_id, "setup_log");
+        assert_eq!(setup_logs.len(), 1, "{setup_logs:?}");
+        assert!(setup_logs[0].0.ends_with("task-setup0.log"));
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A setup that fails in the task worktree after installing only
+    /// ignored files leaves nothing unexported: the worktree goes.
+    #[test]
+    fn setup_generated_ignored_files_permit_cleanup() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.repo.join(".gitignore"), "node_modules/\n").expect("ignore");
+        git(&fixture.repo, &["add", "-A"]);
+        git(&fixture.repo, &["commit", "-q", "-m", "ignore"]);
+        // Installs into an ignored directory everywhere; fails only in
+        // the task worktree, so the base's copy passes.
+        let repo = fixture.repo_policy_with_setup(
+            vec![sh("mkdir -p node_modules && echo x > node_modules/x && \
+                 case \"$(pwd -P)\" in */task) exit 1;; esac")],
+            vec![passing_check()],
+            3,
+        );
+        let backend = conditional_worker("");
+        let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Blocked { code, detail },
+        } = outcome
+        else {
+            panic!("expected blocked, got {outcome:?}");
+        };
+        assert_eq!(code, BlockCode::VerificationSetupFailed, "{detail}");
+        assert!(!detail.contains("is kept"), "{detail}");
+        assert!(
+            !fixture.worktree(&run_id).exists(),
+            "ignored installation output does not keep a worktree alive"
+        );
+        let transitions = fixture.ledger.transitions(&run_id).expect("history");
+        assert!(
+            !transitions
+                .iter()
+                .any(|t| t.reason == Reason::WorktreeNotReleased.as_str()),
+            "{transitions:?}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A setup that leaves untracked, unignored files behind and then
+    /// fails has put something in the tree that is in no patch: the
+    /// worktree is kept, and the record says so from the blocked state.
+    #[test]
+    fn setup_leaving_unexported_changes_keeps_the_worktree() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy_with_setup(
+            vec![sh("echo generated > src/generated.rs && \
+                 case \"$(pwd -P)\" in */task) exit 1;; esac")],
+            vec![passing_check()],
+            3,
+        );
+        let backend = conditional_worker("");
+        let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Blocked { code, detail },
+        } = outcome
+        else {
+            panic!("expected blocked, got {outcome:?}");
+        };
+        assert_eq!(code, BlockCode::VerificationSetupFailed, "{detail}");
+        assert!(detail.contains("the task worktree is kept"), "{detail}");
+        assert!(
+            fixture.worktree(&run_id).join("src/generated.rs").exists(),
+            "the unexported file is still there"
+        );
+        let transitions = fixture.ledger.transitions(&run_id).expect("history");
+        let kept = transitions
+            .iter()
+            .find(|t| t.reason == Reason::WorktreeNotReleased.as_str())
+            .unwrap_or_else(|| panic!("the kept worktree is on the record: {transitions:?}"));
+        assert_eq!(kept.from_state, Some(State::Blocked));
+        assert_eq!(kept.to_state, State::Blocked);
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A setup that fails at a candidate is a gap: no check ran, no
+    /// stronger model is bought, the user decides.
+    #[test]
+    fn a_setup_that_fails_at_a_candidate_is_a_gap_not_a_failure() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy_with_setup(
+            vec![sh("test ! -f src/evil.rs")],
+            vec![passing_check()],
+            3,
+        );
+        let backend = MockBackend::new(|spec| {
+            std::fs::write(spec.work_dir.join("src/evil.rs"), "// breaks the setup\n")
+                .expect("write");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::NeedsDecision { reason, detail },
+        } = outcome
+        else {
+            panic!("expected needs_decision, got {outcome:?}");
+        };
+        assert_eq!(reason, Reason::VerificationGap, "{detail}");
+        assert!(
+            detail.contains("verification setup did not complete"),
+            "{detail}"
+        );
+        let logs = fixture.artifacts.join(run_id.as_str()).join("logs");
+        assert!(logs.join("attempt1-setup0.log").exists());
+        assert!(
+            !logs.join("attempt1-cmd0.log").exists(),
+            "the commands did not run"
+        );
+        let setup_logs = evidence_of(&fixture, &run_id, "setup_log");
+        assert!(
+            setup_logs
+                .iter()
+                .any(|(path, _)| path.ends_with("attempt1-setup0.log")),
+            "{setup_logs:?}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// 127 at a candidate — the worker removed what the check runs — is
+    /// the candidate's failure, judged like any other: a repair, never
+    /// an unrunnable baseline.
+    #[test]
+    fn a_candidate_exit_127_is_a_candidate_failure() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.repo.join("src/tool.sh"), "#!/bin/sh\necho ok\n").expect("tool");
+        git(&fixture.repo, &["add", "-A"]);
+        git(&fixture.repo, &["commit", "-q", "-m", "tool"]);
+        let repo = fixture.repo_policy(vec![sh("sh ./src/tool.sh")], 3);
+        let backend = MockBackend::new(|spec| {
+            let tool = spec.work_dir.join("src/tool.sh");
+            if tool.exists() {
+                std::fs::remove_file(&tool).expect("remove");
+            }
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+        assert!(
+            !matches!(outcome.terminal, Terminal::Blocked { .. }),
+            "a candidate's 127 is not a block: {outcome:?}"
+        );
+        let transitions = fixture
+            .ledger
+            .transitions(&outcome.run_id)
+            .expect("history");
+        assert!(
+            transitions.iter().any(|t| t.to_state == State::Repairing),
+            "the failure was repaired like any other: {transitions:?}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A candidate that is the base tree reuses the baseline's outcomes,
+    /// and with them the base's setup: nothing is installed twice.
+    #[test]
+    fn an_identical_candidate_reuses_the_baseline_and_skips_setup() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy_with_setup(vec![sh("true")], vec![passing_check()], 1);
+        let backend = conditional_worker("");
+        let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+        let logs = fixture.artifacts.join(outcome.run_id.as_str()).join("logs");
+        assert!(logs.join("base-setup0.log").exists());
+        assert!(logs.join("task-setup0.log").exists());
+        assert!(
+            !logs.join("attempt1-setup0.log").exists(),
+            "the base's outcomes were reused, setup included: {outcome:?}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// The assembled candidate of a decomposed run is verified in its own
+    /// worktree, and that worktree needs the setup like any other.
+    #[test]
+    fn the_integrated_head_runs_setup() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy_with_setup(vec![sh("true")], vec![passing_check()], 3);
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = package_worker(Arc::clone(&launches));
+        let contract = decomposed_contract(&fixture, plan_json(false));
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Accepted(_),
+        } = outcome
+        else {
+            panic!("expected acceptance, got {outcome:?}");
+        };
+        let logs = fixture.artifacts.join(run_id.as_str()).join("logs");
+        assert!(
+            logs.join("integration0-setup0.log").exists(),
+            "the integrated head ran the setup: {:?}",
+            std::fs::read_dir(&logs)
+                .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+                .ok()
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
     // -- bounded decomposition (SPEC §19) ----------------------------------

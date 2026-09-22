@@ -171,19 +171,61 @@ pub fn run_command(
         .stdout(log_file.try_clone()?)
         .stderr(log_file);
     crate::procs::own_process_group(&mut command);
-    let mut child = command.spawn()?;
-    // The whole process group goes when the check ends, however it ends:
-    // a `cargo test` grandchild left running in a worktree that is about
-    // to be removed corrupts the next thing that reads it (audit V1).
-    let supervised = crate::procs::wait_for_exit(&mut child, timeout, None)?;
+    let ended = match command.spawn() {
+        Ok(mut child) => {
+            // The whole process group goes when the check ends, however
+            // it ends: a `cargo test` grandchild left running in a
+            // worktree that is about to be removed corrupts the next
+            // thing that reads it (audit V1).
+            crate::procs::wait_for_exit(&mut child, timeout, None)?.ended
+        }
+        // A program that is not there is the same fact whether relais
+        // spawned it directly or a shell looked for it: the shell says
+        // "command not found" and exits 127, and so does this. Written
+        // into the log so the evidence reads the same either way, and
+        // recorded as an outcome — not a runner failure — so the
+        // baseline can say "unrunnable" instead of "interrupted" (see
+        // `unrunnable`). Only NotFound: a program that exists and cannot
+        // be executed is a different problem, not an install away.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            use std::io::Write as _;
+            let mut log = std::fs::OpenOptions::new().append(true).open(&log_path)?;
+            writeln!(log, "relais: {}: command not found", spec.argv[0])?;
+            Ended::Exited(COMMAND_NOT_FOUND)
+        }
+        Err(e) => return Err(VerifyError::Io(e)),
+    };
     let log_bytes = std::fs::read(&log_path)?;
     Ok(CheckOutcome {
         label: label.to_string(),
         argv: spec.argv.clone(),
-        ended: supervised.ended,
+        ended,
         log_path: log_path.to_string_lossy().into_owned(),
         log_sha256: sha256_hex(&log_bytes),
     })
+}
+
+/// The shell's status for "command not found". A check that ends this
+/// way did not run: nothing it was meant to test was tested.
+pub const COMMAND_NOT_FOUND: i32 = 127;
+
+/// Did this check end without running at all — the program the argv
+/// names, or one a script inside it needed, was not found? 127 is what
+/// `sh` reports for that, and what `run_command` records when the spawn
+/// itself finds nothing; a bare `npm` and one behind `sh -c` say the
+/// same thing. At the base this is not a failure to compare candidates
+/// against, it is the absence of a verdict (SPEC §10).
+pub fn unrunnable(outcome: &CheckOutcome) -> bool {
+    outcome.ended == Ended::Exited(COMMAND_NOT_FOUND)
+}
+
+/// The labels of the checks that could not run.
+pub fn unrunnable_checks(checks: &[CheckOutcome]) -> Vec<String> {
+    checks
+        .iter()
+        .filter(|check| unrunnable(check))
+        .map(|check| check.label.clone())
+        .collect()
 }
 
 /// A command's wall clock. Zero is refused rather than rounded up to a
@@ -234,6 +276,47 @@ pub fn run_profile(
     Ok(outcomes)
 }
 
+/// A setup outcome's label: the command's identity behind a `setup:`
+/// prefix, so a setup can never be paired with a check of the same argv
+/// in `baseline_failures` — `npm ci` at the base and `npm ci` at the
+/// candidate are the same step, but neither is a check.
+pub fn setup_label(spec: &CommandSpec) -> String {
+    format!("setup:{}", check_label(spec))
+}
+
+/// Run a profile's setup in a directory, before its commands: the
+/// install step that puts the tree's own dependencies in place. It stops
+/// at the first failure — a `pnpm install` that did not finish makes the
+/// `playwright install` after it meaningless, and the commands after
+/// both would only report that nothing is installed. The outcomes are
+/// evidence (their logs are hashed and recorded like a check's), never
+/// checks: a setup that succeeded passed nothing (SPEC §10).
+pub fn run_setup(
+    dir: &Path,
+    profile: &VerificationProfile,
+    logs_dir: &Path,
+    prefix: &str,
+) -> Result<Vec<CheckOutcome>, VerifyError> {
+    let mut outcomes = Vec::new();
+    for (index, command) in profile.setup.iter().enumerate() {
+        let label = setup_label(command);
+        let log_stem = format!("{prefix}-setup{index}");
+        let outcome = run_command(dir, command, logs_dir, &label, &log_stem)?;
+        let failed = outcome.failed();
+        outcomes.push(outcome);
+        if failed {
+            break;
+        }
+    }
+    Ok(outcomes)
+}
+
+/// The setup command that did not succeed, when one did not. `run_setup`
+/// stops there, so it is the last outcome or none.
+pub fn setup_failure(outcomes: &[CheckOutcome]) -> Option<&CheckOutcome> {
+    outcomes.last().filter(|outcome| outcome.failed())
+}
+
 /// What verification IS, as opposed to what it tests: build manifests,
 /// lockfiles, toolchain pins, the check runner's own configuration, and
 /// any repository-relative program the profile runs. A candidate that
@@ -267,22 +350,32 @@ pub const POLICY_VERIFICATION_INPUTS: &[&str] = &[
     "**/rust-toolchain",
     "package.json",
     "package-lock.json",
+    "npm-shrinkwrap.json",
     "pnpm-lock.yaml",
     "pnpm-workspace.yaml",
     "yarn.lock",
+    "bun.lock",
+    "bun.lockb",
     "**/package.json",
     "**/package-lock.json",
+    "**/npm-shrinkwrap.json",
     "**/pnpm-lock.yaml",
     "**/pnpm-workspace.yaml",
     "**/yarn.lock",
+    "**/bun.lock",
+    "**/bun.lockb",
     "pyproject.toml",
     "requirements*.txt",
     "uv.lock",
     "poetry.lock",
+    "Pipfile",
+    "Pipfile.lock",
     "**/pyproject.toml",
     "**/requirements*.txt",
     "**/uv.lock",
     "**/poetry.lock",
+    "**/Pipfile",
+    "**/Pipfile.lock",
     "go.mod",
     "go.sum",
     "**/go.mod",
@@ -291,6 +384,10 @@ pub const POLICY_VERIFICATION_INPUTS: &[&str] = &[
     "Gemfile.lock",
     "**/Gemfile",
     "**/Gemfile.lock",
+    "composer.json",
+    "composer.lock",
+    "**/composer.json",
+    "**/composer.lock",
     "**/pytest.ini",
     "**/tox.ini",
 ];
@@ -323,7 +420,9 @@ pub fn verification_inputs(profile: &VerificationProfile) -> Vec<String> {
         .map(|p| p.to_string())
         .collect();
     patterns.extend(profile.inputs.iter().cloned());
-    for command in &profile.commands {
+    // A repository-relative setup program (`./scripts/bootstrap.sh`) is
+    // verification too: it decides what the commands run against.
+    for command in profile.setup.iter().chain(&profile.commands) {
         if let Some(program) = command.argv.first() {
             let relative = program.trim_start_matches("./");
             if program.starts_with("./") || program.contains('/') && !program.starts_with('/') {
@@ -817,18 +916,20 @@ impl std::fmt::Display for CacheRefused {
     }
 }
 
-/// Resolve every program the profile's commands run. The probe is a
-/// parameter, so this stays a pure function over what the machine
+/// Resolve every program the profile's setup and commands run. The probe
+/// is a parameter, so this stays a pure function over what the machine
 /// answered. A program that cannot be versioned refuses the cache for
 /// the whole profile: a key that cannot name the toolchain cannot say
-/// two runs shared one.
+/// two runs shared one. The setup's programs count as much as the
+/// commands': hashing the profile captures `["uv", "sync"]`, not which
+/// uv installed the tree the checks then ran against.
 pub fn resolve_toolchain(
     profile: &VerificationProfile,
     probe: &dyn Fn(&str) -> Result<ProgramVersion, VersionUnknown>,
 ) -> Result<Toolchain, CacheRefused> {
     let mut programs: Vec<ProgramVersion> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
-    for command in &profile.commands {
+    for command in profile.setup.iter().chain(&profile.commands) {
         let Some(program) = command.argv.first() else {
             continue;
         };
@@ -1127,6 +1228,7 @@ mod tests {
         let dir = temp_dir("labels");
         let logs = dir.join("logs");
         let profile = VerificationProfile {
+            setup: Vec::new(),
             commands: vec![command(&["sh", "-c", "true"], 10)],
             amont_checks: Vec::new(),
             amont_waivers: Vec::new(),
@@ -1163,6 +1265,7 @@ mod tests {
     #[test]
     fn verification_inputs_split_policy_from_the_test_tree() {
         let profile = VerificationProfile {
+            setup: vec![command(&["./scripts/bootstrap.sh"], 10)],
             commands: vec![
                 command(&["./scripts/check.sh"], 10),
                 command(&["make", "check"], 10),
@@ -1182,6 +1285,7 @@ mod tests {
                 "src/foo_test.go".into(),
                 "tests/test_parser.py".into(),
                 "scripts/check.sh".into(),
+                "scripts/bootstrap.sh".into(),
                 "ci/lint.yml".into(),
                 "docs/README.md".into(),
             ],
@@ -1193,6 +1297,7 @@ mod tests {
                 "Makefile",
                 "crates/x/Cargo.toml",
                 "scripts/check.sh",
+                "scripts/bootstrap.sh",
                 "ci/lint.yml",
             ],
             "build manifests, the profile's declared inputs and the commands' own programs"
@@ -1202,7 +1307,7 @@ mod tests {
             vec!["tests/smoke.rs", "src/foo_test.go", "tests/test_parser.py"],
             "the test tree is work SPEC §10 invites, not a policy change"
         );
-        assert_eq!(touched.all().len(), 7);
+        assert_eq!(touched.all().len(), 8);
         assert!(
             classify_verification_inputs(&profile, &["src/lib.rs".into()])
                 .expect("compiles")
@@ -1257,6 +1362,7 @@ mod tests {
     #[test]
     fn a_malformed_input_pattern_blocks_and_names_itself() {
         let profile = VerificationProfile {
+            setup: Vec::new(),
             commands: Vec::new(),
             amont_checks: Vec::new(),
             amont_waivers: Vec::new(),
@@ -1315,6 +1421,7 @@ mod tests {
         let dir = temp_dir("bcache");
         let cache = BaselineCache::new(&dir);
         let profile = VerificationProfile {
+            setup: Vec::new(),
             commands: vec![command(&["cargo", "test"], 10)],
             amont_checks: Vec::new(),
             amont_waivers: Vec::new(),
@@ -1388,6 +1495,7 @@ mod tests {
     #[test]
     fn a_profile_whose_programs_cannot_be_versioned_refuses_the_cache() {
         let profile = VerificationProfile {
+            setup: Vec::new(),
             commands: vec![
                 command(&["make", "check"], 10),
                 command(&["make", "lint"], 10),
@@ -1421,6 +1529,222 @@ mod tests {
         .expect_err("a program that will not say its version refuses the cache");
         assert!(refused.reason.contains("make"), "{refused}");
         assert!(refused.reason.contains("cannot be cached"), "{refused}");
+    }
+
+    /// A setup step runs first, under its own log stem, with a label no
+    /// check can share: `setup:` in front of the command identity.
+    #[test]
+    fn a_setup_step_runs_before_the_commands_and_is_labelled_apart() {
+        let dir = temp_dir("setup");
+        let logs = dir.join("logs");
+        let profile = VerificationProfile {
+            setup: vec![command(&["sh", "-c", "echo installed > marker"], 10)],
+            commands: vec![command(&["sh", "-c", "test -f marker"], 10)],
+            amont_checks: Vec::new(),
+            amont_waivers: Vec::new(),
+            inputs: Vec::new(),
+            cache_baseline: false,
+        };
+        let setup = run_setup(&dir, &profile, &logs, "base").expect("setup");
+        assert_eq!(setup.len(), 1);
+        assert!(!setup[0].failed());
+        assert!(
+            setup[0].label.starts_with("setup:sh@"),
+            "{}",
+            setup[0].label
+        );
+        assert!(
+            setup[0].log_path.ends_with("base-setup0.log"),
+            "{}",
+            setup[0].log_path
+        );
+        assert_ne!(
+            setup[0].label,
+            check_label(&profile.setup[0]),
+            "a setup label never equals the check label of the same argv"
+        );
+        assert!(setup_failure(&setup).is_none());
+        let checks = run_profile(&dir, &profile, &logs, "base").expect("checks");
+        assert!(
+            !checks[0].failed(),
+            "the command sees what the setup installed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The first failing setup command ends the setup: the next command
+    /// is not attempted, and the failure is the last outcome.
+    #[test]
+    fn setup_stops_at_its_first_failure() {
+        let dir = temp_dir("setup-stop");
+        let logs = dir.join("logs");
+        let profile = VerificationProfile {
+            setup: vec![
+                command(&["sh", "-c", "echo boom >&2; exit 1"], 10),
+                command(&["sh", "-c", "echo never > second"], 10),
+            ],
+            commands: Vec::new(),
+            amont_checks: Vec::new(),
+            amont_waivers: Vec::new(),
+            inputs: Vec::new(),
+            cache_baseline: false,
+        };
+        let setup = run_setup(&dir, &profile, &logs, "task").expect("setup ran");
+        assert_eq!(setup.len(), 1, "the second command was not attempted");
+        let failed = setup_failure(&setup).expect("the failure is reported");
+        assert_eq!(failed.ended, Ended::Exited(1));
+        assert!(
+            std::fs::read_to_string(&failed.log_path)
+                .expect("log")
+                .contains("boom"),
+            "the failing setup's log is evidence"
+        );
+        assert!(!logs.join("task-setup1.log").exists());
+        assert!(!dir.join("second").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A program that is not there is an outcome (exit 127, "command not
+    /// found" in the log), not an io error that interrupts the run — and
+    /// the same outcome whether relais spawned it or a shell looked for
+    /// it, which is what the application-landscape baseline actually
+    /// did (`npm run typecheck` → `sh: react-router: command not found`).
+    #[test]
+    fn a_program_that_is_not_there_is_an_unrunnable_check_not_a_runner_failure() {
+        let dir = temp_dir("notfound");
+        let logs = dir.join("logs");
+        let direct = run_command(
+            &dir,
+            &command(&["relais-no-such-binary-4f3a"], 10),
+            &logs,
+            "relais-no-such-binary-4f3a@0",
+            "base-cmd0",
+        )
+        .expect("not a runner failure");
+        assert_eq!(direct.ended, Ended::Exited(COMMAND_NOT_FOUND));
+        assert!(direct.failed());
+        assert!(unrunnable(&direct));
+        let log = std::fs::read_to_string(&direct.log_path).expect("log exists");
+        assert!(log.contains("command not found"), "{log}");
+        assert_eq!(direct.log_sha256, sha256_hex(log.as_bytes()));
+
+        let via_shell = run_command(
+            &dir,
+            &command(&["sh", "-c", "relais-no-such-binary-4f3a"], 10),
+            &logs,
+            "sh@0",
+            "base-cmd1",
+        )
+        .expect("the shell ran");
+        assert!(unrunnable(&via_shell), "{:?}", via_shell.ended);
+
+        let ordinary = run_command(
+            &dir,
+            &command(&["sh", "-c", "exit 1"], 10),
+            &logs,
+            "sh@1",
+            "base-cmd2",
+        )
+        .expect("ran");
+        assert!(ordinary.failed());
+        assert!(
+            !unrunnable(&ordinary),
+            "exit 1 is a check that ran and said no"
+        );
+        assert_eq!(
+            unrunnable_checks(&[direct.clone(), via_shell.clone(), ordinary]),
+            vec![direct.label, via_shell.label]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The setup's programs are part of the toolchain: a new `uv` may
+    /// install a different tree for the same lockfile, and the baseline
+    /// verdict that ran against the old one must not be reused. Hashing
+    /// the profile sees `["uv", "sync"]`, not which uv.
+    #[test]
+    fn a_setup_program_version_change_rekeys_the_baseline() {
+        let profile = VerificationProfile {
+            setup: vec![command(&["uv", "sync", "--frozen"], 10)],
+            commands: vec![command(&["uv", "run", "pytest"], 10)],
+            amont_checks: Vec::new(),
+            amont_waivers: Vec::new(),
+            inputs: Vec::new(),
+            cache_baseline: true,
+        };
+        let tools = crate::context::ToolVersions {
+            relais: "0.2.0".into(),
+            aval: None,
+            amont: None,
+            claude_code: None,
+        };
+        let probe_with = |version: &'static str| {
+            move |program: &str| {
+                Ok(ProgramVersion {
+                    program: program.to_string(),
+                    path: format!("/usr/bin/{program}"),
+                    version: format!("{program} {version}"),
+                })
+            }
+        };
+        let old = resolve_toolchain(&profile, &probe_with("0.4.0")).expect("resolved");
+        let new = resolve_toolchain(&profile, &probe_with("0.5.0")).expect("resolved");
+        assert_eq!(
+            old.programs.len(),
+            1,
+            "uv is one program, named by setup and command"
+        );
+        assert_ne!(
+            baseline_key("base", &profile, &tools, &old),
+            baseline_key("base", &profile, &tools, &new),
+            "the same profile on a new setup program is a different key"
+        );
+
+        // A profile whose ONLY use of the program is in the setup is
+        // fingerprinted by it just the same.
+        let setup_only = VerificationProfile {
+            setup: vec![command(&["npm", "ci"], 10)],
+            commands: vec![command(&["make", "check"], 10)],
+            ..profile.clone()
+        };
+        let resolved = resolve_toolchain(&setup_only, &probe_with("10.0.0")).expect("resolved");
+        let names: Vec<&str> = resolved
+            .programs
+            .iter()
+            .map(|p| p.program.as_str())
+            .collect();
+        assert_eq!(names, vec!["make", "npm"]);
+    }
+
+    /// A setup program that cannot be versioned refuses the cache for
+    /// the profile, exactly as a check program does: the key could not
+    /// say which installer produced the tree the verdict is about.
+    #[test]
+    fn a_setup_program_that_cannot_be_versioned_refuses_the_cache() {
+        let profile = VerificationProfile {
+            setup: vec![command(&["./scripts/bootstrap.sh"], 10)],
+            commands: vec![command(&["make", "check"], 10)],
+            amont_checks: Vec::new(),
+            amont_waivers: Vec::new(),
+            inputs: Vec::new(),
+            cache_baseline: true,
+        };
+        let refused = resolve_toolchain(&profile, &|program| {
+            if program == "make" {
+                Ok(ProgramVersion {
+                    program: program.to_string(),
+                    path: "/usr/bin/make".into(),
+                    version: "make 4.4".into(),
+                })
+            } else {
+                Err(VersionUnknown::NoAnswer {
+                    program: program.to_string(),
+                    detail: "it printed nothing".into(),
+                })
+            }
+        })
+        .expect_err("a setup program with no version refuses the cache");
+        assert!(refused.reason.contains("bootstrap.sh"), "{refused}");
     }
 
     /// Unique fixture directories under parallel test threads.

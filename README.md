@@ -152,6 +152,35 @@ repo = "git@github.com:me/the-repo.git"   # what plan filled in, for readers
 Then `relais run --task task.json`. A worker refused a tool ends the run
 `blocked (permission_denied)` naming the tool; nothing is escalated.
 
+A verification worktree is a checkout of one revision and nothing else.
+In a repository whose dependencies live in the tree (npm, pnpm, yarn,
+bun, uv, poetry, bundler, composer), the profile's commands find no
+`node_modules` or virtualenv there until a setup step puts one in place,
+and a profile that declares none ends `blocked (baseline_unrunnable)`
+with the block to add named. Go and Rust need no step. The setup is
+declared per profile and, like the commands, is executable authority —
+adding it changes the policy hash, so `relais plan` asks for a new
+grant:
+
+```toml
+[[verification.profiles.default.setup]]
+argv = ["npm", "ci"]
+timeout_seconds = 600
+
+[[verification.profiles.default.commands]]
+argv = ["npm", "test"]
+```
+
+It runs first, in every worktree the commands run in — the base, the
+task worktree, each candidate's copy: a three-attempt run is five
+`npm ci`, and `cache_baseline = true` drops the base's. `relais doctor`
+and `relais plan` warn when a lockfile is at the root and a profile
+declares no setup:
+
+```
+ ! setup        package-lock.json present, and profile `default` declares no setup step: …
+```
+
 `docs/AUDIT-2026-09-20.md` is the audit this behaviour came out of, with
 the findings still open. `docs/REVIEW-2026-09-21.md` is the crate-wide
 review v0.2.0 answers: every finding with the pull request that fixed it
