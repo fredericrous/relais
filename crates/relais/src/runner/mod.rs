@@ -5394,7 +5394,7 @@ mod tests {
             Decision::Granted
         );
         let mut contract = fixture.contract(Review::Off);
-        contract.limits.wall_seconds = 1;
+        contract.limits.wall_seconds = Some(1);
         let backend = conditional_worker("");
         let outcome = fixture.execute_managed(&contract, &repo, &machine, &backend, &gate);
         assert!(

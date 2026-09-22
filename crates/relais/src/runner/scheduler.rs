@@ -650,8 +650,11 @@ fn run_package(
         architecture: contract.architecture.clone(),
         risk_hints: contract.risk_hints.clone(),
         limits: crate::contract::Limits {
-            attempts: plan.limits.attempts_per_package,
-            wall_seconds: remaining_wall.as_secs().max(1),
+            // A package's contract DOES narrow, deliberately: the plan
+            // says how many attempts a package gets, and the wall clock
+            // it inherits is what the root run has left.
+            attempts: Some(plan.limits.attempts_per_package),
+            wall_seconds: Some(remaining_wall.as_secs().max(1)),
         },
         // The root's review setting, as written: a package is reviewed
         // exactly as the contract asks the run to be.

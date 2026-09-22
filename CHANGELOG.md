@@ -10,6 +10,18 @@ missing here.
 
 ### Added
 
+- **A contract limit it does not write no longer narrows anything.**
+  `limits.attempts` and `limits.wall_seconds` defaulted to 3 and 1200,
+  and the effective authority is the intersection of repository and
+  contract — so a repository that raised its wall clock to 2700 s kept
+  watching workers killed at exactly 1200, twice on the machine that
+  raised it, both times read as a model running long. Both fields are
+  optional now: absent means the repository's, and what a contract does
+  write still narrows and still cannot broaden. **A contract that omits
+  `limits` hashes differently than it did**, because the block no longer
+  materializes into its canonical form; one that writes them is
+  unchanged.
+
 - **`relais decide` answers a run that is waiting for a person.** A run
   landing on `needs_review`, `needs_decision` or `interrupted` now opens
   a decision record the moment it does — the same transaction as the

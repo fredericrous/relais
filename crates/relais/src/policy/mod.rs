@@ -994,11 +994,22 @@ pub fn effective_authority(
         });
     }
 
-    let max_attempts = repo.execution.max_attempts.min(contract.limits.attempts);
-    let max_wall_seconds = repo
-        .execution
-        .max_wall_seconds
-        .min(contract.limits.wall_seconds);
+    // The contract narrows only what it actually says. An absent limit
+    // is not a narrowing: it inherits the repository's, so raising a
+    // repository ceiling reaches the runs, which a hard-coded contract
+    // default silently prevented.
+    let max_attempts = contract
+        .limits
+        .attempts
+        .map_or(repo.execution.max_attempts, |attempts| {
+            repo.execution.max_attempts.min(attempts)
+        });
+    let max_wall_seconds = contract
+        .limits
+        .wall_seconds
+        .map_or(repo.execution.max_wall_seconds, |wall| {
+            repo.execution.max_wall_seconds.min(wall)
+        });
 
     // Only the rules the declared scope could touch raise the review
     // floor; a rule about `**/trust/**` says nothing about a docs change.
@@ -1279,10 +1290,10 @@ keys = ["output.contract"]
         assert!(a.blockers.is_empty(), "{:?}", a.blockers);
         assert_eq!(a.max_attempts, 3);
 
-        c.limits.attempts = 1;
+        c.limits.attempts = Some(1);
         let a = effective_authority(&repo, &machine, &c, &identity());
         assert_eq!(a.max_attempts, 1, "contract limits narrow authority");
-        c.limits.attempts = 3;
+        c.limits.attempts = Some(3);
 
         let mut machine_restricted = machine.clone();
         machine_restricted.allowed_models = Some(vec!["haiku".into()]);
@@ -1732,6 +1743,41 @@ amont = { mode = "optional", bin = "/opt/amont/bin/amont" }
             "the template ships risk rules as commented examples: a live \
              leading-`**` rule floors every `…/**` scope to escalation and \
              makes the cheap tiers unreachable"
+        );
+    }
+    /// A repository that raises its ceiling reaches the runs. The
+    /// contract's limits used to DEFAULT to 3 attempts and 1200 seconds,
+    /// and the intersection took them, so a repository that moved its
+    /// wall clock to 2700 s kept watching workers killed at exactly
+    /// 1200 — twice on this machine, both times read as the model
+    /// running long. A limit the contract does not write is not a
+    /// narrowing the author chose.
+    #[test]
+    fn an_unwritten_contract_limit_inherits_the_repositorys() {
+        let mut repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        repo.execution.max_wall_seconds = 2700;
+        repo.execution.max_attempts = 5;
+        let machine = MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo)))
+            .expect("machine parses");
+
+        let mut contract = contract();
+        contract.limits = crate::contract::Limits::default();
+        let a = effective_authority(&repo, &machine, &contract, &identity());
+        assert_eq!(
+            a.max_wall_seconds, 2700,
+            "an unwritten wall clock is the repository's"
+        );
+        assert_eq!(a.max_attempts, 5, "and so are its attempts");
+
+        // What the contract DOES write still narrows, and still cannot
+        // broaden: 9000 is past the repository's ceiling.
+        contract.limits.wall_seconds = Some(600);
+        contract.limits.attempts = Some(9000);
+        let a = effective_authority(&repo, &machine, &contract, &identity());
+        assert_eq!(a.max_wall_seconds, 600, "a written limit narrows");
+        assert_eq!(
+            a.max_attempts, 5,
+            "and a written one past the ceiling does not broaden"
         );
     }
 }
