@@ -79,11 +79,12 @@ pub struct Report {
     pub cost_per_accepted: Option<MicroUsd>,
     pub acceptance_rate: Option<f64>,
     /// Runs whose outcome is owed to a person rather than settled by the
-    /// runner: `needs_review` and `needs_decision` (the quality bar held
-    /// and a human is owed a look) plus `interrupted` (the run's state is
-    /// uncertain and is never retried on its own, SPEC §12). Accepted,
-    /// failed, blocked, cancelled and budget-exhausted runs are settled;
-    /// a run still in flight is not counted either.
+    /// runner and has not yet been answered: a run whose decision row is
+    /// still open. A run that `relais decide` has answered is settled,
+    /// whatever state it is terminal in — `revise` and `abandon` leave
+    /// it where it was on purpose — so counting states here would report
+    /// answered runs as waiting and contradict the open-decision list
+    /// this report prints.
     pub pending_decisions: usize,
     pub cost_completeness: CostCompleteness,
     /// One line per task whose first run falls in the window (SPEC §20):
@@ -181,9 +182,15 @@ pub fn runs_report(ledger: &Ledger, since: &str) -> Result<Report, crate::ledger
         .count();
     let standing = runs.iter().filter(|run| run.standing).count();
     let total_cost = runs.iter().fold(MicroUsd::ZERO, |acc, run| acc + run.cost);
-    let pending_decisions = runs
+    // An OPEN decision, not a state: once `relais decide` answers a run
+    // the person is no longer owed anything, and `revise`/`abandon`
+    // deliberately leave the run terminal in the state it reached. A
+    // count by state would keep reporting answered runs as waiting, and
+    // disagree with the list of open decisions printed below it.
+    let open_decisions = ledger.open_decisions()?;
+    let pending_decisions = open_decisions
         .iter()
-        .filter(|run| run.status.awaits_a_person())
+        .filter(|decision| runs.iter().any(|run| run.run_id == decision.run.as_str()))
         .count();
     let cost_completeness = CostCompleteness::worst(runs.iter().map(|run| run.cost_completeness));
     let cost_per_accepted = if accepted > 0 {
@@ -275,7 +282,7 @@ pub fn runs_report(ledger: &Ledger, since: &str) -> Result<Report, crate::ledger
         cost_per_standing_change,
         pending_feedback,
         backfilled_tasks,
-        open_decisions: ledger.open_decisions()?,
+        open_decisions,
     })
 }
 
@@ -334,7 +341,7 @@ impl Report {
         ));
         if self.pending_decisions > 0 {
             out.push_str(&format!(
-                "awaiting a human: {} run(s) in needs_review/needs_decision/interrupted\n",
+                "awaiting a human: {} run(s) with an unanswered decision\n",
                 self.pending_decisions
             ));
         }
@@ -817,6 +824,62 @@ mod tests {
             "the per-task figure wears ITS completeness, not the older task's"
         );
         // Best effort: a leftover temp dir costs nothing but disk.
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    /// An answered run is settled, whatever state it is terminal in.
+    /// `relais decide --answer revise` leaves the run in `needs_review`
+    /// on purpose, so a count by STATE would keep reporting it as
+    /// waiting while the open-decision list right below it — correctly —
+    /// showed nothing.
+    #[test]
+    fn an_answered_run_is_not_still_awaiting_a_person() {
+        let dir = temp_dir("answered-not-awaiting");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let run = crate::ids::RunId::from_stored("run-waited");
+        let task = crate::ids::TaskId::from_stored("task-waited");
+        ledger
+            .insert_run(&run, "/repo", None, &task, "rk")
+            .expect("run");
+        ledger
+            .record_transition(&Transition {
+                run_id: run.clone(),
+                attempt_id: None,
+                from_state: Some(State::Verifying),
+                to_state: State::NeedsReview,
+                reason: "review_findings".into(),
+                detail: None,
+                at: now_rfc3339(),
+            })
+            .expect("transition");
+
+        let early = "2000-01-01T00:00:00+00:00";
+        let waiting = runs_report(&ledger, early).expect("report");
+        assert_eq!(waiting.pending_decisions, 1, "it is owed an answer");
+        assert_eq!(waiting.open_decisions.len(), 1);
+
+        ledger
+            .resolve_decision(
+                &run,
+                crate::lifecycle::Reason::DecisionRevised,
+                "fredericrous",
+                None,
+                None,
+            )
+            .expect("answered");
+
+        let answered = runs_report(&ledger, early).expect("report");
+        assert_eq!(
+            answered.pending_decisions, 0,
+            "answered, though the run is still terminal in needs_review"
+        );
+        assert!(answered.open_decisions.is_empty());
+        assert_eq!(
+            answered.runs[0].status,
+            State::NeedsReview,
+            "`revise` leaves the run where it was, on purpose"
+        );
+        // Best effort: the fixture is a temp dir; a leftover costs
+        // nothing but disk, and the next run pre-cleans it.
         std::fs::remove_dir_all(&dir).ok();
     }
 }
