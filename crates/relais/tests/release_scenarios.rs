@@ -463,6 +463,163 @@ minimum_tier = "escalation"
     );
 }
 
+// Task-linking: a bare `relais run` derives a fresh task; a second run
+// of the same contract launched with `--revise <task-id>` joins that
+// task instead of starting a new one, so their cost is one denominator.
+#[test]
+fn a_revised_run_joins_its_declared_tasks_cost() {
+    let world = World::new("revise");
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    let task = world.write_task_for("task.json", "an easy one", "optional");
+
+    let first = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    let first_stdout = text(&first.stdout);
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "{first_stdout}\n{}",
+        text(&first.stderr)
+    );
+    let first_run = World::run_id_of(&first_stdout);
+
+    let ledger =
+        relais::ledger::Ledger::open(&world.state.join("ledger.sqlite")).expect("open ledger");
+    let task_id = ledger
+        .task_of_run(&relais::ids::RunId::from_stored(first_run.clone()))
+        .expect("query task")
+        .expect("first run is on record under a task");
+
+    // A DIFFERENT contract: re-running the identical one derives the
+    // identical task from (repo, contract hash) whatever the flag does,
+    // so the same assertions would pass with `--revise` ignored. A
+    // revision is a different contract for the same task, which is the
+    // only shape that can tell the flag apart from the derivation.
+    let revised = world.write_task_for("task-revised.json", "an easy one, restated", "optional");
+    let second = world.relais(&[
+        "run",
+        "--task",
+        revised.to_str().unwrap(),
+        "--revise",
+        task_id.as_str(),
+    ]);
+    let second_stdout = text(&second.stdout);
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "{second_stdout}\n{}",
+        text(&second.stderr)
+    );
+    let second_run = World::run_id_of(&second_stdout);
+    assert_ne!(first_run, second_run, "two distinct runs");
+
+    let second_task = ledger
+        .task_of_run(&relais::ids::RunId::from_stored(second_run.clone()))
+        .expect("query task")
+        .expect("second run is on record under a task");
+    assert_eq!(second_task, task_id, "a revised run joins the SAME task");
+
+    let runs = ledger.runs_of_task(&task_id).expect("runs of task");
+    assert_eq!(runs.len(), 2, "{runs:?}");
+
+    // And the other half of the discrimination: the same revised
+    // contract, run without the flag, is its own task. Without this the
+    // test could not tell "the flag joined them" from "everything joins".
+    let bare = world.relais(&["run", "--task", revised.to_str().unwrap()]);
+    let bare_stdout = text(&bare.stdout);
+    assert_eq!(
+        bare.status.code(),
+        Some(0),
+        "{bare_stdout}\n{}",
+        text(&bare.stderr)
+    );
+    let bare_task = ledger
+        .task_of_run(&relais::ids::RunId::from_stored(World::run_id_of(
+            &bare_stdout,
+        )))
+        .expect("query task")
+        .expect("on record");
+    assert_ne!(
+        bare_task, task_id,
+        "the same contract without --revise starts its own task"
+    );
+
+    let cost_first = ledger
+        .run_cost(&relais::ids::RunId::from_stored(first_run))
+        .expect("first run cost");
+    let cost_second = ledger
+        .run_cost(&relais::ids::RunId::from_stored(second_run))
+        .expect("second run cost");
+    let task_cost = ledger.task_cost(&task_id).expect("task cost");
+    assert!(task_cost > relais::money::MicroUsd::ZERO);
+    assert_eq!(
+        task_cost,
+        cost_first.saturating_add(cost_second),
+        "one task's cost is the sum of both runs"
+    );
+}
+
+/// A contract that declares a task disagreeing with `--revise`, and a
+/// `--revise` naming a task nobody has ever run, are both refused before
+/// any worker launches.
+#[test]
+fn revise_disagreement_and_unknown_task_are_refused_before_dispatch() {
+    let world = World::new("revise-refused");
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    let task = world.write_task_for("task.json", "an easy one", "optional");
+
+    let unknown = world.relais(&[
+        "run",
+        "--task",
+        task.to_str().unwrap(),
+        "--revise",
+        "task-0000000000000000",
+    ]);
+    assert_ne!(unknown.status.code(), Some(0));
+    assert_eq!(world.worker_launches(), 0, "no worker for an unknown task");
+    assert!(
+        text(&unknown.stderr).contains("task-0000000000000000"),
+        "{}",
+        text(&unknown.stderr)
+    );
+
+    // Run once for real to get a task id on record, then declare a
+    // DIFFERENT one on the contract than `--revise` names.
+    let first = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    let first_run = World::run_id_of(&text(&first.stdout));
+    let ledger =
+        relais::ledger::Ledger::open(&world.state.join("ledger.sqlite")).expect("open ledger");
+    let real_task = ledger
+        .task_of_run(&relais::ids::RunId::from_stored(first_run))
+        .expect("query task")
+        .expect("run is on record under a task");
+
+    let declared_path = world.root.join("declared.json");
+    let mut declared: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&task).expect("read")).expect("json");
+    declared["task_id"] = serde_json::json!(real_task.as_str());
+    std::fs::write(&declared_path, declared.to_string()).expect("write");
+
+    let launches_before = world.worker_launches();
+    let disagreeing = world.relais(&[
+        "run",
+        "--task",
+        declared_path.to_str().unwrap(),
+        "--revise",
+        "task-1111111111111111",
+    ]);
+    assert_ne!(disagreeing.status.code(), Some(0));
+    assert_eq!(
+        world.worker_launches(),
+        launches_before,
+        "no worker for a disagreeing declaration"
+    );
+    let stderr = text(&disagreeing.stderr);
+    assert!(stderr.contains(real_task.as_str()), "{stderr}");
+    assert!(stderr.contains("task-1111111111111111"), "{stderr}");
+}
+
 // SPEC §14: a failed implementation gets at most the configured repair
 // and escalation attempts; all costs stay attributed to one task.
 #[test]

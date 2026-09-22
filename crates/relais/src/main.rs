@@ -37,7 +37,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use relais::backend::Backend;
 use relais::contract::TaskContract;
-use relais::ids::{IdSource, RunId};
+use relais::ids::{IdSource, RunId, TaskId};
 use relais::install::{InstallReport, InstallRequest, Mode, Scope};
 use relais::learn::predict::RegistryPredictor;
 use relais::policy::{effective_authority, MachineSettings, RepoPolicy};
@@ -71,12 +71,24 @@ enum Command {
         /// Path to the task contract
         #[arg(long = "task")]
         task: PathBuf,
+        /// Revise an existing task: this run's cost joins its total
+        /// rather than starting a new one. Refused if the contract
+        /// declares a different task, or if this id names no task on
+        /// record.
+        #[arg(long = "revise")]
+        revise: Option<String>,
     },
     /// Validate the contract and start an execution (SPEC §3)
     Run {
         /// Path to the task contract
         #[arg(long = "task")]
         task: PathBuf,
+        /// Revise an existing task: this run's cost joins its total
+        /// rather than starting a new one. Refused if the contract
+        /// declares a different task, or if this id names no task on
+        /// record.
+        #[arg(long = "revise")]
+        revise: Option<String>,
     },
     /// Show recent runs, or one run's current state
     Status { run_id: Option<String> },
@@ -412,8 +424,8 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
     match command {
         Command::Doctor { json } => doctor_command(json),
         Command::Init => init_command(),
-        Command::Plan { task } => plan_command(&task),
-        Command::Run { task } => run_command(&task),
+        Command::Plan { task, revise } => plan_command(&task, revise.as_deref()),
+        Command::Run { task, revise } => run_command(&task, revise.as_deref()),
         Command::Status { run_id } => status_command(run_id.as_deref()),
         Command::Explain { run_id } => explain_command(&run_id),
         Command::Resume {
@@ -1224,6 +1236,35 @@ fn open_ledger() -> Result<Ledger, CliError> {
     operational(Ledger::open(&path), "the ledger is unavailable")
 }
 
+/// What this run's task identity will be, decided before any dispatch
+/// (SPEC's task spine): `None` for a fresh task, derived once preflight
+/// runs; `Some(id)` for a task the contract declares or `--revise`
+/// names, already confirmed on record. A disagreement between the two,
+/// or an id naming no task at all, is refused here by name rather than
+/// silently picked or created.
+fn resolve_task_override(
+    ledger: &Ledger,
+    contract: &TaskContract,
+    revise: Option<&str>,
+) -> Result<Option<TaskId>, String> {
+    let revise = revise.map(TaskId::from_stored);
+    let link = relais::contract::resolve_task_link(contract.task_id.as_ref(), revise.as_ref())
+        .map_err(|e| e.to_string())?;
+    match link {
+        relais::contract::TaskLink::Fresh => Ok(None),
+        relais::contract::TaskLink::Declared(id) | relais::contract::TaskLink::Revises(id) => {
+            let known = ledger
+                .runs_of_task(&id)
+                .map_err(|e| format!("ledger: {e}"))?;
+            if known.is_empty() {
+                Err(format!("unknown task {id}: no run is on record for it"))
+            } else {
+                Ok(Some(id))
+            }
+        }
+    }
+}
+
 fn doctor_command(json: bool) -> Result<CliOutcome, CliError> {
     let report = doctor::doctor(&project_dir()?);
     if json {
@@ -1263,10 +1304,21 @@ fn init_command() -> Result<CliOutcome, CliError> {
     }
 }
 
-fn plan_command(task: &Path) -> Result<CliOutcome, CliError> {
+fn plan_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError> {
     let (root, repo) = load_repo_policy()?;
     let machine = load_machine()?;
     let contract = load_contract(task)?;
+    // Only a contract that NAMES a task needs the ledger, and `plan`
+    // writes nothing: opening it unconditionally would create the state
+    // directory, the database and its migrations as a side effect of a
+    // preflight whose whole promise is that nothing happens yet.
+    if contract.task_id.is_some() || revise.is_some() {
+        let ledger = open_ledger()?;
+        if let Err(detail) = resolve_task_override(&ledger, &contract, revise) {
+            eprintln!("relais plan: {detail}");
+            return Ok(CliOutcome::Blocked);
+        }
+    }
 
     // Matched, not `if let Ok`: a `git status` that FAILS is not a clean
     // tree, and `run` has blocked on exactly this since v0.1.3 (C6).
@@ -1364,11 +1416,18 @@ fn plan_command(task: &Path) -> Result<CliOutcome, CliError> {
     }
 }
 
-fn run_command(task: &Path) -> Result<CliOutcome, CliError> {
+fn run_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError> {
     let (root, repo) = load_repo_policy()?;
     let machine = load_machine()?;
     let contract = load_contract(task)?;
     let ledger = open_ledger()?;
+    let task_override = match resolve_task_override(&ledger, &contract, revise) {
+        Ok(task_override) => task_override,
+        Err(detail) => {
+            eprintln!("relais run: {detail}");
+            return Ok(CliOutcome::Blocked);
+        }
+    };
     let artifacts_dir = paths::runs_dir().map_err(CliError::Home)?;
     let backend = match relais::adapter::claude::ClaudeBackend::discover() {
         Ok(backend) => std::sync::Arc::from(backend),
@@ -1428,6 +1487,7 @@ fn run_command(task: &Path) -> Result<CliOutcome, CliError> {
         gate: Some(&gate),
         session_id: relais::coordinator::session_id(),
         heartbeat_every: std::time::Duration::from_secs(30),
+        task_override: task_override.as_ref(),
     }) {
         Ok(outcome) => outcome,
         Err(e) => {

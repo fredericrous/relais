@@ -292,6 +292,29 @@ fn doctor_names_what_is_missing_and_exits_on_a_blocker() {
     assert_eq!(policy_level, "ok", "{report}");
 }
 
+// Task-linking: `--revise` names an existing task by id; one that
+// matches no run on record is refused by name, before route or dispatch.
+#[test]
+fn plan_revise_of_an_unknown_task_is_refused_by_name() {
+    let world = World::new("revise-unknown");
+    world.write_policy();
+    world.write_machine_without_a_grant();
+    let task = world.write_task("task.json");
+    let plan = world.relais(&[
+        "plan",
+        "--task",
+        task.to_str().unwrap(),
+        "--revise",
+        "task-does-not-exist0",
+    ]);
+    assert_ne!(plan.status.code(), Some(0));
+    assert!(
+        text(&plan.stderr).contains("task-does-not-exist0"),
+        "{}",
+        text(&plan.stderr)
+    );
+}
+
 // SPEC §5: execution needs a trust grant bound to this repository AND
 // this declaration. Without one, `plan` says so and prints the block to
 // paste into machine.toml; nothing is launched and nothing is written.
