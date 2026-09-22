@@ -17,12 +17,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::contract::TaskContract;
 use crate::ids::{DispatchId, PackageId, Pid, RunId, TaskId};
-use crate::lifecycle::State;
+use crate::lifecycle::{Reason, State};
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::outcome::{Outcome, OutcomeDetail, OutcomeKind};
 use crate::policy::Tier;
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 5;
+pub const LEDGER_SCHEMA_VERSION: u64 = 6;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -473,6 +473,58 @@ const MIGRATIONS: &[(&str, &str)] = &[
     CREATE INDEX idx_outcomes_task ON outcomes(task_id);
     "#,
     ),
+    (
+        // A run that reaches `needs_review`, `needs_decision` or
+        // `interrupted` is waiting for a person to answer it (SPEC's
+        // decision spine: `State::awaits_a_person`). Before this, that
+        // wait had no record of its own — only the run's transition
+        // history, which never says WHO answered it or WHEN. One open
+        // row per such run, closed by `relais decide`; `record_transition`
+        // opens the row for every run from here on, in the same
+        // transaction as the transition that raises it, so a run can
+        // never be waiting without one.
+        //
+        // The three state names below are `State::awaits_a_person`'s
+        // definition, spelled out in SQL because a migration cannot call
+        // into this binary's Rust — `lifecycle`'s own test and this
+        // migration's ledger-side test each assert they still agree.
+        "v6",
+        r#"
+    CREATE TABLE decisions (
+        run TEXT PRIMARY KEY,
+        task TEXT NOT NULL,
+        raised_at TEXT NOT NULL,
+        raised_state TEXT NOT NULL,
+        raised_reason TEXT NOT NULL,
+        resolved_at TEXT,
+        resolution TEXT,
+        actor TEXT,
+        note TEXT,
+        successor_run TEXT
+    );
+    CREATE INDEX idx_decisions_unresolved ON decisions(resolved_at);
+    INSERT INTO decisions (run, task, raised_at, raised_state, raised_reason)
+    SELECT runs.id,
+           COALESCE(runs.task_id, 'task-legacy-' || runs.id),
+           COALESCE(
+               (SELECT t.at FROM transitions t WHERE t.run_id = runs.id ORDER BY t.id DESC LIMIT 1),
+               runs.updated_at
+           ),
+           COALESCE(
+               (SELECT t.to_state FROM transitions t WHERE t.run_id = runs.id ORDER BY t.id DESC LIMIT 1),
+               runs.status
+           ),
+           COALESCE(
+               (SELECT t.reason FROM transitions t WHERE t.run_id = runs.id ORDER BY t.id DESC LIMIT 1),
+               'worker_dispatched'
+           )
+      FROM runs
+     WHERE COALESCE(
+               (SELECT t.to_state FROM transitions t WHERE t.run_id = runs.id ORDER BY t.id DESC LIMIT 1),
+               runs.status
+           ) IN ('needs_review', 'needs_decision', 'interrupted');
+    "#,
+    ),
 ];
 
 pub struct Ledger {
@@ -701,6 +753,116 @@ const PROJECTED_STATUS: &str = "COALESCE(\
 pub struct ChildOf<'a> {
     pub parent_run: &'a RunId,
     pub package_id: &'a PackageId,
+}
+
+/// One run's decision row (SPEC's decision spine): when a person was
+/// first owed a look, what state and reason raised it, and — once
+/// answered — who decided what, when, and any successor run their
+/// decision names. `resolved_at.is_none()` is the open half `report`
+/// lists and `relais decide` closes; `waited_seconds` is derived from the
+/// recorded timestamps, never stored, so it is always current for an open
+/// row and exact for a resolved one.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DecisionRecord {
+    pub run: RunId,
+    pub task: TaskId,
+    pub raised_at: String,
+    pub raised_state: State,
+    pub raised_reason: String,
+    pub resolved_at: Option<String>,
+    pub resolution: Option<Reason>,
+    pub actor: Option<String>,
+    pub note: Option<String>,
+    pub successor_run: Option<RunId>,
+    pub waited_seconds: i64,
+}
+
+/// The seconds between two RFC3339 timestamps this ledger itself wrote —
+/// a stamp that will not parse is a corrupt row, not a wait of zero.
+fn seconds_between(start: &str, end: &str) -> Result<i64> {
+    let parse = |what: &'static str, stamp: &str| {
+        chrono::DateTime::parse_from_rfc3339(stamp).map_err(|e| LedgerError::Corrupt {
+            what: what.into(),
+            detail: format!("`{stamp}` is not an RFC3339 timestamp: {e}"),
+        })
+    };
+    let start = parse("a decision's raised_at", start)?;
+    let end = parse("a decision's resolved_at", end)?;
+    Ok((end - start).num_seconds())
+}
+
+/// Raw columns of one `decisions` row, in `SELECT` order.
+type DecisionRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// A `decisions` row as columns, parsed into a [`DecisionRecord`] (P6): an
+/// unknown state or resolution is a `Corrupt` row the caller reports,
+/// never a silently dropped or mismatched decision. `now` is the wait
+/// clock for a row still open; a resolved row uses its own `resolved_at`
+/// instead, so re-reading it later never changes what it says.
+fn parse_decision_row(row: DecisionRow, now: &str) -> Result<DecisionRecord> {
+    let (
+        run,
+        task,
+        raised_at,
+        raised_state,
+        raised_reason,
+        resolved_at,
+        resolution,
+        actor,
+        note,
+        successor_run,
+    ) = row;
+    let resolution = resolution
+        .map(|stored| {
+            Reason::parse(&stored).map_err(|unknown| LedgerError::Corrupt {
+                what: unknown.what.into(),
+                detail: unknown.to_string(),
+            })
+        })
+        .transpose()?;
+    let waited_seconds = seconds_between(&raised_at, resolved_at.as_deref().unwrap_or(now))?;
+    Ok(DecisionRecord {
+        run: RunId::from_stored(run),
+        task: TaskId::from_stored(task),
+        raised_at,
+        raised_state: parse_state(&raised_state)?,
+        raised_reason,
+        resolved_at,
+        resolution,
+        actor,
+        note,
+        successor_run: successor_run.map(RunId::from_stored),
+        waited_seconds,
+    })
+}
+
+const DECISION_COLUMNS: &str =
+    "run, task, raised_at, raised_state, raised_reason, resolved_at, resolution, actor, note, successor_run";
+
+fn decision_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<DecisionRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+    ))
 }
 
 impl Ledger {
@@ -1110,9 +1272,12 @@ impl Ledger {
     /// `accepted` and whose status still said `verifying`, and `resume`
     /// then overwrote an accepted run as `interrupted`.
     ///
-    /// The only other method that writes a record plus derived state is
-    /// `insert_contract_revision`; every other writer below is a single
-    /// statement, which SQLite already runs atomically.
+    /// The only other method that writes a record plus derived state used
+    /// to be `insert_contract_revision`; this one now also opens a
+    /// [`DecisionRecord`] in the same transaction whenever the transition
+    /// lands on a state [`State::awaits_a_person`] — a run can never be
+    /// waiting on a person without a row recording that it started to.
+    /// Nothing here closes one: only `resolve_decision` does that.
     pub fn record_transition(&self, transition: &Transition) -> Result<()> {
         let detail = transition
             .detail
@@ -1148,8 +1313,95 @@ impl Ledger {
                 self.now()
             ],
         )?;
+        if transition.to_state.awaits_a_person() {
+            let task_id: Option<String> = tx
+                .query_row(
+                    "SELECT task_id FROM runs WHERE id = ?1",
+                    [transition.run_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            let task_id =
+                task_id.unwrap_or_else(|| format!("task-legacy-{}", transition.run_id.as_str()));
+            // `OR IGNORE`: a run already terminal in an awaiting state can
+            // still record a same-state transition of its own (worktree
+            // retirement transitions `self.state` to itself once the run
+            // has already stopped) — the decision was already opened the
+            // first time this run reached the state, and `run` is its
+            // primary key.
+            tx.execute(
+                "INSERT OR IGNORE INTO decisions (run, task, raised_at, raised_state, raised_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    transition.run_id.as_str(),
+                    task_id,
+                    transition.at,
+                    transition.to_state.as_str(),
+                    transition.reason,
+                ],
+            )?;
+        }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Every run still waiting for a person to answer it, oldest raised
+    /// first — the queue `relais report` lists and `relais decide`
+    /// closes one row at a time from.
+    pub fn open_decisions(&self) -> Result<Vec<DecisionRecord>> {
+        let now = self.now();
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {DECISION_COLUMNS} FROM decisions WHERE resolved_at IS NULL ORDER BY raised_at, run"
+        ))?;
+        let rows = stmt.query_map([], decision_row_from)?;
+        rows.collect::<std::result::Result<Vec<DecisionRow>, _>>()?
+            .into_iter()
+            .map(|row| parse_decision_row(row, &now))
+            .collect()
+    }
+
+    /// One run's own decision row, open or resolved — what `relais
+    /// explain` reads back. `None` for a run that never raised one.
+    pub fn decision_of_run(&self, run_id: &RunId) -> Result<Option<DecisionRecord>> {
+        let now = self.now();
+        let row: Option<DecisionRow> = self
+            .conn
+            .query_row(
+                &format!("SELECT {DECISION_COLUMNS} FROM decisions WHERE run = ?1"),
+                [run_id.as_str()],
+                decision_row_from,
+            )
+            .optional()?;
+        row.map(|row| parse_decision_row(row, &now)).transpose()
+    }
+
+    /// Answer an open decision: who decided what, when, with an optional
+    /// note and successor run. `Ok(false)` when the run has no OPEN
+    /// decision — never raised one, or one already answered — so the CLI
+    /// can refuse "deciding a run that is not waiting" by name rather
+    /// than silently overwriting a prior answer.
+    pub fn resolve_decision(
+        &self,
+        run_id: &RunId,
+        resolution: Reason,
+        actor: &str,
+        note: Option<&str>,
+        successor_run: Option<&RunId>,
+    ) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE decisions SET resolved_at = ?2, resolution = ?3, actor = ?4, note = ?5, successor_run = ?6
+             WHERE run = ?1 AND resolved_at IS NULL",
+            params![
+                run_id.as_str(),
+                self.now(),
+                resolution.as_str(),
+                actor,
+                note,
+                successor_run.map(RunId::as_str),
+            ],
+        )?;
+        Ok(changed > 0)
     }
 
     /// One piece of evidence bound to a run: the context manifest, a
@@ -1771,6 +2023,153 @@ mod tests {
         (ledger, dir)
     }
 
+    /// The v6 migration's backfill names a state by its quoted, stored
+    /// spelling; `State::awaits_a_person` is the single definition of
+    /// which states those are. This is the converse of `lifecycle`'s own
+    /// test: that one asserts what the enum method answers, this one
+    /// asserts the migration names no state the method disagrees with,
+    /// so the two cannot drift apart silently.
+    #[test]
+    fn the_v6_migration_names_exactly_the_states_that_await_a_person() {
+        let (_, sql) = MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == "v6")
+            .expect("v6 exists");
+        for state in State::ALL {
+            let quoted = format!("'{}'", state.as_str());
+            assert_eq!(
+                sql.contains(&quoted),
+                state.awaits_a_person(),
+                "state {state} disagrees with the migration text"
+            );
+        }
+    }
+
+    /// `record_transition` opens a decision row, in the same transaction,
+    /// the moment a run lands on a state a person is owed a look at — and
+    /// closes nothing itself.
+    #[test]
+    fn record_transition_opens_a_decision_for_a_state_awaiting_a_person() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-nr"), "/repo", None, &task("run-nr"), "rk")
+            .expect("run");
+        assert!(ledger
+            .decision_of_run(&run("run-nr"))
+            .expect("read")
+            .is_none());
+        ledger
+            .record_transition(&Transition {
+                run_id: run("run-nr"),
+                attempt_id: None,
+                from_state: Some(State::Verifying),
+                to_state: State::NeedsReview,
+                reason: Reason::ReviewFindings.as_str().into(),
+                detail: None,
+                at: now_rfc3339(),
+            })
+            .expect("transition");
+        let decision = ledger
+            .decision_of_run(&run("run-nr"))
+            .expect("read")
+            .expect("a decision was opened");
+        assert_eq!(decision.raised_state, State::NeedsReview);
+        assert_eq!(decision.raised_reason, Reason::ReviewFindings.as_str());
+        assert!(decision.resolved_at.is_none());
+        assert!(decision.resolution.is_none());
+        assert!(decision.waited_seconds >= 0);
+        let open = ledger.open_decisions().expect("open");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].run, run("run-nr"));
+        // A transition into a state nobody is owed a look at opens nothing.
+        ledger
+            .insert_run(&run("run-ok"), "/repo", None, &task("run-ok"), "rk")
+            .expect("run");
+        ledger
+            .record_transition(&Transition {
+                run_id: run("run-ok"),
+                attempt_id: None,
+                from_state: Some(State::Prepared),
+                to_state: State::Running,
+                reason: Reason::WorkerDispatched.as_str().into(),
+                detail: None,
+                at: now_rfc3339(),
+            })
+            .expect("transition");
+        assert!(ledger
+            .decision_of_run(&run("run-ok"))
+            .expect("read")
+            .is_none());
+        assert_eq!(ledger.open_decisions().expect("open").len(), 1);
+        // Best effort: the fixture is a temp dir; a leftover costs
+        // nothing but disk, and the next run pre-cleans it.
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `resolve_decision` closes the open row and is refused, by a plain
+    /// `false` the caller reports by name, for a run with no open
+    /// decision — never raised, or already answered.
+    #[test]
+    fn resolve_decision_closes_once_and_refuses_a_run_not_waiting() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-d"), "/repo", None, &task("run-d"), "rk")
+            .expect("run");
+        assert!(!ledger
+            .resolve_decision(
+                &run("run-d"),
+                Reason::DecisionRecorded,
+                "a person",
+                None,
+                None
+            )
+            .expect("resolve"));
+        ledger
+            .record_transition(&Transition {
+                run_id: run("run-d"),
+                attempt_id: None,
+                from_state: Some(State::Verifying),
+                to_state: State::NeedsDecision,
+                reason: Reason::ScopeExceeded.as_str().into(),
+                detail: None,
+                at: now_rfc3339(),
+            })
+            .expect("transition");
+        assert!(ledger
+            .resolve_decision(
+                &run("run-d"),
+                Reason::DecisionApproved,
+                "a person",
+                Some("looks fine"),
+                Some(&run("run-successor")),
+            )
+            .expect("resolve"));
+        let decision = ledger
+            .decision_of_run(&run("run-d"))
+            .expect("read")
+            .expect("still on record");
+        assert_eq!(decision.resolution, Some(Reason::DecisionApproved));
+        assert_eq!(decision.actor.as_deref(), Some("a person"));
+        assert_eq!(decision.note.as_deref(), Some("looks fine"));
+        assert_eq!(decision.successor_run, Some(run("run-successor")));
+        assert!(decision.resolved_at.is_some());
+        assert!(ledger.open_decisions().expect("open").is_empty());
+        // A second answer to the same run is refused: it is not waiting
+        // any more.
+        assert!(!ledger
+            .resolve_decision(
+                &run("run-d"),
+                Reason::DecisionRejected,
+                "someone else",
+                None,
+                None
+            )
+            .expect("resolve"));
+        // Best effort: the fixture is a temp dir; a leftover costs
+        // nothing but disk, and the next run pre-cleans it.
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn event(event_id: &str, run_id: &str, micros: i64) -> UsageEvent {
         UsageEvent {
             event_id: event_id.into(),
@@ -2165,7 +2564,10 @@ mod tests {
             }
         }
         let ledger = Ledger::open(&path).expect("upgrade to v5");
-        assert_eq!(ledger.schema_version().expect("version"), 5);
+        assert_eq!(
+            ledger.schema_version().expect("version"),
+            LEDGER_SCHEMA_VERSION
+        );
         // The proof: a write that needs the new columns succeeds on a
         // ledger that was already v4.
         let columns: Vec<String> = ledger

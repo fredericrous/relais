@@ -12,14 +12,14 @@
 
 use serde::Serialize;
 
-use crate::ledger::{Ledger, TaskOrigin};
+use crate::ledger::{DecisionRecord, Ledger, TaskOrigin};
 use crate::lifecycle::State;
 use crate::money::{CostCompleteness, MicroUsd};
 
 /// Bumped whenever a top-level `Report` key is added, renamed or removed
-/// (this task added the task-spine fields), so a downstream parser can
-/// tell an old shape from a new one instead of guessing from key presence.
-pub const REPORT_SCHEMA_VERSION: u32 = 2;
+/// (this task added `open_decisions`), so a downstream parser can tell an
+/// old shape from a new one instead of guessing from key presence.
+pub const REPORT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RunLine {
@@ -110,6 +110,12 @@ pub struct Report {
     /// Accepted tasks with no recorded outcome yet.
     pub pending_feedback: usize,
     pub backfilled_tasks: usize,
+    /// Every run still waiting on a person to answer it — a `needs_review`
+    /// or `needs_decision` run nobody has decided, or an `interrupted` one
+    /// nobody has resolved (SPEC's decision spine): not scoped to `since`,
+    /// because a decision opened before the window is exactly as owed to
+    /// a person today as one opened inside it.
+    pub open_decisions: Vec<DecisionRecord>,
 }
 
 pub fn runs_report(ledger: &Ledger, since: &str) -> Result<Report, crate::ledger::LedgerError> {
@@ -177,7 +183,7 @@ pub fn runs_report(ledger: &Ledger, since: &str) -> Result<Report, crate::ledger
     let total_cost = runs.iter().fold(MicroUsd::ZERO, |acc, run| acc + run.cost);
     let pending_decisions = runs
         .iter()
-        .filter(|run| awaits_a_person(run.status))
+        .filter(|run| run.status.awaits_a_person())
         .count();
     let cost_completeness = CostCompleteness::worst(runs.iter().map(|run| run.cost_completeness));
     let cost_per_accepted = if accepted > 0 {
@@ -269,6 +275,7 @@ pub fn runs_report(ledger: &Ledger, since: &str) -> Result<Report, crate::ledger
         cost_per_standing_change,
         pending_feedback,
         backfilled_tasks,
+        open_decisions: ledger.open_decisions()?,
     })
 }
 
@@ -378,26 +385,20 @@ impl Report {
                 self.pending_feedback
             ));
         }
+        if !self.open_decisions.is_empty() {
+            out.push('\n');
+            out.push_str("open decisions (a person has not yet answered):\n");
+            for decision in &self.open_decisions {
+                out.push_str(&format!(
+                    "  {}  {} ({}) waiting {}s\n",
+                    decision.run,
+                    decision.raised_state,
+                    decision.raised_reason,
+                    decision.waited_seconds
+                ));
+            }
+        }
         out
-    }
-}
-
-/// Whether a run's final state leaves a person something to do. Total
-/// over `State`, so a new state is a decision made here rather than a
-/// silent omission from the count.
-fn awaits_a_person(state: State) -> bool {
-    match state {
-        State::NeedsReview | State::NeedsDecision | State::Interrupted => true,
-        State::Prepared
-        | State::Running
-        | State::Verifying
-        | State::Repairing
-        | State::Escalating
-        | State::Accepted
-        | State::Blocked
-        | State::Failed
-        | State::BudgetExhausted
-        | State::Cancelled => false,
     }
 }
 
@@ -525,6 +526,7 @@ mod tests {
             cost_per_standing_change: Some(MicroUsd::from_micros(10)),
             pending_feedback: 1,
             backfilled_tasks: 0,
+            open_decisions: vec![],
         };
         let rendered = report.render();
         assert!(
@@ -713,6 +715,7 @@ mod tests {
                 "cost_per_accepted",
                 "cost_per_accepted_task",
                 "cost_per_standing_change",
+                "open_decisions",
                 "pending_decisions",
                 "pending_feedback",
                 "runs",
