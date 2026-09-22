@@ -2037,7 +2037,13 @@ mod tests {
         let socket = dir.join("relais.sock");
         let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
         ledger
-            .insert_run(&RunId::from_stored("run-x"), "/repo", None)
+            .insert_run(
+                &RunId::from_stored("run-x"),
+                "/repo",
+                None,
+                &crate::ids::TaskId::from_stored("task-run-x"),
+                "rk",
+            )
             .expect("run");
         ledger
             .record_dispatch_intent(
@@ -2299,7 +2305,13 @@ mod tests {
         let ledger_path = dir.join("ledger.sqlite");
         let ledger = Ledger::open(&ledger_path).expect("ledger");
         ledger
-            .insert_run(&RunId::from_stored("run-x"), "/repo", None)
+            .insert_run(
+                &RunId::from_stored("run-x"),
+                "/repo",
+                None,
+                &crate::ids::TaskId::from_stored("task-run-x"),
+                "rk",
+            )
             .expect("run");
         ledger
             .record_dispatch_intent(

@@ -186,6 +186,44 @@ impl std::fmt::Display for PackageId {
     }
 }
 
+/// A task identifier: the stable identity that survives contract
+/// revisions and re-runs. Unlike [`RunId`] and [`DispatchId`], it is
+/// never minted from a clock — [`derive_task_id`] derives it from the
+/// repository and the task's first contract, so the same task dispatched
+/// twice (or revised) is still one task.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TaskId(String);
+
+impl TaskId {
+    /// A task identifier read back from the ledger. See [`RunId::from_stored`].
+    pub fn from_stored(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for TaskId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A task's identity, derived — not minted — from the repository it runs
+/// in and the contract its task first dispatched under. Pure: the same
+/// two inputs always produce the same [`TaskId`], so a re-run or a
+/// `--revise` of the same task lands on the same identity without the
+/// ledger being consulted. `repo_key` is `policy::repo_key`'s output;
+/// this module names no other module's types, so it arrives as a plain
+/// string rather than a `RepoIdentity`.
+pub fn derive_task_id(repo_key: &str, first_contract_hash: &str) -> TaskId {
+    let hash = sha256_hex(format!("{repo_key}:{first_contract_hash}").as_bytes());
+    TaskId(format!("task-{}", &hash[..16]))
+}
+
 /// A process id as the operating system reports it. The ledger stores it
 /// as a signed integer, so reading one back is fallible: `Pid::stored`
 /// says so rather than folding "no pid recorded" together with "a number
@@ -285,6 +323,19 @@ mod tests {
         assert_eq!(ids.run_id(), Err(IdError::ClockBeforeEpoch));
         assert_eq!(ids.dispatch_id(), Err(IdError::ClockBeforeEpoch));
         assert!(IdError::ClockBeforeEpoch.to_string().contains("clock"));
+    }
+
+    #[test]
+    fn task_ids_are_pure_and_shaped_task_dash_16_hex() {
+        let a = derive_task_id("repo-key", "hash-1");
+        let b = derive_task_id("repo-key", "hash-1");
+        assert_eq!(a, b, "the same inputs always derive the same task");
+        assert!(a.as_str().starts_with("task-"));
+        assert_eq!(a.as_str().len(), "task-".len() + 16);
+        let different_repo = derive_task_id("other-repo", "hash-1");
+        let different_contract = derive_task_id("repo-key", "hash-2");
+        assert_ne!(a, different_repo);
+        assert_ne!(a, different_contract);
     }
 
     #[test]
