@@ -44,6 +44,19 @@ missing here.
   still carries them — waiving a gap is a policy or contract change, not
   a CLI flag.
 
+- **`relais report --by <dimension>` compares like task classes instead
+  of blending every task into one number.** `--by task-class|tier|model
+  |policy|repository` groups the window's tasks into cohorts; each
+  cohort line carries its task and standing counts, cost per accepted
+  change, acceptance rate over tasks that reached a terminal state (a
+  task still in flight is reported separately rather than counted as a
+  failure), escalation rate, review-correction rate printed with its own
+  denominator (tasks whose reviewer actually ran, not every task),
+  median duration, regressions and pending feedback. A task with no
+  known value for the dimension lands in a named `unknown` bucket rather
+  than being dropped. Omitting `--by` leaves the report exactly as it
+  was; the JSON gains one `cohorts` key beside the existing ones.
+
 ## v0.3.0
 
 ### Added
