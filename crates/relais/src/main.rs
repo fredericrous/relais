@@ -914,6 +914,7 @@ fn train_command() -> Result<CliOutcome, CliError> {
         tiers_supported: outcome.tiers_supported,
         observed_identities: outcome.observed_identities,
         cohorts: vec!["change".into(), "inspect".into()],
+        label_policy_version: dataset.label_policy_version,
         dataset_fingerprint: dataset.fingerprint,
         solver: settings.solver,
         trained_at: relais::ledger::now_rfc3339(),
@@ -2208,26 +2209,51 @@ fn feedback_command(request: FeedbackRequest) -> Result<CliOutcome, CliError> {
         eprintln!("relais feedback: run {run} carries no task identity");
         return Ok(CliOutcome::OperationalFailure);
     };
-    let Some((receipt, _hash)) = operational(ledger.receipt(&run), "feedback")? else {
-        eprintln!("relais feedback: run {run} is accepted but carries no receipt");
-        return Ok(CliOutcome::OperationalFailure);
+    // A run accepted through a person's approval (`relais decide --answer
+    // approve`) on a contract interrupted before verification never wrote
+    // a receipt — SPEC's decision spine reaches `accepted` without one.
+    // Feedback about it is still worth recording; whenever a receipt DOES
+    // exist, it is still the source of truth a `--candidate` is checked
+    // against (SPEC §20: feedback is attributed to the candidate).
+    let receipt = operational(ledger.receipt(&run), "feedback")?;
+    let recorded_candidate = match receipt {
+        Some((receipt, _hash)) => {
+            let Some(sha) = receipt["candidate_sha"].as_str() else {
+                eprintln!("relais feedback: run {run}'s receipt names no candidate");
+                return Ok(CliOutcome::OperationalFailure);
+            };
+            Some(sha.to_string())
+        }
+        // No receipt, but the run may still have finished an attempt and
+        // named what it built. That is the ledger's own answer, and it
+        // stands in for the receipt here exactly as the receipt would.
+        None => operational(ledger.latest_attempt_candidate(&run), "feedback")?,
     };
-    let Some(receipt_candidate) = receipt["candidate_sha"].as_str() else {
-        eprintln!("relais feedback: run {run}'s receipt names no candidate");
-        return Ok(CliOutcome::OperationalFailure);
-    };
-    // The candidate a caller names must be the one the run actually
-    // produced — the receipt, not the caller, is the source of truth
-    // (SPEC §20: feedback is attributed to the candidate).
-    if let Some(candidate) = candidate {
-        if candidate.as_str() != receipt_candidate {
+    match (&recorded_candidate, &candidate) {
+        (Some(recorded), Some(candidate)) if candidate != recorded => {
             eprintln!(
                 "relais feedback: --candidate {candidate} does not match run {run}'s accepted \
-                 candidate {receipt_candidate}"
+                 candidate {recorded}"
             );
             return Ok(CliOutcome::InvalidInput);
         }
+        // Nothing in the ledger says what this run built, so nothing can
+        // check the caller's claim. Storing it anyway would put an
+        // unverifiable sha in the outcomes table as the candidate this
+        // outcome is about (SPEC §20: the receipt, not the caller, is the
+        // source of truth). The outcome itself is still recordable —
+        // without a candidate it cannot vouch for.
+        (None, Some(candidate)) => {
+            eprintln!(
+                "relais feedback: run {run} has no recorded candidate to check --candidate \
+                 {candidate} against — record the outcome without it, or name the run that \
+                 produced the candidate"
+            );
+            return Ok(CliOutcome::InvalidInput);
+        }
+        (Some(_), Some(_)) | (Some(_), None) | (None, None) => {}
     }
+    let candidate_sha = recorded_candidate;
     // The strategy actually used is read off the ledger, never asked of
     // the caller (SPEC §20).
     let Some((_contract, tier)) = operational(ledger.run_contract_and_tier(&run), "feedback")?
@@ -2249,7 +2275,7 @@ fn feedback_command(request: FeedbackRequest) -> Result<CliOutcome, CliError> {
     };
     let kind = outcome.into();
     let detail = relais::outcome::OutcomeDetail {
-        candidate_sha: receipt_candidate.to_string(),
+        candidate_sha,
         strategy: relais::outcome::Strategy {
             tier,
             models,

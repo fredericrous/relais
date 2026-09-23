@@ -395,6 +395,7 @@ mod tests {
             tiers_supported: vec![Tier::Implementation],
             observed_identities: vec![(Tier::Implementation, vec![identity_under_test()])],
             cohorts: vec!["change".into(), "inspect".into()],
+            label_policy_version: crate::learn::dataset::LABEL_POLICY_VERSION,
             dataset_fingerprint: "f".into(),
             solver: crate::learn::learner::SolverSettings::default(),
             trained_at: "now".into(),

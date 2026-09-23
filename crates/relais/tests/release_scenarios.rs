@@ -1377,6 +1377,91 @@ fn a_human_sign_off_gap_is_cleared_only_by_decide_and_then_feedback_accepts_it()
     );
 }
 
+/// A run whose acceptance criterion the contract's own scope excludes
+/// (SPEC §9) reaches `needs_decision` before the runner ever writes a
+/// receipt — there is nothing to seal yet. `relais decide --answer
+/// approve` still accepts it (a person's answer, not relais's own
+/// checks), and `relais feedback` about it has no candidate to verify —
+/// this is the case a receipt-less accepted run exists for.
+#[test]
+fn relais_feedback_accepts_a_person_approved_run_with_no_receipt() {
+    let world = World::new("feedback-no-receipt");
+    let hash = world.write_policy(3);
+    world.write_machine(&hash, "");
+    let path = world.root.join("narrow.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "schema_version": 1,
+            "kind": "change",
+            "objective": "Remove the entry point",
+            "base_ref": "HEAD",
+            "write_scope": ["docs/**"],
+            "acceptance": ["src/main.rs no longer exists"],
+            "verification_profile": "default",
+            "review": "off",
+        })
+        .to_string(),
+    )
+    .expect("task");
+    let run = world.relais(&["run", "--task", path.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(8), "{}", text(&run.stderr));
+    let run_id = world.only_run_id();
+
+    let receipt_path = world.state.join("runs").join(&run_id).join("receipt.json");
+    assert!(
+        !receipt_path.exists(),
+        "a scope-exceeded run has nothing to seal yet: {}",
+        receipt_path.display()
+    );
+
+    let decide = world.relais(&[
+        "decide",
+        &run_id,
+        "--answer",
+        "approve",
+        "--actor",
+        "the release suite",
+    ]);
+    assert_eq!(decide.status.code(), Some(0), "{}", text(&decide.stderr));
+
+    // A scope-exceeded run finished its attempt, so the LEDGER knows
+    // what it built even though no receipt does. That, not the caller,
+    // is what a `--candidate` is checked against: naming another sha is
+    // refused exactly as it would be against a receipt.
+    let wrong_candidate = world.relais(&[
+        "feedback",
+        &run_id,
+        "--outcome",
+        "accepted",
+        "--actor",
+        "a person",
+        "--candidate",
+        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    ]);
+    assert_eq!(
+        wrong_candidate.status.code(),
+        Some(2),
+        "a candidate the run never produced is not recordable as the one it did: {}",
+        text(&wrong_candidate.stderr)
+    );
+
+    let feedback = world.relais(&[
+        "feedback",
+        &run_id,
+        "--outcome",
+        "accepted",
+        "--actor",
+        "a person",
+    ]);
+    assert_eq!(
+        feedback.status.code(),
+        Some(0),
+        "an accepted run with no receipt still accepts feedback: {}",
+        text(&feedback.stderr)
+    );
+}
+
 // SPEC §17, §21: execute → verify → label → build dataset → train →
 // evaluate → promote → route. The loop closes: a promoted artifact is
 // what `plan` and `run` consult, and it says so.

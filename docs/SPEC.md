@@ -360,7 +360,9 @@ No GPU, neural network framework or embedding model is necessary for this design
 
 ### Collection and labels
 
-A task is the unit of sampling. An execution profile combines model, effort, harness, context policy and bounded recovery policy. Capture the starting candidate identity and task contract so comparisons can reproduce the same task.
+A task is the unit of sampling — a task retried to acceptance contributes one training example, not one per attempt. An execution profile combines model, effort, harness, context policy and bounded recovery policy. Capture the starting candidate identity and task contract so comparisons can reproduce the same task.
+
+The labelling rule is versioned, and every dataset and artifact records which version produced it, so a dataset built under an earlier rule is distinguishable from one built under this one rather than silently comparable.
 
 For every dispatch record pre-dispatch features, eligible profiles, selected profile, actual selection probability, versions, timestamps, verification results, human corrections where supplied, usage completeness and costs. Keep attempt-level outcomes distinct from complete-strategy outcomes: a cheap worker rescued by a stronger worker did not succeed without escalation, while the complete strategy may still have delivered an accepted result.
 
@@ -420,7 +422,9 @@ At bounded checkpoints, recovery chooses between retrieving missing context, a f
 
 The adapter contract includes launch, events, cancellation, resume/reconciliation, effective profile, permission capability, sandbox capability and usage completeness. The mandatory Claude Code adapter uses supported native authentication and launches explicitly selected models. An optional alternative adapter can run another harness or local model. No adapter may advertise guarantees its backend cannot enforce.
 
-After acceptance, allow the user to record accepted unchanged, corrected, reverted or confirmed regression. Feedback is attributed to the candidate and strategy, with correction magnitude and evidence where available. Absence of feedback is not a positive quality label. Retain both immediate verification and delayed outcomes.
+After acceptance, allow the user to record accepted unchanged, corrected, reverted or confirmed regression. Feedback is attributed to the candidate and strategy, with correction magnitude and evidence where available. The candidate is optional: a run accepted through a person's approval on a contract interrupted before verification completed never wrote a receipt, and feedback about it is still worth recording. Absence of feedback is not a positive quality label. Retain both immediate verification and delayed outcomes.
+
+A task's later recorded outcome overrides its run's terminal state for labelling purposes: a reverted change or a later confirmed regression is never a positive label, whatever its run's state said. A task accepted through a person's approval rather than verification alone is recorded as such — the dataset names which route accepted it — and does not earn the positive label reserved for verified acceptance.
 
 Report savings as measured comparisons only when supported by comparable trials; otherwise label projections and assumptions. Final delivery includes candidate, verification receipt, route explanation, actual cost boundary, reusable evidence and unresolved decisions. Publishing and deployment remain outside product scope.
 

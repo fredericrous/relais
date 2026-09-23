@@ -13,11 +13,13 @@
 use serde::{Deserialize, Serialize};
 
 use super::features::{
-    expand, FeatureSchema, ProfileIdentity, SparseVec, TaskFeatures, TrainingExample,
+    expand, AcceptanceRoute, FeatureSchema, ProfileIdentity, SparseVec, TaskFeatures,
+    TrainingExample,
 };
-use crate::ids::sha256_hex;
+use crate::ids::{sha256_hex, TaskId};
 use crate::ledger::{Ledger, LedgerError};
-use crate::lifecycle::State;
+use crate::lifecycle::{Reason, State};
+use crate::outcome::OutcomeKind;
 use crate::policy::{RepoPolicy, Tier};
 
 /// The stored contract and first-attempt tier for a run, as dataset
@@ -33,8 +35,23 @@ pub type ContractLookup<'a> = dyn Fn(&str) -> Result<Option<ContractMaterial>, L
 /// Version 2 records, per example, the routing FLOOR its contract had at
 /// dispatch time (SPEC §6): the evaluator's baseline is the route the
 /// router would have taken for that task, which a version-1 dataset does
-/// not carry. Rebuild with `relais dataset build` to train again.
-pub const DATASET_VERSION: u32 = 2;
+/// not carry. Version 3 samples by TASK rather than by run, reads a
+/// task's later recorded outcome into its label, and records which route
+/// (verification or a person's approval) accepted it — none of which a
+/// version-2 dataset carries. Rebuild with `relais dataset build` to
+/// train again.
+pub const DATASET_VERSION: u32 = 3;
+
+/// The version of the rule in [`labelling_of`] and the acceptance
+/// decision at [`build`]'s `route == AcceptanceRoute::Verified` check —
+/// together, "what counts as a positive label". Recorded on every
+/// [`Dataset`] and carried onto the [`super::registry::Artifact`] it
+/// trains, so a dataset or artifact built under an earlier rule is
+/// distinguishable from one built under this one rather than silently
+/// comparable. Bump this whenever either decision changes, independently
+/// of `DATASET_VERSION` — the record layout and the labelling rule are
+/// two different things that happen to change together today.
+pub const LABEL_POLICY_VERSION: u32 = 1;
 
 /// The window dataset construction reads: every run the ledger holds.
 /// Far enough in the past that no relais ledger predates it.
@@ -109,9 +126,10 @@ pub enum Labelling {
     Excluded(&'static str),
 }
 
-/// The labelling a lifecycle state earns. Total over `State` on purpose:
-/// a new state is a compile error here, not a silent negative label.
-pub fn labelling_of(state: State) -> Labelling {
+/// The labelling a lifecycle state earns on its own. Total over `State`
+/// on purpose: a new state is a compile error here, not a silent negative
+/// label.
+fn state_labelling(state: State) -> Labelling {
     match state {
         State::Accepted => Labelling::Accepted,
         State::Failed => Labelling::Failed,
@@ -131,9 +149,66 @@ pub fn labelling_of(state: State) -> Labelling {
     }
 }
 
+/// Whether a task's most recently recorded final outcome (SPEC §20) says
+/// the accepted change is still standing. Exhaustive over `OutcomeKind`
+/// with no wildcard arm: a new outcome kind does not compile here until
+/// it says which way it falls.
+///
+/// The ONE place an outcome kind is read as standing-or-not.
+/// [`labelling_of`] calls it rather than matching the kinds again, and
+/// `TrainingExample::outcome_stood` records what it returned, so an
+/// example cannot say a change stood while its own label says it did
+/// not — two exhaustive matches over one enum stay correct only until
+/// someone adds a variant and answers them differently.
+pub(crate) fn outcome_stands(kind: OutcomeKind) -> bool {
+    match kind {
+        OutcomeKind::AcceptedUnchanged => true,
+        OutcomeKind::Corrected => true,
+        OutcomeKind::Reverted => false,
+        OutcomeKind::ConfirmedRegression => false,
+    }
+}
+
+/// The labelling a task earns from its run's terminal state AND its most
+/// recently recorded final outcome (SPEC §20), so a task later reverted
+/// or a later confirmed regression is never a positive label whatever its
+/// run's state said. Non-accepted labellings are untouched by outcome —
+/// a failed or excluded run has no accepted change for an outcome to
+/// speak about. The `Accepted` branch below matches `Option<OutcomeKind>`
+/// exhaustively with no wildcard, so a new outcome kind does not compile
+/// here until it says which way it falls: they used to be read only from
+/// `state`, so a reverted or later-regressed task kept the positive label
+/// its run's terminal state gave it forever.
+pub fn labelling_of(state: State, outcome: Option<OutcomeKind>) -> Labelling {
+    let base = state_labelling(state);
+    if base != Labelling::Accepted {
+        return base;
+    }
+    match outcome {
+        // No outcome recorded yet is not evidence of anything: the run
+        // was accepted, and absence of feedback is never a positive
+        // label in its own right, only the accepted label already earned.
+        None => Labelling::Accepted,
+        // Not a wildcard: `kind` is bound and handed to the one
+        // exhaustive match over `OutcomeKind` there is, so a new variant
+        // still fails to compile — in `outcome_stands`, once, instead of
+        // here and there.
+        Some(kind) => {
+            if outcome_stands(kind) {
+                Labelling::Accepted
+            } else {
+                Labelling::Failed
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Dataset {
     pub version: u32,
+    /// The version of the labelling rule that produced `records` (see
+    /// [`LABEL_POLICY_VERSION`]).
+    pub label_policy_version: u32,
     pub records: Vec<TrainingExample>,
     pub exclusions: Vec<String>,
     pub fingerprint: String,
@@ -191,7 +266,23 @@ pub fn build(
             since: EPOCH.to_string(),
             cause,
         })?;
+    // The sampling unit is the task, not the run (SPEC §17): a task
+    // retried to acceptance contributes one example, not one per attempt.
+    // `runs_since` reads newest-first, so the first run seen for a task
+    // is its most recent attempt — the one worth representing it, since a
+    // retry exists only because an earlier attempt did not stand.
+    let mut seen_tasks: std::collections::HashSet<TaskId> = std::collections::HashSet::new();
     for (run_id, _repo, _status, _created) in runs {
+        let Some(task_id) = read_of(&run_id, "task identity", ledger.task_of_run(&run_id))? else {
+            exclusions.push(format!("{run_id}: no task identity recorded"));
+            continue;
+        };
+        if !seen_tasks.insert(task_id.clone()) {
+            exclusions.push(format!(
+                "{run_id}: superseded by a later attempt at task {task_id}"
+            ));
+            continue;
+        }
         let material = read_of(&run_id, "contract revision", contract_of(run_id.as_str()))?;
         let Some((contract, objective, tier_name)) = material else {
             exclusions.push(format!("{run_id}: no contract revision recorded"));
@@ -201,9 +292,15 @@ pub fn build(
             exclusions.push(format!("{run_id}: no state recorded"));
             continue;
         };
+        // A task's later recorded outcome (SPEC §20) can withdraw its
+        // positive label even when its state alone said accepted — a
+        // reverted change or a later confirmed regression is never a
+        // positive label.
+        let latest_outcome = read_of(&run_id, "latest outcome", ledger.latest_outcome(&task_id))?;
+        let outcome_kind = latest_outcome.as_ref().map(|stored| stored.outcome.kind);
         // Infrastructure and unresolved outcomes are excluded, not
         // relabelled (SPEC §17).
-        let accepted = match labelling_of(state) {
+        let accepted = match labelling_of(state, outcome_kind) {
             Labelling::Accepted => true,
             Labelling::Failed => false,
             Labelling::Excluded(why) => {
@@ -225,7 +322,28 @@ pub fn build(
             "escalation attempts",
             ledger.escalation_attempted(&run_id),
         )?;
-        let accepted_without_escalation = accepted && !escalated;
+        // A person's approval (`relais decide --answer approve`) accepts
+        // the candidate, but it is not the VERIFIED acceptance SPEC §17
+        // reserves a positive label for: the acceptance predictor is
+        // fitted to estimate verification success, and a human override
+        // is not independent evidence of that. The example still enters
+        // the dataset — `route` names how it was actually accepted, so
+        // the dataset reads honestly — it just never contributes a
+        // positive label.
+        let decision = read_of(&run_id, "decision", ledger.decision_of_run(&run_id))?;
+        let route =
+            if decision.and_then(|record| record.resolution) == Some(Reason::DecisionApproved) {
+                AcceptanceRoute::PersonApproved
+            } else {
+                AcceptanceRoute::Verified
+            };
+        let accepted_without_escalation =
+            accepted && !escalated && route == AcceptanceRoute::Verified;
+        let outcome_stood = outcome_kind.map(outcome_stands);
+        let correction_magnitude = latest_outcome
+            .as_ref()
+            .and_then(|stored| stored.outcome.detail.correction_magnitude)
+            .map(|magnitude| magnitude.get());
         let cost = read_of(&run_id, "cost", ledger.run_cost(&run_id))?;
         let completeness = read_of(
             &run_id,
@@ -266,6 +384,9 @@ pub fn build(
             identity,
             sparse,
             accepted_without_escalation,
+            route,
+            outcome_stood,
+            correction_magnitude,
             complete_cost: cost,
             cost_complete,
             dispatched_at,
@@ -280,6 +401,7 @@ pub fn build(
     let fingerprint = sha256_hex(fingerprint_source.as_bytes());
     Ok(Dataset {
         version: DATASET_VERSION,
+        label_policy_version: LABEL_POLICY_VERSION,
         records,
         exclusions,
         fingerprint,
@@ -438,6 +560,9 @@ mod tests {
             identity: ProfileIdentity::default(),
             sparse: SparseVec(vec![(0, 1.0)]),
             accepted_without_escalation: accepted,
+            route: AcceptanceRoute::Verified,
+            outcome_stood: None,
+            correction_magnitude: None,
             complete_cost: crate::money::MicroUsd::from_micros(100),
             cost_complete: true,
             dispatched_at: at.into(),
@@ -571,9 +696,39 @@ argv = ["true"]
             }
         }
 
+        /// Like [`Self::open`], but with a scripted clock — for a test
+        /// that needs several runs at KNOWN, distinct timestamps rather
+        /// than whatever the wall clock hands out.
+        fn open_with_clock<I: IntoIterator<Item = S>, S: Into<String>>(
+            name: &str,
+            times: I,
+        ) -> Self {
+            let dir = temp_dir(name);
+            let ledger = crate::ledger::Ledger::open_with_clock(
+                &dir.join("ledger.sqlite"),
+                Box::new(crate::ledger::FixedClock::new(times)),
+            )
+            .expect("ledger");
+            let contract = contract();
+            let contract_json = serde_json::to_string(&contract.canonical_value()).expect("json");
+            Self {
+                ledger,
+                contract,
+                contract_json,
+                dir,
+            }
+        }
+
         fn dispatched(&self, run: &str, tier: &str, phase: &str) -> i64 {
+            self.dispatched_for_task(run, task_id(run).as_str(), tier, phase)
+        }
+
+        /// Like [`Self::dispatched`], but for a caller that needs several
+        /// runs to share one task — a retry, or a person's approval
+        /// after an interruption.
+        fn dispatched_for_task(&self, run: &str, task: &str, tier: &str, phase: &str) -> i64 {
             self.ledger
-                .insert_run(&run_id(run), "/r", None, &task_id(run), "rk")
+                .insert_run(&run_id(run), "/r", None, &TaskId::from_stored(task), "rk")
                 .expect("run");
             let revision = self
                 .ledger
@@ -669,6 +824,85 @@ argv = ["true"]
         }
     }
 
+    /// The sampling unit is the task, not the run (SPEC §17): a task
+    /// retried to acceptance contributes ONE record, built from its most
+    /// recent attempt, not one per attempt.
+    #[test]
+    fn a_task_retried_to_acceptance_contributes_one_record() {
+        let times: Vec<String> = (0..30)
+            .map(|minute| format!("2026-01-01T00:{minute:02}:00+00:00"))
+            .collect();
+        let fixture = LedgerFixture::open_with_clock("dataset-retry", times);
+        fixture.dispatched_for_task("run-old", "task-shared", "implementation", "initial");
+        fixture.settle("run-old", State::Failed);
+        fixture.dispatched_for_task("run-new", "task-shared", "escalation", "escalation");
+        fixture.usage("new-worker", "run-new", "fable");
+        fixture.settle("run-new", State::Accepted);
+        let dataset = fixture.build();
+        assert_eq!(
+            dataset.records.len(),
+            1,
+            "one task, however many times it was retried: {:?}",
+            dataset.records
+        );
+        assert_eq!(
+            dataset.records[0].tier,
+            Tier::Escalation,
+            "the later attempt represents it"
+        );
+        assert!(
+            dataset
+                .exclusions
+                .iter()
+                .any(|exclusion| exclusion.contains("run-old") && exclusion.contains("superseded")),
+            "the superseded attempt is still named, not silently dropped: {:?}",
+            dataset.exclusions
+        );
+    }
+
+    /// A person's approval (`relais decide --answer approve`) accepts a
+    /// candidate too, but it is not the verified acceptance a positive
+    /// label requires — the example still enters the dataset, naming its
+    /// route, but never contributes a positive label.
+    #[test]
+    fn a_person_approved_task_is_recorded_but_not_a_positive_label() {
+        let fixture = LedgerFixture::open("dataset-person-approved");
+        fixture.dispatched("run-a", "implementation", "initial");
+        fixture
+            .ledger
+            .record_transition(&crate::ledger::Transition {
+                run_id: run_id("run-a"),
+                attempt_id: None,
+                from_state: Some(State::Verifying),
+                to_state: State::NeedsDecision,
+                reason: "worker_dispatched".into(),
+                detail: None,
+                at: crate::ledger::now_rfc3339(),
+            })
+            .expect("transition into needs_decision opens a decision");
+        fixture
+            .ledger
+            .resolve_decision(
+                &run_id("run-a"),
+                &crate::ledger::DecisionAnswer {
+                    resolution: crate::lifecycle::Reason::DecisionApproved,
+                    actor: "a person",
+                    note: None,
+                    successor_run: None,
+                    from_state: State::NeedsDecision,
+                    to_state: State::Accepted,
+                },
+            )
+            .expect("resolve");
+        let dataset = fixture.build();
+        assert_eq!(dataset.records.len(), 1);
+        assert_eq!(dataset.records[0].route, AcceptanceRoute::PersonApproved);
+        assert!(
+            !dataset.records[0].accepted_without_escalation,
+            "a person's approval is not the verified acceptance a positive label requires"
+        );
+    }
+
     #[test]
     fn a_reviewed_run_is_not_labelled_as_escalated() {
         let fixture = LedgerFixture::open("dataset");
@@ -733,7 +967,7 @@ argv = ["true"]
             State::Cancelled,
         ] {
             assert!(
-                matches!(labelling_of(state), Labelling::Excluded(_)),
+                matches!(labelling_of(state, None), Labelling::Excluded(_)),
                 "{state} is not an evidence-backed reasoning label"
             );
             let fixture = LedgerFixture::open("dataset-state");
@@ -751,8 +985,52 @@ argv = ["true"]
                 dataset.exclusions[0]
             );
         }
-        assert_eq!(labelling_of(State::Accepted), Labelling::Accepted);
-        assert_eq!(labelling_of(State::Failed), Labelling::Failed);
+        assert_eq!(labelling_of(State::Accepted, None), Labelling::Accepted);
+        assert_eq!(labelling_of(State::Failed, None), Labelling::Failed);
+    }
+
+    /// D1: a task whose latest recorded outcome is `reverted` or a
+    /// confirmed regression is never a positive label, whatever its run's
+    /// terminal state said.
+    #[test]
+    fn a_reverted_or_regressed_outcome_withdraws_an_accepted_label() {
+        assert_eq!(
+            labelling_of(State::Accepted, Some(OutcomeKind::Reverted)),
+            Labelling::Failed
+        );
+        assert_eq!(
+            labelling_of(State::Accepted, Some(OutcomeKind::ConfirmedRegression)),
+            Labelling::Failed
+        );
+        assert_eq!(
+            labelling_of(State::Accepted, Some(OutcomeKind::AcceptedUnchanged)),
+            Labelling::Accepted
+        );
+        assert_eq!(
+            labelling_of(State::Accepted, Some(OutcomeKind::Corrected)),
+            Labelling::Accepted
+        );
+        // Absence of feedback is never a positive label BY ITSELF, but it
+        // also never withdraws one already earned by verified acceptance.
+        assert_eq!(labelling_of(State::Accepted, None), Labelling::Accepted);
+        // A non-accepted state is untouched by outcome: there is no
+        // accepted change for an outcome to speak about.
+        assert_eq!(
+            labelling_of(State::Failed, Some(OutcomeKind::Reverted)),
+            Labelling::Failed
+        );
+
+        // The label and the `outcome_stood` an example records must agree
+        // for EVERY kind, not only the four spelled out above: they are
+        // one judgement read twice, and a kind added later could be
+        // classified one way in the label and the other in the example.
+        for kind in OutcomeKind::ALL {
+            assert_eq!(
+                labelling_of(State::Accepted, Some(kind)) == Labelling::Accepted,
+                outcome_stands(kind),
+                "the label and `outcome_stands` disagree about {kind:?}"
+            );
+        }
     }
 
     /// L4: a failing ledger read is an error, never an empty dataset. The
@@ -868,6 +1146,7 @@ argv = ["true"]
     fn class_distribution_is_reported() {
         let dataset = Dataset {
             version: DATASET_VERSION,
+            label_policy_version: LABEL_POLICY_VERSION,
             records: vec![
                 example("a", "2026-09-01", true),
                 example("b", "2026-09-02", false),
