@@ -1137,6 +1137,163 @@ fn a_run_awaiting_a_person_is_answered_by_decide_and_drops_off_the_open_list() {
     );
 }
 
+/// `relais evidence attach` records one row against a run and, when it
+/// names one, the acceptance criterion it answers — and decides nothing:
+/// no criterion is marked met, no state changes, no gap clears. It
+/// refuses a run it does not know, and refuses a criterion id the run's
+/// contract does not declare, naming the ids it does.
+#[test]
+fn evidence_attach_refuses_unknowns_and_records_what_it_is_told() {
+    let world = World::new("evidence-attach");
+    let hash = world.write_policy(3);
+    world.write_machine(&hash, "");
+    let path = world.root.join("narrow.json");
+    let statement = "src/main.rs no longer exists";
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "schema_version": 1,
+            "kind": "change",
+            "objective": "Remove the entry point",
+            "base_ref": "HEAD",
+            "write_scope": ["docs/**"],
+            "acceptance": [statement],
+            "verification_profile": "default",
+            "review": "off",
+        })
+        .to_string(),
+    )
+    .expect("task");
+    // Scoped to docs/** while the criterion is about src/main.rs: the
+    // cheapest way to a run that carries a real contract without waiting
+    // on the fake worker to fix anything.
+    let run = world.relais(&["run", "--task", path.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(8), "{}", text(&run.stderr));
+    let run_id = world.only_run_id();
+    let criterion_id: relais::acceptance::AcceptanceEntry = statement.into();
+    let criterion_id = criterion_id.id();
+
+    let evidence_path = world.root.join("coverage.json");
+    std::fs::write(&evidence_path, "{\"lines\": 100}").expect("evidence file");
+
+    let unknown_run = world.relais(&[
+        "evidence",
+        "attach",
+        "not-a-real-run",
+        "--path",
+        evidence_path.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        unknown_run.status.code(),
+        Some(10),
+        "{}",
+        text(&unknown_run.stderr)
+    );
+    assert!(
+        text(&unknown_run.stderr).contains("unknown run"),
+        "{}",
+        text(&unknown_run.stderr)
+    );
+
+    let unknown_criterion = world.relais(&[
+        "evidence",
+        "attach",
+        &run_id,
+        "--path",
+        evidence_path.to_str().unwrap(),
+        "--criterion",
+        "not-a-real-id",
+    ]);
+    assert_eq!(
+        unknown_criterion.status.code(),
+        Some(2),
+        "{}",
+        text(&unknown_criterion.stderr)
+    );
+    assert!(
+        text(&unknown_criterion.stderr).contains(&criterion_id),
+        "the refusal names the ids the contract does declare: {}",
+        text(&unknown_criterion.stderr)
+    );
+
+    let attach = world.relais(&[
+        "evidence",
+        "attach",
+        &run_id,
+        "--path",
+        evidence_path.to_str().unwrap(),
+        "--tool",
+        "coverage-bot",
+        "--external-id",
+        "cov-42",
+        "--subject",
+        "src/main.rs",
+        "--criterion",
+        &criterion_id,
+    ]);
+    assert_eq!(attach.status.code(), Some(0), "{}", text(&attach.stderr));
+
+    // Recording never decides: the run is still exactly where it was,
+    // waiting on a person, not settled by the evidence just attached.
+    let report = world.relais(&["report", "--since", "2000-01-01", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&text(&report.stdout)).expect("json");
+    let open: Vec<&str> = report["open_decisions"]
+        .as_array()
+        .expect("open_decisions is an array")
+        .iter()
+        .map(|decision| decision["run"].as_str().expect("run"))
+        .collect();
+    assert!(open.contains(&run_id.as_str()), "{report}");
+
+    let explain = world.relais(&["explain", &run_id]);
+    let explained = text(&explain.stdout);
+    assert!(explained.contains("external_attestation"), "{explained}");
+    assert!(explained.contains("coverage-bot"), "{explained}");
+    assert!(explained.contains(&criterion_id), "{explained}");
+
+    // A RELATIVE `--path` is stored the way every other evidence row is
+    // stored: absolute. The runner joins its artifacts directory and
+    // `decide` joins the runs directory, and `explain` prints them all
+    // together — a row saying `report.json` resolves from whatever
+    // directory the person happened to be in, which is no directory at
+    // all by the time anyone reads it back. `relais` runs with the repo
+    // as its cwd here, so this is the path a person would actually type.
+    std::fs::write(world.repo.join("report.json"), "{}").expect("relative evidence file");
+    let relative = world.relais(&[
+        "evidence",
+        "attach",
+        &run_id,
+        "--path",
+        "report.json",
+        "--tool",
+        "coverage-bot",
+    ]);
+    assert_eq!(
+        relative.status.code(),
+        Some(0),
+        "{}",
+        text(&relative.stderr)
+    );
+
+    let explain = world.relais(&["explain", &run_id]);
+    let explained = text(&explain.stdout);
+    let recorded = explained
+        .lines()
+        .find(|line| line.contains("report.json"))
+        .expect("the attached row is printed: {explained}");
+    assert!(
+        recorded.contains(
+            &world
+                .repo
+                .canonicalize()
+                .expect("repo")
+                .display()
+                .to_string()
+        ),
+        "a relative path is recorded absolute, like every other evidence row: {recorded}"
+    );
+}
+
 /// A person's answer ends the run they answered (SPEC §9): `approve`
 /// assigns `accepted`, and every other answer — `reject`, `revise`,
 /// `decided`, `abandon` — assigns `cancelled`. All five raise their
