@@ -36,6 +36,17 @@ missing here.
 
 ### Added
 
+- **The reviewer is asked about stored facts, not only computed
+  ones.** Every finding the review loop missed over v0.4.0's packages
+  shared one shape: a second record of a fact, left disagreeing with the
+  first — a ledger row written without its file, a receipt still naming a
+  gap a person had answered, two hand-written copies of one query. The
+  prompt now asks, for every fact a change records, where else that fact
+  is already written and whether the change keeps them in step; and, for
+  every fact it reads, whether the newest row matching a state is really
+  the event that caused it, since a retired worktree appends a same-state
+  transition after a run is already terminal.
+
 - **A person's answer to `relais decide` now ends the run they
   answered.** `--answer approve` moves the run to `accepted`, and
   `reject`, `revise`, `decided` and `abandon` all move it to
