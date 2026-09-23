@@ -525,6 +525,46 @@ fn a_reverted_outcome_leaves_accepted_unchanged_and_drops_standing() {
     );
 }
 
+// `relais report --by model` groups the window's tasks by the model
+// that ran, so a cost comparison is between like task classes rather
+// than one number blending every model together (SPEC §11).
+#[test]
+fn report_by_model_groups_the_accepted_task_under_the_model_that_ran_it() {
+    let world = World::new("cohort-model");
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    let task = world.write_task_for("task.json", "an easy one", "optional");
+
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    let stdout = text(&run.stdout);
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "{stdout}\n{}",
+        text(&run.stderr)
+    );
+
+    let report = world.relais(&["report", "--since", "2026-01-01", "--json", "--by", "model"]);
+    assert_eq!(report.status.code(), Some(0), "{}", text(&report.stderr));
+    let report: serde_json::Value = serde_json::from_str(&text(&report.stdout)).expect("json");
+    assert_eq!(
+        report["accepted"], 1,
+        "the default figures are unchanged: {report}"
+    );
+    assert_eq!(report["cohorts"]["dimension"], "model", "{report}");
+    let cohorts = report["cohorts"]["cohorts"]
+        .as_array()
+        .expect("cohorts array");
+    assert_eq!(cohorts.len(), 1, "one model ran: {report}");
+    let cohort = &cohorts[0];
+    assert_eq!(cohort["key"], "sonnet", "{report}");
+    assert_eq!(cohort["tasks"], 1, "{report}");
+    assert_eq!(cohort["accepted"], 1, "{report}");
+    assert_eq!(cohort["standing"], 1, "{report}");
+    assert_eq!(cohort["terminal"], 1, "{report}");
+    assert_eq!(cohort["acceptance_rate"], 1.0, "{report}");
+}
+
 // Task-linking: a bare `relais run` derives a fresh task; a second run
 // of the same contract launched with `--revise <task-id>` joins that
 // task instead of starting a new one, so their cost is one denominator.

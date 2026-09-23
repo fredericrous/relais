@@ -119,6 +119,11 @@ enum Command {
         /// Machine-readable output
         #[arg(long)]
         json: bool,
+        /// Group the window's tasks into cohorts over one dimension, so
+        /// cost, acceptance, escalation and correction figures compare
+        /// like task classes rather than blending every task together
+        #[arg(long, value_enum)]
+        by: Option<report::Dimension>,
     },
     /// Owned-dataset and learned-routing operations (SPEC §17)
     Dataset {
@@ -517,7 +522,7 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             Some(run_id) => resume_command(&run_id, Retire::from_flag(retire)),
             None => retire_all_command(),
         },
-        Command::Report { since, json } => report_command(since.as_deref(), json),
+        Command::Report { since, json, by } => report_command(since.as_deref(), json, by),
         Command::Dataset { cmd } => match cmd {
             DatasetCommand::Build => dataset_build_command(),
         },
@@ -1677,7 +1682,7 @@ fn status_command(run_id: Option<&str>) -> Result<CliOutcome, CliError> {
     match run_id {
         None => {
             let report = operational(
-                report::runs_report(&ledger, "2000-01-01T00:00:00+00:00"),
+                report::runs_report(&ledger, "2000-01-01T00:00:00+00:00", None),
                 "status",
             )?;
             print!("{}", report.render());
@@ -2093,14 +2098,18 @@ fn retire_worktree(
     Ok(retired)
 }
 
-fn report_command(since: Option<&str>, json: bool) -> Result<CliOutcome, CliError> {
+fn report_command(
+    since: Option<&str>,
+    json: bool,
+    by: Option<report::Dimension>,
+) -> Result<CliOutcome, CliError> {
     let since = since.map(|since| since.to_string()).unwrap_or_else(|| {
         chrono::Utc::now()
             .format("%Y-%m-01T00:00:00+00:00")
             .to_string()
     });
     let ledger = open_ledger()?;
-    let report = operational(report::runs_report(&ledger, &since), "report")?;
+    let report = operational(report::runs_report(&ledger, &since, by), "report")?;
     if json {
         print_document(&report)?;
     } else {

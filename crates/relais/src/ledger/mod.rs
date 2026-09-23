@@ -1360,6 +1360,99 @@ impl Ledger {
         Ok(count as usize)
     }
 
+    /// Whether a run's reviewer actually ran, from usage events tagged
+    /// with the review phase. The review-correction rate's denominator
+    /// counts only tasks a reviewer looked at (SPEC §11): a rate over
+    /// never-reviewed tasks says nothing about review quality.
+    pub fn review_attempted(&self, run_id: &RunId) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM usage_events WHERE run_id = ?1 AND phase = 'review'",
+            [run_id.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// A run's wall-clock span, from its first attempt's start to its
+    /// last attempt's end. `None` while ANY attempt of the run is still
+    /// open: a run in flight has no duration to report, not a partial
+    /// one. `MAX` skips NULLs, so asking for it alone would answer with
+    /// the span of the attempts that happen to have finished and call a
+    /// run that is still working "done in eight minutes".
+    pub fn run_duration_seconds(&self, run_id: &RunId) -> Result<Option<f64>> {
+        let span: (Option<String>, Option<String>, i64) = self.conn.query_row(
+            "SELECT MIN(started_at), MAX(ended_at),
+                    SUM(CASE WHEN ended_at IS NULL THEN 1 ELSE 0 END)
+               FROM attempts WHERE run_id = ?1",
+            [run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2).unwrap_or(0))),
+        )?;
+        if span.2 > 0 {
+            return Ok(None);
+        }
+        let span = (span.0, span.1);
+        let (start, end) = match span {
+            (Some(start), Some(end)) => (start, end),
+            _ => return Ok(None),
+        };
+        let parse = |what: &'static str, stamp: &str| {
+            chrono::DateTime::parse_from_rfc3339(stamp).map_err(|e| LedgerError::Corrupt {
+                what: format!("{what} of run {run_id}"),
+                detail: format!("`{stamp}` is not an RFC3339 timestamp: {e}"),
+            })
+        };
+        let start = parse("an attempt's started_at", &start)?;
+        let end = parse("an attempt's ended_at", &end)?;
+        Ok(Some((end - start).num_seconds() as f64))
+    }
+
+    /// The earliest model dispatched for any of a task's runs — the
+    /// cohort key for `--by model`. A task revised across models still
+    /// needs one deterministic bucket, and the model it started under is
+    /// the one an author actually chose.
+    pub fn task_first_model(&self, task_id: &TaskId) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT usage_events.model FROM usage_events
+                 JOIN runs ON runs.id = usage_events.run_id
+                 WHERE runs.task_id = ?1 AND usage_events.model IS NOT NULL
+                 ORDER BY usage_events.at ASC, usage_events.id ASC
+                 LIMIT 1",
+                [task_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
+    /// The policy hash on the most recent receipt among a task's runs —
+    /// the cohort key for `--by policy`. A task with no receipt yet (no
+    /// run of it reached verification) has no policy to report.
+    pub fn task_policy_hash(&self, task_id: &TaskId) -> Result<Option<String>> {
+        let receipt_json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT receipts.receipt_json FROM receipts
+                 JOIN runs ON runs.id = receipts.run_id
+                 WHERE runs.task_id = ?1
+                 ORDER BY receipts.at DESC
+                 LIMIT 1",
+                [task_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        receipt_json
+            .map(|json| {
+                serde_json::from_str::<crate::verify::Receipt>(&json)
+                    .map(|receipt| receipt.policy_hash)
+                    .map_err(|e| LedgerError::Corrupt {
+                        what: format!("the receipt of task {task_id}"),
+                        detail: e.to_string(),
+                    })
+            })
+            .transpose()
+    }
+
     pub fn finish_attempt(
         &self,
         attempt_id: i64,
@@ -3626,6 +3719,44 @@ mod tests {
             .latest_outcome(&task("a"))
             .expect_err("an unknown kind is corrupt, not silently absent");
         assert!(matches!(err, LedgerError::Corrupt { .. }), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    /// A run whose second attempt is still open has no duration yet.
+    /// `MAX(ended_at)` skips NULLs, so asking for it alone answers with
+    /// the span of the attempts that finished — which would put a run
+    /// that is still working into a median of completed ones.
+    #[test]
+    fn a_run_with_an_open_attempt_has_no_duration_yet() {
+        let (ledger, dir) = temp_ledger();
+        let run = RunId::from_stored("run-open");
+        let task = TaskId::from_stored("task-open");
+        ledger
+            .insert_run(&run, "/repo", None, &task, "rk")
+            .expect("run");
+        let revision = ledger
+            .insert_contract_revision(&run, "hash", "{}", "HEAD", Some("sha"))
+            .expect("revision");
+        let first = ledger
+            .insert_attempt(&run, revision, 1, "implementation", UsagePhase::Initial)
+            .expect("first attempt");
+        ledger
+            .finish_attempt(first, State::Verifying, None, None)
+            .expect("finished");
+        assert!(
+            ledger.run_duration_seconds(&run).expect("query").is_some(),
+            "one finished attempt and nothing open: the run has a span"
+        );
+
+        ledger
+            .insert_attempt(&run, revision, 2, "implementation", UsagePhase::Repair)
+            .expect("second attempt");
+        assert_eq!(
+            ledger.run_duration_seconds(&run).expect("query"),
+            None,
+            "the repair is still open, so the run is not done"
+        );
+        // Best effort: the fixture is a temp dir; a leftover costs
+        // nothing but disk, and the next run pre-cleans it.
         std::fs::remove_dir_all(&dir).ok();
     }
 }

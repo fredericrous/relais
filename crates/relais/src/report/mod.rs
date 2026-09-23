@@ -15,11 +15,243 @@ use serde::Serialize;
 use crate::ledger::{DecisionRecord, Ledger, PhaseCost, TaskOrigin};
 use crate::lifecycle::State;
 use crate::money::{CostCompleteness, MicroUsd};
+use crate::outcome::OutcomeKind;
 
 /// Bumped whenever a top-level `Report` key is added, renamed or removed
-/// (this task added `open_decisions`), so a downstream parser can tell an
-/// old shape from a new one instead of guessing from key presence.
-pub const REPORT_SCHEMA_VERSION: u32 = 3;
+/// (this task added `cohorts`), so a downstream parser can tell an old
+/// shape from a new one instead of guessing from key presence.
+pub const REPORT_SCHEMA_VERSION: u32 = 4;
+
+/// A dimension `relais report --by` groups the window's tasks over (SPEC
+/// §11: "compare like task classes and policy versions"). Total over the
+/// values a task can be grouped by, so a new dimension is a decision made
+/// here rather than a silently unhandled CLI value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum Dimension {
+    TaskClass,
+    Tier,
+    Model,
+    Policy,
+    Repository,
+}
+
+impl Dimension {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TaskClass => "task_class",
+            Self::Tier => "tier",
+            Self::Model => "model",
+            Self::Policy => "policy",
+            Self::Repository => "repository",
+        }
+    }
+}
+
+impl Serialize for Dimension {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// A task, already mapped by the ledger adapter, ready for the rate
+/// functions below — none of which touch the ledger again. Keeping the
+/// I/O and the arithmetic apart is what makes a rate testable with a
+/// hand-built `Vec` instead of a database.
+#[derive(Debug, Clone)]
+struct CohortTaskRow {
+    accepted: bool,
+    standing: bool,
+    /// Every run of the task has reached a terminal state (SPEC's
+    /// decision spine): a task still in flight has not failed, so
+    /// counting it against acceptance would misreport work that simply
+    /// is not done yet.
+    terminal: bool,
+    escalated: bool,
+    /// A reviewer produced at least one usage event for some run of the
+    /// task — the review-correction rate's denominator.
+    reviewed: bool,
+    corrected: bool,
+    regressed: bool,
+    pending_feedback: bool,
+    /// Summed wall-clock span of the task's completed runs; `None` when
+    /// none of them has finished an attempt yet.
+    duration_seconds: Option<f64>,
+    cost: MicroUsd,
+    cost_completeness: CostCompleteness,
+}
+
+/// Total cost of the cohort's tasks, divided by its accepted count — the
+/// primary metric (SPEC §11), denominated per cohort instead of over the
+/// whole window, so a comparison is between like task classes rather than
+/// one number blending them.
+fn cost_per_accepted_change(rows: &[CohortTaskRow]) -> Option<MicroUsd> {
+    let accepted = rows.iter().filter(|row| row.accepted).count();
+    if accepted == 0 {
+        return None;
+    }
+    let total = rows.iter().fold(MicroUsd::ZERO, |acc, row| acc + row.cost);
+    Some(MicroUsd::from_micros(
+        (total.to_micros() as f64 / accepted as f64).round() as i64,
+    ))
+}
+
+/// Accepted terminal tasks divided by terminal tasks: a task still in
+/// flight is excluded from the denominator rather than counted as a
+/// failure it has not had the chance to be.
+fn acceptance_rate_over_terminal(rows: &[CohortTaskRow]) -> Option<f64> {
+    let terminal: Vec<&CohortTaskRow> = rows.iter().filter(|row| row.terminal).collect();
+    if terminal.is_empty() {
+        return None;
+    }
+    Some(terminal.iter().filter(|row| row.accepted).count() as f64 / terminal.len() as f64)
+}
+
+/// Escalated tasks divided by every task in the cohort.
+fn escalation_rate(rows: &[CohortTaskRow]) -> Option<f64> {
+    if rows.is_empty() {
+        return None;
+    }
+    Some(rows.iter().filter(|row| row.escalated).count() as f64 / rows.len() as f64)
+}
+
+/// Corrections divided by tasks whose reviewer actually ran — the count
+/// reviewed, and the rate over it, since a rate alone hides whether the
+/// denominator was one task or a hundred.
+fn review_correction_rate(rows: &[CohortTaskRow]) -> Option<(usize, f64)> {
+    let reviewed: Vec<&CohortTaskRow> = rows.iter().filter(|row| row.reviewed).collect();
+    if reviewed.is_empty() {
+        return None;
+    }
+    let corrected = reviewed.iter().filter(|row| row.corrected).count();
+    Some((reviewed.len(), corrected as f64 / reviewed.len() as f64))
+}
+
+/// The middle value of the cohort's known task durations; tasks with no
+/// completed run contribute nothing to it rather than a zero that would
+/// pull the median toward work that has not finished.
+fn median_duration_seconds(rows: &[CohortTaskRow]) -> Option<f64> {
+    let mut durations: Vec<f64> = rows.iter().filter_map(|row| row.duration_seconds).collect();
+    if durations.is_empty() {
+        return None;
+    }
+    durations.sort_by(|a, b| a.partial_cmp(b).expect("a duration in seconds is finite"));
+    let mid = durations.len() / 2;
+    Some(if durations.len().is_multiple_of(2) {
+        (durations[mid - 1] + durations[mid]) / 2.0
+    } else {
+        durations[mid]
+    })
+}
+
+fn regressions_count(rows: &[CohortTaskRow]) -> usize {
+    rows.iter().filter(|row| row.regressed).count()
+}
+
+fn pending_feedback_count(rows: &[CohortTaskRow]) -> usize {
+    rows.iter().filter(|row| row.pending_feedback).count()
+}
+
+/// One dimension's value, and what the window's tasks with that value
+/// cost, accepted, escalated and were corrected on — like compared with
+/// like (SPEC §11), rather than one number blending every task class.
+#[derive(Debug, Clone, Serialize)]
+pub struct Cohort {
+    pub key: String,
+    pub tasks: usize,
+    pub accepted: usize,
+    pub standing: usize,
+    pub terminal: usize,
+    /// Tasks with no terminal run yet — reported separately from
+    /// acceptance rather than folded into it as failures.
+    pub in_flight: usize,
+    pub cost: MicroUsd,
+    pub cost_completeness: CostCompleteness,
+    pub cost_per_accepted: Option<MicroUsd>,
+    pub acceptance_rate: Option<f64>,
+    pub escalation_rate: Option<f64>,
+    /// Denominator of `review_correction_rate`: tasks whose reviewer
+    /// actually ran.
+    pub reviewed: usize,
+    pub review_correction_rate: Option<f64>,
+    pub median_duration_seconds: Option<f64>,
+    pub regressions: usize,
+    pub pending_feedback: usize,
+}
+
+fn build_cohort(key: String, rows: Vec<CohortTaskRow>) -> Cohort {
+    let accepted = rows.iter().filter(|row| row.accepted).count();
+    let standing = rows.iter().filter(|row| row.standing).count();
+    let terminal = rows.iter().filter(|row| row.terminal).count();
+    let cost = rows.iter().fold(MicroUsd::ZERO, |acc, row| acc + row.cost);
+    let cost_completeness = CostCompleteness::worst(rows.iter().map(|row| row.cost_completeness));
+    let cost_per_accepted = cost_per_accepted_change(&rows);
+    let acceptance_rate = acceptance_rate_over_terminal(&rows);
+    let escalation_rate = escalation_rate(&rows);
+    let (reviewed, review_correction_rate) = match review_correction_rate(&rows) {
+        Some((reviewed, rate)) => (reviewed, Some(rate)),
+        None => (0, None),
+    };
+    let median_duration_seconds = median_duration_seconds(&rows);
+    let regressions = regressions_count(&rows);
+    let pending_feedback = pending_feedback_count(&rows);
+    Cohort {
+        key,
+        tasks: rows.len(),
+        accepted,
+        standing,
+        terminal,
+        in_flight: rows.len() - terminal,
+        cost,
+        cost_completeness,
+        cost_per_accepted,
+        acceptance_rate,
+        escalation_rate,
+        reviewed,
+        review_correction_rate,
+        median_duration_seconds,
+        regressions,
+        pending_feedback,
+    }
+}
+
+/// The window's tasks grouped over one dimension (SPEC §11).
+#[derive(Debug, Clone, Serialize)]
+pub struct CohortReport {
+    pub dimension: Dimension,
+    pub cohorts: Vec<Cohort>,
+}
+
+/// A task's bucket for one dimension. A task whose value is unknown —
+/// never dispatched under a recorded contract, no receipt yet, no usage
+/// recorded — lands in a named `"unknown"` bucket rather than being
+/// dropped: a report that silently omits work is worse than one that
+/// says it cannot classify it.
+fn cohort_key(
+    ledger: &Ledger,
+    dimension: Dimension,
+    task_row: &crate::ledger::TaskRow,
+) -> Result<String, crate::ledger::LedgerError> {
+    const UNKNOWN: &str = "unknown";
+    Ok(match dimension {
+        Dimension::Repository => task_row.repo_key.clone(),
+        Dimension::Tier => ledger
+            .run_contract_and_tier(&task_row.first_run)?
+            .map(|(_, tier)| tier.as_str().to_string())
+            .unwrap_or_else(|| UNKNOWN.to_string()),
+        Dimension::TaskClass => ledger
+            .run_contract_and_tier(&task_row.first_run)?
+            .map(|(contract, _)| contract.verification_profile)
+            .unwrap_or_else(|| UNKNOWN.to_string()),
+        Dimension::Model => ledger
+            .task_first_model(&task_row.task_id)?
+            .unwrap_or_else(|| UNKNOWN.to_string()),
+        Dimension::Policy => ledger
+            .task_policy_hash(&task_row.task_id)?
+            .map(|hash| hash.chars().take(12).collect())
+            .unwrap_or_else(|| UNKNOWN.to_string()),
+    })
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RunLine {
@@ -122,9 +354,16 @@ pub struct Report {
     /// because a decision opened before the window is exactly as owed to
     /// a person today as one opened inside it.
     pub open_decisions: Vec<DecisionRecord>,
+    /// Present only when `--by <dimension>` was given; the default report
+    /// is unchanged when it is absent.
+    pub cohorts: Option<CohortReport>,
 }
 
-pub fn runs_report(ledger: &Ledger, since: &str) -> Result<Report, crate::ledger::LedgerError> {
+pub fn runs_report(
+    ledger: &Ledger,
+    since: &str,
+    by: Option<Dimension>,
+) -> Result<Report, crate::ledger::LedgerError> {
     let mut runs = Vec::new();
     // One pass over the window's outcomes instead of a `latest_outcome`
     // per accepted run: the rows are ordered oldest first, so the last
@@ -218,13 +457,33 @@ pub fn runs_report(ledger: &Ledger, since: &str) -> Result<Report, crate::ledger
     // accepted run is not a separate cohort member from its first two,
     // failed ones.
     let mut tasks = Vec::new();
+    let mut cohort_rows: std::collections::BTreeMap<String, Vec<CohortTaskRow>> =
+        std::collections::BTreeMap::new();
     for task_row in ledger.tasks_since(since)? {
         let runs_of_task = ledger.runs_of_task(&task_row.task_id)?;
         let mut accepted_task = false;
+        let mut terminal = true;
+        let mut escalated = false;
+        let mut reviewed = false;
+        let mut duration_seconds: Option<f64> = None;
         for run_id in &runs_of_task {
-            if ledger.run_status(run_id)? == Some(State::Accepted) {
+            let status = ledger.run_status(run_id)?;
+            if status == Some(State::Accepted) {
                 accepted_task = true;
-                break;
+            }
+            if by.is_some() {
+                if !status.is_some_and(State::is_terminal) {
+                    terminal = false;
+                }
+                if ledger.escalation_attempted(run_id)? {
+                    escalated = true;
+                }
+                if ledger.review_attempted(run_id)? {
+                    reviewed = true;
+                }
+                if let Some(run_duration) = ledger.run_duration_seconds(run_id)? {
+                    duration_seconds = Some(duration_seconds.unwrap_or(0.0) + run_duration);
+                }
             }
         }
         let cost = ledger.task_cost(&task_row.task_id)?;
@@ -235,6 +494,26 @@ pub fn runs_report(ledger: &Ledger, since: &str) -> Result<Report, crate::ledger
                 .as_ref()
                 .is_some_and(|stored| stored.outcome.kind.withdraws_acceptance());
         let pending_feedback = accepted_task && latest_outcome.is_none();
+        if let Some(dimension) = by {
+            let key = cohort_key(ledger, dimension, &task_row)?;
+            cohort_rows.entry(key).or_default().push(CohortTaskRow {
+                accepted: accepted_task,
+                standing: standing_task,
+                terminal,
+                escalated,
+                reviewed,
+                corrected: latest_outcome
+                    .as_ref()
+                    .is_some_and(|stored| stored.outcome.kind == OutcomeKind::Corrected),
+                regressed: latest_outcome
+                    .as_ref()
+                    .is_some_and(|stored| stored.outcome.kind == OutcomeKind::ConfirmedRegression),
+                pending_feedback,
+                duration_seconds,
+                cost,
+                cost_completeness,
+            });
+        }
         tasks.push(TaskLine {
             task_id: task_row.task_id.as_str().to_string(),
             runs: runs_of_task.len(),
@@ -246,6 +525,13 @@ pub fn runs_report(ledger: &Ledger, since: &str) -> Result<Report, crate::ledger
             pending_feedback,
         });
     }
+    let cohorts = by.map(|dimension| CohortReport {
+        dimension,
+        cohorts: cohort_rows
+            .into_iter()
+            .map(|(key, rows)| build_cohort(key, rows))
+            .collect(),
+    });
     let accepted_tasks = tasks.iter().filter(|task| task.accepted).count();
     let standing_tasks = tasks.iter().filter(|task| task.standing).count();
     let pending_feedback = tasks.iter().filter(|task| task.pending_feedback).count();
@@ -290,6 +576,7 @@ pub fn runs_report(ledger: &Ledger, since: &str) -> Result<Report, crate::ledger
         pending_feedback,
         backfilled_tasks,
         open_decisions,
+        cohorts,
     })
 }
 
@@ -422,6 +709,58 @@ impl Report {
                 ));
             }
         }
+        if let Some(cohort_report) = &self.cohorts {
+            out.push('\n');
+            out.push_str(&format!("by {}:\n", cohort_report.dimension.as_str()));
+            for cohort in &cohort_report.cohorts {
+                out.push_str(&format!(
+                    "  {}  {} tasks, {} accepted, {} standing, {} in flight\n",
+                    cohort.key, cohort.tasks, cohort.accepted, cohort.standing, cohort.in_flight
+                ));
+                match cohort.cost_per_accepted {
+                    Some(cost) => out.push_str(&format!(
+                        "      cost per accepted change: {}\n",
+                        cost_line(cost, cohort.cost_completeness)
+                    )),
+                    None => out
+                        .push_str("      cost per accepted change: no accepted tasks in cohort\n"),
+                }
+                out.push_str(&format!(
+                    "      acceptance rate (of {} terminal): {}\n",
+                    cohort.terminal,
+                    match cohort.acceptance_rate {
+                        Some(rate) => format!("{:.0}%", rate * 100.0),
+                        None => "no terminal tasks".to_string(),
+                    }
+                ));
+                out.push_str(&format!(
+                    "      escalation rate: {}\n",
+                    match cohort.escalation_rate {
+                        Some(rate) => format!("{:.0}%", rate * 100.0),
+                        None => "no tasks".to_string(),
+                    }
+                ));
+                out.push_str(&format!(
+                    "      review-correction rate (of {} reviewed): {}\n",
+                    cohort.reviewed,
+                    match cohort.review_correction_rate {
+                        Some(rate) => format!("{:.0}%", rate * 100.0),
+                        None => "no reviewed tasks".to_string(),
+                    }
+                ));
+                out.push_str(&format!(
+                    "      median duration: {}\n",
+                    match cohort.median_duration_seconds {
+                        Some(seconds) => format!("{seconds:.0}s"),
+                        None => "no completed tasks".to_string(),
+                    }
+                ));
+                out.push_str(&format!(
+                    "      regressions: {}, pending feedback: {}\n",
+                    cohort.regressions, cohort.pending_feedback
+                ));
+            }
+        }
         out
     }
 }
@@ -496,6 +835,243 @@ mod tests {
     }
 
     use super::*;
+
+    /// Every flag false, no duration, the given cost: a base row a test
+    /// overrides only the fields its scenario cares about, rather than
+    /// naming all eleven positionally.
+    fn cohort_row(cost: MicroUsd) -> CohortTaskRow {
+        CohortTaskRow {
+            accepted: false,
+            standing: false,
+            terminal: false,
+            escalated: false,
+            reviewed: false,
+            corrected: false,
+            regressed: false,
+            pending_feedback: false,
+            duration_seconds: None,
+            cost,
+            cost_completeness: CostCompleteness::Actual,
+        }
+    }
+
+    #[test]
+    fn cost_per_accepted_change_divides_total_cost_by_accepted_tasks() {
+        let rows = vec![
+            CohortTaskRow {
+                accepted: true,
+                standing: true,
+                terminal: true,
+                ..cohort_row(MicroUsd::from_micros(100))
+            },
+            CohortTaskRow {
+                terminal: true,
+                ..cohort_row(MicroUsd::from_micros(50))
+            },
+        ];
+        assert_eq!(
+            cost_per_accepted_change(&rows),
+            Some(MicroUsd::from_micros(150)),
+            "divides all recorded cost by the accepted count, failed tasks included"
+        );
+    }
+
+    #[test]
+    fn cost_per_accepted_change_has_none_with_no_accepted_tasks() {
+        let rows = vec![CohortTaskRow {
+            terminal: true,
+            ..cohort_row(MicroUsd::from_micros(50))
+        }];
+        assert_eq!(
+            cost_per_accepted_change(&rows),
+            None,
+            "a zero denominator prints that it has none, not a zero"
+        );
+    }
+
+    #[test]
+    fn acceptance_rate_divides_accepted_by_terminal_and_excludes_in_flight() {
+        let rows = vec![
+            CohortTaskRow {
+                accepted: true,
+                standing: true,
+                terminal: true,
+                ..cohort_row(MicroUsd::ZERO)
+            },
+            CohortTaskRow {
+                terminal: true,
+                ..cohort_row(MicroUsd::ZERO)
+            },
+            // In flight: not terminal, excluded from both sides of the rate.
+            cohort_row(MicroUsd::ZERO),
+        ];
+        assert_eq!(
+            acceptance_rate_over_terminal(&rows),
+            Some(0.5),
+            "divides accepted TERMINAL tasks by terminal tasks, not by every task"
+        );
+    }
+
+    #[test]
+    fn acceptance_rate_is_none_with_no_terminal_tasks() {
+        let rows = vec![cohort_row(MicroUsd::ZERO)];
+        assert_eq!(acceptance_rate_over_terminal(&rows), None);
+    }
+
+    #[test]
+    fn escalation_rate_divides_escalated_by_every_task() {
+        let rows = vec![
+            CohortTaskRow {
+                accepted: true,
+                standing: true,
+                terminal: true,
+                escalated: true,
+                ..cohort_row(MicroUsd::ZERO)
+            },
+            CohortTaskRow {
+                accepted: true,
+                standing: true,
+                terminal: true,
+                ..cohort_row(MicroUsd::ZERO)
+            },
+        ];
+        assert_eq!(escalation_rate(&rows), Some(0.5));
+    }
+
+    #[test]
+    fn review_correction_rate_divides_corrections_by_reviewed_tasks_only() {
+        let rows = vec![
+            // Reviewed and corrected.
+            CohortTaskRow {
+                accepted: true,
+                standing: true,
+                terminal: true,
+                reviewed: true,
+                corrected: true,
+                ..cohort_row(MicroUsd::ZERO)
+            },
+            // Reviewed, not corrected.
+            CohortTaskRow {
+                accepted: true,
+                standing: true,
+                terminal: true,
+                reviewed: true,
+                ..cohort_row(MicroUsd::ZERO)
+            },
+            // Never reviewed: excluded from the denominator entirely, even
+            // though this one WAS corrected — a rate over never-reviewed
+            // tasks says nothing about review quality.
+            CohortTaskRow {
+                accepted: true,
+                standing: true,
+                terminal: true,
+                corrected: true,
+                ..cohort_row(MicroUsd::ZERO)
+            },
+        ];
+        assert_eq!(
+            review_correction_rate(&rows),
+            Some((2, 0.5)),
+            "the denominator is tasks whose reviewer actually ran, not every task"
+        );
+    }
+
+    #[test]
+    fn review_correction_rate_is_none_with_no_reviewed_tasks() {
+        let rows = vec![CohortTaskRow {
+            accepted: true,
+            standing: true,
+            terminal: true,
+            ..cohort_row(MicroUsd::ZERO)
+        }];
+        assert_eq!(review_correction_rate(&rows), None);
+    }
+
+    #[test]
+    fn median_duration_seconds_ignores_tasks_with_no_completed_run() {
+        let rows = vec![
+            CohortTaskRow {
+                accepted: true,
+                standing: true,
+                terminal: true,
+                duration_seconds: Some(10.0),
+                ..cohort_row(MicroUsd::ZERO)
+            },
+            CohortTaskRow {
+                accepted: true,
+                standing: true,
+                terminal: true,
+                duration_seconds: Some(30.0),
+                ..cohort_row(MicroUsd::ZERO)
+            },
+            CohortTaskRow {
+                accepted: true,
+                standing: true,
+                terminal: true,
+                duration_seconds: Some(20.0),
+                ..cohort_row(MicroUsd::ZERO)
+            },
+            // Still in flight: no duration yet, must not pull the median
+            // toward zero.
+            cohort_row(MicroUsd::ZERO),
+        ];
+        assert_eq!(median_duration_seconds(&rows), Some(20.0));
+    }
+
+    #[test]
+    fn median_duration_seconds_is_none_with_no_completed_tasks() {
+        let rows = vec![cohort_row(MicroUsd::ZERO)];
+        assert_eq!(median_duration_seconds(&rows), None);
+    }
+
+    #[test]
+    fn regressions_and_pending_feedback_count_their_own_flag_only() {
+        let rows = vec![
+            CohortTaskRow {
+                accepted: true,
+                terminal: true,
+                regressed: true,
+                ..cohort_row(MicroUsd::ZERO)
+            },
+            CohortTaskRow {
+                accepted: true,
+                standing: true,
+                terminal: true,
+                pending_feedback: true,
+                ..cohort_row(MicroUsd::ZERO)
+            },
+        ];
+        assert_eq!(regressions_count(&rows), 1);
+        assert_eq!(pending_feedback_count(&rows), 1);
+    }
+
+    #[test]
+    fn a_task_unknown_in_a_dimension_lands_in_the_named_unknown_bucket() {
+        let dir = temp_dir("cohort-unknown-bucket");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let run = crate::ids::RunId::from_stored("run-bare");
+        let task = crate::ids::TaskId::from_stored("task-bare");
+        // A run with no contract revision, no receipt, no usage: every
+        // dimension must still classify it rather than drop it.
+        ledger
+            .insert_run(&run, "/repo", None, &task, "rk")
+            .expect("run");
+        let task_row = ledger
+            .tasks_since("2000-01-01T00:00:00+00:00")
+            .expect("tasks")
+            .into_iter()
+            .find(|row| row.task_id == task)
+            .expect("the bare task is in the window");
+        for dimension in [Dimension::TaskClass, Dimension::Tier, Dimension::Model] {
+            assert_eq!(
+                cohort_key(&ledger, dimension, &task_row).expect("cohort key"),
+                "unknown",
+                "{dimension:?} of an undispatched task"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     use crate::ledger::{now_rfc3339, Transition};
 
     /// A test directory nobody else can collide with, pre-cleaned so a
@@ -552,6 +1128,7 @@ mod tests {
             pending_feedback: 1,
             backfilled_tasks: 0,
             open_decisions: vec![],
+            cohorts: None,
         };
         let rendered = report.render();
         assert!(
@@ -617,7 +1194,7 @@ mod tests {
                 .expect("transition");
         }
         let early = "2000-01-01T00:00:00+00:00";
-        let report = runs_report(&ledger, early).expect("report");
+        let report = runs_report(&ledger, early, None).expect("report");
         assert_eq!(report.accepted, 1);
         assert_eq!(report.total_cost, MicroUsd::from_micros(150));
         assert_eq!(report.cost_per_accepted, Some(MicroUsd::from_micros(150)));
@@ -652,7 +1229,7 @@ mod tests {
                 at: now_rfc3339(),
             })
             .expect("transition");
-        let report = runs_report(&ledger, "2000-01-01T00:00:00+00:00").expect("report");
+        let report = runs_report(&ledger, "2000-01-01T00:00:00+00:00", None).expect("report");
         assert_eq!(report.runs.len(), 1);
         assert_eq!(report.pending_decisions, 1);
         assert_eq!(completeness_label(CostCompleteness::Unknown), "unknown");
@@ -714,7 +1291,7 @@ mod tests {
                 .expect("transition");
         }
         let early = "2000-01-01T00:00:00+00:00";
-        let report = runs_report(&ledger, early).expect("report");
+        let report = runs_report(&ledger, early, None).expect("report");
         assert_eq!(report.tasks.len(), 1, "one task, three runs");
         assert_eq!(report.tasks[0].runs, 3);
         assert_eq!(report.tasks[0].cost, MicroUsd::from_micros(60));
@@ -734,7 +1311,7 @@ mod tests {
     fn the_reports_json_shape_has_exactly_the_documented_top_level_keys() {
         let dir = temp_dir("json-shape");
         let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
-        let report = runs_report(&ledger, "2000-01-01T00:00:00+00:00").expect("report");
+        let report = runs_report(&ledger, "2000-01-01T00:00:00+00:00", None).expect("report");
         let value = serde_json::to_value(&report).expect("report serializes");
         let object = value.as_object().expect("report is a JSON object");
         let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
@@ -746,6 +1323,7 @@ mod tests {
                 "accepted",
                 "accepted_tasks",
                 "backfilled_tasks",
+                "cohorts",
                 "cost_completeness",
                 "cost_per_accepted",
                 "cost_per_accepted_task",
@@ -844,7 +1422,7 @@ mod tests {
         }
 
         let ledger = day("2026-01-05T00:00:00+00:00");
-        let report = runs_report(&ledger, "2026-01-02T00:00:00+00:00").expect("report");
+        let report = runs_report(&ledger, "2026-01-02T00:00:00+00:00", None).expect("report");
         assert_eq!(
             report.tasks.len(),
             1,
@@ -886,7 +1464,7 @@ mod tests {
             .expect("transition");
 
         let early = "2000-01-01T00:00:00+00:00";
-        let waiting = runs_report(&ledger, early).expect("report");
+        let waiting = runs_report(&ledger, early, None).expect("report");
         assert_eq!(waiting.pending_decisions, 1, "it is owed an answer");
         assert_eq!(waiting.open_decisions.len(), 1);
 
@@ -900,7 +1478,7 @@ mod tests {
             )
             .expect("answered");
 
-        let answered = runs_report(&ledger, early).expect("report");
+        let answered = runs_report(&ledger, early, None).expect("report");
         assert_eq!(
             answered.pending_decisions, 0,
             "answered, though the run is still terminal in needs_review"
@@ -1009,7 +1587,7 @@ mod tests {
             "the reviewer spent more than the worker: {reviewer:?} vs {worker:?}"
         );
 
-        let report = runs_report(&ledger, "2000-01-01T00:00:00+00:00").expect("report");
+        let report = runs_report(&ledger, "2000-01-01T00:00:00+00:00", None).expect("report");
         let text = report.render();
         // The FIGURES, and where they sit: a rendering that swapped the
         // two phases, or printed them somewhere other than under the
