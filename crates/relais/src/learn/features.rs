@@ -326,6 +326,22 @@ impl Standardization {
     }
 }
 
+/// How a task's acceptance was decided: verification alone, or a
+/// person's explicit approval through `relais decide --answer approve`
+/// on a run interrupted before verification completed (SPEC's decision
+/// spine). A dataset that read the second as the first would train the
+/// acceptance predictor on human judgement it never observed evidence
+/// for — see the comment where `accepted_without_escalation` is computed
+/// for the decision this crate makes about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceptanceRoute {
+    /// Verification alone accepted the candidate.
+    Verified,
+    /// A person approved it; the run may carry no receipt at all.
+    PersonApproved,
+}
+
 /// A complete training example: features, the label (evidence-backed),
 /// and the complete-strategy cost. Attempt-level outcomes stay distinct
 /// from complete-strategy outcomes (SPEC §17): `accepted_without_escalation`
@@ -352,6 +368,19 @@ pub struct TrainingExample {
     /// `expand(task, tier, objective, identity)`, cached.
     pub sparse: SparseVec,
     pub accepted_without_escalation: bool,
+    /// Which route accepted this task (SPEC §20) — recorded so the
+    /// dataset reads honestly rather than as if verification alone had
+    /// decided every example.
+    pub route: AcceptanceRoute,
+    /// Whether the accepted change was still standing under its most
+    /// recently recorded final outcome (SPEC §20): `Some(true)` for
+    /// `accepted_unchanged`/`corrected`, `Some(false)` for
+    /// `reverted`/`confirmed_regression`, `None` when no outcome has been
+    /// recorded yet. Absence is never read as either answer.
+    pub outcome_stood: Option<bool>,
+    /// A correction's size, when the latest recorded outcome was
+    /// `corrected`; `None` for every other outcome, recorded or absent.
+    pub correction_magnitude: Option<f64>,
     pub complete_cost: MicroUsd,
     pub cost_complete: bool,
     pub dispatched_at: String,

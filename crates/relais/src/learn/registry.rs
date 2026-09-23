@@ -19,13 +19,16 @@ use super::learner::{CostModel, LogisticModel, SolverSettings};
 /// adds the PROFILE IDENTITIES training observed per tier: without them
 /// inference keyed coverage on the tier alone, so swapping the model
 /// behind a tier inherited the old model's acceptance evidence (SPEC §17
-/// forbids it). Neither field can be defaulted into an older artifact —
-/// an absent range prices every tier at zero, an absent identity set
-/// claims evidence for every model — so older artifacts are refused by
-/// version rather than silently reinterpreted. Retrain to get a version-3
-/// artifact; the previous one stays promotable only by the relais that
-/// wrote it.
-pub const ARTIFACT_SCHEMA_VERSION: u32 = 3;
+/// forbids it). Version 4 adds the LABEL POLICY VERSION the training
+/// dataset was built under (`crate::learn::dataset::LABEL_POLICY_VERSION`)
+/// — without it, an artifact trained under an earlier labelling rule
+/// (one that let a reverted change keep its positive label, say) would
+/// read as silently comparable to one trained under this one. None of
+/// these fields can be defaulted into an older artifact, so older
+/// artifacts are refused by version rather than silently reinterpreted.
+/// Retrain to get a version-4 artifact; the previous one stays promotable
+/// only by the relais that wrote it.
+pub const ARTIFACT_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -42,6 +45,11 @@ pub struct Artifact {
     /// starts with none.
     pub observed_identities: Vec<(crate::policy::Tier, Vec<super::features::ProfileIdentity>)>,
     pub cohorts: Vec<String>,
+    /// The [`crate::learn::dataset::LABEL_POLICY_VERSION`] the training
+    /// dataset was built under — carried onto the artifact so a dataset
+    /// built under an earlier labelling rule is distinguishable from one
+    /// built under this one, rather than silently comparable.
+    pub label_policy_version: u32,
     pub dataset_fingerprint: String,
     pub solver: SolverSettings,
     pub trained_at: String,
@@ -509,6 +517,7 @@ mod tests {
                 }],
             )],
             cohorts: vec!["change".into()],
+            label_policy_version: crate::learn::dataset::LABEL_POLICY_VERSION,
             dataset_fingerprint: "abc".into(),
             solver: SolverSettings::default(),
             trained_at: "2026-09-18".into(),

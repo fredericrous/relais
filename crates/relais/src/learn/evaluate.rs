@@ -907,7 +907,7 @@ fn converged_label(converged: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::learn::features::{ProfileIdentity, TaskFeatures, TrainingExample};
+    use crate::learn::features::{AcceptanceRoute, ProfileIdentity, TaskFeatures, TrainingExample};
 
     /// A record whose label is learnable from its inputs: accepted tasks
     /// share one objective vocabulary, rejected ones another, so the
@@ -947,6 +947,9 @@ mod tests {
             identity,
             sparse,
             accepted_without_escalation: accepted,
+            route: AcceptanceRoute::Verified,
+            outcome_stood: None,
+            correction_magnitude: None,
             complete_cost: MicroUsd::from_micros(if accepted { 100 } else { 900 }),
             cost_complete: true,
             dispatched_at: at.into(),
@@ -985,6 +988,7 @@ mod tests {
         }
         Dataset {
             version: crate::learn::dataset::DATASET_VERSION,
+            label_policy_version: crate::learn::dataset::LABEL_POLICY_VERSION,
             records,
             exclusions: vec![],
             fingerprint: "f".into(),
@@ -1019,6 +1023,7 @@ mod tests {
         }
         let dataset = Dataset {
             version: crate::learn::dataset::DATASET_VERSION,
+            label_policy_version: crate::learn::dataset::LABEL_POLICY_VERSION,
             records,
             exclusions: vec![],
             fingerprint: "f".into(),
@@ -1057,6 +1062,7 @@ mod tests {
         }
         let dataset = Dataset {
             version: crate::learn::dataset::DATASET_VERSION,
+            label_policy_version: crate::learn::dataset::LABEL_POLICY_VERSION,
             records,
             exclusions: vec![],
             fingerprint: "f".into(),
@@ -1085,6 +1091,7 @@ mod tests {
     fn empty_datasets_refuse_to_train() {
         let dataset = Dataset {
             version: crate::learn::dataset::DATASET_VERSION,
+            label_policy_version: crate::learn::dataset::LABEL_POLICY_VERSION,
             records: vec![],
             exclusions: vec![],
             fingerprint: "f".into(),
@@ -1274,6 +1281,7 @@ mod tests {
         }
         let dataset = Dataset {
             version: crate::learn::dataset::DATASET_VERSION,
+            label_policy_version: crate::learn::dataset::LABEL_POLICY_VERSION,
             records,
             exclusions: vec![],
             fingerprint: "f".into(),
@@ -1325,6 +1333,7 @@ mod tests {
         }
         let dataset = Dataset {
             version: crate::learn::dataset::DATASET_VERSION,
+            label_policy_version: crate::learn::dataset::LABEL_POLICY_VERSION,
             records,
             exclusions: vec![],
             fingerprint: "fingerprint-1".into(),

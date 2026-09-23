@@ -25,6 +25,20 @@ pub enum OutcomeKind {
 }
 
 impl OutcomeKind {
+    /// Every variant, for a caller that has to enumerate them — the
+    /// round-trip property test, and the labelling test that pairs each
+    /// kind against the one predicate that classifies it.
+    ///
+    /// The length is fixed, so a variant added to the enum without being
+    /// added here does not compile the `match` that walks it. Same shape
+    /// as [`crate::lifecycle::State::ALL`].
+    pub const ALL: [Self; 4] = [
+        Self::AcceptedUnchanged,
+        Self::Corrected,
+        Self::Reverted,
+        Self::ConfirmedRegression,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::AcceptedUnchanged => "accepted_unchanged",
@@ -131,9 +145,15 @@ pub struct Strategy {
 /// Everything an outcome carries beyond its kind: the exact candidate,
 /// the strategy that produced it, an optional correction magnitude,
 /// evidence references and who is recording it (SPEC §20).
+///
+/// `candidate_sha` is optional: a run accepted through a person's
+/// approval (`relais decide --answer approve`) on a contract interrupted
+/// before verification never wrote a receipt, and a receipt is the only
+/// place a candidate identity comes from. Feedback about such a run is
+/// still worth recording; it just has no candidate to name.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OutcomeDetail {
-    pub candidate_sha: String,
+    pub candidate_sha: Option<String>,
     pub strategy: Strategy,
     pub correction_magnitude: Option<CorrectionMagnitude>,
     pub evidence: Vec<String>,
@@ -204,7 +224,7 @@ mod tests {
 
     fn detail(magnitude: Option<CorrectionMagnitude>) -> OutcomeDetail {
         OutcomeDetail {
-            candidate_sha: "abc123".into(),
+            candidate_sha: Some("abc123".into()),
             strategy: Strategy {
                 tier: Tier::Implementation,
                 models: vec!["sonnet".into()],
@@ -214,6 +234,16 @@ mod tests {
             evidence: vec![],
             actor: "a reviewer".into(),
         }
+    }
+
+    /// A person's approval (`relais decide --answer approve`) can accept
+    /// a run that never wrote a receipt, so an outcome about it has no
+    /// candidate to name. `Outcome::new` does not require one.
+    #[test]
+    fn a_candidate_sha_is_optional() {
+        let mut without_candidate = detail(None);
+        without_candidate.candidate_sha = None;
+        assert!(Outcome::new(OutcomeKind::AcceptedUnchanged, without_candidate).is_ok());
     }
 
     #[test]

@@ -6,6 +6,32 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## Unreleased
+
+### Added
+
+- **Labelling reads a task's recorded outcome, not just its run's
+  terminal state.** A task whose latest recorded outcome is `reverted`
+  or a confirmed regression is never a positive label, whatever its
+  run's state said — labelling is a pure, exhaustive function over both.
+  A training example now carries what the outcome said: whether the
+  change stood, and a correction's magnitude when one was recorded. The
+  sampling unit is the task, not the run, so a task retried to
+  acceptance contributes one example, not one per attempt. A task
+  accepted through a person's approval rather than verification alone
+  is labelled honestly — the example records which route accepted it —
+  and does not earn the positive label verified acceptance requires.
+  `relais feedback` now records an outcome for an accepted run that
+  carries no receipt, the case a person's approval creates for a run
+  interrupted before verification ever wrote one; a receipt, whenever
+  one does exist, is still checked against a `--candidate` that
+  disagrees with it. The ledger's `outcomes.candidate_sha` gains a
+  migration (v10) making that optionality explicit and tested. The
+  label policy is versioned (`LABEL_POLICY_VERSION`), and the dataset
+  and artifact schema versions move with it (dataset v3, artifact v4)
+  so a dataset or artifact built under the old rule is distinguishable
+  from one built under this one.
+
 ## v0.4.0
 
 ### Added

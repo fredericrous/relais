@@ -22,7 +22,7 @@ use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::outcome::{Outcome, OutcomeDetail, OutcomeKind};
 use crate::policy::Tier;
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 9;
+pub const LEDGER_SCHEMA_VERSION: u64 = 10;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -611,6 +611,38 @@ const MIGRATIONS: &[(&str, &str)] = &[
         recorded_at TEXT NOT NULL,
         PRIMARY KEY (run_id, criterion_id)
     );
+    "#,
+    ),
+    (
+        // `record_outcome` always had a receipt-derived candidate to
+        // write, because a run reaching `accepted` had always gone
+        // through verification, which always stores one. A run accepted
+        // through a person's approval (`relais decide --answer approve`)
+        // on a contract interrupted before verification never wrote a
+        // receipt, so `relais feedback` about it has no candidate to
+        // name. `candidate_sha` was always a nullable column — `ALTER
+        // TABLE ADD COLUMN` cannot declare NOT NULL without a default —
+        // but nothing before this step ever inserted NULL there, so the
+        // guarantee was never exercised. This step rebuilds the table to
+        // make that guarantee explicit and tested, rather than relying on
+        // an accident of v5's DDL. Its own step, not an edit to v5's: v5
+        // shipped and every ledger opened since already ran it.
+        "v10",
+        r#"
+    CREATE TABLE outcomes_v10 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL,
+        task_id TEXT,
+        candidate_sha TEXT,
+        kind TEXT NOT NULL,
+        detail_json TEXT,
+        at TEXT NOT NULL
+    );
+    INSERT INTO outcomes_v10 (id, run_id, task_id, candidate_sha, kind, detail_json, at)
+        SELECT id, run_id, task_id, candidate_sha, kind, detail_json, at FROM outcomes;
+    DROP TABLE outcomes;
+    ALTER TABLE outcomes_v10 RENAME TO outcomes;
+    CREATE INDEX idx_outcomes_task ON outcomes(task_id);
     "#,
     ),
 ];
@@ -1385,6 +1417,29 @@ impl Ledger {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// The candidate the run's last finished attempt produced, if any.
+    ///
+    /// The ledger's own answer to "what did this run actually build",
+    /// independent of whether verification ever sealed a receipt. It is
+    /// what a person-accepted run has instead of one: an interrupted run
+    /// can still have finished an attempt and named its candidate, and
+    /// attributing that run's outcome to a sha the caller typed rather
+    /// than to the one the run recorded would put an unverifiable claim
+    /// in the outcomes table as fact (SPEC §20).
+    pub fn latest_attempt_candidate(&self, run_id: &RunId) -> Result<Option<String>> {
+        let sha: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT candidate_sha FROM attempts
+                 WHERE run_id = ?1 AND candidate_sha IS NOT NULL
+                 ORDER BY attempt_index DESC, id DESC LIMIT 1",
+                [run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(sha)
+    }
+
     /// The contract a run was dispatched under and the tier its first
     /// attempt ran at — what dataset construction needs to reconstruct
     /// dispatch-time features without future information (SPEC §21).
@@ -2099,7 +2154,7 @@ impl Ledger {
             params![
                 run_id.as_str(),
                 task_id.as_str(),
-                outcome.detail.candidate_sha,
+                outcome.detail.candidate_sha.as_deref(),
                 outcome.kind.as_str(),
                 serde_json::to_string(&outcome.detail).expect("outcome detail serializes"),
                 self.now()
@@ -3092,6 +3147,97 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A ledger pinned at exactly v9 — every machine that ran the
+    /// human-signoff release and no later one — upgrades to v10 keeping
+    /// its outcome rows, and can then record one with no candidate: the
+    /// case `relais feedback` gained for a person-approved run that
+    /// never wrote a receipt.
+    #[test]
+    fn a_v9_ledger_upgrades_to_v10_and_accepts_an_outcome_with_no_candidate() {
+        let dir = crate::test_support::temp_dir("ledger-v9-to-v10");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("ledger.sqlite");
+        {
+            // v9 exactly as it shipped: apply every step but the last.
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );",
+            )
+            .expect("migrations table");
+            for (version, sql) in &MIGRATIONS[..9] {
+                conn.execute_batch(sql).expect("step");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, "2026-09-22T00:00:00+00:00"],
+                )
+                .expect("record");
+            }
+            conn.execute(
+                "INSERT INTO outcomes (run_id, task_id, candidate_sha, kind, detail_json, at)
+                 VALUES ('run-old', 'task-old', 'sha-old', 'accepted_unchanged', '{}', ?1)",
+                params!["2026-09-22T00:00:00+00:00"],
+            )
+            .expect("a row written before v10");
+        }
+        let ledger = Ledger::open(&path).expect("upgrade to v10");
+        assert_eq!(
+            ledger.schema_version().expect("version"),
+            LEDGER_SCHEMA_VERSION
+        );
+        // The pre-existing row survived the rebuild.
+        let survived: String = ledger
+            .conn
+            .query_row(
+                "SELECT candidate_sha FROM outcomes WHERE run_id = 'run-old'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row read back");
+        assert_eq!(survived, "sha-old");
+        // The proof: a run accepted by a person, with no receipt, can
+        // record an outcome that names no candidate.
+        ledger
+            .insert_run(
+                &RunId::from_stored("run-a"),
+                "/repo",
+                None,
+                &TaskId::from_stored("task-a"),
+                "rk",
+            )
+            .expect("run");
+        let outcome = Outcome::new(
+            OutcomeKind::AcceptedUnchanged,
+            OutcomeDetail {
+                candidate_sha: None,
+                strategy: crate::outcome::Strategy {
+                    tier: Tier::Implementation,
+                    models: vec!["sonnet".into()],
+                    escalated: false,
+                },
+                correction_magnitude: None,
+                evidence: vec![],
+                actor: "a person".into(),
+            },
+        )
+        .expect("valid outcome");
+        ledger
+            .record_outcome(
+                &RunId::from_stored("run-a"),
+                &TaskId::from_stored("task-a"),
+                &outcome,
+            )
+            .expect("an outcome with no candidate records");
+        let latest = ledger
+            .latest_outcome(&TaskId::from_stored("task-a"))
+            .expect("latest")
+            .expect("recorded");
+        assert_eq!(latest.outcome.detail.candidate_sha, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_v3_ledger_upgrades_to_v4_keeping_every_row_and_cost() {
         let dir = temp_dir("v3-to-v4");
@@ -3753,7 +3899,7 @@ mod tests {
         Outcome::new(
             kind,
             OutcomeDetail {
-                candidate_sha: "cand123".into(),
+                candidate_sha: Some("cand123".into()),
                 strategy: crate::outcome::Strategy {
                     tier: Tier::Implementation,
                     models: vec!["sonnet".into()],
