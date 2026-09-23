@@ -409,6 +409,7 @@ pub fn temporal_splits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lifecycle::UsagePhase;
 
     fn run_id(id: &str) -> crate::ids::RunId {
         crate::ids::RunId::from_stored(id)
@@ -586,7 +587,13 @@ argv = ["true"]
                 .expect("revision");
             let attempt = self
                 .ledger
-                .insert_attempt(&run_id(run), revision, 1, tier, phase)
+                .insert_attempt(
+                    &run_id(run),
+                    revision,
+                    1,
+                    tier,
+                    UsagePhase::parse(phase).expect("known phase"),
+                )
                 .expect("attempt");
             self.ledger
                 .record_dispatch_intent(
@@ -618,6 +625,11 @@ argv = ["true"]
                     completeness: CostCompleteness::Actual,
                     inclusive: false,
                     at: crate::ledger::now_rfc3339(),
+                    phase: None,
+                    duration_ms: None,
+                    requested_model: None,
+                    requested_effort: None,
+                    harness: None,
                 })
                 .expect("usage");
         }
@@ -679,7 +691,13 @@ argv = ["true"]
         let revision = fixture.dispatched("run-b", "implementation", "initial");
         fixture
             .ledger
-            .insert_attempt(&run_id("run-b"), revision, 2, "escalation", "escalation")
+            .insert_attempt(
+                &run_id("run-b"),
+                revision,
+                2,
+                "escalation",
+                UsagePhase::Escalation,
+            )
             .expect("attempt");
         fixture.usage("b-worker", "run-b", "sonnet");
         fixture.usage("b-fable", "run-b", "fable");
@@ -786,7 +804,13 @@ argv = ["true"]
             .expect("revision");
         fixture
             .ledger
-            .insert_attempt(&run_id("run-a"), revision, 1, "implementation", "initial")
+            .insert_attempt(
+                &run_id("run-a"),
+                revision,
+                1,
+                "implementation",
+                UsagePhase::Initial,
+            )
             .expect("attempt");
         fixture.settle("run-a", State::Accepted);
         let dataset = fixture.build();

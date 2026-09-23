@@ -377,6 +377,67 @@ impl std::fmt::Display for State {
     }
 }
 
+/// What phase of a run a usage event's cost belongs to: a worker attempt
+/// at one of its three kinds, the reviewer, the planner, or a package's
+/// integration. Stored on `usage_events` (and, for attempts, on
+/// `attempts.phase` via [`crate::ledger::Ledger::insert_attempt`]) so an
+/// attempt's phase and a usage event's phase are the same typed value,
+/// never two strings that can drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsagePhase {
+    Initial,
+    Repair,
+    Escalation,
+    Review,
+    Planning,
+    Integration,
+}
+
+impl UsagePhase {
+    /// Every variant, for a caller that has to enumerate them — the
+    /// round-trip property test, and anything rendering a legend.
+    ///
+    /// The length is fixed, so a variant added to the enum without being
+    /// added here does not compile the `match` that walks it.
+    pub const ALL: [Self; 6] = [
+        Self::Initial,
+        Self::Repair,
+        Self::Escalation,
+        Self::Review,
+        Self::Planning,
+        Self::Integration,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::Repair => "repair",
+            Self::Escalation => "escalation",
+            Self::Review => "review",
+            Self::Planning => "planning",
+            Self::Integration => "integration",
+        }
+    }
+
+    /// The inverse of [`UsagePhase::as_str`]. A stored name this binary
+    /// does not know is a corrupt row, and the ledger reports it as one.
+    pub fn parse(text: &str) -> Result<Self, UnknownVariant> {
+        serde_json::from_value(serde_json::Value::String(text.to_string())).map_err(|_| {
+            UnknownVariant {
+                what: "usage phase",
+                found: text.to_string(),
+            }
+        })
+    }
+}
+
+impl std::fmt::Display for UsagePhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,6 +456,13 @@ mod tests {
             assert_eq!(State::parse(state.as_str()), Ok(state));
         }
         assert!(State::Accepted.is_terminal() && !State::Verifying.is_terminal());
+        for phase in [
+            UsagePhase::Initial,
+            UsagePhase::Review,
+            UsagePhase::Integration,
+        ] {
+            assert_eq!(UsagePhase::parse(phase.as_str()), Ok(phase));
+        }
     }
 
     /// The states `ledger`'s decision-backfill migration names by their
@@ -444,6 +512,13 @@ mod tests {
             prop_assert_eq!(Reason::parse(reason.as_str()).expect("its own spelling"), reason);
         }
 
+        #[test]
+        fn every_usage_phase_round_trips_through_its_stored_spelling(index in 0usize..UsagePhase::ALL.len()) {
+            use proptest::prelude::*;
+            let phase = UsagePhase::ALL[index];
+            prop_assert_eq!(UsagePhase::parse(phase.as_str()).expect("its own spelling"), phase);
+        }
+
         /// …and a spelling no variant has is refused, never guessed into
         /// the nearest one.
         #[test]
@@ -453,6 +528,8 @@ mod tests {
             prop_assert_eq!(State::parse(&text).is_ok(), known_state, "{}", text);
             let known_reason = Reason::ALL.iter().any(|reason| reason.as_str() == text);
             prop_assert_eq!(Reason::parse(&text).is_ok(), known_reason, "{}", text);
+            let known_phase = UsagePhase::ALL.iter().any(|phase| phase.as_str() == text);
+            prop_assert_eq!(UsagePhase::parse(&text).is_ok(), known_phase, "{}", text);
         }
     }
 }

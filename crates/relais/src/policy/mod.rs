@@ -66,6 +66,19 @@ pub enum Effort {
     High,
 }
 
+impl Effort {
+    /// The stored spelling, owned by the type the way `Tier::as_str` is.
+    /// Two places spelling one enum drift apart — which is exactly what
+    /// typing the usage phase was meant to stop doing for phases.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelProfile {
