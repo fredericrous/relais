@@ -23,6 +23,15 @@ use crate::outcome::OutcomeKind;
 /// the fact the report's accepted-by-relais/accepted-by-person split is
 /// read off, since nothing else on the run records who judged it.
 /// `false` for a run that never reached `Accepted` at all.
+///
+/// The transition wanted is the one that ENTERED `Accepted`, which is
+/// why `from_state` is part of the test. A run keeps recording
+/// transitions after it becomes terminal — retiring its worktree writes
+/// an `accepted -> accepted` row — so the LAST row landing on `Accepted`
+/// is usually that retirement, and reading its reason reports every
+/// person-approved run as relais-approved. The same same-state row
+/// defeated `decide --answer approve`'s gap check (#43) and the v6
+/// decision backfill (#44); this is the third reader to meet it.
 fn accepted_by_person(
     ledger: &Ledger,
     run_id: &crate::ids::RunId,
@@ -30,8 +39,9 @@ fn accepted_by_person(
     Ok(ledger
         .transitions(run_id)?
         .iter()
-        .rev()
-        .find(|transition| transition.to_state == State::Accepted)
+        .find(|transition| {
+            transition.to_state == State::Accepted && transition.from_state != Some(State::Accepted)
+        })
         .is_some_and(|transition| transition.reason == Reason::DecisionApproved.as_str()))
 }
 
@@ -1497,6 +1507,79 @@ mod tests {
         // Best effort: a leftover temp dir costs nothing but disk.
         std::fs::remove_dir_all(&dir).ok();
     }
+    /// The failure this test exists for: `accepted_by_person` read the
+    /// LAST transition landing on `Accepted`, and retiring a run's
+    /// worktree writes an `accepted -> accepted` row whose reason is
+    /// `worktree_retired`. Every person-approved run whose tree had been
+    /// retired — which is every one of them, since retirement follows
+    /// acceptance — was therefore reported as accepted by relais.
+    /// Measured live: two runs approved by hand, the report said
+    /// "judged by relais: 5, judged by a person: 1".
+    #[test]
+    fn a_retired_worktree_does_not_disguise_a_person_approved_run() {
+        let dir = temp_dir("retired-person-approved");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let run = crate::ids::RunId::from_stored("run-approved");
+        let task = crate::ids::TaskId::from_stored("task-approved");
+        ledger
+            .insert_run(&run, "/repo", None, &task, "rk")
+            .expect("run");
+        ledger
+            .record_transition(&Transition {
+                run_id: run.clone(),
+                attempt_id: None,
+                from_state: Some(State::Running),
+                to_state: State::NeedsDecision,
+                reason: "scope_exceeded".into(),
+                detail: None,
+                at: now_rfc3339(),
+            })
+            .expect("transition");
+        ledger
+            .resolve_decision(
+                &run,
+                &crate::ledger::DecisionAnswer {
+                    resolution: Reason::DecisionApproved,
+                    actor: "a person",
+                    note: None,
+                    successor_run: None,
+                    from_state: State::NeedsDecision,
+                    to_state: State::Accepted,
+                },
+            )
+            .expect("approved");
+
+        let early = "2000-01-01T00:00:00+00:00";
+        let before = runs_report(&ledger, early, None).expect("report");
+        assert_eq!(before.accepted_tasks_by_person, 1, "{before:?}");
+
+        // Retirement: the same-state row that used to hide the approval.
+        ledger
+            .record_transition(&Transition {
+                run_id: run.clone(),
+                attempt_id: None,
+                from_state: Some(State::Accepted),
+                to_state: State::Accepted,
+                reason: "worktree_retired".into(),
+                detail: None,
+                at: now_rfc3339(),
+            })
+            .expect("retirement");
+
+        let after = runs_report(&ledger, early, None).expect("report");
+        assert_eq!(
+            after.accepted_tasks_by_person, 1,
+            "retiring the worktree does not change who approved the run: {after:?}"
+        );
+        assert_eq!(after.accepted_tasks_by_relais, 0, "{after:?}");
+        assert_eq!(
+            after.accepted_tasks,
+            after.accepted_tasks_by_relais + after.accepted_tasks_by_person,
+            "the two routes always add up to the whole: {after:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// An answered run is settled, whatever state it is terminal in.
     /// `relais decide --answer revise` moves the run to `cancelled` — a
     /// person's answer ends the run they answered — so a count by STATE
