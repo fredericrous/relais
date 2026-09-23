@@ -3032,7 +3032,15 @@ impl<'a> RunEngine<'a> {
              Report each finding with file/range, the violated acceptance criterion, evidence, and suggested verification.\n\
              You may only run read-only commands (reading files, git log/diff/show, searching). \
              Do not build, test or run checks: the runner has run the profile's checks already, \
-             and a command you could not run is not a finding.\n",
+             and a command you could not run is not a finding.\n\
+             For every fact this change RECORDS, ask where else that same fact is already \
+             written — a ledger row and a file on disk, a run's state and its receipt, a \
+             transition and a column derived from it — and whether the change keeps them in \
+             step. A test that exercises only the in-memory value passes while the stored \
+             copies disagree, so the passing checks above are not evidence about this.\n\
+             Ask the same of what it READS: a record appended after a run is already terminal \
+             (a retired worktree writes a same-state transition) means the NEWEST row matching \
+             a state is usually not the event that caused it.\n",
         );
         prompt.push('\n');
         prompt.push_str(&data_block("objective", &self.config.contract.objective));
@@ -7867,6 +7875,16 @@ mod tests {
         assert!(review.contains("only run read-only commands"), "{review}");
         assert!(
             review.contains("a command you could not run is not a finding"),
+            "{review}"
+        );
+        // The two questions the reviewer is asked about STORED facts,
+        // which the checks above cannot answer for it.
+        assert!(
+            review.contains("where else that same fact is already written"),
+            "{review}"
+        );
+        assert!(
+            review.contains("is usually not the event that caused it"),
             "{review}"
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
