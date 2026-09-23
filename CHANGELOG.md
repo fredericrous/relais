@@ -10,6 +10,27 @@ missing here.
 
 ### Added
 
+- **A person's answer to `relais decide` now ends the run they
+  answered.** `--answer approve` moves the run to `accepted`, and
+  `reject`, `revise`, `decided` and `abandon` all move it to
+  `cancelled` — a run a person answered is no longer reported as still
+  awaiting one. The record says who judged it: an accepted run's
+  transition carries `decision_approved` when a person approved it,
+  distinct from the `checks_and_review_passed` the runner itself writes,
+  so nothing downstream has to guess who vouched for a candidate.
+  `relais decide --answer approve --criterion <id>` additionally records
+  a human sign-off against one declared acceptance criterion and
+  re-seals the run's receipt with it — refused when the contract
+  declares no criterion with that id, naming the ids it does declare. A
+  mandatory criterion whose evidence is a human sign-off still ends a
+  run `needs_decision` without ever launching a reviewer for it; that
+  answer, and nothing else, is what clears the gap it raised.
+  `relais feedback` accepts a person-accepted run exactly like a
+  relais-accepted one, since both are simply `accepted`. `relais report`
+  now prints accepted tasks judged by relais and judged by a person as
+  two separate counts, and its `cost per accepted task` line names the
+  counts behind the denominator it used.
+
 - **A contract can now declare which check, test, review or sign-off
   settles an acceptance criterion.** An acceptance entry is still a
   bare string, exactly as before, or a declared criterion carrying a

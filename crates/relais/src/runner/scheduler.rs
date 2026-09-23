@@ -431,6 +431,10 @@ fn execute_waves(
         let verify::Verified {
             checks,
             gaps,
+            // An assembled revision's sign-off gaps are the ROOT
+            // contract's, already raised (and answerable) on the run
+            // that declared them; integration has nothing to add.
+            acceptance_gaps: _,
             amont_bypasses,
             amont_downgrades,
         } = match engine.verify_candidate(
@@ -970,10 +974,16 @@ fn accept_integrated(
     // (SPEC §19), while the former is what `verify_candidate` gated the
     // assembled revision on above. A receipt that named neither would
     // say nothing about criteria the run was in fact refused against.
+    let signoffs = ledger
+        .human_signoffs(&engine.run_id)?
+        .into_iter()
+        .map(|(criterion_id, _actor)| criterion_id)
+        .collect();
     let (criteria, mandatory_evidence_independence) = verify::settle_acceptance(
         &engine.config.contract.acceptance,
         &root.authority.verification_profile,
         &report,
+        &signoffs,
     );
     let receipt = Receipt {
         run_id: engine.run_id.as_str().to_string(),

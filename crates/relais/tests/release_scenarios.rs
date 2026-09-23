@@ -1108,7 +1108,14 @@ fn a_run_awaiting_a_person_is_answered_by_decide_and_drops_off_the_open_list() {
         "{explained}"
     );
 
-    // The run is not waiting any more: a second answer is refused by name.
+    // The run is not waiting any more: `decided` ended it in `cancelled`
+    // (a person's answer ends the run they answered), so a second answer
+    // is refused by the state check itself, before it ever reaches the
+    // decision row.
+    let report = world.relais(&["report", "--since", "2000-01-01", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&text(&report.stdout)).expect("json");
+    assert_eq!(report["runs"][0]["status"], "cancelled", "{report}");
+
     let redecide = world.relais(&[
         "decide",
         &run_id,
@@ -1124,9 +1131,249 @@ fn a_run_awaiting_a_person_is_answered_by_decide_and_drops_off_the_open_list() {
         text(&redecide.stderr)
     );
     assert!(
-        text(&redecide.stderr).contains("no open decision"),
+        text(&redecide.stderr).contains("not waiting on a person"),
         "{}",
         text(&redecide.stderr)
+    );
+}
+
+/// A person's answer ends the run they answered (SPEC §9): `approve`
+/// assigns `accepted`, and every other answer — `reject`, `revise`,
+/// `decided`, `abandon` — assigns `cancelled`. All five raise their
+/// decision the same way here (a scope-exceeded run carries no
+/// verification gaps, so `approve` is not refused) and each gets a run
+/// of its own so one answer's transition cannot be read off another's.
+#[test]
+fn every_decide_answer_ends_the_run_they_answered_with_its_own_terminal_status() {
+    let answers: [(&str, &str); 5] = [
+        ("approve", "accepted"),
+        ("reject", "cancelled"),
+        ("revise", "cancelled"),
+        ("decided", "cancelled"),
+        ("abandon", "cancelled"),
+    ];
+    for (answer, expected_status) in answers {
+        let world = World::new(&format!("decide-{answer}"));
+        let hash = world.write_policy(3);
+        world.write_machine(&hash, "");
+        let path = world.root.join("narrow.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "schema_version": 1,
+                "kind": "change",
+                "objective": "Remove the entry point",
+                "base_ref": "HEAD",
+                "write_scope": ["docs/**"],
+                "acceptance": ["src/main.rs no longer exists"],
+                "verification_profile": "default",
+                "review": "off",
+            })
+            .to_string(),
+        )
+        .expect("task");
+        let run = world.relais(&["run", "--task", path.to_str().unwrap()]);
+        assert_eq!(
+            run.status.code(),
+            Some(8),
+            "{answer}: {}",
+            text(&run.stderr)
+        );
+        let run_id = world.only_run_id();
+
+        let decide = world.relais(&[
+            "decide",
+            &run_id,
+            "--answer",
+            answer,
+            "--actor",
+            "the release suite",
+        ]);
+        assert_eq!(
+            decide.status.code(),
+            Some(0),
+            "{answer}: {}",
+            text(&decide.stderr)
+        );
+
+        let report = world.relais(&["report", "--since", "2000-01-01", "--json"]);
+        let report: serde_json::Value = serde_json::from_str(&text(&report.stdout)).expect("json");
+        assert_eq!(
+            report["runs"][0]["status"], expected_status,
+            "{answer}: {report}"
+        );
+    }
+}
+
+/// A mandatory criterion whose evidence is a human sign-off stops the
+/// run `needs_decision` naming the gap, without a reviewer ever running
+/// — even though policy requires one for every other candidate — and is
+/// cleared by nothing but `relais decide --answer approve --criterion
+/// <id>` (SPEC §10). That answer also assigns `accepted` (a person's
+/// answer, not relais's own checks) and re-seals the receipt the runner
+/// had already prepared, so `relais feedback` — which only ever accepts
+/// an ACCEPTED run with a receipt — accepts it exactly like a
+/// relais-accepted one. An unknown criterion id is refused first, naming
+/// the ids the contract actually declares.
+#[test]
+fn a_human_sign_off_gap_is_cleared_only_by_decide_and_then_feedback_accepts_it() {
+    let world = World::new("signoff");
+    let hash = world.write_policy(3);
+    world.write_machine(&hash, "");
+    let statement = "a person signed off on the migration";
+    let entry: relais::acceptance::AcceptanceEntry = serde_json::from_value(serde_json::json!({
+        "statement": statement,
+        "evidence": {"kind": "human_sign_off"},
+    }))
+    .expect("parses");
+    let criterion_id = entry.id();
+    // A second criterion the contract settles some OTHER way, to prove a
+    // sign-off cannot answer it.
+    let tested = "the entry point's absence is covered by a test";
+    let tested_entry: relais::acceptance::AcceptanceEntry =
+        serde_json::from_value(serde_json::json!({
+            "statement": tested,
+            "evidence": {"kind": "test", "authorship": "model_added"},
+        }))
+        .expect("parses");
+    let path = world.root.join("signoff.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "schema_version": 1,
+            "kind": "change",
+            "objective": "Remove the entry point, an easy one",
+            "base_ref": "HEAD",
+            "write_scope": ["src/**"],
+            "acceptance": [
+                {"statement": statement, "evidence": {"kind": "human_sign_off"}},
+                {"statement": tested, "evidence": {"kind": "test", "authorship": "model_added"}},
+            ],
+            "verification_profile": "default",
+            "review": "required",
+        })
+        .to_string(),
+    )
+    .expect("task");
+    let run = world.relais(&["run", "--task", path.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(8), "{}", text(&run.stderr));
+    assert!(
+        text(&run.stderr).contains("human sign-off"),
+        "{}",
+        text(&run.stderr)
+    );
+    let run_id = world.only_run_id();
+    assert_eq!(
+        world.worker_launches(),
+        1,
+        "the checks passed; nothing but the sign-off gap remained, so no reviewer ran"
+    );
+
+    let bad_criterion = world.relais(&[
+        "decide",
+        &run_id,
+        "--answer",
+        "approve",
+        "--actor",
+        "a person",
+        "--criterion",
+        "not-a-real-id",
+    ]);
+    assert_eq!(
+        bad_criterion.status.code(),
+        Some(2),
+        "{}",
+        text(&bad_criterion.stderr)
+    );
+    assert!(
+        text(&bad_criterion.stderr).contains(&criterion_id),
+        "the refusal names the ids the contract does declare: {}",
+        text(&bad_criterion.stderr)
+    );
+
+    // A criterion the contract settles some OTHER way cannot be signed
+    // off either: doing so would re-seal the receipt claiming a person
+    // settled what a test was declared to settle — the second acceptance
+    // path this mechanism exists to refuse. The id is real and the
+    // contract does declare it, so only the evidence kind refuses it.
+    let wrong_kind = world.relais(&[
+        "decide",
+        &run_id,
+        "--answer",
+        "approve",
+        "--actor",
+        "a person",
+        "--criterion",
+        &tested_entry.id(),
+    ]);
+    assert_eq!(
+        wrong_kind.status.code(),
+        Some(2),
+        "{}",
+        text(&wrong_kind.stderr)
+    );
+    assert!(
+        text(&wrong_kind.stderr).contains("not settled by a human sign-off"),
+        "{}",
+        text(&wrong_kind.stderr)
+    );
+
+    let decide = world.relais(&[
+        "decide",
+        &run_id,
+        "--answer",
+        "approve",
+        "--actor",
+        "a person",
+        "--note",
+        "looks fine",
+        "--criterion",
+        &criterion_id,
+    ]);
+    assert_eq!(decide.status.code(), Some(0), "{}", text(&decide.stderr));
+
+    let report = world.relais(&["report", "--since", "2000-01-01", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&text(&report.stdout)).expect("json");
+    assert_eq!(report["runs"][0]["status"], "accepted", "{report}");
+
+    // The receipt the runner had already stored is RE-SEALED, not joined
+    // by a second one: the criterion is met by the sign-off, the gap it
+    // raised is gone, and the outcome now agrees with the run's own
+    // state. A receipt still reading `needs_decision` beside an accepted
+    // run would be two records of one fact disagreeing.
+    let receipt: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(world.state.join("runs").join(&run_id).join("receipt.json"))
+            .expect("receipt"),
+    )
+    .expect("json");
+    assert_eq!(receipt["outcome"], "accepted", "{receipt}");
+    assert_eq!(
+        receipt["verification"]["gaps"],
+        serde_json::json!([]),
+        "the answered gap is no longer named: {receipt}"
+    );
+    let signed = receipt["criteria"]
+        .as_array()
+        .expect("criteria")
+        .iter()
+        .find(|criterion| criterion["id"] == criterion_id.as_str())
+        .expect("the signed criterion is in the receipt");
+    assert_eq!(signed["met"], true, "{signed}");
+    assert_eq!(signed["evidence"]["kind"], "human_sign_off", "{signed}");
+
+    let feedback = world.relais(&[
+        "feedback",
+        &run_id,
+        "--outcome",
+        "accepted",
+        "--actor",
+        "a person",
+    ]);
+    assert_eq!(
+        feedback.status.code(),
+        Some(0),
+        "a person-approved run is accepted exactly like a relais-accepted one: {}",
+        text(&feedback.stderr)
     );
 }
 

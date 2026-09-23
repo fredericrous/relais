@@ -11,6 +11,7 @@
 //! An accepted receipt is bound to one candidate and does not authorize
 //! merge or survive edits.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
@@ -155,15 +156,16 @@ impl VerificationReport {
 /// produced no outcome; a named check that ran and FAILED is already a
 /// failing check and needs no separate gap, and preflight already
 /// refuses a name no profile defines, so that branch here is defensive.
-/// A human sign-off has no record anywhere in relais yet — nothing
-/// writes one and nothing reads one — so a mandatory criterion asking
-/// for one can never be satisfied, and saying it was met would be the
-/// silent pass this function exists to prevent.
+/// A human sign-off is unmet unless `signoffs` names this criterion's own
+/// id — `relais decide --answer approve --criterion <id>` is the only
+/// writer of that set (SPEC §10); nothing else can clear this gap, so a
+/// mandatory criterion asking for one can never be silently waived.
 pub fn acceptance_gaps(
     entries: &[AcceptanceEntry],
     profile: &VerificationProfile,
     checks: &[CheckOutcome],
-) -> Vec<String> {
+    signoffs: &HashSet<String>,
+) -> Vec<AcceptanceGap> {
     let mut gaps = Vec::new();
     for entry in entries {
         if !entry.mandatory() {
@@ -174,31 +176,100 @@ pub fn acceptance_gaps(
                 Some(spec) => {
                     let label = check_label(spec);
                     if !checks.iter().any(|check| check.label == label) {
-                        gaps.push(format!(
-                            "acceptance criterion `{}` names check `{name}`, which produced no \
-                             evidence",
-                            entry.id()
-                        ));
+                        gaps.push(AcceptanceGap {
+                            criterion_id: entry.id(),
+                            missing: MissingEvidence::CheckProducedNothing { name: name.clone() },
+                        });
                     }
                 }
-                None => gaps.push(format!(
-                    "acceptance criterion `{}` names check `{name}`, which the verification \
-                     profile does not define",
-                    entry.id()
-                )),
+                None => gaps.push(AcceptanceGap {
+                    criterion_id: entry.id(),
+                    missing: MissingEvidence::CheckUndefined { name: name.clone() },
+                }),
             },
-            Some(Evidence::HumanSignOff) => gaps.push(format!(
-                "acceptance criterion `{}` names a human sign-off, which nothing has recorded",
-                entry.id()
-            )),
+            Some(Evidence::HumanSignOff) if !signoffs.contains(&entry.id()) => {
+                gaps.push(AcceptanceGap {
+                    criterion_id: entry.id(),
+                    missing: MissingEvidence::SignOffUnrecorded,
+                })
+            }
             // A test runs inside the profile's own commands and an LLM
             // review is the reviewer's verdict: both are settled by the
             // report as a whole, so neither can come up empty on its own.
-            // A bare string has declared no evidence to be missing.
-            Some(Evidence::Test { .. } | Evidence::LlmReview) | None => {}
+            // A bare string has declared no evidence to be missing. A
+            // human sign-off already recorded for this id is met, not a
+            // gap.
+            Some(Evidence::Test { .. } | Evidence::LlmReview | Evidence::HumanSignOff) | None => {}
         }
     }
     gaps
+}
+
+/// One mandatory criterion whose declared evidence is missing, kept as
+/// the criterion's id and what is missing rather than as the sentence a
+/// person reads.
+///
+/// `VerificationReport.gaps` is — and stays — a list of sentences: it is
+/// frozen into receipts and transition details, and a stored record's
+/// wording is not something a later binary gets to change. But a caller
+/// deciding what to DO about a gap must not read that prose. Two
+/// spellings of one sentence in two modules is how a reworded message
+/// silently stops clearing a gap, so the sentence is written in exactly
+/// one place ([`AcceptanceGap::message`]) and recognized in exactly one
+/// other ([`sign_off_gap_criterion`]), which is its inverse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptanceGap {
+    pub criterion_id: String,
+    pub missing: MissingEvidence,
+}
+
+/// What a mandatory criterion's declared evidence failed to produce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MissingEvidence {
+    /// A named check the profile defines, which ran nothing.
+    CheckProducedNothing { name: String },
+    /// A named check no profile defines. Preflight already refuses this,
+    /// so reaching it here is defensive.
+    CheckUndefined { name: String },
+    /// A human sign-off nobody has recorded. The one kind a person's own
+    /// later answer can clear (SPEC §10).
+    SignOffUnrecorded,
+}
+
+impl AcceptanceGap {
+    /// The sentence that goes into `VerificationReport.gaps`. The only
+    /// place any of these is written.
+    pub fn message(&self) -> String {
+        let id = &self.criterion_id;
+        match &self.missing {
+            MissingEvidence::CheckProducedNothing { name } => format!(
+                "acceptance criterion `{id}` names check `{name}`, which produced no evidence"
+            ),
+            MissingEvidence::CheckUndefined { name } => format!(
+                "acceptance criterion `{id}` names check `{name}`, which the verification profile \
+                 does not define"
+            ),
+            MissingEvidence::SignOffUnrecorded => format!(
+                "acceptance criterion `{id}` names a human sign-off, which nothing has recorded"
+            ),
+        }
+    }
+}
+
+/// The criterion id inside an ALREADY-STORED sign-off gap sentence, or
+/// `None` when the sentence is some other gap.
+///
+/// This exists for one reader: `relais decide`, which must decide
+/// whether a sign-off has since cleared a gap recorded in a transition
+/// detail frozen months ago. That detail holds prose and nothing else,
+/// so the prose is parsed — by the exact inverse of
+/// [`AcceptanceGap::message`], with a round-trip test over every
+/// [`MissingEvidence`] variant, rather than by a `contains` in the
+/// caller.
+pub fn sign_off_gap_criterion(gap: &str) -> Option<&str> {
+    const PREFIX: &str = "acceptance criterion `";
+    const SUFFIX: &str = "` names a human sign-off, which nothing has recorded";
+    gap.strip_prefix(PREFIX)?.strip_suffix(SUFFIX)
 }
 
 /// How independent the mandatory criteria's evidence was, taken
@@ -235,17 +306,18 @@ pub struct CriterionOutcome {
 /// rule than the contract asked for (SPEC §10).
 ///
 /// A human sign-off is the one kind that passing checks cannot settle,
-/// because it is not a claim about the code: relais has no record of a
-/// person signing anything, so the criterion is unmet and
-/// [`acceptance_gaps`] raises it as a gap. Reading it off `accepted`
-/// would report a sign-off nobody gave.
+/// because it is not a claim about the code: it is met exactly when
+/// `signoffs` names this criterion's own id, recorded by nothing but
+/// `relais decide --answer approve --criterion <id>` (SPEC §10). Reading
+/// it off `accepted` would report a sign-off nobody gave.
 pub fn settle_acceptance(
     entries: &[AcceptanceEntry],
     profile: &VerificationProfile,
     report: &VerificationReport,
+    signoffs: &HashSet<String>,
 ) -> (Vec<CriterionOutcome>, Option<IndependenceSummary>) {
     let accepted = report.accepted();
-    let criteria = entries
+    let criteria: Vec<CriterionOutcome> = entries
         .iter()
         .map(|entry| {
             let evidence = entry.evidence().cloned();
@@ -260,8 +332,7 @@ pub fn settle_acceptance(
                     })
                 }
                 Some(Evidence::Test { .. } | Evidence::LlmReview) | None => accepted,
-                // Nothing records a sign-off, so nothing can find one.
-                Some(Evidence::HumanSignOff) => false,
+                Some(Evidence::HumanSignOff) => signoffs.contains(&entry.id()),
             };
             CriterionOutcome {
                 id: entry.id(),
@@ -273,17 +344,29 @@ pub fn settle_acceptance(
         })
         .collect();
 
-    let mandatory_independence: Vec<bool> = entries
+    let summary = independence_summary(&criteria);
+    (criteria, summary)
+}
+
+/// The `mandatory_evidence_independence` a set of already-settled
+/// criteria imply, taken together (SPEC §10): every mandatory
+/// criterion's evidence independent, none of it, or a mix. Shared by
+/// [`settle_acceptance`] and `relais decide`'s receipt re-seal, so
+/// recomputing this after a sign-off is recorded is the same
+/// computation the receipt was built with the first time, not a second
+/// one that could drift from it.
+pub fn independence_summary(criteria: &[CriterionOutcome]) -> Option<IndependenceSummary> {
+    let mandatory_independence: Vec<bool> = criteria
         .iter()
-        .filter(|entry| entry.mandatory())
-        .map(|entry| match entry.evidence() {
+        .filter(|criterion| criterion.mandatory)
+        .map(|criterion| match &criterion.evidence {
             Some(evidence) => independent(evidence),
             // Settled by the verification profile as a whole: a check,
             // in spirit, and so independent.
             None => true,
         })
         .collect();
-    let summary = if mandatory_independence.is_empty() {
+    if mandatory_independence.is_empty() {
         None
     } else if mandatory_independence
         .iter()
@@ -297,8 +380,7 @@ pub fn settle_acceptance(
         Some(IndependenceSummary::NoneIndependent)
     } else {
         Some(IndependenceSummary::PartlyIndependent)
-    };
-    (criteria, summary)
+    }
 }
 
 /// Run one command against a directory, capturing the merged log to a file
@@ -1040,6 +1122,10 @@ pub fn default_required_checks(inventory: &AmontInventory) -> Vec<String> {
 pub struct Verified {
     pub checks: Vec<CheckOutcome>,
     pub gaps: Vec<String>,
+    /// The acceptance gaps among `gaps`, kept typed. `gaps` holds every
+    /// gap as the sentence that goes into the report; a caller deciding
+    /// what to DO about one reads this instead of the prose.
+    pub acceptance_gaps: Vec<AcceptanceGap>,
     pub amont_bypasses: Vec<String>,
     pub amont_downgrades: Vec<String>,
 }
@@ -2169,9 +2255,16 @@ mod tests {
             log_path: "x.log".into(),
             log_sha256: "h".into(),
         }];
-        let gaps = acceptance_gaps(&entries, &profile, &checks);
+        let gaps = acceptance_gaps(&entries, &profile, &checks, &HashSet::new());
         assert_eq!(gaps.len(), 1, "{gaps:?}");
-        assert!(gaps[0].contains("security-scan"), "{gaps:?}");
+        assert_eq!(
+            gaps[0].missing,
+            MissingEvidence::CheckUndefined {
+                name: "security-scan".into()
+            },
+            "{gaps:?}"
+        );
+        let gaps: Vec<String> = gaps.iter().map(AcceptanceGap::message).collect();
 
         let report = VerificationReport {
             candidate_sha: "abc".into(),
@@ -2244,7 +2337,7 @@ mod tests {
                 crate::acceptance::Evidence::LlmReview,
             ),
         ];
-        let (criteria, summary) = settle_acceptance(&entries, &profile, &report);
+        let (criteria, summary) = settle_acceptance(&entries, &profile, &report, &HashSet::new());
         assert!(
             criteria.iter().all(|c| c.met),
             "checks passed, so every criterion is met: {criteria:?}"
@@ -2256,12 +2349,55 @@ mod tests {
         );
     }
 
+    /// `AcceptanceGap::message` is the only writer of a gap sentence and
+    /// `sign_off_gap_criterion` the only reader of one, and `relais
+    /// decide` clears a gap recorded months ago by pairing them. A
+    /// reworded message that silently stopped parsing would leave an
+    /// answered criterion blocking its run forever, so the pair is
+    /// round-tripped over every variant — including the two that must
+    /// NOT parse as sign-offs.
+    #[test]
+    fn a_sign_off_gap_sentence_round_trips_and_the_others_do_not() {
+        let signed = AcceptanceGap {
+            criterion_id: "c-0123456789ab".into(),
+            missing: MissingEvidence::SignOffUnrecorded,
+        };
+        assert_eq!(
+            sign_off_gap_criterion(&signed.message()),
+            Some("c-0123456789ab")
+        );
+
+        for other in [
+            MissingEvidence::CheckProducedNothing {
+                name: "security-scan".into(),
+            },
+            MissingEvidence::CheckUndefined {
+                name: "security-scan".into(),
+            },
+        ] {
+            let gap = AcceptanceGap {
+                criterion_id: "c-0123456789ab".into(),
+                missing: other,
+            };
+            assert_eq!(
+                sign_off_gap_criterion(&gap.message()),
+                None,
+                "a check gap is not a sign-off gap: {}",
+                gap.message()
+            );
+        }
+
+        // A gap from somewhere else entirely — amont's inventory — is
+        // not a criterion at all.
+        assert_eq!(sign_off_gap_criterion("amont inventory: unavailable"), None);
+    }
+
     /// The failure this test exists for: a mandatory criterion asking
     /// for a human sign-off used to read its answer off `accepted`, so
     /// passing checks reported a sign-off nobody gave — and
     /// `independent()` then counted that invention toward
-    /// `AllIndependent`. Nothing in relais records a sign-off yet, so
-    /// the criterion is unmet and the report carries a gap.
+    /// `AllIndependent`. With no sign-off recorded for this id, the
+    /// criterion is unmet and the report carries a gap.
     #[test]
     fn a_human_sign_off_nobody_gave_is_a_gap_not_a_pass() {
         let profile = VerificationProfile {
@@ -2284,9 +2420,15 @@ mod tests {
             crate::acceptance::Evidence::HumanSignOff,
         )];
 
-        let gaps = acceptance_gaps(&entries, &profile, &checks);
+        let gaps = acceptance_gaps(&entries, &profile, &checks, &HashSet::new());
         assert_eq!(gaps.len(), 1, "{gaps:?}");
-        assert!(gaps[0].contains("human sign-off"), "{gaps:?}");
+        assert_eq!(
+            gaps[0].missing,
+            MissingEvidence::SignOffUnrecorded,
+            "{gaps:?}"
+        );
+        assert_eq!(gaps[0].criterion_id, entries[0].id());
+        let gaps: Vec<String> = gaps.iter().map(AcceptanceGap::message).collect();
 
         let report = VerificationReport {
             candidate_sha: "abc".into(),
@@ -2308,12 +2450,69 @@ mod tests {
             "every check passed, but the sign-off is still missing"
         );
 
-        let (criteria, summary) = settle_acceptance(&entries, &profile, &report);
+        let (criteria, summary) = settle_acceptance(&entries, &profile, &report, &HashSet::new());
         assert!(
             !criteria[0].met,
             "an unrecorded sign-off is not met: {criteria:?}"
         );
         assert_eq!(summary, Some(IndependenceSummary::AllIndependent));
+    }
+
+    /// The other half of the test above: once `relais decide --answer
+    /// approve --criterion <id>` has recorded a sign-off for this exact
+    /// criterion id, it is no longer a gap and settles as met — the
+    /// person's answer is the ONLY thing that clears it (SPEC §10).
+    #[test]
+    fn a_recorded_sign_off_clears_the_gap_and_settles_met() {
+        let profile = VerificationProfile {
+            setup: Vec::new(),
+            commands: vec![named("check", &["sh", "-c", "true"], 10)],
+            amont_checks: Vec::new(),
+            amont_waivers: Vec::new(),
+            inputs: Vec::new(),
+            cache_baseline: false,
+        };
+        let checks = vec![CheckOutcome {
+            label: check_label(&profile.commands[0]),
+            argv: profile.commands[0].argv.clone(),
+            ended: Ended::Exited(0),
+            log_path: "x.log".into(),
+            log_sha256: "h".into(),
+        }];
+        let entries = vec![declared(
+            "a person signed off on the migration",
+            crate::acceptance::Evidence::HumanSignOff,
+        )];
+        let signed_off: HashSet<String> = [entries[0].id()].into_iter().collect();
+
+        let gaps = acceptance_gaps(&entries, &profile, &checks, &signed_off);
+        assert!(gaps.is_empty(), "{gaps:?}");
+        let gaps: Vec<String> = gaps.iter().map(AcceptanceGap::message).collect();
+
+        let report = VerificationReport {
+            candidate_sha: "abc".into(),
+            base_sha: "def".into(),
+            contract_hash: "ch".into(),
+            policy_hash: "ph".into(),
+            checks,
+            gaps,
+            baseline_failures: Vec::new(),
+            amont_bypasses: Vec::new(),
+            amont_downgrades: Vec::new(),
+            verification_inputs_changed: Vec::new(),
+            integration_gaps: Vec::new(),
+            baseline_cached: false,
+            baseline_cache_refused: None,
+        };
+        assert!(report.accepted());
+
+        let (criteria, summary) = settle_acceptance(&entries, &profile, &report, &signed_off);
+        assert!(criteria[0].met, "a recorded sign-off is met: {criteria:?}");
+        assert_eq!(
+            summary,
+            Some(IndependenceSummary::AllIndependent),
+            "a human sign-off is independent by definition"
+        );
     }
 
     #[test]
@@ -2338,6 +2537,7 @@ mod tests {
             &[AcceptanceEntry::Bare("it builds".into())],
             &profile,
             &accepted,
+            &HashSet::new(),
         );
         assert_eq!(all_independent, Some(IndependenceSummary::AllIndependent));
 
@@ -2348,7 +2548,7 @@ mod tests {
                 crate::acceptance::Evidence::LlmReview,
             ),
         ];
-        let (_, partly) = settle_acceptance(&mixed, &profile, &accepted);
+        let (_, partly) = settle_acceptance(&mixed, &profile, &accepted, &HashSet::new());
         assert_eq!(partly, Some(IndependenceSummary::PartlyIndependent));
 
         // A non-mandatory criterion does not enter the summary at all.
@@ -2356,7 +2556,8 @@ mod tests {
             "nice to have",
             crate::acceptance::Evidence::LlmReview,
         )];
-        let (_, none_mandatory) = settle_acceptance(&only_optional, &profile, &accepted);
+        let (_, none_mandatory) =
+            settle_acceptance(&only_optional, &profile, &accepted, &HashSet::new());
         assert_eq!(none_mandatory, None);
     }
 

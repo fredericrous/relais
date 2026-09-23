@@ -228,7 +228,7 @@ Every run delivers a named candidate — a ref under `refs/relais/candidates/<ru
 
 States: `prepared`, `running`, `verifying`, `repairing`, `escalating`, `accepted`, `needs_review`, `needs_decision`, `blocked`, `failed`, `budget_exhausted`, `cancelled`, `interrupted`.
 
-Every transition has a reason code, timestamp and evidence references. A worker can propose completion or blockage; only the runner assigns final state.
+Every transition has a reason code, timestamp and evidence references. A worker can propose completion or blockage; the runner assigns every terminal state on its own, and a person's answer to `relais decide` can also assign two of them — `accepted` for `approve`, `cancelled` for every other answer — with what was answered recorded on the decision row, not the transition detail.
 
 | Observation | Transition |
 | --- | --- |
@@ -259,7 +259,7 @@ Use amont's effective inventory to identify checks and gaps. Run configured acce
 
 Acceptance requires all mandatory criteria to have evidence. Existing tests cover existing behavior; requested behavior may need new regression tests or explicit human evaluation. Tests added by the implementing model are useful but are not independent ground truth. Changes to required checks, fixtures or acceptance tests receive explicit review and cannot silently weaken the contract.
 
-A mandatory criterion whose declared evidence produced nothing is a gap in this same report, refused by the mechanism that already refuses gaps — never a second acceptance path. A criterion settled only by a model-added test or an LLM review is still accepted once the checks pass; the receipt records that its evidence was not independent rather than imposing a stricter rule than the contract asked for. A criterion asking for a human sign-off is met only by a recorded sign-off: reading its answer off the passing checks would report a sign-off nobody gave. The receipt carries, per criterion, whether it was met and by which evidence, and one summary of how independent the mandatory criteria's evidence was.
+A mandatory criterion whose declared evidence produced nothing is a gap in this same report, refused by the mechanism that already refuses gaps — never a second acceptance path. A criterion settled only by a model-added test or an LLM review is still accepted once the checks pass; the receipt records that its evidence was not independent rather than imposing a stricter rule than the contract asked for. A criterion asking for a human sign-off is met only by a recorded sign-off: reading its answer off the passing checks would report a sign-off nobody gave. That sign-off is recorded by nothing but `relais decide --answer approve --criterion <id>`, naming the criterion by the id the contract declares (or derives); every other declared evidence kind is answered by the run itself, this one only by a person. A run stopped by a human-sign-off gap alone still reaches `needs_decision` without a reviewer ever being launched for it. The receipt carries, per criterion, whether it was met and by which evidence, and one summary of how independent the mandatory criteria's evidence was; `relais decide` re-seals that same receipt once a sign-off it names clears the gap.
 
 Semantic review is risk-dependent. A separate reviewer gets the contract, candidate, pertinent source and architecture evidence. It reports concrete findings with file/range, violated criterion, evidence and suggested verification; it cannot edit or waive checks. Findings are triaged by evidence. Lack of findings is not mathematical proof, and reviewer disagreement returns `needs_review` when it cannot be resolved within limits.
 
@@ -278,6 +278,8 @@ Use an integer or decimal money representation, not floating-point accumulation.
 The runner enforces dispatch, attempt, turn and wall-time ceilings. API dollar controls are best effort across in-flight requests and delayed reporting; reserve a margin before dispatch and stop admitting work once exhausted. Report overshoot and unknown usage. Do not advertise an exact financial cap where the provider cannot guarantee it.
 
 Primary outcome metric: all recorded cost, including failed runs, divided by accepted tasks in the same cohort. Also report acceptance rate, review corrections, escalation rate, duration and later user-reported regressions. Compare like task classes and policy versions.
+
+A task accepted because a person answered `relais decide --answer approve` counts in that denominator exactly like one relais accepted on its own checks and review — work a person took is work that landed, and excluding it measures everything except the cases a person cared enough to judge. The two are reported as separate counts beside the metric, never as one number that mixes them, because how much of the denominator relais itself vouched for is the question the metric is asked to answer.
 
 ## 12. Persistence and crash recovery
 

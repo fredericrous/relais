@@ -259,7 +259,12 @@ impl std::fmt::Display for Reason {
 }
 
 /// The lifecycle states (SPEC §9). Stored as their snake_case names in
-/// the ledger; only the runner assigns terminal states.
+/// the ledger. The runner assigns every terminal state on its own; a
+/// person's answer to `relais decide` can also assign exactly two —
+/// `Accepted` for `approve`, `Cancelled` for every other answer — and
+/// what was answered lives on the decision row (SPEC's decision spine:
+/// [`crate::ledger::DecisionRecord`]), not on the transition detail a
+/// runner-driven terminal state carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum State {

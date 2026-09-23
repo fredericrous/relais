@@ -2164,6 +2164,7 @@ impl<'a> RunEngine<'a> {
         let verify::Verified {
             checks,
             gaps,
+            acceptance_gaps,
             amont_bypasses,
             amont_downgrades,
         } = match self.verify_candidate(
@@ -2181,6 +2182,29 @@ impl<'a> RunEngine<'a> {
             }
         };
         if !gaps.is_empty() {
+            // Every other gap here is either unfixable from `relais
+            // decide` (a missing/undefined check) or already a second
+            // problem alongside one; a human-sign-off gap is the one
+            // kind a person's OWN later answer can clear (SPEC §10). When
+            // that is the only kind present, the checks, tests and review
+            // this attempt already ran are worth keeping: store the
+            // receipt they would have produced now, `needs_decision`,
+            // rather than losing that work and making the eventual
+            // approval re-derive it from nothing.
+            if !acceptance_gaps.is_empty()
+                && acceptance_gaps.len() == gaps.len()
+                && acceptance_gaps
+                    .iter()
+                    .all(|gap| gap.missing == verify::MissingEvidence::SignOffUnrecorded)
+            {
+                self.store_pending_receipt(
+                    ctx,
+                    progress,
+                    &candidate,
+                    checks.clone(),
+                    gaps.clone(),
+                )?;
+            }
             return Ok(Step::Ended(
                 self.stop(&progress.budget, Observation::VerificationGap(gaps))?,
             ));
@@ -2304,10 +2328,18 @@ impl<'a> RunEngine<'a> {
             baseline_cached: ctx.baseline.cached,
             baseline_cache_refused: ctx.baseline.cache_refused.clone(),
         };
+        let signoffs = self
+            .config
+            .ledger
+            .human_signoffs(&self.run_id)?
+            .into_iter()
+            .map(|(criterion_id, _actor)| criterion_id)
+            .collect();
         let (criteria, mandatory_evidence_independence) = verify::settle_acceptance(
             &self.config.contract.acceptance,
             &preflight.authority.verification_profile,
             &report,
+            &signoffs,
         );
         let receipt = Receipt {
             run_id: self.run_id.as_str().to_string(),
@@ -2498,6 +2530,35 @@ impl<'a> RunEngine<'a> {
         candidate_sha: &str,
     ) -> Result<(), RunError> {
         let ledger = self.config.ledger;
+        self.persist_receipt(receipt, attempt_id)?;
+        if let Some(attempt_id) = attempt_id {
+            ledger.finish_attempt(
+                attempt_id,
+                State::Accepted,
+                worktree_path
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .as_deref(),
+                Some(candidate_sha),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Write one receipt everywhere a receipt lives: the ledger row, the
+    /// `receipt.json` beside the run's other artifacts, and an evidence
+    /// row pointing at that file with its hash.
+    ///
+    /// All three, always. A receipt in the ledger and not on disk is one
+    /// `relais explain` and a person reading the artifacts directory
+    /// cannot see, and a run that reached a receipt without leaving one
+    /// there looks, to anyone but a ledger query, like a run that never
+    /// produced one.
+    fn persist_receipt(
+        &mut self,
+        receipt: &Receipt,
+        attempt_id: Option<i64>,
+    ) -> Result<(), RunError> {
+        let ledger = self.config.ledger;
         let receipt_hash = receipt.hash();
         ledger.store_receipt(
             &self.run_id,
@@ -2516,17 +2577,73 @@ impl<'a> RunEngine<'a> {
             &receipt_path,
             Some(&receipt_hash),
         )?;
-        if let Some(attempt_id) = attempt_id {
-            ledger.finish_attempt(
-                attempt_id,
-                State::Accepted,
-                worktree_path
-                    .map(|path| path.to_string_lossy().into_owned())
-                    .as_deref(),
-                Some(candidate_sha),
-            )?;
-        }
         Ok(())
+    }
+
+    /// Store the receipt a candidate stopped only by unmet mandatory
+    /// human-sign-off criteria would have earned, `outcome` named as
+    /// `needs_decision` rather than `accepted` — unlike [`Self::seal`],
+    /// this closes no attempt and assigns no state, because the run is
+    /// NOT accepted yet. `relais decide --answer approve --criterion
+    /// <id>` is the only thing that later re-seals this same row: one
+    /// receipt, written once here and possibly overwritten there, never
+    /// a second one.
+    fn store_pending_receipt(
+        &mut self,
+        ctx: &AttemptContext<'_>,
+        progress: &mut Progress,
+        candidate: &Candidate,
+        checks: Vec<verify::CheckOutcome>,
+        gaps: Vec<String>,
+    ) -> Result<(), RunError> {
+        let preflight = ctx.preflight;
+        let report = VerificationReport {
+            candidate_sha: candidate.sha.clone(),
+            base_sha: preflight.base_sha.clone(),
+            contract_hash: preflight.contract_hash.clone(),
+            policy_hash: preflight.authority.authority_hash.clone(),
+            checks,
+            gaps,
+            baseline_failures: ctx.baseline.failures.clone(),
+            amont_bypasses: Vec::new(),
+            amont_downgrades: Vec::new(),
+            verification_inputs_changed: Vec::new(),
+            integration_gaps: preflight.integration_gaps.clone(),
+            baseline_cached: ctx.baseline.cached,
+            baseline_cache_refused: ctx.baseline.cache_refused.clone(),
+        };
+        let signoffs = self
+            .config
+            .ledger
+            .human_signoffs(&self.run_id)?
+            .into_iter()
+            .map(|(criterion_id, _actor)| criterion_id)
+            .collect();
+        let (criteria, mandatory_evidence_independence) = verify::settle_acceptance(
+            &self.config.contract.acceptance,
+            &preflight.authority.verification_profile,
+            &report,
+            &signoffs,
+        );
+        let receipt = Receipt {
+            run_id: self.run_id.as_str().to_string(),
+            candidate_sha: candidate.sha.clone(),
+            base_sha: preflight.base_sha.clone(),
+            contract_hash: preflight.contract_hash.clone(),
+            policy_hash: preflight.authority.authority_hash.clone(),
+            outcome: State::NeedsDecision.as_str().to_string(),
+            verification: report,
+            models_used: progress.models_used.clone(),
+            attempts: candidate.index,
+            cost_completeness: progress.spend.completeness,
+            cost: progress.spend.total,
+            criteria,
+            mandatory_evidence_independence,
+        };
+        // No attempt id: this receipt belongs to the run, and the
+        // attempt that earned it is not finished — the run is waiting on
+        // a person, not accepted.
+        self.persist_receipt(&receipt, None)
     }
 
     /// Wait for a worktree's write lease to be gone before it is
@@ -2776,12 +2893,24 @@ impl<'a> RunEngine<'a> {
         }
         // A mandatory criterion whose named check produced no evidence
         // is a gap here too — the same mechanism that already refuses a
-        // gap, not a second acceptance path (SPEC §10).
-        gaps.extend(verify::acceptance_gaps(
+        // gap, not a second acceptance path (SPEC §10). A human sign-off
+        // this run already carries (recorded by an earlier `relais
+        // decide --answer approve --criterion <id>`) is not a gap either.
+        let signoffs = self
+            .config
+            .ledger
+            .human_signoffs(&self.run_id)
+            .map_err(|e| format!("the ledger refused to read this run's sign-offs: {e}"))?
+            .into_iter()
+            .map(|(criterion_id, _actor)| criterion_id)
+            .collect();
+        let acceptance_gaps = verify::acceptance_gaps(
             &self.config.contract.acceptance,
             &authority.verification_profile,
             &checks,
-        ));
+            &signoffs,
+        );
+        gaps.extend(acceptance_gaps.iter().map(verify::AcceptanceGap::message));
         // The throwaway worktree has done its work. Releasing it here —
         // rather than leaving it to `Drop` — is what gives the failure
         // somewhere to be reported.
@@ -2793,6 +2922,7 @@ impl<'a> RunEngine<'a> {
         Ok(verify::Verified {
             checks,
             gaps,
+            acceptance_gaps,
             amont_bypasses: inventory
                 .as_ref()
                 .map(|inventory| inventory.bypasses.clone())
