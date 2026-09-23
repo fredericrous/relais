@@ -32,7 +32,7 @@ use crate::backend::{Backend, LaunchResult, LaunchSpec};
 use crate::context::{self, ContextError, ContextManifest};
 use crate::contract::{Review, TaskContract};
 use crate::ids::{derive_task_id, DispatchId, PackageId, Pid, RunId};
-use crate::ledger::{Ledger, LedgerError, Transition, UsageEvent};
+use crate::ledger::{EvidenceKind, Ledger, LedgerError, Transition, UsageEvent};
 use crate::lifecycle::UsagePhase;
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::policy::{
@@ -1116,7 +1116,7 @@ impl<'a> RunEngine<'a> {
             &baseline.logs_dir,
             "task",
         )?;
-        self.record_logs(None, "setup_log", &setup)?;
+        self.record_logs(None, EvidenceKind::SetupLog, &setup)?;
         let outcome = match verify::setup_failure(&setup) {
             // The worktree exists and no worker has touched it; whatever
             // the setup left there — an installed `node_modules` the
@@ -1410,7 +1410,7 @@ impl<'a> RunEngine<'a> {
                 self.config.ledger.record_evidence(
                     &self.run_id,
                     None,
-                    "context_manifest",
+                    EvidenceKind::ContextManifest,
                     &manifest_path,
                     Some(&context::manifest_hash(&manifest)),
                 )?;
@@ -1504,7 +1504,7 @@ impl<'a> RunEngine<'a> {
                         &logs_dir,
                         "base",
                     )?;
-                    self.record_logs(None, "setup_log", &setup)?;
+                    self.record_logs(None, EvidenceKind::SetupLog, &setup)?;
                     if let Some(failed) = verify::setup_failure(&setup) {
                         let detail = setup_failure_detail(failed, "the base revision");
                         if let Err(e) = baseline.release() {
@@ -1520,7 +1520,7 @@ impl<'a> RunEngine<'a> {
                         &logs_dir,
                         "base",
                     )?;
-                    self.record_logs(None, "check_log", &checks)?;
+                    self.record_logs(None, EvidenceKind::CheckLog, &checks)?;
                     // A check that could not run at all (exit 127) gives
                     // the base no verdict: nothing to compare a candidate
                     // against, nothing to cache, and no worker can put
@@ -1926,7 +1926,12 @@ impl<'a> RunEngine<'a> {
         // is judged about it.
         if let Some(text) = result.result_text.as_deref() {
             let result_path = self.artifacts.join(format!("attempt-{index}-result.txt"));
-            self.record_artifact(Some(attempt_id), "worker_result", &result_path, text)?;
+            self.record_artifact(
+                Some(attempt_id),
+                EvidenceKind::WorkerResult,
+                &result_path,
+                text,
+            )?;
         }
 
         // A worker blockage proposal is recorded as evidence and the
@@ -1993,7 +1998,7 @@ impl<'a> RunEngine<'a> {
         ledger.record_evidence(
             &self.run_id,
             Some(attempt_id),
-            "candidate_patch",
+            EvidenceKind::CandidatePatch,
             &patch_path,
             Some(&workspace::sha256_file(&patch_path)?),
         )?;
@@ -2483,7 +2488,7 @@ impl<'a> RunEngine<'a> {
     pub(crate) fn record_logs(
         &self,
         attempt_id: Option<i64>,
-        kind: &str,
+        kind: EvidenceKind,
         outcomes: &[verify::CheckOutcome],
     ) -> Result<(), LedgerError> {
         for outcome in outcomes {
@@ -2505,7 +2510,7 @@ impl<'a> RunEngine<'a> {
     pub(crate) fn record_artifact(
         &self,
         attempt_id: Option<i64>,
-        kind: &str,
+        kind: EvidenceKind,
         path: &Path,
         body: &str,
     ) -> Result<(), RunError> {
@@ -2573,7 +2578,7 @@ impl<'a> RunEngine<'a> {
         ledger.record_evidence(
             &self.run_id,
             attempt_id,
-            "receipt",
+            EvidenceKind::Receipt,
             &receipt_path,
             Some(&receipt_hash),
         )?;
@@ -2794,7 +2799,7 @@ impl<'a> RunEngine<'a> {
                     &label.log_prefix(),
                 )
                 .map_err(|e| e.to_string())?;
-                self.record_logs(None, "setup_log", &setup)
+                self.record_logs(None, EvidenceKind::SetupLog, &setup)
                     .map_err(|e| format!("the ledger refused a setup-log evidence row: {e}"))?;
                 match verify::setup_failure(&setup) {
                     // A setup that did not complete at the candidate is a
@@ -2844,7 +2849,7 @@ impl<'a> RunEngine<'a> {
                 .record_evidence(
                     &self.run_id,
                     None,
-                    "check_log",
+                    EvidenceKind::CheckLog,
                     Path::new(&check.log_path),
                     Some(&check.log_sha256),
                 )
@@ -3012,7 +3017,7 @@ impl<'a> RunEngine<'a> {
         // that cannot show its review does not accept (X5).
         if let Err(e) = self.record_artifact(
             None,
-            "review_result",
+            EvidenceKind::ReviewResult,
             &self.artifacts.join("review.txt"),
             &text,
         ) {
@@ -5217,7 +5222,9 @@ mod tests {
         );
         let evidence = fixture.ledger.evidence(&run_id).expect("evidence");
         assert!(
-            evidence.iter().any(|(kind, _, _)| kind == "worker_result"),
+            evidence
+                .iter()
+                .any(|row| row.kind == EvidenceKind::WorkerResult),
             "{evidence:?}"
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
@@ -5780,12 +5787,12 @@ mod tests {
         assert_eq!(manifest.fingerprints[0].path, "src/main.rs");
         assert_eq!(manifest.fingerprints[0].blob.len(), 40, "git's blob id");
         let evidence = fixture.ledger.evidence(&run_id).expect("evidence");
-        let kinds: Vec<&str> = evidence.iter().map(|(kind, _, _)| kind.as_str()).collect();
-        assert!(kinds.contains(&"context_manifest"), "{kinds:?}");
-        assert!(kinds.contains(&"candidate_patch"), "{kinds:?}");
-        assert!(kinds.contains(&"check_log"), "{kinds:?}");
-        assert!(kinds.contains(&"receipt"), "{kinds:?}");
-        assert!(evidence.iter().all(|(_, _, sha)| sha.is_some()));
+        let kinds: Vec<EvidenceKind> = evidence.iter().map(|row| row.kind).collect();
+        assert!(kinds.contains(&EvidenceKind::ContextManifest), "{kinds:?}");
+        assert!(kinds.contains(&EvidenceKind::CandidatePatch), "{kinds:?}");
+        assert!(kinds.contains(&EvidenceKind::CheckLog), "{kinds:?}");
+        assert!(kinds.contains(&EvidenceKind::Receipt), "{kinds:?}");
+        assert!(evidence.iter().all(|row| row.sha256.is_some()));
     }
 
     #[test]
@@ -5923,14 +5930,14 @@ mod tests {
         })
     }
 
-    fn evidence_of(fixture: &Fixture, run_id: &RunId, kind: &str) -> Vec<(String, String)> {
+    fn evidence_of(fixture: &Fixture, run_id: &RunId, kind: EvidenceKind) -> Vec<(String, String)> {
         fixture
             .ledger
             .evidence(run_id)
             .expect("evidence")
             .into_iter()
-            .filter(|(k, _, _)| k == kind)
-            .map(|(_, path, sha)| (path, sha.unwrap_or_default()))
+            .filter(|row| row.kind == kind)
+            .map(|row| (row.path, row.sha256.unwrap_or_default()))
             .collect()
     }
 
@@ -5982,7 +5989,7 @@ mod tests {
             "the exact block is suggested: {detail}"
         );
         assert!(detail.contains("re-grant trust"), "{detail}");
-        let check_logs = evidence_of(&fixture, &run_id, "check_log");
+        let check_logs = evidence_of(&fixture, &run_id, EvidenceKind::CheckLog);
         assert_eq!(
             check_logs.len(),
             2,
@@ -6067,7 +6074,7 @@ mod tests {
         assert_eq!(launches.load(Ordering::SeqCst), 0);
         assert!(detail.contains("the base revision"), "{detail}");
         assert!(detail.contains("exit 1"), "{detail}");
-        let setup_logs = evidence_of(&fixture, &run_id, "setup_log");
+        let setup_logs = evidence_of(&fixture, &run_id, EvidenceKind::SetupLog);
         assert_eq!(setup_logs.len(), 1, "{setup_logs:?}");
         let (path, sha) = &setup_logs[0];
         assert!(path.ends_with("base-setup0.log"), "{path}");
@@ -6083,7 +6090,7 @@ mod tests {
             !logs.join("base-cmd0.log").exists(),
             "the commands never ran"
         );
-        assert!(evidence_of(&fixture, &run_id, "check_log").is_empty());
+        assert!(evidence_of(&fixture, &run_id, EvidenceKind::CheckLog).is_empty());
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
@@ -6159,7 +6166,7 @@ mod tests {
             !logs.join("base-setup0.log").exists(),
             "the cached baseline skipped the base's setup"
         );
-        let setup_logs = evidence_of(&fixture, &run_id, "setup_log");
+        let setup_logs = evidence_of(&fixture, &run_id, EvidenceKind::SetupLog);
         assert_eq!(setup_logs.len(), 1, "{setup_logs:?}");
         assert!(setup_logs[0].0.ends_with("task-setup0.log"));
         std::fs::remove_dir_all(&fixture.dir).ok();
@@ -6287,7 +6294,7 @@ mod tests {
             !logs.join("attempt1-cmd0.log").exists(),
             "the commands did not run"
         );
-        let setup_logs = evidence_of(&fixture, &run_id, "setup_log");
+        let setup_logs = evidence_of(&fixture, &run_id, EvidenceKind::SetupLog);
         assert!(
             setup_logs
                 .iter()

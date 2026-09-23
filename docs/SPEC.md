@@ -230,6 +230,8 @@ States: `prepared`, `running`, `verifying`, `repairing`, `escalating`, `accepted
 
 Every transition has a reason code, timestamp and evidence references. A worker can propose completion or blockage; the runner assigns every terminal state on its own, and a person's answer to `relais decide` can also assign two of them — `accepted` for `approve`, `cancelled` for every other answer — with what was answered recorded on the decision row, not the transition detail.
 
+An evidence reference names what kind of evidence it is, from a closed set rather than free text, and may name the tool that produced it, that tool's own identifier for it, the subject it attests to and the acceptance criterion it answers. Evidence produced outside a run is recorded the same way, and recording it decides nothing: it assigns no state, settles no criterion and clears no gap.
+
 | Observation | Transition |
 | --- | --- |
 | Required checks and review pass on the same candidate | accepted |
@@ -284,6 +286,8 @@ A task accepted because a person answered `relais decide --answer approve` count
 ## 12. Persistence and crash recovery
 
 Use a machine-local data directory with a SQLite ledger and an artifact directory per run. Suggested records: tasks, contract revisions, attempts, transitions, evidence, usage events and outcomes. Store payload schemas with explicit versions and support additive migrations.
+
+An evidence row's kind is a typed value, not free text — a stored name the reading binary does not know is a corrupt row, never silently dropped or coerced. A row may also name where it came from (the tool that produced it and that tool's own identifier for it) and what it is about (the subject it attests to and, when it answers one, the acceptance criterion). All four are optional. `relais evidence attach` records one such row for evidence a tool outside relais produced — against a run and, optionally, the criterion it answers — and decides nothing about it: recording is not deciding, so it never marks a criterion met, changes a run's state, or clears a gap. It refuses a run it does not know, and a criterion id the run's contract does not declare, naming the ids it does.
 
 Artifacts include context manifest, worker results, candidate patch, check logs and receipt. Raw transcripts are opt-in; avoid retaining credentials or private reasoning. Redaction and retention policies apply to artifacts as well as logs. Relais sends no product telemetry.
 
@@ -405,6 +409,8 @@ The complete learning loop is: execute → verify → label → build dataset �
 Maintain a local index linking files, symbols, decision keys, tests and previously verified findings. Use repository paths, language-aware symbol extraction where supported and lexical retrieval; no general-purpose vector-memory service is required. Unknown language or missing impact information falls back to broader retrieval and verification.
 
 Each finding records source fingerprints, repository revision, originating evidence, applicability and invalidation dependencies. Current aval resolution outranks remembered architectural claims. Context reuse never silently drops required constraints. Model summaries remain interpretations, with links to evidence.
+
+Evidence another tool produced — a coverage report, an external scan, a signed attestation — is attached to the run and, where it answers one, to the acceptance criterion it speaks about, carrying the tool's name, that tool's own identifier for it and the subject it attests to. Attaching is recording, never deciding: relais stores what the other tool said and leaves the judgement where the contract put it. Preserve amont/attest ownership and never forge attestations.
 
 Cache verification only when all declared relevant inputs match: candidate content, dependency lockfiles, toolchain, command, configuration and required environment identity. Checks with undeclared external dependencies or nondeterministic behavior are not cacheable by default. Preserve amont/attest ownership and never forge attestations. Cache misses rerun checks. Targeted impact analysis supplements mandatory checks rather than removing them. A profile's setup step is part of its configuration, and the programs the setup runs are part of the toolchain identity; a cached baseline skips the base's setup, not the task worktree's.
 

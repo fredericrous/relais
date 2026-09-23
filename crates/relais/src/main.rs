@@ -44,7 +44,11 @@ use relais::learn::predict::RegistryPredictor;
 use relais::policy::{effective_authority, MachineSettings, RepoPolicy};
 use relais::runner::{execute, Reason, RunConfig, State, Terminal};
 use relais::verify::{independence_summary, Receipt};
-use relais::{doctor, ledger::Ledger, paths, report, resume, route, workspace};
+use relais::{
+    doctor,
+    ledger::{EvidenceKind, EvidenceOrigin, Ledger},
+    paths, report, resume, route, workspace,
+};
 
 #[derive(Parser)]
 #[command(
@@ -222,6 +226,39 @@ enum Command {
         successor: Option<String>,
         /// The acceptance criterion this answer signs off, when the
         /// contract names one whose evidence is a human sign-off
+        #[arg(long = "criterion")]
+        criterion: Option<String>,
+    },
+    /// Evidence operations (SPEC §12, §18)
+    Evidence {
+        #[command(subcommand)]
+        cmd: EvidenceCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum EvidenceCommand {
+    /// Record one piece of evidence produced by another tool against a
+    /// run relais already reasons over. Recording only: this never marks
+    /// a criterion met, changes a run's state, or clears a gap.
+    Attach {
+        run_id: String,
+        /// Path to the evidence file; its content is hashed and the
+        /// hash, not the bytes, is what the ledger stores
+        #[arg(long = "path")]
+        path: PathBuf,
+        /// The tool that produced this evidence
+        #[arg(long = "tool")]
+        tool: Option<String>,
+        /// That tool's own identifier for this evidence
+        #[arg(long = "external-id")]
+        external_id: Option<String>,
+        /// The subject this evidence attests to
+        #[arg(long = "subject")]
+        subject: Option<String>,
+        /// The acceptance criterion this evidence answers, when it
+        /// answers one; refused if the run's contract does not declare
+        /// it
         #[arg(long = "criterion")]
         criterion: Option<String>,
     },
@@ -601,6 +638,23 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             successor.as_deref(),
             criterion.as_deref(),
         ),
+        Command::Evidence { cmd } => match cmd {
+            EvidenceCommand::Attach {
+                run_id,
+                path,
+                tool,
+                external_id,
+                subject,
+                criterion,
+            } => evidence_attach_command(
+                &run_id,
+                &path,
+                tool.as_deref(),
+                external_id.as_deref(),
+                subject.as_deref(),
+                criterion.as_deref(),
+            ),
+        },
     }
 }
 
@@ -1821,6 +1875,23 @@ fn explain_command(run_id: &str) -> Result<CliOutcome, CliError> {
                 .unwrap_or_default()
         );
     }
+    let evidence = operational(ledger.evidence(&run), "explain")?;
+    if !evidence.is_empty() {
+        println!("evidence:");
+        for row in &evidence {
+            // Read through the typed row, not the positional tuple this
+            // replaced — a caller here cannot print the kind where it
+            // meant to print the path.
+            print!("  {}: {}", row.kind, row.path);
+            if let Some(tool) = &row.tool {
+                print!(" via {tool}");
+            }
+            if let Some(criterion_id) = &row.criterion_id {
+                print!(" for {criterion_id}");
+            }
+            println!();
+        }
+    }
     Ok(CliOutcome::Accepted)
 }
 
@@ -2457,6 +2528,88 @@ fn decide_command(
     Ok(CliOutcome::Accepted)
 }
 
+/// Record one piece of evidence produced by another tool, against a run
+/// and, optionally, the acceptance criterion it answers. This decides
+/// nothing: it never marks a criterion met, changes a run's state, or
+/// clears a gap — only `relais decide` and the runner's own verification
+/// do that.
+fn evidence_attach_command(
+    run_id: &str,
+    path: &Path,
+    tool: Option<&str>,
+    external_id: Option<&str>,
+    subject: Option<&str>,
+    criterion: Option<&str>,
+) -> Result<CliOutcome, CliError> {
+    let ledger = open_ledger()?;
+    let run = RunId::from_stored(run_id);
+    if operational(ledger.run_status(&run), "evidence attach")?.is_none() {
+        eprintln!("relais evidence attach: unknown run {run_id}");
+        return Ok(CliOutcome::UnknownRun);
+    }
+    if let Some(criterion_id) = criterion {
+        let Some((contract, _tier)) =
+            operational(ledger.run_contract_and_tier(&run), "evidence attach")?
+        else {
+            eprintln!("relais evidence attach: run {run_id} carries no recorded contract");
+            return Ok(CliOutcome::OperationalFailure);
+        };
+        let declared: Vec<String> = contract.acceptance.iter().map(|entry| entry.id()).collect();
+        if !declared.iter().any(|id| id == criterion_id) {
+            eprintln!(
+                "relais evidence attach: run {run_id} names no acceptance criterion \
+                 `{criterion_id}` — this contract declares: {}",
+                declared.join(", ")
+            );
+            return Ok(CliOutcome::InvalidInput);
+        }
+    }
+    let sha256 = match workspace::sha256_file(path) {
+        Ok(sha256) => sha256,
+        Err(cause) => {
+            eprintln!(
+                "relais evidence attach: {path} cannot be read: {cause}",
+                path = path.display()
+            );
+            return Ok(CliOutcome::InvalidInput);
+        }
+    };
+    // Every other writer of an evidence row stores an absolute path —
+    // the runner joins its artifacts directory, `decide` joins the runs
+    // directory — and `relais explain` prints them all side by side. A
+    // relative `--path` recorded verbatim reads back as a path that
+    // resolves from whatever directory the person happened to be in,
+    // which is no directory at all by the time anyone looks. The sha256
+    // pins the content; this pins where it was.
+    let path = match path.canonicalize() {
+        Ok(absolute) => absolute,
+        Err(cause) => {
+            eprintln!(
+                "relais evidence attach: {path} cannot be resolved to an absolute path: {cause}",
+                path = path.display()
+            );
+            return Ok(CliOutcome::InvalidInput);
+        }
+    };
+    let path = path.as_path();
+    operational(
+        ledger.attach_evidence(
+            &run,
+            path,
+            Some(&sha256),
+            EvidenceOrigin {
+                tool,
+                external_id,
+                subject,
+                criterion_id: criterion,
+            },
+        ),
+        "evidence attach",
+    )?;
+    println!("attached evidence for {run_id}: {}", path.display());
+    Ok(CliOutcome::Accepted)
+}
+
 /// How a test criterion's authorship reads in a refusal.
 fn authorship_label(authorship: relais::acceptance::TestAuthorship) -> &'static str {
     use relais::acceptance::TestAuthorship;
@@ -2540,7 +2693,13 @@ fn reseal_receipt_with_signoff(
             "decide",
         )?;
         operational(
-            ledger.record_evidence(run, None, "receipt", &receipt_path, Some(&receipt_hash)),
+            ledger.record_evidence(
+                run,
+                None,
+                EvidenceKind::Receipt,
+                &receipt_path,
+                Some(&receipt_hash),
+            ),
             "decide",
         )?;
     }

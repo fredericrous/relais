@@ -22,7 +22,7 @@ use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::outcome::{Outcome, OutcomeDetail, OutcomeKind};
 use crate::policy::Tier;
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 10;
+pub const LEDGER_SCHEMA_VERSION: u64 = 11;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -96,6 +96,110 @@ fn parse_tier(stored: &str) -> Result<Tier> {
         what: "attempt tier".into(),
         detail: format!("`{stored}` is not a tier this relais knows"),
     })
+}
+
+/// What an evidence row is: every kind this ledger has ever stored, plus
+/// the two this package introduces. A stored name this binary does not
+/// know is a corrupt row (`parse_evidence_kind`), never silently dropped
+/// or coerced into one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceKind {
+    /// A named check's log, from the verification profile.
+    CheckLog,
+    /// The context manifest assembled for a dispatch.
+    ContextManifest,
+    /// A worker's own result text.
+    WorkerResult,
+    /// A candidate's exported patch.
+    CandidatePatch,
+    /// A reviewer's result text.
+    ReviewResult,
+    /// A stored receipt.
+    Receipt,
+    /// A declared setup's log.
+    SetupLog,
+    /// Evidence another tool produced, recorded by `relais evidence
+    /// attach` and decided about by nothing here.
+    ExternalAttestation,
+    /// A person's sign-off, recorded as evidence like any other kind.
+    HumanSignOff,
+}
+
+impl EvidenceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CheckLog => "check_log",
+            Self::ContextManifest => "context_manifest",
+            Self::WorkerResult => "worker_result",
+            Self::CandidatePatch => "candidate_patch",
+            Self::ReviewResult => "review_result",
+            Self::Receipt => "receipt",
+            Self::SetupLog => "setup_log",
+            Self::ExternalAttestation => "external_attestation",
+            Self::HumanSignOff => "human_sign_off",
+        }
+    }
+
+    fn parse(stored: &str) -> Option<Self> {
+        match stored {
+            "check_log" => Some(Self::CheckLog),
+            "context_manifest" => Some(Self::ContextManifest),
+            "worker_result" => Some(Self::WorkerResult),
+            "candidate_patch" => Some(Self::CandidatePatch),
+            "review_result" => Some(Self::ReviewResult),
+            "receipt" => Some(Self::Receipt),
+            "setup_log" => Some(Self::SetupLog),
+            "external_attestation" => Some(Self::ExternalAttestation),
+            "human_sign_off" => Some(Self::HumanSignOff),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for EvidenceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// An evidence kind string as an evidence row stored it.
+fn parse_evidence_kind(stored: &str) -> Result<EvidenceKind> {
+    EvidenceKind::parse(stored).ok_or_else(|| LedgerError::Corrupt {
+        what: "evidence kind".into(),
+        detail: format!("`{stored}` is not an evidence kind this relais knows"),
+    })
+}
+
+/// Where a piece of evidence came from and what it is about — every
+/// field optional, so a row `record_evidence` writes (nothing here) and
+/// a row `attach_evidence` writes (whatever the caller names) share one
+/// column set without one implying the other.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EvidenceOrigin<'a> {
+    /// The tool that produced this evidence.
+    pub tool: Option<&'a str>,
+    /// That tool's own identifier for this evidence.
+    pub external_id: Option<&'a str>,
+    /// The subject this evidence attests to.
+    pub subject: Option<&'a str>,
+    /// The acceptance criterion this evidence answers, when it answers
+    /// one.
+    pub criterion_id: Option<&'a str>,
+}
+
+/// One piece of evidence bound to a run, read back typed: what kind it
+/// is, where it is, and — when recorded — what it is about. Typed so a
+/// caller cannot read the kind where it meant to read the path, the way
+/// the positional tuple this replaced allowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceRow {
+    pub kind: EvidenceKind,
+    pub path: String,
+    pub sha256: Option<String>,
+    pub tool: Option<String>,
+    pub external_id: Option<String>,
+    pub subject: Option<String>,
+    pub criterion_id: Option<String>,
 }
 
 /// A typed outcome as `latest_outcome`/`outcomes_since` hand it back:
@@ -643,6 +747,22 @@ const MIGRATIONS: &[(&str, &str)] = &[
     DROP TABLE outcomes;
     ALTER TABLE outcomes_v10 RENAME TO outcomes;
     CREATE INDEX idx_outcomes_task ON outcomes(task_id);
+    "#,
+    ),
+    (
+        // An evidence row said only its kind and its path — free text, no
+        // way to name what produced it or what it is about. These four
+        // columns let a row say that: `tool` and `external_id` are where
+        // it came from, `subject` and `criterion_id` are what it attests
+        // to. All nullable, so every row this ledger has ever written
+        // reads back unchanged, and `relais evidence attach` is the only
+        // thing that ever fills them all in.
+        "v11",
+        r#"
+    ALTER TABLE evidence ADD COLUMN tool TEXT;
+    ALTER TABLE evidence ADD COLUMN external_id TEXT;
+    ALTER TABLE evidence ADD COLUMN subject TEXT;
+    ALTER TABLE evidence ADD COLUMN criterion_id TEXT;
     "#,
     ),
 ];
@@ -1784,33 +1904,111 @@ impl Ledger {
         &self,
         run_id: &RunId,
         attempt_id: Option<i64>,
-        kind: &str,
+        kind: EvidenceKind,
         path: &Path,
         sha256: Option<&str>,
     ) -> Result<()> {
+        self.insert_evidence_row(
+            run_id,
+            attempt_id,
+            kind,
+            path,
+            sha256,
+            EvidenceOrigin::default(),
+        )
+    }
+
+    /// Evidence produced by another tool: `relais evidence attach`
+    /// records one row and decides nothing about it — no criterion is
+    /// marked met, no run's state changes, no gap clears.
+    pub fn attach_evidence(
+        &self,
+        run_id: &RunId,
+        path: &Path,
+        sha256: Option<&str>,
+        origin: EvidenceOrigin,
+    ) -> Result<()> {
+        self.insert_evidence_row(
+            run_id,
+            None,
+            EvidenceKind::ExternalAttestation,
+            path,
+            sha256,
+            origin,
+        )
+    }
+
+    fn insert_evidence_row(
+        &self,
+        run_id: &RunId,
+        attempt_id: Option<i64>,
+        kind: EvidenceKind,
+        path: &Path,
+        sha256: Option<&str>,
+        origin: EvidenceOrigin,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO evidence (run_id, attempt_id, kind, path, sha256, at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO evidence
+                (run_id, attempt_id, kind, path, sha256, at,
+                 tool, external_id, subject, criterion_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 run_id.as_str(),
                 attempt_id,
-                kind,
+                kind.as_str(),
                 path.to_string_lossy(),
                 sha256,
-                self.now()
+                self.now(),
+                origin.tool,
+                origin.external_id,
+                origin.subject,
+                origin.criterion_id,
             ],
         )?;
         Ok(())
     }
 
-    pub fn evidence(&self, run_id: &RunId) -> Result<Vec<(String, String, Option<String>)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT kind, path, sha256 FROM evidence WHERE run_id = ?1 ORDER BY id")?;
+    pub fn evidence(&self, run_id: &RunId) -> Result<Vec<EvidenceRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, path, sha256, tool, external_id, subject, criterion_id
+               FROM evidence WHERE run_id = ?1 ORDER BY id",
+        )?;
+        type Row = (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
         let rows = stmt.query_map([run_id.as_str()], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
         })?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        let rows: Vec<Row> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(kind, path, sha256, tool, external_id, subject, criterion_id)| {
+                    Ok(EvidenceRow {
+                        kind: parse_evidence_kind(&kind)?,
+                        path,
+                        sha256,
+                        tool,
+                        external_id,
+                        subject,
+                        criterion_id,
+                    })
+                },
+            )
+            .collect()
     }
 
     pub fn transitions(&self, run_id: &RunId) -> Result<Vec<Transition>> {
@@ -2928,6 +3126,30 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_evidence_kind_is_an_error_not_a_panic() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-bad"), "/repo", None, &task("run-bad"), "rk")
+            .expect("run");
+        ledger
+            .conn
+            .execute(
+                "INSERT INTO evidence (run_id, attempt_id, kind, path, sha256, at)
+                 VALUES ('run-bad', NULL, 'a_kind_nobody_wrote', '/tmp/x', NULL, 'then')",
+                [],
+            )
+            .expect("a row this binary does not know how to read");
+        match ledger.evidence(&run("run-bad")) {
+            Err(LedgerError::Corrupt { what, detail }) => {
+                assert_eq!(what, "evidence kind");
+                assert!(detail.contains("a_kind_nobody_wrote"), "{detail}");
+            }
+            other => panic!("an unknown evidence kind must be an error, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn a_ledger_from_a_newer_relais_is_refused() {
         let (ledger, dir) = temp_ledger();
         drop(ledger);
@@ -3235,6 +3457,68 @@ mod tests {
             .expect("latest")
             .expect("recorded");
         assert_eq!(latest.outcome.detail.candidate_sha, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_v10_ledger_upgrades_to_v11_keeping_every_evidence_row_readable() {
+        let dir = crate::test_support::temp_dir("ledger-v10-to-v11");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("ledger.sqlite");
+        {
+            // v10 exactly as it shipped: apply every step but the last.
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );",
+            )
+            .expect("migrations table");
+            for (version, sql) in &MIGRATIONS[..10] {
+                conn.execute_batch(sql).expect("step");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, "2026-09-22T00:00:00+00:00"],
+                )
+                .expect("record");
+            }
+            conn.execute(
+                "INSERT INTO runs (id, repo_path, status, created_at, updated_at)
+                 VALUES ('run-old', '/repo', 'accepted',
+                         '2026-09-22T00:00:00+00:00', '2026-09-22T00:00:00+00:00')",
+                [],
+            )
+            .expect("a run written before v11");
+            // v10's evidence row shape: no tool/external_id/subject/
+            // criterion_id columns exist yet.
+            conn.execute(
+                "INSERT INTO evidence (run_id, attempt_id, kind, path, sha256, at)
+                 VALUES ('run-old', NULL, 'check_log', '/tmp/old.log', 'deadbeef',
+                         '2026-09-22T00:00:00+00:00')",
+                [],
+            )
+            .expect("a row written before v11");
+        }
+        let ledger = Ledger::open(&path).expect("upgrade to v11");
+        assert_eq!(
+            ledger.schema_version().expect("version"),
+            LEDGER_SCHEMA_VERSION
+        );
+        let evidence = ledger.evidence(&run("run-old")).expect("evidence reads");
+        assert_eq!(
+            evidence,
+            vec![EvidenceRow {
+                kind: EvidenceKind::CheckLog,
+                path: "/tmp/old.log".into(),
+                sha256: Some("deadbeef".into()),
+                tool: None,
+                external_id: None,
+                subject: None,
+                criterion_id: None,
+            }],
+            "a pre-v11 row reads back under its typed kind, the new columns absent"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

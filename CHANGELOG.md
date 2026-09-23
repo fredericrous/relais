@@ -32,6 +32,26 @@ missing here.
   so a dataset or artifact built under the old rule is distinguishable
   from one built under this one.
 
+- **An evidence row says what it is and what it is about.** `kind` was
+  free text; it is now a typed value covering every kind this ledger has
+  ever stored (`check_log`, `context_manifest`, `worker_result`,
+  `candidate_patch`, `review_result`, `receipt`, `setup_log`) plus two
+  this package introduces (`external_attestation`, `human_sign_off`) —
+  a stored name this binary does not know now reads as a corrupt row,
+  never silently dropped or coerced. A row can also name the tool and
+  external id it came from and the subject and acceptance criterion it
+  is about; all four are optional, so every row relais already writes,
+  and every row written before this package, reads unchanged. The
+  evidence table gains these columns in their own migration (v11),
+  proven against a ledger built at exactly the prior schema version.
+  `relais evidence attach` records one such row — evidence a tool
+  outside relais produced, against a run and, optionally, the criterion
+  it answers — and decides nothing about it: no criterion is marked
+  met, no run's state changes, no gap clears. It refuses a run it does
+  not know and a criterion id the run's contract does not declare,
+  naming the ids it does. `relais explain` now prints evidence through
+  this typed row rather than the positional tuple it read before.
+
 ## v0.4.0
 
 ### Added
