@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use relais::acceptance::Evidence;
 use relais::backend::Backend;
 use relais::contract::TaskContract;
 use relais::ids::{IdSource, RunId, TaskId};
@@ -42,6 +43,7 @@ use relais::install::{InstallReport, InstallRequest, Mode, Scope};
 use relais::learn::predict::RegistryPredictor;
 use relais::policy::{effective_authority, MachineSettings, RepoPolicy};
 use relais::runner::{execute, Reason, RunConfig, State, Terminal};
+use relais::verify::{independence_summary, Receipt};
 use relais::{doctor, ledger::Ledger, paths, report, resume, route, workspace};
 
 #[derive(Parser)]
@@ -218,6 +220,10 @@ enum Command {
         /// The run that carries a revision this decision led to, if any
         #[arg(long = "successor")]
         successor: Option<String>,
+        /// The acceptance criterion this answer signs off, when the
+        /// contract names one whose evidence is a human sign-off
+        #[arg(long = "criterion")]
+        criterion: Option<String>,
     },
 }
 
@@ -303,6 +309,19 @@ impl DecideAnswer {
             Self::Revise => Reason::DecisionRevised,
             Self::Decided => Reason::DecisionRecorded,
             Self::Abandon => Reason::DecisionAbandoned,
+        }
+    }
+
+    /// The terminal state a person's answer assigns (SPEC §9): approval
+    /// accepts, every other answer ends the run without one. Matched
+    /// directly over `DecideAnswer`, not the much larger `Reason`, so a
+    /// sixth answer added to this enum without a case here does not
+    /// compile — the property `decide_answers_every_variant_assigns_a_projected_status`
+    /// exercises.
+    fn terminal_state(self) -> State {
+        match self {
+            Self::Approve => State::Accepted,
+            Self::Reject | Self::Revise | Self::Decided | Self::Abandon => State::Cancelled,
         }
     }
 }
@@ -573,12 +592,14 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             actor,
             note,
             successor,
+            criterion,
         } => decide_command(
             &run_id,
             answer,
             &actor,
             note.as_deref(),
             successor.as_deref(),
+            criterion.as_deref(),
         ),
     }
 }
@@ -2268,7 +2289,7 @@ fn open_verification_gaps(ledger: &Ledger, run: &RunId) -> Result<Vec<String>, C
         return Ok(Vec::new());
     };
     let transitions = operational(ledger.transitions(run), "decide")?;
-    Ok(transitions
+    let raised: Vec<String> = transitions
         .iter()
         .find(|transition| {
             transition.at == decision.raised_at && transition.to_state.awaits_a_person()
@@ -2281,7 +2302,26 @@ fn open_verification_gaps(ledger: &Ledger, run: &RunId) -> Result<Vec<String>, C
                 .filter_map(|gap| gap.as_str().map(String::from))
                 .collect()
         })
-        .unwrap_or_default())
+        .unwrap_or_default();
+    // A human-sign-off gap this run's own transition still names is not
+    // open any more once `relais decide --answer approve --criterion
+    // <id>` has recorded that id's sign-off — the frozen detail never
+    // changes, so what clears the gap is read fresh, here, rather than
+    // by rewriting history. The id is taken out of the stored sentence
+    // by `verify::sign_off_gap_criterion`, the inverse of the one
+    // function that wrote it; matching the id anywhere in the prose
+    // would also clear a CHECK gap that happened to name it.
+    let signed_off: Vec<String> = operational(ledger.human_signoffs(run), "decide")?
+        .into_iter()
+        .map(|(criterion_id, _actor)| criterion_id)
+        .collect();
+    Ok(raised
+        .into_iter()
+        .filter(|gap| match relais::verify::sign_off_gap_criterion(gap) {
+            Some(criterion_id) => !signed_off.iter().any(|signed| signed == criterion_id),
+            None => true,
+        })
+        .collect())
 }
 
 fn decide_command(
@@ -2290,6 +2330,7 @@ fn decide_command(
     actor: &str,
     note: Option<&str>,
     successor: Option<&str>,
+    criterion: Option<&str>,
 ) -> Result<CliOutcome, CliError> {
     let ledger = open_ledger()?;
     let run = RunId::from_stored(run_id);
@@ -2302,6 +2343,58 @@ fn decide_command(
             "relais decide: run {run_id} is {state}, not waiting on a person — nothing to decide"
         );
         return Ok(CliOutcome::InvalidInput);
+    }
+    if let Some(criterion_id) = criterion {
+        if answer != DecideAnswer::Approve {
+            eprintln!("relais decide: `--criterion` only applies to `--answer approve`");
+            return Ok(CliOutcome::InvalidInput);
+        }
+        let Some((contract, _tier)) = operational(ledger.run_contract_and_tier(&run), "decide")?
+        else {
+            eprintln!("relais decide: run {run_id} carries no recorded contract");
+            return Ok(CliOutcome::OperationalFailure);
+        };
+        let declared: Vec<String> = contract.acceptance.iter().map(|entry| entry.id()).collect();
+        let Some(entry) = contract
+            .acceptance
+            .iter()
+            .find(|entry| entry.id() == criterion_id)
+        else {
+            eprintln!(
+                "relais decide: run {run_id} names no acceptance criterion `{criterion_id}` — \
+                 this contract declares: {}",
+                declared.join(", ")
+            );
+            return Ok(CliOutcome::InvalidInput);
+        };
+        // Signing off a criterion the contract settles some OTHER way is
+        // the second acceptance path this whole mechanism exists to
+        // refuse: it would re-seal the receipt claiming a person settled
+        // what a check was declared to settle. The gap itself would
+        // survive — `acceptance_gaps` consults the sign-off set only for
+        // `HumanSignOff` evidence — but the receipt would say something
+        // untrue about how the criterion was met, and a receipt nobody
+        // can trust is worse than a run that stays blocked.
+        if !matches!(entry.evidence(), Some(Evidence::HumanSignOff)) {
+            eprintln!(
+                "relais decide: acceptance criterion `{criterion_id}` is not settled by a human \
+                 sign-off but by {} — a sign-off answers only a criterion that asked for one",
+                match entry.evidence() {
+                    Some(Evidence::Check { name }) => format!("check `{name}`"),
+                    Some(Evidence::Test { authorship }) =>
+                        format!("a test ({})", authorship_label(*authorship)),
+                    Some(Evidence::LlmReview) => "an LLM review".to_string(),
+                    Some(Evidence::HumanSignOff) => unreachable!("guarded above"),
+                    None => "the verification profile as a whole".to_string(),
+                }
+            );
+            return Ok(CliOutcome::InvalidInput);
+        }
+        operational(
+            ledger.record_human_signoff(&run, criterion_id, actor, note),
+            "decide",
+        )?;
+        reseal_receipt_with_signoff(&ledger, &run, criterion_id)?;
     }
     if answer == DecideAnswer::Approve {
         let gaps = open_verification_gaps(&ledger, &run)?;
@@ -2317,7 +2410,17 @@ fn decide_command(
     let successor_run = successor.map(RunId::from_stored);
     let resolution = answer.resolution();
     let resolved = operational(
-        ledger.resolve_decision(&run, resolution, actor, note, successor_run.as_ref()),
+        ledger.resolve_decision(
+            &run,
+            &relais::ledger::DecisionAnswer {
+                resolution,
+                actor,
+                note,
+                successor_run: successor_run.as_ref(),
+                from_state: state,
+                to_state: answer.terminal_state(),
+            },
+        ),
         "decide",
     )?;
     if !resolved {
@@ -2326,6 +2429,96 @@ fn decide_command(
     }
     println!("recorded {} for {run_id} by {actor}", resolution.as_str());
     Ok(CliOutcome::Accepted)
+}
+
+/// How a test criterion's authorship reads in a refusal.
+fn authorship_label(authorship: relais::acceptance::TestAuthorship) -> &'static str {
+    use relais::acceptance::TestAuthorship;
+    match authorship {
+        TestAuthorship::PreExisting => "pre-existing",
+        TestAuthorship::HumanAdded => "human-added",
+        TestAuthorship::ModelAdded => "model-added",
+    }
+}
+
+/// Mark one criterion met by the sign-off `relais decide` just recorded,
+/// and re-seal the run's receipt with it (SPEC §10, §12): the runner
+/// already stored a receipt for this run when every check, test and
+/// review passed and only a human sign-off gap remained
+/// ([`relais::runner::RunEngine::store_pending_receipt`]) — this is the
+/// one place that receipt is ever edited, never a second acceptance path
+/// built alongside it. A run with no stored receipt yet (an older run,
+/// or one whose gaps were never signoff-only) has nothing to re-seal;
+/// `relais decide`'s own gap check further down still refuses it if
+/// other gaps remain.
+fn reseal_receipt_with_signoff(
+    ledger: &Ledger,
+    run: &RunId,
+    criterion_id: &str,
+) -> Result<(), CliError> {
+    let Some((stored, _hash)) = operational(ledger.receipt(run), "decide")? else {
+        return Ok(());
+    };
+    // A receipt this same binary wrote and now cannot parse back is
+    // corrupt, not absent — `operational` refuses loudly rather than
+    // this re-seal silently skipping it.
+    let mut receipt: Receipt = operational(serde_json::from_value(stored), "decide")?;
+    for criterion in &mut receipt.criteria {
+        if criterion.id == criterion_id {
+            criterion.met = true;
+            // The criterion ALREADY declared a human sign-off — `decide`
+            // refuses `--criterion` for any other evidence kind — so this
+            // records which evidence settled it, never a rewrite of what
+            // the contract asked for.
+            criterion.evidence = Some(Evidence::HumanSignOff);
+        }
+    }
+    receipt.mandatory_evidence_independence = independence_summary(&receipt.criteria);
+    // The gap this sign-off answers is no longer open, so the receipt
+    // stops naming it — and once no gap is left, the receipt says what
+    // the run now is. A receipt still reading `needs_decision`, still
+    // listing a gap a person has since answered, beside a run the very
+    // same command moved to `accepted`, is two records of one fact
+    // disagreeing: exactly the drift `resolve_decision`'s single
+    // transaction exists to prevent one line further down.
+    receipt
+        .verification
+        .gaps
+        .retain(|gap| relais::verify::sign_off_gap_criterion(gap) != Some(criterion_id));
+    if receipt.verification.accepted() {
+        receipt.outcome = State::Accepted.as_str().to_string();
+    }
+    let receipt_hash = receipt.hash();
+    operational(
+        ledger.store_receipt(
+            run,
+            &serde_json::to_value(&receipt).expect("a receipt serializes"),
+            &receipt_hash,
+        ),
+        "decide",
+    )?;
+    // The ledger row and the file are one receipt. Updating only the row
+    // would leave `receipt.json` — the copy a person actually opens, and
+    // the one the evidence row's hash names — reading `needs_decision`
+    // for a run this command just accepted.
+    let receipt_path = paths::runs_dir()
+        .map_err(CliError::Home)?
+        .join(run.as_str())
+        .join("receipt.json");
+    if receipt_path.exists() {
+        operational(
+            std::fs::write(
+                &receipt_path,
+                serde_json::to_string_pretty(&receipt).expect("a receipt serializes"),
+            ),
+            "decide",
+        )?;
+        operational(
+            ledger.record_evidence(run, None, "receipt", &receipt_path, Some(&receipt_hash)),
+            "decide",
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2342,6 +2535,29 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mkdir");
         let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger opens");
         (ledger, dir)
+    }
+
+    /// Walks every `DecideAnswer` and asserts the terminal state it
+    /// assigns: `approve` accepts, every other answer cancels. Matched
+    /// directly over `DecideAnswer` in `terminal_state`, so a sixth
+    /// variant added to that enum without a case there fails to compile
+    /// this test along with everything else in the crate.
+    #[test]
+    fn decide_answers_every_variant_assigns_a_projected_status() {
+        for answer in [
+            DecideAnswer::Approve,
+            DecideAnswer::Reject,
+            DecideAnswer::Revise,
+            DecideAnswer::Decided,
+            DecideAnswer::Abandon,
+        ] {
+            let expected = if answer == DecideAnswer::Approve {
+                State::Accepted
+            } else {
+                State::Cancelled
+            };
+            assert_eq!(answer.terminal_state(), expected, "{answer:?}");
+        }
     }
 
     /// `decide --answer approve` reads the gaps a `VerificationGap`

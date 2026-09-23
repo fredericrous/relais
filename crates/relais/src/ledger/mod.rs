@@ -22,7 +22,7 @@ use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::outcome::{Outcome, OutcomeDetail, OutcomeKind};
 use crate::policy::Tier;
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 8;
+pub const LEDGER_SCHEMA_VERSION: u64 = 9;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -593,6 +593,26 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ALTER TABLE usage_events ADD COLUMN harness TEXT;
     "#,
     ),
+    (
+        // A mandatory criterion asking for a human sign-off had no way
+        // to be answered: `verify::acceptance_gaps` raised it forever,
+        // because nothing recorded that a person ever gave one. This
+        // table is that record — one row per (run, criterion), written
+        // only by `relais decide --answer approve --criterion <id>` — so
+        // `acceptance_gaps`/`settle_acceptance` can read the id back and
+        // stop treating an answered criterion as unmet.
+        "v9",
+        r#"
+    CREATE TABLE human_signoffs (
+        run_id TEXT NOT NULL,
+        criterion_id TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        note TEXT,
+        recorded_at TEXT NOT NULL,
+        PRIMARY KEY (run_id, criterion_id)
+    );
+    "#,
+    ),
 ];
 
 pub struct Ledger {
@@ -855,6 +875,55 @@ pub struct Transition {
     pub at: String,
 }
 
+/// Append one transition row and bring `runs.status` with it, inside a
+/// transaction the caller owns.
+///
+/// Both writers of the transition chain go through here — the runner's
+/// [`Ledger::record_transition`] and a person's answer in
+/// [`Ledger::resolve_decision`], which cannot call the former because
+/// that one also OPENS a decision row for a waiting state and would
+/// reopen the very row the answer is closing. Two hand-written copies of
+/// this pair is how a column added to one silently stops being written
+/// by the other, so there is one copy.
+///
+/// `runs.status` is updated on every transition, not only terminal ones:
+/// `relais status` used to say `prepared` for a run ten minutes into
+/// verifying.
+fn append_transition(tx: &rusqlite::Transaction<'_>, transition: &Transition) -> Result<()> {
+    let detail = transition
+        .detail
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| LedgerError::Corrupt {
+            what: "a transition detail".into(),
+            detail: e.to_string(),
+        })?;
+    tx.execute(
+        "INSERT INTO transitions
+            (run_id, attempt_id, from_state, to_state, reason, detail_json, at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            transition.run_id.as_str(),
+            transition.attempt_id,
+            transition.from_state.map(|state| state.as_str()),
+            transition.to_state.as_str(),
+            transition.reason,
+            detail,
+            transition.at,
+        ],
+    )?;
+    tx.execute(
+        "UPDATE runs SET status = ?2, updated_at = ?3 WHERE id = ?1",
+        params![
+            transition.run_id.as_str(),
+            transition.to_state.as_str(),
+            transition.at
+        ],
+    )?;
+    Ok(())
+}
+
 /// A run's status as a projection of its transition history (P3): the
 /// last transition's `to_state`, falling back to the `runs.status` column
 /// only for a row with no transition at all — an old ledger's run, written
@@ -880,6 +949,22 @@ pub struct ChildOf<'a> {
 /// lists and `relais decide` closes; `waited_seconds` is derived from the
 /// recorded timestamps, never stored, so it is always current for an open
 /// row and exact for a resolved one.
+/// A person's answer to an open decision: what they decided, who they
+/// are, any note and successor run they named, and the two states their
+/// answer moves the run between. One argument rather than six, because
+/// they are one answer and every caller has all of them at once.
+pub struct DecisionAnswer<'a> {
+    pub resolution: Reason,
+    pub actor: &'a str,
+    pub note: Option<&'a str>,
+    pub successor_run: Option<&'a RunId>,
+    /// The state the run was waiting in.
+    pub from_state: State,
+    /// The terminal state this answer assigns. Never
+    /// [`State::awaits_a_person`]: an answer ends a wait, never starts one.
+    pub to_state: State,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DecisionRecord {
     pub run: RunId,
@@ -1490,40 +1575,8 @@ impl Ledger {
     /// waiting on a person without a row recording that it started to.
     /// Nothing here closes one: only `resolve_decision` does that.
     pub fn record_transition(&self, transition: &Transition) -> Result<()> {
-        let detail = transition
-            .detail
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| LedgerError::Corrupt {
-                what: "a transition detail".into(),
-                detail: e.to_string(),
-            })?;
         let tx = self.write_tx()?;
-        tx.execute(
-            "INSERT INTO transitions
-                (run_id, attempt_id, from_state, to_state, reason, detail_json, at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                transition.run_id.as_str(),
-                transition.attempt_id,
-                transition.from_state.map(|s| s.as_str()),
-                transition.to_state.as_str(),
-                transition.reason,
-                detail,
-                transition.at,
-            ],
-        )?;
-        // Every transition, not only the terminal ones: `relais status`
-        // used to say `prepared` for a run ten minutes into verifying.
-        tx.execute(
-            "UPDATE runs SET status = ?2, updated_at = ?3 WHERE id = ?1",
-            params![
-                transition.run_id.as_str(),
-                transition.to_state.as_str(),
-                self.now()
-            ],
-        )?;
+        append_transition(&tx, transition)?;
         if transition.to_state.awaits_a_person() {
             let task_id: Option<String> = tx
                 .query_row(
@@ -1587,32 +1640,86 @@ impl Ledger {
         row.map(|row| parse_decision_row(row, &now)).transpose()
     }
 
-    /// Answer an open decision: who decided what, when, with an optional
-    /// note and successor run. `Ok(false)` when the run has no OPEN
-    /// decision — never raised one, or one already answered — so the CLI
-    /// can refuse "deciding a run that is not waiting" by name rather
-    /// than silently overwriting a prior answer.
-    pub fn resolve_decision(
-        &self,
-        run_id: &RunId,
-        resolution: Reason,
-        actor: &str,
-        note: Option<&str>,
-        successor_run: Option<&RunId>,
-    ) -> Result<bool> {
-        let changed = self.conn.execute(
+    /// Answer an open decision — who decided what, when, with an optional
+    /// note and successor run — AND record the terminal state that
+    /// answer assigns, one transaction because they are one fact (P3):
+    /// two autocommits here used to let a kill leave a run whose
+    /// decision said `approved` and whose projected status still said
+    /// `needs_decision`, disagreeing with the very answer sitting next
+    /// to it. `to_state` is never [`State::awaits_a_person`], so this
+    /// never opens a new decision row the way [`Self::record_transition`]
+    /// does — it only ever closes the one already open. `Ok(false)` when
+    /// the run has no OPEN decision — never raised one, or one already
+    /// answered — so the CLI can refuse "deciding a run that is not
+    /// waiting" by name rather than silently overwriting a prior answer;
+    /// in that case neither the decision nor the run's state changed.
+    pub fn resolve_decision(&self, run_id: &RunId, answer: &DecisionAnswer<'_>) -> Result<bool> {
+        let now = self.now();
+        let tx = self.write_tx()?;
+        let changed = tx.execute(
             "UPDATE decisions SET resolved_at = ?2, resolution = ?3, actor = ?4, note = ?5, successor_run = ?6
              WHERE run = ?1 AND resolved_at IS NULL",
             params![
                 run_id.as_str(),
-                self.now(),
-                resolution.as_str(),
-                actor,
-                note,
-                successor_run.map(RunId::as_str),
+                now,
+                answer.resolution.as_str(),
+                answer.actor,
+                answer.note,
+                answer.successor_run.map(RunId::as_str),
             ],
         )?;
+        if changed > 0 {
+            append_transition(
+                &tx,
+                &Transition {
+                    run_id: run_id.clone(),
+                    attempt_id: None,
+                    from_state: Some(answer.from_state),
+                    to_state: answer.to_state,
+                    reason: answer.resolution.as_str().to_string(),
+                    detail: None,
+                    at: now.clone(),
+                },
+            )?;
+        }
+        tx.commit()?;
         Ok(changed > 0)
+    }
+
+    /// Record that a person signed off on one acceptance criterion of
+    /// one run — written only by `relais decide --answer approve
+    /// --criterion <id>`. `INSERT OR REPLACE`: answering the same
+    /// criterion twice updates who last signed it and when, rather than
+    /// refusing or silently duplicating a row a later reader would have
+    /// to pick one of.
+    pub fn record_human_signoff(
+        &self,
+        run_id: &RunId,
+        criterion_id: &str,
+        actor: &str,
+        note: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO human_signoffs
+                (run_id, criterion_id, actor, note, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![run_id.as_str(), criterion_id, actor, note, self.now()],
+        )?;
+        Ok(())
+    }
+
+    /// Every criterion a person has signed off for one run, with who
+    /// signed each — what `verify::acceptance_gaps`/`settle_acceptance`
+    /// read back to stop treating an answered human-sign-off criterion
+    /// as unmet.
+    pub fn human_signoffs(&self, run_id: &RunId) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT criterion_id, actor FROM human_signoffs WHERE run_id = ?1 ORDER BY criterion_id",
+        )?;
+        let rows = stmt.query_map([run_id.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// One piece of evidence bound to a run: the context manifest, a
@@ -2383,9 +2490,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `resolve_decision` closes the open row and is refused, by a plain
-    /// `false` the caller reports by name, for a run with no open
-    /// decision — never raised, or already answered.
+    /// `resolve_decision` closes the open row, assigns the terminal
+    /// state that answer carries, and is refused, by a plain `false` the
+    /// caller reports by name, for a run with no open decision — never
+    /// raised, already answered, or already terminal.
     #[test]
     fn resolve_decision_closes_once_and_refuses_a_run_not_waiting() {
         let (ledger, dir) = temp_ledger();
@@ -2395,10 +2503,14 @@ mod tests {
         assert!(!ledger
             .resolve_decision(
                 &run("run-d"),
-                Reason::DecisionRecorded,
-                "a person",
-                None,
-                None
+                &DecisionAnswer {
+                    resolution: Reason::DecisionRecorded,
+                    actor: "a person",
+                    note: None,
+                    successor_run: None,
+                    from_state: State::Prepared,
+                    to_state: State::Cancelled,
+                },
             )
             .expect("resolve"));
         ledger
@@ -2415,10 +2527,14 @@ mod tests {
         assert!(ledger
             .resolve_decision(
                 &run("run-d"),
-                Reason::DecisionApproved,
-                "a person",
-                Some("looks fine"),
-                Some(&run("run-successor")),
+                &DecisionAnswer {
+                    resolution: Reason::DecisionApproved,
+                    actor: "a person",
+                    note: Some("looks fine"),
+                    successor_run: Some(&run("run-successor")),
+                    from_state: State::NeedsDecision,
+                    to_state: State::Accepted,
+                },
             )
             .expect("resolve"));
         let decision = ledger
@@ -2431,17 +2547,31 @@ mod tests {
         assert_eq!(decision.successor_run, Some(run("run-successor")));
         assert!(decision.resolved_at.is_some());
         assert!(ledger.open_decisions().expect("open").is_empty());
+        assert_eq!(
+            ledger.run_status(&run("run-d")).expect("status"),
+            Some(State::Accepted),
+            "a person's approval assigns the state, not only the decision row"
+        );
         // A second answer to the same run is refused: it is not waiting
         // any more.
         assert!(!ledger
             .resolve_decision(
                 &run("run-d"),
-                Reason::DecisionRejected,
-                "someone else",
-                None,
-                None
+                &DecisionAnswer {
+                    resolution: Reason::DecisionRejected,
+                    actor: "someone else",
+                    note: None,
+                    successor_run: None,
+                    from_state: State::Accepted,
+                    to_state: State::Cancelled,
+                },
             )
             .expect("resolve"));
+        assert_eq!(
+            ledger.run_status(&run("run-d")).expect("status"),
+            Some(State::Accepted),
+            "a refused second answer leaves the run's state exactly as the first left it"
+        );
         // Best effort: the fixture is a temp dir; a leftover costs
         // nothing but disk, and the next run pre-cleans it.
         std::fs::remove_dir_all(&dir).ok();

@@ -13,14 +13,33 @@
 use serde::Serialize;
 
 use crate::ledger::{DecisionRecord, Ledger, PhaseCost, TaskOrigin};
-use crate::lifecycle::State;
+use crate::lifecycle::{Reason, State};
 use crate::money::{CostCompleteness, MicroUsd};
 use crate::outcome::OutcomeKind;
 
+/// Whether the transition that landed this run in `Accepted` carries a
+/// person's own answer (`relais decide --answer approve`) rather than
+/// relais's own checks and review (`Reason::ChecksAndReviewPassed`) —
+/// the fact the report's accepted-by-relais/accepted-by-person split is
+/// read off, since nothing else on the run records who judged it.
+/// `false` for a run that never reached `Accepted` at all.
+fn accepted_by_person(
+    ledger: &Ledger,
+    run_id: &crate::ids::RunId,
+) -> Result<bool, crate::ledger::LedgerError> {
+    Ok(ledger
+        .transitions(run_id)?
+        .iter()
+        .rev()
+        .find(|transition| transition.to_state == State::Accepted)
+        .is_some_and(|transition| transition.reason == Reason::DecisionApproved.as_str()))
+}
+
 /// Bumped whenever a top-level `Report` key is added, renamed or removed
-/// (this task added `cohorts`), so a downstream parser can tell an old
-/// shape from a new one instead of guessing from key presence.
-pub const REPORT_SCHEMA_VERSION: u32 = 4;
+/// (this task added `accepted_tasks_by_relais`/`accepted_tasks_by_person`),
+/// so a downstream parser can tell an old shape from a new one instead of
+/// guessing from key presence.
+pub const REPORT_SCHEMA_VERSION: u32 = 5;
 
 /// A dimension `relais report --by` groups the window's tasks over (SPEC
 /// §11: "compare like task classes and policy versions"). Total over the
@@ -297,6 +316,10 @@ pub struct TaskLine {
     /// Accepted, with no outcome recorded yet: a change the dataset is
     /// still owed a label for.
     pub pending_feedback: bool,
+    /// The task's accepted run — when it has one — was judged by a
+    /// person's `relais decide --answer approve`, not by relais's own
+    /// checks and review. Meaningless when `accepted` is `false`.
+    pub accepted_by_person: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -336,11 +359,24 @@ pub struct Report {
     /// or miss an unknown one.
     pub task_cost_completeness: CostCompleteness,
     pub accepted_tasks: usize,
+    /// `accepted_tasks` judged by relais's own checks and review
+    /// (`Reason::ChecksAndReviewPassed`) — the part of `accepted_tasks`
+    /// that was never a person's own answer. `accepted_tasks_by_relais +
+    /// accepted_tasks_by_person == accepted_tasks` always; printed
+    /// separately because a count that mixed the two would say nothing
+    /// about how much of the primary metric's denominator relais itself
+    /// vouched for.
+    pub accepted_tasks_by_relais: usize,
+    /// `accepted_tasks` judged by a person's `relais decide --answer
+    /// approve` instead — most often a mandatory human-sign-off
+    /// criterion's own answer (SPEC §10).
+    pub accepted_tasks_by_person: usize,
     pub standing_tasks: usize,
     /// Total cost of every run of every in-window task, whatever its
-    /// outcome, divided by `accepted_tasks`: the primary metric (SPEC
-    /// §11), denominated in tasks rather than runs so a task retried to
-    /// acceptance is not counted as multiple cheaper successes.
+    /// outcome, divided by `accepted_tasks` — both relais's own and a
+    /// person's — the primary metric (SPEC §11), denominated in tasks
+    /// rather than runs so a task retried to acceptance is not counted
+    /// as multiple cheaper successes.
     pub cost_per_accepted_task: Option<MicroUsd>,
     /// Same numerator, divided by `standing_tasks`: what an accepted
     /// change actually cost once later-reverted tasks are excluded.
@@ -462,6 +498,7 @@ pub fn runs_report(
     for task_row in ledger.tasks_since(since)? {
         let runs_of_task = ledger.runs_of_task(&task_row.task_id)?;
         let mut accepted_task = false;
+        let mut accepted_task_by_person = false;
         let mut terminal = true;
         let mut escalated = false;
         let mut reviewed = false;
@@ -470,6 +507,9 @@ pub fn runs_report(
             let status = ledger.run_status(run_id)?;
             if status == Some(State::Accepted) {
                 accepted_task = true;
+                if accepted_by_person(ledger, run_id)? {
+                    accepted_task_by_person = true;
+                }
             }
             if by.is_some() {
                 if !status.is_some_and(State::is_terminal) {
@@ -523,6 +563,7 @@ pub fn runs_report(
             standing: standing_task,
             backfilled: task_row.origin == TaskOrigin::Backfilled,
             pending_feedback,
+            accepted_by_person: accepted_task_by_person,
         });
     }
     let cohorts = by.map(|dimension| CohortReport {
@@ -533,6 +574,11 @@ pub fn runs_report(
             .collect(),
     });
     let accepted_tasks = tasks.iter().filter(|task| task.accepted).count();
+    let accepted_tasks_by_person = tasks
+        .iter()
+        .filter(|task| task.accepted && task.accepted_by_person)
+        .count();
+    let accepted_tasks_by_relais = accepted_tasks - accepted_tasks_by_person;
     let standing_tasks = tasks.iter().filter(|task| task.standing).count();
     let pending_feedback = tasks.iter().filter(|task| task.pending_feedback).count();
     let backfilled_tasks = tasks.iter().filter(|task| task.backfilled).count();
@@ -570,6 +616,8 @@ pub fn runs_report(
         ),
         tasks,
         accepted_tasks,
+        accepted_tasks_by_relais,
+        accepted_tasks_by_person,
         standing_tasks,
         cost_per_accepted_task,
         cost_per_standing_change,
@@ -662,6 +710,10 @@ impl Report {
             self.standing_tasks,
             self.accepted_tasks.saturating_sub(self.standing_tasks)
         ));
+        out.push_str(&format!(
+            "  judged by relais: {}, judged by a person: {}\n",
+            self.accepted_tasks_by_relais, self.accepted_tasks_by_person
+        ));
         let feedback_coverage = if self.accepted_tasks > 0 {
             format!(
                 "feedback {}/{} accepted tasks",
@@ -677,7 +729,10 @@ impl Report {
         // exists to print.
         match self.cost_per_accepted_task {
             Some(cost) => out.push_str(&format!(
-                "cost per accepted task: {} ({}) (primary metric)\n",
+                "cost per accepted task (N={}, relais {} + person {}): {} ({}) (primary metric)\n",
+                self.accepted_tasks,
+                self.accepted_tasks_by_relais,
+                self.accepted_tasks_by_person,
                 cost_line(cost, self.task_cost_completeness),
                 feedback_coverage
             )),
@@ -1119,8 +1174,11 @@ mod tests {
                 standing: true,
                 backfilled: false,
                 pending_feedback: true,
+                accepted_by_person: false,
             }],
             accepted_tasks: 1,
+            accepted_tasks_by_relais: 1,
+            accepted_tasks_by_person: 0,
             standing_tasks: 1,
             task_cost_completeness: CostCompleteness::Actual,
             cost_per_accepted_task: Some(MicroUsd::from_micros(10)),
@@ -1322,6 +1380,8 @@ mod tests {
                 "acceptance_rate",
                 "accepted",
                 "accepted_tasks",
+                "accepted_tasks_by_person",
+                "accepted_tasks_by_relais",
                 "backfilled_tasks",
                 "cohorts",
                 "cost_completeness",
@@ -1438,10 +1498,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
     /// An answered run is settled, whatever state it is terminal in.
-    /// `relais decide --answer revise` leaves the run in `needs_review`
-    /// on purpose, so a count by STATE would keep reporting it as
-    /// waiting while the open-decision list right below it — correctly —
-    /// showed nothing.
+    /// `relais decide --answer revise` moves the run to `cancelled` — a
+    /// person's answer ends the run they answered — so a count by STATE
+    /// agrees with the open-decision list right below it, which —
+    /// correctly — shows nothing once the run is answered.
     #[test]
     fn an_answered_run_is_not_still_awaiting_a_person() {
         let dir = temp_dir("answered-not-awaiting");
@@ -1471,23 +1531,27 @@ mod tests {
         ledger
             .resolve_decision(
                 &run,
-                crate::lifecycle::Reason::DecisionRevised,
-                "fredericrous",
-                None,
-                None,
+                &crate::ledger::DecisionAnswer {
+                    resolution: crate::lifecycle::Reason::DecisionRevised,
+                    actor: "fredericrous",
+                    note: None,
+                    successor_run: None,
+                    from_state: State::NeedsReview,
+                    to_state: State::Cancelled,
+                },
             )
             .expect("answered");
 
         let answered = runs_report(&ledger, early, None).expect("report");
         assert_eq!(
             answered.pending_decisions, 0,
-            "answered, though the run is still terminal in needs_review"
+            "answered, and cancelled, so it is no longer owed a look"
         );
         assert!(answered.open_decisions.is_empty());
         assert_eq!(
             answered.runs[0].status,
-            State::NeedsReview,
-            "`revise` leaves the run where it was, on purpose"
+            State::Cancelled,
+            "`revise` ends the run a person answered, same as reject/decided/abandon"
         );
         // Best effort: the fixture is a temp dir; a leftover costs
         // nothing but disk, and the next run pre-cleans it.
