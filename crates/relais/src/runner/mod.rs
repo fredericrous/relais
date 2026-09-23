@@ -2304,6 +2304,11 @@ impl<'a> RunEngine<'a> {
             baseline_cached: ctx.baseline.cached,
             baseline_cache_refused: ctx.baseline.cache_refused.clone(),
         };
+        let (criteria, mandatory_evidence_independence) = verify::settle_acceptance(
+            &self.config.contract.acceptance,
+            &preflight.authority.verification_profile,
+            &report,
+        );
         let receipt = Receipt {
             run_id: self.run_id.as_str().to_string(),
             candidate_sha: candidate.sha.clone(),
@@ -2316,6 +2321,8 @@ impl<'a> RunEngine<'a> {
             attempts: candidate.index,
             cost_completeness: progress.spend.completeness,
             cost: progress.spend.total,
+            criteria,
+            mandatory_evidence_independence,
         };
         self.seal(
             &receipt,
@@ -2767,6 +2774,14 @@ impl<'a> RunEngine<'a> {
                 gaps.push(format!("amont inventory: {e}"));
             }
         }
+        // A mandatory criterion whose named check produced no evidence
+        // is a gap here too — the same mechanism that already refuses a
+        // gap, not a second acceptance path (SPEC §10).
+        gaps.extend(verify::acceptance_gaps(
+            &self.config.contract.acceptance,
+            &authority.verification_profile,
+            &checks,
+        ));
         // The throwaway worktree has done its work. Releasing it here —
         // rather than leaving it to `Drop` — is what gives the failure
         // somewhere to be reported.
@@ -2893,7 +2908,7 @@ impl<'a> RunEngine<'a> {
         prompt.push_str(&data_block("objective", &self.config.contract.objective));
         prompt.push_str(&data_list_block(
             "acceptance criteria",
-            &self.config.contract.acceptance,
+            &self.config.contract.acceptance_statements(),
         ));
         if !request.manifest.constraints.is_empty() {
             prompt.push_str(&data_list_block(
@@ -3337,7 +3352,7 @@ fn build_prompt(
     prompt.push_str("verification decides whether the criteria below are met, not you.\n");
     prompt.push_str(&data_list_block(
         "acceptance criteria",
-        &contract.acceptance,
+        &contract.acceptance_statements(),
     ));
     if !manifest.constraints.is_empty() {
         prompt.push_str("the architectural constraints below are in force.\n");
@@ -3853,6 +3868,7 @@ mod tests {
     /// visible from preflight and the candidate must make them green).
     fn main_gone_check() -> CommandSpec {
         CommandSpec {
+            name: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/main.rs".into()],
             timeout_seconds: 30,
         }
@@ -3870,6 +3886,7 @@ mod tests {
         // on a machine with no distribution installed.
         let shell = if cfg!(windows) { "sh" } else { "bash" };
         CommandSpec {
+            name: None,
             argv: vec![shell.into(), "-c".into(), "test ! -f src/main.rs".into()],
             timeout_seconds: 30,
         }
@@ -3877,6 +3894,7 @@ mod tests {
 
     fn passing_check() -> CommandSpec {
         CommandSpec {
+            name: None,
             argv: vec!["sh".into(), "-c".into(), "true".into()],
             timeout_seconds: 30,
         }
@@ -4132,6 +4150,7 @@ mod tests {
         // A check green at the base, red once the worker's change lands —
         // and the worker never makes a second change.
         let no_evil = CommandSpec {
+            name: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/evil.txt".into()],
             timeout_seconds: 30,
         };
@@ -4627,6 +4646,7 @@ mod tests {
         let fixture = Fixture::new();
         // Green at the base, red forever once the worker churns.
         let no_tick0 = CommandSpec {
+            name: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/tick-0.txt".into()],
             timeout_seconds: 30,
         };
@@ -4682,6 +4702,7 @@ mod tests {
     fn attempts_ceiling_without_allowance_fails_the_task() {
         let fixture = Fixture::new();
         let no_tick0 = CommandSpec {
+            name: None,
             argv: vec![
                 "sh".into(),
                 "-c".into(),
@@ -4739,6 +4760,7 @@ mod tests {
         // candidate. Churning candidates avoid the unchanged-candidate
         // shortcut so the full repair-escalation ladder runs out first.
         let marker = CommandSpec {
+            name: None,
             argv: vec!["sh".into(), "-c".into(), "test -f src/marker.txt".into()],
             timeout_seconds: 30,
         };
@@ -5744,6 +5766,7 @@ mod tests {
 
     fn sh(script: &str) -> CommandSpec {
         CommandSpec {
+            name: None,
             argv: vec!["sh".into(), "-c".into(), script.into()],
             timeout_seconds: 30,
         }
@@ -5786,6 +5809,7 @@ mod tests {
         let mut repo = fixture.repo_policy(
             vec![
                 CommandSpec {
+                    name: None,
                     argv: vec!["relais-no-such-binary-4f3a".into()],
                     timeout_seconds: 30,
                 },
@@ -5938,6 +5962,7 @@ mod tests {
         // would pass; git's sh accepts `C:/…` as it is.
         let flag_for_sh = flag.to_string_lossy().replace('\\', "/");
         let setup = CommandSpec {
+            name: None,
             argv: vec![
                 shell.into(),
                 "-c".into(),
@@ -6877,6 +6902,7 @@ mod tests {
             "2026-09-20T12:00:00+00:00",
         ])));
         let no_tick0 = CommandSpec {
+            name: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/tick-0.txt".into()],
             timeout_seconds: 30,
         };
@@ -6979,6 +7005,7 @@ mod tests {
     fn an_exhausted_run_does_not_dispatch_the_reviewer() {
         let fixture = Fixture::new();
         let green = CommandSpec {
+            name: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/main.rs".into()],
             timeout_seconds: 30,
         };

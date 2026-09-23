@@ -5,6 +5,7 @@
 //! acceptance (SPEC §1). Nothing in this crate equates a check pass with
 //! semantic correctness, or a worker's completion message with acceptance.
 
+pub mod acceptance;
 pub mod adapter;
 pub mod admission;
 pub mod backend;

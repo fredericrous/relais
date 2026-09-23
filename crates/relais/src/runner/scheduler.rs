@@ -652,7 +652,7 @@ fn run_package(
         ),
         base_ref: input_sha.to_string(),
         read_hints: contract.read_hints.clone(),
-        acceptance: package.acceptance.clone(),
+        acceptance: package.acceptance.iter().cloned().map(Into::into).collect(),
         verification_profile: contract.verification_profile.clone(),
         architecture: contract.architecture.clone(),
         risk_hints: contract.risk_hints.clone(),
@@ -965,6 +965,16 @@ fn accept_integrated(
         baseline_cached: root.baseline_cached,
         baseline_cache_refused: root.baseline_cache_refused.clone(),
     };
+    // The criteria settled here are the ROOT contract's, not the work
+    // plan's `integration_acceptance` — the latter is still bare strings
+    // (SPEC §19), while the former is what `verify_candidate` gated the
+    // assembled revision on above. A receipt that named neither would
+    // say nothing about criteria the run was in fact refused against.
+    let (criteria, mandatory_evidence_independence) = verify::settle_acceptance(
+        &engine.config.contract.acceptance,
+        &root.authority.verification_profile,
+        &report,
+    );
     let receipt = Receipt {
         run_id: engine.run_id.as_str().to_string(),
         candidate_sha: head.clone(),
@@ -977,6 +987,8 @@ fn accept_integrated(
         attempts: assembly.attempts_total,
         cost_completeness: spend.completeness,
         cost: spend.total,
+        criteria,
+        mandatory_evidence_independence,
     };
     engine.seal(&receipt, None, None, &head)?;
     // The assembled revision is named under this run so the retirement
@@ -1034,7 +1046,10 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
     // is quoted inside its own labelled fence.
     prompt.push_str(&data_block("objective", &contract.objective));
     prompt.push_str(&format!("write_scope: {:?}\n", contract.scope_patterns()));
-    prompt.push_str(&data_list_block("acceptance", &contract.acceptance));
+    prompt.push_str(&data_list_block(
+        "acceptance",
+        &contract.acceptance_statements(),
+    ));
     if !root.manifest.constraints.is_empty() {
         prompt.push_str(&data_list_block("constraints", &root.manifest.constraints));
     }

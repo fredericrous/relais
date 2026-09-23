@@ -51,13 +51,15 @@ IMPURE = {
 }
 # Modules whose non-test code must stay free of the operations above.
 # `policy` decides authority; `contract` and `route` decide from it;
-# `money`, `ids`, `lifecycle` and `resume` are leaf calculations whose
-# inputs — including the clock — are parameters.
+# `acceptance`, `money`, `ids`, `lifecycle`, `outcome` and `resume` are
+# leaf calculations whose inputs — including the clock — are parameters.
 PURE_MODULES = {
+    "acceptance",
     "contract",
     "ids",
     "lifecycle",
     "money",
+    "outcome",
     "policy",
     "resume",
     "route",

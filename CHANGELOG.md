@@ -10,6 +10,30 @@ missing here.
 
 ### Added
 
+- **A contract can now declare which check, test, review or sign-off
+  settles an acceptance criterion.** An acceptance entry is still a
+  bare string, exactly as before, or a declared criterion carrying a
+  statement, an optional id, whether it is mandatory, and its evidence:
+  a named check from the verification profile (`CommandSpec` gains an
+  optional `name`), a test recorded as pre-existing, human-added or
+  model-added, an LLM review, or a human sign-off. A declared criterion
+  naming a check no profile defines is refused at preflight, before any
+  dispatch. A mandatory criterion whose evidence never produced anything
+  to check becomes a gap in the existing verification report — refused
+  by the mechanism that already refuses gaps — rather than a second
+  acceptance path; a criterion settled only by a model-added test or an
+  LLM review is still accepted once the checks pass, because a model
+  writing the test that judges its own work is not independent evidence
+  about it. A mandatory criterion asking for a human sign-off is always
+  a gap for now: relais has no record of a person signing anything, and
+  reading its answer off the passing checks would report a sign-off
+  nobody gave. The receipt now records, per criterion, whether it was
+  met and by which evidence, plus a summary of how independent the
+  mandatory criteria's evidence was — for a decomposed run too, settled
+  against the root contract its assembled revision was verified on. A
+  contract written entirely in bare strings hashes exactly as it did
+  before this change.
+
 - **A usage event now says what produced it.** Every recorded dispatch —
   a worker attempt, the reviewer, the planner — carries its phase
   (`initial`, `repair`, `escalation`, `review`, `planning`,

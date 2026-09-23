@@ -141,9 +141,24 @@ pub struct Integrations {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandSpec {
+    /// The name a declared acceptance criterion's `Evidence::Check`
+    /// names. Omitted from the serialized form when absent, so the
+    /// authority hash of a policy that never named a check is unchanged
+    /// by this field existing at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub argv: Vec<String>,
     #[serde(default = "default_command_timeout")]
     pub timeout_seconds: u64,
+}
+
+/// The command a profile defines under `name`, if any — what a declared
+/// criterion's `Evidence::Check { name }` refers to.
+pub fn named_command<'a>(profile: &'a VerificationProfile, name: &str) -> Option<&'a CommandSpec> {
+    profile
+        .commands
+        .iter()
+        .find(|command| command.name.as_deref() == Some(name))
 }
 
 fn default_command_timeout() -> u64 {
@@ -873,6 +888,10 @@ pub enum BlockCode {
     /// A contract read hint names nothing at the base revision: the
     /// worker would be pointed at a path this tree does not have.
     ReadHintUnresolvable,
+    /// A declared acceptance criterion names a check the verification
+    /// profile does not define. Refused before dispatch: a criterion
+    /// nothing can settle is not a narrower contract, it is a broken one.
+    AcceptanceCheckUnknown,
 }
 
 impl BlockCode {
@@ -903,6 +922,7 @@ impl BlockCode {
             Self::PermissionDenied => "permission_denied",
             Self::ModelUnverified => "model_unverified",
             Self::ReadHintUnresolvable => "read_hint_unresolvable",
+            Self::AcceptanceCheckUnknown => "acceptance_check_unknown",
         }
     }
 }
@@ -991,6 +1011,25 @@ pub fn effective_authority(
             });
             VerificationProfile::default()
         });
+
+    // A declared criterion that names a check the profile does not
+    // define would settle nothing, ever: refused here, before any
+    // dispatch, naming both the criterion and the check (SPEC §10).
+    for criterion in &contract.acceptance {
+        if let Some(crate::acceptance::Evidence::Check { name }) = criterion.evidence() {
+            if named_command(&profile, name).is_none() {
+                blockers.push(Blocker {
+                    code: BlockCode::AcceptanceCheckUnknown,
+                    detail: format!(
+                        "acceptance criterion `{}` names check `{name}`, which verification \
+                         profile `{}` does not define",
+                        criterion.id(),
+                        contract.verification_profile
+                    ),
+                });
+            }
+        }
+    }
 
     let authority_hash = repo.authority_hash();
     let grant_key = grant_key(&authority_hash, repo_identity);
@@ -1355,6 +1394,99 @@ keys = ["output.contract"]
         );
         let a = effective_authority(&with_setup, &machine, &contract(), &identity());
         assert!(!a.trust_granted, "the grant was reviewed without the setup");
+    }
+
+    /// `CommandSpec.name` is what a declared criterion's evidence names;
+    /// absent, it must not appear at all in what the authority hash is
+    /// taken over, so a policy written before this field existed keeps
+    /// the hash its trust grant was reviewed against.
+    #[test]
+    fn an_absent_command_name_does_not_reach_the_authority_hash_input() {
+        let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        let value = serde_json::to_value(&repo).expect("a policy serializes");
+        let commands = value["verification"]["profiles"]["rust-change"]["commands"]
+            .as_array()
+            .expect("commands array");
+        assert!(
+            !commands[0]
+                .as_object()
+                .expect("a command is an object")
+                .contains_key("name"),
+            "an absent command name must not appear in the hashed form: {value}"
+        );
+
+        let named = RepoPolicy::from_toml_str(&REPO_TOML.replace(
+            "[[verification.profiles.rust-change.commands]]\nargv = [\"make\", \"check\"]",
+            "[[verification.profiles.rust-change.commands]]\n\
+             name = \"make check\"\nargv = [\"make\", \"check\"]",
+        ))
+        .expect("parses");
+        assert_ne!(
+            repo.authority_hash(),
+            named.authority_hash(),
+            "naming a command IS a change once it is written"
+        );
+    }
+
+    /// SPEC §10: a declared criterion naming a check no profile defines
+    /// would settle nothing, ever. Refused at preflight, before any
+    /// dispatch, by a block code naming both the criterion and the check.
+    #[test]
+    fn a_declared_criterion_naming_an_unknown_check_is_refused_before_dispatch() {
+        let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        let machine =
+            MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo))).expect("parses");
+        let mut c = contract();
+        let entry =
+            crate::acceptance::AcceptanceEntry::Declared(crate::acceptance::DeclaredCriterion {
+                statement: "the api rejects malformed input".into(),
+                id: None,
+                mandatory: true,
+                evidence: crate::acceptance::Evidence::Check {
+                    name: "no-such-check".into(),
+                },
+            });
+        let entry_id = entry.id();
+        c.acceptance = vec![entry];
+        let a = effective_authority(&repo, &machine, &c, &identity());
+        let blocker = a
+            .blockers
+            .iter()
+            .find(|b| b.code == BlockCode::AcceptanceCheckUnknown)
+            .expect("a criterion naming an unknown check must be refused before dispatch");
+        assert!(blocker.detail.contains("no-such-check"), "{blocker:?}");
+        assert!(blocker.detail.contains(&entry_id), "{blocker:?}");
+    }
+
+    #[test]
+    fn a_declared_criterion_naming_a_defined_check_is_not_blocked() {
+        let named = RepoPolicy::from_toml_str(&REPO_TOML.replace(
+            "[[verification.profiles.rust-change.commands]]\nargv = [\"make\", \"check\"]",
+            "[[verification.profiles.rust-change.commands]]\n\
+             name = \"make check\"\nargv = [\"make\", \"check\"]",
+        ))
+        .expect("parses");
+        let machine =
+            MachineSettings::from_toml_str(&machine_toml(&grant_for(&named))).expect("parses");
+        let mut c = contract();
+        c.acceptance = vec![crate::acceptance::AcceptanceEntry::Declared(
+            crate::acceptance::DeclaredCriterion {
+                statement: "it builds".into(),
+                id: None,
+                mandatory: true,
+                evidence: crate::acceptance::Evidence::Check {
+                    name: "make check".into(),
+                },
+            },
+        )];
+        let a = effective_authority(&named, &machine, &c, &identity());
+        assert!(
+            !a.blockers
+                .iter()
+                .any(|b| b.code == BlockCode::AcceptanceCheckUnknown),
+            "a check the profile defines must not be blocked: {:?}",
+            a.blockers
+        );
     }
 
     #[test]

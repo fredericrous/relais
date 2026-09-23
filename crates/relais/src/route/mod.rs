@@ -620,6 +620,7 @@ mod tests {
                     VerificationProfile {
                         setup: Vec::new(),
                         commands: vec![CommandSpec {
+                            name: None,
                             argv: vec!["make".into(), "check".into()],
                             timeout_seconds: 300,
                         }],
