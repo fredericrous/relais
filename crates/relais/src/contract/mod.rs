@@ -208,7 +208,9 @@ pub struct TaskContract {
     pub base_ref: String,
     pub read_hints: Vec<String>,
     /// Acceptance criteria; for `inspect` these are evidence criteria.
-    pub acceptance: Vec<String>,
+    /// Each entry is a bare string, exactly as always, or a declared
+    /// criterion naming its own evidence (SPEC §10).
+    pub acceptance: Vec<crate::acceptance::AcceptanceEntry>,
     pub verification_profile: String,
     pub architecture: Architecture,
     pub risk_hints: Vec<String>,
@@ -244,7 +246,7 @@ struct ContractWire {
     write_scope: Option<Vec<String>>,
     #[serde(default)]
     read_hints: Vec<String>,
-    acceptance: Vec<String>,
+    acceptance: Vec<crate::acceptance::AcceptanceEntry>,
     verification_profile: String,
     #[serde(default)]
     architecture: Architecture,
@@ -772,9 +774,9 @@ impl TaskContract {
         }
         let mut seen = std::collections::BTreeSet::new();
         for criterion in &self.acceptance {
-            if !seen.insert(criterion.trim()) {
+            if !seen.insert(criterion.statement().trim()) {
                 return Err(ContractError::DuplicateAcceptanceCriterion(
-                    criterion.clone(),
+                    criterion.statement().to_string(),
                 ));
             }
         }
@@ -790,6 +792,15 @@ impl TaskContract {
             plan.validate()?;
         }
         Ok(())
+    }
+
+    /// The acceptance list's own text, for a prompt or a report that
+    /// quotes criteria rather than judging their evidence.
+    pub fn acceptance_statements(&self) -> Vec<String> {
+        self.acceptance
+            .iter()
+            .map(|criterion| criterion.statement().to_string())
+            .collect()
     }
 
     /// Canonical form: the fully materialized struct, not the source text.
@@ -948,6 +959,53 @@ mod tests {
         );
         assert!(c.architecture.keys.is_empty());
         assert_eq!(c.architecture.scope, None);
+    }
+
+    /// A contract's acceptance entry is either a bare string, exactly as
+    /// today, or a declared criterion carrying its own evidence — the two
+    /// forms parse from one untagged field (SPEC §4, §10).
+    #[test]
+    fn a_declared_criterion_parses_alongside_bare_strings() {
+        let json = r#"{
+          "schema_version": 1,
+          "kind": "change",
+          "objective": "Reject malformed input",
+          "base_ref": "HEAD",
+          "write_scope": ["src/**"],
+          "acceptance": [
+            "it builds",
+            {
+              "statement": "the api rejects malformed input",
+              "id": "rejects-malformed",
+              "mandatory": true,
+              "evidence": {"kind": "check", "name": "make check"}
+            },
+            {
+              "statement": "a regression test exists",
+              "mandatory": false,
+              "evidence": {"kind": "test", "authorship": "model_added"}
+            }
+          ],
+          "verification_profile": "rust-change"
+        }"#;
+        let c = TaskContract::from_json_str(json).expect("parses");
+        assert_eq!(
+            c.acceptance_statements(),
+            [
+                "it builds",
+                "the api rejects malformed input",
+                "a regression test exists"
+            ]
+        );
+        assert_eq!(c.acceptance[1].id(), "rejects-malformed");
+        assert!(c.acceptance[0].mandatory());
+        assert!(!c.acceptance[2].mandatory());
+        assert_eq!(
+            c.acceptance[1].evidence(),
+            Some(&crate::acceptance::Evidence::Check {
+                name: "make check".into()
+            })
+        );
     }
 
     /// P5: a scope is untrusted input. A pattern that cannot bound
@@ -1224,15 +1282,17 @@ mod tests {
         assert!(changed_controls(&base, &narrowed).scope);
     }
 
-    /// Adding `task_id` (task-linking) must not move the canonical hash
-    /// of a contract that does not declare one: the field is omitted
-    /// from the wire form when absent, so every hash minted before this
+    /// The canonical hash of a contract that declares neither a
+    /// `task_id` nor a single declared acceptance criterion must not
+    /// move. `task_id` is omitted from the wire form when absent, and an
+    /// acceptance entry written as a bare string still serializes as
+    /// that string — untagged — so every hash minted before either
     /// package stays valid.
     /// The pinned value was read off the BASE commit (2f37f80), before
-    /// this package existed: a golden hash a candidate pins from its own
+    /// this work existed: a golden hash a candidate pins from its own
     /// output cannot tell "unchanged" from "changed and re-pinned".
     #[test]
-    fn example_contract_hash_is_unchanged_by_task_linking() {
+    fn example_contract_hash_is_unchanged_by_task_linking_or_criteria() {
         let c = TaskContract::from_json_str(EXAMPLE).expect("parses");
         assert_eq!(
             c.hash(),

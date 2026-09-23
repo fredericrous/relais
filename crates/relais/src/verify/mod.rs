@@ -19,9 +19,12 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::acceptance::{independent, AcceptanceEntry, Evidence};
 use crate::ids::{canonical_json_hash, sha256_hex};
 use crate::money::{CostCompleteness, MicroUsd};
-use crate::policy::{CommandSpec, DependencyMode, Integrations, VerificationProfile};
+use crate::policy::{
+    named_command, CommandSpec, DependencyMode, Integrations, VerificationProfile,
+};
 use crate::procs::Ended;
 use crate::tooling::{ProgramVersion, VersionUnknown};
 use crate::workspace::{Git, WorkspaceError};
@@ -142,6 +145,160 @@ impl VerificationReport {
             .map(|check| check.label.clone())
             .collect()
     }
+}
+
+/// Mandatory criteria whose declared evidence produced nothing to
+/// check: a gap in this same report, not a second acceptance path — the
+/// run is refused by the mechanism that already refuses gaps (SPEC §10).
+///
+/// Two kinds of evidence can come up empty. A named check may have
+/// produced no outcome; a named check that ran and FAILED is already a
+/// failing check and needs no separate gap, and preflight already
+/// refuses a name no profile defines, so that branch here is defensive.
+/// A human sign-off has no record anywhere in relais yet — nothing
+/// writes one and nothing reads one — so a mandatory criterion asking
+/// for one can never be satisfied, and saying it was met would be the
+/// silent pass this function exists to prevent.
+pub fn acceptance_gaps(
+    entries: &[AcceptanceEntry],
+    profile: &VerificationProfile,
+    checks: &[CheckOutcome],
+) -> Vec<String> {
+    let mut gaps = Vec::new();
+    for entry in entries {
+        if !entry.mandatory() {
+            continue;
+        }
+        match entry.evidence() {
+            Some(Evidence::Check { name }) => match named_command(profile, name) {
+                Some(spec) => {
+                    let label = check_label(spec);
+                    if !checks.iter().any(|check| check.label == label) {
+                        gaps.push(format!(
+                            "acceptance criterion `{}` names check `{name}`, which produced no \
+                             evidence",
+                            entry.id()
+                        ));
+                    }
+                }
+                None => gaps.push(format!(
+                    "acceptance criterion `{}` names check `{name}`, which the verification \
+                     profile does not define",
+                    entry.id()
+                )),
+            },
+            Some(Evidence::HumanSignOff) => gaps.push(format!(
+                "acceptance criterion `{}` names a human sign-off, which nothing has recorded",
+                entry.id()
+            )),
+            // A test runs inside the profile's own commands and an LLM
+            // review is the reviewer's verdict: both are settled by the
+            // report as a whole, so neither can come up empty on its own.
+            // A bare string has declared no evidence to be missing.
+            Some(Evidence::Test { .. } | Evidence::LlmReview) | None => {}
+        }
+    }
+    gaps
+}
+
+/// How independent the mandatory criteria's evidence was, taken
+/// together (SPEC §10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndependenceSummary {
+    AllIndependent,
+    PartlyIndependent,
+    NoneIndependent,
+}
+
+/// One acceptance criterion's settlement: whether it was met, and by
+/// which evidence. `evidence` is absent for a bare string, which has
+/// none declared.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CriterionOutcome {
+    pub id: String,
+    pub statement: String,
+    pub mandatory: bool,
+    pub met: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Evidence>,
+}
+
+/// Settle every acceptance criterion against a finished verification
+/// report. A named check is met exactly when its own outcome succeeded.
+/// A test, a review, or a bare string with no evidence declared is met
+/// exactly when the report as a whole is accepted, because nothing here
+/// can isolate one test's result inside a command that runs many. A
+/// criterion settled only by a model-added test or an LLM review is
+/// still accepted when the checks pass: relais reports what it knows
+/// (the evidence was not independent) rather than inventing a stricter
+/// rule than the contract asked for (SPEC §10).
+///
+/// A human sign-off is the one kind that passing checks cannot settle,
+/// because it is not a claim about the code: relais has no record of a
+/// person signing anything, so the criterion is unmet and
+/// [`acceptance_gaps`] raises it as a gap. Reading it off `accepted`
+/// would report a sign-off nobody gave.
+pub fn settle_acceptance(
+    entries: &[AcceptanceEntry],
+    profile: &VerificationProfile,
+    report: &VerificationReport,
+) -> (Vec<CriterionOutcome>, Option<IndependenceSummary>) {
+    let accepted = report.accepted();
+    let criteria = entries
+        .iter()
+        .map(|entry| {
+            let evidence = entry.evidence().cloned();
+            let met = match &evidence {
+                Some(Evidence::Check { name }) => {
+                    named_command(profile, name).is_some_and(|spec| {
+                        let label = check_label(spec);
+                        report
+                            .checks
+                            .iter()
+                            .any(|check| check.label == label && !check.failed())
+                    })
+                }
+                Some(Evidence::Test { .. } | Evidence::LlmReview) | None => accepted,
+                // Nothing records a sign-off, so nothing can find one.
+                Some(Evidence::HumanSignOff) => false,
+            };
+            CriterionOutcome {
+                id: entry.id(),
+                statement: entry.statement().to_string(),
+                mandatory: entry.mandatory(),
+                met,
+                evidence,
+            }
+        })
+        .collect();
+
+    let mandatory_independence: Vec<bool> = entries
+        .iter()
+        .filter(|entry| entry.mandatory())
+        .map(|entry| match entry.evidence() {
+            Some(evidence) => independent(evidence),
+            // Settled by the verification profile as a whole: a check,
+            // in spirit, and so independent.
+            None => true,
+        })
+        .collect();
+    let summary = if mandatory_independence.is_empty() {
+        None
+    } else if mandatory_independence
+        .iter()
+        .all(|&is_independent| is_independent)
+    {
+        Some(IndependenceSummary::AllIndependent)
+    } else if mandatory_independence
+        .iter()
+        .all(|&is_independent| !is_independent)
+    {
+        Some(IndependenceSummary::NoneIndependent)
+    } else {
+        Some(IndependenceSummary::PartlyIndependent)
+    };
+    (criteria, summary)
 }
 
 /// Run one command against a directory, capturing the merged log to a file
@@ -1032,6 +1189,15 @@ pub struct Receipt {
     pub attempts: u32,
     pub cost_completeness: CostCompleteness,
     pub cost: MicroUsd,
+    /// Per-criterion settlement: whether each acceptance criterion was
+    /// met, and by which evidence. Defaults to empty so a receipt
+    /// written before this existed still parses (SPEC §12).
+    #[serde(default)]
+    pub criteria: Vec<CriterionOutcome>,
+    /// How independent the mandatory criteria's evidence was, taken
+    /// together; `None` when there was nothing mandatory to summarize.
+    #[serde(default)]
+    pub mandatory_evidence_independence: Option<IndependenceSummary>,
 }
 
 impl Receipt {
@@ -1171,6 +1337,7 @@ mod tests {
 
     fn command(argv: &[&str], timeout_seconds: u64) -> CommandSpec {
         CommandSpec {
+            name: None,
             argv: argv.iter().map(|a| a.to_string()).collect(),
             timeout_seconds,
         }
@@ -1940,6 +2107,291 @@ mod tests {
         assert!(!blocked.accepted(), "a gap is never a pass");
     }
 
+    fn named(name: &str, argv: &[&str], timeout_seconds: u64) -> CommandSpec {
+        CommandSpec {
+            name: Some(name.to_string()),
+            argv: argv.iter().map(|a| a.to_string()).collect(),
+            timeout_seconds,
+        }
+    }
+
+    /// A mandatory declared criterion — the default a bare string has
+    /// always had.
+    fn declared(statement: &str, evidence: crate::acceptance::Evidence) -> AcceptanceEntry {
+        AcceptanceEntry::Declared(crate::acceptance::DeclaredCriterion {
+            statement: statement.to_string(),
+            id: None,
+            mandatory: true,
+            evidence,
+        })
+    }
+
+    /// A criterion the contract declared optional.
+    fn declared_optional(
+        statement: &str,
+        evidence: crate::acceptance::Evidence,
+    ) -> AcceptanceEntry {
+        AcceptanceEntry::Declared(crate::acceptance::DeclaredCriterion {
+            statement: statement.to_string(),
+            id: None,
+            mandatory: false,
+            evidence,
+        })
+    }
+
+    /// SPEC §10: a mandatory criterion whose declared evidence never
+    /// produced anything to check is a gap in the SAME report the
+    /// required-check gaps live in, not a second acceptance path — so a
+    /// candidate whose only mandatory criterion is unmet is refused by
+    /// the mechanism that already refuses gaps.
+    #[test]
+    fn a_candidate_whose_only_mandatory_criterion_is_unmet_is_not_accepted() {
+        let profile = VerificationProfile {
+            setup: Vec::new(),
+            commands: vec![named("lint", &["sh", "-c", "true"], 10)],
+            amont_checks: Vec::new(),
+            amont_waivers: Vec::new(),
+            inputs: Vec::new(),
+            cache_baseline: false,
+        };
+        let entries = vec![declared(
+            "the api rejects malformed input",
+            crate::acceptance::Evidence::Check {
+                name: "security-scan".into(),
+            },
+        )];
+        // The profile's own commands all ran and passed; `security-scan`
+        // is simply not among them.
+        let checks = vec![CheckOutcome {
+            label: check_label(&profile.commands[0]),
+            argv: profile.commands[0].argv.clone(),
+            ended: Ended::Exited(0),
+            log_path: "x.log".into(),
+            log_sha256: "h".into(),
+        }];
+        let gaps = acceptance_gaps(&entries, &profile, &checks);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps[0].contains("security-scan"), "{gaps:?}");
+
+        let report = VerificationReport {
+            candidate_sha: "abc".into(),
+            base_sha: "def".into(),
+            contract_hash: "ch".into(),
+            policy_hash: "ph".into(),
+            checks,
+            gaps,
+            baseline_failures: Vec::new(),
+            amont_bypasses: Vec::new(),
+            amont_downgrades: Vec::new(),
+            verification_inputs_changed: Vec::new(),
+            integration_gaps: Vec::new(),
+            baseline_cached: false,
+            baseline_cache_refused: None,
+        };
+        assert!(
+            !report.accepted(),
+            "an unmet mandatory criterion must not be accepted"
+        );
+    }
+
+    /// A criterion settled only by a model-added test or an LLM review
+    /// is still accepted once the checks pass; the receipt says the
+    /// evidence was not independent rather than inventing a stricter
+    /// acceptance rule than the contract asked for (SPEC §10).
+    #[test]
+    fn settling_reports_met_when_checks_pass_and_independence_honestly() {
+        let profile = VerificationProfile {
+            setup: Vec::new(),
+            commands: vec![named("check", &["sh", "-c", "true"], 10)],
+            amont_checks: Vec::new(),
+            amont_waivers: Vec::new(),
+            inputs: Vec::new(),
+            cache_baseline: false,
+        };
+        let checks = vec![CheckOutcome {
+            label: check_label(&profile.commands[0]),
+            argv: profile.commands[0].argv.clone(),
+            ended: Ended::Exited(0),
+            log_path: "x.log".into(),
+            log_sha256: "h".into(),
+        }];
+        let report = VerificationReport {
+            candidate_sha: "abc".into(),
+            base_sha: "def".into(),
+            contract_hash: "ch".into(),
+            policy_hash: "ph".into(),
+            checks,
+            gaps: Vec::new(),
+            baseline_failures: Vec::new(),
+            amont_bypasses: Vec::new(),
+            amont_downgrades: Vec::new(),
+            verification_inputs_changed: Vec::new(),
+            integration_gaps: Vec::new(),
+            baseline_cached: false,
+            baseline_cache_refused: None,
+        };
+        assert!(report.accepted());
+
+        let entries = vec![
+            declared(
+                "the new endpoint is exercised",
+                crate::acceptance::Evidence::Test {
+                    authorship: crate::acceptance::TestAuthorship::ModelAdded,
+                },
+            ),
+            declared(
+                "the change is coherent",
+                crate::acceptance::Evidence::LlmReview,
+            ),
+        ];
+        let (criteria, summary) = settle_acceptance(&entries, &profile, &report);
+        assert!(
+            criteria.iter().all(|c| c.met),
+            "checks passed, so every criterion is met: {criteria:?}"
+        );
+        assert_eq!(
+            summary,
+            Some(IndependenceSummary::NoneIndependent),
+            "neither a model-added test nor an LLM review is independent"
+        );
+    }
+
+    /// The failure this test exists for: a mandatory criterion asking
+    /// for a human sign-off used to read its answer off `accepted`, so
+    /// passing checks reported a sign-off nobody gave — and
+    /// `independent()` then counted that invention toward
+    /// `AllIndependent`. Nothing in relais records a sign-off yet, so
+    /// the criterion is unmet and the report carries a gap.
+    #[test]
+    fn a_human_sign_off_nobody_gave_is_a_gap_not_a_pass() {
+        let profile = VerificationProfile {
+            setup: Vec::new(),
+            commands: vec![named("check", &["sh", "-c", "true"], 10)],
+            amont_checks: Vec::new(),
+            amont_waivers: Vec::new(),
+            inputs: Vec::new(),
+            cache_baseline: false,
+        };
+        let checks = vec![CheckOutcome {
+            label: check_label(&profile.commands[0]),
+            argv: profile.commands[0].argv.clone(),
+            ended: Ended::Exited(0),
+            log_path: "x.log".into(),
+            log_sha256: "h".into(),
+        }];
+        let entries = vec![declared(
+            "a person signed off on the migration",
+            crate::acceptance::Evidence::HumanSignOff,
+        )];
+
+        let gaps = acceptance_gaps(&entries, &profile, &checks);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps[0].contains("human sign-off"), "{gaps:?}");
+
+        let report = VerificationReport {
+            candidate_sha: "abc".into(),
+            base_sha: "def".into(),
+            contract_hash: "ch".into(),
+            policy_hash: "ph".into(),
+            checks,
+            gaps,
+            baseline_failures: Vec::new(),
+            amont_bypasses: Vec::new(),
+            amont_downgrades: Vec::new(),
+            verification_inputs_changed: Vec::new(),
+            integration_gaps: Vec::new(),
+            baseline_cached: false,
+            baseline_cache_refused: None,
+        };
+        assert!(
+            !report.accepted(),
+            "every check passed, but the sign-off is still missing"
+        );
+
+        let (criteria, summary) = settle_acceptance(&entries, &profile, &report);
+        assert!(
+            !criteria[0].met,
+            "an unrecorded sign-off is not met: {criteria:?}"
+        );
+        assert_eq!(summary, Some(IndependenceSummary::AllIndependent));
+    }
+
+    #[test]
+    fn an_all_independent_and_a_mixed_mandatory_set_summarize_honestly() {
+        let profile = VerificationProfile::default();
+        let accepted = VerificationReport {
+            candidate_sha: "abc".into(),
+            base_sha: "def".into(),
+            contract_hash: "ch".into(),
+            policy_hash: "ph".into(),
+            checks: Vec::new(),
+            gaps: Vec::new(),
+            baseline_failures: Vec::new(),
+            amont_bypasses: Vec::new(),
+            amont_downgrades: Vec::new(),
+            verification_inputs_changed: Vec::new(),
+            integration_gaps: Vec::new(),
+            baseline_cached: false,
+            baseline_cache_refused: None,
+        };
+        let (_, all_independent) = settle_acceptance(
+            &[AcceptanceEntry::Bare("it builds".into())],
+            &profile,
+            &accepted,
+        );
+        assert_eq!(all_independent, Some(IndependenceSummary::AllIndependent));
+
+        let mixed = vec![
+            AcceptanceEntry::Bare("it builds".into()),
+            declared(
+                "reviewed for coherence",
+                crate::acceptance::Evidence::LlmReview,
+            ),
+        ];
+        let (_, partly) = settle_acceptance(&mixed, &profile, &accepted);
+        assert_eq!(partly, Some(IndependenceSummary::PartlyIndependent));
+
+        // A non-mandatory criterion does not enter the summary at all.
+        let only_optional = vec![declared_optional(
+            "nice to have",
+            crate::acceptance::Evidence::LlmReview,
+        )];
+        let (_, none_mandatory) = settle_acceptance(&only_optional, &profile, &accepted);
+        assert_eq!(none_mandatory, None);
+    }
+
+    /// A receipt written before per-criterion settlement existed has
+    /// neither field; both default, so it still parses (SPEC §12).
+    #[test]
+    fn a_pre_existing_receipt_without_criteria_still_parses() {
+        let json = r#"{
+            "run_id": "run-1",
+            "candidate_sha": "abc",
+            "base_sha": "def",
+            "contract_hash": "ch",
+            "policy_hash": "ph",
+            "outcome": "accepted",
+            "verification": {
+                "candidate_sha": "abc",
+                "base_sha": "def",
+                "contract_hash": "ch",
+                "policy_hash": "ph",
+                "checks": [],
+                "gaps": [],
+                "baseline_failures": [],
+                "amont_bypasses": [],
+                "amont_downgrades": []
+            },
+            "models_used": ["sonnet"],
+            "attempts": 1,
+            "cost_completeness": "actual",
+            "cost": 12345
+        }"#;
+        let receipt: Receipt = serde_json::from_str(json).expect("a pre-existing receipt parses");
+        assert!(receipt.criteria.is_empty());
+        assert_eq!(receipt.mandatory_evidence_independence, None);
+    }
+
     #[test]
     fn baseline_failures_are_visible_but_not_waived() {
         let failing_check = CheckOutcome {
@@ -1999,6 +2451,8 @@ mod tests {
             attempts: 1,
             cost_completeness: CostCompleteness::Actual,
             cost: MicroUsd::from_micros(12_345),
+            criteria: Vec::new(),
+            mandatory_evidence_independence: None,
         };
         let hash = receipt.hash();
         let mut other = receipt.clone();

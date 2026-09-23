@@ -94,6 +94,27 @@ Paths and profile names are illustrative and must be validated against the repos
 
 Required fields: version, kind, objective, acceptance, verification profile and base. A change also needs bounded write scope. Kinds are `inspect` and `change`. Unknown fields are rejected to catch misspelled controls. Inspection requires evidence criteria instead of a patch.
 
+An acceptance entry is either a bare string, judged by the verification profile as a whole, or a declared criterion naming the evidence that settles it. The two forms share one field, so a contract written entirely in bare strings is unchanged, byte for byte, and hashes as it always did.
+
+```json
+"acceptance": [
+  "Existing fields and exit semantics remain unchanged",
+  {
+    "statement": "Output parses as JSON and preserves original string values",
+    "id": "json-roundtrip",
+    "mandatory": true,
+    "evidence": {"kind": "check", "name": "make check"}
+  },
+  {
+    "statement": "A regression test covers the escaping",
+    "mandatory": false,
+    "evidence": {"kind": "test", "authorship": "model_added"}
+  }
+]
+```
+
+Evidence is a named command in the verification profile (`check`), a test with its authorship recorded as pre-existing, human-added or model-added (`test`), a reviewing model's judgement (`llm_review`), or a person's explicit sign-off (`human_sign_off`). A criterion is mandatory unless it says otherwise, as a bare string always was. Its identity is the author's own id, or one derived from the statement's content, so reordering the list never renumbers a criterion. A criterion naming a check the profile does not define is refused before any dispatch: a criterion nothing can settle is not a narrower contract, it is a broken one.
+
 Worker-supplied risk hints may increase caution but cannot lower repository risk floors. Acceptance text is checked for contradictions and missing prerequisites during preflight; unresolved requirements return `needs_decision`.
 
 ## 5. Configuration and authority
@@ -237,6 +258,8 @@ A declared setup runs in every worktree the profile's commands run in — the ba
 Use amont's effective inventory to identify checks and gaps. Run configured acceptance checks through their documented interfaces; do not assume amont check represents every pre-push gate. A skipped, inert, unavailable or untrusted required check is a gap, not a pass. Relais neither forges nor reuses amont attestations on another tree.
 
 Acceptance requires all mandatory criteria to have evidence. Existing tests cover existing behavior; requested behavior may need new regression tests or explicit human evaluation. Tests added by the implementing model are useful but are not independent ground truth. Changes to required checks, fixtures or acceptance tests receive explicit review and cannot silently weaken the contract.
+
+A mandatory criterion whose declared evidence produced nothing is a gap in this same report, refused by the mechanism that already refuses gaps — never a second acceptance path. A criterion settled only by a model-added test or an LLM review is still accepted once the checks pass; the receipt records that its evidence was not independent rather than imposing a stricter rule than the contract asked for. A criterion asking for a human sign-off is met only by a recorded sign-off: reading its answer off the passing checks would report a sign-off nobody gave. The receipt carries, per criterion, whether it was met and by which evidence, and one summary of how independent the mandatory criteria's evidence was.
 
 Semantic review is risk-dependent. A separate reviewer gets the contract, candidate, pertinent source and architecture evidence. It reports concrete findings with file/range, violated criterion, evidence and suggested verification; it cannot edit or waive checks. Findings are triaged by evidence. Lack of findings is not mathematical proof, and reviewer disagreement returns `needs_review` when it cannot be resolved within limits.
 

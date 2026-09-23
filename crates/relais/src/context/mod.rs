@@ -589,7 +589,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         + contract
             .acceptance
             .iter()
-            .map(|criterion| criterion.len())
+            .map(|criterion| criterion.statement().len())
             .sum::<usize>()
         + constraints
             .iter()
@@ -884,7 +884,10 @@ mod tests {
             err,
             ContextError::SizingProblem {
                 required_bytes: c.objective.len()
-                    + c.acceptance.iter().map(String::len).sum::<usize>()
+                    + c.acceptance
+                        .iter()
+                        .map(|criterion| criterion.statement().len())
+                        .sum::<usize>()
                     + c.read_hints.iter().map(String::len).sum::<usize>(),
                 budget_bytes: 64,
             },
