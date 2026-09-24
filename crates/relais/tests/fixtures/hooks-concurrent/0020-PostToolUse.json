@@ -1,0 +1,73 @@
+{
+  "cwd": "/REPO",
+  "duration_ms": 1896,
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "permission_mode": "default",
+  "prompt_id": "prompt-0000",
+  "session_id": "session-0000",
+  "tool_input": {
+    "description": "Reply FIVE",
+    "model": "opus",
+    "prompt": "Immediately reply with exactly one word: FIVE. Do nothing else.",
+    "run_in_background": false,
+    "subagent_type": "general-purpose"
+  },
+  "tool_name": "Agent",
+  "tool_response": {
+    "agentId": "a1a32a42540eba8f3",
+    "agentType": "general-purpose",
+    "content": [
+      {
+        "text": "FIVE",
+        "type": "text"
+      }
+    ],
+    "harnessNoteCount": 0,
+    "harnessSectionHash": "7a659f077cbb7fe1",
+    "harnessTailCount": 0,
+    "prompt": "Immediately reply with exactly one word: FIVE. Do nothing else.",
+    "resolvedModel": "claude-opus-5-5[1m]",
+    "status": "completed",
+    "totalDurationMs": 1896,
+    "totalTokens": 22959,
+    "totalToolUseCount": 0,
+    "usage": {
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 16071
+      },
+      "cache_creation_input_tokens": 16071,
+      "cache_read_input_tokens": 6880,
+      "inference_geo": "not_available",
+      "input_tokens": 2,
+      "iterations": [
+        {
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 16071
+          },
+          "cache_creation_input_tokens": 16071,
+          "cache_read_input_tokens": 6880,
+          "input_tokens": 2,
+          "output_tokens": 6,
+          "type": "message"
+        }
+      ],
+      "output_tokens": 6,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      },
+      "server_tool_use": {
+        "web_fetch_requests": 0,
+        "web_search_requests": 0
+      },
+      "service_tier": "standard",
+      "speed": "standard"
+    }
+  },
+  "tool_use_id": "toolu-05",
+  "transcript_path": "/REDACTED/transcript.jsonl"
+}
