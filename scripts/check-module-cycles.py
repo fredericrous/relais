@@ -53,6 +53,18 @@ IMPURE = {
 # `policy` decides authority; `contract` and `route` decide from it;
 # `acceptance`, `money`, `ids`, `lifecycle`, `outcome` and `resume` are
 # leaf calculations whose inputs — including the clock — are parameters.
+# Single files that are pure inside a module that is not. A module is
+# the top-level directory here (`module_of`), so a pure decision function
+# living beside an impure sibling — `hook/decide.rs` next to a
+# `hook/mod.rs` that runs processes and writes files — cannot be named on
+# the list above without claiming its sibling is pure too. Keyed on the
+# path relative to `src/`, so the claim is exactly as narrow as it is
+# true.
+PURE_FILES = {
+    "hook/decide.rs",
+    "hook/pairing.rs",
+}
+
 PURE_MODULES = {
     "acceptance",
     "contract",
@@ -239,7 +251,9 @@ def purity_failures() -> list[str]:
     failures = []
     for path in sorted(SRC.rglob("*.rs")):
         module = module_of(path)
-        if module not in PURE_MODULES or path.name in ROOTS:
+        relative = path.relative_to(SRC).as_posix()
+        pure = module in PURE_MODULES or relative in PURE_FILES
+        if not pure or path.name in ROOTS:
             continue
         for number, line in enumerate(production_lines(path), start=1):
             for needle, what in IMPURE.items():
@@ -305,7 +319,8 @@ def main() -> int:
         return 1
     print(
         f"module graph: {len(graph)} modules, no cycles; "
-        f"{len(PURE_MODULES)} pure modules touch no ambient state; "
+        f"{len(PURE_MODULES)} pure modules and {len(PURE_FILES)} pure files "
+        f"touch no ambient state; "
         f"only {PLATFORM_MODULE}.rs names a platform API"
     )
     return 0

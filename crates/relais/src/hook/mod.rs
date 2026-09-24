@@ -21,6 +21,7 @@
 //! The fixtures every later package tests against are transcribed from a
 //! real session this way, rather than assumed.
 
+pub mod decide;
 pub mod event;
 pub mod pairing;
 
