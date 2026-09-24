@@ -54,6 +54,13 @@ pub enum Evidence {
     LlmReview,
     /// A human's explicit sign-off.
     HumanSignOff,
+    /// A gate amont owns: settled by asking amont, through its own
+    /// documented interface (`amont attest covered`), whether a valid
+    /// signed attestation covers this gate on the candidate's own tree
+    /// (SPEC §10, §18). The gate and its attestation stay amont's to
+    /// own — relais never reads `refs/notes/amont-attest`, parses an
+    /// attestation format, or verifies a signature itself.
+    AmontGate { gate: String },
 }
 
 /// Who wrote the test that is a criterion's evidence.
@@ -71,7 +78,10 @@ pub enum TestAuthorship {
 /// model-added test and an LLM review do not, because a model writing
 /// the test that judges its own work is not evidence about the work
 /// (SPEC §10). A human sign-off is independent by definition — it is a
-/// person's own judgement, not the implementing model's.
+/// person's own judgement, not the implementing model's. An amont gate
+/// is independent too: it ran outside this run, and a valid signed
+/// attestation is amont's own verdict, not a claim this run makes about
+/// itself.
 ///
 /// Pure and exhaustive: every [`Evidence`] variant is named here, so a
 /// new one added later fails to compile until this says whether it
@@ -85,6 +95,7 @@ pub fn independent(evidence: &Evidence) -> bool {
         },
         Evidence::LlmReview => false,
         Evidence::HumanSignOff => true,
+        Evidence::AmontGate { .. } => true,
     }
 }
 
@@ -247,6 +258,22 @@ mod tests {
         }));
         assert!(!independent(&Evidence::LlmReview));
         assert!(independent(&Evidence::HumanSignOff));
+        assert!(independent(&Evidence::AmontGate { gate: "x".into() }));
+    }
+
+    #[test]
+    fn an_amont_gate_criterion_round_trips() {
+        let json = r#"{
+            "statement": "the pre-push cargo test gate covers this candidate",
+            "evidence": {"kind": "amont_gate", "gate": "pre-push-cargo-test"}
+        }"#;
+        let entry: AcceptanceEntry = serde_json::from_str(json).expect("parses");
+        assert_eq!(
+            entry.evidence(),
+            Some(&Evidence::AmontGate {
+                gate: "pre-push-cargo-test".into()
+            })
+        );
     }
 
     #[test]

@@ -179,15 +179,27 @@ amont_agent = "off"
     }
 
     fn relais(&self, args: &[&str]) -> Output {
-        Command::new(BIN)
-            .args(args)
+        self.relais_with_env(args, &[])
+    }
+
+    /// The same, with extra environment variables set on the CHILD
+    /// `relais` process only — never `std::env::set_var` on this test
+    /// process itself, which is process-global and racy under the
+    /// threaded test runner (see `paths::resolve_home`). Used to point a
+    /// scenario's `relais` subprocess at a fake `amont` on its own PATH
+    /// without touching any other test's environment.
+    fn relais_with_env(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+        let mut cmd = Command::new(BIN);
+        cmd.args(args)
             .current_dir(&self.repo)
             .env("RELAIS_STATE_DIR", &self.state)
             .env("RELAIS_CONFIG_DIR", &self.config)
             .env("RELAIS_CLAUDE_BIN", &self.claude)
-            .env("RELAIS_SESSION_ID", "tab-test")
-            .output()
-            .expect("relais runs")
+            .env("RELAIS_SESSION_ID", "tab-test");
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
+        cmd.output().expect("relais runs")
     }
 
     fn stop_coordinator(&self) {
@@ -1291,6 +1303,219 @@ fn evidence_attach_refuses_unknowns_and_records_what_it_is_told() {
                 .to_string()
         ),
         "a relative path is recorded absolute, like every other evidence row: {recorded}"
+    );
+}
+
+/// A fake `amont` on PATH, logging every invocation verbatim so a
+/// scenario can assert exactly which command relais ran — the point of
+/// this whole mechanism being that the gate and its attestation stay
+/// amont's to own: relais asks `amont attest covered`, and reads
+/// nothing else (SPEC §10, §18).
+struct FakeAmont {
+    bin_dir: PathBuf,
+    invocations_log: PathBuf,
+}
+
+impl FakeAmont {
+    /// `covered_gates`: the gate names `attest covered` prints, exactly
+    /// as the real command does — it prints the names a valid signed
+    /// attestation covers and IGNORES any argument, so a fake that
+    /// echoed a phrase instead would let relais conclude "covered" from
+    /// output naming no gate at all. An empty list is amont's fail-open
+    /// answer: prints nothing, still exits 0.
+    fn new(root: &Path, covered_gates: &[&str]) -> Self {
+        let bin_dir = root.join("amont-bin");
+        std::fs::create_dir_all(&bin_dir).expect("amont bin dir");
+        let invocations_log = root.join("amont-invocations.log");
+        let script = format!(
+            "#!/bin/sh\necho \"$@\" >> {log}\nif [ \"$1\" = attest ] && [ \"$2\" = covered ]; then\n{body}exit 0\nfi\nexit 1\n",
+            log = shell_quote(&invocations_log),
+            body = if covered_gates.is_empty() {
+                String::new()
+            } else {
+                format!("  echo '{}'\n", covered_gates.join(" "))
+            },
+        );
+        let path = bin_dir.join("amont");
+        std::fs::write(&path, script).expect("fake amont");
+        let mut mode = std::fs::metadata(&path).expect("meta").permissions();
+        use std::os::unix::fs::PermissionsExt;
+        mode.set_mode(0o755);
+        std::fs::set_permissions(&path, mode).expect("chmod");
+        Self {
+            bin_dir,
+            invocations_log,
+        }
+    }
+
+    /// `PATH`, with this fake `amont` found before any real one.
+    fn path_env(&self) -> String {
+        format!(
+            "{}:{}",
+            self.bin_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        )
+    }
+
+    fn invocations(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.invocations_log)
+            .map(|log| log.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+/// A contract can name an amont gate as a mandatory criterion's evidence,
+/// and relais settles it by asking amont's own documented interface —
+/// `amont attest covered <gate>`, on the candidate's own tree — never by
+/// reading git notes or verifying a signature itself. When amont reports
+/// the gate covered, the criterion is met, the run accepts, and an
+/// external-attestation evidence row records amont as the tool and the
+/// candidate sha as the subject against the criterion it answers (SPEC
+/// §10, §18, §12).
+#[test]
+fn an_amont_gate_criterion_is_settled_through_amonts_own_interface() {
+    let world = World::new("amont-gate-covered");
+    let hash = world.write_policy(3);
+    world.write_machine(&hash, "");
+    let gate = "pre-push-cargo-test";
+    // Other gates are covered too: relais must find THIS one by name,
+    // not conclude "covered" from the list being non-empty.
+    let amont = FakeAmont::new(
+        &world.root,
+        &["pre-push-secrets", gate, "pre-push-audit-rust"],
+    );
+    let path = world.root.join("gate.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "schema_version": 1,
+            "kind": "change",
+            "objective": "Remove the entry point",
+            "base_ref": "HEAD",
+            "write_scope": ["src/**"],
+            "acceptance": [{
+                "statement": "the pre-push cargo test gate covers this candidate",
+                "evidence": {"kind": "amont_gate", "gate": gate},
+            }],
+            "verification_profile": "default",
+            "review": "off",
+        })
+        .to_string(),
+    )
+    .expect("task");
+
+    let run = world.relais_with_env(
+        &["run", "--task", path.to_str().unwrap()],
+        &[("PATH", &amont.path_env())],
+    );
+    let stdout = text(&run.stdout);
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "{stdout}\n{}",
+        text(&run.stderr)
+    );
+
+    // relais asked amont's own documented interface — never git notes,
+    // never a signature verifier.
+    let invocations = amont.invocations();
+    assert!(
+        invocations.iter().any(|line| line == "attest covered"),
+        "relais must run `amont attest covered` — with NO gate argument, since the \
+         command ignores one and prints every covered gate — got: {invocations:?}"
+    );
+    assert!(
+        invocations
+            .iter()
+            .all(|line| !line.contains("notes") && !line.contains("ssh-keygen")),
+        "relais must never reach for git notes or a signature verifier: {invocations:?}"
+    );
+
+    let run_id = World::run_id_of(&stdout);
+    let run_dir = world.state.join("runs").join(&run_id);
+    let receipt: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(run_dir.join("receipt.json")).expect("receipt"),
+    )
+    .expect("json");
+    let criteria = receipt["criteria"].as_array().expect("criteria array");
+    let criterion = criteria
+        .iter()
+        .find(|c| c["evidence"]["gate"] == gate)
+        .expect("the amont-gate criterion is in the receipt");
+    assert_eq!(criterion["met"], true, "{receipt}");
+    assert_eq!(criterion["evidence"]["kind"], "amont_gate", "{receipt}");
+
+    let explain = world.relais(&["explain", &run_id]);
+    let explained = text(&explain.stdout);
+    assert!(
+        explained.contains("external_attestation") && explained.contains("via amont"),
+        "the covering gate is recorded as external attestation evidence naming amont: {explained}"
+    );
+}
+
+/// amont's own interface is fail-open by design — it prints nothing and
+/// exits 0 whether an attestation is absent or its signature failed to
+/// verify. relais must never read that as a pass: a mandatory criterion
+/// naming a gate amont does not report as covered becomes a gap in the
+/// same verification report every other gap goes through, and the gap's
+/// message says it cannot tell which of the two amont meant, naming
+/// `amont attest covered` as the command a person can run to see the
+/// same answer (SPEC §10, §18).
+#[test]
+fn an_uncovered_amont_gate_is_a_gap_not_a_silent_pass() {
+    let world = World::new("amont-gate-uncovered");
+    let hash = world.write_policy(3);
+    world.write_machine(&hash, "");
+    let gate = "pre-push-cargo-test";
+    // The sharp case: amont reports a perfectly good attestation, for
+    // gates that are NOT this one. Reading "did it print anything" as
+    // the answer accepted the run here.
+    let amont = FakeAmont::new(&world.root, &["pre-push-secrets", "pre-push-audit-rust"]);
+    let path = world.root.join("gate.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "schema_version": 1,
+            "kind": "change",
+            "objective": "Remove the entry point",
+            "base_ref": "HEAD",
+            "write_scope": ["src/**"],
+            "acceptance": [{
+                "statement": "the pre-push cargo test gate covers this candidate",
+                "evidence": {"kind": "amont_gate", "gate": gate},
+            }],
+            "verification_profile": "default",
+            "review": "off",
+        })
+        .to_string(),
+    )
+    .expect("task");
+
+    let run = world.relais_with_env(
+        &["run", "--task", path.to_str().unwrap()],
+        &[("PATH", &amont.path_env())],
+    );
+    let stderr = text(&run.stderr);
+    assert_eq!(
+        run.status.code(),
+        Some(8),
+        "{stderr}\n{}",
+        text(&run.stdout)
+    );
+    assert!(
+        stderr.contains(&format!("amont gate `{gate}`"))
+            && stderr.contains("amont attest covered")
+            && stderr.contains("cannot tell"),
+        "{stderr}"
+    );
+    let invocations = amont.invocations();
+    assert!(
+        invocations.iter().any(|line| line == "attest covered"),
+        "relais must still have asked amont, even though the answer was no: {invocations:?}"
     );
 }
 

@@ -437,6 +437,7 @@ fn execute_waves(
             acceptance_gaps: _,
             amont_bypasses,
             amont_downgrades,
+            gate_coverage,
         } = match engine.verify_candidate(
             &assembly.head,
             root.authority,
@@ -471,6 +472,7 @@ fn execute_waves(
                     amont_downgrades,
                     touched_inputs,
                     patch_path,
+                    gate_coverage,
                 },
                 assembly,
             );
@@ -695,6 +697,7 @@ fn run_package(
         backend: engine.config.backend,
         git: engine.config.git,
         hooks: engine.config.hooks,
+        attest: engine.config.attest,
         worker_env: engine.config.worker_env.clone(),
         // The package's artifacts hang off the root run's; its
         // worktrees hang off THEIR parent, so a package worker's tree
@@ -860,6 +863,9 @@ struct Assembled {
     /// reviewer is told to read, and one of the two places an accepted
     /// run's content lives.
     patch_path: PathBuf,
+    /// What amont answered about every gate a declared criterion names,
+    /// asked against the assembled head (SPEC §10, §18).
+    gate_coverage: std::collections::BTreeMap<String, Result<bool, verify::AttestError>>,
 }
 
 /// The assembled candidate passed the profile's checks: review it where
@@ -984,6 +990,7 @@ fn accept_integrated(
         &root.authority.verification_profile,
         &report,
         &signoffs,
+        &assembled.gate_coverage,
     );
     let receipt = Receipt {
         run_id: engine.run_id.as_str().to_string(),

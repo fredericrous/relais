@@ -19,6 +19,7 @@
 //! not — is a `RunError`, and ends the run as `interrupted` with the
 //! error on record rather than as a panic with nothing on record.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -32,7 +33,7 @@ use crate::backend::{Backend, LaunchResult, LaunchSpec};
 use crate::context::{self, ContextError, ContextManifest};
 use crate::contract::{Review, TaskContract};
 use crate::ids::{derive_task_id, DispatchId, PackageId, Pid, RunId};
-use crate::ledger::{EvidenceKind, Ledger, LedgerError, Transition, UsageEvent};
+use crate::ledger::{EvidenceKind, EvidenceOrigin, Ledger, LedgerError, Transition, UsageEvent};
 use crate::lifecycle::UsagePhase;
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::policy::{
@@ -152,6 +153,9 @@ pub struct RunConfig<'a> {
     pub git: &'a dyn workspace::Git,
     /// The check inventory (`amont`), as a port.
     pub hooks: &'a dyn verify::HookInventory,
+    /// Whether an amont gate covers a candidate (`amont attest
+    /// covered`), as a port.
+    pub attest: &'a dyn verify::HookAttest,
     /// The environment every worker this run dispatches will run with.
     pub worker_env: crate::backend::LaunchEnv,
     pub artifacts_dir: PathBuf,
@@ -479,6 +483,7 @@ struct Verified {
     amont_downgrades: Vec<String>,
     verification_inputs_changed: Vec<String>,
     review_required: bool,
+    gate_coverage: BTreeMap<String, Result<bool, verify::AttestError>>,
 }
 
 /// How one verification's artifacts are named: its throwaway worktree
@@ -2172,6 +2177,7 @@ impl<'a> RunEngine<'a> {
             acceptance_gaps,
             amont_bypasses,
             amont_downgrades,
+            gate_coverage,
         } = match self.verify_candidate(
             &candidate.sha,
             authority,
@@ -2208,6 +2214,7 @@ impl<'a> RunEngine<'a> {
                     &candidate,
                     checks.clone(),
                     gaps.clone(),
+                    gate_coverage.clone(),
                 )?;
             }
             return Ok(Step::Ended(
@@ -2271,6 +2278,7 @@ impl<'a> RunEngine<'a> {
                 amont_downgrades,
                 verification_inputs_changed,
                 review_required,
+                gate_coverage,
             },
         )
         .map(Step::Ended)
@@ -2345,6 +2353,7 @@ impl<'a> RunEngine<'a> {
             &preflight.authority.verification_profile,
             &report,
             &signoffs,
+            &verified.gate_coverage,
         );
         let receipt = Receipt {
             run_id: self.run_id.as_str().to_string(),
@@ -2600,6 +2609,7 @@ impl<'a> RunEngine<'a> {
         candidate: &Candidate,
         checks: Vec<verify::CheckOutcome>,
         gaps: Vec<String>,
+        gate_coverage: BTreeMap<String, Result<bool, verify::AttestError>>,
     ) -> Result<(), RunError> {
         let preflight = ctx.preflight;
         let report = VerificationReport {
@@ -2629,6 +2639,7 @@ impl<'a> RunEngine<'a> {
             &preflight.authority.verification_profile,
             &report,
             &signoffs,
+            &gate_coverage,
         );
         let receipt = Receipt {
             run_id: self.run_id.as_str().to_string(),
@@ -2762,13 +2773,19 @@ impl<'a> RunEngine<'a> {
             .as_ref()
             .is_some_and(|dependency| dependency.mode() != crate::policy::DependencyMode::Off)
             && crate::tooling::integration_available("amont");
+        // Every distinct gate a declared criterion names as its
+        // evidence: asked through `amont attest covered`, on the
+        // candidate's own tree, whenever there is at least one (SPEC
+        // §10, §18).
+        let gate_names = verify::amont_gate_names(&self.config.contract.acceptance);
         // The inventory is read INSIDE the immutable copy the receipt
         // binds to, never in the user's checkout — a hook the candidate
         // adds or removes must be seen as the candidate has it, and the
-        // checkout can change under the run (audit V11). So the
-        // throwaway worktree is created whenever either the checks or
-        // the inventory needs it.
-        let mut holder = match (reuse.is_none(), amont_on) {
+        // checkout can change under the run (audit V11). Gate coverage is
+        // asked the same way, against the same tree, for the same
+        // reason. So the throwaway worktree is created whenever the
+        // checks, the inventory or a named gate needs it.
+        let mut holder = match (reuse.is_none(), amont_on || !gate_names.is_empty()) {
             (false, false) => None,
             _ => {
                 let verify_path = self
@@ -2909,11 +2926,70 @@ impl<'a> RunEngine<'a> {
             .into_iter()
             .map(|(criterion_id, _actor)| criterion_id)
             .collect();
+        // amont's answer about every gate a declared criterion names,
+        // asked once per gate against the candidate's own tree. `None`
+        // holder with gates named means the checks were reused from the
+        // baseline and no worktree was made for this candidate: relais
+        // still asked nothing about THIS tree, so that is a gap naming
+        // why, never a silent pass.
+        let gate_coverage: BTreeMap<String, Result<bool, verify::AttestError>> =
+            if gate_names.is_empty() {
+                BTreeMap::new()
+            } else {
+                match holder.as_ref() {
+                    Some(holder) => {
+                        verify::amont_gate_coverage(&gate_names, self.config.attest, holder.path())
+                    }
+                    None => gate_names
+                        .iter()
+                        .cloned()
+                        .map(|gate| {
+                            (
+                                gate,
+                                Err(verify::AttestError::NotRun {
+                                    detail: "no verification worktree was available to ask \
+                                             amont about this candidate's tree"
+                                        .to_string(),
+                                }),
+                            )
+                        })
+                        .collect(),
+                }
+            };
+        // A gate amont reports as covered is amont's own verdict about
+        // this candidate: recorded as external attestation evidence,
+        // against the run and the criterion it answers, so the receipt
+        // and `relais explain` show what settled it and where it came
+        // from (SPEC §10, §12).
+        for entry in &self.config.contract.acceptance {
+            if let Some(crate::acceptance::Evidence::AmontGate { gate }) = entry.evidence() {
+                if matches!(gate_coverage.get(gate), Some(Ok(true))) {
+                    let criterion_id = entry.id();
+                    self.config
+                        .ledger
+                        .attach_evidence(
+                            &self.run_id,
+                            Path::new(&format!("amont:attest:{gate}")),
+                            None,
+                            EvidenceOrigin {
+                                tool: Some("amont"),
+                                external_id: Some(gate),
+                                subject: Some(candidate_sha),
+                                criterion_id: Some(&criterion_id),
+                            },
+                        )
+                        .map_err(|e| {
+                            format!("the ledger refused an external-attestation evidence row: {e}")
+                        })?;
+                }
+            }
+        }
         let acceptance_gaps = verify::acceptance_gaps(
             &self.config.contract.acceptance,
             &authority.verification_profile,
             &checks,
             &signoffs,
+            &gate_coverage,
         );
         gaps.extend(acceptance_gaps.iter().map(verify::AcceptanceGap::message));
         // The throwaway worktree has done its work. Releasing it here —
@@ -2936,6 +3012,7 @@ impl<'a> RunEngine<'a> {
                 .as_ref()
                 .map(|inventory| inventory.downgrades.clone())
                 .unwrap_or_default(),
+            gate_coverage,
         })
     }
 
@@ -3861,6 +3938,7 @@ mod tests {
                 backend,
                 git: &crate::workspace::SystemGit,
                 hooks: &crate::verify::FixedInventory(None),
+                attest: &crate::verify::FixedAttest::default(),
                 worker_env: crate::backend::LaunchEnv::default(),
                 artifacts_dir: self.artifacts.clone(),
                 aval_resolver: &resolver,
@@ -3895,6 +3973,7 @@ mod tests {
                 backend,
                 git: &crate::workspace::SystemGit,
                 hooks: &crate::verify::FixedInventory(None),
+                attest: &crate::verify::FixedAttest::default(),
                 worker_env: crate::backend::LaunchEnv::default(),
                 artifacts_dir: self.artifacts.clone(),
                 aval_resolver: &resolver,
@@ -3930,6 +4009,7 @@ mod tests {
                 backend,
                 git: &crate::workspace::SystemGit,
                 hooks: &crate::verify::FixedInventory(None),
+                attest: &crate::verify::FixedAttest::default(),
                 worker_env: crate::backend::LaunchEnv::default(),
                 artifacts_dir: self.artifacts.clone(),
                 aval_resolver: &resolver,
@@ -4506,6 +4586,7 @@ mod tests {
             backend: &backend,
             git: &crate::workspace::SystemGit,
             hooks: &crate::verify::FixedInventory(None),
+            attest: &crate::verify::FixedAttest::default(),
             worker_env: crate::backend::LaunchEnv::default(),
             artifacts_dir: fixture.artifacts.clone(),
             aval_resolver: &resolver,
