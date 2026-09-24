@@ -56,7 +56,8 @@ pub const TARGETS: [&str; 7] = [
 /// One recorded hook invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedHook {
-    pub order: u64,
+    /// Nanoseconds since the epoch when this payload arrived.
+    pub order: u128,
     pub event: String,
     pub payload_path: PathBuf,
 }
@@ -67,7 +68,7 @@ pub struct RecordedHook {
 /// stdout: every I/O failure here is tried and dropped, because the
 /// handler this drives (SPEC: `relais hook --probe --record`) cannot be
 /// the thing that blocks or alters the session it is watching.
-pub fn record(dir: &Path, order: u64, mut stdin: impl Read) -> RecordedHook {
+pub fn record(dir: &Path, order: u128, mut stdin: impl Read) -> RecordedHook {
     let mut bytes = Vec::new();
     // A broken pipe or a truncated write leaves `bytes` with whatever was
     // read so far; still recorded, never surfaced (the handler cannot fail).
@@ -77,11 +78,40 @@ pub fn record(dir: &Path, order: u64, mut stdin: impl Read) -> RecordedHook {
         .read_to_end(&mut bytes);
 
     let event = event_name(&bytes);
-    let payload_path = dir.join(format!("{order:04}-{event}.json"));
     // Best effort: a directory or write failure here would otherwise be
     // the handler's own fault to report, which it is forbidden to do.
     let _ = fs::create_dir_all(dir);
-    let _ = fs::write(&payload_path, &bytes);
+
+    // Two hooks CAN read the clock in the same nanosecond, and two
+    // recordings of one event in one instant would otherwise overwrite
+    // each other — losing a payload, the one thing a recorder may not
+    // do. Claim a free name rather than assume one. The sequence is
+    // always present and zero-padded, so a collision cannot reorder
+    // anything: `…-000-` sorts before `…-001-`, where a bare name and a
+    // `-1-` suffixed one sort the wrong way round ('1' < 'S') and
+    // lexical order would stop being arrival order exactly when two
+    // hooks raced.
+    let mut payload_path = dir.join(format!("{order:021}-000-{event}.json"));
+    for attempt in 1..=u32::MAX {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&payload_path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                let _ = file.write_all(&bytes);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                payload_path = dir.join(format!("{order:021}-{attempt:03}-{event}.json"));
+            }
+            // Any other failure is the handler's own, and it is
+            // forbidden to report one: the recording is lost, the
+            // session is not disturbed.
+            Err(_) => break,
+        }
+    }
 
     RecordedHook {
         order,
@@ -90,13 +120,28 @@ pub fn record(dir: &Path, order: u64, mut stdin: impl Read) -> RecordedHook {
     }
 }
 
-/// The next arrival order for a recording directory: the count of
-/// payloads already written there. Best effort — a probe recording is
-/// evidence gathered once, not a durable sequence a concurrent writer
-/// must serialize against.
-pub fn next_order(dir: &Path) -> u64 {
-    fs::read_dir(dir)
-        .map(|entries| entries.filter_map(Result::ok).count() as u64)
+/// When a payload arrived, in nanoseconds since the epoch — the order
+/// its recording is named for.
+///
+/// NOT a count of what is already in the directory. Hooks fire
+/// concurrently and each is its own process, so two counting the same
+/// directory in the same instant both see N and both claim `000N`.
+/// Measured in a session that spawned five agents: four collisions, and
+/// the ordinals 0003, 0006, 0013 and 0018 never existed. Two payloads
+/// of one event in one instant went further and overwrote each other.
+///
+/// Arrival order is the whole point of a recording — it is the only
+/// thing that says which `SubagentStart` followed which spawn, since no
+/// payload carries both a `tool_use_id` and an `agent_id` — so the
+/// recorder may not be what loses it. A clock read needs no
+/// coordination between processes, and a tie is broken in [`record`]
+/// rather than resolved by whoever happened to write last.
+pub fn arrival_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        // A clock before the epoch is a machine problem, not a reason to
+        // lose the recording: order from zero and keep going.
+        .map(|since| since.as_nanos())
         .unwrap_or(0)
 }
 
@@ -441,14 +486,56 @@ mod tests {
         assert_eq!(on_disk.len() as u64, MAX_PAYLOAD_BYTES);
     }
 
+    /// The failure this test exists for. Order used to be the count of
+    /// files already in the directory, and hooks fire concurrently as
+    /// separate processes: two reading it in the same instant both saw
+    /// N and both wrote `000N`. Measured in a session that spawned five
+    /// agents — four collisions, and the ordinals 0003, 0006, 0013 and
+    /// 0018 never existed. Here both payloads are the SAME event at the
+    /// SAME instant, which under the old scheme did not merely misnumber
+    /// them: the second overwrote the first, losing a recording.
     #[test]
-    fn next_order_counts_existing_recordings() {
+    fn two_payloads_at_one_instant_are_both_kept_and_ordered() {
         let dir = temp_dir("hook-order");
-        assert_eq!(next_order(&dir), 0);
-        record(&dir, 0, Cursor::new(b"{}".to_vec()));
-        assert_eq!(next_order(&dir), 1);
-        record(&dir, 1, Cursor::new(b"{}".to_vec()));
-        assert_eq!(next_order(&dir), 2);
+        let instant = arrival_nanos();
+        let body = |n: u8| format!(r#"{{"hook_event_name":"SubagentStart","n":{n}}}"#).into_bytes();
+
+        let first = record(&dir, instant, Cursor::new(body(1)));
+        let second = record(&dir, instant, Cursor::new(body(2)));
+        assert_ne!(
+            first.payload_path, second.payload_path,
+            "one instant must not cost a recording"
+        );
+
+        let mut names: Vec<String> = fs::read_dir(&dir)
+            .expect("recordings")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 2, "both payloads survive: {names:?}");
+        // Zero-padded throughout, so lexical order IS arrival order —
+        // what a later reader sorts by to see which start followed which
+        // spawn.
+        for (name, want) in names.iter().zip([r#""n":1"#, r#""n":2"#]) {
+            assert!(name.starts_with(&format!("{instant:021}-")), "{names:?}");
+            let body = fs::read_to_string(dir.join(name)).expect("payload");
+            assert!(body.contains(want), "{name} holds {body}");
+        }
+    }
+
+    /// Arrival order is a clock, not a count, so it rises without the
+    /// directory being consulted at all — the property the old scheme
+    /// lacked, and the reason two concurrent hooks no longer collide.
+    #[test]
+    fn arrival_order_rises_without_consulting_the_directory() {
+        let first = arrival_nanos();
+        let second = arrival_nanos();
+        assert!(second >= first, "{second} < {first}");
+        assert!(
+            first > 0,
+            "a failed clock read would order every payload at zero"
+        );
     }
 
     #[test]
