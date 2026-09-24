@@ -10,6 +10,27 @@ missing here.
 
 ### Added
 
+- **A hook payload now parses into a typed `HookEvent`.** `relais::hook::event::parse`
+  turns the bytes a Claude Code hook receives on stdin into `SessionStart`,
+  `SessionEnd`, `SubagentStart`, `SubagentStop`, an `AgentToolCall` (the
+  Agent tool, or its legacy name `Task`, at any of the three tool-scoped
+  phases), or `NotOurs` — the one case for a tool event on any other
+  tool, and for a payload that is not JSON, is not an object, names no
+  event, names an event this binary does not know, or exceeds a
+  one-mebibyte cap. It never fails outward: a hook cannot refuse to
+  answer. Fields the crate has no use for (`cwd`, `effort`,
+  `permission_mode`, `transcript_path`, and more a future harness
+  release will add) are deliberately not rejected, unlike this crate's
+  usual `deny_unknown_fields` habit — every one of the nine payloads
+  transcribed under `crates/relais/tests/fixtures/hooks` parses, a test
+  that walks that directory rather than naming files so a payload a
+  later probe run adds is covered automatically. The session, tool use,
+  agent, agent type and prompt each get their own newtype (`SessionId`,
+  `ToolUseId`, `AgentId`, `AgentType`, `PromptId`) so a function taking
+  two of them cannot be called with them swapped. This package decides
+  nothing, admits nothing and records nothing — it only establishes
+  what a payload IS.
+
 - **`relais doctor --probe-hooks` captures what Claude Code's hooks
   actually send, from a real session.** `relais hook --probe --record
   <dir>` is a record-only handler: it reads one hook payload on stdin
