@@ -1773,4 +1773,133 @@ mod tests {
         // Best effort: a leftover temp dir costs nothing but disk.
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// A run whose attempt started and died before reporting any usage
+    /// is the run the `unknown` label exists for. Before this, an empty
+    /// fold over its usage answered `Actual`, so the window printed a
+    /// clean `$0 (actual)` total for a run the ledger cannot vouch for.
+    #[test]
+    fn a_window_with_a_killed_run_says_unknown_not_a_clean_total() {
+        use crate::lifecycle::UsagePhase;
+
+        let dir = temp_dir("killed-run");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let run = crate::ids::RunId::from_stored("run-killed");
+        let task = crate::ids::TaskId::from_stored("task-killed");
+        ledger
+            .insert_run(&run, "/repo", None, &task, "rk")
+            .expect("run");
+        let revision = ledger
+            .insert_contract_revision(&run, "h", "{}", "HEAD", None)
+            .expect("revision");
+        let attempt = ledger
+            .insert_attempt(&run, revision, 1, "implementation", UsagePhase::Initial)
+            .expect("attempt");
+        ledger
+            .record_dispatch_intent(
+                &crate::ids::DispatchId::from_stored("disp-killed"),
+                &run,
+                Some(attempt),
+                &serde_json::json!({}),
+                0,
+            )
+            .expect("dispatch intent");
+        // The session ends mid-dispatch: no usage event ever arrives.
+
+        let report = runs_report(&ledger, "2000-01-01T00:00:00+00:00", None).expect("report");
+        assert_eq!(report.cost_completeness, CostCompleteness::Unknown);
+        let text = report.render();
+        assert!(
+            text.contains("unknown (no usage was reported)"),
+            "a killed run must not read as a clean zero:\n{text}"
+        );
+        // The line the objective is actually about. The per-run line
+        // above satisfied the substring assertion while THIS one printed
+        // `(actual)` a few lines below it, because the task-level
+        // completeness restated the rule instead of calling it.
+        assert_eq!(
+            report.task_cost_completeness,
+            CostCompleteness::Unknown,
+            "the primary metric's own label:\n{text}"
+        );
+        let metric = text
+            .lines()
+            .find(|line| line.contains("cost per accepted task"))
+            .expect("the primary metric line is printed");
+        assert!(
+            !metric.contains("(actual)"),
+            "the primary metric must not call a killed run's total measured: {metric}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A run whose WORKER reported and whose reviewer was then killed is
+    /// not complete either. The reviewer and the planner are dispatched
+    /// with `attempt_id: None`, so a rule counting attempts reads this
+    /// run as fully reported; the rule counts dispatches, which is what
+    /// the usage event is keyed by.
+    #[test]
+    fn a_reviewer_killed_after_the_worker_reported_is_not_a_complete_total() {
+        use crate::lifecycle::UsagePhase;
+        use crate::money::CostKind;
+
+        let dir = temp_dir("killed-reviewer");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let run = crate::ids::RunId::from_stored("run-rev");
+        let task = crate::ids::TaskId::from_stored("task-rev");
+        ledger
+            .insert_run(&run, "/repo", None, &task, "rk")
+            .expect("run");
+        let revision = ledger
+            .insert_contract_revision(&run, "h", "{}", "HEAD", None)
+            .expect("revision");
+        let attempt = ledger
+            .insert_attempt(&run, revision, 1, "implementation", UsagePhase::Initial)
+            .expect("attempt");
+        let worker = crate::ids::DispatchId::from_stored("disp-worker");
+        ledger
+            .record_dispatch_intent(&worker, &run, Some(attempt), &serde_json::json!({}), 0)
+            .expect("worker dispatch");
+        ledger
+            .record_usage(&crate::ledger::UsageEvent {
+                event_id: worker.as_str().to_string(),
+                run_id: run.clone(),
+                attempt_id: Some(attempt),
+                parent_event_id: None,
+                model: Some("sonnet".into()),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                cost: Some(MicroUsd::from_micros(1_000)),
+                cost_kind: CostKind::ApiSpend,
+                completeness: CostCompleteness::Actual,
+                inclusive: false,
+                phase: Some(UsagePhase::Initial),
+                duration_ms: None,
+                requested_model: None,
+                requested_effort: None,
+                harness: None,
+                at: crate::ledger::now_rfc3339(),
+            })
+            .expect("worker usage");
+        // The reviewer goes out with no attempt of its own, and the
+        // session dies before its usage arrives.
+        ledger
+            .record_dispatch_intent(
+                &crate::ids::DispatchId::from_stored("disp-reviewer"),
+                &run,
+                None,
+                &serde_json::json!({"kind": "review"}),
+                0,
+            )
+            .expect("reviewer dispatch");
+
+        assert_eq!(
+            ledger.run_cost_completeness(&run).expect("completeness"),
+            CostCompleteness::IncompleteLowerBound,
+            "what the worker reported is real; the reviewer's spend is missing"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

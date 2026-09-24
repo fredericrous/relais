@@ -2216,6 +2216,16 @@ impl Ledger {
     /// Worst-case completeness for the run's recorded usage: an unknown
     /// anywhere makes the run's cost unknown; an incomplete anywhere makes
     /// it an incomplete lower bound.
+    ///
+    /// Recorded usage alone cannot tell a run that never ran apart from
+    /// one that ran and reported nothing back — both fold to `Actual`
+    /// over zero rows, and an empty fold is not evidence of a true zero.
+    /// The run's own attempts settle it: a run with no dispatched attempt
+    /// never spent anything, so an empty recording IS the true zero; a
+    /// run with a dispatched attempt that reported no usage at all died
+    /// before it could report, so its cost is unknown, not zero; and a
+    /// run where only some of its attempts reported is a real lower
+    /// bound, not unknown — what was recorded still happened.
     pub fn run_cost_completeness(&self, run_id: &RunId) -> Result<CostCompleteness> {
         let mut values: Vec<String> = {
             let mut stmt = self
@@ -2230,12 +2240,55 @@ impl Ledger {
                     .expect("CostCompleteness serializes: a fieldless enum"),
             );
         }
-        Ok(CostCompleteness::worst(values.iter().map(|value| {
+        let recorded = CostCompleteness::worst(values.iter().map(|value| {
             // A completeness this binary cannot read IS unknown: the fold
             // is the value's own meaning, not a swallowed error, and it
             // can only widen the answer (`Unknown` is the worst case).
             serde_json::from_str(value).unwrap_or(CostCompleteness::Unknown)
-        })))
+        }));
+
+        let (dispatched, reported) = self.run_dispatch_report_counts(run_id)?;
+        // Nothing was ever sent out, so nothing could have reported: the
+        // recorded fold is the whole truth, and for a run blocked at
+        // preflight that is a real $0.
+        if dispatched == 0 {
+            return Ok(recorded);
+        }
+        Ok(if reported == 0 {
+            CostCompleteness::Unknown
+        } else if reported < dispatched {
+            recorded.max(CostCompleteness::IncompleteLowerBound)
+        } else {
+            recorded
+        })
+    }
+
+    /// How many dispatches this run sent out, and how many of them came
+    /// back with their usage — what tells a fully-silent run apart from
+    /// one that reported some dispatches and died before the rest.
+    ///
+    /// Dispatches, not attempts. A worker attempt has both, but the
+    /// reviewer and the planner are dispatched with `attempt_id: None`
+    /// (`runner/mod.rs` review, `runner/scheduler.rs` plan), so counting
+    /// attempts reads a run whose worker reported and whose REVIEWER was
+    /// killed mid-flight as complete. The dispatch is the thing that
+    /// spends money, and its own id is what the usage event carries:
+    /// measured on a live ledger, all 47 `completed` dispatches have a
+    /// usage event keyed by their `dispatch_id` and the two that never
+    /// finished have none.
+    fn run_dispatch_report_counts(&self, run_id: &RunId) -> Result<(i64, i64)> {
+        let dispatched: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM dispatches WHERE run_id = ?1",
+            [run_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let reported: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM dispatches d WHERE d.run_id = ?1
+               AND EXISTS (SELECT 1 FROM usage_events u WHERE u.event_id = d.dispatch_id)",
+            [run_id.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok((dispatched, reported))
     }
 
     /// The run's spend grouped by phase (SPEC §11): which of the run's
@@ -2571,25 +2624,23 @@ impl Ledger {
         Ok(total)
     }
 
-    /// Worst-case completeness across a task's runs, the same rule
-    /// [`Ledger::run_cost_completeness`] applies to one run's tree.
+    /// Worst-case completeness across a task's runs, BY CALLING
+    /// [`Ledger::run_cost_completeness`] per run rather than restating
+    /// what it does.
+    ///
+    /// This used to fold the `usage_events` rows itself, which was the
+    /// same answer right up until `run_cost_completeness` learned that a
+    /// dispatch which never reported its usage makes a run's cost
+    /// unknown. Then a task holding a killed run still folded to
+    /// `Actual` here — and this is the function the PRIMARY METRIC line
+    /// is labelled from, so the one number the change existed to correct
+    /// was the one still printing `(actual)`. One rule, one place.
     pub fn task_cost_completeness(&self, task_id: &TaskId) -> Result<CostCompleteness> {
         let mut values = Vec::new();
         for run in self.runs_of_task(task_id)? {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT DISTINCT completeness FROM usage_events WHERE run_id = ?1")?;
-            let rows = stmt.query_map([run.as_str()], |row| row.get::<_, String>(0))?;
-            for value in rows {
-                values.push(value?);
-            }
+            values.push(self.run_cost_completeness(&run)?);
         }
-        Ok(CostCompleteness::worst(values.iter().map(|value| {
-            // A completeness this binary cannot read IS unknown: the fold
-            // is the value's own meaning, not a swallowed error, and it
-            // can only widen the answer (`Unknown` is the worst case).
-            serde_json::from_str(value).unwrap_or(CostCompleteness::Unknown)
-        })))
+        Ok(CostCompleteness::worst(values))
     }
 
     /// Every task created at or after `since` (RFC3339), newest first —
@@ -3979,6 +4030,133 @@ mod tests {
             CostCompleteness::Unknown,
             "unknown usage is never zero and poisons the total"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Empty usage means three different things depending on the run's
+    /// own record of having started: a run never dispatched has a true
+    /// zero cost; a run that dispatched an attempt and reported nothing
+    /// back has an unknown cost, not a zero one; a run that reported one
+    /// attempt and started a second that never reported has a real,
+    /// incomplete lower bound. Pinned together so the three boundaries
+    /// stay distinguishable from one another, not just individually true.
+    #[test]
+    fn a_killed_run_reports_unknown_or_incomplete_not_a_false_zero() {
+        let (ledger, dir) = temp_ledger();
+
+        ledger
+            .insert_run(&run("run-never"), "/repo", None, &task("run-never"), "rk")
+            .expect("run");
+        assert_eq!(
+            ledger
+                .run_cost_completeness(&run("run-never"))
+                .expect("completeness"),
+            CostCompleteness::Actual,
+            "a run that never dispatched an attempt truly spent nothing"
+        );
+
+        ledger
+            .insert_run(&run("run-silent"), "/repo", None, &task("run-silent"), "rk")
+            .expect("run");
+        let revision = ledger
+            .insert_contract_revision(&run("run-silent"), "h", "{}", "HEAD", None)
+            .expect("revision");
+        let attempt = ledger
+            .insert_attempt(
+                &run("run-silent"),
+                revision,
+                1,
+                "implementation",
+                UsagePhase::Initial,
+            )
+            .expect("attempt");
+        ledger
+            .record_dispatch_intent(
+                &dispatch("disp-silent"),
+                &run("run-silent"),
+                Some(attempt),
+                &serde_json::json!({}),
+                0,
+            )
+            .expect("intent");
+        assert_eq!(
+            ledger
+                .run_cost_completeness(&run("run-silent"))
+                .expect("completeness"),
+            CostCompleteness::Unknown,
+            "a dispatched attempt that reported no usage at all died before it could report"
+        );
+
+        ledger
+            .insert_run(
+                &run("run-partial"),
+                "/repo",
+                None,
+                &task("run-partial"),
+                "rk",
+            )
+            .expect("run");
+        let revision = ledger
+            .insert_contract_revision(&run("run-partial"), "h", "{}", "HEAD", None)
+            .expect("revision");
+        let first = ledger
+            .insert_attempt(
+                &run("run-partial"),
+                revision,
+                1,
+                "implementation",
+                UsagePhase::Initial,
+            )
+            .expect("first attempt");
+        ledger
+            .record_dispatch_intent(
+                &dispatch("disp-partial-1"),
+                &run("run-partial"),
+                Some(first),
+                &serde_json::json!({}),
+                0,
+            )
+            .expect("first intent");
+        // Keyed by the DISPATCH id, which is what every producer does —
+        // worker, reviewer and planner all set `event_id: dispatch_id`,
+        // and all 47 usage events in a live ledger are keyed that way,
+        // none otherwise. A fixture that invented its own id would be
+        // asserting against a shape relais never writes.
+        let mut reported = event("disp-partial-1", "run-partial", 500);
+        reported.attempt_id = Some(first);
+        ledger.record_usage(&reported).expect("reported");
+        let second = ledger
+            .insert_attempt(
+                &run("run-partial"),
+                revision,
+                2,
+                "implementation",
+                UsagePhase::Repair,
+            )
+            .expect("second attempt");
+        ledger
+            .record_dispatch_intent(
+                &dispatch("disp-partial-2"),
+                &run("run-partial"),
+                Some(second),
+                &serde_json::json!({}),
+                0,
+            )
+            .expect("second intent");
+        assert_eq!(
+            ledger
+                .run_cost_completeness(&run("run-partial"))
+                .expect("completeness"),
+            CostCompleteness::IncompleteLowerBound,
+            "the first attempt's usage is real; the silent second attempt \
+             makes the total a lower bound, not an unknown"
+        );
+        assert_eq!(
+            ledger.run_cost(&run("run-partial")).expect("cost"),
+            MicroUsd::from_micros(500),
+            "the reported attempt's cost is still the true lower bound"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
