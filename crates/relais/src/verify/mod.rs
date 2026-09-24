@@ -11,7 +11,7 @@
 //! An accepted receipt is bound to one candidate and does not authorize
 //! merge or survive edits.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
@@ -160,11 +160,19 @@ impl VerificationReport {
 /// id — `relais decide --answer approve --criterion <id>` is the only
 /// writer of that set (SPEC §10); nothing else can clear this gap, so a
 /// mandatory criterion asking for one can never be silently waived.
+///
+/// An amont gate is unmet unless `gate_coverage` maps its name to
+/// `Ok(true)` — the answer `amont attest covered` gave when asked
+/// against the candidate's own tree (see [`amont_gate_coverage`]). A gate
+/// this map does not mention at all is treated the same as `Ok(false)`:
+/// conservative, and the branch is defensive since every gate a
+/// declared criterion names is queried before this runs.
 pub fn acceptance_gaps(
     entries: &[AcceptanceEntry],
     profile: &VerificationProfile,
     checks: &[CheckOutcome],
     signoffs: &HashSet<String>,
+    gate_coverage: &BTreeMap<String, Result<bool, AttestError>>,
 ) -> Vec<AcceptanceGap> {
     let mut gaps = Vec::new();
     for entry in entries {
@@ -193,6 +201,20 @@ pub fn acceptance_gaps(
                     missing: MissingEvidence::SignOffUnrecorded,
                 })
             }
+            Some(Evidence::AmontGate { gate }) => match gate_coverage.get(gate) {
+                Some(Ok(true)) => {}
+                Some(Ok(false)) | None => gaps.push(AcceptanceGap {
+                    criterion_id: entry.id(),
+                    missing: MissingEvidence::GateNotCovered { gate: gate.clone() },
+                }),
+                Some(Err(cause)) => gaps.push(AcceptanceGap {
+                    criterion_id: entry.id(),
+                    missing: MissingEvidence::GateUnavailable {
+                        gate: gate.clone(),
+                        detail: cause.to_string(),
+                    },
+                }),
+            },
             // A test runs inside the profile's own commands and an LLM
             // review is the reviewer's verdict: both are settled by the
             // report as a whole, so neither can come up empty on its own.
@@ -234,6 +256,15 @@ pub enum MissingEvidence {
     /// A human sign-off nobody has recorded. The one kind a person's own
     /// later answer can clear (SPEC §10).
     SignOffUnrecorded,
+    /// `amont attest covered` was asked, on the candidate's own tree, and
+    /// answered "no" — fail-open by design, so this cannot tell an
+    /// absent attestation from one whose signature failed to verify
+    /// (SPEC §10, §18).
+    GateNotCovered { gate: String },
+    /// `amont attest covered` could not be asked at all: amont is
+    /// absent, too old to have the subcommand, or failed some other way.
+    /// The cause relais actually observed, never guessed.
+    GateUnavailable { gate: String, detail: String },
 }
 
 impl AcceptanceGap {
@@ -251,6 +282,16 @@ impl AcceptanceGap {
             ),
             MissingEvidence::SignOffUnrecorded => format!(
                 "acceptance criterion `{id}` names a human sign-off, which nothing has recorded"
+            ),
+            MissingEvidence::GateNotCovered { gate } => format!(
+                "acceptance criterion `{id}` names amont gate `{gate}`, which amont does not \
+                 report as covered on this candidate — its own interface cannot tell an absent \
+                 attestation from one whose signature failed to verify; run `amont attest \
+                 covered {gate}` yourself to see the same answer"
+            ),
+            MissingEvidence::GateUnavailable { gate, detail } => format!(
+                "acceptance criterion `{id}` names amont gate `{gate}`, which could not be \
+                 asked about: {detail}"
             ),
         }
     }
@@ -310,11 +351,17 @@ pub struct CriterionOutcome {
 /// `signoffs` names this criterion's own id, recorded by nothing but
 /// `relais decide --answer approve --criterion <id>` (SPEC §10). Reading
 /// it off `accepted` would report a sign-off nobody gave.
+///
+/// An amont gate is settled the same way: met exactly when
+/// `gate_coverage` maps its name to `Ok(true)`, amont's own answer to
+/// `amont attest covered` on the candidate's own tree — never by reading
+/// `accepted`, which says nothing about a gate amont owns.
 pub fn settle_acceptance(
     entries: &[AcceptanceEntry],
     profile: &VerificationProfile,
     report: &VerificationReport,
     signoffs: &HashSet<String>,
+    gate_coverage: &BTreeMap<String, Result<bool, AttestError>>,
 ) -> (Vec<CriterionOutcome>, Option<IndependenceSummary>) {
     let accepted = report.accepted();
     let criteria: Vec<CriterionOutcome> = entries
@@ -333,6 +380,9 @@ pub fn settle_acceptance(
                 }
                 Some(Evidence::Test { .. } | Evidence::LlmReview) | None => accepted,
                 Some(Evidence::HumanSignOff) => signoffs.contains(&entry.id()),
+                Some(Evidence::AmontGate { gate }) => {
+                    matches!(gate_coverage.get(gate), Some(Ok(true)))
+                }
             };
             CriterionOutcome {
                 id: entry.id(),
@@ -1115,6 +1165,169 @@ pub fn default_required_checks(inventory: &AmontInventory) -> Vec<String> {
         .collect()
 }
 
+/// Why amont could not say whether a gate covers this candidate's tree.
+/// Distinct from amont answering "no": every variant here means relais
+/// could not reach a documented answer at all, and turns into a gap
+/// naming the cause it actually observed, never a silent pass and never
+/// a crash (SPEC §10, §18).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttestError {
+    /// `amont attest covered` could not be started, timed out, or was
+    /// cancelled — including amont being absent from this machine.
+    NotRun { detail: String },
+    /// It ran and did not exit 0: a usage error, such as an amont too
+    /// old to have this subcommand. The documented interface's own
+    /// "not covered" answer is `Ok(false)`, not this — this is relais
+    /// failing to ask, not amont answering.
+    Refused { ended: String },
+}
+
+impl std::fmt::Display for AttestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotRun { detail } => write!(f, "`amont attest covered` did not run: {detail}"),
+            Self::Refused { ended } => write!(f, "`amont attest covered` {ended}"),
+        }
+    }
+}
+
+impl std::error::Error for AttestError {}
+
+/// Whether a valid signed attestation covers one gate on one tree, as a
+/// port relais owns. The runner asks a `HookAttest`; only `AmontCli`
+/// knows the binary's name. The gate and its attestation stay amont's to
+/// own (SPEC §10, §18): this asks amont's own documented interface and
+/// nothing here reads `refs/notes/amont-attest`, parses an attestation
+/// format, or verifies a signature.
+pub trait HookAttest {
+    /// Whether `gate` is covered by a valid signed attestation on the
+    /// tree at `dir`, or why relais could not ask. amont's own interface
+    /// is fail-open — it prints nothing and exits 0 on any failure, so
+    /// `Ok(false)` cannot tell an absent attestation from one whose
+    /// signature failed to verify; only `Err` means relais itself could
+    /// not reach an answer.
+    fn covered(&self, dir: &Path, gate: &str) -> Result<bool, AttestError>;
+}
+
+impl HookAttest for AmontCli {
+    fn covered(&self, dir: &Path, gate: &str) -> Result<bool, AttestError> {
+        amont_attest_covered(dir, gate, self.cancel.as_deref())
+    }
+}
+
+/// A fixed set of answers, for tests. A gate this map does not mention
+/// answers [`AttestError::NotRun`] — a fixture that means to grant
+/// coverage says so by name, rather than a missing entry reading as
+/// silently granted.
+#[derive(Debug, Default)]
+pub struct FixedAttest(pub BTreeMap<String, Result<bool, AttestError>>);
+
+impl HookAttest for FixedAttest {
+    fn covered(&self, _dir: &Path, gate: &str) -> Result<bool, AttestError> {
+        self.0
+            .get(gate)
+            .cloned()
+            .unwrap_or(Err(AttestError::NotRun {
+                detail: format!("no fixed answer for gate `{gate}`"),
+            }))
+    }
+}
+
+/// How long `amont attest covered` may take. Bounded and cancellable
+/// like every other probe (audit V6).
+pub const ATTEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Run `amont attest covered <gate>` against the tree at `dir` — the
+/// candidate's own tree, never the user's checkout, so a signed
+/// attestation is asked about the exact commit being verified. This is
+/// the only place relais spawns `amont attest`: the gate and its
+/// attestation are amont's to own, so relais asks through this one
+/// documented interface and reads nothing else — no git notes, no
+/// signature verifier (SPEC §10, §18).
+pub fn amont_attest_covered(
+    dir: &Path,
+    gate: &str,
+    cancel: Option<&AtomicBool>,
+) -> Result<bool, AttestError> {
+    // No gate argument: `amont attest covered` PRINTS the gate names a
+    // valid attestation covers and ignores anything else on its command
+    // line — passing the gate and reading "did it print something" says
+    // only that SOME gate is covered, so a criterion naming an uncovered
+    // gate would read as covered whenever any other one was. Measured:
+    // `amont attest covered zzz-not-a-gate` prints the full list and
+    // exits 0. The name is matched against the list below instead.
+    let mut command = Command::new("amont");
+    command.arg("attest").arg("covered").current_dir(dir);
+    let end = crate::procs::run_with_timeout(command, ATTEST_TIMEOUT, None, cancel, None).map_err(
+        |e| AttestError::NotRun {
+            detail: e.to_string(),
+        },
+    )?;
+    if end.ended != Ended::Exited(0) {
+        return Err(AttestError::Refused {
+            ended: end.ended.describe(),
+        });
+    }
+    Ok(covers_gate(&end.stdout, gate))
+}
+
+/// Whether `amont attest covered`'s output names this gate.
+///
+/// Pure, and tested, because it is the whole of what relais concludes
+/// from amont: the command prints the covered gate names separated by
+/// whitespace, and everything else about the attestation — that it
+/// exists, that it verifies, that it is for this tree — amont already
+/// decided before printing.
+///
+/// Matching the WHOLE name matters. `amont attest covered <gate>`
+/// ignores its extra argument and prints the full list either way
+/// (measured: `amont attest covered zzz-not-a-gate` prints all five
+/// gates and exits 0), so asking "did it print anything" would report a
+/// criterion's gate as covered whenever some OTHER gate was. A prefix
+/// match would do the same for `pre-push-audit` against
+/// `pre-push-audit-rust`.
+///
+/// Empty output means covered by nothing: amont prints nothing and exits
+/// 0 on any failure, so an absent name is uncovered whatever the reason,
+/// which is the safe direction for a gap.
+fn covers_gate(stdout: &str, gate: &str) -> bool {
+    stdout.split_whitespace().any(|covered| covered == gate)
+}
+
+/// The distinct amont gates any declared acceptance criterion names as
+/// its evidence — mandatory or not, so every declared criterion can be
+/// settled, not only the ones that can block acceptance.
+pub fn amont_gate_names(entries: &[AcceptanceEntry]) -> Vec<String> {
+    let mut gates: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| {
+            entry.evidence().and_then(|evidence| match evidence {
+                Evidence::AmontGate { gate } => Some(gate.clone()),
+                Evidence::Check { .. }
+                | Evidence::Test { .. }
+                | Evidence::LlmReview
+                | Evidence::HumanSignOff => None,
+            })
+        })
+        .collect();
+    gates.sort();
+    gates.dedup();
+    gates
+}
+
+/// Ask amont, once per distinct gate, whether a valid signed attestation
+/// covers it on the tree at `dir`.
+pub fn amont_gate_coverage(
+    gates: &[String],
+    hooks: &dyn HookAttest,
+    dir: &Path,
+) -> BTreeMap<String, Result<bool, AttestError>> {
+    gates
+        .iter()
+        .map(|gate| (gate.clone(), hooks.covered(dir, gate)))
+        .collect()
+}
+
 /// What one candidate's verification established: the checks that ran,
 /// the required checks that are gaps, and what amont's inventory declares
 /// about itself.
@@ -1128,6 +1341,10 @@ pub struct Verified {
     pub acceptance_gaps: Vec<AcceptanceGap>,
     pub amont_bypasses: Vec<String>,
     pub amont_downgrades: Vec<String>,
+    /// What amont answered about every gate a declared criterion named,
+    /// keyed by gate name — settlement reads this, never `accepted`
+    /// (SPEC §10, §18).
+    pub gate_coverage: BTreeMap<String, Result<bool, AttestError>>,
 }
 
 /// The toolchain a profile's commands actually run on: for every program
@@ -2255,7 +2472,13 @@ mod tests {
             log_path: "x.log".into(),
             log_sha256: "h".into(),
         }];
-        let gaps = acceptance_gaps(&entries, &profile, &checks, &HashSet::new());
+        let gaps = acceptance_gaps(
+            &entries,
+            &profile,
+            &checks,
+            &HashSet::new(),
+            &BTreeMap::new(),
+        );
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         assert_eq!(
             gaps[0].missing,
@@ -2337,7 +2560,13 @@ mod tests {
                 crate::acceptance::Evidence::LlmReview,
             ),
         ];
-        let (criteria, summary) = settle_acceptance(&entries, &profile, &report, &HashSet::new());
+        let (criteria, summary) = settle_acceptance(
+            &entries,
+            &profile,
+            &report,
+            &HashSet::new(),
+            &BTreeMap::new(),
+        );
         assert!(
             criteria.iter().all(|c| c.met),
             "checks passed, so every criterion is met: {criteria:?}"
@@ -2420,7 +2649,13 @@ mod tests {
             crate::acceptance::Evidence::HumanSignOff,
         )];
 
-        let gaps = acceptance_gaps(&entries, &profile, &checks, &HashSet::new());
+        let gaps = acceptance_gaps(
+            &entries,
+            &profile,
+            &checks,
+            &HashSet::new(),
+            &BTreeMap::new(),
+        );
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         assert_eq!(
             gaps[0].missing,
@@ -2450,7 +2685,13 @@ mod tests {
             "every check passed, but the sign-off is still missing"
         );
 
-        let (criteria, summary) = settle_acceptance(&entries, &profile, &report, &HashSet::new());
+        let (criteria, summary) = settle_acceptance(
+            &entries,
+            &profile,
+            &report,
+            &HashSet::new(),
+            &BTreeMap::new(),
+        );
         assert!(
             !criteria[0].met,
             "an unrecorded sign-off is not met: {criteria:?}"
@@ -2485,7 +2726,7 @@ mod tests {
         )];
         let signed_off: HashSet<String> = [entries[0].id()].into_iter().collect();
 
-        let gaps = acceptance_gaps(&entries, &profile, &checks, &signed_off);
+        let gaps = acceptance_gaps(&entries, &profile, &checks, &signed_off, &BTreeMap::new());
         assert!(gaps.is_empty(), "{gaps:?}");
         let gaps: Vec<String> = gaps.iter().map(AcceptanceGap::message).collect();
 
@@ -2506,12 +2747,216 @@ mod tests {
         };
         assert!(report.accepted());
 
-        let (criteria, summary) = settle_acceptance(&entries, &profile, &report, &signed_off);
+        let (criteria, summary) =
+            settle_acceptance(&entries, &profile, &report, &signed_off, &BTreeMap::new());
         assert!(criteria[0].met, "a recorded sign-off is met: {criteria:?}");
         assert_eq!(
             summary,
             Some(IndependenceSummary::AllIndependent),
             "a human sign-off is independent by definition"
+        );
+    }
+
+    /// A mandatory criterion can name an amont gate as its evidence, and
+    /// The failure this test exists for: the first candidate passed the
+    /// gate to `amont attest covered` and read "did it print anything"
+    /// as the answer. That command ignores the argument and prints every
+    /// covered gate, so a criterion naming an UNCOVERED gate read as
+    /// covered whenever any other gate was — a silent pass, through the
+    /// one evidence kind relais cannot observe for itself. Every test
+    /// passed anyway, because they all stand in for amont at the
+    /// `HookAttest` port and never reach the parsing.
+    #[test]
+    fn a_gate_is_covered_only_when_the_list_names_that_gate() {
+        let printed = "pre-push-branch-protect pre-push-secrets pre-push-audit-rust\n";
+        assert!(covers_gate(printed, "pre-push-secrets"));
+        assert!(covers_gate(printed, "pre-push-audit-rust"));
+        assert!(
+            !covers_gate(printed, "pre-push-cargo-test"),
+            "a gate the list does not name is not covered by the ones it does"
+        );
+        assert!(
+            !covers_gate(printed, "pre-push-audit"),
+            "a prefix of a covered gate is not that gate"
+        );
+        assert!(
+            !covers_gate(printed, "audit-rust"),
+            "a suffix of a covered gate is not that gate either"
+        );
+        // Nothing printed is amont's fail-open answer: covered by nothing.
+        assert!(!covers_gate("", "pre-push-secrets"));
+        assert!(!covers_gate("   \n  ", "pre-push-secrets"));
+    }
+
+    /// `amont_gate_coverage` asks the `HookAttest` port once per distinct
+    /// gate, on the candidate's own tree. Covered settles the criterion
+    /// met and independent — the gate ran outside this run and its
+    /// attestation is signed (SPEC §10, §18).
+    #[test]
+    fn a_covered_amont_gate_settles_met_and_independent() {
+        let profile = VerificationProfile {
+            setup: Vec::new(),
+            commands: vec![named("check", &["sh", "-c", "true"], 10)],
+            amont_checks: Vec::new(),
+            amont_waivers: Vec::new(),
+            inputs: Vec::new(),
+            cache_baseline: false,
+        };
+        let checks = vec![CheckOutcome {
+            label: check_label(&profile.commands[0]),
+            argv: profile.commands[0].argv.clone(),
+            ended: Ended::Exited(0),
+            log_path: "x.log".into(),
+            log_sha256: "h".into(),
+        }];
+        let entries = vec![declared(
+            "the pre-push cargo test gate covers this candidate",
+            crate::acceptance::Evidence::AmontGate {
+                gate: "pre-push-cargo-test".into(),
+            },
+        )];
+        assert_eq!(
+            amont_gate_names(&entries),
+            vec!["pre-push-cargo-test".to_string()]
+        );
+        let hooks = FixedAttest(
+            [("pre-push-cargo-test".to_string(), Ok(true))]
+                .into_iter()
+                .collect(),
+        );
+        let coverage = amont_gate_coverage(
+            &amont_gate_names(&entries),
+            &hooks,
+            Path::new("/does/not/matter"),
+        );
+
+        let gaps = acceptance_gaps(&entries, &profile, &checks, &HashSet::new(), &coverage);
+        assert!(gaps.is_empty(), "{gaps:?}");
+
+        let report = VerificationReport {
+            candidate_sha: "abc".into(),
+            base_sha: "def".into(),
+            contract_hash: "ch".into(),
+            policy_hash: "ph".into(),
+            checks,
+            gaps: Vec::new(),
+            baseline_failures: Vec::new(),
+            amont_bypasses: Vec::new(),
+            amont_downgrades: Vec::new(),
+            verification_inputs_changed: Vec::new(),
+            integration_gaps: Vec::new(),
+            baseline_cached: false,
+            baseline_cache_refused: None,
+        };
+        let (criteria, summary) =
+            settle_acceptance(&entries, &profile, &report, &HashSet::new(), &coverage);
+        assert!(criteria[0].met, "a covered gate is met: {criteria:?}");
+        assert_eq!(
+            summary,
+            Some(IndependenceSummary::AllIndependent),
+            "an amont gate is independent — it ran outside this run"
+        );
+    }
+
+    /// amont's own interface is fail-open by design: it answers "not
+    /// covered" for an absent attestation and for one whose signature
+    /// failed to verify alike. relais must not turn that into a pass —
+    /// it is a gap, through the same mechanism every other gap goes
+    /// through — and the gap's message says it cannot tell which of the
+    /// two amont meant, naming `amont attest covered` as the command a
+    /// person can run to see the same answer (SPEC §10, §18).
+    #[test]
+    fn an_uncovered_amont_gate_is_a_gap_that_admits_the_ambiguity() {
+        let profile = VerificationProfile {
+            setup: Vec::new(),
+            commands: vec![named("check", &["sh", "-c", "true"], 10)],
+            amont_checks: Vec::new(),
+            amont_waivers: Vec::new(),
+            inputs: Vec::new(),
+            cache_baseline: false,
+        };
+        let checks = vec![CheckOutcome {
+            label: check_label(&profile.commands[0]),
+            argv: profile.commands[0].argv.clone(),
+            ended: Ended::Exited(0),
+            log_path: "x.log".into(),
+            log_sha256: "h".into(),
+        }];
+        let entries = vec![declared(
+            "the pre-push cargo test gate covers this candidate",
+            crate::acceptance::Evidence::AmontGate {
+                gate: "pre-push-cargo-test".into(),
+            },
+        )];
+        let coverage: BTreeMap<String, Result<bool, AttestError>> =
+            [("pre-push-cargo-test".to_string(), Ok(false))]
+                .into_iter()
+                .collect();
+
+        let gaps = acceptance_gaps(&entries, &profile, &checks, &HashSet::new(), &coverage);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(
+            gaps[0].missing,
+            MissingEvidence::GateNotCovered {
+                gate: "pre-push-cargo-test".into()
+            }
+        );
+        let message = gaps[0].message();
+        assert!(message.contains("amont attest covered"), "{message}");
+        assert!(message.contains("cannot tell"), "{message}");
+
+        let report = VerificationReport {
+            candidate_sha: "abc".into(),
+            base_sha: "def".into(),
+            contract_hash: "ch".into(),
+            policy_hash: "ph".into(),
+            checks,
+            gaps: vec![message],
+            baseline_failures: Vec::new(),
+            amont_bypasses: Vec::new(),
+            amont_downgrades: Vec::new(),
+            verification_inputs_changed: Vec::new(),
+            integration_gaps: Vec::new(),
+            baseline_cached: false,
+            baseline_cache_refused: None,
+        };
+        assert!(!report.accepted());
+        let (criteria, _) =
+            settle_acceptance(&entries, &profile, &report, &HashSet::new(), &coverage);
+        assert!(
+            !criteria[0].met,
+            "an uncovered gate is not met: {criteria:?}"
+        );
+    }
+
+    /// amont being absent, too old to have the subcommand, or refusing
+    /// for any other reason is a gap naming the cause relais actually
+    /// observed — never a silent pass and never confused with the
+    /// documented "not covered" answer (SPEC §10, §18).
+    #[test]
+    fn an_amont_that_cannot_be_asked_is_a_gap_naming_the_cause() {
+        let profile = VerificationProfile::default();
+        let entries = vec![declared(
+            "the pre-push cargo test gate covers this candidate",
+            crate::acceptance::Evidence::AmontGate {
+                gate: "pre-push-cargo-test".into(),
+            },
+        )];
+        let coverage: BTreeMap<String, Result<bool, AttestError>> = [(
+            "pre-push-cargo-test".to_string(),
+            Err(AttestError::NotRun {
+                detail: "amont: command not found".into(),
+            }),
+        )]
+        .into_iter()
+        .collect();
+
+        let gaps = acceptance_gaps(&entries, &profile, &[], &HashSet::new(), &coverage);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        let message = gaps[0].message();
+        assert!(
+            message.contains("amont: command not found"),
+            "the cause relais actually observed is named, not guessed: {message}"
         );
     }
 
@@ -2538,6 +2983,7 @@ mod tests {
             &profile,
             &accepted,
             &HashSet::new(),
+            &BTreeMap::new(),
         );
         assert_eq!(all_independent, Some(IndependenceSummary::AllIndependent));
 
@@ -2548,7 +2994,13 @@ mod tests {
                 crate::acceptance::Evidence::LlmReview,
             ),
         ];
-        let (_, partly) = settle_acceptance(&mixed, &profile, &accepted, &HashSet::new());
+        let (_, partly) = settle_acceptance(
+            &mixed,
+            &profile,
+            &accepted,
+            &HashSet::new(),
+            &BTreeMap::new(),
+        );
         assert_eq!(partly, Some(IndependenceSummary::PartlyIndependent));
 
         // A non-mandatory criterion does not enter the summary at all.
@@ -2556,8 +3008,13 @@ mod tests {
             "nice to have",
             crate::acceptance::Evidence::LlmReview,
         )];
-        let (_, none_mandatory) =
-            settle_acceptance(&only_optional, &profile, &accepted, &HashSet::new());
+        let (_, none_mandatory) = settle_acceptance(
+            &only_optional,
+            &profile,
+            &accepted,
+            &HashSet::new(),
+            &BTreeMap::new(),
+        );
         assert_eq!(none_mandatory, None);
     }
 

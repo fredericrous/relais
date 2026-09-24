@@ -1632,6 +1632,7 @@ fn run_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError
     let git = relais::workspace::SystemGit;
     let aval_resolver = relais::context::AvalCli::new(root.clone());
     let hooks = relais::verify::AmontCli::new();
+    let attest = relais::verify::AmontCli::new();
     // What every worker this run dispatches will have in its
     // environment: an allowlist of this process's own, never the whole
     // of it (SPEC §8).
@@ -1669,6 +1670,7 @@ fn run_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError
         backend: backend.as_ref(),
         git: &git,
         hooks: &hooks,
+        attest: &attest,
         worker_env,
         artifacts_dir: artifacts_dir.clone(),
         aval_resolver: &aval_resolver,
@@ -2481,6 +2483,7 @@ fn decide_command(
                     Some(Evidence::Test { authorship }) =>
                         format!("a test ({})", authorship_label(*authorship)),
                     Some(Evidence::LlmReview) => "an LLM review".to_string(),
+                    Some(Evidence::AmontGate { gate }) => format!("amont gate `{gate}`"),
                     Some(Evidence::HumanSignOff) => unreachable!("guarded above"),
                     None => "the verification profile as a whole".to_string(),
                 }

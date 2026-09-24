@@ -52,6 +52,29 @@ missing here.
   naming the ids it does. `relais explain` now prints evidence through
   this typed row rather than the positional tuple it read before.
 
+- **A declared criterion can name an amont gate as its evidence.** A new
+  `Evidence::AmontGate { gate }` sits alongside the named check, test,
+  review and sign-off a criterion could already declare, and settles the
+  same way every gap already does: relais asks amont's own documented
+  interface, `amont attest covered <gate>`, on the candidate's own tree
+  — never by reading `refs/notes/amont-attest`, parsing an attestation
+  format, or verifying a signature here. The gate and its attestation
+  stay amont's to own. A gate amont reports covered is met and
+  independent (it ran outside this run, and a valid signed attestation
+  is amont's own verdict), and records an external-attestation evidence
+  row against the run and the criterion it answers, naming amont as the
+  tool and the candidate SHA as the subject. amont's interface is
+  fail-open by design — it prints nothing and exits 0 whether an
+  attestation is absent or one whose signature failed to verify — so a
+  gate not reported covered is a gap through the same mechanism that
+  already refuses gaps, never a second acceptance path and never a
+  silent pass; its message says it cannot tell which of the two amont
+  meant, and names `amont attest covered` as the command a person can
+  run to see the same answer. amont being absent, too old for the
+  subcommand, or failing any other way is likewise a gap naming the
+  cause relais actually observed, never a silent pass and never a
+  crash.
+
 ## v0.4.0
 
 ### Added
