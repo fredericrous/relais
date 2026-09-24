@@ -68,6 +68,13 @@ enum Command {
         /// Machine-readable output
         #[arg(long)]
         json: bool,
+        /// Probe what Claude Code's hooks actually send: wire the hook
+        /// targets relais will use into a throwaway settings file, run
+        /// one real `claude -p` session through it, and write a
+        /// compatibility record of what fired. Costs money and touches
+        /// the network; never part of `make check`.
+        #[arg(long = "probe-hooks")]
+        probe_hooks: bool,
     },
     /// Create a relais.toml policy for this repository
     Init,
@@ -233,6 +240,17 @@ enum Command {
     Evidence {
         #[command(subcommand)]
         cmd: EvidenceCommand,
+    },
+    /// Record one Claude Code hook payload verbatim. Internal: this is
+    /// the command `relais doctor --probe-hooks` wires into its
+    /// throwaway settings file, not something a person runs directly.
+    Hook {
+        /// The only mode this command has: record, decide nothing.
+        #[arg(long)]
+        probe: bool,
+        /// Where to write the payload
+        #[arg(long = "record")]
+        record: PathBuf,
     },
 }
 
@@ -564,7 +582,16 @@ fn main() {
 /// same pair, so the exit code is decided in exactly one place.
 fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
     match command {
-        Command::Doctor { json } => doctor_command(json),
+        Command::Doctor { json, probe_hooks } => match probe_hooks {
+            true => doctor_probe_hooks_command(),
+            false => doctor_command(json),
+        },
+        Command::Hook { probe, record } => match probe {
+            true => hook_command(&record),
+            false => Err(CliError::Usage {
+                detail: "hook: only `--probe --record <dir>` is implemented".into(),
+            }),
+        },
         Command::Init => init_command(),
         Command::Plan { task, revise } => plan_command(&task, revise.as_deref()),
         Command::Run { task, revise } => run_command(&task, revise.as_deref()),
@@ -1467,6 +1494,57 @@ fn doctor_command(json: bool) -> Result<CliOutcome, CliError> {
         true => Ok(CliOutcome::Blocked),
         false => Ok(CliOutcome::Accepted),
     }
+}
+
+/// `relais hook --probe --record <dir>`: the record-only handler
+/// `relais doctor --probe-hooks` wires into its throwaway settings file.
+/// Reads one payload from stdin, writes it verbatim, decides nothing,
+/// and always accepts — the handler cannot fail the session it is
+/// watching.
+fn hook_command(dir: &Path) -> Result<CliOutcome, CliError> {
+    let order = relais::hook::next_order(dir);
+    relais::hook::record(dir, order, std::io::stdin().lock());
+    Ok(CliOutcome::Accepted)
+}
+
+/// `relais doctor --probe-hooks`: wire the seven hook targets into a
+/// throwaway settings file, run one real session through it, and print
+/// what was observed. Never part of `relais doctor`'s normal report —
+/// this needs a real Claude Code, costs money and touches the network.
+fn doctor_probe_hooks_command() -> Result<CliOutcome, CliError> {
+    let claude_binary = relais::tooling::which("claude").ok_or_else(|| CliError::Operational {
+        operation: "doctor --probe-hooks",
+        cause: Box::new(relais::hook::ProbeHooksError::NoClaudeBinary),
+    })?;
+    let relais_binary = operational(std::env::current_exe(), "doctor --probe-hooks")?;
+    let report = operational(
+        relais::hook::probe(&claude_binary, &relais_binary),
+        "doctor --probe-hooks",
+    )?;
+    println!(
+        "hook probe: Claude Code {}",
+        report.record.claude_code_version
+    );
+    println!("  settings:   {}", report.settings_path.display());
+    println!("  recordings: {}", report.recording_dir.display());
+    for target in &report.record.targets {
+        let fields = if target.fields.is_empty() {
+            "(no fields)".to_string()
+        } else {
+            target.fields.join(", ")
+        };
+        println!(
+            "  {:<20} {:<12} {}",
+            target.target,
+            if target.fired {
+                "fired"
+            } else {
+                "did not fire"
+            },
+            fields
+        );
+    }
+    Ok(CliOutcome::Accepted)
 }
 
 fn init_command() -> Result<CliOutcome, CliError> {

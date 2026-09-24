@@ -1,0 +1,30 @@
+{
+  "agent_id": "agent-01",
+  "agent_type": "general-purpose",
+  "cwd": "/REPO",
+  "duration_ms": 3,
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "permission_mode": "default",
+  "prompt_id": "prompt-0000",
+  "session_id": "session-0000",
+  "tool_input": {
+    "file_path": "/REPO/Cargo.toml",
+    "limit": 1
+  },
+  "tool_name": "Read",
+  "tool_response": {
+    "file": {
+      "content": "<redacted: real content, shape preserved>",
+      "filePath": "/REPO/Cargo.toml",
+      "numLines": 1,
+      "startLine": 1,
+      "totalLines": 25
+    },
+    "type": "text"
+  },
+  "tool_use_id": "toolu-03",
+  "transcript_path": "/REDACTED/transcript.jsonl"
+}

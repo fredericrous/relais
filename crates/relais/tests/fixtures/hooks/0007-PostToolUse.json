@@ -1,0 +1,82 @@
+{
+  "cwd": "/REPO",
+  "duration_ms": 3250,
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "permission_mode": "default",
+  "prompt_id": "prompt-0000",
+  "session_id": "session-0000",
+  "tool_input": {
+    "description": "Read Cargo.toml first line",
+    "model": "opus",
+    "prompt": "Use the Read tool (not Bash) on /REPO/Cargo.toml and report back its first line exactly, verbatim, and nothing else. Do nothing else.",
+    "run_in_background": false,
+    "subagent_type": "general-purpose"
+  },
+  "tool_name": "Agent",
+  "tool_response": {
+    "agentId": "a770738fcb9daf49b",
+    "agentType": "general-purpose",
+    "content": [
+      {
+        "text": "[workspace]",
+        "type": "text"
+      }
+    ],
+    "harnessNoteCount": 0,
+    "harnessSectionHash": "65355b13fbc6bdf6",
+    "harnessTailCount": 0,
+    "prompt": "Use the Read tool (not Bash) on /REPO/Cargo.toml and report back its first line exactly, verbatim, and nothing else. Do nothing else.",
+    "resolvedModel": "claude-opus-5-5[1m]",
+    "status": "completed",
+    "toolStats": {
+      "bashCount": 0,
+      "editFileCount": 0,
+      "linesAdded": 0,
+      "linesRemoved": 0,
+      "otherToolCount": 0,
+      "readCount": 1,
+      "searchCount": 0
+    },
+    "totalDurationMs": 3249,
+    "totalTokens": 25167,
+    "totalToolUseCount": 1,
+    "usage": {
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 2060
+      },
+      "cache_creation_input_tokens": 2060,
+      "cache_read_input_tokens": 23098,
+      "inference_geo": "not_available",
+      "input_tokens": 2,
+      "iterations": [
+        {
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 2060
+          },
+          "cache_creation_input_tokens": 2060,
+          "cache_read_input_tokens": 23098,
+          "input_tokens": 2,
+          "output_tokens": 7,
+          "type": "message"
+        }
+      ],
+      "output_tokens": 7,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      },
+      "server_tool_use": {
+        "web_fetch_requests": 0,
+        "web_search_requests": 0
+      },
+      "service_tier": "standard",
+      "speed": "standard"
+    }
+  },
+  "tool_use_id": "toolu-02",
+  "transcript_path": "/REDACTED/transcript.jsonl"
+}
