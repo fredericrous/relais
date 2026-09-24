@@ -10,6 +10,26 @@ missing here.
 
 ### Added
 
+- **`relais doctor --probe-hooks` captures what Claude Code's hooks
+  actually send, from a real session.** `relais hook --probe --record
+  <dir>` is a record-only handler: it reads one hook payload on stdin
+  and writes it verbatim, deciding nothing about its shape — a hook that
+  exits non-zero or writes to stdout can block or alter the tool call
+  that triggered it, so the handler cannot fail whatever it is handed
+  (invalid JSON, an oversized payload, an event it was not wired for all
+  still record and exit 0). `--probe-hooks` wires that handler into a
+  throwaway settings file for the seven targets relais will use —
+  `PreToolUse`/`PostToolUse`/`PostToolUseFailure` on the Agent tool,
+  `SubagentStart`, `SubagentStop`, `SessionStart`, `SessionEnd` — runs
+  one real `claude -p` session that forces a nested agent call, and
+  writes a compatibility record naming the Claude Code version observed
+  and which fields each target's payloads carried, reported as what was
+  seen rather than what was expected. `relais doctor`'s normal report
+  now flags that record as stale when the installed Claude Code no
+  longer matches the version it names. The probe has its own `make
+  probe-hooks` target — it needs a real Claude Code, costs money and
+  touches the network, so it is never part of `make check`.
+
 - **Labelling reads a task's recorded outcome, not just its run's
   terminal state.** A task whose latest recorded outcome is `reverted`
   or a confirmed regression is never a positive label, whatever its

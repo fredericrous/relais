@@ -1,0 +1,16 @@
+{
+  "cwd": "/REPO",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PreToolUse",
+  "permission_mode": "default",
+  "prompt_id": "prompt-0000",
+  "session_id": "session-0000",
+  "tool_input": {
+    "file_path": "/nonexistent-relais-probe-target"
+  },
+  "tool_name": "Read",
+  "tool_use_id": "toolu-01",
+  "transcript_path": "/REDACTED/transcript.jsonl"
+}

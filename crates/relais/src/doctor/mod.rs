@@ -452,6 +452,7 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
 
     check_command("git", &["--version"], &mut findings, "git");
 
+    let mut installed_claude_version: Option<String> = None;
     match crate::adapter::claude::ClaudeBackend::discover() {
         Err(e) => findings.push(Finding {
             component: "claude-code",
@@ -466,9 +467,13 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
                 level: Level::Fail,
                 detail: failure.to_string(),
             }),
-            Ok(caps) => findings.push(claude_code_finding(&caps)),
+            Ok(caps) => {
+                installed_claude_version = caps.version.clone();
+                findings.push(claude_code_finding(&caps));
+            }
         },
     }
+    findings.push(hook_compat_finding(installed_claude_version.as_deref()));
 
     let policy_path = repo_dir.join("relais.toml");
     let policy = match std::fs::read_to_string(&policy_path) {
@@ -618,6 +623,64 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
     findings.push(coordinator_finding());
 
     DoctorReport { findings }
+}
+
+/// The hook compatibility record `relais doctor --probe-hooks` writes,
+/// checked against the Claude Code actually on PATH. A record is
+/// evidence about one version; trusting it for a different one silently
+/// would mean a fixture built on 2.1.x reads as evidence for 2.3.x that
+/// installed it (SPEC criteria). Never a blocker: nothing here stops a
+/// run, and the record itself is optional.
+fn hook_compat_finding(installed_version: Option<&str>) -> Finding {
+    let path = match crate::hook::compat_record_path() {
+        Ok(path) => path,
+        Err(e) => {
+            return Finding {
+                component: "hook-compat",
+                level: Level::Warn,
+                detail: e.to_string(),
+            }
+        }
+    };
+    match crate::hook::read_compat_record(&path) {
+        None => Finding {
+            component: "hook-compat",
+            level: Level::Warn,
+            detail: format!(
+                "no hook compatibility record yet — run `relais doctor --probe-hooks` \
+                 (costs money, touches the network) to write {}",
+                path.display()
+            ),
+        },
+        Some(record) => match installed_version {
+            Some(installed) if installed == record.claude_code_version => Finding {
+                component: "hook-compat",
+                level: Level::Ok,
+                detail: format!(
+                    "fresh: recorded for Claude Code {} at {}",
+                    record.claude_code_version, record.observed_at
+                ),
+            },
+            Some(installed) => Finding {
+                component: "hook-compat",
+                level: Level::Warn,
+                detail: format!(
+                    "stale: recorded for Claude Code {}, installed is {installed} — \
+                     re-run `relais doctor --probe-hooks`",
+                    record.claude_code_version
+                ),
+            },
+            None => Finding {
+                component: "hook-compat",
+                level: Level::Warn,
+                detail: format!(
+                    "recorded for Claude Code {}, but the installed version could not be \
+                     read — re-run `relais doctor --probe-hooks` once it can",
+                    record.claude_code_version
+                ),
+            },
+        },
+    }
 }
 
 /// The ledger line. A ledger that opens but whose schema version cannot

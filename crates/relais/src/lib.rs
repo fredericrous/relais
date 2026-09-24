@@ -13,6 +13,7 @@ pub mod context;
 pub mod contract;
 pub mod coordinator;
 pub mod doctor;
+pub mod hook;
 pub mod ids;
 pub mod install;
 pub mod ipc;

@@ -489,6 +489,16 @@ For ordinary native Claude Code subagents, collect available lifecycle and trans
 
 If a launch/resume path cannot be intercepted, label its enforcement `observed`, include known usage, and do not claim hard aggregate concurrency/model guarantees over it. Strict runs use managed dispatch for such paths. Coordinator outage must not silently turn a strict managed launch into an unmanaged launch; preserve the request and report unavailable admission. Ordinary unwrapped Claude Code sessions remain usable and are not forcibly terminated.
 
+### The hook compatibility matrix
+
+Before any package reasons over a hook payload, `relais hook --probe --record <dir>` and `relais doctor --probe-hooks` establish what the installed Claude Code actually sends, so later packages test against a transcription of a real session rather than a belief about one.
+
+`relais hook --probe --record <dir>` is record-only: it reads one hook payload on stdin and writes it to `<dir>` byte for byte, alongside the event name and the order it arrived. It parses nothing beyond a best-effort event name for the file name, decides nothing about the payload's shape, and always exits 0 without writing to stdout — a hook that exits non-zero or writes to stdout can block or alter the tool call that triggered it, and a probe that changed the session it was measuring would be measuring itself. A payload that is not valid JSON, exceeds a sane size cap, or arrives for an event the handler was not wired for is still recorded and still exits 0.
+
+`relais doctor --probe-hooks` wires that handler, via a throwaway settings file it writes under the state directory (never the user's own `settings.json`), into the seven targets Relais uses: `PreToolUse`, `PostToolUse` and `PostToolUseFailure` on the Agent tool, plus `SubagentStart`, `SubagentStop`, `SessionStart` and `SessionEnd`. It runs one real `claude -p` session through that settings file, prompted to force at least one nested agent call, then reads the recordings back and writes a compatibility record naming the Claude Code version observed and, per target, whether it fired and which top-level fields its payloads carried — reported as what was seen, never as what was expected. A target that did not fire is recorded as not fired, since a version that sends no such event is a fact about that version, not a probe failure. This needs a real Claude Code, costs money and touches the network, so it is never part of the local check suite; it has its own `make probe-hooks` target.
+
+`relais doctor`'s ordinary run reads that compatibility record back and reports it stale when the Claude Code on PATH no longer matches the version the record names, in the same finding shape doctor uses elsewhere, rather than silently trusting a record from a different version.
+
 ### Resource policy
 
 Use separate limits for active remote model work, local heavy commands, indexing and training. A lightweight remote research agent does not consume the same resource class as a compiler or test container. Parent processes waiting on children retain identity but relinquish active-execution capacity where waiting can be reliably observed; avoid a deadlock in which all slots are held by parents awaiting queued children. Otherwise reserve child capacity before starting a delegation-capable parent, or decline that decomposition explicitly.

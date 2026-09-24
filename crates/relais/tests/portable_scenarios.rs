@@ -292,6 +292,66 @@ fn doctor_names_what_is_missing_and_exits_on_a_blocker() {
     assert_eq!(policy_level, "ok", "{report}");
 }
 
+#[test]
+fn doctor_reports_no_hook_compat_record_until_one_is_written() {
+    let world = World::new("doctor-hook-compat");
+    let first = world.relais(&["doctor", "--json"]);
+    let report: serde_json::Value =
+        serde_json::from_str(text(&first.stdout).trim()).expect("doctor --json is a document");
+    let finding = report["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .find(|f| f["component"] == "hook-compat")
+        .unwrap_or_else(|| panic!("no `hook-compat` finding in {report}"))
+        .clone();
+    assert_eq!(finding["level"], "warn", "{report}");
+    assert!(
+        finding["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no hook compatibility record"),
+        "{finding}"
+    );
+}
+
+#[test]
+fn hook_probe_record_writes_the_payload_verbatim_and_stays_silent() {
+    let world = World::new("hook-probe");
+    let dir = world.root.join("recordings");
+    std::fs::create_dir_all(&dir).expect("recordings dir");
+    let payload = br#"{"hook_event_name":"PreToolUse","tool_name":"Agent"}"#;
+    let output = Command::new(BIN)
+        .args(["hook", "--probe", "--record", &dir.to_string_lossy()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("stdin piped")
+                .write_all(payload)?;
+            child.wait_with_output()
+        })
+        .expect("hook --probe --record runs");
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert!(
+        output.stdout.is_empty(),
+        "the handler must never write to stdout: {}",
+        text(&output.stdout)
+    );
+    let written = std::fs::read_dir(&dir)
+        .expect("recordings dir readable")
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    assert_eq!(written.len(), 1, "exactly one payload was recorded");
+    let recorded = std::fs::read(written[0].path()).expect("payload readable");
+    assert_eq!(recorded, payload, "the payload is recorded byte for byte");
+}
+
 // Task-linking: `--revise` names an existing task by id; one that
 // matches no run on record is refused by name, before route or dispatch.
 #[test]
