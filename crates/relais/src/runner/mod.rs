@@ -825,6 +825,19 @@ impl<'a> RunEngine<'a> {
                         bound_pid = true;
                         match gate.bind(&dispatch_id, None, Some(pid)) {
                             Ok(BindOutcome::Bound) => {}
+                            // A worker binds its own pid to its own
+                            // fresh dispatch, so this cannot happen
+                            // here — but a seat that silently failed to
+                            // bind is the unmanaged launch SPEC §23
+                            // forbids, so it is recorded like the other
+                            // ways a bind can fail rather than ignored.
+                            Ok(BindOutcome::AlreadyBoundToProcess) => record_lost_seat(
+                                seat_lost,
+                                format!(
+                                    "dispatch {dispatch_id} was already bound when pid {pid} \
+                                     tried to bind, so this worker holds no seat of its own"
+                                ),
+                            ),
                             // The coordinator has no such dispatch: this
                             // worker holds no seat, no reservation and
                             // no PID on record, which is the unmanaged

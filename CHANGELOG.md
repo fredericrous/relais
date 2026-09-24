@@ -235,6 +235,33 @@ missing here.
   environment — so a hook that fires twice for one tool call derives one
   `DispatchId`, not two.
 
+- **A dispatch can now be bound to a hook-admitted agent, which has no
+  process id to check.** `AdmissionState::bind_agent_lease` binds a
+  dispatch to an `agent_id` on a lease held for `agent_lease_ttl`
+  (`set_agent_lease_ttl`, default `DEFAULT_AGENT_LEASE_TTL` = 120s,
+  mirroring `binding_lease_secs`) rather than a pid the process table can
+  check, coexisting with the existing pid-checked `bind` rather than
+  replacing it — the hook path never reports a pid, so the old `bind`
+  simply cannot serve it. Reconciliation reports a lapsed lease as its
+  own `ReconcileReport::expired`, distinct from `dropped` (a process
+  found dead) and `unbindable` (a pid-bind that never arrived): the
+  first says a hook stopped reporting, the second says a process ended,
+  and conflating them would lose that distinction. Every binding this
+  way carries a `Provenance` — `Known`, `Inferred { basis }` or
+  `Unknown` — because nothing in a single hook payload joins the tool
+  call that admitted an agent to the agent that then ran (the spawn
+  carries no `agent_id`, the start carries no `tool_use_id`). The new
+  `relais::hook::pairing::pair` makes that join from arrival order: a
+  spawn with exactly one `SubagentStart` waiting behind it pairs as
+  `Known` (`tests/fixtures/hooks-concurrent` recorded five overlapping
+  agents whose spawn was, every time, immediately followed by its own
+  start), and a start arriving with more than one spawn still waiting
+  pairs the oldest as `Inferred`, naming the ambiguity as its basis — a
+  case no recorded session has produced, so its test is built from an
+  invented sequence rather than a fixture. `StatusSnapshot.leased_agents`
+  reports every such binding alongside `bound_processes`, so a reader of
+  a snapshot can tell which kind a dispatch's binding is.
+
 ### Fixed
 
 - **A run whose attempt started and was killed before reporting any

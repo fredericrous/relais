@@ -242,6 +242,11 @@ pub struct StatusSnapshot {
     /// alive now.
     #[serde(default)]
     pub bound_processes: BTreeMap<String, BoundProcess>,
+    /// Every dispatch bound to a hook-admitted agent with no process id:
+    /// the other kind of binding, held on a lease rather than a checked
+    /// pid, and never conflated with `bound_processes` (SPEC §23).
+    #[serde(default)]
+    pub leased_agents: BTreeMap<String, LeasedAgentBinding>,
     /// Exclusive write leases by worktree path, each naming its holder
     /// (SPEC §23). Root verification waits for the relevant ones to be
     /// gone.
@@ -257,6 +262,43 @@ pub struct BoundProcess {
     /// Seconds since this PID was checked alive and recorded. The window
     /// in which the OS could have recycled the number starts there.
     pub bound_for_secs: u64,
+}
+
+/// How a fact this crate did not observe directly was arrived at.
+///
+/// Nothing in a single hook payload joins the tool call that admitted an
+/// agent to the agent that then ran (SPEC §23): the spawn carries no
+/// `agent_id` and the start carries no `tool_use_id`. A binding built
+/// from that join has to say whether the join was unambiguous or chosen
+/// among candidates, so a later reader of a seat, a cost or a parentage
+/// can tell evidence from a guess rather than trusting a comment to have
+/// kept up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "provenance", rename_all = "snake_case")]
+pub enum Provenance {
+    /// Established without ambiguity: exactly one candidate to join to.
+    Known,
+    /// Chosen among more than one candidate, on the basis named.
+    Inferred { basis: String },
+    /// Not established at all.
+    Unknown,
+}
+
+/// A hook-admitted agent bound to a dispatch with no process id behind
+/// it: the hook path never reports one, so there is nothing to check
+/// against the process table (C6 does not apply here — there is no
+/// process). The binding stands on a lease instead, which lapses at
+/// `agent_lease_ttl` rather than being checked, and `provenance` records how
+/// sure the join that produced `agent_id` is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeasedAgentBinding {
+    pub agent_id: String,
+    pub provenance: Provenance,
+    /// Seconds since this lease was taken or last renewed by a
+    /// heartbeat. Past the coordinator's `agent_lease_ttl` — NOT
+    /// `LEASE_GRACE`, which governs a pid binding — it is reported as
+    /// expired.
+    pub leased_for_secs: u64,
 }
 
 /// What the caller should send a cancelled worker. The state machine
@@ -308,6 +350,12 @@ pub struct ReconcileReport {
     /// for `UNBINDABLE_AFTER` grace periods: nothing can bind them now
     /// (C2). Reported separately from `dropped`, which had a corpse.
     pub unbindable: Vec<String>,
+    /// Leases freed because a hook-admitted agent's lease lapsed past
+    /// grace: there is no pid behind it to find dead or alive, so this
+    /// is reported apart from `dropped` (a process found dead) and
+    /// `unbindable` (a pid-bind that never arrived) — a lapsed lease
+    /// says a hook stopped reporting, neither of the others' story.
+    pub expired: Vec<String>,
     /// Bound processes of cancelled dispatches that the caller should
     /// signal, and with what; each dispatch appears at most twice in its
     /// life — once to terminate, once to kill.
@@ -326,6 +374,14 @@ pub enum BindOutcome {
     /// reconcilable against a process that never existed, or worse,
     /// against whatever the OS gives that number next.
     PidNotAlive,
+    /// A lease was offered for a dispatch already bound to a live
+    /// process. Refused rather than applied: the pid is what
+    /// cancellation signals and what reconciliation checks, and a lease
+    /// carries neither, so overwriting one with the other would leave a
+    /// real process that nothing can signal and nothing will notice
+    /// dying. One dispatch is bound by pid or by lease, and which it is
+    /// does not change under it.
+    AlreadyBoundToProcess,
 }
 
 impl BindOutcome {
@@ -552,8 +608,9 @@ impl Cancellation {
     }
 }
 
-/// What the coordinator knows about a dispatch's process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What the coordinator knows about a dispatch's process — or, for a
+/// hook-admitted agent, the fact that there is no process to know about.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Binding {
     /// No process bound. `rounds` counts consecutive reconciles that
     /// found the lease past grace with nothing to check (C2).
@@ -562,13 +619,22 @@ enum Binding {
     /// which the OS could have recycled the number starts at `at`, and
     /// nothing portable closes it (see `procs::alive`).
     Bound { pid: u32, at: Instant },
+    /// A hook-admitted agent: the hook path reports an `agent_id` and
+    /// never a pid, so there is no process table to check this against.
+    /// The lease lapses at `agent_lease_ttl` instead of being checked, and
+    /// `provenance` is how sure the join that produced `agent_id` is.
+    Leased {
+        agent_id: String,
+        provenance: Provenance,
+        since: Instant,
+    },
 }
 
 impl Binding {
-    fn pid(self) -> Option<u32> {
+    fn pid(&self) -> Option<u32> {
         match self {
-            Self::Unbound { .. } => None,
-            Self::Bound { pid, .. } => Some(pid),
+            Self::Unbound { .. } | Self::Leased { .. } => None,
+            Self::Bound { pid, .. } => Some(*pid),
         }
     }
 }
@@ -665,7 +731,25 @@ pub struct AdmissionState {
     write_leases: BTreeMap<String, WriteLease>,
     /// Ceiling on seats held beyond a class cap by resumed parents.
     max_over_admitted: Option<u32>,
+    /// How long a hook-admitted agent's lease is held before it lapses.
+    agent_lease_ttl: Duration,
 }
+
+/// Default duration a hook-admitted agent's lease is held before it
+/// lapses, absent an operator override. Mirrors the default of
+/// `policy::HookAdmissionSettings::binding_lease_secs` (SPEC §23), which
+/// this module does not import: admission takes a plain `Duration`
+/// How long a hook-admitted agent's binding is held before it lapses,
+/// when nothing sets otherwise.
+///
+/// This MIRRORS `policy::HookAdmissionSettings::binding_lease_secs` by
+/// hand — the same number written twice — because nothing yet reads the
+/// setting into admission: `set_agent_lease_ttl` has no caller outside
+/// its own test. That is a gap, not a design: the machine setting is
+/// meant to govern this, and until the package that admits an agent
+/// wires it through, changing one number silently leaves the other
+/// behind. Recorded here rather than left for a reader to discover.
+pub const DEFAULT_AGENT_LEASE_TTL: Duration = Duration::from_secs(120);
 
 impl AdmissionState {
     pub fn new(limits: ConcurrencyLimits) -> Self {
@@ -682,6 +766,7 @@ impl AdmissionState {
             finished_order: VecDeque::new(),
             finished: BTreeSet::new(),
             write_leases: BTreeMap::new(),
+            agent_lease_ttl: DEFAULT_AGENT_LEASE_TTL,
         }
     }
 
@@ -698,6 +783,18 @@ impl AdmissionState {
 
     pub fn max_over_admitted(&self) -> Option<u32> {
         self.max_over_admitted
+    }
+
+    /// Configure how long a hook-admitted agent's lease is held before
+    /// it lapses. Machine settings own this
+    /// (`policy::HookAdmissionSettings::binding_lease_secs`); `new`
+    /// defaults it to `DEFAULT_AGENT_LEASE_TTL`.
+    pub fn set_agent_lease_ttl(&mut self, ttl: Duration) {
+        self.agent_lease_ttl = ttl;
+    }
+
+    pub fn agent_lease_ttl(&self) -> Duration {
+        self.agent_lease_ttl
     }
 
     /// Idempotent (SPEC §23: joins/resumes register idempotently).
@@ -1110,13 +1207,72 @@ impl AdmissionState {
         let Some(dispatch) = self.dispatches.get_mut(dispatch_id) else {
             return false;
         };
-        if agent_id.is_some() {
-            dispatch.agent_id = agent_id.map(str::to_string);
+        if let Some(agent_id) = agent_id {
+            dispatch.agent_id = Some(agent_id.to_string());
+            // A leased binding carries the agent id too, and the two
+            // must not drift: updating only the dispatch's copy left
+            // `status().leased_agents[..].agent_id` reporting the old
+            // one while everything reading the dispatch saw the new one.
+            if let Binding::Leased {
+                agent_id: leased, ..
+            } = &mut dispatch.binding
+            {
+                *leased = agent_id.to_string();
+            }
         }
         if let Some(pid) = pid {
             dispatch.binding = Binding::Bound { pid, at: now };
         }
         true
+    }
+
+    /// Bind a hook-admitted agent to a dispatch with no process id at
+    /// all: the hook path reports an `agent_id` and never a pid, so the
+    /// pid-checked `bind` above cannot serve it (it refuses a pid that
+    /// is not alive, and here there is none to check). The binding
+    /// stands on a lease that lapses at `agent_lease_ttl` instead of being
+    /// checked against a process table, alongside — not instead of —
+    /// the pid-checked kind, and `provenance` travels with it so a later
+    /// reader can tell whether the agent this dispatch's seat, cost or
+    /// parentage rests on was observed or guessed.
+    /// Whether a binding has gone stale, by the one rule both
+    /// `reconcile` and `status` ask. A leased agent lapses on its own,
+    /// shorter clock (`agent_lease_ttl`, SPEC §23); a pid binding and an
+    /// unbound dispatch lapse on `LEASE_GRACE`. The two are different
+    /// guarantees — a lease held open versus a pid worth re-checking —
+    /// that happen to share a mechanism, which is exactly why restating
+    /// the rule in a second place let the two disagree.
+    fn lease_is_stale(binding: &Binding, heartbeat_age: Duration, lease_ttl: Duration) -> bool {
+        match binding {
+            Binding::Leased { .. } => heartbeat_age >= lease_ttl,
+            Binding::Bound { .. } | Binding::Unbound { .. } => heartbeat_age >= LEASE_GRACE,
+        }
+    }
+
+    pub fn bind_agent_lease(
+        &mut self,
+        dispatch_id: &str,
+        agent_id: &str,
+        provenance: Provenance,
+        now: Instant,
+    ) -> BindOutcome {
+        let Some(dispatch) = self.dispatches.get_mut(dispatch_id) else {
+            return BindOutcome::UnknownDispatch;
+        };
+        // Refused, not overwritten. `bind` already refuses a bad bind by
+        // name rather than applying it, and this is the same kind of
+        // refusal: a live pid is what `reconcile` checks and what
+        // cancellation signals, and a lease carries neither.
+        if let Binding::Bound { .. } = dispatch.binding {
+            return BindOutcome::AlreadyBoundToProcess;
+        }
+        dispatch.agent_id = Some(agent_id.to_string());
+        dispatch.binding = Binding::Leased {
+            agent_id: agent_id.to_string(),
+            provenance,
+            since: now,
+        };
+        BindOutcome::Bound
     }
 
     pub fn heartbeat(&mut self, dispatch_id: &str, now: Instant) -> HeartbeatStatus {
@@ -1515,15 +1671,19 @@ impl AdmissionState {
         let mut report = ReconcileReport::default();
         let ids: Vec<String> = self.dispatches.keys().cloned().collect();
         for id in ids {
-            let (stale, binding, cancelled) = {
+            let (heartbeat_age, binding, cancelled) = {
                 let dispatch = &self.dispatches[&id];
                 (
-                    now.saturating_duration_since(dispatch.last_heartbeat) >= LEASE_GRACE,
-                    dispatch.binding,
+                    now.saturating_duration_since(dispatch.last_heartbeat),
+                    dispatch.binding.clone(),
                     dispatch.cancellation.cancelled(),
                 )
             };
-            let pid = binding.pid();
+            // A leased agent lapses on its own, shorter clock
+            // (`agent_lease_ttl`, SPEC §23) rather than `LEASE_GRACE`:
+            // the two are different guarantees (a lease held open versus
+            // a pid worth re-checking) that happen to share a mechanism.
+            let stale = Self::lease_is_stale(&binding, heartbeat_age, self.agent_lease_ttl);
             if cancelled {
                 if let Binding::Bound { pid, at } = binding {
                     if alive(pid) {
@@ -1546,14 +1706,25 @@ impl AdmissionState {
                 }
                 continue;
             }
-            match pid {
-                Some(pid) if !alive(pid) => {
+            match binding {
+                Binding::Bound { pid, .. } => {
+                    if !alive(pid) {
+                        self.settle(&id, None, now);
+                        self.release(&id, now);
+                        report.dropped.push(id);
+                    }
+                }
+                // The hook path that produced this binding never reports
+                // a pid, so there is nothing to check it against — the
+                // lease itself, past `agent_lease_ttl`, is the whole story
+                // (unlike `Unbound`, there is no launcher that might yet
+                // arrive to bind one).
+                Binding::Leased { .. } => {
                     self.settle(&id, None, now);
                     self.release(&id, now);
-                    report.dropped.push(id);
+                    report.expired.push(id);
                 }
-                Some(_) => {}
-                None => {
+                Binding::Unbound { .. } => {
                     let rounds = match self.dispatches.get_mut(&id) {
                         Some(dispatch) => {
                             let Binding::Unbound { rounds } = &mut dispatch.binding else {
@@ -1686,17 +1857,35 @@ impl AdmissionState {
     pub fn status(&self, now: Instant) -> StatusSnapshot {
         let mut active_by_class: BTreeMap<String, u32> = BTreeMap::new();
         let mut bound_processes: BTreeMap<String, BoundProcess> = BTreeMap::new();
+        let mut leased_agents: BTreeMap<String, LeasedAgentBinding> = BTreeMap::new();
         let mut waiting = 0;
         let mut stale_leases = 0;
         for (id, dispatch) in &self.dispatches {
-            if let Binding::Bound { pid, at } = dispatch.binding {
-                bound_processes.insert(
-                    id.clone(),
-                    BoundProcess {
-                        pid,
-                        bound_for_secs: now.saturating_duration_since(at).as_secs(),
-                    },
-                );
+            match &dispatch.binding {
+                Binding::Bound { pid, at } => {
+                    bound_processes.insert(
+                        id.clone(),
+                        BoundProcess {
+                            pid: *pid,
+                            bound_for_secs: now.saturating_duration_since(*at).as_secs(),
+                        },
+                    );
+                }
+                Binding::Leased {
+                    agent_id,
+                    provenance,
+                    since,
+                } => {
+                    leased_agents.insert(
+                        id.clone(),
+                        LeasedAgentBinding {
+                            agent_id: agent_id.clone(),
+                            provenance: provenance.clone(),
+                            leased_for_secs: now.saturating_duration_since(*since).as_secs(),
+                        },
+                    );
+                }
+                Binding::Unbound { .. } => {}
             }
             if dispatch.lifecycle.released() {
                 continue;
@@ -1708,8 +1897,18 @@ impl AdmissionState {
             *active_by_class
                 .entry(dispatch.class.as_str().to_string())
                 .or_default() += 1;
-            if now.saturating_duration_since(dispatch.last_heartbeat) >= LEASE_GRACE
-                && dispatch.binding.pid().is_none()
+            // The SAME rule `reconcile` applies, called rather than
+            // restated: a leased binding lapses on `agent_lease_ttl` and
+            // everything else on `LEASE_GRACE`. Reading `LEASE_GRACE`
+            // for both here reported a lease aged between the two as
+            // healthy while reconcile was already expiring it — one
+            // fact, two derivations, disagreeing on every lease in that
+            // window.
+            if Self::lease_is_stale(
+                &dispatch.binding,
+                now.saturating_duration_since(dispatch.last_heartbeat),
+                self.agent_lease_ttl,
+            ) && dispatch.binding.pid().is_none()
             {
                 stale_leases += 1;
             }
@@ -1768,6 +1967,7 @@ impl AdmissionState {
             runs,
             over_admitted,
             bound_processes,
+            leased_agents,
             write_leases: self
                 .write_leases
                 .iter()
@@ -1827,9 +2027,10 @@ fn mark_cancelled(dispatch: &mut Dispatch, now: Instant) {
 /// send it a second time, only escalate past it (C5), so the ladder step
 /// is recorded here.
 fn hand_over_terminate(dispatch_id: &str, dispatch: &mut Dispatch) -> Option<PendingSignal> {
-    let Binding::Bound { pid, at } = dispatch.binding else {
+    let Binding::Bound { pid, at } = &dispatch.binding else {
         return None;
     };
+    let (pid, at) = (*pid, *at);
     match dispatch.cancellation {
         Cancellation::Requested { since } => {
             dispatch.cancellation = Cancellation::Terminated { since };
@@ -2849,6 +3050,86 @@ mod tests {
         );
         // The bound one is untouched: it has a live process.
         assert!(state.heartbeat("bound", now).known);
+    }
+
+    // A hook-admitted agent never reports a pid, so it cannot use the
+    // pid-checked `bind` (it would just leave the dispatch unbound). It
+    // binds on a lease instead, alongside — not instead of — the
+    // pid-checked kind, and status can tell the two apart.
+    #[test]
+    fn a_hook_admitted_agent_binds_on_a_lease_with_no_pid() {
+        let mut state = state();
+        let t0 = Instant::now();
+        assert!(granted(
+            state.request(&req("hook-agent", "run-a", "tab-a"), t0)
+        ));
+        assert!(granted(state.request(&req("bound", "run-a", "tab-a"), t0)));
+        bind_live(&mut state, "bound", 4242, t0);
+
+        assert_eq!(
+            state.bind_agent_lease("hook-agent", "agent-01", Provenance::Known, t0),
+            BindOutcome::Bound
+        );
+
+        let snapshot = state.status(t0);
+        assert!(
+            snapshot.bound_processes.contains_key("bound"),
+            "the pid-checked binding is unaffected"
+        );
+        assert!(
+            !snapshot.bound_processes.contains_key("hook-agent"),
+            "a leased agent has no pid to report as bound"
+        );
+        let leased = &snapshot.leased_agents["hook-agent"];
+        assert_eq!(leased.agent_id, "agent-01");
+        assert_eq!(leased.provenance, Provenance::Known);
+        assert!(
+            !snapshot.leased_agents.contains_key("bound"),
+            "a pid-bound dispatch is not also reported as leased"
+        );
+    }
+
+    // A lapsed lease is not a dead process (nothing was ever there to
+    // check) and not held open forever: reconciliation reports it as its
+    // own outcome, distinct from `dropped` (a corpse found) and
+    // `unbindable` (a pid-bind that never arrived).
+    #[test]
+    fn an_expired_agent_lease_is_reported_distinctly_from_a_dead_process() {
+        let mut state = state();
+        state.set_agent_lease_ttl(Duration::from_secs(30));
+        let t0 = Instant::now();
+        assert!(granted(
+            state.request(&req("hook-agent", "run-a", "tab-a"), t0)
+        ));
+        assert_eq!(
+            state.bind_agent_lease("hook-agent", "agent-01", Provenance::Known, t0),
+            BindOutcome::Bound
+        );
+
+        // Short of its own TTL, and short of `LEASE_GRACE` too: not
+        // touched. Read through `status`, not `heartbeat`, which would
+        // itself renew the lease and defeat the next check.
+        let before_ttl = t0 + Duration::from_secs(29);
+        let report = state.reconcile(before_ttl, &alive);
+        assert!(report.expired.is_empty());
+        assert!(state
+            .status(before_ttl)
+            .leased_agents
+            .contains_key("hook-agent"));
+
+        // Past its own TTL, but nowhere near `LEASE_GRACE` (300s): a
+        // leased agent lapses on its own, shorter clock, not the
+        // pid-checked one.
+        let past_ttl = t0 + Duration::from_secs(31);
+        let report = state.reconcile(past_ttl, &alive);
+        assert_eq!(report.expired, vec!["hook-agent".to_string()]);
+        assert!(report.dropped.is_empty());
+        assert!(report.unbindable.is_empty());
+        assert!(report.stale.is_empty());
+        assert!(
+            !state.heartbeat("hook-agent", past_ttl).known,
+            "an expired lease's seat is freed, not held open"
+        );
     }
 
     // C5: a cancelled worker is asked once, told once, and then left

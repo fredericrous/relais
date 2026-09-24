@@ -22,6 +22,7 @@
 //! real session this way, rather than assumed.
 
 pub mod event;
+pub mod pairing;
 
 use std::fs;
 use std::io::Read;
