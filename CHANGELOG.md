@@ -6,7 +6,7 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
-## Unreleased
+## v0.4.0
 
 ### Added
 
@@ -74,10 +74,6 @@ missing here.
   subcommand, or failing any other way is likewise a gap naming the
   cause relais actually observed, never a silent pass and never a
   crash.
-
-## v0.4.0
-
-### Added
 
 - **The reviewer is asked about stored facts, not only computed
   ones.** Every finding the review loop missed over v0.4.0's packages
