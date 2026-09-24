@@ -554,6 +554,12 @@ pub struct MachineSettings {
     pub trials: TrialEnvelope,
     #[serde(default)]
     pub routing: RoutingSettings,
+    /// What a hook-admitted agent needs that the rest of this struct does
+    /// not already carry. See [`HookAdmissionSettings`] for what is and
+    /// is not here — the agent and depth caps stay in [`ConcurrencyLimits`]
+    /// rather than being redeclared.
+    #[serde(default)]
+    pub admission: HookAdmissionSettings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -734,6 +740,14 @@ pub fn effective_disallowed_tools(permissions: &Permissions) -> Vec<String> {
     tools
 }
 
+/// `max_active_agents_per_session` and `max_agent_depth` are the agent
+/// and depth caps: the coordinator enforces both (`coordinator::DEFAULT_LIMITS`,
+/// `coordinator::effective_limits`), whose defaults live in
+/// `coordinator::DEFAULT_LIMITS` and are deliberately NOT repeated here:
+/// a number copied into prose is a second record of it, and changing
+/// the constant would silently falsify the copy.
+/// Nothing else in this crate redeclares them — a second home for either
+/// number would be one fact recorded twice, free to drift apart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct ConcurrencyLimits {
@@ -744,6 +758,63 @@ pub struct ConcurrencyLimits {
     pub max_agent_depth: Option<u32>,
     pub max_agents_per_run: Option<u32>,
     pub training_when_idle: bool,
+}
+
+/// Settings a hook-admitted agent needs that no other machine-owned type
+/// carries. Deliberately narrow: this struct states values, it does not
+/// admit an agent, bind a dispatch, reserve money or contact the
+/// coordinator — those actions belong to the admission package this
+/// struct exists for. The agent and depth caps are NOT here; see the
+/// comment on [`ConcurrencyLimits`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HookAdmissionSettings {
+    /// How long a binding may be held before it lapses, in seconds,
+    /// measured from the moment the hook records it. A binding older
+    /// than this is treated as gone whether or not anything freed it
+    /// explicitly — the mechanism a crashed or forgotten hook needs so a
+    /// stale binding does not block admission forever.
+    pub binding_lease_secs: u64,
+    /// What one dispatch reserves against its session's money before the
+    /// provider reports real usage. Zero is not "no limit enforced by
+    /// accident" — it is the stated default, and it means observation
+    /// rather than refusal: a hook admits every agent the rest of policy
+    /// allows and tracks spend as it is reported, without holding any of
+    /// it back up front. A machine that wants dispatch itself throttled
+    /// on money sets this above zero explicitly.
+    pub dispatch_reserve_micros: MicroUsd,
+    /// What a hook does when the coordinator cannot be reached.
+    pub on_coordinator_unreachable: CoordinatorUnreachableBehavior,
+}
+
+impl Default for HookAdmissionSettings {
+    fn default() -> Self {
+        Self {
+            binding_lease_secs: 120,
+            dispatch_reserve_micros: MicroUsd::ZERO,
+            on_coordinator_unreachable: CoordinatorUnreachableBehavior::CarryOn,
+        }
+    }
+}
+
+/// A named choice, not a bare boolean, so a reader of a settings file
+/// sees which behaviour is configured rather than which flag is true.
+///
+/// Default is [`Self::CarryOn`]: SPEC §23 says a coordinator outage "must
+/// not silently turn a strict managed launch into an unmanaged launch",
+/// but a hook is not queuing a managed dispatch behind a retry — it is
+/// holding open a tool call a person or another agent is waiting on. A
+/// hook that refused every agent whenever the daemon was mid-restart
+/// would be worse than the gap it guards against, so the default lets
+/// the agent through and records the outage rather than blocking on it;
+/// `Refuse` is for a machine that has decided the alternative — an
+/// unrecorded agent — is the greater risk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinatorUnreachableBehavior {
+    #[default]
+    CarryOn,
+    Refuse,
 }
 
 /// Authorized experimentation envelope (SPEC §13, §17). Automatic trials
@@ -1367,6 +1438,20 @@ keys = ["output.contract"]
             .blockers
             .iter()
             .any(|b| b.code == BlockCode::MissingTrustGrant));
+    }
+
+    /// A machine.toml written before `[admission]` existed has no such
+    /// table at all, and must still parse and mean what it meant: the
+    /// new settings are optional, defaulted, and never asked for.
+    #[test]
+    fn a_machine_toml_without_admission_parses_with_defaults() {
+        let machine = MachineSettings::from_toml_str(&machine_toml("")).expect("parses");
+        assert_eq!(machine.admission.binding_lease_secs, 120);
+        assert_eq!(machine.admission.dispatch_reserve_micros, MicroUsd::ZERO);
+        assert_eq!(
+            machine.admission.on_coordinator_unreachable,
+            CoordinatorUnreachableBehavior::CarryOn
+        );
     }
 
     /// A setup step runs the repository's own lifecycle scripts inside a

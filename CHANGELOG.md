@@ -219,6 +219,22 @@ missing here.
   than being dropped. Omitting `--by` leaves the report exactly as it
   was; the JSON gains one `cohorts` key beside the existing ones.
 
+- **Machine settings now carry what a hook-admitted agent needs that no
+  other field states.** `MachineSettings.admission` is a new, optional
+  `[admission]` table: `binding_lease_secs` (how long a binding may be
+  held before it lapses, default 120), `dispatch_reserve_micros` (what
+  one dispatch reserves against its session's money, default zero —
+  observation, not refusal), and `on_coordinator_unreachable`, a named
+  `carry_on`/`refuse` choice rather than a boolean, defaulting to
+  `carry_on` so a restarting coordinator does not turn into every agent
+  being refused. The agent and depth caps already on `ConcurrencyLimits`
+  are not redeclared. A `machine.toml` written before this table existed
+  still parses unchanged. `ids::derive_dispatch_id(session, tool_use)`
+  and `ids::derive_run_id(session)` are new pure functions — the same
+  inputs always derive the same identity, reading no clock, counter or
+  environment — so a hook that fires twice for one tool call derives one
+  `DispatchId`, not two.
+
 ### Fixed
 
 - **A run whose attempt started and was killed before reporting any

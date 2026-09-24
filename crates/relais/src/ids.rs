@@ -325,6 +325,37 @@ impl std::fmt::Display for ToolUseId {
     }
 }
 
+/// A dispatch's identity, derived — not minted — from the session that
+/// requested it and the tool use it answers. Pure: the same session and
+/// tool use always derive the same [`DispatchId`], reading no clock, no
+/// counter and no environment. This is what lets a hook that fires twice
+/// for one tool call (a retried delivery, not two requests) recognise
+/// its second firing as the same dispatch rather than admit it again —
+/// the recognition [`IdSource::dispatch_id`]'s clock-and-sequence mint
+/// cannot give, because two calls to it never agree.
+pub fn derive_dispatch_id(session: &SessionId, tool_use: &ToolUseId) -> DispatchId {
+    // Hashed as a structured value, not as two strings with a separator
+    // between them. `format!("{a}:{b}")` cannot say where the first
+    // input ended, so ("a:b", "c") and ("a", "b:c") hash identically —
+    // demonstrated, not hypothesised — and neither newtype validates
+    // its contents. Claude Code's own ids carry no colon today, which
+    // makes this a structural ambiguity rather than a live collision,
+    // and a structural ambiguity in an identity is not worth keeping
+    // when the crate already has a composite hash that cannot have one.
+    let hash = canonical_json_hash(&serde_json::json!({
+        "session": session.as_str(),
+        "tool_use": tool_use.as_str(),
+    }));
+    DispatchId(format!("disp-{}", &hash[..16]))
+}
+
+/// A run's identity, derived — not minted — from the session it belongs
+/// to. Pure for the same reason [`derive_dispatch_id`] is.
+pub fn derive_run_id(session: &SessionId) -> RunId {
+    let hash = sha256_hex(format!("run:{}", session.as_str()).as_bytes());
+    RunId(format!("run-{}", &hash[..16]))
+}
+
 /// A subagent's identifier at runtime, as the harness's `agent_id`
 /// names it — distinct from [`AgentType`], which names the KIND of
 /// agent (`general-purpose`, …), not the one running instance.
@@ -453,6 +484,46 @@ mod tests {
         let different_contract = derive_task_id("repo-key", "hash-2");
         assert_ne!(a, different_repo);
         assert_ne!(a, different_contract);
+    }
+
+    #[test]
+    fn dispatch_ids_are_pure_and_a_repeat_delivery_matches() {
+        let session = SessionId::new("session-a");
+        let tool_use = ToolUseId::new("toolu-01");
+        let first = derive_dispatch_id(&session, &tool_use);
+        let second = derive_dispatch_id(&session, &tool_use);
+        assert_eq!(
+            first, second,
+            "a hook that fires twice for one tool call derives the same dispatch"
+        );
+        let different_tool_use = derive_dispatch_id(&session, &ToolUseId::new("toolu-02"));
+        let different_session = derive_dispatch_id(&SessionId::new("session-b"), &tool_use);
+        assert_ne!(first, different_tool_use);
+        assert_ne!(first, different_session);
+
+        // Where the first input ends must be unambiguous. Concatenating
+        // with a separator could not say: `("a:b", "c")` and
+        // `("a", "b:c")` both rendered `a:b:c` and derived ONE id —
+        // demonstrated, not hypothesised. Neither newtype validates its
+        // contents, so nothing but this keeps the two apart.
+        let split_left = derive_dispatch_id(&SessionId::new("a:b"), &ToolUseId::new("c"));
+        let split_right = derive_dispatch_id(&SessionId::new("a"), &ToolUseId::new("b:c"));
+        assert_ne!(
+            split_left, split_right,
+            "two different (session, tool use) pairs must not share a dispatch identity"
+        );
+    }
+
+    #[test]
+    fn run_ids_derived_from_a_session_are_pure() {
+        let session = SessionId::new("session-a");
+        let first = derive_run_id(&session);
+        let second = derive_run_id(&session);
+        assert_eq!(
+            first, second,
+            "the same session always derives the same run"
+        );
+        assert_ne!(first, derive_run_id(&SessionId::new("session-b")));
     }
 
     #[test]
