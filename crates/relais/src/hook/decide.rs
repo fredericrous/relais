@@ -16,13 +16,11 @@
 //! anything. It decides, and [`HookAnswer::stdout_payload`] renders the
 //! decision into the one shape a hook may speak in.
 //!
-//! NOTHING IN THE CRATE CALLS THIS YET. `relais hook` records payloads for
-//! the probe and does not decide about them, so no refusal this module can
-//! render reaches a session: asking the coordinator, writing the answer to
-//! stdout and journalling it belong to the package that wires the hook up.
-//! Stated here because a reader who finds a complete, tested decision
-//! function would otherwise reasonably assume it is in force — and a
-//! refusal nobody emits looks exactly like a refusal nobody triggered.
+//! `super::respond::handle` is the caller that wires this up: `relais
+//! hook`, run with no flags, asks the coordinator about a spawn, calls
+//! [`decide_or_silent`], prints [`HookAnswer::stdout_payload`] when there
+//! is one, and journals the firing. This module stays pure regardless —
+//! the wiring is what changed, not the decision.
 //!
 //! `PostToolUseFailure` is deliberately not among the events this decides
 //! on: across five probe sessions (`tests/fixtures/hooks/README.md` and
@@ -137,11 +135,26 @@ fn decide_spawn(settings: &HookAdmissionSettings, coordinator: CoordinatorAnswer
                     .to_string(),
             },
         },
-        // None of these says yes on the person's behalf — see the module
-        // doc — they simply have nothing to refuse.
-        Some(Decision::Granted | Decision::AlreadyAdmitted | Decision::Queued { .. }) => {
-            HookAnswer::Silent
-        }
+        // Neither says yes on the person's behalf — see the module doc —
+        // they simply have nothing to refuse.
+        Some(Decision::Granted | Decision::AlreadyAdmitted) => HookAnswer::Silent,
+        // Queued is REFUSED, not waited out. A hook cannot hold a tool
+        // call open: it answers now or the call proceeds. Staying silent
+        // would let the agent run anyway AND leave the queue entry
+        // counting against the run's cap until it lapsed — the spawn
+        // admitted twice over, once in fact and once on paper.
+        //
+        // Refusing is the honest translation of "not yet" for a caller
+        // that has no later. The seat is released by the refusal path,
+        // which is the only chance there will be to release it.
+        Some(Decision::Queued { position }) => HookAnswer::Refuse {
+            reason: format!(
+                "relais did not admit this agent: the session is at its limit and this spawn \
+                 was queued at position {position}, but a hook cannot hold a tool call open \
+                 while it waits. Retry when a running agent finishes, or start the work with \
+                 `relais run`, which can wait."
+            ),
+        },
         Some(Decision::Refused { code, detail }) => HookAnswer::Refuse {
             reason: refusal_message(code, &detail),
         },
@@ -373,11 +386,15 @@ mod tests {
                 coordinator: Some(Decision::AlreadyAdmitted),
                 expect_refusal: false,
             },
+            // Refused, not silent. A hook answers now or the call
+            // proceeds, so "queued" has no faithful silent rendering:
+            // staying quiet would run the agent AND leave its queue
+            // entry counting against the cap.
             Case {
                 name: "queued",
                 settings: carry_on(),
                 coordinator: Some(Decision::Queued { position: 3 }),
-                expect_refusal: false,
+                expect_refusal: true,
             },
             Case {
                 name: "refused: unknown run",

@@ -482,6 +482,7 @@ impl Coordinator {
         socket_path: &Path,
         limits: ConcurrencyLimits,
         ledger: Option<&Ledger>,
+        agent_lease_ttl: Duration,
     ) -> Result<(Self, Listener), CoordinatorError> {
         // Read the live set BEFORE electing: not `unwrap_or_default()`,
         // because an empty live set and an unreadable one look identical
@@ -504,6 +505,12 @@ impl Coordinator {
             .unwrap_or_else(|| Path::new("."))
             .join("coordinator.lock");
         let mut state = AdmissionState::new(limits);
+        // The machine's `binding_lease_secs` governs the lease a
+        // hook-admitted agent is held on (SPEC §23): read here, at the
+        // one place an `AdmissionState` is constructed for real, rather
+        // than left at `DEFAULT_AGENT_LEASE_TTL` for every coordinator
+        // regardless of what machine.toml states.
+        state.set_agent_lease_ttl(agent_lease_ttl);
         {
             let now = Instant::now();
             for live in live {
@@ -1662,8 +1669,9 @@ pub fn run_daemon(
     socket_path: &Path,
     limits: ConcurrencyLimits,
     ledger: Option<&Ledger>,
+    agent_lease_ttl: Duration,
 ) -> Result<(), CoordinatorError> {
-    let (coordinator, listener) = Coordinator::start(socket_path, limits, ledger)?;
+    let (coordinator, listener) = Coordinator::start(socket_path, limits, ledger, agent_lease_ttl)?;
     coordinator.serve(listener)
 }
 
@@ -1822,7 +1830,13 @@ mod tests {
     fn client_daemon_round_trip_and_shutdown() {
         let dir = temp_dir("rt");
         let socket = dir.join("relais.sock");
-        let (coordinator, listener) = Coordinator::start(&socket, limits(), None).expect("start");
+        let (coordinator, listener) = Coordinator::start(
+            &socket,
+            limits(),
+            None,
+            crate::admission::DEFAULT_AGENT_LEASE_TTL,
+        )
+        .expect("start");
         let state = Arc::clone(&coordinator.state);
         let server = std::thread::spawn(move || coordinator.serve(listener));
         let client = Client::new(socket.clone());
@@ -1960,7 +1974,13 @@ mod tests {
             max_agents_per_run: Some(64),
             training_when_idle: false,
         };
-        let (coordinator, listener) = Coordinator::start(&socket, limits, None).expect("start");
+        let (coordinator, listener) = Coordinator::start(
+            &socket,
+            limits,
+            None,
+            crate::admission::DEFAULT_AGENT_LEASE_TTL,
+        )
+        .expect("start");
         let server = std::thread::spawn(move || coordinator.serve(listener));
         let client = Client::new(socket.clone());
         client
@@ -2117,8 +2137,13 @@ mod tests {
         ledger
             .finish_dispatch(&DispatchId::from_stored("finished"), "completed")
             .expect("finish");
-        let (coordinator, listener) =
-            Coordinator::start(&socket, limits(), Some(&ledger)).expect("start");
+        let (coordinator, listener) = Coordinator::start(
+            &socket,
+            limits(),
+            Some(&ledger),
+            crate::admission::DEFAULT_AGENT_LEASE_TTL,
+        )
+        .expect("start");
         drop(listener);
         let state = coordinator.state.lock().expect("lock");
         let snapshot = state.status(Instant::now());
@@ -2350,9 +2375,14 @@ mod tests {
             .expect("second connection")
             .execute("DROP TABLE dispatches", [])
             .expect("drop");
-        let error = Coordinator::start(&socket, limits(), Some(&ledger))
-            .err()
-            .expect("start refuses");
+        let error = Coordinator::start(
+            &socket,
+            limits(),
+            Some(&ledger),
+            crate::admission::DEFAULT_AGENT_LEASE_TTL,
+        )
+        .err()
+        .expect("start refuses");
         assert!(
             matches!(error, CoordinatorError::LiveSetUnreadable { .. }),
             "{error}"
