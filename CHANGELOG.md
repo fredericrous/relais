@@ -178,6 +178,21 @@ missing here.
   than being dropped. Omitting `--by` leaves the report exactly as it
   was; the JSON gains one `cohorts` key beside the existing ones.
 
+### Fixed
+
+- **A run whose attempt started and was killed before reporting any
+  usage no longer reads as `$0 (actual)`.** `run_cost_completeness`
+  folded an empty set of usage rows to `Actual`, so a run interrupted
+  mid-dispatch — no usage event ever arrived — looked identical to a
+  run that genuinely spent nothing. The ledger now tells the two apart
+  by the run's own attempts: no dispatched attempt at all is a true
+  zero; a dispatched attempt with no usage anywhere is `unknown`; a
+  run that reported some attempts and started a silent one is an
+  `incomplete lower bound`, not unknown, since what was recorded is
+  still real. The rule rolls up through a work-package tree the same
+  way cost already does. `docs/SPEC.md` §11 needed no wording change —
+  it already said missing usage is unknown, never zero.
+
 ## v0.3.0
 
 ### Added
