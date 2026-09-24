@@ -51,6 +51,23 @@ missing here.
   probe-hooks` target — it needs a real Claude Code, costs money and
   touches the network, so it is never part of `make check`.
 
+- **A hook now decides what to say about one event, purely.**
+  `relais::hook::decide::decide` takes the typed event, the machine's own
+  admission settings and whatever the coordinator answered, and resolves
+  to one of exactly two things: `HookAnswer::Silent`, or
+  `HookAnswer::Refuse { reason }` naming what was exceeded and what the
+  person can do about it — never an affirmative answer, since a hook that
+  said yes on a person's behalf would override their own permission
+  settings. Only a spawn still in `PreToolUse` is ever refused; every
+  other event, `PostToolUseFailure` included (it has never fired in five
+  probe sessions), resolves silent. A coordinator that could not be
+  reached is handled by the stance `HookAdmissionSettings::on_coordinator_unreachable`
+  already names, rather than guessed at here, and `decide_or_silent`
+  catches any panic and turns it into silence rather than leaving a tool
+  call unanswered. The function reads no clock, touches no filesystem and
+  makes no network call, so every reachable case is exercised by a
+  table-driven test rather than sampled.
+
 - **Labelling reads a task's recorded outcome, not just its run's
   terminal state.** A task whose latest recorded outcome is `reverted`
   or a confirmed regression is never a positive label, whatever its
