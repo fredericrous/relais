@@ -1,0 +1,73 @@
+{
+  "cwd": "/REPO",
+  "duration_ms": 1768,
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "permission_mode": "default",
+  "prompt_id": "prompt-0000",
+  "session_id": "session-0000",
+  "tool_input": {
+    "description": "Reply ONE",
+    "model": "opus",
+    "prompt": "Immediately reply with exactly one word: ONE. Do nothing else.",
+    "run_in_background": false,
+    "subagent_type": "general-purpose"
+  },
+  "tool_name": "Agent",
+  "tool_response": {
+    "agentId": "a60f03c856f5e23c0",
+    "agentType": "general-purpose",
+    "content": [
+      {
+        "text": "ONE",
+        "type": "text"
+      }
+    ],
+    "harnessNoteCount": 0,
+    "harnessSectionHash": "87d932e755bfa0e8",
+    "harnessTailCount": 0,
+    "prompt": "Immediately reply with exactly one word: ONE. Do nothing else.",
+    "resolvedModel": "claude-opus-5-5[1m]",
+    "status": "completed",
+    "totalDurationMs": 1766,
+    "totalTokens": 22957,
+    "totalToolUseCount": 0,
+    "usage": {
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 22950
+      },
+      "cache_creation_input_tokens": 22950,
+      "cache_read_input_tokens": 0,
+      "inference_geo": "not_available",
+      "input_tokens": 2,
+      "iterations": [
+        {
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 22950
+          },
+          "cache_creation_input_tokens": 22950,
+          "cache_read_input_tokens": 0,
+          "input_tokens": 2,
+          "output_tokens": 5,
+          "type": "message"
+        }
+      ],
+      "output_tokens": 5,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      },
+      "server_tool_use": {
+        "web_fetch_requests": 0,
+        "web_search_requests": 0
+      },
+      "service_tier": "standard",
+      "speed": "standard"
+    }
+  },
+  "tool_use_id": "toolu-01",
+  "transcript_path": "/REDACTED/transcript.jsonl"
+}

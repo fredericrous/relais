@@ -24,6 +24,31 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hooks")
 }
 
+/// Every recorded set, so a set added by a later probe run is walked the
+/// moment it lands — the same reason the walk below names no file.
+fn fixture_dirs() -> Vec<PathBuf> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mut dirs: Vec<PathBuf> = fs::read_dir(&root)
+        .unwrap_or_else(|e| panic!("read {}: {e}", root.display()))
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("hooks"))
+        })
+        .collect();
+    dirs.sort();
+    assert!(
+        !dirs.is_empty(),
+        "no recorded sets under {}",
+        root.display()
+    );
+    dirs
+}
+
 /// Which variant a recording must parse into, read off the recording
 /// itself: the event name is the part of the file name after the arrival
 /// order, and a tool event is ours only when its `tool_name` is the
@@ -73,23 +98,25 @@ fn variant_of(event: &HookEvent) -> &'static str {
 
 #[test]
 fn every_recorded_payload_parses_into_what_it_is() {
-    let dir = fixtures_dir();
     let mut checked = 0usize;
-    for entry in fs::read_dir(&dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
+    for dir in fixture_dirs() {
+        for entry in fs::read_dir(&dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let want = expected(&path, &bytes);
+            let got = variant_of(&parse(&bytes));
+            assert_eq!(
+                got,
+                want,
+                "{}/{} parsed as {got}, not {want}",
+                dir.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+            );
+            checked += 1;
         }
-        let bytes = fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let want = expected(&path, &bytes);
-        let got = variant_of(&parse(&bytes));
-        assert_eq!(
-            got,
-            want,
-            "{} parsed as {got}, not {want}",
-            path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
-        );
-        checked += 1;
     }
     // Not a fixed count: a later probe run may add payloads, and this
     // test exists so those are covered without being listed. Zero,
@@ -97,8 +124,7 @@ fn every_recorded_payload_parses_into_what_it_is() {
     // silently did nothing.
     assert!(
         checked > 0,
-        "no recorded payloads under {} — this test proves nothing",
-        dir.display()
+        "no recorded payloads at all — this test proves nothing"
     );
 }
 

@@ -1,0 +1,20 @@
+{
+  "cwd": "/REPO",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PreToolUse",
+  "permission_mode": "default",
+  "prompt_id": "prompt-0000",
+  "session_id": "session-0000",
+  "tool_input": {
+    "description": "Reply FOUR",
+    "model": "opus",
+    "prompt": "Immediately reply with exactly one word: FOUR. Do nothing else.",
+    "run_in_background": false,
+    "subagent_type": "general-purpose"
+  },
+  "tool_name": "Agent",
+  "tool_use_id": "toolu-04",
+  "transcript_path": "/REDACTED/transcript.jsonl"
+}

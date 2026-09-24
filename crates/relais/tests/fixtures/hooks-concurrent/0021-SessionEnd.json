@@ -1,0 +1,8 @@
+{
+  "cwd": "/REPO",
+  "hook_event_name": "SessionEnd",
+  "prompt_id": "prompt-0000",
+  "reason": "other",
+  "session_id": "session-0000",
+  "transcript_path": "/REDACTED/transcript.jsonl"
+}

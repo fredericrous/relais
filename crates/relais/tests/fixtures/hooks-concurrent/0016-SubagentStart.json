@@ -1,0 +1,9 @@
+{
+  "agent_id": "agent-05",
+  "agent_type": "general-purpose",
+  "cwd": "/REPO",
+  "hook_event_name": "SubagentStart",
+  "prompt_id": "prompt-0000",
+  "session_id": "session-0000",
+  "transcript_path": "/REDACTED/transcript.jsonl"
+}

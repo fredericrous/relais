@@ -1,0 +1,18 @@
+{
+  "agent_id": "agent-02",
+  "agent_transcript_path": "/REDACTED/transcript.jsonl",
+  "agent_type": "general-purpose",
+  "background_tasks": [],
+  "cwd": "/REPO",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "SubagentStop",
+  "last_assistant_message": "<redacted: real content, shape preserved>",
+  "permission_mode": "default",
+  "prompt_id": "prompt-0000",
+  "session_crons": [],
+  "session_id": "session-0000",
+  "stop_hook_active": false,
+  "transcript_path": "/REDACTED/transcript.jsonl"
+}
