@@ -499,6 +499,16 @@ Before any package reasons over a hook payload, `relais hook --probe --record <d
 
 `relais doctor`'s ordinary run reads that compatibility record back and reports it stale when the Claude Code on PATH no longer matches the version the record names, in the same finding shape doctor uses elsewhere, rather than silently trusting a record from a different version.
 
+### Turning a hook payload into a typed event
+
+`relais::hook::event::parse` turns the bytes a hook receives on stdin into a typed `HookEvent`, against the nine payloads transcribed under `crates/relais/tests/fixtures/hooks` rather than an invented shape. This is parsing only: the module decides nothing, admits nothing and records nothing — it establishes what a payload IS, so the packages that act on it argue about policy rather than about JSON.
+
+A payload lands in one of: `SessionStart`, `SessionEnd`, `SubagentStart`, `SubagentStop`, `AgentToolCall` (a `PreToolUse`/`PostToolUse`/`PostToolUseFailure` event whose tool is the Agent tool, or its legacy name `Task`), or `NotOurs`. `NotOurs` is one case for two different reasons: a tool event for any tool other than the Agent tool (`0001-PreToolUse.json`, a `Read`, lands there), and a payload that is not JSON, is not an object, names no event, names an event this binary does not know, or exceeds a one-mebibyte cap. A hook cannot refuse to answer, so `parse` never returns an error and never panics.
+
+The fields this module reads are deliberately not `#[serde(deny_unknown_fields)]`, unlike this crate's usual habit: the recorded payloads carry `cwd`, `effort`, `permission_mode`, `transcript_path`, `background_tasks`, `session_crons`, `stop_hook_active` and more this module has no use for, and a future Claude Code release will add others it has not carried yet. Rejecting fields this module does not model would turn every harness release into an outage.
+
+The caller's agent (`agent_id` at the top level) is optional because it is genuinely absent there: `0002-PreToolUse.json`, the spawn itself, carries none, while `0004-PreToolUse.json`, a call the subagent made, carries one — pinned to that measurement rather than to a guess. The session, tool use, agent, agent type and prompt each get their own newtype (`SessionId`, `ToolUseId`, `AgentId`, `AgentType`, `PromptId` in `ids.rs`), so a function taking two of them cannot be called with them swapped.
+
 ### Resource policy
 
 Use separate limits for active remote model work, local heavy commands, indexing and training. A lightweight remote research agent does not consume the same resource class as a compiler or test container. Parent processes waiting on children retain identity but relinquish active-execution capacity where waiting can be reliably observed; avoid a deadlock in which all slots are held by parents awaiting queued children. Otherwise reserve child capacity before starting a delegation-capable parent, or decline that decomposition explicitly.

@@ -21,6 +21,8 @@
 //! The fixtures every later package tests against are transcribed from a
 //! real session this way, rather than assumed.
 
+pub mod event;
+
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
