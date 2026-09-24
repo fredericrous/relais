@@ -736,19 +736,17 @@ pub struct AdmissionState {
 }
 
 /// Default duration a hook-admitted agent's lease is held before it
-/// lapses, absent an operator override. Mirrors the default of
-/// `policy::HookAdmissionSettings::binding_lease_secs` (SPEC §23), which
-/// this module does not import: admission takes a plain `Duration`
-/// How long a hook-admitted agent's binding is held before it lapses,
-/// when nothing sets otherwise.
+/// lapses, absent an operator override — this module does not import
+/// `policy::HookAdmissionSettings`, so admission takes a plain
+/// `Duration` rather than the settings type itself.
 ///
-/// This MIRRORS `policy::HookAdmissionSettings::binding_lease_secs` by
-/// hand — the same number written twice — because nothing yet reads the
-/// setting into admission: `set_agent_lease_ttl` has no caller outside
-/// its own test. That is a gap, not a design: the machine setting is
-/// meant to govern this, and until the package that admits an agent
-/// wires it through, changing one number silently leaves the other
-/// behind. Recorded here rather than left for a reader to discover.
+/// This is a FALLBACK, not the number in force: `coordinator::Coordinator::start`
+/// reads `policy::HookAdmissionSettings::binding_lease_secs` from
+/// machine.toml and calls `set_agent_lease_ttl` with it before serving,
+/// so the setting governs the lease actually in force. This constant
+/// only matters for an `AdmissionState` built with `new` and never
+/// reconfigured — every test that does not care what the value is, and
+/// nothing on the path a real coordinator serves.
 pub const DEFAULT_AGENT_LEASE_TTL: Duration = Duration::from_secs(120);
 
 impl AdmissionState {

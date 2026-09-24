@@ -120,6 +120,15 @@ pub fn runs_dir() -> Result<PathBuf, HomeUnset> {
     Ok(state_dir()?.join(RUNS_DIR))
 }
 
+/// Where `relais hook` journals every firing it answers, one JSON line
+/// per firing (SPEC §23). A payload carries a transcript path and a
+/// working directory that name a person's machine, so this file is
+/// created owner-only and never shared with the socket or settings
+/// files above.
+pub fn hook_journal_path() -> Result<PathBuf, HomeUnset> {
+    Ok(state_dir()?.join("hook_journal.jsonl"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

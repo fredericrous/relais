@@ -1,7 +1,7 @@
-//! The hook probe: a record-only handler for Claude Code hook payloads,
-//! and the machinery that drives one real session through it.
+//! The hook probe and the live hook handler for Claude Code hook
+//! payloads.
 //!
-//! Two halves, deliberately unequal in what they know:
+//! Three pieces, deliberately unequal in what they know:
 //!
 //! - [`record`] is `relais hook --probe --record <dir>`: it reads one
 //!   payload on stdin and writes it to disk byte for byte. It parses
@@ -17,6 +17,10 @@
 //!   reading is metadata about the recording (field names, not values;
 //!   never a relais type), not the interpretation the packages this probe
 //!   exists to give fixtures to will eventually do.
+//! - [`respond::handle`] is `relais hook` with no flags: the live path,
+//!   which parses a payload with [`event::parse`], asks the coordinator
+//!   about a spawn, applies [`decide::decide`] and prints the answer.
+//!   This is the one that can refuse a tool call; the two above never do.
 //!
 //! The fixtures every later package tests against are transcribed from a
 //! real session this way, rather than assumed.
@@ -24,6 +28,7 @@
 pub mod decide;
 pub mod event;
 pub mod pairing;
+pub mod respond;
 
 use std::fs;
 use std::io::Read;

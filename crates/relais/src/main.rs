@@ -32,6 +32,7 @@
 //! README.md carries the same table for people who do not read source.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -41,7 +42,7 @@ use relais::contract::TaskContract;
 use relais::ids::{IdSource, RunId, TaskId};
 use relais::install::{InstallReport, InstallRequest, Mode, Scope};
 use relais::learn::predict::RegistryPredictor;
-use relais::policy::{effective_authority, MachineSettings, RepoPolicy};
+use relais::policy::{effective_authority, HookAdmissionSettings, MachineSettings, RepoPolicy};
 use relais::runner::{execute, Reason, RunConfig, State, Terminal};
 use relais::verify::{independence_summary, Receipt};
 use relais::{
@@ -241,16 +242,19 @@ enum Command {
         #[command(subcommand)]
         cmd: EvidenceCommand,
     },
-    /// Record one Claude Code hook payload verbatim. Internal: this is
-    /// the command `relais doctor --probe-hooks` wires into its
-    /// throwaway settings file, not something a person runs directly.
+    /// Read one Claude Code hook payload on stdin and answer it (SPEC
+    /// §23): silence, or a refusal a person can act on. With `--probe
+    /// --record <dir>`, record the payload verbatim instead and decide
+    /// nothing — the internal mode `relais doctor --probe-hooks` wires
+    /// into its throwaway settings file, not something a person runs
+    /// directly.
     Hook {
-        /// The only mode this command has: record, decide nothing.
+        /// Record-only mode: requires `--record`.
         #[arg(long)]
         probe: bool,
-        /// Where to write the payload
+        /// Where `--probe` writes the payload
         #[arg(long = "record")]
-        record: PathBuf,
+        record: Option<PathBuf>,
     },
 }
 
@@ -586,10 +590,14 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             true => doctor_probe_hooks_command(),
             false => doctor_command(json),
         },
-        Command::Hook { probe, record } => match probe {
-            true => hook_command(&record),
-            false => Err(CliError::Usage {
-                detail: "hook: only `--probe --record <dir>` is implemented".into(),
+        Command::Hook { probe, record } => match (probe, record) {
+            (true, Some(dir)) => hook_command(&dir),
+            (false, None) => Ok(hook_respond_command()),
+            (true, None) => Err(CliError::Usage {
+                detail: "hook --probe: needs --record <dir>".into(),
+            }),
+            (false, Some(_)) => Err(CliError::Usage {
+                detail: "hook --record: needs --probe".into(),
             }),
         },
         Command::Init => init_command(),
@@ -1257,10 +1265,16 @@ fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome, CliError> 
             // states would silently become the defaults, which are
             // wider (X5) — so it stops the daemon instead.
             let path = paths::machine_settings_path().map_err(CliError::Home)?;
-            let limits = match std::fs::read_to_string(&path) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    coordinator::effective_limits(&Default::default())
-                }
+            // The machine's `binding_lease_secs` governs the lease a
+            // hook-admitted agent is held on (SPEC §23), read from the
+            // same file and the same parse as the concurrency limits
+            // above it, rather than left at `AdmissionState`'s own
+            // fallback regardless of what machine.toml states.
+            let (limits, agent_lease_ttl) = match std::fs::read_to_string(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+                    coordinator::effective_limits(&Default::default()),
+                    Duration::from_secs(HookAdmissionSettings::default().binding_lease_secs),
+                ),
                 Err(cause) => {
                     return Err(CliError::Read {
                         what: "the machine settings",
@@ -1269,7 +1283,10 @@ fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome, CliError> 
                     })
                 }
                 Ok(text) => match MachineSettings::from_toml_str(&text) {
-                    Ok(machine) => coordinator::effective_limits(&machine.concurrency),
+                    Ok(machine) => (
+                        coordinator::effective_limits(&machine.concurrency),
+                        Duration::from_secs(machine.admission.binding_lease_secs),
+                    ),
                     Err(e) => {
                         eprintln!(
                             "relais coordinator: {} is invalid: {e}; refusing to serve with \
@@ -1301,7 +1318,7 @@ fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome, CliError> 
                     None
                 }
             };
-            match coordinator::run_daemon(&socket, limits, ledger.as_ref()) {
+            match coordinator::run_daemon(&socket, limits, ledger.as_ref(), agent_lease_ttl) {
                 Ok(()) => Ok(CliOutcome::Accepted),
                 Err(e) => {
                     eprintln!("relais coordinator: {e}");
@@ -1505,6 +1522,75 @@ fn hook_command(dir: &Path) -> Result<CliOutcome, CliError> {
     let order = relais::hook::arrival_nanos();
     relais::hook::record(dir, order, std::io::stdin().lock());
     Ok(CliOutcome::Accepted)
+}
+
+/// `relais hook`, run with no flags: read one payload on stdin, decide
+/// what to say about it, and say it (SPEC §23). Always accepts — a
+/// non-zero exit from a hook is reported to the session as a failure of
+/// the tool call it was watching, so a relais that cannot answer must be
+/// indistinguishable from a relais that had nothing to say. Every path
+/// that could fail (an unreadable settings file, an unreachable
+/// coordinator, a payload that is not JSON, a panic anywhere inside) is
+/// swallowed rather than surfaced; `relais doctor` is where any of that
+/// is reported as a finding.
+fn hook_respond_command() -> CliOutcome {
+    // The whole body, not just `respond::handle`: reading stdin,
+    // loading settings and journalling all run here too, and none of
+    // them may take the process down with them any more than the
+    // decision itself may.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook_respond));
+    CliOutcome::Accepted
+}
+
+fn hook_respond() {
+    use std::io::Read;
+    let mut payload = Vec::new();
+    // A truncated read leaves `payload` with whatever arrived so far;
+    // `event::parse` treats that the same as any other input it cannot
+    // make sense of (`HookEvent::NotOurs`), so the hook still answers.
+    let _ = std::io::stdin().lock().read_to_end(&mut payload);
+
+    let settings = hook_admission_settings();
+
+    let Ok(socket) = relais::coordinator::socket_path() else {
+        // No home directory: nothing to connect to and nowhere to
+        // journal. `decide_or_silent` still owes an answer for "the
+        // coordinator could not be reached" under this machine's own
+        // stance, so build one directly rather than skip the decision
+        // entirely.
+        let event = relais::hook::event::parse(&payload);
+        let answer = relais::hook::decide::decide_or_silent(&event, &settings, None);
+        if let Some(text) = answer.stdout_payload() {
+            println!("{text}");
+        }
+        return;
+    };
+    let gate = relais::coordinator::RemoteGate::new(socket);
+    let handled = relais::hook::respond::handle(&payload, &settings, &gate);
+    if let Some(text) = handled.answer.stdout_payload() {
+        println!("{text}");
+    }
+    if let Ok(path) = paths::hook_journal_path() {
+        let entry = relais::hook::respond::journal_entry(&payload, &handled);
+        // Best effort, like every other step here: a journal write
+        // failure is not the tool call's to report, and it already
+        // answered above.
+        let _ = relais::hook::respond::append_journal(&path, &entry);
+    }
+}
+
+/// The machine's hook-admission settings, or the stated defaults when
+/// machine.toml is missing or will not parse. A hook cannot refuse to
+/// answer over a settings problem any more than over anything else it
+/// might hit — that failure belongs to `relais doctor`, not to a hook
+/// answer holding a tool call open.
+fn hook_admission_settings() -> relais::policy::HookAdmissionSettings {
+    paths::machine_settings_path()
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| MachineSettings::from_toml_str(&text).ok())
+        .map(|machine| machine.admission)
+        .unwrap_or_default()
 }
 
 /// `relais doctor --probe-hooks`: wire the seven hook targets into a

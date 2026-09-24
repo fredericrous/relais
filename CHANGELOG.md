@@ -279,6 +279,26 @@ missing here.
   reports every such binding alongside `bound_processes`, so a reader of
   a snapshot can tell which kind a dispatch's binding is.
 
+- **`relais hook`, run with no flags, now answers for real.** It reads
+  one payload on stdin, asks the coordinator about a spawn (only a
+  `PreToolUse` on the Agent tool — every other event is answered with
+  no call at all), applies the existing pure `hook::decide::decide`,
+  prints a refusal to stdout when there is one and nothing at all when
+  there is not, and on a refusal withdraws the request it asked about
+  so a refused spawn is never left holding a reservation. The command
+  exits 0 on every path — a payload that is not JSON, an unreachable
+  coordinator, a missing or invalid machine.toml, a panic anywhere
+  inside — because a non-zero exit from a hook fails the tool call it
+  was watching, and a relais that cannot answer must look exactly like
+  one that had nothing to say. Every firing is journalled as one JSON
+  line to `hook_journal.jsonl` under the state directory, created
+  owner-only (mode 0600) since a payload names a person's transcript
+  path and working directory. The machine's `binding_lease_secs` now
+  governs the lease a hook-admitted agent is actually held on:
+  `coordinator::Coordinator::start` reads it from machine.toml and
+  calls `set_agent_lease_ttl` before serving, so it no longer merely
+  mirrors `DEFAULT_AGENT_LEASE_TTL` by hand.
+
 ### Fixed
 
 - **A run whose attempt started and was killed before reporting any
