@@ -1502,7 +1502,7 @@ fn doctor_command(json: bool) -> Result<CliOutcome, CliError> {
 /// and always accepts — the handler cannot fail the session it is
 /// watching.
 fn hook_command(dir: &Path) -> Result<CliOutcome, CliError> {
-    let order = relais::hook::next_order(dir);
+    let order = relais::hook::arrival_nanos();
     relais::hook::record(dir, order, std::io::stdin().lock());
     Ok(CliOutcome::Accepted)
 }
