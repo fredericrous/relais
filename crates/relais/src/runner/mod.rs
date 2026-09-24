@@ -3913,6 +3913,7 @@ mod tests {
                 concurrency: ConcurrencyLimits::default(),
                 trials: TrialEnvelope::default(),
                 routing: Default::default(),
+                admission: Default::default(),
             }
         }
 
