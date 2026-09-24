@@ -1011,6 +1011,19 @@ pub fn handle(
             // cannot be this client's worker, and once the OS reuses the
             // number it would be somebody else's process — which
             // reconcile would later terminate as a cancelled worker.
+            // Only a lease can hit this, and `bind` is the pid path, so
+            // reaching it here would mean a dispatch was bound by pid
+            // twice. Refused with the same shape rather than acked: a
+            // bind that did not happen must not read as one that did.
+            BindOutcome::AlreadyBoundToProcess => Response::Refused {
+                refusal: Refused::PidNotAlive {
+                    pid,
+                    detail: format!(
+                        "dispatch {dispatch_id} is already bound to a live process; a second \
+                         binding would leave the first unsignalable"
+                    ),
+                },
+            },
             BindOutcome::PidNotAlive => Response::Refused {
                 refusal: Refused::PidNotAlive {
                     pid,
