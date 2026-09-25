@@ -346,6 +346,49 @@ missing here.
   calls `set_agent_lease_ttl` before serving, so it no longer merely
   mirrors `DEFAULT_AGENT_LEASE_TTL` by hand.
 
+- **The first spawn of a session now registers its own run, so the
+  caps `relais hook` enforces are reachable at all.** Every session
+  `relais run` had not already started found no run on record at its
+  first spawn, and `request_admission` refuses an unregistered run
+  outright — so the hook answered `UnknownRun` for every ordinary tab,
+  regardless of any cap, and no cap had ever been observed refusing a
+  spawn on the hook path. `hook::respond::ask_coordinator` now derives
+  that session's own run id exactly as `admit` did, registers it with
+  no budget, agent-cap or depth override, and retries the admission
+  once — at most once per firing, since a hook cannot hold a tool call
+  open. An unreachable coordinator is never registered against: that
+  failure stays `CoordinatorAnswer::None`, resolved by
+  `on_coordinator_unreachable` as before. Registering cannot resurrect
+  or launder a run: the id is always the one the hook derives from the
+  session in hand, never one a caller supplied.
+
+  For that cap to count agents rather than spawns, the seat has to come
+  back when the call ends, and it now does: a `PostToolUse` or
+  `PostToolUseFailure` on the Agent tool carries the same `tool_use_id`
+  its spawn did, so the dispatch id derives identically and the end
+  settles and releases exactly what the start took — no pairing, nothing
+  remembered between firings. Settled with `None` rather than a figure,
+  because a hook payload carries no usage: that books the reservation as
+  a lower bound and marks the run uncertain, where zero would claim the
+  agent was free. Without this the seat would lapse only with the unbound
+  dispatch's five-minute grace, so `max_active_agents_per_session` would
+  cap spawns per rolling five minutes while the refusal advised retrying
+  "when a running agent finishes" — advice that would free nothing.
+
+  Three limits of this path are stated rather than implied away, in SPEC
+  §23 and the README's known limits. **Depth is not enforced**: nothing
+  in one payload joins a spawn to the dispatch it descends from, so every
+  hook-admitted spawn is requested at depth 0. **No money limit is
+  enforced**: the registered run carries no budget and the coordinator
+  refuses on budget only for a run that has one, so
+  `dispatch_reserve_micros` above zero changes what a spawn reserves
+  against an unbounded total and refuses nothing. **A cancellation is not
+  durable**: `relais cancel` on a session's derived run holds until the
+  next reconcile reaps it — 15 seconds — after which the next spawn finds
+  no record, registers the run again and is admitted, because the
+  cancellation lived in coordinator memory and nothing on disk tells a
+  reaped-cancelled run from a session never seen.
+
 ### Fixed
 
 - **A run whose attempt started and was killed before reporting any
