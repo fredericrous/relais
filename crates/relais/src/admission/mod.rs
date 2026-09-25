@@ -328,6 +328,15 @@ pub struct StatusSnapshot {
     /// specifically.
     #[serde(default)]
     pub expired_hook_leases: u32,
+    /// Live dispatches adopted from a ledger row written before the
+    /// migration that added `source`, `parent_dispatch` and `depth`
+    /// (SPEC §23): the caps still bind on these, but on a session and a
+    /// reservation only — their parent and depth were never recorded and
+    /// are enforced as root/zero rather than known. Counted apart so a
+    /// person can see how much of what is live rests on a complete
+    /// record and how much does not.
+    #[serde(default)]
+    pub adopted_pre_migration: u32,
 }
 
 /// A process bound to a dispatch, and how stale the check that bound it
@@ -700,6 +709,21 @@ enum AdmissionCount {
     Readopted,
 }
 
+/// Whether an adopted dispatch's parentage, depth and source came off the
+/// ledger row as fact, or the row predates the columns that would have
+/// recorded them (SPEC §23: a restart's adoption reports what it does
+/// not know rather than guessing it).
+///
+/// Not a bool: a `false` here would read as "this dispatch is untrusted",
+/// which is not the claim — a `PreMigration` dispatch is adopted and
+/// enforced exactly like any other, only counted apart so a person can
+/// tell how much of what is live rests on a genuine record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attribution {
+    Recorded,
+    PreMigration,
+}
+
 /// Where a dispatch is between admission and oblivion.
 ///
 /// The two ends — the seat coming back and the usage settling — arrive
@@ -848,6 +872,7 @@ struct Dispatch {
     agent_id: Option<String>,
     last_heartbeat: Instant,
     source: DispatchSource,
+    attribution: Attribution,
 }
 
 /// One worktree's exclusive write lease (SPEC §23: "concurrent writers
@@ -1110,6 +1135,7 @@ impl AdmissionState {
                 now,
                 Lifecycle::Claimed,
                 AdmissionCount::First,
+                Attribution::Recorded,
             );
             return Decision::Granted;
         }
@@ -1270,6 +1296,7 @@ impl AdmissionState {
         now: Instant,
         lifecycle: Lifecycle,
         count: AdmissionCount,
+        attribution: Attribution,
     ) {
         let parent_known = request
             .parent_dispatch
@@ -1305,6 +1332,7 @@ impl AdmissionState {
                 agent_id: None,
                 last_heartbeat: now,
                 source: request.source,
+                attribution,
             },
         );
     }
@@ -1363,6 +1391,7 @@ impl AdmissionState {
                 now,
                 Lifecycle::Unclaimed,
                 AdmissionCount::First,
+                Attribution::Recorded,
             );
         }
     }
@@ -2114,11 +2143,20 @@ impl AdmissionState {
     /// restart, without a fresh admission decision: it is already running
     /// (SPEC §23: coordinator restart reconciles without duplicate live
     /// workers). Unknown parents are recorded as unknown.
+    ///
+    /// `attribution` is the caller's own verdict on `request`: whether the
+    /// ledger row it was built from carried its session, parent, depth and
+    /// source as fact ([`Attribution::Recorded`]) or the row predates the
+    /// columns that would have recorded them
+    /// ([`Attribution::PreMigration`]) — this function does not re-derive
+    /// it, only counts it (`status().adopted_pre_migration`) so the caps
+    /// this dispatch is held to are shown for what they rest on.
     pub fn adopt(
         &mut self,
         request: &DispatchRequest,
         pid: Option<u32>,
         agent_id: Option<&str>,
+        attribution: Attribution,
         now: Instant,
     ) {
         if self.dispatches.contains_key(&request.dispatch_id) {
@@ -2143,6 +2181,7 @@ impl AdmissionState {
             now,
             Lifecycle::Claimed,
             AdmissionCount::Readopted,
+            attribution,
         );
         // The adopter checked this PID against the process table before
         // adopting at all (`Coordinator::start`): re-checking here would
@@ -2158,6 +2197,7 @@ impl AdmissionState {
         let mut stale_leases = 0;
         let mut active_by_source: BTreeMap<String, u32> = BTreeMap::new();
         let mut expired_hook_leases = 0;
+        let mut adopted_pre_migration = 0;
         for (id, dispatch) in &self.dispatches {
             // A lease is the hook's way of holding a seat without a pid,
             // but `bind_agent_lease` is callable for any dispatch, so a
@@ -2214,6 +2254,9 @@ impl AdmissionState {
             *active_by_source
                 .entry(dispatch.source.as_str().to_string())
                 .or_default() += 1;
+            if dispatch.attribution == Attribution::PreMigration {
+                adopted_pre_migration += 1;
+            }
             // The SAME rule `reconcile` applies, called rather than
             // restated: a leased binding lapses on `agent_lease_ttl` and
             // everything else on `LEASE_GRACE`. Reading `LEASE_GRACE`
@@ -2297,6 +2340,7 @@ impl AdmissionState {
                 .map(|(source, count)| (source.as_str().to_string(), *count))
                 .collect(),
             expired_hook_leases,
+            adopted_pre_migration,
         }
     }
 
@@ -3441,9 +3485,26 @@ mod tests {
         // Adopt from the ledger's live set: no fresh admission, no
         // duplicate, unknown parent recorded as unknown.
         let orphan = child("orphan", "run-a", "tab-a", "gone-parent", 1);
-        state.adopt(&orphan, Some(7777), Some("agent-7"), t0);
-        state.adopt(&orphan, Some(7777), Some("agent-7"), t0);
+        state.adopt(
+            &orphan,
+            Some(7777),
+            Some("agent-7"),
+            Attribution::Recorded,
+            t0,
+        );
+        state.adopt(
+            &orphan,
+            Some(7777),
+            Some("agent-7"),
+            Attribution::Recorded,
+            t0,
+        );
         assert_eq!(state.status(t0).active_by_class["model_work"], 1);
+        assert_eq!(
+            state.status(t0).adopted_pre_migration,
+            0,
+            "this row carried its parent and depth as fact"
+        );
         assert_eq!(
             state.parentage("orphan"),
             Some(Parentage::Unrecognised {
@@ -3667,7 +3728,7 @@ mod tests {
         let mut state = state();
         let t0 = Instant::now();
         let request = req("adopted-one", "run-a", "tab-a");
-        state.adopt(&request, None, Some("agent-01"), t0);
+        state.adopt(&request, None, Some("agent-01"), Attribution::Recorded, t0);
         let snapshot = state.status(t0);
         assert_eq!(
             snapshot

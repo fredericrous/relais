@@ -228,6 +228,13 @@ or the reason it was kept, and a scorecard re-measured afterwards.
   Without the hook, or with the coordinator unreachable, native
   subagents are observed only: managed dispatch through `relais run` is
   the sole path the coordinator caps.
+- A hook-admitted spawn writes no ledger row at all — nothing on this
+  path calls `record_dispatch_intent` — so a coordinator restart has
+  nothing to adopt it from. Its seat is gone the moment the coordinator
+  that granted it exits, and the agent it admitted keeps running
+  unwatched: this is a real limit of the hook-admitted design (SPEC
+  §23), not something a restart's adoption is asked to paper over by
+  inventing a ledger row for a dispatch that never had one.
 - The local `msrv` target proves the declared floor only when that
   toolchain is installed (`rustup toolchain install 1.88.0`); without it
   `make msrv` FAILS and says so, rather than passing on a skip. Set

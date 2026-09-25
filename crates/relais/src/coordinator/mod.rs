@@ -22,10 +22,10 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::admission::{
-    AdmissionState, AgentSettleOutcome, BindOutcome, Decision, DispatchRequest, DispatchSource,
-    Enforcement, Gate, GateError, HeartbeatStatus, LifecycleOutcome, PendingSignal, Provenance,
-    ReleaseWriteOutcome, ResourceClass, ResumeOutcome, RunRegistration, Signal, StatusSnapshot,
-    WaitOutcome, WithdrawOutcome, WriteLeaseOutcome,
+    AdmissionState, AgentSettleOutcome, Attribution, BindOutcome, Decision, DispatchRequest,
+    DispatchSource, Enforcement, Gate, GateError, HeartbeatStatus, LifecycleOutcome, PendingSignal,
+    Provenance, ReleaseWriteOutcome, ResourceClass, ResumeOutcome, RunRegistration, Signal,
+    StatusSnapshot, WaitOutcome, WithdrawOutcome, WriteLeaseOutcome,
 };
 use crate::ipc::{Listener, Stream};
 use crate::ledger::Ledger;
@@ -565,15 +565,30 @@ impl Coordinator {
                     continue;
                 }
                 let pid = Some(pid);
+                // `source` is the one column every post-migration row
+                // carries and no pre-migration row does (all four were
+                // added together): its presence is what tells a fully
+                // recorded row from one this coordinator cannot re-derive,
+                // so the session, parent and depth below are read off the
+                // row rather than guessed either way — a restart widens
+                // nothing it does not also report.
+                let attribution = if live.source.is_some() {
+                    Attribution::Recorded
+                } else {
+                    Attribution::PreMigration
+                };
                 state.adopt(
                     &DispatchRequest {
                         dispatch_id: live.dispatch.as_str().to_string(),
                         run_id: live.run.as_str().to_string(),
-                        session_id: "unknown".into(),
-                        parent_dispatch: None,
-                        depth: 0,
+                        session_id: live.session_id.clone().unwrap_or_else(|| "unknown".into()),
+                        parent_dispatch: live.parent_dispatch.clone(),
+                        depth: live
+                            .depth
+                            .and_then(|depth| u32::try_from(depth).ok())
+                            .unwrap_or(0),
                         resource: ResourceClass::ModelWork,
-                        reserve_micros: 0,
+                        reserve_micros: live.reserve_micros,
                         // Adopted from the ledger row the runner itself
                         // wrote before this election: a managed dispatch
                         // surviving a restart, not a hook-admitted one —
@@ -582,7 +597,8 @@ impl Coordinator {
                         source: DispatchSource::ManagedRun,
                     },
                     pid,
-                    None,
+                    live.agent_id.as_deref(),
+                    attribution,
                     now,
                 );
             }
@@ -2305,6 +2321,83 @@ mod tests {
             "only the live, bound dispatch is adopted"
         );
         assert_eq!(snapshot.runs["run-x"].admitted_total, 1);
+        assert_eq!(
+            snapshot.runs["run-x"].session_id, "sess",
+            "the ledger row already named the session; adoption reads it \
+             rather than placing every restart under \"unknown\""
+        );
+        assert_eq!(
+            snapshot.adopted_pre_migration, 0,
+            "this row carries source, parent and depth; nothing about it is unrecorded"
+        );
+        drop(state);
+        std::fs::remove_file(&socket).ok();
+    }
+
+    // The objective this migration exists for: a per-session cap that
+    // bound before a restart still binds after it, because the adopted
+    // dispatch keeps the real session a placeholder "unknown" erased.
+    #[test]
+    fn a_restarted_coordinator_still_enforces_the_per_session_cap() {
+        let dir = temp_dir("adopt-cap");
+        let socket = dir.join("relais.sock");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        ledger
+            .insert_run(
+                &RunId::from_stored("run-cap-1"),
+                "/repo",
+                None,
+                &crate::ids::TaskId::from_stored("task-run-cap-1"),
+                "rk",
+            )
+            .expect("run");
+        ledger
+            .record_dispatch_intent(
+                &DispatchId::from_stored("live"),
+                &RunId::from_stored("run-cap-1"),
+                None,
+                &serde_json::json!({}),
+                0,
+            )
+            .expect("intent");
+        ledger
+            .attach_dispatch_process(
+                &DispatchId::from_stored("live"),
+                Some(Pid::new(std::process::id())),
+                Some("cap-session"),
+            )
+            .expect("attach");
+
+        // `limits()` caps `max_active_agents_per_session` at 1: the
+        // session above is already at that cap before the coordinator
+        // this process runs even elects.
+        let (coordinator, listener) = Coordinator::start(
+            &socket,
+            limits(),
+            Some(&ledger),
+            crate::admission::DEFAULT_AGENT_LEASE_TTL,
+        )
+        .expect("start");
+        drop(listener);
+        let mut state = coordinator.state.lock().expect("lock");
+        assert_eq!(
+            state.status(Instant::now()).runs["run-cap-1"].session_id,
+            "cap-session"
+        );
+        // A second run in the SAME session — the ordinary shape of a
+        // person's tab starting a new run once the first has settled
+        // enough to still hold a live seat.
+        state.register_run(&registration("run-cap-2", "cap-session"), Instant::now());
+        assert_eq!(
+            state.request(
+                &request("second", "run-cap-2", "cap-session"),
+                Instant::now()
+            ),
+            Decision::Queued { position: 1 },
+            "the adopted dispatch's real session still fills the per-session \
+             cap; before this fix it was adopted under \"unknown\" and this \
+             was Granted"
+        );
         drop(state);
         std::fs::remove_file(&socket).ok();
     }
