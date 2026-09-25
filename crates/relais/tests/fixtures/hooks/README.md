@@ -39,9 +39,11 @@ Three things worth reading off it:
   Absence only means something once the case that would show presence is
   exercised.
 - **`SubagentStart`/`SubagentStop` carry no `tool_use_id`,** and the spawn's
-  `PreToolUse`/`PostToolUse` carry no `agent_id`. Nothing in a single payload
-  joins the tool call that admitted an agent to the agent that then ran. That
-  join has to be made from `agent_type`, arrival order, and `prompt_id`.
+  `PreToolUse`/`PostToolUse` carry no top-level `agent_id`. Nothing BEFORE the
+  agent runs joins the tool call that admitted it to the agent that then ran;
+  that join has to be made from `agent_type`, arrival order, and `prompt_id`.
+  Afterwards there is one: the Agent `PostToolUse`'s `tool_response.agentId`
+  (see `0009`/`0010` below).
 - **`prompt_id` is identical across every event of one turn** (absent only from
   `SessionStart`). It scopes a correlation to the turn, which narrows the
   candidates before `agent_type` has to disambiguate — it does not by itself
@@ -58,6 +60,48 @@ Three things worth reading off it:
 - **Concurrent agents of one type.** One agent ran here, so the ambiguous case
   the binding logic exists for is not represented. A fixture for it has to come
   from a session that spawns several at once.
+
+## `0009`/`0010`: an async launch, and the agent's real end
+
+These two come from a **different, later session** (Claude Code 2.1.282), not
+the one tabulated above — hence `session-0001`/`prompt-0001`/`toolu-11`/
+`agent-11`. Like `0000`–`0008` they are verbatim recordings with their values
+redacted: keys, types and presence are untouched. That session ran four agents
+against a per-session cap of three with the hook wired by `relais install
+--claude --hooks`, and admitted all four — which is how the launch/end
+distinction below was found rather than reasoned.
+
+The two files are one agent's pair: `0009`'s `tool_response.agentId` and
+`0010`'s `agent_id` are the same agent, aliased `agent-11`. Distinct real
+agents keep distinct aliases, which is why `0010`'s `background_tasks` names
+`agent-11` beside `agent-12` — a sibling still running when this one stopped.
+
+| order | event | tool | `agent_id` | `tool_use_id` | `tool_response.agentId` |
+|---|---|---|---|---|---|
+| 0009 | PostToolUse | Agent | absent | `toolu-11` | `agent-11` |
+| 0010 | SubagentStop | — | `agent-11` | absent | — |
+
+What they showed:
+
+- **`duration_ms` on an Agent `PostToolUse` measures the LAUNCH, not the
+  agent's run.** The `PostToolUse` arrived ~100 ms after its `PreToolUse` with
+  `duration_ms: 8` and `status: "async_launched"`, while the agent it launched
+  ran on for 6–16 seconds more until its `SubagentStop`. A seat released on
+  `PostToolUse` is released at launch, and a per-session cap enforced that way
+  does not bind. (`0007`'s `duration_ms: 3250` with `status: "completed"` is the
+  synchronous case, where the call does wait for the agent — and even there its
+  `SubagentStop` arrives first; see `../hooks-concurrent/README.md`.)
+- **`tool_response.agentId` is the only place a tool call and the agent it
+  produced appear together.** Every other payload carries one side of the join:
+  the spawn's `PreToolUse` has the `tool_use_id` and no agent, `SubagentStart`/
+  `SubagentStop` have the `agent_id` and no tool call. The `PostToolUse` has
+  both — which is why relais binds a spawn's seat to its agent there, and gives
+  it back on the `SubagentStop` that names that agent.
+
+`tool_response.agentId` was left unredacted in `0007` (and in
+`../hooks-concurrent`) when `agent_id` was substituted, so in those recordings
+the two do not match by value. In `0009`/`0010` they are substituted alike, so
+the join the harness makes is visible in the fixtures too.
 
 ## Redaction
 

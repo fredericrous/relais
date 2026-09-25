@@ -1,0 +1,29 @@
+{
+  "cwd": "/REPO",
+  "duration_ms": 8,
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "permission_mode": "bypassPermissions",
+  "prompt_id": "prompt-0001",
+  "session_id": "session-0001",
+  "tool_input": {
+    "description": "<redacted: real content, shape preserved>",
+    "prompt": "<redacted: real content, shape preserved>",
+    "subagent_type": "general-purpose"
+  },
+  "tool_name": "Agent",
+  "tool_response": {
+    "agentId": "agent-11",
+    "canReadOutputFile": true,
+    "description": "<redacted: real content, shape preserved>",
+    "isAsync": true,
+    "outputFile": "/REDACTED/transcript.jsonl",
+    "prompt": "<redacted: real content, shape preserved>",
+    "resolvedModel": "claude-opus-5-5",
+    "status": "async_launched"
+  },
+  "tool_use_id": "toolu-11",
+  "transcript_path": "/REDACTED/transcript.jsonl"
+}

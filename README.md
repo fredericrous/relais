@@ -199,12 +199,19 @@ or the reason it was kept, and a scorecard re-measured afterwards.
   recorded but not yet run concurrently.
 - Native Claude Code subagents are admitted but never tracked as
   individuals: with the hook wired (`relais install --claude --hooks`),
-  a spawn is asked about and can be refused, and the end of its tool
-  call gives the seat back — but relais never learns which agent ran
-  under which spawn, so depth is not enforced on this path and a subtree
-  cannot be cancelled. Without the hook, or with the coordinator
-  unreachable, native subagents are observed only: managed dispatch
-  through `relais run` is the sole path the coordinator caps.
+  a spawn is asked about and can be refused (`PreToolUse`), its seat is
+  bound to the agent it launched when the tool call returns
+  (`PostToolUse`, which for an async spawn is at launch, not at the
+  agent's end), and the seat comes back when that agent stops
+  (`SubagentStop`). An agent whose `SubagentStop` never arrives holds
+  its seat until its lease lapses (`binding_lease_secs`): the cap
+  over-counts for that long rather than under-counting, and an agent
+  that runs longer than the lease loses its seat early, since nothing
+  renews it. Nothing joins a spawn to the agent that spawned it, so
+  depth is not enforced on this path and a subtree cannot be cancelled.
+  Without the hook, or with the coordinator unreachable, native
+  subagents are observed only: managed dispatch through `relais run` is
+  the sole path the coordinator caps.
 - The local `msrv` target proves the declared floor only when that
   toolchain is installed (`rustup toolchain install 1.88.0`); without it
   `make msrv` FAILS and says so, rather than passing on a skip. Set

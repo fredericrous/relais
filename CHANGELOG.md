@@ -6,6 +6,39 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## Unreleased
+
+### Changed
+
+- **BREAKING: the coordinator wire protocol is now 3
+  (`PROTOCOL_VERSION` 2 → 3).** Two requests were added —
+  `BindAgentLease` and `SettleByAgent` — and a coordinator left running
+  from an older install does not have them. Run `relais coordinator
+  stop` before upgrading (or after: the first command against a v2
+  daemon names the skew and says the same thing), and the next command
+  starts a coordinator that matches.
+
+### Fixed
+
+- **The per-session agent cap binds on the hook path.** A spawn's seat
+  used to be given back on the Agent tool's `PostToolUse`, taken to be
+  the agent's end. It is not: a real Claude Code 2.1.282 session showed
+  an async spawn's `PostToolUse` arriving ~100ms after its `PreToolUse`
+  with `duration_ms: 8` and `tool_response.status: "async_launched"`,
+  while the agent ran 6–16 seconds more — so every seat came back at
+  launch and `max_active_agents_per_session` admitted agents past the
+  cap. The seat now follows the agent: admitted on `PreToolUse`, bound
+  on `PostToolUse` to the agent its `tool_response.agentId` names (the
+  only payload that names a tool call and its agent together), and
+  given back on that agent's `SubagentStop`, found by session and agent
+  id. A synchronous spawn, whose `SubagentStop` arrives before its
+  `PostToolUse`, is handled too: the coordinator remembers the stop and
+  the late bind ends the dispatch at once. An agent whose
+  `SubagentStop` never arrives holds its seat until its lease lapses —
+  a cap that over-counts for that long, never one that under-counts.
+  `hook::event::ToolCallPhase::Post` now carries `launched_agent`, the
+  only phase that can.
+
 ## v0.4.0
 
 ### Added

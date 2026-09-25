@@ -467,6 +467,26 @@ pub enum WithdrawOutcome {
     UnknownDispatch,
 }
 
+/// What `settle_by_agent` did with the end of an agent's life.
+///
+/// A `SubagentStop` names an agent, never a tool call, so the dispatch
+/// it ends can only be found through a binding made earlier — the
+/// `PostToolUse` that reported which agent the spawn launched (SPEC §23).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum AgentSettleOutcome {
+    /// The dispatch bound to this agent was settled and its seat given
+    /// back.
+    Settled { dispatch_id: String },
+    /// Nothing was bound to this agent. Not an error, and ordinary: an
+    /// agent spawned before the hook was wired, or while the coordinator
+    /// was down, ends like any other. So does an agent whose own
+    /// `PostToolUse` has not arrived yet — a synchronous spawn's
+    /// `SubagentStop` precedes it — which is why the stop is remembered,
+    /// and a later bind of the same agent finishes the dispatch at once.
+    NothingBound,
+}
+
 /// What `acquire_write` did (SPEC §23: one writer per worktree).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
@@ -733,6 +753,13 @@ pub struct AdmissionState {
     max_over_admitted: Option<u32>,
     /// How long a hook-admitted agent's lease is held before it lapses.
     agent_lease_ttl: Duration,
+    /// Agents whose end (`settle_by_agent`) arrived before anything was
+    /// bound to them, keyed by `(session_id, agent_id)`, newest last and
+    /// capped at `TERMINAL_MEMORY` like `finished`. A synchronous spawn's
+    /// `SubagentStop` precedes the `PostToolUse` that binds it, so the
+    /// bind has to be able to find out that its agent is already over.
+    stopped_order: VecDeque<(String, String)>,
+    stopped: BTreeSet<(String, String)>,
 }
 
 /// Default duration a hook-admitted agent's lease is held before it
@@ -765,6 +792,8 @@ impl AdmissionState {
             finished: BTreeSet::new(),
             write_leases: BTreeMap::new(),
             agent_lease_ttl: DEFAULT_AGENT_LEASE_TTL,
+            stopped_order: VecDeque::new(),
+            stopped: BTreeSet::new(),
         }
     }
 
@@ -1270,7 +1299,64 @@ impl AdmissionState {
             provenance,
             since: now,
         };
+        // The agent may already be over: a synchronous spawn's
+        // `SubagentStop` arrives before the `PostToolUse` that binds it,
+        // and found nothing to settle then. Its end was remembered, so
+        // it is applied now rather than left to hold the seat until the
+        // lease lapses.
+        let key = (dispatch.session_id.clone(), agent_id.to_string());
+        if self.stopped.remove(&key) {
+            self.stopped_order.retain(|stopped| stopped != &key);
+            self.settle(dispatch_id, None, now);
+            self.release(dispatch_id, now);
+        }
         BindOutcome::Bound
+    }
+
+    /// End the dispatch bound to an agent: settle it and give its seat
+    /// back, found by the `(session_id, agent_id)` pair a `SubagentStop`
+    /// carries rather than by a dispatch id, which that payload has no
+    /// way to derive — it names no tool call.
+    ///
+    /// Nothing bound is not an error (see
+    /// [`AgentSettleOutcome::NothingBound`]); the stop is remembered so
+    /// that a bind arriving after it ends the dispatch at once.
+    pub fn settle_by_agent(
+        &mut self,
+        session_id: &str,
+        agent_id: &str,
+        spent_micros: Option<i64>,
+        now: Instant,
+    ) -> AgentSettleOutcome {
+        let bound = self
+            .dispatches
+            .iter()
+            .find(|(_, dispatch)| {
+                dispatch.session_id == session_id && dispatch.agent_id.as_deref() == Some(agent_id)
+            })
+            .map(|(id, _)| id.clone());
+        let Some(dispatch_id) = bound else {
+            self.remember_stopped(session_id, agent_id);
+            return AgentSettleOutcome::NothingBound;
+        };
+        self.settle(&dispatch_id, spent_micros, now);
+        self.release(&dispatch_id, now);
+        AgentSettleOutcome::Settled { dispatch_id }
+    }
+
+    /// Remember an agent that ended with nothing bound to it, evicting
+    /// the oldest past the cap.
+    fn remember_stopped(&mut self, session_id: &str, agent_id: &str) {
+        let key = (session_id.to_string(), agent_id.to_string());
+        if !self.stopped.insert(key.clone()) {
+            return;
+        }
+        self.stopped_order.push_back(key);
+        while self.stopped_order.len() > TERMINAL_MEMORY {
+            if let Some(oldest) = self.stopped_order.pop_front() {
+                self.stopped.remove(&oldest);
+            }
+        }
     }
 
     pub fn heartbeat(&mut self, dispatch_id: &str, now: Instant) -> HeartbeatStatus {
@@ -2097,6 +2183,29 @@ pub trait Gate {
     ) -> Result<LifecycleOutcome, GateError>;
     /// Abandon a request that was never launched.
     fn withdraw(&self, dispatch_id: &str) -> Result<WithdrawOutcome, GateError>;
+    /// Bind a hook-admitted agent to its dispatch on a lease, with no
+    /// process id (see `AdmissionState::bind_agent_lease`). The default
+    /// binds nothing and says so: a gate that tracks no hook-admitted
+    /// agents holds no dispatch to bind one to.
+    fn bind_agent_lease(
+        &self,
+        _dispatch_id: &str,
+        _agent_id: &str,
+        _provenance: &Provenance,
+    ) -> Result<BindOutcome, GateError> {
+        Ok(BindOutcome::UnknownDispatch)
+    }
+    /// An agent ended: settle and release whatever dispatch is bound to
+    /// it (see `AdmissionState::settle_by_agent`). The default has
+    /// nothing bound to any agent, for the same reason as above.
+    fn settle_by_agent(
+        &self,
+        _session_id: &str,
+        _agent_id: &str,
+        _spent_micros: Option<i64>,
+    ) -> Result<AgentSettleOutcome, GateError> {
+        Ok(AgentSettleOutcome::NothingBound)
+    }
     /// The run reached an end state and will dispatch nothing more. Until
     /// a root runner says so, a registered run keeps the coordinator from
     /// idling out (see `AdmissionState::is_idle`), so a runner that owns a
@@ -2324,6 +2433,31 @@ impl Gate for LocalGate {
 
     fn withdraw(&self, dispatch_id: &str) -> Result<WithdrawOutcome, GateError> {
         Ok(self.admission().withdraw(dispatch_id, Instant::now()))
+    }
+
+    fn bind_agent_lease(
+        &self,
+        dispatch_id: &str,
+        agent_id: &str,
+        provenance: &Provenance,
+    ) -> Result<BindOutcome, GateError> {
+        Ok(self.admission().bind_agent_lease(
+            dispatch_id,
+            agent_id,
+            provenance.clone(),
+            Instant::now(),
+        ))
+    }
+
+    fn settle_by_agent(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        spent_micros: Option<i64>,
+    ) -> Result<AgentSettleOutcome, GateError> {
+        Ok(self
+            .admission()
+            .settle_by_agent(session_id, agent_id, spent_micros, Instant::now()))
     }
 
     fn finish_run(&self, run_id: &str) -> Result<LifecycleOutcome, GateError> {
@@ -3084,6 +3218,78 @@ mod tests {
         assert!(
             !snapshot.leased_agents.contains_key("bound"),
             "a pid-bound dispatch is not also reported as leased"
+        );
+    }
+
+    // A `SubagentStop` names an agent, not a dispatch: the end is found
+    // through the binding the agent's `PostToolUse` made, and it frees
+    // the seat that binding alone did not.
+    #[test]
+    fn an_agent_end_settles_the_dispatch_bound_to_it() {
+        let mut state = state();
+        let t0 = Instant::now();
+        assert!(granted(state.request(&req("d1", "run-a", "tab-a"), t0)));
+        assert!(granted(state.request(&req("d2", "run-a", "tab-a"), t0)));
+        assert_eq!(
+            state.bind_agent_lease("d1", "agent-01", Provenance::Known, t0),
+            BindOutcome::Bound
+        );
+        assert!(
+            matches!(
+                state.request(&req("d3", "run-a", "tab-a"), t0),
+                Decision::Queued { .. }
+            ),
+            "binding an agent frees nothing: it is still running"
+        );
+        assert_eq!(
+            state.settle_by_agent("tab-b", "agent-01", None, t0),
+            AgentSettleOutcome::NothingBound,
+            "the same agent id in another session is another agent"
+        );
+        assert_eq!(
+            state.settle_by_agent("tab-a", "agent-01", None, t0),
+            AgentSettleOutcome::Settled {
+                dispatch_id: "d1".into()
+            }
+        );
+        assert_eq!(
+            state.status(t0).runs["run-a"].uncertain_settlements,
+            1,
+            "a hook knows no usage, so the settlement is uncertain, never zero"
+        );
+        assert_eq!(
+            state.request(&req("d3", "run-a", "tab-a"), t0),
+            Decision::Granted,
+            "the seat the agent held went to the queued request"
+        );
+    }
+
+    // A synchronous spawn's `SubagentStop` arrives BEFORE the
+    // `PostToolUse` that binds its agent (`tests/fixtures/hooks-concurrent`).
+    // The stop finds nothing, and is remembered, so the bind that follows
+    // ends the dispatch at once instead of holding the seat until the
+    // lease lapses.
+    #[test]
+    fn an_agent_that_ended_before_its_bind_is_finished_by_the_bind() {
+        let mut state = state();
+        let t0 = Instant::now();
+        assert!(granted(state.request(&req("d1", "run-a", "tab-a"), t0)));
+        assert!(granted(state.request(&req("d2", "run-a", "tab-a"), t0)));
+        assert_eq!(
+            state.settle_by_agent("tab-a", "agent-01", None, t0),
+            AgentSettleOutcome::NothingBound
+        );
+        assert_eq!(
+            state.bind_agent_lease("d1", "agent-01", Provenance::Known, t0),
+            BindOutcome::Bound
+        );
+        assert!(
+            state.parentage("d1").is_none(),
+            "both ends have arrived, so the dispatch is gone"
+        );
+        assert_eq!(
+            state.request(&req("d3", "run-a", "tab-a"), t0),
+            Decision::Granted
         );
     }
 

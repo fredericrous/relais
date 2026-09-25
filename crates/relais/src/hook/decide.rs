@@ -107,7 +107,7 @@ pub fn decide(
             // Only `Pre` still holds the tool call open long enough to
             // refuse it.
             ToolCallPhase::Pre => decide_spawn(settings, coordinator),
-            ToolCallPhase::Post => HookAnswer::Silent,
+            ToolCallPhase::Post { .. } => HookAnswer::Silent,
             // Never observed to fire (see module doc); matched explicitly
             // rather than folded into a wildcard, so the exclusion is
             // recorded here rather than merely implied.
@@ -313,7 +313,12 @@ mod tests {
                 }),
             ),
             ("NotOurs", HookEvent::NotOurs),
-            ("PostToolUse", spawn(ToolCallPhase::Post)),
+            (
+                "PostToolUse",
+                spawn(ToolCallPhase::Post {
+                    launched_agent: Some(AgentId::new("a1")),
+                }),
+            ),
             ("PostToolUseFailure", spawn(ToolCallPhase::PostFailure)),
         ];
         // Every stance against every coordinator answer. What this pins
