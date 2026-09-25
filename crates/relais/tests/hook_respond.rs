@@ -14,41 +14,41 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use relais::coordinator::{Coordinator, Request};
 use relais::policy::ConcurrencyLimits;
+use relais::test_support::short_temp_dir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_relais");
 
 /// One isolated world: a state directory and a config directory, and
 /// nothing else — no repository, since a hook never runs `relais` from
 /// inside one.
+///
+/// `_scratch` is the whole cleanup story: it is the same guard
+/// `test_support::short_temp_dir` gives the library's own tests, so
+/// dropping — panic or not — removes `state` and `config` with it. This
+/// suite is a separate crate from `relais`'s `src/`, so it cannot reach
+/// a `pub(crate)` helper; `test_support` is `pub` for exactly this.
 struct World {
+    _scratch: relais::test_support::TempDir,
     state: PathBuf,
     config: PathBuf,
 }
 
 impl World {
     fn new(tag: &str) -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let base = if cfg!(unix) {
-            PathBuf::from("/tmp")
-        } else {
-            std::env::temp_dir()
-        };
-        let root = base.join(format!(
-            "rl-hook-{tag}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let state = root.join("state");
-        let config = root.join("cfg");
+        let scratch = short_temp_dir(&format!("hook-{tag}"));
+        let state = scratch.join("state");
+        let config = scratch.join("cfg");
         std::fs::create_dir_all(&state).expect("state");
         std::fs::create_dir_all(&config).expect("config");
-        Self { state, config }
+        Self {
+            _scratch: scratch,
+            state,
+            config,
+        }
     }
 
     fn socket(&self) -> PathBuf {
@@ -450,4 +450,36 @@ fn every_firing_is_journalled_owner_only() {
     }
 
     coordinator.stop();
+}
+
+/// The case a trailing `remove_dir_all` always missed: the test body
+/// never reaches its last line. `World`'s `_scratch` field is a `Drop`
+/// guard, so a panic mid-body still loses the directory.
+#[test]
+fn a_panicking_test_still_loses_its_world() {
+    let world = World::new("panic-cleanup");
+    let path = world.state.parent().expect("world root").to_path_buf();
+    assert!(path.exists());
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _world = world;
+        panic!("the test body never gets here on purpose");
+    }));
+    assert!(outcome.is_err());
+    assert!(!path.exists());
+}
+
+/// The assertion that would have caught the present hole: this suite's
+/// own `World` builds a directory under the same `SCRATCH_PREFIX`
+/// `doctor::count_strays` reads, not a hand-rolled `rl-hook-` prefix the
+/// scan never knew about.
+#[test]
+fn a_world_is_countable_by_doctors_scan() {
+    let world = World::new("scan-proof");
+    let root = world.state.parent().expect("world root").to_path_buf();
+    let parent = root.parent().expect("world's parent").to_path_buf();
+    let (count, _) = relais::doctor::count_strays(&parent).expect("scan");
+    assert!(
+        count >= 1,
+        "the world's own root must be counted among {parent:?}'s strays"
+    );
 }

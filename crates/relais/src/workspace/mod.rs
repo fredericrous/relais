@@ -820,7 +820,7 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
 
-    fn temp_repo() -> (PathBuf, PathBuf) {
+    fn temp_repo() -> (crate::test_support::TempDir, PathBuf) {
         let dir = crate::test_support::temp_dir("ws");
         let repo = dir.join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir");

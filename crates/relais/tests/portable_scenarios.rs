@@ -12,16 +12,23 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use relais::policy::RepoPolicy;
+use relais::test_support::short_temp_dir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_relais");
 
 /// One isolated world: a git repository, a state directory and a config
 /// directory, and nothing else. No fake harness: every scenario here is
 /// one that must not launch one.
+///
+/// `_scratch` is the same `Drop` guard `test_support::short_temp_dir`
+/// gives the library's own tests — this suite is a separate crate and
+/// cannot reach a `pub(crate)` helper, which is why `test_support` is
+/// `pub`. `root` stays a plain `PathBuf`, derived from the guard, since
+/// the rest of this file joins paths off it throughout.
 struct World {
+    _scratch: relais::test_support::TempDir,
     root: PathBuf,
     repo: PathBuf,
     state: PathBuf,
@@ -30,23 +37,11 @@ struct World {
 
 impl World {
     fn new(tag: &str) -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
         // Short paths under /tmp where there is one: the coordinator
         // socket lives in the state directory and a Unix socket path is
         // capped near 100 bytes. Windows has neither /tmp nor the cap.
-        let base = if cfg!(unix) {
-            PathBuf::from("/tmp")
-        } else {
-            std::env::temp_dir()
-        };
-        let root = base.join(format!(
-            "rl-pt-{tag}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        // Pre-cleaned: a directory left by a killed run of this suite
-        // with the same pid would hand the scenario somebody's ledger.
-        let _ = std::fs::remove_dir_all(&root);
+        let scratch = short_temp_dir(&format!("pt-{tag}"));
+        let root = scratch.to_path_buf();
         let repo = root.join("repo");
         let state = root.join("state");
         let config = root.join("cfg");
@@ -67,6 +62,7 @@ impl World {
         git(&repo, &["add", "-A"]);
         git(&repo, &["commit", "-q", "-m", "base"]);
         Self {
+            _scratch: scratch,
             root,
             repo,
             state,
@@ -176,9 +172,10 @@ commands = []
 impl Drop for World {
     fn drop(&mut self) {
         // Nothing here starts a daemon, but `plan` and `status` may have
-        // asked one to exist; stopping is harmless when none did.
+        // asked one to exist; stopping is harmless when none did. The
+        // root itself is removed by `_scratch`'s own `Drop`, run after
+        // this body, panic or not.
         let _ = self.relais(&["coordinator", "stop"]);
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
@@ -702,4 +699,35 @@ fn exit_codes_follow_the_documented_table() {
     // 0 — and the ordinary path still exits 0.
     assert_eq!(world.relais(&["doctor", "--json"]).status.code(), Some(3));
     assert_eq!(world.relais(&["report", "--json"]).status.code(), Some(0));
+}
+
+/// The case a trailing `remove_dir_all` always missed: the test body
+/// never reaches its last line. `World`'s `_scratch` field is a `Drop`
+/// guard, so a panic mid-body still loses the directory.
+#[test]
+fn a_panicking_test_still_loses_its_world() {
+    let world = World::new("panic-cleanup");
+    let root = world.root.clone();
+    assert!(root.exists());
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _world = world;
+        panic!("the test body never gets here on purpose");
+    }));
+    assert!(outcome.is_err());
+    assert!(!root.exists());
+}
+
+/// The assertion that would have caught the present hole: this suite's
+/// own `World` builds a directory under the same `SCRATCH_PREFIX`
+/// `doctor::count_strays` reads, not a hand-rolled `rl-pt-` prefix the
+/// scan never knew about.
+#[test]
+fn a_world_is_countable_by_doctors_scan() {
+    let world = World::new("scan-proof");
+    let parent = world.root.parent().expect("world's parent").to_path_buf();
+    let (count, _) = relais::doctor::count_strays(&parent).expect("scan");
+    assert!(
+        count >= 1,
+        "the world's own root must be counted among {parent:?}'s strays"
+    );
 }

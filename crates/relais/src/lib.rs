@@ -31,8 +31,13 @@ pub mod resume;
 pub mod rng;
 pub mod route;
 pub mod runner;
-#[cfg(test)]
-pub(crate) mod test_support;
+/// Scratch-directory test helpers. `pub`, not `#[cfg(test)]`: the
+/// integration suites under `tests/` build this crate as an ordinary
+/// dependency and cannot see `pub(crate)`, so this is the one
+/// visibility that lets the library helper and the suites share one
+/// guard and one prefix instead of each rolling their own.
+#[doc(hidden)]
+pub mod test_support;
 pub mod tooling;
 pub mod verify;
 pub mod workspace;

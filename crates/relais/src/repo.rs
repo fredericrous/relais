@@ -276,7 +276,7 @@ mod tests {
     /// Pid AND an in-process counter, pre-cleaned: two tests of this
     /// file run in parallel threads of one process, and a pid-only name
     /// makes them share a directory (P12).
-    fn temp_dir(label: &str) -> std::path::PathBuf {
+    fn temp_dir(label: &str) -> crate::test_support::TempDir {
         crate::test_support::temp_dir(label)
     }
 
