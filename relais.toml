@@ -10,7 +10,12 @@ id = "sonnet"
 effort = "medium"
 
 [models.escalation]
-id = "fable"
+# An alias, like the two tiers above, and deliberately not the dated id:
+# `backend::model_matches` treats a bare word as an alias and accepts any
+# `claude-opus-*` the harness reports, while `claude-opus-5-5` would
+# demand exact equality and turn a dated variant into an unapproved
+# substitution — a run that fails after the worker has been paid (#49).
+id = "opus"
 effort = "medium"
 
 [execution]
