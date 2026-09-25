@@ -132,6 +132,39 @@ missing here.
 
 ### Fixed
 
+- **`doctor` and `install --hooks` now see every settings file Claude
+  Code merges, not just the first that matches (#94).** Measured on
+  2.1.282: a relais command wired into `.claude/settings.local.json`
+  fires alongside one in `.claude/settings.json`, both on `PreToolUse`,
+  on every spawn. `hook-live` and `hook-timeout` used to `find_map` over
+  the project's `settings.json` then the user's, so a hook wired only in
+  the local file was reported as absent — and following doctor's own
+  advice to install one is how a machine ends up with two. Both findings
+  now read `install::settings::settings_candidates` (the project's
+  `settings.json`, its `settings.local.json`, then the user's
+  `settings.json`) and treat a command recorded in more than one of them
+  as a failure of its own, naming every file it is in, rather than
+  silently checking whichever one they saw first. `relais install
+  --claude --hooks` reads the same list before writing: if a relais
+  command is already recorded in one of the OTHER files, it refuses and
+  writes nothing rather than adding the very duplicate this issue is
+  about. `docs/INTEGRATIONS.md`'s troubleshooting entry no longer tells a
+  reader to work around the blind spot by hand — there is nothing left to
+  work around.
+
+  Two narrower blind spots in the same scan went with it. The candidate
+  list is now built from the directory the command was invoked in and the
+  home directory, passed in as `MergedRoots`, rather than derived from
+  whichever directory the install is writing to: for a `--user` install
+  the target's own parent IS the home scope, so deriving the project root
+  from it pointed at `~`, and a user-scope install never looked at the
+  project's files at all. And a candidate that exists but cannot be
+  opened is no longer read as absent: `install` refuses rather than write
+  a possible duplicate it could not rule out, and every doctor finding
+  that reports "nothing is wired" names the files it could not read in
+  the same breath — an absence concluded over a file nobody could open is
+  not an absence.
+
 - **A baseline check the wall clock or a signal cut off is
   `BaselineUnrunnable`, not a baseline failure.** The base's preflight
   filtered baseline checks for exit-127 "command not found" only, so a

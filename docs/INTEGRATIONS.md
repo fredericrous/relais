@@ -122,19 +122,24 @@ Three separate findings, because they answer three separate questions:
   coordinator cannot be reached, which a coordinator-less scratch
   directory never can), feeding it a fixture `PreToolUse` spawn payload.
   This never touches your real hook journal or reserves a seat in your
-  real coordinator. Three outcomes: no relais command found in any
-  `settings.json` doctor can see; a recorded command that ran and
-  refused, as configured; and a recorded command that ran but printed no
-  refusal — wired in and enforcing nothing, reported together with how
-  the run ended. A fourth case is not a verdict on the hook at all: if
-  doctor could not stage or spawn the exercise, it says the hook's
+  real coordinator. Outcomes: no relais command found in any settings
+  file doctor can see; a recorded command that ran and refused, as
+  configured; a recorded command that ran but printed no refusal — wired
+  in and enforcing nothing, reported together with how the run ended; and
+  a relais command recorded in MORE than one settings file, which is a
+  failure of its own — Claude Code merges the files and runs every one on
+  every spawn, so this is never a case of picking one to check and
+  ignoring the rest. A further case is not a verdict on the hook at all:
+  if doctor could not stage or spawn the exercise, it says the hook's
   behavior is unknown and why, rather than reporting silence as failure.
 
-`doctor` checks the project's own `.claude/settings.json` first, then
-your `~/.claude/settings.json`; the first one that names a relais command
-on `PreToolUse` is the one `hook-live` and `hook-timeout` report against.
-`hook-compat` reads no settings file at all — it compares the
-compatibility record against the Claude Code on `PATH`.
+`doctor` checks every settings file Claude Code merges: the project's own
+`.claude/settings.json`, the project's `.claude/settings.local.json`, and
+your `~/.claude/settings.json` — all three, not just the first that names
+a relais command on `PreToolUse`, so `hook-live` and `hook-timeout` see a
+hook wired only in the local file exactly as they would one in the
+committed file. `hook-compat` reads no settings file at all — it compares
+the compatibility record against the Claude Code on `PATH`.
 
 ### The compatibility matrix
 
@@ -221,14 +226,24 @@ about hooks stay in the [README](../README.md#known-limits).
   spawn, each asking the coordinator; the second sees the first's dispatch
   and answers `AlreadyAdmitted`.
 
-  `relais doctor` does NOT read them all — `hook-live` and `hook-timeout`
-  take the project's `.claude/settings.json`, else the user's, and never
-  `.claude/settings.local.json`. A hook wired only in the local file is
-  therefore reported as absent while it is running, and doctor will tell
-  you to install one. Following that advice is how you end up with two.
-  Tracked as issue #94; until it is fixed, wire the hook through `relais
-  install --claude --hooks` (which writes the file doctor reads) rather
-  than by hand into the local one.
+  `relais doctor` reads every settings file the harness merges — the
+  project's `.claude/settings.json`, its `.claude/settings.local.json`,
+  and the user's `~/.claude/settings.json` — and reports a hook recorded
+  in more than one of them as a failure naming every file it found it in,
+  rather than silently checking whichever one it saw first. `relais
+  install --claude --hooks` also refuses on the same condition: it looks
+  for a relais command in the OTHER files before writing, and if one is
+  already there it writes nothing rather than adding a second handler.
+
+  So if you already have two — from before this existed, or from wiring one
+  by hand into the local file — delete the ones you do not want. Install
+  will not put them back, and it will not add another while any of them
+  remain: with a handler still recorded in a file install is not writing,
+  it refuses and names that file. Keeping the one in
+  `.claude/settings.json` is the case that needs nothing further, since
+  that is the file install itself targets; keep one elsewhere and install
+  stays refused, which is correct — there is already a hook, and a second
+  is what you are trying to avoid.
 - **Each git worktree is a separate session.** A Claude Code
   `session_id` is per process, and opening a worktree normally starts a
   fresh `claude` process for it — so `max_active_agents_per_session`

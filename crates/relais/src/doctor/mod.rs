@@ -12,7 +12,6 @@
 //! no code reads.
 
 use serde::Serialize;
-use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -449,7 +448,24 @@ pub(crate) fn directory_findings() -> Vec<Finding> {
 
 /// Probe the environment relative to one repository directory (the cwd in
 /// practice) and the machine-owned settings.
+/// The roots both hook findings scan. Resolved once here so the two
+/// cannot disagree about which files the harness merges.
+fn merged_roots<'a>(
+    repo_dir: &'a Path,
+    home: Option<&'a Path>,
+) -> crate::install::settings::MergedRoots<'a> {
+    crate::install::settings::MergedRoots {
+        project: Some(repo_dir),
+        home,
+    }
+}
+
 pub fn doctor(repo_dir: &Path) -> DoctorReport {
+    // No home directory is a fact about the machine, not a doctor
+    // failure: every finding that needs one reports its own absence, and
+    // `paths::home_dir`'s error is already surfaced by the findings that
+    // depend on it.
+    let home = paths::home_dir().ok();
     let mut findings = directory_findings();
 
     check_command("git", &["--version"], &mut findings, "git");
@@ -609,7 +625,10 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
                     if let Some(trials) = trials_finding(&settings) {
                         findings.push(trials);
                     }
-                    findings.push(hook_timeout_finding(repo_dir, &settings.admission));
+                    findings.push(hook_timeout_finding(
+                        merged_roots(repo_dir, home.as_deref()),
+                        &settings.admission,
+                    ));
                 }
                 Err(e) => findings.push(Finding {
                     component: "machine.toml",
@@ -625,7 +644,7 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
     findings.push(worktrees_finding_on_disk());
     findings.push(strays_finding_on_disk());
     findings.push(coordinator_finding());
-    findings.push(hook_live_finding(repo_dir));
+    findings.push(hook_live_finding(merged_roots(repo_dir, home.as_deref())));
 
     DoctorReport { findings }
 }
@@ -843,49 +862,82 @@ fn shell_command(command: &str) -> std::process::Command {
     process
 }
 
-/// The `PreToolUse` command relais itself would have recorded: a
-/// `{"type":"command","command":"…"}` hook whose command ends in
-/// ` hook` — the exact shape `install::settings::apply_hooks` writes,
-/// read back rather than reconstructed, so this never drifts from what
-/// install actually does. `PreToolUse` is the only phase that can still
-/// refuse a tool call (`hook::decide`'s module doc), so it is the only
-/// one worth exercising.
-pub(crate) fn recorded_hook_command(settings_text: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(settings_text).ok()?;
-    let entries = value.pointer("/hooks/PreToolUse")?.as_array()?;
-    entries.iter().find_map(|entry| {
-        entry.get("hooks")?.as_array()?.iter().find_map(|hook| {
-            if hook.get("type")?.as_str()? != "command" {
-                return None;
-            }
-            let command = hook.get("command")?.as_str()?;
-            command
-                .trim_end()
-                .ends_with(" hook")
-                .then(|| command.to_string())
-        })
-    })
+/// A settings file, among
+/// [`crate::install::settings::settings_candidates`], that records a relais
+/// `PreToolUse` command — carrying its text so both `hook-live` and
+/// `hook-timeout` can read what they each need from it without a second
+/// pass over the disk.
+struct RecordedHook {
+    label: &'static str,
+    path: PathBuf,
+    text: String,
 }
 
-/// The `timeout` recorded on the same `PreToolUse` leaf
-/// [`recorded_hook_command`] finds — `Some(None)` when the leaf exists
-/// but carries no `timeout` field at all, which a settings file written
-/// before `timeout` existed leaves exactly that way.
-pub(crate) fn recorded_pretooluse_timeout_secs(settings_text: &str) -> Option<Option<u64>> {
-    let value: Value = serde_json::from_str(settings_text).ok()?;
-    let entries = value.pointer("/hooks/PreToolUse")?.as_array()?;
-    entries.iter().find_map(|entry| {
-        entry.get("hooks")?.as_array()?.iter().find_map(|hook| {
-            if hook.get("type")?.as_str()? != "command" {
-                return None;
+/// What a scan of the merged settings files found — and what it could not
+/// read. Kept apart because they answer different questions: `hooks` is
+/// what is wired, `unreadable` is where that answer is incomplete, and
+/// folding the second into "nothing wired" is the false absence this
+/// finding exists to stop (#94).
+impl RecordedScan {
+    /// What to append when a candidate could not be read. An absence
+    /// concluded over a file nobody could open is not an absence — it is
+    /// the false zero this scan exists to stop — so every finding that
+    /// reports "nothing is wired" says this in the same breath.
+    fn unreadable_note(&self) -> String {
+        if self.unreadable.is_empty() {
+            return String::new();
+        }
+        let listed: Vec<String> = self
+            .unreadable
+            .iter()
+            .map(|(label, path, why)| format!("{} ({label}): {why}", path.display()))
+            .collect();
+        format!(
+            " — but {} settings file(s) could not be read, so this is not a complete answer: {}",
+            self.unreadable.len(),
+            listed.join("; ")
+        )
+    }
+}
+
+struct RecordedScan {
+    hooks: Vec<RecordedHook>,
+    unreadable: Vec<(&'static str, PathBuf, String)>,
+}
+
+/// Every candidate settings file that records a relais `PreToolUse`
+/// command, in candidate order. Empty means nothing is wired; more than
+/// one entry means Claude Code will run more than one handler on every
+/// spawn — both findings below treat that as a case of its own rather
+/// than silently picking the first.
+fn recorded_hooks(roots: crate::install::settings::MergedRoots<'_>) -> RecordedScan {
+    let mut hooks = Vec::new();
+    let mut unreadable = Vec::new();
+    for (label, path) in crate::install::settings::settings_candidates(roots) {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                if crate::install::settings::recorded_hook_command(&text).is_some() {
+                    hooks.push(RecordedHook { label, path, text });
+                }
             }
-            let command = hook.get("command")?.as_str()?;
-            command
-                .trim_end()
-                .ends_with(" hook")
-                .then(|| hook.get("timeout").and_then(Value::as_u64))
-        })
-    })
+            // Absent is the ordinary case and records no hook.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // Present and unreadable is NOT absent: it may record a hook
+            // nobody can see, so it is carried rather than swallowed.
+            Err(e) => unreadable.push((label, path, e.to_string())),
+        }
+    }
+    RecordedScan { hooks, unreadable }
+}
+
+/// Names every settings file in `hooks`, for a finding detail that lets a
+/// person see exactly which files to reconcile.
+fn describe_hook_locations(hooks: &[RecordedHook]) -> String {
+    hooks
+        .iter()
+        .map(|hook| format!("{} ({})", hook.path.display(), hook.label))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The hook cannot read its own handler timeout — nothing in a hook
@@ -900,7 +952,7 @@ pub(crate) fn recorded_pretooluse_timeout_secs(settings_text: &str) -> Option<Op
 /// rather than a warning: this is the one outcome the whole package
 /// exists to prevent.
 fn hook_timeout_finding(
-    repo_dir: &Path,
+    roots: crate::install::settings::MergedRoots<'_>,
     admission: &crate::policy::HookAdmissionSettings,
 ) -> Finding {
     let queue_wait = match admission.queue_behaviour() {
@@ -908,114 +960,133 @@ fn hook_timeout_finding(
         crate::policy::QueueBehaviour::WaitUpTo(wait) => wait,
     };
     let required = crate::install::settings::derived_pretooluse_timeout(queue_wait).as_secs();
-    let mut candidates = vec![repo_dir.join(".claude").join("settings.json")];
-    if let Ok(home) = paths::home_dir() {
-        candidates.push(home.join(".claude").join("settings.json"));
-    }
-    let recorded = candidates.iter().find_map(|path| {
-        let text = std::fs::read_to_string(path).ok()?;
-        recorded_pretooluse_timeout_secs(&text).map(|timeout| (path.clone(), timeout))
-    });
-    match recorded {
-        None => Finding {
+    let scan = recorded_hooks(roots);
+    match scan.hooks.as_slice() {
+        [] => Finding {
             component: "hook-timeout",
             level: Level::Warn,
-            detail: "no relais command is recorded on PreToolUse in any settings.json this \
-                     repository can see, so there is no recorded timeout to check — see \
-                     `hook-live`"
-                .into(),
-        },
-        Some((path, Some(timeout))) if timeout >= required => Finding {
-            component: "hook-timeout",
-            level: Level::Ok,
             detail: format!(
-                "{} records a PreToolUse timeout of {timeout}s, which covers the {required}s \
-                 this machine's queue_wait_secs currently requires",
-                path.display()
+                "no relais command is recorded on PreToolUse in any settings file this \
+                 repository can see, so there is no recorded timeout to check — see \
+                 `hook-live`{}",
+                scan.unreadable_note()
             ),
         },
-        Some((path, Some(timeout))) => Finding {
+        [hook] => {
+            let timeout = crate::install::settings::recorded_pretooluse_timeout_secs(&hook.text)
+                .expect("recorded_hooks only keeps files recorded_hook_command matched");
+            match timeout {
+                Some(timeout) if timeout >= required => Finding {
+                    component: "hook-timeout",
+                    level: Level::Ok,
+                    detail: format!(
+                        "{} records a PreToolUse timeout of {timeout}s, which covers the \
+                         {required}s this machine's queue_wait_secs currently requires",
+                        hook.path.display()
+                    ),
+                },
+                Some(timeout) => Finding {
+                    component: "hook-timeout",
+                    level: Level::Fail,
+                    detail: format!(
+                        "{} records a PreToolUse timeout of {timeout}s, but this machine's \
+                         queue_wait_secs now requires at least {required}s — an expired hook \
+                         fails OPEN (SPEC §23), so a queued spawn can be admitted without \
+                         relais ever deciding; run `relais install --claude --hooks --write` \
+                         to correct it, or lower `queue_wait_secs` under `[admission]` in \
+                         machine.toml",
+                        hook.path.display()
+                    ),
+                },
+                None => Finding {
+                    component: "hook-timeout",
+                    level: Level::Fail,
+                    detail: format!(
+                        "{} records a PreToolUse hook with no timeout field at all — Claude \
+                         Code then waits for it indefinitely (300s measured, and nothing \
+                         suggests that is a ceiling), which is worse than any recorded number; \
+                         run `relais install --claude --hooks --write` to add one",
+                        hook.path.display()
+                    ),
+                },
+            }
+        }
+        many => Finding {
             component: "hook-timeout",
-            level: Level::Fail,
+            level: Level::Warn,
             detail: format!(
-                "{} records a PreToolUse timeout of {timeout}s, but this machine's \
-                 queue_wait_secs now requires at least {required}s — an expired hook fails \
-                 OPEN (SPEC §23), so a queued spawn can be admitted without relais ever \
-                 deciding; run `relais install --claude --hooks --write` to correct it, or \
-                 lower `queue_wait_secs` under `[admission]` in machine.toml",
-                path.display()
-            ),
-        },
-        Some((path, None)) => Finding {
-            component: "hook-timeout",
-            level: Level::Fail,
-            detail: format!(
-                "{} records a PreToolUse hook with no timeout field at all — Claude Code then \
-                 waits for it indefinitely (300s measured, and nothing suggests that is a \
-                 ceiling), which is worse than any recorded number; run \
-                 `relais install --claude --hooks --write` to add one",
-                path.display()
+                "a relais command is recorded on PreToolUse in more than one settings file — \
+                 {} — see `hook-live`",
+                describe_hook_locations(many)
             ),
         },
     }
 }
 
 /// `relais doctor` exercising the live hook (SPEC criteria), checked
-/// against every settings.json scope this repository can see: the
-/// project's own `.claude/settings.json` first, the user's
-/// `~/.claude/settings.json` otherwise. Never part of `--probe-hooks`:
-/// that command needs a real Claude Code session and costs money; this
-/// spawns nothing but the hook binary itself.
-fn hook_live_finding(repo_dir: &Path) -> Finding {
-    let mut candidates = vec![repo_dir.join(".claude").join("settings.json")];
-    if let Ok(home) = paths::home_dir() {
-        candidates.push(home.join(".claude").join("settings.json"));
-    }
-    let recorded = candidates.iter().find_map(|path| {
-        let text = std::fs::read_to_string(path).ok()?;
-        recorded_hook_command(&text).map(|command| (path.clone(), command))
-    });
-    match recorded {
-        None => Finding {
+/// against every settings file Claude Code merges — see
+/// [`crate::install::settings::settings_candidates`]. Never part of `--probe-hooks`: that command
+/// needs a real Claude Code session and costs money; this spawns nothing
+/// but the hook binary itself.
+fn hook_live_finding(roots: crate::install::settings::MergedRoots<'_>) -> Finding {
+    let scan = recorded_hooks(roots);
+    match scan.hooks.as_slice() {
+        [] => Finding {
             component: "hook-live",
             level: Level::Warn,
-            detail: "no relais command is recorded on PreToolUse in any settings.json this \
-                     repository can see — wire it with \
-                     `relais install --claude --hooks --write`"
-                .into(),
+            detail: format!(
+                "no relais command is recorded on PreToolUse in any settings file this \
+                 repository can see — wire it with \
+                 `relais install --claude --hooks --write`{}",
+                scan.unreadable_note()
+            ),
         },
-        Some((path, command)) => match probe_recorded_hook(&command) {
-            HookHealth::Refused => Finding {
-                component: "hook-live",
-                level: Level::Ok,
-                detail: format!(
-                    "recorded in {} and exercised: it refused a fixture spawn against an \
-                     unreachable coordinator, as configured",
-                    path.display()
-                ),
-            },
-            HookHealth::RecordedButDidNotRefuse { how } => Finding {
-                component: "hook-live",
-                level: Level::Fail,
-                detail: format!(
-                    "recorded in {} as `{command}`, but exercising it with a fixture spawn \
-                     against an unreachable coordinator did not produce a deny ({how}) — this \
-                     hook is wired in and enforces nothing",
-                    path.display()
-                ),
-            },
-            // Not a verdict on the hook: doctor could not run it, and
-            // says so. Reporting this as "enforces nothing" would be a
-            // claim about a run that never happened.
-            HookHealth::CouldNotExercise { why } => Finding {
-                component: "hook-live",
-                level: Level::Warn,
-                detail: format!(
-                    "recorded in {} as `{command}`, but it could not be exercised, so whether \
-                     it refuses is unknown: {why}",
-                    path.display()
-                ),
-            },
+        [hook] => {
+            let command = crate::install::settings::recorded_hook_command(&hook.text)
+                .expect("recorded_hooks only keeps files recorded_hook_command matched");
+            match probe_recorded_hook(&command) {
+                HookHealth::Refused => Finding {
+                    component: "hook-live",
+                    level: Level::Ok,
+                    detail: format!(
+                        "recorded in {} and exercised: it refused a fixture spawn against an \
+                         unreachable coordinator, as configured",
+                        hook.path.display()
+                    ),
+                },
+                HookHealth::RecordedButDidNotRefuse { how } => Finding {
+                    component: "hook-live",
+                    level: Level::Fail,
+                    detail: format!(
+                        "recorded in {} as `{command}`, but exercising it with a fixture spawn \
+                         against an unreachable coordinator did not produce a deny ({how}) — \
+                         this hook is wired in and enforces nothing",
+                        hook.path.display()
+                    ),
+                },
+                // Not a verdict on the hook: doctor could not run it, and
+                // says so. Reporting this as "enforces nothing" would be a
+                // claim about a run that never happened.
+                HookHealth::CouldNotExercise { why } => Finding {
+                    component: "hook-live",
+                    level: Level::Warn,
+                    detail: format!(
+                        "recorded in {} as `{command}`, but it could not be exercised, so \
+                         whether it refuses is unknown: {why}",
+                        hook.path.display()
+                    ),
+                },
+            }
+        }
+        many => Finding {
+            component: "hook-live",
+            level: Level::Fail,
+            detail: format!(
+                "a relais command is recorded on PreToolUse in more than one settings file — \
+                 {} — Claude Code merges them and fires every one on every spawn, each asking \
+                 the coordinator; remove all but one",
+                describe_hook_locations(many)
+            ),
         },
     }
 }
@@ -1679,75 +1750,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn recorded_hook_command_finds_a_pretooluse_relais_command_and_ignores_others() {
-        let settings = serde_json::json!({
-            "hooks": {
-                "PreToolUse": [
-                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/bin/lint"}]},
-                    {"matcher": "Agent|Task", "hooks": [
-                        {"type": "command", "command": "/opt/relais/bin/relais hook --probe --record /tmp/x"},
-                        {"type": "command", "command": "/opt/relais/bin/relais hook"}
-                    ]}
-                ]
-            }
-        })
-        .to_string();
-        assert_eq!(
-            recorded_hook_command(&settings),
-            Some("/opt/relais/bin/relais hook".to_string())
-        );
-    }
-
-    #[test]
-    fn recorded_hook_command_is_none_without_a_plain_hook_invocation() {
-        let settings = serde_json::json!({
-            "hooks": {
-                "PreToolUse": [
-                    {"hooks": [{"type": "command", "command": "/opt/relais/bin/relais hook --probe --record /tmp/x"}]}
-                ]
-            }
-        })
-        .to_string();
-        assert_eq!(recorded_hook_command(&settings), None);
-        assert_eq!(recorded_hook_command("{}"), None);
-        assert_eq!(recorded_hook_command("not json"), None);
-    }
-
-    #[test]
-    fn recorded_pretooluse_timeout_secs_reads_the_same_leaf_recorded_hook_command_does() {
-        let settings = serde_json::json!({
-            "hooks": {
-                "PreToolUse": [
-                    {"matcher": "Agent|Task", "hooks": [
-                        {"type": "command", "command": "/opt/relais/bin/relais hook", "timeout": 19}
-                    ]}
-                ]
-            }
-        })
-        .to_string();
-        assert_eq!(recorded_pretooluse_timeout_secs(&settings), Some(Some(19)));
-    }
-
-    /// An entry an older relais wrote, before `timeout` existed, carries
-    /// no such field at all: distinguished from "no relais command
-    /// recorded" (`None`) by `Some(None)`.
-    #[test]
-    fn recorded_pretooluse_timeout_secs_is_some_none_for_an_older_entry_with_no_field() {
-        let settings = serde_json::json!({
-            "hooks": {
-                "PreToolUse": [
-                    {"matcher": "Agent|Task", "hooks": [
-                        {"type": "command", "command": "/opt/relais/bin/relais hook"}
-                    ]}
-                ]
-            }
-        })
-        .to_string();
-        assert_eq!(recorded_pretooluse_timeout_secs(&settings), Some(None));
-        assert_eq!(recorded_pretooluse_timeout_secs("{}"), None);
-    }
-
     /// A settings.json whose recorded timeout no longer covers the
     /// configured wait is a FAILURE, not a warning — the one outcome
     /// this whole package exists to prevent (SPEC §23: an expired hook
@@ -1776,7 +1778,7 @@ mod tests {
             queue_wait_secs: 30,
             ..Default::default()
         };
-        let finding = hook_timeout_finding(&dir, &admission);
+        let finding = hook_timeout_finding(merged_roots(&dir, None), &admission);
         assert_eq!(finding.level, Level::Fail, "{}", finding.detail);
         assert!(finding.detail.contains("3s"), "{}", finding.detail);
         std::fs::remove_dir_all(&dir).ok();
@@ -1815,8 +1817,157 @@ mod tests {
         )
         .expect("write");
 
-        let finding = hook_timeout_finding(&dir, &admission);
+        let finding = hook_timeout_finding(merged_roots(&dir, None), &admission);
         assert_eq!(finding.level, Level::Ok, "{}", finding.detail);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A relais command recorded ONLY in `settings.local.json` — the file
+    /// the old `find_map` over `.claude/settings.json` then `$HOME` could
+    /// never see (issue #94) — is found and exercised exactly as one in
+    /// the project's own `settings.json` would be.
+    #[cfg(unix)]
+    #[test]
+    fn hook_live_finding_finds_and_exercises_a_hook_recorded_only_in_the_local_settings_file() {
+        let dir = crate::test_support::temp_dir("doctor-hook-live-local-only");
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("mkdir");
+        let deny = serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "no",
+            }
+        })
+        .to_string();
+        let deny_file = dir.join("deny.json");
+        std::fs::write(&deny_file, &deny).expect("write deny fixture");
+        let command = format!("cat {}; : hook", deny_file.display());
+        std::fs::write(
+            claude_dir.join("settings.local.json"),
+            serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [
+                        {"matcher": "Agent|Task", "hooks": [
+                            {"type": "command", "command": command}
+                        ]}
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .expect("write");
+
+        let finding = hook_live_finding(merged_roots(&dir, None));
+        assert_eq!(finding.level, Level::Ok, "{}", finding.detail);
+        assert!(
+            finding.detail.contains("settings.local.json"),
+            "{}",
+            finding.detail
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same file, for the timeout check: a stale timeout recorded
+    /// only in `settings.local.json` is still caught.
+    #[test]
+    fn hook_timeout_finding_reads_a_timeout_recorded_only_in_the_local_settings_file() {
+        let dir = crate::test_support::temp_dir("doctor-hook-timeout-local-only");
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("mkdir");
+        std::fs::write(
+            claude_dir.join("settings.local.json"),
+            serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [
+                        {"matcher": "Agent|Task", "hooks": [
+                            {"type": "command", "command": "/opt/relais/bin/relais hook", "timeout": 3}
+                        ]}
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .expect("write");
+
+        let admission = crate::policy::HookAdmissionSettings {
+            queue_wait_secs: 30,
+            ..Default::default()
+        };
+        let finding = hook_timeout_finding(merged_roots(&dir, None), &admission);
+        assert_eq!(finding.level, Level::Fail, "{}", finding.detail);
+        assert!(
+            finding.detail.contains("settings.local.json"),
+            "{}",
+            finding.detail
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two settings files recording a relais command is a finding of its
+    /// own, not a silent pass on the first one found: Claude Code merges
+    /// them and runs both on every spawn.
+    #[test]
+    fn hook_live_finding_fails_when_more_than_one_settings_file_records_a_hook() {
+        let dir = crate::test_support::temp_dir("doctor-hook-live-duplicate");
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("mkdir");
+        let entry = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Agent|Task", "hooks": [
+                        {"type": "command", "command": "/opt/relais/bin/relais hook"}
+                    ]}
+                ]
+            }
+        })
+        .to_string();
+        std::fs::write(claude_dir.join("settings.json"), &entry).expect("write");
+        std::fs::write(claude_dir.join("settings.local.json"), &entry).expect("write");
+
+        let finding = hook_live_finding(merged_roots(&dir, None));
+        assert_eq!(finding.level, Level::Fail, "{}", finding.detail);
+        assert!(
+            finding.detail.contains("settings.json"),
+            "{}",
+            finding.detail
+        );
+        assert!(
+            finding.detail.contains("settings.local.json"),
+            "{}",
+            finding.detail
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Same duplicate, from the timeout side: it defers to `hook-live`
+    /// rather than picking one of the two files to check.
+    #[test]
+    fn hook_timeout_finding_warns_when_more_than_one_settings_file_records_a_hook() {
+        let dir = crate::test_support::temp_dir("doctor-hook-timeout-duplicate");
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("mkdir");
+        let entry = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Agent|Task", "hooks": [
+                        {"type": "command", "command": "/opt/relais/bin/relais hook", "timeout": 60}
+                    ]}
+                ]
+            }
+        })
+        .to_string();
+        std::fs::write(claude_dir.join("settings.json"), &entry).expect("write");
+        std::fs::write(claude_dir.join("settings.local.json"), &entry).expect("write");
+
+        let admission = crate::policy::HookAdmissionSettings::default();
+        let finding = hook_timeout_finding(merged_roots(&dir, None), &admission);
+        assert_eq!(finding.level, Level::Warn, "{}", finding.detail);
+        assert!(
+            finding.detail.contains("more than one"),
+            "{}",
+            finding.detail
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

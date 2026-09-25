@@ -392,6 +392,78 @@ fn doctor_exercises_the_recorded_hook_and_reports_a_refusal() {
     assert!(detail.contains("settings.json"), "{finding}");
 }
 
+// Issue #94, measured on Claude Code 2.1.282: `.claude/settings.json` and
+// `.claude/settings.local.json` are merged, and a relais handler recorded
+// in both fires twice on every spawn. `install --claude --hooks` must not
+// produce that duplicate itself — if one is already wired in the OTHER
+// file the harness merges, it refuses to write the one it owns rather
+// than adding a second handler behind a person's back.
+#[test]
+fn install_hooks_refuses_when_the_local_settings_file_already_carries_one() {
+    let world = World::new("install-hooks-dup");
+    std::fs::create_dir_all(world.repo.join(".claude")).expect("mkdir");
+    std::fs::write(
+        world.repo.join(".claude/settings.local.json"),
+        serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Agent|Task", "hooks": [
+                        {"type": "command", "command": "/opt/relais/bin/relais hook"}
+                    ]}
+                ]
+            }
+        })
+        .to_string(),
+    )
+    .expect("write settings.local.json");
+
+    let write = world.relais(&["install", "--claude", "--hooks", "--write"]);
+    assert_eq!(write.status.code(), Some(13), "{}", text(&write.stdout));
+    let stderr = text(&write.stderr);
+    assert!(stderr.contains("refused"), "{stderr}");
+    assert!(stderr.contains("settings.local.json"), "{stderr}");
+    assert!(
+        !world.repo.join(".claude/settings.json").exists(),
+        "refused: settings.json must not have been written"
+    );
+}
+
+// The same measured merge, from doctor's side: two settings files each
+// naming a relais command is a finding of its own, not a silent pass on
+// whichever one doctor happens to read first.
+#[test]
+fn doctor_fails_hook_live_when_two_settings_files_record_a_hook() {
+    let world = World::new("doctor-hook-dup");
+    std::fs::create_dir_all(world.repo.join(".claude")).expect("mkdir");
+    let entry = serde_json::json!({
+        "hooks": {
+            "PreToolUse": [
+                {"matcher": "Agent|Task", "hooks": [
+                    {"type": "command", "command": "/opt/relais/bin/relais hook"}
+                ]}
+            ]
+        }
+    })
+    .to_string();
+    std::fs::write(world.repo.join(".claude/settings.json"), &entry).expect("write settings.json");
+    std::fs::write(world.repo.join(".claude/settings.local.json"), &entry)
+        .expect("write settings.local.json");
+
+    let doctor = world.relais(&["doctor", "--json"]);
+    let report: serde_json::Value =
+        serde_json::from_str(text(&doctor.stdout).trim()).expect("doctor --json is a document");
+    let finding = report["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .find(|f| f["component"] == "hook-live")
+        .expect("a hook-live finding");
+    assert_eq!(finding["level"], "fail", "{finding}");
+    let detail = finding["detail"].as_str().expect("detail");
+    assert!(detail.contains("settings.json"), "{finding}");
+    assert!(detail.contains("settings.local.json"), "{finding}");
+}
+
 // SPEC §3: doctor names what is missing rather than dying on it, and the
 // process exits on a blocker. C2: the PATH lookup that finds `git` has to
 // work on the platform the build ships for — this scenario is the one

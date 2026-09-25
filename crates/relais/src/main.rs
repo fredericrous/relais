@@ -827,14 +827,26 @@ fn install_hooks_target(request: &InstallRequest, home: &Path) -> Result<CliOutc
     let relais_binary = operational(std::env::current_exe(), "install --hooks")?;
     let root = request.root(home);
     let queue_wait = admission_queue_wait();
+    // Both roots the harness merges, regardless of which one this install
+    // writes to: a `--user` install still has to see the project's files,
+    // or it writes the second handler issue #94 is about. The project is
+    // the directory the command was run in; `home` here is the install
+    // scope's root, which for a project install is the project itself, so
+    // the real home is resolved separately.
+    let project = operational(std::env::current_dir(), "install --hooks")?;
+    let real_home = relais::paths::home_dir().ok();
+    let roots = relais::install::settings::MergedRoots {
+        project: Some(project.as_path()),
+        home: real_home.as_deref(),
+    };
     match request.mode {
         Mode::Preview => Ok(render_hooks_preview(operational(
-            root.plan_hooks(&relais_binary, queue_wait),
+            root.plan_hooks(&relais_binary, queue_wait, roots),
             "install --hooks",
         )?)),
         Mode::Apply => {
             let applied = operational(
-                root.apply_hooks(&relais_binary, queue_wait),
+                root.apply_hooks(&relais_binary, queue_wait, roots),
                 "install --hooks",
             )?;
             Ok(render_hooks_applied(applied))

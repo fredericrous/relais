@@ -816,6 +816,14 @@ pub enum HooksApplied {
     Refused { reason: String, paste_block: String },
 }
 
+/// What a caller who found nothing to paste puts in `paste_block`
+/// instead: the field exists for an unrenderable FILE, where there is a
+/// fragment to hand-merge; a duplicate handler in another file has no
+/// such fragment — removing the other file's entry is the fix, not
+/// pasting anything here.
+const NO_PASTE_BLOCK: &str = "(nothing to paste here — remove the duplicate handler from the \
+                               other settings file first)";
+
 /// What one `--hooks` uninstall pass did.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HooksRemoved {
@@ -846,15 +854,72 @@ impl InstallRoot {
         }
     }
 
+    /// A relais `PreToolUse` command already recorded in one of the OTHER
+    /// settings files the Claude Code harness merges with this one — see
+    /// [`settings::settings_candidates`], the single list of files it
+    /// merges (issue #94). `home_dir`, when given, is the real user home:
+    /// a project-scope install still needs it to see `~/.claude/settings.json`,
+    /// even though the `home` an install request otherwise carries is the
+    /// project root for that scope (`InstallRequest::root`'s doc comment).
+    /// A private parameter rather than read from the environment here, so
+    /// a test can drive this against a controlled directory; the two
+    /// public entry points below resolve the real one themselves. `None`
+    /// means writing here is free to go ahead as far as duplicates are
+    /// concerned.
+    fn duplicate_hook_reason(&self, roots: settings::MergedRoots<'_>) -> Option<String> {
+        let target = self.settings_path();
+        settings::settings_candidates(roots)
+            .into_iter()
+            .filter(|(_, path)| *path != target)
+            .find_map(|(label, path)| {
+                // NotFound is the ordinary case: that file records no
+                // hook. Anything else is a file that MIGHT record one and
+                // cannot be read, and treating it as "no hook" would let
+                // an install write the second handler this check exists
+                // to prevent (#94) — the same rule `read_settings` states
+                // for the file being written.
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+                    Err(e) => {
+                        return Some(format!(
+                            "{} ({label}) cannot be read ({e}), so whether it already records a \
+                             relais command is unknown — Claude Code merges settings files and \
+                             would run both; read or remove that file before wiring another here",
+                            path.display()
+                        ))
+                    }
+                };
+                settings::recorded_hook_command(&text)?;
+                Some(format!(
+                    "a relais command is already recorded on PreToolUse in {} ({label}) — \
+                     Claude Code merges settings files and would run both on every spawn; \
+                     remove that one before wiring another here",
+                    path.display()
+                ))
+            })
+    }
+
     /// Plan wiring the live hook into `settings.json`. Preview-first,
     /// like every other plan here: nothing is written. `queue_wait` is
     /// the admission wait currently configured — what the `PreToolUse`
-    /// handler's recorded timeout must cover.
+    /// handler's recorded timeout must cover. A relais command already
+    /// recorded in another settings file the harness merges reads as
+    /// [`HooksPlan::Unrenderable`], the same "nothing will be written"
+    /// shape a file that cannot be safely edited already gets — there is
+    /// no fragment to paste for this one, only another file to clean up.
     pub fn plan_hooks(
         &self,
         relais_binary: &Path,
         queue_wait: std::time::Duration,
+        roots: settings::MergedRoots<'_>,
     ) -> std::io::Result<HooksPlan> {
+        if let Some(reason) = self.duplicate_hook_reason(roots) {
+            return Ok(HooksPlan::Unrenderable {
+                reason,
+                paste_block: NO_PASTE_BLOCK.to_string(),
+            });
+        }
         Ok(settings::plan_hooks(
             self.read_settings()?.as_deref(),
             relais_binary,
@@ -866,12 +931,21 @@ impl InstallRoot {
     /// re-checked for a round trip here, not trusted from the plan — the
     /// preview and the write are two moments, and a file edited or
     /// reformatted in between must be refused now, not silently
-    /// rewritten on the strength of an earlier reading (C9).
+    /// rewritten on the strength of an earlier reading (C9). The
+    /// duplicate check is re-run here too, for the same reason, and
+    /// reads as [`HooksApplied::Refused`] — see [`Self::plan_hooks`].
     pub fn apply_hooks(
         &self,
         relais_binary: &Path,
         queue_wait: std::time::Duration,
+        roots: settings::MergedRoots<'_>,
     ) -> std::io::Result<HooksApplied> {
+        if let Some(reason) = self.duplicate_hook_reason(roots) {
+            return Ok(HooksApplied::Refused {
+                reason,
+                paste_block: NO_PASTE_BLOCK.to_string(),
+            });
+        }
         let text = self.read_settings()?;
         match settings::plan_hooks(text.as_deref(), relais_binary, queue_wait) {
             HooksPlan::Unrenderable {
@@ -1578,6 +1652,17 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Roots naming no other settings file, for the tests that are about
+    /// what install writes rather than about the duplicate check. Written
+    /// out rather than defaulted so a test that DOES care has to say so:
+    /// the whole of issue #94 was a root being inferred instead of named.
+    fn no_other_roots() -> settings::MergedRoots<'static> {
+        settings::MergedRoots {
+            project: None,
+            home: None,
+        }
+    }
+
     fn relais_binary_for_test() -> PathBuf {
         PathBuf::from("/opt/relais/bin/relais")
     }
@@ -1609,12 +1694,12 @@ mod tests {
         let (root, dir) = temp_root();
         let binary = relais_binary_for_test();
         let plan = root
-            .plan_hooks(&binary, Duration::from_secs(2))
+            .plan_hooks(&binary, Duration::from_secs(2), no_other_roots())
             .expect("plan hooks");
         assert_eq!(plan.applicable_count(), 7);
 
         let applied = root
-            .apply_hooks(&binary, Duration::from_secs(2))
+            .apply_hooks(&binary, Duration::from_secs(2), no_other_roots())
             .expect("apply hooks");
         let HooksApplied::Applied(events) = applied else {
             panic!("expected events to be wired: {applied:?}");
@@ -1623,13 +1708,109 @@ mod tests {
 
         // A re-run is a no-op.
         let replan = root
-            .plan_hooks(&binary, Duration::from_secs(2))
+            .plan_hooks(&binary, Duration::from_secs(2), no_other_roots())
             .expect("re-plan hooks");
         assert_eq!(replan.applicable_count(), 0, "{replan:?}");
         let reapplied = root
-            .apply_hooks(&binary, Duration::from_secs(2))
+            .apply_hooks(&binary, Duration::from_secs(2), no_other_roots())
             .expect("apply hooks again");
         assert_eq!(reapplied, HooksApplied::AlreadyCurrent);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `duplicate_hook_reason` itself, driven with an explicit home
+    /// directory rather than through `plan_hooks`/`apply_hooks` (which
+    /// resolve the real one): the user's `~/.claude/settings.json` is one
+    /// of the files the harness merges, and a relais command already
+    /// there is a duplicate a project-scope install must see too.
+    #[test]
+    fn duplicate_hook_reason_sees_a_relais_command_in_the_users_settings_file() {
+        let (root, dir) = temp_root();
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".claude")).expect("mkdir");
+        std::fs::write(
+            home.join(".claude").join("settings.json"),
+            serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [
+                        {"matcher": "Agent|Task", "hooks": [
+                            {"type": "command", "command": "/opt/relais/bin/relais hook"}
+                        ]}
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .expect("write");
+
+        assert!(root.duplicate_hook_reason(no_other_roots()).is_none());
+        let reason = root
+            .duplicate_hook_reason(settings::MergedRoots {
+                project: None,
+                home: Some(&home),
+            })
+            .expect("a duplicate in the user's settings.json");
+        assert!(reason.contains("settings.json"), "{reason}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `settings.local.json` sits right next to `settings.json` and
+    /// Claude Code merges the two (issue #94): a relais command already
+    /// recorded there is a duplicate this install must refuse to add to,
+    /// not a file it is blind to.
+    #[test]
+    fn hooks_apply_refuses_when_the_local_settings_file_already_has_a_relais_hook() {
+        let (root, dir) = temp_root();
+        std::fs::create_dir_all(&root.claude_dir).expect("mkdir");
+        std::fs::write(
+            root.claude_dir.join("settings.local.json"),
+            serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [
+                        {"matcher": "Agent|Task", "hooks": [
+                            {"type": "command", "command": "/opt/relais/bin/relais hook"}
+                        ]}
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .expect("write");
+
+        let binary = relais_binary_for_test();
+        // This test is ABOUT the roots, so it names them: the project
+        // whose `.claude` holds the local file. `no_other_roots()` would
+        // tell the duplicate check to look nowhere and the refusal would
+        // never fire — which is what a blanket sweep of these call sites
+        // did, and what naming the helper that way is meant to reveal.
+        let project = root
+            .claude_dir
+            .parent()
+            .expect("the fixture's project root")
+            .to_path_buf();
+        let roots = settings::MergedRoots {
+            project: Some(project.as_path()),
+            home: None,
+        };
+        let planned = root
+            .plan_hooks(&binary, Duration::from_secs(2), roots)
+            .expect("plan hooks");
+        let HooksPlan::Unrenderable { reason, .. } = planned else {
+            panic!("expected a duplicate to refuse the plan: {planned:?}");
+        };
+        assert!(reason.contains("settings.local.json"), "{reason}");
+
+        let applied = root
+            .apply_hooks(&binary, Duration::from_secs(2), roots)
+            .expect("apply hooks");
+        let HooksApplied::Refused { reason, .. } = applied else {
+            panic!("expected a duplicate to refuse the apply: {applied:?}");
+        };
+        assert!(reason.contains("settings.local.json"), "{reason}");
+        assert!(
+            !root.claude_dir.join("settings.json").exists(),
+            "refused: nothing written"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1659,9 +1840,9 @@ mod tests {
         }
 
         let binary = relais_binary_for_test();
-        let planned = root.plan_hooks(&binary, Duration::from_secs(2));
+        let planned = root.plan_hooks(&binary, Duration::from_secs(2), no_other_roots());
         assert!(planned.is_err(), "an unreadable file is not an absent one");
-        let applied = root.apply_hooks(&binary, Duration::from_secs(2));
+        let applied = root.apply_hooks(&binary, Duration::from_secs(2), no_other_roots());
         assert!(applied.is_err(), "{applied:?}");
 
         std::fs::set_permissions(&settings_path, std::fs::Permissions::from_mode(0o600))
@@ -1685,7 +1866,7 @@ mod tests {
         .expect("write");
         let binary = relais_binary_for_test();
         let applied = root
-            .apply_hooks(&binary, Duration::from_secs(2))
+            .apply_hooks(&binary, Duration::from_secs(2), no_other_roots())
             .expect("apply hooks");
         assert!(
             matches!(applied, HooksApplied::Refused { .. }),
@@ -1700,7 +1881,7 @@ mod tests {
     fn hooks_uninstall_removes_only_what_install_added() {
         let (root, dir) = temp_root();
         let binary = relais_binary_for_test();
-        root.apply_hooks(&binary, Duration::from_secs(2))
+        root.apply_hooks(&binary, Duration::from_secs(2), no_other_roots())
             .expect("apply hooks");
 
         // Add a foreign hook on the same event, same matcher, so the
