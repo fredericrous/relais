@@ -87,10 +87,11 @@ impl World {
     }
 }
 
-/// Elect and serve a coordinator in a background thread, generous
-/// concurrency limits so the only thing that can refuse a spawn is
-/// whether its run was registered. Returns the running handle and a
-/// client already able to register runs against it.
+/// Elect and serve a coordinator in a background thread. `start` uses
+/// limits generous enough that nothing here is refused by a cap;
+/// `start_with_limits` is how the cap test sets one low enough to bind,
+/// which is the whole point of that test. Returns the running handle and
+/// a client already able to register runs against it.
 struct RunningCoordinator {
     server: Option<std::thread::JoinHandle<()>>,
     client: relais::coordinator::Client,
@@ -98,15 +99,21 @@ struct RunningCoordinator {
 
 impl RunningCoordinator {
     fn start(socket: &Path) -> Self {
-        let limits = ConcurrencyLimits {
-            max_active_agents: Some(64),
-            max_active_agents_per_session: Some(64),
-            max_heavy_commands: Some(8),
-            max_training_jobs: Some(1),
-            max_agent_depth: Some(8),
-            max_agents_per_run: Some(256),
-            training_when_idle: false,
-        };
+        Self::start_with_limits(
+            socket,
+            ConcurrencyLimits {
+                max_active_agents: Some(64),
+                max_active_agents_per_session: Some(64),
+                max_heavy_commands: Some(8),
+                max_training_jobs: Some(1),
+                max_agent_depth: Some(8),
+                max_agents_per_run: Some(256),
+                training_when_idle: false,
+            },
+        )
+    }
+
+    fn start_with_limits(socket: &Path, limits: ConcurrencyLimits) -> Self {
         let (coordinator, listener) = Coordinator::start(
             socket,
             limits,
@@ -165,22 +172,104 @@ fn spawn_payload(session: &str, tool_use: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// A coordinator that refuses (nothing registered for this session's
-/// derived run) produces a refusal on stdout, through the command.
+/// The end of a spawn's tool call, carrying the same `tool_use_id` the
+/// spawn did — which is what lets the end find the seat the start took.
+fn finish_payload(session: &str, tool_use: &str) -> Vec<u8> {
+    serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": session,
+        "tool_name": "Agent",
+        "tool_use_id": tool_use,
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// A spawn in a session the coordinator has never heard of is answered
+/// on its merits rather than refused for having no record: the command
+/// derives and registers that session's own run and retries the
+/// admission once, and with room to spare the retry is silent — through
+/// the compiled binary against a coordinator that was never told about
+/// this session beforehand.
 #[test]
-fn a_refusing_coordinator_produces_a_refusal_on_stdout() {
-    let world = World::new("refuse");
+fn an_unregistered_session_is_admitted_silently_through_the_command() {
+    let world = World::new("unregistered");
     let coordinator = RunningCoordinator::start(&world.socket());
 
-    let payload = spawn_payload("session-refuse", "tool-refuse");
+    let payload = spawn_payload("session-never-registered", "tool-first");
     let (code, stdout, stderr) = world.hook(&payload);
 
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert_eq!(
+        stdout, "",
+        "a self-registered first spawn with room is admitted silently: stderr={stderr}"
+    );
+
+    coordinator.stop();
+}
+
+/// A CAP is observed refusing a spawn, end to end, through the command:
+/// with the machine's per-session agent cap set to 2, the first two
+/// firings of one session are silent and the third is refused with a
+/// message that names the limit — never `UnknownRun`, which would prove
+/// only that the mechanism carries an answer, nothing about a limit.
+#[test]
+fn a_cap_refuses_a_spawn_through_the_command_end_to_end() {
+    let world = World::new("cap");
+    let limits = ConcurrencyLimits {
+        max_active_agents: Some(64),
+        max_active_agents_per_session: Some(2),
+        max_heavy_commands: Some(8),
+        max_training_jobs: Some(1),
+        max_agent_depth: Some(8),
+        max_agents_per_run: Some(256),
+        training_when_idle: false,
+    };
+    let coordinator = RunningCoordinator::start_with_limits(&world.socket(), limits);
+
+    let session = "session-capped";
+    for tool_use in ["tool-1", "tool-2"] {
+        let (code, stdout, stderr) = world.hook(&spawn_payload(session, tool_use));
+        assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+        assert_eq!(
+            stdout, "",
+            "spawn {tool_use} is under the cap and should be silent: stderr={stderr}"
+        );
+    }
+
+    let (code, stdout, stderr) = world.hook(&spawn_payload(session, "tool-3"));
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     assert!(
         stdout.contains("\"permissionDecision\":\"deny\""),
         "stdout={stdout}"
     );
-    assert!(stdout.contains("is not registered"), "stdout={stdout}");
+    assert!(
+        !stdout.contains("is not registered"),
+        "the cap refusal must not be UnknownRun: stdout={stdout}"
+    );
+    // WHICH refusal, not merely that one arrived: `RunCancelled`,
+    // `AlreadyFinished` or a depth refusal would all satisfy "a deny that
+    // is not UnknownRun", and none of them would be the cap. The cap's
+    // own rendering names the limit and offers retrying when an agent
+    // finishes — which the seat being given back at the end of a call is
+    // what makes true.
+    assert!(
+        stdout.contains("at its limit") || stdout.contains("limit"),
+        "the refusal must be the cap's own, naming the limit: stdout={stdout}"
+    );
+
+    // And the cap counts RUNNING agents: end tool-1's call, and the seat
+    // it held comes back, so the next spawn is admitted.
+    let (code, stdout, stderr) = world.hook(&finish_payload(session, "tool-1"));
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert_eq!(stdout, "", "the end of a call is never refused");
+
+    let (code, stdout, stderr) = world.hook(&spawn_payload(session, "tool-4"));
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert_eq!(
+        stdout, "",
+        "with a seat given back, the next spawn is admitted: stderr={stderr}"
+    );
 
     coordinator.stop();
 }
@@ -314,17 +403,13 @@ fn every_firing_is_journalled_owner_only() {
     for line in &lines {
         let value: serde_json::Value = serde_json::from_str(line).expect("journal line is JSON");
         // WHICH decision, not merely that one was written. These spawns
-        // name runs the coordinator has never heard of, so each must be
-        // refused; asserting only `is_string()` would pass a journal
-        // that recorded every refusal as "silent" — which is precisely
-        // the entry a person reading it later would need to be true.
-        assert_eq!(value["decision"], "refuse", "{line}");
-        assert!(
-            value["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("relais")),
-            "a refusal records what it said, not just that it refused: {line}"
-        );
+        // each name a session the coordinator has never heard of, and
+        // each now self-registers its own run and is admitted with
+        // room to spare, so both must record "silent" — asserting only
+        // `is_string()` would pass a journal that recorded every firing
+        // as "refuse" just as readily.
+        assert_eq!(value["decision"], "silent", "{line}");
+        assert!(value["reason"].is_null(), "{line}");
         assert!(value["payload"]["session_id"].is_string(), "{line}");
     }
 

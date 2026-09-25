@@ -197,8 +197,14 @@ or the reason it was kept, and a scorecard re-measured afterwards.
 - The decomposition scheduler executes packages sequentially in
   topological order; waves of independent packages are computed and
   recorded but not yet run concurrently.
-- Native Claude Code subagents are observed, not admitted: only managed
-  dispatch through `relais run` is capped by the coordinator.
+- Native Claude Code subagents are admitted but never tracked as
+  individuals: with the hook wired (`relais install --claude --hooks`),
+  a spawn is asked about and can be refused, and the end of its tool
+  call gives the seat back — but relais never learns which agent ran
+  under which spawn, so depth is not enforced on this path and a subtree
+  cannot be cancelled. Without the hook, or with the coordinator
+  unreachable, native subagents are observed only: managed dispatch
+  through `relais run` is the sole path the coordinator caps.
 - The local `msrv` target proves the declared floor only when that
   toolchain is installed (`rustup toolchain install 1.88.0`); without it
   `make msrv` FAILS and says so, rather than passing on a skip. Set
@@ -206,3 +212,20 @@ or the reason it was kept, and a scorecard re-measured afterwards.
 - `install.sh` and `install.ps1` refuse to install a download they cannot
   verify (no `SHA256SUMS`, no sha256 tool). `RELAIS_SKIP_CHECKSUM=1` is
   the explicit way to accept an unverified binary.
+- A hook-admitted spawn is governed only by the machine's own
+  `[concurrency]` limits — the same caps the coordinator applies to any
+  other run — and there is no separate machine setting for it. **No
+  money limit is enforced on this path at all**: the run the hook
+  registers carries no budget, and the coordinator refuses on budget
+  only for a run that has one, so raising `dispatch_reserve_micros`
+  changes what a spawn reserves against an unbounded total and still
+  refuses nothing. A hook-admitted session is capped by agent count, not
+  by spend.
+- `relais cancel` on a session's own derived run holds for as long as
+  the coordinator still remembers it. A cancelled run with nothing
+  outstanding is reaped at the next reconcile — 15 seconds — after which
+  the next spawn in that session finds no record, registers the run
+  again and is admitted: the cancellation lives in coordinator memory,
+  and nothing on disk lets a hook tell a reaped-cancelled run from a
+  session it has never seen. Cancelling a tab's agents is not a
+  durable stop; closing the tab is.
