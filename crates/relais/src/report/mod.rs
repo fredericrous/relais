@@ -19,13 +19,15 @@ use crate::outcome::OutcomeKind;
 
 /// Whether the transition that landed this run in `Accepted` carries a
 /// person's own answer (`relais decide --answer approve`) rather than
-/// relais's own checks and review (`Reason::ChecksAndReviewPassed`) —
-/// the fact the report's accepted-by-relais/accepted-by-person split is
-/// read off, since nothing else on the run records who judged it.
-/// `false` for a run that never reached `Accepted` at all.
+/// relais's own checks and review (`Reason::ChecksAndReviewPassed`) — or
+/// the run reached `AcceptedByPerson` at all, which is never anything
+/// but a person's own answer (`relais decide --answer salvaged`): the
+/// fact the report's accepted-by-relais/accepted-by-person split is read
+/// off, since nothing else on the run records who judged it. `false` for
+/// a run that never reached either state.
 ///
-/// The transition wanted is the one that ENTERED `Accepted`, which is
-/// why `from_state` is part of the test. A run keeps recording
+/// The transition wanted is the one that ENTERED the accepted state,
+/// which is why `from_state` is part of the test. A run keeps recording
 /// transitions after it becomes terminal — retiring its worktree writes
 /// an `accepted -> accepted` row — so the LAST row landing on `Accepted`
 /// is usually that retirement, and reading its reason reports every
@@ -40,9 +42,24 @@ fn accepted_by_person(
         .transitions(run_id)?
         .iter()
         .find(|transition| {
-            transition.to_state == State::Accepted && transition.from_state != Some(State::Accepted)
+            matches!(
+                transition.to_state,
+                State::Accepted | State::AcceptedByPerson
+            ) && transition.from_state != Some(transition.to_state)
         })
-        .is_some_and(|transition| transition.reason == Reason::DecisionApproved.as_str()))
+        .is_some_and(|transition| {
+            transition.reason == Reason::DecisionApproved.as_str()
+                || transition.reason == Reason::DecisionSalvaged.as_str()
+        }))
+}
+
+/// Whether a run's own state counts as an accepted candidate for the
+/// primary metric (SPEC §20): the runner's own `Accepted`, or a person's
+/// salvage of a terminal run's work (`State::AcceptedByPerson`) — the
+/// candidate `relais decide --answer approve`/`salvaged` accepted either
+/// way, never a state still in flight or one that ended without one.
+fn is_accepted(status: State) -> bool {
+    matches!(status, State::Accepted | State::AcceptedByPerson)
 }
 
 /// Bumped whenever a top-level `Report` key is added, renamed or removed
@@ -496,7 +513,7 @@ pub fn runs_report(
                     .last()
                     .map(|transition| transition.reason.clone())
             });
-        let mut standing = status == State::Accepted;
+        let mut standing = is_accepted(status);
         if standing {
             if let Some(task_id) = ledger.task_of_run(&run_id)? {
                 if let Some(withdrawn) = withdrawn_tasks.get(&task_id) {
@@ -516,10 +533,7 @@ pub fn runs_report(
             standing,
         });
     }
-    let accepted = runs
-        .iter()
-        .filter(|run| run.status == State::Accepted)
-        .count();
+    let accepted = runs.iter().filter(|run| is_accepted(run.status)).count();
     let standing = runs.iter().filter(|run| run.standing).count();
     let total_cost = runs.iter().fold(MicroUsd::ZERO, |acc, run| acc + run.cost);
     // An OPEN decision, not a state: once `relais decide` answers a run
@@ -563,7 +577,7 @@ pub fn runs_report(
         let mut duration_seconds: Option<f64> = None;
         for run_id in &runs_of_task {
             let status = ledger.run_status(run_id)?;
-            if status == Some(State::Accepted) {
+            if status.is_some_and(is_accepted) {
                 accepted_task = true;
                 if accepted_by_person(ledger, run_id)? {
                     accepted_task_by_person = true;

@@ -637,7 +637,7 @@ mod tests {
         assert_eq!(parsed.effective_model, None);
         assert_eq!(parsed.usage.cost, Cost::Unknown);
         assert_eq!(
-            crate::backend::verify_model("sonnet", parsed.effective_model.as_deref()),
+            crate::backend::verify_model("sonnet", parsed.effective_model.as_deref(), &[]),
             crate::backend::ModelVerification::Unverified {
                 requested: "sonnet".into()
             },

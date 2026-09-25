@@ -146,6 +146,9 @@ fn state_labelling(state: State) -> Labelling {
         State::NeedsReview => Labelling::Excluded("needs_review, no evidence-backed label yet"),
         State::NeedsDecision => Labelling::Excluded("needs_decision, no evidence-backed label yet"),
         State::Cancelled => Labelling::Excluded("cancelled, no evidence-backed label yet"),
+        State::AcceptedByPerson => {
+            Labelling::Excluded("accepted by a person, not the runner's own reasoning verdict")
+        }
     }
 }
 

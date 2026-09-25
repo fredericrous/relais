@@ -200,7 +200,7 @@ on implementation failure: one repair, then escalation
 on architecture conflict: needs_decision
 ```
 
-No silent fallback is allowed. Unavailable models yield `blocked:model_unavailable`, or an explicitly pre-authorized alternative whose identity and cost are recorded. Provider-driven model substitution is detected where observable; an unapproved substitution stops further dispatch and invalidates any claim that the requested route was tested.
+No silent fallback is allowed. Unavailable models yield `blocked:model_unavailable`, or an explicitly pre-authorized alternative whose identity and cost are recorded. Provider-driven model substitution is detected where observable; an unapproved substitution stops further dispatch and invalidates any claim that the requested route was tested. A substitution the machine has reviewed in advance (`[routing].approved_substitutions` in `machine.toml`, naming the exact requested/effective pair) is accepted rather than refused — dispatch continues, and both identities are recorded, so the spend is attributed to the model that actually ran and the route's own request is not lost. This list is machine-owned only: accepting a costlier model is a spending decision a repository must not be able to widen on its own, the same reasoning that keeps `allowed_models` out of repository policy.
 
 ## 7. Context package
 
@@ -230,9 +230,9 @@ Every run delivers a named candidate — a ref under `refs/relais/candidates/<ru
 
 ## 9. Attempt lifecycle and escalation
 
-States: `prepared`, `running`, `verifying`, `repairing`, `escalating`, `accepted`, `needs_review`, `needs_decision`, `blocked`, `failed`, `budget_exhausted`, `cancelled`, `interrupted`.
+States: `prepared`, `running`, `verifying`, `repairing`, `escalating`, `accepted`, `needs_review`, `needs_decision`, `blocked`, `failed`, `budget_exhausted`, `cancelled`, `interrupted`, `accepted_by_person`.
 
-Every transition has a reason code, timestamp and evidence references. A worker can propose completion or blockage; the runner assigns every terminal state on its own, and a person's answer to `relais decide` can also assign two of them — `accepted` for `approve`, `cancelled` for every other answer — with what was answered recorded on the decision row, not the transition detail.
+Every transition has a reason code, timestamp and evidence references. A worker can propose completion or blockage; the runner assigns every terminal state on its own, and a person's answer to `relais decide` can also assign one of them — `accepted` for `approve`, `cancelled` for every other ordinary answer, except `salvaged`, which answers a run already terminal WITHOUT having awaited a person (`blocked`, `failed`, `budget_exhausted`, `cancelled`) and assigns `accepted_by_person` — with what was answered recorded on the decision row, not the transition detail. `relais decide --answer salvaged --candidate <sha>` records that a person finished and merged the candidate such a run left behind; the run's own reason for ending is kept on the decision row alongside the salvage's own resolution, never replaced by it, and the primary accepted-change metric (§11) counts `accepted_by_person` exactly like `accepted`.
 
 An evidence reference names what kind of evidence it is, from a closed set rather than free text, and may name the tool that produced it, that tool's own identifier for it, the subject it attests to and the acceptance criterion it answers. Evidence produced outside a run is recorded the same way, and recording it decides nothing: it assigns no state, settles no criterion and clears no gap.
 
@@ -288,6 +288,8 @@ The runner enforces dispatch, attempt, turn and wall-time ceilings. API dollar c
 Primary outcome metric: all recorded cost, including failed runs, divided by accepted tasks in the same cohort. Also report acceptance rate, review corrections, escalation rate, duration and later user-reported regressions. Compare like task classes and policy versions.
 
 A task accepted because a person answered `relais decide --answer approve` counts in that denominator exactly like one relais accepted on its own checks and review — work a person took is work that landed, and excluding it measures everything except the cases a person cared enough to judge. The two are reported as separate counts beside the metric, never as one number that mixes them, because how much of the denominator relais itself vouched for is the question the metric is asked to answer.
+
+A task whose run ended without relais's own acceptance, but whose candidate a person finished and merged anyway (`relais decide --answer salvaged`, §9), also counts in the denominator — the cost was already spent and the work already landed; excluding it understates the metric by exactly the work relais discarded and a person rescued.
 
 ## 12. Persistence and crash recovery
 
@@ -437,6 +439,8 @@ At bounded checkpoints, recovery chooses between retrieving missing context, a f
 The adapter contract includes launch, events, cancellation, resume/reconciliation, effective profile, permission capability, sandbox capability and usage completeness. The mandatory Claude Code adapter uses supported native authentication and launches explicitly selected models. An optional alternative adapter can run another harness or local model. No adapter may advertise guarantees its backend cannot enforce.
 
 After acceptance, allow the user to record accepted unchanged, corrected, reverted or confirmed regression. Feedback is attributed to the candidate and strategy, with correction magnitude and evidence where available. The candidate is optional: a run accepted through a person's approval on a contract interrupted before verification completed never wrote a receipt, and feedback about it is still worth recording. Absence of feedback is not a positive quality label. Retain both immediate verification and delayed outcomes.
+
+Feedback about a run a person salvaged (§9) is attributed to the candidate the salvage named, not to any candidate the run's own discarded attempt produced — that attempt's work was never what was merged.
 
 A task's later recorded outcome overrides its run's terminal state for labelling purposes: a reverted change or a later confirmed regression is never a positive label, whatever its run's state said. A task accepted through a person's approval rather than verification alone is recorded as such — the dataset names which route accepted it — and does not earn the positive label reserved for verified acceptance.
 

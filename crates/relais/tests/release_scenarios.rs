@@ -905,6 +905,150 @@ fn blocked_outcomes_are_explicit_and_launch_nothing() {
     assert_eq!(candidates, 0, "no blocked run reached a candidate");
 }
 
+// #49: a terminal run relais itself never accepted — after producing a
+// complete candidate, here, exactly the shape the issue measured three
+// times — opened no decision row, so a person who finished and merged
+// that candidate anyway had no way to say so; the spend stayed on the
+// ledger with no acceptance recorded against it. `relais decide --answer
+// salvaged --candidate <sha>` is that missing answer: it keeps the run's
+// own reason for ending rather than replacing it, and `relais feedback`
+// and the primary metric both count the salvaged run as accepted from
+// there on.
+#[test]
+fn a_salvaged_run_keeps_its_reason_counts_as_accepted_and_takes_feedback() {
+    let world = World::new("salvage");
+    let hash = world.write_policy(3);
+    // Two sonnet attempts at $0.01 each reach a $0.02 ceiling before the
+    // escalation could be bought — the run ends `budget_exhausted` with a
+    // patch already on disk, the same shape `budget_exhaustion_preserves_evidence_and_stops_dispatch`
+    // exercises: a real attempt ran, for a reason unrelated to whether
+    // its candidate was any good.
+    world.write_machine(&hash, "[spending]\nper_run_micros = 20000\n");
+    let task = world.write_task("task.json", "off");
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(5), "{}", text(&run.stderr));
+    let run_id = world.only_run_id();
+
+    let report = world.relais(&["report", "--since", "2000-01-01", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&text(&report.stdout)).expect("json");
+    assert_eq!(report["runs"][0]["status"], "budget_exhausted", "{report}");
+    assert_eq!(report["accepted"], 0, "{report}");
+
+    // The ordinary answers do not reach a run that never awaited a
+    // person.
+    let approve = world.relais(&[
+        "decide", &run_id, "--answer", "approve", "--actor", "a person",
+    ]);
+    assert_eq!(approve.status.code(), Some(2), "{}", text(&approve.stderr));
+
+    // `salvaged` requires `--candidate`.
+    let no_candidate = world.relais(&[
+        "decide", &run_id, "--answer", "salvaged", "--actor", "a person",
+    ]);
+    assert_eq!(
+        no_candidate.status.code(),
+        Some(2),
+        "{}",
+        text(&no_candidate.stderr)
+    );
+    assert!(text(&no_candidate.stderr).contains("--candidate"));
+
+    let salvage = world.relais(&[
+        "decide",
+        &run_id,
+        "--answer",
+        "salvaged",
+        "--actor",
+        "a person",
+        "--candidate",
+        "handmerged123",
+        "--note",
+        "finished it by hand after the budget ran out",
+    ]);
+    assert_eq!(salvage.status.code(), Some(0), "{}", text(&salvage.stderr));
+    assert!(text(&salvage.stdout).contains("decision_salvaged"));
+    assert!(
+        text(&salvage.stdout).contains("limit_reached"),
+        "the run's own reason for ending is reported back: {}",
+        text(&salvage.stdout)
+    );
+
+    // A second salvage of the same run is refused: it already carries a
+    // decision.
+    let resalvage = world.relais(&[
+        "decide",
+        &run_id,
+        "--answer",
+        "salvaged",
+        "--actor",
+        "someone else",
+        "--candidate",
+        "other456",
+    ]);
+    assert_eq!(
+        resalvage.status.code(),
+        Some(2),
+        "{}",
+        text(&resalvage.stderr)
+    );
+
+    let explain = world.relais(&["explain", &run_id]);
+    let explained = text(&explain.stdout);
+    assert!(explained.contains("decision_salvaged"), "{explained}");
+    assert!(
+        explained.contains("limit_reached"),
+        "the original reason still shows up on the decision: {explained}"
+    );
+
+    // The primary metric now counts this run as accepted, exactly the
+    // gap #49 named: relais's own spend on a run a person rescued no
+    // longer vanishes from the numerator's denominator.
+    let report = world.relais(&["report", "--since", "2000-01-01", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&text(&report.stdout)).expect("json");
+    assert_eq!(
+        report["runs"][0]["status"], "accepted_by_person",
+        "{report}"
+    );
+    assert_eq!(report["accepted"], 1, "{report}");
+
+    // `feedback` now accepts the salvaged run and checks a candidate
+    // against the one the salvage recorded, never the discarded attempt.
+    let mismatch = world.relais(&[
+        "feedback",
+        &run_id,
+        "--outcome",
+        "accepted",
+        "--candidate",
+        "not-the-one",
+        "--actor",
+        "a person",
+    ]);
+    assert_eq!(
+        mismatch.status.code(),
+        Some(2),
+        "{}",
+        text(&mismatch.stderr)
+    );
+    assert!(text(&mismatch.stderr).contains("handmerged123"));
+
+    let feedback = world.relais(&[
+        "feedback",
+        &run_id,
+        "--outcome",
+        "accepted",
+        "--candidate",
+        "handmerged123",
+        "--actor",
+        "a person",
+    ]);
+    assert_eq!(
+        feedback.status.code(),
+        Some(0),
+        "{}",
+        text(&feedback.stderr)
+    );
+}
+
 // SPEC §10: a baseline that cannot run, and a declared setup that does
 // not succeed, are blocked before a worker is launched — with the
 // remedy named, and with `relais plan` and `relais doctor` warning
