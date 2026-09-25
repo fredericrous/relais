@@ -10,6 +10,20 @@ missing here.
 
 ### Added
 
+- **A hook refusal now carries the rule that produced it, the reason, the
+  remedy and whether relais decided or could not tell, as separate fields
+  rather than one opaque sentence.** `hook::decide::Refusal` replaces
+  `HookAnswer::Refuse`'s bare `reason: String` with a `rule: RefusalRule`
+  (spanning both the hook's own rules — a queue timeout, a coordinator
+  that could not be reached — and admission's own `Refusal` codes), a
+  `reason`, a `remedy`, and an `availability: Availability` distinguishing
+  `Decided` from `Unknown`. `Refusal::sentence()` renders the exact text a
+  person and the model already saw, built from those fields rather than
+  stored beside them, and the hook journal now records `rule` and
+  `availability` alongside `reason`, so `relais doctor` and a person can
+  group firings by which rule fired and tell a session that hit its limit
+  from a machine whose coordinator was unreachable.
+
 - **A pre-authorized model substitution is accepted and recorded instead
   of ending the run, and a person can salvage the work of one that still
   ends anyway (#49).** `[routing].approved_substitutions` in
