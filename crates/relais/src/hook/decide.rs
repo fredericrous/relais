@@ -35,19 +35,109 @@
 use std::time::Duration;
 
 use super::event::{HookEvent, ToolCallPhase};
-use crate::admission::{Decision, Refusal};
+use crate::admission::{Decision, Refusal as AdmissionRefusal};
 use crate::policy::{CoordinatorUnreachableBehavior, HookAdmissionSettings};
 
+/// Which rule produced a refusal. Spans both this module's own rules — a
+/// queue `respond::wait_for_a_seat` gave up on, a coordinator that could
+/// not be reached at all — and admission's own [`AdmissionRefusal`] codes,
+/// so a journal reader or `relais doctor` can group firings by the rule
+/// that actually fired, rather than by parsing a sentence back apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalRule {
+    /// `respond::wait_for_a_seat` gave up before the coordinator admitted
+    /// this spawn.
+    QueueTimeout,
+    /// The coordinator could not be reached at all, and
+    /// `on_coordinator_unreachable` says to refuse rather than carry on.
+    CoordinatorUnreachable,
+    /// The coordinator was reached and refused outright, for this code.
+    Admission(AdmissionRefusal),
+}
+
+impl RefusalRule {
+    /// A short, stable label for grouping — the journal and `relais
+    /// doctor` key on this, not on the rendered sentence, which is prose
+    /// for a person and may be reworded without the rule it names moving.
+    pub fn label(&self) -> String {
+        match self {
+            RefusalRule::QueueTimeout => "queue_timeout".to_string(),
+            RefusalRule::CoordinatorUnreachable => "coordinator_unreachable".to_string(),
+            RefusalRule::Admission(code) => format!("admission_{}", code.as_str()),
+        }
+    }
+}
+
+/// Whether relais evaluated policy and refused, or could not reach the
+/// coordinator and refused because its settings say to. A cap refusal and
+/// an unreachable coordinator both deny the spawn; today only the prose
+/// distinguishes them, and this is the field that does instead — a reader
+/// grouping the journal by outcome can tell a session that hit its limit
+/// from a machine whose daemon was down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Availability {
+    /// relais reached the coordinator (or gave up waiting on a real
+    /// answer) and refused on the merits.
+    Decided,
+    /// relais could not reach the coordinator at all, and is refusing
+    /// because it could not tell what the right answer was.
+    Unknown,
+}
+
+/// A refused spawn, as data rather than one opaque string: the rule that
+/// fired, what was exceeded, what the person can do about it, and whether
+/// relais actually decided or merely could not tell. [`Refusal::sentence`]
+/// renders these into the text a person and the model both see — nothing
+/// stores that text separately, so the two can never drift apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub rule: RefusalRule,
+    /// What was exceeded, or why this could not be admitted.
+    pub reason: String,
+    /// What the person can do about it.
+    pub remedy: String,
+}
+
+impl Refusal {
+    /// The one sentence a person and the model both see, built from the
+    /// fields above rather than stored beside them. Each rule keeps the
+    /// exact wording it always has — this only changes what assembles
+    /// it.
+    pub fn sentence(&self) -> String {
+        match self.rule {
+            RefusalRule::CoordinatorUnreachable => {
+                format!("{}. {}", self.reason, self.remedy)
+            }
+            RefusalRule::QueueTimeout => {
+                format!(
+                    "relais did not admit this agent: {}. {}",
+                    self.reason, self.remedy
+                )
+            }
+            RefusalRule::Admission(_) => {
+                format!(
+                    "relais refused this agent: {}. {}.",
+                    self.reason, self.remedy
+                )
+            }
+        }
+    }
+}
+
 /// The one shape a hook may speak in. There is deliberately no variant that
-/// says yes on a person's behalf — see the module doc.
+/// says yes on a person's behalf — see the module doc. There is also no
+/// variant that only advises: the hook denies or stays silent, never
+/// anything in between (SPEC §23 records this narrowing explicitly, so a
+/// reader finds a decision here rather than an oversight).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookAnswer {
     /// Nothing to say: exit 0, nothing on stdout.
     Silent,
-    /// Refuse the tool call. `reason` names what was exceeded and what the
-    /// person can do about it: a message a person cannot act on gets
-    /// ignored, and this one arrives in the middle of their work.
-    Refuse { reason: String },
+    /// Refuse the tool call. A message a person cannot act on gets
+    /// ignored, and this one arrives in the middle of their work, so
+    /// `refusal.sentence()` always names what was exceeded and what the
+    /// person can do about it.
+    Refuse { refusal: Refusal },
 }
 
 impl HookAnswer {
@@ -71,16 +161,19 @@ impl HookAnswer {
     pub fn stdout_payload(&self) -> Option<String> {
         match self {
             HookAnswer::Silent => None,
-            HookAnswer::Refuse { reason } => Some(
-                serde_json::json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": reason,
-                    }
-                })
-                .to_string(),
-            ),
+            HookAnswer::Refuse { refusal } => {
+                let reason = refusal.sentence();
+                Some(
+                    serde_json::json!({
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason": reason,
+                        }
+                    })
+                    .to_string(),
+                )
+            }
         }
     }
 }
@@ -137,13 +230,20 @@ fn decide_spawn(
             // unreachable (SPEC §23).
             CoordinatorUnreachableBehavior::CarryOn => HookAnswer::Silent,
             CoordinatorUnreachableBehavior::Refuse => HookAnswer::Refuse {
-                reason: "relais could not reach its coordinator, and this machine is \
-                         configured to refuse admission rather than carry on unmanaged. \
-                         Retry once the coordinator is reachable (`relais doctor` reports \
-                         its status), or set `on_coordinator_unreachable = \"carry_on\"` \
-                         under `[admission]` in machine.toml if an unmanaged spawn is \
-                         acceptable here."
-                    .to_string(),
+                refusal: Refusal {
+                    rule: RefusalRule::CoordinatorUnreachable,
+                    reason: "relais could not reach its coordinator, and this machine is \
+                             configured to refuse admission rather than carry on unmanaged"
+                        .to_string(),
+                    remedy: "Retry once the coordinator is reachable (`relais doctor` reports \
+                             its status), or set `on_coordinator_unreachable = \"carry_on\"` \
+                             under `[admission]` in machine.toml if an unmanaged spawn is \
+                             acceptable here."
+                        .to_string(),
+                    // relais never learned what the coordinator would
+                    // have said — this is not a decision on the merits,
+                    // it is a stance taken in the absence of one.
+                },
             },
         },
         // Neither says yes on the person's behalf — see the module doc —
@@ -163,16 +263,23 @@ fn decide_spawn(
         // seat is released by the wait itself before this is ever
         // printed.
         Some(Decision::Queued { position }) => HookAnswer::Refuse {
-            reason: format!(
-                "relais did not admit this agent: the session is at its limit and this spawn \
-                 was queued at position {position}. relais waited {} for a seat before giving \
-                 up. Retry when a running agent finishes, or start the work with `relais run`, \
-                 which can wait longer.",
-                format_waited(waited),
-            ),
+            refusal: Refusal {
+                rule: RefusalRule::QueueTimeout,
+                reason: format!(
+                    "the session is at its limit and this spawn was queued at position \
+                     {position}. relais waited {} for a seat before giving up",
+                    format_waited(waited),
+                ),
+                remedy: "Retry when a running agent finishes, or start the work with `relais \
+                         run`, which can wait longer."
+                    .to_string(),
+                // relais did reach the coordinator and did learn the
+                // session was at its limit; giving up on the wait is a
+                // decision, not an unknown.
+            },
         },
         Some(Decision::Refused { code, detail }) => HookAnswer::Refuse {
-            reason: refusal_message(code, &detail),
+            refusal: refusal_for(code, detail),
         },
     }
 }
@@ -192,30 +299,33 @@ fn format_waited(waited: Duration) -> String {
 
 /// What was exceeded and what the person can do about it, for every way
 /// admission can refuse a spawn. A table, not a `_ =>` arm: a new
-/// [`Refusal`] variant fails to compile here until this says what it means.
-fn refusal_message(code: Refusal, detail: &str) -> String {
-    let advice = match code {
-        Refusal::UnknownRun => {
+/// [`AdmissionRefusal`] variant fails to compile here until this says what
+/// it means.
+fn refusal_for(code: AdmissionRefusal, detail: String) -> Refusal {
+    let remedy = match code {
+        AdmissionRefusal::UnknownRun => {
             "the coordinator has no record of this run; restart the session that started it"
         }
-        Refusal::RunCancelled => "this run was cancelled; nothing further is admitted under it",
+        AdmissionRefusal::RunCancelled => {
+            "this run was cancelled; nothing further is admitted under it"
+        }
         // BOTH files, because the cap in force is the SMALLER of the
         // two: the coordinator takes `min(run limit, machine limit)`
         // (`admission::AdmissionState`), so advice naming only one sends
         // a person to edit a file that may not be the binding
         // constraint — they raise it, are refused again, and have no
         // reason to suspect the other.
-        Refusal::DepthExceeded => {
+        AdmissionRefusal::DepthExceeded => {
             "the cap in force is the smaller of `max_agent_depth` under `[execution]` in \
              relais.toml and the same key under `[concurrency]` in machine.toml — raise \
              whichever is lower, or nest one level less deep"
         }
-        Refusal::RunAgentCap => {
+        AdmissionRefusal::RunAgentCap => {
             "the cap in force is the smaller of `max_agents_total` under `[execution]` in \
              relais.toml and `max_agents_per_run` under `[concurrency]` in machine.toml — \
              raise whichever is lower, or start a new run"
         }
-        Refusal::BudgetExceeded => {
+        AdmissionRefusal::BudgetExceeded => {
             "raise `per_run_micros` under `[spending]` in machine.toml, or wait for \
              outstanding reservations to settle"
         }
@@ -225,11 +335,49 @@ fn refusal_message(code: Refusal, detail: &str) -> String {
         // cannot mint a new one, and advising them to would be advice
         // that cannot be followed. Saying the work already happened is
         // the whole of what is useful here.
-        Refusal::AlreadyFinished => {
+        AdmissionRefusal::AlreadyFinished => {
             "this dispatch already ran and settled, so nothing further is admitted under it"
         }
     };
-    format!("relais refused this agent: {detail}. {advice}.")
+    Refusal {
+        rule: RefusalRule::Admission(code),
+        reason: detail,
+        remedy: remedy.to_string(),
+    }
+}
+
+/// Whether an admission refusal was a decision on the merits, for every
+/// [`AdmissionRefusal`] variant. A table, not a `_ =>` arm: a new variant
+/// fails to compile here until this says which it is (SPEC §23) — today
+/// that is always `Decided`, because the coordinator only ever reaches
+/// this table once it has actually evaluated policy; a code that meant
+/// "could not tell" would belong beside `CoordinatorUnreachable` instead.
+impl RefusalRule {
+    /// Whether relais decided this or merely could not tell, DERIVED from
+    /// the rule rather than carried beside it.
+    ///
+    /// Stored as its own field, the two could disagree: `rule:
+    /// CoordinatorUnreachable, availability: Decided` compiled, and would
+    /// have journalled an outage as a decision — the exact
+    /// limit-versus-outage confusion this type exists to remove. Derived,
+    /// the contradiction is unrepresentable, and a new variant on either
+    /// enum cannot compile until it says which it is.
+    pub fn availability(self) -> Availability {
+        match self {
+            // The coordinator never answered, so nothing was decided.
+            RefusalRule::CoordinatorUnreachable => Availability::Unknown,
+            // It answered, and relais chose to stop waiting for it.
+            RefusalRule::QueueTimeout => Availability::Decided,
+            RefusalRule::Admission(code) => match code {
+                AdmissionRefusal::UnknownRun
+                | AdmissionRefusal::RunCancelled
+                | AdmissionRefusal::DepthExceeded
+                | AdmissionRefusal::RunAgentCap
+                | AdmissionRefusal::BudgetExceeded
+                | AdmissionRefusal::AlreadyFinished => Availability::Decided,
+            },
+        }
+    }
 }
 
 /// [`decide`] wrapped so a panic anywhere inside it cannot take the tool
@@ -265,6 +413,22 @@ mod tests {
     /// the very word it is checking for) does not trip its own check —
     /// rather than trusting a reviewer to keep noticing on every future
     /// edit.
+    #[test]
+    fn an_inconsistent_availability_cannot_be_built() {
+        // The pair the review named: `CoordinatorUnreachable` with
+        // `Decided` compiled while availability was a field, and would
+        // have journalled an outage as a decision. Derived, there is no
+        // field to set — this test exists to fail to compile if one
+        // comes back, and to state the invariant where a reader of the
+        // type will look for it.
+        let refusal = Refusal {
+            rule: RefusalRule::CoordinatorUnreachable,
+            reason: "relais could not reach its coordinator".into(),
+            remedy: "start it, or set on_coordinator_unreachable".into(),
+        };
+        assert_eq!(refusal.rule.availability(), Availability::Unknown);
+    }
+
     #[test]
     fn production_code_never_spells_out_the_forbidden_word() {
         let source = include_str!("decide.rs");
@@ -375,7 +539,7 @@ mod tests {
                     Some(Decision::Granted),
                     Some(Decision::AlreadyAdmitted),
                     Some(Decision::Refused {
-                        code: Refusal::RunAgentCap,
+                        code: AdmissionRefusal::RunAgentCap,
                         detail: "the run is at its agent cap".to_string(),
                     }),
                 ] {
@@ -445,7 +609,7 @@ mod tests {
                 name: "refused: unknown run",
                 settings: carry_on(),
                 coordinator: Some(Decision::Refused {
-                    code: Refusal::UnknownRun,
+                    code: AdmissionRefusal::UnknownRun,
                     detail: "run r1 is not registered".into(),
                 }),
                 waited: Duration::ZERO,
@@ -455,7 +619,7 @@ mod tests {
                 name: "refused: run cancelled",
                 settings: carry_on(),
                 coordinator: Some(Decision::Refused {
-                    code: Refusal::RunCancelled,
+                    code: AdmissionRefusal::RunCancelled,
                     detail: "run r1 was cancelled".into(),
                 }),
                 waited: Duration::ZERO,
@@ -465,7 +629,7 @@ mod tests {
                 name: "refused: depth exceeded",
                 settings: carry_on(),
                 coordinator: Some(Decision::Refused {
-                    code: Refusal::DepthExceeded,
+                    code: AdmissionRefusal::DepthExceeded,
                     detail: "depth 4 exceeds the effective maximum 3".into(),
                 }),
                 waited: Duration::ZERO,
@@ -475,7 +639,7 @@ mod tests {
                 name: "refused: run agent cap",
                 settings: carry_on(),
                 coordinator: Some(Decision::Refused {
-                    code: Refusal::RunAgentCap,
+                    code: AdmissionRefusal::RunAgentCap,
                     detail: "run r1 has used its aggregate agent cap (24)".into(),
                 }),
                 waited: Duration::ZERO,
@@ -485,7 +649,7 @@ mod tests {
                 name: "refused: budget exceeded",
                 settings: carry_on(),
                 coordinator: Some(Decision::Refused {
-                    code: Refusal::BudgetExceeded,
+                    code: AdmissionRefusal::BudgetExceeded,
                     detail: "reserving 500 on top of 900 committed exceeds the run budget 1000"
                         .into(),
                 }),
@@ -496,7 +660,7 @@ mod tests {
                 name: "refused: already finished",
                 settings: carry_on(),
                 coordinator: Some(Decision::Refused {
-                    code: Refusal::AlreadyFinished,
+                    code: AdmissionRefusal::AlreadyFinished,
                     detail: "dispatch d1 already ran and settled".into(),
                 }),
                 waited: Duration::ZERO,
@@ -514,15 +678,37 @@ mod tests {
             );
             match (&answer, case.expect_refusal) {
                 (HookAnswer::Silent, false) => {}
-                (HookAnswer::Refuse { reason }, true) => {
+                (HookAnswer::Refuse { refusal }, true) => {
+                    let reason = refusal.sentence();
                     assert!(!reason.is_empty(), "{}: empty reason", case.name);
+                    // Every refusal here is a decision on the merits
+                    // except the unreachable-coordinator case, which
+                    // could not tell — covered again, on its own, below.
+                    let expected_availability = if case.coordinator.is_none() {
+                        Availability::Unknown
+                    } else {
+                        Availability::Decided
+                    };
+                    assert_eq!(
+                        refusal.rule.availability(),
+                        expected_availability,
+                        "{}: {:?}",
+                        case.name,
+                        refusal.rule.availability()
+                    );
                     // What was exceeded (the detail) and what to do about
                     // it (the advice) both have to be in the message a
                     // person actually sees.
-                    if let Some(Decision::Refused { detail, .. }) = &case.coordinator {
+                    if let Some(Decision::Refused { code, detail }) = &case.coordinator {
                         assert!(
                             reason.contains(detail.as_str()),
                             "{}: reason `{reason}` drops the detail",
+                            case.name
+                        );
+                        assert_eq!(
+                            refusal.rule,
+                            RefusalRule::Admission(*code),
+                            "{}: rule does not name the admission code",
                             case.name
                         );
                     }
@@ -537,6 +723,7 @@ mod tests {
                             "{}: {reason}",
                             case.name
                         );
+                        assert_eq!(refusal.rule, RefusalRule::QueueTimeout, "{}", case.name);
                     }
                 }
                 _ => panic!(
@@ -547,6 +734,23 @@ mod tests {
         }
     }
 
+    /// The distinction the whole change exists for: a coordinator that
+    /// could not be reached at all refuses with `Availability::Unknown`
+    /// and `RefusalRule::CoordinatorUnreachable`, never the same rule or
+    /// availability an admission refusal carries — a reader grouping the
+    /// journal by rule or availability can tell a limit from an outage.
+    #[test]
+    fn coordinator_unreachable_refuses_as_unknown_not_decided() {
+        let event = spawn(ToolCallPhase::Pre);
+        let answer = decide(&event, &refuse_on_unreachable(), None, Duration::ZERO);
+        let HookAnswer::Refuse { refusal } = answer else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(refusal.rule, RefusalRule::CoordinatorUnreachable);
+        assert_eq!(refusal.rule.availability(), Availability::Unknown);
+        assert!(refusal.sentence().contains("could not reach"));
+    }
+
     #[test]
     fn silent_has_no_stdout_payload() {
         assert_eq!(HookAnswer::Silent.stdout_payload(), None);
@@ -555,7 +759,11 @@ mod tests {
     #[test]
     fn a_refusal_renders_reason_and_never_the_word_allow_on_stdout() {
         let answer = HookAnswer::Refuse {
-            reason: "depth 4 exceeds the effective maximum 3. raise max_agent_depth.".into(),
+            refusal: Refusal {
+                rule: RefusalRule::Admission(AdmissionRefusal::DepthExceeded),
+                reason: "depth 4 exceeds the effective maximum 3".into(),
+                remedy: "raise max_agent_depth".into(),
+            },
         };
         let payload = answer.stdout_payload().expect("refusal renders a payload");
         assert!(payload.contains("\"permissionDecision\":\"deny\""));
@@ -574,7 +782,7 @@ mod tests {
             None,
             Some(Decision::Granted),
             Some(Decision::Refused {
-                code: Refusal::DepthExceeded,
+                code: AdmissionRefusal::DepthExceeded,
                 detail: "depth 4 exceeds the effective maximum 3".into(),
             }),
         ] {

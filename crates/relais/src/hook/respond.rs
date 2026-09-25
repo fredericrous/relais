@@ -320,6 +320,16 @@ fn wait_outcome(handled: &Handled) -> &'static str {
     }
 }
 
+/// `Refusal`'s availability, spelled the way a journal reader — or
+/// `relais doctor` — groups by it: `Some` on a refusal, `None` on silence,
+/// never a third string standing in for "not applicable".
+fn availability_label(availability: &super::decide::Availability) -> &'static str {
+    match availability {
+        super::decide::Availability::Decided => "decided",
+        super::decide::Availability::Unknown => "unknown",
+    }
+}
+
 /// What one firing is journalled as: what arrived, what the
 /// coordinator answered (when it was asked), how long it waited and what
 /// came of that, and what was decided. Pure — it builds the record,
@@ -332,9 +342,14 @@ pub fn journal_entry(payload: &[u8], handled: &Handled) -> serde_json::Value {
     let payload_value = serde_json::from_slice::<serde_json::Value>(payload).unwrap_or_else(|_| {
         serde_json::Value::String(String::from_utf8_lossy(payload).into_owned())
     });
-    let (decision, reason) = match &handled.answer {
-        HookAnswer::Silent => ("silent", None),
-        HookAnswer::Refuse { reason } => ("refuse", Some(reason.clone())),
+    let (decision, reason, rule, availability) = match &handled.answer {
+        HookAnswer::Silent => ("silent", None, None, None),
+        HookAnswer::Refuse { refusal } => (
+            "refuse",
+            Some(refusal.sentence()),
+            Some(refusal.rule.label()),
+            Some(availability_label(&refusal.rule.availability())),
+        ),
     };
     serde_json::json!({
         "recorded_at": chrono::Utc::now().to_rfc3339(),
@@ -354,6 +369,8 @@ pub fn journal_entry(payload: &[u8], handled: &Handled) -> serde_json::Value {
             .map(|decision| format!("{decision:?}")),
         "decision": decision,
         "reason": reason,
+        "rule": rule,
+        "availability": availability,
         "waited_ms": handled.waited.as_millis() as u64,
         "outcome": wait_outcome(handled),
     })
@@ -614,7 +631,7 @@ mod tests {
             "must register at most once per firing"
         );
         let reason = match &handled.answer {
-            HookAnswer::Refuse { reason } => reason.clone(),
+            HookAnswer::Refuse { refusal } => refusal.sentence(),
             other => panic!("expected a refusal, got {other:?}"),
         };
         assert!(reason.contains("is not registered"), "{reason}");
@@ -800,7 +817,13 @@ mod tests {
         let payload = spawn_payload(session.as_str(), "tool-1");
         let handled = handle(&payload, &settings(), &gate);
         match &handled.answer {
-            HookAnswer::Refuse { reason } => assert!(reason.contains("cancelled"), "{reason}"),
+            HookAnswer::Refuse { refusal } => {
+                assert!(
+                    refusal.sentence().contains("cancelled"),
+                    "{}",
+                    refusal.sentence()
+                )
+            }
             other => panic!("expected a refusal, got {other:?}"),
         }
         assert!(matches!(
@@ -909,7 +932,7 @@ mod tests {
         let payload = spawn_payload(session, "tool-3");
         let handled = handle(&payload, &settings(), &gate);
         let reason = match &handled.answer {
-            HookAnswer::Refuse { reason } => reason.clone(),
+            HookAnswer::Refuse { refusal } => refusal.sentence(),
             other => panic!("expected the capped spawn to be refused, got {other:?}"),
         };
         assert!(
@@ -1371,7 +1394,14 @@ mod tests {
 
     #[test]
     fn journal_entry_carries_the_raw_payload_and_the_decision() {
+        use super::super::decide::{Refusal, RefusalRule};
+
         let payload = spawn_payload("session-j", "tool-j");
+        let refusal = Refusal {
+            rule: RefusalRule::Admission(crate::admission::Refusal::UnknownRun),
+            reason: "run r1 is not registered".into(),
+            remedy: "restart the session that started it".into(),
+        };
         let handled = Handled {
             event: event::parse(&payload),
             coordinator: Some(crate::admission::Decision::Refused {
@@ -1379,17 +1409,26 @@ mod tests {
                 detail: "run r1 is not registered".into(),
             }),
             answer: HookAnswer::Refuse {
-                reason: "relais refused this agent: run r1 is not registered. restart the session"
-                    .into(),
+                refusal: refusal.clone(),
             },
             waited: Duration::ZERO,
         };
         let entry = journal_entry(&payload, &handled);
         assert_eq!(entry["decision"], "refuse");
+        // The journalled reason must be exactly what `stdout_payload`
+        // tells the session, not a paraphrase of it.
+        assert_eq!(
+            entry["reason"].as_str().expect("reason"),
+            refusal.sentence()
+        );
         assert!(entry["reason"]
             .as_str()
             .expect("reason")
             .contains("not registered"));
+        // The rule and availability the criteria asks for: present on a
+        // refusal, and naming the admission code that actually fired.
+        assert_eq!(entry["rule"], "admission_unknown_run");
+        assert_eq!(entry["availability"], "decided");
         assert_eq!(entry["payload"]["session_id"], "session-j");
         assert!(entry["recorded_at"].as_str().is_some());
         assert_eq!(entry["waited_ms"], 0);
@@ -1432,7 +1471,11 @@ mod tests {
             event: event::parse(&payload),
             coordinator: Some(crate::admission::Decision::Queued { position: 1 }),
             answer: HookAnswer::Refuse {
-                reason: "relais waited 2.0s for a seat before giving up".into(),
+                refusal: super::super::decide::Refusal {
+                    rule: super::super::decide::RefusalRule::QueueTimeout,
+                    reason: "relais waited 2.0s for a seat before giving up".into(),
+                    remedy: "retry when a running agent finishes".into(),
+                },
             },
             waited: Duration::from_secs(2),
         };
@@ -1611,9 +1654,14 @@ mod tests {
             &gate,
         );
         match &second.answer {
-            HookAnswer::Refuse { reason } => {
+            HookAnswer::Refuse { refusal } => {
+                let reason = refusal.sentence();
                 assert!(reason.contains("waited"), "{reason}");
                 assert!(!reason.contains("cannot hold a tool call open"), "{reason}");
+                assert_eq!(
+                    refusal.rule,
+                    super::super::decide::RefusalRule::QueueTimeout
+                );
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
