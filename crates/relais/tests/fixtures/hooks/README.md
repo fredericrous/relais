@@ -114,3 +114,25 @@ and file contents and assistant messages → a placeholder string.
 
 A fixture asserting on a redacted value is asserting on the redaction. Assert on
 which fields exist, how they relate, and which payloads carry them.
+
+## Harness facts measured beside these payloads
+
+No fixture here shows them — they are about how the harness *behaves*, not
+about a payload's shape — so they are recorded here, with the observation
+that established each, rather than being re-derived by the next reader.
+
+Claude Code 2.1.282, on this machine:
+
+| what | measured |
+|---|---|
+| a hook holds its tool call open | a 5 s hook delayed the call 5.02 s, then it ran |
+| a hook past its handler `timeout` | killed, its answer DISCARDED, **and the call proceeded** |
+| no `timeout` field | no limit observed: a 300 s hook ran to completion, the session waited 312 s |
+| hook delivery is concurrent | a `SubagentStop` fired at +1.70 s while another hook blocked from +0.42 s to +25.44 s |
+| several settings files | they MERGE: a hook in `settings.json` and one in `settings.local.json`, both on `PreToolUse`, both fired on one call |
+| `PostToolUse` on the Agent tool | the LAUNCH, not the end: `duration_ms: 8`, `tool_response.status: "async_launched"`, while the agent ran 6–16 s more |
+
+The second row is why relais derives its handler timeout from the wait it
+configures and answers before it (SPEC §23): an expired hook is not a
+refusal, it is an admission nobody decided. The fifth is why `relais
+doctor` reading one settings file is a bug (#94) and not a simplification.
