@@ -107,6 +107,23 @@ missing here.
 
 ### Fixed
 
+- **A baseline check the wall clock or a signal cut off is
+  `BaselineUnrunnable`, not a baseline failure.** The base's preflight
+  filtered baseline checks for exit-127 "command not found" only, so a
+  check that timed out, was cancelled, or died on a signal fell through
+  to the ordinary failure count — reported as `needs_decision
+  (baseline_failure_not_waived)` alongside a base the checks actually
+  passed on, pointing a reader at "these checks also fail at the base"
+  when the base gave no verdict at all. The baseline preflight in
+  `runner/mod.rs` now also treats `Ended::TimedOut`, `Ended::Cancelled`
+  and `Ended::Signalled` as no-verdict endings, and the block's detail
+  names the check, how it ended (`Ended::describe`) and the wall limit
+  it ran against, so a reader is pointed at contention or at a limit
+  that is too low instead of at broken code. `verify::unrunnable` keeps
+  meaning "command not found" for every caller that asks about a
+  candidate — a candidate check that times out is still, correctly, a
+  failure; only the base's own preflight makes this wider judgement.
+
 - **A coordinator restart keeps the facts its caps depend on.**
   `Ledger::live_dispatches` used to return only a dispatch id, run id
   and pid, so `Coordinator::start` adopted every surviving dispatch

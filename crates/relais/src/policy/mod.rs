@@ -1012,10 +1012,13 @@ pub enum BlockCode {
     AvalToolFailure,
     ContextSizing,
     BaselineVerificationFailed,
-    /// The base revision's checks could not run at all — a program the
-    /// profile names was not found (exit 127) — so the base has no
-    /// verdict and no candidate can be compared to it. Not a baseline
-    /// FAILURE, which is a check that ran and said no.
+    /// The base revision's checks could not run to a verdict — a program
+    /// the profile names was not found (exit 127), or the check was cut
+    /// off before it finished (the wall clock, or a signal) — so the base
+    /// has no verdict and no candidate can be compared to it. Not a
+    /// baseline FAILURE, which is a check that RAN and said no: reporting
+    /// a check that never finished as one sends a reader to look for a
+    /// broken base that is not broken.
     BaselineUnrunnable,
     /// A declared setup command did not succeed in a worktree the run
     /// owns (the base or the task worktree), so the profile's commands
