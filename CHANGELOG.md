@@ -34,6 +34,25 @@ missing here.
   the gap where relais's own spend on a run a person rescued vanished
   from the denominator.
 
+- **A run still waiting on a person can be salvaged too, not only a
+  terminal one (#86).** `relais decide --answer salvaged --candidate
+  <sha>` used to refuse outright whenever a run already carried a
+  decision row of its own — which conflated a run a person had already
+  answered (rightly refused, a second answer) with a run merely waiting
+  on one (wrongly refused: the row is open, nobody has answered it yet).
+  `record_salvage` now tells the two apart: an OPEN row is resolved by
+  the salvage itself, in place of the answer that never came, while a
+  RESOLVED row still refuses a second answer exactly as before. Either
+  way the run's own reason for stopping is kept, never overwritten by the
+  salvage's own resolution, and no decision already recorded is
+  rewritten. `salvaged` is a person's acceptance of specific work — the
+  candidate it names — distinct from `decided`, which resolves a question
+  and says nothing about whether code shipped; its help text, SPEC §9 and
+  SPEC §11 say so now. A release scenario drives the loop the issue
+  measured: a run that stopped `needs_decision` is salvaged, `report`
+  counts its task as accepted by a person with its cost attached, and
+  `feedback` then attaches a correction magnitude to it.
+
 - **A queued spawn now waits for a seat instead of being refused at
   once.** Measured on Claude Code 2.1.282: a `PreToolUse` hook holds its
   tool call open for as long as it runs, so relais no longer has to

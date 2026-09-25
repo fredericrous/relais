@@ -1049,6 +1049,183 @@ fn a_salvaged_run_keeps_its_reason_counts_as_accepted_and_takes_feedback() {
     );
 }
 
+// #86: a run WAITING on a person can be salvaged too. #49's answer was
+// refused whenever a decision row already existed, which conflated the
+// second-answer guard it was written for with every run that merely
+// stopped for a decision — the shape three packages in this workstream
+// took, each finished and merged by hand with no acceptance recorded
+// against its spend. Here the run stops `needs_decision` for a reason
+// unrelated to the work (the candidate left the write scope); the salvage
+// resolves the row already open instead of raising a second, keeps
+// `scope_exceeded` as the reason the run stopped, the report counts the
+// task as accepted by a person with its cost attached, and `feedback`
+// then attaches a correction magnitude to it.
+#[test]
+fn a_run_waiting_on_a_person_is_salvaged_counted_and_takes_feedback() {
+    let world = World::new("salvage-waiting");
+    let hash = world.write_policy(3);
+    world.write_machine(&hash, "");
+    let path = world.root.join("narrow.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "schema_version": 1,
+            "kind": "change",
+            "objective": "Remove the entry point",
+            "base_ref": "HEAD",
+            "write_scope": ["docs/**"],
+            "acceptance": ["src/main.rs no longer exists"],
+            "verification_profile": "default",
+            "review": "off",
+        })
+        .to_string(),
+    )
+    .expect("task");
+    let run = world.relais(&["run", "--task", path.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(8), "{}", text(&run.stderr));
+    assert!(
+        text(&run.stderr).contains("scope_exceeded"),
+        "{}",
+        text(&run.stderr)
+    );
+    let run_id = world.only_run_id();
+
+    // The run is waiting: its decision row is open and nothing is
+    // accepted yet.
+    let report = world.relais(&["report", "--since", "2000-01-01", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&text(&report.stdout)).expect("json");
+    assert_eq!(report["runs"][0]["status"], "needs_decision", "{report}");
+    assert_eq!(report["accepted"], 0, "{report}");
+    assert_eq!(report["open_decisions"][0]["run"], run_id, "{report}");
+    let run_cost = report["runs"][0]["cost"]
+        .as_u64()
+        .expect("a run line carries its cost");
+
+    // A person finished the candidate by hand and merged it: the salvage
+    // is accepted on the waiting run, and reports back the reason the run
+    // stopped for — not a resolution of the question it raised.
+    let salvage = world.relais(&[
+        "decide",
+        &run_id,
+        "--answer",
+        "salvaged",
+        "--actor",
+        "a person",
+        "--candidate",
+        "handmerged789",
+        "--note",
+        "the scope was fine; merged it by hand",
+    ]);
+    assert_eq!(salvage.status.code(), Some(0), "{}", text(&salvage.stderr));
+    assert!(text(&salvage.stdout).contains("decision_salvaged"));
+    assert!(
+        text(&salvage.stdout).contains("scope_exceeded"),
+        "the reason the run stopped for is reported back: {}",
+        text(&salvage.stdout)
+    );
+
+    // The row already open was resolved, not left beside a second one,
+    // and the run is no longer waiting — so the ordinary answers no
+    // longer reach it, and neither does a second salvage.
+    let report = world.relais(&["report", "--since", "2000-01-01", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&text(&report.stdout)).expect("json");
+    assert!(
+        report["open_decisions"]
+            .as_array()
+            .expect("array")
+            .is_empty(),
+        "{report}"
+    );
+    assert_eq!(
+        report["runs"][0]["status"], "accepted_by_person",
+        "{report}"
+    );
+    let redecide = world.relais(&[
+        "decide",
+        &run_id,
+        "--answer",
+        "decided",
+        "--actor",
+        "someone else",
+    ]);
+    assert_eq!(
+        redecide.status.code(),
+        Some(2),
+        "{}",
+        text(&redecide.stderr)
+    );
+    let resalvage = world.relais(&[
+        "decide",
+        &run_id,
+        "--answer",
+        "salvaged",
+        "--actor",
+        "someone else",
+        "--candidate",
+        "other456",
+    ]);
+    assert_eq!(
+        resalvage.status.code(),
+        Some(2),
+        "{}",
+        text(&resalvage.stderr)
+    );
+
+    // `explain` shows the salvage on the decision the run itself raised,
+    // with the reason it stopped for kept beside the resolution.
+    let explain = world.relais(&["explain", &run_id]);
+    let explained = text(&explain.stdout);
+    assert!(explained.contains("decision_salvaged"), "{explained}");
+    assert!(explained.contains("scope_exceeded"), "{explained}");
+    assert!(explained.contains("a person"), "{explained}");
+
+    // The primary metric counts the task as accepted by a person, with
+    // the run's own spend attached to it — the number three packages in
+    // this workstream could only improve by not being rescued.
+    assert_eq!(report["accepted"], 1, "{report}");
+    assert_eq!(report["accepted_tasks_by_person"], 1, "{report}");
+    assert_eq!(report["accepted_tasks_by_relais"], 0, "{report}");
+    let task = &report["tasks"][0];
+    assert_eq!(task["accepted"], true, "{report}");
+    assert_eq!(task["accepted_by_person"], true, "{report}");
+    assert_eq!(task["cost"], run_cost, "{report}");
+    assert_eq!(report["total_cost"], run_cost, "{report}");
+
+    // `feedback` then attaches a magnitude against the candidate the
+    // salvage recorded — the sequence the three packages could not
+    // express.
+    let feedback = world.relais(&[
+        "feedback",
+        &run_id,
+        "--outcome",
+        "corrected",
+        "--candidate",
+        "handmerged789",
+        "--magnitude",
+        "0.25",
+        "--actor",
+        "a person",
+    ]);
+    assert_eq!(
+        feedback.status.code(),
+        Some(0),
+        "{}",
+        text(&feedback.stderr)
+    );
+    let report = world.relais(&["report", "--since", "2000-01-01", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&text(&report.stdout)).expect("json");
+    assert_eq!(report["accepted"], 1, "{report}");
+    assert_eq!(
+        report["standing"], 1,
+        "a correction is a later fact about a change still in the tree: {report}"
+    );
+    assert_eq!(
+        report["pending_feedback"], 0,
+        "the salvaged task is no longer owed a label: {report}"
+    );
+    assert_eq!(report["tasks"][0]["pending_feedback"], false, "{report}");
+}
+
 // SPEC §10: a baseline that cannot run, and a declared setup that does
 // not succeed, are blocked before a worker is launched — with the
 // remedy named, and with `relais plan` and `relais doctor` warning

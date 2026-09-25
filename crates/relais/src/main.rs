@@ -371,11 +371,13 @@ enum DecideAnswer {
     Decided,
     /// The run is abandoned rather than answered further.
     Abandon,
-    /// A person finished and merged the candidate a terminal run left
-    /// behind, for a reason unrelated to the work itself. Unlike every
-    /// other answer, this one applies to a run that never awaited a
-    /// person — `--candidate` is required, and the run's own terminal
-    /// reason is kept, not replaced.
+    /// A person finished and merged specific work — the candidate this
+    /// run's own worktree carried, whether the run ended on its own
+    /// (terminal) or is still waiting on a person — for a reason
+    /// unrelated to the work itself. `decided` resolves a question and
+    /// says nothing about whether code shipped; `salvaged` is a person's
+    /// acceptance of that specific candidate. `--candidate` is required,
+    /// and the run's own reason for stopping is kept, not replaced.
     Salvaged,
 }
 
@@ -2901,11 +2903,12 @@ fn decide_command(
         eprintln!("relais decide: unknown run {run_id}");
         return Ok(CliOutcome::UnknownRun);
     };
-    // `salvaged` answers a run no other answer can reach: one that ended
-    // WITHOUT ever awaiting a person, so it opened no decision row for
-    // `resolve_decision` to close. It takes its own path below rather
-    // than falling into the `awaits_a_person` gate every other answer
-    // shares.
+    // `salvaged` answers a run no other answer can reach: one whose
+    // candidate a person finished and merged themselves, whether the run
+    // ended on its own (never awaiting a person, so it opened no decision
+    // row for `resolve_decision` to close) or is still waiting on one (an
+    // OPEN row of its own). It takes its own path below rather than
+    // falling into the `awaits_a_person` gate every other answer shares.
     if answer == DecideAnswer::Salvaged {
         return salvage_command(
             &ledger,
@@ -3024,12 +3027,16 @@ struct SalvageAnswer<'a> {
     candidate: Option<&'a str>,
 }
 
-/// `relais decide --answer salvaged --candidate <sha>`: a terminal run
-/// relais itself never accepted, whose candidate a person finished and
-/// merged anyway (SPEC's decision spine). Distinct from every other
-/// answer in `decide_command` because this run never awaited a person —
-/// it ended on its own, for a reason [`Ledger::record_salvage`] keeps
-/// rather than overwrites.
+/// `relais decide --answer salvaged --candidate <sha>`: a run relais
+/// itself never accepted, whose candidate a person finished and merged
+/// anyway (SPEC's decision spine) — terminal, or still waiting on a
+/// person. Distinct from every other answer in `decide_command`: a run
+/// that never awaited a person opened no decision row for
+/// `resolve_decision` to close, and even a run that IS waiting is
+/// answered here rather than there, because this is about what happened
+/// to the candidate, not about resolving the question the wait raised.
+/// Either way the run's own reason for stopping is kept, not overwritten,
+/// by [`Ledger::record_salvage`].
 fn salvage_command(
     ledger: &Ledger,
     run: &RunId,
@@ -3048,13 +3055,14 @@ fn salvage_command(
         eprintln!("relais decide: `--successor` does not apply to `--answer salvaged`");
         return Ok(CliOutcome::InvalidInput);
     }
-    // Salvage answers a run that ended on its own, without producing an
-    // accepted candidate: never one still in flight, never one already
-    // accepted the ordinary way or already salvaged once.
+    // Salvage answers a run that has stopped running, without relais
+    // itself producing an accepted candidate: never one still in flight,
+    // never one already accepted the ordinary way or already salvaged
+    // once.
     if !state.is_terminal() || matches!(state, State::Accepted | State::AcceptedByPerson) {
         eprintln!(
-            "relais decide: run {run} is {state} — `salvaged` answers a run that already \
-             ended without an accepted candidate, not one still in flight or already accepted"
+            "relais decide: run {run} is {state} — `salvaged` answers a run that has already \
+             stopped without an accepted candidate, not one still in flight or already accepted"
         );
         return Ok(CliOutcome::InvalidInput);
     }
