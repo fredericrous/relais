@@ -378,16 +378,21 @@ fn doctor_exercises_the_recorded_hook_and_reports_a_refusal() {
     // back to `~/.claude/settings.json`, and this world's home is inside
     // it (see `World::relais_in`), so the path it names proves which file
     // it read.
-    assert!(
-        detail.contains(
-            &world
-                .repo
-                .join(".claude/settings.json")
-                .display()
-                .to_string()
-        ),
-        "{finding}"
-    );
+    //
+    // Matched on this world's unique directory name rather than on the
+    // rendered path: the two disagree about separators on Windows (the
+    // detail carries `…\repo\.claude\settings.json`, a `join` here
+    // produces `…\repo\.claude/settings.json`) and the name is what
+    // actually carries the proof — it holds the pid and a counter, so no
+    // settings.json outside this world can contain it.
+    let world_name = world
+        .root
+        .file_name()
+        .expect("the world root has a name")
+        .to_string_lossy()
+        .into_owned();
+    assert!(detail.contains(&world_name), "{finding}");
+    assert!(detail.contains("settings.json"), "{finding}");
 }
 
 // SPEC §3: doctor names what is missing rather than dying on it, and the
