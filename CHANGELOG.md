@@ -107,6 +107,27 @@ missing here.
 
 ### Fixed
 
+- **A coordinator restart keeps the facts its caps depend on.**
+  `Ledger::live_dispatches` used to return only a dispatch id, run id
+  and pid, so `Coordinator::start` adopted every surviving dispatch
+  with `session_id: "unknown"`, no parent and depth 0 — even though the
+  ledger row already carried its real session and reservation. A
+  restart silently widened the per-session cap, because everything
+  adopted after it shared one session no cap was ever configured for.
+  A new ledger migration (v12) adds `source`, `agent_id`,
+  `parent_dispatch` and `depth` columns to `dispatches` — the session
+  and the reservation were already columns — and `live_dispatches`
+  returns all of it, so adoption carries the real session, parent,
+  depth and reservation forward across a restart, and the caps that
+  bound before it still bind after. A row written before this
+  migration reports its new columns as genuinely unrecorded rather
+  than guessed root/depth-zero (`Attribution::PreMigration`), and
+  `relais coordinator status` counts those dispatches apart
+  (`adopted_pre_migration`). A hook-admitted spawn still writes no
+  ledger row at all, so it is never adopted — a real limit of that
+  path's design, stated in SPEC §23 and the README rather than
+  papered over.
+
 - **The per-session agent cap binds on the hook path.** A spawn's seat
   used to be given back on the Agent tool's `PostToolUse`, taken to be
   the agent's end. It is not: a real Claude Code 2.1.282 session showed

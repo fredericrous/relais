@@ -22,7 +22,7 @@ use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::outcome::{Outcome, OutcomeDetail, OutcomeKind};
 use crate::policy::Tier;
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 11;
+pub const LEDGER_SCHEMA_VERSION: u64 = 12;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -765,6 +765,24 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ALTER TABLE evidence ADD COLUMN criterion_id TEXT;
     "#,
     ),
+    (
+        // A coordinator restart adopts every dispatch `live_dispatches`
+        // still calls `launched` (SPEC §23), but that query named only
+        // `dispatch_id`, `run_id` and `pid` — so adoption filled the
+        // caps a restart cannot re-derive with placeholders: session
+        // "unknown", no parent, depth 0. The session and reservation
+        // were already columns; these four were not. All four are
+        // nullable, so a row from before this step reads back with them
+        // NULL, never guessed — `live_dispatches` reports that row as
+        // unrecorded rather than inventing an answer for it.
+        "v12",
+        r#"
+    ALTER TABLE dispatches ADD COLUMN source TEXT;
+    ALTER TABLE dispatches ADD COLUMN agent_id TEXT;
+    ALTER TABLE dispatches ADD COLUMN parent_dispatch TEXT;
+    ALTER TABLE dispatches ADD COLUMN depth INTEGER;
+    "#,
+    ),
 ];
 
 pub struct Ledger {
@@ -1014,6 +1032,30 @@ pub struct LiveDispatch {
     /// record" and nothing else — a value no process could have is a
     /// corrupt row and reported as one.
     pub pid: Option<Pid>,
+    /// The session this dispatch was launched for, set the moment the
+    /// process was bound (`attach_dispatch_process`) — the same fact a
+    /// fresh admission already carries.
+    pub session_id: Option<String>,
+    /// What was reserved from the run's budget before launch (SPEC §12).
+    pub reserve_micros: i64,
+    /// `Some("managed_run")` on every row this crate ever wrote; `None`
+    /// only for a row from before the migration that added this column —
+    /// the signal `attribution` in `coordinator` reads to tell a fully
+    /// recorded row from one it cannot.
+    pub source: Option<String>,
+    /// The agent bound to this dispatch, when the binding reached the
+    /// ledger before this row stopped being live. Genuinely optional on
+    /// every row, migration or not: nothing currently writes it while a
+    /// dispatch is still `launched`.
+    pub agent_id: Option<String>,
+    /// The dispatch this one descends from. `None` on a post-migration
+    /// row is a fact — this crate only ever writes root dispatches — not
+    /// an unrecorded parent; a pre-migration row (`source` is `None`)
+    /// carries no such fact either way.
+    pub parent_dispatch: Option<String>,
+    /// `Some(0)` on every post-migration row (this crate only ever
+    /// writes root dispatches); `None` only on a pre-migration one.
+    pub depth: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2271,6 +2313,15 @@ impl Ledger {
 
     /// Dispatch intent is persisted BEFORE the process exists (SPEC §12).
     /// A retry with the same dispatch ID is a no-op, not a duplicate.
+    ///
+    /// `parent_dispatch` is always NULL and `depth` always 0: every
+    /// dispatch this function ever writes is a root managed worker a
+    /// runner launches directly (SPEC §23) — a deeper, hook-admitted
+    /// spawn never calls this, and never has a ledger row to adopt at
+    /// all. `source` is always `managed_run` for the same reason: this
+    /// function IS the managed path. Recording the three as constants
+    /// here is stating what is already true at the point of writing, not
+    /// a guess `live_dispatches` would otherwise have to make later.
     pub fn record_dispatch_intent(
         &self,
         dispatch_id: &DispatchId,
@@ -2283,8 +2334,9 @@ impl Ledger {
         let inserted = self.conn.execute(
             "INSERT OR IGNORE INTO dispatches
                 (dispatch_id, run_id, attempt_id, intent_json, state,
-                 reserved_micros, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                 reserved_micros, created_at, updated_at,
+                 source, agent_id, parent_dispatch, depth)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, NULL, NULL, ?9)",
             params![
                 dispatch_id.as_str(),
                 run_id.as_str(),
@@ -2292,7 +2344,9 @@ impl Ledger {
                 serde_json::to_string(intent).expect("intent serializes"),
                 "intent",
                 reserved_micros,
-                now
+                now,
+                "managed_run",
+                0i64,
             ],
         )?;
         Ok(inserted == 1)
@@ -2330,25 +2384,59 @@ impl Ledger {
     /// state — the reconciliation set after a crash or restart. An absent
     /// terminal result never means nothing executed (SPEC §12).
     pub fn live_dispatches(&self) -> Result<Vec<LiveDispatch>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT dispatch_id, run_id, pid FROM dispatches WHERE state = 'launched'")?;
-        type Row = (String, String, Option<i64>);
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        /// One raw row of the adoption query, before the pid is checked
+        /// for corruption — named so the query and the conversion below
+        /// are not stitched together through a tuple wide enough to
+        /// misalign a field by position.
+        struct Row {
+            dispatch: String,
+            run: String,
+            pid: Option<i64>,
+            session_id: Option<String>,
+            reserve_micros: i64,
+            source: Option<String>,
+            agent_id: Option<String>,
+            parent_dispatch: Option<String>,
+            depth: Option<i64>,
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT dispatch_id, run_id, pid, session_id, reserved_micros,
+                    source, agent_id, parent_dispatch, depth
+             FROM dispatches WHERE state = 'launched'",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Row {
+                dispatch: row.get(0)?,
+                run: row.get(1)?,
+                pid: row.get(2)?,
+                session_id: row.get(3)?,
+                reserve_micros: row.get(4)?,
+                source: row.get(5)?,
+                agent_id: row.get(6)?,
+                parent_dispatch: row.get(7)?,
+                depth: row.get(8)?,
+            })
+        })?;
         let rows: Vec<Row> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|(dispatch, run, pid)| {
-                let pid = match pid {
+            .map(|row| {
+                let pid = match row.pid {
                     None => None,
                     Some(raw) => Some(Pid::stored(raw).ok_or_else(|| LedgerError::Corrupt {
-                        what: format!("the pid of dispatch {dispatch}"),
+                        what: format!("the pid of dispatch {}", row.dispatch),
                         detail: format!("`{raw}` is not a process id"),
                     })?),
                 };
                 Ok(LiveDispatch {
-                    dispatch: DispatchId::from_stored(dispatch),
-                    run: RunId::from_stored(run),
+                    dispatch: DispatchId::from_stored(row.dispatch),
+                    run: RunId::from_stored(row.run),
                     pid,
+                    session_id: row.session_id,
+                    reserve_micros: row.reserve_micros,
+                    source: row.source,
+                    agent_id: row.agent_id,
+                    parent_dispatch: row.parent_dispatch,
+                    depth: row.depth,
                 })
             })
             .collect()
@@ -4557,12 +4645,63 @@ mod tests {
                 dispatch: dispatch("disp-1"),
                 run: run("run-d"),
                 pid: Some(Pid::new(4242)),
+                session_id: Some("sess-1".into()),
+                reserve_micros: 0,
+                source: Some("managed_run".into()),
+                agent_id: None,
+                parent_dispatch: None,
+                depth: Some(0),
             }]
         );
         ledger
             .finish_dispatch(&dispatch("disp-1"), "completed")
             .expect("finish");
         assert!(ledger.live_dispatches().expect("live").is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A row a pre-v12 binary wrote and never revisited: `source`,
+    // `agent_id`, `parent_dispatch` and `depth` were never columns it
+    // could have filled in, so they read back NULL forever. `live_dispatches`
+    // must report that as absent, not silently reuse the post-migration
+    // default of "root, depth 0, managed_run".
+    #[test]
+    fn a_pre_migration_row_reports_its_new_columns_as_unrecorded() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-legacy"), "/repo", None, &task("run-legacy"), "rk")
+            .expect("run");
+        // What a pre-v12 `record_dispatch_intent` + `attach_dispatch_process`
+        // pair would have left behind: session and reservation set, the
+        // four new columns never touched.
+        ledger
+            .conn
+            .execute(
+                "INSERT INTO dispatches
+                    (dispatch_id, run_id, intent_json, state, pid, session_id,
+                     reserved_micros, created_at, updated_at)
+                 VALUES ('legacy-1', 'run-legacy', '{}', 'launched', 4242, 'sess-old',
+                         500, 'now', 'now')",
+                [],
+            )
+            .expect("legacy row");
+        let live = ledger.live_dispatches().expect("live");
+        assert_eq!(
+            live,
+            vec![LiveDispatch {
+                dispatch: dispatch("legacy-1"),
+                run: run("run-legacy"),
+                pid: Some(Pid::new(4242)),
+                session_id: Some("sess-old".into()),
+                reserve_micros: 500,
+                source: None,
+                agent_id: None,
+                parent_dispatch: None,
+                depth: None,
+            }],
+            "session and reservation were already columns and read back; \
+             source, parent and depth did not exist yet and read back absent"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

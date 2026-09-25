@@ -198,6 +198,12 @@ mod tests {
             dispatch: DispatchId::from_stored(dispatch.to_string()),
             run: RunId::from_stored("run-1"),
             pid: pid.map(Pid::new),
+            session_id: Some("tab".into()),
+            reserve_micros: 0,
+            source: Some("managed_run".into()),
+            agent_id: None,
+            parent_dispatch: None,
+            depth: Some(0),
         }
     }
 

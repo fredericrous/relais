@@ -1456,6 +1456,13 @@ fn coordinator_status_command(socket: &Path, json: bool) -> Result<CliOutcome, C
         snapshot.over_admitted
     );
     println!("sessions: {}", snapshot.sessions.join(", "));
+    if snapshot.adopted_pre_migration > 0 {
+        println!(
+            "adopted from a pre-migration ledger row: {} — session and reservation are real, \
+             parent and depth are unrecorded and enforced as root/zero",
+            snapshot.adopted_pre_migration
+        );
+    }
     if !snapshot.bound_processes.is_empty() {
         // How old the liveness check behind each binding is: the window
         // in which the OS could have recycled the number cannot be
