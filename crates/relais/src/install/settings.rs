@@ -51,6 +51,54 @@
 
 use serde_json::Value;
 use std::path::Path;
+use std::time::Duration;
+
+/// Extra slack the derived `PreToolUse` handler timeout carries beyond
+/// the arithmetic of the wait and the wire timeouts: process startup and
+/// teardown around the hook binary itself, and scheduling jitter. Named
+/// rather than folded into either budget, because it belongs to neither.
+pub const HANDLER_TIMEOUT_MARGIN: Duration = Duration::from_secs(5);
+
+/// A modest, explicit timeout for every handler that is not `PreToolUse`.
+/// None of them can hold a tool call open — `hook::decide`'s module doc:
+/// only `PreToolUse` still can — so none needs the derived budget below.
+/// But an ABSENT `timeout` field waits indefinitely (300 s measured on
+/// Claude Code 2.1.282, and nothing suggests that is a ceiling — SPEC
+/// §23), so every handler relais installs carries one explicitly, this
+/// one included.
+pub const OTHER_HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The `PreToolUse` handler timeout the installer must write so relais
+/// always answers before the harness stops listening. An expired hook is
+/// not a refusal — it is an admission nobody decided (SPEC §23) — so the
+/// hook has to stop polling at its own deadline (`queue_wait`) with
+/// enough of this budget left to withdraw its own request and print a
+/// refusal: a connect, and two coordinator round trips (the admit that
+/// gave up, and the withdraw that follows it), plus a stated margin for
+/// everything around the hook binary itself that is not the arithmetic
+/// of waiting.
+///
+/// Derived, not chosen: raising `queue_wait_secs` without raising this
+/// cannot compile-and-ship (see the test beside this function).
+pub fn derived_pretooluse_timeout(queue_wait: Duration) -> Duration {
+    queue_wait
+        + crate::ipc::CONNECT_TIMEOUT
+        + 2 * crate::coordinator::REQUEST_TIMEOUT
+        + HANDLER_TIMEOUT_MARGIN
+}
+
+/// The handler timeout, in whole seconds, [`apply_hooks`] must record for
+/// one event: the derived budget for `PreToolUse`, the modest explicit
+/// one for everything else. Not a match over an enum — `event` is a
+/// plain name out of [`HOOK_TARGETS`], never a type this crate owns — so
+/// there is no exhaustiveness concern to trade away here.
+fn handler_timeout_secs(event: &str, queue_wait: Duration) -> u64 {
+    if event == "PreToolUse" {
+        derived_pretooluse_timeout(queue_wait).as_secs()
+    } else {
+        OTHER_HANDLER_TIMEOUT.as_secs()
+    }
+}
 
 /// The seven live targets, paired with the matcher relais installs for
 /// each. The three tool-scoped events are matched to the Agent tool and
@@ -84,8 +132,13 @@ pub fn hook_command(relais_binary: &Path) -> String {
 /// What one target's plan says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookEventAction {
-    /// relais's command is already on this event: nothing to do.
+    /// relais's command is already on this event, with the timeout
+    /// currently required: nothing to do.
     Current,
+    /// relais's command is already on this event, but its recorded
+    /// `timeout` is absent or no longer covers `queue_wait_secs`: it is
+    /// corrected in place, nothing else about the entry changes.
+    CorrectTimeout,
     /// An entry already matches relais's matcher; its command joins that
     /// entry's `hooks` array.
     JoinExisting,
@@ -164,15 +217,22 @@ pub fn render_like(original: Option<&str>, value: &Value) -> String {
 /// The fragment relais would add, for a person to paste in by hand when
 /// the file itself is refused. Shows every target relais installs,
 /// exactly as [`apply_hooks`] would add it to an empty document.
-fn paste_block(relais_binary: &Path) -> String {
+fn paste_block(relais_binary: &Path, queue_wait: Duration) -> String {
     let mut value = serde_json::json!({});
-    apply_hooks(&mut value, relais_binary);
+    apply_hooks(&mut value, relais_binary, queue_wait);
     render_canonical(&value)
 }
 
 /// Plan the hook wiring against a settings document that may not exist
 /// yet (`existing_text: None`) or may be invalid or unrenderable JSON.
-pub fn plan_hooks(existing_text: Option<&str>, relais_binary: &Path) -> HooksPlan {
+/// `queue_wait` is the admission wait currently configured
+/// (`policy::HookAdmissionSettings::queue_behaviour`'s bound, zero for
+/// `RefuseImmediately`): what the `PreToolUse` timeout must cover.
+pub fn plan_hooks(
+    existing_text: Option<&str>,
+    relais_binary: &Path,
+    queue_wait: Duration,
+) -> HooksPlan {
     let value: Value = match existing_text {
         None => serde_json::json!({}),
         Some(text) => match serde_json::from_str(text) {
@@ -180,7 +240,7 @@ pub fn plan_hooks(existing_text: Option<&str>, relais_binary: &Path) -> HooksPla
             Err(e) => {
                 return HooksPlan::Unrenderable {
                     reason: format!("settings.json is not valid JSON: {e}"),
-                    paste_block: paste_block(relais_binary),
+                    paste_block: paste_block(relais_binary, queue_wait),
                 }
             }
         },
@@ -193,22 +253,28 @@ pub fn plan_hooks(existing_text: Option<&str>, relais_binary: &Path) -> HooksPla
                          editing it here would bury the change in reformatting nobody asked \
                          for"
                 .to_string(),
-                paste_block: paste_block(relais_binary),
+                paste_block: paste_block(relais_binary, queue_wait),
             };
         }
     }
     HooksPlan::Ready {
-        events: plan_events(&value, relais_binary),
+        events: plan_events(&value, relais_binary, queue_wait),
     }
 }
 
-fn plan_events(value: &Value, relais_binary: &Path) -> Vec<HookEventPlan> {
+fn plan_events(value: &Value, relais_binary: &Path, queue_wait: Duration) -> Vec<HookEventPlan> {
     let command = hook_command(relais_binary);
     HOOK_TARGETS
         .iter()
         .map(|(event, matcher)| HookEventPlan {
             event,
-            action: event_action(value, event, *matcher, &command),
+            action: event_action(
+                value,
+                event,
+                *matcher,
+                &command,
+                handler_timeout_secs(event, queue_wait),
+            ),
         })
         .collect()
 }
@@ -244,6 +310,40 @@ fn entry_has_command(entry: &Value, command: &str) -> bool {
         })
 }
 
+/// The `timeout` recorded on the leaf hook object whose command is
+/// `command`, if that leaf exists anywhere in this event's entries.
+/// `Some(None)` means the leaf exists but carries no `timeout` field at
+/// all — the absent-timeout case a re-run must correct.
+fn entry_command_timeout_secs(entries: &[Value], command: &str) -> Option<Option<u64>> {
+    entries.iter().find_map(|entry| {
+        entry
+            .get("hooks")?
+            .as_array()?
+            .iter()
+            .find(|hook| {
+                hook.get("type").and_then(Value::as_str) == Some("command")
+                    && hook.get("command").and_then(Value::as_str) == Some(command)
+            })
+            .map(|hook| hook.get("timeout").and_then(Value::as_u64))
+    })
+}
+
+/// The leaf hook object whose command is `command`, mutably, wherever it
+/// sits among this event's entries — for [`apply_hooks`] to correct its
+/// `timeout` in place rather than pushing a duplicate.
+fn entry_command_hook_mut<'a>(array: &'a mut [Value], command: &str) -> Option<&'a mut Value> {
+    array.iter_mut().find_map(|entry| {
+        entry
+            .get_mut("hooks")?
+            .as_array_mut()?
+            .iter_mut()
+            .find(|hook| {
+                hook.get("type").and_then(Value::as_str) == Some("command")
+                    && hook.get("command").and_then(Value::as_str) == Some(command)
+            })
+    })
+}
+
 /// What one event needs. An entry is relais's to join when its matcher
 /// is the same string relais installs — see the module doc on why a
 /// different matcher is not widened but gets its own entry.
@@ -252,13 +352,15 @@ fn event_action(
     event: &str,
     matcher: Option<&str>,
     command: &str,
+    required_timeout_secs: u64,
 ) -> HookEventAction {
     let entries = entries(value, event);
-    if entries
-        .iter()
-        .any(|entry| entry_has_command(entry, command))
-    {
-        return HookEventAction::Current;
+    if let Some(recorded) = entry_command_timeout_secs(entries, command) {
+        return if recorded == Some(required_timeout_secs) {
+            HookEventAction::Current
+        } else {
+            HookEventAction::CorrectTimeout
+        };
     }
     if entries.iter().any(|entry| entry_matcher(entry) == matcher) {
         HookEventAction::JoinExisting
@@ -268,16 +370,22 @@ fn event_action(
 }
 
 /// Apply the wiring in place: join relais's command into a matching
-/// entry, or append a fresh entry, for every event that is not already
-/// current. Returns the events actually changed, in target order.
+/// entry, append a fresh entry, or correct an already-present entry's
+/// `timeout`, for every event that is not already current. Returns the
+/// events actually changed, in target order.
 ///
 /// Never called on a document that has not just been confirmed to round
 /// trip — the caller re-checks that at write time, the same way the file
 /// install re-checks its own markers between plan and apply (C9).
-pub fn apply_hooks(value: &mut Value, relais_binary: &Path) -> Vec<&'static str> {
+pub fn apply_hooks(
+    value: &mut Value,
+    relais_binary: &Path,
+    queue_wait: Duration,
+) -> Vec<&'static str> {
     let command = hook_command(relais_binary);
     let mut changed = Vec::new();
     for (event, matcher) in HOOK_TARGETS {
+        let required = handler_timeout_secs(event, queue_wait);
         let array = value
             .as_object_mut()
             .expect("a JSON document is always an object at its root here")
@@ -289,13 +397,19 @@ pub fn apply_hooks(value: &mut Value, relais_binary: &Path) -> Vec<&'static str>
             .or_insert_with(|| serde_json::json!([]))
             .as_array_mut()
             .expect("an event's hooks are always an array");
-        if array.iter().any(|entry| entry_has_command(entry, &command)) {
+        if let Some(hook) = entry_command_hook_mut(array, &command) {
+            let recorded = hook.get("timeout").and_then(Value::as_u64);
+            if recorded != Some(required) {
+                hook["timeout"] = serde_json::json!(required);
+                changed.push(event);
+            }
             continue;
         }
         let joined = array
             .iter_mut()
             .find(|entry| entry_matcher(entry) == matcher);
-        let hook_object = serde_json::json!({"type": "command", "command": command});
+        let hook_object =
+            serde_json::json!({"type": "command", "command": command, "timeout": required});
         match joined {
             Some(entry) => {
                 entry
@@ -482,7 +596,7 @@ mod tests {
 
     #[test]
     fn planning_an_absent_file_wants_all_seven_as_new_entries() {
-        let plan = plan_hooks(None, binary());
+        let plan = plan_hooks(None, binary(), Duration::from_secs(2));
         let HooksPlan::Ready { events } = plan else {
             panic!("an absent file is always renderable");
         };
@@ -493,10 +607,10 @@ mod tests {
     #[test]
     fn applying_then_planning_again_finds_nothing_left_to_do() {
         let mut value = serde_json::json!({});
-        let changed = apply_hooks(&mut value, binary());
+        let changed = apply_hooks(&mut value, binary(), Duration::from_secs(2));
         assert_eq!(changed.len(), 7, "{changed:?}");
         let rendered = render_canonical(&value);
-        let plan = plan_hooks(Some(&rendered), binary());
+        let plan = plan_hooks(Some(&rendered), binary(), Duration::from_secs(2));
         let HooksPlan::Ready { events } = plan else {
             panic!("relais's own canonical rendering always round-trips: {rendered}");
         };
@@ -515,11 +629,11 @@ mod tests {
                 ]
             }
         });
-        let plan = plan_events(&value, binary());
+        let plan = plan_events(&value, binary(), Duration::from_secs(2));
         let pre = plan.iter().find(|e| e.event == "PreToolUse").unwrap();
         assert_eq!(pre.action, HookEventAction::JoinExisting);
 
-        apply_hooks(&mut value, binary());
+        apply_hooks(&mut value, binary(), Duration::from_secs(2));
         let entries = value["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(
             entries.len(),
@@ -543,7 +657,7 @@ mod tests {
                 ]
             }
         });
-        apply_hooks(&mut value, binary());
+        apply_hooks(&mut value, binary(), Duration::from_secs(2));
         let entries = value["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(
             entries.len(),
@@ -601,7 +715,7 @@ mod tests {
     #[test]
     fn a_hand_formatted_file_is_refused_rather_than_rewritten() {
         let hand_written = "{\n  \"hooks\": {\n    \"PreToolUse\":[]\n  }\n}\n";
-        let plan = plan_hooks(Some(hand_written), binary());
+        let plan = plan_hooks(Some(hand_written), binary(), Duration::from_secs(2));
         let HooksPlan::Unrenderable {
             reason,
             paste_block,
@@ -624,13 +738,13 @@ mod tests {
     #[test]
     fn the_trailing_newline_is_the_only_tolerated_difference_and_is_preserved() {
         let mut value = serde_json::json!({});
-        apply_hooks(&mut value, binary());
+        apply_hooks(&mut value, binary(), Duration::from_secs(2));
         let canonical = render_canonical(&value);
 
         let with_newline = format!("{canonical}\n");
         assert!(
             matches!(
-                plan_hooks(Some(&with_newline), binary()),
+                plan_hooks(Some(&with_newline), binary(), Duration::from_secs(2)),
                 HooksPlan::Ready { .. }
             ),
             "a trailing newline is accepted"
@@ -643,7 +757,7 @@ mod tests {
 
         assert!(
             matches!(
-                plan_hooks(Some(&canonical), binary()),
+                plan_hooks(Some(&canonical), binary(), Duration::from_secs(2)),
                 HooksPlan::Ready { .. }
             ),
             "no trailing newline is accepted too"
@@ -661,7 +775,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    plan_hooks(Some(&text), binary()),
+                    plan_hooks(Some(&text), binary(), Duration::from_secs(2)),
                     HooksPlan::Unrenderable { .. }
                 ),
                 "{label} must be refused: relais cannot write that tail back"
@@ -675,7 +789,7 @@ mod tests {
 
     #[test]
     fn invalid_json_is_refused_with_a_reason_naming_the_parse_error() {
-        let plan = plan_hooks(Some("not json {{{"), binary());
+        let plan = plan_hooks(Some("not json {{{"), binary(), Duration::from_secs(2));
         let HooksPlan::Unrenderable { reason, .. } = plan else {
             panic!("invalid JSON must be refused");
         };
@@ -698,5 +812,140 @@ mod tests {
             hook_command(Path::new("/opt/relais/bin/relais")),
             "/opt/relais/bin/relais hook"
         );
+    }
+
+    /// The derived formula covers the wait plus every wire timeout the
+    /// hook's own polling can spend, plus a margin — for the SHIPPED
+    /// defaults, not a hand-picked example. Reads the live constants
+    /// rather than hardcoding a number, so raising `queue_wait_secs`'s
+    /// default without raising this cannot compile-and-ship: the
+    /// inequality is checked against whatever those constants currently
+    /// are, not a snapshot of them.
+    #[test]
+    fn the_derived_pretooluse_timeout_covers_the_shipped_default_wait() {
+        let queue_wait = Duration::from_secs(crate::policy::DEFAULT_QUEUE_WAIT_SECS);
+        let derived = derived_pretooluse_timeout(queue_wait);
+        let floor =
+            queue_wait + crate::ipc::CONNECT_TIMEOUT + 2 * crate::coordinator::REQUEST_TIMEOUT;
+        assert!(
+            derived >= floor,
+            "derived {derived:?} must cover at least the wait plus the wire timeouts {floor:?}"
+        );
+        assert!(
+            derived > floor,
+            "and strictly more, by the stated margin: {derived:?} vs {floor:?}"
+        );
+    }
+
+    /// Every handler [`apply_hooks`] installs carries an explicit
+    /// `timeout` — an absent one waits indefinitely (SPEC §23) — and
+    /// `PreToolUse`'s is exactly the derived formula, never a number
+    /// duplicated at the call site.
+    #[test]
+    fn every_installed_handler_carries_the_timeout_the_formula_says_it_should() {
+        let mut value = serde_json::json!({});
+        let queue_wait = Duration::from_secs(7);
+        apply_hooks(&mut value, binary(), queue_wait);
+        for (event, _matcher) in HOOK_TARGETS {
+            let hooks = value["hooks"][event][0]["hooks"].as_array().unwrap();
+            let timeout = hooks[0]["timeout"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{event} has no timeout: {:?}", hooks[0]));
+            let expected = if event == "PreToolUse" {
+                derived_pretooluse_timeout(queue_wait).as_secs()
+            } else {
+                OTHER_HANDLER_TIMEOUT.as_secs()
+            };
+            assert_eq!(timeout, expected, "{event}");
+        }
+    }
+
+    /// A re-run with a larger configured wait corrects the recorded
+    /// `PreToolUse` timeout in place — joining nothing new, duplicating
+    /// nothing — because a settings file whose timeout no longer covers
+    /// the configured wait is exactly the state `doctor` must be able to
+    /// catch, and installing over it is how it stops being true.
+    #[test]
+    fn reapplying_with_a_larger_queue_wait_corrects_a_stale_pretooluse_timeout() {
+        let mut value = serde_json::json!({});
+        apply_hooks(&mut value, binary(), Duration::from_secs(2));
+        let old_timeout = value["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"]
+            .as_u64()
+            .unwrap();
+
+        let rendered = render_canonical(&value);
+        let plan = plan_hooks(Some(&rendered), binary(), Duration::from_secs(30));
+        let HooksPlan::Ready { events } = plan else {
+            panic!("relais's own rendering always round-trips");
+        };
+        let pre = events.iter().find(|e| e.event == "PreToolUse").unwrap();
+        assert_eq!(pre.action, HookEventAction::CorrectTimeout);
+        // Every other event's timeout does not depend on the wait, so a
+        // wait change alone must not touch them.
+        assert!(events
+            .iter()
+            .filter(|e| e.event != "PreToolUse")
+            .all(|e| e.action == HookEventAction::Current));
+
+        let changed = apply_hooks(&mut value, binary(), Duration::from_secs(30));
+        assert_eq!(changed, vec!["PreToolUse"]);
+        let new_timeout = value["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"]
+            .as_u64()
+            .unwrap();
+        assert!(new_timeout > old_timeout, "{old_timeout} vs {new_timeout}");
+        assert_eq!(
+            new_timeout,
+            derived_pretooluse_timeout(Duration::from_secs(30)).as_secs()
+        );
+
+        // Idempotent from here: re-planning at the same wait finds
+        // nothing left to correct.
+        let replan = plan_hooks(
+            Some(&render_canonical(&value)),
+            binary(),
+            Duration::from_secs(30),
+        );
+        let HooksPlan::Ready { events } = replan else {
+            panic!("relais's own rendering always round-trips");
+        };
+        assert!(events.iter().all(|e| e.action == HookEventAction::Current));
+    }
+
+    /// An entry an OLDER relais installed — before `timeout` existed at
+    /// all — is corrected on the next `--hooks` re-run rather than left
+    /// with an absent timeout: `install --claude --hooks` re-run over a
+    /// settings file an older relais wrote must add one, not skip it as
+    /// "already current".
+    #[test]
+    fn reapplying_over_an_older_entry_with_no_timeout_field_adds_one() {
+        let mut value = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Agent|Task", "hooks": [
+                        {"type": "command", "command": hook_command(binary())}
+                    ]}
+                ]
+            }
+        });
+        let plan = plan_events(&value, binary(), Duration::from_secs(2));
+        let pre = plan.iter().find(|e| e.event == "PreToolUse").unwrap();
+        assert_eq!(pre.action, HookEventAction::CorrectTimeout);
+
+        let changed = apply_hooks(&mut value, binary(), Duration::from_secs(2));
+        assert!(
+            changed.contains(&"PreToolUse"),
+            "PreToolUse must be corrected: {changed:?}"
+        );
+        let timeout = value["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(
+            timeout,
+            derived_pretooluse_timeout(Duration::from_secs(2)).as_secs()
+        );
+        // The foreign matcher entry it joined is otherwise untouched:
+        // still one entry, still the same matcher.
+        let entries = value["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
     }
 }

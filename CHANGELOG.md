@@ -8,6 +8,35 @@ missing here.
 
 ## Unreleased
 
+### Added
+
+- **A queued spawn now waits for a seat instead of being refused at
+  once.** Measured on Claude Code 2.1.282: a `PreToolUse` hook holds its
+  tool call open for as long as it runs, so relais no longer has to
+  refuse a spawn the moment it queues — the refusal that used to say "a
+  hook cannot hold a tool call open" was false. `queue_wait_secs` under
+  `[admission]` in machine.toml (default: 2 seconds) names how long a
+  queued spawn polls for a freed seat before giving up; zero keeps
+  today's immediate refusal. The polling re-asks the coordinator's
+  existing admission protocol at `runner::ADMISSION_POLL`'s cadence — the
+  same one `relais run` already uses — so no new coordinator request or
+  wire message was needed. The `PreToolUse` handler timeout `relais
+  install --claude --hooks` writes is now derived from the wait (plus
+  the coordinator's own connect and round-trip timeouts, plus a margin)
+  rather than left absent — an absent `timeout` field waits
+  indefinitely, measured at 300 seconds with nothing suggesting a
+  ceiling — and every other installed handler now carries an explicit,
+  modest one too. `relais doctor` fails (not warns) when a recorded
+  settings.json timeout no longer covers the configured wait, since the
+  hook cannot read its own handler timeout and a stale one silently
+  turns every capped spawn into an admission nobody decided. A hook
+  killed mid-wait cannot strand the seat it was waiting on: an admitted
+  but never-claimed dispatch is now reaped on its own short grace
+  (`admission::UNCLAIMED_GRACE`, 5 seconds) rather than a lease's
+  300-second one. The hook journal now records `waited_ms` and an
+  `outcome` (`immediate`, `admitted_after_waiting`, or
+  `refused_after_waiting`) for every firing.
+
 ### Changed
 
 - **BREAKING: the coordinator wire protocol is now 3

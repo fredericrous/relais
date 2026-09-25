@@ -180,8 +180,10 @@ pub struct RunConfig<'a> {
     pub task_override: Option<&'a crate::ids::TaskId>,
 }
 
-/// Poll period while queued for admission.
-const ADMISSION_POLL: Duration = Duration::from_millis(250);
+/// Poll period while queued for admission. `pub(crate)`: `hook::respond`
+/// polls a queued spawn at the same cadence, reusing this constant rather
+/// than inventing a second one beside it.
+pub(crate) const ADMISSION_POLL: Duration = Duration::from_millis(250);
 
 /// How many consecutive unanswered heartbeats make a coordinator
 /// unreachable rather than slow (R6). Cancellation travels on the

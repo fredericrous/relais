@@ -11,6 +11,7 @@
 //! invalidates them.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -785,6 +786,21 @@ pub struct HookAdmissionSettings {
     pub dispatch_reserve_micros: MicroUsd,
     /// What a hook does when the coordinator cannot be reached.
     pub on_coordinator_unreachable: CoordinatorUnreachableBehavior,
+    /// How long a `PreToolUse` spawn queued for a seat may wait before
+    /// the hook gives up, in seconds; zero means give up at once. This is
+    /// the raw number machine.toml stores — see [`HookAdmissionSettings::queue_behaviour`],
+    /// the one place that decides what zero means. Nothing else in this
+    /// crate reads the field directly.
+    ///
+    /// Measured on Claude Code 2.1.282 (SPEC §23): a `PreToolUse` hook
+    /// holds its tool call open for as long as it runs, so a hook CAN
+    /// wait for a freed seat rather than refusing at once — this is the
+    /// budget for that wait. Short by default (two seconds): the case
+    /// this serves is an agent finishing right now, and a long default
+    /// would buy stalls and widen the window in which a hook killed
+    /// mid-wait can strand a seat (bounded instead by
+    /// `admission::UNCLAIMED_GRACE`).
+    pub queue_wait_secs: u64,
 }
 
 impl Default for HookAdmissionSettings {
@@ -793,6 +809,36 @@ impl Default for HookAdmissionSettings {
             binding_lease_secs: 120,
             dispatch_reserve_micros: MicroUsd::ZERO,
             on_coordinator_unreachable: CoordinatorUnreachableBehavior::CarryOn,
+            queue_wait_secs: DEFAULT_QUEUE_WAIT_SECS,
+        }
+    }
+}
+
+/// The default `queue_wait_secs`, named so the constant is not repeated
+/// inside its own default and readable at a glance rather than derived
+/// from the doc comment above it.
+pub const DEFAULT_QUEUE_WAIT_SECS: u64 = 2;
+
+/// What a queued `PreToolUse` spawn does about the wait: give up at once
+/// (`queue_wait_secs = 0`, exactly today's behaviour), or hold the tool
+/// call open and poll for a seat up to a bound. A named choice, not a
+/// bare integer read for its sign or its zero-ness at each call site —
+/// see [`HookAdmissionSettings::queue_behaviour`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueBehaviour {
+    RefuseImmediately,
+    WaitUpTo(Duration),
+}
+
+impl HookAdmissionSettings {
+    /// The one place that decides what `queue_wait_secs` means: zero is
+    /// [`QueueBehaviour::RefuseImmediately`], exactly as before this
+    /// field existed; anything else is a bound to wait up to. Every other
+    /// reader of the wait consults this, never the raw integer.
+    pub fn queue_behaviour(&self) -> QueueBehaviour {
+        match self.queue_wait_secs {
+            0 => QueueBehaviour::RefuseImmediately,
+            secs => QueueBehaviour::WaitUpTo(Duration::from_secs(secs)),
         }
     }
 }
@@ -1451,6 +1497,33 @@ keys = ["output.contract"]
         assert_eq!(
             machine.admission.on_coordinator_unreachable,
             CoordinatorUnreachableBehavior::CarryOn
+        );
+        assert_eq!(machine.admission.queue_wait_secs, DEFAULT_QUEUE_WAIT_SECS);
+        assert_eq!(
+            machine.admission.queue_behaviour(),
+            QueueBehaviour::WaitUpTo(Duration::from_secs(2))
+        );
+    }
+
+    /// The single place that decides what `queue_wait_secs` means: zero
+    /// is refuse-at-once, exactly today's behaviour before this field
+    /// existed; anything else is a bound to wait up to. No other code
+    /// path may read the raw integer and decide for itself.
+    #[test]
+    fn queue_behaviour_is_the_one_place_zero_means_refuse_immediately() {
+        let zero = HookAdmissionSettings {
+            queue_wait_secs: 0,
+            ..HookAdmissionSettings::default()
+        };
+        assert_eq!(zero.queue_behaviour(), QueueBehaviour::RefuseImmediately);
+
+        let five = HookAdmissionSettings {
+            queue_wait_secs: 5,
+            ..HookAdmissionSettings::default()
+        };
+        assert_eq!(
+            five.queue_behaviour(),
+            QueueBehaviour::WaitUpTo(Duration::from_secs(5))
         );
     }
 

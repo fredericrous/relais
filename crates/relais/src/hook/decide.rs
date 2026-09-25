@@ -32,6 +32,8 @@
 //! this — until then it is matched explicitly below, alongside every other
 //! phase, and resolves to silence like the rest.
 
+use std::time::Duration;
+
 use super::event::{HookEvent, ToolCallPhase};
 use crate::admission::{Decision, Refusal};
 use crate::policy::{CoordinatorUnreachableBehavior, HookAdmissionSettings};
@@ -90,12 +92,16 @@ impl HookAnswer {
 pub type CoordinatorAnswer = Option<Decision>;
 
 /// Decide what a hook should do about one event, as a pure function of the
-/// event, the machine's admission settings and whatever the coordinator
-/// answered.
+/// event, the machine's admission settings, whatever the coordinator
+/// answered, and how long `respond::wait_for_a_seat` already waited for
+/// it. `waited` is a value handed in, never a clock read here: the
+/// sleeping, the clock and the socket all live in `respond` (SPEC §23),
+/// and this function stays pure and total.
 pub fn decide(
     event: &HookEvent,
     settings: &HookAdmissionSettings,
     coordinator: CoordinatorAnswer,
+    waited: Duration,
 ) -> HookAnswer {
     match event {
         HookEvent::SessionStart(_)
@@ -106,7 +112,7 @@ pub fn decide(
         HookEvent::AgentToolCall(call) => match call.phase {
             // Only `Pre` still holds the tool call open long enough to
             // refuse it.
-            ToolCallPhase::Pre => decide_spawn(settings, coordinator),
+            ToolCallPhase::Pre => decide_spawn(settings, coordinator, waited),
             ToolCallPhase::Post { .. } => HookAnswer::Silent,
             // Never observed to fire (see module doc); matched explicitly
             // rather than folded into a wildcard, so the exclusion is
@@ -117,8 +123,13 @@ pub fn decide(
 }
 
 /// Decide about one spawn (a `PreToolUse` on the Agent tool), given what
-/// the coordinator answered.
-fn decide_spawn(settings: &HookAdmissionSettings, coordinator: CoordinatorAnswer) -> HookAnswer {
+/// the coordinator answered and how long this firing already waited for
+/// it.
+fn decide_spawn(
+    settings: &HookAdmissionSettings,
+    coordinator: CoordinatorAnswer,
+    waited: Duration,
+) -> HookAnswer {
     match coordinator {
         None => match settings.on_coordinator_unreachable {
             // Carrying on records the outage elsewhere and stays silent
@@ -138,26 +149,44 @@ fn decide_spawn(settings: &HookAdmissionSettings, coordinator: CoordinatorAnswer
         // Neither says yes on the person's behalf — see the module doc —
         // they simply have nothing to refuse.
         Some(Decision::Granted | Decision::AlreadyAdmitted) => HookAnswer::Silent,
-        // Queued is REFUSED, not waited out. A hook cannot hold a tool
-        // call open: it answers now or the call proceeds. Staying silent
-        // would let the agent run anyway AND leave the queue entry
-        // counting against the run's cap until it lapsed — the spawn
-        // admitted twice over, once in fact and once on paper.
-        //
-        // Refusing is the honest translation of "not yet" for a caller
-        // that has no later. The seat is released by the refusal path,
-        // which is the only chance there will be to release it.
+        // Still queued after `respond::wait_for_a_seat` has already
+        // waited up to `settings.queue_behaviour()`'s bound: refused now,
+        // not silently. Measured on Claude Code 2.1.282 (SPEC §23): a
+        // hook DOES hold its tool call open for as long as it runs, so
+        // this is not "cannot wait" — it waited exactly `waited`, and is
+        // giving up because a hook cannot wait forever, and the harness's
+        // own handler timeout is a hard ceiling this one must answer
+        // inside of (`install::settings::derived_pretooluse_timeout`).
+        // Staying silent instead would let the agent run anyway AND leave
+        // the queue entry counting against the run's cap — the spawn
+        // admitted twice over, once in fact and once on paper — so the
+        // seat is released by the wait itself before this is ever
+        // printed.
         Some(Decision::Queued { position }) => HookAnswer::Refuse {
             reason: format!(
                 "relais did not admit this agent: the session is at its limit and this spawn \
-                 was queued at position {position}, but a hook cannot hold a tool call open \
-                 while it waits. Retry when a running agent finishes, or start the work with \
-                 `relais run`, which can wait."
+                 was queued at position {position}. relais waited {} for a seat before giving \
+                 up. Retry when a running agent finishes, or start the work with `relais run`, \
+                 which can wait longer.",
+                format_waited(waited),
             ),
         },
         Some(Decision::Refused { code, detail }) => HookAnswer::Refuse {
             reason: refusal_message(code, &detail),
         },
+    }
+}
+
+/// How long this firing waited, rendered the way a person reads it
+/// rather than as a raw millisecond count. Whole seconds once the wait
+/// crosses one, because nobody needs sub-second precision on a bound that
+/// defaults to two seconds; milliseconds below that, because "0 seconds"
+/// would understate a real, if short, wait.
+fn format_waited(waited: Duration) -> String {
+    if waited >= Duration::from_secs(1) {
+        format!("{:.1}s", waited.as_secs_f64())
+    } else {
+        format!("{}ms", waited.as_millis())
     }
 }
 
@@ -212,9 +241,10 @@ pub fn decide_or_silent(
     event: &HookEvent,
     settings: &HookAdmissionSettings,
     coordinator: CoordinatorAnswer,
+    waited: Duration,
 ) -> HookAnswer {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        decide(event, settings, coordinator)
+        decide(event, settings, coordinator, waited)
     }))
     .unwrap_or(HookAnswer::Silent)
 }
@@ -248,11 +278,16 @@ mod tests {
         );
     }
 
+    // Zero: `decide` itself never waits (`respond::wait_for_a_seat` does,
+    // and has its own tests) — its `Queued` cases here are exercised as
+    // an already-resolved coordinator answer, with `waited` passed in
+    // directly, so nothing in this file's tests needs a real wait.
     fn carry_on() -> HookAdmissionSettings {
         HookAdmissionSettings {
             binding_lease_secs: 120,
             dispatch_reserve_micros: MicroUsd::ZERO,
             on_coordinator_unreachable: CoordinatorUnreachableBehavior::CarryOn,
+            queue_wait_secs: 0,
         }
     }
 
@@ -344,7 +379,7 @@ mod tests {
                         detail: "the run is at its agent cap".to_string(),
                     }),
                 ] {
-                    let answer = decide(&event, &settings, coordinator.clone());
+                    let answer = decide(&event, &settings, coordinator.clone(), Duration::ZERO);
                     assert!(
                         is_silent(&answer),
                         "{name} under {:?} with {coordinator:?}: {answer:?}",
@@ -364,6 +399,7 @@ mod tests {
             name: &'static str,
             settings: HookAdmissionSettings,
             coordinator: CoordinatorAnswer,
+            waited: Duration,
             expect_refusal: bool,
         }
         let cases = vec![
@@ -371,34 +407,38 @@ mod tests {
                 name: "unreachable, carry on",
                 settings: carry_on(),
                 coordinator: None,
+                waited: Duration::ZERO,
                 expect_refusal: false,
             },
             Case {
                 name: "unreachable, refuse",
                 settings: refuse_on_unreachable(),
                 coordinator: None,
+                waited: Duration::ZERO,
                 expect_refusal: true,
             },
             Case {
                 name: "granted",
                 settings: carry_on(),
                 coordinator: Some(Decision::Granted),
+                waited: Duration::ZERO,
                 expect_refusal: false,
             },
             Case {
                 name: "already admitted",
                 settings: carry_on(),
                 coordinator: Some(Decision::AlreadyAdmitted),
+                waited: Duration::ZERO,
                 expect_refusal: false,
             },
-            // Refused, not silent. A hook answers now or the call
-            // proceeds, so "queued" has no faithful silent rendering:
-            // staying quiet would run the agent AND leave its queue
-            // entry counting against the cap.
+            // Refused, not silent, once `respond::wait_for_a_seat` has
+            // already waited out its bound: staying quiet would run the
+            // agent AND leave its queue entry counting against the cap.
             Case {
                 name: "queued",
                 settings: carry_on(),
                 coordinator: Some(Decision::Queued { position: 3 }),
+                waited: Duration::from_millis(1_800),
                 expect_refusal: true,
             },
             Case {
@@ -408,6 +448,7 @@ mod tests {
                     code: Refusal::UnknownRun,
                     detail: "run r1 is not registered".into(),
                 }),
+                waited: Duration::ZERO,
                 expect_refusal: true,
             },
             Case {
@@ -417,6 +458,7 @@ mod tests {
                     code: Refusal::RunCancelled,
                     detail: "run r1 was cancelled".into(),
                 }),
+                waited: Duration::ZERO,
                 expect_refusal: true,
             },
             Case {
@@ -426,6 +468,7 @@ mod tests {
                     code: Refusal::DepthExceeded,
                     detail: "depth 4 exceeds the effective maximum 3".into(),
                 }),
+                waited: Duration::ZERO,
                 expect_refusal: true,
             },
             Case {
@@ -435,6 +478,7 @@ mod tests {
                     code: Refusal::RunAgentCap,
                     detail: "run r1 has used its aggregate agent cap (24)".into(),
                 }),
+                waited: Duration::ZERO,
                 expect_refusal: true,
             },
             Case {
@@ -445,6 +489,7 @@ mod tests {
                     detail: "reserving 500 on top of 900 committed exceeds the run budget 1000"
                         .into(),
                 }),
+                waited: Duration::ZERO,
                 expect_refusal: true,
             },
             Case {
@@ -454,13 +499,19 @@ mod tests {
                     code: Refusal::AlreadyFinished,
                     detail: "dispatch d1 already ran and settled".into(),
                 }),
+                waited: Duration::ZERO,
                 expect_refusal: true,
             },
         ];
 
         for case in cases {
             let event = spawn(ToolCallPhase::Pre);
-            let answer = decide(&event, &case.settings, case.coordinator.clone());
+            let answer = decide(
+                &event,
+                &case.settings,
+                case.coordinator.clone(),
+                case.waited,
+            );
             match (&answer, case.expect_refusal) {
                 (HookAnswer::Silent, false) => {}
                 (HookAnswer::Refuse { reason }, true) => {
@@ -472,6 +523,18 @@ mod tests {
                         assert!(
                             reason.contains(detail.as_str()),
                             "{}: reason `{reason}` drops the detail",
+                            case.name
+                        );
+                    }
+                    // The queued case is the one the false claim used to
+                    // live in: the message must say how long this firing
+                    // actually waited, and never say a hook cannot hold
+                    // its call open — it just did, for `case.waited`.
+                    if matches!(&case.coordinator, Some(Decision::Queued { .. })) {
+                        assert!(reason.contains("1.8s"), "{}: {reason}", case.name);
+                        assert!(
+                            !reason.contains("cannot hold a tool call open"),
+                            "{}: {reason}",
                             case.name
                         );
                     }
@@ -516,8 +579,18 @@ mod tests {
             }),
         ] {
             assert_eq!(
-                decide(&event, &carry_on(), coordinator.clone()),
-                decide_or_silent(&event, &carry_on(), coordinator),
+                decide(
+                    &event,
+                    &carry_on(),
+                    coordinator.clone(),
+                    Duration::from_millis(1_234)
+                ),
+                decide_or_silent(
+                    &event,
+                    &carry_on(),
+                    coordinator,
+                    Duration::from_millis(1_234)
+                ),
             );
         }
     }

@@ -55,7 +55,10 @@ const RECONCILE_EVERY: Duration = Duration::from_secs(15);
 /// object; anything larger is a malformed or hostile client, and is
 /// answered with an error rather than buffered.
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// `pub(crate)`: the hook's own admission wait derives its handler
+/// timeout from this (`install::settings::derived_pretooluse_timeout`),
+/// so the number in force lives here once rather than being copied.
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 /// How many connections are served at once. Every request is short and
 /// capped by `REQUEST_TIMEOUT`, so a small pool is enough; what it

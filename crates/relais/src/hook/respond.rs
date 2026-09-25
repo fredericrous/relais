@@ -10,6 +10,7 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use super::decide::{decide_or_silent, CoordinatorAnswer, HookAnswer};
 use super::event::{self, HookEvent, ToolCallPhase};
@@ -17,7 +18,8 @@ use crate::admission::{
     Decision, DispatchRequest, Gate, Provenance, Refusal, ResourceClass, RunRegistration,
 };
 use crate::ids;
-use crate::policy::HookAdmissionSettings;
+use crate::policy::{HookAdmissionSettings, QueueBehaviour};
+use crate::runner::ADMISSION_POLL;
 
 /// What one hook firing did, end to end: the event a payload classified
 /// as, whatever the coordinator answered (only ever `Some` for a
@@ -27,6 +29,10 @@ pub struct Handled {
     pub event: HookEvent,
     pub coordinator: CoordinatorAnswer,
     pub answer: HookAnswer,
+    /// How long [`ask_coordinator`] waited for a seat before this
+    /// answer, via [`wait_for_a_seat`]. Zero for every firing that was
+    /// never queued at all.
+    pub waited: Duration,
 }
 
 /// Handle one hook payload: parse it, ask the coordinator about a
@@ -50,13 +56,14 @@ pub fn handle(payload: &[u8], settings: &HookAdmissionSettings, gate: &dyn Gate)
         event: HookEvent::NotOurs,
         coordinator: None,
         answer: HookAnswer::Silent,
+        waited: Duration::ZERO,
     })
 }
 
 fn handle_inner(payload: &[u8], settings: &HookAdmissionSettings, gate: &dyn Gate) -> Handled {
     let event = event::parse(payload);
-    let coordinator = ask_coordinator(&event, settings, gate);
-    let answer = decide_or_silent(&event, settings, coordinator.clone());
+    let (coordinator, waited) = ask_coordinator(&event, settings, gate);
+    let answer = decide_or_silent(&event, settings, coordinator.clone(), waited);
     follow_agent_lifecycle(&event, gate);
     if matches!(answer, HookAnswer::Refuse { .. }) {
         if let HookEvent::AgentToolCall(call) = &event {
@@ -75,6 +82,7 @@ fn handle_inner(payload: &[u8], settings: &HookAdmissionSettings, gate: &dyn Gat
         event,
         coordinator,
         answer,
+        waited,
     }
 }
 
@@ -159,21 +167,26 @@ fn follow_agent_lifecycle(event: &HookEvent, gate: &dyn Gate) {
     }
 }
 
-/// Ask the coordinator about one spawn. Only a `PreToolUse` on the
-/// Agent tool is ever asked about: every other event is answered
-/// `None` without a call, because [`decide`](super::decide::decide)
-/// never refuses one, and the agent's later life is followed by
-/// [`follow_agent_lifecycle`] rather than by asking anything.
+/// Ask the coordinator about one spawn, and — when it queues — wait for a
+/// seat. Only a `PreToolUse` on the Agent tool is ever asked about: every
+/// other event is answered `None` without a call, because
+/// [`decide`](super::decide::decide) never refuses one, and the agent's
+/// later life is followed by [`follow_agent_lifecycle`] rather than by
+/// asking anything.
+///
+/// Returns the coordinator's final answer alongside how long this firing
+/// waited for it: the sleeping happens entirely in [`wait_for_a_seat`],
+/// never in `decide`.
 fn ask_coordinator(
     event: &HookEvent,
     settings: &HookAdmissionSettings,
     gate: &dyn Gate,
-) -> CoordinatorAnswer {
+) -> (CoordinatorAnswer, Duration) {
     let HookEvent::AgentToolCall(call) = event else {
-        return None;
+        return (None, Duration::ZERO);
     };
     if call.phase != ToolCallPhase::Pre {
-        return None;
+        return (None, Duration::ZERO);
     }
     let dispatch_id = ids::derive_dispatch_id(&call.session_id, &call.tool_use_id);
     let run_id = ids::derive_run_id(&call.session_id);
@@ -194,16 +207,16 @@ fn ask_coordinator(
     // socket, a protocol mismatch — is exactly `CoordinatorAnswer`'s
     // `None`: "could not be reached at all", handled by
     // `HookAdmissionSettings::on_coordinator_unreachable` inside
-    // `decide` rather than here. `Err` short-circuits the `?` below
-    // before any registration is attempted: a coordinator that cannot
-    // be reached is not something to register against.
-    let first = gate.admit(&request).ok()?;
+    // `decide` rather than here.
+    let Some(first) = gate.admit(&request).ok() else {
+        return (None, Duration::ZERO);
+    };
     let Decision::Refused {
         code: Refusal::UnknownRun,
         ..
     } = &first
     else {
-        return Some(first);
+        return wait_for_a_seat(first, settings, gate, &request);
     };
     // The first spawn of a session finds no run on record — nothing
     // registers one before it — so this fills in the record its own
@@ -227,18 +240,88 @@ fn ask_coordinator(
     // `on_coordinator_unreachable` — silence or refusal, the machine's
     // choice — would never get to decide. `None` is how this function
     // says "could not be reached at all".
-    gate.register_run(&registration).ok()?;
+    if gate.register_run(&registration).is_err() {
+        return (None, Duration::ZERO);
+    }
     // At most one retry per firing: whatever this second call answers
     // — admitted, still unknown, or something else entirely — is what
-    // the hook is told. A hook cannot hold a tool call open, so there
-    // is no third attempt. An error here is the same outage as above,
-    // and answered the same way rather than as the earlier refusal.
-    gate.admit(&request).ok()
+    // the hook waits on (or is told at once). No third attempt.
+    let Some(retried) = gate.admit(&request).ok() else {
+        return (None, Duration::ZERO);
+    };
+    wait_for_a_seat(retried, settings, gate, &request)
+}
+
+/// Poll for a seat behind a `Queued` answer, re-asking with the same
+/// dispatch ID at `runner::ADMISSION_POLL` cadence — the protocol
+/// `admission::AdmissionState::request` already speaks for `relais run`'s
+/// own managed dispatch, reused here rather than invented a second time —
+/// for up to `settings.queue_behaviour()`'s bound.
+///
+/// Measured on Claude Code 2.1.282 (SPEC §23): a `PreToolUse` hook holds
+/// its tool call open for as long as it runs, so this sleeping is exactly
+/// what a hook can do that `decide` cannot decide to do — it is not pure,
+/// it touches the clock and the socket, and it lives here rather than
+/// there for that reason. `RefuseImmediately` and anything that is not
+/// `Queued` return at once with no wait at all.
+///
+/// Gives up at its own deadline, withdrawing the request so a caller that
+/// reaches this line does not strand its own seat — the same seat
+/// `admission::UNCLAIMED_GRACE` reaps regardless, for the caller that
+/// cannot reach this line at all (killed mid-wait).
+fn wait_for_a_seat(
+    mut decision: Decision,
+    settings: &HookAdmissionSettings,
+    gate: &dyn Gate,
+    request: &DispatchRequest,
+) -> (CoordinatorAnswer, Duration) {
+    if !matches!(decision, Decision::Queued { .. }) {
+        return (Some(decision), Duration::ZERO);
+    }
+    let max_wait = match settings.queue_behaviour() {
+        QueueBehaviour::RefuseImmediately => return (Some(decision), Duration::ZERO),
+        QueueBehaviour::WaitUpTo(max) => max,
+    };
+    let started = Instant::now();
+    let deadline = started + max_wait;
+    while matches!(decision, Decision::Queued { .. }) && Instant::now() < deadline {
+        std::thread::sleep(ADMISSION_POLL);
+        let Some(next) = gate.admit(request).ok() else {
+            return (None, started.elapsed());
+        };
+        decision = next;
+    }
+    if matches!(decision, Decision::Queued { .. }) {
+        // Deliberately duplicated: `handle_inner`'s refusal path also
+        // withdraws, and today that covers this case, because `decide`
+        // renders every `Queued` as a refusal. Delete this and no test
+        // fails — the one that looks like it would, passes on the other
+        // withdrawal. It is kept because the coupling is the fragile
+        // part: the day `Queued` stops meaning refuse, or a wait gives
+        // up into some other answer, this entry has to leave the queue
+        // regardless, and the seat it holds is not free until it does.
+        let _ = gate.withdraw(request.dispatch_id.as_str());
+    }
+    (Some(decision), started.elapsed())
+}
+
+/// What this firing's wait came of, distinguished so backpressure and
+/// stalling do not collapse into one number in the journal — the only
+/// record either of them leaves.
+fn wait_outcome(handled: &Handled) -> &'static str {
+    if handled.waited.is_zero() {
+        return "immediate";
+    }
+    match &handled.answer {
+        HookAnswer::Silent => "admitted_after_waiting",
+        HookAnswer::Refuse { .. } => "refused_after_waiting",
+    }
 }
 
 /// What one firing is journalled as: what arrived, what the
-/// coordinator answered (when it was asked), and what was decided.
-/// Pure — it builds the record, [`append_journal`] writes it.
+/// coordinator answered (when it was asked), how long it waited and what
+/// came of that, and what was decided. Pure — it builds the record,
+/// [`append_journal`] writes it.
 pub fn journal_entry(payload: &[u8], handled: &Handled) -> serde_json::Value {
     // The raw payload, not a re-serialization of the typed event: a
     // payload this crate does not model (a future harness field, or
@@ -269,6 +352,8 @@ pub fn journal_entry(payload: &[u8], handled: &Handled) -> serde_json::Value {
             .map(|decision| format!("{decision:?}")),
         "decision": decision,
         "reason": reason,
+        "waited_ms": handled.waited.as_millis() as u64,
+        "outcome": wait_outcome(handled),
     })
 }
 
@@ -343,11 +428,25 @@ mod tests {
     use crate::ids::{SessionId, ToolUseId};
     use crate::policy::{ConcurrencyLimits, CoordinatorUnreachableBehavior};
 
+    // Zero: every existing test here predates the wait and expects an
+    // immediate refusal at a cap. The wait itself gets its own settings
+    // and its own tests, below.
     fn settings() -> HookAdmissionSettings {
         HookAdmissionSettings {
             binding_lease_secs: 120,
             dispatch_reserve_micros: crate::money::MicroUsd::ZERO,
             on_coordinator_unreachable: CoordinatorUnreachableBehavior::CarryOn,
+            queue_wait_secs: 0,
+        }
+    }
+
+    /// A short, real wait — long enough for a background thread to free a
+    /// seat mid-poll, short enough that a test which exhausts it stays
+    /// fast.
+    fn waiting_settings(queue_wait_secs: u64) -> HookAdmissionSettings {
+        HookAdmissionSettings {
+            queue_wait_secs,
+            ..settings()
         }
     }
 
@@ -1280,6 +1379,7 @@ mod tests {
                 reason: "relais refused this agent: run r1 is not registered. restart the session"
                     .into(),
             },
+            waited: Duration::ZERO,
         };
         let entry = journal_entry(&payload, &handled);
         assert_eq!(entry["decision"], "refuse");
@@ -1289,6 +1389,8 @@ mod tests {
             .contains("not registered"));
         assert_eq!(entry["payload"]["session_id"], "session-j");
         assert!(entry["recorded_at"].as_str().is_some());
+        assert_eq!(entry["waited_ms"], 0);
+        assert_eq!(entry["outcome"], "immediate");
     }
 
     #[test]
@@ -1297,11 +1399,43 @@ mod tests {
             event: HookEvent::NotOurs,
             coordinator: None,
             answer: HookAnswer::Silent,
+            waited: Duration::ZERO,
         };
         let entry = journal_entry(b"not json {{{", &handled);
         assert_eq!(entry["payload"], "not json {{{");
         assert_eq!(entry["decision"], "silent");
         assert!(entry["reason"].is_null());
+    }
+
+    /// A firing that waited and was then admitted is journalled as
+    /// `admitted_after_waiting`, distinct from a firing that waited and
+    /// was refused: without the two being told apart in the record,
+    /// backpressure and stalling look identical in the only place either
+    /// one is visible.
+    #[test]
+    fn journal_entry_distinguishes_admitted_after_waiting_from_refused_after_waiting() {
+        let payload = spawn_payload("session-wait", "tool-wait");
+        let admitted = Handled {
+            event: event::parse(&payload),
+            coordinator: Some(crate::admission::Decision::Granted),
+            answer: HookAnswer::Silent,
+            waited: Duration::from_millis(900),
+        };
+        let entry = journal_entry(&payload, &admitted);
+        assert_eq!(entry["waited_ms"], 900);
+        assert_eq!(entry["outcome"], "admitted_after_waiting");
+
+        let refused = Handled {
+            event: event::parse(&payload),
+            coordinator: Some(crate::admission::Decision::Queued { position: 1 }),
+            answer: HookAnswer::Refuse {
+                reason: "relais waited 2.0s for a seat before giving up".into(),
+            },
+            waited: Duration::from_secs(2),
+        };
+        let entry = journal_entry(&payload, &refused);
+        assert_eq!(entry["waited_ms"], 2_000);
+        assert_eq!(entry["outcome"], "refused_after_waiting");
     }
 
     #[cfg(unix)]
@@ -1381,5 +1515,139 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(line)
                 .unwrap_or_else(|err| panic!("line is not valid JSON: {err}: {line:?}"));
         }
+    }
+
+    /// A queued spawn a freed seat admits MID-WAIT comes back silent —
+    /// the polling protocol works, not just its timeout path — and the
+    /// polling that got it there never created a duplicate queue entry
+    /// or a second reservation: afterward exactly one seat is held for
+    /// the session and nothing is left queued.
+    #[test]
+    fn a_queued_spawn_a_freed_seat_admits_mid_wait_comes_back_silent() {
+        let limits = ConcurrencyLimits {
+            max_active_agents_per_session: Some(1),
+            ..ConcurrencyLimits::default()
+        };
+        let gate = std::sync::Arc::new(LocalGate::new(limits));
+        let session = "session-waits";
+
+        let first = handle(
+            &spawn_payload(session, "tool-1"),
+            &settings(),
+            gate.as_ref(),
+        );
+        assert_eq!(first.answer, HookAnswer::Silent, "tool-1 takes the seat");
+
+        let first_dispatch =
+            ids::derive_dispatch_id(&SessionId::new(session), &ToolUseId::new("tool-1"));
+        let releaser_gate = gate.clone();
+        let releaser = std::thread::spawn(move || {
+            // Well inside the two-second wait budget below, and well
+            // past `runner::ADMISSION_POLL` (250 ms), so the second
+            // spawn is certainly still polling when this lands.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            releaser_gate
+                .settle(first_dispatch.as_str(), None)
+                .expect("settle");
+            releaser_gate
+                .release(first_dispatch.as_str())
+                .expect("release");
+        });
+
+        let second = handle(
+            &spawn_payload(session, "tool-2"),
+            &waiting_settings(2),
+            gate.as_ref(),
+        );
+        releaser.join().expect("releaser thread");
+
+        assert_eq!(
+            second.answer,
+            HookAnswer::Silent,
+            "the freed seat admits it before the wait runs out"
+        );
+        assert!(
+            second.waited >= std::time::Duration::from_millis(200),
+            "it actually waited rather than being admitted at once: {:?}",
+            second.waited
+        );
+        assert!(
+            second.waited < std::time::Duration::from_secs(2),
+            "it was admitted before its budget ran out: {:?}",
+            second.waited
+        );
+
+        let after = gate.status();
+        assert_eq!(after.queued, 0, "no duplicate queue entry remains");
+        assert_eq!(
+            after.active_by_class.get(ResourceClass::ModelWork.as_str()),
+            Some(&1),
+            "exactly one seat is held afterward — no second reservation"
+        );
+    }
+
+    /// A queued spawn that exhausts its whole wait budget is refused, and
+    /// withdraws its own queue entry rather than leaving it behind for
+    /// `admission::UNCLAIMED_GRACE` to clean up.
+    #[test]
+    fn a_queued_spawn_that_exhausts_its_wait_is_refused_and_withdraws_itself() {
+        let limits = ConcurrencyLimits {
+            max_active_agents_per_session: Some(1),
+            ..ConcurrencyLimits::default()
+        };
+        let gate = LocalGate::new(limits);
+        let session = "session-gives-up";
+        let first = handle(&spawn_payload(session, "tool-1"), &settings(), &gate);
+        assert_eq!(first.answer, HookAnswer::Silent);
+
+        // Nothing ever frees tool-1's seat: the second spawn waits out
+        // its whole budget and gives up.
+        let second = handle(
+            &spawn_payload(session, "tool-2"),
+            &waiting_settings(1),
+            &gate,
+        );
+        match &second.answer {
+            HookAnswer::Refuse { reason } => {
+                assert!(reason.contains("waited"), "{reason}");
+                assert!(!reason.contains("cannot hold a tool call open"), "{reason}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(
+            second.waited >= std::time::Duration::from_millis(900),
+            "it waited out its whole budget: {:?}",
+            second.waited
+        );
+
+        let status = gate.status();
+        assert_eq!(
+            status.queued, 0,
+            "the exhausted wait withdrew its own queue entry"
+        );
+    }
+
+    /// `queue_wait_secs = 0` refuses at once, exactly as before this
+    /// package existed: no sleep, no poll.
+    #[test]
+    fn a_zero_queue_wait_refuses_at_once_with_no_wait() {
+        let limits = ConcurrencyLimits {
+            max_active_agents_per_session: Some(1),
+            ..ConcurrencyLimits::default()
+        };
+        let gate = LocalGate::new(limits);
+        let session = "session-refuses-at-once";
+        let first = handle(&spawn_payload(session, "tool-1"), &settings(), &gate);
+        assert_eq!(first.answer, HookAnswer::Silent);
+
+        let started = std::time::Instant::now();
+        let second = handle(&spawn_payload(session, "tool-2"), &settings(), &gate);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "queue_wait_secs = 0 must not sleep at all: {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(second.answer, HookAnswer::Refuse { .. }));
+        assert_eq!(second.waited, std::time::Duration::ZERO);
     }
 }

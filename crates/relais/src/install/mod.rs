@@ -847,11 +847,18 @@ impl InstallRoot {
     }
 
     /// Plan wiring the live hook into `settings.json`. Preview-first,
-    /// like every other plan here: nothing is written.
-    pub fn plan_hooks(&self, relais_binary: &Path) -> std::io::Result<HooksPlan> {
+    /// like every other plan here: nothing is written. `queue_wait` is
+    /// the admission wait currently configured — what the `PreToolUse`
+    /// handler's recorded timeout must cover.
+    pub fn plan_hooks(
+        &self,
+        relais_binary: &Path,
+        queue_wait: std::time::Duration,
+    ) -> std::io::Result<HooksPlan> {
         Ok(settings::plan_hooks(
             self.read_settings()?.as_deref(),
             relais_binary,
+            queue_wait,
         ))
     }
 
@@ -860,9 +867,13 @@ impl InstallRoot {
     /// preview and the write are two moments, and a file edited or
     /// reformatted in between must be refused now, not silently
     /// rewritten on the strength of an earlier reading (C9).
-    pub fn apply_hooks(&self, relais_binary: &Path) -> std::io::Result<HooksApplied> {
+    pub fn apply_hooks(
+        &self,
+        relais_binary: &Path,
+        queue_wait: std::time::Duration,
+    ) -> std::io::Result<HooksApplied> {
         let text = self.read_settings()?;
-        match settings::plan_hooks(text.as_deref(), relais_binary) {
+        match settings::plan_hooks(text.as_deref(), relais_binary, queue_wait) {
             HooksPlan::Unrenderable {
                 reason,
                 paste_block,
@@ -879,7 +890,7 @@ impl InstallRoot {
                     Some(t) => serde_json::from_str(t)
                         .expect("plan_hooks already parsed this text without error"),
                 };
-                let changed = settings::apply_hooks(&mut value, relais_binary);
+                let changed = settings::apply_hooks(&mut value, relais_binary, queue_wait);
                 let rendered = settings::render_like(text.as_deref(), &value);
                 std::fs::create_dir_all(&self.claude_dir)?;
                 write_atomic(&self.settings_path(), &rendered)?;
@@ -972,6 +983,7 @@ impl InstallPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn temp_root() -> (InstallRoot, PathBuf) {
         let dir = crate::test_support::temp_dir("install");
@@ -1596,19 +1608,27 @@ mod tests {
     fn hooks_apply_wires_all_seven_targets_into_a_fresh_settings_file() {
         let (root, dir) = temp_root();
         let binary = relais_binary_for_test();
-        let plan = root.plan_hooks(&binary).expect("plan hooks");
+        let plan = root
+            .plan_hooks(&binary, Duration::from_secs(2))
+            .expect("plan hooks");
         assert_eq!(plan.applicable_count(), 7);
 
-        let applied = root.apply_hooks(&binary).expect("apply hooks");
+        let applied = root
+            .apply_hooks(&binary, Duration::from_secs(2))
+            .expect("apply hooks");
         let HooksApplied::Applied(events) = applied else {
             panic!("expected events to be wired: {applied:?}");
         };
         assert_eq!(events.len(), 7, "{events:?}");
 
         // A re-run is a no-op.
-        let replan = root.plan_hooks(&binary).expect("re-plan hooks");
+        let replan = root
+            .plan_hooks(&binary, Duration::from_secs(2))
+            .expect("re-plan hooks");
         assert_eq!(replan.applicable_count(), 0, "{replan:?}");
-        let reapplied = root.apply_hooks(&binary).expect("apply hooks again");
+        let reapplied = root
+            .apply_hooks(&binary, Duration::from_secs(2))
+            .expect("apply hooks again");
         assert_eq!(reapplied, HooksApplied::AlreadyCurrent);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1639,9 +1659,9 @@ mod tests {
         }
 
         let binary = relais_binary_for_test();
-        let planned = root.plan_hooks(&binary);
+        let planned = root.plan_hooks(&binary, Duration::from_secs(2));
         assert!(planned.is_err(), "an unreadable file is not an absent one");
-        let applied = root.apply_hooks(&binary);
+        let applied = root.apply_hooks(&binary, Duration::from_secs(2));
         assert!(applied.is_err(), "{applied:?}");
 
         std::fs::set_permissions(&settings_path, std::fs::Permissions::from_mode(0o600))
@@ -1664,7 +1684,9 @@ mod tests {
         )
         .expect("write");
         let binary = relais_binary_for_test();
-        let applied = root.apply_hooks(&binary).expect("apply hooks");
+        let applied = root
+            .apply_hooks(&binary, Duration::from_secs(2))
+            .expect("apply hooks");
         assert!(
             matches!(applied, HooksApplied::Refused { .. }),
             "{applied:?}"
@@ -1678,7 +1700,8 @@ mod tests {
     fn hooks_uninstall_removes_only_what_install_added() {
         let (root, dir) = temp_root();
         let binary = relais_binary_for_test();
-        root.apply_hooks(&binary).expect("apply hooks");
+        root.apply_hooks(&binary, Duration::from_secs(2))
+            .expect("apply hooks");
 
         // Add a foreign hook on the same event, same matcher, so the
         // removal has to leave it behind.

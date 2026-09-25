@@ -810,15 +810,30 @@ fn install_command(write: bool, user: bool, targets: Targets) -> Result<CliOutco
 fn install_hooks_target(request: &InstallRequest, home: &Path) -> Result<CliOutcome, CliError> {
     let relais_binary = operational(std::env::current_exe(), "install --hooks")?;
     let root = request.root(home);
+    let queue_wait = admission_queue_wait();
     match request.mode {
         Mode::Preview => Ok(render_hooks_preview(operational(
-            root.plan_hooks(&relais_binary),
+            root.plan_hooks(&relais_binary, queue_wait),
             "install --hooks",
         )?)),
         Mode::Apply => {
-            let applied = operational(root.apply_hooks(&relais_binary), "install --hooks")?;
+            let applied = operational(
+                root.apply_hooks(&relais_binary, queue_wait),
+                "install --hooks",
+            )?;
             Ok(render_hooks_applied(applied))
         }
+    }
+}
+
+/// The admission wait the installer must size the `PreToolUse` handler
+/// timeout for — a missing or unreadable machine.toml is exactly the
+/// default this crate ships (`hook_admission_settings` reads the same
+/// way), never an error install itself should stop over.
+fn admission_queue_wait() -> std::time::Duration {
+    match hook_admission_settings().queue_behaviour() {
+        relais::policy::QueueBehaviour::RefuseImmediately => std::time::Duration::ZERO,
+        relais::policy::QueueBehaviour::WaitUpTo(wait) => wait,
     }
 }
 
@@ -877,6 +892,7 @@ fn render_hooks_preview(plan: relais::install::HooksPlan) -> CliOutcome {
                     "  {:<8} {}",
                     match event.action {
                         relais::install::HookEventAction::Current => "keep",
+                        relais::install::HookEventAction::CorrectTimeout => "retime",
                         relais::install::HookEventAction::JoinExisting => "join",
                         relais::install::HookEventAction::NewEntry => "add",
                     },
@@ -1771,7 +1787,12 @@ fn hook_respond() {
         // stance, so build one directly rather than skip the decision
         // entirely.
         let event = relais::hook::event::parse(&payload);
-        let answer = relais::hook::decide::decide_or_silent(&event, &settings, None);
+        let answer = relais::hook::decide::decide_or_silent(
+            &event,
+            &settings,
+            None,
+            std::time::Duration::ZERO,
+        );
         if let Some(text) = answer.stdout_payload() {
             println!("{text}");
         }

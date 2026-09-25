@@ -31,6 +31,21 @@ pub const AGING_AFTER: Duration = Duration::from_secs(30);
 /// (SPEC §23).
 pub const LEASE_GRACE: Duration = Duration::from_secs(300);
 
+/// A dispatch `drain` admitted from the queue but that nothing has
+/// claimed — the caller that queued it was killed mid-wait, or stopped
+/// polling for some other reason — is reaped on this grace rather than
+/// `LEASE_GRACE`: nothing is bound to it (there is no process, and no
+/// hook-admitted lease either), so `LEASE_GRACE`'s reasoning does not
+/// apply, and a seat nobody can free for five minutes is exactly what a
+/// hook that waits for admission (SPEC §23) introduces if nothing reaps
+/// it sooner.
+///
+/// Necessarily longer than `runner::ADMISSION_POLL` (250 ms), the cadence
+/// every caller of this protocol polls at: an ordinary poller sees itself
+/// drained and claims it well within this window, so only an abandoned
+/// entry is ever still `Unclaimed` when this fires.
+pub const UNCLAIMED_GRACE: Duration = Duration::from_secs(5);
+
 /// A registered run that has admitted nothing for this long, and has no
 /// dispatch or queued request left, is presumed abandoned — its root
 /// runner died without cancelling — and stops holding the daemon open.
@@ -360,6 +375,12 @@ pub struct ReconcileReport {
     /// signal, and with what; each dispatch appears at most twice in its
     /// life — once to terminate, once to kill.
     pub to_signal: Vec<PendingSignal>,
+    /// Dispatches freed by [`UNCLAIMED_GRACE`]: admitted from the queue,
+    /// never claimed, abandoned. Reported apart from `dropped` (a bound
+    /// process found dead), `unbindable` (a pid-bind that never arrived)
+    /// and `expired` (a hook-admitted lease that lapsed) — none of those
+    /// stories fit an entry nothing was ever bound to at all.
+    pub unclaimed_reaped: Vec<String>,
 }
 
 /// What `bind` did. A bind is the one moment the coordinator can check
@@ -1740,6 +1761,27 @@ impl AdmissionState {
         self.release(dispatch_id, now)
     }
 
+    /// Free a dispatch `drain` admitted but that nothing has claimed for
+    /// [`UNCLAIMED_GRACE`]: the caller that queued it is gone, so this is
+    /// the same as an explicit [`Self::withdraw`] — nothing ran, nothing
+    /// settles, and the ID is not remembered as finished (SPEC §23's
+    /// A14) — except that nobody asked for it.
+    fn reap_unclaimed(&mut self, now: Instant, report: &mut ReconcileReport) {
+        let abandoned: Vec<String> = self
+            .dispatches
+            .iter()
+            .filter(|(_, dispatch)| {
+                dispatch.lifecycle == Lifecycle::Unclaimed
+                    && now.saturating_duration_since(dispatch.last_heartbeat) >= UNCLAIMED_GRACE
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in abandoned {
+            self.discard_unclaimed(&id, now);
+            report.unclaimed_reaped.push(id);
+        }
+    }
+
     /// Lease reconciliation. `alive(pid)` is the process table.
     ///
     /// - A stale lease with a dead bound process is dropped; its
@@ -1753,6 +1795,7 @@ impl AdmissionState {
     ///   then nothing (C5). The state machine sends neither.
     pub fn reconcile(&mut self, now: Instant, alive: &dyn Fn(u32) -> bool) -> ReconcileReport {
         let mut report = ReconcileReport::default();
+        self.reap_unclaimed(now, &mut report);
         let ids: Vec<String> = self.dispatches.keys().cloned().collect();
         for id in ids {
             let (heartbeat_age, binding, cancelled) = {
@@ -2590,6 +2633,110 @@ mod tests {
             WaitOutcome::Waiting,
             "{dispatch_id} waits"
         );
+    }
+
+    /// A dispatch `drain` admitted from the queue, but that nobody ever
+    /// polled `request` again to claim — exactly what a hook killed
+    /// mid-wait leaves behind — is freed on `UNCLAIMED_GRACE`, not
+    /// `LEASE_GRACE`: the seat is back, and available to a later request,
+    /// well inside a lease's own grace period.
+    #[test]
+    fn an_unclaimed_dispatch_is_reaped_on_unclaimed_grace_well_inside_lease_grace() {
+        let mut state = AdmissionState::new(ConcurrencyLimits {
+            max_active_agents_per_session: Some(1),
+            ..ConcurrencyLimits::default()
+        });
+        let t0 = Instant::now();
+        state.register_run(
+            &RunRegistration {
+                run_id: "run-a".into(),
+                session_id: "tab-a".into(),
+                budget_micros: None,
+                max_agents: None,
+                max_depth: None,
+            },
+            t0,
+        );
+
+        // d1 takes the only seat; d2 queues behind it.
+        assert!(granted(state.request(&req("d1", "run-a", "tab-a"), t0)));
+        assert_eq!(
+            state.request(&req("d2", "run-a", "tab-a"), t0),
+            Decision::Queued { position: 1 }
+        );
+
+        // d1 settles and frees its seat: `drain` (inside `release`)
+        // admits d2 straight into the dispatch table as `Unclaimed` — but
+        // unlike every other test here, nothing ever calls `request`
+        // again for d2 to claim it. That is the failure mode: a hook
+        // that queued it was killed before it could poll again.
+        state.settle("d1", None, t0);
+        state.release("d1", t0);
+        assert!(
+            state.dispatches.contains_key("d2"),
+            "d2 was drained but never claimed"
+        );
+
+        // Sanity: this reap has to land well before a lease's own grace,
+        // or it is not the shorter mechanism the type exists to be.
+        assert!(UNCLAIMED_GRACE < LEASE_GRACE);
+
+        let t1 = t0 + UNCLAIMED_GRACE + Duration::from_millis(1);
+        let report = state.reconcile(t1, &alive);
+        assert_eq!(
+            report.unclaimed_reaped,
+            vec!["d2".to_string()],
+            "d2 must be the one reaped, and reported as such"
+        );
+        assert!(
+            !state.dispatches.contains_key("d2"),
+            "the abandoned entry is gone"
+        );
+
+        // The seat it held is genuinely free: a fresh request is admitted
+        // directly rather than queuing behind a ghost.
+        assert!(granted(state.request(&req("d3", "run-a", "tab-a"), t1)));
+    }
+
+    /// The reap must never touch a dispatch an ordinary caller is still
+    /// polling for: it is far enough inside `UNCLAIMED_GRACE` that a
+    /// caller polling at `runner::ADMISSION_POLL` (250 ms) claims it long
+    /// before this would ever fire.
+    #[test]
+    fn a_dispatch_claimed_promptly_is_never_reaped() {
+        let mut state = AdmissionState::new(ConcurrencyLimits {
+            max_active_agents_per_session: Some(1),
+            ..ConcurrencyLimits::default()
+        });
+        let t0 = Instant::now();
+        state.register_run(
+            &RunRegistration {
+                run_id: "run-a".into(),
+                session_id: "tab-a".into(),
+                budget_micros: None,
+                max_agents: None,
+                max_depth: None,
+            },
+            t0,
+        );
+        assert!(granted(state.request(&req("d1", "run-a", "tab-a"), t0)));
+        assert_eq!(
+            state.request(&req("d2", "run-a", "tab-a"), t0),
+            Decision::Queued { position: 1 }
+        );
+        state.settle("d1", None, t0);
+        state.release("d1", t0);
+
+        // The caller polls again promptly, well within `UNCLAIMED_GRACE`,
+        // and claims it.
+        let t1 = t0 + Duration::from_millis(250);
+        assert!(granted(state.request(&req("d2", "run-a", "tab-a"), t1)));
+
+        // Reconciling long after does nothing to it: it is `Claimed`, not
+        // `Unclaimed`, and the reap only ever touches the latter.
+        let t2 = t1 + UNCLAIMED_GRACE + Duration::from_secs(1);
+        let report = state.reconcile(t2, &alive);
+        assert!(report.unclaimed_reaped.is_empty());
     }
 
     // SPEC §23 acceptance: three simultaneous sessions, multiple agents
