@@ -21,10 +21,14 @@
 //! for ever (C1); a rename either happened or did not.
 
 use serde::Serialize;
+use serde_json::Value;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::ids::sha256_hex;
+
+pub mod settings;
+pub use settings::{HookEventAction, HookEventPlan, HooksPlan};
 
 pub const BEGIN_MARKER: &str = "<!-- relais:begin";
 /// The begin marker's spelling INSIDE YAML frontmatter. Claude Code reads
@@ -83,7 +87,7 @@ fn owned_file(content: &str) -> String {
 ///
 /// The temporary file is removed on every failure path, so a full disk
 /// or a permission error leaves nothing behind but the original.
-fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     // A sibling, hidden, and unique per process and per call: two relais
     // processes installing at once must not share a staging file.
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -800,6 +804,130 @@ impl InstallRoot {
     }
 }
 
+/// What one `--hooks` apply pass did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HooksApplied {
+    /// Every target was already current; nothing was written.
+    AlreadyCurrent,
+    /// The named events were added, and the file was rewritten.
+    Applied(Vec<&'static str>),
+    /// The file could not be re-rendered byte for byte; nothing was
+    /// written. Carries the message and the fragment to paste by hand.
+    Refused { reason: String, paste_block: String },
+}
+
+/// What one `--hooks` uninstall pass did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HooksRemoved {
+    AlreadyAbsent,
+    Removed(Vec<&'static str>),
+    Refused { reason: String },
+}
+
+impl InstallRoot {
+    fn settings_path(&self) -> PathBuf {
+        self.claude_dir.join("settings.json")
+    }
+
+    /// The settings file's text, or `None` when there is no such file.
+    ///
+    /// Only `NotFound` is `None`. Every other error — no permission to
+    /// read it, a directory in its place, an I/O failure mid-read — is
+    /// returned, because "I could not see what is there" is not "there
+    /// is nothing there", and the caller's answer to the second is to
+    /// write a fresh seven-handler document. Collapsing the two would
+    /// mean a settings.json relais could not read got replaced by one it
+    /// composed, which is the opposite of this module's promise.
+    fn read_settings(&self) -> std::io::Result<Option<String>> {
+        match std::fs::read_to_string(self.settings_path()) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Plan wiring the live hook into `settings.json`. Preview-first,
+    /// like every other plan here: nothing is written.
+    pub fn plan_hooks(&self, relais_binary: &Path) -> std::io::Result<HooksPlan> {
+        Ok(settings::plan_hooks(
+            self.read_settings()?.as_deref(),
+            relais_binary,
+        ))
+    }
+
+    /// Apply a hooks plan: `--write`. The file is re-read and
+    /// re-checked for a round trip here, not trusted from the plan — the
+    /// preview and the write are two moments, and a file edited or
+    /// reformatted in between must be refused now, not silently
+    /// rewritten on the strength of an earlier reading (C9).
+    pub fn apply_hooks(&self, relais_binary: &Path) -> std::io::Result<HooksApplied> {
+        let text = self.read_settings()?;
+        match settings::plan_hooks(text.as_deref(), relais_binary) {
+            HooksPlan::Unrenderable {
+                reason,
+                paste_block,
+            } => Ok(HooksApplied::Refused {
+                reason,
+                paste_block,
+            }),
+            HooksPlan::Ready { events } => {
+                if !events.iter().any(|e| e.action.changes_anything()) {
+                    return Ok(HooksApplied::AlreadyCurrent);
+                }
+                let mut value: Value = match &text {
+                    None => serde_json::json!({}),
+                    Some(t) => serde_json::from_str(t)
+                        .expect("plan_hooks already parsed this text without error"),
+                };
+                let changed = settings::apply_hooks(&mut value, relais_binary);
+                let rendered = settings::render_like(text.as_deref(), &value);
+                std::fs::create_dir_all(&self.claude_dir)?;
+                write_atomic(&self.settings_path(), &rendered)?;
+                Ok(HooksApplied::Applied(changed))
+            }
+        }
+    }
+
+    /// Plan removing relais's own hook commands from `settings.json`.
+    pub fn plan_hooks_removal(
+        &self,
+        relais_binary: &Path,
+    ) -> std::io::Result<settings::HooksRemovalPlan> {
+        Ok(settings::plan_removal(
+            self.read_settings()?.as_deref(),
+            relais_binary,
+        ))
+    }
+
+    /// Apply a hooks removal plan: `--write`. Re-checked at write time
+    /// for the same reason [`Self::apply_hooks`] is.
+    pub fn apply_hooks_removal(&self, relais_binary: &Path) -> std::io::Result<HooksRemoved> {
+        let text = self.read_settings()?;
+        match settings::plan_removal(text.as_deref(), relais_binary) {
+            settings::HooksRemovalPlan::Unrenderable { reason } => {
+                Ok(HooksRemoved::Refused { reason })
+            }
+            settings::HooksRemovalPlan::Ready { events } => {
+                if !events
+                    .iter()
+                    .any(|e| e.action == settings::HookRemovalAction::WouldRemove)
+                {
+                    return Ok(HooksRemoved::AlreadyAbsent);
+                }
+                let mut value: Value = match &text {
+                    None => serde_json::json!({}),
+                    Some(t) => serde_json::from_str(t)
+                        .expect("plan_removal already parsed this text without error"),
+                };
+                let changed = settings::remove_hooks(&mut value, relais_binary);
+                let rendered = settings::render_like(text.as_deref(), &value);
+                write_atomic(&self.settings_path(), &rendered)?;
+                Ok(HooksRemoved::Removed(changed))
+            }
+        }
+    }
+}
+
 impl InstallPlan {
     /// How many of the planned actions `apply` is meant to carry out.
     /// The rest are reported-only: foreign, conflicted or malformed.
@@ -1435,6 +1563,167 @@ mod tests {
             project.root(&home).claude_dir,
             dir.join("repo").join(".claude")
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn relais_binary_for_test() -> PathBuf {
+        PathBuf::from("/opt/relais/bin/relais")
+    }
+
+    /// `install --claude` alone (no `--hooks`) reads and writes no
+    /// settings.json at all — wiring a hook into a file the user
+    /// maintains is a separate, explicit ask. A settings.json already in
+    /// place before the run is byte-identical after it.
+    #[test]
+    fn install_without_hooks_never_touches_settings_json() {
+        let (root, dir) = temp_root();
+        std::fs::create_dir_all(&root.claude_dir).expect("mkdir");
+        let settings_path = root.claude_dir.join("settings.json");
+        let original = "{\n  \"hooks\": {}\n}\n";
+        std::fs::write(&settings_path, original).expect("write settings");
+
+        root.apply(&root.plan()).expect("apply");
+
+        assert_eq!(
+            std::fs::read_to_string(&settings_path).expect("read"),
+            original,
+            "settings.json must be untouched by a plain --claude install"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hooks_apply_wires_all_seven_targets_into_a_fresh_settings_file() {
+        let (root, dir) = temp_root();
+        let binary = relais_binary_for_test();
+        let plan = root.plan_hooks(&binary).expect("plan hooks");
+        assert_eq!(plan.applicable_count(), 7);
+
+        let applied = root.apply_hooks(&binary).expect("apply hooks");
+        let HooksApplied::Applied(events) = applied else {
+            panic!("expected events to be wired: {applied:?}");
+        };
+        assert_eq!(events.len(), 7, "{events:?}");
+
+        // A re-run is a no-op.
+        let replan = root.plan_hooks(&binary).expect("re-plan hooks");
+        assert_eq!(replan.applicable_count(), 0, "{replan:?}");
+        let reapplied = root.apply_hooks(&binary).expect("apply hooks again");
+        assert_eq!(reapplied, HooksApplied::AlreadyCurrent);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A settings.json relais cannot READ is not a settings.json that is
+    /// absent. The error reaches the caller and nothing is written: the
+    /// alternative — treating "no permission" as "no file" — replaces a
+    /// person's configuration with a document relais composed, having
+    /// never seen what it destroyed.
+    #[test]
+    #[cfg(unix)]
+    fn hooks_apply_refuses_a_settings_file_it_cannot_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, dir) = temp_root();
+        std::fs::create_dir_all(&root.claude_dir).expect("mkdir");
+        let settings_path = root.claude_dir.join("settings.json");
+        let original = "{\n  \"hooks\": {}\n}\n";
+        std::fs::write(&settings_path, original).expect("write");
+        std::fs::set_permissions(&settings_path, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod");
+
+        // Running as root defeats the premise: the file IS readable then,
+        // and the scenario cannot be staged at all.
+        if std::fs::read_to_string(&settings_path).is_ok() {
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+
+        let binary = relais_binary_for_test();
+        let planned = root.plan_hooks(&binary);
+        assert!(planned.is_err(), "an unreadable file is not an absent one");
+        let applied = root.apply_hooks(&binary);
+        assert!(applied.is_err(), "{applied:?}");
+
+        std::fs::set_permissions(&settings_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod back");
+        assert_eq!(
+            std::fs::read_to_string(&settings_path).expect("read"),
+            original,
+            "the file relais could not read is still exactly as it was"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hooks_apply_is_refused_on_a_hand_formatted_settings_file() {
+        let (root, dir) = temp_root();
+        std::fs::create_dir_all(&root.claude_dir).expect("mkdir");
+        std::fs::write(
+            root.claude_dir.join("settings.json"),
+            "{\n  \"hooks\":{}\n}\n",
+        )
+        .expect("write");
+        let binary = relais_binary_for_test();
+        let applied = root.apply_hooks(&binary).expect("apply hooks");
+        assert!(
+            matches!(applied, HooksApplied::Refused { .. }),
+            "{applied:?}"
+        );
+        let after = std::fs::read_to_string(root.claude_dir.join("settings.json")).expect("read");
+        assert_eq!(after, "{\n  \"hooks\":{}\n}\n", "refused: nothing written");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hooks_uninstall_removes_only_what_install_added() {
+        let (root, dir) = temp_root();
+        let binary = relais_binary_for_test();
+        root.apply_hooks(&binary).expect("apply hooks");
+
+        // Add a foreign hook on the same event, same matcher, so the
+        // removal has to leave it behind.
+        let settings_path = root.claude_dir.join("settings.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
+                .expect("parse");
+        value["hooks"]["PreToolUse"][0]["hooks"]
+            .as_array_mut()
+            .expect("hooks array")
+            .push(serde_json::json!({"type": "command", "command": "/usr/bin/someone-elses-tool"}));
+        std::fs::write(&settings_path, settings::render_canonical(&value) + "\n")
+            .expect("write foreign hook");
+
+        let plan = root.plan_hooks_removal(&binary).expect("plan removal");
+        assert_eq!(plan.applicable_count(), 7);
+        let removed = root.apply_hooks_removal(&binary).expect("apply removal");
+        let HooksRemoved::Removed(events) = removed else {
+            panic!("expected removal: {removed:?}");
+        };
+        assert_eq!(events.len(), 7, "{events:?}");
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
+                .expect("parse");
+        let pre_tool_use = after["hooks"]["PreToolUse"].as_array().expect("array");
+        assert_eq!(
+            pre_tool_use.len(),
+            1,
+            "the entry another author's handler lives on survives: {pre_tool_use:?}"
+        );
+        let remaining_hooks = pre_tool_use[0]["hooks"].as_array().expect("hooks");
+        assert_eq!(remaining_hooks.len(), 1, "{remaining_hooks:?}");
+        assert_eq!(
+            remaining_hooks[0]["command"], "/usr/bin/someone-elses-tool",
+            "another author's handler on the same event survives"
+        );
+
+        // A re-run has nothing left to remove.
+        let replan = root.plan_hooks_removal(&binary).expect("re-plan removal");
+        assert_eq!(replan.applicable_count(), 0, "{replan:?}");
+        let reremoved = root
+            .apply_hooks_removal(&binary)
+            .expect("apply removal again");
+        assert_eq!(reremoved, HooksRemoved::AlreadyAbsent);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

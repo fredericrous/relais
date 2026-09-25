@@ -93,6 +93,20 @@ impl World {
             .env("RELAIS_CONFIG_DIR", &self.config)
             .env("RELAIS_CLAUDE_BIN", self.root.join("no-such-claude"))
             .env("RELAIS_SESSION_ID", "tab-test")
+            // This world's home, so nothing here reads — or acts on —
+            // the home directory of whoever is running `make check`.
+            // `doctor` falls back to `~/.claude/settings.json` when the
+            // repository has none, and a developer who has installed the
+            // hooks has a real relais command recorded there: without
+            // this, the suite would spawn that command from inside the
+            // test run and assert against whatever it said. A test whose
+            // answer depends on the machine's configuration is not a test
+            // of this code.
+            .env("HOME", &self.root)
+            // Windows resolves a home from `USERPROFILE` when `HOME` is
+            // unset (`paths::resolve_home`), and the CI matrix runs
+            // there, so both have to point into the world.
+            .env("USERPROFILE", &self.root)
             .output()
             .expect("relais runs")
     }
@@ -233,6 +247,146 @@ fn install_is_preview_first_and_uninstall_keeps_foreign_and_modified_files() {
     assert!(
         world.repo.join(".claude/agents/custom.md").exists(),
         "foreign files are kept"
+    );
+}
+
+// The objective this suite exists for: `relais install --claude` alone
+// never touches settings.json, `--hooks` wires all seven targets in and
+// a re-run says nothing is left to do, and `relais doctor` exercises the
+// recorded command — spawning it for real against a scratch environment
+// — rather than merely reading the file back.
+#[test]
+fn install_claude_alone_never_touches_settings_json() {
+    let world = World::new("install-no-hooks");
+    std::fs::create_dir_all(world.repo.join(".claude")).expect("mkdir");
+    let settings = world.repo.join(".claude/settings.json");
+    let original = "{\n  \"hooks\": {}\n}\n";
+    std::fs::write(&settings, original).expect("write settings");
+    let write = world.relais(&["install", "--claude", "--write"]);
+    assert_eq!(write.status.code(), Some(0), "{}", text(&write.stderr));
+    assert_eq!(
+        std::fs::read_to_string(&settings).expect("read"),
+        original,
+        "settings.json is untouched by a plain --claude install"
+    );
+}
+
+#[test]
+fn install_hooks_wires_settings_json_and_a_rerun_is_current() {
+    let world = World::new("install-hooks");
+    let write = world.relais(&["install", "--claude", "--hooks", "--write"]);
+    assert_eq!(write.status.code(), Some(0), "{}", text(&write.stderr));
+    let settings_path = world.repo.join(".claude/settings.json");
+    let settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("settings"))
+            .expect("valid json");
+    for event in [
+        "PreToolUse",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "SubagentStart",
+        "SubagentStop",
+        "SessionStart",
+        "SessionEnd",
+    ] {
+        assert!(
+            settings["hooks"][event]
+                .as_array()
+                .is_some_and(|a| !a.is_empty()),
+            "{event} must carry a relais handler: {settings}"
+        );
+    }
+    assert_eq!(
+        settings["hooks"]["PreToolUse"][0]["matcher"], "Agent|Task",
+        "{settings}"
+    );
+    assert!(settings["hooks"]["SessionStart"][0]
+        .get("matcher")
+        .is_none());
+
+    let rerun = world.relais(&["install", "--claude", "--hooks", "--write"]);
+    assert_eq!(rerun.status.code(), Some(0), "{}", text(&rerun.stderr));
+    assert!(
+        text(&rerun.stdout).contains("already current"),
+        "{}",
+        text(&rerun.stdout)
+    );
+
+    // Uninstall removes relais's own commands and leaves anything foreign.
+    let uninstall = world.relais(&["uninstall", "--claude", "--hooks", "--write"]);
+    assert_eq!(
+        uninstall.status.code(),
+        Some(0),
+        "{}",
+        text(&uninstall.stderr)
+    );
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("settings"))
+            .expect("valid json");
+    assert!(
+        after["hooks"]["PreToolUse"][0]["hooks"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "{after}"
+    );
+}
+
+// `relais doctor` exercises the hook it finds recorded in settings.json
+// by spawning it for real: a fixture spawn payload on stdin, its
+// directories redirected to a scratch environment that refuses when the
+// coordinator is unreachable (there is none reachable from a scratch
+// state directory). The recorded command IS this test binary, so this
+// proves the wiring end to end, not just the planning.
+#[test]
+fn doctor_exercises_the_recorded_hook_and_reports_a_refusal() {
+    let world = World::new("doctor-hook-live");
+    let before = world.relais(&["doctor", "--json"]);
+    let report: serde_json::Value =
+        serde_json::from_str(text(&before.stdout).trim()).expect("doctor --json is a document");
+    let finding = report["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .find(|f| f["component"] == "hook-live")
+        .expect("a hook-live finding");
+    assert_eq!(finding["level"], "warn", "{finding}");
+    assert!(
+        finding["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no relais command is recorded"),
+        "{finding}"
+    );
+
+    let write = world.relais(&["install", "--claude", "--hooks", "--write"]);
+    assert_eq!(write.status.code(), Some(0), "{}", text(&write.stderr));
+
+    let after = world.relais(&["doctor", "--json"]);
+    let report: serde_json::Value =
+        serde_json::from_str(text(&after.stdout).trim()).expect("doctor --json is a document");
+    let finding = report["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .find(|f| f["component"] == "hook-live")
+        .expect("a hook-live finding");
+    assert_eq!(finding["level"], "ok", "{finding}");
+    let detail = finding["detail"].as_str().expect("detail");
+    assert!(detail.contains("refused"), "{finding}");
+    // The command it exercised is the one THIS world wrote, not one from
+    // the home directory of whoever is running the suite: `doctor` falls
+    // back to `~/.claude/settings.json`, and this world's home is inside
+    // it (see `World::relais_in`), so the path it names proves which file
+    // it read.
+    assert!(
+        detail.contains(
+            &world
+                .repo
+                .join(".claude/settings.json")
+                .display()
+                .to_string()
+        ),
+        "{finding}"
     );
 }
 
