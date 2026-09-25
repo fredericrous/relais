@@ -245,6 +245,10 @@ enum Command {
         /// contract names one whose evidence is a human sign-off
         #[arg(long = "criterion")]
         criterion: Option<String>,
+        /// The candidate a person finished and merged; required by, and
+        /// only meaningful with, `--answer salvaged`
+        #[arg(long = "candidate")]
+        candidate: Option<String>,
     },
     /// Evidence operations (SPEC §12, §18)
     Evidence {
@@ -367,6 +371,12 @@ enum DecideAnswer {
     Decided,
     /// The run is abandoned rather than answered further.
     Abandon,
+    /// A person finished and merged the candidate a terminal run left
+    /// behind, for a reason unrelated to the work itself. Unlike every
+    /// other answer, this one applies to a run that never awaited a
+    /// person — `--candidate` is required, and the run's own terminal
+    /// reason is kept, not replaced.
+    Salvaged,
 }
 
 impl DecideAnswer {
@@ -377,6 +387,7 @@ impl DecideAnswer {
             Self::Revise => Reason::DecisionRevised,
             Self::Decided => Reason::DecisionRecorded,
             Self::Abandon => Reason::DecisionAbandoned,
+            Self::Salvaged => Reason::DecisionSalvaged,
         }
     }
 
@@ -390,6 +401,7 @@ impl DecideAnswer {
         match self {
             Self::Approve => State::Accepted,
             Self::Reject | Self::Revise | Self::Decided | Self::Abandon => State::Cancelled,
+            Self::Salvaged => State::AcceptedByPerson,
         }
     }
 }
@@ -676,6 +688,7 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             note,
             successor,
             criterion,
+            candidate,
         } => decide_command(
             &run_id,
             answer,
@@ -683,6 +696,7 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             note.as_deref(),
             successor.as_deref(),
             criterion.as_deref(),
+            candidate.as_deref(),
         ),
         Command::Evidence { cmd } => match cmd {
             EvidenceCommand::Attach {
@@ -2705,9 +2719,11 @@ fn feedback_command(request: FeedbackRequest) -> Result<CliOutcome, CliError> {
         return Ok(CliOutcome::UnknownRun);
     };
     // SPEC §20: feedback is attributed to the candidate; absence of
-    // feedback is never a positive label. Only accepted runs have a
-    // candidate whose later life is worth recording.
-    if state != State::Accepted {
+    // feedback is never a positive label. Only a run that reached an
+    // accepted candidate — the runner's own verification, or a person's
+    // salvage of a terminal run's work — has one whose later life is
+    // worth recording.
+    if state != State::Accepted && state != State::AcceptedByPerson {
         eprintln!(
             "relais feedback: run {run} is {state}, not accepted — final outcome feedback \
              records what happened to an ACCEPTED change"
@@ -2718,25 +2734,36 @@ fn feedback_command(request: FeedbackRequest) -> Result<CliOutcome, CliError> {
         eprintln!("relais feedback: run {run} carries no task identity");
         return Ok(CliOutcome::OperationalFailure);
     };
-    // A run accepted through a person's approval (`relais decide --answer
-    // approve`) on a contract interrupted before verification never wrote
-    // a receipt — SPEC's decision spine reaches `accepted` without one.
-    // Feedback about it is still worth recording; whenever a receipt DOES
-    // exist, it is still the source of truth a `--candidate` is checked
-    // against (SPEC §20: feedback is attributed to the candidate).
-    let receipt = operational(ledger.receipt(&run), "feedback")?;
-    let recorded_candidate = match receipt {
-        Some((receipt, _hash)) => {
-            let Some(sha) = receipt["candidate_sha"].as_str() else {
-                eprintln!("relais feedback: run {run}'s receipt names no candidate");
-                return Ok(CliOutcome::OperationalFailure);
-            };
-            Some(sha.to_string())
+    // A salvaged run's candidate is never relais's own: it is whatever a
+    // person named with `--candidate` on `relais decide --answer
+    // salvaged`, read back from the same transition that recorded it —
+    // never the receipt (a salvaged run never wrote one) and never the
+    // latest attempt's own candidate (that is the work relais discarded,
+    // not what the person actually merged).
+    let recorded_candidate = if state == State::AcceptedByPerson {
+        operational(ledger.salvaged_candidate(&run), "feedback")?
+    } else {
+        // A run accepted through a person's approval (`relais decide
+        // --answer approve`) on a contract interrupted before
+        // verification never wrote a receipt — SPEC's decision spine
+        // reaches `accepted` without one. Feedback about it is still
+        // worth recording; whenever a receipt DOES exist, it is still
+        // the source of truth a `--candidate` is checked against (SPEC
+        // §20: feedback is attributed to the candidate).
+        match operational(ledger.receipt(&run), "feedback")? {
+            Some((receipt, _hash)) => {
+                let Some(sha) = receipt["candidate_sha"].as_str() else {
+                    eprintln!("relais feedback: run {run}'s receipt names no candidate");
+                    return Ok(CliOutcome::OperationalFailure);
+                };
+                Some(sha.to_string())
+            }
+            // No receipt, but the run may still have finished an attempt
+            // and named what it built. That is the ledger's own answer,
+            // and it stands in for the receipt here exactly as the
+            // receipt would.
+            None => operational(ledger.latest_attempt_candidate(&run), "feedback")?,
         }
-        // No receipt, but the run may still have finished an attempt and
-        // named what it built. That is the ledger's own answer, and it
-        // stands in for the receipt here exactly as the receipt would.
-        None => operational(ledger.latest_attempt_candidate(&run), "feedback")?,
     };
     match (&recorded_candidate, &candidate) {
         (Some(recorded), Some(candidate)) if candidate != recorded => {
@@ -2866,6 +2893,7 @@ fn decide_command(
     note: Option<&str>,
     successor: Option<&str>,
     criterion: Option<&str>,
+    candidate: Option<&str>,
 ) -> Result<CliOutcome, CliError> {
     let ledger = open_ledger()?;
     let run = RunId::from_stored(run_id);
@@ -2873,6 +2901,25 @@ fn decide_command(
         eprintln!("relais decide: unknown run {run_id}");
         return Ok(CliOutcome::UnknownRun);
     };
+    // `salvaged` answers a run no other answer can reach: one that ended
+    // WITHOUT ever awaiting a person, so it opened no decision row for
+    // `resolve_decision` to close. It takes its own path below rather
+    // than falling into the `awaits_a_person` gate every other answer
+    // shares.
+    if answer == DecideAnswer::Salvaged {
+        return salvage_command(
+            &ledger,
+            &run,
+            state,
+            &SalvageAnswer {
+                actor,
+                note,
+                criterion,
+                successor,
+                candidate,
+            },
+        );
+    }
     if !state.awaits_a_person() {
         eprintln!(
             "relais decide: run {run_id} is {state}, not waiting on a person — nothing to decide"
@@ -2964,6 +3011,67 @@ fn decide_command(
         return Ok(CliOutcome::InvalidInput);
     }
     println!("recorded {} for {run_id} by {actor}", resolution.as_str());
+    Ok(CliOutcome::Accepted)
+}
+
+/// The CLI flags `--answer salvaged` reads, grouped because they answer
+/// one decision together (mirrors [`relais::ledger::DecisionAnswer`]).
+struct SalvageAnswer<'a> {
+    actor: &'a str,
+    note: Option<&'a str>,
+    criterion: Option<&'a str>,
+    successor: Option<&'a str>,
+    candidate: Option<&'a str>,
+}
+
+/// `relais decide --answer salvaged --candidate <sha>`: a terminal run
+/// relais itself never accepted, whose candidate a person finished and
+/// merged anyway (SPEC's decision spine). Distinct from every other
+/// answer in `decide_command` because this run never awaited a person —
+/// it ended on its own, for a reason [`Ledger::record_salvage`] keeps
+/// rather than overwrites.
+fn salvage_command(
+    ledger: &Ledger,
+    run: &RunId,
+    state: State,
+    answer: &SalvageAnswer<'_>,
+) -> Result<CliOutcome, CliError> {
+    let Some(candidate_sha) = answer.candidate else {
+        eprintln!("relais decide: `--answer salvaged` requires `--candidate <sha>`");
+        return Ok(CliOutcome::InvalidInput);
+    };
+    if answer.criterion.is_some() {
+        eprintln!("relais decide: `--criterion` does not apply to `--answer salvaged`");
+        return Ok(CliOutcome::InvalidInput);
+    }
+    if answer.successor.is_some() {
+        eprintln!("relais decide: `--successor` does not apply to `--answer salvaged`");
+        return Ok(CliOutcome::InvalidInput);
+    }
+    // Salvage answers a run that ended on its own, without producing an
+    // accepted candidate: never one still in flight, never one already
+    // accepted the ordinary way or already salvaged once.
+    if !state.is_terminal() || matches!(state, State::Accepted | State::AcceptedByPerson) {
+        eprintln!(
+            "relais decide: run {run} is {state} — `salvaged` answers a run that already \
+             ended without an accepted candidate, not one still in flight or already accepted"
+        );
+        return Ok(CliOutcome::InvalidInput);
+    }
+    let Some(original_reason) = operational(
+        ledger.record_salvage(run, candidate_sha, answer.actor, answer.note),
+        "decide",
+    )?
+    else {
+        eprintln!("relais decide: run {run} already carries a decision on record");
+        return Ok(CliOutcome::InvalidInput);
+    };
+    println!(
+        "recorded {} for {run} by {} (originally ended: {})",
+        Reason::DecisionSalvaged.as_str(),
+        answer.actor,
+        original_reason.as_str()
+    );
     Ok(CliOutcome::Accepted)
 }
 
@@ -3162,10 +3270,11 @@ mod tests {
     }
 
     /// Walks every `DecideAnswer` and asserts the terminal state it
-    /// assigns: `approve` accepts, every other answer cancels. Matched
-    /// directly over `DecideAnswer` in `terminal_state`, so a sixth
-    /// variant added to that enum without a case there fails to compile
-    /// this test along with everything else in the crate.
+    /// assigns: `approve` accepts, `salvaged` reaches its own distinct
+    /// accepted state, every other answer cancels. Matched directly over
+    /// `DecideAnswer` in `terminal_state`, so a seventh variant added to
+    /// that enum without a case there fails to compile this test along
+    /// with everything else in the crate.
     #[test]
     fn decide_answers_every_variant_assigns_a_projected_status() {
         for answer in [
@@ -3174,11 +3283,15 @@ mod tests {
             DecideAnswer::Revise,
             DecideAnswer::Decided,
             DecideAnswer::Abandon,
+            DecideAnswer::Salvaged,
         ] {
-            let expected = if answer == DecideAnswer::Approve {
-                State::Accepted
-            } else {
-                State::Cancelled
+            let expected = match answer {
+                DecideAnswer::Approve => State::Accepted,
+                DecideAnswer::Salvaged => State::AcceptedByPerson,
+                DecideAnswer::Reject
+                | DecideAnswer::Revise
+                | DecideAnswer::Decided
+                | DecideAnswer::Abandon => State::Cancelled,
             };
             assert_eq!(answer.terminal_state(), expected, "{answer:?}");
         }

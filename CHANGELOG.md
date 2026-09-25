@@ -10,6 +10,30 @@ missing here.
 
 ### Added
 
+- **A pre-authorized model substitution is accepted and recorded instead
+  of ending the run, and a person can salvage the work of one that still
+  ends anyway (#49).** `[routing].approved_substitutions` in
+  `machine.toml` names exact `requested`/`effective` model pairs a person
+  reviewed in advance; a dispatch that matches one is
+  `ModelVerification::Approved`, a new outcome distinct from both a plain
+  match and an unapproved `Substituted` — dispatch carries on, and the
+  usage event already recorded both identities, so the money is
+  attributed to the model that actually ran and the route's own request
+  is not lost. The list is machine-owned, like `allowed_models`: a
+  repository cannot widen what it spends by naming its own approvals.
+  Separately, a terminal run relais itself never accepted — one that
+  failed, was blocked, or ran out of budget, for a reason that may have
+  nothing to do with the work itself — can now say a person finished and
+  merged its candidate anyway: `relais decide --answer salvaged
+  --candidate <sha>` moves the run to a new `accepted_by_person` state,
+  keeps the reason it originally ended (never overwritten by the
+  salvage's own `decision_salvaged` resolution), and `relais feedback`
+  now accepts it, checking `--candidate` against the one the salvage
+  recorded rather than the discarded attempt. The primary "cost per
+  accepted change" metric now counts a salvaged run as accepted, closing
+  the gap where relais's own spend on a run a person rescued vanished
+  from the denominator.
+
 - **A queued spawn now waits for a seat instead of being refused at
   once.** Measured on Claude Code 2.1.282: a `PreToolUse` hook holds its
   tool call open for as long as it runs, so relais no longer has to

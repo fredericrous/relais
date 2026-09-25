@@ -127,6 +127,18 @@ pub enum Reason {
     DecisionRecorded,
     /// A person gave up on the run rather than answering it.
     DecisionAbandoned,
+    /// A person finished and merged the candidate a terminal run left
+    /// behind, for a reason unrelated to the work itself
+    /// (`relais decide --answer salvaged --candidate <sha>`). The run's
+    /// own terminal reason is untouched by this — it is recorded
+    /// alongside, on the same decision row, not replaced.
+    DecisionSalvaged,
+    /// A substitution `machine.toml` authorised in advance was accepted:
+    /// the run carried on, and this is the record that it did. Without
+    /// it the fact lives only in two usage-event columns nobody reads
+    /// side by side, and `relais explain` would show a run that quietly
+    /// ran on a model nobody asked it for.
+    ModelSubstitutionApproved,
 }
 
 impl Reason {
@@ -135,7 +147,7 @@ impl Reason {
     ///
     /// The length is fixed, so a variant added to the enum without being
     /// added here does not compile the `match` that walks it.
-    pub const ALL: [Self; 48] = [
+    pub const ALL: [Self; 50] = [
         Self::ChecksAndReviewPassed,
         Self::BehavioralFailure,
         Self::RepairExhausted,
@@ -184,6 +196,8 @@ impl Reason {
         Self::DecisionRevised,
         Self::DecisionRecorded,
         Self::DecisionAbandoned,
+        Self::DecisionSalvaged,
+        Self::ModelSubstitutionApproved,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -236,6 +250,8 @@ impl Reason {
             Self::DecisionRevised => "decision_revised",
             Self::DecisionRecorded => "decision_recorded",
             Self::DecisionAbandoned => "decision_abandoned",
+            Self::DecisionSalvaged => "decision_salvaged",
+            Self::ModelSubstitutionApproved => "model_substitution_approved",
         }
     }
 
@@ -281,6 +297,11 @@ pub enum State {
     BudgetExhausted,
     Cancelled,
     Interrupted,
+    /// A person finished and merged the candidate a terminal run left
+    /// behind (`relais decide --answer salvaged`) — accepted, but never
+    /// by the runner's own verification, so it is a distinct state from
+    /// [`State::Accepted`] rather than the same one reached a second way.
+    AcceptedByPerson,
 }
 
 impl State {
@@ -289,7 +310,7 @@ impl State {
     ///
     /// The length is fixed, so a variant added to the enum without being
     /// added here does not compile the `match` that walks it.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Prepared,
         Self::Running,
         Self::Verifying,
@@ -303,6 +324,7 @@ impl State {
         Self::BudgetExhausted,
         Self::Cancelled,
         Self::Interrupted,
+        Self::AcceptedByPerson,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -320,6 +342,7 @@ impl State {
             Self::BudgetExhausted => "budget_exhausted",
             Self::Cancelled => "cancelled",
             Self::Interrupted => "interrupted",
+            Self::AcceptedByPerson => "accepted_by_person",
         }
     }
 
@@ -345,6 +368,7 @@ impl State {
                 | Self::BudgetExhausted
                 | Self::Cancelled
                 | Self::Interrupted
+                | Self::AcceptedByPerson
         )
     }
 
@@ -371,7 +395,8 @@ impl State {
             | Self::Failed
             | Self::Blocked
             | Self::BudgetExhausted
-            | Self::Cancelled => false,
+            | Self::Cancelled
+            | Self::AcceptedByPerson => false,
         }
     }
 }

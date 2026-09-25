@@ -1855,9 +1855,40 @@ impl<'a> RunEngine<'a> {
         // (SPEC §6). A harness that named NO model leaves the
         // question open, which is a recorded gap and stops dispatch
         // just the same: the run cannot say the route was tested
-        // (audit V3).
-        match crate::backend::verify_model(&requested_model, result.effective_model.as_deref()) {
+        // (audit V3). A substitution `machine.toml` approved in advance
+        // is neither: dispatch carries on exactly as a match would — the
+        // usage event just recorded above already carries both the
+        // requested model and the effective one that ran, so the money
+        // is attributed to the model that actually ran and the route's
+        // own request is not lost.
+        match crate::backend::verify_model(
+            &requested_model,
+            result.effective_model.as_deref(),
+            &self.config.machine.routing.approved_substitutions,
+        ) {
             crate::backend::ModelVerification::Matches => {}
+            // Recorded, not waved through. The usage event above already
+            // carries both identities, so the money is attributed
+            // correctly either way — but that pair is two columns a
+            // reader would have to compare deliberately, and nothing in
+            // the run's own story would say a substitution happened.
+            // This is a same-state transition, the idiom this runner
+            // already uses for a fact that changes no state.
+            crate::backend::ModelVerification::Approved {
+                requested,
+                effective,
+            } => {
+                let state = self.state;
+                self.transition(
+                    state,
+                    Reason::ModelSubstitutionApproved,
+                    serde_json::json!({
+                        "requested": requested,
+                        "effective": effective,
+                        "dispatch": dispatch_id.as_str(),
+                    }),
+                )?;
+            }
             crate::backend::ModelVerification::Substituted {
                 requested,
                 effective,
@@ -4523,6 +4554,71 @@ mod tests {
             panic!("expected failed, got {outcome:?}");
         };
         assert!(detail.contains("substituted"), "{detail}");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// The third answer this package exists for: a substitution the
+    /// MACHINE authorised in advance carries on rather than throwing the
+    /// finished work away — and it is recorded while it does. Both
+    /// halves matter: an approved substitution that ended the run would
+    /// be the bug this fixes, and one that vanished into a success would
+    /// leave a run that quietly used a model nobody asked for with
+    /// nothing in its own story saying so.
+    #[test]
+    fn an_approved_substitution_carries_on_and_is_recorded() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let mut machine = fixture.machine_for(&repo);
+        machine.routing.approved_substitutions = vec![crate::policy::ApprovedSubstitution {
+            requested: "sonnet".into(),
+            effective: "claude-opus-5-5".into(),
+            note: Some("the provider substitutes under load; reviewed 2026-09-25".into()),
+        }];
+        // The same worker the accepted-run tests use, reporting the
+        // substituted model the machine approved.
+        let backend = MockBackend::new(move |spec| {
+            if spec.prompt.contains("semantic reviewer") {
+                return MockOutcome {
+                    result_text: Some("review ok\nFINDINGS: none".into()),
+                    exit_code: Some(0),
+                    effective_model: Some("claude-opus-5-5".into()),
+                    ..Default::default()
+                };
+            }
+            if spec.prompt.contains("relais task") {
+                std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("worker completes");
+            }
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                effective_model: Some("claude-opus-5-5".into()),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute_with_machine(
+            &fixture.contract(Review::Optional),
+            &repo,
+            &machine,
+            &backend,
+        );
+        assert!(
+            matches!(outcome.terminal, Terminal::Accepted { .. }),
+            "an approved substitution does not end the run: {:?}",
+            outcome.terminal
+        );
+
+        let transitions = fixture
+            .ledger
+            .transitions(&outcome.run_id)
+            .expect("transitions");
+        let recorded = transitions
+            .iter()
+            .find(|t| t.reason == Reason::ModelSubstitutionApproved.as_str())
+            .expect("the approved substitution is recorded in the run's own story");
+        let detail = recorded.detail.as_ref().expect("detail");
+        assert_eq!(detail["requested"], "sonnet", "{detail}");
+        assert_eq!(detail["effective"], "claude-opus-5-5", "{detail}");
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 

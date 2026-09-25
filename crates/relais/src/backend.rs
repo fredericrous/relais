@@ -463,15 +463,27 @@ pub fn model_matches(requested: &str, effective: &str) -> bool {
     is_alias && effective.contains(&requested)
 }
 
-/// What a dispatch established about the model that ran. Three answers,
+/// What a dispatch established about the model that ran. Four answers,
 /// not two: a harness that reports no model leaves the question OPEN,
 /// and reading that as agreement is how an unreported substitution used
-/// to pass (audit V3).
+/// to pass (audit V3); a substitution the machine reviewed in advance is
+/// distinct from one nobody approved, so accepting it cannot be mistaken
+/// for the harness having matched the request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelVerification {
     /// The harness named a model that satisfies the route's request.
     Matches,
-    /// It named a different one: an unapproved substitution (SPEC §6).
+    /// It named a different one, and `machine.toml` names this exact
+    /// substitution in advance (SPEC §6): accepted, not refused. Still
+    /// two distinct identities — the route's request and the model that
+    /// actually ran — carried separately so both reach the dispatch, the
+    /// usage event and the receipt.
+    Approved {
+        requested: String,
+        effective: String,
+    },
+    /// It named a different one, and nothing approved it: an unapproved
+    /// substitution (SPEC §6).
     Substituted {
         requested: String,
         effective: String,
@@ -483,10 +495,26 @@ pub enum ModelVerification {
 
 /// Check the model the harness reported against the one the route asked
 /// for. `None` is the harness reporting nothing, which is a gap, never a
-/// match.
-pub fn verify_model(requested: &str, effective: Option<&str>) -> ModelVerification {
+/// match. `approved_substitutions` is machine-owned (SPEC §6: accepting a
+/// costlier model is a spending decision a repo must not be able to
+/// widen) — see [`crate::policy::RoutingSettings::approved_substitutions`].
+pub fn verify_model(
+    requested: &str,
+    effective: Option<&str>,
+    approved_substitutions: &[crate::policy::ApprovedSubstitution],
+) -> ModelVerification {
     match effective {
         Some(effective) if model_matches(requested, effective) => ModelVerification::Matches,
+        Some(effective)
+            if approved_substitutions
+                .iter()
+                .any(|approval| approval.approves(requested, effective)) =>
+        {
+            ModelVerification::Approved {
+                requested: requested.to_string(),
+                effective: effective.to_string(),
+            }
+        }
         Some(effective) => ModelVerification::Substituted {
             requested: requested.to_string(),
             effective: effective.to_string(),
@@ -619,20 +647,47 @@ mod tests {
     #[test]
     fn an_unreported_model_is_unverified_not_a_match() {
         assert_eq!(
-            verify_model("sonnet", Some("claude-sonnet-5")),
+            verify_model("sonnet", Some("claude-sonnet-5"), &[]),
             ModelVerification::Matches
         );
         assert_eq!(
-            verify_model("sonnet", Some("claude-haiku-4-5")),
+            verify_model("sonnet", Some("claude-haiku-4-5"), &[]),
             ModelVerification::Substituted {
                 requested: "sonnet".into(),
                 effective: "claude-haiku-4-5".into(),
             }
         );
         assert_eq!(
-            verify_model("sonnet", None),
+            verify_model("sonnet", None, &[]),
             ModelVerification::Unverified {
                 requested: "sonnet".into()
+            }
+        );
+    }
+
+    /// A substitution `machine.toml` names in advance is accepted rather
+    /// than refused, but stays a distinct answer from a genuine match —
+    /// both identities survive. Anything not in the list is still an
+    /// unapproved substitution, list or no list.
+    #[test]
+    fn a_listed_substitution_is_approved_and_an_unlisted_one_still_is_not() {
+        let approved = vec![crate::policy::ApprovedSubstitution {
+            requested: "sonnet".into(),
+            effective: "claude-haiku-4-5".into(),
+            note: None,
+        }];
+        assert_eq!(
+            verify_model("sonnet", Some("claude-haiku-4-5"), &approved),
+            ModelVerification::Approved {
+                requested: "sonnet".into(),
+                effective: "claude-haiku-4-5".into(),
+            }
+        );
+        assert_eq!(
+            verify_model("sonnet", Some("claude-fable-5-1"), &approved),
+            ModelVerification::Substituted {
+                requested: "sonnet".into(),
+                effective: "claude-fable-5-1".into(),
             }
         );
     }

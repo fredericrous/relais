@@ -563,6 +563,33 @@ pub struct MachineSettings {
     pub admission: HookAdmissionSettings,
 }
 
+/// One substitution `machine.toml` reviewed and will accept without
+/// ending a run — see [`MachineSettings::approved_substitutions`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedSubstitution {
+    /// The model ID or alias a route requested.
+    pub requested: String,
+    /// The model ID the harness is permitted to report running instead.
+    pub effective: String,
+    /// Why this substitution is accepted — required in spirit, not in
+    /// type: left optional so an older entry still parses, but every
+    /// entry a person writes should carry one.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+impl ApprovedSubstitution {
+    /// Whether this entry covers exactly this requested/effective pair.
+    /// Case-insensitive, trimmed, like [`crate::backend::model_matches`] —
+    /// but an exact pair, never an alias match: this list names concrete
+    /// substitutions a person reviewed, not a pattern.
+    pub fn approves(&self, requested: &str, effective: &str) -> bool {
+        self.requested.trim().eq_ignore_ascii_case(requested.trim())
+            && self.effective.trim().eq_ignore_ascii_case(effective.trim())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct SpendingCeilings {
@@ -905,6 +932,14 @@ pub struct RoutingSettings {
     /// artifact may abstain on and still be promoted. An artifact that
     /// abstains on most tasks is the baseline wearing a model's name.
     pub max_abstention_rate: f64,
+    /// Substitutions reviewed and accepted in advance: a dispatch that
+    /// requested `requested` and ran `effective` instead stops being an
+    /// unapproved substitution that ends the run (SPEC §6) and becomes an
+    /// accepted [`crate::backend::ModelVerification::Approved`] one.
+    /// Machine-owned only, like `allowed_models` on [`MachineSettings`] —
+    /// accepting a costlier model is a spending decision a repository
+    /// must not be able to widen on its own.
+    pub approved_substitutions: Vec<ApprovedSubstitution>,
 }
 
 impl Default for RoutingSettings {
@@ -914,6 +949,7 @@ impl Default for RoutingSettings {
             quality_floor: Some(0.75),
             min_supported_test_records: 20,
             max_abstention_rate: 0.5,
+            approved_substitutions: Vec::new(),
         }
     }
 }

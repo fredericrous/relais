@@ -1861,6 +1861,141 @@ impl Ledger {
         Ok(changed > 0)
     }
 
+    /// Record that a person finished and merged the candidate a terminal
+    /// run left behind — `relais decide --answer salvaged --candidate
+    /// <sha>`. Unlike [`Self::resolve_decision`], this run never opened a
+    /// decision row: [`Self::record_transition`] only opens one for a
+    /// state [`State::awaits_a_person`], and a salvaged run's terminal
+    /// state (`failed`, `blocked`, `budget_exhausted`, `cancelled`) is
+    /// never one of those. So this both raises AND resolves the row in
+    /// the same write, with `raised_state`/`raised_reason` carrying
+    /// forward the run's OWN terminal state and reason exactly as its
+    /// last transition recorded them — the reason it originally ended is
+    /// kept, not replaced by the salvage's own resolution — and records a
+    /// new transition to [`State::AcceptedByPerson`] whose detail names
+    /// the candidate a person actually merged.
+    ///
+    /// `Ok(None)` when the run has no terminal transition to salvage (an
+    /// unknown run, or one still in flight) or already carries a decision
+    /// row of its own, open or resolved — a second answer is refused by
+    /// name rather than silently overwriting the first. `Ok(Some(reason))`
+    /// on success, naming the reason the run originally ended with, for
+    /// the caller to report back.
+    pub fn record_salvage(
+        &self,
+        run_id: &RunId,
+        candidate_sha: &str,
+        actor: &str,
+        note: Option<&str>,
+    ) -> Result<Option<Reason>> {
+        let now = self.now();
+        let tx = self.write_tx()?;
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT run FROM decisions WHERE run = ?1",
+                [run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if existing.is_some() {
+            return Ok(None);
+        }
+        // The transition wanted is the one that ENTERED the run's
+        // current terminal state, not merely the last row: a run keeps
+        // recording transitions after it becomes terminal — retiring its
+        // worktree writes a same-state row — and reading THAT reason
+        // would report every salvaged run's own ending as
+        // `worktree_retired` (the same trap `report::accepted_by_person`
+        // guards against for `Accepted`).
+        let last: Option<(String, String)> = tx
+            .query_row(
+                "SELECT to_state, reason FROM transitions
+                 WHERE run_id = ?1 AND (from_state IS NULL OR from_state != to_state)
+                 ORDER BY id DESC LIMIT 1",
+                [run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((last_state, last_reason)) = last else {
+            return Ok(None);
+        };
+        let original_reason =
+            Reason::parse(&last_reason).map_err(|unknown| LedgerError::Corrupt {
+                what: unknown.what.into(),
+                detail: unknown.to_string(),
+            })?;
+        let task_id: Option<String> = tx
+            .query_row(
+                "SELECT task_id FROM runs WHERE id = ?1",
+                [run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let task_id = task_id.unwrap_or_else(|| format!("task-legacy-{}", run_id.as_str()));
+        tx.execute(
+            "INSERT INTO decisions
+                (run, task, raised_at, raised_state, raised_reason, resolved_at, resolution, actor, note)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                run_id.as_str(),
+                task_id,
+                now,
+                last_state,
+                last_reason,
+                now,
+                Reason::DecisionSalvaged.as_str(),
+                actor,
+                note,
+            ],
+        )?;
+        append_transition(
+            &tx,
+            &Transition {
+                run_id: run_id.clone(),
+                attempt_id: None,
+                from_state: Some(parse_state(&last_state)?),
+                to_state: State::AcceptedByPerson,
+                reason: Reason::DecisionSalvaged.as_str().to_string(),
+                detail: Some(serde_json::json!({ "candidate_sha": candidate_sha })),
+                at: now,
+            },
+        )?;
+        tx.commit()?;
+        Ok(Some(original_reason))
+    }
+
+    /// The candidate a person recorded merging when they salvaged a
+    /// terminal run (SPEC's decision spine): the `candidate_sha`
+    /// [`Self::record_salvage`] wrote into the [`State::AcceptedByPerson`]
+    /// transition's detail. `None` for a run that was never salvaged —
+    /// including one accepted the ordinary way, whose candidate `receipt`
+    /// names instead.
+    pub fn salvaged_candidate(&self, run_id: &RunId) -> Result<Option<String>> {
+        let detail: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT detail_json FROM transitions
+                 WHERE run_id = ?1 AND to_state = ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![run_id.as_str(), State::AcceptedByPerson.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(detail) = detail else {
+            return Ok(None);
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&detail).map_err(|e| LedgerError::Corrupt {
+                what: format!("the salvage detail of run {run_id}"),
+                detail: e.to_string(),
+            })?;
+        Ok(value
+            .get("candidate_sha")
+            .and_then(|v| v.as_str())
+            .map(str::to_string))
+    }
+
     /// Record that a person signed off on one acceptance criterion of
     /// one run — written only by `relais decide --answer approve
     /// --criterion <id>`. `INSERT OR REPLACE`: answering the same
@@ -2878,6 +3013,80 @@ mod tests {
         );
         // Best effort: the fixture is a temp dir; a leftover costs
         // nothing but disk, and the next run pre-cleans it.
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A terminal run that never awaited a person — `record_transition`
+    /// opens a decision row only for [`State::awaits_a_person`], and
+    /// `failed` is not one — has no open decision for `resolve_decision`
+    /// to close. `record_salvage` is the answer that reaches it anyway,
+    /// keeping the run's own reason for ending rather than losing it
+    /// under the salvage's own resolution (#49), and a second salvage of
+    /// the same run is refused exactly like a second `resolve_decision`.
+    #[test]
+    fn record_salvage_keeps_the_original_reason_and_refuses_a_second_answer() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-s"), "/repo", None, &task("run-s"), "rk")
+            .expect("run");
+        ledger
+            .record_transition(&Transition {
+                run_id: run("run-s"),
+                attempt_id: None,
+                from_state: Some(State::Verifying),
+                to_state: State::Failed,
+                reason: Reason::BehavioralFailure.as_str().into(),
+                detail: None,
+                at: now_rfc3339(),
+            })
+            .expect("transition");
+        // A `failed` run opens no decision row: nothing for
+        // `resolve_decision` to close.
+        assert!(ledger
+            .decision_of_run(&run("run-s"))
+            .expect("read")
+            .is_none());
+        let original_reason = ledger
+            .record_salvage(&run("run-s"), "abc123", "a person", Some("merged by hand"))
+            .expect("salvage")
+            .expect("a terminal run with no prior decision salvages");
+        assert_eq!(original_reason, Reason::BehavioralFailure);
+        assert_eq!(
+            ledger.run_status(&run("run-s")).expect("status"),
+            Some(State::AcceptedByPerson)
+        );
+        assert_eq!(
+            ledger.salvaged_candidate(&run("run-s")).expect("candidate"),
+            Some("abc123".to_string())
+        );
+        let decision = ledger
+            .decision_of_run(&run("run-s"))
+            .expect("read")
+            .expect("the salvage recorded a decision row");
+        assert_eq!(decision.raised_state, State::Failed);
+        assert_eq!(
+            decision.raised_reason,
+            Reason::BehavioralFailure.as_str(),
+            "the run's own reason for ending survives, not overwritten by the salvage"
+        );
+        assert_eq!(decision.resolution, Some(Reason::DecisionSalvaged));
+        assert_eq!(decision.actor.as_deref(), Some("a person"));
+        assert!(decision.resolved_at.is_some());
+        assert!(
+            ledger.open_decisions().expect("open").is_empty(),
+            "raised and resolved in the same write; never left open"
+        );
+        // A second salvage of the same run is refused: it already
+        // carries a decision.
+        assert!(ledger
+            .record_salvage(&run("run-s"), "def456", "someone else", None)
+            .expect("salvage")
+            .is_none());
+        assert_eq!(
+            ledger.salvaged_candidate(&run("run-s")).expect("candidate"),
+            Some("abc123".to_string()),
+            "the refused second answer leaves the first candidate on record"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
