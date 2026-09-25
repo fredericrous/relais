@@ -232,12 +232,25 @@ pub fn journal_entry(payload: &[u8], handled: &Handled) -> serde_json::Value {
 /// owner-only if it does not exist yet. A payload names a person's
 /// transcript path and working directory (SPEC §23), so the file this
 /// writes to is never created with group or other access.
+///
+/// The line is rendered into one buffer, newline included, and handed to
+/// a single `write_all`. `O_APPEND` makes each individual write atomic in
+/// where it lands, never a group of them, and `writeln!` on a `File` goes
+/// through `Write::write_fmt`, which issues one write per formatted
+/// fragment — `Display for serde_json::Value` streams a record as braces,
+/// keys, colons and values, so a single line left dozens of syscalls
+/// behind, not two. Two firings at the same instant interleaved those
+/// fragments and left lines that were not JSON (issue #78). Folding the
+/// newline into the `writeln!` would have fixed nothing; what matters is
+/// that the whole record is one write.
 pub fn append_journal(path: &Path, entry: &serde_json::Value) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut file = open_owner_only(path)?;
-    writeln!(file, "{entry}")
+    let mut line = entry.to_string();
+    line.push('\n');
+    file.write_all(line.as_bytes())
 }
 
 #[cfg(unix)]
@@ -1156,5 +1169,53 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    // The test above calls `append_journal` sequentially, one write
+    // fully finished before the next starts, so it could never observe
+    // two firings landing at the same instant — which is exactly how the
+    // interleaved-write bug reached a real session (issue #78: two
+    // spawns whose firings collided wrote two lines that were not JSON).
+    // This test instead fires many threads at the same file concurrently,
+    // the way two hooks racing actually do.
+    //
+    // Confirmed red before it was trusted: with the body restored to
+    // `writeln!(file, "{entry}")` this failed on five runs out of five.
+    // A concurrency test that has only ever been seen green proves
+    // nothing about the race it claims to cover.
+    //
+    // Not gated to unix: the Windows arm opens the same file with
+    // `append(true)` and `FILE_APPEND_DATA` is per-write atomic in the
+    // same way, so the race — and this regression — belong to both
+    // platforms. Nothing in the body is platform-specific, unlike the
+    // permission-mode test above.
+    #[test]
+    fn append_journal_survives_concurrent_writers() {
+        let dir = crate::test_support::temp_dir("hook-journal-concurrent");
+        let path = dir.join("hook_journal.jsonl");
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 50;
+        std::thread::scope(|scope| {
+            for thread_id in 0..THREADS {
+                let path = &path;
+                scope.spawn(move || {
+                    for i in 0..PER_THREAD {
+                        let entry = serde_json::json!({"thread": thread_id, "i": i});
+                        append_journal(path, &entry).expect("append");
+                    }
+                });
+            }
+        });
+        let text = std::fs::read_to_string(&path).expect("read");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            THREADS * PER_THREAD,
+            "every write must land as its own line"
+        );
+        for line in lines {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|err| panic!("line is not valid JSON: {err}: {line:?}"));
+        }
     }
 }
