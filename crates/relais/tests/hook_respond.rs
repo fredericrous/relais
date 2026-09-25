@@ -172,14 +172,36 @@ fn spawn_payload(session: &str, tool_use: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// The end of a spawn's tool call, carrying the same `tool_use_id` the
-/// spawn did — which is what lets the end find the seat the start took.
-fn finish_payload(session: &str, tool_use: &str) -> Vec<u8> {
+/// The spawn's tool call returning at LAUNCH, as a real async spawn's
+/// does (`fixtures/hooks/0009-PostToolUse.json`): same `tool_use_id`,
+/// the agent still running, and the agent it launched named in
+/// `tool_response.agentId`.
+fn launched_payload(session: &str, tool_use: &str, agent: &str) -> Vec<u8> {
     serde_json::json!({
         "hook_event_name": "PostToolUse",
         "session_id": session,
         "tool_name": "Agent",
         "tool_use_id": tool_use,
+        "duration_ms": 8,
+        "tool_response": {
+            "isAsync": true,
+            "status": "async_launched",
+            "agentId": agent,
+        },
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// The agent's real end (`fixtures/hooks/0010-SubagentStop.json`): it
+/// names the agent and no tool call.
+fn stop_payload(session: &str, agent: &str) -> Vec<u8> {
+    serde_json::json!({
+        "hook_event_name": "SubagentStop",
+        "session_id": session,
+        "agent_id": agent,
+        "agent_type": "general-purpose",
+        "background_tasks": [],
     })
     .to_string()
     .into_bytes()
@@ -213,6 +235,10 @@ fn an_unregistered_session_is_admitted_silently_through_the_command() {
 /// firings of one session are silent and the third is refused with a
 /// message that names the limit — never `UnknownRun`, which would prove
 /// only that the mechanism carries an answer, nothing about a limit.
+///
+/// It stays refused after both spawns' `PostToolUse` has fired, because
+/// an Agent call returns at launch while its agent runs on, and only a
+/// `SubagentStop` gives a seat back.
 #[test]
 fn a_cap_refuses_a_spawn_through_the_command_end_to_end() {
     let world = World::new("cap");
@@ -228,15 +254,24 @@ fn a_cap_refuses_a_spawn_through_the_command_end_to_end() {
     let coordinator = RunningCoordinator::start_with_limits(&world.socket(), limits);
 
     let session = "session-capped";
-    for tool_use in ["tool-1", "tool-2"] {
+    for (tool_use, agent) in [("tool-1", "agent-1"), ("tool-2", "agent-2")] {
         let (code, stdout, stderr) = world.hook(&spawn_payload(session, tool_use));
         assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
         assert_eq!(
             stdout, "",
             "spawn {tool_use} is under the cap and should be silent: stderr={stderr}"
         );
+        // The call returns at launch, ~100ms later in a real session,
+        // while the agent it launched keeps running.
+        let (code, stdout, stderr) = world.hook(&launched_payload(session, tool_use, agent));
+        assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+        assert_eq!(stdout, "", "the return of a call is never refused");
     }
 
+    // Both calls have returned and both agents still run. Releasing on
+    // `PostToolUse` — which is when a real async launch returns — would
+    // have freed both seats already and admitted this spawn: this is the
+    // assertion that fails on that behaviour.
     let (code, stdout, stderr) = world.hook(&spawn_payload(session, "tool-3"));
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     assert!(
@@ -251,18 +286,19 @@ fn a_cap_refuses_a_spawn_through_the_command_end_to_end() {
     // `AlreadyFinished` or a depth refusal would all satisfy "a deny that
     // is not UnknownRun", and none of them would be the cap. The cap's
     // own rendering names the limit and offers retrying when an agent
-    // finishes — which the seat being given back at the end of a call is
+    // finishes — which the seat being given back when the agent stops is
     // what makes true.
     assert!(
         stdout.contains("at its limit") || stdout.contains("limit"),
         "the refusal must be the cap's own, naming the limit: stdout={stdout}"
     );
 
-    // And the cap counts RUNNING agents: end tool-1's call, and the seat
-    // it held comes back, so the next spawn is admitted.
-    let (code, stdout, stderr) = world.hook(&finish_payload(session, "tool-1"));
+    // And the cap counts RUNNING agents: agent-1 stops, and the seat its
+    // spawn held comes back — found by the agent, since `SubagentStop`
+    // names no tool call — so the next spawn is admitted.
+    let (code, stdout, stderr) = world.hook(&stop_payload(session, "agent-1"));
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    assert_eq!(stdout, "", "the end of a call is never refused");
+    assert_eq!(stdout, "", "an agent's end is never refused");
 
     let (code, stdout, stderr) = world.hook(&spawn_payload(session, "tool-4"));
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");

@@ -22,10 +22,10 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::admission::{
-    AdmissionState, BindOutcome, Decision, DispatchRequest, Enforcement, Gate, GateError,
-    HeartbeatStatus, LifecycleOutcome, PendingSignal, ReleaseWriteOutcome, ResourceClass,
-    ResumeOutcome, RunRegistration, Signal, StatusSnapshot, WaitOutcome, WithdrawOutcome,
-    WriteLeaseOutcome,
+    AdmissionState, AgentSettleOutcome, BindOutcome, Decision, DispatchRequest, Enforcement, Gate,
+    GateError, HeartbeatStatus, LifecycleOutcome, PendingSignal, Provenance, ReleaseWriteOutcome,
+    ResourceClass, ResumeOutcome, RunRegistration, Signal, StatusSnapshot, WaitOutcome,
+    WithdrawOutcome, WriteLeaseOutcome,
 };
 use crate::ipc::{Listener, Stream};
 use crate::ledger::Ledger;
@@ -83,7 +83,11 @@ const DESCRIPTOR_RETRIES: u32 = 20;
 /// dispatch", which a v1 client read as success. A `Pong` carries this
 /// number so the skew is named at the first call instead of becoming a
 /// worker with no seat (A2).
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// v3 added `bind_agent_lease` and `settle_by_agent`: a hook-admitted
+/// agent's seat is bound on its `PostToolUse` and given back on its
+/// `SubagentStop`, and a v2 daemon has neither call.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Why a coordinator call, election or startup failed. Every variant
 /// names the operation and the entity it was about, so a caller can tell
@@ -230,6 +234,23 @@ pub enum Request {
     Withdraw {
         dispatch_id: String,
     },
+    /// Bind a hook-admitted agent to its dispatch on a lease, with no
+    /// process id: the hook path reports the agent a spawn launched
+    /// (`PostToolUse`'s `tool_response.agentId`) and never a pid.
+    BindAgentLease {
+        dispatch_id: String,
+        agent_id: String,
+        provenance: Provenance,
+    },
+    /// An agent ended (`SubagentStop`): settle and release whatever
+    /// dispatch is bound to it. Named by session and agent because that
+    /// payload names no tool call to derive a dispatch id from.
+    /// `spent_micros: None` = unknown usage, as for `Settle`.
+    SettleByAgent {
+        session_id: String,
+        agent_id: String,
+        spent_micros: Option<i64>,
+    },
     /// The run reached an end state; nothing is cancelled or signalled.
     /// Until a run is finished (or cancelled) it keeps the daemon from
     /// idle-exiting under a run that is merely verifying.
@@ -297,12 +318,18 @@ pub enum Refused {
     /// The caller already received `Granted` for this dispatch: its
     /// launch may be in flight, so the request cannot be abandoned.
     AlreadyClaimed,
+    /// A lease was offered for a dispatch already bound to a live
+    /// process; a lease carries no pid to signal or check, so it is not
+    /// applied over one.
+    AlreadyBoundToProcess { detail: String },
 }
 
 impl Refused {
     fn describe(&self) -> String {
         match self {
-            Self::PidNotAlive { detail, .. } | Self::UnverifiableWait { detail } => detail.clone(),
+            Self::PidNotAlive { detail, .. }
+            | Self::UnverifiableWait { detail }
+            | Self::AlreadyBoundToProcess { detail } => detail.clone(),
             Self::OverAdmitted { over, max } => format!(
                 "resuming would hold {over} seats beyond the class cap, past the configured \
                  maximum of {max}; it stays waiting and can poll again"
@@ -368,6 +395,11 @@ pub enum Response {
     },
     Decision {
         decision: Decision,
+    },
+    /// What ending an agent did — including that nothing was bound to
+    /// it, which is an ordinary answer and not `Unknown`.
+    AgentSettled {
+        outcome: AgentSettleOutcome,
     },
     Heartbeat {
         status: HeartbeatStatus,
@@ -1105,6 +1137,42 @@ pub fn handle(
                 refusal: Refused::AlreadyClaimed,
             },
         },
+        Request::BindAgentLease {
+            dispatch_id,
+            agent_id,
+            provenance,
+        } => match state.bind_agent_lease(&dispatch_id, &agent_id, provenance, now) {
+            BindOutcome::Bound => Response::Ack,
+            BindOutcome::UnknownDispatch => Response::Unknown {
+                entity: Entity::Dispatch,
+                id: dispatch_id,
+            },
+            BindOutcome::AlreadyBoundToProcess => Response::Refused {
+                refusal: Refused::AlreadyBoundToProcess {
+                    detail: format!(
+                        "dispatch {dispatch_id} is already bound to a live process; a lease for \
+                         agent {agent_id} would leave it unsignalable"
+                    ),
+                },
+            },
+            // A lease names no pid, so `bind_agent_lease` never checks
+            // one; answered in the pid path's own shape all the same,
+            // because a bind that did not happen must not read as one
+            // that did.
+            BindOutcome::PidNotAlive => Response::Refused {
+                refusal: Refused::PidNotAlive {
+                    pid: None,
+                    detail: format!("dispatch {dispatch_id} keeps no binding"),
+                },
+            },
+        },
+        Request::SettleByAgent {
+            session_id,
+            agent_id,
+            spent_micros,
+        } => Response::AgentSettled {
+            outcome: state.settle_by_agent(&session_id, &agent_id, spent_micros, now),
+        },
         Request::FinishRun { run_id } => lifecycle(state.finish_run(&run_id), Entity::Run, &run_id),
         Request::AcquireWrite {
             dispatch_id,
@@ -1463,6 +1531,84 @@ impl Gate for RemoteGate {
                 &refusal,
             )),
             other => Err(Self::unexpected("withdraw", &other)),
+        }
+    }
+
+    fn bind_agent_lease(
+        &self,
+        dispatch_id: &str,
+        agent_id: &str,
+        provenance: &Provenance,
+    ) -> Result<BindOutcome, GateError> {
+        match self.call(
+            "bind_agent_lease",
+            Request::BindAgentLease {
+                dispatch_id: dispatch_id.into(),
+                agent_id: agent_id.into(),
+                provenance: provenance.clone(),
+            },
+        )? {
+            Response::Ack => Ok(BindOutcome::Bound),
+            // No such dispatch: nothing was bound, and never success.
+            Response::Unknown { .. } => Ok(BindOutcome::UnknownDispatch),
+            Response::Refused {
+                refusal: Refused::AlreadyBoundToProcess { .. },
+            } => Ok(BindOutcome::AlreadyBoundToProcess),
+            Response::Refused {
+                refusal: Refused::PidNotAlive { .. },
+            } => Ok(BindOutcome::PidNotAlive),
+            Response::Refused { refusal } => Err(Self::refused(
+                "bind_agent_lease",
+                &format!("dispatch {dispatch_id}"),
+                &refusal,
+            )),
+            // Listed rather than caught by a wildcard, so a reply added
+            // later has to be placed here on purpose.
+            unexpected @ (Response::AgentSettled { .. }
+            | Response::Error { .. }
+            | Response::ShuttingDown
+            | Response::Pong { .. }
+            | Response::Decision { .. }
+            | Response::Heartbeat { .. }
+            | Response::WriteLease { .. }
+            | Response::Cancelled { .. }
+            | Response::Status { .. }) => Err(Self::unexpected("bind_agent_lease", &unexpected)),
+        }
+    }
+
+    fn settle_by_agent(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        spent_micros: Option<i64>,
+    ) -> Result<AgentSettleOutcome, GateError> {
+        match self.call(
+            "settle_by_agent",
+            Request::SettleByAgent {
+                session_id: session_id.into(),
+                agent_id: agent_id.into(),
+                spent_micros,
+            },
+        )? {
+            Response::AgentSettled { outcome } => Ok(outcome),
+            Response::Refused { refusal } => Err(Self::refused(
+                "settle_by_agent",
+                &format!("agent {agent_id} of session {session_id}"),
+                &refusal,
+            )),
+            // `Unknown` included: nothing bound to an agent is
+            // `AgentSettled { NothingBound }`, never `Unknown`, so a daemon
+            // answering `Unknown` is not one this build understands.
+            unexpected @ (Response::Ack
+            | Response::Unknown { .. }
+            | Response::Error { .. }
+            | Response::ShuttingDown
+            | Response::Pong { .. }
+            | Response::Decision { .. }
+            | Response::Heartbeat { .. }
+            | Response::WriteLease { .. }
+            | Response::Cancelled { .. }
+            | Response::Status { .. }) => Err(Self::unexpected("settle_by_agent", &unexpected)),
         }
     }
 
@@ -2229,6 +2375,80 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&unknown).expect("serialize"))
                 .expect("parse");
         assert_eq!(round_tripped, unknown);
+    }
+
+    // The hook's seat lifecycle over the wire: a lease bound to the
+    // agent a spawn launched, and the agent's end found by session and
+    // agent alone. An agent nothing is bound to is an ordinary answer,
+    // not `Unknown`.
+    #[test]
+    fn an_agent_bound_by_lease_is_settled_by_its_agent_id() {
+        let mut state = AdmissionState::new(limits());
+        let now = Instant::now();
+        let (registered, _) = handle(
+            Request::RegisterRun {
+                registration: registration("run-h", "sess-h"),
+            },
+            &mut state,
+            now,
+        );
+        assert_eq!(registered, Response::Ack);
+        let (admitted, _) = handle(
+            Request::RequestAdmission {
+                request: request("d-h", "run-h", "sess-h"),
+            },
+            &mut state,
+            now,
+        );
+        assert_eq!(
+            admitted,
+            Response::Decision {
+                decision: Decision::Granted
+            }
+        );
+        let (bound, _) = handle(
+            Request::BindAgentLease {
+                dispatch_id: "d-h".into(),
+                agent_id: "agent-01".into(),
+                provenance: Provenance::Known,
+            },
+            &mut state,
+            now,
+        );
+        assert_eq!(bound, Response::Ack);
+        let (ended, _) = handle(
+            Request::SettleByAgent {
+                session_id: "sess-h".into(),
+                agent_id: "agent-01".into(),
+                spent_micros: None,
+            },
+            &mut state,
+            now,
+        );
+        assert_eq!(
+            ended,
+            Response::AgentSettled {
+                outcome: AgentSettleOutcome::Settled {
+                    dispatch_id: "d-h".into()
+                }
+            }
+        );
+        let (again, _) = handle(
+            Request::SettleByAgent {
+                session_id: "sess-h".into(),
+                agent_id: "agent-01".into(),
+                spent_micros: None,
+            },
+            &mut state,
+            now,
+        );
+        assert_eq!(
+            again,
+            Response::AgentSettled {
+                outcome: AgentSettleOutcome::NothingBound
+            },
+            "a duplicate end finds nothing bound, and says so without failing"
+        );
     }
 
     // A2: a daemon left running from another install answers perfectly

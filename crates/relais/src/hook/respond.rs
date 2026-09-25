@@ -13,7 +13,9 @@ use std::path::Path;
 
 use super::decide::{decide_or_silent, CoordinatorAnswer, HookAnswer};
 use super::event::{self, HookEvent, ToolCallPhase};
-use crate::admission::{Decision, DispatchRequest, Gate, Refusal, ResourceClass, RunRegistration};
+use crate::admission::{
+    Decision, DispatchRequest, Gate, Provenance, Refusal, ResourceClass, RunRegistration,
+};
 use crate::ids;
 use crate::policy::HookAdmissionSettings;
 
@@ -28,10 +30,12 @@ pub struct Handled {
 }
 
 /// Handle one hook payload: parse it, ask the coordinator about a
-/// spawn, apply the existing pure decision, and then give back what this
-/// tool call was holding — the request itself on a refusal, the seat and
-/// the reservation once the call has ended — so a session's cap counts
-/// agents that are running rather than agents that ever started.
+/// spawn, apply the existing pure decision, and then keep the seat's
+/// record in step with the agent — the request itself withdrawn on a
+/// refusal, the seat bound to the agent a spawn launched, and the seat
+/// and the reservation given back once that agent has ended — so a
+/// session's cap counts agents that are running rather than agents that
+/// ever started.
 ///
 /// Wrapped in `catch_unwind` for the same reason [`decide_or_silent`]
 /// is: a hook that dies mid-answer would otherwise leave the tool call
@@ -53,7 +57,7 @@ fn handle_inner(payload: &[u8], settings: &HookAdmissionSettings, gate: &dyn Gat
     let event = event::parse(payload);
     let coordinator = ask_coordinator(&event, settings, gate);
     let answer = decide_or_silent(&event, settings, coordinator.clone());
-    finish_ended_call(&event, gate);
+    follow_agent_lifecycle(&event, gate);
     if matches!(answer, HookAnswer::Refuse { .. }) {
         if let HookEvent::AgentToolCall(call) = &event {
             let dispatch_id = ids::derive_dispatch_id(&call.session_id, &call.tool_use_id);
@@ -74,52 +78,92 @@ fn handle_inner(payload: &[u8], settings: &HookAdmissionSettings, gate: &dyn Gat
     }
 }
 
-/// Give the seat back when the tool call that took it has ended.
+/// Keep a spawn's seat for exactly as long as the AGENT runs: admitted
+/// on `PreToolUse`, bound to its agent on `PostToolUse`, given back on
+/// `SubagentStop`.
 ///
-/// Without this the cap does not mean what it says. A granted spawn
-/// holds its seat until the unbound dispatch lapses — `LEASE_GRACE`, five
-/// minutes — so `max_active_agents_per_session` would cap spawns per
-/// rolling five minutes rather than agents that are running, and the
-/// refusal the harness receives ("retry when a running agent finishes")
-/// would be advice that could not work: finishing an agent would free
-/// nothing. `PostToolUse` and `PostToolUseFailure` carry the same
-/// `tool_use_id` the spawn did, so the dispatch id derives identically
-/// and the end finds exactly what the start took, with no pairing and
-/// nothing remembered between firings.
+/// The seat follows the agent, not the tool call, because the two end at
+/// different moments. A real Claude Code 2.1.282 session showed an Agent
+/// `PostToolUse` arriving ~100ms after its `PreToolUse` with
+/// `duration_ms: 8`, `tool_response.isAsync: true` and `status:
+/// "async_launched"` — the call returns at LAUNCH — while the agent it
+/// launched ran 6–16 seconds more (`tests/fixtures/hooks/0009`). Giving
+/// the seat back on `PostToolUse` therefore gave it back at launch, and
+/// `max_active_agents_per_session` stopped binding: every agent past the
+/// cap was admitted, its predecessors' seats already free.
+///
+/// `SubagentStop` is the agent's real end, but it names the agent
+/// (`agent_id`), never the tool call, so the dispatch id — derived from
+/// `session_id` and `tool_use_id` — cannot be recomputed from it. The
+/// join exists in one payload only: the `PostToolUse`, whose
+/// `tool_response.agentId` names the agent this `tool_use_id` launched.
+/// So the `Post` binds the dispatch to that agent, and the `Stop` asks
+/// the coordinator to settle whatever is bound to its agent. The order
+/// of the two does not matter — a synchronous spawn's `SubagentStop`
+/// arrives BEFORE its `PostToolUse` (`tests/fixtures/hooks-concurrent`),
+/// and the coordinator remembers a stop that found nothing bound, so
+/// the late bind ends the dispatch at once.
+///
+/// An agent whose `SubagentStop` never arrives holds its seat until its
+/// lease lapses (`binding_lease_secs`): the cap over-counts for that
+/// long, and never under-counts. A `PostToolUse` that names no agent (a
+/// `PostToolUseFailure`, which launched nothing, or a payload from a
+/// harness that does not carry `agentId`) binds nothing, and that seat
+/// too goes back when the unbound dispatch lapses.
 ///
 /// Settled with `None` rather than a figure: a hook payload carries no
 /// usage, and `None` books the reservation as a lower bound and marks the
 /// run uncertain, which is what not knowing looks like when it is
 /// recorded honestly. Zero would be a claim that the agent was free.
 /// Both ends together let the coordinator forget the entry.
-fn finish_ended_call(event: &HookEvent, gate: &dyn Gate) {
-    let HookEvent::AgentToolCall(call) = event else {
-        return;
-    };
-    let ended = match call.phase {
-        ToolCallPhase::Post | ToolCallPhase::PostFailure => true,
-        ToolCallPhase::Pre => false,
-    };
-    if !ended {
-        return;
+fn follow_agent_lifecycle(event: &HookEvent, gate: &dyn Gate) {
+    match event {
+        HookEvent::AgentToolCall(call) => match &call.phase {
+            ToolCallPhase::Post {
+                launched_agent: Some(agent_id),
+            } => {
+                let dispatch_id = ids::derive_dispatch_id(&call.session_id, &call.tool_use_id);
+                // Best effort, and `UnknownDispatch` much of the time: an
+                // agent this relais never admitted — spawned before the
+                // hook was wired, or while the coordinator was down —
+                // returns its call like any other, and there is no seat to
+                // bind. A hook cannot fail on bookkeeping any more than on
+                // the decision itself, so the result changes nothing the
+                // session is told. `Known`: the payload itself names both
+                // the tool call and the agent, so the join is observed.
+                let _ = gate.bind_agent_lease(
+                    dispatch_id.as_str(),
+                    agent_id.as_str(),
+                    &Provenance::Known,
+                );
+            }
+            // Nothing launched, or nothing named: no agent to bind the
+            // seat to. Not released either — `Post` is not the agent's
+            // end — so it waits for its lease to lapse.
+            ToolCallPhase::Post {
+                launched_agent: None,
+            }
+            | ToolCallPhase::PostFailure
+            | ToolCallPhase::Pre => {}
+        },
+        HookEvent::SubagentStop(stop) => {
+            // Best effort for the same reason as the bind above, and
+            // `NothingBound` is an ordinary answer rather than a failure:
+            // an agent relais never admitted ends like any other.
+            let _ = gate.settle_by_agent(stop.session_id.as_str(), stop.agent_id.as_str(), None);
+        }
+        HookEvent::SessionStart(_)
+        | HookEvent::SessionEnd(_)
+        | HookEvent::SubagentStart(_)
+        | HookEvent::NotOurs => {}
     }
-    let dispatch_id = ids::derive_dispatch_id(&call.session_id, &call.tool_use_id);
-    // Both calls are best effort and both are expected to be `Unknown`
-    // much of the time: an agent this relais never admitted — spawned
-    // before the hook was wired, or while the coordinator was down —
-    // ends its call like any other, and a seat nobody took cannot be
-    // given back. A hook cannot fail on cleanup any more than on the
-    // decision itself, so neither result changes what the session is
-    // told; what matters is that the seat does not outlive the call.
-    let _ = gate.settle(dispatch_id.as_str(), None);
-    let _ = gate.release(dispatch_id.as_str());
 }
 
 /// Ask the coordinator about one spawn. Only a `PreToolUse` on the
 /// Agent tool is ever asked about: every other event is answered
 /// `None` without a call, because [`decide`](super::decide::decide)
-/// never refuses one, and the end of a call is handled by
-/// [`finish_ended_call`] rather than by asking anything.
+/// never refuses one, and the agent's later life is followed by
+/// [`follow_agent_lifecycle`] rather than by asking anything.
 fn ask_coordinator(
     event: &HookEvent,
     settings: &HookAdmissionSettings,
@@ -318,16 +362,36 @@ mod tests {
         .into_bytes()
     }
 
-    /// The end of that same spawn's tool call: same `tool_use_id`, so
-    /// the same derived dispatch id — which is what lets the end find
-    /// the seat the start took without anything being remembered
-    /// between the two firings.
-    fn finish_payload(session: &str, tool_use: &str) -> Vec<u8> {
+    /// The spawn's own tool call returning, the way a real async launch
+    /// does (`tests/fixtures/hooks/0009-PostToolUse.json`): at once, with
+    /// the agent still running, naming the agent it launched. Same
+    /// `tool_use_id` as the spawn, so the same derived dispatch id.
+    fn launched_payload(session: &str, tool_use: &str, agent: &str) -> Vec<u8> {
         serde_json::json!({
             "hook_event_name": "PostToolUse",
             "session_id": session,
             "tool_name": "Agent",
             "tool_use_id": tool_use,
+            "duration_ms": 8,
+            "tool_response": {
+                "isAsync": true,
+                "status": "async_launched",
+                "agentId": agent,
+            },
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// The agent's real end (`tests/fixtures/hooks/0010-SubagentStop.json`):
+    /// it names the agent, and no tool call.
+    fn stop_payload(session: &str, agent: &str) -> Vec<u8> {
+        serde_json::json!({
+            "hook_event_name": "SubagentStop",
+            "session_id": session,
+            "agent_id": agent,
+            "agent_type": "general-purpose",
+            "background_tasks": [],
         })
         .to_string()
         .into_bytes()
@@ -756,27 +820,38 @@ mod tests {
         );
     }
 
-    /// What makes that cap a cap on RUNNING agents rather than on spawns
-    /// per five minutes: the end of a tool call gives its seat back, so a
-    /// spawn refused a moment ago is admitted once one of the agents
-    /// ahead of it finishes. Without the release in `finish_ended_call`
-    /// this fails — the seat would sit there until the unbound dispatch
-    /// lapsed on `LEASE_GRACE`, and the refusal's own advice ("retry when
-    /// a running agent finishes") would be something a person could
-    /// follow and still be refused.
+    /// What makes that cap a cap on RUNNING agents: a seat is held from
+    /// the spawn until the AGENT stops, and the tool call returning in
+    /// between frees nothing. A real async launch returns its
+    /// `PostToolUse` ~100ms after the spawn while the agent runs on, so
+    /// the assertion that matters here is the refusal AFTER both
+    /// `PostToolUse`s: release-on-`PostToolUse` passes every other line
+    /// of this test and fails exactly that one — the cap would have
+    /// stopped binding the moment each agent launched.
     #[test]
-    fn finishing_a_call_gives_its_seat_back_to_the_session() {
+    fn a_seat_is_held_until_its_agent_stops_not_until_its_call_returns() {
         let limits = ConcurrencyLimits {
             max_active_agents_per_session: Some(2),
             ..ConcurrencyLimits::default()
         };
         let gate = LocalGate::new(limits);
         let session = "session-freed";
-        for tool_use in ["tool-1", "tool-2"] {
+        for (tool_use, agent) in [("tool-1", "agent-1"), ("tool-2", "agent-2")] {
             assert_eq!(
                 handle(&spawn_payload(session, tool_use), &settings(), &gate).answer,
                 HookAnswer::Silent,
                 "spawn {tool_use} is under the cap"
+            );
+            // The call returns at launch, naming the agent it launched.
+            assert_eq!(
+                handle(
+                    &launched_payload(session, tool_use, agent),
+                    &settings(),
+                    &gate
+                )
+                .answer,
+                HookAnswer::Silent,
+                "the return of a call is never refused"
             );
         }
         assert!(
@@ -784,22 +859,86 @@ mod tests {
                 handle(&spawn_payload(session, "tool-3"), &settings(), &gate).answer,
                 HookAnswer::Refuse { .. }
             ),
-            "the third spawn is over the cap while both agents hold seats"
+            "both calls have returned but both agents still run: the third spawn is over the cap"
         );
 
-        // tool-1's call ends. Same `tool_use_id`, so the same dispatch id.
-        let finished = handle(&finish_payload(session, "tool-1"), &settings(), &gate);
+        // agent-1 ends. Its `SubagentStop` names no tool call; the seat is
+        // found through the binding its `PostToolUse` made.
+        let stopped = handle(&stop_payload(session, "agent-1"), &settings(), &gate);
         assert_eq!(
-            finished.answer,
+            stopped.answer,
             HookAnswer::Silent,
-            "the end of a call is never refused"
+            "an agent's end is never refused"
         );
 
         assert_eq!(
             handle(&spawn_payload(session, "tool-4"), &settings(), &gate).answer,
             HookAnswer::Silent,
-            "with a seat given back, the next spawn is admitted"
+            "with the stopped agent's seat given back, the next spawn is admitted"
         );
+    }
+
+    /// A synchronous spawn's `SubagentStop` arrives BEFORE its own
+    /// `PostToolUse` (`tests/fixtures/hooks-concurrent`), so when the
+    /// stop fires nothing is bound to its agent yet. The seat is still
+    /// given back — by the bind that follows — rather than held until the
+    /// lease lapses.
+    #[test]
+    fn an_agent_that_stops_before_its_call_returns_still_gives_its_seat_back() {
+        let limits = ConcurrencyLimits {
+            max_active_agents_per_session: Some(1),
+            ..ConcurrencyLimits::default()
+        };
+        let gate = LocalGate::new(limits);
+        let session = "session-sync";
+        assert_eq!(
+            handle(&spawn_payload(session, "tool-1"), &settings(), &gate).answer,
+            HookAnswer::Silent
+        );
+        handle(&stop_payload(session, "agent-1"), &settings(), &gate);
+        handle(
+            &launched_payload(session, "tool-1", "agent-1"),
+            &settings(),
+            &gate,
+        );
+        assert_eq!(
+            handle(&spawn_payload(session, "tool-2"), &settings(), &gate).answer,
+            HookAnswer::Silent,
+            "the agent is over, whichever of its two ends arrived first"
+        );
+    }
+
+    /// A `PostToolUseFailure` launched nothing and names no agent: it
+    /// binds nothing and releases nothing, so the seat stays held (until
+    /// the unbound dispatch lapses) rather than the cap under-counting.
+    #[test]
+    fn a_post_tool_use_failure_gives_nothing_back() {
+        let limits = ConcurrencyLimits {
+            max_active_agents_per_session: Some(1),
+            ..ConcurrencyLimits::default()
+        };
+        let gate = LocalGate::new(limits);
+        let session = "session-failed";
+        assert_eq!(
+            handle(&spawn_payload(session, "tool-1"), &settings(), &gate).answer,
+            HookAnswer::Silent
+        );
+        let failure = serde_json::json!({
+            "hook_event_name": "PostToolUseFailure",
+            "session_id": session,
+            "tool_name": "Agent",
+            "tool_use_id": "tool-1",
+        })
+        .to_string()
+        .into_bytes();
+        assert_eq!(
+            handle(&failure, &settings(), &gate).answer,
+            HookAnswer::Silent
+        );
+        assert!(matches!(
+            handle(&spawn_payload(session, "tool-2"), &settings(), &gate).answer,
+            HookAnswer::Refuse { .. }
+        ));
     }
 
     /// A registered run with room grants, and `decide` renders that as
@@ -935,9 +1074,6 @@ mod tests {
         );
     }
 
-    /// `PostToolUse` never asks the coordinator at all — asking about a
-    /// phase `decide` never refuses would reserve a seat this module
-    /// has no later chance to release.
     /// A gate that fails the test if it is consulted at all — the way
     /// "this path must not reach the coordinator" is asserted, since a
     /// seat reserved on a path with no later release leaks silently.
@@ -999,24 +1135,52 @@ mod tests {
         ) -> Result<crate::admission::WithdrawOutcome, crate::admission::GateError> {
             unreachable!()
         }
+        fn bind_agent_lease(
+            &self,
+            _: &str,
+            _: &str,
+            _: &Provenance,
+        ) -> Result<crate::admission::BindOutcome, crate::admission::GateError> {
+            unreachable!()
+        }
+        fn settle_by_agent(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<i64>,
+        ) -> Result<crate::admission::AgentSettleOutcome, crate::admission::GateError> {
+            unreachable!()
+        }
         fn enforcement(&self) -> crate::admission::Enforcement {
             crate::admission::Enforcement::InProcess
         }
     }
 
+    /// A `PostToolUse` that names no launched agent, and a
+    /// `PostToolUseFailure`, never reach the coordinator at all: there
+    /// is nothing to admit (asking about a phase `decide` never refuses
+    /// would reserve a seat nothing later gives back) and no agent to
+    /// bind. The event is asserted too — `handle` turns a panic into
+    /// `NotOurs`, so without it a gate that WAS asked would pass here.
     #[test]
-    fn a_post_tool_use_never_asks_the_coordinator() {
-        let payload = serde_json::json!({
-            "hook_event_name": "PostToolUse",
-            "session_id": "session-x",
-            "tool_name": "Agent",
-            "tool_use_id": "tool-4",
-        })
-        .to_string()
-        .into_bytes();
-        let handled = handle(&payload, &settings(), &PanicsIfAsked);
-        assert_eq!(handled.answer, HookAnswer::Silent);
-        assert_eq!(handled.coordinator, None);
+    fn a_post_naming_no_agent_never_asks_the_coordinator() {
+        for event_name in ["PostToolUse", "PostToolUseFailure"] {
+            let payload = serde_json::json!({
+                "hook_event_name": event_name,
+                "session_id": "session-x",
+                "tool_name": "Agent",
+                "tool_use_id": "tool-4",
+            })
+            .to_string()
+            .into_bytes();
+            let handled = handle(&payload, &settings(), &PanicsIfAsked);
+            assert!(
+                matches!(handled.event, HookEvent::AgentToolCall(_)),
+                "{event_name}: the gate was asked, and the panic was caught"
+            );
+            assert_eq!(handled.answer, HookAnswer::Silent);
+            assert_eq!(handled.coordinator, None);
+        }
     }
 
     /// A payload that is not JSON never reaches the coordinator and

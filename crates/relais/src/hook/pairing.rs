@@ -176,7 +176,12 @@ mod tests {
             // Denied, or failed: a spawn that returns without ever
             // producing an agent.
             call("toolu-dead", ToolCallPhase::Pre),
-            call("toolu-dead", ToolCallPhase::Post),
+            call(
+                "toolu-dead",
+                ToolCallPhase::Post {
+                    launched_agent: None,
+                },
+            ),
             // A real spawn, which must get the agent that follows it.
             call("toolu-live", ToolCallPhase::Pre),
             HookEvent::SubagentStart(SubagentStart {

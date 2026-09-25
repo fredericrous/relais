@@ -2,10 +2,11 @@
 //!
 //! Parsing only: this module decides nothing, admits nothing and
 //! records nothing — it establishes what a payload IS, so the packages
-//! that act on it argue about policy rather than about JSON. The nine
-//! payloads under `crates/relais/tests/fixtures/hooks` are transcribed
-//! from a real session (see that directory's `README.md`); this module
-//! is written against what they showed, not against invented shapes.
+//! that act on it argue about policy rather than about JSON. The
+//! payloads under `crates/relais/tests/fixtures/hooks*` come from real
+//! sessions (see each directory's `README.md` for how, and which two
+//! were modelled rather than recorded verbatim); this module is written
+//! against what they showed, not against invented shapes.
 
 use serde::Deserialize;
 
@@ -84,11 +85,25 @@ pub struct SubagentStop {
     pub prompt_id: Option<PromptId>,
 }
 
-/// Which of the three tool-scoped events a payload was.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which of the three tool-scoped events a payload was, with what only
+/// that phase carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolCallPhase {
     Pre,
-    Post,
+    /// The tool call returned. For the Agent tool that is NOT the end of
+    /// the agent: an agent launched asynchronously returns here at once
+    /// (`tool_response.status: "async_launched"`, a `duration_ms` of a
+    /// few milliseconds — `0009-PostToolUse.json`) and runs on until its
+    /// `SubagentStop`.
+    Post {
+        /// `tool_response.agentId`: the agent this call launched. The
+        /// only place a tool call and the agent it produced appear in one
+        /// payload, and only in this phase — so it lives here rather than
+        /// on [`AgentToolCall`], where every `Pre` caller would have to
+        /// wonder about it. `None` when the payload does not carry it (an
+        /// older harness, a call that launched nothing); never invented.
+        launched_agent: Option<AgentId>,
+    },
     PostFailure,
 }
 
@@ -125,6 +140,12 @@ struct Envelope {
     agent_type: Option<AgentType>,
     tool_name: Option<String>,
     tool_use_id: Option<ToolUseId>,
+    /// Held loosely on purpose: its shape belongs to whichever tool ran,
+    /// and a `Read`'s response is nothing like an `Agent`'s. Only
+    /// `agentId` is ever read out of it (see [`launched_agent`]); a shape
+    /// typed any tighter would turn some other tool's response into an
+    /// envelope that fails to parse.
+    tool_response: Option<serde_json::Value>,
 }
 
 /// Parse one hook payload into a typed event. Never fails outward — see
@@ -178,10 +199,26 @@ fn classify(envelope: Envelope) -> HookEvent {
             })
         }
         "PreToolUse" => classify_tool_call(ToolCallPhase::Pre, envelope),
-        "PostToolUse" => classify_tool_call(ToolCallPhase::Post, envelope),
+        "PostToolUse" => {
+            let launched_agent = launched_agent(&envelope);
+            classify_tool_call(ToolCallPhase::Post { launched_agent }, envelope)
+        }
         "PostToolUseFailure" => classify_tool_call(ToolCallPhase::PostFailure, envelope),
         _ => HookEvent::NotOurs,
     }
+}
+
+/// The agent a `PostToolUse` reports having launched, if it reports one
+/// as a string under `tool_response.agentId`. Absent, or anything but a
+/// string, is `None` — the payload is still a tool call relais acts on,
+/// it just names no agent to bind.
+fn launched_agent(envelope: &Envelope) -> Option<AgentId> {
+    envelope
+        .tool_response
+        .as_ref()?
+        .get("agentId")?
+        .as_str()
+        .map(AgentId::new)
 }
 
 fn classify_subagent(
@@ -287,7 +324,12 @@ mod tests {
     fn an_agent_tool_call_parses_for_each_phase() {
         for (name, phase) in [
             ("PreToolUse", ToolCallPhase::Pre),
-            ("PostToolUse", ToolCallPhase::Post),
+            (
+                "PostToolUse",
+                ToolCallPhase::Post {
+                    launched_agent: None,
+                },
+            ),
             ("PostToolUseFailure", ToolCallPhase::PostFailure),
         ] {
             let payload = format!(
@@ -416,6 +458,94 @@ mod tests {
                 prompt_id: Some(PromptId::new("prompt-0000")),
             })
         );
+    }
+
+    /// `tool_response.agentId` is read only in the `Post` phase: a `Pre`
+    /// or a `PostFailure` payload that somehow carried one still has no
+    /// launched agent, because the type gives those phases nowhere to
+    /// put it.
+    #[test]
+    fn only_a_post_carries_the_agent_it_launched() {
+        for (name, want) in [
+            ("PreToolUse", ToolCallPhase::Pre),
+            (
+                "PostToolUse",
+                ToolCallPhase::Post {
+                    launched_agent: Some(AgentId::new("agent-9")),
+                },
+            ),
+            ("PostToolUseFailure", ToolCallPhase::PostFailure),
+        ] {
+            let payload = serde_json::json!({
+                "hook_event_name": name,
+                "session_id": "s1",
+                "tool_name": "Agent",
+                "tool_use_id": "t1",
+                "tool_response": { "agentId": "agent-9" },
+            })
+            .to_string();
+            let HookEvent::AgentToolCall(call) = parse(payload.as_bytes()) else {
+                panic!("{name} on the Agent tool is ours");
+            };
+            assert_eq!(call.phase, want, "{name}");
+        }
+    }
+
+    /// A `Post` without `tool_response.agentId` — no `tool_response` at
+    /// all, one with no `agentId`, one that is not an object, or an
+    /// `agentId` that is not a string — still parses, and names no agent
+    /// rather than inventing one.
+    #[test]
+    fn a_post_without_an_agent_id_parses_with_none() {
+        let responses = [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!("text")),
+            Some(serde_json::json!({ "agentId": 7 })),
+        ];
+        for tool_response in responses {
+            let mut payload = serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "s1",
+                "tool_name": "Agent",
+                "tool_use_id": "t1",
+            });
+            if let Some(response) = tool_response {
+                payload["tool_response"] = response;
+            }
+            let bytes = payload.to_string().into_bytes();
+            let HookEvent::AgentToolCall(call) = parse(&bytes) else {
+                panic!("a Post on the Agent tool is ours: {payload}");
+            };
+            assert_eq!(
+                call.phase,
+                ToolCallPhase::Post {
+                    launched_agent: None
+                },
+                "{payload}"
+            );
+        }
+    }
+
+    /// The measurement this phase's payload is pinned to: an Agent
+    /// `PostToolUse` that returned at LAUNCH, carrying the agent it
+    /// launched — the same agent the `SubagentStop` (`0010`) names.
+    #[test]
+    fn fixture_0009_an_async_launch_names_the_agent_its_stop_will_name() {
+        let HookEvent::AgentToolCall(call) = parse(&fixture("0009-PostToolUse.json")) else {
+            panic!("0009 is an Agent PostToolUse");
+        };
+        let ToolCallPhase::Post {
+            launched_agent: Some(launched),
+        } = call.phase
+        else {
+            panic!("0009 carries tool_response.agentId: {:?}", call.phase);
+        };
+        let HookEvent::SubagentStop(stop) = parse(&fixture("0010-SubagentStop.json")) else {
+            panic!("0010 is a SubagentStop");
+        };
+        assert_eq!(launched, stop.agent_id);
+        assert_eq!(call.session_id, stop.session_id);
     }
 
     // The fixture walk lives in `tests/hook_event_fixtures.rs`, not
