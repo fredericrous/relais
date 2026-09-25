@@ -46,10 +46,11 @@ fn accepted_by_person(
 }
 
 /// Bumped whenever a top-level `Report` key is added, renamed or removed
-/// (this task added `accepted_tasks_by_relais`/`accepted_tasks_by_person`),
+/// (this task added `enforcement`, the same summary `relais coordinator
+/// status` prints, so its JSON agrees with the sentence a person sees),
 /// so a downstream parser can tell an old shape from a new one instead of
 /// guessing from key presence.
-pub const REPORT_SCHEMA_VERSION: u32 = 5;
+pub const REPORT_SCHEMA_VERSION: u32 = 6;
 
 /// A dimension `relais report --by` groups the window's tasks over (SPEC
 /// §11: "compare like task classes and policy versions"). Total over the
@@ -403,6 +404,53 @@ pub struct Report {
     /// Present only when `--by <dimension>` was given; the default report
     /// is unchanged when it is absent.
     pub cohorts: Option<CohortReport>,
+    /// The same enforcement summary `relais coordinator status` prints,
+    /// carried as structured data (SPEC §23) so a later tool reading this
+    /// report's JSON is never told something the coordinator disagrees
+    /// with. `runs_report` itself never touches a coordinator socket —
+    /// it stays a pure function of the ledger — so this defaults to
+    /// [`EnforcementReport::observed`]; `relais report`'s CLI layer
+    /// overwrites it with a live snapshot when one is reachable.
+    pub enforcement: EnforcementReport,
+}
+
+/// The same enforcement summary `relais coordinator status` prints (SPEC
+/// §23), carried as structured data: the counts by
+/// [`crate::admission::DispatchSource`] the sentence is computed from,
+/// alongside the sentence itself, so a later reader never has to
+/// re-derive it and risk disagreeing with what a person saw.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EnforcementReport {
+    pub enforcement: crate::admission::Enforcement,
+    pub active_by_source: std::collections::BTreeMap<String, u32>,
+    pub admitted_by_source: std::collections::BTreeMap<String, u32>,
+    pub expired_hook_leases: u32,
+    pub sentence: String,
+}
+
+impl EnforcementReport {
+    /// No coordinator was reachable (or none was asked): the honest
+    /// default is that nothing is capping anything, not a guess dressed
+    /// up as one of the other two.
+    pub fn observed() -> Self {
+        Self::from_snapshot(
+            crate::admission::Enforcement::Observed,
+            &crate::admission::StatusSnapshot::default(),
+        )
+    }
+
+    pub fn from_snapshot(
+        enforcement: crate::admission::Enforcement,
+        snapshot: &crate::admission::StatusSnapshot,
+    ) -> Self {
+        Self {
+            enforcement,
+            active_by_source: snapshot.active_by_source.clone(),
+            admitted_by_source: snapshot.admitted_by_source.clone(),
+            expired_hook_leases: snapshot.expired_hook_leases,
+            sentence: crate::admission::enforcement_line(enforcement, snapshot),
+        }
+    }
 }
 
 pub fn runs_report(
@@ -635,6 +683,7 @@ pub fn runs_report(
         backfilled_tasks,
         open_decisions,
         cohorts,
+        enforcement: EnforcementReport::observed(),
     })
 }
 
@@ -826,6 +875,9 @@ impl Report {
                 ));
             }
         }
+        out.push('\n');
+        out.push_str(&self.enforcement.sentence);
+        out.push('\n');
         out
     }
 }
@@ -870,6 +922,27 @@ pub fn completeness_label(completeness: CostCompleteness) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    /// The default every `relais report` starts from, and the one that
+    /// shipped contradicting itself: with no coordinator reachable the
+    /// summary says nothing is capped, so its sentence must not go on to
+    /// describe the caps. This is the path a report takes whenever no
+    /// daemon is running, not an edge case.
+    #[test]
+    fn the_observed_summary_does_not_describe_caps_it_just_denied() {
+        let observed = EnforcementReport::observed();
+        assert_eq!(
+            observed.enforcement,
+            crate::admission::Enforcement::Observed
+        );
+        let lower = observed.sentence.to_lowercase();
+        assert!(lower.contains("nothing is capped"), "{}", observed.sentence);
+        assert!(
+            !lower.contains("are capped on agent count"),
+            "{}",
+            observed.sentence
+        );
+    }
     #[test]
     fn a_cost_line_never_reads_unreported_usage_as_free() {
         use super::*;
@@ -1197,6 +1270,7 @@ mod tests {
             backfilled_tasks: 0,
             open_decisions: vec![],
             cohorts: None,
+            enforcement: EnforcementReport::observed(),
         };
         let rendered = report.render();
         assert!(
@@ -1398,6 +1472,7 @@ mod tests {
                 "cost_per_accepted",
                 "cost_per_accepted_task",
                 "cost_per_standing_change",
+                "enforcement",
                 "open_decisions",
                 "pending_decisions",
                 "pending_feedback",

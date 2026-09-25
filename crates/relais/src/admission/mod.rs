@@ -161,6 +161,40 @@ pub struct DispatchRequest {
     /// concurrent children cannot spend the same allowance twice. Zero
     /// when the run has no money ceiling.
     pub reserve_micros: i64,
+    /// Where this request came from: a field the caller that builds it
+    /// already knows, not a bool and not inferred at the far end (SPEC
+    /// §23). `#[serde(default)]` so a request written by an older relais
+    /// — over the wire or to disk — deserializes as `ManagedRun` rather
+    /// than becoming unrepresentable.
+    #[serde(default)]
+    pub source: DispatchSource,
+}
+
+/// Where a dispatch's admission was asked from. The hook labels its own
+/// admissions [`Self::HookAdmitted`] and the runner labels its own
+/// [`Self::ManagedRun`] — at the one place each builds the request, never
+/// guessed afterward from what the dispatch looks like. [`Self::Observed`]
+/// is for a dispatch this coordinator only ever watched, never gated
+/// (SPEC §23: `relais coordinator status` must say which of these a count
+/// is, since a hook-admitted spawn is capped differently than a managed
+/// one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchSource {
+    #[default]
+    ManagedRun,
+    HookAdmitted,
+    Observed,
+}
+
+impl DispatchSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ManagedRun => "managed_run",
+            Self::HookAdmitted => "hook_admitted",
+            Self::Observed => "observed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,6 +301,33 @@ pub struct StatusSnapshot {
     /// gone.
     #[serde(default)]
     pub write_leases: BTreeMap<String, String>,
+    /// Live (not yet released) dispatches, by [`DispatchSource::as_str`] —
+    /// the count `relais coordinator status`'s enforcement line names for
+    /// hook-admitted spawns, since a released dispatch is no longer
+    /// holding a seat to be capped at all.
+    #[serde(default)]
+    pub active_by_source: BTreeMap<String, u32>,
+    /// Every dispatch this coordinator has admitted by
+    /// [`DispatchSource::as_str`] since this process started, NOT
+    /// counting what it re-adopted from the process it replaced: an
+    /// adopted dispatch was let through by a coordinator that is gone,
+    /// and counting it here would give the managed path a lifetime
+    /// reaching back through elections while the hook path — which
+    /// writes no ledger row and so is never adopted — restarted at
+    /// zero, under one label. Kept
+    /// alongside `active_by_source` rather than instead of it, because
+    /// "how many were ever let through" and "how many are live right now"
+    /// are different questions the enforcement line answers both of.
+    #[serde(default)]
+    pub admitted_by_source: BTreeMap<String, u32>,
+    /// Hook-admitted leases held past `agent_lease_ttl` with no heartbeat
+    /// renewing them — not yet reaped by reconcile, but already expired.
+    /// Reported apart from `stale_leases`, which also counts a pid
+    /// binding past `LEASE_GRACE`: the enforcement line's "seat held from
+    /// bind until `SubagentStop` or its lease" claim is about this count
+    /// specifically.
+    #[serde(default)]
+    pub expired_hook_leases: u32,
 }
 
 /// A process bound to a dispatch, and how stale the check that bound it
@@ -538,8 +599,11 @@ pub enum ReleaseWriteOutcome {
 }
 
 /// What a gate can actually enforce, for reports (SPEC §23: observed-only
-/// paths are labelled, never claimed as guarantees).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// paths are labelled, never claimed as guarantees). The three read as
+/// what a person would ask: in-process caps bind inside one process,
+/// coordinator caps bind across every tab of this OS user, observed means
+/// relais is watching and refusing nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Enforcement {
     /// One process holds the state: caps bind within this process, and
@@ -548,6 +612,12 @@ pub enum Enforcement {
     /// The shared per-user coordinator: caps bind across every tab of
     /// this OS user.
     Coordinator,
+    /// Nothing is capping this session at all — no hook wired, or the
+    /// coordinator unreachable with `on_coordinator_unreachable =
+    /// "carry_on"` in force. The honest answer, not a guess dressed up as
+    /// one of the other two.
+    #[default]
+    Observed,
 }
 
 impl Enforcement {
@@ -555,6 +625,7 @@ impl Enforcement {
         match self {
             Self::InProcess => "managed (in-process)",
             Self::Coordinator => "managed (coordinator)",
+            Self::Observed => "observed only (nothing is capped)",
         }
     }
 }
@@ -563,6 +634,70 @@ impl std::fmt::Display for Enforcement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// The sentence `relais coordinator status` and `relais report` both
+/// print, derived from the coordinator's own counts rather than asserted
+/// beside them (SPEC §23) — the reason `main.rs` no longer carries this as
+/// a string literal nothing computes.
+///
+/// Names what IS capped for a hook-admitted spawn — agent count per
+/// session and per run, the seat held from `PostToolUse` bind until
+/// `SubagentStop` or its lease — and what is NOT, just as plainly: depth,
+/// because nothing in a single hook payload joins a spawn to the dispatch
+/// it descends from, and spend, because the run a hook registers carries
+/// no budget and the coordinator only ever refuses on budget for a run
+/// that has one.
+pub fn enforcement_line(enforcement: Enforcement, snapshot: &StatusSnapshot) -> String {
+    let source = DispatchSource::HookAdmitted.as_str();
+    let live = snapshot.active_by_source.get(source).copied().unwrap_or(0);
+    let admitted = snapshot
+        .admitted_by_source
+        .get(source)
+        .copied()
+        .unwrap_or(0);
+    // Branching on the enforcement is the whole point: the counts below
+    // describe a cap that is in force, and printing them under
+    // `Observed` would say "nothing is capped" and then describe the
+    // capping in the same breath. A sentence that contradicts itself is
+    // worse than the literal this replaced, because it looks computed.
+    match enforcement {
+        // The variant's own label already says nothing is capped, so
+        // this half says only WHY and what that leaves true.
+        Enforcement::Observed => format!(
+            "enforcement: {enforcement} — either no relais hook is wired into this session's \
+             settings.json (`relais install --claude --hooks`), or the coordinator could not \
+             be reached and `on_coordinator_unreachable` is `carry_on`. Spawns are seen and \
+             recorded, and none of them can be refused ({live} hook-admitted seat(s) still \
+             held from before)"
+        ),
+        Enforcement::InProcess | Enforcement::Coordinator => format!(
+            "enforcement: {enforcement} — hook-admitted spawns are capped on agent count per \
+             session and per run, the seat held from PostToolUse bind until SubagentStop or \
+             its lease ({live} live, {admitted} admitted total, {} expired lease(s) not yet \
+             reaped); depth and spend are NOT enforced on that path (a hook payload joins no \
+             spawn to the dispatch it descends from, and the run it registers carries no \
+             budget)",
+            snapshot.expired_hook_leases,
+        ),
+    }
+}
+
+/// Whether an admission is this coordinator letting something through
+/// for the first time, or re-adopting what a previous process already
+/// let through after an election.
+///
+/// Not a bool: the two readings of `false` — "do not count" and "count
+/// it twice" — are exactly the confusion this distinguishes. An adopted
+/// dispatch was admitted by a process that is gone; counting it again
+/// would make `admitted_by_source` mean "since this process started"
+/// for the hook path (which writes no ledger row and so is never
+/// adopted) and "since some earlier process started" for the managed
+/// one, under a single label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionCount {
+    First,
+    Readopted,
 }
 
 /// Where a dispatch is between admission and oblivion.
@@ -712,6 +847,7 @@ struct Dispatch {
     cancellation: Cancellation,
     agent_id: Option<String>,
     last_heartbeat: Instant,
+    source: DispatchSource,
 }
 
 /// One worktree's exclusive write lease (SPEC §23: "concurrent writers
@@ -781,6 +917,11 @@ pub struct AdmissionState {
     /// bind has to be able to find out that its agent is already over.
     stopped_order: VecDeque<(String, String)>,
     stopped: BTreeSet<(String, String)>,
+    /// Every dispatch ever admitted, by source, for as long as this
+    /// process runs — kept apart from `dispatches` because a released and
+    /// settled dispatch is removed from that map, and the enforcement
+    /// line's "admitted total" would otherwise forget it existed.
+    admitted_by_source: BTreeMap<DispatchSource, u32>,
 }
 
 /// Default duration a hook-admitted agent's lease is held before it
@@ -815,6 +956,7 @@ impl AdmissionState {
             agent_lease_ttl: DEFAULT_AGENT_LEASE_TTL,
             stopped_order: VecDeque::new(),
             stopped: BTreeSet::new(),
+            admitted_by_source: BTreeMap::new(),
         }
     }
 
@@ -963,7 +1105,12 @@ impl AdmissionState {
         }
         self.register_session(&request.session_id);
         if self.admissible(request) {
-            self.admit(request.clone(), now, Lifecycle::Claimed);
+            self.admit(
+                request.clone(),
+                now,
+                Lifecycle::Claimed,
+                AdmissionCount::First,
+            );
             return Decision::Granted;
         }
         self.queue.push(Queued {
@@ -1117,7 +1264,13 @@ impl AdmissionState {
         true
     }
 
-    fn admit(&mut self, request: DispatchRequest, now: Instant, lifecycle: Lifecycle) {
+    fn admit(
+        &mut self,
+        request: DispatchRequest,
+        now: Instant,
+        lifecycle: Lifecycle,
+        count: AdmissionCount,
+    ) {
         let parent_known = request
             .parent_dispatch
             .as_ref()
@@ -1132,6 +1285,9 @@ impl AdmissionState {
         }
         if let Some(session) = self.sessions.get_mut(&request.session_id) {
             session.last_served = Some(now);
+        }
+        if count == AdmissionCount::First {
+            *self.admitted_by_source.entry(request.source).or_default() += 1;
         }
         self.dispatches.insert(
             request.dispatch_id.clone(),
@@ -1148,6 +1304,7 @@ impl AdmissionState {
                 cancellation: Cancellation::None,
                 agent_id: None,
                 last_heartbeat: now,
+                source: request.source,
             },
         );
     }
@@ -1201,7 +1358,12 @@ impl AdmissionState {
             if let Some(Decision::Refused { .. }) = self.check_hard_limits(&queued.request) {
                 continue;
             }
-            self.admit(queued.request, now, Lifecycle::Unclaimed);
+            self.admit(
+                queued.request,
+                now,
+                Lifecycle::Unclaimed,
+                AdmissionCount::First,
+            );
         }
     }
 
@@ -1974,7 +2136,14 @@ impl AdmissionState {
                 now,
             );
         }
-        self.admit(request.clone(), now, Lifecycle::Claimed);
+        // Re-adopted, never re-counted: this dispatch was admitted by
+        // the process this one replaced.
+        self.admit(
+            request.clone(),
+            now,
+            Lifecycle::Claimed,
+            AdmissionCount::Readopted,
+        );
         // The adopter checked this PID against the process table before
         // adopting at all (`Coordinator::start`): re-checking here would
         // only widen the window, not narrow it.
@@ -1987,7 +2156,25 @@ impl AdmissionState {
         let mut leased_agents: BTreeMap<String, LeasedAgentBinding> = BTreeMap::new();
         let mut waiting = 0;
         let mut stale_leases = 0;
+        let mut active_by_source: BTreeMap<String, u32> = BTreeMap::new();
+        let mut expired_hook_leases = 0;
         for (id, dispatch) in &self.dispatches {
+            // A lease is the hook's way of holding a seat without a pid,
+            // but `bind_agent_lease` is callable for any dispatch, so a
+            // MANAGED one that took a lease would otherwise be counted
+            // here and reported under a sentence that is entirely about
+            // the hook path. The source is what the count claims to be
+            // about, so the source is what it filters on.
+            if dispatch.source == DispatchSource::HookAdmitted
+                && matches!(dispatch.binding, Binding::Leased { .. })
+                && Self::lease_is_stale(
+                    &dispatch.binding,
+                    now.saturating_duration_since(dispatch.last_heartbeat),
+                    self.agent_lease_ttl,
+                )
+            {
+                expired_hook_leases += 1;
+            }
             match &dispatch.binding {
                 Binding::Bound { pid, at } => {
                     bound_processes.insert(
@@ -2023,6 +2210,9 @@ impl AdmissionState {
             }
             *active_by_class
                 .entry(dispatch.class.as_str().to_string())
+                .or_default() += 1;
+            *active_by_source
+                .entry(dispatch.source.as_str().to_string())
                 .or_default() += 1;
             // The SAME rule `reconcile` applies, called rather than
             // restated: a leased binding lapses on `agent_lease_ttl` and
@@ -2100,6 +2290,13 @@ impl AdmissionState {
                 .iter()
                 .map(|(worktree, lease)| (worktree.clone(), lease.holder.clone()))
                 .collect(),
+            active_by_source,
+            admitted_by_source: self
+                .admitted_by_source
+                .iter()
+                .map(|(source, count)| (source.as_str().to_string(), *count))
+                .collect(),
+            expired_hook_leases,
         }
     }
 
@@ -2579,6 +2776,7 @@ mod tests {
             depth: 0,
             resource: ResourceClass::ModelWork,
             reserve_micros: 0,
+            source: DispatchSource::ManagedRun,
         }
     }
 
@@ -3365,6 +3563,129 @@ mod tests {
         assert!(
             !snapshot.leased_agents.contains_key("bound"),
             "a pid-bound dispatch is not also reported as leased"
+        );
+    }
+
+    /// SPEC §23: `relais coordinator status`'s enforcement line has to
+    /// name both halves — what a hook-admitted spawn IS capped on (agent
+    /// count) and what it is NOT (depth, spend) — derived from the
+    /// coordinator's own counts rather than a string nothing computes.
+    #[test]
+    fn the_enforcement_line_names_what_hook_admitted_spawns_are_and_are_not_capped_on() {
+        let mut state = state();
+        let t0 = Instant::now();
+        let request = DispatchRequest {
+            source: DispatchSource::HookAdmitted,
+            ..req("hook-agent", "run-a", "tab-a")
+        };
+        assert!(granted(state.request(&request, t0)));
+        assert_eq!(
+            state.bind_agent_lease("hook-agent", "agent-01", Provenance::Known, t0),
+            BindOutcome::Bound
+        );
+        let snapshot = state.status(t0);
+        let line = enforcement_line(Enforcement::Coordinator, &snapshot);
+        assert!(line.contains("1 live"), "{line}");
+        assert!(line.contains("1 admitted total"), "{line}");
+        assert!(
+            line.contains("agent count per session and per run"),
+            "names what hook-admitted spawns ARE capped on: {line}"
+        );
+        let lower = line.to_lowercase();
+        assert!(
+            lower.contains("depth") && lower.contains("spend") && lower.contains("not enforced"),
+            "names what they are NOT capped on: {line}"
+        );
+    }
+
+    /// The other half of that sentence, and the one that shipped
+    /// self-contradictory: under `Observed` nothing is capping anything,
+    /// so the line must not go on to describe the capping. A report with
+    /// no coordinator reachable renders exactly this, which is the
+    /// default path, not an edge.
+    #[test]
+    fn the_enforcement_line_under_observed_does_not_describe_caps_it_just_denied() {
+        let line = enforcement_line(Enforcement::Observed, &StatusSnapshot::default());
+        let lower = line.to_lowercase();
+        assert!(
+            lower.contains("nothing is capped"),
+            "the label says so plainly: {line}"
+        );
+        assert!(
+            !lower.contains("are capped on agent count"),
+            "and must not then describe the caps in the same breath: {line}"
+        );
+        assert!(
+            lower.contains("hooks") || lower.contains("hook"),
+            "it points at the two reasons nothing is capping: {line}"
+        );
+    }
+
+    /// An expired LEASE is reported as a hook-path number, so a managed
+    /// dispatch that took one must not be counted under a sentence that
+    /// is entirely about hook-admitted spawns.
+    #[test]
+    fn an_expired_lease_on_a_managed_dispatch_is_not_counted_as_a_hook_lease() {
+        let mut state = state();
+        let t0 = Instant::now();
+        let managed = req("managed-one", "run-a", "tab-a");
+        assert!(granted(state.request(&managed, t0)));
+        assert_eq!(
+            state.bind_agent_lease("managed-one", "agent-01", Provenance::Known, t0),
+            BindOutcome::Bound
+        );
+        let expired = t0 + state.agent_lease_ttl + Duration::from_secs(1);
+        assert_eq!(
+            state.status(expired).expired_hook_leases,
+            0,
+            "the lease expired, but the dispatch is managed, not hook-admitted"
+        );
+
+        let hooked = DispatchRequest {
+            source: DispatchSource::HookAdmitted,
+            ..req("hook-one", "run-a", "tab-a")
+        };
+        assert!(granted(state.request(&hooked, t0)));
+        assert_eq!(
+            state.bind_agent_lease("hook-one", "agent-02", Provenance::Known, t0),
+            BindOutcome::Bound
+        );
+        assert_eq!(
+            state.status(expired).expired_hook_leases,
+            1,
+            "and the hook-admitted one is"
+        );
+    }
+
+    /// `admitted_by_source` means "this process let it through". A
+    /// coordinator that adopts a previous process's dispatches after an
+    /// election must not count them again: the managed path is adopted
+    /// from the ledger and the hook path is not, so counting adoptions
+    /// would put two different lifetimes under one label.
+    #[test]
+    fn adopting_a_previous_coordinators_dispatch_does_not_count_it_again() {
+        let mut state = state();
+        let t0 = Instant::now();
+        let request = req("adopted-one", "run-a", "tab-a");
+        state.adopt(&request, None, Some("agent-01"), t0);
+        let snapshot = state.status(t0);
+        assert_eq!(
+            snapshot
+                .admitted_by_source
+                .get(DispatchSource::ManagedRun.as_str())
+                .copied()
+                .unwrap_or(0),
+            0,
+            "an adopted dispatch was admitted by the process this one replaced"
+        );
+        assert_eq!(
+            snapshot
+                .active_by_source
+                .get(DispatchSource::ManagedRun.as_str())
+                .copied()
+                .unwrap_or(0),
+            1,
+            "it is still live, and still counted as live"
         );
     }
 

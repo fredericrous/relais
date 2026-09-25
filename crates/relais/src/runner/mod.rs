@@ -26,8 +26,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::admission::{
-    BindOutcome, Decision, DispatchRequest, Gate, GateError, Refusal, ReleaseWriteOutcome,
-    ResourceClass, RunRegistration, WriteLeaseOutcome,
+    BindOutcome, Decision, DispatchRequest, DispatchSource, Gate, GateError, Refusal,
+    ReleaseWriteOutcome, ResourceClass, RunRegistration, WriteLeaseOutcome,
 };
 use crate::backend::{Backend, LaunchResult, LaunchSpec};
 use crate::context::{self, ContextError, ContextManifest};
@@ -684,6 +684,7 @@ impl<'a> RunEngine<'a> {
             depth,
             resource: ResourceClass::ModelWork,
             reserve_micros,
+            source: DispatchSource::ManagedRun,
         };
         loop {
             match gate.admit(&request) {
@@ -5712,6 +5713,7 @@ mod tests {
                 depth: 0,
                 resource: ResourceClass::ModelWork,
                 reserve_micros: 0,
+                source: DispatchSource::ManagedRun,
             })
             .expect("admit"),
             Decision::Granted
