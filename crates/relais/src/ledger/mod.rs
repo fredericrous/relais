@@ -2961,11 +2961,11 @@ mod tests {
     /// Pid AND an in-process counter, pre-cleaned: the test binary runs
     /// these in parallel threads of one process, so a pid-only name is
     /// one directory two tests share (P12).
-    fn temp_dir(label: &str) -> std::path::PathBuf {
+    fn temp_dir(label: &str) -> crate::test_support::TempDir {
         crate::test_support::temp_dir(&format!("ledger-{label}"))
     }
 
-    fn temp_ledger() -> (Ledger, std::path::PathBuf) {
+    fn temp_ledger() -> (Ledger, crate::test_support::TempDir) {
         let dir = temp_dir("open");
         let path = dir.join("ledger.sqlite");
         let ledger = Ledger::open(&path).expect("ledger opens");

@@ -334,7 +334,7 @@ mod tests {
     /// crashed earlier run cannot decide this one: the process owns the
     /// pid, the counter orders the directories within it. A thread id is
     /// reused the moment a thread ends.
-    fn temp_dir(name: &str) -> std::path::PathBuf {
+    fn temp_dir(name: &str) -> crate::test_support::TempDir {
         crate::test_support::temp_dir(&format!("predict-{name}"))
     }
 

@@ -3273,13 +3273,13 @@ mod tests {
     use super::*;
     use relais::ledger::{Ledger, Transition};
 
-    fn temp_ledger(label: &str) -> (Ledger, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "relais-main-test-{label}-{}-{}",
-            std::process::id(),
-            relais::ledger::now_rfc3339().replace([':', '.', '+'], "-")
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+    fn temp_ledger(label: &str) -> (Ledger, relais::test_support::TempDir) {
+        // Through the shared helper, not a hand-rolled path: this one
+        // built its own `relais-main-test-*` directory under the
+        // per-user temp root with no guard at all, which is the fourth
+        // creator this change had to find — and a grep for
+        // `from("/tmp")` does not see it.
+        let dir = relais::test_support::short_temp_dir(&format!("main-{label}"));
         let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger opens");
         (ledger, dir)
     }

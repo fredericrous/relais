@@ -3774,7 +3774,7 @@ mod tests {
     // -- fixtures ---------------------------------------------------------
 
     struct Fixture {
-        dir: PathBuf,
+        dir: crate::test_support::TempDir,
         repo: PathBuf,
         artifacts: PathBuf,
         ledger: Ledger,

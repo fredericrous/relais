@@ -14,16 +14,23 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use relais::policy::RepoPolicy;
+use relais::test_support::short_temp_dir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_relais");
 
 /// One isolated world: repo, state dir, config dir, fake claude. Short
 /// paths under /tmp because the coordinator socket lives in the state
 /// dir and Unix socket paths are limited to ~100 bytes.
+///
+/// `_scratch` is the same `Drop` guard `test_support::short_temp_dir`
+/// gives the library's own tests — this suite is a separate crate and
+/// cannot reach a `pub(crate)` helper, which is why `test_support` is
+/// `pub`. `root` stays a plain `PathBuf`, derived from the guard, since
+/// the rest of this file joins paths off it throughout.
 struct World {
+    _scratch: relais::test_support::TempDir,
     root: PathBuf,
     repo: PathBuf,
     state: PathBuf,
@@ -33,12 +40,8 @@ struct World {
 
 impl World {
     fn new(tag: &str) -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let root = PathBuf::from("/tmp").join(format!(
-            "rl-it-{tag}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let scratch = short_temp_dir(&format!("it-{tag}"));
+        let root = scratch.to_path_buf();
         let repo = root.join("repo");
         let state = root.join("state");
         let config = root.join("cfg");
@@ -65,6 +68,7 @@ impl World {
         mode.set_mode(0o755);
         std::fs::set_permissions(&claude, mode).expect("chmod");
         Self {
+            _scratch: scratch,
             root,
             repo,
             state,
@@ -280,8 +284,8 @@ impl Drop for World {
     fn drop(&mut self) {
         self.stop_coordinator();
         // Worktrees registered in the repo point into the state dir;
-        // remove everything together.
-        let _ = std::fs::remove_dir_all(&self.root);
+        // `_scratch`'s own `Drop`, run after this body, removes
+        // everything together.
     }
 }
 
@@ -2626,5 +2630,36 @@ fn files_written_after_the_result_are_not_in_the_candidate() {
     assert_eq!(
         receipt["verification"]["candidate_sha"], candidate,
         "the verdict is bound to the snapshot, not to the worktree as it is now"
+    );
+}
+
+/// The case a trailing `remove_dir_all` always missed: the test body
+/// never reaches its last line. `World`'s `_scratch` field is a `Drop`
+/// guard, so a panic mid-body still loses the directory.
+#[test]
+fn a_panicking_test_still_loses_its_world() {
+    let world = World::new("panic-cleanup");
+    let root = world.root.clone();
+    assert!(root.exists());
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _world = world;
+        panic!("the test body never gets here on purpose");
+    }));
+    assert!(outcome.is_err());
+    assert!(!root.exists());
+}
+
+/// The assertion that would have caught the present hole: this suite's
+/// own `World` builds a directory under the same `SCRATCH_PREFIX`
+/// `doctor::count_strays` reads, not a hand-rolled `rl-it-` prefix the
+/// scan never knew about.
+#[test]
+fn a_world_is_countable_by_doctors_scan() {
+    let world = World::new("scan-proof");
+    let parent = world.root.parent().expect("world's parent").to_path_buf();
+    let (count, _) = relais::doctor::count_strays(&parent).expect("scan");
+    assert!(
+        count >= 1,
+        "the world's own root must be counted among {parent:?}'s strays"
     );
 }

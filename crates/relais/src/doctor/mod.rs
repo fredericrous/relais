@@ -13,7 +13,7 @@
 
 use serde::Serialize;
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::backend::Capabilities;
@@ -758,20 +758,35 @@ pub(crate) fn hook_health_from_probe(end: &crate::procs::ProcessEnd) -> HookHeal
 /// cannot be reached — the scratch state directory holds no coordinator
 /// socket, so it never can be.
 fn probe_recorded_hook(command: &str) -> HookHealth {
-    let scratch = std::env::temp_dir().join(format!(
-        "relais-doctor-hook-probe-{}-{}",
+    let scratch = Scratch(std::env::temp_dir().join(format!(
+        "{}doctor-hook-probe-{}-{}",
+        crate::test_support::SCRATCH_PREFIX,
         std::process::id(),
         chrono::Utc::now().format("%Y%m%dT%H%M%S%f")
-    ));
-    let config_dir = scratch.join("config");
-    let state_dir = scratch.join("state");
-    let outcome = stage_and_run(command, &config_dir, &state_dir);
-    // Best effort, and deliberately not reported: the answer above is
-    // about the hook, and a scratch directory that outlives this run
-    // says nothing about it. `relais doctor` has its own finding for
-    // leftover state.
-    let _ = std::fs::remove_dir_all(&scratch);
-    outcome
+    )));
+    let config_dir = scratch.0.join("config");
+    let state_dir = scratch.0.join("state");
+    stage_and_run(command, &config_dir, &state_dir)
+}
+
+/// The probe's scratch directory, removed when it drops.
+///
+/// A `Drop` and not a trailing `remove_dir_all`: this is the one place
+/// `relais doctor` — production, running for a person — creates a
+/// directory of this shape, and a trailing statement does not run if
+/// anything above it panics. The tool that reports stranded scratch
+/// directories should not be a source of them. It carries
+/// `SCRATCH_PREFIX` so that if one does survive a kill, the same scan
+/// counts it.
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // Best effort, and deliberately not reported: the probe's answer
+        // is about the hook, and a directory that outlives it says
+        // nothing about that answer.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Stage the scratch environment and run the command in it. Split out so
@@ -1106,30 +1121,61 @@ pub(crate) fn worktrees_finding(
     }
 }
 
-/// The scratch directories `test_support::short_temp_dir` leaves under
-/// `/tmp` when a test run is killed before its guard can drop — the
-/// guard (`temp-dir-lifetime`) stops new ones; it does nothing for the
+/// The scratch directories `test_support::short_temp_dir` and the
+/// integration suites' own world types leave under `/tmp` when a test
+/// run is killed before its guard can drop — the guard
+/// (`temp-dir-lifetime`) stops new ones; it does nothing for the
 /// thousands a machine this old already carries.
 fn strays_finding_on_disk() -> Finding {
-    strays_finding(count_strays(Path::new("/tmp")))
+    // BOTH roots a test helper can strand a directory under:
+    // `short_temp_dir` goes to `/tmp` (a socket path's 104-byte cap), and
+    // `temp_dir` to `std::env::temp_dir()`, which on macOS is
+    // `/var/folders/...` — scanning only `/tmp` reported a clean machine
+    // while the other root filled up, which is the "believed zero" this
+    // finding exists to prevent. The same root twice is counted once.
+    let tmp = PathBuf::from("/tmp");
+    let env_tmp = std::env::temp_dir();
+    let mut roots = vec![tmp];
+    if !roots.contains(&env_tmp) {
+        roots.push(env_tmp);
+    }
+    strays_finding(count_strays_under(&roots))
 }
 
-/// The verdict on `/tmp/relais-*`, given what the scan found. Never a
-/// blocker: a stray only costs disk. A scan that could not run is a
-/// failure to say so, not a clean state.
+/// The counts across several roots, folded. Any root that cannot be read
+/// fails the whole scan rather than being skipped: a partial count
+/// reported as a total is the shape of answer this finding must not give.
+fn count_strays_under(roots: &[PathBuf]) -> std::io::Result<(u64, u64)> {
+    let mut count = 0;
+    let mut bytes = 0;
+    for root in roots {
+        let (c, b) = count_strays(root)?;
+        count += c;
+        bytes += b;
+    }
+    Ok((count, bytes))
+}
+
+/// The verdict on `/tmp/{SCRATCH_PREFIX}*`, given what the scan found.
+/// Never a blocker: a stray only costs disk. A scan that could not run
+/// is a failure to say so, not a clean state.
 pub(crate) fn strays_finding(strays: std::io::Result<(u64, u64)>) -> Finding {
     match strays {
         Ok((0, _)) => Finding {
             component: "temp-strays",
             level: Level::Ok,
-            detail: "no /tmp/relais-* directory is left over".into(),
+            detail: format!(
+                "no /tmp/{}* directory is left over",
+                crate::test_support::SCRATCH_PREFIX
+            ),
         },
         Ok((count, bytes)) => Finding {
             component: "temp-strays",
             level: Level::Warn,
             detail: format!(
-                "{count} /tmp/relais-* director{} left over from a killed test run, {bytes} \
+                "{count} /tmp/{}* director{} left over from a killed test run, {bytes} \
                  bytes; safe to remove by hand",
+                crate::test_support::SCRATCH_PREFIX,
                 if count == 1 { "y" } else { "ies" }
             ),
         },
@@ -1147,11 +1193,20 @@ pub(crate) fn strays_finding(strays: std::io::Result<(u64, u64)>) -> Finding {
     }
 }
 
-/// The count and total bytes of `relais-*` directories directly under
-/// `root` — `short_temp_dir`'s own naming, so this counts exactly what
-/// that function can strand. A root that does not exist (no `/tmp` on
-/// this platform) counts as none, not a failure.
-fn count_strays(root: &Path) -> std::io::Result<(u64, u64)> {
+/// The count and total bytes of `{SCRATCH_PREFIX}*` directories directly
+/// under `root` — the one prefix `test_support::short_temp_dir`, the
+/// integration suites' own world types and this scan all read from
+/// [`crate::test_support::SCRATCH_PREFIX`], so this counts exactly what
+/// any of them can strand. `pub`, not `pub(crate)`: an integration suite
+/// under `tests/` proves its own world is countable by calling this
+/// directly. A root that does not exist (no `/tmp` on this platform)
+/// counts as none, not a failure.
+/// The prefix `short_temp_dir` wrote before `SCRATCH_PREFIX` unified it
+/// with the integration suites'. Counted alongside the current one so a
+/// machine that ran relais in between is not told it is clean.
+const LEGACY_SCRATCH_PREFIX: &str = "relais-";
+
+pub fn count_strays(root: &Path) -> std::io::Result<(u64, u64)> {
     if !root.is_dir() {
         return Ok((0, 0));
     }
@@ -1168,7 +1223,16 @@ fn count_strays(root: &Path) -> std::io::Result<(u64, u64)> {
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        if entry.file_name().to_string_lossy().starts_with("relais-") && file_type.is_dir() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // The current prefix AND the one `short_temp_dir` used before it
+        // was unified: a machine that ran this suite in between carries
+        // `relais-*` directories, and a scan that stopped counting them
+        // the moment the prefix changed would tell that machine it was
+        // clean — the same false zero this finding exists to prevent.
+        // Droppable once no machine can still be carrying them.
+        let stray = name.starts_with(crate::test_support::SCRATCH_PREFIX)
+            || name.starts_with(LEGACY_SCRATCH_PREFIX);
+        if stray && file_type.is_dir() {
             count += 1;
             bytes += crate::workspace::dir_size(&entry.path()).unwrap_or(0);
         }
@@ -1560,7 +1624,7 @@ mod tests {
         assert!(unscanned.detail.contains("boom"), "{}", unscanned.detail);
     }
 
-    /// Leftover `/tmp/relais-*` directories are a `!` naming the count
+    /// Leftover `/tmp/rl-*` directories are a `!` naming the count
     /// and the bytes, never a blocker; none is a pass; a scan that could
     /// not run says so.
     #[test]
@@ -1569,7 +1633,7 @@ mod tests {
         assert_eq!(none.level, Level::Ok, "{}", none.detail);
         let some = strays_finding(Ok((2, 1024)));
         assert_eq!(some.level, Level::Warn, "{}", some.detail);
-        assert!(some.detail.contains("2 /tmp/relais-*"), "{}", some.detail);
+        assert!(some.detail.contains("2 /tmp/rl-*"), "{}", some.detail);
         assert!(some.detail.contains("1024 bytes"), "{}", some.detail);
         let unscanned = strays_finding(Err(std::io::Error::other("boom")));
         assert_eq!(
@@ -1590,18 +1654,24 @@ mod tests {
         assert!(!report.failed(), "an unscannable /tmp must not fail doctor");
     }
 
-    /// `count_strays` counts only `relais-*` directories directly under
-    /// the root, and a root that does not exist is none, not a failure.
+    /// `count_strays` counts only `{SCRATCH_PREFIX}*` directories
+    /// directly under the root, and a root that does not exist is none,
+    /// not a failure.
     #[test]
-    fn count_strays_finds_only_relais_prefixed_directories() {
+    fn count_strays_finds_only_scratch_prefixed_directories() {
         let dir = crate::test_support::short_temp_dir("doctor-strays");
         let root = dir.to_path_buf();
-        std::fs::create_dir(root.join("relais-a-1-1")).expect("a stray");
-        std::fs::write(root.join("relais-a-1-1").join("f"), b"12345").expect("a file");
-        std::fs::create_dir(root.join("relais-b-1-2")).expect("another stray");
-        std::fs::write(root.join("not-relais"), b"ignored").expect("a non-stray file");
+        std::fs::create_dir(root.join("rl-a-1-1")).expect("a stray");
+        std::fs::write(root.join("rl-a-1-1").join("f"), b"12345").expect("a file");
+        std::fs::create_dir(root.join("rl-b-1-2")).expect("another stray");
+        std::fs::write(root.join("not-rl"), b"ignored").expect("a non-stray file");
+        // A directory `short_temp_dir` left before the prefix was
+        // unified. A machine that ran relais between the two changes
+        // carries these, and stopping counting them the moment the
+        // prefix changed would report that machine clean.
+        std::fs::create_dir(root.join("relais-old-1-3")).expect("a legacy stray");
         let (count, bytes) = count_strays(&root).expect("scan");
-        assert_eq!(count, 2);
+        assert_eq!(count, 3, "both the current prefix and the legacy one");
         assert_eq!(bytes, 5);
         assert_eq!(
             count_strays(&root.join("absent")).expect("absent is none"),

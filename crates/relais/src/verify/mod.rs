@@ -2218,7 +2218,7 @@ mod tests {
     }
 
     /// Unique fixture directories under parallel test threads.
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
+    fn temp_dir(tag: &str) -> crate::test_support::TempDir {
         crate::test_support::temp_dir(&format!("verify-{tag}"))
     }
 

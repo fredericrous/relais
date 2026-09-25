@@ -985,7 +985,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn temp_root() -> (InstallRoot, PathBuf) {
+    fn temp_root() -> (InstallRoot, crate::test_support::TempDir) {
         let dir = crate::test_support::temp_dir("install");
         let root = InstallRoot {
             claude_dir: dir.join("project").join(".claude"),

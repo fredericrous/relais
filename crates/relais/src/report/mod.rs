@@ -1230,7 +1230,7 @@ mod tests {
     /// crashed earlier run cannot decide this one. The pid alone is not
     /// enough: two tests in one process shared it, and the second opened
     /// the first's ledger.
-    fn temp_dir(name: &str) -> std::path::PathBuf {
+    fn temp_dir(name: &str) -> crate::test_support::TempDir {
         crate::test_support::temp_dir(&format!("report-{name}"))
     }
 

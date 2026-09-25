@@ -152,9 +152,34 @@ missing here.
   `remove_dir_all(...).ok()` a test body may never reach — the case that
   happens most while a feature is being developed, and the one that
   filled a 466 GB volume and stopped a session outright. `relais doctor`
-  now also counts `/tmp/relais-*` directories already stranded on the
-  machine by the old pattern, the way it already reports retained run
-  worktrees; the guard only stops new ones.
+  now also counts the directories already stranded on the machine by the
+  old pattern, the way it already reports retained run worktrees; the
+  guard only stops new ones. (The prefix it counts became
+  `test_support::SCRATCH_PREFIX` in the entry below, which is the one
+  shape both halves now agree on — this entry said `/tmp/relais-*` while
+  it was the only prefix there was.)
+
+- **The three integration suites (`hook_respond.rs`, `portable_scenarios.rs`,
+  `release_scenarios.rs`) get the same drop guard `short_temp_dir` gives
+  the library's own tests, instead of building their own `/tmp/rl-hook-*`,
+  `/tmp/rl-pt-*` and `/tmp/rl-it-*` worlds with no cleanup at all.**
+  Measured before this change: 1057 stray directories under `/tmp`, every
+  one of them from these three suites, while `relais doctor` reported
+  none — its stray scan counted only the `relais-*` prefix
+  `short_temp_dir` used, never the suites' own hand-rolled prefixes. A
+  test crate under `tests/` cannot see a `pub(crate)` item, which is why
+  the suites had rolled their own worlds to begin with, so
+  `test_support` is now `pub` (nothing here runs on a production path)
+  and every scratch directory a test can strand — the library helper's
+  and all three suites' — carries one prefix, `test_support::
+  SCRATCH_PREFIX`, that the guard, the suites and doctor's scan all read.
+  `short_temp_dir` adopted the suites' shorter `rl-` prefix rather than
+  the other way around: these directories hold Unix sockets, and a
+  socket path is capped near 104 bytes on macOS. Each suite gained a
+  test proving its own world's directory is removed after a panic inside
+  `catch_unwind`, and a second proving that world is counted by
+  `doctor::count_strays` (now `pub` for exactly this) — the assertion
+  that would have caught the present hole.
 
 ## v0.4.0
 

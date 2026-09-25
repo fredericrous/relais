@@ -531,7 +531,7 @@ mod tests {
     /// the pid, the counter orders the directories within it. A thread id
     /// is reused the moment a thread ends, so two tests in one run shared
     /// a registry — and one of them saw the other's active pointer.
-    fn temp_registry(name: &str) -> (Registry, PathBuf) {
+    fn temp_registry(name: &str) -> (Registry, crate::test_support::TempDir) {
         let dir = crate::test_support::temp_dir(&format!("registry-{name}"));
         let registry = Registry::open(&dir).expect("registry");
         (registry, dir)

@@ -549,7 +549,7 @@ mod tests {
     /// owns the pid, and the counter orders the directories within it.
     /// A thread id is reused the moment a thread ends, which made two
     /// tests in one run share a ledger.
-    fn temp_dir(name: &str) -> std::path::PathBuf {
+    fn temp_dir(name: &str) -> crate::test_support::TempDir {
         crate::test_support::temp_dir(name)
     }
 
@@ -682,7 +682,7 @@ argv = ["true"]
         ledger: crate::ledger::Ledger,
         contract: crate::contract::TaskContract,
         contract_json: String,
-        dir: std::path::PathBuf,
+        dir: crate::test_support::TempDir,
     }
 
     impl LedgerFixture {
