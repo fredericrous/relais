@@ -22,10 +22,10 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::admission::{
-    AdmissionState, AgentSettleOutcome, BindOutcome, Decision, DispatchRequest, Enforcement, Gate,
-    GateError, HeartbeatStatus, LifecycleOutcome, PendingSignal, Provenance, ReleaseWriteOutcome,
-    ResourceClass, ResumeOutcome, RunRegistration, Signal, StatusSnapshot, WaitOutcome,
-    WithdrawOutcome, WriteLeaseOutcome,
+    AdmissionState, AgentSettleOutcome, BindOutcome, Decision, DispatchRequest, DispatchSource,
+    Enforcement, Gate, GateError, HeartbeatStatus, LifecycleOutcome, PendingSignal, Provenance,
+    ReleaseWriteOutcome, ResourceClass, ResumeOutcome, RunRegistration, Signal, StatusSnapshot,
+    WaitOutcome, WithdrawOutcome, WriteLeaseOutcome,
 };
 use crate::ipc::{Listener, Stream};
 use crate::ledger::Ledger;
@@ -574,6 +574,12 @@ impl Coordinator {
                         depth: 0,
                         resource: ResourceClass::ModelWork,
                         reserve_micros: 0,
+                        // Adopted from the ledger row the runner itself
+                        // wrote before this election: a managed dispatch
+                        // surviving a restart, not a hook-admitted one —
+                        // the hook path never writes a ledger row (SPEC
+                        // §23).
+                        source: DispatchSource::ManagedRun,
                     },
                     pid,
                     None,
@@ -1908,6 +1914,7 @@ mod tests {
             depth: 0,
             resource: ResourceClass::ModelWork,
             reserve_micros: 0,
+            source: DispatchSource::ManagedRun,
         }
     }
 

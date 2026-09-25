@@ -37,6 +37,21 @@ missing here.
   `outcome` (`immediate`, `admitted_after_waiting`, or
   `refused_after_waiting`) for every firing.
 
+- **`relais coordinator status` and `relais report` now derive their
+  enforcement line from the coordinator's own counts instead of printing
+  a fixed sentence nothing computed.** Every `DispatchRequest` now names
+  a `DispatchSource` (`ManagedRun`, `HookAdmitted`, or `Observed`, the
+  caller's own label, defaulted to `ManagedRun` for anything
+  deserialized without one); `StatusSnapshot` carries live and admitted
+  counts by source plus expired-but-unreaped hook leases; and
+  `Enforcement` gains `Observed` for the honest case where nothing is
+  capping a session at all. The rendered line names both halves of the
+  hook-admitted path: what IS capped (agent count per session and per
+  run) and what is NOT (depth — a hook payload joins no spawn to its
+  parent — and spend — the run a hook registers carries no budget).
+  `relais report`'s JSON carries the same summary under a new
+  `enforcement` key (`REPORT_SCHEMA_VERSION` 5 → 6).
+
 ### Changed
 
 - **BREAKING: the coordinator wire protocol is now 3

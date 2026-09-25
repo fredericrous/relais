@@ -1394,6 +1394,17 @@ fn coordinator_status_command(socket: &Path, json: bool) -> Result<CliOutcome, C
                     "no coordinator is serving this user ({socket_text}); one starts on the \
                      first managed dispatch ({e})"
                 );
+                // The one situation this whole line exists for. With no
+                // daemon answering, a hook under `carry_on` refuses
+                // nothing — and saying nothing here is how that went
+                // unnoticed until it was measured.
+                println!(
+                    "{}",
+                    relais::admission::enforcement_line(
+                        relais::admission::Enforcement::Observed,
+                        &relais::admission::StatusSnapshot::default(),
+                    )
+                );
             }
             return Ok(CliOutcome::Accepted);
         }
@@ -1468,7 +1479,18 @@ fn coordinator_status_command(socket: &Path, json: bool) -> Result<CliOutcome, C
             if run.cancelled { " CANCELLED" } else { "" }
         );
     }
-    println!("enforcement: managed dispatch only; native subagents are observed, not capped");
+    println!(
+        "{}",
+        relais::admission::enforcement_line(
+            // This snapshot came back, so a coordinator is serving and
+            // its caps bind across every tab of this user. Read off the
+            // answer rather than named as a constant here: the absent
+            // branch above reaches the same function with `Observed`,
+            // and the two must not be able to drift into agreeing.
+            relais::admission::Enforcement::Coordinator,
+            &snapshot,
+        )
+    );
     Ok(CliOutcome::Accepted)
 }
 
@@ -2601,7 +2623,24 @@ fn report_command(
             .to_string()
     });
     let ledger = open_ledger()?;
-    let report = operational(report::runs_report(&ledger, &since, by), "report")?;
+    let mut report = operational(report::runs_report(&ledger, &since, by), "report")?;
+    // Best-effort: a report is still a report with no coordinator
+    // reachable, and `EnforcementReport::observed` already says so
+    // honestly rather than this command failing over it.
+    report.enforcement = relais::coordinator::socket_path()
+        .ok()
+        .map(relais::coordinator::Client::new)
+        .and_then(|client| client.status().ok())
+        .map(|snapshot| {
+            // A snapshot came back: a coordinator is serving. The
+            // fallback below is the other half of the same question, so
+            // neither is a free-standing claim about enforcement.
+            report::EnforcementReport::from_snapshot(
+                relais::admission::Enforcement::Coordinator,
+                &snapshot,
+            )
+        })
+        .unwrap_or_else(report::EnforcementReport::observed);
     if json {
         print_document(&report)?;
     } else {

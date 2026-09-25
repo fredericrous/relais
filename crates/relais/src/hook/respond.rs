@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 use super::decide::{decide_or_silent, CoordinatorAnswer, HookAnswer};
 use super::event::{self, HookEvent, ToolCallPhase};
 use crate::admission::{
-    Decision, DispatchRequest, Gate, Provenance, Refusal, ResourceClass, RunRegistration,
+    Decision, DispatchRequest, DispatchSource, Gate, Provenance, Refusal, ResourceClass,
+    RunRegistration,
 };
 use crate::ids;
 use crate::policy::{HookAdmissionSettings, QueueBehaviour};
@@ -202,6 +203,7 @@ fn ask_coordinator(
         depth: 0,
         resource: ResourceClass::ModelWork,
         reserve_micros: settings.dispatch_reserve_micros.to_micros(),
+        source: DispatchSource::HookAdmitted,
     };
     // Any failure to reach the coordinator — no daemon, a stale
     // socket, a protocol mismatch — is exactly `CoordinatorAnswer`'s
@@ -854,6 +856,7 @@ mod tests {
             depth: 0,
             resource: ResourceClass::ModelWork,
             reserve_micros: 0,
+            source: DispatchSource::HookAdmitted,
         };
 
         assert!(
