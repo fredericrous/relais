@@ -1542,12 +1542,27 @@ impl<'a> RunEngine<'a> {
                         "base",
                     )?;
                     self.record_logs(None, EvidenceKind::CheckLog, &checks)?;
-                    // A check that could not run at all (exit 127) gives
-                    // the base no verdict: nothing to compare a candidate
-                    // against, nothing to cache, and no worker can put
-                    // the missing program there. Blocked, with the
-                    // remedy named — which is not always "add a setup".
-                    let unrunnable = verify::unrunnable_checks(&checks);
+                    // A check that gave no verdict at the base — the
+                    // program was not found (exit 127), or the wall clock
+                    // cut it off before it reported a status — leaves
+                    // nothing to compare a candidate against, for exactly
+                    // the same reason a missing program does: nothing to
+                    // cache, and no worker can fix code that never ran.
+                    // Blocked, with the remedy named — which is not
+                    // always "add a setup". A candidate that times out is
+                    // still judged as a failure (verify::CheckOutcome::
+                    // failed); this reclassification happens only here,
+                    // where the base is judged.
+                    let unrunnable: Vec<&verify::CheckOutcome> = checks
+                        .iter()
+                        .filter(|check| {
+                            verify::unrunnable(check)
+                                || matches!(
+                                    check.ended,
+                                    Ended::TimedOut | Ended::Cancelled | Ended::Signalled
+                                )
+                        })
+                        .collect();
                     if !unrunnable.is_empty() {
                         let detail = unrunnable_baseline_detail(
                             self.config.repo_dir,
@@ -3695,27 +3710,97 @@ fn setup_failure_detail(failed: &verify::CheckOutcome, where_: &str) -> String {
     )
 }
 
-/// What an unrunnable baseline says, and what to do about it. The remedy
-/// depends on what was declared: with no setup and a lockfile at the
-/// root, the missing program is most likely the tree's own dependencies
-/// and the block that installs them is spelled out; with a setup that
-/// succeeded and a program still missing, adding another install step is
-/// the wrong move, and the detail says so.
+/// The wall limit a profile declared for the command behind this
+/// label, if the label still names one of the profile's commands.
+fn command_timeout_seconds(profile: &VerificationProfile, label: &str) -> Option<u64> {
+    profile
+        .commands
+        .iter()
+        .find(|command| verify::check_label(command) == label)
+        .map(|command| command.timeout_seconds)
+}
+
+/// What an unrunnable baseline says, and what to do about it. A check
+/// that never reported a status splits into two different remedies: a
+/// missing program (exit 127) depends on what was declared — with no
+/// setup and a lockfile at the root, the missing program is most likely
+/// the tree's own dependencies and the block that installs them is
+/// spelled out; with a setup that succeeded and a program still missing,
+/// adding another install step is the wrong move. A check the wall clock
+/// or a signal cut off names the limit it ran against instead, so a
+/// reader is pointed at contention or at a limit that is too low, not at
+/// a base that is broken.
 fn unrunnable_baseline_detail(
     repo_dir: &Path,
     profile_name: &str,
     profile: &VerificationProfile,
     base_sha: &str,
-    labels: &[String],
+    checks: &[&verify::CheckOutcome],
 ) -> String {
     let short = base_sha.get(..8).unwrap_or(base_sha);
+    let mut not_found_labels: Vec<&str> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
+    // Told apart because the remedy differs: a wall limit can be raised,
+    // a kill cannot.
+    let mut timed_out = false;
+    let mut cut_off = false;
+    for check in checks {
+        match check.ended {
+            Ended::Exited(_) => {
+                not_found_labels.push(&check.label);
+                lines.push(format!(
+                    "{} exited {} (command not found)",
+                    check.label,
+                    verify::COMMAND_NOT_FOUND
+                ));
+            }
+            // The wall limit belongs to the ending that hit it. A
+            // check the OOM killer took, or one that crashed, did not
+            // run out of time, and quoting a limit it never reached
+            // sends a reader to raise a number that was not the cause.
+            Ended::TimedOut => {
+                timed_out = true;
+                let limit = command_timeout_seconds(profile, &check.label)
+                    .map(|seconds| format!("{seconds}s wall limit"))
+                    .unwrap_or_else(|| "no known wall limit".to_string());
+                lines.push(format!("{} timed out ({limit})", check.label));
+            }
+            Ended::Signalled | Ended::Cancelled => {
+                cut_off = true;
+                lines.push(format!("{} {}", check.label, check.ended.describe()));
+            }
+        }
+    }
     let mut detail = format!(
-        "{} exited {} (command not found) at the base revision {short}: the base has no \
-         verdict to compare a candidate against, and no worker can put the missing program \
-         there. A verification worktree holds the repository's files and nothing else.",
-        labels.join(", "),
-        verify::COMMAND_NOT_FOUND
+        "{} at the base revision {short}: the base has no verdict to compare a candidate \
+         against. A verification worktree holds the repository's files and nothing else.",
+        lines.join("; ")
     );
+    if !not_found_labels.is_empty() {
+        detail.push_str(
+            " A missing program is not something a worker can put there; the exited-127 \
+             check(s) above name it.",
+        );
+    }
+    if timed_out {
+        detail.push_str(
+            " A check that did not finish before its wall limit is not a failure in the \
+             code: either this machine was contended when it ran, or the limit is too low \
+             for this check. A timeout that reproduces consistently against this exact base \
+             revision, run alone, points at the limit; one that does not points at \
+             contention.",
+        );
+    }
+    if cut_off {
+        detail.push_str(
+            " A check that died without reporting a status did not run out of time: it was \
+             killed or it crashed. The out-of-memory killer is the common cause on a \
+             contended machine, and the check's own log is where the evidence is.",
+        );
+    }
+    if not_found_labels.is_empty() {
+        return detail;
+    }
     if profile.setup.is_empty() {
         let found = crate::repo::lockfiles(repo_dir);
         if found.is_empty() {
@@ -6206,6 +6291,48 @@ mod tests {
         assert_eq!(
             cached, 0,
             "an unrunnable baseline is not a verdict to cache"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A check that ran past its wall limit at the base is a base that
+    /// could not be verified, not a base that failed: nothing ran to a
+    /// verdict, so there is nothing to compare a candidate against.
+    /// Blocked before any worker, and the detail names the check, how it
+    /// ended, and the limit it ran against — not a claim that the code
+    /// is broken.
+    #[test]
+    fn a_baseline_check_the_wall_clock_kills_is_unrunnable_not_failed() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(
+            vec![CommandSpec {
+                name: None,
+                argv: vec!["sh".into(), "-c".into(), "sleep 5".into()],
+                timeout_seconds: 1,
+            }],
+            3,
+        );
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = counting_worker(Arc::clone(&launches));
+        let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+        let RunOutcome {
+            terminal: Terminal::Blocked { code, detail },
+            ..
+        } = outcome
+        else {
+            panic!("expected blocked, got {outcome:?}");
+        };
+        assert_eq!(code, BlockCode::BaselineUnrunnable, "{detail}");
+        assert_eq!(launches.load(Ordering::SeqCst), 0, "no worker was bought");
+        assert!(detail.contains("timed out"), "{detail}");
+        assert!(detail.contains("1s wall limit"), "{detail}");
+        assert!(
+            detail.contains("sh -c sleep 5") || detail.contains("sh@"),
+            "the check is named: {detail}"
+        );
+        assert!(
+            !detail.contains("command not found"),
+            "a timeout is not a missing program: {detail}"
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }

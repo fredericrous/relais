@@ -508,15 +508,6 @@ pub fn unrunnable(outcome: &CheckOutcome) -> bool {
     outcome.ended == Ended::Exited(COMMAND_NOT_FOUND)
 }
 
-/// The labels of the checks that could not run.
-pub fn unrunnable_checks(checks: &[CheckOutcome]) -> Vec<String> {
-    checks
-        .iter()
-        .filter(|check| unrunnable(check))
-        .map(|check| check.label.clone())
-        .collect()
-}
-
 /// A command's wall clock. Zero is refused rather than rounded up to a
 /// second: a policy that gives a check no time is a policy mistake, and
 /// silently running it for one second made the mistake invisible
@@ -1430,6 +1421,16 @@ pub fn baseline_key(
 ) -> String {
     sha256_hex(
         serde_json::json!({
+            // What a cached entry MEANS, not just what it was computed
+            // from. Before this version a base check killed by the wall
+            // clock was cached as an ordinary failure label, so an
+            // opted-in repo would keep reading that entry and keep
+            // ending `baseline_failure_not_waived` however many times
+            // the base was fixed — the stored answer outliving the
+            // judgement that produced it. Bumping this retires every
+            // entry written under the old meaning, at the cost of one
+            // baseline run each.
+            "meaning": BASELINE_MEANING_VERSION,
             "base": base_sha,
             "profile": profile,
             "tools": tools,
@@ -1439,6 +1440,11 @@ pub fn baseline_key(
         .as_bytes(),
     )
 }
+
+/// Bumped when what a cached baseline entry means changes, rather than
+/// what it was computed from. v2: a check that did not run to a verdict
+/// is `BaselineUnrunnable` and is never cached as a failure.
+const BASELINE_MEANING_VERSION: u32 = 2;
 
 /// Cached baseline failures, one JSON file per key, opt-in per profile
 /// (SPEC §18: not cacheable by default). A miss reruns the checks; a
@@ -2121,9 +2127,36 @@ mod tests {
             !unrunnable(&ordinary),
             "exit 1 is a check that ran and said no"
         );
-        assert_eq!(
-            unrunnable_checks(&[direct.clone(), via_shell.clone(), ordinary]),
-            vec![direct.label, via_shell.label]
+        // Per check, not through an aggregator: the runner asks
+        // `unrunnable` about one outcome at a time, and a helper that
+        // only its own test calls is a leftover of the shape before it.
+        assert!(unrunnable(&direct), "{}", direct.label);
+        assert!(unrunnable(&via_shell), "{}", via_shell.label);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A candidate check the wall clock kills is a failure, full stop —
+    /// `unrunnable` keeps meaning "command not found" and says nothing
+    /// about it. Reclassifying a timeout as unrunnable at a candidate
+    /// would let a hanging test through instead of failing it; that
+    /// judgement is made only at the base, in the runner (SPEC §10).
+    #[test]
+    fn a_candidate_check_the_wall_clock_kills_is_a_failure_not_unrunnable() {
+        let dir = temp_dir("candidate-timeout");
+        let logs = dir.join("logs");
+        let hung = run_command(
+            &dir,
+            &command(&["sh", "-c", "sleep 5"], 1),
+            &logs,
+            "sh@0",
+            "cand0",
+        )
+        .expect("run");
+        assert_eq!(hung.ended, Ended::TimedOut);
+        assert!(hung.failed(), "a hung candidate check is a failure");
+        assert!(
+            !unrunnable(&hung),
+            "a timeout is not the same fact as a missing program"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
