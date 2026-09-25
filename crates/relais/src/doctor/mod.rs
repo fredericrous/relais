@@ -609,6 +609,7 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
                     if let Some(trials) = trials_finding(&settings) {
                         findings.push(trials);
                     }
+                    findings.push(hook_timeout_finding(repo_dir, &settings.admission));
                 }
                 Err(e) => findings.push(Finding {
                     component: "machine.toml",
@@ -848,6 +849,99 @@ pub(crate) fn recorded_hook_command(settings_text: &str) -> Option<String> {
                 .then(|| command.to_string())
         })
     })
+}
+
+/// The `timeout` recorded on the same `PreToolUse` leaf
+/// [`recorded_hook_command`] finds — `Some(None)` when the leaf exists
+/// but carries no `timeout` field at all, which a settings file written
+/// before `timeout` existed leaves exactly that way.
+pub(crate) fn recorded_pretooluse_timeout_secs(settings_text: &str) -> Option<Option<u64>> {
+    let value: Value = serde_json::from_str(settings_text).ok()?;
+    let entries = value.pointer("/hooks/PreToolUse")?.as_array()?;
+    entries.iter().find_map(|entry| {
+        entry.get("hooks")?.as_array()?.iter().find_map(|hook| {
+            if hook.get("type")?.as_str()? != "command" {
+                return None;
+            }
+            let command = hook.get("command")?.as_str()?;
+            command
+                .trim_end()
+                .ends_with(" hook")
+                .then(|| hook.get("timeout").and_then(Value::as_u64))
+        })
+    })
+}
+
+/// The hook cannot read its own handler timeout — nothing in a hook
+/// payload carries it — so a hand-edited or stale settings.json silently
+/// converts every capped spawn into a fail-open admission the moment the
+/// recorded timeout stops covering the configured wait: the hook then
+/// waits `queue_wait_secs` regardless, and the harness kills it before it
+/// can withdraw and print, deciding nothing and running the agent anyway
+/// (the false "expired hook fails open" SPEC §23 records). `doctor` is
+/// the one place that CAN read both sides — the file and the machine
+/// settings — so it is the one place that can catch it, as a FAILURE
+/// rather than a warning: this is the one outcome the whole package
+/// exists to prevent.
+fn hook_timeout_finding(
+    repo_dir: &Path,
+    admission: &crate::policy::HookAdmissionSettings,
+) -> Finding {
+    let queue_wait = match admission.queue_behaviour() {
+        crate::policy::QueueBehaviour::RefuseImmediately => Duration::ZERO,
+        crate::policy::QueueBehaviour::WaitUpTo(wait) => wait,
+    };
+    let required = crate::install::settings::derived_pretooluse_timeout(queue_wait).as_secs();
+    let mut candidates = vec![repo_dir.join(".claude").join("settings.json")];
+    if let Ok(home) = paths::home_dir() {
+        candidates.push(home.join(".claude").join("settings.json"));
+    }
+    let recorded = candidates.iter().find_map(|path| {
+        let text = std::fs::read_to_string(path).ok()?;
+        recorded_pretooluse_timeout_secs(&text).map(|timeout| (path.clone(), timeout))
+    });
+    match recorded {
+        None => Finding {
+            component: "hook-timeout",
+            level: Level::Warn,
+            detail: "no relais command is recorded on PreToolUse in any settings.json this \
+                     repository can see, so there is no recorded timeout to check — see \
+                     `hook-live`"
+                .into(),
+        },
+        Some((path, Some(timeout))) if timeout >= required => Finding {
+            component: "hook-timeout",
+            level: Level::Ok,
+            detail: format!(
+                "{} records a PreToolUse timeout of {timeout}s, which covers the {required}s \
+                 this machine's queue_wait_secs currently requires",
+                path.display()
+            ),
+        },
+        Some((path, Some(timeout))) => Finding {
+            component: "hook-timeout",
+            level: Level::Fail,
+            detail: format!(
+                "{} records a PreToolUse timeout of {timeout}s, but this machine's \
+                 queue_wait_secs now requires at least {required}s — an expired hook fails \
+                 OPEN (SPEC §23), so a queued spawn can be admitted without relais ever \
+                 deciding; run `relais install --claude --hooks --write` to correct it, or \
+                 lower `queue_wait_secs` under `[admission]` in machine.toml",
+                path.display()
+            ),
+        },
+        Some((path, None)) => Finding {
+            component: "hook-timeout",
+            level: Level::Fail,
+            detail: format!(
+                "{} records a PreToolUse hook with no timeout field at all — Claude Code then \
+                 waits for it indefinitely (300s measured, and nothing suggests that is a \
+                 ceiling), which is worse than any recorded number; run \
+                 `relais install --claude --hooks --write` to add one",
+                path.display()
+            ),
+        },
+    }
 }
 
 /// `relais doctor` exercising the live hook (SPEC criteria), checked
@@ -1428,6 +1522,112 @@ mod tests {
         assert_eq!(recorded_hook_command(&settings), None);
         assert_eq!(recorded_hook_command("{}"), None);
         assert_eq!(recorded_hook_command("not json"), None);
+    }
+
+    #[test]
+    fn recorded_pretooluse_timeout_secs_reads_the_same_leaf_recorded_hook_command_does() {
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Agent|Task", "hooks": [
+                        {"type": "command", "command": "/opt/relais/bin/relais hook", "timeout": 19}
+                    ]}
+                ]
+            }
+        })
+        .to_string();
+        assert_eq!(recorded_pretooluse_timeout_secs(&settings), Some(Some(19)));
+    }
+
+    /// An entry an older relais wrote, before `timeout` existed, carries
+    /// no such field at all: distinguished from "no relais command
+    /// recorded" (`None`) by `Some(None)`.
+    #[test]
+    fn recorded_pretooluse_timeout_secs_is_some_none_for_an_older_entry_with_no_field() {
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Agent|Task", "hooks": [
+                        {"type": "command", "command": "/opt/relais/bin/relais hook"}
+                    ]}
+                ]
+            }
+        })
+        .to_string();
+        assert_eq!(recorded_pretooluse_timeout_secs(&settings), Some(None));
+        assert_eq!(recorded_pretooluse_timeout_secs("{}"), None);
+    }
+
+    /// A settings.json whose recorded timeout no longer covers the
+    /// configured wait is a FAILURE, not a warning — the one outcome
+    /// this whole package exists to prevent (SPEC §23: an expired hook
+    /// fails open).
+    #[test]
+    fn hook_timeout_finding_fails_when_the_recorded_timeout_falls_short() {
+        let dir = crate::test_support::temp_dir("doctor-hook-timeout-short");
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("mkdir");
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [
+                        {"matcher": "Agent|Task", "hooks": [
+                            {"type": "command", "command": "/opt/relais/bin/relais hook", "timeout": 3}
+                        ]}
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .expect("write");
+
+        let admission = crate::policy::HookAdmissionSettings {
+            queue_wait_secs: 30,
+            ..Default::default()
+        };
+        let finding = hook_timeout_finding(&dir, &admission);
+        assert_eq!(finding.level, Level::Fail, "{}", finding.detail);
+        assert!(finding.detail.contains("3s"), "{}", finding.detail);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A recorded timeout that covers the currently configured wait is
+    /// `Ok`.
+    #[test]
+    fn hook_timeout_finding_is_ok_when_the_recorded_timeout_covers_the_wait() {
+        let dir = crate::test_support::temp_dir("doctor-hook-timeout-ok");
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("mkdir");
+        let admission = crate::policy::HookAdmissionSettings {
+            queue_wait_secs: 2,
+            ..Default::default()
+        };
+        let required = crate::install::settings::derived_pretooluse_timeout(
+            match admission.queue_behaviour() {
+                crate::policy::QueueBehaviour::WaitUpTo(wait) => wait,
+                crate::policy::QueueBehaviour::RefuseImmediately => Duration::ZERO,
+            },
+        )
+        .as_secs();
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [
+                        {"matcher": "Agent|Task", "hooks": [
+                            {"type": "command", "command": "/opt/relais/bin/relais hook", "timeout": required}
+                        ]}
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .expect("write");
+
+        let finding = hook_timeout_finding(&dir, &admission);
+        assert_eq!(finding.level, Level::Ok, "{}", finding.detail);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn probe_end(ended: crate::procs::Ended, stdout: &str) -> crate::procs::ProcessEnd {

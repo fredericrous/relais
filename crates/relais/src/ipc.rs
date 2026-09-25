@@ -17,6 +17,15 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
+/// How long a client's connect to the coordinator endpoint may take. On
+/// Windows this bounds the loopback TCP connect the emulation makes; on
+/// Unix a connect to a local socket path does not block on the network,
+/// so the constant does not gate anything there, but it is still the
+/// number a caller should reserve a budget for talking to this endpoint
+/// at all — `install::settings::derived_pretooluse_timeout` reads it from
+/// here rather than assuming a value.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// A bound endpoint. Dropping it does not remove the path; the owner
 /// removes the file on exit exactly as it would a Unix socket.
 #[derive(Debug)]
@@ -249,7 +258,6 @@ mod imp {
     const NONCE_LINE: usize = NONCE_BYTES * 2 + 1;
     /// How long a fresh connection has to present the nonce.
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-    const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
     #[derive(Debug)]
     pub struct Listener {
@@ -330,7 +338,7 @@ mod imp {
             ));
         }
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
-        let mut stream = TcpStream::connect_timeout(&addr.into(), CONNECT_TIMEOUT)?;
+        let mut stream = TcpStream::connect_timeout(&addr.into(), super::CONNECT_TIMEOUT)?;
         stream.write_all(nonce.as_bytes())?;
         stream.write_all(b"\n")?;
         Ok(stream)

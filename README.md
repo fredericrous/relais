@@ -199,7 +199,8 @@ or the reason it was kept, and a scorecard re-measured afterwards.
   recorded but not yet run concurrently.
 - Native Claude Code subagents are admitted but never tracked as
   individuals: with the hook wired (`relais install --claude --hooks`),
-  a spawn is asked about and can be refused (`PreToolUse`), its seat is
+  a spawn is asked about and can be refused, or made to WAIT for a seat
+  (`PreToolUse`), its seat is
   bound to the agent it launched when the tool call returns
   (`PostToolUse`, which for an async spawn is at launch, not at the
   agent's end), and the seat comes back when that agent stops
@@ -207,6 +208,21 @@ or the reason it was kept, and a scorecard re-measured afterwards.
   its seat until its lease lapses (`binding_lease_secs`): the cap
   over-counts for that long rather than under-counting, and an agent
   that runs longer than the lease loses its seat early, since nothing
+  tells the coordinator otherwise. A `PreToolUse` hook actually holds
+  its tool call open for as long as it runs, measured directly against
+  a real Claude Code 2.1.282 session — so a spawn that queues no longer
+  has to be refused at once: `queue_wait_secs` under `[admission]` in
+  machine.toml (default:
+  2 seconds; zero keeps the old immediate refusal) lets it poll for a
+  freed seat instead. Because an expired hook handler fails OPEN (its
+  answer discarded, the tool call proceeding regardless — also
+  measured) and an absent `timeout` field waits indefinitely (300s
+  measured, no ceiling in sight), `relais install --claude --hooks`
+  derives the `PreToolUse` handler's timeout from the configured wait
+  so the hook always has budget left to give up and answer before the
+  harness would kill it, and `relais doctor` fails if a recorded
+  settings.json timeout ever falls short of what the configured wait
+  needs.
   renews it. Nothing joins a spawn to the agent that spawned it, so
   depth is not enforced on this path and a subtree cannot be cancelled.
   Without the hook, or with the coordinator unreachable, native
