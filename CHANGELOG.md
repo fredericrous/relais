@@ -404,6 +404,19 @@ missing here.
   way cost already does. `docs/SPEC.md` §11 needed no wording change —
   it already said missing usage is unknown, never zero.
 
+- **A journal write can no longer interleave with a concurrent one.**
+  `append_journal` rendered its record with `writeln!`, which goes
+  through `Write::write_fmt` and issues one write per formatted
+  fragment — every brace, key, colon and value of the record, dozens of
+  syscalls for one line. `O_APPEND` makes each individual write atomic
+  in where it lands, never a group of them, so two hook firings at the
+  same instant interleaved their fragments and left lines in
+  `hook_journal.jsonl` that were not JSON. Measured in a real session,
+  not inferred: the two lines that failed to parse were exactly the two
+  spawns whose timestamps collided. The record is now rendered into one
+  buffer, newline included, and written with a single `write_all`;
+  folding the newline into the `writeln!` would have fixed nothing.
+
 ## v0.3.0
 
 ### Added
