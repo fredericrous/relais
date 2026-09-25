@@ -83,6 +83,15 @@ missing here.
   `hook::event::ToolCallPhase::Post` now carries `launched_agent`, the
   only phase that can.
 
+- **A test's short-lived temp directory (`test_support::short_temp_dir`)
+  is now removed on drop, panic or not**, instead of by a trailing
+  `remove_dir_all(...).ok()` a test body may never reach — the case that
+  happens most while a feature is being developed, and the one that
+  filled a 466 GB volume and stopped a session outright. `relais doctor`
+  now also counts `/tmp/relais-*` directories already stranded on the
+  machine by the old pattern, the way it already reports retained run
+  worktrees; the guard only stops new ones.
+
 ## v0.4.0
 
 ### Added

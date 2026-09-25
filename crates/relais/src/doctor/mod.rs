@@ -623,6 +623,7 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
     findings.push(ledger_finding());
     findings.push(registry_finding());
     findings.push(worktrees_finding_on_disk());
+    findings.push(strays_finding_on_disk());
     findings.push(coordinator_finding());
     findings.push(hook_live_finding(repo_dir));
 
@@ -1105,6 +1106,76 @@ pub(crate) fn worktrees_finding(
     }
 }
 
+/// The scratch directories `test_support::short_temp_dir` leaves under
+/// `/tmp` when a test run is killed before its guard can drop — the
+/// guard (`temp-dir-lifetime`) stops new ones; it does nothing for the
+/// thousands a machine this old already carries.
+fn strays_finding_on_disk() -> Finding {
+    strays_finding(count_strays(Path::new("/tmp")))
+}
+
+/// The verdict on `/tmp/relais-*`, given what the scan found. Never a
+/// blocker: a stray only costs disk. A scan that could not run is a
+/// failure to say so, not a clean state.
+pub(crate) fn strays_finding(strays: std::io::Result<(u64, u64)>) -> Finding {
+    match strays {
+        Ok((0, _)) => Finding {
+            component: "temp-strays",
+            level: Level::Ok,
+            detail: "no /tmp/relais-* directory is left over".into(),
+        },
+        Ok((count, bytes)) => Finding {
+            component: "temp-strays",
+            level: Level::Warn,
+            detail: format!(
+                "{count} /tmp/relais-* director{} left over from a killed test run, {bytes} \
+                 bytes; safe to remove by hand",
+                if count == 1 { "y" } else { "ies" }
+            ),
+        },
+        // A count of leftover scratch directories is information, never a
+        // blocker: `DoctorReport::failed()` treats `Fail` as one, and
+        // this finding's own text tells a person the strays are "safe to
+        // remove by hand". Failing doctor because a shared, churning
+        // `/tmp` could not be read would stop a run over something that
+        // is not about the run at all.
+        Err(e) => Finding {
+            component: "temp-strays",
+            level: Level::Warn,
+            detail: format!("/tmp could not be scanned for leftover test directories: {e}"),
+        },
+    }
+}
+
+/// The count and total bytes of `relais-*` directories directly under
+/// `root` — `short_temp_dir`'s own naming, so this counts exactly what
+/// that function can strand. A root that does not exist (no `/tmp` on
+/// this platform) counts as none, not a failure.
+fn count_strays(root: &Path) -> std::io::Result<(u64, u64)> {
+    if !root.is_dir() {
+        return Ok((0, 0));
+    }
+    let mut count = 0u64;
+    let mut bytes = 0u64;
+    for entry in std::fs::read_dir(root)? {
+        // Per-entry errors are SKIPPED, not propagated. `/tmp` is shared
+        // with every process on the machine, so an entry can vanish
+        // between the listing and the stat through no fault of this
+        // scan; treating that as a failed scan would report nothing
+        // about the thing being counted. Undercounting by one stray is
+        // the right trade against that.
+        let Ok(entry) = entry else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if entry.file_name().to_string_lossy().starts_with("relais-") && file_type.is_dir() {
+            count += 1;
+            bytes += crate::workspace::dir_size(&entry.path()).unwrap_or(0);
+        }
+    }
+    Ok((count, bytes))
+}
+
 /// The learned-artifact registry. An absent directory is the cold start,
 /// not a fault: routing abstains to the conservative baseline.
 fn registry_finding() -> Finding {
@@ -1487,6 +1558,55 @@ mod tests {
         let unscanned = worktrees_finding(Err(WorkspaceError::Git("boom".into())));
         assert_eq!(unscanned.level, Level::Fail);
         assert!(unscanned.detail.contains("boom"), "{}", unscanned.detail);
+    }
+
+    /// Leftover `/tmp/relais-*` directories are a `!` naming the count
+    /// and the bytes, never a blocker; none is a pass; a scan that could
+    /// not run says so.
+    #[test]
+    fn temp_strays_are_a_warning_naming_the_count_and_bytes() {
+        let none = strays_finding(Ok((0, 0)));
+        assert_eq!(none.level, Level::Ok, "{}", none.detail);
+        let some = strays_finding(Ok((2, 1024)));
+        assert_eq!(some.level, Level::Warn, "{}", some.detail);
+        assert!(some.detail.contains("2 /tmp/relais-*"), "{}", some.detail);
+        assert!(some.detail.contains("1024 bytes"), "{}", some.detail);
+        let unscanned = strays_finding(Err(std::io::Error::other("boom")));
+        assert_eq!(
+            unscanned.level,
+            Level::Warn,
+            "a count of scratch directories is information, never a blocker: {}",
+            unscanned.detail
+        );
+        assert!(unscanned.detail.contains("boom"), "{}", unscanned.detail);
+
+        // The claim in this finding's own text — "safe to remove by
+        // hand" — is only true if it cannot stop a run. `/tmp` is shared
+        // with every process on the machine, so an unreadable entry
+        // there says nothing about the work doctor was asked about.
+        let report = DoctorReport {
+            findings: vec![strays_finding(Err(std::io::Error::other("boom")))],
+        };
+        assert!(!report.failed(), "an unscannable /tmp must not fail doctor");
+    }
+
+    /// `count_strays` counts only `relais-*` directories directly under
+    /// the root, and a root that does not exist is none, not a failure.
+    #[test]
+    fn count_strays_finds_only_relais_prefixed_directories() {
+        let dir = crate::test_support::short_temp_dir("doctor-strays");
+        let root = dir.to_path_buf();
+        std::fs::create_dir(root.join("relais-a-1-1")).expect("a stray");
+        std::fs::write(root.join("relais-a-1-1").join("f"), b"12345").expect("a file");
+        std::fs::create_dir(root.join("relais-b-1-2")).expect("another stray");
+        std::fs::write(root.join("not-relais"), b"ignored").expect("a non-stray file");
+        let (count, bytes) = count_strays(&root).expect("scan");
+        assert_eq!(count, 2);
+        assert_eq!(bytes, 5);
+        assert_eq!(
+            count_strays(&root.join("absent")).expect("absent is none"),
+            (0, 0)
+        );
     }
 
     #[test]

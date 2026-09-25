@@ -1860,7 +1860,7 @@ mod tests {
     use super::*;
     use crate::ids::{DispatchId, Pid, RunId};
 
-    fn temp_dir(tag: &str) -> PathBuf {
+    fn temp_dir(tag: &str) -> crate::test_support::TempDir {
         crate::test_support::short_temp_dir(tag)
     }
 
@@ -1949,7 +1949,6 @@ mod tests {
             elect_within(&socket, Duration::from_secs(5)).expect("a released lock is taken");
         drop(listener);
         drop(lock);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     // C7: the wedge. A lock file left behind by a SIGKILLed coordinator,
@@ -1979,7 +1978,6 @@ mod tests {
         );
         drop(listener);
         drop(lock);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2107,7 +2105,6 @@ mod tests {
             state.lock().expect("lock").status(Instant::now()).runs["run-1"].admitted_total,
             2
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     // C9: every other "simultaneous" test is sequential calls on the
@@ -2217,7 +2214,6 @@ mod tests {
         let _ = client.request(&Request::Shutdown);
         let _ = Client::new(socket.clone()).ping();
         server.join().expect("server thread").expect("serve");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2311,7 +2307,6 @@ mod tests {
         assert_eq!(snapshot.runs["run-x"].admitted_total, 1);
         drop(state);
         std::fs::remove_file(&socket).ok();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     // C3/C4: one request thread panicking must not wedge every later
@@ -2359,7 +2354,6 @@ mod tests {
             err.to_string().starts_with("admission unavailable"),
             "{err}"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     // A2: the hole the union closes. v1 answered "I have never heard of
@@ -2494,7 +2488,6 @@ mod tests {
         );
         assert!(err.to_string().contains("coordinator stop"), "{err}");
         server.join().expect("server");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     // A11: a daemon that is shutting down answers the connection it has
@@ -2526,7 +2519,6 @@ mod tests {
             lock_state(&state).status(Instant::now()).runs.is_empty(),
             "and the registration really was not applied"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     // A5: idle-exit decided under the lock and acted after it, so a
@@ -2625,7 +2617,6 @@ mod tests {
             !dir.join("coordinator.lock").exists(),
             "nor a lock nobody holds"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
