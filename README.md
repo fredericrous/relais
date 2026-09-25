@@ -193,48 +193,9 @@ or the reason it was kept, and a scorecard re-measured afterwards.
 - On Windows the coordinator's endpoint is a loopback TCP port plus a
   nonce in the socket file rather than a Unix socket; the file's ACL is
   the permission restriction. Worker trees are killed with `taskkill`.
-
 - The decomposition scheduler executes packages sequentially in
   topological order; waves of independent packages are computed and
   recorded but not yet run concurrently.
-- Native Claude Code subagents are admitted but never tracked as
-  individuals: with the hook wired (`relais install --claude --hooks`),
-  a spawn is asked about and can be refused, or made to WAIT for a seat
-  (`PreToolUse`), its seat is
-  bound to the agent it launched when the tool call returns
-  (`PostToolUse`, which for an async spawn is at launch, not at the
-  agent's end), and the seat comes back when that agent stops
-  (`SubagentStop`). An agent whose `SubagentStop` never arrives holds
-  its seat until its lease lapses (`binding_lease_secs`): the cap
-  over-counts for that long rather than under-counting, and an agent
-  that runs longer than the lease loses its seat early, since nothing
-  tells the coordinator otherwise. A `PreToolUse` hook actually holds
-  its tool call open for as long as it runs, measured directly against
-  a real Claude Code 2.1.282 session — so a spawn that queues no longer
-  has to be refused at once: `queue_wait_secs` under `[admission]` in
-  machine.toml (default:
-  2 seconds; zero keeps the old immediate refusal) lets it poll for a
-  freed seat instead. Because an expired hook handler fails OPEN (its
-  answer discarded, the tool call proceeding regardless — also
-  measured) and an absent `timeout` field waits indefinitely (300s
-  measured, no ceiling in sight), `relais install --claude --hooks`
-  derives the `PreToolUse` handler's timeout from the configured wait
-  so the hook always has budget left to give up and answer before the
-  harness would kill it, and `relais doctor` fails if a recorded
-  settings.json timeout ever falls short of what the configured wait
-  needs.
-  renews it. Nothing joins a spawn to the agent that spawned it, so
-  depth is not enforced on this path and a subtree cannot be cancelled.
-  Without the hook, or with the coordinator unreachable, native
-  subagents are observed only: managed dispatch through `relais run` is
-  the sole path the coordinator caps.
-- A hook-admitted spawn writes no ledger row at all — nothing on this
-  path calls `record_dispatch_intent` — so a coordinator restart has
-  nothing to adopt it from. Its seat is gone the moment the coordinator
-  that granted it exits, and the agent it admitted keeps running
-  unwatched: this is a real limit of the hook-admitted design (SPEC
-  §23), not something a restart's adoption is asked to paper over by
-  inventing a ledger row for a dispatch that never had one.
 - The local `msrv` target proves the declared floor only when that
   toolchain is installed (`rustup toolchain install 1.88.0`); without it
   `make msrv` FAILS and says so, rather than passing on a skip. Set
@@ -242,20 +203,11 @@ or the reason it was kept, and a scorecard re-measured afterwards.
 - `install.sh` and `install.ps1` refuse to install a download they cannot
   verify (no `SHA256SUMS`, no sha256 tool). `RELAIS_SKIP_CHECKSUM=1` is
   the explicit way to accept an unverified binary.
-- A hook-admitted spawn is governed only by the machine's own
-  `[concurrency]` limits — the same caps the coordinator applies to any
-  other run — and there is no separate machine setting for it. **No
-  money limit is enforced on this path at all**: the run the hook
-  registers carries no budget, and the coordinator refuses on budget
-  only for a run that has one, so raising `dispatch_reserve_micros`
-  changes what a spawn reserves against an unbounded total and still
-  refuses nothing. A hook-admitted session is capped by agent count, not
-  by spend.
-- `relais cancel` on a session's own derived run holds for as long as
-  the coordinator still remembers it. A cancelled run with nothing
-  outstanding is reaped at the next reconcile — 15 seconds — after which
-  the next spawn in that session finds no record, registers the run
-  again and is admitted: the cancellation lives in coordinator memory,
-  and nothing on disk lets a hook tell a reaped-cancelled run from a
-  session it has never seen. Cancelling a tab's agents is not a
-  durable stop; closing the tab is.
+
+The `relais install --claude --hooks` integration — what it wires, its
+handler timeouts, how to remove it, what `relais doctor` reports on it,
+and the four limits specific to that path (subagents admitted but never
+tracked as individuals, no ledger row for a coordinator restart to
+adopt, no money cap on that path, and a cancellation that lasts only
+until the next reconcile) — has its own document:
+[`docs/INTEGRATIONS.md`](docs/INTEGRATIONS.md).

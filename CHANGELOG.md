@@ -109,6 +109,17 @@ missing here.
   `relais report`'s JSON carries the same summary under a new
   `enforcement` key (`REPORT_SCHEMA_VERSION` 5 → 6).
 
+### Docs
+
+- **The Claude Code hook integration now has its own document,
+  `docs/INTEGRATIONS.md`.** The README's `Known limits` section had grown
+  four hook-specific bullets one measurement at a time; they moved there
+  along with what `relais install --claude --hooks` actually wires (the
+  seven targets, the timeouts and where each number comes from, how to
+  remove it) and what `relais doctor` reports on it, each keeping the
+  measurement that established it. The README keeps the limits that are
+  not about hooks and points across for the rest.
+
 ### Changed
 
 - **BREAKING: the coordinator wire protocol is now 3
