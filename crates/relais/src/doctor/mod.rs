@@ -12,7 +12,9 @@
 //! no code reads.
 
 use serde::Serialize;
+use serde_json::Value;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::backend::Capabilities;
 use crate::policy::{Dependency, DependencyMode, MachineSettings, RepoPolicy};
@@ -621,6 +623,7 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
     findings.push(registry_finding());
     findings.push(worktrees_finding_on_disk());
     findings.push(coordinator_finding());
+    findings.push(hook_live_finding(repo_dir));
 
     DoctorReport { findings }
 }
@@ -677,6 +680,230 @@ fn hook_compat_finding(installed_version: Option<&str>) -> Finding {
                     "recorded for Claude Code {}, but the installed version could not be \
                      read — re-run `relais doctor --probe-hooks` once it can",
                     record.claude_code_version
+                ),
+            },
+        },
+    }
+}
+
+/// What exercising a recorded hook command found. `relais doctor`
+/// distinguishes a case above this one — no command recorded at all —
+/// before this type ever comes into it; these are what a command that IS
+/// recorded can turn out to be, and [`HookHealth::RecordedButDidNotRefuse`]
+/// is the dangerous one: a dead guard reads as enforcement to anyone who
+/// has not gone looking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HookHealth {
+    /// The recorded command was spawned with a fixture spawn payload
+    /// against a scratch environment configured to refuse when the
+    /// coordinator is unreachable, and it did: exit 0, a deny on stdout.
+    Refused,
+    /// The recorded command ran, and did not print a deny — wired in and
+    /// enforcing nothing. `how` is how it ended, because a hook that
+    /// exits non-zero, times out or dies on a signal is a different
+    /// defect from one that exits 0 with nothing to say, and reporting
+    /// them as one sends a person looking in the wrong place.
+    RecordedButDidNotRefuse { how: String },
+    /// The exercise never happened: the scratch environment could not be
+    /// staged, or the command could not be spawned at all (a recorded
+    /// path that no longer exists is the common case). Kept apart from
+    /// the case above on purpose — "it ran and enforced nothing" is a
+    /// claim about the hook, and asserting it off a run that never
+    /// happened is a lie doctor would be telling about the one thing it
+    /// was asked to establish.
+    CouldNotExercise { why: String },
+}
+
+/// The fixture `relais doctor` feeds the recorded hook on stdin: a
+/// `PreToolUse` spawn of the Agent tool that names no run the scratch
+/// coordinator (there is none reachable) could possibly know about,
+/// so a working hook has something concrete to refuse.
+fn hook_probe_payload() -> Vec<u8> {
+    serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "relais-doctor-hook-probe",
+        "tool_name": "Agent",
+        "tool_use_id": "relais-doctor-hook-probe-1",
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Whether a process end amounts to a live refusal: it exited zero (a
+/// non-zero exit from a hook corrupts the tool call it was watching, so
+/// relais's own hook exits 0 on every path and a broken one often does
+/// too — the payload is what actually distinguishes them) and it printed
+/// the `permissionDecision` the whole payload shape hinges on.
+///
+/// Takes the whole end rather than a flag: how it ended is part of the
+/// answer, and a bool would have thrown it away exactly where a person
+/// reading the finding needs it.
+pub(crate) fn hook_health_from_probe(end: &crate::procs::ProcessEnd) -> HookHealth {
+    if end.ended.succeeded() && end.stdout.contains("\"permissionDecision\":\"deny\"") {
+        return HookHealth::Refused;
+    }
+    HookHealth::RecordedButDidNotRefuse {
+        how: end.ended.describe(),
+    }
+}
+
+/// Spawn the exact command recorded in settings.json (never anything
+/// this crate reconstructs) with the fixture payload on stdin, its
+/// config and state directories redirected to a scratch directory of
+/// their own so this exercise never touches the person's real hook
+/// journal or reserves a seat in their real coordinator, and a
+/// machine.toml there that refuses admission when the coordinator
+/// cannot be reached — the scratch state directory holds no coordinator
+/// socket, so it never can be.
+fn probe_recorded_hook(command: &str) -> HookHealth {
+    let scratch = std::env::temp_dir().join(format!(
+        "relais-doctor-hook-probe-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%f")
+    ));
+    let config_dir = scratch.join("config");
+    let state_dir = scratch.join("state");
+    let outcome = stage_and_run(command, &config_dir, &state_dir);
+    // Best effort, and deliberately not reported: the answer above is
+    // about the hook, and a scratch directory that outlives this run
+    // says nothing about it. `relais doctor` has its own finding for
+    // leftover state.
+    let _ = std::fs::remove_dir_all(&scratch);
+    outcome
+}
+
+/// Stage the scratch environment and run the command in it. Split out so
+/// every way the staging can fail arrives as [`HookHealth::CouldNotExercise`]
+/// carrying the reason, rather than being flattened into a verdict about
+/// a hook that was never spawned.
+fn stage_and_run(command: &str, config_dir: &Path, state_dir: &Path) -> HookHealth {
+    for dir in [config_dir, state_dir] {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            return HookHealth::CouldNotExercise {
+                why: format!("could not create {}: {e}", dir.display()),
+            };
+        }
+    }
+    let machine_toml = config_dir.join("machine.toml");
+    if let Err(e) = std::fs::write(
+        &machine_toml,
+        "schema_version = 1\n\n[admission]\non_coordinator_unreachable = \"refuse\"\n",
+    ) {
+        return HookHealth::CouldNotExercise {
+            why: format!("could not write {}: {e}", machine_toml.display()),
+        };
+    }
+    let mut process = shell_command(command);
+    process.env(paths::CONFIG_DIR_ENV, config_dir);
+    process.env(paths::STATE_DIR_ENV, state_dir);
+    match crate::procs::run_with_timeout(
+        process,
+        Duration::from_secs(10),
+        Some(hook_probe_payload()),
+        None,
+        None,
+    ) {
+        Ok(end) => hook_health_from_probe(&end),
+        Err(e) => HookHealth::CouldNotExercise {
+            why: format!("could not run it: {e}"),
+        },
+    }
+}
+
+/// A shell invocation of a recorded hook command string, the way Claude
+/// Code itself launches one: `sh -c` on Unix, `cmd /C` on Windows.
+#[cfg(unix)]
+fn shell_command(command: &str) -> std::process::Command {
+    let mut process = std::process::Command::new("sh");
+    process.arg("-c").arg(command);
+    process
+}
+
+#[cfg(windows)]
+fn shell_command(command: &str) -> std::process::Command {
+    let mut process = std::process::Command::new("cmd");
+    process.args(["/C", command]);
+    process
+}
+
+/// The `PreToolUse` command relais itself would have recorded: a
+/// `{"type":"command","command":"…"}` hook whose command ends in
+/// ` hook` — the exact shape `install::settings::apply_hooks` writes,
+/// read back rather than reconstructed, so this never drifts from what
+/// install actually does. `PreToolUse` is the only phase that can still
+/// refuse a tool call (`hook::decide`'s module doc), so it is the only
+/// one worth exercising.
+pub(crate) fn recorded_hook_command(settings_text: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(settings_text).ok()?;
+    let entries = value.pointer("/hooks/PreToolUse")?.as_array()?;
+    entries.iter().find_map(|entry| {
+        entry.get("hooks")?.as_array()?.iter().find_map(|hook| {
+            if hook.get("type")?.as_str()? != "command" {
+                return None;
+            }
+            let command = hook.get("command")?.as_str()?;
+            command
+                .trim_end()
+                .ends_with(" hook")
+                .then(|| command.to_string())
+        })
+    })
+}
+
+/// `relais doctor` exercising the live hook (SPEC criteria), checked
+/// against every settings.json scope this repository can see: the
+/// project's own `.claude/settings.json` first, the user's
+/// `~/.claude/settings.json` otherwise. Never part of `--probe-hooks`:
+/// that command needs a real Claude Code session and costs money; this
+/// spawns nothing but the hook binary itself.
+fn hook_live_finding(repo_dir: &Path) -> Finding {
+    let mut candidates = vec![repo_dir.join(".claude").join("settings.json")];
+    if let Ok(home) = paths::home_dir() {
+        candidates.push(home.join(".claude").join("settings.json"));
+    }
+    let recorded = candidates.iter().find_map(|path| {
+        let text = std::fs::read_to_string(path).ok()?;
+        recorded_hook_command(&text).map(|command| (path.clone(), command))
+    });
+    match recorded {
+        None => Finding {
+            component: "hook-live",
+            level: Level::Warn,
+            detail: "no relais command is recorded on PreToolUse in any settings.json this \
+                     repository can see — wire it with \
+                     `relais install --claude --hooks --write`"
+                .into(),
+        },
+        Some((path, command)) => match probe_recorded_hook(&command) {
+            HookHealth::Refused => Finding {
+                component: "hook-live",
+                level: Level::Ok,
+                detail: format!(
+                    "recorded in {} and exercised: it refused a fixture spawn against an \
+                     unreachable coordinator, as configured",
+                    path.display()
+                ),
+            },
+            HookHealth::RecordedButDidNotRefuse { how } => Finding {
+                component: "hook-live",
+                level: Level::Fail,
+                detail: format!(
+                    "recorded in {} as `{command}`, but exercising it with a fixture spawn \
+                     against an unreachable coordinator did not produce a deny ({how}) — this \
+                     hook is wired in and enforces nothing",
+                    path.display()
+                ),
+            },
+            // Not a verdict on the hook: doctor could not run it, and
+            // says so. Reporting this as "enforces nothing" would be a
+            // claim about a run that never happened.
+            HookHealth::CouldNotExercise { why } => Finding {
+                component: "hook-live",
+                level: Level::Warn,
+                detail: format!(
+                    "recorded in {} as `{command}`, but it could not be exercised, so whether \
+                     it refuses is unknown: {why}",
+                    path.display()
                 ),
             },
         },
@@ -1166,5 +1393,131 @@ mod tests {
         let unscanned = worktrees_finding(Err(WorkspaceError::Git("boom".into())));
         assert_eq!(unscanned.level, Level::Fail);
         assert!(unscanned.detail.contains("boom"), "{}", unscanned.detail);
+    }
+
+    #[test]
+    fn recorded_hook_command_finds_a_pretooluse_relais_command_and_ignores_others() {
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/bin/lint"}]},
+                    {"matcher": "Agent|Task", "hooks": [
+                        {"type": "command", "command": "/opt/relais/bin/relais hook --probe --record /tmp/x"},
+                        {"type": "command", "command": "/opt/relais/bin/relais hook"}
+                    ]}
+                ]
+            }
+        })
+        .to_string();
+        assert_eq!(
+            recorded_hook_command(&settings),
+            Some("/opt/relais/bin/relais hook".to_string())
+        );
+    }
+
+    #[test]
+    fn recorded_hook_command_is_none_without_a_plain_hook_invocation() {
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"hooks": [{"type": "command", "command": "/opt/relais/bin/relais hook --probe --record /tmp/x"}]}
+                ]
+            }
+        })
+        .to_string();
+        assert_eq!(recorded_hook_command(&settings), None);
+        assert_eq!(recorded_hook_command("{}"), None);
+        assert_eq!(recorded_hook_command("not json"), None);
+    }
+
+    fn probe_end(ended: crate::procs::Ended, stdout: &str) -> crate::procs::ProcessEnd {
+        crate::procs::ProcessEnd {
+            ended,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            group: crate::procs::GroupKill::NothingLeft,
+            captured: crate::procs::Captured::Complete,
+        }
+    }
+
+    /// The outcomes doctor must tell apart: exit non-zero is never read
+    /// as a refusal (a broken hook and a refusing hook must not look the
+    /// same), a zero exit with no deny payload is the dead guard rather
+    /// than a pass, and each non-refusal carries HOW it ended, because
+    /// "timed out" and "exit 0, said nothing" send a person to different
+    /// places.
+    #[test]
+    fn hook_health_from_probe_requires_both_a_clean_exit_and_a_deny_payload() {
+        use crate::procs::Ended;
+
+        let deny = serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "no",
+            }
+        })
+        .to_string();
+        assert_eq!(
+            hook_health_from_probe(&probe_end(Ended::Exited(0), &deny)),
+            HookHealth::Refused
+        );
+        assert_eq!(
+            hook_health_from_probe(&probe_end(Ended::Exited(1), &deny)),
+            HookHealth::RecordedButDidNotRefuse {
+                how: "exit 1".to_string()
+            },
+            "a non-zero exit is never read as a refusal"
+        );
+        assert_eq!(
+            hook_health_from_probe(&probe_end(Ended::Exited(0), "")),
+            HookHealth::RecordedButDidNotRefuse {
+                how: "exit 0".to_string()
+            },
+            "exit zero with nothing printed is a dead guard, not a pass"
+        );
+        assert_eq!(
+            hook_health_from_probe(&probe_end(Ended::TimedOut, &deny)),
+            HookHealth::RecordedButDidNotRefuse {
+                how: "timed out".to_string()
+            },
+            "a hook that hung is reported as having hung, not as having said nothing"
+        );
+    }
+
+    /// An exercise that could not be staged is `CouldNotExercise`, never
+    /// the dead-guard verdict: doctor may only report what the hook did
+    /// when the hook actually ran. Staged deterministically by putting a
+    /// FILE where the scratch config directory has to go, so
+    /// `create_dir_all` cannot succeed.
+    #[test]
+    fn an_exercise_that_could_not_be_staged_is_not_reported_as_a_dead_guard() {
+        let base = crate::test_support::temp_dir("doctor-hook-unstageable");
+        let blocked = base.join("config");
+        std::fs::write(&blocked, "not a directory").expect("write");
+
+        let health = stage_and_run("true", &blocked, &base.join("state"));
+        match &health {
+            HookHealth::CouldNotExercise { why } => {
+                assert!(why.contains("could not create"), "{why}");
+            }
+            other => panic!("staging failed, so nothing ran: {other:?}"),
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A recorded command that does not exist must not come back
+    /// `Refused`. A shell reports it as exit 127 rather than a spawn
+    /// failure, so which of the two remaining outcomes it lands in is a
+    /// fact about the platform's shell; what is asserted here is the part
+    /// that is relais's promise — it never reads as a working guard.
+    #[test]
+    fn a_command_that_does_not_exist_never_reads_as_a_refusal() {
+        let health = probe_recorded_hook("/nonexistent/relais-does-not-exist hook");
+        assert_ne!(
+            health,
+            HookHealth::Refused,
+            "a command that does not exist cannot have refused anything"
+        );
     }
 }

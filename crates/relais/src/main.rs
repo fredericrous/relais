@@ -191,6 +191,11 @@ enum Command {
         /// Install the Claude Code skill and agent definitions
         #[arg(long = "claude")]
         claude: bool,
+        /// Also wire the live hook into settings.json (SPEC §23);
+        /// requires --claude. settings.json is a file a person
+        /// maintains by hand, so this is a separate, explicit ask.
+        #[arg(long = "hooks", requires = "claude")]
+        hooks: bool,
         /// Apply the reviewed changes instead of previewing
         #[arg(long)]
         write: bool,
@@ -203,6 +208,10 @@ enum Command {
         /// Remove the Claude Code skill and agent definitions
         #[arg(long = "claude")]
         claude: bool,
+        /// Also remove relais's own commands from settings.json;
+        /// requires --claude
+        #[arg(long = "hooks", requires = "claude")]
+        hooks: bool,
         /// Apply the removal instead of previewing
         #[arg(long)]
         write: bool,
@@ -639,20 +648,22 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
         }),
         Command::Install {
             claude,
+            hooks,
             write,
             user,
         } => match claude {
-            true => install_command(write, user),
+            true => install_command(write, user, Targets::from_flag(hooks)),
             false => Err(CliError::Usage {
                 detail: "install: name what to install (--claude)".into(),
             }),
         },
         Command::Uninstall {
             claude,
+            hooks,
             write,
             user,
         } => match claude {
-            true => uninstall_command(write, user),
+            true => uninstall_command(write, user, Targets::from_flag(hooks)),
             false => Err(CliError::Usage {
                 detail: "uninstall: name what to remove (--claude)".into(),
             }),
@@ -755,18 +766,219 @@ fn render_install(verb: &str, request: &InstallRequest, report: &InstallReport) 
     }
 }
 
-fn install_command(write: bool, user: bool) -> Result<CliOutcome, CliError> {
+/// What an `install`/`uninstall --claude` invocation is aimed at. Not a
+/// flag: `settings.json` is a file a person maintains by hand, so
+/// touching it is a different target rather than a modifier of the same
+/// one, and the two cases read as what they are at every call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Targets {
+    /// The owned files under `.claude/` only.
+    OwnedFiles,
+    /// The owned files, and then the hook wiring in `settings.json`.
+    OwnedFilesAndHooks,
+}
+
+impl Targets {
+    /// `--hooks` names the second target. The flag lives in the CLI
+    /// surface, where clap parses it; nothing below this line takes a
+    /// bool that means "and also do the other thing".
+    fn from_flag(hooks: bool) -> Self {
+        match hooks {
+            true => Targets::OwnedFilesAndHooks,
+            false => Targets::OwnedFiles,
+        }
+    }
+}
+
+fn install_command(write: bool, user: bool, targets: Targets) -> Result<CliOutcome, CliError> {
     let request = install_request(write, user)?;
     let home = install_home(&request.scope)?;
     let report = operational(relais::install::install(&request, &home), "install")?;
-    Ok(render_install("install", &request, &report))
+    let outcome = render_install("install", &request, &report);
+    match targets {
+        Targets::OwnedFiles => Ok(outcome),
+        Targets::OwnedFilesAndHooks => Ok(worse_outcome(
+            outcome,
+            install_hooks_target(&request, &home)?,
+        )),
+    }
 }
 
-fn uninstall_command(write: bool, user: bool) -> Result<CliOutcome, CliError> {
+/// The settings.json half of `install --claude --hooks`, on its own so
+/// the function above stays one thing: the owned files, then whatever
+/// else was named.
+fn install_hooks_target(request: &InstallRequest, home: &Path) -> Result<CliOutcome, CliError> {
+    let relais_binary = operational(std::env::current_exe(), "install --hooks")?;
+    let root = request.root(home);
+    match request.mode {
+        Mode::Preview => Ok(render_hooks_preview(operational(
+            root.plan_hooks(&relais_binary),
+            "install --hooks",
+        )?)),
+        Mode::Apply => {
+            let applied = operational(root.apply_hooks(&relais_binary), "install --hooks")?;
+            Ok(render_hooks_applied(applied))
+        }
+    }
+}
+
+fn uninstall_command(write: bool, user: bool, targets: Targets) -> Result<CliOutcome, CliError> {
     let request = install_request(write, user)?;
     let home = install_home(&request.scope)?;
     let report = operational(relais::install::uninstall(&request, &home), "uninstall")?;
-    Ok(render_install("uninstall", &request, &report))
+    let outcome = render_install("uninstall", &request, &report);
+    match targets {
+        Targets::OwnedFiles => Ok(outcome),
+        Targets::OwnedFilesAndHooks => Ok(worse_outcome(
+            outcome,
+            uninstall_hooks_target(&request, &home)?,
+        )),
+    }
+}
+
+/// The settings.json half of `uninstall --claude --hooks`.
+fn uninstall_hooks_target(request: &InstallRequest, home: &Path) -> Result<CliOutcome, CliError> {
+    let relais_binary = operational(std::env::current_exe(), "uninstall --hooks")?;
+    let root = request.root(home);
+    match request.mode {
+        Mode::Preview => Ok(render_hooks_removal_preview(operational(
+            root.plan_hooks_removal(&relais_binary),
+            "uninstall --hooks",
+        )?)),
+        Mode::Apply => {
+            let removed = operational(
+                root.apply_hooks_removal(&relais_binary),
+                "uninstall --hooks",
+            )?;
+            Ok(render_hooks_removed(removed))
+        }
+    }
+}
+
+/// The worse of two outcomes from one combined `--claude --hooks`
+/// invocation, so a hooks refusal is never masked by an otherwise clean
+/// file install (or the reverse). `Accepted` is the only outcome neither
+/// side reports as a problem, so anything else wins.
+fn worse_outcome(a: CliOutcome, b: CliOutcome) -> CliOutcome {
+    if a == CliOutcome::Accepted {
+        b
+    } else {
+        a
+    }
+}
+
+/// Print what wiring the hook would do, in preview mode.
+fn render_hooks_preview(plan: relais::install::HooksPlan) -> CliOutcome {
+    match plan {
+        relais::install::HooksPlan::Ready { events } => {
+            println!("relais install --claude --hooks (settings.json)");
+            for event in &events {
+                println!(
+                    "  {:<8} {}",
+                    match event.action {
+                        relais::install::HookEventAction::Current => "keep",
+                        relais::install::HookEventAction::JoinExisting => "join",
+                        relais::install::HookEventAction::NewEntry => "add",
+                    },
+                    event.event
+                );
+            }
+            if events.iter().any(|e| e.action.changes_anything()) {
+                println!("preview only: re-run with --write to apply");
+            } else {
+                println!("nothing to do");
+            }
+            CliOutcome::Accepted
+        }
+        relais::install::HooksPlan::Unrenderable {
+            reason,
+            paste_block,
+        } => print_unrenderable("install", &reason, &paste_block),
+    }
+}
+
+fn render_hooks_applied(applied: relais::install::HooksApplied) -> CliOutcome {
+    match applied {
+        relais::install::HooksApplied::AlreadyCurrent => {
+            println!("relais install --claude --hooks: settings.json is already current");
+            CliOutcome::Accepted
+        }
+        relais::install::HooksApplied::Applied(events) => {
+            println!(
+                "relais install --claude --hooks: wired {} event(s): {}",
+                events.len(),
+                events.join(", ")
+            );
+            CliOutcome::Accepted
+        }
+        relais::install::HooksApplied::Refused {
+            reason,
+            paste_block,
+        } => print_unrenderable("install", &reason, &paste_block),
+    }
+}
+
+fn render_hooks_removal_preview(plan: relais::install::settings::HooksRemovalPlan) -> CliOutcome {
+    match plan {
+        relais::install::settings::HooksRemovalPlan::Ready { events } => {
+            println!("relais uninstall --claude --hooks (settings.json)");
+            for event in &events {
+                println!(
+                    "  {:<8} {}",
+                    match event.action {
+                        relais::install::settings::HookRemovalAction::WouldRemove => "remove",
+                        relais::install::settings::HookRemovalAction::NotPresent => "keep",
+                    },
+                    event.event
+                );
+            }
+            if events
+                .iter()
+                .any(|e| e.action == relais::install::settings::HookRemovalAction::WouldRemove)
+            {
+                println!("preview only: re-run with --write to apply");
+            } else {
+                println!("nothing to do");
+            }
+            CliOutcome::Accepted
+        }
+        relais::install::settings::HooksRemovalPlan::Unrenderable { reason } => {
+            eprintln!("relais uninstall --hooks: refused — {reason}");
+            CliOutcome::Blocked
+        }
+    }
+}
+
+fn render_hooks_removed(removed: relais::install::HooksRemoved) -> CliOutcome {
+    match removed {
+        relais::install::HooksRemoved::AlreadyAbsent => {
+            println!("relais uninstall --claude --hooks: nothing of relais's was on settings.json");
+            CliOutcome::Accepted
+        }
+        relais::install::HooksRemoved::Removed(events) => {
+            println!(
+                "relais uninstall --claude --hooks: removed {} event(s): {}",
+                events.len(),
+                events.join(", ")
+            );
+            CliOutcome::Accepted
+        }
+        relais::install::HooksRemoved::Refused { reason } => {
+            eprintln!("relais uninstall --hooks: refused — {reason}");
+            CliOutcome::Blocked
+        }
+    }
+}
+
+/// A settings.json that failed the round-trip check: nothing was
+/// written, so the exit is `NotFullyApplied` rather than `Blocked` —
+/// the file install half of a combined `--claude --hooks` run may well
+/// have succeeded, and this is "part of the plan could not be applied",
+/// not "nothing ran at all".
+fn print_unrenderable(verb: &str, reason: &str, paste_block: &str) -> CliOutcome {
+    eprintln!("relais {verb} --hooks: refused — {reason}");
+    println!("paste this into settings.json's \"hooks\" key by hand:\n{paste_block}");
+    CliOutcome::NotFullyApplied
 }
 
 /// The registry, when learned routing is on and the registry opens; a

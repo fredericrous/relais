@@ -51,6 +51,53 @@ missing here.
   probe-hooks` target — it needs a real Claude Code, costs money and
   touches the network, so it is never part of `make check`.
 
+- **`relais install --claude --hooks` wires the live hook into
+  `settings.json`, and `relais doctor` proves it actually refuses.**
+  Until now `relais install --claude` wrote four owned files and never
+  touched `settings.json` at all, so enforcement was one hand-edit away
+  from existing and read, to anyone who had not made that edit, exactly
+  like enforcement that was in force. `--hooks` (requires `--claude`,
+  preview-first like every other install action) adds one relais
+  handler on each of the seven targets the compatibility matrix names —
+  the three tool-scoped events matched to the Agent tool and its legacy
+  name `Task`, the four lifecycle events matched to nothing — recorded
+  as the absolute path of the running relais binary, never a bare name
+  PATH could fail to resolve. `settings.json` is a file a person
+  maintains by hand, not a marked, hash-checked block like the agent and
+  skill files, so every write round-trips the file through `serde_json`
+  first (`preserve_order` stays off, so keys sort and
+  `canonical_json_hash` stays stable) and refuses to write at all when
+  the file cannot be re-rendered byte for byte — nothing is written, and
+  the fragment to paste in by hand is printed instead. The single
+  tolerated difference is the trailing newline `serde_json` does not emit
+  and editors add; the file is written back with the tail it arrived
+  with, and trailing blank lines or a `\r\n` tail are refused like
+  anything else relais cannot reproduce. A handler someone else already
+  has on one of these events is joined into rather than duplicated beside
+  when it sits on the matcher relais installs — an entry on a different
+  matcher gets its own, since widening somebody else's matcher would
+  change which tool calls their handler sees. A re-run says the file is
+  already current; uninstall removes only the leaf command relais itself
+  added, never an entry object at that granularity, because relais cannot
+  tell an entry it left empty apart from one that was already empty when
+  it arrived; and a settings.json relais cannot READ is an error, never
+  treated as an absent file to be replaced with one relais composed.
+  `relais doctor`'s ordinary run now reports the live hook by exercising
+  it: it spawns the exact command recorded in `settings.json` with a
+  fixture `PreToolUse` payload on stdin, its config and state
+  directories redirected to a scratch environment configured to refuse
+  when the coordinator is unreachable, and distinguishes nothing
+  recorded, a recorded hook that refused, a recorded hook that ran but
+  did not refuse (the dead-guard case that looks installed and enforces
+  nothing, reported with how it ended) and — kept apart from that
+  verdict — an exercise that could not be staged or spawned at all, where
+  what the hook would do is reported as unknown rather than guessed.
+  Every settings.json write goes
+  through the existing atomic stage-and-rename, so a settings.json that
+  is a symlink is replaced rather than written through, and a plain
+  `relais install --claude` (no `--hooks`) still reads and writes
+  nothing under that name.
+
 - **A hook now decides what to say about one event, purely.**
   `relais::hook::decide::decide` takes the typed event, the machine's own
   admission settings and whatever the coordinator answered, and resolves
