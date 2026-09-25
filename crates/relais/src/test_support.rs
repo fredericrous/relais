@@ -9,7 +9,7 @@
 //! directories behind and the next run to draw that pid inherits them
 //! (`tests.first-properties`). Written once, it is right once.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -29,17 +29,46 @@ pub(crate) fn temp_dir(tag: &str) -> PathBuf {
     make(std::env::temp_dir(), tag)
 }
 
-/// The same, under the shortest root the platform has.
+/// The same, under the shortest root the platform has, as a value that
+/// removes the directory when it drops — panic or not, so the lifetime
+/// is this type's business rather than a trailing statement every call
+/// site may or may not remember.
 ///
 /// A Unix socket path is capped at 104 bytes on macOS and 108 on Linux,
 /// and the per-user temp directory alone can spend most of that, so an
 /// endpoint goes directly under `/tmp` — still in a directory of this
 /// call's own, never at a fixed path two runs would share (A15).
-pub(crate) fn short_temp_dir(tag: &str) -> PathBuf {
-    if cfg!(unix) {
+pub(crate) fn short_temp_dir(tag: &str) -> TempDir {
+    TempDir(if cfg!(unix) {
         make(PathBuf::from("/tmp"), tag)
     } else {
         temp_dir(tag)
+    })
+}
+
+/// A directory made by [`short_temp_dir`], removed on drop.
+///
+/// Cleanup is best effort: a leftover only costs disk, while a failure
+/// here would hide the result the test actually produced.
+pub(crate) struct TempDir(PathBuf);
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for TempDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
     }
 }
 
@@ -88,3 +117,24 @@ pub(crate) fn stays(window: std::time::Duration, mut holds: impl FnMut() -> bool
 /// How often the two above look. Short enough that a ready test costs
 /// the wait and nothing more.
 const POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The case a trailing `remove_dir_all(...).ok()` always missed: the
+    // test body never reaches its last line. `Drop` runs during unwind
+    // regardless.
+    #[test]
+    fn a_panicking_test_body_still_loses_its_directory() {
+        let dir = short_temp_dir("panic-cleanup");
+        let path = dir.to_path_buf();
+        assert!(path.exists());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _dir = dir;
+            panic!("the test body never gets here on purpose");
+        }));
+        assert!(outcome.is_err());
+        assert!(!path.exists());
+    }
+}

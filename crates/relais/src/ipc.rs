@@ -391,13 +391,15 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
 
-    fn endpoint(tag: &str) -> std::path::PathBuf {
-        crate::test_support::short_temp_dir(&format!("ipc-{tag}")).join("endpoint")
+    fn endpoint(tag: &str) -> (crate::test_support::TempDir, std::path::PathBuf) {
+        let dir = crate::test_support::short_temp_dir(&format!("ipc-{tag}"));
+        let path = dir.join("endpoint");
+        (dir, path)
     }
 
     #[test]
     fn a_line_goes_there_and_a_line_comes_back() {
-        let path = endpoint("rt");
+        let (_dir, path) = endpoint("rt");
         let listener = Listener::bind(&path).expect("bind");
         let server = std::thread::spawn(move || {
             let stream = listener.accept().expect("accepted").expect("a connection");
@@ -413,12 +415,11 @@ mod tests {
         BufReader::new(stream).read_line(&mut line).expect("read");
         assert_eq!(line.trim(), "echo hello");
         server.join().expect("server");
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn a_missing_endpoint_is_not_found_and_a_stale_one_is_refused() {
-        let path = endpoint("stale");
+        let (_dir, path) = endpoint("stale");
         assert_eq!(
             Stream::connect(&path).unwrap_err().kind(),
             io::ErrorKind::NotFound
@@ -429,7 +430,6 @@ mod tests {
         // after its owner died: connecting must fail, not hang.
         assert!(path.exists());
         assert!(Stream::connect(&path).is_err());
-        std::fs::remove_file(&path).ok();
     }
 
     // A8: the socket carries `shutdown` and `cancel_run`, and `bind`
@@ -440,7 +440,7 @@ mod tests {
     #[test]
     fn the_endpoint_is_owner_only_from_the_moment_it_exists() {
         use std::os::unix::fs::PermissionsExt;
-        let path = endpoint("mode");
+        let (_dir, path) = endpoint("mode");
         let mode_of = |file: &std::path::Path| {
             std::fs::metadata(file)
                 .expect("metadata")
@@ -457,7 +457,6 @@ mod tests {
         assert_eq!(mode_of(&again), 0o600);
         drop(second);
         drop(listener);
-        std::fs::remove_dir_all(path.parent().expect("dir")).ok();
     }
 
     // A8: one coordinator per OS user (SPEC §23), so the uid on the
@@ -466,7 +465,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_peer_of_a_connection_is_checked_against_our_own_uid() {
-        let path = endpoint("peer");
+        let (_dir, path) = endpoint("peer");
         let listener = Listener::bind(&path).expect("bind");
         let connecting = std::thread::spawn({
             let path = path.clone();
@@ -482,7 +481,6 @@ mod tests {
         assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
         assert!(refused.to_string().contains("uid 0"), "{refused}");
         drop(listener);
-        std::fs::remove_dir_all(path.parent().expect("dir")).ok();
     }
 
     // The errno spellings live with the syscall, in `procs`; the test
@@ -496,7 +494,7 @@ mod tests {
 
     #[test]
     fn a_non_blocking_listener_says_when_nothing_is_waiting() {
-        let path = endpoint("nonblocking");
+        let (_dir, path) = endpoint("nonblocking");
         let listener = Listener::bind(&path).expect("bind");
         listener.set_nonblocking(true).expect("non-blocking");
         assert!(
@@ -516,14 +514,13 @@ mod tests {
         BufReader::new(accepted).read_line(&mut line).expect("read");
         assert_eq!(line.trim(), "hello");
         drop(listener);
-        std::fs::remove_dir_all(path.parent().expect("dir")).ok();
     }
 
     #[cfg(windows)]
     #[test]
     fn a_connection_without_the_nonce_is_dropped_unread() {
         use std::net::TcpStream;
-        let path = endpoint("nonce");
+        let (_dir, path) = endpoint("nonce");
         let listener = Listener::bind(&path).expect("bind");
         let port: u16 = std::fs::read_to_string(&path)
             .expect("file")
@@ -541,6 +538,5 @@ mod tests {
             accepted.unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
-        std::fs::remove_dir_all(path.parent().expect("dir")).ok();
     }
 }
