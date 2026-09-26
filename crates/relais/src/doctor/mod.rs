@@ -676,34 +676,63 @@ fn hook_compat_finding(installed_version: Option<&str>) -> Finding {
                 path.display()
             ),
         },
-        Some(record) => match installed_version {
-            Some(installed) if installed == record.claude_code_version => Finding {
-                component: "hook-compat",
-                level: Level::Ok,
-                detail: format!(
-                    "fresh: recorded for Claude Code {} at {}",
-                    record.claude_code_version, record.observed_at
-                ),
-            },
-            Some(installed) => Finding {
-                component: "hook-compat",
-                level: Level::Warn,
-                detail: format!(
-                    "stale: recorded for Claude Code {}, installed is {installed} — \
-                     re-run `relais doctor --probe-hooks`",
-                    record.claude_code_version
-                ),
-            },
-            None => Finding {
-                component: "hook-compat",
-                level: Level::Warn,
-                detail: format!(
-                    "recorded for Claude Code {}, but the installed version could not be \
-                     read — re-run `relais doctor --probe-hooks` once it can",
-                    record.claude_code_version
-                ),
-            },
-        },
+        Some(record) => {
+            let capabilities = capabilities_summary(&record.capabilities);
+            match installed_version {
+                Some(installed) if installed == record.claude_code_version => Finding {
+                    component: "hook-compat",
+                    level: Level::Ok,
+                    detail: format!(
+                        "fresh: recorded for Claude Code {} at {} — {capabilities}",
+                        record.claude_code_version, record.observed_at
+                    ),
+                },
+                Some(installed) => Finding {
+                    component: "hook-compat",
+                    level: Level::Warn,
+                    detail: format!(
+                        "stale: recorded for Claude Code {}, installed is {installed} — \
+                         re-run `relais doctor --probe-hooks` — {capabilities}",
+                        record.claude_code_version
+                    ),
+                },
+                None => Finding {
+                    component: "hook-compat",
+                    level: Level::Warn,
+                    detail: format!(
+                        "recorded for Claude Code {}, but the installed version could not be \
+                         read — re-run `relais doctor --probe-hooks` once it can — {capabilities}",
+                        record.claude_code_version
+                    ),
+                },
+            }
+        }
+    }
+}
+
+/// Render a record's [`crate::hook::HookCapabilities`] for a `doctor`
+/// finding. `None` (a record written before capabilities existed) is
+/// reported as absent — never rendered as every capability being
+/// `false`, which would read as a measurement that was never taken.
+fn capabilities_summary(capabilities: &Option<crate::hook::HookCapabilities>) -> String {
+    let Some(capabilities) = capabilities else {
+        return "capabilities: absent (record predates capability probing)".to_string();
+    };
+    format!(
+        "capabilities: agent_tool_name={}, parent_agent_id={}, post_tool_use_failure_fires={}",
+        render_capability(&capabilities.agent_tool_name, |name| name.clone()),
+        render_capability(&capabilities.parent_agent_id, |v| v.to_string()),
+        render_capability(&capabilities.post_tool_use_failure_fires, |v| v.to_string()),
+    )
+}
+
+fn render_capability<T>(
+    capability: &crate::hook::Capability<T>,
+    show: impl FnOnce(&T) -> String,
+) -> String {
+    match capability {
+        crate::hook::Capability::Known(value) => show(value),
+        crate::hook::Capability::Unknown => "unknown".to_string(),
     }
 }
 
@@ -1378,6 +1407,46 @@ mod tests {
     use super::*;
     use crate::adapter::claude::capabilities_from_help;
     use std::path::PathBuf;
+
+    /// An older record carries no capabilities at all. Reporting that as
+    /// a row of `false` would state, as measurement, that the harness
+    /// lacks every capability — from a file that never looked.
+    #[test]
+    fn absent_capabilities_are_reported_absent_never_as_false() {
+        let rendered = capabilities_summary(&None);
+        assert!(rendered.contains("absent"), "{rendered}");
+        assert!(
+            !rendered.contains("false"),
+            "an absent record must not read as a negative measurement: {rendered}"
+        );
+    }
+
+    /// `Unknown` and `Known(false)` are different claims — "the probe did
+    /// not settle this" against "the harness does not do this" — and must
+    /// not render alike.
+    #[test]
+    fn unknown_capabilities_render_unknown_not_false() {
+        use crate::hook::{Capability, HookCapabilities};
+        let rendered = capabilities_summary(&Some(HookCapabilities {
+            agent_tool_name: Capability::Unknown,
+            parent_agent_id: Capability::Unknown,
+            post_tool_use_failure_fires: Capability::Unknown,
+        }));
+        assert_eq!(rendered.matches("unknown").count(), 3, "{rendered}");
+        assert!(!rendered.contains("false"), "{rendered}");
+
+        let negative = capabilities_summary(&Some(HookCapabilities {
+            agent_tool_name: Capability::Known("Agent".to_string()),
+            parent_agent_id: Capability::Unknown,
+            post_tool_use_failure_fires: Capability::Known(false),
+        }));
+        assert!(negative.contains("agent_tool_name=Agent"), "{negative}");
+        assert!(negative.contains("parent_agent_id=unknown"), "{negative}");
+        assert!(
+            negative.contains("post_tool_use_failure_fires=false"),
+            "a measured negative DOES render false: {negative}"
+        );
+    }
 
     const HELP_2_1: &str = "usage: claude -p --model <model> --effort <level> \
          --output-format <format> --max-budget-usd <amount> \

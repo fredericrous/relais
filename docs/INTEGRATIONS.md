@@ -148,16 +148,29 @@ the compatibility record against the Claude Code on `PATH`.
 of the ordinary `doctor` run: it needs a real Claude Code session (a
 throwaway settings file under the state directory, never your own
 `settings.json`), costs money, and touches the network. It runs one
-`claude -p` session prompted to force a nested agent call, records every
-payload that arrives on the seven targets, and writes a compatibility
-record naming the Claude Code version observed and, per target, whether
-it fired and what fields its payload carried — reported as what was
-seen, never as what was expected. There is no shipped compatibility
-table, and none is implied to exist on a fresh machine: the matrix is
-written by this command, not carried as a static claim in this
-document. A target that never fires for a given Claude Code version is
-recorded as not firing; that is a fact about that version, not a probe
-failure.
+`claude -p` session whose prompt forces a subagent to itself launch a
+second subagent — so a spawn made FROM INSIDE a subagent is recorded, not
+only the top-level one the main session makes — records every payload
+that arrives on the seven targets, and writes a compatibility record
+naming the Claude Code version observed and, per target, whether it
+fired and what fields its payload carried — reported as what was seen,
+never as what was expected. There is no shipped compatibility table, and
+none is implied to exist on a fresh machine: the matrix is written by
+this command, not carried as a static claim in this document. A target
+that never fires for a given Claude Code version is recorded as not
+firing; that is a fact about that version, not a probe failure.
+
+The record also carries a `capabilities` section: what the harness's
+BEHAVIOR showed itself capable of, derived from the same recorded
+payloads rather than from which fields merely appeared — which tool name
+it sent for an agent spawn, whether a nested spawn's own payload named
+the subagent that made it (so parentage at depth two can be joined), and
+whether the failing tool call the probe makes actually fired
+`PostToolUseFailure`. A capability the recordings cannot settle is
+reported as unknown, never defaulted to `false`; `relais doctor` reports
+it alongside the freshness finding, and a record written before this
+field existed is reported as having no capabilities at all, not as every
+capability being false.
 
 Nothing here narrows which models a hook-admitted agent may use. That
 would need both a compatibility record confirming the harness reports

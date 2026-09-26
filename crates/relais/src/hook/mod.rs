@@ -202,14 +202,141 @@ pub struct TargetObservation {
     pub fields: Vec<String>,
 }
 
+/// Whether the recordings settled a capability, and what they showed —
+/// never collapsed to `false` when a probe simply never exercised the
+/// case that would show `true`. `Unknown` is the honest answer when the
+/// recordings contain nothing that could settle the question either way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Capability<T> {
+    Known(T),
+    Unknown,
+}
+
+/// What one probe measured about the harness's own BEHAVIOR, not merely
+/// which top-level fields a payload carried (that is [`TargetObservation`]).
+/// Every field here is derived from the recorded payloads by
+/// [`derive_capabilities`], a pure function — never hardcoded, never
+/// assumed from what a harness "should" do.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookCapabilities {
+    /// Which tool name the harness actually sent for an agent spawn:
+    /// `Agent` or `Task`. `Unknown` when no such `PreToolUse` was recorded.
+    pub agent_tool_name: Capability<String>,
+    /// Whether a nested agent spawn — one made from inside a subagent,
+    /// rather than the top-level one the main session made — carried its
+    /// own `agent_id`, which is what would let a reader join that spawn to
+    /// the subagent that made it, and so enforce depth on the hook path.
+    /// `Known(true)` is the only positive answer the payloads can give;
+    /// `Unknown` covers both "no nested spawn was recorded" and "one was
+    /// recorded carrying nothing that proves it nested", because a single
+    /// payload cannot tell those apart. Never `Known(false)` — see
+    /// [`derive_capabilities`].
+    pub parent_agent_id: Capability<bool>,
+    /// Whether `PostToolUseFailure` fired for the probe's failing tool
+    /// call. `Known(false)` only when the failing call was itself
+    /// recorded; otherwise `Unknown`, because a probe whose model skipped
+    /// the failing step says nothing about whether the event fires.
+    pub post_tool_use_failure_fires: Capability<bool>,
+}
+
+/// Derive [`HookCapabilities`] from the recorded payloads alone.
+///
+/// Nesting is read from what a payload SAYS, never from where it sits in
+/// the sequence. An earlier version took the first `Agent`/`Task`
+/// `PreToolUse` to be the top-level spawn and every later one to be
+/// nested; two top-level spawns — a model retry, or a model that simply
+/// did not follow the prompt — then made the second one "nested", and its
+/// missing `agent_id` was reported as the harness lacking the field.
+///
+/// What a payload can actually settle, given that `agent_id` is absent at
+/// the top level and names the caller's agent otherwise: an `Agent`/`Task`
+/// `PreToolUse` that CARRIES an `agent_id` was made from inside a
+/// subagent, so it proves both that a nested spawn happened and that the
+/// harness reports the caller — `Known(true)`. One without an `agent_id`
+/// cannot be told apart from a top-level spawn, so it proves nothing.
+/// `Known(false)` is therefore unreachable here by construction: it would
+/// need positive evidence that a nested spawn occurred AND carried no
+/// `agent_id`, and no single payload carries that. The honest negative is
+/// `Unknown` — re-run the probe until it records the case.
+/// The path [`PROBE_PROMPT`] asks the session to read so that the read
+/// fails. Named once and used by both the prompt and the check for
+/// whether that call was recorded, so the two cannot drift: a renamed
+/// path that only the prompt knew about would silently turn
+/// `post_tool_use_failure_fires` into a permanent `Unknown`.
+pub const PROBE_FAILING_PATH: &str = "/nonexistent-relais-probe-target";
+
+/// Whether a `PreToolUse` payload is the probe's deliberately failing
+/// read. Reads `tool_input` for the one path the probe itself chose: a
+/// value, not a field name, because "did the session make this call"
+/// cannot be answered from field names alone.
+fn names_the_failing_probe_path(payload: &Value) -> bool {
+    payload
+        .get("tool_input")
+        .and_then(|input| input.get("file_path").or_else(|| input.get("path")))
+        .and_then(Value::as_str)
+        .is_some_and(|path| path == PROBE_FAILING_PATH)
+}
+
+pub fn derive_capabilities(
+    pre_tool_use: &[Value],
+    failing_call_recorded: bool,
+    post_tool_use_failure_fired: bool,
+) -> HookCapabilities {
+    let agent_calls: Vec<&Value> = pre_tool_use
+        .iter()
+        .filter(|payload| {
+            matches!(
+                payload.get("tool_name").and_then(Value::as_str),
+                Some("Agent") | Some("Task")
+            )
+        })
+        .collect();
+
+    let agent_tool_name = agent_calls
+        .first()
+        .and_then(|payload| payload.get("tool_name").and_then(Value::as_str))
+        .map(|name| Capability::Known(name.to_string()))
+        .unwrap_or(Capability::Unknown);
+
+    let parent_agent_id = if agent_calls
+        .iter()
+        .any(|payload| payload.get("agent_id").is_some())
+    {
+        Capability::Known(true)
+    } else {
+        Capability::Unknown
+    };
+
+    // `Known(false)` needs the failing call to have been RECORDED: only
+    // then does the absence of a `PostToolUseFailure` say something about
+    // the harness rather than about a probe that never made the call.
+    let post_tool_use_failure_fires = match (failing_call_recorded, post_tool_use_failure_fired) {
+        (_, true) => Capability::Known(true),
+        (true, false) => Capability::Known(false),
+        (false, false) => Capability::Unknown,
+    };
+
+    HookCapabilities {
+        agent_tool_name,
+        parent_agent_id,
+        post_tool_use_failure_fires,
+    }
+}
+
 /// The compatibility record `relais doctor --probe-hooks` writes: which
-/// Claude Code version was observed, and what each target's payloads
-/// looked like on it.
+/// Claude Code version was observed, what each target's payloads looked
+/// like on it, and what the harness's behavior showed itself capable of.
+/// `capabilities` is `None` for a record written before this field
+/// existed — reported by `doctor` as absent, never as every capability
+/// being `false`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompatRecord {
     pub claude_code_version: String,
     pub observed_at: String,
     pub targets: Vec<TargetObservation>,
+    #[serde(default)]
+    pub capabilities: Option<HookCapabilities>,
 }
 
 /// Where the compatibility record lives: state-directory-relative, so
@@ -228,27 +355,39 @@ pub fn read_compat_record(path: &Path) -> Option<CompatRecord> {
 }
 
 /// How long the one real session `--probe-hooks` runs may take. Generous:
-/// it is asked to make a nested agent call, which is real model work,
-/// not a version probe.
+/// the subagent it spawns is itself asked to spawn a second subagent, so
+/// both hops are real model work, not a version probe.
 pub const PROBE_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// The prompt the probe session is given. It has to exercise three
+/// The prompt the probe session is given. It has to exercise four
 /// things the payloads cannot be read off without: an agent call, so
 /// `SubagentStart`/`SubagentStop` fire; a tool call made BY the
 /// subagent, so a payload whose caller is an agent is recorded and
 /// `agent_id`'s presence there is a measurement rather than an
-/// assumption; and a tool call that FAILS, so `PostToolUseFailure` has
-/// something to fire on. An earlier prompt did only the first, and the
-/// other two events read as "did not fire" — which says nothing about
-/// the harness and everything about the prompt.
+/// assumption; a SECOND agent call made BY that subagent, so a
+/// `PreToolUse` naming `Agent`/`Task` is recorded whose own payload
+/// carries an `agent_id` — the only way parentage at depth two (a
+/// subagent's spawn of a subagent) is measured rather than assumed; and
+/// a tool call that FAILS, so `PostToolUseFailure` has something to fire
+/// on; and a spawn made BY a subagent, so whether a nested spawn's own
+/// payload names its caller is a measurement rather than an inference.
+///
+/// Each step was added because the one before it left a question the
+/// recordings could not answer. The prompt this replaces already did the
+/// first three — the failing Read included — so the nested spawn is the
+/// only new one; before it, `parent_agent_id` had nothing to read and the
+/// depth join stayed an assumption. `PostToolUseFailure`'s not firing,
+/// by contrast, has been measured since the failing Read was added.
 ///
 /// The probe does not care what any of it finds, only that the harness
 /// routed through the events being probed.
 pub const PROBE_PROMPT: &str = "Do exactly these two things and nothing else. \
 First, use the Read tool on the path /nonexistent-relais-probe-target so that it fails; \
 report only that it failed. Second, use the Task tool to launch one general-purpose \
-subagent, and tell that subagent to itself use the Read tool on this repository's \
-Cargo.toml and report back its first line. Print that line and stop.";
+subagent, and tell that subagent to do two things itself: use the Read tool on this \
+repository's Cargo.toml and report back its first line, and then use the Task tool to \
+launch a second general-purpose subagent whose only job is to reply with the single \
+word done. Print the first line from Cargo.toml and stop.";
 
 /// What one run of this probe measured on Claude Code 2.1.281, kept
 /// here because the next person to read this module will want it before
@@ -335,6 +474,19 @@ pub fn probe(
     }
 
     let claude_code_version = probe_version(claude_binary).unwrap_or_else(|| "unknown".to_string());
+    let pre_tool_use_payloads = load_payloads(&recording_dir, "PreToolUse");
+    let post_tool_use_failure_fired = observe_target(&recording_dir, "PostToolUseFailure").fired;
+    // Whether the session actually made the call that was supposed to
+    // fail. Without this, a model that skipped step one would have its
+    // silence read as "the harness does not fire PostToolUseFailure".
+    let failing_call_recorded = pre_tool_use_payloads
+        .iter()
+        .any(names_the_failing_probe_path);
+    let capabilities = derive_capabilities(
+        &pre_tool_use_payloads,
+        failing_call_recorded,
+        post_tool_use_failure_fired,
+    );
     let record = CompatRecord {
         claude_code_version,
         observed_at: chrono::Utc::now().to_rfc3339(),
@@ -342,6 +494,7 @@ pub fn probe(
             .iter()
             .map(|t| observe_target(&recording_dir, t))
             .collect(),
+        capabilities: Some(capabilities),
     };
 
     let compat_path = compat_record_path().map_err(ProbeHooksError::Home)?;
@@ -410,6 +563,31 @@ fn observe_target(recording_dir: &Path, target: &str) -> TargetObservation {
         fired,
         fields: fields.into_iter().collect(),
     }
+}
+
+/// Every payload recorded for `target`, parsed and in arrival order (the
+/// recording file names sort lexically by arrival — see [`arrival_nanos`]).
+/// A file that fails to parse as JSON is skipped rather than treated as
+/// evidence of anything: [`derive_capabilities`] can only read what
+/// parsed.
+fn load_payloads(recording_dir: &Path, target: &str) -> Vec<Value> {
+    let mut paths: Vec<PathBuf> = fs::read_dir(recording_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(&format!("-{target}.json")))
+        })
+        .collect();
+    paths.sort();
+    paths
+        .iter()
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .filter_map(|text| serde_json::from_str::<Value>(&text).ok())
+        .collect()
 }
 
 /// The throwaway settings document: every target from [`TARGETS`] wired
@@ -576,6 +754,158 @@ mod tests {
                 "hook_event_name".to_string()
             ]
         );
+    }
+
+    fn agent_call(tool_name: &str, agent_id: Option<&str>) -> Value {
+        let mut payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool_name,
+        });
+        if let Some(agent_id) = agent_id {
+            payload["agent_id"] = Value::String(agent_id.to_string());
+        }
+        payload
+    }
+
+    /// A `Read` payload naming the path the probe asks to fail on.
+    fn failing_read() -> Value {
+        serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": PROBE_FAILING_PATH},
+        })
+    }
+
+    #[test]
+    fn a_spawn_carrying_a_caller_agent_id_proves_nesting() {
+        // `agent_id` is absent at the top level, so a spawn that HAS one
+        // was made from inside a subagent. That is the whole positive
+        // case: it proves both that nesting happened and that the
+        // harness names the caller.
+        let pre_tool_use = vec![
+            agent_call("Task", None),
+            agent_call("Task", Some("agent-01")),
+        ];
+        let capabilities = derive_capabilities(&pre_tool_use, false, false);
+        assert_eq!(
+            capabilities.parent_agent_id,
+            Capability::Known(true),
+            "{capabilities:?}"
+        );
+        assert_eq!(
+            capabilities.agent_tool_name,
+            Capability::Known("Task".to_string())
+        );
+    }
+
+    #[test]
+    fn order_does_not_decide_nesting_only_the_payload_does() {
+        // The caller-bearing payload FIRST. An earlier version read
+        // nesting off position — first call top-level, later calls
+        // nested — and would have called this one top-level and missed
+        // the proof entirely.
+        let pre_tool_use = vec![
+            agent_call("Task", Some("agent-01")),
+            agent_call("Task", None),
+        ];
+        assert_eq!(
+            derive_capabilities(&pre_tool_use, false, false).parent_agent_id,
+            Capability::Known(true)
+        );
+    }
+
+    #[test]
+    fn two_top_level_spawns_are_unknown_not_unsupported() {
+        // The case the position rule got wrong: a model that retried, or
+        // simply did not follow the prompt, makes two top-level spawns
+        // and no nested one. Neither carries an `agent_id` because
+        // neither was made from inside an agent. Reporting the harness
+        // as lacking the field here would be a measurement of the
+        // prompt, not of the harness.
+        let pre_tool_use = vec![agent_call("Agent", None), agent_call("Agent", None)];
+        assert_eq!(
+            derive_capabilities(&pre_tool_use, false, false).parent_agent_id,
+            Capability::Unknown
+        );
+    }
+
+    #[test]
+    fn no_nested_spawn_recorded_is_unknown_not_unsupported() {
+        let pre_tool_use = vec![agent_call("Agent", None)];
+        assert_eq!(
+            derive_capabilities(&pre_tool_use, false, false).parent_agent_id,
+            Capability::Unknown
+        );
+    }
+
+    #[test]
+    fn parent_agent_id_is_never_reported_unsupported() {
+        // `Known(false)` would claim the harness omits the caller on a
+        // nested spawn, and no single payload can establish that: a
+        // payload with no `agent_id` is indistinguishable from a
+        // top-level spawn. Any input must give `Known(true)` or
+        // `Unknown`, never `Known(false)`.
+        for pre in [
+            vec![],
+            vec![agent_call("Agent", None)],
+            vec![agent_call("Agent", None), agent_call("Agent", None)],
+            vec![agent_call("Task", Some("a")), agent_call("Task", None)],
+            vec![failing_read()],
+        ] {
+            let got = derive_capabilities(&pre, false, false).parent_agent_id;
+            assert_ne!(got, Capability::Known(false), "input {pre:?} gave {got:?}");
+        }
+    }
+
+    #[test]
+    fn no_agent_call_at_all_leaves_agent_tool_name_unknown() {
+        let capabilities = derive_capabilities(&[], false, false);
+        assert_eq!(capabilities.agent_tool_name, Capability::Unknown);
+        assert_eq!(capabilities.parent_agent_id, Capability::Unknown);
+    }
+
+    #[test]
+    fn the_failure_event_is_only_unsupported_once_the_failing_call_is_recorded() {
+        // Fired: settled, whatever else was recorded.
+        assert_eq!(
+            derive_capabilities(&[], false, true).post_tool_use_failure_fires,
+            Capability::Known(true)
+        );
+        // The failing call WAS made and the event did not fire: that is a
+        // fact about the harness.
+        assert_eq!(
+            derive_capabilities(&[failing_read()], true, false).post_tool_use_failure_fires,
+            Capability::Known(false)
+        );
+        // The failing call was never recorded, so the event had nothing to
+        // fire on. Silence here measures the prompt, not the harness.
+        assert_eq!(
+            derive_capabilities(&[], false, false).post_tool_use_failure_fires,
+            Capability::Unknown
+        );
+    }
+
+    #[test]
+    fn the_prompt_asks_for_the_path_the_derivation_looks_for() {
+        // The one guard against the two drifting: a renamed path known
+        // only to the prompt would turn the capability into a permanent
+        // `Unknown` with nothing to show why.
+        assert!(
+            PROBE_PROMPT.contains(PROBE_FAILING_PATH),
+            "PROBE_PROMPT must name PROBE_FAILING_PATH ({PROBE_FAILING_PATH})"
+        );
+        assert!(names_the_failing_probe_path(&failing_read()));
+    }
+
+    #[test]
+    fn compat_record_without_capabilities_deserializes_as_absent() {
+        let json = serde_json::json!({
+            "claude_code_version": "2.1.283 (Claude Code)",
+            "observed_at": "2026-09-24T00:00:00Z",
+            "targets": [],
+        });
+        let record: CompatRecord = serde_json::from_value(json).unwrap();
+        assert!(record.capabilities.is_none());
     }
 
     #[test]

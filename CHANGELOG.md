@@ -6,6 +6,40 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## Unreleased
+
+### Added
+
+- **The hook compatibility record now names what the harness can DO, not
+  only which fields fired.** `relais doctor --probe-hooks`'s `CompatRecord`
+  gains a `capabilities` section — `agent_tool_name` (whether the harness
+  sends `Agent` or `Task`), `parent_agent_id` (whether a nested spawn made
+  from inside a subagent carries its own `agent_id`, joining parentage at
+  depth two), and `post_tool_use_failure_fires` — each derived from the
+  recorded payloads by a pure function, never hardcoded. A capability the
+  recordings cannot settle reads as `unknown`, never as `false`: a probe
+  that failed to exercise a case must never be reported as the harness
+  lacking it. The probe prompt now forces a subagent to itself launch a
+  second subagent, so the nested-spawn case is actually measured rather
+  than assumed; `relais doctor` reports the capabilities alongside the
+  existing freshness finding, and a pre-existing record without them is
+  reported as absent, not as every capability being false.
+
+  Nesting is read from what a payload SAYS, never from where it sits in
+  the sequence. Because `agent_id` is absent at the top level and names
+  the caller otherwise, a spawn that CARRIES one was made from inside a
+  subagent and proves the case; a spawn without one cannot be told apart
+  from a top-level spawn and proves nothing. `parent_agent_id` is
+  therefore `Known(true)` or `Unknown` and never `Known(false)`, which a
+  test asserts over every shape of input: claiming the harness omits the
+  caller would need evidence no single payload carries. Likewise
+  `post_tool_use_failure_fires` is only `false` once the deliberately
+  failing read was itself recorded — a session whose model skipped that
+  step measures the prompt, not the harness. The path that read uses is
+  one constant the prompt and the derivation share, with a test that the
+  prompt still names it, so a rename cannot quietly turn the capability
+  into a permanent `unknown`.
+
 ## v0.5.0
 
 ### Added
