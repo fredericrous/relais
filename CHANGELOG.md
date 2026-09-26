@@ -10,6 +10,43 @@ missing here.
 
 ### Added
 
+- **A recipe is now a versioned, hashed unit.** `[[recipes]]` entries in
+  `relais.toml` gain `revision` (`u32`, default `0`) and `enabled`
+  (`bool`, default `true`), plus optional per-recipe `models`,
+  `execution` and `context` blocks — **declared and hashed, and not yet
+  applied to anything.** Nothing reads them: `route` still takes a
+  recipe's `tier` and no dispatch path consults its models or execution.
+  Setting one today therefore changes the authority hash — and so costs a
+  trust re-grant — while changing nothing that runs. They are here so the
+  shape and the hash settle in one release rather than two; the release
+  that reads them will say so. Each recipe now carries a `recipe_id`, a
+  pure content-derived
+  identity (everything about the recipe except its `name`) that is
+  stable across runs and process restarts. When several recipes cover a
+  task, `route` selects the highest `revision` among those that are
+  `enabled` — a disabled recipe is never selected even at the highest
+  revision, and a recipe that does not cover the task is never selected
+  whatever its revision. `relais.toml` now refuses two recipes sharing
+  `(name, revision)`, and refuses two recipes sharing a `recipe_id` (the
+  same executable content declared twice), each with a typed error
+  naming the offenders.
+
+  `POLICY_SCHEMA_VERSION` becomes `2`; `relais.toml` at `schema_version =
+  1` still validates unchanged, and `schema_version` itself stays outside
+  the authority hash as it always has.
+
+  **A repository with recipes shaped as they are today does not need to
+  re-issue its trust grant.** Every new `RecipeSpec` field is
+  `skip_serializing_if`-omitted when it carries its default, so a recipe
+  written before this change — no `revision`, no `enabled`, no
+  `models`/`execution`/`context` — serializes exactly as it did, and the
+  authority hash it feeds does not move. A repository that starts using
+  `revision`, `enabled: false`, or a per-recipe override for the first
+  time changes what the recipe actually authorizes, and its trust grant
+  is invalidated the same way any other declaration change invalidates
+  one — that is not new here, it is the existing rule applying to a
+  field that is new.
+
 - **Depth is now enforced on the hook path, where a caller resolves.**
   As of Claude Code 2.1.283, a nested spawn's own `PreToolUse` — one made
   from inside a subagent — carries `agent_id`, naming the agent that made

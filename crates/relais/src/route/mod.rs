@@ -206,6 +206,13 @@ pub struct Recipe {
     /// Contract scope must fall entirely within these patterns.
     pub scope_within: Vec<String>,
     pub tier: Tier,
+    /// Which version of this recipe this is; when several recipes cover
+    /// a task, the highest revision among the enabled ones wins.
+    pub revision: u32,
+    /// Whether this revision is eligible for selection at all. A
+    /// disabled recipe is never selected, even when it is the highest
+    /// revision among those covering the task.
+    pub enabled: bool,
 }
 
 impl From<&crate::policy::RecipeSpec> for Recipe {
@@ -215,6 +222,8 @@ impl From<&crate::policy::RecipeSpec> for Recipe {
             kind: spec.kind,
             scope_within: spec.scope_within.clone(),
             tier: spec.tier,
+            revision: spec.revision,
+            enabled: spec.enabled,
         }
     }
 }
@@ -400,18 +409,26 @@ pub fn route(inputs: RouteInputs<'_>) -> Routed {
     };
 
     // Deterministic recipes win when they fully cover the task
-    // (SPEC §6, step 3).
+    // (SPEC §6, step 3). The rule for WHICH one — highest enabled
+    // revision, config order breaking ties — is
+    // `policy::recipe::select_highest_enabled_revision` and is called,
+    // never restated here. Route held its own `filter`+`fold` saying the
+    // same thing; the two agreed, including the tie-break, and nothing
+    // kept them agreeing, which is the shape of defect this codebase has
+    // paid for repeatedly. This is the only caller, so the rule's own
+    // unit tests now cover production rather than a parallel copy.
     let mut estimates_seen: Option<Estimates> = None;
-    let recipe_recipes: Vec<Recipe> = repo.recipes.iter().map(Recipe::from).collect();
-    let selected: (Tier, RoutedBy) = if let Some(recipe) = recipe_recipes
-        .iter()
-        .find(|recipe| eligible.contains(&recipe.tier) && recipe_covers(contract, recipe))
-    {
+    let covering = crate::policy::select_highest_enabled_revision(&repo.recipes, |spec| {
+        let recipe = Recipe::from(spec);
+        eligible.contains(&recipe.tier) && recipe_covers(contract, &recipe)
+    })
+    .map(Recipe::from);
+    let selected: (Tier, RoutedBy) = if let Some(recipe) = &covering {
         reasons.push(RouteReason::new(
             "deterministic_recipe",
             format!(
-                "deterministic recipe `{}` fully covers the task",
-                recipe.name
+                "deterministic recipe `{}` (revision {}) fully covers the task",
+                recipe.name, recipe.revision
             ),
         ));
         (recipe.tier, RoutedBy::DeterministicRecipe)
@@ -1180,6 +1197,11 @@ mod tests {
             kind: Some(Kind::Change),
             scope_within: vec!["docs/**".into()],
             tier: Tier::Implementation,
+            revision: 0,
+            enabled: true,
+            models: None,
+            execution: None,
+            context: None,
         });
         let machine = machine_for(&repo);
         let docs = change_contract(&["docs/guide.md"]);
@@ -1203,6 +1225,11 @@ mod tests {
             // A tier that IS eligible for a change, so nothing but the
             // coverage test can keep the recipe from being chosen.
             tier: Tier::Escalation,
+            revision: 0,
+            enabled: true,
+            models: None,
+            execution: None,
+            context: None,
         });
         let machine = machine_for(&repo);
         let everything = change_contract(&["**"]);
@@ -1221,6 +1248,78 @@ mod tests {
         let docs = change_contract(&["docs/api/**"]);
         let d = route_with(&docs, &repo, &machine);
         assert_eq!(d.routed_by, RoutedBy::DeterministicRecipe);
+    }
+
+    fn docs_recipe(revision: u32, enabled: bool) -> crate::policy::RecipeSpec {
+        crate::policy::RecipeSpec {
+            kind: Some(Kind::Change),
+            scope_within: vec!["docs/**".into()],
+            revision,
+            enabled,
+            ..crate::policy::RecipeSpec::covering("docs-touchup", Tier::Implementation)
+        }
+    }
+
+    #[test]
+    fn selection_picks_the_highest_enabled_revision_among_covering_recipes() {
+        let mut repo = repo_policy();
+        repo.recipes.push(docs_recipe(0, true));
+        repo.recipes.push(docs_recipe(2, true));
+        repo.recipes.push(docs_recipe(1, true));
+        let machine = machine_for(&repo);
+        let docs = change_contract(&["docs/guide.md"]);
+        let d = route_with(&docs, &repo, &machine);
+        assert_eq!(d.routed_by, RoutedBy::DeterministicRecipe);
+        assert!(
+            d.reasons
+                .iter()
+                .any(|r| r.id == "deterministic_recipe" && r.text.contains("revision 2")),
+            "the highest enabled revision (2) is the one selected: {:?}",
+            d.reasons
+        );
+    }
+
+    #[test]
+    fn a_disabled_recipe_is_never_selected_even_at_the_highest_revision() {
+        let mut repo = repo_policy();
+        repo.recipes.push(docs_recipe(0, true));
+        repo.recipes.push(docs_recipe(2, false));
+        let machine = machine_for(&repo);
+        let docs = change_contract(&["docs/guide.md"]);
+        let d = route_with(&docs, &repo, &machine);
+        assert_eq!(d.routed_by, RoutedBy::DeterministicRecipe);
+        assert!(
+            d.reasons
+                .iter()
+                .any(|r| r.id == "deterministic_recipe" && r.text.contains("revision 0")),
+            "the disabled revision 2 is never selected, whatever its revision: {:?}",
+            d.reasons
+        );
+        let mut repo_all_disabled = repo_policy();
+        repo_all_disabled.recipes.push(docs_recipe(2, false));
+        let machine = machine_for(&repo_all_disabled);
+        let d = route_with(&docs, &repo_all_disabled, &machine);
+        assert_eq!(
+            d.routed_by,
+            RoutedBy::ConservativeBaseline,
+            "the only recipe is disabled, so nothing routes by recipe"
+        );
+    }
+
+    #[test]
+    fn a_recipe_that_does_not_cover_the_task_is_never_selected() {
+        let mut repo = repo_policy();
+        // Highest revision, enabled — but scoped to docs/**, which does
+        // not cover this contract's write scope.
+        repo.recipes.push(docs_recipe(5, true));
+        let machine = machine_for(&repo);
+        let outside_scope = change_contract(&["crates/**"]);
+        let d = route_with(&outside_scope, &repo, &machine);
+        assert_eq!(
+            d.routed_by,
+            RoutedBy::ConservativeBaseline,
+            "a recipe whose scope_within does not cover the contract is never selected"
+        );
     }
 
     proptest::proptest! {
