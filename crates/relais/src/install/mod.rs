@@ -1,7 +1,7 @@
 //! Claude Code integration (SPEC §3).
 //!
 //! `relais install --claude` proposes a small namespaced set of agent
-//! definitions and a `/relais` skill. Preview-first: `--write` applies
+//! definitions and skills. Preview-first: `--write` applies
 //! reviewed changes; merging never replaces unrelated entries. Every
 //! owned block carries begin/end markers with a content hash, so
 //! uninstall removes only owned, UNCHANGED artifacts and a user-modified
@@ -244,6 +244,18 @@ pub fn owned_files() -> Vec<(PathBuf, String)> {
             Path::new("skills").join("relais").join("SKILL.md"),
             skill_relais(),
         ),
+        (
+            Path::new("skills")
+                .join("relais-verified-push")
+                .join("SKILL.md"),
+            skill_relais_verified_push(),
+        ),
+        (
+            Path::new("skills")
+                .join("relais-architecture-conflict")
+                .join("SKILL.md"),
+            skill_relais_architecture_conflict(),
+        ),
     ]
 }
 
@@ -326,6 +338,22 @@ description: Route a bounded coding task through the relais supervised runner �
 Express the requested work as a task contract, then hand it to the
 runner. The parent does not supervise intermediate turns.
 
+## Inputs
+
+Before a contract can be written, the caller must supply:
+
+- the repository or task worktree the change belongs to (its root is
+  where `relais.toml` is found);
+- one precise objective sentence;
+- the write scope: which paths the change may touch;
+- acceptance criteria a command can verify — never "looks right" or a
+  worker's own completion message;
+- the verification profile to run, named in that repository's
+  `relais.toml`.
+
+Missing any of these is a reason to ask, not to guess one on the
+caller's behalf.
+
 ## Steps
 
 1. Work from the repository the task changes — its task worktree when
@@ -372,6 +400,117 @@ artifacts path is printed on every terminal state.
   worker's completion message is never acceptance.
 - If the run needs a decision, make it explicitly — do not let a model
   invent it.
+
+## Done when
+
+- the contract was written to `<root>/.relais/task.json` and `relais
+  plan` accepted it without complaint;
+- the run reached a terminal state (accepted, needs_decision,
+  needs_review, blocked, failed, budget_exhausted or interrupted) and
+  that state, not a worker's own summary, was read;
+- a `needs_decision` outcome was resolved explicitly, not guessed;
+- for `accepted`, the printed artifacts path was checked, not assumed.
+"#;
+    body.trim_end().to_string()
+}
+
+fn skill_relais_verified_push() -> String {
+    let body = r#"---
+name: relais-verified-push
+description: Verify a push actually left before trusting it — gate status, rehearsal, a bare push, then confirm the remote ref moved.
+---
+
+# /relais-verified-push
+
+A push that "succeeded" is not the same claim as a push that left. Run
+these four steps in order, from the repository the branch lives in.
+
+## Steps
+
+1. Check what pushing next gates: `amont list --json --stage pre-push
+   --pushed`. The output is the `amont-list-v1` envelope: a `checks`
+   array whose rows carry `id`, `effective_severity` and `status`. Read
+   it before assuming the push is clean.
+
+2. Rehearse the push gate on a snapshot of HEAD, ahead of time:
+   `amont rehearse --wait`. This runs the same checks `git push` would
+   run, with no remote connection open, so the push itself is fast and
+   does not hold the remote idle while a suite runs.
+
+3. Push, bare — never piped:
+
+   ```sh
+   git push
+   ```
+
+   Never pipe `git push` into `tail`, `head` or `grep`. A pipeline's exit
+   status is the LAST command's, so the trimming command reports exit 0
+   however the push actually ended, and the trimmed output discards the
+   one line that would have said why it failed. If output must be
+   trimmed, redirect to a file and read the file — never pipe a mutating
+   command's own exit status away.
+
+4. Confirm the ref actually moved, against the remote, not the local
+   log: `git ls-remote origin refs/heads/<branch>`. Compare the sha it
+   reports to `git log --oneline -1 <branch>`; only a match is a push
+   that left.
+
+## Rules
+
+- Never trust a `git push` exit code alone; step 4 is the actual
+  verification.
+- A rehearsal failure is the push gate telling you now what `git push`
+  would have refused later — fix it before step 3, not after.
+"#;
+    body.trim_end().to_string()
+}
+
+fn skill_relais_architecture_conflict() -> String {
+    let body = r#"---
+name: relais-architecture-conflict
+description: Resolve an architecture decision key and handle every outcome aval can return, including a corpus that contradicts itself.
+---
+
+# /relais-architecture-conflict
+
+`aval resolve <key> --json` has a stable exit-code contract; read the
+code, not just stdout, before deciding what happened.
+
+## Exit codes
+
+| exit | meaning |
+|---|---|
+| 0 | active — a decision exists and holds |
+| 4 | undecided — no record answers this key |
+| 5 | contradiction — the corpus disagrees with itself |
+| 6 | retired — a decision existed and was withdrawn |
+| 7 | unknown — the key is not one aval recognises |
+| 1 | tool failure |
+| 2 | usage error |
+| 3 | corpus unreadable |
+
+## On exit 5 (contradiction)
+
+Do not pick a side. aval is read-only and deciding between two
+contradicting records is not this skill's call, or the caller's model's
+call, to make silently. Instead:
+
+1. Write an inspect contract (`"kind": "inspect"`) capturing the
+   evidence: the key, the scope, and both records aval's contradiction
+   names.
+2. Hand back a decision that names BOTH readings the corpus supports,
+   with their evidence, and says explicitly that the corpus contradicts
+   itself here.
+3. Let a person or an explicit decision step choose; never resolve the
+   contradiction by preferring one record over the other on your own
+   initiative.
+
+## Rules
+
+- Exit 1/2/3 are tool or corpus failures, not decisions — retry or
+  report the failure, never treat them as "undecided".
+- A `suggestion` field in aval's output is advisory: it resolves
+  nothing and is never a substitute for calling `aval resolve` again.
 "#;
     body.trim_end().to_string()
 }
@@ -1071,7 +1210,7 @@ mod tests {
     fn install_is_preview_first_and_merge_safe() {
         let (root, dir) = temp_root();
         let plan = root.plan();
-        assert_eq!(plan.actions.len(), 4);
+        assert_eq!(plan.actions.len(), 6);
         assert!(plan
             .actions
             .iter()
@@ -1079,7 +1218,7 @@ mod tests {
         // Preview wrote nothing.
         assert!(!root.claude_dir.exists());
         let applied = root.apply(&plan).expect("apply");
-        assert_eq!(applied.applied.len(), 4);
+        assert_eq!(applied.applied.len(), 6);
         assert!(applied.not_applied.is_empty(), "{applied:?}");
         let skill = root.claude_dir.join("skills/relais/SKILL.md");
         assert!(skill.is_file());
@@ -1152,7 +1291,7 @@ mod tests {
         // The three unchanged agents are removed entirely; the skill's
         // owned block is removed but the user's note survives; the
         // foreign agent was never ours.
-        assert_eq!(applied.len(), 4, "{applied:?}");
+        assert_eq!(applied.len(), 6, "{applied:?}");
         assert!(!root.claude_dir.join("agents/relais-research.md").exists());
         let remaining = std::fs::read_to_string(&owned).expect("kept file");
         assert!(
@@ -1405,6 +1544,80 @@ mod tests {
         }
     }
 
+    /// A body and its installed path can never disagree: the frontmatter
+    /// `name:` a file carries must match the agent or skill directory it
+    /// is installed at, so a mismatch cannot ship silently.
+    #[test]
+    fn every_owned_body_names_the_path_it_installs_at() {
+        for (relative, content) in owned_files() {
+            assert!(
+                content.starts_with("---\n"),
+                "{relative:?}: the body must open with frontmatter:\n{content}"
+            );
+            let name_line = content
+                .lines()
+                .find(|line| line.starts_with("name: "))
+                .unwrap_or_else(|| panic!("{relative:?}: no `name:` line in frontmatter"));
+            let name = name_line.trim_start_matches("name: ").trim();
+            let expected = if relative.starts_with("agents") {
+                relative
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .expect("agent file stem")
+                    .to_string()
+            } else {
+                relative
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|s| s.to_str())
+                    .expect("skill directory name")
+                    .to_string()
+            };
+            assert_eq!(
+                name, expected,
+                "{relative:?}: frontmatter name must match its install path"
+            );
+        }
+    }
+
+    /// The relais-verified-push skill exists to stop exactly one failure
+    /// mode: a piped `git push` reporting success when the push did not
+    /// happen. It must name every step, and must not itself contain the
+    /// pattern it teaches against.
+    #[test]
+    fn relais_verified_push_names_every_step_and_never_pipes_a_mutation() {
+        let body = skill_relais_verified_push();
+        for needle in [
+            "amont list",
+            "amont rehearse --wait",
+            "git push",
+            "git ls-remote",
+        ] {
+            assert!(
+                body.contains(needle),
+                "the skill must name `{needle}`:\n{body}"
+            );
+        }
+        // No exemption, deliberately. An earlier version of this test
+        // skipped any line containing `…` or "Do not", so that the prose
+        // warning could quote the anti-pattern — and that exemption let
+        // `git push origin … | tail -1` sit INSIDE the fenced step a
+        // reader copies from and still pass (verified by injecting it).
+        // The body is worded so no single line ever needs the exemption:
+        // the warning names `git push` and the trimming commands in
+        // separate code spans, so a line carrying both is always a
+        // genuine invocation.
+        for line in body.lines() {
+            let has_mutation = line.contains("git push") || line.contains("git commit");
+            let pipes_into_trim =
+                line.contains("| tail") || line.contains("| head") || line.contains("| grep");
+            assert!(
+                !(has_mutation && pipes_into_trim),
+                "a mutating command must never be piped into tail/head/grep: {line:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_marker_installed_above_the_frontmatter_migrates_under_it() {
         let (root, dir) = temp_root();
@@ -1543,14 +1756,14 @@ mod tests {
     fn an_action_the_write_cannot_carry_out_is_reported() {
         let (root, dir) = temp_root();
         let plan = root.plan();
-        assert_eq!(plan.applicable_count(), 4);
+        assert_eq!(plan.applicable_count(), 6);
         // Between plan and apply, somebody else writes one of the files.
         let agent = root.claude_dir.join("agents/relais-review.md");
         std::fs::create_dir_all(agent.parent().expect("parent")).expect("mkdir");
         std::fs::write(&agent, "# mine now\n").expect("foreign");
 
         let done = root.apply(&plan).expect("apply");
-        assert_eq!(done.applied.len(), 3, "{done:?}");
+        assert_eq!(done.applied.len(), 5, "{done:?}");
         assert_eq!(
             done.not_applied
                 .iter()
@@ -1572,14 +1785,14 @@ mod tests {
         let (root, dir) = temp_root();
         root.apply(&root.plan()).expect("apply");
         let plan = root.uninstall_plan();
-        assert_eq!(plan.applicable_count(), 4);
+        assert_eq!(plan.applicable_count(), 6);
         // The user edits inside the block after previewing the removal.
         let agent = root.claude_dir.join("agents/relais-research.md");
         let text = std::fs::read_to_string(&agent).expect("read");
         std::fs::write(&agent, text.replace("advisory set", "MY set")).expect("edit inside");
 
         let done = root.apply_uninstall(&plan).expect("uninstall");
-        assert_eq!(done.applied.len(), 3, "{done:?}");
+        assert_eq!(done.applied.len(), 5, "{done:?}");
         assert_eq!(
             done.not_applied
                 .iter()
@@ -1611,7 +1824,7 @@ mod tests {
         assert_eq!(request.scope_label(), "user level");
         let preview = install(&request, &home).expect("preview");
         assert_eq!(preview.mode, Mode::Preview);
-        assert_eq!(preview.plan.applicable_count(), 4);
+        assert_eq!(preview.plan.applicable_count(), 6);
         assert!(preview.applied.is_empty(), "a preview writes nothing");
         assert!(
             !home.join(".claude").exists(),
@@ -1623,7 +1836,7 @@ mod tests {
             mode: Mode::Apply,
         };
         let written = install(&request, &home).expect("apply");
-        assert_eq!(written.applied.len(), 4, "{written:?}");
+        assert_eq!(written.applied.len(), 6, "{written:?}");
         assert!(written.not_applied.is_empty(), "{written:?}");
         assert!(home.join(".claude/skills/relais/SKILL.md").is_file());
         assert!(home.join(".claude/agents/relais-research.md").is_file());
@@ -1636,7 +1849,7 @@ mod tests {
             &home,
         )
         .expect("uninstall");
-        assert_eq!(removed.applied.len(), 4, "{removed:?}");
+        assert_eq!(removed.applied.len(), 6, "{removed:?}");
         assert!(!home.join(".claude/agents/relais-research.md").exists());
 
         // A project request is the same shape with the directory named.

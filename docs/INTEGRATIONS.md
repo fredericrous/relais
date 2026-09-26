@@ -1,7 +1,8 @@
 # The Claude Code hook integration
 
-`relais install --claude` writes agent definitions and a `/relais` skill;
-it never touches `settings.json`. `relais install --claude --hooks` is a
+`relais install --claude` writes agent definitions and three skills —
+`/relais`, `/relais-verified-push` and `/relais-architecture-conflict` —
+and never touches `settings.json`. `relais install --claude --hooks` is a
 separate, explicit ask on top of that: it wires a live hook into
 `.claude/settings.json` so relais can see — and, on one event, refuse —
 native Claude Code subagent spawns. This document explains what that
