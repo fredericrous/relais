@@ -10,6 +10,28 @@ missing here.
 
 ### Added
 
+- **The learner is now keyed on the recipe that produced a run, not just
+  its model profile.** `ProfileIdentity` becomes `RecipeIdentity` and
+  gains `recipe_id`: the identity of the deterministic recipe that
+  covered the task (`RecipeSpec::recipe_id`), alongside the
+  model/effort/harness it already carried. Two runs that differ only in
+  the recipe revision that produced them are now two different
+  identities; two runs under a byte-identical recipe (or with no
+  covering recipe at all) are one. `predict` abstains — never guesses —
+  when asked about a `RecipeIdentity` the active artifact has not
+  observed, exactly as it already did for an unseen model or harness.
+
+  `FEATURE_SCHEMA_VERSION` moves `1` → `2`, `DATASET_VERSION` `3` → `4`,
+  `ARTIFACT_SCHEMA_VERSION` `4` → `5` and `EVAL_SCHEMA_VERSION` `2` → `3`
+  together: an artifact, the dataset it was trained on and the features
+  that describe it are one fact recorded in four places, and a version
+  that moved alone would let a reader pair a new artifact with an old
+  dataset. **Existing learned artifacts and datasets must be rebuilt** —
+  `relais dataset build` and `relais train` again — nothing on this
+  machine silently reads an artifact or dataset written under the
+  previous versions; a stored artifact at an older schema version is
+  refused outright, naming the version found and the version expected.
+
 - **A recipe is now a versioned, hashed unit.** `[[recipes]]` entries in
   `relais.toml` gain `revision` (`u32`, default `0`) and `enabled`
   (`bool`, default `true`), plus optional per-recipe `models`,

@@ -692,7 +692,7 @@ mod tests {
             architecture_keys: 0.0,
             objective_len: 42.0,
         };
-        let identity = crate::learn::features::ProfileIdentity::default();
+        let identity = crate::learn::features::RecipeIdentity::default();
         let a = expand(
             &task,
             crate::policy::Tier::Implementation,

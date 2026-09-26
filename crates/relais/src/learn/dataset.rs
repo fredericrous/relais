@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::features::{
-    expand, AcceptanceRoute, FeatureSchema, ProfileIdentity, SparseVec, TaskFeatures,
+    expand, AcceptanceRoute, FeatureSchema, RecipeIdentity, SparseVec, TaskFeatures,
     TrainingExample,
 };
 use crate::ids::{sha256_hex, TaskId};
@@ -38,9 +38,12 @@ pub type ContractLookup<'a> = dyn Fn(&str) -> Result<Option<ContractMaterial>, L
 /// not carry. Version 3 samples by TASK rather than by run, reads a
 /// task's later recorded outcome into its label, and records which route
 /// (verification or a person's approval) accepted it — none of which a
-/// version-2 dataset carries. Rebuild with `relais dataset build` to
-/// train again.
-pub const DATASET_VERSION: u32 = 3;
+/// version-2 dataset carries. Version 4 keys `identity` on the recipe that
+/// produced the run too (`RecipeIdentity::recipe_id`, formerly
+/// `ProfileIdentity`), not only its model/effort/harness — a version-3
+/// dataset pools two revisions of one recipe as if they were the same
+/// thing. Rebuild with `relais dataset build` to train again.
+pub const DATASET_VERSION: u32 = 4;
 
 /// The version of the rule in [`labelling_of`] and the acceptance
 /// decision at [`build`]'s `route == AcceptanceRoute::Verified` check —
@@ -363,11 +366,21 @@ pub fn build(
             "first dispatch intent",
             ledger.first_dispatch_intent(&run_id),
         )?;
-        let Some(identity) = intent.as_ref().and_then(identity_of_intent) else {
+        let Some(base_identity) = intent.as_ref().and_then(identity_of_intent) else {
             exclusions.push(format!(
                 "{run_id}: no dispatch intent naming a model; the outcome cannot be attributed"
             ));
             continue;
+        };
+        let eligibility = crate::route::eligible_tiers(&contract, repo_policy, &repo_policy.models);
+        // The recipe that produced this run, reconstructed the same pure
+        // way the router itself would decide it (SPEC §17): two revisions
+        // of one recipe are never pooled as if they were the same thing.
+        let recipe_id =
+            crate::route::covering_recipe_id(&contract, repo_policy, &eligibility.tiers);
+        let identity = RecipeIdentity {
+            recipe_id,
+            ..base_identity
         };
         let sparse: SparseVec = expand(&task, tier, &objective, &identity, &schema);
         let transitions = read_of(&run_id, "transitions", ledger.transitions(&run_id))?;
@@ -381,7 +394,7 @@ pub fn build(
         records.push(TrainingExample {
             family: task_family(&contract),
             tier,
-            floor: crate::route::eligible_tiers(&contract, repo_policy, &repo_policy.models).floor,
+            floor: eligibility.floor,
             task,
             objective: objective.clone(),
             identity,
@@ -412,20 +425,23 @@ pub fn build(
     })
 }
 
-/// The profile identity a dispatch intent records, or `None` when it names
-/// no model. Reading with `intent["model"]` returned JSON null for a
-/// malformed intent, which became the model literally called "unknown".
-fn identity_of_intent(intent: &serde_json::Value) -> Option<ProfileIdentity> {
+/// The model/effort/harness identity a dispatch intent records, or `None`
+/// when it names no model. Reading with `intent["model"]` returned JSON
+/// null for a malformed intent, which became the model literally called
+/// "unknown". Carries no `recipe_id` — the dispatch intent does not record
+/// one, so the caller fills it in from the contract and policy.
+fn identity_of_intent(intent: &serde_json::Value) -> Option<RecipeIdentity> {
     let text = |key: &str| {
         intent
             .get(key)
             .and_then(|value| value.as_str())
             .map(str::to_string)
     };
-    Some(ProfileIdentity {
+    Some(RecipeIdentity {
         model: text("model")?,
         effort: text("effort"),
         harness: text("harness"),
+        recipe_id: None,
     })
 }
 
@@ -560,7 +576,7 @@ mod tests {
             floor: Tier::Implementation,
             task: TaskFeatures::extract(&contract(), &repo_policy()),
             objective: "objective".into(),
-            identity: ProfileIdentity::default(),
+            identity: RecipeIdentity::default(),
             sparse: SparseVec(vec![(0, 1.0)]),
             accepted_without_escalation: accepted,
             route: AcceptanceRoute::Verified,
@@ -807,6 +823,13 @@ argv = ["true"]
         }
 
         fn build(&self) -> Dataset {
+            self.build_with_repo(&repo_policy())
+        }
+
+        /// Like [`Self::build`], but against a caller-chosen policy — for a
+        /// test that needs a repo whose `[[recipes]]` table decides part of
+        /// the identity the dataset reconstructs.
+        fn build_with_repo(&self, repo: &RepoPolicy) -> Dataset {
             let contract_of = |run: &str| {
                 let Some((contract, tier)) = self.ledger.run_contract_and_tier(&run_id(run))?
                 else {
@@ -815,7 +838,7 @@ argv = ["true"]
                 let objective = contract.objective.clone();
                 Ok(Some((contract, objective, tier.as_str().to_string())))
             };
-            build(&self.ledger, &contract_of, &repo_policy()).expect("dataset builds")
+            build(&self.ledger, &contract_of, repo).expect("dataset builds")
         }
     }
 
@@ -1117,11 +1140,80 @@ argv = ["true"]
         assert_eq!(dataset.records[0].floor, Tier::Implementation);
         assert_eq!(
             dataset.records[0].identity,
-            ProfileIdentity {
+            RecipeIdentity {
                 model: "sonnet".into(),
                 effort: Some("medium".into()),
                 harness: None,
+                recipe_id: None,
             }
+        );
+    }
+
+    /// The identity a record carries is keyed on the recipe that covered
+    /// it too, reconstructed the same pure way the router itself would
+    /// decide it: two revisions of one recipe are never pooled as if they
+    /// were the same thing, and a byte-identical recipe reused across two
+    /// runs gives the same identity both times.
+    #[test]
+    fn a_records_identity_is_keyed_on_the_covering_recipe() {
+        let repo_rev0 = RepoPolicy::from_toml_str(
+            r#"schema_version = 1
+[models.implementation]
+id = "sonnet"
+[[verification.profiles.p.commands]]
+argv = ["true"]
+[[recipes]]
+name = "crates-recipe"
+scope_within = ["crates/**"]
+tier = "implementation"
+revision = 0
+"#,
+        )
+        .expect("policy");
+        let repo_rev1 = RepoPolicy::from_toml_str(
+            r#"schema_version = 1
+[models.implementation]
+id = "sonnet"
+[[verification.profiles.p.commands]]
+argv = ["true"]
+[[recipes]]
+name = "crates-recipe"
+scope_within = ["crates/**"]
+tier = "implementation"
+revision = 1
+"#,
+        )
+        .expect("policy");
+
+        let fixture_a = LedgerFixture::open("dataset-recipe-a");
+        fixture_a.dispatched("run-a", "implementation", "initial");
+        fixture_a.usage("a-worker", "run-a", "sonnet");
+        fixture_a.settle("run-a", State::Accepted);
+        let dataset_a = fixture_a.build_with_repo(&repo_rev0);
+        let identity_a = dataset_a.records[0].identity.clone();
+        assert!(
+            identity_a.recipe_id.is_some(),
+            "the covering recipe's id rides on the identity: {identity_a:?}"
+        );
+
+        let fixture_b = LedgerFixture::open("dataset-recipe-b");
+        fixture_b.dispatched("run-b", "implementation", "initial");
+        fixture_b.usage("b-worker", "run-b", "sonnet");
+        fixture_b.settle("run-b", State::Accepted);
+        let dataset_b = fixture_b.build_with_repo(&repo_rev0);
+        assert_eq!(
+            identity_a, dataset_b.records[0].identity,
+            "two runs under a byte-identical recipe share an identity"
+        );
+
+        let fixture_c = LedgerFixture::open("dataset-recipe-c");
+        fixture_c.dispatched("run-c", "implementation", "initial");
+        fixture_c.usage("c-worker", "run-c", "sonnet");
+        fixture_c.settle("run-c", State::Accepted);
+        let dataset_c = fixture_c.build_with_repo(&repo_rev1);
+        assert_ne!(
+            identity_a, dataset_c.records[0].identity,
+            "a run under a different revision of the same recipe is a different identity"
         );
     }
 
