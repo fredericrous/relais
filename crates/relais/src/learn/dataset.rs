@@ -21,6 +21,7 @@ use crate::ledger::{Ledger, LedgerError};
 use crate::lifecycle::{Reason, State};
 use crate::outcome::OutcomeKind;
 use crate::policy::{RepoPolicy, Tier};
+use crate::route::RoutedBy;
 
 /// The stored contract and first-attempt tier for a run, as dataset
 /// construction consumes them.
@@ -219,7 +220,33 @@ pub struct Dataset {
     pub exclusions: Vec<String>,
     pub fingerprint: String,
     pub built_at: String,
+    /// How the dataset's records break down by the route (SPEC §6) that
+    /// dispatched them.
+    pub route_coverage: RouteCoverage,
 }
+
+/// A record whose dispatch's `routed_by` was never recorded (ledger
+/// migration v13 or later) is excluded from `by_route` — reported as
+/// `excluded`, with `excluded_reason` saying why — rather than folded
+/// into a route it was never observed taking. It is NOT the same
+/// question as [`Dataset::exclusions`]: such a record still trains the
+/// acceptance model, it simply cannot be attributed to a route.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteCoverage {
+    /// Counts keyed by [`RoutedBy::as_str`], over records whose dispatch
+    /// recorded a routing decision.
+    pub by_route: std::collections::BTreeMap<String, usize>,
+    /// Records whose dispatch recorded no routing decision at all.
+    pub excluded: usize,
+    pub excluded_reason: String,
+}
+
+/// Why a record with no recorded `routed_by` is excluded from
+/// [`RouteCoverage::by_route`] rather than silently dropped from the
+/// count.
+const ROUTE_COVERAGE_EXCLUDED_REASON: &str =
+    "no routed_by recorded for this dispatch: it predates ledger v13, \
+     or its routing decision was never captured";
 
 /// How the labels fall: the numbers a person needs to see before trusting
 /// anything fitted on them. Two bare `usize`s in a tuple were read in the
@@ -266,6 +293,9 @@ pub fn build(
     let schema = FeatureSchema::standard();
     let mut records = Vec::new();
     let mut exclusions = Vec::new();
+    let mut route_by_route: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut route_excluded = 0usize;
     let runs = ledger
         .runs_since(EPOCH)
         .map_err(|cause| DatasetError::RunList {
@@ -372,6 +402,23 @@ pub fn build(
             ));
             continue;
         };
+        // The route this dispatch recorded (SPEC §6), for the per-route
+        // breakdown. A `None` here is a fact — no routing decision was
+        // ever captured for it — and is excluded from `by_route` rather
+        // than counted under any of the routes it might have taken.
+        let routed_by: Option<RoutedBy> = read_of(
+            &run_id,
+            "routed by",
+            ledger.first_dispatch_routed_by(&run_id),
+        )?;
+        match routed_by {
+            Some(routed_by) => {
+                *route_by_route
+                    .entry(routed_by.as_str().to_string())
+                    .or_insert(0) += 1;
+            }
+            None => route_excluded += 1,
+        }
         let eligibility = crate::route::eligible_tiers(&contract, repo_policy, &repo_policy.models);
         // The recipe that produced this run, reconstructed the same pure
         // way the router itself would decide it (SPEC §17): two revisions
@@ -422,6 +469,11 @@ pub fn build(
         exclusions,
         fingerprint,
         built_at: crate::ledger::now_rfc3339(),
+        route_coverage: RouteCoverage {
+            by_route: route_by_route,
+            excluded: route_excluded,
+            excluded_reason: ROUTE_COVERAGE_EXCLUDED_REASON.to_string(),
+        },
     })
 }
 
@@ -776,8 +828,25 @@ argv = ["true"]
                     Some(attempt),
                     &serde_json::json!({"model": "sonnet", "effort": "medium"}),
                     0,
+                    RoutedBy::ConservativeBaseline,
                 )
                 .expect("intent");
+            revision
+        }
+
+        /// Like [`Self::dispatched`], but the dispatch it records carries
+        /// no `routed_by` at all — what a dispatch from before ledger
+        /// v13 looks like on read-back, simulated by nulling the column
+        /// a real `record_dispatch_intent` call just wrote.
+        fn dispatched_without_routed_by(&self, run: &str, tier: &str, phase: &str) -> i64 {
+            let revision = self.dispatched(run, tier, phase);
+            let conn = rusqlite::Connection::open(self.dir.join("ledger.sqlite"))
+                .expect("raw connection to the same ledger file");
+            conn.execute(
+                "UPDATE dispatches SET routed_by = NULL WHERE run_id = ?1",
+                rusqlite::params![run_id(run).as_str()],
+            )
+            .expect("clear routed_by");
             revision
         }
 
@@ -883,6 +952,47 @@ argv = ["true"]
                 .any(|exclusion| exclusion.contains("run-old") && exclusion.contains("superseded")),
             "the superseded attempt is still named, not silently dropped: {:?}",
             dataset.exclusions
+        );
+    }
+
+    /// A dispatch with no recorded `routed_by` still trains the
+    /// acceptance model (it is not in `exclusions`), but it is excluded
+    /// from the per-route breakdown, and that exclusion is counted with
+    /// its reason rather than silently dropped.
+    #[test]
+    fn records_with_no_routed_by_are_excluded_from_route_coverage_with_a_reason() {
+        let fixture = LedgerFixture::open("dataset-route-coverage");
+        fixture.dispatched("run-known", "implementation", "initial");
+        fixture.settle("run-known", State::Accepted);
+        fixture.dispatched_without_routed_by("run-unknown", "implementation", "initial");
+        fixture.settle("run-unknown", State::Accepted);
+        let dataset = fixture.build();
+        assert_eq!(
+            dataset.records.len(),
+            2,
+            "both dispatches still train the acceptance model: {:?}",
+            dataset.records
+        );
+        assert!(
+            dataset.exclusions.is_empty(),
+            "missing routed_by is not a dataset exclusion, only a route-coverage one: {:?}",
+            dataset.exclusions
+        );
+        assert_eq!(
+            dataset.route_coverage.by_route.get("conservative_baseline"),
+            Some(&1),
+            "the recorded dispatch counts under its own route: {:?}",
+            dataset.route_coverage
+        );
+        assert_eq!(
+            dataset.route_coverage.excluded, 1,
+            "the unrecorded dispatch is excluded from the breakdown, not folded into a route \
+             it was never observed taking: {:?}",
+            dataset.route_coverage
+        );
+        assert!(
+            !dataset.route_coverage.excluded_reason.is_empty(),
+            "the exclusion carries a reason, not a bare count"
         );
     }
 
@@ -1249,6 +1359,7 @@ revision = 1
             exclusions: vec![],
             fingerprint: "f".into(),
             built_at: "now".into(),
+            route_coverage: Default::default(),
         };
         assert_eq!(
             dataset.acceptance_labels(),

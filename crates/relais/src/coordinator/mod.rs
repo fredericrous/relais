@@ -1881,6 +1881,7 @@ pub fn effective_limits(configured: &ConcurrencyLimits) -> ConcurrencyLimits {
 mod tests {
     use super::*;
     use crate::ids::{DispatchId, Pid, RunId};
+    use crate::route::RoutedBy;
 
     fn temp_dir(tag: &str) -> crate::test_support::TempDir {
         crate::test_support::short_temp_dir(tag)
@@ -2260,6 +2261,7 @@ mod tests {
                 None,
                 &serde_json::json!({}),
                 0,
+                RoutedBy::ConservativeBaseline,
             )
             .expect("intent");
         ledger
@@ -2276,6 +2278,7 @@ mod tests {
                 None,
                 &serde_json::json!({}),
                 0,
+                RoutedBy::ConservativeBaseline,
             )
             .expect("intent");
         ledger
@@ -2295,6 +2298,7 @@ mod tests {
                 None,
                 &serde_json::json!({}),
                 0,
+                RoutedBy::ConservativeBaseline,
             )
             .expect("intent");
         ledger
@@ -2307,6 +2311,7 @@ mod tests {
                 None,
                 &serde_json::json!({}),
                 0,
+                RoutedBy::ConservativeBaseline,
             )
             .expect("intent");
         ledger
@@ -2365,6 +2370,7 @@ mod tests {
                 None,
                 &serde_json::json!({}),
                 0,
+                RoutedBy::ConservativeBaseline,
             )
             .expect("intent");
         ledger
@@ -2680,6 +2686,7 @@ mod tests {
                 None,
                 &serde_json::json!({}),
                 0,
+                RoutedBy::ConservativeBaseline,
             )
             .expect("intent");
         ledger

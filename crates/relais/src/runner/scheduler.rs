@@ -939,6 +939,7 @@ fn accept_integrated(
                 // writes (R4).
                 patch_path: assembled.patch_path.clone(),
                 deadline: root.deadline,
+                routed_by: root.decision.routed_by,
             },
             &mut spend,
         );
@@ -1089,6 +1090,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
             "kind": "plan",
         }),
         remaining_budget.unwrap_or(0),
+        root.decision.routed_by,
     )?;
     let spec = LaunchSpec {
         dispatch_id: dispatch_id.as_str().to_string(),
