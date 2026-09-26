@@ -50,7 +50,7 @@
 //! left it that way" apart.
 
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Extra slack the derived `PreToolUse` handler timeout carries beyond
@@ -166,7 +166,11 @@ pub enum HooksPlan {
     Ready { events: Vec<HookEventPlan> },
     /// The file cannot be re-rendered byte for byte, so nothing will be
     /// written. `paste_block` is the fragment a person can merge in by
-    /// hand.
+    /// hand — or, when [`crate::install::InstallRoot::plan_hooks`] found
+    /// a relais command already recorded in another settings file the
+    /// harness merges with this one (issue #94), a note that there is
+    /// nothing to paste: the fix there is to remove the other one, not to
+    /// add a second.
     Unrenderable { reason: String, paste_block: String },
 }
 
@@ -556,6 +560,104 @@ pub fn target_names() -> Vec<&'static str> {
     HOOK_TARGETS.iter().map(|(event, _)| *event).collect()
 }
 
+/// Every settings file Claude Code merges into one hook configuration
+/// (issue #94, measured on 2.1.282), in the order this crate lists them:
+/// the project's own `.claude/settings.json`, the project's
+/// `.claude/settings.local.json`, then the user's `~/.claude/settings.json`.
+/// Merged, not overridden — a handler recorded in more than one of these
+/// fires more than once on every spawn — so a reader has to look at all of
+/// them rather than stop at the first match. Shared by `doctor`'s
+/// `hook-live`/`hook-timeout` findings and this module's own duplicate
+/// check before an install writes a second handler.
+pub fn settings_candidates(roots: MergedRoots<'_>) -> Vec<(&'static str, PathBuf)> {
+    let mut candidates = Vec::new();
+    if let Some(project) = roots.project {
+        candidates.push((
+            "project settings.json",
+            project.join(".claude").join("settings.json"),
+        ));
+        candidates.push((
+            "project settings.local.json",
+            project.join(".claude").join("settings.local.json"),
+        ));
+    }
+    if let Some(home) = roots.home {
+        candidates.push((
+            "user settings.json",
+            home.join(".claude").join("settings.json"),
+        ));
+    }
+    // A project inside the home directory, or a scope whose two roots
+    // coincide, names the same file twice — and a duplicate in the list
+    // reads as two handlers, which is exactly the finding this list
+    // feeds. Deduplicated on the path, keeping the first label.
+    let mut seen = std::collections::BTreeSet::new();
+    candidates.retain(|(_, path)| seen.insert(path.clone()));
+    candidates
+}
+
+/// The roots Claude Code merges settings from, named so the two cannot be
+/// passed the wrong way round.
+///
+/// Both are independent of which scope an install WRITES to: the harness
+/// merges the project's files and the user's regardless, so a `--user`
+/// install still has to look at the project's (issue #94 was exactly this
+/// — deriving one root from the install target meant a user-scope install
+/// checked the home directory twice and the project never).
+#[derive(Debug, Clone, Copy)]
+pub struct MergedRoots<'a> {
+    /// The directory the command was invoked in — NOT derived from where
+    /// an install writes: for a project install the scope's own "home" IS
+    /// the project root, so deriving either root from the target pointed
+    /// one of them at the wrong place depending on scope (#94).
+    pub project: Option<&'a Path>,
+    pub home: Option<&'a Path>,
+}
+
+/// The `PreToolUse` command relais itself would have recorded: a
+/// `{"type":"command","command":"…"}` hook whose command ends in
+/// ` hook` — the exact shape [`apply_hooks`] writes, read back rather than
+/// reconstructed, so this never drifts from what install actually does.
+/// `PreToolUse` is the only phase that can still refuse a tool call
+/// (`hook::decide`'s module doc), so it is the only one worth exercising.
+pub(crate) fn recorded_hook_command(settings_text: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(settings_text).ok()?;
+    let entries = value.pointer("/hooks/PreToolUse")?.as_array()?;
+    entries.iter().find_map(|entry| {
+        entry.get("hooks")?.as_array()?.iter().find_map(|hook| {
+            if hook.get("type")?.as_str()? != "command" {
+                return None;
+            }
+            let command = hook.get("command")?.as_str()?;
+            command
+                .trim_end()
+                .ends_with(" hook")
+                .then(|| command.to_string())
+        })
+    })
+}
+
+/// The `timeout` recorded on the same `PreToolUse` leaf
+/// [`recorded_hook_command`] finds — `Some(None)` when the leaf exists
+/// but carries no `timeout` field at all, which a settings file written
+/// before `timeout` existed leaves exactly that way.
+pub(crate) fn recorded_pretooluse_timeout_secs(settings_text: &str) -> Option<Option<u64>> {
+    let value: Value = serde_json::from_str(settings_text).ok()?;
+    let entries = value.pointer("/hooks/PreToolUse")?.as_array()?;
+    entries.iter().find_map(|entry| {
+        entry.get("hooks")?.as_array()?.iter().find_map(|hook| {
+            if hook.get("type")?.as_str()? != "command" {
+                return None;
+            }
+            let command = hook.get("command")?.as_str()?;
+            command
+                .trim_end()
+                .ends_with(" hook")
+                .then(|| hook.get("timeout").and_then(Value::as_u64))
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,6 +665,113 @@ mod tests {
 
     fn binary() -> &'static Path {
         Path::new("/opt/relais/bin/relais")
+    }
+
+    #[test]
+    fn recorded_hook_command_finds_a_pretooluse_relais_command_and_ignores_others() {
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/bin/lint"}]},
+                    {"matcher": "Agent|Task", "hooks": [
+                        {"type": "command", "command": "/opt/relais/bin/relais hook --probe --record /tmp/x"},
+                        {"type": "command", "command": "/opt/relais/bin/relais hook"}
+                    ]}
+                ]
+            }
+        })
+        .to_string();
+        assert_eq!(
+            recorded_hook_command(&settings),
+            Some("/opt/relais/bin/relais hook".to_string())
+        );
+    }
+
+    #[test]
+    fn recorded_hook_command_is_none_without_a_plain_hook_invocation() {
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"hooks": [{"type": "command", "command": "/opt/relais/bin/relais hook --probe --record /tmp/x"}]}
+                ]
+            }
+        })
+        .to_string();
+        assert_eq!(recorded_hook_command(&settings), None);
+        assert_eq!(recorded_hook_command("{}"), None);
+        assert_eq!(recorded_hook_command("not json"), None);
+    }
+
+    #[test]
+    fn recorded_pretooluse_timeout_secs_reads_the_same_leaf_recorded_hook_command_does() {
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Agent|Task", "hooks": [
+                        {"type": "command", "command": "/opt/relais/bin/relais hook", "timeout": 19}
+                    ]}
+                ]
+            }
+        })
+        .to_string();
+        assert_eq!(recorded_pretooluse_timeout_secs(&settings), Some(Some(19)));
+    }
+
+    /// An entry an older relais wrote, before `timeout` existed, carries
+    /// no such field at all: distinguished from "no relais command
+    /// recorded" (`None`) by `Some(None)`.
+    #[test]
+    fn recorded_pretooluse_timeout_secs_is_some_none_for_an_older_entry_with_no_field() {
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Agent|Task", "hooks": [
+                        {"type": "command", "command": "/opt/relais/bin/relais hook"}
+                    ]}
+                ]
+            }
+        })
+        .to_string();
+        assert_eq!(recorded_pretooluse_timeout_secs(&settings), Some(None));
+        assert_eq!(recorded_pretooluse_timeout_secs("{}"), None);
+    }
+
+    /// The three files the harness merges, in order, with the user scope
+    /// included only when a home directory is given — a project-scope
+    /// caller with no resolvable `$HOME` must not be refused over it.
+    #[test]
+    fn settings_candidates_lists_project_then_local_then_user_when_home_is_given() {
+        let repo = Path::new("/repo");
+        let home = Path::new("/home/dev");
+        let candidates = settings_candidates(MergedRoots {
+            project: Some(repo),
+            home: Some(home),
+        });
+        assert_eq!(
+            candidates,
+            vec![
+                (
+                    "project settings.json",
+                    repo.join(".claude").join("settings.json")
+                ),
+                (
+                    "project settings.local.json",
+                    repo.join(".claude").join("settings.local.json")
+                ),
+                (
+                    "user settings.json",
+                    home.join(".claude").join("settings.json")
+                ),
+            ]
+        );
+        assert_eq!(
+            settings_candidates(MergedRoots {
+                project: Some(repo),
+                home: None
+            })
+            .len(),
+            2
+        );
     }
 
     #[test]
