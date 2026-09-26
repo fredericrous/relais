@@ -595,6 +595,12 @@ impl Coordinator {
                         // the hook path never writes a ledger row (SPEC
                         // §23).
                         source: DispatchSource::ManagedRun,
+                        // Adopted from a ledger row a managed run wrote:
+                        // it self-reports its parent through
+                        // `parent_dispatch` directly, never through a
+                        // caller's agent id, so there is nothing to carry
+                        // here.
+                        caller_agent_id: None,
                     },
                     pid,
                     live.agent_id.as_deref(),
@@ -1931,6 +1937,7 @@ mod tests {
             resource: ResourceClass::ModelWork,
             reserve_micros: 0,
             source: DispatchSource::ManagedRun,
+            caller_agent_id: None,
         }
     }
 

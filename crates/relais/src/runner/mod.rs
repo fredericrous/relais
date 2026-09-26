@@ -685,6 +685,11 @@ impl<'a> RunEngine<'a> {
             resource: ResourceClass::ModelWork,
             reserve_micros,
             source: DispatchSource::ManagedRun,
+            // A managed dispatch self-reports its parent through
+            // `parent_dispatch` above; `caller_agent_id` exists only for
+            // the hook path, which has a caller's agent id and no
+            // dispatch id of its own to report.
+            caller_agent_id: None,
         };
         loop {
             match gate.admit(&request) {
@@ -5895,6 +5900,7 @@ mod tests {
                 resource: ResourceClass::ModelWork,
                 reserve_micros: 0,
                 source: DispatchSource::ManagedRun,
+                caller_agent_id: None,
             })
             .expect("admit"),
             Decision::Granted

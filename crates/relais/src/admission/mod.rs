@@ -168,6 +168,30 @@ pub struct DispatchRequest {
     /// than becoming unrepresentable.
     #[serde(default)]
     pub source: DispatchSource,
+    /// The CALLER's agent — the agent that made this spawn, not the one
+    /// it admits — for a hook-admitted request whose `PreToolUse` carried
+    /// one (`hook::event::AgentToolCall::caller_agent_id`, measured
+    /// present on a nested spawn as of Claude Code 2.1.283; see
+    /// `tests/fixtures/hooks/README.md`). `None` both for a request with
+    /// no caller to report (a top-level spawn, or any managed dispatch,
+    /// which reports its parent through `parent_dispatch` directly
+    /// instead) and is never set alongside an explicit `parent_dispatch`
+    /// — the coordinator resolves this into a `parent_dispatch` itself
+    /// (`AdmissionState::resolve_caller`) rather than trusting a caller to
+    /// resolve its own parentage, which is exactly the join that path
+    /// used to have no way to make.
+    ///
+    /// Additive and defaulted, not a `PROTOCOL_VERSION` bump, for the same
+    /// reason `source` above is: an older relais's request has no such
+    /// key at all and deserializes with `None`, and a newer request's
+    /// extra key is simply unread by a struct that predates this field —
+    /// neither `DispatchRequest` nor the `Request` wire enum that carries
+    /// it denies unknown fields on THIS struct (`Request` denies them on
+    /// its own variants' fields, not inside the ones it embeds). Both
+    /// directions of a mixed-version pair are exercised in
+    /// `a_mixed_version_pair_of_dispatch_requests_stays_wire_compatible`.
+    #[serde(default)]
+    pub caller_agent_id: Option<String>,
 }
 
 /// Where a dispatch's admission was asked from. The hook labels its own
@@ -684,9 +708,12 @@ pub fn enforcement_line(enforcement: Enforcement, snapshot: &StatusSnapshot) -> 
             "enforcement: {enforcement} — hook-admitted spawns are capped on agent count per \
              session and per run, the seat held from PostToolUse bind until SubagentStop or \
              its lease ({live} live, {admitted} admitted total, {} expired lease(s) not yet \
-             reaped); depth and spend are NOT enforced on that path (a hook payload joins no \
-             spawn to the dispatch it descends from, and the run it registers carries no \
-             budget)",
+             reaped); depth IS enforced through the existing depth check when a spawn's own \
+             PreToolUse names a caller (`agent_id`) this coordinator holds a binding for — a \
+             top-level spawn names no caller and enforces no depth beyond its self-report, and \
+             a caller with no binding (never bound, or its lease lapsed) resolves to no parent \
+             and is admitted rather than refused for it; spend is still NOT enforced on this \
+             path (the run it registers carries no budget)",
             snapshot.expired_hook_leases,
         ),
     }
@@ -870,6 +897,12 @@ struct Dispatch {
     binding: Binding,
     cancellation: Cancellation,
     agent_id: Option<String>,
+    /// The raw `DispatchRequest::caller_agent_id` this dispatch was
+    /// admitted with, kept even when it did not resolve to `parent`: a
+    /// dispatch with `parent: None` and this `Some` named a caller the
+    /// coordinator held no binding for, which is missing knowledge, not
+    /// the same fact as a dispatch that named no caller at all.
+    caller_agent_id: Option<String>,
     last_heartbeat: Instant,
     source: DispatchSource,
     attribution: Attribution,
@@ -1058,7 +1091,18 @@ impl AdmissionState {
     /// first call that finds the dispatch admitted returns `Granted`
     /// exactly once, whether it was admitted directly or drained from
     /// the queue; every later call returns `AlreadyAdmitted`.
+    ///
+    /// Resolves `request.caller_agent_id` into `parent_dispatch` before
+    /// anything else runs, so every hard limit below it — in particular
+    /// the depth check in [`Self::check_hard_limits`], which reads
+    /// `parent_dispatch` through [`Self::effective_depth`] — sees the
+    /// resolved parent rather than the self-report. No second depth
+    /// calculation exists anywhere else: resolving here and once is what
+    /// keeps `effective_depth` the only place depth is derived from a
+    /// parent.
     pub fn request(&mut self, request: &DispatchRequest, now: Instant) -> Decision {
+        let resolved = self.resolve_caller(request);
+        let request = &resolved;
         // Idempotency does not end at settlement (C8): a dispatch ID that
         // already ran is refused, not re-admitted. `AlreadyAdmitted` is
         // the answer while the entry lives; once it is gone, the entry
@@ -1226,6 +1270,48 @@ impl AdmissionState {
         None
     }
 
+    /// Turn `request.caller_agent_id` into `parent_dispatch`, so
+    /// [`Self::effective_depth`] and [`Self::admit`] — which both read
+    /// `parent_dispatch` and nothing else — need no separate awareness of
+    /// hook-admitted parentage at all.
+    ///
+    /// An explicit `parent_dispatch` is never overridden: only a request
+    /// that named no parent of its own (every hook-admitted request today)
+    /// is resolved this way, so a managed dispatch's self-reported
+    /// parentage is untouched. A `caller_agent_id` this coordinator holds
+    /// no binding for — an agent it never saw bound, or one whose lease
+    /// has lapsed and been reaped — resolves to no parent, exactly like a
+    /// request with no caller at all: [`Self::effective_depth`] then falls
+    /// back to `request.depth` (0, on the hook path) rather than a second
+    /// calculation inventing one, and nothing here refuses the request for
+    /// it. The clone still carries the original `caller_agent_id`, so
+    /// [`Self::admit`] can record on the `Dispatch` that a caller was
+    /// named even where it did not resolve — missing knowledge, not a
+    /// violation, and not the same fact as a spawn that named no caller.
+    fn resolve_caller(&self, request: &DispatchRequest) -> DispatchRequest {
+        let mut resolved = request.clone();
+        if resolved.parent_dispatch.is_some() {
+            return resolved;
+        }
+        let Some(agent) = request.caller_agent_id.as_deref() else {
+            return resolved;
+        };
+        resolved.parent_dispatch = self.dispatch_bound_to_agent(&request.session_id, agent);
+        resolved
+    }
+
+    /// The live dispatch this session's agent is bound to, if any — the
+    /// same `agent_id` [`Self::bind_agent_lease`] and [`Self::bind_checked`]
+    /// record on a `Dispatch` once its `PostToolUse`/adoption names it.
+    /// Scoped to the session because an `agent_id` is only ever compared
+    /// within the session that reported it.
+    fn dispatch_bound_to_agent(&self, session_id: &str, agent_id: &str) -> Option<String> {
+        self.dispatches.iter().find_map(|(id, dispatch)| {
+            (dispatch.session_id == session_id && dispatch.agent_id.as_deref() == Some(agent_id))
+                .then(|| id.clone())
+        })
+    }
+
     /// The depth to enforce. `request.depth` is a self-report; when the
     /// named parent is a dispatch this coordinator admitted, its recorded
     /// depth plus one is the fact, and a child claiming 0 under a deep
@@ -1330,6 +1416,7 @@ impl AdmissionState {
                 binding: Binding::Unbound { rounds: 0 },
                 cancellation: Cancellation::None,
                 agent_id: None,
+                caller_agent_id: request.caller_agent_id,
                 last_heartbeat: now,
                 source: request.source,
                 attribution,
@@ -2363,6 +2450,19 @@ impl AdmissionState {
             .map(|dispatch| dispatch.depth)
     }
 
+    /// The raw `caller_agent_id` a dispatch was admitted with, whether or
+    /// not it resolved to `parent` — `Some(None)` for a dispatch this
+    /// coordinator holds that named no caller at all, `Some(Some(agent))`
+    /// for one that did (resolved or not), `None` for a dispatch this
+    /// coordinator does not hold. Distinguishing an unresolved caller from
+    /// no caller at all is the whole reason this is kept apart from
+    /// [`Self::parentage`], which reports `Root` for both.
+    pub fn caller_agent_id_of(&self, dispatch_id: &str) -> Option<Option<&str>> {
+        self.dispatches
+            .get(dispatch_id)
+            .map(|dispatch| dispatch.caller_agent_id.as_deref())
+    }
+
     /// True when nothing is registered as active, waiting or queued AND
     /// every registered run has reached an end state — the coordinator's
     /// idle-exit condition.
@@ -2821,6 +2921,7 @@ mod tests {
             resource: ResourceClass::ModelWork,
             reserve_micros: 0,
             source: DispatchSource::ManagedRun,
+            caller_agent_id: None,
         }
     }
 
@@ -3196,6 +3297,209 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// The hook path's own version of parentage: a request naming a
+    /// `caller_agent_id` this coordinator has bound resolves to that
+    /// dispatch as `parent_dispatch`, and depth is derived from it exactly
+    /// as `effective_depth` derives any other resolved parent's — one
+    /// deeper than the caller, never the caller's own self-report of 0.
+    #[test]
+    fn a_nested_spawn_naming_a_bound_caller_gets_that_dispatch_as_parent_and_one_deeper() {
+        let mut state = state();
+        let t0 = Instant::now();
+        let caller = DispatchRequest {
+            source: DispatchSource::HookAdmitted,
+            ..req("caller-dispatch", "run-a", "tab-a")
+        };
+        assert!(granted(state.request(&caller, t0)));
+        assert_eq!(
+            state.bind_agent_lease("caller-dispatch", "caller-agent", Provenance::Known, t0),
+            BindOutcome::Bound
+        );
+
+        let nested = DispatchRequest {
+            source: DispatchSource::HookAdmitted,
+            caller_agent_id: Some("caller-agent".into()),
+            ..req("nested-dispatch", "run-a", "tab-a")
+        };
+        assert!(granted(state.request(&nested, t0)));
+
+        assert_eq!(
+            state.parentage("nested-dispatch"),
+            Some(Parentage::Known {
+                parent: "caller-dispatch".into()
+            })
+        );
+        assert_eq!(state.depth_of("nested-dispatch"), Some(1));
+    }
+
+    /// A spawn whose payload carries no `agent_id` at all — every
+    /// top-level spawn — names no caller and is never given a fabricated
+    /// one: it stays at depth 0 with no parent, indistinguishable from any
+    /// other root dispatch.
+    #[test]
+    fn a_top_level_spawn_with_no_caller_stays_at_depth_zero_with_no_parent() {
+        let mut state = state();
+        let t0 = Instant::now();
+        let top_level = DispatchRequest {
+            source: DispatchSource::HookAdmitted,
+            ..req("top-level", "run-a", "tab-a")
+        };
+        assert!(granted(state.request(&top_level, t0)));
+        assert_eq!(state.parentage("top-level"), Some(Parentage::Root));
+        assert_eq!(state.depth_of("top-level"), Some(0));
+        assert_eq!(state.caller_agent_id_of("top-level"), Some(None));
+    }
+
+    /// A `caller_agent_id` this coordinator holds no binding for — an
+    /// agent it never saw bound, or one whose lease already lapsed — is
+    /// missing knowledge, not a violation: it resolves to no parent
+    /// exactly like the top-level case, and the spawn is admitted rather
+    /// than refused for naming a caller nobody can vouch for.
+    #[test]
+    fn a_caller_with_no_binding_resolves_to_no_parent_and_is_not_refused() {
+        let mut state = state();
+        let t0 = Instant::now();
+        let orphaned = DispatchRequest {
+            source: DispatchSource::HookAdmitted,
+            caller_agent_id: Some("agent-nobody-bound".into()),
+            ..req("orphaned-caller", "run-a", "tab-a")
+        };
+        assert!(granted(state.request(&orphaned, t0)));
+        assert_eq!(state.parentage("orphaned-caller"), Some(Parentage::Root));
+        assert_eq!(state.depth_of("orphaned-caller"), Some(0));
+        // The raw claim is kept even though it did not resolve: an
+        // unresolvable caller and a spawn that named none at all are
+        // different facts, recorded as such rather than collapsed.
+        assert_eq!(
+            state.caller_agent_id_of("orphaned-caller"),
+            Some(Some("agent-nobody-bound"))
+        );
+    }
+
+    /// The other side of the same mechanism: a chain of resolved callers
+    /// deep enough to exceed `max_agent_depth` is refused with the
+    /// existing `DepthExceeded` refusal — the same check a managed
+    /// dispatch's explicit `parent_dispatch` already goes through, not a
+    /// second one invented for the hook path.
+    #[test]
+    fn a_spawn_exceeding_max_agent_depth_through_a_resolved_chain_is_refused() {
+        let mut state = state();
+        let t0 = Instant::now();
+        // `limits()` caps `max_agent_depth` at 2 and
+        // `max_active_agents_per_session` at 2, so each hop is released
+        // (seat back, record kept — `bind_agent_lease` and `depth_of` still
+        // read it) before the next is requested: the chain is about depth,
+        // not about the concurrency cap this test is not exercising.
+        let mut chain = vec!["chain-0".to_string()];
+        let mut caller_agent: Option<String> = None;
+        for depth in 0..3 {
+            let dispatch_id = chain.last().unwrap().clone();
+            let request = DispatchRequest {
+                source: DispatchSource::HookAdmitted,
+                caller_agent_id: caller_agent.clone(),
+                ..req(&dispatch_id, "run-a", "tab-a")
+            };
+            assert!(granted(state.request(&request, t0)), "hop {depth}");
+            assert_eq!(state.depth_of(&dispatch_id), Some(depth), "hop {depth}");
+            let agent_id = format!("agent-{depth}");
+            state.bind_agent_lease(&dispatch_id, &agent_id, Provenance::Known, t0);
+            state.release(&dispatch_id, t0);
+            caller_agent = Some(agent_id);
+            chain.push(format!("chain-{}", depth + 1));
+        }
+
+        let one_hop_too_deep = DispatchRequest {
+            source: DispatchSource::HookAdmitted,
+            caller_agent_id: caller_agent,
+            ..req(chain.last().unwrap(), "run-a", "tab-a")
+        };
+        assert!(matches!(
+            state.request(&one_hop_too_deep, t0),
+            Decision::Refused {
+                code: Refusal::DepthExceeded,
+                ..
+            }
+        ));
+    }
+
+    /// `caller_agent_id` is additive and `#[serde(default)]`, deliberately
+    /// not a `PROTOCOL_VERSION` bump: an older relais's `DispatchRequest`
+    /// has no such key, and `Request`/`DispatchRequest` deny unknown
+    /// fields only on the wire enum's OWN variant fields, never inside a
+    /// struct they merely embed (`Request`'s `deny_unknown_fields` covers
+    /// `RequestAdmission { request: DispatchRequest }`'s one field named
+    /// `request`, not `DispatchRequest`'s own fields). So both directions
+    /// of a mixed-version pair have to stay wire-compatible with no
+    /// version negotiation at all, and this is what proves it rather than
+    /// asserting the attribute is present.
+    #[test]
+    fn a_mixed_version_pair_of_dispatch_requests_stays_wire_compatible() {
+        // An older relais's request, serialized before this field existed:
+        // no `caller_agent_id` key on the wire at all. A newer daemon still
+        // parses it, with the field absent rather than a parse error.
+        let older_clients_json = serde_json::json!({
+            "dispatch_id": "d1",
+            "run_id": "r1",
+            "session_id": "s1",
+            "parent_dispatch": null,
+            "depth": 0,
+            "resource": "model_work",
+            "reserve_micros": 0,
+            "source": "hook_admitted",
+        });
+        let parsed_by_newer_daemon: DispatchRequest =
+            serde_json::from_value(older_clients_json).expect("an older request still parses");
+        assert_eq!(parsed_by_newer_daemon.caller_agent_id, None);
+
+        // A newer relais's request, carrying the field. An older daemon's
+        // `DispatchRequest` — modelled here as the pre-change shape, since
+        // two versions of the real type cannot both be compiled in at
+        // once — has no field to put it in, and parses anyway rather than
+        // refusing the whole request over one key it does not know.
+        let newer_clients_json = serde_json::json!({
+            "dispatch_id": "d2",
+            "run_id": "r1",
+            "session_id": "s1",
+            "parent_dispatch": null,
+            "depth": 0,
+            "resource": "model_work",
+            "reserve_micros": 0,
+            "source": "hook_admitted",
+            "caller_agent_id": "agent-01",
+        });
+        #[derive(Debug, Deserialize)]
+        struct OlderDaemonsDispatchRequest {
+            dispatch_id: String,
+            run_id: String,
+            session_id: String,
+            #[serde(default)]
+            parent_dispatch: Option<String>,
+            depth: u32,
+            resource: ResourceClass,
+            reserve_micros: i64,
+            #[serde(default)]
+            source: DispatchSource,
+            // No `caller_agent_id` field here at all — the pre-change
+            // shape — and no `deny_unknown_fields` either, matching
+            // `DispatchRequest`'s own attributes today.
+        }
+        let parsed_by_older_daemon: OlderDaemonsDispatchRequest =
+            serde_json::from_value(newer_clients_json)
+                .expect("a newer request's extra field is ignored, not refused");
+        // Every field is asserted, not just one: the claim is that the
+        // WHOLE pre-change shape still arrives intact beside the key the
+        // older daemon does not know, and a field left unread would be a
+        // field this test never actually checked.
+        assert_eq!(parsed_by_older_daemon.dispatch_id, "d2");
+        assert_eq!(parsed_by_older_daemon.run_id, "r1");
+        assert_eq!(parsed_by_older_daemon.session_id, "s1");
+        assert_eq!(parsed_by_older_daemon.parent_dispatch, None);
+        assert_eq!(parsed_by_older_daemon.depth, 0);
+        assert_eq!(parsed_by_older_daemon.resource, ResourceClass::ModelWork);
+        assert_eq!(parsed_by_older_daemon.reserve_micros, 0);
+        assert_eq!(parsed_by_older_daemon.source, DispatchSource::HookAdmitted);
     }
 
     // SPEC §23 acceptance: parents waiting for children cannot exhaust
@@ -3629,8 +3933,10 @@ mod tests {
 
     /// SPEC §23: `relais coordinator status`'s enforcement line has to
     /// name both halves — what a hook-admitted spawn IS capped on (agent
-    /// count) and what it is NOT (depth, spend) — derived from the
-    /// coordinator's own counts rather than a string nothing computes.
+    /// count, and now depth through a resolved caller) and what it is
+    /// still NOT (spend, and depth beyond a resolved caller) — derived
+    /// from the coordinator's own counts rather than a string nothing
+    /// computes.
     #[test]
     fn the_enforcement_line_names_what_hook_admitted_spawns_are_and_are_not_capped_on() {
         let mut state = state();
@@ -3654,8 +3960,47 @@ mod tests {
         );
         let lower = line.to_lowercase();
         assert!(
-            lower.contains("depth") && lower.contains("spend") && lower.contains("not enforced"),
-            "names what they are NOT capped on: {line}"
+            lower.contains("depth") && lower.contains("is enforced"),
+            "must no longer claim depth is universally unenforced on the hook path: {line}"
+        );
+        assert!(
+            lower.contains("spend") && lower.contains("not enforced"),
+            "spend is still not enforced on this path: {line}"
+        );
+    }
+
+    /// The line still has to stay honest about what a resolved caller does
+    /// NOT cover: a top-level spawn (this one) names no caller at all, so
+    /// it enforces no depth beyond its own self-report — the sentence
+    /// names that gap by name rather than letting "depth is enforced"
+    /// alone imply every hook-admitted spawn now carries one.
+    #[test]
+    fn the_enforcement_line_still_names_the_cases_a_resolved_caller_does_not_cover() {
+        let mut state = state();
+        let t0 = Instant::now();
+        let request = DispatchRequest {
+            source: DispatchSource::HookAdmitted,
+            ..req("hook-top-level", "run-a", "tab-a")
+        };
+        assert!(granted(state.request(&request, t0)));
+        let snapshot = state.status(t0);
+        let line = enforcement_line(Enforcement::Coordinator, &snapshot);
+        let lower = line.to_lowercase();
+        assert!(
+            lower.contains("no caller") || lower.contains("top-level"),
+            "names the top-level case a resolved caller does not cover: {line}"
+        );
+        assert!(
+            lower.contains("no binding") || lower.contains("lapsed"),
+            "names the unresolvable-caller case too: {line}"
+        );
+        // Resolving a caller buys DEPTH and nothing else. The run a hook
+        // registers still carries no budget, so a line that stopped
+        // saying so would be claiming an enforcement this change did not
+        // add — the failure mode this whole sentence exists against.
+        assert!(
+            lower.contains("spend is still not enforced"),
+            "must keep saying spend is unenforced on the hook path: {line}"
         );
     }
 
