@@ -996,6 +996,7 @@ mod tests {
             exclusions: vec![],
             fingerprint: "f".into(),
             built_at: "now".into(),
+            route_coverage: Default::default(),
         }
     }
 
@@ -1031,6 +1032,7 @@ mod tests {
             exclusions: vec![],
             fingerprint: "f".into(),
             built_at: "now".into(),
+            route_coverage: Default::default(),
         };
         let outcome = train_and_evaluate(&dataset, &settings(0.75, 5)).expect("trains");
         assert!(
@@ -1070,6 +1072,7 @@ mod tests {
             exclusions: vec![],
             fingerprint: "f".into(),
             built_at: "now".into(),
+            route_coverage: Default::default(),
         };
         let outcome = train_and_evaluate(&dataset, &settings(0.75, 5)).expect("trains");
         let report = &outcome.report;
@@ -1099,6 +1102,7 @@ mod tests {
             exclusions: vec![],
             fingerprint: "f".into(),
             built_at: "now".into(),
+            route_coverage: Default::default(),
         };
         assert!(matches!(
             train_and_evaluate(&dataset, &settings(0.75, 5)),
@@ -1289,6 +1293,7 @@ mod tests {
             exclusions: vec![],
             fingerprint: "f".into(),
             built_at: "now".into(),
+            route_coverage: Default::default(),
         };
         let outcome = train_and_evaluate(&dataset, &settings(0.5, 5)).expect("trains");
         assert_eq!(
@@ -1342,6 +1347,7 @@ mod tests {
             exclusions: vec![],
             fingerprint: "fingerprint-1".into(),
             built_at: "now".into(),
+            route_coverage: Default::default(),
         };
         let error = train_and_evaluate(&dataset, &settings(0.75, 5)).expect_err("refuses");
         assert!(

@@ -188,6 +188,8 @@ Eligibility, risk floors and acceptance are deterministic. Within the eligible p
 4. Route mandatory high-risk work directly to its policy floor. For remaining tasks, extract pre-dispatch task features and select among eligible profiles using a validated Relais-trained model. When trained evidence is absent or insufficient, use the configured conservative baseline and collect outcomes for training.
 5. Emit the selected profile, rule IDs, reasons, verification requirements and maximum permitted attempts.
 
+Which of these four steps actually decided (`RoutedBy`: `DeterministicRecipe`, `RiskFloor`, `LearnedArtifact` or `ConservativeBaseline`) is recorded on the dispatch itself (see §12), so a later reader can tell a route the learner actually chose from one the router only abstained to. A dispatch recorded before ledger migration v13 carries no such record at all — read back as absent, never as `ConservativeBaseline`, which is a positive claim about a decision that was never captured.
+
 Complexity and consequences are separate: a one-line authorization change may be simple and high-consequence. File count alone never determines risk. A non-sensitive task with uncertain entry points may need a bounded research phase, whose cost counts against the same run.
 
 Example explanation:
@@ -301,6 +303,8 @@ Artifacts include context manifest, worker results, candidate patch, check logs 
 
 Persist dispatch intent before spawning a process, then its PID/session identifier. On restart reconcile liveness, terminal output and artifacts before scheduling another attempt. Never assume an absent terminal result means nothing executed. Mark uncertain state `interrupted`, preserve changes, and avoid retrying commands with unknown side effects.
 
+Dispatch intent also records which of the router's four strategies actually decided the route (`routed_by`, §6), a nullable column added by ledger migration v13. A dispatch recorded before v13 reads that column back as absent, not as the conservative baseline — "nobody recorded how this was routed" and "the router ran and abstained to the baseline" are different facts, and only one of them was ever true of a pre-v13 row. A stored value this binary does not recognise is a corrupt row, reported as one, never silently read as the baseline either.
+
 A receipt includes run ID, candidate identity, contract/policy hashes, outcome, verification evidence, actual models, attempt count and cost completeness. A returned worker JSON document cannot impersonate a runner receipt.
 
 ## 13. Implementation outline
@@ -379,6 +383,8 @@ The labelling rule is versioned, and every dataset and artifact records which ve
 For every dispatch record pre-dispatch features, eligible profiles, selected profile, actual selection probability, versions, timestamps, verification results, human corrections where supplied, usage completeness and costs. Keep attempt-level outcomes distinct from complete-strategy outcomes: a cheap worker rescued by a stronger worker did not succeed without escalation, while the complete strategy may still have delivered an accepted result.
 
 Labels are evidence-backed: verified acceptance, rejected candidate, blocked environment, interruption, escalation, user correction or confirmed regression. Infrastructure failures and unknown results are not silently converted into reasoning failures. Absence of later feedback is not proof of defect-free output. Maintain observation windows for delayed outcomes and identify still-pending labels.
+
+A record whose dispatch carries no recorded route (§6, §12 — a pre-v13 dispatch, or one whose routing was otherwise never captured) still trains the acceptance model, but is excluded from any per-route breakdown of the dataset: folding it into a route it was never observed taking would misattribute it. That exclusion is counted and reasoned about, not silently dropped.
 
 Primary optimization is expected complete-strategy cost subject to the configured quality requirement. The acceptance predictor is a measured proxy; independent verification is still mandatory. Track immediate acceptance and later confirmed quality separately.
 

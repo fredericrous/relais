@@ -41,7 +41,7 @@ use crate::policy::{
     RepoPolicy, Tier, VerificationProfile,
 };
 use crate::procs::Ended;
-use crate::route::{route, Route, RouteInputs, RoutePredictor, Routed};
+use crate::route::{route, Route, RouteInputs, RoutePredictor, Routed, RoutedBy};
 use crate::verify::{self, amont_gaps, Receipt, VerificationReport};
 use crate::workspace::{self, TaskWorktree, WorkspaceError};
 
@@ -1755,6 +1755,7 @@ impl<'a> RunEngine<'a> {
                 "prompt_bytes": prompt.len(),
             }),
             0,
+            ctx.preflight.decision.routed_by,
         )?;
         ledger.record_features(
             &dispatch_id,
@@ -2371,6 +2372,7 @@ impl<'a> RunEngine<'a> {
                     verification_inputs_changed: &verified.verification_inputs_changed,
                     patch_path: candidate.latest_patch.clone(),
                     deadline: ctx.deadline,
+                    routed_by: preflight.decision.routed_by,
                 },
                 &mut progress.spend,
             );
@@ -3307,6 +3309,7 @@ impl<'a> RunEngine<'a> {
                 "kind": "review",
             }),
             remaining_budget.unwrap_or(0),
+            request.routed_by,
         );
         if let Err(e) = recorded {
             return Err(ReviewOutcome::Unavailable(format!(
@@ -3420,6 +3423,11 @@ pub(crate) struct ReviewRequest<'r> {
     /// decomposed path never writes (R4).
     pub(crate) patch_path: PathBuf,
     pub(crate) deadline: Instant,
+    /// How the candidate's own dispatch was routed (SPEC §6) — the
+    /// review is accounted to the same run, so it carries the same
+    /// routing fact rather than a value the reviewer's own dispatch
+    /// never actually decided.
+    pub(crate) routed_by: RoutedBy,
 }
 
 /// The verdict, read from the LAST non-empty line of a reviewer's

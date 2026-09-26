@@ -21,8 +21,9 @@ use crate::lifecycle::{Reason, State, UsagePhase};
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::outcome::{Outcome, OutcomeDetail, OutcomeKind};
 use crate::policy::Tier;
+use crate::route::RoutedBy;
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 12;
+pub const LEDGER_SCHEMA_VERSION: u64 = 13;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -95,6 +96,17 @@ fn parse_tier(stored: &str) -> Result<Tier> {
     Tier::parse(stored).ok_or_else(|| LedgerError::Corrupt {
         what: "attempt tier".into(),
         detail: format!("`{stored}` is not a tier this relais knows"),
+    })
+}
+
+/// A `routed_by` string as a dispatch row stored it. An unparseable value
+/// is a corrupt row, never silently read as `ConservativeBaseline` — that
+/// would assert a decision was actually made when the string just names
+/// nothing this relais knows.
+fn parse_routed_by(stored: &str) -> Result<RoutedBy> {
+    RoutedBy::parse(stored).ok_or_else(|| LedgerError::Corrupt {
+        what: "dispatch routed_by".into(),
+        detail: format!("`{stored}` is not a routing decision this relais knows"),
     })
 }
 
@@ -781,6 +793,20 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ALTER TABLE dispatches ADD COLUMN agent_id TEXT;
     ALTER TABLE dispatches ADD COLUMN parent_dispatch TEXT;
     ALTER TABLE dispatches ADD COLUMN depth INTEGER;
+    "#,
+    ),
+    (
+        // The router decides among a deterministic recipe, a risk floor,
+        // a learned artifact or the conservative baseline (SPEC §6), but
+        // nothing recorded which one a dispatch actually got — a dataset
+        // could not tell a route the learner chose from one it never got
+        // the evidence to choose. Nullable, so a row from before this
+        // step reads back `None`: "nobody recorded how this was routed",
+        // never coerced into `ConservativeBaseline`, which is a positive
+        // claim about a decision that was never captured.
+        "v13",
+        r#"
+    ALTER TABLE dispatches ADD COLUMN routed_by TEXT;
     "#,
     ),
 ];
@@ -2329,14 +2355,15 @@ impl Ledger {
         attempt_id: Option<i64>,
         intent: &serde_json::Value,
         reserved_micros: i64,
+        routed_by: RoutedBy,
     ) -> Result<bool> {
         let now = self.now();
         let inserted = self.conn.execute(
             "INSERT OR IGNORE INTO dispatches
                 (dispatch_id, run_id, attempt_id, intent_json, state,
                  reserved_micros, created_at, updated_at,
-                 source, agent_id, parent_dispatch, depth)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, NULL, NULL, ?9)",
+                 source, agent_id, parent_dispatch, depth, routed_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, NULL, NULL, ?9, ?10)",
             params![
                 dispatch_id.as_str(),
                 run_id.as_str(),
@@ -2347,6 +2374,7 @@ impl Ledger {
                 now,
                 "managed_run",
                 0i64,
+                routed_by.as_str(),
             ],
         )?;
         Ok(inserted == 1)
@@ -2745,6 +2773,33 @@ impl Ledger {
             })
         })
         .transpose()
+    }
+
+    /// How a run's first dispatch was routed (SPEC §6), as recorded at
+    /// dispatch time. `None` is a dispatch that predates migration v13 —
+    /// no routing decision was ever captured for it — not the same fact
+    /// as [`RoutedBy::ConservativeBaseline`], which says the router ran
+    /// and abstained to the baseline.
+    pub fn first_dispatch_routed_by(&self, run_id: &RunId) -> Result<Option<RoutedBy>> {
+        // `routed_by` is nullable, so the column read itself is
+        // `Option<String>`; wrapping that in `.optional()` (for "no
+        // dispatch row at all") gives `Option<Option<String>>` — no
+        // dispatch and a dispatch with `routed_by` NULL collapse into
+        // the same `None` via `.flatten()`, which is the right answer:
+        // both mean "no routing decision to read".
+        let stored: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT routed_by FROM dispatches WHERE run_id = ?1
+                 ORDER BY created_at, dispatch_id LIMIT 1",
+                [run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        stored
+            .flatten()
+            .map(|stored| parse_routed_by(&stored))
+            .transpose()
     }
 
     /// What a learned artifact estimated for a run at routing time, so a
@@ -4536,6 +4591,7 @@ mod tests {
                 Some(attempt),
                 &serde_json::json!({}),
                 0,
+                RoutedBy::ConservativeBaseline,
             )
             .expect("intent");
         assert_eq!(
@@ -4574,6 +4630,7 @@ mod tests {
                 Some(first),
                 &serde_json::json!({}),
                 0,
+                RoutedBy::ConservativeBaseline,
             )
             .expect("first intent");
         // Keyed by the DISPATCH id, which is what every producer does —
@@ -4600,6 +4657,7 @@ mod tests {
                 Some(second),
                 &serde_json::json!({}),
                 0,
+                RoutedBy::ConservativeBaseline,
             )
             .expect("second intent");
         assert_eq!(
@@ -4627,11 +4685,25 @@ mod tests {
             .expect("run");
         let intent = serde_json::json!({"model": "sonnet", "effort": "medium"});
         assert!(ledger
-            .record_dispatch_intent(&dispatch("disp-1"), &run("run-d"), None, &intent, 0)
+            .record_dispatch_intent(
+                &dispatch("disp-1"),
+                &run("run-d"),
+                None,
+                &intent,
+                0,
+                RoutedBy::ConservativeBaseline
+            )
             .expect("intent"));
         assert!(
             !ledger
-                .record_dispatch_intent(&dispatch("disp-1"), &run("run-d"), None, &intent, 0)
+                .record_dispatch_intent(
+                    &dispatch("disp-1"),
+                    &run("run-d"),
+                    None,
+                    &intent,
+                    0,
+                    RoutedBy::ConservativeBaseline
+                )
                 .expect("retry"),
             "same dispatch ID cannot create a duplicate"
         );
@@ -4701,6 +4773,124 @@ mod tests {
             }],
             "session and reservation were already columns and read back; \
              source, parent and depth did not exist yet and read back absent"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A row a pre-v13 binary wrote: `routed_by` was never a column it
+    // could have filled in, so it reads back NULL forever — `None`, the
+    // fact "nobody recorded how this was routed", never coerced into
+    // `Some(RoutedBy::ConservativeBaseline)`, which would claim the
+    // router ran and abstained when no such decision was ever captured.
+    #[test]
+    fn a_pre_migration_row_reports_its_routed_by_as_unrecorded() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-legacy"), "/repo", None, &task("run-legacy"), "rk")
+            .expect("run");
+        ledger
+            .conn
+            .execute(
+                "INSERT INTO dispatches
+                    (dispatch_id, run_id, intent_json, state,
+                     reserved_micros, created_at, updated_at)
+                 VALUES ('legacy-1', 'run-legacy', '{}', 'intent', 0, 'now', 'now')",
+                [],
+            )
+            .expect("legacy row");
+        assert_eq!(
+            ledger
+                .first_dispatch_routed_by(&run("run-legacy"))
+                .expect("routed_by"),
+            None,
+            "a pre-v13 row never wrote routed_by; it reads back absent, not baseline"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unparseable_routed_by_is_a_corrupt_row_not_a_default() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-bad"), "/repo", None, &task("run-bad"), "rk")
+            .expect("run");
+        ledger
+            .conn
+            .execute(
+                "INSERT INTO dispatches
+                    (dispatch_id, run_id, intent_json, state,
+                     reserved_micros, created_at, updated_at, routed_by)
+                 VALUES ('bad-1', 'run-bad', '{}', 'intent', 0, 'now', 'now', 'not_a_route')",
+                [],
+            )
+            .expect("bad row");
+        let err = ledger
+            .first_dispatch_routed_by(&run("run-bad"))
+            .expect_err("unparseable routed_by must not read as a default");
+        assert!(matches!(err, LedgerError::Corrupt { .. }), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A ledger frozen at exactly v12 upgrades to v13 without losing any
+    /// existing row, and the new column is readable on it.
+    #[test]
+    fn v13_adds_routed_by_without_touching_existing_rows() {
+        let dir = temp_dir("v12-to-v13");
+        let path = dir.join("ledger.sqlite");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );",
+            )
+            .expect("migrations table");
+            // Pinned to v12, not `MIGRATIONS.len() - 1`: a step appended
+            // after this test is written must not silently change what
+            // "at v12" means here.
+            for (version, sql) in &MIGRATIONS[..12] {
+                conn.execute_batch(sql).expect("apply step");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, "then"],
+                )
+                .expect("record step");
+            }
+            conn.execute(
+                "INSERT INTO runs (id, repo_path, status, created_at, updated_at)
+                 VALUES ('run-old', '/repo', 'accepted', 'now', 'now')",
+                [],
+            )
+            .expect("a run written before v13");
+            conn.execute(
+                "INSERT INTO dispatches
+                    (dispatch_id, run_id, intent_json, state,
+                     reserved_micros, created_at, updated_at)
+                 VALUES ('pre-v13', 'run-old', '{}', 'intent', 0, 'now', 'now')",
+                [],
+            )
+            .expect("pre-v13 row");
+        }
+        let ledger = Ledger::open(&path).expect("upgrade to current schema");
+        assert_eq!(
+            ledger.schema_version().expect("version"),
+            LEDGER_SCHEMA_VERSION
+        );
+        assert_eq!(
+            ledger
+                .first_dispatch_routed_by(&run("run-old"))
+                .expect("routed_by"),
+            None,
+            "the upgrade adds the column; it does not retroactively fill it in"
+        );
+        assert_eq!(
+            ledger
+                .first_dispatch_intent(&run("run-old"))
+                .expect("intent")
+                .expect("row survives the upgrade"),
+            serde_json::json!({}),
+            "the pre-existing row is preserved, not dropped or rewritten"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

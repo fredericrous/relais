@@ -1891,6 +1891,7 @@ mod tests {
                 Some(attempt),
                 &serde_json::json!({}),
                 0,
+                crate::route::RoutedBy::ConservativeBaseline,
             )
             .expect("dispatch intent");
         // The session ends mid-dispatch: no usage event ever arrives.
@@ -1947,7 +1948,14 @@ mod tests {
             .expect("attempt");
         let worker = crate::ids::DispatchId::from_stored("disp-worker");
         ledger
-            .record_dispatch_intent(&worker, &run, Some(attempt), &serde_json::json!({}), 0)
+            .record_dispatch_intent(
+                &worker,
+                &run,
+                Some(attempt),
+                &serde_json::json!({}),
+                0,
+                crate::route::RoutedBy::ConservativeBaseline,
+            )
             .expect("worker dispatch");
         ledger
             .record_usage(&crate::ledger::UsageEvent {
@@ -1981,6 +1989,7 @@ mod tests {
                 None,
                 &serde_json::json!({"kind": "review"}),
                 0,
+                crate::route::RoutedBy::ConservativeBaseline,
             )
             .expect("reviewer dispatch");
 

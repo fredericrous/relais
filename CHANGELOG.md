@@ -10,6 +10,20 @@ missing here.
 
 ### Added
 
+- **A dispatch now records which routing strategy actually decided its
+  route.** `RoutedBy` (`DeterministicRecipe`, `RiskFloor`,
+  `LearnedArtifact` or `ConservativeBaseline`) gains a stable string form
+  and `Serialize`/`Deserialize`, and `record_dispatch_intent` stores it
+  against every dispatch. Ledger migration **v13** adds a nullable
+  `dispatches.routed_by` column — additive, like every migration before
+  it: no existing row is rewritten. A dispatch recorded before v13 reads
+  the column back as absent, never as `ConservativeBaseline` — "nobody
+  recorded how this was routed" and "the router ran and abstained to the
+  baseline" are different facts, and a pre-v13 row only ever carries the
+  first one. `learn::dataset` now reports a per-route breakdown of its
+  records, excluding — and counting, with a reason — any record whose
+  dispatch has no recorded route.
+
 - **The learner is now keyed on the recipe that produced a run, not just
   its model profile.** `ProfileIdentity` becomes `RecipeIdentity` and
   gains `recipe_id`: the identity of the deterministic recipe that

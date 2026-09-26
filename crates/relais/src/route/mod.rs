@@ -12,6 +12,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::contract::scope::{scope_contained_in, write_scope_could_touch};
 use crate::contract::{Kind, Review, TaskContract};
 use crate::money::MicroUsd;
@@ -151,7 +153,8 @@ impl Blocked {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RoutedBy {
     /// Explicitly configured deterministic recipe covered the task.
     DeterministicRecipe,
@@ -161,6 +164,50 @@ pub enum RoutedBy {
     LearnedArtifact,
     /// Conservative baseline; trained evidence absent or insufficient.
     ConservativeBaseline,
+}
+
+impl RoutedBy {
+    /// Every variant, for a caller that has to enumerate them — the
+    /// round-trip test, and anything rendering a legend.
+    ///
+    /// The length is fixed, matching `Reason::ALL`, `State::ALL` and
+    /// `UsagePhase::ALL`: a variant added to the enum and not added here
+    /// fails to compile rather than quietly leaving the round-trip test
+    /// walking a short list and reporting success over a variant it never
+    /// saw. A `&[RoutedBy]` slice would have accepted the short list.
+    pub const ALL: [Self; 4] = [
+        RoutedBy::DeterministicRecipe,
+        RoutedBy::RiskFloor,
+        RoutedBy::LearnedArtifact,
+        RoutedBy::ConservativeBaseline,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DeterministicRecipe => "deterministic_recipe",
+            Self::RiskFloor => "risk_floor",
+            Self::LearnedArtifact => "learned_artifact",
+            Self::ConservativeBaseline => "conservative_baseline",
+        }
+    }
+
+    /// The inverse of [`RoutedBy::as_str`], for a value read back from the
+    /// ledger. `None` is a name this relais does not know.
+    pub fn parse(stored: &str) -> Option<Self> {
+        Some(match stored {
+            "deterministic_recipe" => Self::DeterministicRecipe,
+            "risk_floor" => Self::RiskFloor,
+            "learned_artifact" => Self::LearnedArtifact,
+            "conservative_baseline" => Self::ConservativeBaseline,
+            _ => return None,
+        })
+    }
+}
+
+impl std::fmt::Display for RoutedBy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
 }
 
 /// The risk floor from declared scope and repository rules: the highest
@@ -622,6 +669,24 @@ mod tests {
         effective_authority, CommandSpec, ConcurrencyLimits, Dependency, DependencyMode,
         ExecutionPolicy, ModelProfile, RiskRule, VerificationPolicy, VerificationProfile,
     };
+
+    #[test]
+    fn routed_by_round_trips_through_its_string_form() {
+        for variant in RoutedBy::ALL {
+            let stored = variant.as_str();
+            assert_eq!(
+                RoutedBy::parse(stored),
+                Some(variant),
+                "{variant:?} must parse back from its own as_str()"
+            );
+            let json = serde_json::to_string(&variant).expect("serializes");
+            assert_eq!(
+                serde_json::from_str::<RoutedBy>(&json).expect("deserializes"),
+                variant,
+                "{variant:?} must round-trip through serde"
+            );
+        }
+    }
 
     fn repo_policy() -> RepoPolicy {
         RepoPolicy {
