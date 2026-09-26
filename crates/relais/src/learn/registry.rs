@@ -23,12 +23,16 @@ use super::learner::{CostModel, LogisticModel, SolverSettings};
 /// dataset was built under (`crate::learn::dataset::LABEL_POLICY_VERSION`)
 /// — without it, an artifact trained under an earlier labelling rule
 /// (one that let a reverted change keep its positive label, say) would
-/// read as silently comparable to one trained under this one. None of
-/// these fields can be defaulted into an older artifact, so older
-/// artifacts are refused by version rather than silently reinterpreted.
-/// Retrain to get a version-4 artifact; the previous one stays promotable
-/// only by the relais that wrote it.
-pub const ARTIFACT_SCHEMA_VERSION: u32 = 4;
+/// read as silently comparable to one trained under this one. Version 5
+/// keys `observed_identities` on `RecipeIdentity` (formerly
+/// `ProfileIdentity`): the identity now carries the `recipe_id` of the
+/// deterministic recipe that produced a run, alongside its model/effort/
+/// harness, so a model swap AND a recipe revision bump both start with no
+/// inherited evidence. None of these fields can be defaulted into an
+/// older artifact, so older artifacts are refused by version rather than
+/// silently reinterpreted. Retrain to get a version-5 artifact; the
+/// previous one stays promotable only by the relais that wrote it.
+pub const ARTIFACT_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -43,7 +47,7 @@ pub struct Artifact {
     /// abstains for a tier whose CURRENT identity is not in this set:
     /// evidence belongs to the profile that produced it, and a model swap
     /// starts with none.
-    pub observed_identities: Vec<(crate::policy::Tier, Vec<super::features::ProfileIdentity>)>,
+    pub observed_identities: Vec<(crate::policy::Tier, Vec<super::features::RecipeIdentity>)>,
     pub cohorts: Vec<String>,
     /// The [`crate::learn::dataset::LABEL_POLICY_VERSION`] the training
     /// dataset was built under — carried onto the artifact so a dataset
@@ -479,7 +483,7 @@ mod tests {
     use crate::learn::evaluate::{
         Calibration, Coefficients, EvalReport, PromotionGates, EVAL_SCHEMA_VERSION,
     };
-    use crate::learn::features::{feature_dim, FeatureSchema, ProfileIdentity, Standardization};
+    use crate::learn::features::{feature_dim, FeatureSchema, RecipeIdentity, Standardization};
     use crate::learn::learner::FitReport;
     use crate::policy::Tier;
 
@@ -510,10 +514,11 @@ mod tests {
             tiers_supported: vec![Tier::Implementation],
             observed_identities: vec![(
                 Tier::Implementation,
-                vec![ProfileIdentity {
+                vec![RecipeIdentity {
                     model: "sonnet".into(),
                     effort: None,
                     harness: None,
+                    recipe_id: None,
                 }],
             )],
             cohorts: vec!["change".into()],
@@ -542,6 +547,37 @@ mod tests {
         let artifact = artifact("art-1", None);
         let parsed = Artifact::from_json(&artifact.to_json()).expect("round trip");
         assert_eq!(parsed, artifact);
+    }
+
+    /// A stored artifact written at an older schema version is refused, not
+    /// read as if it were current: there is no learned artifact on this
+    /// machine that predates the bump, so this pins the refusal directly
+    /// rather than relying on one turning up.
+    #[test]
+    fn a_stored_artifact_at_the_previous_schema_version_is_refused() {
+        let mut previous_version = artifact("art-old-version", None);
+        previous_version.schema_version = ARTIFACT_SCHEMA_VERSION - 1;
+        let text = serde_json::to_string(&previous_version).expect("serializes");
+        let error = Artifact::from_json(&text).expect_err("an older schema version is refused");
+        assert!(
+            matches!(
+                error,
+                ArtifactError::IncompatibleSchema {
+                    found,
+                    expected,
+                } if found == ARTIFACT_SCHEMA_VERSION - 1 && expected == ARTIFACT_SCHEMA_VERSION
+            ),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&(ARTIFACT_SCHEMA_VERSION - 1).to_string())
+                && error
+                    .to_string()
+                    .contains(&ARTIFACT_SCHEMA_VERSION.to_string()),
+            "the refusal names both the version found and the version expected: {error}"
+        );
     }
 
     #[test]

@@ -16,7 +16,8 @@ use crate::contract::scope::{scope_contained_in, write_scope_could_touch};
 use crate::contract::{Kind, Review, TaskContract};
 use crate::money::MicroUsd;
 use crate::policy::{
-    BlockCode, Blocker, EffectiveAuthority, MachineSettings, ModelProfile, RepoPolicy, Tier,
+    BlockCode, Blocker, EffectiveAuthority, MachineSettings, ModelProfile, RecipeSpec, RepoPolicy,
+    Tier,
 };
 
 /// Estimates from an owned, Relais-trained artifact (SPEC §16). The
@@ -310,6 +311,37 @@ pub fn eligible_tiers(
     }
 }
 
+/// The `RecipeSpec` that would win among the eligible tiers for this
+/// contract — highest enabled revision, config order breaking ties — the
+/// same rule `route` uses to decide whether a recipe wins over the
+/// learner (SPEC §6, step 3). The one place that rule is stated; `route`
+/// and [`covering_recipe_id`] both call it rather than restating it.
+fn covering_recipe_spec<'a>(
+    contract: &TaskContract,
+    repo: &'a RepoPolicy,
+    eligible: &[Tier],
+) -> Option<&'a RecipeSpec> {
+    crate::policy::select_highest_enabled_revision(&repo.recipes, |spec| {
+        let recipe = Recipe::from(spec);
+        eligible.contains(&recipe.tier) && recipe_covers(contract, &recipe)
+    })
+}
+
+/// The [`RecipeSpec::recipe_id`] of the recipe that produced this task's
+/// route, or `None` when no configured recipe covers it. Pure: no clock,
+/// no environment, no filesystem — only the recipes policy declares and
+/// the contract's own kind and scope, read in the fixed order `repo.recipes`
+/// stores them. Used to key learned evidence on the recipe that actually
+/// produced a run (SPEC §17), not only the model/effort/harness beneath it:
+/// two revisions of one recipe can behave differently on the same profile.
+pub fn covering_recipe_id(
+    contract: &TaskContract,
+    repo: &RepoPolicy,
+    eligible: &[Tier],
+) -> Option<String> {
+    covering_recipe_spec(contract, repo, eligible).map(RecipeSpec::recipe_id)
+}
+
 fn recipe_covers(contract: &TaskContract, recipe: &Recipe) -> bool {
     if let Some(kind) = recipe.kind {
         if contract.kind() != kind {
@@ -418,11 +450,7 @@ pub fn route(inputs: RouteInputs<'_>) -> Routed {
     // paid for repeatedly. This is the only caller, so the rule's own
     // unit tests now cover production rather than a parallel copy.
     let mut estimates_seen: Option<Estimates> = None;
-    let covering = crate::policy::select_highest_enabled_revision(&repo.recipes, |spec| {
-        let recipe = Recipe::from(spec);
-        eligible.contains(&recipe.tier) && recipe_covers(contract, &recipe)
-    })
-    .map(Recipe::from);
+    let covering = covering_recipe_spec(contract, repo, &eligible).map(Recipe::from);
     let selected: (Tier, RoutedBy) = if let Some(recipe) = &covering {
         reasons.push(RouteReason::new(
             "deterministic_recipe",
@@ -1303,6 +1331,45 @@ mod tests {
             d.routed_by,
             RoutedBy::ConservativeBaseline,
             "the only recipe is disabled, so nothing routes by recipe"
+        );
+    }
+
+    /// The recipe identity a run gets keyed on: a pure function of the
+    /// contract and policy, agreeing with `route`'s own choice of recipe —
+    /// two revisions of one recipe are two different ids, and a
+    /// byte-identical recipe (whatever it is named) is the same id.
+    #[test]
+    fn covering_recipe_id_differs_by_revision_and_matches_when_byte_identical() {
+        let docs = change_contract(&["docs/guide.md"]);
+        let eligible = [Tier::Implementation];
+
+        let mut repo_rev0 = repo_policy();
+        repo_rev0.recipes.push(docs_recipe(0, true));
+        let id_rev0 = covering_recipe_id(&docs, &repo_rev0, &eligible);
+        assert!(id_rev0.is_some());
+
+        let mut repo_rev1 = repo_policy();
+        repo_rev1.recipes.push(docs_recipe(1, true));
+        let id_rev1 = covering_recipe_id(&docs, &repo_rev1, &eligible);
+        assert_ne!(
+            id_rev0, id_rev1,
+            "two runs differing only in the recipe revision that produced them are different \
+             identities"
+        );
+
+        let mut repo_rev0_again = repo_policy();
+        repo_rev0_again.recipes.push(docs_recipe(0, true));
+        let id_rev0_again = covering_recipe_id(&docs, &repo_rev0_again, &eligible);
+        assert_eq!(
+            id_rev0, id_rev0_again,
+            "two runs under a byte-identical recipe are the same identity"
+        );
+
+        let no_recipe = repo_policy();
+        assert_eq!(
+            covering_recipe_id(&docs, &no_recipe, &eligible),
+            None,
+            "no configured recipe covers this task"
         );
     }
 

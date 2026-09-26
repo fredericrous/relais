@@ -14,7 +14,15 @@ use crate::contract::{Kind, TaskContract};
 use crate::money::MicroUsd;
 use crate::policy::{RepoPolicy, Tier};
 
-pub const FEATURE_SCHEMA_VERSION: u32 = 1;
+/// Version 2 adds the recipe identity to what a profile's tokens hash:
+/// `RecipeIdentity` (formerly `ProfileIdentity`) now carries the
+/// `recipe_id` of the deterministic recipe that produced a run, alongside
+/// its model/effort/harness. The dataset, artifact and evaluation schema
+/// versions move with it — see `dataset::DATASET_VERSION`,
+/// `registry::ARTIFACT_SCHEMA_VERSION` and `evaluate::EVAL_SCHEMA_VERSION`
+/// — because a feature vector, the dataset it came from and the artifact
+/// fitted on it are one fact recorded in four places.
+pub const FEATURE_SCHEMA_VERSION: u32 = 2;
 pub const DEFAULT_HASHED_BUCKETS: usize = 256;
 
 /// Frozen hashing configuration: the tokenizer and bucket count live in
@@ -124,17 +132,26 @@ pub fn cohort_of_kind(kind: Kind) -> &'static str {
     }
 }
 
-/// The execution profile's identity at dispatch (SPEC §16: "model/effort/
-/// harness identity" are initial features). A new model or harness
-/// version is a new identity; evidence is not blindly inherited.
+/// The identity of what produced a run at dispatch (SPEC §16: "model/
+/// effort/harness identity" are initial features; SPEC §17: the recipe
+/// that produced a run is part of that identity too). A new model,
+/// harness version or recipe revision is a new identity; evidence is not
+/// blindly inherited. Two runs under a byte-identical recipe — or with no
+/// recipe at all — share an identity; two runs that differ only in the
+/// recipe revision that produced them do not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ProfileIdentity {
+pub struct RecipeIdentity {
     pub model: String,
     pub effort: Option<String>,
     pub harness: Option<String>,
+    /// The [`crate::policy::RecipeSpec::recipe_id`] of the deterministic
+    /// recipe that covered this task, or `None` when no configured recipe
+    /// covered it (SPEC §6, step 3). Pools no two revisions of one recipe
+    /// as if they were the same thing.
+    pub recipe_id: Option<String>,
 }
 
-impl ProfileIdentity {
+impl RecipeIdentity {
     /// The tokens this identity hashes to. Prefixed so `sonnet` the model
     /// and `sonnet` in an objective never share a bucket.
     fn tokens(&self) -> Vec<String> {
@@ -144,6 +161,9 @@ impl ProfileIdentity {
         }
         if let Some(harness) = &self.harness {
             tokens.push(format!("harness={harness}"));
+        }
+        if let Some(recipe_id) = &self.recipe_id {
+            tokens.push(format!("recipe={recipe_id}"));
         }
         tokens
     }
@@ -209,7 +229,7 @@ pub fn expand(
     task: &TaskFeatures,
     tier: Tier,
     objective: &str,
-    identity: &ProfileIdentity,
+    identity: &RecipeIdentity,
     schema: &FeatureSchema,
 ) -> SparseVec {
     let mut features: Vec<(usize, f64)> = Vec::with_capacity(48);
@@ -364,7 +384,7 @@ pub struct TrainingExample {
     /// `sparse` alone is the expansion for the observed tier only.
     pub task: TaskFeatures,
     pub objective: String,
-    pub identity: ProfileIdentity,
+    pub identity: RecipeIdentity,
     /// `expand(task, tier, objective, identity)`, cached.
     pub sparse: SparseVec,
     pub accepted_without_escalation: bool,
@@ -426,10 +446,11 @@ mod tests {
     fn expansion_is_shared_between_train_and_inference() {
         let schema = FeatureSchema::standard();
         let task = TaskFeatures::extract(&contract(), &repo());
-        let identity = ProfileIdentity {
+        let identity = RecipeIdentity {
             model: "sonnet".into(),
             effort: Some("medium".into()),
             harness: Some("claude-code 2.1".into()),
+            recipe_id: None,
         };
         let a = expand(
             &task,
@@ -465,7 +486,7 @@ mod tests {
         assert!(escalation_hot.is_some());
         // A new harness version is a new identity (SPEC §17: evidence is
         // not blindly inherited).
-        let newer = ProfileIdentity {
+        let newer = RecipeIdentity {
             harness: Some("claude-code 2.2".into()),
             ..identity.clone()
         };
@@ -477,13 +498,62 @@ mod tests {
             &schema,
         );
         assert_ne!(a, c);
+        // Two revisions of one recipe are two different identities; a
+        // byte-identical recipe (or no recipe at all) is the same one.
+        let recipe_rev0 = RecipeIdentity {
+            recipe_id: Some("recipe-hash-rev0".into()),
+            ..identity.clone()
+        };
+        let recipe_rev1 = RecipeIdentity {
+            recipe_id: Some("recipe-hash-rev1".into()),
+            ..identity.clone()
+        };
+        let recipe_rev0_again = RecipeIdentity {
+            recipe_id: Some("recipe-hash-rev0".into()),
+            ..identity.clone()
+        };
+        assert_ne!(
+            expand(
+                &task,
+                Tier::Implementation,
+                &contract().objective,
+                &recipe_rev0,
+                &schema,
+            ),
+            expand(
+                &task,
+                Tier::Implementation,
+                &contract().objective,
+                &recipe_rev1,
+                &schema,
+            ),
+            "two runs differing only in the recipe revision that produced them are different \
+             identities"
+        );
+        assert_eq!(
+            expand(
+                &task,
+                Tier::Implementation,
+                &contract().objective,
+                &recipe_rev0,
+                &schema,
+            ),
+            expand(
+                &task,
+                Tier::Implementation,
+                &contract().objective,
+                &recipe_rev0_again,
+                &schema,
+            ),
+            "two runs under a byte-identical recipe are the same identity"
+        );
     }
 
     #[test]
     fn hashed_features_use_the_frozen_tokenizer() {
         let schema = FeatureSchema::standard();
         let task = TaskFeatures::extract(&contract(), &repo());
-        let identity = ProfileIdentity::default();
+        let identity = RecipeIdentity::default();
         let a = expand(
             &task,
             Tier::Research,

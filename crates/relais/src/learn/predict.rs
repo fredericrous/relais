@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::features::{
-    expand, feature_dim, FeatureSchema, ProfileIdentity, SparseVec, Standardization, TaskFeatures,
+    expand, feature_dim, FeatureSchema, RecipeIdentity, SparseVec, Standardization, TaskFeatures,
 };
 use super::registry::Registry;
 use crate::contract::TaskContract;
@@ -50,13 +50,22 @@ pub fn estimate_from_registry(
 ) -> InferenceResult {
     let schema = FeatureSchema::standard();
     let task = TaskFeatures::extract(contract, repo_policy);
+    // The recipe that would cover this task among the eligible tiers, the
+    // same pure rule the router uses to decide whether a recipe wins over
+    // the learner (SPEC §6, step 3) — recorded here so evidence is keyed
+    // on the recipe that produced a run, not only the model beneath it.
+    let recipe_id = crate::route::covering_recipe_id(contract, repo_policy, eligible);
     // The identity a tier would dispatch WITH — the same tokens the
-    // dataset builder reads back from the dispatch intent.
-    let identity_of = |tier: Tier| -> ProfileIdentity {
+    // dataset builder reads back from the dispatch intent and the recipe
+    // that would cover it.
+    let identity_of = |tier: Tier| -> RecipeIdentity {
         authority
             .models
             .get(&tier)
-            .map(|profile| profile_identity(profile, harness))
+            .map(|profile| RecipeIdentity {
+                recipe_id: recipe_id.clone(),
+                ..profile_identity(profile, harness)
+            })
             .unwrap_or_default()
     };
     let inputs: Vec<(Tier, SparseVec)> = eligible
@@ -188,7 +197,7 @@ pub fn estimate_from_registry(
 fn observed_identity(
     artifact: &super::registry::Artifact,
     tier: Tier,
-    identity: &ProfileIdentity,
+    identity: &RecipeIdentity,
 ) -> bool {
     artifact
         .observed_identities
@@ -197,8 +206,8 @@ fn observed_identity(
         .is_some_and(|(_, identities)| identities.contains(identity))
 }
 
-/// A profile identity as a reason line reads it.
-fn describe(identity: &ProfileIdentity) -> String {
+/// A recipe identity as a reason line reads it.
+fn describe(identity: &RecipeIdentity) -> String {
     let mut text = identity.model.clone();
     if let Some(effort) = &identity.effort {
         text.push_str(&format!("/{effort}"));
@@ -206,17 +215,22 @@ fn describe(identity: &ProfileIdentity) -> String {
     if let Some(harness) = &identity.harness {
         text.push_str(&format!(" on {harness}"));
     }
+    if let Some(recipe_id) = &identity.recipe_id {
+        text.push_str(&format!(" via recipe {recipe_id}"));
+    }
     text
 }
 
-/// One profile's identity tokens, as the runner records them in the
-/// dispatch intent and the dataset reads them back: one function, so the
-/// train and inference sides cannot drift.
+/// One profile's model/effort/harness identity tokens, as the runner
+/// records them in the dispatch intent and the dataset reads them back:
+/// one function, so the train and inference sides cannot drift. Carries no
+/// `recipe_id` — the caller folds in the recipe that covers the task, since
+/// that is a property of the task and policy, not of the profile.
 pub fn profile_identity(
     profile: &crate::policy::ModelProfile,
     harness: Option<&str>,
-) -> ProfileIdentity {
-    ProfileIdentity {
+) -> RecipeIdentity {
+    RecipeIdentity {
         model: profile.id.clone(),
         effort: profile.effort.map(|effort| {
             // An owned fieldless enum always serializes to a string; the
@@ -228,6 +242,7 @@ pub fn profile_identity(
                 .unwrap_or_else(|| format!("{effort:?}").to_lowercase())
         }),
         harness: harness.map(str::to_string),
+        recipe_id: None,
     }
 }
 
@@ -301,7 +316,7 @@ impl RoutePredictor for RegistryPredictor<'_> {
 pub fn standardized_inputs(
     task: &TaskFeatures,
     objective: &str,
-    identity: &ProfileIdentity,
+    identity: &RecipeIdentity,
     tiers: &[Tier],
     schema: &FeatureSchema,
     standardization: &Standardization,
@@ -341,7 +356,7 @@ mod tests {
     /// The identity the implementation tier dispatches with under the
     /// template policy and no harness — what the fixture artifact
     /// observed in training.
-    fn identity_under_test() -> ProfileIdentity {
+    fn identity_under_test() -> RecipeIdentity {
         let repo = repo_policy();
         let profile = repo
             .models
@@ -534,6 +549,66 @@ mod tests {
         assert!(predictor
             .estimate(&contract(), &auth, &[Tier::Implementation])
             .is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Coverage is keyed by the RECIPE identity too, not only model/effort/
+    /// harness: a task now covered by a different revision of the recipe
+    /// that produced training is a `RecipeIdentity` the artifact never
+    /// observed, and gets no invented evidence (SPEC §17). The artifact HAS
+    /// observations here — for the no-recipe identity — so this exercises
+    /// the abstention path rather than one an empty artifact would pass
+    /// trivially.
+    #[test]
+    fn a_recipe_revision_training_never_saw_gets_no_estimate() {
+        let dir = temp_dir("recipe-identity");
+        let registry = Registry::open(&dir).expect("registry");
+        registry
+            .store(&artifact_over_the_whole_feature_space())
+            .expect("store");
+        std::fs::write(
+            dir.join("active.json"),
+            serde_json::json!({ "artifact_id": "art-test" }).to_string(),
+        )
+        .expect("activate");
+
+        let repo_no_recipe = repo_policy();
+        let auth = authority();
+        let observed = estimate_from_registry(
+            &registry,
+            &contract(),
+            &repo_no_recipe,
+            &auth,
+            &[Tier::Implementation],
+            None,
+        );
+        assert_eq!(
+            observed.abstention_reason, None,
+            "the identity training observed (no covering recipe) still estimates"
+        );
+
+        let mut repo_with_recipe = repo_policy();
+        repo_with_recipe.recipes.push(crate::policy::RecipeSpec {
+            scope_within: vec!["src/**".into()],
+            ..crate::policy::RecipeSpec::covering("src-recipe", Tier::Implementation)
+        });
+        let under_recipe = estimate_from_registry(
+            &registry,
+            &contract(),
+            &repo_with_recipe,
+            &auth,
+            &[Tier::Implementation],
+            None,
+        );
+        assert!(
+            under_recipe
+                .abstention_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("was not observed in training")),
+            "{:?}",
+            under_recipe.abstention_reason
+        );
+        assert!(under_recipe.acceptance.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -16,8 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::dataset::{temporal_splits, Dataset, TemporalSplits};
 use super::features::{
-    expand, feature_dim, FeatureSchema, ProfileIdentity, SparseVec, Standardization,
-    TrainingExample,
+    expand, feature_dim, FeatureSchema, RecipeIdentity, SparseVec, Standardization, TrainingExample,
 };
 use super::learner::{CostModel, FitReport, LogisticModel, SolverSettings};
 use crate::money::MicroUsd;
@@ -26,8 +25,11 @@ use crate::route::{select_learned, tiers_at_or_above, Estimates};
 
 /// Version 2 adds the fit reports, the calibration temperature, the
 /// supported-record count and the thresholds behind every gate, so the
-/// verdict can be RECOMPUTED from the report instead of believed.
-pub const EVAL_SCHEMA_VERSION: u32 = 2;
+/// verdict can be RECOMPUTED from the report instead of believed. Version 3
+/// moves with `RecipeIdentity` (formerly `ProfileIdentity`): the identities
+/// this report's dataset and artifact were fitted on now carry the recipe
+/// that produced each run, alongside its model/effort/harness.
+pub const EVAL_SCHEMA_VERSION: u32 = 3;
 
 pub const DEFAULT_MIN_RECORDS_PER_TIER: usize = 5;
 pub const DEFAULT_QUALITY_FLOOR: f64 = 0.75;
@@ -318,7 +320,7 @@ pub struct TrainOutcome {
     /// Inference abstains for a tier whose current identity is not in this
     /// set, so a model swap never inherits the old model's evidence
     /// (SPEC §17).
-    pub observed_identities: Vec<(Tier, Vec<ProfileIdentity>)>,
+    pub observed_identities: Vec<(Tier, Vec<RecipeIdentity>)>,
     pub report: EvalReport,
 }
 
@@ -604,8 +606,8 @@ pub fn train_and_evaluate(
 
 /// The identities seen per tier in the training split, deduplicated and
 /// ordered. Evidence belongs to the profile that produced it.
-fn identities_per_tier(train: &[&TrainingExample]) -> Vec<(Tier, Vec<ProfileIdentity>)> {
-    let mut per_tier: std::collections::BTreeMap<Tier, Vec<ProfileIdentity>> =
+fn identities_per_tier(train: &[&TrainingExample]) -> Vec<(Tier, Vec<RecipeIdentity>)> {
+    let mut per_tier: std::collections::BTreeMap<Tier, Vec<RecipeIdentity>> =
         std::collections::BTreeMap::new();
     for record in train {
         let seen = per_tier.entry(record.tier).or_default();
@@ -907,7 +909,7 @@ fn converged_label(converged: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::learn::features::{AcceptanceRoute, ProfileIdentity, TaskFeatures, TrainingExample};
+    use crate::learn::features::{AcceptanceRoute, RecipeIdentity, TaskFeatures, TrainingExample};
 
     /// A record whose label is learnable from its inputs: accepted tasks
     /// share one objective vocabulary, rejected ones another, so the
@@ -932,10 +934,11 @@ mod tests {
         } else {
             "rewrite the entire subsystem"
         };
-        let identity = ProfileIdentity {
+        let identity = RecipeIdentity {
             model: "sonnet".into(),
             effort: None,
             harness: None,
+            recipe_id: None,
         };
         let sparse = expand(&task, tier, objective, &identity, &schema);
         TrainingExample {
@@ -1309,10 +1312,11 @@ mod tests {
             outcome.observed_identities,
             vec![(
                 Tier::Implementation,
-                vec![ProfileIdentity {
+                vec![RecipeIdentity {
                     model: "sonnet".into(),
                     effort: None,
                     harness: None,
+                    recipe_id: None,
                 }]
             )]
         );

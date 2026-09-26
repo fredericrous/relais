@@ -352,7 +352,7 @@ The runner selects a profile at a task boundary and launches the existing harnes
 
 The initial owned learner is regularized logistic regression for acceptance without escalation, with a separate simple cost estimator for complete-strategy cost. This is an implementation choice within the complete product, not a staged product version. Matrix factorization or a larger learner may replace it only if evaluation establishes a benefit. The chosen learner does not reproduce RouteLLM's matrix-factorization architecture.
 
-The initial feature extractor is deterministic: task category, language, scope breadth, existing implementation examples, relevant risk indicators, verification availability, unresolved decision dependencies, and model/effort/harness identity. Optional hashed task-text features use the same frozen tokenizer and hashing configuration at train and inference time. No external embedding API is required by default.
+The initial feature extractor is deterministic: task category, language, scope breadth, existing implementation examples, relevant risk indicators, verification availability, unresolved decision dependencies, and the recipe identity of what produced the run — model/effort/harness alongside the `recipe_id` of the deterministic recipe that covered the task, when one did. Optional hashed task-text features use the same frozen tokenizer and hashing configuration at train and inference time. No external embedding API is required by default.
 
 Only information available at dispatch enters initial-routing features. Actual patch size, later failures and final outcomes are labels or recovery-stage evidence, not initial features. Unavailable features are represented explicitly. Free-text task inputs are untrusted data, not policy instructions.
 
@@ -372,7 +372,7 @@ No GPU, neural network framework or embedding model is necessary for this design
 
 ### Collection and labels
 
-A task is the unit of sampling — a task retried to acceptance contributes one training example, not one per attempt. An execution profile combines model, effort, harness, context policy and bounded recovery policy. Capture the starting candidate identity and task contract so comparisons can reproduce the same task.
+A task is the unit of sampling — a task retried to acceptance contributes one training example, not one per attempt. An execution profile combines model, effort, harness, context policy and bounded recovery policy. Capture the starting candidate identity and task contract so comparisons can reproduce the same task. The candidate identity is keyed on the recipe that produced the run, not only the model profile beneath it: a run under one revision of a recipe and a run under another are never pooled as if they were the same thing, and a byte-identical recipe (across two runs, whatever it is named) is one identity.
 
 The labelling rule is versioned, and every dataset and artifact records which version produced it, so a dataset built under an earlier rule is distinguishable from one built under this one rather than silently comparable.
 
@@ -408,7 +408,7 @@ Every artifact contains dataset fingerprint, feature schema, label policy, learn
 
 Cold-start operation uses conservative rules while collecting real outcomes. Training can run whenever data is available, but promotion requires evidence. The training pipeline ships in the complete release; the product cannot honestly ship with demonstrated knowledge of model/repository combinations it has never measured.
 
-Detect drift through profile/version changes, feature distribution and observed outcomes. New model or harness versions receive new identities; evidence is not blindly inherited. Confirmed regressions trigger investigation, trial suspension or rollback according to policy. Retraining must not relax risk floors, acceptance criteria or permission boundaries.
+Detect drift through profile/version changes, feature distribution and observed outcomes. New model or harness versions, and new revisions of a recipe, receive new identities; evidence is not blindly inherited. Prediction abstains — never guesses — when asked about an identity the active artifact has not observed, whether the change is a model swap or a recipe revision bump. Confirmed regressions trigger investigation, trial suspension or rollback according to policy. Retraining must not relax risk floors, acceptance criteria or permission boundaries.
 
 The complete learning loop is: execute → verify → label → build dataset → train → evaluate → promote or reject → monitor. RouteLLM informs the design; Relais implements and owns the entire learning loop in Rust.
 
