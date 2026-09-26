@@ -10,6 +10,36 @@ missing here.
 
 ### Added
 
+- **`relais install --claude` now ships two more skills relais owns end
+  to end, and `/relais` states its own inputs and completion criteria.**
+  `/relais-verified-push` walks the four steps that make a `git push`
+  trustworthy — `amont list --json --stage pre-push --pushed`, `amont
+  rehearse --wait`, a bare `git push`, then `git ls-remote origin
+  refs/heads/<branch>` to confirm the ref moved — and says why the push
+  itself must never be piped into `tail`/`head`/`grep` (a pipeline's
+  exit status is the last command's, not the push's). `/relais-architecture-conflict`
+  states aval's exit-code contract for `aval resolve <key> --json` (0
+  active, 4 undecided, 5 contradiction, 6 retired, 7 unknown, 1/2/3 tool,
+  usage or corpus failure) and, on a contradiction, hands back a
+  decision naming both readings rather than picking one. `/relais`
+  itself gained an `## Inputs` section naming what the caller must
+  supply before a contract can be written, and a `## Done when` section
+  of checkable completion criteria.
+
+  A test asserts the verified-push body names all four steps and that no
+  line of it pipes a mutating command into `tail`, `head` or `grep`, so
+  the skill cannot come to teach the failure mode it exists to prevent.
+  The test carries no exemption for prose: an earlier version skipped any
+  line containing `…` or "Do not", and that exemption was measured to let
+  `git push origin … | tail -1` sit inside the fenced step a reader
+  copies from and still pass. The body is instead worded so the warning
+  names `git push` and the trimming commands in separate code spans,
+  leaving every line that carries both a genuine invocation.
+
+  `docs/SPEC.md` §3 and `install`'s own module doc said `--claude` writes
+  "a `/relais` skill"; both now say skills, so no copy of that fact
+  disagrees with `owned_files()`.
+
 - **A hook refusal now carries the rule that produced it, the reason, the
   remedy and whether relais decided or could not tell, as separate fields
   rather than one opaque sentence.** `hook::decide::Refusal` replaces
