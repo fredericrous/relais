@@ -194,14 +194,22 @@ about hooks stay in the [README](../README.md#known-limits).
   long rather than under-counting, and an agent that runs longer than the
   lease loses its seat before it actually stops, since nothing tells the
   coordinator otherwise.
-- **Depth is not enforced, and a subtree cannot be cancelled.** Nothing in
-  a single hook payload joins a spawn to the dispatch it descends from
+- **Depth is enforced only where a caller resolves, and a subtree still
+  cannot be cancelled.** As of Claude Code 2.1.283 a nested spawn's own
+  `PreToolUse` carries `agent_id`, naming the agent that made it
   (`crates/relais/tests/fixtures/hooks/README.md` records which payloads
-  carry `agent_id` and which do not), so every hook-admitted spawn is
-  requested at depth 0 and `max_agent_depth` governs managed dispatch
-  only. For the same reason relais cannot name the agents beneath one
-  spawn, so it cannot cancel a subtree: `relais cancel` reaches managed
-  dispatch, and on this path only the session's own run.
+  carry it and which do not), and the coordinator resolves that id into
+  the dispatch it is bound to and enforces `max_agent_depth` against it
+  exactly as it would a managed dispatch's own `parent_dispatch`. Two
+  cases still enforce no depth beyond a spawn's own self-report of 0: a
+  top-level spawn, which names no caller at all, and a caller this
+  coordinator holds no binding for — never bound, or its lease already
+  lapsed — which is missing knowledge rather than grounds to refuse the
+  spawn. Cancelling a subtree is unaffected by any of this: a
+  hook-admitted agent has no process id bound to it (see the next
+  bullet), so even a fully resolved chain has nothing `relais cancel`
+  could signal beneath the one dispatch it names; `relais cancel` reaches
+  managed dispatch, and on this path only the session's own run.
 - **Without the hook, or with the coordinator unreachable, native
   subagents are only observed.** Nothing is refused, and `relais
   coordinator status` says so in as many words (`enforcement: observed
@@ -214,13 +222,13 @@ about hooks stay in the [README](../README.md#known-limits).
   running unwatched. This is a real limit of the hook-admitted design,
   not something a restart's adoption logic is asked to paper over by
   inventing a row for a dispatch that never had one.
-- **No money cap applies on this path, only an agent-count cap.** A
-  hook-admitted spawn is governed by the machine's own `[concurrency]`
-  limits — the same caps that apply to any other run — and by nothing
-  else. The run a hook registers carries no budget, and the coordinator
-  only refuses on budget for a run that has one, so raising
-  `dispatch_reserve_micros` above zero changes what a spawn reserves
-  against an unbounded total and still refuses nothing.
+- **No money cap applies on this path, only agent-count and (where a
+  caller resolves) depth.** A hook-admitted spawn is governed by the
+  machine's own `[concurrency]` limits — the same caps that apply to any
+  other run — and by nothing else. The run a hook registers carries no
+  budget, and the coordinator only refuses on budget for a run that has
+  one, so raising `dispatch_reserve_micros` above zero changes what a
+  spawn reserves against an unbounded total and still refuses nothing.
 - **A cancellation on this path lasts only until the next reconcile.**
   `relais cancel` marks a session's derived run terminal, but a
   cancelled run with nothing outstanding is reaped at the next

@@ -143,6 +143,43 @@ not settle: whether a NESTED spawn — a subagent's own `PreToolUse` for
 `Agent`/`Task`, launching a second subagent — carries an `agent_id` naming
 the subagent that made it, which is what would let parentage at depth two
 be joined rather than guessed. That is `parent_agent_id` in `relais doctor
---probe-hooks`'s compatibility record, and it stays `unknown` on this
-machine until a probe prompt that actually forces that second hop has run
-and recorded it — nothing here claims it confirmed before then.
+--probe-hooks`'s compatibility record.
+
+## `parent_agent_id`: what is confirmed and what is not
+
+Two different things sit under this question, and they are not the same
+fact:
+
+- **Whether a payload carries `agent_id` at all when made from inside a
+  subagent.** Confirmed above, and unconditionally: `0004`/`0005` are a
+  `Read` made by `agent-01`, not an `Agent`/`Task` call, and they already
+  show `agent_id` present on a call a subagent made. `hook::event::parse`
+  reads `agent_id` the same way off every tool-scoped payload regardless
+  of which tool it names or how deep the caller sits — there is no
+  special case in that module for the Agent tool versus any other, and
+  none for a first hop versus a second one. Nothing about the mechanism
+  that reports the caller is specific to the Agent tool.
+- **Whether a SECOND hop — a subagent's own spawn of a THIRD-level
+  agent — has actually been recorded showing that `agent_id`.** This is
+  the one still open. `relais doctor --probe-hooks`'s prompt forces a
+  subagent to spawn a second subagent (so the nested-spawn case is
+  exercised at all — see the harness-facts table above and
+  `hook::derive_capabilities`'s doc comment), and `parent_agent_id` reads
+  `Known(true)` the moment a payload recorded in that run carries an
+  `agent_id` on an `Agent`/`Task` `PreToolUse`. On THIS machine, at the
+  time this file was last written, that specific probe run had not yet
+  produced a compatibility record carrying `capabilities.parent_agent_id:
+  known(true)` committed anywhere in this tree — every fixture pair here
+  (`0000`–`0010`) predates the two-level probe. `admission::resolve_caller`
+  is written and tested (`admission::tests::a_nested_spawn_naming_a_bound_caller_...`)
+  against the FIELD, `DispatchRequest::caller_agent_id`, exactly as the
+  first bullet's mechanism reports it — its unit tests use synthetic
+  payloads, not this directory's recordings, because nothing recorded
+  here is itself a two-level spawn.
+
+Run `make probe-hooks` against a live Claude Code session, once available,
+and commit the resulting compatibility record (or a new numbered fixture
+pair transcribed from it, following the pattern `0009`/`0010` set) rather
+than treating the first bullet's confirmation as settling the second one —
+they are different measurements, and this file exists so the difference
+does not get collapsed into a single "yes."

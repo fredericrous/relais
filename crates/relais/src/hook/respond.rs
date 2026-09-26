@@ -195,15 +195,27 @@ fn ask_coordinator(
         dispatch_id: dispatch_id.as_str().to_string(),
         run_id: run_id.as_str().to_string(),
         session_id: call.session_id.as_str().to_string(),
-        // Nothing in a single hook payload joins the tool call that
-        // admitted an agent to the dispatch it descends from (see
-        // `hook::event`'s module doc), so a parent this coordinator
-        // could enforce depth against is not knowable here.
+        // `parent_dispatch` is never set here — this hook has no dispatch
+        // id for its caller, only an agent id — but that is not the same
+        // claim `hook::event`'s module doc used to make about a single
+        // payload joining nothing at all. As of Claude Code 2.1.283 a
+        // nested spawn's own `PreToolUse` carries `call.caller_agent_id`
+        // (`tests/fixtures/hooks/README.md`), and the coordinator resolves
+        // that agent id into the dispatch it is bound to and uses THAT as
+        // this request's effective parent
+        // (`admission::AdmissionState::resolve_caller`) — so depth is
+        // enforced on this path whenever the caller resolves, through the
+        // one `effective_depth` calculation every other dispatch already
+        // goes through.
         parent_dispatch: None,
         depth: 0,
         resource: ResourceClass::ModelWork,
         reserve_micros: settings.dispatch_reserve_micros.to_micros(),
         source: DispatchSource::HookAdmitted,
+        caller_agent_id: call
+            .caller_agent_id
+            .as_ref()
+            .map(|id| id.as_str().to_string()),
     };
     // Any failure to reach the coordinator — no daemon, a stale
     // socket, a protocol mismatch — is exactly `CoordinatorAnswer`'s
@@ -475,6 +487,22 @@ mod tests {
             "session_id": session,
             "tool_name": "Agent",
             "tool_use_id": tool_use,
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// A spawn made FROM INSIDE a subagent — the shape a nested `Agent`
+    /// `PreToolUse` carries on Claude Code 2.1.283, `agent_id` naming the
+    /// caller rather than being absent (`0004-PreToolUse.json`,
+    /// `tests/fixtures/hooks/README.md`).
+    fn nested_spawn_payload(session: &str, tool_use: &str, caller_agent: &str) -> Vec<u8> {
+        serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": session,
+            "tool_name": "Agent",
+            "tool_use_id": tool_use,
+            "agent_id": caller_agent,
         })
         .to_string()
         .into_bytes()
@@ -880,6 +908,7 @@ mod tests {
             resource: ResourceClass::ModelWork,
             reserve_micros: 0,
             source: DispatchSource::HookAdmitted,
+            caller_agent_id: None,
         };
 
         assert!(
@@ -1030,6 +1059,111 @@ mod tests {
             handle(&spawn_payload(session, "tool-2"), &settings(), &gate).answer,
             HookAnswer::Silent,
             "the agent is over, whichever of its two ends arrived first"
+        );
+    }
+
+    /// The wiring this module owns: a `PreToolUse`'s `agent_id` — absent
+    /// on a top-level spawn, present on one made from inside a subagent
+    /// (`hook::event::AgentToolCall::caller_agent_id`) — reaches the
+    /// `DispatchRequest` the coordinator resolves against, rather than
+    /// being dropped on the way as `parent_dispatch: None` used to mean
+    /// "not knowable here" for every hook-admitted request. What the
+    /// coordinator DOES with a resolved caller is `admission::mod`'s own
+    /// tests (`a_nested_spawn_naming_a_bound_caller_...`); this one is
+    /// about the one field this module is responsible for setting.
+    #[test]
+    fn a_nested_spawns_caller_agent_id_reaches_the_dispatch_request() {
+        struct CapturingGate {
+            inner: LocalGate,
+            last_caller_agent_id: std::sync::Mutex<Option<Option<String>>>,
+        }
+        impl Gate for CapturingGate {
+            fn register_run(
+                &self,
+                registration: &RunRegistration,
+            ) -> Result<(), crate::admission::GateError> {
+                self.inner.register_run(registration)
+            }
+            fn admit(
+                &self,
+                request: &DispatchRequest,
+            ) -> Result<crate::admission::Decision, crate::admission::GateError> {
+                *self.last_caller_agent_id.lock().unwrap() = Some(request.caller_agent_id.clone());
+                self.inner.admit(request)
+            }
+            fn bind(
+                &self,
+                dispatch_id: &str,
+                agent_id: Option<&str>,
+                pid: Option<u32>,
+            ) -> Result<crate::admission::BindOutcome, crate::admission::GateError> {
+                self.inner.bind(dispatch_id, agent_id, pid)
+            }
+            fn heartbeat(
+                &self,
+                dispatch_id: &str,
+            ) -> Result<crate::admission::HeartbeatStatus, crate::admission::GateError>
+            {
+                self.inner.heartbeat(dispatch_id)
+            }
+            fn mark_waiting(
+                &self,
+                dispatch_id: &str,
+            ) -> Result<crate::admission::WaitOutcome, crate::admission::GateError> {
+                self.inner.mark_waiting(dispatch_id)
+            }
+            fn resume(
+                &self,
+                dispatch_id: &str,
+            ) -> Result<crate::admission::ResumeOutcome, crate::admission::GateError> {
+                self.inner.resume(dispatch_id)
+            }
+            fn release(
+                &self,
+                dispatch_id: &str,
+            ) -> Result<crate::admission::LifecycleOutcome, crate::admission::GateError>
+            {
+                self.inner.release(dispatch_id)
+            }
+            fn settle(
+                &self,
+                dispatch_id: &str,
+                spent_micros: Option<i64>,
+            ) -> Result<crate::admission::LifecycleOutcome, crate::admission::GateError>
+            {
+                self.inner.settle(dispatch_id, spent_micros)
+            }
+            fn withdraw(
+                &self,
+                dispatch_id: &str,
+            ) -> Result<crate::admission::WithdrawOutcome, crate::admission::GateError>
+            {
+                self.inner.withdraw(dispatch_id)
+            }
+            fn enforcement(&self) -> crate::admission::Enforcement {
+                self.inner.enforcement()
+            }
+        }
+        let gate = CapturingGate {
+            inner: LocalGate::new(ConcurrencyLimits::default()),
+            last_caller_agent_id: std::sync::Mutex::new(None),
+        };
+        handle(&spawn_payload("session-a", "tool-top"), &settings(), &gate);
+        assert_eq!(
+            *gate.last_caller_agent_id.lock().unwrap(),
+            Some(None),
+            "a top-level spawn's payload carries no agent_id and reports no caller"
+        );
+
+        handle(
+            &nested_spawn_payload("session-a", "tool-nested", "caller-agent-1"),
+            &settings(),
+            &gate,
+        );
+        assert_eq!(
+            *gate.last_caller_agent_id.lock().unwrap(),
+            Some(Some("caller-agent-1".to_string())),
+            "a nested spawn's payload names its caller, and this module forwards it"
         );
     }
 

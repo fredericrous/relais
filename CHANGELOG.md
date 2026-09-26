@@ -10,6 +10,36 @@ missing here.
 
 ### Added
 
+- **Depth is now enforced on the hook path, where a caller resolves.**
+  As of Claude Code 2.1.283, a nested spawn's own `PreToolUse` — one made
+  from inside a subagent — carries `agent_id`, naming the agent that made
+  it (`crates/relais/tests/fixtures/hooks/README.md`). `DispatchRequest`
+  gains `caller_agent_id`, carrying that agent id on the wire, and the
+  coordinator (`AdmissionState::resolve_caller`) resolves it into the
+  dispatch that agent is bound to and enforces `max_agent_depth` against
+  it through the existing depth check — the same one a managed
+  dispatch's own `parent_dispatch` already goes through, not a second
+  one. A top-level spawn names no caller and is never given a fabricated
+  one, so it still enforces no depth beyond its self-report of 0; a
+  caller this coordinator holds no binding for — never bound, or its
+  lease already lapsed — resolves to no parent the same way and is
+  admitted rather than refused for it, since that is missing knowledge,
+  not a violation. `relais coordinator status` and `relais report`'s
+  enforcement line say so plainly now, instead of claiming depth is
+  unenforced on this path outright.
+
+  `caller_agent_id` is additive and `#[serde(default)]`, not a
+  `PROTOCOL_VERSION` bump: an older relais's request has no such key and
+  deserializes with `None`, and a newer request's extra key is simply
+  unread by an older daemon that predates the field, since neither
+  `DispatchRequest` nor the `Request` wire enum denies unknown fields
+  inside an embedded struct. Both directions of that mixed-version pair
+  are exercised with no live daemon of either version. **Upgrading past
+  this change needs no `relais coordinator stop`.**
+
+  Still not enforced on this path: money. The run a hook registers
+  carries no budget, and nothing here changes that.
+
 - **The hook compatibility record now names what the harness can DO, not
   only which fields fired.** `relais doctor --probe-hooks`'s `CompatRecord`
   gains a `capabilities` section — `agent_tool_name` (whether the harness
