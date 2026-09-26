@@ -121,7 +121,7 @@ No fixture here shows them — they are about how the harness *behaves*, not
 about a payload's shape — so they are recorded here, with the observation
 that established each, rather than being re-derived by the next reader.
 
-Claude Code 2.1.282, on this machine:
+Claude Code 2.1.282, on this machine, unless a row says otherwise:
 
 | what | measured |
 |---|---|
@@ -131,8 +131,18 @@ Claude Code 2.1.282, on this machine:
 | hook delivery is concurrent | a `SubagentStop` fired at +1.70 s while another hook blocked from +0.42 s to +25.44 s |
 | several settings files | they MERGE: a hook in `settings.json` and one in `settings.local.json`, both on `PreToolUse`, both fired on one call |
 | `PostToolUse` on the Agent tool | the LAUNCH, not the end: `duration_ms: 8`, `tool_response.status: "async_launched"`, while the agent ran 6–16 s more |
+| `PreToolUse`/`PostToolUse` on Claude Code 2.1.283 | now carry `agent_id` and `agent_type`, which 2.1.282 did not; `agent_id` is absent at the top level and names the caller's agent otherwise |
 
 The second row is why relais derives its handler timeout from the wait it
 configures and answers before it (SPEC §23): an expired hook is not a
 refusal, it is an admission nobody decided. The fifth is why `relais
 doctor` reading one settings file is a bug (#94) and not a simplification.
+
+`agent_id`'s new presence on 2.1.283 raises a question the row above does
+not settle: whether a NESTED spawn — a subagent's own `PreToolUse` for
+`Agent`/`Task`, launching a second subagent — carries an `agent_id` naming
+the subagent that made it, which is what would let parentage at depth two
+be joined rather than guessed. That is `parent_agent_id` in `relais doctor
+--probe-hooks`'s compatibility record, and it stays `unknown` on this
+machine until a probe prompt that actually forces that second hop has run
+and recorded it — nothing here claims it confirmed before then.
