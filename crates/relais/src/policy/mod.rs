@@ -19,7 +19,28 @@ use crate::contract::{Review, TaskContract};
 use crate::ids::canonical_json_hash;
 use crate::money::MicroUsd;
 
-pub const POLICY_SCHEMA_VERSION: u64 = 1;
+mod recipe;
+pub use recipe::{select_highest_enabled_revision, validate_recipes, RecipeError, RecipeSpec};
+
+/// The highest `relais.toml` `schema_version` this relais understands.
+/// `RepoPolicy::validate` accepts every version from
+/// [`MIN_POLICY_SCHEMA_VERSION`] through this one — the format is
+/// additive, so a repository's existing declaration keeps working
+/// unchanged after an upgrade (SPEC §5). `schema_version` itself is
+/// outside the authority hash ([`AUTHORITY_EXCLUSIONS`]), so bumping this
+/// constant never invalidates a grant on its own.
+pub const POLICY_SCHEMA_VERSION: u64 = 2;
+
+/// The lowest `relais.toml` `schema_version` `RepoPolicy::validate`
+/// accepts.
+pub const MIN_POLICY_SCHEMA_VERSION: u64 = 1;
+
+/// `machine.toml`'s own schema version, checked separately from
+/// [`POLICY_SCHEMA_VERSION`]: machine-owned settings are a different
+/// format from repo policy, and did not change when recipes gained
+/// revisions, so this stays fixed rather than tracking the repo policy
+/// version upward.
+pub const MACHINE_SCHEMA_VERSION: u64 = 1;
 
 /// How much context a worker prompt may carry when `relais.toml` says
 /// nothing. Repositories override it with `[context] budget_bytes`, which
@@ -323,17 +344,6 @@ pub struct RepoPolicy {
     pub recipes: Vec<RecipeSpec>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RecipeSpec {
-    pub name: String,
-    #[serde(default)]
-    pub kind: Option<crate::contract::Kind>,
-    #[serde(default)]
-    pub scope_within: Vec<String>,
-    pub tier: Tier,
-}
-
 impl RepoPolicy {
     pub fn from_toml_str(text: &str) -> Result<Self, PolicyError> {
         let policy: RepoPolicy =
@@ -343,7 +353,7 @@ impl RepoPolicy {
     }
 
     pub fn validate(&self) -> Result<(), PolicyError> {
-        if self.schema_version != POLICY_SCHEMA_VERSION {
+        if !(MIN_POLICY_SCHEMA_VERSION..=POLICY_SCHEMA_VERSION).contains(&self.schema_version) {
             return Err(PolicyError::UnsupportedSchemaVersion(self.schema_version));
         }
         for rule in &self.risk {
@@ -358,6 +368,7 @@ impl RepoPolicy {
                 }
             }
         }
+        validate_recipes(&self.recipes).map_err(PolicyError::InvalidRecipe)?;
         Ok(())
     }
 
@@ -505,6 +516,9 @@ pub enum PolicyError {
         key: String,
         detail: String,
     },
+    /// A `[[recipes]]` table with two recipes sharing `(name, revision)`
+    /// or two recipes sharing a [`RecipeSpec::recipe_id`].
+    InvalidRecipe(RecipeError),
 }
 
 impl std::fmt::Display for PolicyError {
@@ -512,7 +526,8 @@ impl std::fmt::Display for PolicyError {
         match self {
             Self::UnsupportedSchemaVersion(v) => write!(
                 f,
-                "unsupported relais.toml schema_version {v} (this relais understands {POLICY_SCHEMA_VERSION})"
+                "unsupported relais.toml schema_version {v} (this relais understands \
+                 {MIN_POLICY_SCHEMA_VERSION}..={POLICY_SCHEMA_VERSION})"
             ),
             Self::MalformedToml(detail) => write!(f, "policy file is not valid TOML: {detail}"),
             Self::EmptyRiskPaths => write!(f, "a [[risk]] rule needs at least one path pattern"),
@@ -524,6 +539,7 @@ impl std::fmt::Display for PolicyError {
             Self::InvalidTrustGrant { key, detail } => {
                 write!(f, "trust grant [trust.\"{key}\"]: {detail}")
             }
+            Self::InvalidRecipe(err) => write!(f, "{err}"),
         }
     }
 }
@@ -958,7 +974,7 @@ impl MachineSettings {
     pub fn from_toml_str(text: &str) -> Result<Self, PolicyError> {
         let settings: MachineSettings =
             toml::from_str(text).map_err(|e| PolicyError::MalformedToml(e.to_string()))?;
-        if settings.schema_version != POLICY_SCHEMA_VERSION {
+        if settings.schema_version != MACHINE_SCHEMA_VERSION {
             return Err(PolicyError::UnsupportedSchemaVersion(
                 settings.schema_version,
             ));
@@ -2019,6 +2035,26 @@ keys = ["output.contract"]
     }
 
     #[test]
+    fn validate_accepts_schema_version_1_and_2_but_not_others() {
+        let v1 = RepoPolicy::from_toml_str(REPO_TOML).expect("schema_version 1 still parses");
+        assert_eq!(v1.schema_version, 1);
+
+        let v2 = RepoPolicy::from_toml_str(&REPO_TOML.replacen(
+            "schema_version = 1",
+            "schema_version = 2",
+            1,
+        ))
+        .expect("schema_version 2 parses");
+        assert_eq!(v2.schema_version, 2);
+
+        let unsupported = REPO_TOML.replacen("schema_version = 1", "schema_version = 3", 1);
+        assert_eq!(
+            RepoPolicy::from_toml_str(&unsupported),
+            Err(PolicyError::UnsupportedSchemaVersion(3))
+        );
+    }
+
+    #[test]
     fn recipes_are_hashed_as_executable_authority() {
         let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
         let with_recipe = RepoPolicy::from_toml_str(&format!(
@@ -2036,6 +2072,76 @@ keys = ["output.contract"]
             MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo))).expect("parses");
         assert!(
             !effective_authority(&with_recipe, &machine, &contract(), &identity()).trust_granted
+        );
+    }
+
+    /// A FROZEN policy fixture, deliberately not `include_str!` of this
+    /// repository's live `relais.toml`.
+    ///
+    /// The hashes below were measured against this exact text with the
+    /// PRE-CHANGE binary. Reading the live file instead would make the
+    /// policy content and the pinned hash two copies of one fact with
+    /// only one of them frozen: any ordinary edit to `relais.toml` — a
+    /// raised wall clock, a new risk rule — would fail this test, and the
+    /// obvious repair would be to update the literal, which is precisely
+    /// what the pin exists to forbid. The fixture is minimal because what
+    /// is under test is how a RecipeSpec serializes, not what this
+    /// repository happens to configure.
+    ///
+    /// Change this text only together with a hash re-measured on a build
+    /// that does NOT contain the change being tested.
+    const FROZEN_V1_POLICY: &str = r#"schema_version = 1
+
+[models.research]
+id = "haiku"
+
+[models.implementation]
+id = "sonnet"
+
+[models.escalation]
+id = "opus"
+
+[execution]
+max_attempts = 3
+max_repairs_before_escalation = 1
+max_wall_seconds = 600
+allow_nested_agents = false
+max_agent_depth = 1
+max_agents_total = 1
+
+[integrations]
+aval = "optional"
+amont = "optional"
+
+[[verification.profiles.default.commands]]
+argv = ["true"]
+timeout_seconds = 60
+"#;
+
+    #[test]
+    fn authority_hash_of_a_policy_shaped_as_todays_does_not_move() {
+        let repo = RepoPolicy::from_toml_str(FROZEN_V1_POLICY).expect("the frozen fixture parses");
+        assert_eq!(
+            repo.authority_hash(),
+            "62accc6aa657334e14ec991ef466b22c3db7917bb3bb8654d85d111ecf3acf33",
+            "the authority hash of a v1-shaped policy must not move; a moved hash is a DEAD \
+             TRUST GRANT on every repository whose policy has this shape"
+        );
+
+        // The case the skip_serializing_if attributes exist for: a recipe
+        // that sets only the fields a v1 policy could set must serialize
+        // as it did before RecipeSpec grew revision/enabled/models/
+        // execution/context.
+        let with_recipe = RepoPolicy::from_toml_str(&format!(
+            "{FROZEN_V1_POLICY}\n[[recipes]]\nname = \"docs-touchup\"\nkind = \"change\"\n\
+             scope_within = [\"docs/**\"]\ntier = \"research\"\n"
+        ))
+        .expect("the frozen fixture plus one recipe parses");
+        assert_eq!(
+            with_recipe.authority_hash(),
+            "ae3a0efe11b4cecfcdc95e527e05bba923967d62556767a91750c17cb12e75cb",
+            "a recipe setting only name/kind/scope_within/tier must hash exactly as it did \
+             before RecipeSpec grew its new fields"
         );
     }
 

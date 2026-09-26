@@ -184,7 +184,7 @@ Eligibility, risk floors and acceptance are deterministic. Within the eligible p
 
 1. Validate permissions, contract, base revision, verification profile and remaining limits.
 2. Apply risk floors from declared scope, relevant repository rules and task kind. Unclassified writes use the conservative configured route, not Haiku.
-3. Prefer an explicitly configured deterministic recipe when it fully covers the task. Relais does not infer arbitrary shell recipes from prose.
+3. Prefer an explicitly configured deterministic recipe when it fully covers the task. Relais does not infer arbitrary shell recipes from prose. A recipe is a versioned, hashed unit: each carries a `revision` and an `enabled` flag, and a content-derived `recipe_id`. When several recipes cover the task, the one selected is the highest `revision` among those that are `enabled` — a disabled recipe is never selected, even at the highest revision, and a recipe that does not cover the task is never selected whatever its revision. `relais.toml` refuses two recipes sharing `(name, revision)`, and refuses two recipes sharing a `recipe_id` (the same executable content declared twice).
 4. Route mandatory high-risk work directly to its policy floor. For remaining tasks, extract pre-dispatch task features and select among eligible profiles using a validated Relais-trained model. When trained evidence is absent or insufficient, use the configured conservative baseline and collect outcomes for training.
 5. Emit the selected profile, rule IDs, reasons, verification requirements and maximum permitted attempts.
 
