@@ -811,6 +811,94 @@ pub fn forget_run_refs(repo_dir: &Path, run_id: &str) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// A fresh, single-commit checkout of `source_repo` at exactly
+/// `base_sha`, for a replay's workspace (SPEC §24). `git init` plus a
+/// shallow `fetch` of that one commit — never a `git worktree add` of the
+/// live repository. A linked worktree shares the live repository's object
+/// store, so anything reachable there (a later commit carrying the
+/// accepted candidate this task already earned, on a branch the base SHA
+/// never points at) is one `git show`/`git log` away from a worker inside
+/// it. This checkout's object store holds nothing but `base_sha` and its
+/// own history: the accepted answer is not merely hidden from the working
+/// tree, it was never fetched, so no ref, reflog or dangling-object walk
+/// inside `dest` can reach it.
+///
+/// `dest` ends up a complete, ordinary repository (not a linked worktree),
+/// which is deliberate: a caller then treats it exactly as it would treat
+/// any freshly cloned repository — including handing its path to
+/// [`create_worktree`] the way `relais run` hands it the live repository's
+/// root, so the rest of a run's machinery (routing, verification,
+/// snapshotting, scope checks) needs no replay-specific path through it.
+pub fn create_replay_checkout(source_repo: &Path, base_sha: &str, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir_all(dest)?;
+    git(dest, &["init", "-q"])?;
+    let source = source_repo.to_string_lossy().into_owned();
+    git(dest, &["fetch", "--depth", "1", "-q", &source, base_sha])?;
+    // The checkout must carry the SAME repository identity as the source,
+    // or it has none of its own worth having. `repo::identity` reads
+    // `remote get-url origin` and otherwise falls back to the canonical
+    // git common dir — which for a bare `git init` under a fresh
+    // `replay/<trial>` directory is a different identity on every replay,
+    // so `grant_key(authority_hash, identity)` could never match a grant
+    // and every replay was blocked at preflight before dispatching
+    // anything. Copying the source's origin says the true thing: this is
+    // the same repository, at an older commit.
+    //
+    // When the source has no origin either, its identity is its own common
+    // dir, and there is nothing to copy — the caller is told rather than
+    // left with a checkout whose identity is a temporary path.
+    match git_answer_opt(source_repo, &["remote", "get-url", "origin"]) {
+        Some(url) => {
+            git(dest, &["remote", "add", "origin", &url])?;
+            Ok(())
+        }
+        None => Err(WorkspaceError::Git(format!(
+            "{} names no `origin`, so a replay checkout cannot inherit its identity and would \
+             be treated as a different repository than the task it replays",
+            source_repo.display()
+        ))),
+    }
+}
+
+/// One trimmed line of git's answer, or `None` when it does not answer.
+/// Mirrors `repo::identity`'s own probe, so the two agree about what
+/// counts as "this repository names an origin".
+fn git_answer_opt(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = git_command(dir).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// Bring a replay checkout's own `refs/relais/*` into the live
+/// repository, so what the arm produced survives the checkout.
+///
+/// The runner names its candidate and snapshot refs in the repository it
+/// ran in. For a replay that is a scratch checkout the caller then
+/// removes — so without this the receipt's `candidate_sha` and the run's
+/// `repo_path` described objects and a directory that no longer existed,
+/// and the trial row pointed at nothing. Fetched into the live repository
+/// under the same ref names, which is where `explain` and `resume` look.
+pub fn fetch_candidate_refs(live_repo: &Path, checkout: &Path) -> Result<()> {
+    let source = checkout.to_string_lossy().into_owned();
+    git(
+        live_repo,
+        &[
+            "fetch",
+            "--no-tags",
+            "-q",
+            &source,
+            "refs/relais/*:refs/relais/*",
+        ],
+    )?;
+    Ok(())
+}
+
 pub fn sha256_file(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path)?;
     Ok(sha256_hex(&bytes))
@@ -1383,6 +1471,74 @@ mod tests {
         assert!(std::fs::read_to_string(&first.patch_path)
             .expect("first patch")
             .contains("{ one }"));
+    }
+
+    /// A replay checkout never carries the accepted answer: not in its
+    /// working tree, and not even as a reachable git object. The base SHA
+    /// this checkout is built from is, by construction, the run's base —
+    /// before the accepted candidate's own commit — but this test does
+    /// not merely trust that; it puts a later "accepted" commit in the
+    /// source repository and asserts the replay checkout can reach
+    /// neither its content nor its object.
+    #[test]
+    fn a_replay_checkout_cannot_reach_the_accepted_answer() {
+        let (dir, repo) = temp_repo();
+        let base_sha = resolve_base(&repo, "HEAD").expect("base");
+        // The accepted run's own change, landed after the base: exactly
+        // what a replay must re-earn, not read.
+        std::fs::write(
+            repo.join("src/main.rs"),
+            "fn main() { accepted_answer() }\n",
+        )
+        .expect("write");
+        git(&repo, &["add", "-A"]).expect("add");
+        git(&repo, &["commit", "-q", "-m", "the accepted change"]).expect("commit");
+        let accepted_sha = git(&repo, &["rev-parse", "HEAD"]).expect("head");
+        assert_ne!(
+            base_sha, accepted_sha,
+            "the accepted commit is past the base"
+        );
+
+        // A replay checkout inherits the source's identity from its
+        // `origin`, so a source without one is refused — deliberately, or
+        // the checkout would be a different repository than the task it
+        // replays and its grant could never match. A real repository has
+        // one; the fixture needs it to be a fair stand-in.
+        git(
+            &repo,
+            &["remote", "add", "origin", "git@example.invalid:o/r.git"],
+        )
+        .expect("origin");
+
+        let dest = dir.join("replay-checkout");
+        create_replay_checkout(&repo, &base_sha, &dest).expect("checkout");
+
+        // The identity the checkout will be judged under is the SOURCE's,
+        // which is what makes a grant issued for that repository apply.
+        assert_eq!(
+            git(&dest, &["remote", "get-url", "origin"])
+                .expect("the checkout names an origin")
+                .trim(),
+            "git@example.invalid:o/r.git",
+            "the checkout must carry the source repository's identity"
+        );
+
+        // The object is not merely unreferenced in `dest` — it was never
+        // fetched, so git cannot even inspect it there.
+        assert!(
+            git(&dest, &["cat-file", "-e", &accepted_sha]).is_err(),
+            "the accepted commit must not be a reachable object in the replay checkout"
+        );
+        // A worktree off this checkout, at the base, has none of the
+        // accepted content in its working tree either.
+        let wt_path = dir.join("replay-wt");
+        create_worktree(&dest, &base_sha, &wt_path).expect("worktree from checkout");
+        let content = std::fs::read_to_string(wt_path.join("src/main.rs")).expect("read");
+        assert!(
+            !content.contains("accepted_answer"),
+            "the replay workspace must start from the base, not the accepted answer: {content}"
+        );
+        remove_worktree(&dest, &wt_path);
     }
 
     /// The sweep sees both layouts and only directories that are

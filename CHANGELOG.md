@@ -304,6 +304,61 @@ missing here.
   admissibility and returns a value; no policy file is written, no trust
   grant is issued, no recipe is enabled, and no learner calls it yet.
 
+- **`relais dataset replay` re-runs a task's already-accepted run under a
+  candidate recipe.** `relais dataset replay --task <id> --recipe
+  <candidate.toml> [--dry-run]` admits the candidate through
+  `route::validate_candidate` (the same door a learner's own proposal
+  goes through — a candidate it refuses is refused here with that same
+  rejection), refuses a source run that is not `Accepted`, and refuses
+  when the verification profile that would judge the replay differs from
+  the one recorded on the source run's receipt.
+
+  **THE REPLAY WORKSPACE DOES NOT CONTAIN THE ACCEPTED ANSWER.** It is
+  built as a fresh, single-commit checkout at the source run's base SHA —
+  `git init` plus a shallow `git fetch` of exactly that commit — never a
+  `git worktree add` of the live repository, whose object store would
+  make the accepted candidate's own later commit one `git show` away.
+  `workspace::create_replay_checkout` is the boundary; a new test asserts
+  the accepted candidate's own commit is unreachable as a git object in
+  the replay checkout, not merely absent from a working tree.
+
+  **This costs real money, per task replayed, and compares nothing on
+  its own.** A replay dispatches a real worker through the same
+  `runner::execute` path `relais run` takes, so its usage is ordinary
+  `CostKind::ApiSpend` under the same admission gate and per-run
+  ceilings — there is no separate cost kind or bypass for it. It records
+  exactly one `trials` row: `assignment_probability = 1.0` (nothing was
+  sampled), `workspace_isolation = "fresh_checkout_no_accepted_answer"`,
+  settled once through the existing `Ledger::settle_trial`, under a run
+  carrying `RunPurpose::Replay`. `--dry-run` reports what would run — the
+  source run, the candidate's covering recipe, the verification profile
+  hash checked — and spends nothing: no worker, no trial row, no usage.
+
+  NOTHING HERE PROMOTES OR COMPARES ANYTHING. A replay produces one arm's
+  result for one task; it does not evaluate, score, rank or promote a
+  recipe, and a single replay — or a small, deliberately-run set of them
+  — is not evidence that one should be. The command's own output says so
+  on every run, dry or not.
+
+  **A candidate needs its own trust grant before it can be replayed.** A
+  replay runs under the candidate's policy, so its authority hash is the
+  candidate's, and `grant_key(authority_hash, repo_identity)` will not
+  match the incumbent's grant — the first replay of a candidate stops at
+  the ordinary missing-grant refusal and prints the block to paste. That
+  is the design, not an obstacle to route around: `validate_candidate`
+  decides what is ADMISSIBLE mechanically, and a trust grant is the
+  person saying they reviewed this particular candidate. Replay spends
+  real money dispatching workers, so it is not a door that opens without
+  review.
+
+  The replay checkout inherits the source repository's `origin`, so it
+  carries the same repository identity the task's own runs do — without
+  that, a bare `git init` gave every replay a fresh identity derived from
+  a throwaway path, no grant could ever match it, and every replay would
+  have blocked at preflight before dispatching anything. A source
+  repository that names no `origin` is refused rather than given an
+  identity that is a temporary directory.
+
 ## v0.5.0
 
 ### Added

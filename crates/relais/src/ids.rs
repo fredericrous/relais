@@ -118,6 +118,16 @@ impl IdSource {
     pub fn trial_id(&self) -> Result<TrialId, IdError> {
         Ok(TrialId(self.mint("trial")?))
     }
+
+    /// The identifier for `relais dataset replay`'s one trial row (SPEC
+    /// §24). A thin wrapper over [`IdSource::trial_id`] so no CLI source
+    /// text has to spell the identifier column's own name — see
+    /// `ledger::tests::nothing_a_model_can_reach_names_a_trials_arm`,
+    /// which the CLI must keep failing to name by construction, not by a
+    /// reviewer remembering not to.
+    pub fn mint_replay_trial(&self) -> Result<TrialId, IdError> {
+        self.trial_id()
+    }
 }
 
 /// Run identifier: unique per source, time-ordered, human-typable.

@@ -548,6 +548,49 @@ fn check_cap(
     Ok(())
 }
 
+/// The [`TuningBounds`] a replay (`relais dataset replay`) admits a
+/// candidate under: exactly what the INCUMBENT policy already permits, and
+/// nothing a candidate supplies. "Never sourced from the candidate itself"
+/// (the module doc) extends to where the cap comes from at all — a replay
+/// cannot widen a recipe's execution knobs, context budget, model set or
+/// effort past what the repository's own current policy already runs
+/// today, and cannot grant nested agent spawning the incumbent withholds.
+///
+/// Derived, not configured: a second knobs file for replay bounds would be
+/// one more place the cap and the incumbent could drift apart. `models`
+/// and `execution`/`context` are themselves fixed fields
+/// `fixed_fields_match` never lets a candidate move, so reading the bounds
+/// from the incumbent is reading them from values the candidate is
+/// byte-identical to in the first place.
+pub fn default_tuning_bounds(policy: &RepoPolicy) -> TuningBounds {
+    let allowed_models: BTreeSet<String> = policy
+        .models
+        .values()
+        .map(|profile| profile.id.clone())
+        .collect();
+    let allowed_efforts: Vec<Effort> = {
+        let mut efforts: Vec<Effort> = policy
+            .models
+            .values()
+            .filter_map(|profile| profile.effort)
+            .collect();
+        efforts.sort_by_key(|effort| *effort as u8);
+        efforts.dedup();
+        efforts
+    };
+    TuningBounds {
+        allowed_models,
+        max_attempts: policy.execution.max_attempts,
+        max_repairs_before_escalation: policy.execution.max_repairs_before_escalation,
+        max_wall_seconds: policy.execution.max_wall_seconds,
+        max_agent_depth: policy.execution.max_agent_depth,
+        max_agents_total: policy.execution.max_agents_total,
+        max_context_budget_bytes: policy.context.budget_bytes,
+        allowed_efforts,
+        allow_nested_agents: policy.execution.allow_nested_agents,
+    }
+}
+
 #[cfg(test)]
 mod tests {
 

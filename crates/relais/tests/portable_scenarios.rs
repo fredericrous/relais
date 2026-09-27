@@ -803,3 +803,72 @@ fn a_world_is_countable_by_doctors_scan() {
         "the world's own root must be counted among {parent:?}'s strays"
     );
 }
+
+/// `relais dataset replay` writes NOTHING when it cannot proceed.
+///
+/// Scoped to what this can actually establish, and named for it. The
+/// first version of this test claimed to cover `--dry-run` itself and did
+/// not: with a task id that has no accepted run, the command returns at
+/// that refusal BEFORE reaching the dry-run branch, so injecting a write
+/// into that branch left the test green (verified). A test whose name
+/// promises more than it reaches is worse than no test, because the gap
+/// then looks covered.
+///
+/// What it does prove is still worth having: the refusal paths — an
+/// unknown task, no accepted run — touch the ledger not at all, byte for
+/// byte. Compared as FILE BYTES rather than row counts, since a row
+/// written and rolled back, or a table no reader happens to query, passes
+/// a count and is still a write.
+///
+/// The dry-run branch proper needs a world holding an accepted run with a
+/// receipt, which no portable scenario can build without dispatching a
+/// worker. It is covered by the unit tests around `replay_command`'s
+/// pieces instead, and the branch itself returns before `load_machine`,
+/// before a trial id is minted, and before `execute` — the writes are all
+/// downstream of the return.
+#[test]
+fn a_replay_that_cannot_proceed_leaves_the_ledger_byte_identical() {
+    let world = World::new("replay-dry-run");
+
+    // Give the world a ledger to be unchanged: any command that opens it
+    // creates and migrates it, and a migration is a legitimate write.
+    // The comparison has to start after that.
+    world.relais(&["report", "--json"]);
+    let ledger = world.state.join("ledger.sqlite");
+    assert!(
+        ledger.is_file(),
+        "the world needs a ledger before this can mean anything"
+    );
+    let before = std::fs::read(&ledger).expect("read the ledger");
+
+    // A candidate recipe file that parses. The task id need not exist:
+    // whichever refusal the dry run reaches, it must reach it without
+    // writing — an unknown task, a candidate no recipe covers and a
+    // clean dry run are all cases where nothing should be recorded.
+    let candidate = world.root.join("candidate.toml");
+    std::fs::write(
+        &candidate,
+        std::fs::read(world.repo.join("relais.toml")).unwrap_or_default(),
+    )
+    .expect("write the candidate");
+
+    let out = world.relais(&[
+        "dataset",
+        "replay",
+        "--task",
+        "task-0000000000000000",
+        "--recipe",
+        candidate.to_string_lossy().as_ref(),
+        "--dry-run",
+    ]);
+
+    let after = std::fs::read(&ledger).expect("read the ledger again");
+    assert_eq!(
+        before,
+        after,
+        "a replay that cannot proceed must leave the ledger byte-identical; stdout was \
+         {:?}, stderr {:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

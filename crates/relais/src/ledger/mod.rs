@@ -519,6 +519,32 @@ pub struct NewTrial<'a> {
     pub workspace_isolation: &'a str,
 }
 
+/// What recording a REPLAY's arm needs. Grouped rather than passed
+/// positionally, and without an `#[allow(clippy::too_many_arguments)]`:
+/// a prior run's own acceptance criteria, stored in this repository's
+/// receipts, read "no new `_ =>` arm over an enum this crate owns, no new
+/// bool parameter, no new `#[allow]`" — and the established answer to
+/// `too_many_arguments` here is to group, as `DecisionAnswer` and
+/// [`NewTrial`] beside it already do.
+///
+/// The fields a replay does NOT get to choose are absent by construction:
+/// `arm_index`, `assignment_probability` and `seed` are set by
+/// `insert_replay_trial` itself, because a replay is one deliberate
+/// re-run rather than a draw, and a caller that could name them could
+/// describe a sampled comparison that never happened.
+#[derive(Debug, Clone, Copy)]
+pub struct NewReplayTrial<'a> {
+    pub trial_id: &'a TrialId,
+    pub task_id: &'a TaskId,
+    pub source_run_id: &'a RunId,
+    pub incumbent_recipe_id: &'a str,
+    pub arm_recipe_id: &'a str,
+    pub base_sha: &'a str,
+    pub contract_hash: &'a str,
+    pub verification_profile_hash: &'a str,
+    pub workspace_isolation: &'a str,
+}
+
 /// Raw columns of one `trials` row, in the order [`parse_trial_row`]
 /// expects them.
 #[allow(clippy::type_complexity)]
@@ -1859,6 +1885,27 @@ impl Ledger {
             )
             .optional()?;
         purpose.flatten().map(|p| parse_run_purpose(&p)).transpose()
+    }
+
+    /// Record why a run exists, when it is not ordinary work (SPEC §17,
+    /// §24). Written once, by the one caller minting that kind of run —
+    /// `relais dataset replay` for [`RunPurpose::Replay`] — never by
+    /// anything a contract or a worker can reach: no `TaskContract` field
+    /// and no CLI flag on `relais plan`/`relais run` accepts a purpose.
+    /// `changed != 1` is a run id nothing on record recognizes, reported
+    /// rather than silently accepted as a no-op.
+    pub fn set_run_purpose(&self, id: &RunId, purpose: RunPurpose) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE runs SET purpose = ?2 WHERE id = ?1",
+            params![id.as_str(), purpose.as_str()],
+        )?;
+        if changed != 1 {
+            return Err(LedgerError::Corrupt {
+                what: "runs.purpose".into(),
+                detail: format!("setting the purpose of {id} changed {changed} rows, not 1"),
+            });
+        }
+        Ok(())
     }
 
     /// Where a run's worktree came from: the repository it ran in and
@@ -3207,6 +3254,33 @@ impl Ledger {
     /// anything a model can put in a file or a command. When assignment
     /// arrives it must keep that true — and a test over the CLI surface,
     /// not a visibility modifier, is what will say so.
+    /// Record `relais dataset replay`'s one deliberate arm (SPEC §24):
+    /// nothing was drawn, so this fixes what an ordinary trial's arm index
+    /// and assignment probability are for a replay, rather than handing
+    /// either to a caller that has no business naming them — the CLI must
+    /// not be ABLE to spell out which trials column an arm or a draw
+    /// probability lands in (`nothing_a_model_can_reach_names_a_trials_arm`
+    /// below), and a plain positional signature here is what keeps that
+    /// true after this call exists, not merely before it.
+    pub fn insert_replay_trial(&self, replay: &NewReplayTrial<'_>) -> Result<()> {
+        self.insert_trial(&NewTrial {
+            trial_id: replay.trial_id,
+            task_id: replay.task_id,
+            source_run_id: replay.source_run_id,
+            incumbent_recipe_id: replay.incumbent_recipe_id,
+            arm_recipe_id: replay.arm_recipe_id,
+            // A replay is one deliberate re-run, not a draw among several
+            // arms: there is only ever one, assigned with certainty.
+            arm_index: 0,
+            assignment_probability: 1.0,
+            seed: 0,
+            base_sha: replay.base_sha,
+            contract_hash: replay.contract_hash,
+            verification_profile_hash: replay.verification_profile_hash,
+            workspace_isolation: replay.workspace_isolation,
+        })
+    }
+
     pub fn insert_trial(&self, trial: &NewTrial<'_>) -> Result<()> {
         let now = self.now();
         self.conn.execute(
@@ -5620,20 +5694,61 @@ mod tests {
     fn nothing_a_model_can_reach_names_a_trials_arm() {
         const CLI: &str = include_str!("../main.rs");
         const CONTRACT: &str = include_str!("../contract/mod.rs");
+
+        // The three a caller must never choose. An arm index and a draw
+        // probability describe a SAMPLED comparison; a seed reproduces
+        // one. A caller able to name any of them could describe a
+        // comparison that never happened, which is the whole value of a
+        // trial gone.
+        //
+        // `trial_id` and `arm_recipe_id` were on this list and are not
+        // any more. That was over-broad, and only passed while nothing
+        // recorded a trial from the CLI: `relais dataset replay` now
+        // does, and both are DERIVED there — the id from
+        // `IdSource::mint_replay_trial`, the recipe from the candidate
+        // `validate_candidate` already admitted. Forbidding the
+        // identifiers would have forced the legitimate path to obscure
+        // itself. What replaces them is stricter, not looser: the
+        // structural check below.
         for (what, source) in [("the CLI", CLI), ("the task contract", CONTRACT)] {
-            for forbidden in [
-                "arm_index",
-                "assignment_probability",
-                "trial_id",
-                "arm_recipe_id",
-            ] {
+            // `seed` is NOT scanned for: `main.rs` names the solver's
+            // training seed (`settings.solver.seed`), which has nothing
+            // to do with a trial, and a substring scan cannot tell the
+            // two apart. The structural check below is what actually
+            // keeps a caller from naming a trial's seed; these two
+            // identifiers are scanned because they have no innocent
+            // meaning anywhere in this crate.
+            for forbidden in ["arm_index", "assignment_probability"] {
                 assert!(
                     !source.contains(forbidden),
-                    "{what} must not name `{forbidden}`: a trial's arm and the probability it \
-                     was drawn with come from relais's own assignment, never from a flag a \
-                     person types or a field a model writes into a contract"
+                    "{what} must not name `{forbidden}`: a trial's arm and the probability \
+                     it was drawn with come from relais's own assignment, never from a flag a \
+                     person types or a field a model writes"
                 );
             }
+        }
+
+        // Structural, and the part the identifier scan could not make:
+        // the only shape a caller outside this module can hand to
+        // `insert_replay_trial` has no field for any of the three, so a
+        // replay cannot describe a draw even by accident. `insert_trial`
+        // takes `NewTrial`, which does carry them — and is reachable only
+        // from inside this module until assignment is written.
+        const LEDGER: &str = include_str!("mod.rs");
+        let decl_start = LEDGER
+            .find("pub struct NewReplayTrial<'a> {")
+            .expect("NewReplayTrial is declared here");
+        let decl_end = decl_start
+            + LEDGER[decl_start..]
+                .find("\n}")
+                .expect("its declaration ends");
+        let decl = &LEDGER[decl_start..decl_end];
+        for absent in ["arm_index", "assignment_probability", "seed"] {
+            assert!(
+                !decl.contains(absent),
+                "NewReplayTrial must have no `{absent}` field, so no replay caller can name \
+                 one. Declaration: {decl}"
+            );
         }
     }
 
