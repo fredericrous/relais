@@ -29,7 +29,7 @@ pre-push runs, and a remote may drop the idle session while a suite runs).
 Where `amont.rehearseOnCommit` is on, every commit already starts that
 rehearsal in the background and `--wait` only follows it. Give both commands the
 longest timeout your tooling allows, never its default: here a check is
-killed only after 2m00s of silence or 1h00m in total
+killed only after 10m00s of silence or 1h00m in total
 (`amont.idleTimeout` / `amont.timeout`), and a test suite may legitimately
 run for most of that. If your tooling caps a foreground command below it,
 run the command in the background and read its result when it exits —

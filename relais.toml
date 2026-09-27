@@ -42,7 +42,24 @@ amont_agent = "required"
 
 [[verification.profiles.default.commands]]
 argv = ["make", "check"]
-timeout_seconds = 300
+# 30 minutes, from measurement rather than taste. `make check` at
+# adda6685, run ALONE on an idle machine, took 614 s and passed — more
+# than twice the 300 s that had been here since the suite was a fraction
+# of its present size. It compiles the crate, runs ~740 tests, builds
+# again on the MSRV toolchain and fetches the advisory database; none of
+# that got faster as the crate grew.
+#
+# The cost of the old limit was not a slow run, it was a WRONG ANSWER
+# about the base: a verification that ran out of clock reports
+# `baseline_unrunnable`, and every candidate against that base is blocked
+# before a worker is dispatched. relais says plainly that a timeout is
+# not a failure in the code — but a limit set below what a healthy tree
+# takes turns every run into that message.
+#
+# Headroom is deliberate: 614 s alone is the floor, and this machine runs
+# these under parallel agent load where the same check takes longer. A
+# limit that only holds on an idle machine is the same bug again.
+timeout_seconds = 1800
 
 # A candidate that touches what the profile's verdict depends on — build
 # manifests, lockfiles, the test tree, fixtures, or a program the profile
