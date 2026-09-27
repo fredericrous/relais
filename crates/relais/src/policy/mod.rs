@@ -20,7 +20,10 @@ use crate::ids::canonical_json_hash;
 use crate::money::MicroUsd;
 
 mod recipe;
-pub use recipe::{select_highest_enabled_revision, validate_recipes, RecipeError, RecipeSpec};
+pub use recipe::{
+    select_highest_enabled_revision, validate_recipes, CoveringRecipe, RecipeError, RecipeRecord,
+    RecipeSpec,
+};
 
 /// The highest `relais.toml` `schema_version` this relais understands.
 /// `RepoPolicy::validate` accepts every version from
@@ -234,6 +237,20 @@ pub struct VerificationProfile {
     /// the repository knows which it has.
     #[serde(default)]
     pub cache_baseline: bool,
+}
+
+impl VerificationProfile {
+    /// A pure, content-derived hash of this profile alone: setup,
+    /// commands, amont checks/waivers, inputs and `cache_baseline`.
+    /// Distinct from [`RepoPolicy::authority_hash`], which moves whenever
+    /// anything in the policy moves — another profile, a model, a recipe
+    /// promotion — even when none of it touches verification. This hash
+    /// answers "was this run judged by the same checks", which the
+    /// whole-policy hash cannot, and is what [`crate::verify::Receipt`]
+    /// binds as `verification_profile_hash`.
+    pub fn hash(&self) -> String {
+        canonical_json_hash(&serde_json::to_value(self).expect("VerificationProfile serializes"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2072,6 +2089,30 @@ keys = ["output.contract"]
             MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo))).expect("parses");
         assert!(
             !effective_authority(&with_recipe, &machine, &contract(), &identity()).trust_granted
+        );
+    }
+
+    /// `policy_hash` (the authority hash) moves whenever anything in the
+    /// policy moves, including a recipe promotion that touches no check —
+    /// so it cannot answer "was this judged by the same checks".
+    /// `VerificationProfile::hash` answers exactly that: it is unmoved by
+    /// a change entirely outside verification.
+    #[test]
+    fn verification_profile_hash_is_unmoved_by_an_unrelated_policy_change() {
+        let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        let with_recipe = RepoPolicy::from_toml_str(&format!(
+            "{REPO_TOML}\n[[recipes]]\nname = \"docs\"\nscope_within = [\"docs/**\"]\ntier = \"research\"\n"
+        ))
+        .expect("parses");
+        assert_ne!(
+            repo.authority_hash(),
+            with_recipe.authority_hash(),
+            "adding a recipe is an authority change"
+        );
+        assert_eq!(
+            repo.verification.profiles["rust-change"].hash(),
+            with_recipe.verification.profiles["rust-change"].hash(),
+            "the verification profile itself did not change"
         );
     }
 

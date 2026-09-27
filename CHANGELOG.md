@@ -10,6 +10,45 @@ missing here.
 
 ### Added
 
+- **A run's receipt and dispatch intent now name the recipe that covered
+  the task.** `Receipt` gains `recipe: RecipeRecord` and
+  `verification_profile_hash`, and `record_dispatch_intent` records the
+  same recipe id, name and revision beside the model, effort, harness,
+  tier and kind it already carried.
+
+  `RecipeRecord` has three states rather than two, because an `Option`
+  cannot hold the difference and the difference is load-bearing:
+  `NotRecorded` for a receipt written before the field existed, which
+  said nothing either way; `NoneCovered` for a run whose route is known
+  and which no configured recipe covered; and `Covered` naming the
+  recipe. Collapsing the first two into one `None` would let a reader
+  counting runs a recipe produced score the receipts already on disk as
+  "no recipe covered" — a positive claim about a fact they never
+  recorded.
+
+  `verification_profile_hash` hashes the verification PROFILE that
+  actually judged the candidate — its setup, commands, amont checks and
+  waivers, inputs and cache setting — not `policy_hash`, which moves
+  whenever anything in the policy moves, including a recipe promotion
+  that touches no check, and so cannot answer "was this judged by the
+  same checks".
+
+  Both fields are `#[serde(default)]`, following the `criteria` field's
+  precedent. `Receipt::hash()` is computed once at store time and nothing
+  ever recomputes it to compare, so a receipt written after this change
+  hashes differently from one written before: it records more, which is
+  the point and not something to "stabilize" with `skip_serializing_if`.
+
+  A test parses the receipts actually stored on this machine rather than
+  a fixture of the right shape — and found that two of the five have
+  never been readable, for a reason predating this change:
+  `CheckOutcome::ended` was added without a serde default, so every
+  receipt written before `bbc0589` (#24) fails with ``missing field
+  `ended` ``. That is filed as #108 and is NOT fixed here; the honest fix
+  needs an `Ended` variant meaning "the record does not say", which is a
+  design decision of its own. The test asserts those two still fail for
+  exactly that reason, so fixing #108 breaks it deliberately.
+
 - **A dispatch now records which routing strategy actually decided its
   route.** `RoutedBy` (`DeterministicRecipe`, `RiskFloor`,
   `LearnedArtifact` or `ConservativeBaseline`) gains a stable string form

@@ -1507,9 +1507,36 @@ pub struct Receipt {
     /// together; `None` when there was nothing mandatory to summarize.
     #[serde(default)]
     pub mandatory_evidence_independence: Option<IndependenceSummary>,
+    /// What this receipt records about the recipe that covered the run
+    /// (SPEC §6, §12, §17). Three states, because two are not enough: a
+    /// receipt written before this field existed recorded nothing either
+    /// way (`NotRecorded`, the `serde(default)`), a run whose route is
+    /// known but which no recipe covered recorded that fact
+    /// (`NoneCovered`), and a covered run names its recipe (`Covered`).
+    /// An `Option<CoveringRecipe>` collapsed the first two, so a reader
+    /// counting runs a recipe produced would have scored the receipts
+    /// already on disk as "no recipe covered" rather than as unknown.
+    #[serde(default)]
+    pub recipe: crate::policy::RecipeRecord,
+    /// The hash of the verification PROFILE that actually judged this
+    /// candidate (SPEC §12) — not `policy_hash`, which moves whenever
+    /// anything in the policy moves, including a recipe promotion that
+    /// touches no check. Defaults to an empty string so a receipt written
+    /// before this field existed still parses.
+    #[serde(default)]
+    pub verification_profile_hash: String,
 }
 
 impl Receipt {
+    /// A canonical-JSON hash over every field above, computed once at
+    /// store time and written beside the row in `receipts.hash` — nothing
+    /// ever recomputes it and compares, so it is not the authority hash,
+    /// where a moved value kills a trust grant. A receipt written after
+    /// `recipe` and `verification_profile_hash` were added SHOULD hash
+    /// differently from one written before: it now records more, and
+    /// that is exactly what this hash is for. Do not add
+    /// `skip_serializing_if` to either field to "stabilize" this hash —
+    /// there is nothing on the other end comparing it to a prior value.
     pub fn hash(&self) -> String {
         canonical_json_hash(&serde_json::to_value(self).expect("receipt serializes"))
     }
@@ -1642,6 +1669,76 @@ pub fn integration_gaps(
 
 #[cfg(test)]
 mod tests {
+
+    /// `run-65bea577a556f-f2bc`, verbatim.
+    const PRE_FIELD_RECEIPT_1: &str = r#"{"run_id":"run-65bea577a556f-f2bc","candidate_sha":"345dd682748b54808465283a682415e95631b90a","base_sha":"7323b4423a7fc56b1eeffc3bab0d75257b36809f","contract_hash":"ede951fb37e8da587f264038e938afbbe66b59eb22449e999ef7c2f9c549d54d","policy_hash":"69e18988be2d101ac459ddb33bec0137e9c33788467239fb7398506411a3efc5","outcome":"accepted","verification":{"candidate_sha":"345dd682748b54808465283a682415e95631b90a","base_sha":"7323b4423a7fc56b1eeffc3bab0d75257b36809f","contract_hash":"ede951fb37e8da587f264038e938afbbe66b59eb22449e999ef7c2f9c549d54d","policy_hash":"69e18988be2d101ac459ddb33bec0137e9c33788467239fb7398506411a3efc5","checks":[{"label":"make@c1c4713f","argv":["make","check"],"exit":0,"timed_out":false,"log_path":"/Users/fredericrous/.local/state/relais/runs/run-65bea577a556f-f2bc/logs/attempt1-cmd0.log","log_sha256":"6fa3d38941fce387c373c4b90cab582437b7d5547c852b141d9db1d025b5e275"}],"gaps":[],"baseline_failures":[],"amont_bypasses":[],"amont_downgrades":[],"verification_inputs_changed":[],"integration_gaps":[],"baseline_cached":false},"models_used":["haiku"],"attempts":1,"cost_completeness":"actual","cost":138390}"#;
+
+    /// `run-65beaee85956b-21f7`, verbatim.
+    const PRE_FIELD_RECEIPT_2: &str = r#"{"run_id":"run-65beaee85956b-21f7","candidate_sha":"e75c1b7e797f8ce5f09106314019e38c12d4b06e","base_sha":"af485569242c901edbf8b0aa8d079da339899571","contract_hash":"07597e4e79d6b5db303848faef5a83092b91f93585630e59bc39b81100126a06","policy_hash":"f2934f557150d4cbe84a57ee2cec03a662027d4f47908aceab40877f5cc470f4","outcome":"accepted","verification":{"candidate_sha":"e75c1b7e797f8ce5f09106314019e38c12d4b06e","base_sha":"af485569242c901edbf8b0aa8d079da339899571","contract_hash":"07597e4e79d6b5db303848faef5a83092b91f93585630e59bc39b81100126a06","policy_hash":"f2934f557150d4cbe84a57ee2cec03a662027d4f47908aceab40877f5cc470f4","checks":[{"label":"make@c1c4713f","argv":["make","check"],"exit":0,"timed_out":false,"log_path":"/Users/fredericrous/.local/state/relais/runs/run-65beaee85956b-21f7/logs/attempt1-cmd0.log","log_sha256":"90533b7d5a7d3ec544b155a283a083b4d27c8ac5f55057de495d88b0d3face9c"}],"gaps":[],"baseline_failures":[],"amont_bypasses":[],"amont_downgrades":[],"verification_inputs_changed":[],"integration_gaps":[],"baseline_cached":false},"models_used":["claude-sonnet-5"],"attempts":1,"cost_completeness":"actual","cost":348456}"#;
+
+    /// `run-65c083902dd9a-32f2`, verbatim.
+    const PRE_FIELD_RECEIPT_3: &str = r#"{"run_id":"run-65c083902dd9a-32f2","candidate_sha":"7b9f24ce9926e47b778a4d540a8ac48219352406","base_sha":"39c47ef1dbe697735bdcab01dfa9152a767c17cc","contract_hash":"ad3f611a09986544da26aa298fc6aedfa620007f690296934331a5a434c12937","policy_hash":"3c3bf4f67d5379c8e3c14e213bee58945a09b49d4ace905db74d3c8167702bce","outcome":"accepted","verification":{"candidate_sha":"7b9f24ce9926e47b778a4d540a8ac48219352406","base_sha":"39c47ef1dbe697735bdcab01dfa9152a767c17cc","contract_hash":"ad3f611a09986544da26aa298fc6aedfa620007f690296934331a5a434c12937","policy_hash":"3c3bf4f67d5379c8e3c14e213bee58945a09b49d4ace905db74d3c8167702bce","checks":[{"label":"make@c1c4713f","argv":["make","check"],"ended":{"exited":0},"log_path":"/Users/fredericrous/.local/state/relais/runs/run-65c083902dd9a-32f2/logs/base-cmd0.log","log_sha256":"2e11fa60569dca14ddc5b04bd11036193f5cdf4d914ce28ef1eb354ed1d6d573"}],"gaps":[],"baseline_failures":[],"amont_bypasses":[],"amont_downgrades":[],"verification_inputs_changed":[],"integration_gaps":[],"baseline_cached":false,"baseline_cache_refused":null},"models_used":["claude-haiku-4-5"],"attempts":1,"cost_completeness":"actual","cost":76325}"#;
+
+    /// `run-65c08aba5fed0-429e`, verbatim.
+    const PRE_FIELD_RECEIPT_4: &str = r#"{"run_id":"run-65c08aba5fed0-429e","candidate_sha":"e0c65a0f6993b5b9489db23c2a6dc8143f945f9d","base_sha":"e92a4be3684bef060dd5a075da4e009c8dc8089e","contract_hash":"f7dd1092bd32328c159d8d8ba8a01471538f12e2439c5c9f23d65e226720eb30","policy_hash":"2b7c659066ba2a659aa34d02280146c592e330138b8882b4392e308aee2bb5d5","outcome":"accepted","verification":{"candidate_sha":"e0c65a0f6993b5b9489db23c2a6dc8143f945f9d","base_sha":"e92a4be3684bef060dd5a075da4e009c8dc8089e","contract_hash":"f7dd1092bd32328c159d8d8ba8a01471538f12e2439c5c9f23d65e226720eb30","policy_hash":"2b7c659066ba2a659aa34d02280146c592e330138b8882b4392e308aee2bb5d5","checks":[{"label":"npm@e7f1a614","argv":["npm","run","typecheck"],"ended":{"exited":0},"log_path":"/Users/fredericrous/.local/state/relais/runs/run-65c08aba5fed0-429e/logs/attempt1-cmd0.log","log_sha256":"31bf9ff6ae9452c00bbe693aafea5619651b2efe5321e7b5766c299750179b66"},{"label":"npm@edad09f9","argv":["npm","run","lint"],"ended":{"exited":0},"log_path":"/Users/fredericrous/.local/state/relais/runs/run-65c08aba5fed0-429e/logs/attempt1-cmd1.log","log_sha256":"31906c88b30cdcd0543e47c386c5582d9b9c21c5b9503e2793fdefaed291bc7f"},{"label":"npm@86ddd8f4","argv":["npm","run","test:unit"],"ended":{"exited":0},"log_path":"/Users/fredericrous/.local/state/relais/runs/run-65c08aba5fed0-429e/logs/attempt1-cmd2.log","log_sha256":"e63c1bb67c5730abb9e6c097435e17b83e02237bc6c55d5ebebb5472e1cc975e"}],"gaps":[],"baseline_failures":[],"amont_bypasses":[],"amont_downgrades":[],"verification_inputs_changed":[],"integration_gaps":[],"baseline_cached":false,"baseline_cache_refused":null},"models_used":["claude-sonnet-5"],"attempts":1,"cost_completeness":"actual","cost":274002}"#;
+
+    /// `run-65c37c19bbf9a-6c72`, verbatim.
+    const PRE_FIELD_RECEIPT_5: &str = r#"{"run_id":"run-65c37c19bbf9a-6c72","candidate_sha":"de92ac635059652489d624b90f4dc8d84a26605e","base_sha":"d931ba8f4349d51d96fc9b3984a380a9212e109b","contract_hash":"33758fefa04dd12414def1df5217602247293dc68b831f3e72d1b180211760d9","policy_hash":"5e5e9d7d08e3d279c63891709b2b657211950e5ee4c0647da6ae8c8bc12be398","outcome":"accepted","verification":{"candidate_sha":"de92ac635059652489d624b90f4dc8d84a26605e","base_sha":"d931ba8f4349d51d96fc9b3984a380a9212e109b","contract_hash":"33758fefa04dd12414def1df5217602247293dc68b831f3e72d1b180211760d9","policy_hash":"5e5e9d7d08e3d279c63891709b2b657211950e5ee4c0647da6ae8c8bc12be398","checks":[{"label":"make@c1c4713f","argv":["make","check"],"ended":{"exited":0},"log_path":"/Users/fredericrous/.local/state/relais/runs/run-65c37c19bbf9a-6c72/logs/attempt1-cmd0.log","log_sha256":"b74a0eb6cf67db1a7499901e1aa8a0afd7aa7163dec30e96b21443bf0a1ba9fb"}],"gaps":[],"baseline_failures":[],"amont_bypasses":[],"amont_downgrades":[],"verification_inputs_changed":["crates/relais/tests/release_scenarios.rs"],"integration_gaps":[],"baseline_cached":false,"baseline_cache_refused":null},"models_used":["claude-sonnet-5"],"attempts":1,"cost_completeness":"actual","cost":9924800,"criteria":[{"id":"c-e2744e354c19","statement":"`make check` passes (fmt, clippy -D warnings, tests, msrv, audit, scripts/check-module-cycles.py).","mandatory":true,"met":true},{"id":"amont-gate-is-evidence","statement":"A declared acceptance criterion can name an amont gate as its evidence, alongside the named check, test, review and sign-off it can name today, and `independent()` counts it as independent ground truth because the gate ran outside this run and its attestation is signed.","mandatory":true,"met":true,"evidence":{"kind":"test","authorship":"model_added"}},{"id":"asks-amont-not-its-notes","statement":"Whether a gate is covered is asked of amont through its documented interface \u2014 `amont attest covered`, run against the candidate's own tree \u2014 and never by reading `refs/notes/amont-attest`, parsing an attestation format, or invoking a signature verifier here. The gate and its attestation stay amont's to own (SPEC \u00a710, \u00a718), and a test asserts relais runs that command rather than reaching for git notes or ssh-keygen.","mandatory":true,"met":true,"evidence":{"kind":"test","authorship":"model_added"}},{"id":"uncovered-gate-is-a-gap","statement":"A mandatory criterion naming a gate that amont does not report as covered becomes a gap in the existing verification report, refused by the mechanism that already refuses gaps \u2014 never a second acceptance path. This is the safe direction even though `amont attest covered` is fail-open by design (it prints nothing and exits 0 on any failure), because a gate whose name does not appear is treated as uncovered whatever the reason.","mandatory":true,"met":true,"evidence":{"kind":"test","authorship":"model_added"}},{"id":"gap-says-what-it-cannot-know","statement":"Because that interface cannot distinguish an absent attestation from one whose signature failed to verify, the gap's message says so rather than asserting a cause it does not know, and names `amont attest covered` as the command a person can run to see the same answer.","mandatory":true,"met":true,"evidence":{"kind":"test","authorship":"model_added"}},{"id":"coverage-is-recorded-as-evidence","statement":"A gate amont reports as covered records an external attestation evidence row against the run and the criterion it answers, naming amont as the tool and the candidate sha as the subject, so the receipt and `relais explain` show what settled the criterion and where it came from.","mandatory":true,"met":true,"evidence":{"kind":"test","authorship":"model_added"}},{"id":"unavailable-amont-is-a-gap","statement":"An amont that is absent, too old to have the subcommand, or fails for any other reason is a gap naming the cause, never a silent pass and never a crash \u2014 relais reports what it could not establish.","mandatory":true,"met":true,"evidence":{"kind":"test","authorship":"model_added"}},{"id":"coherent","statement":"The change reads as one idea, and nothing in it lets relais conclude a gate passed on evidence amont did not give it.","mandatory":false,"met":true,"evidence":{"kind":"llm_review"}},{"id":"c-cca6cd9cef5b","statement":"No new `_ =>` arm over an enum this crate owns, no new bool parameter, no new `#[allow]`, and every new silencing of a fallible operation carries a one-line reason at the site.","mandatory":true,"met":true},{"id":"c-f86c85776acf","statement":"The CHANGELOG gains an entry under the unreleased heading, and docs/SPEC.md says the same where it already describes acceptance evidence and amont ownership.","mandatory":true,"met":true}],"mandatory_evidence_independence":"partly_independent"}"#;
+
+    /// The receipts actually on this machine's disk when `recipe` and
+    /// `verification_profile_hash` were added, verbatim. The test above
+    /// proves a hand-written 11-key document parses; these prove the
+    /// documents that EXIST do — and they turned up a pre-existing bug
+    /// this change did not cause and does not fix.
+    ///
+    /// Three of the five parse, and read the new fields as unrecorded,
+    /// which is what `serde(default)` is here for. TWO DO NOT, and not
+    /// because of anything added here: `CheckOutcome::ended` was
+    /// introduced by `bbc0589` (#24) with no `serde(default)`, so every
+    /// receipt stored before it is unreadable — `relais` cannot
+    /// deserialize its own oldest records. Filed as #108.
+    ///
+    /// The two are asserted to fail for exactly that reason rather than
+    /// being quietly excluded, so that fixing #108 breaks this test and
+    /// whoever fixes it is told to promote them into the parsing set.
+    #[test]
+    fn receipts_already_on_disk_still_parse() {
+        const PARSES: &[&str] = &[
+            PRE_FIELD_RECEIPT_3,
+            PRE_FIELD_RECEIPT_4,
+            PRE_FIELD_RECEIPT_5,
+        ];
+        const BLOCKED_BY_ISSUE_108: &[&str] = &[PRE_FIELD_RECEIPT_1, PRE_FIELD_RECEIPT_2];
+
+        for (n, json) in PARSES.iter().enumerate() {
+            let receipt: Receipt = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("stored receipt {n} must still parse: {e}"));
+            assert_eq!(
+                receipt.recipe,
+                crate::policy::RecipeRecord::NotRecorded,
+                "receipt {n} recorded nothing about a recipe, and must read as such"
+            );
+            assert!(
+                receipt.verification_profile_hash.is_empty(),
+                "receipt {n} named no verification profile hash"
+            );
+            assert!(!receipt.run_id.is_empty(), "receipt {n} keeps its run id");
+        }
+
+        for (n, json) in BLOCKED_BY_ISSUE_108.iter().enumerate() {
+            let parsed: Result<Receipt, _> = serde_json::from_str(json);
+            let error = parsed
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("receipt {n} now parses — #108 is fixed, so move it into PARSES")
+                })
+                .to_string();
+            assert!(
+                error.contains("missing field `ended`"),
+                "receipt {n} must still fail for #108's reason and no other: {error}"
+            );
+        }
+    }
     use super::*;
 
     fn command(argv: &[&str], timeout_seconds: u64) -> CommandSpec {
@@ -3081,6 +3178,12 @@ mod tests {
         let receipt: Receipt = serde_json::from_str(json).expect("a pre-existing receipt parses");
         assert!(receipt.criteria.is_empty());
         assert_eq!(receipt.mandatory_evidence_independence, None);
+        // A receipt parsed from JSON that never carried the field:
+        // NotRecorded, which is what `serde(default)` must yield — never
+        // `NoneCovered`, which would claim the run had no covering recipe
+        // when nobody wrote that down.
+        assert_eq!(receipt.recipe, crate::policy::RecipeRecord::NotRecorded);
+        assert_eq!(receipt.verification_profile_hash, "");
     }
 
     #[test]
@@ -3144,6 +3247,8 @@ mod tests {
             cost: MicroUsd::from_micros(12_345),
             criteria: Vec::new(),
             mandatory_evidence_independence: None,
+            recipe: crate::policy::RecipeRecord::NotRecorded,
+            verification_profile_hash: "vph".into(),
         };
         let hash = receipt.hash();
         let mut other = receipt.clone();

@@ -210,6 +210,68 @@ impl RecipeSpec {
     }
 }
 
+/// The identity of the recipe that covered a run, named on its dispatch
+/// intent and its receipt (SPEC §12, §17): id, name and revision together,
+/// never separately, so a reader cannot see a name with no id or a
+/// revision with no name. A run no recipe covers records the absence of
+/// this type — `None` — not a placeholder built from empty/zero fields;
+/// the two are different facts and only one of them was ever true of a
+/// given run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoveringRecipe {
+    pub id: String,
+    pub name: String,
+    pub revision: u32,
+}
+
+/// What a receipt records about the recipe that produced a run. THREE
+/// states, not two, because `Option` cannot hold the difference and the
+/// difference is load-bearing:
+///
+/// - `NotRecorded` — this receipt predates the field. Nobody wrote down
+///   whether a recipe covered the run, either way.
+/// - `NoneCovered` — recorded, and no configured recipe covered the task:
+///   the learner or the conservative baseline decided.
+/// - `Covered` — recorded, and this is the recipe.
+///
+/// An `Option<CoveringRecipe>` collapsed the first two into one `None`,
+/// so a reader counting "runs produced by a recipe" would have scored the
+/// five receipts already stored on this machine as "no recipe covered"
+/// rather than as unknown — a positive claim about a fact those receipts
+/// never recorded. `NotRecorded` is the `Default`, so a receipt written
+/// before this field existed still parses into the honest answer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RecipeRecord {
+    #[default]
+    NotRecorded,
+    NoneCovered,
+    Covered(CoveringRecipe),
+}
+
+impl RecipeRecord {
+    /// What a run whose route is known records: the covering recipe, or
+    /// `NoneCovered` when nothing covered it. Never `NotRecorded` — a
+    /// caller that knows the route has, by definition, recorded it.
+    pub fn of(covering: Option<CoveringRecipe>) -> Self {
+        match covering {
+            Some(recipe) => Self::Covered(recipe),
+            None => Self::NoneCovered,
+        }
+    }
+
+    /// The covering recipe, if one was recorded AND covered the task.
+    /// `NotRecorded` and `NoneCovered` both answer `None` here, which is
+    /// correct for a caller that only wants the recipe; a caller that
+    /// must tell them apart matches on the variants instead.
+    pub fn covering(&self) -> Option<&CoveringRecipe> {
+        match self {
+            Self::Covered(recipe) => Some(recipe),
+            Self::NotRecorded | Self::NoneCovered => None,
+        }
+    }
+}
+
 /// Among the recipes a task's coverage predicate accepts, the one
 /// `route` selects: the highest `revision` among those that are
 /// `enabled`. A disabled recipe is never selected even when it is the
@@ -241,6 +303,50 @@ pub fn select_highest_enabled_revision(
 
 #[cfg(test)]
 mod tests {
+
+    /// The distinction an `Option<CoveringRecipe>` could not hold. All
+    /// three states must be mutually distinguishable, and the one a
+    /// missing JSON key yields must be the honest one.
+    #[test]
+    fn a_missing_record_is_not_the_same_as_a_recorded_absence() {
+        use super::{CoveringRecipe, RecipeRecord};
+
+        // What `serde(default)` gives a receipt that predates the field.
+        let from_old_json: RecipeRecord = serde_json::from_str("null").unwrap_or_default();
+        assert_eq!(RecipeRecord::default(), RecipeRecord::NotRecorded);
+        assert_eq!(from_old_json, RecipeRecord::NotRecorded);
+
+        // What a run whose route IS known records when nothing covered it.
+        let recorded_absence = RecipeRecord::of(None);
+        assert_eq!(recorded_absence, RecipeRecord::NoneCovered);
+
+        // The three are distinct: collapsing any pair would let a reader
+        // score "nobody wrote it down" as "no recipe covered this".
+        let covered = RecipeRecord::of(Some(CoveringRecipe {
+            id: "rid-1".into(),
+            name: "docs".into(),
+            revision: 2,
+        }));
+        assert_ne!(RecipeRecord::NotRecorded, recorded_absence);
+        assert_ne!(RecipeRecord::NotRecorded, covered);
+        assert_ne!(recorded_absence, covered);
+
+        // `covering()` answers None for both non-covered states, which is
+        // right for a caller that only wants the recipe.
+        assert!(RecipeRecord::NotRecorded.covering().is_none());
+        assert!(recorded_absence.covering().is_none());
+        assert_eq!(covered.covering().map(|r| r.revision), Some(2));
+
+        // Round-trips, so a stored receipt reads back as what was written.
+        for state in [RecipeRecord::NotRecorded, recorded_absence, covered] {
+            let json = serde_json::to_string(&state).expect("serializes");
+            assert_eq!(
+                serde_json::from_str::<RecipeRecord>(&json).expect("parses"),
+                state,
+                "{json} must round-trip"
+            );
+        }
+    }
     use super::*;
 
     fn recipe(name: &str, revision: u32, enabled: bool) -> RecipeSpec {

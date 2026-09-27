@@ -107,6 +107,11 @@ pub struct Route {
     /// What the artifact estimated, when one was consulted — recorded by
     /// the runner as a prediction row whatever it decided.
     pub estimates: Option<Estimates>,
+    /// The deterministic recipe that produced this route, when one fully
+    /// covered the task; `None` when the learner or the conservative
+    /// baseline decided instead. Named on the run's receipt and dispatch
+    /// intent (SPEC §12, §17) via [`Recipe::covering_identity`].
+    pub covering: Option<Recipe>,
     pub reasons: Vec<RouteReason>,
 }
 
@@ -249,6 +254,10 @@ fn risk_floor(contract: &TaskContract, repo: &RepoPolicy) -> (Option<Tier>, Vec<
 /// prose.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recipe {
+    /// [`crate::policy::RecipeSpec::recipe_id`]: the recipe's
+    /// content-derived identity, named on a run's receipt and dispatch
+    /// intent alongside `name` and `revision` (SPEC §12, §17).
+    pub recipe_id: String,
     pub name: String,
     pub kind: Option<Kind>,
     /// Contract scope must fall entirely within these patterns.
@@ -266,12 +275,27 @@ pub struct Recipe {
 impl From<&crate::policy::RecipeSpec> for Recipe {
     fn from(spec: &crate::policy::RecipeSpec) -> Self {
         Recipe {
+            recipe_id: spec.recipe_id(),
             name: spec.name.clone(),
             kind: spec.kind,
             scope_within: spec.scope_within.clone(),
             tier: spec.tier,
             revision: spec.revision,
             enabled: spec.enabled,
+        }
+    }
+}
+
+impl Recipe {
+    /// This recipe's identity as recorded on a receipt or dispatch
+    /// intent: id, name and revision, and nothing else — `kind`,
+    /// `scope_within`, `tier` and `enabled` decided whether it covered
+    /// the task, not what a reader needs to know afterward.
+    pub fn covering_identity(&self) -> crate::policy::CoveringRecipe {
+        crate::policy::CoveringRecipe {
+            id: self.recipe_id.clone(),
+            name: self.name.clone(),
+            revision: self.revision,
         }
     }
 }
@@ -566,6 +590,7 @@ pub fn route(inputs: RouteInputs<'_>) -> Routed {
         max_repairs_before_escalation: authority.max_repairs_before_escalation,
         routed_by: selected.1,
         estimates: estimates_seen,
+        covering,
         reasons,
     })
 }

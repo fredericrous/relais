@@ -41,7 +41,7 @@ use crate::policy::{
     RepoPolicy, Tier, VerificationProfile,
 };
 use crate::procs::Ended;
-use crate::route::{route, Route, RouteInputs, RoutePredictor, Routed, RoutedBy};
+use crate::route::{route, Recipe, Route, RouteInputs, RoutePredictor, Routed, RoutedBy};
 use crate::verify::{self, amont_gaps, Receipt, VerificationReport};
 use crate::workspace::{self, TaskWorktree, WorkspaceError};
 
@@ -1753,6 +1753,9 @@ impl<'a> RunEngine<'a> {
                 "tier": tier.as_str(),
                 "kind": kind.as_str(),
                 "prompt_bytes": prompt.len(),
+                "recipe_id": ctx.preflight.decision.covering.as_ref().map(|r| &r.recipe_id),
+                "recipe_name": ctx.preflight.decision.covering.as_ref().map(|r| &r.name),
+                "recipe_revision": ctx.preflight.decision.covering.as_ref().map(|r| r.revision),
             }),
             0,
             ctx.preflight.decision.routed_by,
@@ -2373,6 +2376,7 @@ impl<'a> RunEngine<'a> {
                     patch_path: candidate.latest_patch.clone(),
                     deadline: ctx.deadline,
                     routed_by: preflight.decision.routed_by,
+                    covering: preflight.decision.covering.clone(),
                 },
                 &mut progress.spend,
             );
@@ -2438,6 +2442,14 @@ impl<'a> RunEngine<'a> {
             cost: progress.spend.total,
             criteria,
             mandatory_evidence_independence,
+            recipe: crate::policy::RecipeRecord::of(
+                preflight
+                    .decision
+                    .covering
+                    .as_ref()
+                    .map(Recipe::covering_identity),
+            ),
+            verification_profile_hash: preflight.authority.verification_profile.hash(),
         };
         self.seal(
             &receipt,
@@ -2724,6 +2736,14 @@ impl<'a> RunEngine<'a> {
             cost: progress.spend.total,
             criteria,
             mandatory_evidence_independence,
+            recipe: crate::policy::RecipeRecord::of(
+                preflight
+                    .decision
+                    .covering
+                    .as_ref()
+                    .map(Recipe::covering_identity),
+            ),
+            verification_profile_hash: preflight.authority.verification_profile.hash(),
         };
         // No attempt id: this receipt belongs to the run, and the
         // attempt that earned it is not finished — the run is waiting on
@@ -3307,6 +3327,9 @@ impl<'a> RunEngine<'a> {
                 "harness": self.harness,
                 "tier": reviewer_tier.as_str(),
                 "kind": "review",
+                "recipe_id": request.covering.as_ref().map(|r| &r.recipe_id),
+                "recipe_name": request.covering.as_ref().map(|r| &r.name),
+                "recipe_revision": request.covering.as_ref().map(|r| r.revision),
             }),
             remaining_budget.unwrap_or(0),
             request.routed_by,
@@ -3428,6 +3451,9 @@ pub(crate) struct ReviewRequest<'r> {
     /// routing fact rather than a value the reviewer's own dispatch
     /// never actually decided.
     pub(crate) routed_by: RoutedBy,
+    /// The recipe that covered the candidate's own dispatch, if any —
+    /// carried the same way as `routed_by`, for the same reason.
+    pub(crate) covering: Option<Recipe>,
 }
 
 /// The verdict, read from the LAST non-empty line of a reviewer's
@@ -3864,7 +3890,7 @@ mod tests {
     use crate::context::AvalVerdict;
     use crate::policy::{
         CommandSpec, ConcurrencyLimits, Dependency, DependencyMode, ExecutionPolicy, ModelProfile,
-        RiskRule, TrialEnvelope, VerificationPolicy, VerificationProfile,
+        RecipeSpec, RiskRule, TrialEnvelope, VerificationPolicy, VerificationProfile,
     };
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -5393,6 +5419,75 @@ mod tests {
         assert_eq!(
             crate::report::cost_line(receipt.cost, receipt.cost_completeness),
             "at least $0.00004 (unknown: some usage was not reported)"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_run_under_no_recipe_records_absence() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let backend = MockBackend::new(|spec| {
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(40)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+        let RunOutcome {
+            terminal: Terminal::Accepted(receipt),
+            ..
+        } = outcome
+        else {
+            panic!("expected acceptance, got {outcome:?}");
+        };
+        // `NoneCovered`, NOT `NotRecorded`: this run recorded the fact
+        // that nothing covered it. A pre-existing receipt, which never
+        // recorded either way, is the one that reads `NotRecorded` — and
+        // an `Option` could not have told the two apart.
+        assert_eq!(
+            receipt.recipe,
+            crate::policy::RecipeRecord::NoneCovered,
+            "no recipe covers this task, and the receipt says so rather than staying silent"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_run_under_a_covering_recipe_names_it_on_the_receipt() {
+        let fixture = Fixture::new();
+        let mut repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let recipe = RecipeSpec::covering("src-touchup", Tier::Implementation);
+        let expected_id = recipe.recipe_id();
+        repo.recipes.push(recipe);
+        let backend = MockBackend::new(|spec| {
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(40)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+        let RunOutcome {
+            terminal: Terminal::Accepted(receipt),
+            ..
+        } = outcome
+        else {
+            panic!("expected acceptance, got {outcome:?}");
+        };
+        assert_eq!(
+            receipt.recipe,
+            crate::policy::RecipeRecord::Covered(crate::policy::CoveringRecipe {
+                id: expected_id,
+                name: "src-touchup".into(),
+                revision: 0,
+            }),
+            "the deterministic recipe that covered the task is named on the receipt"
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }

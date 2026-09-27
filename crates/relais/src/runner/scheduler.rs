@@ -30,7 +30,7 @@ use crate::lifecycle::UsagePhase;
 use crate::money::{CostKind, MicroUsd};
 use crate::policy::{BlockCode, EffectiveAuthority, MachineSettings, Tier};
 use crate::procs::Ended;
-use crate::route::Route;
+use crate::route::{Recipe, Route};
 use crate::verify::{self, Receipt, VerificationReport};
 use crate::workspace::{self, WorkspaceError};
 
@@ -940,6 +940,7 @@ fn accept_integrated(
                 patch_path: assembled.patch_path.clone(),
                 deadline: root.deadline,
                 routed_by: root.decision.routed_by,
+                covering: root.decision.covering.clone(),
             },
             &mut spend,
         );
@@ -1007,6 +1008,13 @@ fn accept_integrated(
         cost: spend.total,
         criteria,
         mandatory_evidence_independence,
+        recipe: crate::policy::RecipeRecord::of(
+            root.decision
+                .covering
+                .as_ref()
+                .map(Recipe::covering_identity),
+        ),
+        verification_profile_hash: root.authority.verification_profile.hash(),
     };
     engine.seal(&receipt, None, None, &head)?;
     // The assembled revision is named under this run so the retirement
@@ -1088,6 +1096,9 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
             "effort": profile.effort,
             "harness": engine.harness,
             "kind": "plan",
+            "recipe_id": root.decision.covering.as_ref().map(|r| &r.recipe_id),
+            "recipe_name": root.decision.covering.as_ref().map(|r| &r.name),
+            "recipe_revision": root.decision.covering.as_ref().map(|r| r.revision),
         }),
         remaining_budget.unwrap_or(0),
         root.decision.routed_by,
