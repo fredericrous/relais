@@ -23,7 +23,9 @@ use crate::policy::{
 };
 
 mod candidate;
-pub use candidate::{validate_candidate, CandidateRecipe, CandidateRejection, TuningBounds};
+pub use candidate::{
+    default_tuning_bounds, validate_candidate, CandidateRecipe, CandidateRejection, TuningBounds,
+};
 
 /// Estimates from an owned, Relais-trained artifact (SPEC §16). The
 /// predictor abstains (returns `None`) when it has no supported coverage

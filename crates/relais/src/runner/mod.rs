@@ -178,6 +178,13 @@ pub struct RunConfig<'a> {
     /// before. Only consulted for a root run — a child always inherits
     /// its parent's task regardless of this field.
     pub task_override: Option<&'a crate::ids::TaskId>,
+    /// Why this run exists, when it is not ordinary work. Written with
+    /// the run row itself, NOT stamped afterwards: a replay stamped after
+    /// `execute` returned left money spent under a run the ledger showed
+    /// as ordinary whenever `execute` errored or the process was killed,
+    /// and no trial to account for it. A run's purpose holds for the
+    /// whole run or it is not a purpose.
+    pub purpose: Option<crate::lifecycle::RunPurpose>,
 }
 
 /// Poll period while queued for admission. `pub(crate)`: `hook::respond`
@@ -1191,13 +1198,22 @@ impl<'a> RunEngine<'a> {
                     Some(task) => task.clone(),
                     None => derive_task_id(&this_repo_key, &self.config.contract.hash()),
                 };
-                ledger.insert_run(
+                let inserted = ledger.insert_run(
                     &self.run_id,
                     &self.config.repo_dir.to_string_lossy(),
                     Some(&self.config.session_id),
                     &task,
                     &this_repo_key,
-                )?
+                );
+                // Before anything can be dispatched. A purpose written
+                // after the run finishes is absent for every path that
+                // does not reach the end — an error, a kill, a ceiling —
+                // and those are exactly the runs whose spend most needs
+                // accounting for.
+                if let Some(purpose) = self.config.purpose {
+                    ledger.set_run_purpose(&self.run_id, purpose)?;
+                }
+                inserted?
             }
             Some((parent_run, package_id, _role)) => {
                 // A work package is not a task of its own (SPEC §19): it
@@ -4119,6 +4135,7 @@ mod tests {
                 session_id: "test-session".into(),
                 heartbeat_every: Duration::from_millis(50),
                 task_override: None,
+                purpose: None,
             })
             .expect("the fixture's id source mints identifiers")
         }
@@ -4154,6 +4171,7 @@ mod tests {
                 session_id: "test-session".into(),
                 heartbeat_every: Duration::from_millis(50),
                 task_override: None,
+                purpose: None,
             })
             .expect("the fixture's id source mints identifiers")
         }
@@ -4190,6 +4208,7 @@ mod tests {
                 session_id: "test-session".into(),
                 heartbeat_every: Duration::from_millis(50),
                 task_override: None,
+                purpose: None,
             })
             .expect("the fixture's id source mints identifiers")
         }
@@ -4832,6 +4851,7 @@ mod tests {
             session_id: "test-session".into(),
             heartbeat_every: Duration::from_millis(50),
             task_override: None,
+            purpose: None,
         })
         .expect("the fixture's id source mints identifiers");
         let RunOutcome {

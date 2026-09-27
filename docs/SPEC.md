@@ -650,6 +650,28 @@ Leases use heartbeats and reconciliation. Lease expiry does not prove a worker d
 
 Compatibility references: Claude Code hook semantics and subagent depth/concurrency controls. These establish adapter constraints, not evidence that Relais has been implemented or tested.
 
+## 24. Task replay
+
+`relais dataset replay --task <id> --recipe <candidate.toml>` re-runs a task's already-accepted run under a candidate recipe, so the candidate has to earn its own result rather than borrow the incumbent's. This is NOT a promotion mechanism and does not compare, score, rank or promote anything: it produces exactly one arm's result for one task. A single replay, or a small deliberately-run set of them, is not evidence that a recipe should be promoted — that judgment, if it is ever made, is a later mechanism's job, not this command's.
+
+### Admission
+
+A candidate is admitted through the same door a learner's own proposal is: `route::validate_candidate` (§17), against `TuningBounds` derived from the repository's own current policy — never from the candidate, and never from a second, replay-specific configuration file that could drift from the boundary a learner's proposal already has to clear. A candidate `validate_candidate` refuses is refused here with that same rejection; replay is not a second door into an unvalidated policy.
+
+The source run must be `Accepted` — the runner's own verification settled it, not a person's salvage — because only that run wrote a receipt with a verification profile hash to check a replay's comparability against. Replay additionally refuses when the verification profile that would judge the replay differs, by content hash, from the one recorded on the source run's receipt: a comparison judged by different checks is not a comparison, even though the candidate's own `verification` field cannot itself move (it is one of the fixed fields `validate_candidate` never lets a candidate touch) — the check exists for the case where the repository's policy, not the candidate, moved between the source run and the replay.
+
+### Workspace isolation
+
+The replay workspace MUST NOT contain the accepted answer. It is built as a fresh, single-commit checkout at the source run's recorded base SHA — `git init` plus a shallow `git fetch` of exactly that one commit — never a `git worktree add` of the live repository. A linked worktree shares the live repository's object store, where the accepted candidate's own commit (reachable from later history, past the base) is one `git show` away; a fresh checkout's object store holds nothing but the base commit and its own history, so the accepted answer is not merely absent from the working tree, it was never fetched. From that checkout, the rest of a run's ordinary machinery — routing, dispatch, verification, snapshotting — proceeds exactly as `relais run` takes it, needing no replay-specific path through it.
+
+### Spend and ceilings
+
+A replay dispatches a real worker and spends real money: usage is recorded as ordinary `CostKind::ApiSpend`, under the same admission gate, machine limits and per-run ceilings every other run goes through — there is no separate cost kind or bypass that would let a replay's spend escape a ceiling ordinary work is subject to. `--dry-run` reports what would run (the source run, the candidate's covering recipe, the verification profile hash checked) and spends nothing: no worker is dispatched, no trial row is written, no usage is recorded.
+
+### Record
+
+A completed replay writes exactly one `trials` row (§17): `assignment_probability` is `1.0`, because nothing was sampled — a replay is a deliberate re-run, not a draw among several arms — and `workspace_isolation` records `fresh_checkout_no_accepted_answer`, distinct from whatever an ordinary or sampled trial's workspace records. The row is settled once, through the same settle-once path (`Ledger::settle_trial`) every other trial's outcome is. The run itself carries `RunPurpose::Replay`, distinguishing it on the ledger from ordinary work.
+
 ---
 
 Companion repositories: [amont](https://github.com/fredericrous/amont), [aval](https://github.com/fredericrous/aval), [amont-agent](https://github.com/fredericrous/amont-agent).

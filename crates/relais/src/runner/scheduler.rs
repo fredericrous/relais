@@ -712,6 +712,11 @@ fn run_package(
         // Irrelevant for a child: `preflight`'s child branch inherits
         // the root's task from the ledger unconditionally, never this.
         task_override: None,
+        // A package inherits its root's purpose implicitly: the root run
+        // carries it, and a package is not a run a reader accounts for on
+        // its own. Naming it here would be a second record of the same
+        // fact, free to disagree.
+        purpose: None,
     };
     engine.transition(
         State::Running,

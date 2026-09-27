@@ -42,8 +42,11 @@ use relais::contract::TaskContract;
 use relais::ids::{IdSource, RunId, TaskId};
 use relais::install::{InstallReport, InstallRequest, Mode, Scope};
 use relais::learn::predict::RegistryPredictor;
+use relais::ledger::{TrialCost, TrialOutcome};
+use relais::lifecycle::RunPurpose;
+use relais::money::CostCompleteness;
 use relais::policy::{effective_authority, HookAdmissionSettings, MachineSettings, RepoPolicy};
-use relais::runner::{execute, Reason, RunConfig, State, Terminal};
+use relais::runner::{execute, worktree_root, Reason, RunConfig, State, Terminal};
 use relais::verify::{independence_summary, Receipt};
 use relais::{
     doctor,
@@ -329,6 +332,25 @@ enum CoordinatorCommand {
 enum DatasetCommand {
     /// Snapshot a versioned dataset from the ledger (SPEC §17)
     Build,
+    /// Re-run a task's already-accepted run under a candidate recipe, in a
+    /// workspace where the accepted answer is genuinely absent (SPEC §24).
+    /// Spends real money, subject to the ordinary ceilings, and produces
+    /// exactly one arm's result: this compares, scores, ranks and
+    /// promotes NOTHING on its own.
+    Replay {
+        /// The task whose accepted run to replay
+        #[arg(long = "task")]
+        task: String,
+        /// Path to the candidate `relais.toml`, admitted through the same
+        /// boundary a learner's proposal is (route::validate_candidate);
+        /// a candidate it refuses is refused here with that same rejection
+        #[arg(long = "recipe")]
+        recipe: PathBuf,
+        /// Report what would run and spend nothing: no worker dispatched,
+        /// no trial recorded, no usage recorded
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -639,6 +661,11 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
         Command::Report { since, json, by } => report_command(since.as_deref(), json, by),
         Command::Dataset { cmd } => match cmd {
             DatasetCommand::Build => dataset_build_command(),
+            DatasetCommand::Replay {
+                task,
+                recipe,
+                dry_run,
+            } => replay_command(&task, &recipe, dry_run),
         },
         Command::Train => train_command(),
         Command::Evaluate { artifact } => evaluate_command(&artifact),
@@ -2135,6 +2162,7 @@ fn run_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError
         session_id: relais::coordinator::session_id(),
         heartbeat_every: std::time::Duration::from_secs(30),
         task_override: task_override.as_ref(),
+        purpose: None,
     }) {
         Ok(outcome) => outcome,
         Err(e) => {
@@ -2206,6 +2234,321 @@ fn run_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError
             Ok(CliOutcome::Cancelled)
         }
     }
+}
+
+/// `relais dataset replay` (SPEC §24): re-run a task's already-accepted
+/// run under a candidate recipe, in a workspace where the accepted answer
+/// is genuinely absent, and record that arm as one settled trial. This is
+/// NOT a promotion mechanism and does not compare, score, rank or promote
+/// anything — it produces exactly one arm's result for one task, and it
+/// spends real money, subject to the ordinary ceilings ordinary work goes
+/// through (the same `execute` path `relais run` takes).
+fn replay_command(task: &str, recipe: &Path, dry_run: bool) -> Result<CliOutcome, CliError> {
+    let (root, incumbent) = load_repo_policy()?;
+    let candidate_text = std::fs::read_to_string(recipe).map_err(|cause| CliError::Read {
+        what: "the candidate recipe",
+        path: recipe.to_path_buf(),
+        cause,
+    })?;
+    let candidate_policy =
+        RepoPolicy::from_toml_str(&candidate_text).map_err(|cause| CliError::Invalid {
+            what: "the candidate recipe",
+            path: recipe.to_path_buf(),
+            cause: Box::new(cause),
+        })?;
+    // Admitted through the same door a learner's proposal is — never a
+    // second, looser one for replay.
+    let bounds = route::default_tuning_bounds(&incumbent);
+    let candidate = match route::validate_candidate(&incumbent, &candidate_policy, &bounds) {
+        Ok(candidate) => candidate,
+        Err(rejection) => {
+            eprintln!("relais dataset replay: candidate refused: {rejection}");
+            return Ok(CliOutcome::Blocked);
+        }
+    };
+
+    let ledger = open_ledger()?;
+    let task_id = TaskId::from_stored(task);
+    let runs = operational(ledger.runs_of_task(&task_id), "dataset replay")?;
+    // `runs_of_task` comes back oldest-first, so `.rev()` walks newest
+    // first — and needs the `break` it was missing: without one the
+    // assignment kept overwriting and the EARLIEST accepted run won,
+    // the opposite of what reversing the list was for. An older receipt
+    // is also likelier to carry an empty verification profile hash, so
+    // the bug made the comparability refusal fire more often too.
+    //
+    // A replay is never its own source. Replay runs execute under the
+    // task's own id, so an accepted replay would otherwise be eligible as
+    // the "accepted run" of the next replay, and an arm would be compared
+    // against another arm instead of against the work that actually
+    // shipped.
+    let mut source_run = None;
+    for run in runs.into_iter().rev() {
+        // Exactly `Accepted` (SPEC §24) — not `AcceptedByPerson`: a
+        // person's salvage never went through the runner's own
+        // verification, so there is no receipt with a verification
+        // profile hash to check a replay's comparability against.
+        if operational(ledger.run_status(&run), "dataset replay")? != Some(State::Accepted) {
+            continue;
+        }
+        if operational(ledger.run_purpose(&run), "dataset replay")?.is_some() {
+            continue;
+        }
+        source_run = Some(run);
+        break;
+    }
+    let Some(source_run) = source_run else {
+        eprintln!("relais dataset replay: task {task_id} has no accepted run on record");
+        return Ok(CliOutcome::UnknownRun);
+    };
+
+    let Some((source_contract, _tier)) =
+        operational(ledger.run_contract_and_tier(&source_run), "dataset replay")?
+    else {
+        eprintln!("relais dataset replay: run {source_run} carries no recorded contract");
+        return Ok(CliOutcome::OperationalFailure);
+    };
+    let Some((receipt, _hash)) = operational(ledger.receipt(&source_run), "dataset replay")? else {
+        eprintln!("relais dataset replay: run {source_run} has no receipt to replay from");
+        return Ok(CliOutcome::OperationalFailure);
+    };
+    let (Some(base_sha), Some(source_profile_hash), Some(contract_hash)) = (
+        receipt["base_sha"].as_str(),
+        receipt["verification_profile_hash"].as_str(),
+        receipt["contract_hash"].as_str(),
+    ) else {
+        eprintln!("relais dataset replay: run {source_run}'s receipt is missing a base SHA, a contract hash, or a verification profile hash");
+        return Ok(CliOutcome::OperationalFailure);
+    };
+    let base_sha = base_sha.to_string();
+    let source_profile_hash = source_profile_hash.to_string();
+    let contract_hash = contract_hash.to_string();
+
+    // The profile hash that would judge THIS replay: the candidate's own
+    // verification is byte-identical to the incumbent's
+    // (`fixed_fields_match` never lets it move), so this is really asking
+    // whether the REPOSITORY's verification has moved since the source run
+    // — a comparison judged by different checks is not a comparison.
+    let profile_name = &source_contract.verification_profile;
+    let Some(profile) = candidate.policy().verification.profiles.get(profile_name) else {
+        eprintln!(
+            "relais dataset replay: verification profile `{profile_name}` is not declared in \
+             the candidate policy"
+        );
+        return Ok(CliOutcome::InvalidInput);
+    };
+    let replay_profile_hash = profile.hash();
+    if replay_profile_hash != source_profile_hash {
+        eprintln!(
+            "relais dataset replay: verification profile hash mismatch — the source run {} was \
+             judged by `{source_profile_hash}`, but a replay would be judged by \
+             `{replay_profile_hash}`; a comparison judged by different checks is not a \
+             comparison",
+            source_run
+        );
+        return Ok(CliOutcome::Blocked);
+    }
+
+    let incumbent_eligible = route::eligible_tiers(&source_contract, &incumbent, &incumbent.models);
+    let incumbent_recipe_id =
+        route::covering_recipe_id(&source_contract, &incumbent, &incumbent_eligible.tiers)
+            .unwrap_or_default();
+    let candidate_eligible = route::eligible_tiers(
+        &source_contract,
+        candidate.policy(),
+        &candidate.policy().models,
+    );
+    let arm_recipe = route::covering_recipe_id(
+        &source_contract,
+        candidate.policy(),
+        &candidate_eligible.tiers,
+    );
+
+    println!(
+        "this replay is one arm's result; it does not compare, score, rank or promote anything"
+    );
+    if dry_run {
+        println!("dry run: nothing was dispatched, no trial was recorded, no usage was spent");
+        println!("would replay source run: {source_run} (task {task_id})");
+        println!(
+            "candidate recipe: {}",
+            arm_recipe
+                .as_deref()
+                .unwrap_or("(no recipe covers this task under the candidate)")
+        );
+        println!("verification profile hash checked: {replay_profile_hash}");
+        return Ok(CliOutcome::Accepted);
+    }
+    let Some(arm_recipe) = arm_recipe else {
+        eprintln!("relais dataset replay: no recipe in the candidate policy covers task {task_id}");
+        return Ok(CliOutcome::Blocked);
+    };
+
+    let machine = load_machine()?;
+    let artifacts_dir = paths::runs_dir().map_err(CliError::Home)?;
+    let ids = id_source();
+    let replay_id = match ids.mint_replay_trial() {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("relais dataset replay: {e}");
+            return Ok(CliOutcome::OperationalFailure);
+        }
+    };
+
+    // The isolated workspace (SPEC §24): a fresh checkout at the source
+    // run's base SHA, never a worktree of the live repository — so the
+    // accepted answer this task already earned is not merely hidden from
+    // the tree, it was never fetched into this repository's object store.
+    let checkout_dir = worktree_root(&artifacts_dir)
+        .join("replay")
+        .join(replay_id.as_str());
+    if let Err(e) = workspace::create_replay_checkout(&root, &base_sha, &checkout_dir) {
+        eprintln!("relais dataset replay: {e}");
+        return Ok(CliOutcome::OperationalFailure);
+    }
+    let replay_contract = TaskContract {
+        base_ref: base_sha.clone(),
+        ..source_contract.clone()
+    };
+
+    let backend = match relais::adapter::claude::ClaudeBackend::discover() {
+        Ok(backend) => std::sync::Arc::from(backend),
+        Err(e) => {
+            eprintln!("relais dataset replay: {e}");
+            return Ok(CliOutcome::Blocked);
+        }
+    };
+    let git = relais::workspace::SystemGit;
+    let aval_resolver = relais::context::AvalCli::new(checkout_dir.clone());
+    let hooks = relais::verify::AmontCli::new();
+    let attest = relais::verify::AmontCli::new();
+    let worker_env = relais::backend::LaunchEnv::from_process_env();
+    let socket = relais::coordinator::socket_path().map_err(CliError::Home)?;
+    if let Err(e) = relais::coordinator::ensure_running(&socket) {
+        eprintln!("relais dataset replay: blocked (admission_unavailable): {e}");
+        return Ok(CliOutcome::Blocked);
+    }
+    let gate = relais::coordinator::RemoteGate::new(socket);
+
+    let outcome = execute(&RunConfig {
+        repo_dir: &checkout_dir,
+        contract: &replay_contract,
+        repo_policy: candidate.policy(),
+        machine: &machine,
+        ledger: &ledger,
+        ids: &ids,
+        backend: backend.as_ref(),
+        git: &git,
+        hooks: &hooks,
+        attest: &attest,
+        worker_env,
+        artifacts_dir: artifacts_dir.clone(),
+        aval_resolver: &aval_resolver,
+        predictor: None,
+        gate: Some(&gate),
+        session_id: relais::coordinator::session_id(),
+        heartbeat_every: std::time::Duration::from_secs(30),
+        task_override: Some(&task_id),
+        purpose: Some(RunPurpose::Replay),
+    });
+    // Bring the replay's own refs into the live repository BEFORE the
+    // checkout goes. The runner names its candidate and snapshot refs in
+    // `repo_dir`, which here is the scratch checkout, and the receipt's
+    // `candidate_sha` and the run's `repo_path` point into it — so
+    // deleting it first left the ledger describing objects that no longer
+    // existed, and an arm that "earned its result" had nothing to show.
+    let fetched = relais::workspace::fetch_candidate_refs(&root, &checkout_dir);
+    if let Err(e) = &fetched {
+        eprintln!(
+            "relais dataset replay: could not bring the replay's refs into {}: {e}. Leaving the \
+             checkout at {} so the result is not lost.",
+            root.display(),
+            checkout_dir.display()
+        );
+    }
+    // Only once the refs are safe. A failure to remove is logged, never
+    // fatal; a checkout kept because its refs could not be saved is the
+    // better outcome of the two.
+    if fetched.is_ok() {
+        if let Err(e) = std::fs::remove_dir_all(&checkout_dir) {
+            eprintln!("relais dataset replay: could not remove the replay checkout: {e}");
+        }
+    }
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            eprintln!("relais dataset replay: {e}");
+            return Ok(CliOutcome::OperationalFailure);
+        }
+    };
+
+    // The purpose was written with the run row (see `RunConfig::purpose`),
+    // so there is nothing to stamp here.
+
+    let (trial_outcome, accepted_without_escalation) = match &outcome.terminal {
+        Terminal::Accepted(receipt) => (TrialOutcome::Accepted, receipt.attempts <= 1),
+        Terminal::Failed { .. } | Terminal::NeedsReview { .. } | Terminal::NeedsDecision { .. } => {
+            (TrialOutcome::Rejected, false)
+        }
+        Terminal::Blocked { .. }
+        | Terminal::BudgetExhausted { .. }
+        | Terminal::Interrupted { .. }
+        | Terminal::Cancelled { .. } => (TrialOutcome::Errored, false),
+    };
+    let completeness = operational(
+        ledger.run_cost_completeness(&outcome.run_id),
+        "dataset replay",
+    )?;
+    let cost_value = match completeness {
+        CostCompleteness::Unknown => None,
+        _ => Some(operational(
+            ledger.run_cost(&outcome.run_id),
+            "dataset replay",
+        )?),
+    };
+    let trial_cost = TrialCost::new(cost_value, completeness).expect(
+        "a cost/completeness pair read back from the ledger's own settled values is always \
+         a consistent one",
+    );
+    let duration_ms = operational(
+        ledger.run_duration_seconds(&outcome.run_id),
+        "dataset replay",
+    )?
+    .map(|seconds| (seconds * 1000.0) as i64)
+    .unwrap_or(0);
+
+    operational(
+        ledger.insert_replay_trial(&relais::ledger::NewReplayTrial {
+            trial_id: &replay_id,
+            task_id: &task_id,
+            source_run_id: &source_run,
+            incumbent_recipe_id: &incumbent_recipe_id,
+            arm_recipe_id: &arm_recipe,
+            base_sha: &base_sha,
+            contract_hash: &contract_hash,
+            verification_profile_hash: &replay_profile_hash,
+            workspace_isolation: "fresh_checkout_no_accepted_answer",
+        }),
+        "dataset replay",
+    )?;
+    operational(
+        ledger.settle_trial(
+            &replay_id,
+            trial_outcome,
+            accepted_without_escalation,
+            trial_cost,
+            duration_ms,
+        ),
+        "dataset replay",
+    )?;
+
+    println!("replay run: {}", outcome.run_id());
+    println!("replay record: {replay_id}");
+    println!("outcome:       {trial_outcome}");
+    println!(
+        "this replay is one arm's result; it does not compare, score, rank or promote anything"
+    );
+    Ok(CliOutcome::Accepted)
 }
 
 fn status_command(run_id: Option<&str>) -> Result<CliOutcome, CliError> {
