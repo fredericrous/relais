@@ -15,12 +15,15 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::contract::scope::{scope_contained_in, write_scope_could_touch};
-use crate::contract::{Kind, Review, TaskContract};
+use crate::contract::{Kind, Review, Task, TaskContract};
 use crate::money::MicroUsd;
 use crate::policy::{
     BlockCode, Blocker, EffectiveAuthority, MachineSettings, ModelProfile, RecipeSpec, RepoPolicy,
-    Tier,
+    RiskRule, Tier,
 };
+
+mod candidate;
+pub use candidate::{validate_candidate, CandidateRecipe, CandidateRejection, TuningBounds};
 
 /// Estimates from an owned, Relais-trained artifact (SPEC §16). The
 /// predictor abstains (returns `None`) when it has no supported coverage
@@ -223,10 +226,10 @@ impl std::fmt::Display for RoutedBy {
 /// disjunct that asked whether the scope could touch the empty pattern —
 /// a rule nobody wrote, applied to the one scope that matches everything.
 /// Policy validation rejects a pathless rule outright.
-fn risk_floor(contract: &TaskContract, repo: &RepoPolicy) -> (Option<Tier>, Vec<RouteReason>) {
+fn risk_floor(contract: &TaskContract, risk: &[RiskRule]) -> (Option<Tier>, Vec<RouteReason>) {
     let mut floor: Option<Tier> = None;
     let mut fired = Vec::new();
-    for (index, rule) in repo.risk.iter().enumerate() {
+    for (index, rule) in risk.iter().enumerate() {
         let touches = rule
             .paths
             .iter()
@@ -328,6 +331,61 @@ pub fn kind_floor(kind: Kind) -> Tier {
     }
 }
 
+/// The tier floor a RECIPE's own declared kind and scope demand, using the
+/// exact [`kind_floor`] and [`risk_floor`] a real task's floor is computed
+/// with — never a second copy of either rule. `kind: None` matches both
+/// kinds (SPEC §6, [`recipe_covers`]), so it is judged as `Kind::Change`,
+/// the stricter of the two floors, rather than letting an unconstrained
+/// recipe hide behind the lower inspect floor. An empty `scope_within`
+/// covers any path (same as `recipe_covers`), so it is judged against `**`
+/// — every risk rule it could touch, not none of them. A scope this relais
+/// cannot even compile is judged at the top of the ladder: an unreadable
+/// declaration is not evidence of safety.
+fn recipe_tier_floor(kind: Option<Kind>, scope_within: &[String], risk: &[RiskRule]) -> Tier {
+    let effective_kind = kind.unwrap_or(Kind::Change);
+    let floor = kind_floor(effective_kind);
+    let patterns = if scope_within.is_empty() {
+        vec!["**".to_string()]
+    } else {
+        scope_within.to_vec()
+    };
+    // `risk_floor` runs for EVERY kind, as `eligible_tiers` does. An
+    // earlier version returned `kind_floor` immediately for
+    // `Kind::Inspect`, which gives the same answer today — `Task::Inspect`
+    // carries no write scope, so no risk rule can match it — but only
+    // because of that. It baked the assumption in, and a change to
+    // inspect contracts or to how rules match scope would have made the
+    // validator's floor and routing's floor disagree silently. Letting
+    // the same function decide costs nothing and cannot drift.
+    let task = match effective_kind {
+        Kind::Inspect => Task::Inspect,
+        Kind::Change => match Task::change(patterns) {
+            Ok(task) => task,
+            Err(_) => return Tier::Escalation,
+        },
+    };
+    let contract = TaskContract {
+        schema_version: crate::contract::SCHEMA_VERSION,
+        task,
+        objective: String::new(),
+        base_ref: String::new(),
+        read_hints: Vec::new(),
+        acceptance: Vec::new(),
+        verification_profile: String::new(),
+        architecture: Default::default(),
+        risk_hints: Vec::new(),
+        limits: Default::default(),
+        review: Default::default(),
+        decomposition: None,
+        task_id: None,
+    };
+    let (rule_floor, _reasons) = risk_floor(&contract, risk);
+    match rule_floor {
+        Some(rule_floor) if rule_floor > floor => rule_floor,
+        _ => floor,
+    }
+}
+
 /// Every configured tier at or above `floor`, cheapest first. The ladder
 /// is fixed (research < implementation < escalation); `configured` says
 /// which rungs policy names a model for.
@@ -360,7 +418,7 @@ pub fn eligible_tiers(
             "inspection task; research tier eligible",
         )),
     }
-    let (rule_floor, fired_rules) = risk_floor(contract, repo);
+    let (rule_floor, fired_rules) = risk_floor(contract, &repo.risk);
     reasons.extend(fired_rules);
     if let Some(rule_floor) = rule_floor {
         if rule_floor > floor {
@@ -1320,6 +1378,7 @@ mod tests {
             models: None,
             execution: None,
             context: None,
+            review: None,
         });
         let machine = machine_for(&repo);
         let docs = change_contract(&["docs/guide.md"]);
@@ -1348,6 +1407,7 @@ mod tests {
             models: None,
             execution: None,
             context: None,
+            review: None,
         });
         let machine = machine_for(&repo);
         let everything = change_contract(&["**"]);
