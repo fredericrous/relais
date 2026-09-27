@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b993e5fe1757d7e7910a603addf63b21ae15cc009b2bc6d8410cae47505533e5 # shrinks to scope = ["docs/**"], kind_is_change = true, risk = [RiskRule { paths: ["**"], minimum_tier: Escalation, review: Some(Required) }], tamper = WeakenVerification
