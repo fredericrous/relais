@@ -16,14 +16,14 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use serde::{Deserialize, Serialize};
 
 use crate::contract::TaskContract;
-use crate::ids::{DispatchId, PackageId, Pid, RunId, TaskId};
-use crate::lifecycle::{Reason, State, UsagePhase};
+use crate::ids::{DispatchId, PackageId, Pid, RunId, TaskId, TrialId};
+use crate::lifecycle::{Reason, RunPurpose, State, UsagePhase};
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::outcome::{Outcome, OutcomeDetail, OutcomeKind};
 use crate::policy::Tier;
 use crate::route::RoutedBy;
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 13;
+pub const LEDGER_SCHEMA_VERSION: u64 = 14;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -107,6 +107,74 @@ fn parse_routed_by(stored: &str) -> Result<RoutedBy> {
     RoutedBy::parse(stored).ok_or_else(|| LedgerError::Corrupt {
         what: "dispatch routed_by".into(),
         detail: format!("`{stored}` is not a routing decision this relais knows"),
+    })
+}
+
+/// A run purpose string as a run row stored it.
+fn parse_run_purpose(stored: &str) -> Result<RunPurpose> {
+    RunPurpose::parse(stored).map_err(|unknown| LedgerError::Corrupt {
+        what: unknown.what.into(),
+        detail: unknown.to_string(),
+    })
+}
+
+/// A cost completeness string as a trial row stored it — the same
+/// quoted-JSON spelling `record_usage` writes (SPEC §11): `NULL` means
+/// "not settled yet", never `Unknown`, which is a positive claim that
+/// settlement happened and reported no usage.
+fn parse_cost_completeness(stored: &str) -> Result<CostCompleteness> {
+    serde_json::from_str(stored).map_err(|e| LedgerError::Corrupt {
+        what: "trial cost completeness".into(),
+        detail: e.to_string(),
+    })
+}
+
+/// What became of one trial arm's run, once settled (SPEC §17). `NULL`
+/// on the row means "not settled yet" — a trial in flight — never a
+/// fourth, unnamed outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrialOutcome {
+    /// The arm's candidate was accepted.
+    Accepted,
+    /// Verification (or a person) concluded the candidate should not be
+    /// accepted.
+    Rejected,
+    /// The arm's run ended on an infrastructure fault — a crash, a
+    /// cancellation — rather than a verification verdict, so it is not
+    /// comparable evidence for or against the arm.
+    Errored,
+}
+
+impl TrialOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Errored => "errored",
+        }
+    }
+
+    fn parse(stored: &str) -> Option<Self> {
+        match stored {
+            "accepted" => Some(Self::Accepted),
+            "rejected" => Some(Self::Rejected),
+            "errored" => Some(Self::Errored),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for TrialOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// A trial outcome string as a trial row stored it.
+fn parse_trial_outcome(stored: &str) -> Result<TrialOutcome> {
+    TrialOutcome::parse(stored).ok_or_else(|| LedgerError::Corrupt {
+        what: "trial outcome".into(),
+        detail: format!("`{stored}` is not a trial outcome this relais knows"),
     })
 }
 
@@ -310,6 +378,249 @@ fn parse_task_origin(stored: &str) -> Result<TaskOrigin> {
         what: "task origin".into(),
         detail: format!("`{stored}` is not a task origin this relais knows"),
     })
+}
+
+/// One arm of one controlled comparison (SPEC §17), as the ledger holds
+/// it: which task and source run it derives from, the incumbent and arm
+/// recipes being compared, the arm's index and the assignment
+/// probability it was drawn with, the seed and identity inputs that let
+/// it reproduce, how its workspace was isolated, and — once settled —
+/// what happened to it.
+///
+/// Storage and a reader only: nothing in this crate constructs one
+/// through an assignment decision. `outcome`, `accepted_without_escalation`,
+/// `cost`, `cost_completeness` and `duration_ms` are all `None` until
+/// something settles the row; `cost: None` means unknown usage, never a
+/// A settled trial's cost together with how complete that figure is, as
+/// ONE value so the two cannot disagree.
+///
+/// They were two arguments, and that made two impossible states
+/// representable: a cost of zero marked `Unknown` — so a trial whose
+/// usage was never reported read as FREE — and a missing cost marked
+/// `Actual`, an actual figure that is not there. The ledger already
+/// refuses this for usage rows: migration v2 normalises with
+/// `CASE WHEN completeness = '"unknown"' THEN NULL ELSE cost_micros END`.
+/// The rule is the same here; it is enforced in the type rather than
+/// restated in SQL, so the write path and the read path cannot drift.
+///
+/// `Unknown` carries no figure by construction. Every other completeness
+/// requires one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrialCost {
+    cost: Option<MicroUsd>,
+    completeness: CostCompleteness,
+}
+
+/// Why a cost and its completeness could not be paired.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TrialCostError {
+    /// `Unknown` with a figure: if the figure is real, say how complete
+    /// it is; if it is not, there is no figure.
+    UnknownWithAFigure,
+    /// A figure's completeness with no figure — `Actual` names an amount
+    /// that is absent.
+    FigureCompletenessWithoutAFigure(CostCompleteness),
+}
+
+impl std::fmt::Display for TrialCostError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownWithAFigure => write!(
+                f,
+                "a trial cost marked `unknown` carries no figure; a figure needs a completeness \
+                 that describes it"
+            ),
+            Self::FigureCompletenessWithoutAFigure(completeness) => write!(
+                f,
+                "a trial cost marked `{completeness:?}` names a figure, and none was given"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TrialCostError {}
+
+impl TrialCost {
+    /// The only way to build one. A trial whose usage was never reported.
+    pub const UNKNOWN: Self = Self {
+        cost: None,
+        completeness: CostCompleteness::Unknown,
+    };
+
+    pub fn new(
+        cost: Option<MicroUsd>,
+        completeness: CostCompleteness,
+    ) -> std::result::Result<Self, TrialCostError> {
+        match (cost, completeness) {
+            (Some(_), CostCompleteness::Unknown) => Err(TrialCostError::UnknownWithAFigure),
+            (None, CostCompleteness::Unknown) => Ok(Self::UNKNOWN),
+            (Some(cost), completeness) => Ok(Self {
+                cost: Some(cost),
+                completeness,
+            }),
+            (None, completeness) => Err(TrialCostError::FigureCompletenessWithoutAFigure(
+                completeness,
+            )),
+        }
+    }
+
+    /// The figure, when there is one. `None` is UNKNOWN, never zero.
+    pub fn cost(self) -> Option<MicroUsd> {
+        self.cost
+    }
+
+    pub fn completeness(self) -> CostCompleteness {
+        self.completeness
+    }
+}
+
+/// free trial (SPEC §11).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrialRow {
+    pub trial_id: TrialId,
+    pub task_id: TaskId,
+    pub source_run_id: RunId,
+    pub incumbent_recipe_id: String,
+    pub arm_recipe_id: String,
+    pub arm_index: u32,
+    pub assignment_probability: f64,
+    pub seed: u64,
+    pub base_sha: String,
+    pub contract_hash: String,
+    pub verification_profile_hash: String,
+    pub workspace_isolation: String,
+    pub outcome: Option<TrialOutcome>,
+    pub accepted_without_escalation: Option<bool>,
+    /// `None` until the arm is settled. Once settled, the figure and its
+    /// completeness travel together and cannot disagree.
+    pub cost: Option<TrialCost>,
+    pub duration_ms: Option<i64>,
+    pub created_at: String,
+}
+
+/// What recording a fresh trial row needs — everything a comparison
+/// knows about an arm before it has run (SPEC §17). Borrowed, like
+/// [`EvidenceOrigin`], because every caller already owns these as typed
+/// values or `&str`s and a trial is written once, at the point of
+/// assignment.
+#[derive(Debug, Clone, Copy)]
+pub struct NewTrial<'a> {
+    pub trial_id: &'a TrialId,
+    pub task_id: &'a TaskId,
+    pub source_run_id: &'a RunId,
+    pub incumbent_recipe_id: &'a str,
+    pub arm_recipe_id: &'a str,
+    pub arm_index: u32,
+    pub assignment_probability: f64,
+    pub seed: u64,
+    pub base_sha: &'a str,
+    pub contract_hash: &'a str,
+    pub verification_profile_hash: &'a str,
+    pub workspace_isolation: &'a str,
+}
+
+/// Raw columns of one `trials` row, in the order [`parse_trial_row`]
+/// expects them.
+#[allow(clippy::type_complexity)]
+type TrialColumns = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    f64,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<i64>,
+    String,
+);
+
+/// A `trials` row as columns, parsed into a [`TrialRow`]: an
+/// unrecognised outcome or cost completeness is a `Corrupt` row the
+/// caller reports, never silently normalised into a settled-looking one.
+fn parse_trial_row(columns: TrialColumns) -> Result<TrialRow> {
+    let (
+        trial_id,
+        task_id,
+        source_run_id,
+        incumbent_recipe_id,
+        arm_recipe_id,
+        arm_index,
+        assignment_probability,
+        seed,
+        base_sha,
+        contract_hash,
+        verification_profile_hash,
+        workspace_isolation,
+        outcome,
+        accepted_without_escalation,
+        cost_micros,
+        cost_completeness,
+        duration_ms,
+        created_at,
+    ) = columns;
+    Ok(TrialRow {
+        trial_id: TrialId::from_stored(trial_id),
+        task_id: TaskId::from_stored(task_id),
+        source_run_id: RunId::from_stored(source_run_id),
+        incumbent_recipe_id,
+        arm_recipe_id,
+        // `as u32` turned a stored -1 into 4294967295 and 4294967296
+        // into 0 — a corrupt row read back as a plausible arm. `seed`
+        // needs no such care: u64 <-> i64 round-trips every bit.
+        arm_index: u32::try_from(arm_index).map_err(|_| LedgerError::Corrupt {
+            what: "trials.arm_index".into(),
+            detail: format!("{arm_index} is not an arm index"),
+        })?,
+        assignment_probability,
+        seed: seed as u64,
+        base_sha,
+        contract_hash,
+        verification_profile_hash,
+        workspace_isolation,
+        outcome: outcome.as_deref().map(parse_trial_outcome).transpose()?,
+        accepted_without_escalation: accepted_without_escalation.map(|v| v != 0),
+        // The figure and its completeness are paired HERE, through the
+        // one constructor that refuses an impossible pair, so a row
+        // written by an older binary — or by hand — that says "0, but
+        // unknown" is Corrupt rather than a trial that reads as free.
+        cost: parse_trial_cost(cost_micros, cost_completeness.as_deref())?,
+        duration_ms,
+        created_at,
+    })
+}
+
+/// Pair a stored cost with its stored completeness, refusing the two
+/// combinations that say contradictory things. An unsettled trial has
+/// neither and reads `None`; a settled one must have a coherent pair.
+fn parse_trial_cost(
+    cost_micros: Option<i64>,
+    completeness: Option<&str>,
+) -> Result<Option<TrialCost>> {
+    match (cost_micros, completeness) {
+        (None, None) => Ok(None),
+        (cost, Some(stored)) => {
+            let completeness = parse_cost_completeness(stored)?;
+            TrialCost::new(cost.map(MicroUsd::from_micros), completeness)
+                .map(Some)
+                .map_err(|e| LedgerError::Corrupt {
+                    what: "trials.cost_micros/cost_completeness".into(),
+                    detail: e.to_string(),
+                })
+        }
+        (Some(cost), None) => Err(LedgerError::Corrupt {
+            what: "trials.cost_completeness".into(),
+            detail: format!("a cost of {cost} micros with no completeness beside it"),
+        }),
+    }
 }
 
 /// Where the ledger's timestamps come from. The wall clock in
@@ -807,6 +1118,48 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "v13",
         r#"
     ALTER TABLE dispatches ADD COLUMN routed_by TEXT;
+    "#,
+    ),
+    (
+        // A controlled comparison needs somewhere to live: one row per
+        // arm of one comparison (SPEC §17), a run's purpose distinguishing
+        // ordinary work from a replay or a live trial arm, and a trial id
+        // on the dispatch that belongs to one. Storage and readers only —
+        // nothing here assigns a trial, gives a run a purpose or a
+        // dispatch a trial id; that is a later package. `runs.purpose`
+        // and `dispatches.trial_id` are nullable, so every existing row
+        // reads back as ordinary work with no trial id, never guessed
+        // into either.
+        "v14",
+        r#"
+    CREATE TABLE trials (
+        trial_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        source_run_id TEXT NOT NULL,
+        incumbent_recipe_id TEXT NOT NULL,
+        arm_recipe_id TEXT NOT NULL,
+        arm_index INTEGER NOT NULL,
+        assignment_probability REAL NOT NULL,
+        seed INTEGER NOT NULL,
+        base_sha TEXT NOT NULL,
+        contract_hash TEXT NOT NULL,
+        verification_profile_hash TEXT NOT NULL,
+        workspace_isolation TEXT NOT NULL,
+        outcome TEXT,
+        accepted_without_escalation INTEGER,
+        cost_micros INTEGER,
+        cost_completeness TEXT,
+        duration_ms INTEGER,
+        created_at TEXT NOT NULL,
+        -- When the arm concluded, which `created_at` cannot answer: an
+        -- arm that never settles and one that settled instantly are the
+        -- same row without this. NULL until `settle_trial` fills it, and
+        -- `settle_trial` refuses a second settlement, so it is written
+        -- exactly once.
+        settled_at TEXT
+    );
+    ALTER TABLE runs ADD COLUMN purpose TEXT;
+    ALTER TABLE dispatches ADD COLUMN trial_id TEXT;
     "#,
     ),
 ];
@@ -1490,6 +1843,22 @@ impl Ledger {
             )
             .optional()?;
         status.map(|s| parse_state(&s)).transpose()
+    }
+
+    /// Why a run exists, when it is not ordinary work (SPEC §17). `None`
+    /// covers both a run written before migration v14 and an ordinary
+    /// run written since — the column is nullable and nothing in this
+    /// crate ever writes it, so every run reads back this way.
+    pub fn run_purpose(&self, id: &RunId) -> Result<Option<RunPurpose>> {
+        let purpose: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT purpose FROM runs WHERE id = ?1",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        purpose.flatten().map(|p| parse_run_purpose(&p)).transpose()
     }
 
     /// Where a run's worktree came from: the repository it ran in and
@@ -2800,6 +3169,177 @@ impl Ledger {
             .flatten()
             .map(|stored| parse_routed_by(&stored))
             .transpose()
+    }
+
+    /// The trial a run's first dispatch belongs to, if any (SPEC §17).
+    /// `None` covers a dispatch with no trial id and a run with no
+    /// dispatch at all — nothing in this crate ever writes the column,
+    /// so every dispatch reads back this way. An id is stored as given,
+    /// not validated against the `trials` table: reading whether it
+    /// names a real trial is [`Ledger::trials_by_run`]'s job, not this
+    /// one's.
+    pub fn first_dispatch_trial_id(&self, run_id: &RunId) -> Result<Option<TrialId>> {
+        let stored: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT trial_id FROM dispatches WHERE run_id = ?1
+                 ORDER BY created_at, dispatch_id LIMIT 1",
+                [run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(stored.flatten().map(TrialId::from_stored))
+    }
+
+    /// Record one arm of one comparison (SPEC §17).
+    ///
+    /// What keeps a model out of this is NOT the visibility of this
+    /// function — an earlier comment claimed `pub` amounted to a
+    /// crate-only boundary, which it never did, and narrowing it to
+    /// `pub(crate)` only made both writers dead code while nothing
+    /// assigns trials yet. A worker is a separate process running shell
+    /// commands; it cannot call a Rust function at any visibility.
+    ///
+    /// The boundary that does hold: no CLI subcommand or flag accepts a
+    /// trial id, an arm index or an assignment probability, and no
+    /// `TaskContract` field feeds one. A trial's arm and probability come
+    /// from relais's own assignment (not yet written), never from
+    /// anything a model can put in a file or a command. When assignment
+    /// arrives it must keep that true — and a test over the CLI surface,
+    /// not a visibility modifier, is what will say so.
+    pub fn insert_trial(&self, trial: &NewTrial<'_>) -> Result<()> {
+        let now = self.now();
+        self.conn.execute(
+            "INSERT INTO trials
+                (trial_id, task_id, source_run_id, incumbent_recipe_id,
+                 arm_recipe_id, arm_index, assignment_probability, seed,
+                 base_sha, contract_hash, verification_profile_hash,
+                 workspace_isolation, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                trial.trial_id.as_str(),
+                trial.task_id.as_str(),
+                trial.source_run_id.as_str(),
+                trial.incumbent_recipe_id,
+                trial.arm_recipe_id,
+                trial.arm_index,
+                trial.assignment_probability,
+                trial.seed as i64,
+                trial.base_sha,
+                trial.contract_hash,
+                trial.verification_profile_hash,
+                trial.workspace_isolation,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Settle a trial: what happened to its arm, once it is known. Cost
+    /// is `None` for unknown usage, never zero (SPEC §11) — a trial
+    /// whose usage was never reported must not read as free.
+    /// Settle one arm, once. The cost arrives already paired with its
+    /// completeness ([`TrialCost`]), so a zero marked `unknown` — a trial
+    /// reading as FREE when its usage was never reported — cannot be
+    /// passed in.
+    ///
+    /// `WHERE trial_id = ?1 AND outcome IS NULL` and the affected-row
+    /// count together make this settle-once: an unknown id changes no
+    /// row, and a trial already settled changes no row, and both are
+    /// errors rather than a silent `Ok(())`. A settlement that vanished
+    /// because of a typo, or a first outcome quietly replaced by a
+    /// second, are the two ways this row stops being the one record of
+    /// what happened to the arm.
+    pub fn settle_trial(
+        &self,
+        trial_id: &TrialId,
+        outcome: TrialOutcome,
+        accepted_without_escalation: bool,
+        cost: TrialCost,
+        duration_ms: i64,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE trials SET outcome = ?2, accepted_without_escalation = ?3,
+                cost_micros = ?4, cost_completeness = ?5, duration_ms = ?6,
+                settled_at = ?7
+             WHERE trial_id = ?1 AND outcome IS NULL",
+            params![
+                trial_id.as_str(),
+                outcome.as_str(),
+                accepted_without_escalation,
+                cost.cost().map(MicroUsd::to_micros),
+                serde_json::to_string(&cost.completeness()).expect("completeness serializes"),
+                duration_ms,
+                self.now(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(LedgerError::Corrupt {
+                what: "trials.settle".into(),
+                detail: format!(
+                    "settling trial {} changed {changed} rows, not 1: either no such trial, or \
+                     it was already settled and its first outcome must not be overwritten",
+                    trial_id.as_str()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    const TRIAL_COLUMNS: &'static str = "trial_id, task_id, source_run_id, incumbent_recipe_id,
+         arm_recipe_id, arm_index, assignment_probability, seed, base_sha,
+         contract_hash, verification_profile_hash, workspace_isolation,
+         outcome, accepted_without_escalation, cost_micros, cost_completeness,
+         duration_ms, created_at";
+
+    /// Every trial recorded for one task, oldest first — a typed reader:
+    /// a row with an unrecognised outcome or cost completeness is a
+    /// [`LedgerError::Corrupt`], never silently normalised.
+    pub fn trials_by_task(&self, task_id: &TaskId) -> Result<Vec<TrialRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM trials WHERE task_id = ?1 ORDER BY created_at, trial_id",
+            Self::TRIAL_COLUMNS
+        ))?;
+        let rows = stmt.query_map([task_id.as_str()], Self::trial_columns)?;
+        let rows: Vec<TrialColumns> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter().map(parse_trial_row).collect()
+    }
+
+    /// Every trial whose source run is this one, oldest first. See
+    /// [`Ledger::trials_by_task`] for the corruption guarantee.
+    pub fn trials_by_run(&self, source_run_id: &RunId) -> Result<Vec<TrialRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM trials WHERE source_run_id = ?1 ORDER BY created_at, trial_id",
+            Self::TRIAL_COLUMNS
+        ))?;
+        let rows = stmt.query_map([source_run_id.as_str()], Self::trial_columns)?;
+        let rows: Vec<TrialColumns> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter().map(parse_trial_row).collect()
+    }
+
+    /// Maps one `trials` row, in [`Self::TRIAL_COLUMNS`]'s order, into
+    /// the raw tuple [`parse_trial_row`] expects.
+    fn trial_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrialColumns> {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+            row.get(8)?,
+            row.get(9)?,
+            row.get(10)?,
+            row.get(11)?,
+            row.get(12)?,
+            row.get(13)?,
+            row.get(14)?,
+            row.get(15)?,
+            row.get(16)?,
+            row.get(17)?,
+        ))
     }
 
     /// What a learned artifact estimated for a run at routing time, so a
@@ -4891,6 +5431,492 @@ mod tests {
                 .expect("row survives the upgrade"),
             serde_json::json!({}),
             "the pre-existing row is preserved, not dropped or rewritten"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn trial(id: &str) -> TrialId {
+        TrialId::from_stored(id)
+    }
+
+    /// A ledger frozen at exactly v13 upgrades to v14 without losing any
+    /// existing row: the `trials` table, `runs.purpose` and
+    /// `dispatches.trial_id` all appear, and every pre-existing row
+    /// reads back as ordinary work with no trial id — never guessed
+    /// into either.
+    #[test]
+    fn v14_adds_trials_purpose_and_trial_id_without_touching_existing_rows() {
+        let dir = temp_dir("v13-to-v14");
+        let path = dir.join("ledger.sqlite");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );",
+            )
+            .expect("migrations table");
+            // Pinned to v13, not `MIGRATIONS.len() - 1`: a step appended
+            // after this test is written must not silently change what
+            // "at v13" means here.
+            for (version, sql) in &MIGRATIONS[..13] {
+                conn.execute_batch(sql).expect("apply step");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, "then"],
+                )
+                .expect("record step");
+            }
+            conn.execute(
+                "INSERT INTO runs (id, repo_path, status, created_at, updated_at)
+                 VALUES ('run-old', '/repo', 'accepted', 'now', 'now')",
+                [],
+            )
+            .expect("a run written before v14");
+            conn.execute(
+                "INSERT INTO dispatches
+                    (dispatch_id, run_id, intent_json, state,
+                     reserved_micros, created_at, updated_at)
+                 VALUES ('pre-v14', 'run-old', '{}', 'intent', 0, 'now', 'now')",
+                [],
+            )
+            .expect("pre-v14 row");
+        }
+        let ledger = Ledger::open(&path).expect("upgrade to current schema");
+        assert_eq!(
+            ledger.schema_version().expect("version"),
+            LEDGER_SCHEMA_VERSION
+        );
+        assert_eq!(
+            ledger.trials_by_task(&task("nonexistent")).expect("trials"),
+            vec![],
+            "the trials table exists and is empty on a fresh upgrade"
+        );
+        assert_eq!(
+            ledger.run_purpose(&run("run-old")).expect("purpose"),
+            None,
+            "the upgrade adds the column; it does not retroactively fill it in"
+        );
+        assert_eq!(
+            ledger
+                .first_dispatch_trial_id(&run("run-old"))
+                .expect("trial_id"),
+            None
+        );
+        assert_eq!(
+            ledger
+                .first_dispatch_intent(&run("run-old"))
+                .expect("intent")
+                .expect("row survives the upgrade"),
+            serde_json::json!({}),
+            "the pre-existing row is preserved, not dropped or rewritten"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn new_trial<'a>(id: &'a TrialId, task_id: &'a TaskId, source_run: &'a RunId) -> NewTrial<'a> {
+        NewTrial {
+            trial_id: id,
+            task_id,
+            source_run_id: source_run,
+            incumbent_recipe_id: "recipe-incumbent",
+            arm_recipe_id: "recipe-arm",
+            arm_index: 1,
+            assignment_probability: 0.25,
+            seed: 42,
+            base_sha: "base-sha",
+            contract_hash: "contract-hash",
+            verification_profile_hash: "profile-hash",
+            workspace_isolation: "worktree",
+        }
+    }
+
+    /// A freshly inserted trial reads back with every field it was
+    /// given, unsettled: `outcome`, `accepted_without_escalation`,
+    /// `cost`, `cost_completeness` and `duration_ms` all absent, not
+    /// zero or a guessed default.
+    #[test]
+    fn a_fresh_trial_reads_back_unsettled() {
+        let (ledger, dir) = temp_ledger();
+        let t = trial("trial-1");
+        let source_task = task("t1");
+        let source_run = run("run-1");
+        ledger
+            .insert_run(&source_run, "/repo", None, &source_task, "rk")
+            .expect("run");
+        ledger
+            .insert_trial(&new_trial(&t, &source_task, &source_run))
+            .expect("insert trial");
+        let rows = ledger.trials_by_task(&source_task).expect("trials");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.trial_id, t);
+        assert_eq!(row.task_id, source_task);
+        assert_eq!(row.source_run_id, source_run);
+        assert_eq!(row.incumbent_recipe_id, "recipe-incumbent");
+        assert_eq!(row.arm_recipe_id, "recipe-arm");
+        assert_eq!(row.arm_index, 1);
+        assert_eq!(row.assignment_probability, 0.25);
+        assert_eq!(row.seed, 42);
+        assert_eq!(row.base_sha, "base-sha");
+        assert_eq!(row.contract_hash, "contract-hash");
+        assert_eq!(row.verification_profile_hash, "profile-hash");
+        assert_eq!(row.workspace_isolation, "worktree");
+        assert_eq!(row.outcome, None);
+        assert_eq!(row.accepted_without_escalation, None);
+        assert_eq!(
+            row.cost, None,
+            "unreported usage is unknown, never a free trial"
+        );
+        assert!(row.cost.is_none(), "an unsettled arm has no cost pair");
+        assert_eq!(row.duration_ms, None);
+        assert_eq!(
+            ledger.trials_by_run(&source_run).expect("trials"),
+            rows,
+            "the same row, read by its source run"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Settling a trial fills in exactly the fields settlement carries,
+    /// and a NULL cost stays NULL when usage genuinely was never
+    /// reported — it never rounds to zero.
+    #[test]
+    fn settling_a_trial_records_its_outcome_and_never_defaults_an_unknown_cost() {
+        let (ledger, dir) = temp_ledger();
+        let t = trial("trial-2");
+        let source_task = task("t2");
+        let source_run = run("run-2");
+        ledger
+            .insert_run(&source_run, "/repo", None, &source_task, "rk")
+            .expect("run");
+        ledger
+            .insert_trial(&new_trial(&t, &source_task, &source_run))
+            .expect("insert trial");
+        ledger
+            .settle_trial(&t, TrialOutcome::Accepted, true, TrialCost::UNKNOWN, 4_500)
+            .expect("settle");
+        let row = ledger
+            .trials_by_task(&source_task)
+            .expect("trials")
+            .remove(0);
+        assert_eq!(row.outcome, Some(TrialOutcome::Accepted));
+        assert_eq!(row.accepted_without_escalation, Some(true));
+        let cost = row.cost.expect("a settled trial has a paired cost");
+        assert_eq!(cost.cost(), None, "usage was never reported, not free");
+        assert_eq!(cost.completeness(), CostCompleteness::Unknown);
+        assert_eq!(row.duration_ms, Some(4_500));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The boundary that actually keeps a model out of a comparison: no
+    /// CLI surface and no contract field names a trial's arm or the
+    /// probability it was drawn with. A worker cannot call a Rust
+    /// function at any visibility, so this — not `pub(crate)` — is the
+    /// thing worth asserting, and it must still hold when assignment is
+    /// written.
+    #[test]
+    fn nothing_a_model_can_reach_names_a_trials_arm() {
+        const CLI: &str = include_str!("../main.rs");
+        const CONTRACT: &str = include_str!("../contract/mod.rs");
+        for (what, source) in [("the CLI", CLI), ("the task contract", CONTRACT)] {
+            for forbidden in [
+                "arm_index",
+                "assignment_probability",
+                "trial_id",
+                "arm_recipe_id",
+            ] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{what} must not name `{forbidden}`: a trial's arm and the probability it \
+                     was drawn with come from relais's own assignment, never from a flag a \
+                     person types or a field a model writes into a contract"
+                );
+            }
+        }
+    }
+
+    /// The two combinations a cost and its completeness must never form.
+    /// Both were representable while they were separate arguments, and
+    /// the first is the one that mattered: a zero marked `unknown` made a
+    /// trial whose usage was never reported read as FREE.
+    #[test]
+    fn a_cost_and_its_completeness_cannot_disagree() {
+        assert_eq!(
+            TrialCost::new(Some(MicroUsd::from_micros(0)), CostCompleteness::Unknown),
+            Err(TrialCostError::UnknownWithAFigure),
+            "a figure marked unknown is a figure that reads as free"
+        );
+        assert_eq!(
+            TrialCost::new(None, CostCompleteness::Actual),
+            Err(TrialCostError::FigureCompletenessWithoutAFigure(
+                CostCompleteness::Actual
+            )),
+            "an `actual` figure that is not there"
+        );
+        // And the pairs that are coherent.
+        assert_eq!(
+            TrialCost::new(None, CostCompleteness::Unknown),
+            Ok(TrialCost::UNKNOWN)
+        );
+        for completeness in [
+            CostCompleteness::Actual,
+            CostCompleteness::Estimated,
+            CostCompleteness::IncompleteLowerBound,
+        ] {
+            let paired = TrialCost::new(Some(MicroUsd::from_micros(7)), completeness)
+                .expect("a figure with a completeness describing it");
+            assert_eq!(paired.cost(), Some(MicroUsd::from_micros(7)));
+            assert_eq!(paired.completeness(), completeness);
+        }
+    }
+
+    /// A row stored with the disagreeing pair — by an older binary, or by
+    /// hand — is corrupt on the way out, not a trial that reads as free.
+    #[test]
+    fn a_stored_cost_disagreeing_with_its_completeness_is_corrupt() {
+        let (ledger, dir) = temp_ledger();
+        let source_task = TaskId::from_stored("task-c");
+        let source_run = run("run-c");
+        ledger
+            .insert_run(&source_run, "/repo", None, &source_task, "rk")
+            .expect("run");
+        let t = TrialId::from_stored("trial-c");
+        ledger
+            .insert_trial(&new_trial(&t, &source_task, &source_run))
+            .expect("insert trial");
+        // Zero micros, marked unknown: what `settle_trial` can no longer
+        // be asked to write.
+        ledger
+            .conn
+            .execute(
+                "UPDATE trials SET outcome = 'accepted', cost_micros = 0,
+                     cost_completeness = '\"unknown\"' WHERE trial_id = ?1",
+                params![t.as_str()],
+            )
+            .expect("hand-written row");
+        let error = ledger
+            .trials_by_task(&source_task)
+            .expect_err("a disagreeing pair is corrupt");
+        assert!(matches!(error, LedgerError::Corrupt { .. }), "{error:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Settling is once, and a settlement that found no row is an error
+    /// rather than a silent success.
+    #[test]
+    fn settling_an_unknown_or_already_settled_trial_is_refused() {
+        let (ledger, dir) = temp_ledger();
+        let source_task = TaskId::from_stored("task-d");
+        let source_run = run("run-d");
+        ledger
+            .insert_run(&source_run, "/repo", None, &source_task, "rk")
+            .expect("run");
+        let t = TrialId::from_stored("trial-d");
+        ledger
+            .insert_trial(&new_trial(&t, &source_task, &source_run))
+            .expect("insert trial");
+
+        // A typo loses the settlement entirely if this returns Ok.
+        let missing = TrialId::from_stored("no-such-trial");
+        assert!(
+            ledger
+                .settle_trial(
+                    &missing,
+                    TrialOutcome::Accepted,
+                    true,
+                    TrialCost::UNKNOWN,
+                    1
+                )
+                .is_err(),
+            "settling a trial that does not exist must not report success"
+        );
+
+        ledger
+            .settle_trial(&t, TrialOutcome::Accepted, true, TrialCost::UNKNOWN, 10)
+            .expect("first settlement");
+        assert!(
+            ledger
+                .settle_trial(&t, TrialOutcome::Rejected, false, TrialCost::UNKNOWN, 20)
+                .is_err(),
+            "a second settlement must not overwrite the first outcome"
+        );
+        let row = ledger
+            .trials_by_task(&source_task)
+            .expect("trials")
+            .remove(0);
+        assert_eq!(
+            row.outcome,
+            Some(TrialOutcome::Accepted),
+            "the first outcome stands"
+        );
+        assert_eq!(row.duration_ms, Some(10), "and so does its duration");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An arm index that cannot be one is corrupt, not wrapped. `as u32`
+    /// read a stored -1 back as 4294967295.
+    #[test]
+    fn an_out_of_range_arm_index_is_corrupt_not_wrapped() {
+        let (ledger, dir) = temp_ledger();
+        let source_task = TaskId::from_stored("task-e");
+        let source_run = run("run-e");
+        ledger
+            .insert_run(&source_run, "/repo", None, &source_task, "rk")
+            .expect("run");
+        let t = TrialId::from_stored("trial-e");
+        ledger
+            .insert_trial(&new_trial(&t, &source_task, &source_run))
+            .expect("insert trial");
+        for stored in [-1i64, i64::from(u32::MAX) + 1] {
+            ledger
+                .conn
+                .execute(
+                    "UPDATE trials SET arm_index = ?2 WHERE trial_id = ?1",
+                    params![t.as_str(), stored],
+                )
+                .expect("hand-written arm index");
+            let error = ledger
+                .trials_by_task(&source_task)
+                .expect_err("an impossible arm index is corrupt");
+            assert!(matches!(error, LedgerError::Corrupt { .. }), "{error:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A trial settled with an actual, known cost reads that cost back
+    /// exactly — distinct from the unknown case above.
+    #[test]
+    fn settling_a_trial_with_a_known_cost_reads_it_back() {
+        let (ledger, dir) = temp_ledger();
+        let t = trial("trial-3");
+        let source_task = task("t3");
+        let source_run = run("run-3");
+        ledger
+            .insert_run(&source_run, "/repo", None, &source_task, "rk")
+            .expect("run");
+        ledger
+            .insert_trial(&new_trial(&t, &source_task, &source_run))
+            .expect("insert trial");
+        ledger
+            .settle_trial(
+                &t,
+                TrialOutcome::Rejected,
+                false,
+                TrialCost::new(
+                    Some(MicroUsd::from_micros(123_456)),
+                    CostCompleteness::Actual,
+                )
+                .expect("a figure with a completeness that describes it"),
+                1_000,
+            )
+            .expect("settle");
+        let row = ledger
+            .trials_by_task(&source_task)
+            .expect("trials")
+            .remove(0);
+        assert_eq!(row.outcome, Some(TrialOutcome::Rejected));
+        assert_eq!(row.accepted_without_escalation, Some(false));
+        let cost = row.cost.expect("a settled trial has a paired cost");
+        assert_eq!(cost.cost(), Some(MicroUsd::from_micros(123_456)));
+        assert_eq!(cost.completeness(), CostCompleteness::Actual);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An unparseable outcome, cost completeness or run purpose is a
+    /// corrupt row the caller reports, never silently normalised into a
+    /// default.
+    #[test]
+    fn unrecognised_outcome_completeness_and_purpose_are_corrupt_rows() {
+        let (ledger, dir) = temp_ledger();
+        let source_task = task("t-bad");
+        let source_run = run("run-bad-trial");
+        ledger
+            .insert_run(&source_run, "/repo", None, &source_task, "rk")
+            .expect("run");
+        ledger
+            .conn
+            .execute(
+                "INSERT INTO trials
+                    (trial_id, task_id, source_run_id, incumbent_recipe_id,
+                     arm_recipe_id, arm_index, assignment_probability, seed,
+                     base_sha, contract_hash, verification_profile_hash,
+                     workspace_isolation, outcome, cost_completeness, created_at)
+                 VALUES ('trial-bad', ?1, ?2, 'inc', 'arm', 0, 0.5, 1,
+                         'sha', 'ch', 'ph', 'worktree', 'not_an_outcome',
+                         '\"not_a_completeness\"', 'now')",
+                params![source_task.as_str(), source_run.as_str()],
+            )
+            .expect("bad row");
+        let err = ledger
+            .trials_by_task(&source_task)
+            .expect_err("unparseable outcome must not read as a default");
+        assert!(matches!(err, LedgerError::Corrupt { .. }), "{err}");
+
+        ledger
+            .conn
+            .execute(
+                "UPDATE trials SET outcome = NULL WHERE trial_id = 'trial-bad'",
+                [],
+            )
+            .expect("clear outcome");
+        let err = ledger
+            .trials_by_task(&source_task)
+            .expect_err("unparseable completeness must not read as a default");
+        assert!(matches!(err, LedgerError::Corrupt { .. }), "{err}");
+
+        ledger
+            .conn
+            .execute(
+                "UPDATE runs SET purpose = 'not_a_purpose' WHERE id = ?1",
+                [source_run.as_str()],
+            )
+            .expect("bad purpose");
+        let err = ledger
+            .run_purpose(&source_run)
+            .expect_err("unparseable purpose must not read as ordinary work");
+        assert!(matches!(err, LedgerError::Corrupt { .. }), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A run's recorded purpose is distinguishable from ordinary work
+    /// and from the other purpose — read back typed, exactly as
+    /// written, by a reader nothing in this package calls.
+    #[test]
+    fn a_recorded_run_purpose_reads_back_distinct_from_ordinary_work() {
+        let (ledger, dir) = temp_ledger();
+        let source_task = task("t-purpose");
+        let source_run = run("run-purpose");
+        ledger
+            .insert_run(&source_run, "/repo", None, &source_task, "rk")
+            .expect("run");
+        assert_eq!(
+            ledger.run_purpose(&source_run).expect("purpose"),
+            None,
+            "nothing in this package ever assigns a purpose"
+        );
+        ledger
+            .conn
+            .execute(
+                "UPDATE runs SET purpose = ?1 WHERE id = ?2",
+                params![RunPurpose::Replay.as_str(), source_run.as_str()],
+            )
+            .expect("set purpose");
+        assert_eq!(
+            ledger.run_purpose(&source_run).expect("purpose"),
+            Some(RunPurpose::Replay)
+        );
+        ledger
+            .conn
+            .execute(
+                "UPDATE runs SET purpose = ?1 WHERE id = ?2",
+                params![RunPurpose::TrialArm.as_str(), source_run.as_str()],
+            )
+            .expect("set purpose");
+        assert_eq!(
+            ledger.run_purpose(&source_run).expect("purpose"),
+            Some(RunPurpose::TrialArm)
         );
         std::fs::remove_dir_all(&dir).ok();
     }

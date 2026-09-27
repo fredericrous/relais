@@ -10,6 +10,69 @@ missing here.
 
 ### Added
 
+- **A controlled comparison now has somewhere to live.** Ledger
+  migration **v14** (`LEDGER_SCHEMA_VERSION` 13 → 14) adds a `trials`
+  table, a nullable `runs.purpose` and a nullable `dispatches.trial_id`.
+  A `trials` row records ONE ARM of one comparison: which task and
+  source run it derives from, the incumbent and arm recipe ids, the
+  arm's index and the assignment probability it was drawn with, the
+  seed, the base sha, the contract hash, the verification profile hash,
+  how the workspace was isolated, and — once settled — the outcome
+  (`accepted`, `rejected` or `errored`), whether it was accepted without
+  escalation, its cost, its cost completeness and its duration. Cost is
+  nullable and `NULL` means unknown, never zero: a trial whose usage was
+  never reported does not read as free. A `settled_at` records when the
+  arm concluded, which `created_at` cannot — without it an arm that never
+  settled and one that settled instantly are the same row.
+
+  The figure and its completeness are ONE value, `TrialCost`, because as
+  two arguments they could disagree: a zero marked `unknown` made a trial
+  whose usage was never reported read as FREE, and a missing cost marked
+  `actual` named a figure that was not there. `TrialCost::new` refuses
+  both, the reader pairs stored columns through it, and a row already
+  holding a disagreeing pair is `Corrupt` rather than free. The ledger
+  already enforced this for usage rows in migration v2 with
+  `CASE WHEN completeness = '"unknown"' THEN NULL ELSE cost_micros END`;
+  the rule now lives in the type instead of being restated in SQL.
+
+  Settling is once. `settle_trial` matches `outcome IS NULL` and requires
+  exactly one affected row, so an unknown trial id and an
+  already-settled arm are both errors rather than a silent `Ok(())` — a
+  settlement lost to a typo, or a first outcome quietly replaced by a
+  second, are the two ways this row stops being the one record of what
+  happened to the arm. An `arm_index` that cannot be one is `Corrupt`
+  rather than wrapped: `as u32` read a stored `-1` back as `4294967295`.
+
+  **Nothing yet assigns a trial.** No routing decision consults the
+  table, no code path gives a run a purpose, and no dispatch is given a
+  trial id — this release is storage and readers only, so a reader should
+  not conclude trials are running. What keeps a model out of a comparison
+  is not the visibility of the writers but that no CLI flag and no
+  `TaskContract` field names a trial's arm or the probability it was drawn
+  with; a worker is a separate process and cannot call a Rust function at
+  any visibility. A test over the CLI and contract sources asserts that,
+  and it must keep holding when assignment is written.
+
+  `runs.purpose` (`RunPurpose`: `replay` or `trial_arm`) is a typed
+  value with an exhaustive parse, not a free string. `NULL` means an
+  ordinary run — every run that already exists, and the overwhelming
+  majority of runs going forward — and is never confused with a
+  recorded purpose. `Ledger::trials_by_task`, `Ledger::trials_by_run`
+  and `Ledger::run_purpose` are typed readers: a stored row with an
+  unrecognised outcome, cost completeness or purpose comes back as
+  `LedgerError::Corrupt`, never silently normalised into a default.
+
+  The migration is purely additive: a ledger frozen at exactly v13
+  upgrades without losing or rewriting any existing row, and every run
+  and dispatch written before it reads back as ordinary work with no
+  trial id. **Nothing here assigns a trial.** No routing decision
+  consults the `trials` table, no run is given a purpose by any existing
+  code path, and no dispatch is given a trial id — this package is
+  storage and readers only, called nowhere outside test code; assignment
+  is a later package. The table is not written by anything a worker or
+  a model controls: no contract, prompt or worker output can name a
+  trial id, an arm index or an assignment probability.
+
 - **A run's receipt and dispatch intent now name the recipe that covered
   the task.** `Receipt` gains `recipe: RecipeRecord` and
   `verification_profile_hash`, and `record_dispatch_intent` records the

@@ -111,6 +111,13 @@ impl IdSource {
     pub fn dispatch_id(&self) -> Result<DispatchId, IdError> {
         Ok(DispatchId(self.mint("disp")?))
     }
+
+    /// A fresh trial identifier. Minting one names no arm and assigns
+    /// nothing — assignment is a later package; this is the same kind of
+    /// identifier every other minted id here is.
+    pub fn trial_id(&self) -> Result<TrialId, IdError> {
+        Ok(TrialId(self.mint("trial")?))
+    }
 }
 
 /// Run identifier: unique per source, time-ordered, human-typable.
@@ -158,6 +165,31 @@ impl DispatchId {
 }
 
 impl std::fmt::Display for DispatchId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A trial identifier: one arm of one comparison (SPEC §17). Storage and
+/// readers only — nothing in this crate mints one for a dispatch or a
+/// run yet; assignment is a later package.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TrialId(String);
+
+impl TrialId {
+    /// A trial identifier read back from the ledger or given on the
+    /// command line. See [`RunId::from_stored`].
+    pub fn from_stored(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for TrialId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
@@ -446,6 +478,11 @@ mod tests {
             .expect("dispatch id")
             .as_str()
             .starts_with("disp-"));
+        assert!(ids
+            .trial_id()
+            .expect("trial id")
+            .as_str()
+            .starts_with("trial-"));
     }
 
     /// The format is the ledger's wire format: a supplied clock and

@@ -468,6 +468,57 @@ impl std::fmt::Display for UsagePhase {
     }
 }
 
+/// Why a run exists, when it is not ordinary work (SPEC §17: a
+/// controlled comparison needs somewhere to record which arm a run is,
+/// distinct from a task dispatched in the ordinary way).
+///
+/// `None` — no column value — means ordinary work: the overwhelming
+/// majority of runs, and every run that already exists before this type
+/// did. It is never confused with either variant here; a run either has
+/// a recorded purpose or it does not, and "does not" is not a third
+/// purpose to enumerate. Nothing in this package sets this on a run —
+/// assignment is a later package.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunPurpose {
+    /// A completed task replayed on an alternative profile, from its
+    /// original input snapshot, in an isolated workspace (SPEC §17).
+    Replay,
+    /// One arm of a live, randomly-assigned routing trial (SPEC §17).
+    TrialArm,
+}
+
+impl RunPurpose {
+    /// Every variant, for a caller that has to enumerate them. Same
+    /// shape as [`UsagePhase::ALL`].
+    pub const ALL: [Self; 2] = [Self::Replay, Self::TrialArm];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Replay => "replay",
+            Self::TrialArm => "trial_arm",
+        }
+    }
+
+    /// The inverse of [`RunPurpose::as_str`]. A stored name this binary
+    /// does not know is a corrupt row, never silently read as ordinary
+    /// work.
+    pub fn parse(text: &str) -> Result<Self, UnknownVariant> {
+        serde_json::from_value(serde_json::Value::String(text.to_string())).map_err(|_| {
+            UnknownVariant {
+                what: "run purpose",
+                found: text.to_string(),
+            }
+        })
+    }
+}
+
+impl std::fmt::Display for RunPurpose {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,6 +544,11 @@ mod tests {
         ] {
             assert_eq!(UsagePhase::parse(phase.as_str()), Ok(phase));
         }
+        for purpose in [RunPurpose::Replay, RunPurpose::TrialArm] {
+            assert_eq!(RunPurpose::parse(purpose.as_str()), Ok(purpose));
+        }
+        assert_ne!(RunPurpose::Replay, RunPurpose::TrialArm);
+        assert!(RunPurpose::parse("ordinary").is_err());
     }
 
     /// The states `ledger`'s decision-backfill migration names by their
@@ -547,6 +603,13 @@ mod tests {
             use proptest::prelude::*;
             let phase = UsagePhase::ALL[index];
             prop_assert_eq!(UsagePhase::parse(phase.as_str()).expect("its own spelling"), phase);
+        }
+
+        #[test]
+        fn every_run_purpose_round_trips_through_its_stored_spelling(index in 0usize..RunPurpose::ALL.len()) {
+            use proptest::prelude::*;
+            let purpose = RunPurpose::ALL[index];
+            prop_assert_eq!(RunPurpose::parse(purpose.as_str()).expect("its own spelling"), purpose);
         }
 
         /// …and a spelling no variant has is refused, never guessed into
