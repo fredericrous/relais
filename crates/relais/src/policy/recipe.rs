@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::contract::Kind;
+use crate::contract::{Kind, Review};
 use crate::ids::canonical_json_hash;
 
 use super::{ContextPolicy, ExecutionPolicy, ModelProfile, Tier};
@@ -92,6 +92,14 @@ pub struct RecipeSpec {
     /// see [`RecipeSpec::models`] for what that costs and why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextPolicy>,
+    /// Per-recipe review floor override — DECLARED AND HASHED, NOT YET
+    /// READ; see [`RecipeSpec::models`] for what that costs and why. A
+    /// tunable knob a candidate revision may raise but never lower (SPEC
+    /// §17): the same shape as [`super::RiskRule::review`], one level
+    /// down, so a recipe can demand more caution than the risk rules its
+    /// scope touches without a repository editing those rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<Review>,
 }
 
 impl RecipeSpec {
@@ -206,6 +214,7 @@ impl RecipeSpec {
             models: None,
             execution: None,
             context: None,
+            review: None,
         }
     }
 }
@@ -360,6 +369,7 @@ mod tests {
             models: None,
             execution: None,
             context: None,
+            review: None,
         }
     }
 

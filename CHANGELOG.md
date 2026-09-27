@@ -245,6 +245,65 @@ missing here.
   prompt still names it, so a rename cannot quietly turn the capability
   into a permanent `unknown`.
 
+- **The boundary a learner may not cross now has a name:
+  `route::validate_candidate(incumbent, candidate, bounds)`.** It is the
+  ONLY way to obtain a `CandidateRecipe` — the type's fields are private,
+  and nothing else constructs, derives `Default` for, deserializes, or
+  converts into one. The check is DEFAULT-FIXED, not default-tunable: a
+  candidate `RepoPolicy` may differ from the incumbent only in `recipes`,
+  and every other field — `schema_version`, `models`, `execution`,
+  `context`, `integrations`, `verification`, `risk`, `architecture` — must
+  serialize byte-identically, enforced by an exhaustive struct
+  destructure so a field added to `RepoPolicy` later fails this function
+  to compile rather than silently becoming tunable. Recipe history is
+  append-only: a candidate's `recipes` must start with every recipe the
+  incumbent already declared, in that order, and an appended entry may
+  retune only `tier`, `enabled`, `models`, `execution`, `context` and a
+  new per-recipe `review` — never `name`, `kind` or `scope_within`.
+
+  `RecipeSpec::review` is **declared and hashed, not yet read**, like the
+  `models`, `execution` and `context` blocks beside it: nothing resolves a
+  recipe's review level today, so setting one costs a trust re-grant and
+  changes nothing that runs. It is bounded here anyway, because the
+  validator has to refuse a lowering BEFORE the field is read — otherwise
+  the first release that reads it inherits candidates already accepted
+  with review lowered. An absent review resolves through
+  `Review::default()`, which is `Optional` and not `Off`, so
+  `None → Some(Off)` is a lowering and is refused.
+
+  Tuning is bounded by a caller-supplied `TuningBounds` (an allowed model
+  set, allowed efforts, numeric knob caps and whether nested agents may be
+  granted at all), a `revision` that strictly advances past its
+  family's highest, and a tier that never falls below the floor
+  RE-DERIVED at validation time from the candidate's own risk rules and
+  the task kind, using the exact `route::kind_floor` and the same
+  risk-floor logic a real task's floor is computed with — never read from
+  a field the candidate supplies, never a second copy of the rule. Two
+  property tests back this: one asserts every accepted candidate's risk,
+  verification, architecture and integrations are untouched and every
+  recipe clears its floor; the other states the adversarial case
+  directly — no generated candidate that lowers a tier below its floor,
+  weakens verification, or edits risk rules can ever come back `Ok`.
+
+  Two things a candidate may not touch at all, distinct from a knob above
+  its cap because no value makes them admissible: `allow_nested_agents`,
+  which is a capability rather than a number — before the sub-structs were
+  destructured field by field, a candidate revision setting it to `true`
+  was ACCEPTED, so a learner could have turned on nested agent spawning —
+  and `effort`, which is spend a learner does not raise for itself.
+
+  `CandidateRecipe` lives with `validate_candidate` in a private module
+  with a private field, so nothing else can mint one: a forged
+  `fn forged(p) -> CandidateRecipe { CandidateRecipe { policy: p } }`
+  elsewhere in the file is `error[E0451]: field `policy` ... is private`.
+  A source scan was tried first and let that exact forgery through, since
+  it exempted the whole file — and a grep cannot tell a construction from
+  a `matches!` pattern anyway.
+
+  NOTHING IN THIS PACKAGE PROMOTES ANYTHING. `validate_candidate` decides
+  admissibility and returns a value; no policy file is written, no trust
+  grant is issued, no recipe is enabled, and no learner calls it yet.
+
 ## v0.5.0
 
 ### Added
