@@ -857,7 +857,10 @@ fn budget_exhaustion_preserves_evidence_and_stops_dispatch() {
     // SPEC §11 exhaustion has its own code now (main.rs's table): a
     // caller that retries on "failed" must not retry on a spent ceiling.
     assert_eq!(run.status.code(), Some(5), "{stderr}");
-    assert!(stderr.starts_with("budget_exhausted:"), "{stderr}");
+    assert!(
+        outcome_after_session_line(&stderr).starts_with("budget_exhausted:"),
+        "{stderr}"
+    );
     let runs = std::fs::read_dir(world.state.join("runs"))
         .expect("runs")
         .flatten()
@@ -2455,7 +2458,10 @@ fn an_interrupted_worker_is_reconciled_by_resume_without_a_second_worker() {
     let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
     let stderr = text(&run.stderr);
     assert_eq!(run.status.code(), Some(6), "{stderr}");
-    assert!(stderr.starts_with("interrupted:"), "{stderr}");
+    assert!(
+        outcome_after_session_line(&stderr).starts_with("interrupted:"),
+        "{stderr}"
+    );
     let run_id = world.only_run_id();
     assert!(
         stderr.contains(&format!("relais resume {run_id}")),
@@ -2730,4 +2736,19 @@ fn a_world_is_countable_by_doctors_scan() {
         count >= 1,
         "the world's own root must be counted among {parent:?}'s strays"
     );
+}
+
+/// `relais run` prints the session it attributes the run to as the first
+/// stderr line, before it executes, so the line is there on every path.
+/// The outcome is the line right after it: assert both, so neither the
+/// session line nor the outcome line can go missing unnoticed.
+fn outcome_after_session_line(stderr: &str) -> &str {
+    let (first, rest) = stderr
+        .split_once('\n')
+        .unwrap_or_else(|| panic!("stderr has no line after the first: {stderr}"));
+    assert!(
+        first.starts_with("session: "),
+        "the first stderr line names the session: {stderr}"
+    );
+    rest
 }

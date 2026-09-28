@@ -2083,10 +2083,21 @@ fn plan_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliErro
             .as_ref()
             .map(|predictor| predictor as &dyn route::RoutePredictor),
     });
+    let session = relais::coordinator::resolve_session();
     println!("contract hash: {}", contract.hash());
     println!("policy hash: {}", authority.authority_hash);
     println!("repository: {repo_identity}");
     println!("base: {} ({})", base_sha, contract.base_ref);
+    // Stderr, not stdout: `plan`'s stdout stays what it was (see below),
+    // and session attribution is not part of that contract.
+    eprintln!("session: {} ({})", session.id, session.source);
+    if session.source.is_fallback() {
+        eprintln!(
+            "relais plan: warning: no CLAUDE_CODE_SESSION_ID or RELAIS_SESSION_ID in the \
+             environment; attributing this call to {}",
+            session.source
+        );
+    }
     // The same line `relais doctor` prints, on stderr so the plan's
     // stdout stays what it was: a lockfile with no setup declared is
     // worth knowing before a run spends a baseline on exit 127.
@@ -2187,6 +2198,19 @@ fn run_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError
         .as_ref()
         .map(|registry| RegistryPredictor::new(registry, &repo, harness.as_deref()));
     let ids = id_source();
+    let session = relais::coordinator::resolve_session();
+    // Printed here, before `execute`, so it is visible on every path —
+    // including the `Err` arm below that returns early — and only once:
+    // a run can take minutes, and deferring this to the end read as
+    // silence for the whole time it ran.
+    eprintln!("session: {} ({})", session.id, session.source);
+    if session.source.is_fallback() {
+        eprintln!(
+            "relais run: warning: no CLAUDE_CODE_SESSION_ID or RELAIS_SESSION_ID in the \
+             environment; attributing this run to {}",
+            session.source
+        );
+    }
     let outcome = match execute(&RunConfig {
         repo_dir: &root,
         contract: &contract,
@@ -2205,7 +2229,7 @@ fn run_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError
             .as_ref()
             .map(|predictor| predictor as &dyn route::RoutePredictor),
         gate: Some(&gate),
-        session_id: relais::coordinator::session_id(),
+        session_id: session.id.clone(),
         heartbeat_every: std::time::Duration::from_secs(30),
         task_override: task_override.as_ref(),
         purpose: None,
@@ -2217,7 +2241,7 @@ fn run_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError
         }
     };
     let run_dir = artifacts_dir.join(outcome.run_id());
-    match &outcome.terminal {
+    let result = match &outcome.terminal {
         Terminal::Accepted(receipt) => {
             println!("accepted: {}", receipt.candidate_sha);
             println!("receipt: {}/receipt.json", run_dir.display());
@@ -2279,7 +2303,8 @@ fn run_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError
             );
             Ok(CliOutcome::Cancelled)
         }
-    }
+    };
+    result
 }
 
 /// `relais dataset replay` (SPEC §24): re-run a task's already-accepted
@@ -2476,6 +2501,18 @@ fn replay_command(task: &str, recipe: &Path, dry_run: bool) -> Result<CliOutcome
     }
     let gate = relais::coordinator::RemoteGate::new(socket);
 
+    let session = relais::coordinator::resolve_session();
+    // Same placement as `relais run`: before `execute`, so it is visible
+    // on every path rather than deferred to the end of a run that spends
+    // real money and can take minutes.
+    eprintln!("session: {} ({})", session.id, session.source);
+    if session.source.is_fallback() {
+        eprintln!(
+            "relais dataset replay: warning: no CLAUDE_CODE_SESSION_ID or RELAIS_SESSION_ID in \
+             the environment; attributing this replay to {}",
+            session.source
+        );
+    }
     let outcome = execute(&RunConfig {
         repo_dir: &checkout_dir,
         contract: &replay_contract,
@@ -2492,7 +2529,7 @@ fn replay_command(task: &str, recipe: &Path, dry_run: bool) -> Result<CliOutcome
         aval_resolver: &aval_resolver,
         predictor: None,
         gate: Some(&gate),
-        session_id: relais::coordinator::session_id(),
+        session_id: session.id.clone(),
         heartbeat_every: std::time::Duration::from_secs(30),
         task_override: Some(&task_id),
         purpose: Some(RunPurpose::Replay),

@@ -274,6 +274,13 @@ about hooks stay in the [README](../README.md#known-limits).
   same task in parallel across tabs adds up against
   `max_active_agents`, the per-machine total, not against any one
   session's limit.
+- **`relais run`/`relais plan` key their own session off
+  `CLAUDE_CODE_SESSION_ID`**, the variable Claude Code exports to its
+  Bash tool — not the hook `session_id` above, which arrives in each
+  hook's JSON payload rather than the environment. `RELAIS_SESSION_ID`
+  overrides it explicitly when set. If neither is present, the parent
+  process id names the tab instead, and both commands print which of the
+  three happened; a fallback is a warning on stderr, not a silent guess.
 - **CI should not inherit `carry_on` by accident.** A CI runner
   typically has no relais coordinator running at all, and
   `on_coordinator_unreachable` defaults to `carry_on` precisely so an

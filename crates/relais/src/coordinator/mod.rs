@@ -1757,11 +1757,59 @@ pub fn socket_path() -> Result<PathBuf, crate::paths::HomeUnset> {
     Ok(crate::paths::state_dir()?.join("relais.sock"))
 }
 
-/// The interactive session this CLI call belongs to. `RELAIS_SESSION_ID`
-/// wins (the /relais skill sets it), then Claude Code's own session
-/// variable when present; otherwise the parent PID names the tab and
-/// the attribution is labelled as such rather than guessed.
-pub fn session_id() -> String {
+/// Where a resolved session id came from, so a fallback can say so
+/// instead of silently standing in for the real thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSource {
+    /// `RELAIS_SESSION_ID`, set explicitly by the caller. Wins over
+    /// everything else.
+    Override,
+    /// `CLAUDE_CODE_SESSION_ID` — the variable Claude Code 2.1.283
+    /// actually exports to its Bash tool, matching the `session_id` and
+    /// `transcript_path` the relais hook journal records.
+    ClaudeCode,
+    /// Neither variable was set: the parent process id (or, lacking a
+    /// parent, this process's own id) stands in. Every call sharing that
+    /// shell collapses onto the same attribution — this is a guess, not
+    /// an identity, and must be named as one.
+    ParentPidFallback,
+}
+
+impl SessionSource {
+    pub fn is_fallback(self) -> bool {
+        matches!(self, SessionSource::ParentPidFallback)
+    }
+}
+
+impl std::fmt::Display for SessionSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionSource::Override => write!(f, "explicit override (RELAIS_SESSION_ID)"),
+            SessionSource::ClaudeCode => {
+                write!(f, "Claude Code session (CLAUDE_CODE_SESSION_ID)")
+            }
+            SessionSource::ParentPidFallback => write!(
+                f,
+                "parent-PID fallback (neither RELAIS_SESSION_ID nor CLAUDE_CODE_SESSION_ID is set)"
+            ),
+        }
+    }
+}
+
+/// A resolved session id together with where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSessionId {
+    pub id: String,
+    pub source: SessionSource,
+}
+
+/// The interactive session this CLI call belongs to, with the source
+/// that produced it. `RELAIS_SESSION_ID` wins when a caller sets it
+/// explicitly; otherwise `CLAUDE_CODE_SESSION_ID` (the variable Claude
+/// Code itself exports) names the session; otherwise the parent PID
+/// names the tab and the attribution is labelled as a fallback rather
+/// than guessed silently.
+pub fn resolve_session() -> ResolvedSessionId {
     resolve_session_id(
         |name| std::env::var_os(name),
         crate::procs::parent_pid(),
@@ -1769,8 +1817,8 @@ pub fn session_id() -> String {
     )
 }
 
-/// The rule behind [`session_id`], with the lookup and the process facts
-/// handed in.
+/// The rule behind [`resolve_session`], with the lookup and the process
+/// facts handed in.
 ///
 /// Injected the way `paths::resolve_home` is: read from the ambient
 /// environment, the fallback branch could only be asserted when the
@@ -1781,18 +1829,25 @@ fn resolve_session_id(
     var: impl Fn(&str) -> Option<std::ffi::OsString>,
     parent: Option<u32>,
     own: u32,
-) -> String {
-    for name in ["RELAIS_SESSION_ID", "CLAUDE_SESSION_ID"] {
+) -> ResolvedSessionId {
+    for (name, source) in [
+        ("RELAIS_SESSION_ID", SessionSource::Override),
+        ("CLAUDE_CODE_SESSION_ID", SessionSource::ClaudeCode),
+    ] {
         if let Some(id) = var(name) {
             let id = id.to_string_lossy().trim().to_string();
             if !id.is_empty() {
-                return id;
+                return ResolvedSessionId { id, source };
             }
         }
     }
-    match parent {
+    let id = match parent {
         Some(parent) => format!("unattributed-ppid-{parent}"),
         None => format!("unattributed-pid-{own}"),
+    };
+    ResolvedSessionId {
+        id,
+        source: SessionSource::ParentPidFallback,
     }
 }
 
@@ -2749,31 +2804,65 @@ mod tests {
         }
         // Every branch asserted unconditionally: the developer's own
         // shell cannot weaken this into `assert!(!id.is_empty())`.
+        let resolved = resolve_session_id(set("RELAIS_SESSION_ID", "  sess-1  "), Some(7), 9);
+        assert_eq!(resolved.id, "sess-1", "relais's own variable wins, trimmed");
+        assert_eq!(resolved.source, SessionSource::Override);
+
+        // Models the real environment measured on this machine: Claude
+        // Code 2.1.283 exports `CLAUDE_CODE_SESSION_ID` to its Bash tool,
+        // and `CLAUDE_SESSION_ID` is unset — no Claude Code on this
+        // machine sets it. FALSIFY: rename this back to
+        // `CLAUDE_SESSION_ID` and watch it fail, then restore.
+        let resolved = resolve_session_id(set("CLAUDE_CODE_SESSION_ID", "sess-2"), Some(7), 9);
         assert_eq!(
-            resolve_session_id(set("RELAIS_SESSION_ID", "  sess-1  "), Some(7), 9),
-            "sess-1",
-            "relais's own variable wins, trimmed"
+            resolved.id, "sess-2",
+            "Claude Code's own session variable is the fallback"
         );
+        assert_eq!(resolved.source, SessionSource::ClaudeCode);
+
+        let resolved = resolve_session_id(set("RELAIS_SESSION_ID", "   "), Some(7), 9);
         assert_eq!(
-            resolve_session_id(set("CLAUDE_SESSION_ID", "sess-2"), Some(7), 9),
-            "sess-2",
-            "the harness's variable is the fallback"
-        );
-        assert_eq!(
-            resolve_session_id(set("RELAIS_SESSION_ID", "   "), Some(7), 9),
-            "unattributed-ppid-7",
+            resolved.id, "unattributed-ppid-7",
             "a blank value is no value"
         );
+        assert_eq!(resolved.source, SessionSource::ParentPidFallback);
+
+        let resolved = resolve_session_id(none, Some(7), 9);
         assert_eq!(
-            resolve_session_id(none, Some(7), 9),
-            "unattributed-ppid-7",
+            resolved.id, "unattributed-ppid-7",
             "no variable: the parent names the tab, labelled as a guess"
         );
+        assert_eq!(resolved.source, SessionSource::ParentPidFallback);
+        assert!(resolved.source.is_fallback());
+
+        let resolved = resolve_session_id(none, None, 9);
         assert_eq!(
-            resolve_session_id(none, None, 9),
-            "unattributed-pid-9",
+            resolved.id, "unattributed-pid-9",
             "no parent either: this process, still labelled"
         );
-        assert!(!session_id().is_empty(), "and the ambient call answers");
+        assert_eq!(resolved.source, SessionSource::ParentPidFallback);
+
+        assert!(
+            !resolve_session().id.is_empty(),
+            "and the ambient call answers"
+        );
+    }
+
+    /// `RELAIS_SESSION_ID` must win even when `CLAUDE_CODE_SESSION_ID` is
+    /// ALSO set — the ordinary case for a Claude Code tab where a caller
+    /// has additionally exported an explicit override. FALSIFY: swap the
+    /// two entries in `resolve_session_id`'s lookup list and watch this
+    /// fail with `resolved.id == "claude-session"` instead; restore the
+    /// original order afterward.
+    #[test]
+    fn override_wins_even_when_claude_code_is_also_set() {
+        let both = |asked: &str| match asked {
+            "RELAIS_SESSION_ID" => Some(std::ffi::OsString::from("override-session")),
+            "CLAUDE_CODE_SESSION_ID" => Some(std::ffi::OsString::from("claude-session")),
+            _ => None,
+        };
+        let resolved = resolve_session_id(both, Some(7), 9);
+        assert_eq!(resolved.id, "override-session");
+        assert_eq!(resolved.source, SessionSource::Override);
     }
 }

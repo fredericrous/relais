@@ -384,9 +384,11 @@ must not edit files.
 
 3. Preflight without spending: `relais plan --task .relais/task.json`
 
-4. Execute, naming this session so the coordinator's per-session limits
-   and attribution are per TAB rather than per shell (SPEC §23):
-   `RELAIS_SESSION_ID="${CLAUDE_SESSION_ID:-$$}" relais run --task .relais/task.json`
+4. Execute — relais reads `CLAUDE_CODE_SESSION_ID` from the environment
+   on its own, so the coordinator's per-session limits and attribution
+   are per TAB rather than per shell (SPEC §23) without naming anything
+   explicitly:
+   `relais run --task .relais/task.json`
 
 5. Read the outcome: accepted (receipt + patch), needs_decision,
 needs_review, blocked, failed, budget_exhausted or interrupted. The
@@ -1616,6 +1618,30 @@ mod tests {
                 "a mutating command must never be piped into tail/head/grep: {line:?}"
             );
         }
+    }
+
+    /// `relais run`/`relais plan` resolve their own session from
+    /// `RELAIS_SESSION_ID`/`CLAUDE_CODE_SESSION_ID`; the skill must not
+    /// tell a caller to shell out `RELAIS_SESSION_ID="${CLAUDE_SESSION_ID:-$$}"`
+    /// by hand, which named the wrong variable and stood in a raw shell
+    /// PID for every session sharing that shell. FALSIFY: put that prefix
+    /// back in front of `relais run --task .relais/task.json` and watch
+    /// this fail; restore afterward.
+    #[test]
+    fn relais_skill_names_no_manual_session_id_prefix() {
+        let body = skill_relais();
+        assert!(
+            !body.contains("CLAUDE_SESSION_ID"),
+            "the skill must not name the wrong session variable:\n{body}"
+        );
+        assert!(
+            !body.contains("$$"),
+            "the skill must not stand a raw shell PID in for a session:\n{body}"
+        );
+        assert!(
+            body.contains("relais run --task .relais/task.json"),
+            "the skill must still show the plain invocation:\n{body}"
+        );
     }
 
     #[test]
