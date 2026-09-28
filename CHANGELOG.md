@@ -10,6 +10,27 @@ missing here.
 
 ### Added
 
+- **`relais recipe list`, `relais recipe show <name>` and `relais recipe
+  diff <candidate.toml>` let a person see what a policy declares before
+  anything is replayed or evaluated.** All three are read-only. `list`
+  prints every recipe the repository's `relais.toml` declares — name,
+  revision, enabled, tier, kind, scope and `recipe_id` — one per line,
+  saying so in words when there are none rather than printing nothing.
+  `show` prints every revision of one recipe, including its `models`,
+  `execution`, `context` and `review` blocks when set, each still marked
+  DECLARED AND HASHED, NOT YET READ by routing; an unknown name is
+  refused, naming the recipes that do exist. `diff` compares a
+  candidate's recipes to the repository's own field by field, using each
+  side's EFFECTIVE value rather than its compact form, so a field a
+  candidate leaves at its default never prints as an absent `null` —
+  derived from each recipe's own shape, not a hand-picked list, so a
+  field added to `RecipeSpec` later shows up without anyone remembering
+  to add it — and states whether `route::validate_candidate` would admit
+  the candidate,
+  quoting the rejection when it would not. Admissible is not approved:
+  an admitted candidate still needs its own trust grant, and none of the
+  three commands grants, replays, evaluates or writes anything.
+
 - **`relais recipe evaluate <candidate.toml>` turns replayed arms into a
   comparison that says what it is.** It reads every settled trial in the
   ledger whose arm ran under one of the candidate's own recipes, pairs

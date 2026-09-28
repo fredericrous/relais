@@ -142,6 +142,54 @@ commands = []
             .authority_hash()
     }
 
+    /// A policy declaring one recipe family across two revisions —
+    /// `docs-touchup` revision 0 (enabled) and revision 1 (disabled) —
+    /// for the `recipe list`/`show`/`diff` scenarios, none of which run
+    /// a verification command either.
+    fn write_policy_with_recipes(&self) -> String {
+        let policy = r#"schema_version = 1
+
+[models.research]
+id = "haiku"
+
+[models.implementation]
+id = "sonnet"
+
+[models.escalation]
+id = "fable"
+
+[execution]
+max_attempts = 3
+max_repairs_before_escalation = 1
+max_wall_seconds = 120
+
+[integrations]
+aval = "off"
+amont = "off"
+amont_agent = "off"
+
+[verification.profiles.default]
+commands = []
+
+[[recipes]]
+name = "docs-touchup"
+scope_within = ["docs/**"]
+tier = "implementation"
+revision = 0
+
+[[recipes]]
+name = "docs-touchup"
+scope_within = ["docs/**"]
+tier = "implementation"
+revision = 1
+enabled = false
+"#;
+        std::fs::write(self.repo.join("relais.toml"), policy).expect("policy");
+        git(&self.repo, &["add", "-A"]);
+        git(&self.repo, &["commit", "-q", "-m", "policy with recipes"]);
+        policy.to_string()
+    }
+
     /// Machine settings that exist and grant nothing: the state a fresh
     /// install is in, and the one a missing trust grant is about.
     fn write_machine_without_a_grant(&self) {
@@ -870,5 +918,260 @@ fn a_replay_that_cannot_proceed_leaves_the_ledger_byte_identical() {
          {:?}, stderr {:?}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// SPEC §26: `relais recipe list`/`show`/`diff` are read-only, and a
+// policy that declares no recipes says so in words.
+
+#[test]
+fn recipe_list_says_so_in_words_when_there_are_none() {
+    let world = World::new("recipe-list-empty");
+    world.write_policy();
+    let out = world.relais(&["recipe", "list"]);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("declares no recipes"),
+        "empty output would be indistinguishable from a failure to read: {stdout:?}"
+    );
+}
+
+#[test]
+fn recipe_list_reports_every_recipe_in_declaration_order() {
+    let world = World::new("recipe-list");
+    world.write_policy_with_recipes();
+    let out = world.relais(&["recipe", "list"]);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = text(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "one line per recipe: {stdout:?}");
+    for (line, revision, enabled) in [
+        (lines[0], "revision=0", "enabled=true"),
+        (lines[1], "revision=1", "enabled=false"),
+    ] {
+        assert!(line.contains("docs-touchup"), "{line}");
+        assert!(line.contains(revision), "{line}");
+        assert!(line.contains(enabled), "{line}");
+        assert!(line.contains("tier=implementation"), "{line}");
+        assert!(line.contains("kind=unset"), "{line}");
+        assert!(line.contains("scope=docs/**"), "{line}");
+        assert!(line.contains("recipe_id="), "{line}");
+    }
+}
+
+#[test]
+fn recipe_show_prints_every_revision_and_refuses_an_unknown_name() {
+    let world = World::new("recipe-show");
+    world.write_policy_with_recipes();
+
+    let ok = world.relais(&["recipe", "show", "docs-touchup"]);
+    assert_eq!(ok.status.code(), Some(0));
+    let stdout = text(&ok.stdout);
+    assert!(stdout.contains("revision 0"), "{stdout}");
+    assert!(stdout.contains("revision 1"), "{stdout}");
+    assert!(
+        stdout.contains("revision 0") && stdout.find("revision 0") < stdout.find("revision 1"),
+        "revisions print oldest first: {stdout}"
+    );
+
+    let unknown = world.relais(&["recipe", "show", "no-such-recipe"]);
+    assert_eq!(
+        unknown.status.code(),
+        Some(2),
+        "an unknown name is a refusal, never exit 0: {:?}",
+        text(&unknown.stderr)
+    );
+    let stderr = text(&unknown.stderr);
+    assert!(stderr.contains("no-such-recipe"), "{stderr}");
+    assert!(
+        stderr.contains("docs-touchup"),
+        "the refusal names the recipes that do exist: {stderr}"
+    );
+}
+
+#[test]
+fn recipe_show_flags_declared_but_unread_blocks() {
+    let world = World::new("recipe-show-blocks");
+    let policy = r#"schema_version = 1
+
+[models.implementation]
+id = "sonnet"
+
+[execution]
+max_attempts = 3
+max_repairs_before_escalation = 1
+max_wall_seconds = 120
+
+[integrations]
+aval = "off"
+amont = "off"
+amont_agent = "off"
+
+[verification.profiles.default]
+commands = []
+
+[[recipes]]
+name = "tuned"
+scope_within = ["docs/**"]
+tier = "implementation"
+review = "required"
+
+[recipes.models.implementation]
+id = "sonnet"
+"#;
+    std::fs::write(world.repo.join("relais.toml"), policy).expect("policy");
+    git(&world.repo, &["add", "-A"]);
+    git(&world.repo, &["commit", "-q", "-m", "recipe with models"]);
+
+    let out = world.relais(&["recipe", "show", "tuned"]);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = text(&out.stdout);
+    assert!(stdout.contains("models:"), "{stdout}");
+    assert!(stdout.contains("review:"), "{stdout}");
+    for label in ["models:", "review:"] {
+        assert!(
+            stdout
+                .lines()
+                .find(|line| line.trim_start().starts_with(label))
+                .is_some_and(|line| line.contains("DECLARED AND HASHED, NOT YET READ")),
+            "{label} must carry the same caveat its field doc does: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn recipe_diff_reports_field_changes_and_the_admission_verdict() {
+    let world = World::new("recipe-diff");
+    let base = world.write_policy_with_recipes();
+
+    // Rewrites revision 1's history in place: `enabled` flips true and
+    // `tier` rises to escalation. History being append-only, this is a
+    // real, field-level change that `validate_candidate` must refuse.
+    let rewritten = base.replace(
+        "tier = \"implementation\"\nrevision = 1\nenabled = false",
+        "tier = \"escalation\"\nrevision = 1",
+    );
+    assert_ne!(rewritten, base, "the replacement must actually match");
+    let rewritten_candidate = world.root.join("rewritten.toml");
+    std::fs::write(&rewritten_candidate, &rewritten).expect("write candidate");
+    RepoPolicy::from_toml_str(&rewritten).expect("the candidate itself parses");
+
+    let diff = world.relais(&[
+        "recipe",
+        "diff",
+        rewritten_candidate.to_string_lossy().as_ref(),
+    ]);
+    assert_eq!(diff.status.code(), Some(0), "{:?}", text(&diff.stderr));
+    let stdout = text(&diff.stdout);
+    assert!(stdout.contains("docs-touchup revision 1:"), "{stdout}");
+    assert!(stdout.contains("enabled"), "{stdout}");
+    assert!(stdout.contains("tier"), "{stdout}");
+    assert!(
+        stdout.contains("not admissible"),
+        "a rewritten history entry must not be admissible: {stdout}"
+    );
+    assert!(
+        stdout.contains("admissible is not approved"),
+        "the caveat must be stated whichever way the verdict falls: {stdout}"
+    );
+
+    // A candidate that only APPENDS a validly tuned new revision is
+    // admissible.
+    let appended = format!(
+        "{base}\n[[recipes]]\nname = \"docs-touchup\"\nscope_within = [\"docs/**\"]\ntier = \"implementation\"\nrevision = 2\n"
+    );
+    let appended_candidate = world.root.join("appended.toml");
+    std::fs::write(&appended_candidate, &appended).expect("write candidate");
+    RepoPolicy::from_toml_str(&appended).expect("the candidate itself parses");
+
+    let diff2 = world.relais(&[
+        "recipe",
+        "diff",
+        appended_candidate.to_string_lossy().as_ref(),
+    ]);
+    assert_eq!(diff2.status.code(), Some(0), "{:?}", text(&diff2.stderr));
+    let stdout2 = text(&diff2.stdout);
+    assert!(stdout2.contains("only in the candidate"), "{stdout2}");
+    assert!(
+        stdout2.contains("admissible: route::validate_candidate would ADMIT"),
+        "{stdout2}"
+    );
+}
+
+/// ALL THREE recipe subcommands are read-only. Falsified separately for
+/// each path so an early failure can never pass the byte-identical ledger
+/// check by accident:
+/// - `recipe_list_command`: a temporary probe appending bytes to the
+///   ledger file was added, and this test turned red with exactly the
+///   ledger-bytes assertion failing, before the probe was removed.
+/// - `recipe_show_command`: same probe, injected into the loop over
+///   revisions, same red result, before it was removed.
+/// - `recipe_diff_command`: same probe, injected right before the
+///   admission verdict is printed, same red result, before it was
+///   removed.
+///
+/// Each subcommand's own exit code and stdout are asserted too, so a
+/// silent early failure inside one of them cannot slip past the ledger
+/// comparison by short-circuiting before the probe would have fired.
+#[test]
+fn recipe_subcommands_never_touch_the_ledger() {
+    let world = World::new("recipe-read-only");
+    world.write_policy_with_recipes();
+
+    // Give the world a ledger to be unchanged: any command that opens it
+    // creates and migrates it, and a migration is a legitimate write.
+    // The comparison has to start after that.
+    world.relais(&["report", "--json"]);
+    let ledger = world.state.join("ledger.sqlite");
+    assert!(
+        ledger.is_file(),
+        "the world needs a ledger before this can mean anything"
+    );
+    let before = std::fs::read(&ledger).expect("read the ledger");
+
+    let candidate = world.root.join("candidate.toml");
+    std::fs::write(
+        &candidate,
+        std::fs::read(world.repo.join("relais.toml")).unwrap_or_default(),
+    )
+    .expect("write the candidate");
+
+    let list = world.relais(&["recipe", "list"]);
+    assert_eq!(list.status.code(), Some(0), "{:?}", text(&list.stderr));
+    assert!(
+        text(&list.stdout).contains("docs-touchup"),
+        "{:?}",
+        text(&list.stdout)
+    );
+
+    let show = world.relais(&["recipe", "show", "docs-touchup"]);
+    assert_eq!(show.status.code(), Some(0), "{:?}", text(&show.stderr));
+    assert!(
+        text(&show.stdout).contains("revision 0"),
+        "{:?}",
+        text(&show.stdout)
+    );
+
+    let show_unknown = world.relais(&["recipe", "show", "no-such-recipe"]);
+    assert_eq!(
+        show_unknown.status.code(),
+        Some(2),
+        "{:?}",
+        text(&show_unknown.stderr)
+    );
+
+    let diff = world.relais(&["recipe", "diff", candidate.to_string_lossy().as_ref()]);
+    assert_eq!(diff.status.code(), Some(0), "{:?}", text(&diff.stderr));
+    assert!(
+        text(&diff.stdout).contains("no differences"),
+        "{:?}",
+        text(&diff.stdout)
+    );
+
+    let after = std::fs::read(&ledger).expect("read the ledger again");
+    assert_eq!(
+        before, after,
+        "recipe list/show/diff must leave the ledger byte-identical"
     );
 }
