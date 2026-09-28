@@ -672,6 +672,36 @@ A replay dispatches a real worker and spends real money: usage is recorded as or
 
 A completed replay writes exactly one `trials` row (§17): `assignment_probability` is `1.0`, because nothing was sampled — a replay is a deliberate re-run, not a draw among several arms — and `workspace_isolation` records `fresh_checkout_no_accepted_answer`, distinct from whatever an ordinary or sampled trial's workspace records. The row is settled once, through the same settle-once path (`Ledger::settle_trial`) every other trial's outcome is. The run itself carries `RunPurpose::Replay`, distinguishing it on the ledger from ordinary work.
 
+## 25. Recipe comparison
+
+`relais recipe evaluate <candidate.toml>` reads the settled trials for a candidate recipe and reports a comparison. It is a reader, not an actor: nothing in this command promotes a recipe, writes a policy, or issues a trust grant. `relais promote` — which activates a learned artifact — is the only thing in this product that activates anything, and it takes an artifact id, not a recipe.
+
+The candidate is admitted through the same door a replay's candidate is (§24): `route::validate_candidate`, against the repository's own current policy. "The trials for this candidate" means every settled `trials` row whose `arm_recipe_id` names one of the candidate policy's own recipes — a candidate is a whole policy, and different tasks may cover under different recipes within it, so the comparison is not keyed on a single recipe id.
+
+### Pairing
+
+The unit of comparison is the task, not the run. Each matched trial is one task's candidate arm; it is paired against the incumbent result that task's source run already earned — the accepted run a replay re-ran. A task replayed more than once still contributes exactly one paired observation (the earliest settled arm), so a task with more runs never outweighs one with a single run.
+
+### What is reported
+
+- **Per-arm acceptance**, an inverse-propensity-weighted estimate over each arm's observations. A replay's assignment probability is always `1.0`, so this collapses to a plain mean; a future randomized trial's recorded probability would not.
+- **Cost per accepted change**, the mean `TrialCost` figure over the accepted observations whose cost is known. A cost that was never reported is never folded into that mean as zero (§11); the report separately counts how many accepted observations carried a known figure and how many did not, so an unknown does not vanish from view.
+- **A paired bootstrap interval** over the candidate-minus-incumbent acceptance difference, resampling whole tasks (never splitting a pair across resamples) with replacement. The seed is a deterministic hash of the sorted paired task ids — never the platform's own randomness and never dependent on read order — and is carried in the report, so the same trials produce the same interval on any machine.
+
+### The comparison basis
+
+`ComparisonBasis` names what the comparison rests on: `Replay` (what `relais dataset replay` produces), `Randomized` (relais's own random assignment among eligible arms — not produced by anything shipped yet), or `Observational` (data that was never assigned at all). An observational basis can never promote, whatever the numbers say, because it is not a comparison; the report's rendered output names that gate explicitly rather than burying it in a footnote.
+
+### Off-policy abstention
+
+An arm's acceptance estimate abstains — names what is missing, produces no number — rather than guessing when it has no support: no trials matched it, or every trial's assignment probability is zero or non-finite and so cannot carry an inverse-propensity estimate (§17: "do not infer performance for profiles with zero observation probability"). An abstained estimate is itself a failed promotion gate.
+
+### The verdict
+
+Promotion is gated, and the gate is unspellable to defeat: `ComparisonReport::promotable` is the only way to obtain a `Promotable` value, which has a private field and no public constructor, and it hands one back only when `ComparisonReport::failures` — RECOMPUTED from the report's own stored figures on every call, never read from a cached verdict — is empty. Editing a stored report's figures changes what `failures` returns; nothing about the report can disagree with itself and still say it passed.
+
+The gates: the basis must not be `Observational`; at least 20 paired tasks (below that, a comparison is a proof of mechanism, not evidence about a recipe — the first intended real use, a three-task replay, is exactly this case and must refuse); and neither arm's acceptance estimate may be abstained. A refused report's rendered output states its basis and paired count together (`basis: replay, n=3`), names every unmet gate in words, and contains no sentence — no "PASSED", no approval — a reader could mistake for a weak pass.
+
 ---
 
 Companion repositories: [amont](https://github.com/fredericrous/amont), [aval](https://github.com/fredericrous/aval), [amont-agent](https://github.com/fredericrous/amont-agent).

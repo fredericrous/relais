@@ -474,6 +474,45 @@ impl TrialCost {
     }
 }
 
+/// Hand-written rather than derived: a derived `Deserialize` would read
+/// `cost`/`completeness` straight onto the struct's private fields,
+/// bypassing [`TrialCost::new`] and reintroducing exactly the
+/// impossible pair the private fields exist to rule out — a stored
+/// report a caller edited into "0, but unknown" would deserialize
+/// without complaint. Routing through `new` keeps that refused on read,
+/// not merely on construction.
+impl Serialize for TrialCost {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Repr {
+            cost: Option<MicroUsd>,
+            completeness: CostCompleteness,
+        }
+        Repr {
+            cost: self.cost,
+            completeness: self.completeness,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TrialCost {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Repr {
+            cost: Option<MicroUsd>,
+            completeness: CostCompleteness,
+        }
+        let repr = Repr::deserialize(deserializer)?;
+        TrialCost::new(repr.cost, repr.completeness).map_err(serde::de::Error::custom)
+    }
+}
+
 /// free trial (SPEC §11).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrialRow {
@@ -3389,6 +3428,32 @@ impl Ledger {
         let rows = stmt.query_map([source_run_id.as_str()], Self::trial_columns)?;
         let rows: Vec<TrialColumns> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
         rows.into_iter().map(parse_trial_row).collect()
+    }
+
+    /// Every SETTLED trial whose arm ran under one of the given recipe
+    /// ids, oldest first. A candidate is a whole policy, and different
+    /// tasks may cover under different recipes within it, so "the trials
+    /// for this candidate" means every arm whose `arm_recipe_id` names a
+    /// recipe the candidate itself declares — never a single recipe id,
+    /// and never an unsettled row still in flight. See
+    /// [`Ledger::trials_by_task`] for the corruption guarantee.
+    pub fn settled_trials_for_recipes(
+        &self,
+        recipe_ids: &std::collections::BTreeSet<String>,
+    ) -> Result<Vec<TrialRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM trials WHERE outcome IS NOT NULL ORDER BY created_at, trial_id",
+            Self::TRIAL_COLUMNS
+        ))?;
+        let rows = stmt.query_map([], Self::trial_columns)?;
+        let rows: Vec<TrialColumns> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(parse_trial_row)
+            .filter(|row| match row {
+                Ok(row) => recipe_ids.contains(&row.arm_recipe_id),
+                Err(_) => true,
+            })
+            .collect()
     }
 
     /// Maps one `trials` row, in [`Self::TRIAL_COLUMNS`]'s order, into
