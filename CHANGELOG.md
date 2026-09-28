@@ -426,6 +426,33 @@ missing here.
   repository that names no `origin` is refused rather than given an
   identity that is a temporary directory.
 
+### Fixed
+
+- **A CLI call now attributes to the actual Claude Code session, not the
+  shell PID.** `resolve_session_id` read `CLAUDE_SESSION_ID`, a variable
+  no installed Claude Code sets; it never fired, so every run fell
+  through to the parent-PID fallback and `root_session` on every ledger
+  row was a shell PID — per-tab attribution had silently become
+  per-shell. It now reads `CLAUDE_CODE_SESSION_ID`, the variable Claude
+  Code 2.1.283 actually exports to its Bash tool (measured against the
+  same session's own hook journal). `RELAIS_SESSION_ID` still overrides
+  it explicitly when set. The resolution now reports which of the three
+  happened — override, Claude Code session, or PID fallback — as a typed
+  value, and `relais run`, `relais plan` and `relais dataset replay`
+  print it on stderr before anything executes; a fallback also prints a
+  warning naming why. **A `run`'s stderr now begins with this `session:`
+  line; the outcome (`accepted:`, `interrupted:`, …) is the line after
+  it** — a caller that read the outcome from stderr's first line must
+  skip it. `plan`'s stdout is unchanged. The `/relais` skill `relais install --claude`
+  writes no longer tells callers to compute
+  `RELAIS_SESSION_ID="${CLAUDE_SESSION_ID:-$$}"` themselves — that
+  construction always produced the PID, since the variable it read never
+  existed — and instead lets `relais run` derive the session on its own.
+  **Existing installs must re-run `relais install --claude` to replace
+  the skill text.** Runs already recorded in the ledger keep the PID they
+  were attributed under; that mapping is not backfilled, and attribution
+  is correct from this release forward only.
+
 ## v0.5.0
 
 ### Added

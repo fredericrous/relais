@@ -742,6 +742,29 @@ fn plan_without_a_trust_grant_is_blocked_and_prints_the_grant() {
     );
 }
 
+// `plan`'s stdout is a stable contract other tooling parses (the
+// preceding test asserts `missing_trust_grant` appears exactly once
+// there). Session attribution is not part of that contract and belongs
+// on stderr, alongside the fallback warning.
+#[test]
+fn plan_prints_the_session_line_to_stderr_not_stdout() {
+    let world = World::new("session-stderr");
+    world.write_policy();
+    world.write_machine_without_a_grant();
+    let task = world.write_task("task.json");
+    let plan = world.relais(&["plan", "--task", task.to_str().unwrap()]);
+    let stdout = text(&plan.stdout);
+    let stderr = text(&plan.stderr);
+    assert!(
+        !stdout.contains("session:"),
+        "session attribution must not be on stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("session: tab-test"),
+        "and must be on stderr: {stderr}"
+    );
+}
+
 // C3: `coordinator status --json` is a document in every state,
 // including the one where nothing answers — never an English sentence a
 // parser would choke on, and never a silent zero.
