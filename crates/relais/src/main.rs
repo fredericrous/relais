@@ -2107,6 +2107,21 @@ fn plan_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliErro
             return Ok(CliOutcome::Blocked);
         }
     };
+    // The same check `run` performs in `assemble_context`: a read hint
+    // that does not resolve at the base revision points the worker at a
+    // path this tree does not have, and `plan` should refuse it exactly
+    // as `run` does rather than route a candidate `run` would then block.
+    if let Err(unresolvable) = relais::context::fingerprint_hints(
+        &relais::workspace::SystemGit,
+        &root,
+        &base_sha,
+        &contract.read_hints,
+    ) {
+        eprintln!(
+            "relais plan: blocked (read_hint_unresolvable): {unresolvable} (base {base_sha})"
+        );
+        return Ok(CliOutcome::Blocked);
+    }
     let repo_identity = relais::repo::identity(&root);
     let authority = effective_authority(&repo, &machine, &contract, &repo_identity);
     let harness = harness_identity();
