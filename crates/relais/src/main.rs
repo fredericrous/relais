@@ -46,9 +46,10 @@ use relais::learn::comparison::{
     evaluate_candidate, DEFAULT_BOOTSTRAP_RESAMPLES, MIN_PAIRED_TASKS,
 };
 use relais::learn::predict::RegistryPredictor;
-use relais::ledger::{TrialCost, TrialOutcome};
+use relais::ledger::{OrchestrationUsageRow, TrialCost, TrialOutcome};
 use relais::lifecycle::RunPurpose;
-use relais::money::CostCompleteness;
+use relais::money::{CostCompleteness, MicroUsd};
+use relais::orchestration::{self, PriceTable, TranscriptSource};
 use relais::policy::{
     effective_authority, HookAdmissionSettings, MachineSettings, RecipeSpec, RepoPolicy,
 };
@@ -147,6 +148,16 @@ enum Command {
         /// like task classes rather than blending every task together
         #[arg(long, value_enum)]
         by: Option<report::Dimension>,
+        /// Skip importing orchestration usage before rendering: the
+        /// figure printed is whatever a previous `relais usage import`
+        /// already put in the ledger, not a fresh pass over transcripts
+        #[arg(long = "no-import")]
+        no_import: bool,
+    },
+    /// The orchestrating Claude Code session's own usage (SPEC §11)
+    Usage {
+        #[command(subcommand)]
+        cmd: UsageCommand,
     },
     /// Owned-dataset and learned-routing operations (SPEC §17)
     Dataset {
@@ -362,6 +373,24 @@ enum DatasetCommand {
         /// no trial recorded, no usage recorded
         #[arg(long = "dry-run")]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum UsageCommand {
+    /// Import orchestration usage from Claude Code session transcripts
+    /// (SPEC §11): every session that is the `root_session` of at least
+    /// one run, unless `--session` narrows it to one. Idempotent —
+    /// importing the same session twice inserts nothing the second time.
+    Import {
+        /// Import exactly this session instead of every session on
+        /// record as a run's root
+        #[arg(long)]
+        session: Option<String>,
+        /// Where Claude Code session transcripts live, instead of
+        /// `~/.claude/projects` (or `$CLAUDE_CONFIG_DIR/projects`)
+        #[arg(long = "projects-dir")]
+        projects_dir: Option<PathBuf>,
     },
 }
 
@@ -698,7 +727,18 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             Some(run_id) => resume_command(&run_id, Retire::from_flag(retire)),
             None => retire_all_command(),
         },
-        Command::Report { since, json, by } => report_command(since.as_deref(), json, by),
+        Command::Report {
+            since,
+            json,
+            by,
+            no_import,
+        } => report_command(since.as_deref(), json, by, no_import),
+        Command::Usage { cmd } => match cmd {
+            UsageCommand::Import {
+                session,
+                projects_dir,
+            } => usage_import_command(session.as_deref(), projects_dir.as_deref()),
+        },
         Command::Dataset { cmd } => match cmd {
             DatasetCommand::Build => dataset_build_command(),
             DatasetCommand::Replay {
@@ -3405,6 +3445,7 @@ fn report_command(
     since: Option<&str>,
     json: bool,
     by: Option<report::Dimension>,
+    no_import: bool,
 ) -> Result<CliOutcome, CliError> {
     let since = since.map(|since| since.to_string()).unwrap_or_else(|| {
         chrono::Utc::now()
@@ -3412,7 +3453,15 @@ fn report_command(
             .to_string()
     });
     let ledger = open_ledger()?;
+    let mut not_imported = NotImported::default();
+    if !no_import {
+        let projects_dir = paths::claude_projects_dir().map_err(CliError::Home)?;
+        let price_table = load_price_table()?;
+        not_imported = import_for_report(&ledger, &projects_dir, &price_table, &since)?;
+    }
     let mut report = operational(report::runs_report(&ledger, &since, by), "report")?;
+    report.orchestration.unattributable = not_imported.unattributable;
+    report.orchestration.transcript_missing = not_imported.transcript_missing;
     // Best-effort: a report is still a report with no coordinator
     // reachable, and `EnforcementReport::observed` already says so
     // honestly rather than this command failing over it.
@@ -3434,6 +3483,229 @@ fn report_command(
         print_document(&report)?;
     } else {
         print!("{}", report.render());
+    }
+    Ok(CliOutcome::Accepted)
+}
+
+/// `~/.config/relais/machine.toml`'s `[pricing]` table, or an empty one
+/// when the file is absent — the same "absent settings means the
+/// defaults" posture `coordinator daemon` already takes reading this
+/// file, not an error just because nobody has priced anything yet.
+fn load_price_table() -> Result<PriceTable, CliError> {
+    let path = paths::machine_settings_path().map_err(CliError::Home)?;
+    match std::fs::read_to_string(&path) {
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => Ok(PriceTable::empty()),
+        Err(cause) => Err(CliError::Read {
+            what: "the machine settings",
+            path,
+            cause,
+        }),
+        Ok(text) => match MachineSettings::from_toml_str(&text) {
+            Ok(machine) => Ok(machine.pricing.unwrap_or_else(PriceTable::empty)),
+            Err(e) => Err(CliError::Invalid {
+                what: "the machine settings",
+                path,
+                cause: Box::new(e),
+            }),
+        },
+    }
+}
+
+/// Every run recorded before the session-identity fix (#119) keyed a run
+/// by the bare shell PID relais fell back to — a value that was never a
+/// Claude Code session id, so it can never have a transcript. Reported
+/// as `unattributable`, counted, never guessed at (SPEC §11); distinct
+/// from a session that SHOULD have a transcript but none was found,
+/// which is `transcript missing` instead.
+fn is_bare_shell_pid(session_id: &str) -> bool {
+    !session_id.is_empty() && session_id.chars().all(|c| c.is_ascii_digit())
+}
+
+/// One session's message count, token totals and cost, imported.
+struct ImportSummary {
+    messages: usize,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_5m_tokens: u64,
+    cache_write_1h_tokens: u64,
+    cost: MicroUsd,
+    completeness: CostCompleteness,
+}
+
+/// Sessions `relais report` could not import, counted only for sessions
+/// that started a run inside the report window.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct NotImported {
+    unattributable: usize,
+    transcript_missing: usize,
+}
+
+/// What `relais report` imports before it renders. EVERY orchestrating
+/// session is imported, not only those whose run started inside the
+/// window: a session that started a run on the 30th and kept reviewing
+/// and landing work on the 1st and 2nd spends inside a window its run
+/// predates, and that spend is attributed by each message's own
+/// timestamp (SPEC §11) — but only once it has been imported. Import is
+/// idempotent (`message_id` is unique), so re-reading a session costs a
+/// parse and inserts nothing. The window narrows only the COUNTS of
+/// sessions that could not be imported, so a pre-fix PID session from
+/// months ago is not reported as missing on every later report.
+fn import_for_report(
+    ledger: &Ledger,
+    projects_dir: &Path,
+    price_table: &PriceTable,
+    since: &str,
+) -> Result<NotImported, CliError> {
+    let in_window: std::collections::BTreeSet<String> =
+        operational(ledger.distinct_root_sessions_since(since), "usage import")?
+            .into_iter()
+            .collect();
+    let mut not_imported = NotImported::default();
+    for session_id in operational(ledger.distinct_root_sessions(), "usage import")? {
+        let counted = in_window.contains(&session_id);
+        match import_session(ledger, projects_dir, price_table, &session_id)? {
+            SessionImportOutcome::Imported(_) => {}
+            SessionImportOutcome::Unattributable if counted => not_imported.unattributable += 1,
+            SessionImportOutcome::TranscriptMissing if counted => {
+                not_imported.transcript_missing += 1
+            }
+            SessionImportOutcome::Unattributable | SessionImportOutcome::TranscriptMissing => {}
+        }
+    }
+    Ok(not_imported)
+}
+
+enum SessionImportOutcome {
+    Imported(ImportSummary),
+    Unattributable,
+    TranscriptMissing,
+}
+
+/// Import one session's orchestration usage: its main transcript and
+/// every subagent file beside it (SPEC §11). Idempotent — every insert
+/// goes through `record_orchestration_usage`'s `message_id` uniqueness,
+/// so importing the same session twice inserts nothing the second time.
+fn import_session(
+    ledger: &Ledger,
+    projects_dir: &Path,
+    price_table: &PriceTable,
+    session_id: &str,
+) -> Result<SessionImportOutcome, CliError> {
+    if is_bare_shell_pid(session_id) {
+        return Ok(SessionImportOutcome::Unattributable);
+    }
+    let Some(main_path) = paths::find_transcript(projects_dir, session_id) else {
+        return Ok(SessionImportOutcome::TranscriptMissing);
+    };
+    let mut files = vec![(TranscriptSource::Main, main_path.clone())];
+    for path in paths::subagent_transcripts(&main_path) {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("subagent")
+            .to_string();
+        files.push((TranscriptSource::Subagent(name), path));
+    }
+    let mut summary = ImportSummary {
+        messages: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_5m_tokens: 0,
+        cache_write_1h_tokens: 0,
+        cost: MicroUsd::ZERO,
+        completeness: CostCompleteness::Actual,
+    };
+    let mut parts = Vec::new();
+    for (source, path) in files {
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(cause) => {
+                return Err(CliError::Read {
+                    what: "a transcript file",
+                    path,
+                    cause,
+                })
+            }
+        };
+        for record in orchestration::parse_transcript(&text) {
+            let priced = orchestration::price(&record, price_table);
+            summary.messages += 1;
+            summary.input_tokens += record.input_tokens;
+            summary.output_tokens += record.output_tokens;
+            summary.cache_read_tokens += record.cache_read_input_tokens;
+            summary.cache_write_5m_tokens += record.cache_writes.ephemeral_5m_input_tokens;
+            summary.cache_write_1h_tokens += record.cache_writes.ephemeral_1h_input_tokens;
+            if let Some(cost) = priced.cost {
+                summary.cost = summary.cost.saturating_add(cost);
+            }
+            parts.push(priced.completeness);
+            let row = OrchestrationUsageRow {
+                message_id: record.message_id,
+                session_id: session_id.to_string(),
+                transcript: source.clone(),
+                model: record.model,
+                speed: record.speed,
+                input_tokens: record.input_tokens,
+                output_tokens: record.output_tokens,
+                cache_read_tokens: record.cache_read_input_tokens,
+                cache_write_5m_tokens: record.cache_writes.ephemeral_5m_input_tokens,
+                cache_write_1h_tokens: record.cache_writes.ephemeral_1h_input_tokens,
+                cost: priced.cost,
+                pricing_version: if priced.pricing_version.is_empty() {
+                    None
+                } else {
+                    Some(priced.pricing_version)
+                },
+                completeness: priced.completeness,
+                at: record.timestamp,
+            };
+            operational(ledger.record_orchestration_usage(&row), "usage import")?;
+        }
+    }
+    summary.completeness = CostCompleteness::worst(parts);
+    Ok(SessionImportOutcome::Imported(summary))
+}
+
+fn usage_import_command(
+    session: Option<&str>,
+    projects_dir: Option<&Path>,
+) -> Result<CliOutcome, CliError> {
+    let ledger = open_ledger()?;
+    let projects_dir = match projects_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => paths::claude_projects_dir().map_err(CliError::Home)?,
+    };
+    let price_table = load_price_table()?;
+    let sessions = match session {
+        Some(id) => vec![id.to_string()],
+        None => operational(ledger.distinct_root_sessions(), "usage import")?,
+    };
+    if sessions.is_empty() {
+        println!("relais usage import: no session is the root of any run on record");
+    }
+    for session_id in sessions {
+        match import_session(&ledger, &projects_dir, &price_table, &session_id)? {
+            SessionImportOutcome::Imported(summary) => {
+                println!(
+                    "{session_id}: {} message(s), {} input + {} output tokens: {}",
+                    summary.messages,
+                    summary.input_tokens,
+                    summary.output_tokens,
+                    report::cost_line(summary.cost, summary.completeness),
+                );
+            }
+            SessionImportOutcome::Unattributable => {
+                println!(
+                    "{session_id}: unattributable (root_session is a bare shell PID from \
+                     before the session-identity fix; it never had a transcript)"
+                );
+            }
+            SessionImportOutcome::TranscriptMissing => {
+                println!("{session_id}: transcript missing");
+            }
+        }
     }
     Ok(CliOutcome::Accepted)
 }
@@ -4048,6 +4320,64 @@ mod tests {
         let dir = relais::test_support::short_temp_dir(&format!("main-{label}"));
         let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger opens");
         (ledger, dir)
+    }
+
+    /// A session that started its run BEFORE the report window and kept
+    /// orchestrating inside it: its in-window spend must be imported and
+    /// counted by `relais report`'s own import path, not only by a
+    /// hand-run `relais usage import`. Session S starts a run on 09-30,
+    /// then spends on 10-02; the window opens on 10-01.
+    ///
+    /// FALSIFIED: with `import_for_report` iterating
+    /// `distinct_root_sessions_since` (the reviewed patch), the in-window
+    /// cost read back as $0 and this test failed; restored.
+    #[test]
+    fn report_imports_in_window_spend_of_a_session_whose_run_predates_the_window() {
+        let dir = relais::test_support::short_temp_dir("main-orch-window");
+        let ledger = Ledger::open_with_clock(
+            &dir.join("ledger.sqlite"),
+            Box::new(relais::ledger::FixedClock::new([
+                "2026-09-30T23:00:00+00:00",
+            ])),
+        )
+        .expect("ledger opens");
+        ledger
+            .insert_run(
+                &relais::ids::RunId::from_stored("run-s"),
+                "/repo",
+                Some("sess-s"),
+                &relais::ids::TaskId::from_stored("task-s"),
+                "rk",
+            )
+            .expect("run before the window");
+        let projects = dir.join("projects").join("-slug");
+        std::fs::create_dir_all(&projects).expect("projects dir");
+        std::fs::write(
+            projects.join("sess-s.jsonl"),
+            r#"{"type":"assistant","timestamp":"2026-10-02T10:00:00Z","message":{"id":"msg-oct","model":"claude-opus-5","usage":{"input_tokens":1000000,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}}"#,
+        )
+        .expect("transcript");
+        let table = PriceTable {
+            version: "test".into(),
+            models: vec![relais::orchestration::ModelPrice {
+                ids: vec!["claude-opus-5".into()],
+                input: 5_000_000,
+                output: 25_000_000,
+                cache_read: 500_000,
+                cache_write_5m: 6_250_000,
+                cache_write_1h: 10_000_000,
+                fast_input: None,
+                fast_output: None,
+            }],
+        };
+        let since = "2026-10-01T00:00:00+00:00";
+        let not_imported =
+            import_for_report(&ledger, &dir.join("projects"), &table, since).expect("imports");
+        assert_eq!(not_imported, NotImported::default());
+        let (cost, _) = ledger
+            .orchestration_spend_since(since)
+            .expect("spend in the window");
+        assert_eq!(cost, MicroUsd::from_micros(5_000_000));
     }
 
     /// Walks every `DecideAnswer` and asserts the terminal state it

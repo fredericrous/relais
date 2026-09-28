@@ -594,6 +594,16 @@ pub struct MachineSettings {
     /// rather than being redeclared.
     #[serde(default)]
     pub admission: HookAdmissionSettings,
+    /// Orchestration usage prices (SPEC §11), read from `[pricing]` and
+    /// never from constants in the code — an Anthropic price change is a
+    /// config edit. `None` when machine.toml has no `[pricing]` block;
+    /// callers treat that the same as an empty table (every record prices
+    /// `Unknown`). Machine policy, not repo policy: this field belongs to
+    /// `MachineSettings`, not [`RepoPolicy`], so it never feeds
+    /// [`RepoPolicy::authority_hash`] and never invalidates a trust
+    /// grant.
+    #[serde(default)]
+    pub pricing: Option<crate::orchestration::PriceTable>,
 }
 
 /// One substitution `machine.toml` reviewed and will accept without
@@ -1624,6 +1634,37 @@ keys = ["output.contract"]
         );
         let a = effective_authority(&with_setup, &machine, &contract(), &identity());
         assert!(!a.trust_granted, "the grant was reviewed without the setup");
+    }
+
+    /// `[pricing]` is machine policy, not repo policy (SPEC §11): adding
+    /// or editing it in machine.toml must not move a repo's authority
+    /// hash or invalidate a trust grant reviewed before it existed.
+    #[test]
+    fn a_pricing_block_in_machine_settings_does_not_move_the_authority_hash() {
+        let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        let without_pricing =
+            MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo))).expect("parses");
+        let with_pricing = MachineSettings::from_toml_str(&format!(
+            "{}\n[pricing]\nversion = \"2026-09-01\"\n\n\
+             [[pricing.models]]\nids = [\"claude-haiku-4-5\"]\ninput = 1000000\n\
+             output = 5000000\ncache_read = 100000\ncache_write_5m = 1250000\n\
+             cache_write_1h = 2000000\n",
+            machine_toml(&grant_for(&repo))
+        ))
+        .expect("parses");
+        assert!(without_pricing.pricing.is_none());
+        assert!(with_pricing.pricing.is_some());
+        assert_eq!(
+            repo.authority_hash(),
+            repo.authority_hash(),
+            "a repo's own hash never reads machine.toml at all"
+        );
+        let a = effective_authority(&repo, &without_pricing, &contract(), &identity());
+        let b = effective_authority(&repo, &with_pricing, &contract(), &identity());
+        assert_eq!(
+            a.trust_granted, b.trust_granted,
+            "a pricing block must not affect whether the existing grant still holds"
+        );
     }
 
     /// `CommandSpec.name` is what a declared criterion's evidence names;

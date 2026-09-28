@@ -15,7 +15,7 @@
 //! directories in effect and flags the ones the environment supplied.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The environment variables that relocate the two directories. Named
 /// here so `doctor` and the paths themselves cannot disagree about the
@@ -129,6 +129,77 @@ pub fn hook_journal_path() -> Result<PathBuf, HomeUnset> {
     Ok(state_dir()?.join("hook_journal.jsonl"))
 }
 
+/// Claude Code's own config directory relocator (SPEC §11): a session's
+/// transcripts live under it, at `<dir>/projects/<slug>/<session>.jsonl`.
+/// Named for Claude Code's own variable, not relais's — this is the
+/// other CLI's directory, not this one's.
+pub const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
+
+/// Where Claude Code writes session transcripts: `$CLAUDE_CONFIG_DIR` when
+/// set, otherwise `$HOME/.claude`.
+pub fn claude_projects_dir() -> Result<PathBuf, HomeUnset> {
+    match dir_override(CLAUDE_CONFIG_DIR_ENV) {
+        Some(dir) => Ok(dir.join("projects")),
+        None => Ok(home_dir()?.join(".claude").join("projects")),
+    }
+}
+
+/// A session's main transcript, found by searching the projects
+/// directory for `<session_id>.jsonl` — the session id, not its project
+/// slug, is what a run's `root_session` records, so the slug's own
+/// directory name is not knowable ahead of the search. `None` when no
+/// such file exists anywhere under `projects_dir`, which is a fact
+/// ("transcript missing"), not an error.
+pub fn find_transcript(projects_dir: &Path, session_id: &str) -> Option<PathBuf> {
+    let target = format!("{session_id}.jsonl");
+    let mut stack = vec![projects_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().and_then(|name| name.to_str()) == Some(target.as_str()) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// A session's subagent transcripts: sibling files of its main
+/// transcript, at `<slug>/<session>/subagents/agent-*.jsonl`. A subagent
+/// turn is never a sidechain line inside the main file — it lives only
+/// here — so importing a session's usage means reading every file this
+/// returns too. A missing `subagents` directory (a session that spawned
+/// no subagents) is not an error: it reads back as no subagent files,
+/// the same as an empty one.
+pub fn subagent_transcripts(main_transcript: &Path) -> Vec<PathBuf> {
+    let (Some(stem), Some(parent)) = (
+        main_transcript.file_stem().and_then(|s| s.to_str()),
+        main_transcript.parent(),
+    ) else {
+        return Vec::new();
+    };
+    let subagents_dir = parent.join(stem).join("subagents");
+    let Ok(entries) = std::fs::read_dir(&subagents_dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("agent-") && name.ends_with(".jsonl"))
+        })
+        .collect();
+    files.sort();
+    files
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +241,51 @@ mod tests {
     #[test]
     fn an_empty_home_is_no_home() {
         assert_eq!(resolve_home(lookup(&[("HOME", "")])), Err(HomeUnset));
+    }
+
+    fn scratch(label: &str) -> crate::test_support::TempDir {
+        crate::test_support::temp_dir(&format!("paths-{label}"))
+    }
+
+    #[test]
+    fn find_transcript_searches_every_project_slug() {
+        let dir = scratch("find-transcript");
+        let slug_dir = dir.join("-some-project-slug");
+        std::fs::create_dir_all(&slug_dir).expect("slug dir");
+        let transcript = slug_dir.join("sess-1.jsonl");
+        std::fs::write(&transcript, "{}\n").expect("transcript");
+        assert_eq!(find_transcript(&dir, "sess-1"), Some(transcript));
+        assert_eq!(find_transcript(&dir, "sess-missing"), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn subagent_transcripts_are_found_beside_the_main_file() {
+        let dir = scratch("subagents");
+        let slug_dir = dir.join("-some-project-slug");
+        let subagents_dir = slug_dir.join("sess-1").join("subagents");
+        std::fs::create_dir_all(&subagents_dir).expect("subagents dir");
+        let main = slug_dir.join("sess-1.jsonl");
+        std::fs::write(&main, "{}\n").expect("main transcript");
+        let agent_one = subagents_dir.join("agent-1.jsonl");
+        let agent_two = subagents_dir.join("agent-2.jsonl");
+        std::fs::write(&agent_one, "{}\n").expect("agent 1");
+        std::fs::write(&agent_two, "{}\n").expect("agent 2");
+        // Not a subagent transcript: shares the directory but not the
+        // naming convention import relies on.
+        std::fs::write(subagents_dir.join("notes.txt"), "").expect("decoy");
+        assert_eq!(subagent_transcripts(&main), vec![agent_one, agent_two]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_missing_subagents_directory_is_not_an_error() {
+        let dir = scratch("no-subagents");
+        let slug_dir = dir.join("-some-project-slug");
+        std::fs::create_dir_all(&slug_dir).expect("slug dir");
+        let main = slug_dir.join("sess-1.jsonl");
+        std::fs::write(&main, "{}\n").expect("main transcript");
+        assert_eq!(subagent_transcripts(&main), Vec::<PathBuf>::new());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

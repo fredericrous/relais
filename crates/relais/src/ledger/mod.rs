@@ -19,11 +19,12 @@ use crate::contract::TaskContract;
 use crate::ids::{DispatchId, PackageId, Pid, RunId, TaskId, TrialId};
 use crate::lifecycle::{Reason, RunPurpose, State, UsagePhase};
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
+use crate::orchestration::{Speed, TranscriptSource};
 use crate::outcome::{Outcome, OutcomeDetail, OutcomeKind};
 use crate::policy::Tier;
 use crate::route::RoutedBy;
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 14;
+pub const LEDGER_SCHEMA_VERSION: u64 = 15;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -1227,6 +1228,39 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ALTER TABLE dispatches ADD COLUMN trial_id TEXT;
     "#,
     ),
+    (
+        // The orchestrating Claude Code session's own spend (SPEC §11):
+        // one row per API message, imported from that session's own
+        // transcript rather than reported by a worker. `message_id` is
+        // the transcript's own dedup key and is UNIQUE, so importing the
+        // same session twice inserts nothing the second time
+        // (`INSERT OR IGNORE`). `cost_micros` is nullable — a model
+        // absent from the price table is unknown, never zero (SPEC §11)
+        // — and `pricing_version` travels with it so a stored cost can
+        // always be traced to the table it came from, even after that
+        // table changes.
+        "v15",
+        r#"
+    CREATE TABLE orchestration_usage (
+        message_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        transcript TEXT NOT NULL,
+        model TEXT NOT NULL,
+        speed TEXT NOT NULL,
+        input_tokens INTEGER NOT NULL,
+        output_tokens INTEGER NOT NULL,
+        cache_read_tokens INTEGER NOT NULL,
+        cache_write_5m_tokens INTEGER NOT NULL,
+        cache_write_1h_tokens INTEGER NOT NULL,
+        cost_micros INTEGER,
+        pricing_version TEXT,
+        completeness TEXT NOT NULL,
+        at TEXT NOT NULL
+    );
+    CREATE INDEX idx_orchestration_usage_session ON orchestration_usage(session_id);
+    CREATE INDEX idx_orchestration_usage_at ON orchestration_usage(at);
+    "#,
+    ),
 ];
 
 pub struct Ledger {
@@ -1704,6 +1738,27 @@ fn decision_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<DecisionRow> {
         row.get(8)?,
         row.get(9)?,
     ))
+}
+
+/// One orchestrating-session API message, ready to persist: the pure
+/// [`crate::orchestration::UsageRecord`] plus its price and the identity
+/// the transcript itself does not carry (which session, which file).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrchestrationUsageRow {
+    pub message_id: String,
+    pub session_id: String,
+    pub transcript: TranscriptSource,
+    pub model: String,
+    pub speed: Speed,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_5m_tokens: u64,
+    pub cache_write_1h_tokens: u64,
+    pub cost: Option<MicroUsd>,
+    pub pricing_version: Option<String>,
+    pub completeness: CostCompleteness,
+    pub at: String,
 }
 
 impl Ledger {
@@ -3575,6 +3630,105 @@ impl Ledger {
         Ok(MicroUsd::from_micros(micros))
     }
 
+    /// Every session id that is the `root_session` of at least one run
+    /// (SPEC §11): the population `relais usage import` and `relais
+    /// report` import orchestration spend for. A worker's own session is
+    /// never in here as a worker — only as whatever it happens to have
+    /// been the root of, if anything — so a relais worker's spend, which
+    /// is already paid for as a usage event of its run, is never
+    /// double-counted as orchestration too.
+    pub fn distinct_root_sessions(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT root_session FROM runs WHERE root_session IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// [`Self::distinct_root_sessions`], narrowed to sessions that are the
+    /// `root_session` of a run created inside the window (SPEC §11): the
+    /// same `created_at >= ?1` a report's own run population is windowed
+    /// by ([`Self::runs_since`]). Without this, a session from long
+    /// before the window — one already reported `unattributable` or
+    /// `transcript missing` on every past `relais report` — would keep
+    /// showing up in that count forever, on every window, rather than
+    /// only the ones a person is actually looking at right now.
+    pub fn distinct_root_sessions_since(&self, since: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT root_session FROM runs
+                 WHERE root_session IS NOT NULL AND created_at >= ?1",
+        )?;
+        let rows = stmt.query_map([since], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// One orchestration API message, priced (or not) and attributed to
+    /// a session and the transcript file it came from. Returns whether a
+    /// row was inserted or grew. A message imported while it was still
+    /// streaming carries a partial `output_tokens`; a later import of the
+    /// finished message raises it (and its cost), and nothing else ever
+    /// changes an existing row — re-importing the same content is a no-op.
+    pub fn record_orchestration_usage(&self, row: &OrchestrationUsageRow) -> Result<bool> {
+        let inserted = self.conn.execute(
+            "INSERT INTO orchestration_usage
+                (message_id, session_id, transcript, model, speed,
+                 input_tokens, output_tokens, cache_read_tokens,
+                 cache_write_5m_tokens, cache_write_1h_tokens,
+                 cost_micros, pricing_version, completeness, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(message_id) DO UPDATE SET
+                 output_tokens = excluded.output_tokens,
+                 cost_micros = excluded.cost_micros,
+                 pricing_version = excluded.pricing_version,
+                 completeness = excluded.completeness
+             WHERE excluded.output_tokens > orchestration_usage.output_tokens",
+            params![
+                row.message_id,
+                row.session_id,
+                row.transcript.label(),
+                row.model,
+                row.speed.as_str(),
+                row.input_tokens as i64,
+                row.output_tokens as i64,
+                row.cache_read_tokens as i64,
+                row.cache_write_5m_tokens as i64,
+                row.cache_write_1h_tokens as i64,
+                row.cost.map(MicroUsd::to_micros),
+                row.pricing_version,
+                serde_json::to_string(&row.completeness).expect("completeness serializes"),
+                row.at,
+            ],
+        )?;
+        Ok(inserted == 1)
+    }
+
+    /// Orchestration spend attributed to the window by each message's OWN
+    /// timestamp (SPEC §11), not by any run's `created_at` — a session
+    /// that spans several days splits across windows correctly this way.
+    pub fn orchestration_spend_since(&self, since: &str) -> Result<(MicroUsd, CostCompleteness)> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT cost_micros, completeness FROM orchestration_usage WHERE at >= ?1")?;
+        let rows = stmt.query_map([since], |row| {
+            Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut total = MicroUsd::ZERO;
+        let mut parts = Vec::new();
+        for row in rows {
+            let (cost_micros, completeness) = row?;
+            let completeness: CostCompleteness =
+                serde_json::from_str(&completeness).map_err(|e| LedgerError::Corrupt {
+                    what: "an orchestration usage row's completeness".into(),
+                    detail: e.to_string(),
+                })?;
+            parts.push(completeness);
+            if let Some(micros) = cost_micros {
+                total = total.saturating_add(MicroUsd::from_micros(micros));
+            }
+        }
+        Ok((total, CostCompleteness::worst(parts)))
+    }
+
     /// The task a run belongs to, when one is on record. `None` only for
     /// a row written by a binary older than schema v4 that has not yet
     /// been migrated into this ledger — every run the migration or
@@ -4299,6 +4453,191 @@ mod tests {
             LEDGER_SCHEMA_VERSION,
             "no double-apply"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn usage_row(message_id: &str, session_id: &str, at: &str) -> OrchestrationUsageRow {
+        OrchestrationUsageRow {
+            message_id: message_id.into(),
+            session_id: session_id.into(),
+            transcript: TranscriptSource::Main,
+            model: "claude-haiku-4-5".into(),
+            speed: Speed::Standard,
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: 0,
+            cache_write_5m_tokens: 0,
+            cache_write_1h_tokens: 0,
+            cost: Some(MicroUsd::from_micros(1_000)),
+            pricing_version: Some("2026-09-01".into()),
+            completeness: CostCompleteness::Actual,
+            at: at.into(),
+        }
+    }
+
+    /// A message imported mid-stream carries a partial `output_tokens`.
+    /// Re-importing the finished message must raise it and its cost, and
+    /// an older, smaller snapshot must never lower it back. FALSIFIED:
+    /// with `INSERT OR IGNORE` the row stayed at 50 tokens / $0.001;
+    /// restored.
+    #[test]
+    fn a_message_imported_mid_stream_grows_to_its_final_snapshot() {
+        let (ledger, dir) = temp_ledger();
+        let partial = usage_row("msg-1", "sess-1", "2026-09-28T00:00:00Z");
+        assert!(ledger
+            .record_orchestration_usage(&partial)
+            .expect("partial"));
+        let finished = OrchestrationUsageRow {
+            output_tokens: 400,
+            cost: Some(MicroUsd::from_micros(3_000)),
+            ..usage_row("msg-1", "sess-1", "2026-09-28T00:00:00Z")
+        };
+        assert!(ledger
+            .record_orchestration_usage(&finished)
+            .expect("finished snapshot raises the row"));
+        assert!(!ledger
+            .record_orchestration_usage(&partial)
+            .expect("an older snapshot is a no-op"));
+        let (spend, _) = ledger
+            .orchestration_spend_since("2000-01-01T00:00:00Z")
+            .expect("spend");
+        assert_eq!(spend, MicroUsd::from_micros(3_000));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Importing the same session twice inserts nothing the second time
+    /// (SPEC §11): `message_id` is the transcript's own dedup key and is
+    /// the table's primary key.
+    #[test]
+    fn recording_the_same_message_id_twice_is_a_no_op() {
+        let (ledger, dir) = temp_ledger();
+        let row = usage_row("msg-1", "sess-1", "2026-09-28T00:00:00Z");
+        assert!(ledger
+            .record_orchestration_usage(&row)
+            .expect("first insert"));
+        assert!(!ledger
+            .record_orchestration_usage(&row)
+            .expect("second insert is a no-op"));
+        let (spend, completeness) = ledger
+            .orchestration_spend_since("2000-01-01T00:00:00Z")
+            .expect("spend");
+        assert_eq!(
+            spend,
+            MicroUsd::from_micros(1_000),
+            "counted once, not twice"
+        );
+        assert_eq!(completeness, CostCompleteness::Actual);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Orchestration spend is attributed to the report window by each
+    /// message's OWN timestamp, not by the run's `created_at` (SPEC
+    /// §11): a session that spans several days splits across windows.
+    #[test]
+    fn orchestration_spend_is_windowed_by_message_timestamp() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .record_orchestration_usage(&usage_row("msg-early", "sess-1", "2026-09-01T00:00:00Z"))
+            .expect("early insert");
+        ledger
+            .record_orchestration_usage(&usage_row("msg-late", "sess-1", "2026-09-20T00:00:00Z"))
+            .expect("late insert");
+        let (window_one, _) = ledger
+            .orchestration_spend_since("2026-09-01T00:00:00Z")
+            .expect("window one");
+        let (window_two, _) = ledger
+            .orchestration_spend_since("2026-09-10T00:00:00Z")
+            .expect("window two");
+        assert_eq!(window_one, MicroUsd::from_micros(2_000), "both messages");
+        assert_eq!(
+            window_two,
+            MicroUsd::from_micros(1_000),
+            "only the later one"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A relais worker's own session is never in `distinct_root_sessions`
+    /// as a worker — only ever as whatever it was the root of, if
+    /// anything — so its spend, already paid for as a usage event of its
+    /// run, is never imported and double-counted as orchestration too.
+    #[test]
+    fn distinct_root_sessions_only_names_sessions_that_started_a_run() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-a"), "/repo", Some("sess-root"), &task("a"), "rk")
+            .expect("run with a root session");
+        ledger
+            .insert_run(&run("run-b"), "/repo", None, &task("b"), "rk")
+            .expect("run with no root session");
+        let sessions = ledger.distinct_root_sessions().expect("sessions");
+        assert_eq!(sessions, vec!["sess-root".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A session from long before the report window must not keep
+    /// showing up as `unattributable`/`transcript missing` on every
+    /// later `relais report` (SPEC §11): `distinct_root_sessions_since`
+    /// narrows those COUNTS to runs created inside the window. It never
+    /// narrows what is imported — see `import_for_report` in main.rs.
+    #[test]
+    fn distinct_root_sessions_since_excludes_runs_created_before_the_window() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(
+                &run("run-old"),
+                "/repo",
+                Some("sess-old"),
+                &task("old"),
+                "rk",
+            )
+            .expect("old run");
+        ledger
+            .insert_run(
+                &run("run-new"),
+                "/repo",
+                Some("sess-new"),
+                &task("new"),
+                "rk",
+            )
+            .expect("new run");
+        ledger
+            .conn
+            .execute(
+                "UPDATE runs SET created_at = '2020-01-01T00:00:00+00:00' WHERE id = 'run-old'",
+                [],
+            )
+            .expect("backdate the old run");
+        let sessions = ledger
+            .distinct_root_sessions_since("2025-01-01T00:00:00+00:00")
+            .expect("sessions");
+        assert_eq!(sessions, vec!["sess-new".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The v15 migration only adds a new table and its indexes — nothing
+    /// it does touches an existing row, so an upgrade from a pre-v15
+    /// ledger keeps every row exactly as it stood before.
+    #[test]
+    fn upgrading_to_v15_keeps_every_existing_row() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-pre-v15"), "/repo", None, &task("pre"), "rk")
+            .expect("run");
+        drop(ledger);
+        let reopened = Ledger::open(&dir.join("ledger.sqlite")).expect("reopen applies v15");
+        assert_eq!(
+            reopened.schema_version().expect("count"),
+            LEDGER_SCHEMA_VERSION
+        );
+        let (id, _, status, _) = reopened
+            .runs_since("2000-01-01T00:00:00Z")
+            .expect("runs")
+            .into_iter()
+            .find(|(id, ..)| *id == run("run-pre-v15"))
+            .expect("the pre-v15 row is still there");
+        assert_eq!(id, run("run-pre-v15"));
+        assert_eq!(status, State::Prepared.as_str());
         std::fs::remove_dir_all(&dir).ok();
     }
 
