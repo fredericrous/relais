@@ -720,6 +720,18 @@ Three read-only commands let a person see what a policy declares before anything
 
 `recipe_id` is always read from `RecipeSpec::recipe_id`, never recomputed by these commands, so the id `list` and `show` print is the id `replay` and `evaluate` record.
 
+## 27. Recipe promotion and rollback
+
+Two commands change which recipe revisions a repository's `relais.toml` declares. Both are human-gated, append-only, never grant, and never run anything: no worker is dispatched, no replay is started, no trial is written, and `machine.toml` is never opened.
+
+`relais recipe promote <candidate.toml> [--write]` admits the candidate through `route::validate_candidate` exactly as `recipe diff`, `dataset replay` and `recipe evaluate` do, then RECOMPUTES the comparison with `learn::comparison::evaluate_candidate` from the ledger's settled trials — it never reads a verdict a previous `evaluate` printed. It proceeds only when `ComparisonReport::promotable` hands back a `Promotable`. A refusal lists the report's own failed gates (§25), states the basis and paired count (`basis: replay, n=3`), writes nothing, and exits 17 (`PromotionRefused`), distinct from a candidate `validate_candidate` refuses (3). `Promotable` keeps its private constructor: the only path from a report to a write is `Amendment::for_promotion`, which takes one by value.
+
+Without `--write`, a promotable candidate prints the `[[recipes]]` fragment(s) it adds — the new revisions only — the evaluation it rests on (basis, n, per-arm acceptance and cost, the paired interval), and the trust block for the policy that would result, in the shape `relais plan` prints for a missing grant. Nothing is written.
+
+`relais recipe rollback <name> [--write]` restores the revision below the currently effective one — the effective one being the highest enabled revision, as routing selects it (§6) — by appending a NEW revision N+1 whose fields equal revision N-1's, enabled. It never edits or disables an existing revision: recipe history in a policy is append-only, as `validate_candidate` already enforces for a candidate. Removing a change is always allowed, so rollback needs no evaluation. A recipe with fewer than two revisions, one with no enabled revision, or an unknown name is refused, naming what exists (exit 2). Without `--write` it prints the fragment and the resulting trust block.
+
+`--write` APPENDS the fragment(s) to `relais.toml` as text and never re-serializes the file: every existing byte, comment and ordering is kept, so the file before is a byte-exact prefix of the file after. Before appending, the text is parsed back and must equal the policy the amendment means to produce; a file the fragment cannot be appended to is refused, not corrupted. The new policy has a new authority hash (§5), so no existing grant covers it: the next `relais plan` reports `missing_trust_grant` until a person reviews the printed block and pastes it into `machine.toml`. Neither command issues that grant.
+
 ---
 
 Companion repositories: [amont](https://github.com/fredericrous/amont), [aval](https://github.com/fredericrous/aval), [amont-agent](https://github.com/fredericrous/amont-agent).

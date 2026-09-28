@@ -254,12 +254,11 @@ impl ComparisonReport {
         self.failures().is_empty().then(sealed::Promotable::mint)
     }
 
-    pub fn render(&self) -> String {
-        let mut out = String::from("relais recipe evaluate\n");
-        out.push_str(
-            "this evaluation reads and reports; it promotes nothing, writes no policy, and \
-             issues no grant\n",
-        );
+    /// What the comparison rests on and what each arm showed — basis, n,
+    /// per-arm acceptance and cost, the paired interval — with no verdict
+    /// and no statement about what the caller will do with it.
+    pub fn render_evidence(&self) -> String {
+        let mut out = String::new();
         out.push_str(&format!("basis: {}, n={}\n", self.basis, self.paired_tasks));
         out.push_str(&format!(
             "errored trials set aside (not comparable evidence for or against the arm): {}\n",
@@ -277,6 +276,16 @@ impl ComparisonReport {
             self.interval.resamples,
             self.interval.seed,
         ));
+        out
+    }
+
+    pub fn render(&self) -> String {
+        let mut out = String::from("relais recipe evaluate\n");
+        out.push_str(
+            "this evaluation reads and reports; it promotes nothing, writes no policy, and \
+             issues no grant\n",
+        );
+        out.push_str(&self.render_evidence());
         let failures = self.failures();
         if failures.is_empty() {
             out.push_str("gates: PASSED\n");
