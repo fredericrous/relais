@@ -238,6 +238,82 @@ about hooks stay in the [README](../README.md#known-limits).
   hook tell a reaped-cancelled run from a session it has never seen.
   Cancelling a tab's agents is not a durable stop — closing the tab is.
 
+## Orchestration usage import
+
+`relais usage import` and `relais report` (which imports before
+rendering unless `--no-import` is given) read the orchestrating Claude
+Code session's own usage — the session that wrote contracts, reviewed
+candidates and landed PRs, not a worker's own session (SPEC §11) — and
+fold it into `relais report` beside worker spend.
+
+- **Where transcripts are read from.** `~/.claude/projects` by default,
+  honouring `CLAUDE_CONFIG_DIR` when it is set (Claude Code's own
+  variable — `$CLAUDE_CONFIG_DIR/projects`, not relais's
+  `RELAIS_CONFIG_DIR`). `relais usage import --projects-dir <path>`
+  overrides it directly. A session's main transcript is found by
+  searching that directory for `<session_id>.jsonl`; its subagent turns
+  live in separate files beside it, at
+  `<slug>/<session_id>/subagents/agent-*.jsonl` — never as sidechain
+  lines inside the main file — and every one of them is read too. A
+  missing `subagents` directory is not an error, and a session whose
+  main transcript cannot be found is reported `transcript missing`, not
+  zero spend.
+- **Which sessions are imported.** A session is imported when it is the
+  `root_session` of at least one run on record (`--session <id>` narrows
+  it to one). A relais worker's own session is never imported this way —
+  it is already paid for as a usage event of its run, and importing it
+  too would double it. A run recorded before the session-identity fix
+  (`fix(session): key runs by CLAUDE_CODE_SESSION_ID`, #119) has a bare
+  shell PID for `root_session`, which was never a Claude Code session id
+  and so can never have a transcript; such a run is reported
+  `unattributable`, counted, never guessed at.
+- **`[pricing]` in `machine.toml`.** Prices live in
+  `~/.config/relais/machine.toml`, never in the binary, because Anthropic
+  changes them without a relais release to match. Shape:
+
+  ```toml
+  [pricing]
+  version = "2026-09-01"
+
+  [[pricing.models]]
+  ids = ["claude-haiku-4-5", "claude-haiku-4-5-20251001"]
+  input = 1000000          # micro-USD per million input tokens
+  output = 5000000
+  cache_read = 100000
+  cache_write_5m = 1250000  # 5-minute cache write TTL
+  cache_write_1h = 2000000  # 1-hour cache write TTL — priced separately;
+                             # a single "cache write" figure cannot tell
+                             # the two TTLs apart, and they cost different
+                             # multiples of base input
+  # fast_input = 2000000    # optional: a non-"standard" service tier
+  # fast_output = 10000000  # (present only when the provider bills one)
+  ```
+
+  `ids` names every model string that bills at this rate — a model is
+  commonly addressed both by its bare family name and by a dated
+  snapshot id, and both belong in the same list. A model absent from the
+  table, or a non-standard speed the table has no `fast_input`/
+  `fast_output` for, prices as unknown, never as zero. **Update this
+  table by hand** whenever Anthropic changes a price; nothing in relais
+  fetches or infers one. Adding or editing `[pricing]` is machine policy,
+  not repo policy — it never moves a repository's authority hash or
+  invalidates a trust grant reviewed before it existed.
+- **Idempotent.** Every imported message is keyed by the transcript's
+  own `message.id`; importing the same session twice inserts nothing the
+  second time.
+- **Final snapshot wins.** Claude Code writes one API message as several
+  transcript lines with the same `message.id`, and `output_tokens` grows
+  across them (8, 8, 316). Import keeps the line with the most output,
+  and a message imported while still streaming is raised to its final
+  count on the next import — never lowered.
+- **Estimated, not billed.** The figure is tokens times the `[pricing]`
+  table: labelled `estimated`, never `actual`. On a subscription it is
+  what the same usage would cost at API rates, not what was paid.
+- **`relais report` imports every orchestrating session**, not only those
+  whose run started inside the window: a session that keeps working
+  after the window opens spends inside it. The window only narrows which
+  `unattributable` / `transcript missing` sessions are counted.
+
 ## Troubleshooting
 
 - **More than one settings file names a hook.** Nothing wins: Claude Code

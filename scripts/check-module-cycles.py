@@ -71,6 +71,7 @@ PURE_MODULES = {
     "ids",
     "lifecycle",
     "money",
+    "orchestration",
     "outcome",
     "policy",
     "resume",

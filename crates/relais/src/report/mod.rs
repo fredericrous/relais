@@ -67,7 +67,7 @@ fn is_accepted(status: State) -> bool {
 /// status` prints, so its JSON agrees with the sentence a person sees),
 /// so a downstream parser can tell an old shape from a new one instead of
 /// guessing from key presence.
-pub const REPORT_SCHEMA_VERSION: u32 = 6;
+pub const REPORT_SCHEMA_VERSION: u32 = 7;
 
 /// A dimension `relais report --by` groups the window's tasks over (SPEC
 /// §11: "compare like task classes and policy versions"). Total over the
@@ -429,6 +429,38 @@ pub struct Report {
     /// [`EnforcementReport::observed`]; `relais report`'s CLI layer
     /// overwrites it with a live snapshot when one is reachable.
     pub enforcement: EnforcementReport,
+    /// What the orchestrating Claude Code session itself spent (SPEC
+    /// §11): writing contracts, reviewing candidates, landing PRs — the
+    /// largest line worker spend alone leaves out. Never netted against
+    /// worker spend, never hidden behind a flag.
+    pub orchestration: OrchestrationSummary,
+    /// The primary metric with orchestration spend folded in, labelled
+    /// an upper bound (SPEC §11): one orchestrating session can do work
+    /// unrelated to relais runs too, so this over-states what an
+    /// accepted change cost, where [`Report::cost_per_accepted_task`]
+    /// under-states it by leaving orchestration out entirely.
+    pub cost_per_accepted_task_with_orchestration: Option<MicroUsd>,
+}
+
+/// Orchestration spend imported from Claude Code session transcripts
+/// (SPEC §11), attributed to the report window by each message's own
+/// timestamp. `unattributable` and `transcript_missing` are counted, not
+/// guessed at: a session whose `root_session` is a bare shell PID from
+/// before the session-identity fix (#119) can never have a transcript
+/// and is `unattributable`; a session that should have one but none was
+/// found at the searched path is `transcript_missing`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct OrchestrationSummary {
+    pub cost: MicroUsd,
+    pub cost_completeness: CostCompleteness,
+    pub unattributable: usize,
+    pub transcript_missing: usize,
+}
+
+impl OrchestrationSummary {
+    pub fn not_imported(&self) -> usize {
+        self.unattributable + self.transcript_missing
+    }
 }
 
 /// The same enforcement summary `relais coordinator status` prints (SPEC
@@ -671,6 +703,26 @@ pub fn runs_report(
     } else {
         None
     };
+    let (orchestration_cost, orchestration_completeness) =
+        ledger.orchestration_spend_since(since)?;
+    let orchestration = OrchestrationSummary {
+        cost: orchestration_cost,
+        cost_completeness: orchestration_completeness,
+        // Filled in by the CLI layer after an import pass, the same way
+        // `enforcement` is filled in with a live coordinator snapshot:
+        // this function stays a pure read of what the ledger already
+        // holds, never touching the filesystem for a transcript itself.
+        unattributable: 0,
+        transcript_missing: 0,
+    };
+    let cost_per_accepted_task_with_orchestration = if accepted_tasks > 0 {
+        Some(MicroUsd::from_micros(
+            ((total_task_cost + orchestration.cost).to_micros() as f64 / accepted_tasks as f64)
+                .round() as i64,
+        ))
+    } else {
+        None
+    };
 
     Ok(Report {
         schema_version: REPORT_SCHEMA_VERSION,
@@ -698,6 +750,8 @@ pub fn runs_report(
         open_decisions,
         cohorts,
         enforcement: EnforcementReport::observed(),
+        orchestration,
+        cost_per_accepted_task_with_orchestration,
     })
 }
 
@@ -711,6 +765,7 @@ impl Report {
         out.push('\n');
         if self.runs.is_empty() {
             out.push_str("no runs recorded in this window\n");
+            self.push_orchestration_lines(&mut out);
             return out;
         }
         for run in &self.runs {
@@ -890,9 +945,45 @@ impl Report {
             }
         }
         out.push('\n');
+        self.push_orchestration_lines(&mut out);
+        out.push('\n');
         out.push_str(&self.enforcement.sentence);
         out.push('\n');
         out
+    }
+
+    /// Orchestration spend beside worker spend, on every render (SPEC
+    /// §11) — including the empty-window early return above, so it is
+    /// never silently omitted just because no run fell in the window.
+    fn push_orchestration_lines(&self, out: &mut String) {
+        out.push_str(&format!(
+            "orchestration (the orchestrating session's own spend): {}\n",
+            cost_line(
+                self.orchestration.cost,
+                self.orchestration.cost_completeness
+            )
+        ));
+        match self.cost_per_accepted_task_with_orchestration {
+            Some(cost) => out.push_str(&format!(
+                "cost per accepted task with orchestration (upper bound): {}\n",
+                cost_line(
+                    cost,
+                    self.task_cost_completeness
+                        .max(self.orchestration.cost_completeness)
+                )
+            )),
+            None => out.push_str(
+                "cost per accepted task with orchestration: no accepted tasks in window\n",
+            ),
+        }
+        if self.orchestration.not_imported() > 0 {
+            out.push_str(&format!(
+                "orchestration: not imported ({} session(s): {} unattributable, {} transcript missing)\n",
+                self.orchestration.not_imported(),
+                self.orchestration.unattributable,
+                self.orchestration.transcript_missing,
+            ));
+        }
     }
 }
 
@@ -1285,6 +1376,13 @@ mod tests {
             open_decisions: vec![],
             cohorts: None,
             enforcement: EnforcementReport::observed(),
+            orchestration: OrchestrationSummary {
+                cost: MicroUsd::ZERO,
+                cost_completeness: CostCompleteness::Unknown,
+                unattributable: 0,
+                transcript_missing: 0,
+            },
+            cost_per_accepted_task_with_orchestration: Some(MicroUsd::from_micros(10)),
         };
         let rendered = report.render();
         assert!(
@@ -1485,9 +1583,11 @@ mod tests {
                 "cost_completeness",
                 "cost_per_accepted",
                 "cost_per_accepted_task",
+                "cost_per_accepted_task_with_orchestration",
                 "cost_per_standing_change",
                 "enforcement",
                 "open_decisions",
+                "orchestration",
                 "pending_decisions",
                 "pending_feedback",
                 "runs",
@@ -1501,6 +1601,61 @@ mod tests {
             ]
         );
         // Best effort: a leftover temp dir costs nothing but disk.
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Orchestration spend shows up beside worker spend, windowed by each
+    /// message's OWN timestamp rather than any run's `created_at` — SPEC
+    /// §11's whole point is that it stops being the line the primary
+    /// metric leaves out.
+    #[test]
+    fn orchestration_spend_is_reported_beside_worker_spend_and_windowed_by_message_time() {
+        let dir = temp_dir("orchestration-spend");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        ledger
+            .record_orchestration_usage(&crate::ledger::OrchestrationUsageRow {
+                message_id: "msg-in-window".into(),
+                session_id: "sess-1".into(),
+                transcript: crate::orchestration::TranscriptSource::Main,
+                model: "claude-opus-5-5".into(),
+                speed: crate::orchestration::Speed::Standard,
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_read_tokens: 0,
+                cache_write_5m_tokens: 0,
+                cache_write_1h_tokens: 0,
+                cost: Some(MicroUsd::from_micros(5_000_000)),
+                pricing_version: Some("2026-09-01".into()),
+                completeness: CostCompleteness::Actual,
+                at: "2026-09-20T00:00:00Z".into(),
+            })
+            .expect("in-window row");
+        ledger
+            .record_orchestration_usage(&crate::ledger::OrchestrationUsageRow {
+                message_id: "msg-before-window".into(),
+                session_id: "sess-1".into(),
+                transcript: crate::orchestration::TranscriptSource::Main,
+                model: "claude-opus-5-5".into(),
+                speed: crate::orchestration::Speed::Standard,
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_read_tokens: 0,
+                cache_write_5m_tokens: 0,
+                cache_write_1h_tokens: 0,
+                cost: Some(MicroUsd::from_micros(9_000_000)),
+                pricing_version: Some("2026-09-01".into()),
+                completeness: CostCompleteness::Actual,
+                at: "2026-08-01T00:00:00Z".into(),
+            })
+            .expect("out-of-window row");
+        let report = runs_report(&ledger, "2026-09-01T00:00:00Z", None).expect("report");
+        assert_eq!(report.orchestration.cost, MicroUsd::from_micros(5_000_000));
+        assert_eq!(
+            report.orchestration.cost_completeness,
+            CostCompleteness::Actual
+        );
+        let text = report.render();
+        assert!(text.contains("orchestration"), "{text}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

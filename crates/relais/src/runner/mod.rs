@@ -4101,6 +4101,7 @@ mod tests {
                 trials: TrialEnvelope::default(),
                 routing: Default::default(),
                 admission: Default::default(),
+                pricing: None,
             }
         }
 

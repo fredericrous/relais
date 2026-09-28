@@ -10,6 +10,39 @@ missing here.
 
 ### Added
 
+- **`relais usage import` and `relais report` now account for the
+  orchestrating Claude Code session's own spend, not just workers'.**
+  Cost per accepted change used to leave out the session that wrote
+  contracts, reviewed candidates and landed PRs — measured on one
+  machine as the largest line: about $44 of worker/review/repair spend
+  in the ledger against roughly $290 the orchestrating session itself
+  spent, moving `relais report`'s printed $8/accepted-change to the real
+  $31. `relais usage import [--session <id>] [--projects-dir <path>]`
+  reads a session's Claude Code transcript (`~/.claude/projects` by
+  default, honouring `CLAUDE_CONFIG_DIR`) and every subagent file beside
+  it, prices it from a new `[pricing]` table in
+  `~/.config/relais/machine.toml` (never from constants in the code),
+  and records it in a new ledger table keyed by the transcript's own
+  `message.id` — idempotent, so importing the same session twice
+  inserts nothing the second time; of a message's streamed lines the one
+  with the most output is kept, and a message imported mid-stream grows
+  to its final count on the next import. The figure is labelled
+  `estimated` (tokens × price table), never `actual`. Only a session that is the
+  `root_session` of at least one run is imported; a worker's own session
+  never is, since it is already paid for as a usage event of its run. A
+  session predating the session-identity fix (#119, `root_session` a
+  bare shell PID) is reported `unattributable`, counted, never guessed
+  at; one whose transcript cannot be found is `transcript missing`.
+  `relais report` imports before rendering unless `--no-import` is
+  given, and now prints orchestration spend beside worker spend on every
+  render, plus cost-per-accepted-task both without and with
+  orchestration folded in — the latter labelled an upper bound, since
+  one orchestrating session can do work unrelated to relais runs too.
+  Orchestration spend is never netted against worker spend, hidden
+  behind a flag, or folded silently into the worker figure. See [docs
+  /INTEGRATIONS.md](docs/INTEGRATIONS.md#orchestration-usage-import) and
+  [SPEC §11](docs/SPEC.md#11-cost-and-resource-accounting).
+
 - **`relais recipe list`, `relais recipe show <name>` and `relais recipe
   diff <candidate.toml>` let a person see what a policy declares before
   anything is replayed or evaluated.** All three are read-only. `list`
