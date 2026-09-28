@@ -702,6 +702,18 @@ Promotion is gated, and the gate is unspellable to defeat: `ComparisonReport::pr
 
 The gates: the basis must not be `Observational`; at least 20 paired tasks (below that, a comparison is a proof of mechanism, not evidence about a recipe — the first intended real use, a three-task replay, is exactly this case and must refuse); and neither arm's acceptance estimate may be abstained. A refused report's rendered output states its basis and paired count together (`basis: replay, n=3`), names every unmet gate in words, and contains no sentence — no "PASSED", no approval — a reader could mistake for a weak pass.
 
+## 26. Recipe inspection
+
+Three read-only commands let a person see what a policy declares before anything is replayed or evaluated. None of the three grants, replays, evaluates or writes anything.
+
+`relais recipe list` prints every recipe the repository's `relais.toml` declares — name, revision, enabled, tier, kind, scope and `recipe_id` — one per line, in declaration order. A policy that declares no recipes says so in words; empty output would be indistinguishable from a failure to read.
+
+`relais recipe show <name>` prints every revision of that recipe, including the per-recipe `models`, `execution`, `context` and `review` blocks when set. Those blocks carry the same caveat their field docs do: DECLARED AND HASHED, NOT YET READ by routing. An unknown name is a refusal naming the recipes that do exist, not an empty success.
+
+`relais recipe diff <candidate.toml>` compares the candidate's recipes to the repository's own, per recipe and revision, and names every field that differs, using each side's EFFECTIVE value rather than its compact serialized form — a field a candidate leaves at its default, and so omits from the file, compares as that default, never as an absent `null`. The set of compared fields is still derived from `RecipeSpec`'s own shape rather than a hand-picked field list, so a field added to the type later appears in the diff without anyone remembering to add it. It also states whether `route::validate_candidate` would admit the candidate — quoting the rejection when it would not — and says in the same breath that admissible is not approved: an admitted candidate still needs its own trust grant before anything runs, evaluates or replays under it (§24, §25).
+
+`recipe_id` is always read from `RecipeSpec::recipe_id`, never recomputed by these commands, so the id `list` and `show` print is the id `replay` and `evaluate` record.
+
 ---
 
 Companion repositories: [amont](https://github.com/fredericrous/amont), [aval](https://github.com/fredericrous/aval), [amont-agent](https://github.com/fredericrous/amont-agent).
