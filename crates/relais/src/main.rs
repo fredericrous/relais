@@ -3762,7 +3762,7 @@ fn feedback_run(
     let task_id = TaskId::from_stored(task.expect("clap requires run_id or --task"));
     let runs = operational(ledger.runs_of_task(&task_id), "feedback")?;
     for candidate in runs.into_iter().rev() {
-        if operational(ledger.run_status(&candidate), "feedback")? == Some(State::Accepted) {
+        if operational(ledger.run_status(&candidate), "feedback")?.is_some_and(State::is_accepted) {
             return Ok(Ok(candidate));
         }
     }
@@ -3809,7 +3809,7 @@ fn feedback_command(request: FeedbackRequest) -> Result<CliOutcome, CliError> {
     // accepted candidate — the runner's own verification, or a person's
     // salvage of a terminal run's work — has one whose later life is
     // worth recording.
-    if state != State::Accepted && state != State::AcceptedByPerson {
+    if !state.is_accepted() {
         eprintln!(
             "relais feedback: run {run} is {state}, not accepted — final outcome feedback \
              records what happened to an ACCEPTED change"
@@ -4144,7 +4144,7 @@ fn salvage_command(
     // itself producing an accepted candidate: never one still in flight,
     // never one already accepted the ordinary way or already salvaged
     // once.
-    if !state.is_terminal() || matches!(state, State::Accepted | State::AcceptedByPerson) {
+    if !state.is_terminal() || state.is_accepted() {
         eprintln!(
             "relais decide: run {run} is {state} — `salvaged` answers a run that has already \
              stopped without an accepted candidate, not one still in flight or already accepted"
@@ -4838,5 +4838,80 @@ mod tests {
             diffs[0].2, "true",
             "the omitted default must compare as its effective value, never null: {diffs:?}"
         );
+    }
+
+    /// #118: `feedback --task` used to look for a run in `State::Accepted`
+    /// only, so a task whose sole acceptance was a person's salvage
+    /// (`State::AcceptedByPerson`) refused with "no accepted run on
+    /// record" — even though `relais feedback <run-id>` on that very run
+    /// accepts it. The task here carries two runs: the first reaches
+    /// `needs_review` and is answered `revise` (cancelled, no
+    /// acceptance), the second ends `failed` and is then salvaged. The
+    /// `--task` lookup must land on the salvaged run.
+    ///
+    /// FALSIFIED: restricting `feedback_run`'s loop back to
+    /// `Some(State::Accepted)` (the pre-fix condition) makes this test
+    /// fail with `Err(CliOutcome::UnknownRun)`; restored to
+    /// `State::is_accepted`.
+    #[test]
+    fn feedback_task_finds_a_run_the_only_acceptance_was_a_persons_salvage() {
+        let (ledger, dir) = temp_ledger("salvage-task");
+        let task = relais::ids::TaskId::from_stored("task-salvaged");
+
+        let revised = RunId::from_stored("run-revised");
+        ledger
+            .insert_run(&revised, "/repo", None, &task, "rk")
+            .expect("run");
+        ledger
+            .record_transition(&Transition {
+                run_id: revised.clone(),
+                attempt_id: None,
+                from_state: Some(State::Verifying),
+                to_state: State::NeedsReview,
+                reason: Reason::VerificationGap.as_str().into(),
+                detail: None,
+                at: ledger.now(),
+            })
+            .expect("transition");
+        assert!(ledger
+            .resolve_decision(
+                &revised,
+                &relais::ledger::DecisionAnswer {
+                    resolution: Reason::DecisionRevised,
+                    actor: "a person",
+                    note: None,
+                    successor_run: None,
+                    from_state: State::NeedsReview,
+                    to_state: State::Cancelled,
+                },
+            )
+            .expect("resolve"));
+
+        let salvaged = RunId::from_stored("run-salvaged");
+        ledger
+            .insert_run(&salvaged, "/repo", None, &task, "rk")
+            .expect("run");
+        ledger
+            .record_transition(&Transition {
+                run_id: salvaged.clone(),
+                attempt_id: None,
+                from_state: Some(State::Verifying),
+                to_state: State::Failed,
+                reason: Reason::BehavioralFailure.as_str().into(),
+                detail: None,
+                at: ledger.now(),
+            })
+            .expect("transition");
+        ledger
+            .record_salvage(&salvaged, "deadbeef", "a person", None)
+            .expect("salvage")
+            .expect("a terminal run with no prior decision salvages");
+
+        let found = feedback_run(&ledger, None, Some(task.as_str()))
+            .expect("feedback_run")
+            .expect("a salvaged run counts as accepted");
+        assert_eq!(found, salvaged);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

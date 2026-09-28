@@ -466,6 +466,16 @@ missing here.
 
 ### Fixed
 
+- **`relais feedback --task <id>` now finds a task's accepted run when
+  the acceptance was a person's salvage (#118).** It used to search only
+  for a run the runner itself accepted, so a task whose only acceptance
+  was `relais decide --answer salvaged` refused with `task … has no
+  accepted run on record` even though `relais feedback <run-id>` would
+  accept that exact run directly. Both paths now share one definition of
+  "accepted" — an exhaustive match over the run state — so they cannot
+  drift apart again; `relais report`'s accepted/standing task counts
+  already used the wider definition and are unaffected.
+
 - **`relais plan` now refuses a contract whose read hints do not resolve
   at the base revision, exactly as `relais run` already does (#97).**
   `plan` used to route a contract whose `read_hints` named a path the

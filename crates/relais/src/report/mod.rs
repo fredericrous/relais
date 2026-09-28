@@ -53,15 +53,6 @@ fn accepted_by_person(
         }))
 }
 
-/// Whether a run's own state counts as an accepted candidate for the
-/// primary metric (SPEC §20): the runner's own `Accepted`, or a person's
-/// salvage of a terminal run's work (`State::AcceptedByPerson`) — the
-/// candidate `relais decide --answer approve`/`salvaged` accepted either
-/// way, never a state still in flight or one that ended without one.
-fn is_accepted(status: State) -> bool {
-    matches!(status, State::Accepted | State::AcceptedByPerson)
-}
-
 /// Bumped whenever a top-level `Report` key is added, renamed or removed
 /// (this task added `enforcement`, the same summary `relais coordinator
 /// status` prints, so its JSON agrees with the sentence a person sees),
@@ -545,7 +536,7 @@ pub fn runs_report(
                     .last()
                     .map(|transition| transition.reason.clone())
             });
-        let mut standing = is_accepted(status);
+        let mut standing = status.is_accepted();
         if standing {
             if let Some(task_id) = ledger.task_of_run(&run_id)? {
                 if let Some(withdrawn) = withdrawn_tasks.get(&task_id) {
@@ -565,7 +556,7 @@ pub fn runs_report(
             standing,
         });
     }
-    let accepted = runs.iter().filter(|run| is_accepted(run.status)).count();
+    let accepted = runs.iter().filter(|run| run.status.is_accepted()).count();
     let standing = runs.iter().filter(|run| run.standing).count();
     let total_cost = runs.iter().fold(MicroUsd::ZERO, |acc, run| acc + run.cost);
     // An OPEN decision, not a state: once `relais decide` answers a run
@@ -609,7 +600,7 @@ pub fn runs_report(
         let mut duration_seconds: Option<f64> = None;
         for run_id in &runs_of_task {
             let status = ledger.run_status(run_id)?;
-            if status.is_some_and(is_accepted) {
+            if status.is_some_and(State::is_accepted) {
                 accepted_task = true;
                 if accepted_by_person(ledger, run_id)? {
                     accepted_task_by_person = true;
@@ -2153,6 +2144,76 @@ mod tests {
             CostCompleteness::IncompleteLowerBound,
             "what the worker reported is real; the reviewer's spend is missing"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #118: the same task `feedback_task_finds_a_run_the_only_acceptance_was_a_persons_salvage`
+    /// (`main.rs`) builds — one run answered `needs_review` -> `revise`
+    /// (cancelled, no acceptance), a second run `failed` and then
+    /// salvaged — must read as accepted here too, so `relais feedback
+    /// --task` and `relais report` agree on the same task.
+    #[test]
+    fn a_task_whose_only_acceptance_is_a_persons_salvage_is_counted_accepted() {
+        let dir = temp_dir("salvage-task-report");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let task = crate::ids::TaskId::from_stored("task-salvaged-report");
+
+        let revised = crate::ids::RunId::from_stored("run-revised-report");
+        ledger
+            .insert_run(&revised, "/repo", None, &task, "rk")
+            .expect("run");
+        ledger
+            .record_transition(&Transition {
+                run_id: revised.clone(),
+                attempt_id: None,
+                from_state: Some(State::Verifying),
+                to_state: State::NeedsReview,
+                reason: "review_findings".into(),
+                detail: None,
+                at: now_rfc3339(),
+            })
+            .expect("transition");
+        ledger
+            .resolve_decision(
+                &revised,
+                &crate::ledger::DecisionAnswer {
+                    resolution: Reason::DecisionRevised,
+                    actor: "a person",
+                    note: None,
+                    successor_run: None,
+                    from_state: State::NeedsReview,
+                    to_state: State::Cancelled,
+                },
+            )
+            .expect("resolve");
+
+        let salvaged = crate::ids::RunId::from_stored("run-salvaged-report");
+        ledger
+            .insert_run(&salvaged, "/repo", None, &task, "rk")
+            .expect("run");
+        ledger
+            .record_transition(&Transition {
+                run_id: salvaged.clone(),
+                attempt_id: None,
+                from_state: Some(State::Verifying),
+                to_state: State::Failed,
+                reason: "behavioral_failure".into(),
+                detail: None,
+                at: now_rfc3339(),
+            })
+            .expect("transition");
+        ledger
+            .record_salvage(&salvaged, "deadbeef", "a person", None)
+            .expect("salvage")
+            .expect("a terminal run with no prior decision salvages");
+
+        let report = runs_report(&ledger, "2000-01-01T00:00:00+00:00", None).expect("report");
+        assert_eq!(
+            report.accepted_tasks, 1,
+            "the task's only acceptance is a person's salvage: {report:?}"
+        );
+        assert_eq!(report.accepted_tasks_by_person, 1, "{report:?}");
+        assert_eq!(report.standing_tasks, 1, "{report:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
