@@ -41,6 +41,9 @@ use relais::backend::Backend;
 use relais::contract::TaskContract;
 use relais::ids::{IdSource, RunId, TaskId};
 use relais::install::{InstallReport, InstallRequest, Mode, Scope};
+use relais::learn::comparison::{
+    evaluate_candidate, DEFAULT_BOOTSTRAP_RESAMPLES, MIN_PAIRED_TASKS,
+};
 use relais::learn::predict::RegistryPredictor;
 use relais::ledger::{TrialCost, TrialOutcome};
 use relais::lifecycle::RunPurpose;
@@ -146,6 +149,12 @@ enum Command {
     Dataset {
         #[command(subcommand)]
         cmd: DatasetCommand,
+    },
+    /// Read settled trials and report a candidate recipe's comparison
+    /// against the incumbent — never promotes anything (SPEC §25)
+    Recipe {
+        #[command(subcommand)]
+        cmd: RecipeCommand,
     },
     /// Fit feature transforms and predictors on an owned dataset
     Train,
@@ -350,6 +359,18 @@ enum DatasetCommand {
         /// no trial recorded, no usage recorded
         #[arg(long = "dry-run")]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RecipeCommand {
+    /// Read the settled trials for a candidate recipe and report a paired
+    /// comparison against the incumbent (SPEC §25). Reads and reports
+    /// only: nothing here promotes, writes a policy, or issues a grant.
+    Evaluate {
+        /// Path to the candidate `relais.toml`, admitted through the same
+        /// boundary a learner's proposal is (route::validate_candidate)
+        candidate: PathBuf,
     },
 }
 
@@ -666,6 +687,9 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
                 recipe,
                 dry_run,
             } => replay_command(&task, &recipe, dry_run),
+        },
+        Command::Recipe { cmd } => match cmd {
+            RecipeCommand::Evaluate { candidate } => recipe_evaluate_command(&candidate),
         },
         Command::Train => train_command(),
         Command::Evaluate { artifact } => evaluate_command(&artifact),
@@ -2548,6 +2572,50 @@ fn replay_command(task: &str, recipe: &Path, dry_run: bool) -> Result<CliOutcome
     println!(
         "this replay is one arm's result; it does not compare, score, rank or promote anything"
     );
+    Ok(CliOutcome::Accepted)
+}
+
+/// Read the settled trials for a candidate recipe and print a paired
+/// comparison against the incumbent (SPEC §25). This command reads and
+/// reports; it never promotes, writes a policy, or issues a grant —
+/// `relais promote` is the only thing in this crate that activates
+/// anything, and it takes a learned artifact id, not a recipe.
+fn recipe_evaluate_command(candidate_path: &Path) -> Result<CliOutcome, CliError> {
+    let (_root, incumbent) = load_repo_policy()?;
+    let candidate_text =
+        std::fs::read_to_string(candidate_path).map_err(|cause| CliError::Read {
+            what: "the candidate recipe",
+            path: candidate_path.to_path_buf(),
+            cause,
+        })?;
+    let candidate_policy =
+        RepoPolicy::from_toml_str(&candidate_text).map_err(|cause| CliError::Invalid {
+            what: "the candidate recipe",
+            path: candidate_path.to_path_buf(),
+            cause: Box::new(cause),
+        })?;
+    // Admitted through the same door a learner's proposal, or a replay's
+    // candidate, is — never a second, looser one for evaluation.
+    let bounds = route::default_tuning_bounds(&incumbent);
+    let candidate = match route::validate_candidate(&incumbent, &candidate_policy, &bounds) {
+        Ok(candidate) => candidate,
+        Err(rejection) => {
+            eprintln!("relais recipe evaluate: candidate refused: {rejection}");
+            return Ok(CliOutcome::Blocked);
+        }
+    };
+
+    let ledger = open_ledger()?;
+    let report = operational(
+        evaluate_candidate(
+            &ledger,
+            candidate.policy(),
+            MIN_PAIRED_TASKS,
+            DEFAULT_BOOTSTRAP_RESAMPLES,
+        ),
+        "recipe evaluate",
+    )?;
+    print!("{}", report.render());
     Ok(CliOutcome::Accepted)
 }
 

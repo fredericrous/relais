@@ -12,6 +12,7 @@
 //! execute → verify → label → build dataset → train → evaluate →
 //! promote or reject → monitor.
 
+pub mod comparison;
 pub mod dataset;
 pub mod evaluate;
 pub mod features;

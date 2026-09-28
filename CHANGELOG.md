@@ -10,6 +10,52 @@ missing here.
 
 ### Added
 
+- **`relais recipe evaluate <candidate.toml>` turns replayed arms into a
+  comparison that says what it is.** It reads every settled trial in the
+  ledger whose arm ran under one of the candidate's own recipes, pairs
+  each task's arm against the incumbent result the task's source run
+  already earned — one paired observation per task, so a task replayed
+  twice does not outweigh one replayed once — and reports per-arm
+  acceptance, cost per accepted change, and a paired bootstrap interval
+  over the candidate-minus-incumbent acceptance difference. The bootstrap
+  is seeded from a deterministic hash of the paired task ids alone, so
+  the same trials give the same interval on any machine, in any order.
+
+  **The verdict is unspellable unless every gate passes.** Following
+  `route::CandidateRecipe`'s own pattern, `Promotable` has a private
+  field and no public constructor: only `ComparisonReport::promotable`
+  mints one, and only when `ComparisonReport::failures` — recomputed from
+  the report's own stored figures on every call, never a cached boolean —
+  comes back empty. A report whose figures are edited after the fact
+  disagrees with its own prior verdict instead of asserting one; a test
+  proves it by editing a passing fixture's `paired_tasks` down and
+  watching the recomputed failures change underneath it.
+
+  `ComparisonBasis` distinguishes what a comparison rests on: `Replay`
+  (what `relais dataset replay` produces today), `Randomized` (nothing
+  produces this yet), and `Observational`. An observational basis fails
+  its own named gate and can never promote, whatever the numbers say —
+  it was never assigned, so it is not a comparison. The gates also
+  require at least 20 paired tasks and refuse when an arm's off-policy
+  acceptance estimate has no support: zero trials, or an assignment
+  probability that is zero or non-finite abstain explicitly rather than
+  guessing a number. Cost follows `TrialCost`: a trial whose usage was
+  never reported does not enter a mean as zero, and the report counts how
+  many accepted arms had unknown cost rather than dropping them silently.
+
+  **The first intended real use is a three-task proof of mechanism, and
+  it cannot promote.** With 20 paired tasks required and three replayed,
+  the command refuses, states its basis and count together
+  (`basis: replay, n=3`), and names the unmet gate in words. A test
+  asserts the rendered output contains no sentence — no "PASSED", no
+  approval — a reader could quote as promoting the candidate.
+
+  **Nothing here promotes, writes a policy, or issues a grant.** The
+  command reads settled trials and reports; the printed output says so in
+  its first two lines, and `relais promote` — which activates a learned
+  artifact, not a recipe — remains the only thing in this crate that
+  activates anything.
+
 - **A controlled comparison now has somewhere to live.** Ledger
   migration **v14** (`LEDGER_SCHEMA_VERSION` 13 → 14) adds a `trials`
   table, a nullable `runs.purpose` and a nullable `dispatches.trial_id`.
