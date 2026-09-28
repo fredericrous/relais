@@ -14,6 +14,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::{Condvar, Mutex};
 
 use relais::policy::RepoPolicy;
 use relais::test_support::short_temp_dir;
@@ -28,6 +29,64 @@ const BIN: &str = env!("CARGO_BIN_EXE_relais");
 /// gives the library's own tests — this suite is a separate crate and
 /// cannot reach a `pub(crate)` helper, which is why `test_support` is
 /// `pub`. `root` stays a plain `PathBuf`, derived from the guard, since
+/// How many scenario worlds may be alive at once.
+///
+/// Not a CPU bound — these scenarios are process bound. Each world spawns
+/// the `relais` binary, which lazily starts its own coordinator daemon,
+/// and `cargo test` runs as many scenarios in parallel as the machine has
+/// cores (12 here). Measured: the suite is 28/28 alone and 7–9 FAILED when
+/// another `cargo test` or `make check` is running on the same machine.
+///
+/// That flakiness is not free. relais verifies a candidate by running this
+/// project's own `make check`, so a saturated machine turns a passing
+/// candidate into a `behavioral_failure`, which buys a REPAIR ATTEMPT —
+/// another dispatch, another worker, another verification — and can
+/// exhaust the run's wall clock outright. `run-65c7e51b58e6f-10970` lost
+/// $3.98 that way on a candidate that passes cleanly (relais#115).
+///
+/// Four, so the suite still overlaps its slow scenarios without every
+/// core racing to spawn a daemon. The bound is on WORLDS rather than on
+/// `--test-threads`, because a test harness flag cannot be set per-suite
+/// from `Cargo.toml` and the scenarios that do not build a world have no
+/// reason to queue.
+const MAX_LIVE_WORLDS: usize = 4;
+
+static LIVE_WORLD_PERMITS: Mutex<usize> = Mutex::new(MAX_LIVE_WORLDS);
+static A_WORLD_ENDED: Condvar = Condvar::new();
+
+/// A permit to hold one world, returned when the world drops.
+struct WorldPermit;
+
+impl WorldPermit {
+    fn acquire() -> Self {
+        // Poisoning is tolerated deliberately: a panicking scenario must
+        // not wedge every scenario after it. The count is a plain usize
+        // and a panic cannot leave it in a shape the next waiter cannot
+        // read — and `a_panicking_test_still_loses_its_world` exists
+        // precisely because scenarios do panic on purpose here.
+        let mut free = LIVE_WORLD_PERMITS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *free == 0 {
+            free = A_WORLD_ENDED
+                .wait(free)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *free -= 1;
+        WorldPermit
+    }
+}
+
+impl Drop for WorldPermit {
+    fn drop(&mut self) {
+        let mut free = LIVE_WORLD_PERMITS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *free += 1;
+        A_WORLD_ENDED.notify_one();
+    }
+}
+
 /// the rest of this file joins paths off it throughout.
 struct World {
     _scratch: relais::test_support::TempDir,
@@ -36,10 +95,18 @@ struct World {
     state: PathBuf,
     config: PathBuf,
     claude: PathBuf,
+    /// Released only once this world is gone — declared last so it drops
+    /// after `_scratch`, which is what actually tears the world down.
+    /// Bounding live worlds is what keeps a saturated machine from
+    /// failing a candidate that passes (relais#115).
+    _permit: WorldPermit,
 }
 
 impl World {
     fn new(tag: &str) -> Self {
+        // Before any directory or process exists: the point is to bound
+        // how many of these are ALIVE, not how many have finished.
+        let permit = WorldPermit::acquire();
         let scratch = short_temp_dir(&format!("it-{tag}"));
         let root = scratch.to_path_buf();
         let repo = root.join("repo");
@@ -74,6 +141,7 @@ impl World {
             state,
             config,
             claude,
+            _permit: permit,
         }
     }
 
