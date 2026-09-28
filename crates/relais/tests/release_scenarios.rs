@@ -632,6 +632,163 @@ fn a_reverted_outcome_leaves_accepted_unchanged_and_drops_standing() {
     );
 }
 
+// `relais feedback --note <text>` records free-text context on the
+// outcome (issue #98), the same shape as `relais decide --note`, and
+// `relais explain <run>` prints it on the outcome line.
+//
+// FALSIFY: in `feedback_command` (main.rs), replace the `note` field's
+// value with `None` when building `OutcomeDetail` — this test fails
+// because `explain`'s outcome line no longer carries the note.
+#[test]
+fn feedback_note_is_recorded_and_shown_by_explain() {
+    let world = World::new("feedback-note");
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    let task = world.write_task_for("task.json", "an easy one", "optional");
+
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    let run_id = World::run_id_of(&text(&run.stdout));
+
+    let feedback = world.relais(&[
+        "feedback",
+        &run_id,
+        "--outcome",
+        "accepted",
+        "--actor",
+        "the release suite",
+        "--note",
+        "merged as-is, no follow-up needed",
+    ]);
+    assert_eq!(
+        feedback.status.code(),
+        Some(0),
+        "{}",
+        text(&feedback.stderr)
+    );
+
+    let explained = text(&world.relais(&["explain", &run_id]).stdout);
+    let outcome_line = explained
+        .lines()
+        .find(|line| line.starts_with("outcome:"))
+        .unwrap_or_else(|| panic!("no outcome line: {explained}"));
+    assert_eq!(
+        outcome_line,
+        "outcome: accepted_unchanged — merged as-is, no follow-up needed"
+    );
+}
+
+// Omitting `--note` records no note, and `explain`'s outcome line
+// carries no note suffix at all — not even an empty one.
+#[test]
+fn feedback_without_a_note_leaves_the_outcome_line_bare() {
+    let world = World::new("feedback-no-note");
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    let task = world.write_task_for("task.json", "an easy one", "optional");
+
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    let run_id = World::run_id_of(&text(&run.stdout));
+
+    let feedback = world.relais(&[
+        "feedback",
+        &run_id,
+        "--outcome",
+        "accepted",
+        "--actor",
+        "the release suite",
+    ]);
+    assert_eq!(
+        feedback.status.code(),
+        Some(0),
+        "{}",
+        text(&feedback.stderr)
+    );
+
+    let explained = text(&world.relais(&["explain", &run_id]).stdout);
+    let outcome_line = explained
+        .lines()
+        .find(|line| line.starts_with("outcome:"))
+        .unwrap_or_else(|| panic!("no outcome line: {explained}"));
+    assert_eq!(outcome_line, "outcome: accepted_unchanged");
+}
+
+// `relais explain <run>` reads that run's OWN latest outcome row
+// (`outcome_of_run`, a per-run query), never the task's newest outcome
+// filtered by run: a later run of the same task recording its own
+// feedback must not hide an earlier run's note when the EARLIER run is
+// the one being explained (SPEC §20, issue #98).
+#[test]
+fn explain_shows_each_runs_own_outcome_note_not_a_later_runs() {
+    let world = World::new("feedback-per-run");
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    let task = world.write_task_for("task.json", "an easy one", "optional");
+
+    let first = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    let first_run = World::run_id_of(&text(&first.stdout));
+
+    let ledger =
+        relais::ledger::Ledger::open(&world.state.join("ledger.sqlite")).expect("open ledger");
+    let task_id = ledger
+        .task_of_run(&relais::ids::RunId::from_stored(first_run.clone()))
+        .expect("query task")
+        .expect("first run is on record under a task");
+
+    let feedback_first = world.relais(&[
+        "feedback",
+        &first_run,
+        "--outcome",
+        "accepted",
+        "--actor",
+        "the release suite",
+        "--note",
+        "run one's own note",
+    ]);
+    assert_eq!(
+        feedback_first.status.code(),
+        Some(0),
+        "{}",
+        text(&feedback_first.stderr)
+    );
+
+    let revised = world.write_task_for("task-revised.json", "an easy one, restated", "optional");
+    let second = world.relais(&[
+        "run",
+        "--task",
+        revised.to_str().unwrap(),
+        "--revise",
+        task_id.as_str(),
+    ]);
+    let second_run = World::run_id_of(&text(&second.stdout));
+
+    let feedback_second = world.relais(&[
+        "feedback",
+        &second_run,
+        "--outcome",
+        "accepted",
+        "--actor",
+        "the release suite",
+        "--note",
+        "run two's own note",
+    ]);
+    assert_eq!(
+        feedback_second.status.code(),
+        Some(0),
+        "{}",
+        text(&feedback_second.stderr)
+    );
+
+    let explain_first = text(&world.relais(&["explain", &first_run]).stdout);
+    let outcome_line = explain_first
+        .lines()
+        .find(|line| line.starts_with("outcome:"))
+        .unwrap_or_else(|| panic!("no outcome line: {explain_first}"));
+    assert_eq!(
+        outcome_line,
+        "outcome: accepted_unchanged — run one's own note"
+    );
+}
+
 // `relais report --by model` groups the window's tasks by the model
 // that ran, so a cost comparison is between like task classes rather
 // than one number blending every model together (SPEC §11).

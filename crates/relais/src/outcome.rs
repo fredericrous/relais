@@ -158,6 +158,11 @@ pub struct OutcomeDetail {
     pub correction_magnitude: Option<CorrectionMagnitude>,
     pub evidence: Vec<String>,
     pub actor: String,
+    /// Free-text context for this outcome (issue #98), the same shape as
+    /// `relais decide --note`. Additive: `#[serde(default)]` so a row
+    /// stored before this field existed still reads back as `None`.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// A typed outcome: a kind together with the detail its kind requires.
@@ -233,6 +238,7 @@ mod tests {
             correction_magnitude: magnitude,
             evidence: vec![],
             actor: "a reviewer".into(),
+            note: None,
         }
     }
 
@@ -303,6 +309,22 @@ mod tests {
             assert_eq!(OutcomeKind::parse(kind.as_str()), Some(kind));
         }
         assert_eq!(OutcomeKind::parse("not-a-kind"), None);
+    }
+
+    /// A row stored before `note` existed carries no `note` key at all.
+    /// `#[serde(default)]` must read that back as `None`, not refuse to
+    /// parse the row.
+    #[test]
+    fn a_detail_without_a_stored_note_field_parses_as_no_note() {
+        let json = r#"{
+            "candidate_sha": "abc123",
+            "strategy": {"tier": "implementation", "models": ["sonnet"], "escalated": false},
+            "correction_magnitude": null,
+            "evidence": [],
+            "actor": "a reviewer"
+        }"#;
+        let parsed: OutcomeDetail = serde_json::from_str(json).expect("parses");
+        assert_eq!(parsed.note, None);
     }
 
     #[test]

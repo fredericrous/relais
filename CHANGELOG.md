@@ -10,6 +10,11 @@ missing here.
 
 ### Added
 
+- **`relais feedback` gains `--note <text>`** (#98), recording free-text
+  context on a final outcome the same way `relais decide --note`
+  already does. `relais explain <run>` prints that run's own outcome,
+  with the note when one was given. Omitting `--note` stores no note
+  and adds no suffix to the outcome line.
 - **`relais usage import` and `relais report` now account for the
   orchestrating Claude Code session's own spend, not just workers'.**
   Cost per accepted change used to leave out the session that wrote
