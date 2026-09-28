@@ -666,7 +666,7 @@ The source run must be `Accepted` — the runner's own verification settled it, 
 
 ### Workspace isolation
 
-The replay workspace MUST NOT contain the accepted answer. It is built as a fresh, single-commit checkout at the source run's recorded base SHA — `git init` plus a shallow `git fetch` of exactly that one commit — never a `git worktree add` of the live repository. A linked worktree shares the live repository's object store, where the accepted candidate's own commit (reachable from later history, past the base) is one `git show` away; a fresh checkout's object store holds nothing but the base commit and its own history, so the accepted answer is not merely absent from the working tree, it was never fetched. From that checkout, the rest of a run's ordinary machinery — routing, dispatch, verification, snapshotting — proceeds exactly as `relais run` takes it, needing no replay-specific path through it.
+The replay workspace MUST NOT contain the accepted answer. It is built as a fresh, single-commit checkout at the source run's recorded base SHA — `git init`, a shallow `git fetch` of exactly that one commit, then `git checkout --detach FETCH_HEAD` so the working tree is actually the source repository's tree at that commit — never a `git worktree add` of the live repository. A linked worktree shares the live repository's object store, where the accepted candidate's own commit (reachable from later history, past the base) is one `git show` away; a fresh checkout's object store holds nothing but the base commit and its own history, so the accepted answer is not merely absent from the working tree, it was never fetched. From that checkout, the rest of a run's ordinary machinery — routing, dispatch, verification, snapshotting — proceeds exactly as `relais run` takes it, needing no replay-specific path through it. Without the checkout step, anything that reads the working tree before dispatching — preflight resolving architecture decisions from a tracked `.adr.yaml`, for one — finds nothing, and a repository requiring that decision blocks every replay at $0.
 
 ### Spend and ceilings
 
@@ -685,6 +685,8 @@ The candidate is admitted through the same door a replay's candidate is (§24): 
 ### Pairing
 
 The unit of comparison is the task, not the run. Each matched trial is one task's candidate arm; it is paired against the incumbent result that task's source run already earned — the accepted run a replay re-ran. A task replayed more than once still contributes exactly one paired observation (the earliest settled arm), so a task with more runs never outweighs one with a single run.
+
+An `Errored` trial — the runner's own infrastructure fault, never a verification verdict — is "not comparable evidence for or against the arm" and never becomes that observation: a task's pairing skips it and uses its earliest settled NON-errored trial instead, so an errored trial followed by a real one pairs on the real one. A task whose only settled trials errored contributes no pair at all. These trials are set aside, not silently dropped: the report counts how many were, and prints that count alongside the pairing it made from what was left.
 
 ### What is reported
 
