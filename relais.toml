@@ -110,3 +110,13 @@ keys = [
     "release.trigger",
     "release.version-scheme",
 ]
+
+# Change work routes on the implementation tier — what the built-in floor
+# already picks, declared as a recipe so a candidate revision can be
+# replayed and compared against it (SPEC §24-25).
+[[recipes]]
+name = "change-routing"
+revision = 1
+kind = "change"
+scope_within = ["**"]
+tier = "implementation"
