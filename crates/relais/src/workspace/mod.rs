@@ -1571,8 +1571,13 @@ mod tests {
         let dest = dir.join("replay-checkout");
         create_replay_checkout(&repo, &base_sha, &dest).expect("checkout");
 
+        // Line endings normalised: a Windows git with `core.autocrlf`
+        // checks `base\n` out as `base\r\n`, which is still the tracked
+        // file at base_sha.
         assert_eq!(
-            std::fs::read_to_string(dest.join("file.txt")).expect("file tracked at base_sha"),
+            std::fs::read_to_string(dest.join("file.txt"))
+                .expect("file tracked at base_sha")
+                .replace("\r\n", "\n"),
             "base\n",
             "the checkout's working tree must be the source's tree at base_sha"
         );
