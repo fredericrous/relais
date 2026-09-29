@@ -4383,7 +4383,7 @@ fn decide_command(
                  sign-off but by {} — a sign-off answers only a criterion that asked for one",
                 match entry.evidence() {
                     Some(Evidence::Check { name }) => format!("check `{name}`"),
-                    Some(Evidence::Test { authorship }) =>
+                    Some(Evidence::Test { authorship, .. }) =>
                         format!("a test ({})", authorship_label(*authorship)),
                     Some(Evidence::LlmReview) => "an LLM review".to_string(),
                     Some(Evidence::AmontGate { gate }) => format!("amont gate `{gate}`"),

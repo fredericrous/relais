@@ -819,6 +819,7 @@ mod tests {
                             name: None,
                             argv: vec!["make".into(), "check".into()],
                             timeout_seconds: 300,
+                            junit: None,
                         }],
                         amont_checks: Vec::new(),
                         amont_waivers: Vec::new(),

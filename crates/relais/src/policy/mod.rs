@@ -175,6 +175,14 @@ pub struct CommandSpec {
     pub argv: Vec<String>,
     #[serde(default = "default_command_timeout")]
     pub timeout_seconds: u64,
+    /// A JUnit XML report this command writes, relative to the worktree
+    /// it runs in. After the command runs, verification reads it for
+    /// per-test results, which is what lets a declared criterion name one
+    /// test (SPEC §10, #51). The command's own pass/fail stays its exit
+    /// status. Omitted from the serialized form when absent, so the
+    /// authority hash of a policy that declares none is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub junit: Option<String>,
 }
 
 /// The command a profile defines under `name`, if any — what a declared
@@ -1729,6 +1737,41 @@ keys = ["output.contract"]
             named.authority_hash(),
             "naming a command IS a change once it is written"
         );
+    }
+
+    /// `CommandSpec.junit` is a declared JUnit report path. Absent, it
+    /// must not appear in the hashed form (the frozen-policy golden
+    /// below, `authority_hash_of_a_policy_shaped_as_todays_does_not_move`,
+    /// pins the hash of a policy that sets none); written, it is
+    /// executable-adjacent authority and moves the hash.
+    #[test]
+    fn a_junit_path_reaches_the_authority_hash_only_when_written() {
+        let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        let value = serde_json::to_value(&repo).expect("a policy serializes");
+        let commands = value["verification"]["profiles"]["rust-change"]["commands"]
+            .as_array()
+            .expect("commands array");
+        assert!(
+            !commands[0]
+                .as_object()
+                .expect("a command is an object")
+                .contains_key("junit"),
+            "an absent junit path must not appear in the hashed form: {value}"
+        );
+
+        let with_junit = RepoPolicy::from_toml_str(&REPO_TOML.replace(
+            "[[verification.profiles.rust-change.commands]]\nargv = [\"make\", \"check\"]",
+            "[[verification.profiles.rust-change.commands]]\n\
+             argv = [\"make\", \"check\"]\njunit = \"target/junit.xml\"",
+        ))
+        .expect("parses");
+        assert_eq!(
+            with_junit.verification.profiles["rust-change"].commands[0]
+                .junit
+                .as_deref(),
+            Some("target/junit.xml")
+        );
+        assert_ne!(repo.authority_hash(), with_junit.authority_hash());
     }
 
     /// SPEC §10: a declared criterion naming a check no profile defines

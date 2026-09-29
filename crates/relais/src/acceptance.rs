@@ -48,8 +48,16 @@ pub enum Evidence {
     /// A named command in the verification profile (`CommandSpec.name`).
     Check { name: String },
     /// A test, with who wrote it — a model writing the test that judges
-    /// its own work is not evidence about the work.
-    Test { authorship: TestAuthorship },
+    /// its own work is not evidence about the work. With a `name`, the
+    /// criterion is settled by that one test's result in a verification
+    /// command's JUnit report (`CommandSpec.junit`); without one, by the
+    /// report as a whole, as it always was. Omitted when absent, so every
+    /// stored contract and receipt reads back and re-serializes unchanged.
+    Test {
+        authorship: TestAuthorship,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     /// A reviewing model's judgement: useful, never independent.
     LlmReview,
     /// A human's explicit sign-off.
@@ -89,7 +97,7 @@ pub enum TestAuthorship {
 pub fn independent(evidence: &Evidence) -> bool {
     match evidence {
         Evidence::Check { .. } => true,
-        Evidence::Test { authorship } => match authorship {
+        Evidence::Test { authorship, .. } => match authorship {
             TestAuthorship::PreExisting | TestAuthorship::HumanAdded => true,
             TestAuthorship::ModelAdded => false,
         },
@@ -248,17 +256,48 @@ mod tests {
     fn independence_is_exhaustive_over_evidence_kinds() {
         assert!(independent(&Evidence::Check { name: "x".into() }));
         assert!(independent(&Evidence::Test {
-            authorship: TestAuthorship::PreExisting
+            authorship: TestAuthorship::PreExisting,
+            name: None
         }));
         assert!(independent(&Evidence::Test {
-            authorship: TestAuthorship::HumanAdded
+            authorship: TestAuthorship::HumanAdded,
+            name: Some("t".into())
         }));
         assert!(!independent(&Evidence::Test {
-            authorship: TestAuthorship::ModelAdded
+            authorship: TestAuthorship::ModelAdded,
+            name: None
         }));
         assert!(!independent(&Evidence::LlmReview));
         assert!(independent(&Evidence::HumanSignOff));
         assert!(independent(&Evidence::AmontGate { gate: "x".into() }));
+    }
+
+    #[test]
+    fn a_test_without_a_name_reads_and_writes_back_unchanged() {
+        let stored = r#"{"kind":"test","authorship":"pre_existing"}"#;
+        let evidence: Evidence = serde_json::from_str(stored).expect("parses");
+        assert_eq!(
+            evidence,
+            Evidence::Test {
+                authorship: TestAuthorship::PreExisting,
+                name: None
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&evidence).expect("serializes"),
+            stored
+        );
+
+        let named: Evidence =
+            serde_json::from_str(r#"{"kind":"test","authorship":"human_added","name":"a::b"}"#)
+                .expect("parses");
+        assert_eq!(
+            named,
+            Evidence::Test {
+                authorship: TestAuthorship::HumanAdded,
+                name: Some("a::b".into())
+            }
+        );
     }
 
     #[test]

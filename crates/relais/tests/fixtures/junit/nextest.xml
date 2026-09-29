@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="3" failures="0" errors="0" uuid="0f0e5c3e-6f56-4a7f-8a0e-6d3d1c3a1b11" timestamp="2026-09-29T08:00:00.000+00:00" time="0.412">
+    <testsuite name="relais" tests="3" disabled="0" errors="0" failures="0">
+        <testcase name="acceptance::tests::a_bare_string_parses_and_is_mandatory_with_no_evidence" classname="relais" timestamp="2026-09-29T08:00:00.000+00:00" time="0.004"/>
+        <testcase name="verify::tests::a_named_check_is_met_when_it_succeeded" classname="relais" timestamp="2026-09-29T08:00:00.010+00:00" time="0.021">
+            <system-out><![CDATA[settled & <done>]]></system-out>
+        </testcase>
+        <testcase name="verify::tests::a_flaky_test_passes_on_retry" classname="relais" timestamp="2026-09-29T08:00:00.030+00:00" time="0.050">
+            <flakyFailure timestamp="2026-09-29T08:00:00.030+00:00" time="0.020" type="test failure">
+                <system-err>first attempt failed</system-err>
+            </flakyFailure>
+        </testcase>
+    </testsuite>
+</testsuites>

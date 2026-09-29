@@ -375,6 +375,59 @@ each row's recorded assignment probability, in a `basis: randomized`
 block beside the replay comparison. A row counts toward a candidate only
 when that candidate was one of the non-control arms of the draw.
 
+## Per-test results (`junit`)
+
+A verification command reports an exit status and nothing finer. If it also
+writes a JUnit XML report, a `test` criterion can name one test and be
+settled by that test's own result (SPEC §4, §10). Declare the report's path,
+relative to the worktree, on the command:
+
+```toml
+[[verification.profiles.default.commands]]
+argv = ["cargo", "nextest", "run", "--profile", "ci"]
+junit = "target/nextest/ci/junit.xml"
+```
+
+The criterion then names the test by its id, `classname::name` (or `name`
+when the report has no classname), and is met only when the report holds
+that id as passed:
+
+```json
+{"statement": "Malformed input is rejected",
+ "evidence": {"kind": "test", "authorship": "pre_existing",
+              "name": "my-crate::api::tests::rejects_malformed_input"}}
+```
+
+- **cargo-nextest** — `cargo nextest run --profile ci`, with JUnit enabled
+  in `.config/nextest.toml`:
+
+  ```toml
+  [profile.ci.junit]
+  path = "junit.xml"
+  ```
+
+  nextest writes it to `target/nextest/ci/junit.xml`. The classname is the
+  test binary (`my-crate`), the name the test's path, so the id reads
+  `my-crate::api::tests::rejects_malformed_input`.
+- **pytest** — `["pytest", "--junitxml=report.xml"]` with
+  `junit = "report.xml"`. The id is `tests.test_api::test_rejects_malformed_input`.
+- **vitest** — `["npx", "vitest", "run", "--reporter=junit",
+  "--outputFile=junit.xml"]` with `junit = "junit.xml"`. The classname is the
+  test file, so the id reads `src/api.test.ts::api > rejects malformed input`.
+  Jest's `jest-junit` reporter writes the same shape.
+
+A failed or skipped test is not met and refuses acceptance, even when the
+command exited 0, and the receipt names which. The report that was read is
+kept with the check logs as a `junit_report` evidence row. A test the
+report does not hold — or a profile where no command declares `junit` — is a
+gap naming the test. A declared report that is missing or unparseable is
+recorded on the check (`junit: missing`, `junit: unparseable (<reason>)`) and
+does not change the command's exit status. relais deletes the file before the
+command runs, so a report committed to the candidate is never read.
+
+relais's own policy does not use this: its `make check` runs `cargo test`,
+which writes no report. Nothing changes until a repository opts in.
+
 ## Troubleshooting
 
 - **More than one settings file names a hook.** Nothing wins: Claude Code

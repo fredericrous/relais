@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites>
+  <testsuite name="pytest" errors="1" failures="1" skipped="0" tests="3" time="0.200">
+    <testcase classname="tests.test_api" name="test_passes" time="0.001"/>
+    <testcase classname="tests.test_api" name="test_fails" time="0.002">
+      <failure message="assert 1 == 2">def test_fails():
+&gt;       assert 1 == 2
+E       assert 1 == 2</failure>
+    </testcase>
+    <testcase classname="tests.test_api" name="test_errors" time="0.002">
+      <error message="collection failure">ImportError</error>
+    </testcase>
+  </testsuite>
+</testsuites>

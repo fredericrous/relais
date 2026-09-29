@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="pytest" tests="2">
+    <testcase classname="tests.test_api" name="test_passes" time="0.001"/>
+    <testcase classname="tests.test_api" name="test_cut_off" time="0.002">
+      <failure message="the report was cut off here
