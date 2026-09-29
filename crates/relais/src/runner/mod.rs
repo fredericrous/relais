@@ -45,6 +45,7 @@ use crate::route::{route, Recipe, Route, RouteInputs, RoutePredictor, Routed, Ro
 use crate::verify::{self, amont_gaps, Receipt, VerificationReport};
 use crate::workspace::{self, TaskWorktree, WorkspaceError};
 
+pub mod live_trial;
 pub mod machine;
 pub mod scheduler;
 
@@ -185,6 +186,10 @@ pub struct RunConfig<'a> {
     /// and no trial to account for it. A run's purpose holds for the
     /// whole run or it is not a purpose.
     pub purpose: Option<crate::lifecycle::RunPurpose>,
+    /// The id this run executes as, when the caller minted it ahead of
+    /// `execute` — a live trial row names its own run and is written
+    /// before any worker is dispatched. `None` mints one here.
+    pub run_id: Option<RunId>,
 }
 
 /// Poll period while queued for admission. `pub(crate)`: `hook::respond`
@@ -552,7 +557,10 @@ impl<'a> RunEngine<'a> {
         config: &'a RunConfig<'a>,
         parent: Option<(RunId, PackageId, PackageRole)>,
     ) -> Result<Self, RunError> {
-        let run_id = config.ids.run_id()?;
+        let run_id = match &config.run_id {
+            Some(run_id) if parent.is_none() => run_id.clone(),
+            Some(_) | None => config.ids.run_id()?,
+        };
         let artifacts = config.artifacts_dir.join(run_id.as_str());
         let worktrees = worktree_root(&config.artifacts_dir).join(run_id.as_str());
         let verify_dir = verify_root(&config.artifacts_dir).join(run_id.as_str());
@@ -4137,6 +4145,7 @@ mod tests {
                 heartbeat_every: Duration::from_millis(50),
                 task_override: None,
                 purpose: None,
+                run_id: None,
             })
             .expect("the fixture's id source mints identifiers")
         }
@@ -4173,6 +4182,7 @@ mod tests {
                 heartbeat_every: Duration::from_millis(50),
                 task_override: None,
                 purpose: None,
+                run_id: None,
             })
             .expect("the fixture's id source mints identifiers")
         }
@@ -4210,6 +4220,7 @@ mod tests {
                 heartbeat_every: Duration::from_millis(50),
                 task_override: None,
                 purpose: None,
+                run_id: None,
             })
             .expect("the fixture's id source mints identifiers")
         }
@@ -4853,6 +4864,7 @@ mod tests {
             heartbeat_every: Duration::from_millis(50),
             task_override: None,
             purpose: None,
+            run_id: None,
         })
         .expect("the fixture's id source mints identifiers");
         let RunOutcome {

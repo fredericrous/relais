@@ -23,6 +23,7 @@ use crate::policy::{
 };
 
 mod candidate;
+pub mod trial;
 pub use candidate::{
     default_tuning_bounds, validate_candidate, CandidateRecipe, CandidateRejection, TuningBounds,
 };
