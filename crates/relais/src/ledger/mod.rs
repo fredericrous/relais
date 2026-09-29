@@ -24,7 +24,7 @@ use crate::outcome::{Outcome, OutcomeDetail, OutcomeKind};
 use crate::policy::Tier;
 use crate::route::RoutedBy;
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 16;
+pub const LEDGER_SCHEMA_VERSION: u64 = 17;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -551,6 +551,10 @@ pub struct TrialRow {
     pub cost: Option<TrialCost>,
     pub duration_ms: Option<i64>,
     pub created_at: String,
+    /// The run the arm itself executed as: the replay's own run for a
+    /// replay, the run itself for a live trial. `None` on a row written
+    /// before ledger step v17, whose arm run is not on record.
+    pub arm_run_id: Option<RunId>,
 }
 
 /// What recording a fresh trial row needs — everything a comparison
@@ -575,6 +579,8 @@ pub struct NewTrial<'a> {
     /// The JSON list of every arm's recipe id, when the arm was drawn
     /// among several. `None` for a replay.
     pub arms_json: Option<&'a str>,
+    /// The run the arm executed as; see [`TrialRow::arm_run_id`].
+    pub arm_run_id: &'a RunId,
 }
 
 /// What recording a REPLAY's arm needs. Grouped rather than passed
@@ -601,6 +607,8 @@ pub struct NewReplayTrial<'a> {
     pub contract_hash: &'a str,
     pub verification_profile_hash: &'a str,
     pub workspace_isolation: &'a str,
+    /// The replay's own run, known once `execute` has returned.
+    pub arm_run_id: &'a RunId,
 }
 
 /// Raw columns of one `trials` row, in the order [`parse_trial_row`]
@@ -625,6 +633,7 @@ type TrialColumns = (
     Option<String>,
     Option<i64>,
     String,
+    Option<String>,
 );
 
 /// A `trials` row as columns, parsed into a [`TrialRow`]: an
@@ -650,6 +659,7 @@ fn parse_trial_row(columns: TrialColumns) -> Result<TrialRow> {
         cost_completeness,
         duration_ms,
         created_at,
+        arm_run_id,
     ) = columns;
     Ok(TrialRow {
         trial_id: TrialId::from_stored(trial_id),
@@ -679,6 +689,7 @@ fn parse_trial_row(columns: TrialColumns) -> Result<TrialRow> {
         cost: parse_trial_cost(cost_micros, cost_completeness.as_deref())?,
         duration_ms,
         created_at,
+        arm_run_id: arm_run_id.map(RunId::from_stored),
     })
 }
 
@@ -1289,6 +1300,16 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ALTER TABLE trials ADD COLUMN arms_json TEXT;
     "#,
     ),
+    (
+        // A replay trial named its SOURCE run only, so which run the arm
+        // itself executed as had to be guessed by recency. `arm_run_id`
+        // records it. NULL on every row written before this step: those
+        // arms' runs are not known, and nothing reads them by guesswork.
+        "v17",
+        r#"
+    ALTER TABLE trials ADD COLUMN arm_run_id TEXT;
+    "#,
+    ),
 ];
 
 pub struct Ledger {
@@ -1475,6 +1496,27 @@ pub struct UsageEvent {
     pub requested_effort: Option<String>,
     /// The harness identity the run probed.
     pub harness: Option<String>,
+}
+
+/// One requested alias and the model the harness reported running for
+/// it, as one `usage_events` row carried them. Both are always present:
+/// a row missing either says nothing about what an alias resolved to.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ModelPair {
+    pub requested: String,
+    pub effective: String,
+}
+
+/// Every event that ran `effective` under the requested `requested`
+/// alias: when the first and the last of them happened, and how many
+/// there were. The raw material of alias-drift detection (SPEC §11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelObservation {
+    pub requested: String,
+    pub effective: String,
+    pub first_seen: String,
+    pub last_seen: String,
+    pub count: u64,
 }
 
 /// One phase's contribution to a run's cost (SPEC §11): what
@@ -2131,6 +2173,96 @@ impl Ledger {
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Every (requested alias, effective model) pair a usage event
+    /// recorded, with its first and last `at` and its event count, oldest
+    /// first within an alias. Rows missing either side are left out: they
+    /// predate the `requested_model` column or carry no reported model,
+    /// and neither says what an alias resolved to. A negative count is
+    /// [`LedgerError::Corrupt`].
+    pub fn model_observations(&self) -> Result<Vec<ModelObservation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT requested_model, model, MIN(at), MAX(at), COUNT(*) FROM usage_events
+             WHERE requested_model IS NOT NULL AND model IS NOT NULL
+             GROUP BY requested_model, model
+             ORDER BY requested_model, MIN(at), model",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(requested, effective, first_seen, last_seen, count)| {
+                let count = u64::try_from(count).map_err(|_| LedgerError::Corrupt {
+                    what: "a model observation's event count".into(),
+                    detail: format!("{requested} -> {effective} counted {count} events"),
+                })?;
+                Ok(ModelObservation {
+                    requested,
+                    effective,
+                    first_seen,
+                    last_seen,
+                    count,
+                })
+            })
+            .collect()
+    }
+
+    /// The requested alias and effective model of each distinct pair the
+    /// usage events of a run's WHOLE tree recorded — the root and every
+    /// child run, the set [`Ledger::run_cost`] sums over.
+    pub fn run_models(&self, run_id: &RunId) -> Result<Vec<ModelPair>> {
+        let mut pairs = std::collections::BTreeSet::new();
+        for run in self.run_tree(run_id)? {
+            let mut stmt = self.conn.prepare(
+                "SELECT DISTINCT requested_model, model FROM usage_events
+                 WHERE run_id = ?1 AND requested_model IS NOT NULL AND model IS NOT NULL",
+            )?;
+            let rows = stmt.query_map([run.as_str()], |row| {
+                Ok(ModelPair {
+                    requested: row.get(0)?,
+                    effective: row.get(1)?,
+                })
+            })?;
+            for pair in rows {
+                pairs.insert(pair?);
+            }
+        }
+        Ok(pairs.into_iter().collect())
+    }
+
+    /// A run and every child run beneath it, recursively, the root first:
+    /// the one walk `run_cost` and `run_models` share, so "the run's tree"
+    /// cannot mean two sets.
+    fn run_tree(&self, root: &RunId) -> Result<Vec<RunId>> {
+        let mut tree = vec![root.clone()];
+        let mut next = 0;
+        while let Some(run) = tree.get(next).cloned() {
+            tree.extend(self.child_runs(&run)?.into_iter().map(|child| child.run));
+            next += 1;
+        }
+        Ok(tree)
+    }
+
+    /// Every distinct model an orchestration usage record names at or
+    /// after `since` (RFC3339), sorted. Only orchestration usage is priced
+    /// from machine.toml's `[pricing]`; a worker's usage event carries the
+    /// cost its provider reported, so a worker model with no price entry
+    /// is not a gap.
+    pub fn models_seen_since(&self, since: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT model FROM orchestration_usage WHERE at >= ?1
+             ORDER BY 1",
+        )?;
+        let rows = stmt.query_map([since], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// Distinct models that actually ran for a run, from usage events.
@@ -3017,11 +3149,11 @@ impl Ledger {
     /// inclusive parent is excluded and the parent is counted once. An
     /// inclusive event with no children simply counts itself.
     pub fn run_cost(&self, run_id: &RunId) -> Result<MicroUsd> {
-        let mut total = self.run_own_cost(run_id)?;
         // A root run's cost is its tree's: packages are separate runs
         // attributed to it (SPEC §19, §23), each counted once.
-        for child in self.child_runs(run_id)? {
-            total = total.saturating_add(self.run_cost(&child.run)?);
+        let mut total = MicroUsd::from_micros(0);
+        for run in self.run_tree(run_id)? {
+            total = total.saturating_add(self.run_own_cost(&run)?);
         }
         Ok(total)
     }
@@ -3430,6 +3562,7 @@ impl Ledger {
             verification_profile_hash: replay.verification_profile_hash,
             workspace_isolation: replay.workspace_isolation,
             arms_json: None,
+            arm_run_id: replay.arm_run_id,
         })
     }
 
@@ -3482,8 +3615,8 @@ impl Ledger {
                 (trial_id, task_id, source_run_id, incumbent_recipe_id,
                  arm_recipe_id, arm_index, assignment_probability, seed,
                  base_sha, contract_hash, verification_profile_hash,
-                 workspace_isolation, created_at, arms_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 workspace_isolation, created_at, arms_json, arm_run_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 trial.trial_id.as_str(),
                 trial.task_id.as_str(),
@@ -3499,6 +3632,7 @@ impl Ledger {
                 trial.workspace_isolation,
                 now,
                 trial.arms_json,
+                trial.arm_run_id.as_str(),
             ],
         )?;
         Ok(())
@@ -3559,7 +3693,7 @@ impl Ledger {
          arm_recipe_id, arm_index, assignment_probability, seed, base_sha,
          contract_hash, verification_profile_hash, workspace_isolation,
          outcome, accepted_without_escalation, cost_micros, cost_completeness,
-         duration_ms, created_at";
+         duration_ms, created_at, arm_run_id";
 
     /// Every trial recorded for one task, oldest first — a typed reader:
     /// a row with an unrecognised outcome or cost completeness is a
@@ -3633,7 +3767,7 @@ impl Ledger {
             Self::TRIAL_COLUMNS
         ))?;
         let rows = stmt.query_map([LIVE_WORKTREE], |row| {
-            Ok((Self::trial_columns(row)?, row.get::<_, String>(18)?))
+            Ok((Self::trial_columns(row)?, row.get::<_, String>(19)?))
         })?;
         let rows: Vec<(TrialColumns, String)> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
         let mut kept = Vec::new();
@@ -3672,6 +3806,7 @@ impl Ledger {
             row.get(15)?,
             row.get(16)?,
             row.get(17)?,
+            row.get(18)?,
         ))
     }
 
@@ -6181,6 +6316,50 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A ledger frozen at exactly v16 upgrades to v17 keeping every trial
+    /// row: `arm_run_id` appears and reads `None` on the rows written
+    /// before it, never filled in by a guess.
+    #[test]
+    fn v17_adds_arm_run_id_and_keeps_every_existing_trial() {
+        let dir = temp_dir("v16-to-v17");
+        let path = dir.join("ledger.sqlite");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );",
+            )
+            .expect("migrations table");
+            for (version, sql) in &MIGRATIONS[..16] {
+                conn.execute_batch(sql).expect("apply step");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, "then"],
+                )
+                .expect("record step");
+            }
+            conn.execute(
+                "INSERT INTO trials
+                    (trial_id, task_id, source_run_id, incumbent_recipe_id,
+                     arm_recipe_id, arm_index, assignment_probability, seed,
+                     base_sha, contract_hash, verification_profile_hash,
+                     workspace_isolation, created_at)
+                 VALUES ('trial-old', 'task-old', 'run-old', 'inc', 'arm', 0, 1.0, 0,
+                         'sha', 'ch', 'ph', 'worktree', 'now')",
+                [],
+            )
+            .expect("a trial written before v17");
+        }
+        let ledger = Ledger::open(&path).expect("upgrade to current schema");
+        let rows = ledger.trials_by_task(&task("old")).expect("trials");
+        assert_eq!(rows.len(), 1, "the pre-existing trial survives");
+        assert_eq!(rows[0].source_run_id, run("run-old"));
+        assert_eq!(rows[0].arm_run_id, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn new_trial<'a>(id: &'a TrialId, task_id: &'a TaskId, source_run: &'a RunId) -> NewTrial<'a> {
         NewTrial {
             trial_id: id,
@@ -6196,6 +6375,7 @@ mod tests {
             verification_profile_hash: "profile-hash",
             workspace_isolation: "worktree",
             arms_json: None,
+            arm_run_id: source_run,
         }
     }
 
@@ -6930,6 +7110,93 @@ mod tests {
         );
         // Best effort: the fixture is a temp dir; a leftover costs
         // nothing but disk, and the next run pre-cleans it.
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Observations group by (requested, effective) with the first and last
+    /// `at` and a count; a row missing either side is not one, and a run's
+    /// models and the models seen since a date read from the same rows.
+    #[test]
+    fn model_observations_group_the_pairs_and_leave_out_rows_without_both_sides() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-m"), "/r", None, &task("m"), "rk")
+            .expect("run");
+        let put = |id: &str, requested: Option<&str>, model: Option<&str>, at: &str| {
+            let mut e = event(id, "run-m", 1);
+            e.requested_model = requested.map(Into::into);
+            e.model = model.map(Into::into);
+            e.at = at.into();
+            ledger.record_usage(&e).expect("usage");
+        };
+        put(
+            "a",
+            Some("sonnet"),
+            Some("claude-sonnet-5"),
+            "2026-09-23T00:39:00+00:00",
+        );
+        put(
+            "b",
+            Some("sonnet"),
+            Some("claude-sonnet-5"),
+            "2026-09-28T17:35:00+00:00",
+        );
+        put(
+            "c",
+            Some("sonnet"),
+            Some("claude-sonnet-5-5"),
+            "2026-09-28T20:08:00+00:00",
+        );
+        put("d", None, Some("claude-old"), "2026-09-01T00:00:00+00:00");
+        put("e", Some("sonnet"), None, "2026-09-02T00:00:00+00:00");
+        let observations = ledger.model_observations().expect("observations");
+        assert_eq!(
+            observations,
+            vec![
+                ModelObservation {
+                    requested: "sonnet".into(),
+                    effective: "claude-sonnet-5".into(),
+                    first_seen: "2026-09-23T00:39:00+00:00".into(),
+                    last_seen: "2026-09-28T17:35:00+00:00".into(),
+                    count: 2,
+                },
+                ModelObservation {
+                    requested: "sonnet".into(),
+                    effective: "claude-sonnet-5-5".into(),
+                    first_seen: "2026-09-28T20:08:00+00:00".into(),
+                    last_seen: "2026-09-28T20:08:00+00:00".into(),
+                    count: 1,
+                },
+            ]
+        );
+        let pair = |effective: &str| ModelPair {
+            requested: "sonnet".into(),
+            effective: effective.into(),
+        };
+        assert_eq!(
+            ledger.run_models(&run("run-m")).expect("run models"),
+            vec![pair("claude-sonnet-5"), pair("claude-sonnet-5-5")]
+        );
+        // Worker usage carries its provider-reported cost and is never
+        // priced from `[pricing]`, so it names no model here; only
+        // orchestration usage does.
+        assert!(ledger
+            .models_seen_since("2026-09-28T00:00:00+00:00")
+            .expect("models since")
+            .is_empty());
+        ledger
+            .record_orchestration_usage(&usage_row(
+                "msg-orch",
+                "sess-orch",
+                "2026-09-28T21:00:00+00:00",
+            ))
+            .expect("orchestration usage");
+        assert_eq!(
+            ledger
+                .models_seen_since("2026-09-28T00:00:00+00:00")
+                .expect("models since"),
+            vec!["claude-haiku-4-5".to_string()]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

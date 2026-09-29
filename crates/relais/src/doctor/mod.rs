@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::backend::Capabilities;
+use crate::learn::drift::{alias_switches, AliasSwitch};
+use crate::orchestration::PriceTable;
 use crate::policy::{Dependency, DependencyMode, MachineSettings, RepoPolicy, TrialEnvelope};
 use crate::runner::live_trial;
 use crate::{ledger::Ledger, paths};
@@ -663,6 +665,7 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
     // Without a home directory none of the machine-local paths resolve.
     // That is already the `home` finding above; here each dependent check
     // says it could not run rather than inventing a path.
+    let mut pricing = PricingConfig::Unread;
     match paths::machine_settings_path() {
         Err(e) => findings.push(Finding {
             component: "machine.toml",
@@ -688,6 +691,10 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
                         level: Level::Ok,
                         detail: format!("valid; {} trust grant(s)", settings.trust.len()),
                     });
+                    pricing = match &settings.pricing {
+                        Some(table) => PricingConfig::Table(table.clone()),
+                        None => PricingConfig::Unconfigured,
+                    };
                     findings.push(trust_finding(policy.as_ref(), &settings, repo_dir));
                     findings.push(trials_finding(&settings, policy.as_ref(), repo_dir));
                     findings.push(hook_timeout_finding(
@@ -705,6 +712,7 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
     }
 
     findings.push(ledger_finding());
+    findings.extend(model_findings(&pricing));
     findings.push(registry_finding());
     findings.push(worktrees_finding_on_disk());
     findings.push(strays_finding_on_disk());
@@ -1232,6 +1240,122 @@ pub(crate) fn ledger_schema_finding(
             ),
         },
     }
+}
+
+/// How far back a model counts as "in use" for the pricing-gap warning.
+const PRICING_WINDOW_DAYS: i64 = 30;
+
+/// What `machine.toml` says about `[pricing]`, once it could be read.
+enum PricingConfig {
+    /// `machine.toml` is missing or invalid: that is its own finding, and
+    /// says nothing about pricing.
+    Unread,
+    /// Readable, with no `[pricing]` block.
+    Unconfigured,
+    Table(PriceTable),
+}
+
+/// The `models` and `pricing` lines, from the ledger: alias drift over
+/// everything recorded, and effective models in use during the last
+/// [`PRICING_WINDOW_DAYS`] that `[pricing]` has no entry for.
+fn model_findings(pricing: &PricingConfig) -> Vec<Finding> {
+    let unreadable = |what: &str, e: &dyn std::fmt::Display| Finding {
+        component: "models",
+        level: Level::Warn,
+        detail: format!("{what} could not be read from the ledger: {e}"),
+    };
+    let ledger = match paths::ledger_path() {
+        Ok(path) if path.exists() => match Ledger::open(&path) {
+            Ok(ledger) => ledger,
+            Err(e) => return vec![unreadable("model usage", &e)],
+        },
+        // No ledger yet is the `ledger` finding's to report.
+        Ok(_) | Err(_) => return Vec::new(),
+    };
+    let mut findings = match ledger.model_observations() {
+        Ok(observations) => alias_drift_findings(&alias_switches(&observations)),
+        Err(e) => vec![unreadable("alias usage", &e)],
+    };
+    let since = (chrono::Utc::now() - chrono::Duration::days(PRICING_WINDOW_DAYS)).to_rfc3339();
+    match ledger.models_seen_since(&since) {
+        Ok(models) => findings.extend(pricing_findings(&models, pricing)),
+        Err(e) => findings.push(unreadable("the models in use", &e)),
+    }
+    findings
+}
+
+/// One warning per alias switch, or the all-clear. Everything measured
+/// across a switch mixes two models, which is what the line says.
+fn alias_drift_findings(switches: &[AliasSwitch]) -> Vec<Finding> {
+    if switches.is_empty() {
+        return vec![Finding {
+            component: "models",
+            level: Level::Ok,
+            detail: "no alias drift".into(),
+        }];
+    }
+    let minute = |at: &str| at.chars().take(16).collect::<String>();
+    switches
+        .iter()
+        .map(|switch| Finding {
+            component: "models",
+            level: Level::Warn,
+            detail: format!(
+                "alias {} now runs {} (since {}); before: {} (until {}) — figures straddling \
+                 the switch mix two models",
+                switch.alias,
+                switch.to,
+                minute(&switch.first_to),
+                switch.from,
+                minute(&switch.last_from),
+            ),
+        })
+        .collect()
+}
+
+/// A warning for each model in use that `[pricing]` has no entry for; one
+/// line when there is no `[pricing]` table at all. It never suggests a
+/// price: rates are the machine owner's to state (SPEC §11).
+fn pricing_findings(models: &[String], pricing: &PricingConfig) -> Vec<Finding> {
+    let table = match pricing {
+        PricingConfig::Unread => return Vec::new(),
+        PricingConfig::Unconfigured => {
+            return vec![Finding {
+                component: "pricing",
+                level: Level::Warn,
+                detail: "pricing is unconfigured: machine.toml has no [pricing] table, so \
+                         orchestration usage prices as unknown"
+                    .into(),
+            }]
+        }
+        PricingConfig::Table(table) => table,
+    };
+    let unpriced: Vec<Finding> = models
+        .iter()
+        .filter(|model| {
+            !table
+                .models
+                .iter()
+                .any(|price| price.ids.iter().any(|id| id == *model))
+        })
+        .map(|model| Finding {
+            component: "pricing",
+            level: Level::Warn,
+            detail: format!(
+                "{model} has no [pricing] entry; orchestration usage on it prices as unknown"
+            ),
+        })
+        .collect();
+    if unpriced.is_empty() {
+        return vec![Finding {
+            component: "pricing",
+            level: Level::Ok,
+            detail: format!(
+                "every model in use in the last {PRICING_WINDOW_DAYS} days has a [pricing] entry"
+            ),
+        }];
+    }
+    unpriced
 }
 
 /// The retained run worktrees under the state directory, read from disk.
@@ -2236,5 +2360,85 @@ mod tests {
             HookHealth::Refused,
             "a command that does not exist cannot have refused anything"
         );
+    }
+
+    fn switch() -> AliasSwitch {
+        AliasSwitch {
+            alias: "sonnet".into(),
+            from: "claude-sonnet-5".into(),
+            to: "claude-sonnet-5-5".into(),
+            last_from: "2026-09-28T17:35:12.5+00:00".into(),
+            first_to: "2026-09-28T20:08:40+00:00".into(),
+        }
+    }
+
+    #[test]
+    fn an_alias_switch_is_one_warning_naming_both_models_and_both_times() {
+        let findings = alias_drift_findings(&[switch()]);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].level, Level::Warn);
+        assert_eq!(
+            findings[0].detail,
+            "alias sonnet now runs claude-sonnet-5-5 (since 2026-09-28T20:08); before: \
+             claude-sonnet-5 (until 2026-09-28T17:35) — figures straddling the switch mix \
+             two models"
+        );
+    }
+
+    #[test]
+    fn no_switch_reads_as_no_alias_drift() {
+        let findings = alias_drift_findings(&[]);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].level, Level::Ok);
+        assert_eq!(findings[0].detail, "no alias drift");
+    }
+
+    fn priced(ids: &[&str]) -> PricingConfig {
+        PricingConfig::Table(PriceTable {
+            version: "v".into(),
+            models: vec![crate::orchestration::ModelPrice {
+                ids: ids.iter().map(|id| id.to_string()).collect(),
+                input: 1,
+                output: 1,
+                cache_read: 1,
+                cache_write_5m: 1,
+                cache_write_1h: 1,
+                fast_input: None,
+                fast_output: None,
+            }],
+        })
+    }
+
+    #[test]
+    fn a_model_without_a_price_entry_is_warned_once_and_no_price_is_suggested() {
+        let models = vec![
+            "claude-sonnet-5".to_string(),
+            "claude-sonnet-5-5".to_string(),
+        ];
+        let findings = pricing_findings(&models, &priced(&["claude-sonnet-5"]));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].level, Level::Warn);
+        assert_eq!(
+            findings[0].detail,
+            "claude-sonnet-5-5 has no [pricing] entry; orchestration usage on it prices as \
+             unknown"
+        );
+    }
+
+    #[test]
+    fn a_machine_without_a_pricing_table_gets_one_line_not_one_per_model() {
+        let models = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let findings = pricing_findings(&models, &PricingConfig::Unconfigured);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].detail.contains("unconfigured"), "{findings:?}");
+        assert!(pricing_findings(&models, &PricingConfig::Unread).is_empty());
+    }
+
+    #[test]
+    fn every_model_priced_is_an_ok_line() {
+        let models = vec!["claude-sonnet-5".to_string()];
+        let findings = pricing_findings(&models, &priced(&["claude-sonnet-5"]));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].level, Level::Ok);
     }
 }

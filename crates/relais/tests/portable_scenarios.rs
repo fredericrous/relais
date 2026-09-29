@@ -1238,6 +1238,7 @@ fn settle_accepted_replays(world: &World, arm_recipe_id: &str, count: usize) {
                 contract_hash: "contract",
                 verification_profile_hash: "profile",
                 workspace_isolation: "fresh_checkout_no_accepted_answer",
+                arm_run_id: &run_id,
             })
             .expect("insert trial");
         ledger
@@ -1322,6 +1323,7 @@ fn settle_accepted_live_draws(world: &World, arm_recipe_id: &str, per_arm: usize
                     verification_profile_hash: "profile",
                     workspace_isolation: LIVE_WORKTREE,
                     arms_json: Some(&arms_json),
+                    arm_run_id: &run_id,
                 })
                 .expect("insert live trial");
             ledger

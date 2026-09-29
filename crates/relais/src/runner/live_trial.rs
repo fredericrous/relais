@@ -244,6 +244,7 @@ impl Decision {
             verification_profile_hash: facts.verification_profile_hash,
             workspace_isolation: LIVE_WORKTREE,
             arms_json: Some(&arms_json),
+            arm_run_id: run_id,
         })?;
         Ok(Some(trial_id))
     }

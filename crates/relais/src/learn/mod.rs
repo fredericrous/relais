@@ -14,6 +14,7 @@
 
 pub mod comparison;
 pub mod dataset;
+pub mod drift;
 pub mod evaluate;
 pub mod features;
 pub mod learner;
