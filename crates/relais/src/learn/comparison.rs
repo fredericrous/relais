@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use super::drift::{model_caveats, ModelCaveat};
 use crate::ids::TaskId;
 use crate::ledger::{Ledger, LedgerError, TrialCost, TrialOutcome, TrialRow, LIVE_WORKTREE};
 use crate::lifecycle::State;
@@ -332,6 +333,18 @@ pub struct ComparisonReport {
     /// written before this field existed reads back as `None`.
     #[serde(default)]
     pub randomized: Option<RandomizedComparison>,
+    /// Aliases that ran different effective models in the incumbent's runs
+    /// and the candidate's (SPEC §11). A caveat on the evidence: the two
+    /// arms did not run the same model under the same name. It is not read
+    /// by [`Self::failures`]. Additive: a report written before this field
+    /// existed reads back empty.
+    #[serde(default)]
+    pub model_caveats: Vec<ModelCaveat>,
+    /// How many compared trials the caveat check could not read, because
+    /// the row was written before arm runs were stored (ledger step v17)
+    /// and so names no run for its arm. Additive: reads back as 0.
+    #[serde(default)]
+    pub model_caveats_unchecked: usize,
 }
 
 impl ComparisonReport {
@@ -413,6 +426,15 @@ impl ComparisonReport {
         ));
         if let Some(randomized) = &self.randomized {
             out.push_str(&render_randomized(randomized));
+        }
+        for caveat in &self.model_caveats {
+            out.push_str(&format!("caveat: {caveat}\n"));
+        }
+        if self.model_caveats_unchecked > 0 {
+            out.push_str(&format!(
+                "model caveats could not check {} trial(s) recorded before arm runs were stored\n",
+                self.model_caveats_unchecked
+            ));
         }
         out
     }
@@ -595,11 +617,10 @@ pub fn evaluate_candidate(
     );
     let interval = bootstrap_paired_interval(&pairs, seed, resamples);
 
-    let randomized = randomized_comparison(
-        ledger.settled_live_trials_for_arms(&arm_ids)?,
-        &arm_ids,
-        resamples,
-    );
+    let live = ledger.settled_live_trials_for_arms(&arm_ids)?;
+    let (model_caveats, model_caveats_unchecked) =
+        arm_model_caveats(ledger, &by_task, &live, &arm_ids)?;
+    let randomized = randomized_comparison(live, &arm_ids, resamples);
 
     Ok(ComparisonReport {
         candidate_recipe_ids: recipe_ids,
@@ -612,7 +633,50 @@ pub fn evaluate_candidate(
         arm: arm_summary_value,
         interval,
         randomized,
+        model_caveats,
+        model_caveats_unchecked,
     })
+}
+
+/// The aliases whose effective models differ between the incumbent's runs
+/// and the candidate's, and how many compared trials could not be read.
+/// Replay pairs contribute each source run to the incumbent side and the
+/// replay run the trial recorded (`arm_run_id`) to the candidate's; live
+/// trials contribute every control run to the incumbent side and every run
+/// of one of the candidate's arms to the candidate's. A trial that recorded
+/// no arm run contributes nothing and is counted, never guessed at.
+fn arm_model_caveats(
+    ledger: &Ledger,
+    replays: &BTreeMap<TaskId, TrialRow>,
+    live: &[TrialRow],
+    arm_ids: &BTreeSet<String>,
+) -> Result<(Vec<ModelCaveat>, usize), LedgerError> {
+    let mut incumbent = Vec::new();
+    let mut candidate = Vec::new();
+    let mut unchecked = 0;
+    for trial in replays.values() {
+        match &trial.arm_run_id {
+            Some(arm_run) => {
+                incumbent.extend(ledger.run_models(&trial.source_run_id)?);
+                candidate.extend(ledger.run_models(arm_run)?);
+            }
+            None => unchecked += 1,
+        }
+    }
+    for trial in live {
+        let side = if trial.arm_index == 0 {
+            &mut incumbent
+        } else if arm_ids.contains(&trial.arm_recipe_id) {
+            &mut candidate
+        } else {
+            continue;
+        };
+        match &trial.arm_run_id {
+            Some(arm_run) => side.extend(ledger.run_models(arm_run)?),
+            None => unchecked += 1,
+        }
+    }
+    Ok((model_caveats(&incumbent, &candidate), unchecked))
 }
 
 /// The cost the ledger settled for a run, paired with its completeness —
@@ -1010,7 +1074,10 @@ fn bootstrap_paired_interval(pairs: &[PairedTask], seed: u64, resamples: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::{RunId, TrialId};
+    use crate::ids::{PackageId, RunId, TrialId};
+    use crate::ledger::{ChildOf, NewReplayTrial, UsageEvent};
+    use crate::lifecycle::RunPurpose;
+    use crate::money::{CostCompleteness, CostKind};
 
     /// A settled trial row for one task, with only the fields the pairing
     /// logic reads left variable.
@@ -1033,6 +1100,7 @@ mod tests {
             cost: Some(TrialCost::UNKNOWN),
             duration_ms: Some(1),
             created_at: created_at.into(),
+            arm_run_id: None,
         }
     }
 
@@ -1126,6 +1194,8 @@ mod tests {
             errored_trials_set_aside: 0,
             incumbent_replay_trials_set_aside: 0,
             randomized: None,
+            model_caveats: Vec::new(),
+            model_caveats_unchecked: 0,
             incumbent: ArmSummary {
                 acceptance: AcceptanceEstimate::Estimated(0.8),
                 cost_per_acceptance: CostPerAcceptance {
@@ -1242,6 +1312,8 @@ mod tests {
             errored_trials_set_aside: 0,
             incumbent_replay_trials_set_aside: 0,
             randomized: None,
+            model_caveats: Vec::new(),
+            model_caveats_unchecked: 0,
             incumbent: arm_summary(&incumbent_observations),
             arm: arm_summary(&observations),
             interval: bootstrap_paired_interval(&pairs, seed, DEFAULT_BOOTSTRAP_RESAMPLES),
@@ -1410,6 +1482,7 @@ mod tests {
                     contract_hash: "contract",
                     verification_profile_hash: "profile",
                     workspace_isolation: "fresh_checkout_no_accepted_answer",
+                    arm_run_id: &run_id,
                 })
                 .expect("insert replay");
             ledger
@@ -1481,6 +1554,7 @@ mod tests {
                 verification_profile_hash: "profile",
                 workspace_isolation: LIVE_WORKTREE,
                 arms_json: Some(&arms_json),
+                arm_run_id: &run_id,
             })
             .expect("insert live");
         ledger
@@ -1843,6 +1917,287 @@ mod tests {
             randomized.control.acceptance,
             AcceptanceEstimate::Abstained(AbstentionReason::NoTrials)
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn usage(event_id: &str, run: &RunId, requested: &str, effective: &str) -> UsageEvent {
+        UsageEvent {
+            event_id: event_id.into(),
+            run_id: run.clone(),
+            attempt_id: None,
+            parent_event_id: None,
+            model: Some(effective.into()),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost: None,
+            cost_kind: CostKind::ApiSpend,
+            completeness: CostCompleteness::Unknown,
+            inclusive: false,
+            at: crate::ledger::now_rfc3339(),
+            phase: None,
+            duration_ms: None,
+            requested_model: Some(requested.into()),
+            requested_effort: None,
+            harness: None,
+        }
+    }
+
+    /// A replay pair whose incumbent ran `claude-sonnet-5` and whose replay
+    /// ran `claude-sonnet-5-5`, both requested as `sonnet`: the evidence
+    /// carries a caveat, in the rendering and in the JSON, and the gates
+    /// read exactly as they do without it.
+    ///
+    #[test]
+    fn a_pair_whose_alias_moved_between_the_runs_is_a_caveat_not_a_gate() {
+        let (candidate, arm) = candidate_with_one_recipe();
+        let dir = crate::test_support::short_temp_dir("cmp-drift").to_path_buf();
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger opens");
+        let task = TaskId::from_stored("task-drift");
+        let source = RunId::from_stored("run-source");
+        let replay = RunId::from_stored("run-replay");
+        ledger
+            .insert_run(&source, "/repo", None, &task, "rk")
+            .expect("source run");
+        ledger
+            .record_usage(&usage("u-source", &source, "sonnet", "claude-sonnet-5"))
+            .expect("source usage");
+        ledger
+            .insert_run(&replay, "/scratch", None, &task, "rk")
+            .expect("replay run");
+        ledger
+            .set_run_purpose(&replay, RunPurpose::Replay)
+            .expect("replay purpose");
+        ledger
+            .record_usage(&usage("u-replay", &replay, "sonnet", "claude-sonnet-5-5"))
+            .expect("replay usage");
+        let trial_id = TrialId::from_stored("replay-drift");
+        ledger
+            .insert_replay_trial(&NewReplayTrial {
+                trial_id: &trial_id,
+                task_id: &task,
+                source_run_id: &source,
+                incumbent_recipe_id: "incumbent",
+                arm_recipe_id: &arm,
+                base_sha: "base",
+                contract_hash: "contract",
+                verification_profile_hash: "profile",
+                workspace_isolation: "fresh_checkout_no_accepted_answer",
+                arm_run_id: &replay,
+            })
+            .expect("insert replay");
+        ledger
+            .settle_trial(
+                &trial_id,
+                TrialOutcome::Accepted,
+                true,
+                TrialCost::UNKNOWN,
+                1,
+            )
+            .expect("settle replay");
+
+        let report =
+            evaluate_candidate(&ledger, &base_policy(), &candidate, 20, 200).expect("evaluates");
+        assert_eq!(report.model_caveats.len(), 1, "{:?}", report.model_caveats);
+        let line = "caveat: alias sonnet ran claude-sonnet-5 in incumbent runs and \
+                    claude-sonnet-5-5 in candidate runs\n";
+        assert!(
+            report.render_evidence().contains(line),
+            "{}",
+            report.render()
+        );
+        let json = serde_json::to_value(&report).expect("serializes");
+        assert_eq!(json["model_caveats"][0]["alias"], "sonnet");
+        let without = ComparisonReport {
+            model_caveats: Vec::new(),
+            model_caveats_unchecked: 0,
+            ..report.clone()
+        };
+        assert_eq!(report.failures(), without.failures());
+        assert_eq!(report.promotable(), without.promotable());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A settled replay trial of `task` against `source`, whose arm ran as
+    /// `arm_run`.
+    fn settled_replay(
+        ledger: &Ledger,
+        arm: &str,
+        id: &str,
+        task: &TaskId,
+        (source, arm_run): (&RunId, &RunId),
+    ) {
+        let trial_id = TrialId::from_stored(id);
+        ledger
+            .insert_replay_trial(&NewReplayTrial {
+                trial_id: &trial_id,
+                task_id: task,
+                source_run_id: source,
+                incumbent_recipe_id: "incumbent",
+                arm_recipe_id: arm,
+                base_sha: "base",
+                contract_hash: "contract",
+                verification_profile_hash: "profile",
+                workspace_isolation: "fresh_checkout_no_accepted_answer",
+                arm_run_id: arm_run,
+            })
+            .expect("insert replay");
+        ledger
+            .settle_trial(
+                &trial_id,
+                TrialOutcome::Accepted,
+                true,
+                TrialCost::UNKNOWN,
+                1,
+            )
+            .expect("settle replay");
+    }
+
+    fn replay_run(ledger: &Ledger, run: &RunId, task: &TaskId) {
+        ledger
+            .insert_run(run, "/scratch", None, task, "rk")
+            .expect("replay run");
+        ledger
+            .set_run_purpose(run, RunPurpose::Replay)
+            .expect("replay purpose");
+    }
+
+    /// Two replay-purpose runs of one task, created before either trial
+    /// row is written, with different models: each trial row names its OWN
+    /// run, and the caveat of the earlier trial reads that run — not the
+    /// newest replay run the task had by then.
+    ///
+    /// FALSIFY: resolve the replay run by recency (the task's newest
+    /// replay-purpose run created before the trial row) instead of
+    /// `arm_run_id`; the first trial then reads `run-replay-b`, which ran
+    /// the incumbent's model, and the caveat vanishes.
+    #[test]
+    fn each_trial_reads_the_replay_run_it_recorded_not_the_newest() {
+        let (candidate, arm) = candidate_with_one_recipe();
+        let dir = crate::test_support::short_temp_dir("cmp-own-run").to_path_buf();
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger opens");
+        let task = TaskId::from_stored("task-overlap");
+        let source = RunId::from_stored("run-source");
+        let first = RunId::from_stored("run-replay-a");
+        let second = RunId::from_stored("run-replay-b");
+        ledger
+            .insert_run(&source, "/repo", None, &task, "rk")
+            .expect("source run");
+        ledger
+            .record_usage(&usage("u-source", &source, "sonnet", "claude-sonnet-5"))
+            .expect("source usage");
+        replay_run(&ledger, &first, &task);
+        replay_run(&ledger, &second, &task);
+        ledger
+            .record_usage(&usage("u-first", &first, "sonnet", "claude-sonnet-5-5"))
+            .expect("first usage");
+        ledger
+            .record_usage(&usage("u-second", &second, "sonnet", "claude-sonnet-5"))
+            .expect("second usage");
+        settled_replay(&ledger, &arm, "replay-a", &task, (&source, &first));
+        settled_replay(&ledger, &arm, "replay-b", &task, (&source, &second));
+
+        let report =
+            evaluate_candidate(&ledger, &base_policy(), &candidate, 20, 200).expect("evaluates");
+        assert_eq!(report.model_caveats.len(), 1, "{:?}", report.model_caveats);
+        assert_eq!(report.model_caveats_unchecked, 0);
+        let rows = ledger.trials_by_task(&task).expect("trials");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.arm_run_id.clone())
+                .collect::<Vec<_>>(),
+            vec![Some(first), Some(second)]
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The models a run used are read over its whole tree: the source run
+    /// has no usage of its own, and its child run recorded `claude-sonnet-5`
+    /// while the replay's child recorded `claude-sonnet-5-5`.
+    ///
+    /// FALSIFY: read the root run only; both sides are then empty and the
+    /// caveat vanishes.
+    #[test]
+    fn models_are_read_over_the_whole_run_tree() {
+        let (candidate, arm) = candidate_with_one_recipe();
+        let dir = crate::test_support::short_temp_dir("cmp-tree").to_path_buf();
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger opens");
+        let task = TaskId::from_stored("task-tree");
+        let source = RunId::from_stored("run-source");
+        let replay = RunId::from_stored("run-replay");
+        ledger
+            .insert_run(&source, "/repo", None, &task, "rk")
+            .expect("source run");
+        replay_run(&ledger, &replay, &task);
+        for (root, child, event, effective) in [
+            (&source, "run-source-child", "u-source", "claude-sonnet-5"),
+            (&replay, "run-replay-child", "u-replay", "claude-sonnet-5-5"),
+        ] {
+            let child = RunId::from_stored(child);
+            ledger
+                .insert_child_run(
+                    &child,
+                    "/repo",
+                    None,
+                    ChildOf {
+                        parent_run: root,
+                        package_id: &PackageId::from_stored("pkg"),
+                    },
+                    &task,
+                    "rk",
+                )
+                .expect("child run");
+            ledger
+                .record_usage(&usage(event, &child, "sonnet", effective))
+                .expect("child usage");
+        }
+        settled_replay(&ledger, &arm, "replay-tree", &task, (&source, &replay));
+
+        let report =
+            evaluate_candidate(&ledger, &base_policy(), &candidate, 20, 200).expect("evaluates");
+        assert_eq!(report.model_caveats.len(), 1, "{:?}", report.model_caveats);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A trial row written before arm runs were stored contributes no
+    /// observation and is counted, once, in the caveat block.
+    #[test]
+    fn a_trial_without_an_arm_run_is_counted_not_guessed() {
+        let (candidate, arm) = candidate_with_one_recipe();
+        let dir = crate::test_support::short_temp_dir("cmp-legacy").to_path_buf();
+        let path = dir.join("ledger.sqlite");
+        let ledger = Ledger::open(&path).expect("ledger opens");
+        let task = TaskId::from_stored("task-legacy");
+        let source = RunId::from_stored("run-source");
+        let replay = RunId::from_stored("run-replay");
+        ledger
+            .insert_run(&source, "/repo", None, &task, "rk")
+            .expect("source run");
+        ledger
+            .record_usage(&usage("u-source", &source, "sonnet", "claude-sonnet-5"))
+            .expect("source usage");
+        replay_run(&ledger, &replay, &task);
+        ledger
+            .record_usage(&usage("u-replay", &replay, "sonnet", "claude-sonnet-5-5"))
+            .expect("replay usage");
+        settled_replay(&ledger, &arm, "replay-legacy", &task, (&source, &replay));
+        rusqlite::Connection::open(&path)
+            .expect("second connection")
+            .execute("UPDATE trials SET arm_run_id = NULL", [])
+            .expect("erase the arm run");
+
+        let report =
+            evaluate_candidate(&ledger, &base_policy(), &candidate, 20, 200).expect("evaluates");
+        assert!(
+            report.model_caveats.is_empty(),
+            "{:?}",
+            report.model_caveats
+        );
+        assert_eq!(report.model_caveats_unchecked, 1);
+        let line =
+            "model caveats could not check 1 trial(s) recorded before arm runs were stored\n";
+        assert_eq!(report.render_evidence().matches(line).count(), 1);
         std::fs::remove_dir_all(dir).ok();
     }
 }

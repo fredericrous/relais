@@ -21,6 +21,23 @@ missing here.
 
 ### Added
 
+- **Model-alias drift, in `relais doctor` and `relais recipe evaluate`.**
+  When a requested alias such as `sonnet` starts running a different
+  effective model (Claude Code 2.1.284 moved it from `claude-sonnet-5` to
+  `claude-sonnet-5-5`), `doctor` prints one `models` warning per switch,
+  or `no alias drift`. A model that overlaps the current one's span, or
+  has a single event, is an anomaly, not a switch. `doctor` also warns,
+  once per model, when an effective model seen in the last 30 days has no
+  `[pricing]` entry. `recipe evaluate` prints a `caveat:` line, and adds a
+  `model_caveats` JSON field, when the incumbent's and the candidate's
+  runs used different models under one alias; it is a caveat, not a gate.
+  A run's models are read over its whole tree (the root and every child
+  run, the set `run_cost` sums). Ledger step v17 adds a nullable
+  `trials.arm_run_id`, the run the arm itself executed as: `dataset replay`
+  writes the replay run's id there, a live trial row its own run id. A
+  trial row without one (every row written before v17) is not guessed at;
+  the caveat block says `model caveats could not check N trial(s) recorded
+  before arm runs were stored`.
 - **`relais report --by recipe`.** Cost, acceptance and escalation per
   routing recipe revision, grouped by the recipe that routed each task's
   first worker dispatch (`<name>@<revision> [<12 chars of id>]`; a task

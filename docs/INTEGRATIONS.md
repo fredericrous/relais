@@ -297,7 +297,11 @@ fold it into `relais report` beside worker spend.
   table by hand** whenever Anthropic changes a price; nothing in relais
   fetches or infers one. Adding or editing `[pricing]` is machine policy,
   not repo policy — it never moves a repository's authority hash or
-  invalidates a trust grant reviewed before it existed.
+  invalidates a trust grant reviewed before it existed. `relais doctor`
+  warns, once per model, when an effective model seen in the last 30 days
+  has no entry (`! pricing  claude-sonnet-5-5 has no [pricing] entry`), and
+  says pricing is unconfigured when there is no table; it never suggests a
+  price.
 - **Idempotent.** Every imported message is keyed by the transcript's
   own `message.id`; importing the same session twice inserts nothing the
   second time.

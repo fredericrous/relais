@@ -2840,6 +2840,7 @@ fn replay_command(task: &str, recipe: &Path, dry_run: bool) -> Result<CliOutcome
             contract_hash: &contract_hash,
             verification_profile_hash: &replay_profile_hash,
             workspace_isolation: "fresh_checkout_no_accepted_answer",
+            arm_run_id: &outcome.run_id,
         }),
         "dataset replay",
     )?;
