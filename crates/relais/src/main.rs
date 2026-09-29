@@ -460,6 +460,9 @@ enum FeedbackOutcome {
     Reverted,
     /// A later user-reported regression was confirmed
     Regression,
+    /// The accepted candidate was abandoned for reasons unrelated to its
+    /// quality and never shipped. Takes it out of the accepted count.
+    NotShipped,
 }
 
 impl From<FeedbackOutcome> for relais::outcome::OutcomeKind {
@@ -469,6 +472,7 @@ impl From<FeedbackOutcome> for relais::outcome::OutcomeKind {
             FeedbackOutcome::Corrected => Self::Corrected,
             FeedbackOutcome::Reverted => Self::Reverted,
             FeedbackOutcome::Regression => Self::ConfirmedRegression,
+            FeedbackOutcome::NotShipped => Self::NeverShipped,
         }
     }
 }

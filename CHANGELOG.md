@@ -19,6 +19,21 @@ missing here.
   pipes, redirects, `;`, `&&`, `$(…)` or `VAR=value` prefixes, since the
   permission matcher refuses them and a refused command forced the
   candidate into review. It also says workers cannot spawn subagents.
+- **Every stored receipt parses (#108).** A receipt written before
+  `CheckOutcome::ended` existed failed with `missing field ended`. Its
+  check end now reads as unrecorded — never as an exit, timeout,
+  cancellation or signal — and an unrecorded end never counts as a pass.
+  Only deserialization can produce the unrecorded state; a live check
+  always records how it ended.
+
+### Added
+
+- **`relais feedback --outcome not-shipped` (#99).** A person's statement
+  that an accepted candidate was abandoned for reasons unrelated to its
+  quality. The task leaves the accepted and standing counts, its cost
+  stays in the numerator, it is not a regression and not a revert, and
+  it is excluded from training. `relais report` prints how many accepted
+  tasks were marked never-shipped.
 
 ## v0.7.0
 

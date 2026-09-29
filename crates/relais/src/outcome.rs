@@ -22,6 +22,11 @@ pub enum OutcomeKind {
     Reverted,
     /// A later user-reported regression was confirmed.
     ConfirmedRegression,
+    /// A person's statement that the accepted candidate was abandoned
+    /// for reasons unrelated to its quality, so it was never shipped.
+    /// Never inferred. Distinct from [`OutcomeKind::Reverted`], which
+    /// was shipped and then backed out (issue #99).
+    NeverShipped,
 }
 
 impl OutcomeKind {
@@ -32,11 +37,12 @@ impl OutcomeKind {
     /// The length is fixed, so a variant added to the enum without being
     /// added here does not compile the `match` that walks it. Same shape
     /// as [`crate::lifecycle::State::ALL`].
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::AcceptedUnchanged,
         Self::Corrected,
         Self::Reverted,
         Self::ConfirmedRegression,
+        Self::NeverShipped,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -45,6 +51,7 @@ impl OutcomeKind {
             Self::Corrected => "corrected",
             Self::Reverted => "reverted",
             Self::ConfirmedRegression => "confirmed_regression",
+            Self::NeverShipped => "never_shipped",
         }
     }
 
@@ -56,6 +63,7 @@ impl OutcomeKind {
             "corrected" => Some(Self::Corrected),
             "reverted" => Some(Self::Reverted),
             "confirmed_regression" => Some(Self::ConfirmedRegression),
+            "never_shipped" => Some(Self::NeverShipped),
             _ => None,
         }
     }
@@ -65,11 +73,26 @@ impl OutcomeKind {
     /// meaningful for changes that were not later taken back. Only
     /// `reverted` withdraws the change itself; a correction or a
     /// confirmed regression are later facts about a change that is still
-    /// in the tree.
+    /// in the tree. A never-shipped change is not in the tree at all, so
+    /// it does not stand either.
     pub fn withdraws_acceptance(self) -> bool {
         match self {
-            Self::Reverted => true,
+            Self::Reverted | Self::NeverShipped => true,
             Self::AcceptedUnchanged | Self::Corrected | Self::ConfirmedRegression => false,
+        }
+    }
+
+    /// Whether a person said the accepted change was never shipped,
+    /// which takes it out of the accepted count altogether — unlike a
+    /// `reverted` change, which was accepted, shipped and taken back.
+    /// Its cost stays in the numerator: the money was spent.
+    pub fn leaves_accepted(self) -> bool {
+        match self {
+            Self::NeverShipped => true,
+            Self::AcceptedUnchanged
+            | Self::Corrected
+            | Self::Reverted
+            | Self::ConfirmedRegression => false,
         }
     }
 }
@@ -212,13 +235,15 @@ impl Outcome {
             OutcomeKind::AcceptedUnchanged
             | OutcomeKind::Reverted
             | OutcomeKind::ConfirmedRegression
+            | OutcomeKind::NeverShipped
                 if has_magnitude =>
             {
                 Err(OutcomeError::MagnitudeRefused(kind))
             }
             OutcomeKind::AcceptedUnchanged
             | OutcomeKind::Reverted
-            | OutcomeKind::ConfirmedRegression => Ok(Self { kind, detail }),
+            | OutcomeKind::ConfirmedRegression
+            | OutcomeKind::NeverShipped => Ok(Self { kind, detail }),
         }
     }
 }
@@ -300,12 +325,7 @@ mod tests {
 
     #[test]
     fn kind_round_trips_through_its_stored_string() {
-        for kind in [
-            OutcomeKind::AcceptedUnchanged,
-            OutcomeKind::Corrected,
-            OutcomeKind::Reverted,
-            OutcomeKind::ConfirmedRegression,
-        ] {
+        for kind in OutcomeKind::ALL {
             assert_eq!(OutcomeKind::parse(kind.as_str()), Some(kind));
         }
         assert_eq!(OutcomeKind::parse("not-a-kind"), None);
@@ -328,10 +348,35 @@ mod tests {
     }
 
     #[test]
-    fn only_reverted_withdraws_acceptance() {
+    fn only_reverted_and_never_shipped_withdraw_acceptance() {
         assert!(OutcomeKind::Reverted.withdraws_acceptance());
+        assert!(OutcomeKind::NeverShipped.withdraws_acceptance());
         assert!(!OutcomeKind::AcceptedUnchanged.withdraws_acceptance());
         assert!(!OutcomeKind::Corrected.withdraws_acceptance());
         assert!(!OutcomeKind::ConfirmedRegression.withdraws_acceptance());
+    }
+
+    /// Shipped-then-backed-out and never-shipped are different facts: a
+    /// reverted change stays in the accepted count, a never-shipped one
+    /// leaves it.
+    #[test]
+    fn only_never_shipped_leaves_the_accepted_count() {
+        for kind in OutcomeKind::ALL {
+            assert_eq!(
+                kind.leaves_accepted(),
+                kind == OutcomeKind::NeverShipped,
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn never_shipped_refuses_a_magnitude() {
+        let magnitude = CorrectionMagnitude::new(0.2).expect("magnitude");
+        assert_eq!(
+            Outcome::new(OutcomeKind::NeverShipped, detail(Some(magnitude))),
+            Err(OutcomeError::MagnitudeRefused(OutcomeKind::NeverShipped))
+        );
+        assert!(Outcome::new(OutcomeKind::NeverShipped, detail(None)).is_ok());
     }
 }

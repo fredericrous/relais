@@ -58,8 +58,8 @@ fn accepted_by_person(
 /// (this task added `enforcement`, the same summary `relais coordinator
 /// status` prints, so its JSON agrees with the sentence a person sees),
 /// so a downstream parser can tell an old shape from a new one instead of
-/// guessing from key presence.
-pub const REPORT_SCHEMA_VERSION: u32 = 8;
+/// guessing from key presence. 9: `never_shipped_tasks`.
+pub const REPORT_SCHEMA_VERSION: u32 = 9;
 
 /// A dimension `relais report --by` groups the window's tasks over (SPEC
 /// §11: "compare like task classes and policy versions"). Total over the
@@ -105,6 +105,10 @@ impl Serialize for Dimension {
 struct CohortTaskRow {
     accepted: bool,
     standing: bool,
+    /// Accepted, then a person said it was never shipped: out of
+    /// `accepted`, not a failure, and not in the acceptance rate's
+    /// denominator.
+    never_shipped: bool,
     /// Every run of the task has reached a terminal state (SPEC's
     /// decision spine): a task still in flight has not failed, so
     /// counting it against acceptance would misreport work that simply
@@ -143,7 +147,10 @@ fn cost_per_accepted_change(rows: &[CohortTaskRow]) -> Option<MicroUsd> {
 /// flight is excluded from the denominator rather than counted as a
 /// failure it has not had the chance to be.
 fn acceptance_rate_over_terminal(rows: &[CohortTaskRow]) -> Option<f64> {
-    let terminal: Vec<&CohortTaskRow> = rows.iter().filter(|row| row.terminal).collect();
+    let terminal: Vec<&CohortTaskRow> = rows
+        .iter()
+        .filter(|row| row.terminal && !row.never_shipped)
+        .collect();
     if terminal.is_empty() {
         return None;
     }
@@ -204,6 +211,8 @@ pub struct Cohort {
     pub tasks: usize,
     pub accepted: usize,
     pub standing: usize,
+    /// Accepted tasks a person marked never shipped: not in `accepted`.
+    pub never_shipped: usize,
     pub terminal: usize,
     /// Tasks with no terminal run yet — reported separately from
     /// acceptance rather than folded into it as failures.
@@ -225,6 +234,7 @@ pub struct Cohort {
 fn build_cohort(key: String, rows: Vec<CohortTaskRow>) -> Cohort {
     let accepted = rows.iter().filter(|row| row.accepted).count();
     let standing = rows.iter().filter(|row| row.standing).count();
+    let never_shipped = rows.iter().filter(|row| row.never_shipped).count();
     let terminal = rows.iter().filter(|row| row.terminal).count();
     let cost = rows.iter().fold(MicroUsd::ZERO, |acc, row| acc + row.cost);
     let cost_completeness = CostCompleteness::worst(rows.iter().map(|row| row.cost_completeness));
@@ -243,6 +253,7 @@ fn build_cohort(key: String, rows: Vec<CohortTaskRow>) -> Cohort {
         tasks: rows.len(),
         accepted,
         standing,
+        never_shipped,
         terminal,
         in_flight: rows.len() - terminal,
         cost,
@@ -456,6 +467,9 @@ pub struct TaskLine {
     /// Accepted, and the task's latest recorded outcome (if any) has not
     /// withdrawn it. Absence of feedback is never a negative label.
     pub standing: bool,
+    /// Its accepted change was, by a person's statement, never shipped:
+    /// `accepted` is false for it, its cost stays in the numerator.
+    pub never_shipped: bool,
     /// Reconstructed by the v4 migration for a run written before the
     /// task spine existed, rather than minted at dispatch time.
     pub backfilled: bool,
@@ -518,6 +532,11 @@ pub struct Report {
     /// criterion's own answer (SPEC §10).
     pub accepted_tasks_by_person: usize,
     pub standing_tasks: usize,
+    /// Tasks whose accepted change a person marked never shipped
+    /// (`relais feedback --outcome not-shipped`): out of
+    /// `accepted_tasks` and `standing_tasks`, not a regression, cost
+    /// still in the numerator. Printed so the exclusion is visible.
+    pub never_shipped_tasks: usize,
     /// Total cost of every run of every in-window task, whatever its
     /// outcome, divided by `accepted_tasks` — both relais's own and a
     /// person's — the primary metric (SPEC §11), denominated in tasks
@@ -762,6 +781,11 @@ pub fn runs_report(
         let cost = ledger.task_cost(&task_row.task_id)?;
         let cost_completeness = ledger.task_cost_completeness(&task_row.task_id)?;
         let latest_outcome = ledger.latest_outcome(&task_row.task_id)?;
+        let never_shipped_task = accepted_task
+            && latest_outcome
+                .as_ref()
+                .is_some_and(|stored| stored.outcome.kind.leaves_accepted());
+        let accepted_task = accepted_task && !never_shipped_task;
         let standing_task = accepted_task
             && !latest_outcome
                 .as_ref()
@@ -790,6 +814,11 @@ pub fn runs_report(
                     }
                 }
             }
+            let cohort_never_shipped = cohort_accepted
+                && cohort_outcome
+                    .as_ref()
+                    .is_some_and(|stored| stored.outcome.kind.leaves_accepted());
+            let cohort_accepted = cohort_accepted && !cohort_never_shipped;
             let cohort_standing = cohort_accepted
                 && !cohort_outcome
                     .as_ref()
@@ -797,6 +826,7 @@ pub fn runs_report(
             cohort_rows.entry(key).or_default().push(CohortTaskRow {
                 accepted: cohort_accepted,
                 standing: cohort_standing,
+                never_shipped: cohort_never_shipped,
                 terminal,
                 escalated,
                 reviewed,
@@ -819,6 +849,7 @@ pub fn runs_report(
             cost_completeness,
             accepted: accepted_task,
             standing: standing_task,
+            never_shipped: never_shipped_task,
             backfilled: task_row.origin == TaskOrigin::Backfilled,
             pending_feedback,
             accepted_by_person: accepted_task_by_person,
@@ -848,6 +879,7 @@ pub fn runs_report(
         .count();
     let accepted_tasks_by_relais = accepted_tasks - accepted_tasks_by_person;
     let standing_tasks = tasks.iter().filter(|task| task.standing).count();
+    let never_shipped_tasks = tasks.iter().filter(|task| task.never_shipped).count();
     let pending_feedback = tasks.iter().filter(|task| task.pending_feedback).count();
     let backfilled_tasks = tasks.iter().filter(|task| task.backfilled).count();
     let total_task_cost = tasks
@@ -907,6 +939,7 @@ pub fn runs_report(
         accepted_tasks_by_relais,
         accepted_tasks_by_person,
         standing_tasks,
+        never_shipped_tasks,
         cost_per_accepted_task,
         cost_per_standing_change,
         pending_feedback,
@@ -1018,6 +1051,13 @@ impl Report {
         } else {
             "no accepted tasks".to_string()
         };
+        // The exclusion is visible on the metric's own line: these tasks
+        // were accepted, a person said they were never shipped, and their
+        // cost is still in the numerator.
+        let feedback_coverage = format!(
+            "{feedback_coverage}; {} accepted task(s) marked never shipped, excluded",
+            self.never_shipped_tasks
+        );
         // Through `cost_line`, like every other figure: an unknown
         // completeness with nothing recorded must not render as `$0`,
         // which reads as free — least of all on the line this report
@@ -1031,7 +1071,14 @@ impl Report {
                 cost_line(cost, self.task_cost_completeness),
                 feedback_coverage
             )),
-            None => out.push_str("cost per accepted task: no accepted tasks in window\n"),
+            // The never-shipped count rides here too: a window whose only
+            // accepted tasks were all marked never shipped has none left,
+            // and the exclusion must not vanish exactly then.
+            None => out.push_str(&format!(
+                "cost per accepted task: no accepted tasks in window ({} accepted task(s) marked \
+                 never shipped, excluded)\n",
+                self.never_shipped_tasks
+            )),
         }
         match self.cost_per_standing_change {
             Some(cost) => out.push_str(&format!(
@@ -1269,6 +1316,7 @@ mod tests {
         CohortTaskRow {
             accepted: false,
             standing: false,
+            never_shipped: false,
             terminal: false,
             escalated: false,
             reviewed: false,
@@ -1543,6 +1591,7 @@ mod tests {
                 cost_completeness: CostCompleteness::Actual,
                 accepted: true,
                 standing: true,
+                never_shipped: false,
                 backfilled: false,
                 pending_feedback: true,
                 accepted_by_person: false,
@@ -1551,6 +1600,7 @@ mod tests {
             accepted_tasks_by_relais: 1,
             accepted_tasks_by_person: 0,
             standing_tasks: 1,
+            never_shipped_tasks: 0,
             task_cost_completeness: CostCompleteness::Actual,
             cost_per_accepted_task: Some(MicroUsd::from_micros(10)),
             cost_per_standing_change: Some(MicroUsd::from_micros(10)),
@@ -1771,6 +1821,7 @@ mod tests {
                 "cost_per_accepted_task_with_orchestration",
                 "cost_per_standing_change",
                 "enforcement",
+                "never_shipped_tasks",
                 "observational",
                 "open_decisions",
                 "orchestration",
@@ -2667,6 +2718,146 @@ mod tests {
         let other = runs_report(&ledger, since, Some(Dimension::Tier)).expect("report");
         assert!(other.observational.is_none() && other.trial_spend.is_none());
         assert!(!other.render().contains("observational"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #99: `reverted` (shipped, then backed out) and `not-shipped`
+    /// (never shipped) are different facts with different effects. A
+    /// reverted task was accepted and stops standing; a never-shipped
+    /// task leaves the accepted count too, is counted on its own line,
+    /// keeps its cost in the numerator, and is no regression.
+    ///
+    /// Falsified: with `leaves_accepted` answering `true` for `Reverted`
+    /// too (the same effect as `NeverShipped`), the reverted task drops
+    /// out of `accepted_tasks` and this test fails on `accepted_tasks`;
+    /// restored, it passes.
+    #[test]
+    fn reverted_and_never_shipped_have_distinct_effects() {
+        let dir = temp_dir("never-shipped");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let accept = |run_id: &str, task_id: &str, kind: Option<OutcomeKind>| {
+            let task = crate::ids::TaskId::from_stored(task_id);
+            let run = recorded_run(&ledger, run_id, &task, 100, None, None);
+            ledger
+                .record_transition(&Transition {
+                    run_id: run.clone(),
+                    attempt_id: None,
+                    from_state: Some(State::Verifying),
+                    to_state: State::Accepted,
+                    reason: "checks_and_review_passed".into(),
+                    detail: None,
+                    at: now_rfc3339(),
+                })
+                .expect("transition");
+            if let Some(kind) = kind {
+                let outcome = crate::outcome::Outcome::new(
+                    kind,
+                    crate::outcome::OutcomeDetail {
+                        candidate_sha: None,
+                        strategy: crate::outcome::Strategy {
+                            tier: crate::policy::Tier::Implementation,
+                            models: vec!["sonnet".into()],
+                            escalated: false,
+                        },
+                        correction_magnitude: None,
+                        evidence: vec![],
+                        actor: "a person".into(),
+                        note: None,
+                    },
+                )
+                .expect("outcome");
+                ledger
+                    .record_outcome(&run, &task, &outcome)
+                    .expect("record");
+            }
+        };
+        accept("run-reverted", "task-reverted", Some(OutcomeKind::Reverted));
+        accept(
+            "run-never-shipped",
+            "task-never-shipped",
+            Some(OutcomeKind::NeverShipped),
+        );
+        accept("run-plain", "task-plain", None);
+
+        let report = runs_report(&ledger, "2000-01-01T00:00:00+00:00", None).expect("report");
+        let line = |task: &str| {
+            report
+                .tasks
+                .iter()
+                .find(|line| line.task_id == task)
+                .unwrap_or_else(|| panic!("{task} is in the window"))
+        };
+        let reverted = line("task-reverted");
+        assert!(reverted.accepted && !reverted.standing && !reverted.never_shipped);
+        let never_shipped = line("task-never-shipped");
+        assert!(!never_shipped.accepted && !never_shipped.standing && never_shipped.never_shipped);
+
+        assert_eq!(report.accepted_tasks, 2, "reverted stays accepted");
+        assert_eq!(report.standing_tasks, 1, "only the plain task stands");
+        assert_eq!(report.never_shipped_tasks, 1);
+        assert_eq!(
+            report.cost_per_accepted_task,
+            Some(MicroUsd::from_micros(150)),
+            "all three tasks' cost over the two accepted"
+        );
+        assert!(report
+            .render()
+            .contains("1 accepted task(s) marked never shipped"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A window whose only accepted task was marked never shipped has no
+    /// accepted task left, and the report must still say why rather than
+    /// print a bare "no accepted tasks".
+    ///
+    /// Falsified: with the `None` arm printing only "no accepted tasks in
+    /// window" again, this test failed; restored, it passes.
+    #[test]
+    fn the_never_shipped_count_survives_an_empty_accepted_set() {
+        let dir = temp_dir("never-shipped-only");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let task = crate::ids::TaskId::from_stored("task-only");
+        let run = recorded_run(&ledger, "run-only", &task, 100, None, None);
+        ledger
+            .record_transition(&Transition {
+                run_id: run.clone(),
+                attempt_id: None,
+                from_state: Some(State::Verifying),
+                to_state: State::Accepted,
+                reason: "checks_and_review_passed".into(),
+                detail: None,
+                at: now_rfc3339(),
+            })
+            .expect("transition");
+        let outcome = crate::outcome::Outcome::new(
+            OutcomeKind::NeverShipped,
+            crate::outcome::OutcomeDetail {
+                candidate_sha: None,
+                strategy: crate::outcome::Strategy {
+                    tier: crate::policy::Tier::Implementation,
+                    models: vec!["sonnet".into()],
+                    escalated: false,
+                },
+                correction_magnitude: None,
+                evidence: vec![],
+                actor: "a person".into(),
+                note: None,
+            },
+        )
+        .expect("outcome");
+        ledger
+            .record_outcome(&run, &task, &outcome)
+            .expect("record");
+        let report = runs_report(&ledger, "2000-01-01T00:00:00+00:00", None).expect("report");
+        assert_eq!(report.accepted_tasks, 0);
+        assert_eq!(report.never_shipped_tasks, 1);
+        assert!(
+            report
+                .render()
+                .contains("1 accepted task(s) marked never shipped"),
+            "{}",
+            report.render()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
