@@ -22,8 +22,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::{Admission, EffortSet};
 use crate::money::{CostCompleteness, MicroUsd};
-use crate::policy::Effort;
+use crate::policy::EffortId;
 use crate::procs::{Ended, RunError};
 
 #[derive(Debug)]
@@ -34,6 +35,13 @@ pub enum BackendError {
     /// failed, or a pipe reader was lost. Never a worker's doing.
     Process(RunError),
     Unsupported(&'static str),
+    /// The dispatch asked for an effort the installed harness does not
+    /// accept. An effort is never dropped silently: the run is blocked.
+    EffortUnsupported {
+        effort: EffortId,
+        model: String,
+        harness_version: String,
+    },
 }
 
 impl std::fmt::Display for BackendError {
@@ -43,6 +51,15 @@ impl std::fmt::Display for BackendError {
             Self::Launch(detail) => write!(f, "backend launch failed: {detail}"),
             Self::Process(e) => write!(f, "backend launch failed: {e}"),
             Self::Unsupported(what) => write!(f, "backend does not support {what}"),
+            Self::EffortUnsupported {
+                effort,
+                model,
+                harness_version,
+            } => write!(
+                f,
+                "the harness (version {harness_version}) does not accept effort `{effort}` for \
+                 model `{model}`; run `relais doctor` for what it accepts"
+            ),
         }
     }
 }
@@ -51,8 +68,53 @@ impl std::error::Error for BackendError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Process(e) => Some(e),
-            Self::MissingBinary(_) | Self::Launch(_) | Self::Unsupported(_) => None,
+            Self::MissingBinary(_)
+            | Self::Launch(_)
+            | Self::Unsupported(_)
+            | Self::EffortUnsupported { .. } => None,
         }
+    }
+}
+
+impl BackendError {
+    /// Why the run is blocked, as the code `plan`, `run` and `explain`
+    /// print: an effort the harness refuses is its own code, not a
+    /// harness that is missing.
+    pub fn block_code(&self) -> crate::policy::BlockCode {
+        use crate::policy::BlockCode;
+        match self {
+            Self::EffortUnsupported { .. } => BlockCode::EffortUnsupported,
+            Self::MissingBinary(_) | Self::Launch(_) | Self::Process(_) | Self::Unsupported(_) => {
+                BlockCode::BackendUnavailable
+            }
+        }
+    }
+}
+
+/// The adapter's rule for a requested effort: passed on when the harness
+/// accepts it, refused (typed, naming effort, model and harness version)
+/// when its CLI fact is `Unsupported` or `Known` without it, and passed on
+/// when the CLI fact is `Unknown` — the carve-out for the effort the repo
+/// policy explicitly configures (SPEC §20). Never dropped.
+pub fn check_effort(
+    accepted: &EffortSet,
+    effort: &EffortId,
+    model: &str,
+    harness_version: Option<&str>,
+) -> Result<(), BackendError> {
+    match accepted.admission_of(effort) {
+        Admission::Accepted => Ok(()),
+        // holds-until: correctly scoped only while routing never changes the
+        // effort, so what is passed on is always the one the repo policy
+        // configured; it ends when P2/P3 route-time admissibility blocks
+        // effort changes under an unknown catalog
+        // (rule change.a-deferral-names-its-ceiling).
+        Admission::Unverifiable => Ok(()),
+        Admission::Refused => Err(BackendError::EffortUnsupported {
+            effort: effort.clone(),
+            model: model.to_string(),
+            harness_version: harness_version.unwrap_or("unknown").to_string(),
+        }),
     }
 }
 
@@ -77,7 +139,9 @@ pub struct Capabilities {
     pub backend: String,
     pub version: Option<String>,
     pub supports_model: bool,
-    pub supports_effort: bool,
+    /// The CLI-accepted efforts, read from the harness (never assumed):
+    /// a known set, established absent, or unknown.
+    pub accepted_efforts: EffortSet,
     pub supports_max_turns: bool,
     pub supports_output_format_json: bool,
     /// A per-launch API dollar ceiling (`--max-budget-usd` on Claude
@@ -318,7 +382,7 @@ pub struct LaunchSpec {
     pub dispatch_id: String,
     pub prompt: String,
     pub model: String,
-    pub effort: Option<Effort>,
+    pub effort: Option<EffortId>,
     pub max_turns: Option<u32>,
     pub budget_micros: Option<i64>,
     pub disallowed_tools: Vec<String>,
@@ -549,6 +613,43 @@ pub trait Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::Fact;
+
+    fn effort(name: &str) -> EffortId {
+        EffortId::parse(name).expect("a valid effort identifier")
+    }
+
+    #[test]
+    fn an_effort_is_refused_by_name_unless_the_cli_fact_cannot_say() {
+        let known = Fact::Known(vec![effort("low"), effort("high")]);
+        assert!(check_effort(&known, &effort("high"), "sonnet", Some("2.1.284")).is_ok());
+        assert!(check_effort(&Fact::Unknown, &effort("ultra"), "sonnet", None).is_ok());
+        for refused in [known, Fact::Unsupported] {
+            let err = check_effort(&refused, &effort("ultra"), "sonnet", Some("2.1.284"))
+                .expect_err("not accepted");
+            assert!(
+                matches!(
+                    &err,
+                    BackendError::EffortUnsupported { effort, model, harness_version }
+                        if effort.as_str() == "ultra"
+                            && model == "sonnet"
+                            && harness_version == "2.1.284"
+                ),
+                "{err:?}"
+            );
+            assert_eq!(
+                err.block_code(),
+                crate::policy::BlockCode::EffortUnsupported
+            );
+        }
+        let unversioned =
+            check_effort(&Fact::Unsupported, &effort("low"), "m", None).expect_err("refused");
+        assert!(unversioned.to_string().contains("version unknown"));
+        assert_eq!(
+            BackendError::Launch("x".into()).block_code(),
+            crate::policy::BlockCode::BackendUnavailable
+        );
+    }
 
     #[test]
     fn a_blockage_claim_opens_a_line_and_a_mention_does_not() {

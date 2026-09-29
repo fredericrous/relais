@@ -37,7 +37,7 @@ use crate::ledger::{EvidenceKind, EvidenceOrigin, Ledger, LedgerError, Transitio
 use crate::lifecycle::UsagePhase;
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::policy::{
-    effective_authority, repo_key, BlockCode, EffectiveAuthority, Effort, MachineSettings,
+    effective_authority, repo_key, BlockCode, EffectiveAuthority, EffortId, MachineSettings,
     RepoPolicy, Tier, VerificationProfile,
 };
 use crate::procs::Ended;
@@ -684,11 +684,9 @@ impl<'a> RunEngine<'a> {
         let Some(gate) = self.config.gate else {
             return Ok(match self.config.backend.launch(&spec) {
                 Ok(result) => Ok(result),
-                Err(e) => Err(self.block(
-                    Reason::BlockedPreflight,
-                    BlockCode::BackendUnavailable,
-                    e.to_string(),
-                )?),
+                Err(e) => {
+                    Err(self.block(Reason::BlockedPreflight, e.block_code(), e.to_string())?)
+                }
             });
         };
         let request = DispatchRequest {
@@ -950,7 +948,7 @@ impl<'a> RunEngine<'a> {
                 let _ = gate.settle(&spec.dispatch_id, None);
                 return Ok(Err(self.block(
                     Reason::BlockedPreflight,
-                    BlockCode::BackendUnavailable,
+                    e.block_code(),
                     e.to_string(),
                 )?));
             }
@@ -1831,7 +1829,7 @@ impl<'a> RunEngine<'a> {
             dispatch_id: dispatch_id.as_str().to_string(),
             prompt,
             model: model_profile.id.clone(),
-            effort: model_profile.effort,
+            effort: model_profile.effort.clone(),
             max_turns: None,
             budget_micros: remaining_budget,
             disallowed_tools: authority.disallowed_tools.clone(),
@@ -1844,7 +1842,7 @@ impl<'a> RunEngine<'a> {
         };
 
         let requested_model = model_profile.id.clone();
-        let requested_effort = effort_str(model_profile.effort);
+        let requested_effort = effort_str(model_profile.effort.as_ref());
         // Around the launch, monotonic: the dispatch's own elapsed time,
         // never derived from the `at` timestamps `record_usage` stamps.
         let dispatch_start = Instant::now();
@@ -3353,7 +3351,7 @@ impl<'a> RunEngine<'a> {
             dispatch_id: dispatch_id.as_str().to_string(),
             prompt,
             model: profile.id.clone(),
-            effort: profile.effort,
+            effort: profile.effort.clone(),
             max_turns: None,
             budget_micros: remaining_budget,
             disallowed_tools: request.authority.disallowed_tools.clone(),
@@ -3467,7 +3465,7 @@ impl<'a> RunEngine<'a> {
             phase: Some(UsagePhase::Review),
             duration_ms: Some(dispatch_start.elapsed().as_millis() as i64),
             requested_model: Some(profile.id.clone()),
-            requested_effort: effort_str(profile.effort),
+            requested_effort: effort_str(profile.effort.as_ref()),
             harness: self.harness.clone(),
         };
         if let Err(e) = self.config.ledger.record_usage(&event) {
@@ -3671,8 +3669,8 @@ pub(crate) fn spend_limit(spent: MicroUsd, ceiling: MicroUsd, which: Ceiling) ->
 
 /// A route's requested effort, spelled the way a usage event stores it.
 /// `None` for a model without effort control — omitted, never guessed.
-pub(crate) fn effort_str(effort: Option<Effort>) -> Option<String> {
-    effort.map(Effort::as_str).map(str::to_string)
+pub(crate) fn effort_str(effort: Option<&EffortId>) -> Option<String> {
+    effort.map(EffortId::as_str).map(str::to_string)
 }
 
 /// The start of the UTC day containing an RFC3339 instant, formatted the
@@ -4149,6 +4147,7 @@ mod tests {
                 routing: Default::default(),
                 admission: Default::default(),
                 pricing: None,
+                efforts: Default::default(),
             }
         }
 
@@ -4698,6 +4697,118 @@ mod tests {
         assert_eq!(transitions[0].to_state, State::Running);
         assert_eq!(transitions[1].to_state, State::Blocked);
         assert_eq!(transitions[2].reason, Reason::WorktreeRetired.as_str());
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A dispatch that requests an effort the harness does not accept is
+    /// blocked with a typed reason naming effort, model and harness — the
+    /// effort is never dropped and the worker never launched.
+    #[test]
+    fn an_effort_the_harness_refuses_blocks_the_run_and_launches_nothing() {
+        use crate::catalog::Fact;
+        let fixture = Fixture::new();
+        let mut repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        for profile in repo.models.values_mut() {
+            profile.effort = EffortId::parse("medium").ok();
+        }
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&launches);
+        let backend = MockBackend::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            MockOutcome::default()
+        })
+        .accepting(Fact::Known(vec![EffortId::parse("low").expect("valid")]));
+        let outcome = fixture.execute(&fixture.contract(Review::Optional), &repo, &backend);
+        let RunOutcome {
+            terminal: Terminal::Blocked { code, detail },
+            ..
+        } = &outcome
+        else {
+            panic!("expected blocked, got {outcome:?}");
+        };
+        assert_eq!(*code, BlockCode::EffortUnsupported);
+        assert!(
+            detail.contains("medium") && detail.contains("version test"),
+            "the detail names the effort and the harness version: {detail}"
+        );
+        assert_eq!(
+            launches.load(Ordering::SeqCst),
+            0,
+            "the refusal comes before any worker runs"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// The carve-out: a harness whose help lists no levels is passed the
+    /// effort the policy configured, exactly as configured.
+    #[test]
+    fn an_unknown_cli_fact_dispatches_exactly_the_configured_effort() {
+        use crate::catalog::Fact;
+        let fixture = Fixture::new();
+        let mut repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        for profile in repo.models.values_mut() {
+            profile.effort = EffortId::parse("medium").ok();
+        }
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        let backend = MockBackend::new(move |spec| {
+            record
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(spec.effort.clone());
+            MockOutcome::default()
+        })
+        .accepting(Fact::Unknown);
+        let outcome = fixture.execute(&fixture.contract(Review::Optional), &repo, &backend);
+        assert!(
+            !matches!(outcome.terminal, Terminal::Blocked { .. }),
+            "{outcome:?}"
+        );
+        let seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!seen.is_empty(), "a worker was dispatched");
+        assert!(
+            seen.iter()
+                .all(|effort| effort.as_ref().map(EffortId::as_str) == Some("medium")),
+            "{seen:?}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// An effort id no code names (`ultra`), listed by the harness, routes
+    /// and reaches the dispatch as data — P1 changes no routing.
+    #[test]
+    fn an_unfamiliar_effort_the_harness_lists_is_dispatched_as_configured() {
+        use crate::catalog::Fact;
+        let fixture = Fixture::new();
+        let mut repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        for profile in repo.models.values_mut() {
+            profile.effort = EffortId::parse("ultra").ok();
+        }
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        let backend = MockBackend::new(move |spec| {
+            record
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(spec.effort.clone());
+            MockOutcome::default()
+        })
+        .accepting(Fact::Known(vec![
+            EffortId::parse("low").expect("valid"),
+            EffortId::parse("ultra").expect("valid"),
+        ]));
+        let outcome = fixture.execute(&fixture.contract(Review::Optional), &repo, &backend);
+        assert!(
+            !matches!(outcome.terminal, Terminal::Blocked { .. }),
+            "{outcome:?}"
+        );
+        let seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!seen.is_empty(), "a worker was dispatched");
+        assert!(
+            seen.iter()
+                .all(|effort| effort.as_ref().map(EffortId::as_str) == Some("ultra")),
+            "{seen:?}"
+        );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 

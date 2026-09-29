@@ -1113,7 +1113,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         dispatch_id: dispatch_id.as_str().to_string(),
         prompt,
         model: profile.id.clone(),
-        effort: profile.effort,
+        effort: profile.effort.clone(),
         max_turns: Some(8),
         budget_micros: remaining_budget,
         disallowed_tools: {
@@ -1184,7 +1184,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         phase: Some(UsagePhase::Planning),
         duration_ms: Some(dispatch_start.elapsed().as_millis() as i64),
         requested_model: Some(profile.id.clone()),
-        requested_effort: effort_str(profile.effort),
+        requested_effort: effort_str(profile.effort.as_ref()),
         harness: engine.harness.clone(),
     })?;
     if result.ended == Ended::Cancelled {

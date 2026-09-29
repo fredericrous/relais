@@ -17,11 +17,11 @@
 //! back into `route` would be exactly the cycle that script exists to
 //! catch.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use crate::contract::Review;
 use crate::policy::{
-    validate_recipes, ContextPolicy, Effort, ExecutionPolicy, ModelProfile, RecipeError,
+    validate_recipes, ContextPolicy, EffortId, ExecutionPolicy, ModelProfile, RecipeError,
     RecipeSpec, RepoPolicy, RiskRule, Tier,
 };
 
@@ -42,7 +42,7 @@ pub struct TuningBounds {
     /// Efforts a recipe's own `models` table may name. `effort` was
     /// unbounded, so a candidate could raise every tier's effort — spend
     /// a learner must not choose for itself.
-    pub allowed_efforts: Vec<Effort>,
+    pub allowed_efforts: HashSet<EffortId>,
     /// Whether a candidate may grant nested agent spawning. A CAPABILITY,
     /// not a number to tune: `false` here means a candidate cannot turn
     /// it on however it retunes the caps around it.
@@ -161,7 +161,7 @@ pub enum CandidateRejection {
     EffortNotAllowed {
         name: String,
         tier: Tier,
-        effort: Effort,
+        effort: EffortId,
     },
     /// A new recipe entry would grant a capability the bounds withhold.
     /// Distinct from a knob above its cap: no number makes this
@@ -235,7 +235,7 @@ impl std::fmt::Display for CandidateRejection {
             ),
             Self::EffortNotAllowed { name, tier, effort } => write!(
                 f,
-                "recipe `{name}` names effort `{effort:?}` for the {tier:?} tier, which the \
+                "recipe `{name}` names effort `{effort}` for the {tier:?} tier, which the \
                  tuning bounds do not allow: effort is spend, and a learner does not raise its own"
             ),
             Self::CapabilityNotGranted { name, capability } => write!(
@@ -462,7 +462,7 @@ fn validate_new_recipe(
                     return Err(CandidateRejection::EffortNotAllowed {
                         name: new_name.clone(),
                         tier: *tier,
-                        effort: *effort,
+                        effort: effort.clone(),
                     });
                 }
             }
@@ -568,16 +568,13 @@ pub fn default_tuning_bounds(policy: &RepoPolicy) -> TuningBounds {
         .values()
         .map(|profile| profile.id.clone())
         .collect();
-    let allowed_efforts: Vec<Effort> = {
-        let mut efforts: Vec<Effort> = policy
-            .models
-            .values()
-            .filter_map(|profile| profile.effort)
-            .collect();
-        efforts.sort_by_key(|effort| *effort as u8);
-        efforts.dedup();
-        efforts
-    };
+    // A set: which effort is above which is the catalog's configured
+    // order, so nothing here sorts.
+    let allowed_efforts: HashSet<EffortId> = policy
+        .models
+        .values()
+        .filter_map(|profile| profile.effort.clone())
+        .collect();
     TuningBounds {
         allowed_models,
         max_attempts: policy.execution.max_attempts,
@@ -642,17 +639,15 @@ mod tests {
             Tier::Implementation,
             ModelProfile {
                 id: "sonnet".into(),
-                effort: Some(Effort::High),
+                effort: Some(effort("high")),
             },
         )]));
         candidate.recipes.push(tuned);
         assert!(
             matches!(
                 validate_candidate(&incumbent, &candidate, &bounds()),
-                Err(CandidateRejection::EffortNotAllowed {
-                    effort: Effort::High,
-                    ..
-                })
+                Err(CandidateRejection::EffortNotAllowed { effort, .. })
+                    if effort.as_str() == "high"
             ),
             "an effort outside the allowed set is refused"
         );
@@ -692,11 +687,15 @@ mod tests {
 
     use crate::contract::Kind;
     use crate::policy::{
-        ArchitectureConfig, ContextPolicy, Dependency, DependencyMode, Effort, ExecutionPolicy,
+        ArchitectureConfig, ContextPolicy, Dependency, DependencyMode, ExecutionPolicy,
         Integrations, ModelProfile, RiskRule, VerificationPolicy,
     };
 
     use super::*;
+
+    fn effort(name: &str) -> EffortId {
+        EffortId::parse(name).expect("a valid effort identifier")
+    }
 
     fn bounds() -> TuningBounds {
         TuningBounds {
@@ -710,7 +709,7 @@ mod tests {
             max_agent_depth: 4,
             max_agents_total: 32,
             max_context_budget_bytes: 128 * 1024,
-            allowed_efforts: vec![Effort::Low, Effort::Medium],
+            allowed_efforts: HashSet::from([effort("low"), effort("medium")]),
             // Withheld, which is the interesting default for a test: a
             // candidate must not be able to grant itself nested agents.
             allow_nested_agents: false,
@@ -987,7 +986,7 @@ mod tests {
             Tier::Implementation,
             ModelProfile {
                 id: "not-allowed-model".into(),
-                effort: Some(Effort::Medium),
+                effort: Some(effort("medium")),
             },
         )]));
         let candidate = policy_with_recipes(vec![base, tuned]);

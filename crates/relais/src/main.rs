@@ -87,8 +87,14 @@ enum Command {
         /// one real `claude -p` session through it, and write a
         /// compatibility record of what fired. Costs money and touches
         /// the network; never part of `make check`.
-        #[arg(long = "probe-hooks")]
+        #[arg(long = "probe-hooks", conflicts_with = "effort_template")]
         probe_hooks: bool,
+        /// Print the machine.toml block that states the effort facts
+        /// `doctor` reports unknown: the CLI-accepted list pre-filled from
+        /// `--help`, the model-support and order lines left for you to
+        /// confirm.
+        #[arg(long = "effort-template", conflicts_with = "json")]
+        effort_template: bool,
     },
     /// Create a relais.toml policy for this repository
     Init,
@@ -758,9 +764,14 @@ fn main() {
 /// same pair, so the exit code is decided in exactly one place.
 fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
     match command {
-        Command::Doctor { json, probe_hooks } => match probe_hooks {
-            true => doctor_probe_hooks_command(),
-            false => doctor_command(json),
+        Command::Doctor {
+            json,
+            probe_hooks,
+            effort_template,
+        } => match (probe_hooks, effort_template) {
+            (true, _) => doctor_probe_hooks_command(),
+            (false, true) => doctor_effort_template_command(),
+            (false, false) => doctor_command(json),
         },
         Command::Hook { probe, record } => match (probe, record) {
             (true, Some(dir)) => hook_command(&dir),
@@ -1975,6 +1986,13 @@ fn doctor_command(json: bool) -> Result<CliOutcome, CliError> {
         true => Ok(CliOutcome::Blocked),
         false => Ok(CliOutcome::Accepted),
     }
+}
+
+/// `relais doctor --effort-template`: just the block to paste.
+fn doctor_effort_template_command() -> Result<CliOutcome, CliError> {
+    let (_, policy) = load_repo_policy()?;
+    print!("{}", doctor::effort_template_for(&policy));
+    Ok(CliOutcome::Accepted)
 }
 
 /// `relais hook --probe --record <dir>`: the record-only handler

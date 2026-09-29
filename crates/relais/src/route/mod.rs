@@ -790,14 +790,14 @@ mod tests {
                     Tier::Implementation,
                     ModelProfile {
                         id: "sonnet".into(),
-                        effort: Some(crate::policy::Effort::Medium),
+                        effort: crate::policy::EffortId::parse("medium").ok(),
                     },
                 ),
                 (
                     Tier::Escalation,
                     ModelProfile {
                         id: "fable".into(),
-                        effort: Some(crate::policy::Effort::Medium),
+                        effort: crate::policy::EffortId::parse("medium").ok(),
                     },
                 ),
             ]),
@@ -846,6 +846,7 @@ mod tests {
             routing: Default::default(),
             admission: Default::default(),
             pricing: None,
+            efforts: Default::default(),
         };
         machine.trust.insert(
             crate::policy::grant_key(&repo.authority_hash(), &identity()),
@@ -943,6 +944,37 @@ mod tests {
         assert_eq!(d.routed_by, RoutedBy::ConservativeBaseline);
         assert_eq!(d.max_attempts, 3);
         assert_eq!(d.escalation_tier, Some(Tier::Escalation));
+    }
+
+    /// A tier configured with an effort id no code names still routes, and
+    /// the routed tier's profile carries it: effort is data to the router.
+    #[test]
+    fn a_tier_with_an_unfamiliar_effort_routes_and_carries_it() {
+        use crate::catalog::{self, Admissible, Fact};
+        use crate::policy::{EffortId, EffortModelEntry, EffortSettings};
+        let ultra = EffortId::parse("ultra").expect("valid");
+        let mut repo = repo_policy();
+        repo.models
+            .get_mut(&Tier::Implementation)
+            .expect("the implementation tier")
+            .effort = Some(ultra.clone());
+        let mut machine = machine_for(&repo);
+        machine.efforts = EffortSettings {
+            order: Some(vec![EffortId::parse("low").expect("valid"), ultra.clone()]),
+            models: vec![EffortModelEntry {
+                ids: vec!["sonnet".into()],
+                supported: Some(vec![ultra.clone()]),
+                order: None,
+            }],
+        };
+        let d = route_with(&change_contract(&["crates/amont/**"]), &repo, &machine);
+        assert_eq!(d.tier, Tier::Implementation);
+        // P1 routing does not choose effort, so the route decision carries
+        // none to assert on; that `ultra` is actually DISPATCHED is proved
+        // by the runner test that records every launch's `spec.effort`.
+        let cli = Fact::Known(vec![ultra.clone()]);
+        let catalog = catalog::resolve(&cli, &machine.efforts, &ultra, "sonnet");
+        assert_eq!(catalog.admissible(), Admissible::Set(vec![ultra]));
     }
 
     #[test]
@@ -1151,6 +1183,7 @@ mod tests {
             routing: Default::default(),
             admission: Default::default(),
             pricing: None,
+            efforts: Default::default(),
         };
         let d = expect_blocked(decide(
             &change_contract(&["crates/amont/**"]),
@@ -1349,6 +1382,7 @@ mod tests {
             routing: Default::default(),
             admission: Default::default(),
             pricing: None,
+            efforts: Default::default(),
         };
         let d = expect_blocked(decide(
             &change_contract(&["crates/amont/**"]),

@@ -184,6 +184,31 @@ review = "required"
 
 These patterns are examples, not verified mappings of the three repositories. Explicit IDs are recommended for reproducible policies; aliases are permitted for convenience and the effective model must be recorded. A profile can omit effort for models without that capability.
 
+### Effort is data
+
+An effort is an identifier, not a member of a compiled list: `^[a-z][a-z0-9_-]{0,31}$`, checked when `relais.toml` is read, with a typed error naming the bad value. It serializes as the plain string it was written as, so the authority hash of a policy that already says `effort = "medium"` does not move. Nothing orders identifiers: no comparison on the type and no list of levels in the code. Which effort is above which comes only from the catalog below, and a new level (`ultra`) needs configuration, not a release.
+
+The catalog is resolved per (harness version, model id) from three independent facts, each `known`, `unsupported` or `unknown`:
+
+1. **CLI-accepted**, read from the harness `--help`: the list that follows `--effort` (it may wrap onto the next line). Membership only; the order the CLI prints is never used. `unsupported` when there is no `--effort` flag; `unknown` when the flag is there and no list can be read. There is no fallback set.
+2. **Model support**, from machine.toml `[[efforts.models]] ids = [...], supported = [...]`. `supported = []` means the model has no effort control. A model with no entry is `unknown`.
+3. **Order**, lowest first, from `[[efforts.models]] order = [...]` for that model, else machine-wide `[efforts] order = [...]`. `unknown` when neither is set; there is no built-in default.
+
+```toml
+[routing]
+max_effort = "high"        # default; spend authority, never evidence
+
+[efforts]
+order = ["low", "medium", "high", "xhigh", "max"]
+
+[[efforts.models]]
+ids = ["claude-sonnet-5-5"]
+supported = ["low", "medium", "high", "xhigh", "max"]
+# order = [...]            # optional: this model's own order
+```
+
+Every key is optional, so an existing machine.toml parses unchanged. The admissible set is CLI-accepted ∩ model-supported ∩ authorized, in the configured order; authorized is `[routing] max_effort` read as a position in that order (that entry and every one below it). `next(e)` is the next admissible entry after `e` in the order, or none, stepping over gaps. `relais doctor` prints the admissible set for each model in the policy's tiers, or which fact is unknown or unsupported, and then the block to paste; `relais doctor --effort-template` prints just that block, with the CLI-accepted list pre-filled from `--help` and the model-support and order lines left as comments for the person to confirm. P1 does not change routing: every dispatch still requests exactly the tier's configured effort.
+
 Repository commands, hooks and model launch configuration are executable authority. Relais requires a content-bound machine trust grant for a reviewed execution profile and relevant configuration. It delegates amont-specific trust to amont; it does not infer trust from repository ownership. Changed execution declarations invalidate the grant. Worker changes cannot update the frozen grant or commands during a run.
 
 A verification profile may declare a setup step: the commands that install the tree's own dependencies inside a verification worktree before the profile's commands run. It is executable authority like the commands (an installer runs the repository's lifecycle scripts), hashed into the grant, and never inferred: relais may report that a lockfile is present and no setup is declared, and it never runs an installer that policy does not name.
@@ -469,6 +494,8 @@ At bounded checkpoints, recovery chooses between retrieving missing context, a f
 ## 20. Execution backends and final outcome feedback
 
 The adapter contract includes launch, events, cancellation, resume/reconciliation, effective profile, permission capability, sandbox capability and usage completeness. The mandatory Claude Code adapter uses supported native authentication and launches explicitly selected models. An optional alternative adapter can run another harness or local model. No adapter may advertise guarantees its backend cannot enforce.
+
+The adapter never drops an effort silently. When a dispatch requests an effort and the CLI-accepted fact (§5) is `unsupported`, or `known` without that effort, the launch fails with `EffortUnsupported { effort, model, harness_version }` and the run ends blocked (`effort_unsupported`, exit 3) with no worker started. When the fact is `unknown` — the flag exists and its help lists no levels — the adapter passes the effort the repository policy explicitly configured through: a compatibility carve-out, so a harness whose help is unreadable does not silently lose spend controls a policy asked for. The carve-out covers only the configured effort, never one the adapter picked.
 
 After acceptance, allow the user to record accepted unchanged, corrected, reverted or confirmed regression. Feedback is attributed to the candidate and strategy, with correction magnitude, evidence and an optional free-text note where available. The candidate is optional: a run accepted through a person's approval on a contract interrupted before verification completed never wrote a receipt, and feedback about it is still worth recording. Absence of feedback is not a positive quality label. Retain both immediate verification and delayed outcomes.
 

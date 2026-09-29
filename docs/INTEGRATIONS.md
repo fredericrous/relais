@@ -428,6 +428,43 @@ command runs, so a report committed to the candidate is never read.
 relais's own policy does not use this: its `make check` runs `cargo test`,
 which writes no report. Nothing changes until a repository opts in.
 
+## Effort identifiers and the catalog (`effort`)
+
+An effort in `relais.toml` (`effort = "medium"`) is an identifier matching
+`^[a-z][a-z0-9_-]{0,31}$`, not one of a built-in three. Which levels a
+Claude Code accepts, which a model supports and how they are ordered are
+three separate facts, each `known`, `unsupported` or `unknown`:
+
+- **CLI-accepted** is read from `claude --help`: the list after
+  `--effort <level>`, which the CLI wraps onto the next line. `unsupported`
+  when the flag is missing; `unknown` when the flag has no list. Never a
+  guessed set, and the order the help prints is not used.
+- **Model support** is `[[efforts.models]] ids = [...], supported = [...]`
+  in machine.toml. `supported = []` says the model has no effort control.
+  A model with no entry is `unknown`.
+- **Order**, lowest first, is `[[efforts.models]] order = [...]` for a
+  model, else `[efforts] order = [...]`. There is no default.
+
+`[routing] max_effort` (default `"high"`) is a position in that order: the
+entry and everything below it are authorized. It is spend authority and
+never evidence of what a harness or model supports. Adding a level such as
+`ultra` is a machine.toml edit: list it in the model's `supported`, put it
+in the order, and make sure the CLI's help lists it.
+
+`relais doctor` prints an `effort` finding: for each model in the
+repository's tiers, the admissible set in order, or which facts are unknown
+or unsupported. When anything is unknown it prints the machine.toml block to
+paste. `relais doctor --effort-template` prints just that block. The CLI
+list is filled in from `--help`; the model-support and order lines are
+comments for you to confirm, not assertions.
+
+The adapter never drops an effort. A dispatch that requests one the CLI is
+known not to accept (no `--effort`, or a listed set without it) stops with
+`EffortUnsupported { effort, model, harness_version }` and the run is
+blocked (`effort_unsupported`, exit 3). When the help lists no levels the
+configured effort is passed through anyway: the compatibility carve-out for
+the effort the repository policy explicitly configures.
+
 ## Troubleshooting
 
 - **More than one settings file names a hook.** Nothing wins: Claude Code
