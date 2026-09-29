@@ -318,6 +318,12 @@ pub struct ComparisonReport {
     /// the arm" by that variant's own doc, so they never enter a pair. Set
     /// aside rather than dropped: this count is how they stay visible.
     pub errored_trials_set_aside: usize,
+    /// Settled replay trials whose arm was an unchanged incumbent recipe:
+    /// the candidate did not change that task's route, so they are not
+    /// evidence about it. Counted, never silently dropped. Additive: a
+    /// report written before this field existed reads back as 0.
+    #[serde(default)]
+    pub incumbent_replay_trials_set_aside: usize,
     pub incumbent: ArmSummary,
     pub arm: ArmSummary,
     pub interval: PairedInterval,
@@ -388,6 +394,10 @@ impl ComparisonReport {
         out.push_str(&format!(
             "errored trials set aside (not comparable evidence for or against the arm): {}\n",
             self.errored_trials_set_aside
+        ));
+        out.push_str(&format!(
+            "replay trials on an unchanged incumbent recipe set aside: {}\n",
+            self.incumbent_replay_trials_set_aside
         ));
         out.push_str(&format!("incumbent: {}\n", render_arm(&self.incumbent)));
         out.push_str(&format!("candidate arm: {}\n", render_arm(&self.arm)));
@@ -505,17 +515,27 @@ mod sealed {
 }
 pub use sealed::Promotable;
 
+/// A candidate's own arm ids: its recipe ids MINUS the incumbent's. A
+/// candidate is the base policy plus appended revisions and a recipe id is
+/// a content hash, so the base recipes' ids are shared with the incumbent
+/// and name no change the candidate made. Both trial selectors (replay and
+/// live, SPEC §25) use this one definition.
+pub fn candidate_arm_ids(incumbent: &RepoPolicy, candidate: &RepoPolicy) -> BTreeSet<String> {
+    let ids = |policy: &RepoPolicy| -> BTreeSet<String> {
+        policy.recipes.iter().map(RecipeSpec::recipe_id).collect()
+    };
+    ids(candidate)
+        .difference(&ids(incumbent))
+        .cloned()
+        .collect()
+}
+
 /// Read the settled trials for `candidate` and build its comparison
 /// report (SPEC §25). "The trials for this candidate" means every
-/// settled arm whose `arm_recipe_id` names one of the candidate's own
-/// recipes — a candidate is a whole policy, and different tasks may
-/// cover under different recipes within it.
-///
-/// A candidate is the base policy plus appended revisions, so its recipe
-/// ids include the `incumbent`'s own (a recipe id is a content hash). The
-/// live section therefore keys on the candidate's ARM ids: its recipe ids
-/// minus the incumbent's, so a control row counts only when a recipe new in
-/// the candidate was among its non-control arms.
+/// settled arm whose `arm_recipe_id` is one of the candidate's ARM ids
+/// ([`candidate_arm_ids`]). A replay whose arm was an unchanged incumbent
+/// recipe is set aside and counted, and a live trial's control row counts
+/// only when a recipe new in the candidate was among its non-control arms.
 pub fn evaluate_candidate(
     ledger: &Ledger,
     incumbent: &RepoPolicy,
@@ -528,7 +548,11 @@ pub fn evaluate_candidate(
         .iter()
         .map(RecipeSpec::recipe_id)
         .collect();
-    let trials = replay_trials(ledger.settled_trials_for_recipes(&recipe_ids)?);
+    let arm_ids = candidate_arm_ids(incumbent, candidate);
+    let (trials, incumbent_replay_trials_set_aside) = arm_replay_trials(
+        replay_trials(ledger.settled_trials_for_recipes(&recipe_ids)?),
+        &arm_ids,
+    );
     let (by_task, errored_trials_set_aside) = earliest_non_errored_per_task(trials);
 
     let basis = comparison_basis(by_task.values());
@@ -571,12 +595,6 @@ pub fn evaluate_candidate(
     );
     let interval = bootstrap_paired_interval(&pairs, seed, resamples);
 
-    let incumbent_ids: BTreeSet<String> = incumbent
-        .recipes
-        .iter()
-        .map(RecipeSpec::recipe_id)
-        .collect();
-    let arm_ids: BTreeSet<String> = recipe_ids.difference(&incumbent_ids).cloned().collect();
     let randomized = randomized_comparison(
         ledger.settled_live_trials_for_arms(&arm_ids)?,
         &arm_ids,
@@ -589,6 +607,7 @@ pub fn evaluate_candidate(
         paired_tasks: pairs.len(),
         min_paired_tasks,
         errored_trials_set_aside,
+        incumbent_replay_trials_set_aside,
         incumbent: incumbent_summary,
         arm: arm_summary_value,
         interval,
@@ -622,6 +641,16 @@ fn replay_trials(trials: Vec<TrialRow>) -> Vec<TrialRow> {
         .into_iter()
         .filter(|trial| trial.workspace_isolation != LIVE_WORKTREE)
         .collect()
+}
+
+/// Split replay trials into those whose arm is one of the candidate's arm
+/// ids, which are evidence, and the rest, which ran an unchanged incumbent
+/// recipe and are only counted.
+fn arm_replay_trials(trials: Vec<TrialRow>, arm_ids: &BTreeSet<String>) -> (Vec<TrialRow>, usize) {
+    let (arm, incumbent): (Vec<TrialRow>, Vec<TrialRow>) = trials
+        .into_iter()
+        .partition(|trial| arm_ids.contains(&trial.arm_recipe_id));
+    (arm, incumbent.len())
 }
 
 /// The unpaired, inverse-propensity comparison over live trials, or `None`
@@ -1095,6 +1124,7 @@ mod tests {
             paired_tasks: 25,
             min_paired_tasks: MIN_PAIRED_TASKS,
             errored_trials_set_aside: 0,
+            incumbent_replay_trials_set_aside: 0,
             randomized: None,
             incumbent: ArmSummary {
                 acceptance: AcceptanceEstimate::Estimated(0.8),
@@ -1210,6 +1240,7 @@ mod tests {
             paired_tasks: pairs.len(),
             min_paired_tasks: MIN_PAIRED_TASKS,
             errored_trials_set_aside: 0,
+            incumbent_replay_trials_set_aside: 0,
             randomized: None,
             incumbent: arm_summary(&incumbent_observations),
             arm: arm_summary(&observations),
@@ -1495,6 +1526,39 @@ mod tests {
             "{}",
             report.render()
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A candidate built as base plus one appended revision, with real
+    /// recipe ids: a replay whose arm is the new revision's id pairs; one
+    /// whose arm is the base recipe's id is not paired and is counted as
+    /// set aside. With 3 replays on the revision and none on the base, the
+    /// set-aside count reads 0 (the 3-task proof's shape).
+    ///
+    /// FALSIFY: selecting on all the candidate's recipe ids again paired
+    /// the base-arm replays and failed the second half. Restored.
+    #[test]
+    fn a_replay_on_an_unchanged_incumbent_recipe_is_set_aside_not_paired() {
+        let (candidate, arm) = candidate_with_one_recipe();
+        let (proof, proof_dir) = ledger_with_replays(&arm, 3);
+        let report =
+            evaluate_candidate(&proof, &base_policy(), &candidate, 20, 200).expect("evaluates");
+        assert_eq!(report.paired_tasks, 3);
+        assert_eq!(report.incumbent_replay_trials_set_aside, 0);
+
+        let (ledger, dir) = ledger_with_replays(&base_recipe_id(), 2);
+        let report =
+            evaluate_candidate(&ledger, &base_policy(), &candidate, 20, 200).expect("evaluates");
+        assert_eq!(report.paired_tasks, 0);
+        assert_eq!(report.incumbent_replay_trials_set_aside, 2);
+        assert!(
+            report
+                .render()
+                .contains("replay trials on an unchanged incumbent recipe set aside: 2\n"),
+            "{}",
+            report.render()
+        );
+        std::fs::remove_dir_all(proof_dir).ok();
         std::fs::remove_dir_all(dir).ok();
     }
 
