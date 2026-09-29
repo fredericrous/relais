@@ -167,8 +167,9 @@ enum Command {
         #[command(subcommand)]
         cmd: DatasetCommand,
     },
-    /// Read settled trials and report a candidate recipe's comparison
-    /// against the incumbent — never promotes anything (SPEC §25)
+    /// Inspect, evaluate, promote and roll back recipe revisions (SPEC
+    /// §25-27). Only `promote --write` and `rollback --write` change a
+    /// file, by appending to relais.toml; nothing here grants trust
     Recipe {
         #[command(subcommand)]
         cmd: RecipeCommand,
