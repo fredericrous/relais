@@ -10,6 +10,13 @@ missing here.
 
 ### Fixed
 
+- **The worker prompt also names the edit habits that get refused (#105).**
+  Refusals measured before the plain-command rule reached the worker prompt
+  included heredoc and inline-script edits and copies to `/tmp`; the three
+  runs after it had one refusal, an in-place `sed -i` edit. The rules now
+  tell workers to edit with their file-editing tools and never copy to
+  `/tmp`.
+
 - **A worker can no longer pick its own model by spawning a subagent
   (#120).** The deny floor gains `Agent` and `Task`; a measured sonnet
   worker had delegated its task to an Opus subagent. `allow_nested_agents`
