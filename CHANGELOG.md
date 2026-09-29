@@ -21,6 +21,16 @@ missing here.
 
 ### Added
 
+- **`relais report --by recipe`.** Cost, acceptance and escalation per
+  routing recipe revision, grouped by the recipe that routed each task's
+  first worker dispatch (`<name>@<revision> [<12 chars of id>]`; a task
+  routed with no recipe is named after how it was routed, one with nothing
+  recorded is `unrecorded`). Replay and live trial-arm spend is printed on
+  its own `trial spend:` line on every such render and is never part of an
+  ordinary cohort. The figures are labelled observational — cohorts differ
+  in which tasks they received, so they are not a comparison between
+  recipes; `relais recipe evaluate` is. JSON gains `trial_spend` and
+  `observational` (report schema version 8).
 - **Live trials, OFF by default.** A machine can enable `[trials]` in
   `machine.toml` so `relais run` draws each eligible task's arm — the
   incumbent or one candidate recipe policy — with a recorded probability

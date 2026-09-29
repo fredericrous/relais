@@ -829,6 +829,56 @@ fn report_by_model_groups_the_accepted_task_under_the_model_that_ran_it() {
     assert_eq!(cohort["acceptance_rate"], 1.0, "{report}");
 }
 
+// `relais report --by recipe` runs end to end through the binary: the
+// help lists the dimension, the text and the JSON both carry the
+// observational sentence and the trial-spend line, and the task's cohort
+// is named after how it was routed (SPEC §11).
+#[test]
+fn report_by_recipe_runs_end_to_end_and_says_it_is_observational() {
+    let world = World::new("cohort-recipe");
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    let task = world.write_task_for("task.json", "an easy one", "optional");
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(0), "{}", text(&run.stderr));
+
+    let help = world.relais(&["report", "--help"]);
+    assert!(
+        text(&help.stdout).contains("recipe"),
+        "{}",
+        text(&help.stdout)
+    );
+
+    let json = world.relais(&[
+        "report",
+        "--since",
+        "2026-01-01",
+        "--json",
+        "--by",
+        "recipe",
+    ]);
+    assert_eq!(json.status.code(), Some(0), "{}", text(&json.stderr));
+    let json: serde_json::Value = serde_json::from_str(&text(&json.stdout)).expect("json");
+    assert_eq!(json["cohorts"]["dimension"], "recipe", "{json}");
+    assert_eq!(
+        json["cohorts"]["cohorts"].as_array().map(Vec::len),
+        Some(1),
+        "{json}"
+    );
+    assert!(json["observational"].is_string(), "{json}");
+    assert!(json["trial_spend"]["live"]["runs"].is_number(), "{json}");
+
+    let plain = world.relais(&["report", "--since", "2026-01-01", "--by", "recipe"]);
+    assert_eq!(plain.status.code(), Some(0), "{}", text(&plain.stderr));
+    let plain = text(&plain.stdout);
+    assert!(plain.contains("trial spend: replay "), "{plain}");
+    assert_eq!(
+        plain.matches("not a comparison between recipes").count(),
+        1,
+        "{plain}"
+    );
+}
+
 // Task-linking: a bare `relais run` derives a fresh task; a second run
 // of the same contract launched with `--revise <task-id>` joins that
 // task instead of starting a new one, so their cost is one denominator.
