@@ -83,24 +83,67 @@ impl Tier {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Effort {
-    Low,
-    Medium,
-    High,
+/// An effort identifier: data, not a closed list. What levels exist is a
+/// fact about a harness and a model (see [`crate::catalog`]), so this type
+/// only guarantees the spelling, `^[a-z][a-z0-9_-]{0,31}$`, checked when
+/// it is deserialized. It serializes as the plain string, so a policy
+/// that already names `effort = "medium"` hashes exactly as before.
+///
+/// There is deliberately no ordering here: which level is above which is
+/// the catalog's configured order, never a property of the name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct EffortId(String);
+
+/// The text is not an effort identifier; names the value that was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffortIdError {
+    pub value: String,
 }
 
-impl Effort {
-    /// The stored spelling, owned by the type the way `Tier::as_str` is.
-    /// Two places spelling one enum drift apart — which is exactly what
-    /// typing the usage phase was meant to stop doing for phases.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
+impl std::fmt::Display for EffortIdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "`{}` is not an effort identifier (lowercase letter, then up to 31 of a-z, 0-9, `_` or `-`)",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for EffortIdError {}
+
+impl EffortId {
+    pub fn parse(text: &str) -> Result<Self, EffortIdError> {
+        let mut chars = text.chars();
+        let well_formed = chars.next().is_some_and(|c| c.is_ascii_lowercase())
+            && text.len() <= 32
+            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+        if well_formed {
+            Ok(Self(text.to_string()))
+        } else {
+            Err(EffortIdError {
+                value: text.to_string(),
+            })
         }
+    }
+
+    /// The stored spelling.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for EffortId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for EffortId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).map_err(serde::de::Error::custom)
     }
 }
 
@@ -112,7 +155,7 @@ pub struct ModelProfile {
     pub id: String,
     /// Omitted for models without effort control.
     #[serde(default)]
-    pub effort: Option<Effort>,
+    pub effort: Option<EffortId>,
 }
 
 /// Integration dependency: required, optional or off. A missing required
@@ -618,6 +661,51 @@ pub struct MachineSettings {
     /// grant.
     #[serde(default)]
     pub pricing: Option<crate::orchestration::PriceTable>,
+    /// What efforts a model supports, and in what order. Machine-owned
+    /// like `[pricing]`: it feeds no authority hash. Every key is optional
+    /// and `doctor` reports what is missing.
+    #[serde(default)]
+    pub efforts: EffortSettings,
+}
+
+/// `[efforts]` in machine.toml: the order and per-model support the
+/// catalog ([`crate::catalog`]) resolves from. Nothing here has a built-in
+/// default — an absent key is an unknown fact, never a guessed one.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct EffortSettings {
+    /// The machine-wide order, lowest first. A model's own `order`
+    /// overrides it.
+    pub order: Option<Vec<EffortId>>,
+    pub models: Vec<EffortModelEntry>,
+}
+
+/// One `[[efforts.models]]` entry: the facts about one or more models.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffortModelEntry {
+    /// Model IDs this entry describes.
+    pub ids: Vec<String>,
+    /// The efforts these models support; `[]` means no effort control.
+    /// Absent means the support is not stated.
+    #[serde(default)]
+    pub supported: Option<Vec<EffortId>>,
+    /// The order for these models, lowest first.
+    #[serde(default)]
+    pub order: Option<Vec<EffortId>>,
+}
+
+impl EffortSettings {
+    /// The entry naming `model`, if any. Case-insensitive and trimmed,
+    /// like [`crate::backend::model_matches`]'s exact-id comparison.
+    pub fn entry_for(&self, model: &str) -> Option<&EffortModelEntry> {
+        self.models.iter().find(|entry| {
+            entry
+                .ids
+                .iter()
+                .any(|id| id.trim().eq_ignore_ascii_case(model.trim()))
+        })
+    }
 }
 
 /// One substitution `machine.toml` reviewed and will accept without
@@ -1023,11 +1111,16 @@ pub struct RoutingSettings {
     /// accepting a costlier model is a spending decision a repository
     /// must not be able to widen on its own.
     pub approved_substitutions: Vec<ApprovedSubstitution>,
+    /// The highest effort this machine authorizes, named by its position
+    /// in the configured order: that entry and every one below it. It is
+    /// spend authority, never evidence of what a harness or model supports.
+    pub max_effort: EffortId,
 }
 
 impl Default for RoutingSettings {
     fn default() -> Self {
         Self {
+            max_effort: EffortId("high".into()),
             learned_enabled: true,
             quality_floor: Some(0.75),
             min_supported_test_records: 20,
@@ -1109,6 +1202,9 @@ pub enum BlockCode {
     VerificationSetupFailed,
     WorktreeUnavailable,
     BackendUnavailable,
+    /// The dispatch requested an effort the installed harness does not
+    /// accept for the model. Never dropped silently (SPEC §20).
+    EffortUnsupported,
     AdmissionUnavailable,
     AdmissionRefused,
     SnapshotFailed,
@@ -1150,6 +1246,7 @@ impl BlockCode {
             Self::VerificationSetupFailed => "verification_setup_failed",
             Self::WorktreeUnavailable => "worktree_unavailable",
             Self::BackendUnavailable => "backend_unavailable",
+            Self::EffortUnsupported => "effort_unsupported",
             Self::AdmissionUnavailable => "admission_unavailable",
             Self::AdmissionRefused => "admission_refused",
             Self::SnapshotFailed => "snapshot_failed",
@@ -1538,7 +1635,7 @@ keys = ["output.contract"]
         assert_eq!(policy.models[&Tier::Implementation].id, "sonnet");
         assert_eq!(
             policy.models[&Tier::Implementation].effort,
-            Some(Effort::Medium)
+            EffortId::parse("medium").ok()
         );
         assert_eq!(policy.risk[0].minimum_tier, Tier::Escalation);
         assert_eq!(policy.risk[0].review, Some(Review::Required));
@@ -2331,6 +2428,74 @@ timeout_seconds = 60
             "ae3a0efe11b4cecfcdc95e527e05bba923967d62556767a91750c17cb12e75cb",
             "a recipe setting only name/kind/scope_within/tier must hash exactly as it did \
              before RecipeSpec grew its new fields"
+        );
+    }
+
+    /// Effort became data (`EffortId`) and must serialize as the plain
+    /// string the closed enum did: a moved hash is a dead trust grant.
+    #[test]
+    fn the_authority_hash_survives_effort_becoming_data() {
+        let own = RepoPolicy::from_toml_str(include_str!("../../../../relais.toml"))
+            .expect("this repository's own relais.toml parses");
+        assert_eq!(
+            own.authority_hash(),
+            "afff01a0df657a98568c538fd07d0281e15b41d64073d277b4bf6e49f1f8880c",
+            "the hash of this repository's own policy must not move"
+        );
+        let tiered = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        assert_eq!(
+            tiered.authority_hash(),
+            "d909b85bb81bf97cd2a2415b758cc9cc9d5d74eac087ef3746755ac1d27c74c7",
+            "a policy with per-tier efforts must hash as it did with the enum"
+        );
+    }
+
+    #[test]
+    fn an_effort_identifier_is_validated_when_it_is_read() {
+        for good in ["low", "xhigh", "ultra", "x", "a_b-c9"] {
+            assert_eq!(EffortId::parse(good).expect(good).as_str(), good);
+        }
+        let too_long = "a".repeat(33);
+        for bad in ["", "High", "1up", "-x", "a b", "é", too_long.as_str()] {
+            assert_eq!(
+                EffortId::parse(bad),
+                Err(EffortIdError { value: bad.into() }),
+                "`{bad}` is not an identifier"
+            );
+        }
+        let err = RepoPolicy::from_toml_str(
+            &REPO_TOML.replace("effort = \"medium\"", "effort = \"Ultra!\""),
+        )
+        .expect_err("a malformed effort is refused");
+        assert!(
+            err.to_string().contains("Ultra!"),
+            "the error names the bad value: {err}"
+        );
+        assert_eq!(
+            serde_json::to_string(&EffortId::parse("xhigh").expect("valid")).expect("serializes"),
+            "\"xhigh\"",
+            "it serializes as the plain string"
+        );
+    }
+
+    #[test]
+    fn machine_efforts_are_optional_and_strictly_shaped() {
+        let bare = MachineSettings::from_toml_str(&machine_toml("")).expect("parses");
+        assert_eq!(bare.efforts, EffortSettings::default());
+        assert_eq!(bare.routing.max_effort.as_str(), "high");
+        let set = MachineSettings::from_toml_str(&machine_toml(
+            "[routing]\nmax_effort = \"max\"\n\n[efforts]\norder = [\"low\", \"high\"]\n\n\
+             [[efforts.models]]\nids = [\"haiku\"]\nsupported = []\n",
+        ))
+        .expect("parses");
+        assert_eq!(set.routing.max_effort.as_str(), "max");
+        assert_eq!(set.efforts.order.as_ref().map(Vec::len), Some(2));
+        let entry = set.efforts.entry_for("HAIKU").expect("an entry");
+        assert_eq!(entry.supported, Some(vec![]));
+        assert!(set.efforts.entry_for("sonnet").is_none());
+        assert!(
+            MachineSettings::from_toml_str(&machine_toml("[efforts]\nlevels = []\n")).is_err(),
+            "an unknown key is still refused"
         );
     }
 

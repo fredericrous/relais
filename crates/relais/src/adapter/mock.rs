@@ -8,9 +8,11 @@
 use std::sync::Arc;
 
 use crate::backend::{
-    claims_blockage, Backend, BackendError, Capabilities, LaunchResult, LaunchSpec,
+    check_effort, claims_blockage, Backend, BackendError, Capabilities, LaunchResult, LaunchSpec,
     PermissionEnforcement, SandboxCapability, UsageReport,
 };
+use crate::catalog::{EffortSet, Fact};
+use crate::policy::EffortId;
 use crate::procs::Ended;
 
 #[derive(Debug, Clone, Default)]
@@ -28,13 +30,35 @@ pub struct MockOutcome {
 
 pub struct MockBackend {
     pub behavior: Arc<dyn Fn(&LaunchSpec) -> MockOutcome + Send + Sync>,
+    /// The CLI-accepted efforts it advertises: one knob for each state
+    /// (`Known`, `Unsupported`, `Unknown`). Defaults to the five levels
+    /// Claude Code 2.1.284 lists, so a test that never sets it sees a
+    /// harness that accepts every effort a policy names.
+    pub accepted_efforts: EffortSet,
+}
+
+/// The efforts a default mock accepts.
+fn default_accepted_efforts() -> EffortSet {
+    Fact::Known(
+        ["low", "medium", "high", "xhigh", "max"]
+            .into_iter()
+            .filter_map(|name| EffortId::parse(name).ok())
+            .collect(),
+    )
 }
 
 impl MockBackend {
     pub fn new(behavior: impl Fn(&LaunchSpec) -> MockOutcome + Send + Sync + 'static) -> Self {
         Self {
             behavior: Arc::new(behavior),
+            accepted_efforts: default_accepted_efforts(),
         }
+    }
+
+    /// The same backend advertising `accepted` as its CLI-accepted efforts.
+    pub fn accepting(mut self, accepted: EffortSet) -> Self {
+        self.accepted_efforts = accepted;
+        self
     }
 }
 
@@ -48,7 +72,7 @@ impl Backend for MockBackend {
             backend: "mock".into(),
             version: Some("test".into()),
             supports_model: true,
-            supports_effort: true,
+            accepted_efforts: self.accepted_efforts.clone(),
             supports_max_turns: true,
             supports_output_format_json: false,
             supports_budget: false,
@@ -60,6 +84,11 @@ impl Backend for MockBackend {
     }
 
     fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError> {
+        // The same rule the Claude adapter applies: a requested effort is
+        // passed on or refused, never dropped.
+        if let Some(effort) = &spec.effort {
+            check_effort(&self.accepted_efforts, effort, &spec.model, Some("test"))?;
+        }
         let outcome = (self.behavior)(spec);
         // A cancellation outranks whatever the script said: the runner
         // reads a cancelled dispatch before it reads a missing result.

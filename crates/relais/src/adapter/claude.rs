@@ -267,7 +267,7 @@ pub fn capabilities_from_help(version: String, help: &str) -> Capabilities {
         backend: "claude-code".into(),
         version: Some(version),
         supports_model: supports("--model"),
-        supports_effort: supports("--effort"),
+        accepted_efforts: crate::catalog::parse_cli_efforts(help),
         supports_max_turns: supports("--max-turns"),
         supports_output_format_json: supports("--output-format"),
         supports_budget: supports("--max-budget-usd"),
@@ -296,18 +296,18 @@ pub fn build_argv(spec: &LaunchSpec, caps: &Capabilities) -> Result<Vec<String>,
     }
 
     let mut argv: Vec<String> = vec!["-p".into(), "--model".into(), spec.model.clone()];
-    if let Some(effort) = spec.effort {
-        if caps.supports_effort {
-            argv.push("--effort".into());
-            argv.push(
-                match effort {
-                    crate::policy::Effort::Low => "low",
-                    crate::policy::Effort::Medium => "medium",
-                    crate::policy::Effort::High => "high",
-                }
-                .into(),
-            );
-        }
+    // An effort is passed on or refused, never dropped: when the CLI fact
+    // is `Unknown` the configured effort goes through (the compatibility
+    // carve-out), and when the CLI is known to lack it the run is blocked.
+    if let Some(effort) = &spec.effort {
+        crate::backend::check_effort(
+            &caps.accepted_efforts,
+            effort,
+            &spec.model,
+            caps.version.as_deref(),
+        )?;
+        argv.push("--effort".into());
+        argv.push(effort.as_str().to_string());
     }
     // A turn ceiling only reaches the harness when the harness has a flag
     // for it; Claude Code 2.1.x has none. The capability is reported
@@ -578,7 +578,7 @@ mod tests {
             dispatch_id: "disp-1".into(),
             prompt: "do it".into(),
             model: "sonnet".into(),
-            effort: Some(crate::policy::Effort::Medium),
+            effort: crate::policy::EffortId::parse("medium").ok(),
             max_turns: Some(12),
             budget_micros: budget,
             disallowed_tools: vec!["Bash(git push:*)".into()],
@@ -705,7 +705,11 @@ mod tests {
     fn capabilities_come_from_the_installed_help_text() {
         let caps = capabilities_from_help("2.1.278".into(), HELP_2_1);
         assert!(caps.supports_model);
-        assert!(caps.supports_effort);
+        assert_eq!(
+            caps.accepted_efforts,
+            crate::catalog::Fact::Unknown,
+            "the flag is there and no list of levels is"
+        );
         assert!(caps.supports_budget, "--max-budget-usd is the budget flag");
         assert!(!caps.supports_max_turns, "2.1.278 has no turn ceiling");
         assert!(caps.supports_disallowed_tools);
@@ -797,8 +801,73 @@ mod tests {
         let err = build_argv(&no_deny, &caps).expect_err("allowlist unsupported");
         assert!(matches!(err, BackendError::Unsupported(_)));
         no_deny.allowed_tools.clear();
+        no_deny.effort = None;
         let argv = build_argv(&no_deny, &caps).expect("nothing left to refuse");
         assert!(!argv.iter().any(|arg| arg == "--max-budget-usd"));
+    }
+
+    fn effort_value(argv: &[String]) -> Option<&str> {
+        argv.iter()
+            .position(|arg| arg == "--effort")
+            .map(|at| argv[at + 1].as_str())
+    }
+
+    /// The real 2.1.284 help lists its levels, so a level outside that
+    /// list is refused with all three facts named, and one inside it is
+    /// passed through exactly as configured.
+    #[test]
+    fn a_requested_effort_is_passed_on_or_refused_never_dropped() {
+        let help = include_str!("../../tests/fixtures/help/claude-2.1.284.txt");
+        let caps = capabilities_from_help("2.1.284".into(), help);
+        let argv = build_argv(&spec(None), &caps).expect("medium is listed");
+        assert_eq!(effort_value(&argv), Some("medium"));
+
+        let mut ultra = spec(None);
+        ultra.effort = crate::policy::EffortId::parse("ultra").ok();
+        let err = build_argv(&ultra, &caps).expect_err("ultra is not listed");
+        let BackendError::EffortUnsupported {
+            effort,
+            model,
+            harness_version,
+        } = &err
+        else {
+            panic!("expected EffortUnsupported, got {err:?}");
+        };
+        assert_eq!(
+            (effort.as_str(), model.as_str(), harness_version.as_str()),
+            ("ultra", "sonnet", "2.1.284")
+        );
+        assert!(err.to_string().contains("ultra"), "{err}");
+
+        let none = capabilities_from_help(
+            "2.1.0".into(),
+            include_str!("../../tests/fixtures/help/claude-no-effort.txt"),
+        );
+        let mut plain = spec(None);
+        plain.disallowed_tools.clear();
+        plain.allowed_tools.clear();
+        assert!(
+            matches!(
+                build_argv(&plain, &none),
+                Err(BackendError::EffortUnsupported { .. })
+            ),
+            "a CLI with no --effort flag refuses instead of dropping it"
+        );
+        plain.effort = None;
+        assert!(build_argv(&plain, &none).is_ok(), "no request, no refusal");
+    }
+
+    /// The compatibility carve-out: the flag exists, its help lists no
+    /// levels, and the effort the repo policy configured goes through.
+    #[test]
+    fn an_unknown_cli_fact_passes_the_configured_effort_through() {
+        let caps = capabilities_from_help(
+            "2.1.0".into(),
+            include_str!("../../tests/fixtures/help/claude-effort-no-list.txt"),
+        );
+        assert_eq!(caps.accepted_efforts, crate::catalog::Fact::Unknown);
+        let argv = build_argv(&spec(None), &caps).expect("passed through");
+        assert_eq!(effort_value(&argv), Some("medium"));
     }
 
     /// V13: the launch runs with the worker's worktree as its working

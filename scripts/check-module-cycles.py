@@ -69,6 +69,7 @@ PURE_FILES = {
 
 PURE_MODULES = {
     "acceptance",
+    "catalog",
     "contract",
     "ids",
     "lifecycle",

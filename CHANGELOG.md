@@ -33,8 +33,36 @@ missing here.
   Only deserialization can produce the unrecorded state; a live check
   always records how it ended.
 
+### Changed
+
+- **Effort is data, not a closed `Low|Medium|High` enum (P1).** An effort is
+  an identifier (`^[a-z][a-z0-9_-]{0,31}$`, refused with the bad value named)
+  that serializes as the same plain string, so the authority hash of every
+  existing policy is unchanged — pinned by a golden test on this
+  repository's own `relais.toml`. Nothing orders identifiers; ordering comes
+  only from the catalog. `TuningBounds.allowed_efforts` is the incumbent's
+  set, unordered.
+- **The adapter no longer drops an effort silently.** A dispatch that
+  requests an effort the harness does not accept (no `--effort` flag, or a
+  `--help` list without it) fails with a typed `EffortUnsupported` naming
+  effort, model and harness version, and the run ends blocked (exit 3).
+  When the help lists no levels the configured effort is passed through, as
+  a compatibility carve-out. `Capabilities::supports_effort` became
+  `accepted_efforts`: a known set, unsupported, or unknown.
+- **`relais doctor` continuation lines are indented under their finding.**
+
 ### Added
 
+- **An effort catalog, and `relais doctor` reports it (P1).** Per
+  (harness version, model id), three independent facts each known,
+  unsupported or unknown: what the CLI accepts (read from `--help`), what
+  the model supports and the order (machine.toml `[efforts]` and
+  `[[efforts.models]]`, all optional). The admissible set is their
+  intersection in the configured order, cut at `[routing] max_effort`
+  (default `high`). A new level such as `ultra` needs no Rust change. The
+  `effort` finding prints each policy model's admissible set or which fact
+  is missing, with the machine.toml block to paste;
+  `relais doctor --effort-template` prints just that block.
 - **An acceptance criterion can name the test that settles it (#51).** A
   verification command may declare `junit`, the path of a JUnit XML report
   it writes (cargo-nextest, pytest `--junitxml`, vitest/jest junit

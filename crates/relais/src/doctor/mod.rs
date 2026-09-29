@@ -16,9 +16,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::backend::Capabilities;
+use crate::catalog::{self, Admissible, EffortCatalog, EffortSet, Fact};
 use crate::learn::drift::{alias_switches, AliasSwitch};
 use crate::orchestration::PriceTable;
-use crate::policy::{Dependency, DependencyMode, MachineSettings, RepoPolicy, TrialEnvelope};
+use crate::policy::{
+    Dependency, DependencyMode, EffortId, EffortSettings, MachineSettings, ModelProfile,
+    RepoPolicy, TrialEnvelope,
+};
 use crate::runner::live_trial;
 use crate::{ledger::Ledger, paths};
 
@@ -80,12 +84,21 @@ impl DoctorReport {
     pub fn render(&self) -> String {
         let mut out = String::from("relais doctor\n");
         for finding in &self.findings {
+            let mut lines = finding.detail.lines();
             out.push_str(&format!(
                 " {} {:<12} {}\n",
                 finding.level.mark(),
                 finding.component,
-                finding.detail
+                lines.next().unwrap_or_default()
             ));
+            // A detail of several lines lines up under its first, so the
+            // block reads as one finding and no line outgrows 80 columns.
+            for line in lines {
+                match line.is_empty() {
+                    true => out.push('\n'),
+                    false => out.push_str(&format!("{:16}{line}\n", "")),
+                }
+            }
         }
         if self.failed() {
             out.push_str("\nfix the ✗ findings before running tasks\n");
@@ -236,6 +249,299 @@ pub(crate) fn claude_code_finding(caps: &Capabilities) -> Finding {
             Level::Warn
         },
         detail,
+    }
+}
+
+/// Columns a finding's detail may use: `render` puts 16 of the 80 in
+/// front of it.
+const DETAIL_COLUMNS: usize = 62;
+
+/// Every model the repo policy names, once, in tier order.
+pub fn policy_models(policy: &RepoPolicy) -> Vec<String> {
+    let mut models: Vec<String> = Vec::new();
+    for profile in policy.models.values() {
+        if !models.contains(&profile.id) {
+            models.push(profile.id.clone());
+        }
+    }
+    models
+}
+
+/// Words wrapped to `width` columns; continuation lines start with
+/// `indent`. A word longer than the width stays whole.
+fn wrap(text: &str, width: usize, indent: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if !current.is_empty() && current.len() + 1 + word.len() > width {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(indent);
+        } else if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn fact_word(fact: &EffortSet) -> &'static str {
+    match fact {
+        Fact::Known(_) => "known",
+        Fact::Unsupported => "unsupported",
+        Fact::Unknown => "unknown",
+    }
+}
+
+fn quoted_list(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|item| format!("\"{item}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `key = ["a", "b"]`, on one line when it fits and as a multi-line
+/// array when it does not, each line prefixed with `prefix`.
+fn list_lines(prefix: &str, key: &str, items: &[String]) -> Vec<String> {
+    let one = format!("{prefix}{key} = [{}]", quoted_list(items));
+    if one.len() <= DETAIL_COLUMNS {
+        return vec![one];
+    }
+    let mut lines = vec![format!("{prefix}{key} = [")];
+    let mut row = String::new();
+    for item in items {
+        let piece = format!("\"{item}\",");
+        if !row.is_empty() && prefix.len() + 4 + row.len() + 1 + piece.len() > DETAIL_COLUMNS {
+            lines.push(format!("{prefix}    {row}"));
+            row.clear();
+        }
+        if !row.is_empty() {
+            row.push(' ');
+        }
+        row.push_str(&piece);
+    }
+    if !row.is_empty() {
+        lines.push(format!("{prefix}    {row}"));
+    }
+    lines.push(format!("{prefix}]"));
+    lines
+}
+
+/// What probing the harness for its CLI-accepted efforts yielded: the
+/// fact, and — when the harness could not be found or probed — why. A
+/// failed probe's fact is `Unknown`, and says so instead of blaming a
+/// `--help` that was never read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliEffortProbe {
+    pub fact: EffortSet,
+    pub failure: Option<String>,
+}
+
+impl CliEffortProbe {
+    pub fn read(fact: EffortSet) -> Self {
+        Self {
+            fact,
+            failure: None,
+        }
+    }
+
+    pub fn failed(reason: String) -> Self {
+        Self {
+            fact: EffortSet::Unknown,
+            failure: Some(reason),
+        }
+    }
+}
+
+/// Find and probe the installed Claude Code, once, for both `doctor` and
+/// `--effort-template`: a harness that could not be found and one that
+/// did not answer are both named by the reason.
+fn probe_harness() -> Result<crate::backend::Capabilities, String> {
+    let backend = crate::adapter::claude::ClaudeBackend::discover().map_err(|e| e.to_string())?;
+    backend
+        .probe_report()
+        .map_err(|failure| failure.to_string())
+}
+
+/// Find and probe the installed Claude Code for its `--effort` list.
+fn probe_cli_efforts() -> CliEffortProbe {
+    match probe_harness() {
+        Err(reason) => CliEffortProbe::failed(reason),
+        Ok(caps) => CliEffortProbe::read(caps.accepted_efforts),
+    }
+}
+
+/// The CLI-accepted list as a doctor line, from `--help`; a harness that
+/// could not be probed is named as that.
+fn cli_line(probe: &CliEffortProbe) -> String {
+    if let Some(failure) = &probe.failure {
+        return format!("cli accepts: unknown (harness not probed: {failure})");
+    }
+    match &probe.fact {
+        Fact::Known(list) => format!(
+            "cli accepts: {}",
+            list.iter()
+                .map(EffortId::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Fact::Unsupported => "cli accepts: nothing (no --effort flag in --help)".into(),
+        Fact::Unknown => "cli accepts: unknown (--effort has no list in --help)".into(),
+    }
+}
+
+/// What the catalog says about one model, in a line.
+fn model_effort_line(catalog: &EffortCatalog) -> String {
+    let model = &catalog.model;
+    match catalog.admissible() {
+        Admissible::Set(set) if !set.is_empty() => format!(
+            "{model}: {} (up to max_effort {})",
+            set.iter()
+                .map(EffortId::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+            catalog.max_effort
+        ),
+        Admissible::Set(_) => {
+            let unsupported = catalog.unsupported();
+            if unsupported.is_empty() {
+                format!(
+                    "{model}: none admissible; max_effort {} authorizes none of what the cli \
+                     and the model share",
+                    catalog.max_effort
+                )
+            } else {
+                let names: Vec<&str> = unsupported.iter().map(|name| name.as_str()).collect();
+                format!(
+                    "{model}: none admissible; unsupported: {}",
+                    names.join(", ")
+                )
+            }
+        }
+        Admissible::Undetermined(_) => format!(
+            "{model}: undetermined; cli-accepted {}, model support {}, order {}",
+            fact_word(&catalog.cli),
+            fact_word(&catalog.supported),
+            fact_word(&catalog.order)
+        ),
+    }
+}
+
+/// The lines to paste into machine.toml: the headings live, every fact
+/// commented out for the person to confirm. Nothing is asserted — the
+/// candidate lists come from what `--help` printed, and the model-support
+/// and order lines stay comments until someone has checked them.
+fn template_body(models: &[String], cli: &EffortSet) -> Vec<String> {
+    let candidates: Vec<String> = match cli {
+        Fact::Known(list) => list.iter().map(|id| id.as_str().to_string()).collect(),
+        Fact::Unsupported | Fact::Unknown => {
+            vec!["<lowest>".into(), "...".into(), "<highest>".into()]
+        }
+    };
+    let mut lines = vec![
+        "# Confirm each commented line, then uncomment it.".to_string(),
+        "[efforts]".to_string(),
+        "# order, lowest first (the cli's listing is not an order):".to_string(),
+    ];
+    lines.extend(list_lines("# ", "order", &candidates));
+    for model in models {
+        lines.push(String::new());
+        lines.push("[[efforts.models]]".into());
+        lines.push(format!("ids = [\"{model}\"]"));
+        lines.push("# efforts it supports; [] means no effort control:".into());
+        lines.extend(list_lines("# ", "supported", &candidates));
+    }
+    lines
+}
+
+/// `relais doctor --effort-template`: the block to paste, with the
+/// CLI-accepted list pre-filled from `--help`.
+pub fn effort_template(models: &[String], probe: &CliEffortProbe) -> String {
+    let mut lines: Vec<String> = wrap(&cli_line(probe), DETAIL_COLUMNS, "  ")
+        .into_iter()
+        .map(|line| format!("# {line}"))
+        .collect();
+    lines.extend(template_body(models, &probe.fact));
+    let mut text = lines.join("\n");
+    text.push('\n');
+    text
+}
+
+/// The `effort` finding: for each model in the repo policy's tiers the
+/// admissible set in order, or which fact is unknown or unsupported —
+/// and, when any is unknown, the machine.toml block to fill in. A
+/// configured effort on a CLI with no `--effort` flag is a warning of its
+/// own: every run at it is refused by the adapter.
+pub fn effort_finding(
+    profiles: &[ModelProfile],
+    probe: &CliEffortProbe,
+    settings: &EffortSettings,
+    max_effort: &EffortId,
+) -> Finding {
+    let mut models: Vec<String> = Vec::new();
+    for profile in profiles {
+        if !models.contains(&profile.id) {
+            models.push(profile.id.clone());
+        }
+    }
+    let catalogs: Vec<EffortCatalog> = models
+        .iter()
+        .map(|model| catalog::resolve(&probe.fact, settings, max_effort, model))
+        .collect();
+    let mut lines = wrap(&cli_line(probe), DETAIL_COLUMNS, "  ");
+    for catalog in &catalogs {
+        lines.extend(wrap(&model_effort_line(catalog), DETAIL_COLUMNS, "  "));
+    }
+    // A configured effort the adapter will refuse is a warning, whether
+    // the cli has no --effort flag at all or lists levels without it.
+    let mut blocked = false;
+    for profile in profiles {
+        let Some(effort) = &profile.effort else {
+            continue;
+        };
+        let refusal = match &probe.fact {
+            Fact::Unsupported => Some("the cli has no --effort flag".to_string()),
+            Fact::Known(accepted) if !accepted.contains(effort) => Some(format!(
+                "the cli does not accept it (accepts: {})",
+                accepted
+                    .iter()
+                    .map(EffortId::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            Fact::Known(_) | Fact::Unknown => None,
+        };
+        if let Some(reason) = refusal {
+            blocked = true;
+            lines.extend(wrap(
+                &format!(
+                    "{}: effort {effort} is configured but {reason}; every run at it \
+                     will be blocked (exit 3)",
+                    profile.id
+                ),
+                DETAIL_COLUMNS,
+                "  ",
+            ));
+        }
+    }
+    let undetermined = catalogs
+        .iter()
+        .any(|catalog| matches!(catalog.admissible(), Admissible::Undetermined(_)));
+    if undetermined {
+        lines.push("add to machine.toml, confirming each line:".into());
+        lines.extend(template_body(&models, &probe.fact));
+    }
+    Finding {
+        component: "effort",
+        level: if undetermined || blocked {
+            Level::Warn
+        } else {
+            Level::Ok
+        },
+        detail: lines.join("\n"),
     }
 }
 
@@ -540,26 +846,23 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
     check_command("git", &["--version"], &mut findings, "git");
 
     let mut installed_claude_version: Option<String> = None;
-    match crate::adapter::claude::ClaudeBackend::discover() {
-        Err(e) => findings.push(Finding {
-            component: "claude-code",
-            level: Level::Fail,
-            detail: e.to_string(),
-        }),
-        Ok(backend) => match backend.probe_report() {
-            // A probe that errored says so: "did not answer" and
-            // "answered and refused" are different things to fix.
-            Err(failure) => findings.push(Finding {
+    // A probe that errored says so: "not found", "did not answer" and
+    // "answered and refused" are different things to fix.
+    let cli_probe = match probe_harness() {
+        Err(reason) => {
+            findings.push(Finding {
                 component: "claude-code",
                 level: Level::Fail,
-                detail: failure.to_string(),
-            }),
-            Ok(caps) => {
-                installed_claude_version = caps.version.clone();
-                findings.push(claude_code_finding(&caps));
-            }
-        },
-    }
+                detail: reason.clone(),
+            });
+            CliEffortProbe::failed(reason)
+        }
+        Ok(caps) => {
+            installed_claude_version = caps.version.clone();
+            findings.push(claude_code_finding(&caps));
+            CliEffortProbe::read(caps.accepted_efforts)
+        }
+    };
     findings.push(hook_compat_finding(installed_claude_version.as_deref()));
 
     let policy_path = repo_dir.join("relais.toml");
@@ -666,6 +969,10 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
     // That is already the `home` finding above; here each dependent check
     // says it could not run rather than inventing a path.
     let mut pricing = PricingConfig::Unread;
+    // What the catalog resolves from; a machine.toml that is absent or
+    // invalid states no effort fact, which is how the finding reads it.
+    let mut effort_settings = EffortSettings::default();
+    let mut max_effort = crate::policy::RoutingSettings::default().max_effort;
     match paths::machine_settings_path() {
         Err(e) => findings.push(Finding {
             component: "machine.toml",
@@ -691,6 +998,8 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
                         level: Level::Ok,
                         detail: format!("valid; {} trust grant(s)", settings.trust.len()),
                     });
+                    effort_settings = settings.efforts.clone();
+                    max_effort = settings.routing.max_effort.clone();
                     pricing = match &settings.pricing {
                         Some(table) => PricingConfig::Table(table.clone()),
                         None => PricingConfig::Unconfigured,
@@ -711,6 +1020,14 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
         },
     }
 
+    if let Some(policy) = &policy {
+        findings.push(effort_finding(
+            &policy.models.values().cloned().collect::<Vec<_>>(),
+            &cli_probe,
+            &effort_settings,
+            &max_effort,
+        ));
+    }
     findings.push(ledger_finding());
     findings.extend(model_findings(&pricing));
     findings.push(registry_finding());
@@ -720,6 +1037,14 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
     findings.push(hook_live_finding(merged_roots(repo_dir, home.as_deref())));
 
     DoctorReport { findings }
+}
+
+/// `relais doctor --effort-template`: the machine.toml block for this
+/// repository's models, with the CLI-accepted list read from the installed
+/// Claude Code's `--help`. A harness that cannot be probed leaves that
+/// list unknown rather than guessed, and says why it could not be probed.
+pub fn effort_template_for(policy: &RepoPolicy) -> String {
+    effort_template(&policy_models(policy), &probe_cli_efforts())
 }
 
 /// The hook compatibility record `relais doctor --probe-hooks` writes,
@@ -2440,5 +2765,317 @@ mod tests {
         let findings = pricing_findings(&models, &priced(&["claude-sonnet-5"]));
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].level, Level::Ok);
+    }
+
+    fn effort(name: &str) -> EffortId {
+        EffortId::parse(name).expect("a valid effort identifier")
+    }
+
+    fn cli_2_1_284() -> CliEffortProbe {
+        probe(catalog::parse_cli_efforts(include_str!(
+            "../../tests/fixtures/help/claude-2.1.284.txt"
+        )))
+    }
+
+    fn probe(fact: EffortSet) -> CliEffortProbe {
+        CliEffortProbe::read(fact)
+    }
+
+    fn profile(id: &str, effort_id: Option<&str>) -> ModelProfile {
+        ModelProfile {
+            id: id.to_string(),
+            effort: effort_id.map(effort),
+        }
+    }
+
+    fn rendered(finding: Finding) -> String {
+        DoctorReport {
+            findings: vec![finding],
+        }
+        .render()
+    }
+
+    fn no_line_is_wider_than_80(text: &str) {
+        for line in text.lines() {
+            assert!(line.chars().count() <= 80, "{} cols: {line}", line.len());
+        }
+    }
+
+    /// With nothing in machine.toml the finding shows the CLI list from
+    /// `--help` and names the two facts nobody stated, and offers the
+    /// block to paste — all inside 80 columns.
+    #[test]
+    fn the_effort_finding_reports_unknown_facts_and_offers_the_block() {
+        let models = vec![
+            profile("claude-sonnet-5-5", None),
+            profile("claude-haiku-4-5", None),
+        ];
+        let finding = effort_finding(
+            &models,
+            &cli_2_1_284(),
+            &EffortSettings::default(),
+            &effort("high"),
+        );
+        assert_eq!(finding.component, "effort");
+        assert_eq!(finding.level, Level::Warn);
+        let text = rendered(finding);
+        assert!(
+            text.contains("cli accepts: low, medium, high, xhigh, max"),
+            "{text}"
+        );
+        assert!(
+            text.contains("claude-sonnet-5-5: undetermined; cli-accepted known, model")
+                && text.contains("support unknown, order unknown"),
+            "{text}"
+        );
+        assert!(text.contains("[[efforts.models]]"), "{text}");
+        assert!(text.contains("ids = [\"claude-haiku-4-5\"]"), "{text}");
+        assert!(
+            !text.lines().any(|line| {
+                let line = line.trim_start();
+                line.starts_with("order =") || line.starts_with("supported =")
+            }),
+            "a fact is offered as a comment, never asserted: {text}"
+        );
+        no_line_is_wider_than_80(&text);
+    }
+
+    #[test]
+    fn a_configured_model_prints_its_admissible_set_in_order() {
+        let settings = EffortSettings {
+            order: Some(vec![effort("low"), effort("medium"), effort("high")]),
+            models: vec![crate::policy::EffortModelEntry {
+                ids: vec!["sonnet".into()],
+                supported: Some(vec![effort("high"), effort("low")]),
+                order: None,
+            }],
+        };
+        let finding = effort_finding(
+            &[profile("sonnet", Some("high"))],
+            &cli_2_1_284(),
+            &settings,
+            &effort("high"),
+        );
+        assert_eq!(finding.level, Level::Ok);
+        assert!(
+            finding
+                .detail
+                .contains("sonnet: low, high (up to max_effort high)"),
+            "{}",
+            finding.detail
+        );
+        assert!(!finding.detail.contains("machine.toml"), "nothing to add");
+    }
+
+    #[test]
+    fn a_model_without_effort_control_and_a_cli_without_the_flag_are_named() {
+        let settings = EffortSettings {
+            order: Some(vec![effort("low"), effort("high")]),
+            models: vec![crate::policy::EffortModelEntry {
+                ids: vec!["haiku".into()],
+                supported: Some(vec![]),
+                order: None,
+            }],
+        };
+        let finding = effort_finding(
+            &[profile("haiku", None)],
+            &cli_2_1_284(),
+            &settings,
+            &effort("high"),
+        );
+        assert!(
+            finding
+                .detail
+                .contains("haiku: none admissible; unsupported: model support"),
+            "{}",
+            finding.detail
+        );
+        let no_flag = effort_finding(
+            &[profile("haiku", None)],
+            &probe(EffortSet::Unsupported),
+            &settings,
+            &effort("high"),
+        );
+        assert!(
+            no_flag
+                .detail
+                .contains("cli accepts: nothing (no --effort flag"),
+            "{}",
+            no_flag.detail
+        );
+        assert_eq!(no_flag.level, Level::Ok, "no effort is configured");
+    }
+
+    /// A configured effort on a CLI with no `--effort` flag is refused by
+    /// the adapter on every run, so doctor warns rather than says ok.
+    #[test]
+    fn a_configured_effort_on_a_cli_without_the_flag_is_a_warning() {
+        let settings = EffortSettings {
+            order: Some(vec![effort("low"), effort("high")]),
+            models: vec![crate::policy::EffortModelEntry {
+                ids: vec!["sonnet".into()],
+                supported: Some(vec![effort("low"), effort("high")]),
+                order: None,
+            }],
+        };
+        let finding = effort_finding(
+            &[profile("sonnet", Some("high"))],
+            &probe(EffortSet::Unsupported),
+            &settings,
+            &effort("high"),
+        );
+        assert_eq!(finding.level, Level::Warn, "{}", finding.detail);
+        let text = finding.detail.replace('\n', " ");
+        assert!(
+            text.contains("sonnet: effort high is configured but the cli has no --effort"),
+            "{text}"
+        );
+        assert!(text.contains("will be blocked"), "{text}");
+    }
+
+    /// A configured effort the cli lists levels WITHOUT is refused by the
+    /// adapter just the same, so it warns too, naming what is accepted.
+    /// An accepted effort is ok. Falsified: with the `Known` refusal arm
+    /// answering `None`, this test failed on the level; restored.
+    #[test]
+    fn a_configured_effort_the_cli_does_not_list_is_a_warning() {
+        let settings = EffortSettings {
+            order: Some(vec![effort("low"), effort("high")]),
+            models: vec![crate::policy::EffortModelEntry {
+                ids: vec!["sonnet".into()],
+                supported: Some(vec![effort("low"), effort("high")]),
+                order: None,
+            }],
+        };
+        let finding = effort_finding(
+            &[profile("sonnet", Some("high"))],
+            &probe(EffortSet::Known(vec![effort("low"), effort("medium")])),
+            &settings,
+            &effort("high"),
+        );
+        assert_eq!(finding.level, Level::Warn, "{}", finding.detail);
+        // Wrapping indents continuation lines, so compare with whitespace
+        // collapsed rather than byte for byte.
+        let text = finding
+            .detail
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("sonnet: effort high is configured but the cli does not accept it (accepts: low, medium)"),
+            "{text}"
+        );
+        let accepted = effort_finding(
+            &[profile("sonnet", Some("high"))],
+            &probe(EffortSet::Known(vec![effort("low"), effort("high")])),
+            &settings,
+            &effort("high"),
+        );
+        assert_eq!(accepted.level, Level::Ok, "{}", accepted.detail);
+    }
+
+    /// A harness that could not be found or probed says so, on its own
+    /// line, and never blames a `--help` that was not read.
+    #[test]
+    fn a_harness_that_could_not_be_probed_is_named_not_blamed_on_help() {
+        let failed = CliEffortProbe::failed("no claude".into());
+        assert_eq!(failed.fact, EffortSet::Unknown);
+        let finding = effort_finding(
+            &[profile("sonnet", None)],
+            &failed,
+            &EffortSettings::default(),
+            &effort("high"),
+        );
+        let text = finding.detail.clone();
+        assert!(
+            text.lines()
+                .any(|line| line.contains("harness not probed: no claude")),
+            "{text}"
+        );
+        assert!(!text.contains("no list in --help"), "{text}");
+        let template = effort_template(&["sonnet".to_string()], &failed);
+        assert!(
+            template.contains("harness not probed: no claude"),
+            "{template}"
+        );
+        assert!(!template.contains("no list in --help"), "{template}");
+        let unlisted = effort_finding(
+            &[profile("sonnet", None)],
+            &probe(EffortSet::Unknown),
+            &EffortSettings::default(),
+            &effort("high"),
+        );
+        assert!(
+            unlisted.detail.contains("--effort has no list in --help"),
+            "{}",
+            unlisted.detail
+        );
+    }
+
+    /// An identifier no code names is printed in its place in the order.
+    #[test]
+    fn an_unfamiliar_effort_is_printed_in_its_ordered_position() {
+        let order = vec![
+            effort("low"),
+            effort("high"),
+            effort("ultra"),
+            effort("max"),
+        ];
+        let settings = EffortSettings {
+            order: Some(order.clone()),
+            models: vec![crate::policy::EffortModelEntry {
+                ids: vec!["sonnet".into()],
+                supported: Some(vec![effort("max"), effort("ultra"), effort("low")]),
+                order: None,
+            }],
+        };
+        let finding = effort_finding(
+            &[profile("sonnet", Some("ultra"))],
+            &probe(Fact::Known(order)),
+            &settings,
+            &effort("max"),
+        );
+        assert_eq!(finding.level, Level::Ok, "{}", finding.detail);
+        assert!(
+            finding
+                .detail
+                .contains("sonnet: low, ultra, max (up to max_effort max)"),
+            "{}",
+            finding.detail
+        );
+    }
+
+    #[test]
+    fn the_template_prefills_the_cli_list_and_asserts_nothing_else() {
+        let text = effort_template(&["claude-sonnet-5-5".to_string()], &cli_2_1_284());
+        assert!(
+            text.contains("# cli accepts: low, medium, high, xhigh, max"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# order = [\"low\", \"medium\", \"high\", \"xhigh\", \"max\"]"),
+            "{text}"
+        );
+        assert!(text.contains("# supported = ["), "{text}");
+        assert!(text.contains("[efforts]"), "{text}");
+        no_line_is_wider_than_80(&text);
+        let unknown = effort_template(&["m".to_string()], &probe(EffortSet::Unknown));
+        assert!(unknown.contains("cli accepts: unknown"), "{unknown}");
+        assert!(
+            unknown.contains("<lowest>"),
+            "no list is guessed: {unknown}"
+        );
+        assert!(!unknown.contains("\"low\""), "{unknown}");
+    }
+
+    #[test]
+    fn a_long_list_wraps_inside_the_column_budget() {
+        let many: Vec<EffortId> = (0..14).map(|n| effort(&format!("level-{n}"))).collect();
+        let text = effort_template(
+            &["a-rather-long-model-identifier".to_string()],
+            &probe(Fact::Known(many)),
+        );
+        no_line_is_wider_than_80(&text);
+        assert!(text.contains("level-13"), "{text}");
     }
 }

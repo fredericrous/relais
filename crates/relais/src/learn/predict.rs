@@ -232,15 +232,10 @@ pub fn profile_identity(
 ) -> RecipeIdentity {
     RecipeIdentity {
         model: profile.id.clone(),
-        effort: profile.effort.map(|effort| {
-            // An owned fieldless enum always serializes to a string; the
-            // Debug spelling below is the same token in the same case,
-            // so neither branch can produce a different identity.
-            serde_json::to_value(effort)
-                .ok()
-                .and_then(|value| value.as_str().map(str::to_string))
-                .unwrap_or_else(|| format!("{effort:?}").to_lowercase())
-        }),
+        effort: profile
+            .effort
+            .as_ref()
+            .map(|effort| effort.as_str().to_string()),
         harness: harness.map(str::to_string),
         recipe_id: None,
     }

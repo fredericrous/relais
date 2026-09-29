@@ -9,6 +9,7 @@ pub mod acceptance;
 pub mod adapter;
 pub mod admission;
 pub mod backend;
+pub mod catalog;
 pub mod context;
 pub mod contract;
 pub mod coordinator;
