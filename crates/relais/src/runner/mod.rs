@@ -1587,8 +1587,9 @@ impl<'a> RunEngine<'a> {
                         .filter(|check| {
                             verify::unrunnable(check)
                                 || matches!(
-                                    check.ended,
-                                    Ended::TimedOut | Ended::Cancelled | Ended::Signalled
+                                    check.ended.recorded(),
+                                    Some(Ended::TimedOut | Ended::Cancelled | Ended::Signalled)
+                                        | None
                                 )
                         })
                         .collect();
@@ -3813,8 +3814,8 @@ fn unrunnable_baseline_detail(
     let mut timed_out = false;
     let mut cut_off = false;
     for check in checks {
-        match check.ended {
-            Ended::Exited(_) => {
+        match check.ended.recorded() {
+            Some(Ended::Exited(_)) => {
                 not_found_labels.push(&check.label);
                 lines.push(format!(
                     "{} exited {} (command not found)",
@@ -3826,14 +3827,14 @@ fn unrunnable_baseline_detail(
             // check the OOM killer took, or one that crashed, did not
             // run out of time, and quoting a limit it never reached
             // sends a reader to raise a number that was not the cause.
-            Ended::TimedOut => {
+            Some(Ended::TimedOut) => {
                 timed_out = true;
                 let limit = command_timeout_seconds(profile, &check.label)
                     .map(|seconds| format!("{seconds}s wall limit"))
                     .unwrap_or_else(|| "no known wall limit".to_string());
                 lines.push(format!("{} timed out ({limit})", check.label));
             }
-            Ended::Signalled | Ended::Cancelled => {
+            Some(Ended::Signalled | Ended::Cancelled) | None => {
                 cut_off = true;
                 lines.push(format!("{} {}", check.label, check.ended.describe()));
             }

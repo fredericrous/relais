@@ -167,12 +167,18 @@ fn state_labelling(state: State) -> Labelling {
 /// example cannot say a change stood while its own label says it did
 /// not — two exhaustive matches over one enum stay correct only until
 /// someone adds a variant and answers them differently.
-pub(crate) fn outcome_stands(kind: OutcomeKind) -> bool {
+///
+/// `None` is an outcome that says nothing about the change's quality:
+/// `never_shipped` is a person's statement that it was abandoned for
+/// reasons unrelated to it, so it is neither a positive nor a negative
+/// label and the example is left out of training.
+pub(crate) fn outcome_stands(kind: OutcomeKind) -> Option<bool> {
     match kind {
-        OutcomeKind::AcceptedUnchanged => true,
-        OutcomeKind::Corrected => true,
-        OutcomeKind::Reverted => false,
-        OutcomeKind::ConfirmedRegression => false,
+        OutcomeKind::AcceptedUnchanged => Some(true),
+        OutcomeKind::Corrected => Some(true),
+        OutcomeKind::Reverted => Some(false),
+        OutcomeKind::ConfirmedRegression => Some(false),
+        OutcomeKind::NeverShipped => None,
     }
 }
 
@@ -200,13 +206,13 @@ pub fn labelling_of(state: State, outcome: Option<OutcomeKind>) -> Labelling {
         // exhaustive match over `OutcomeKind` there is, so a new variant
         // still fails to compile — in `outcome_stands`, once, instead of
         // here and there.
-        Some(kind) => {
-            if outcome_stands(kind) {
-                Labelling::Accepted
-            } else {
-                Labelling::Failed
-            }
-        }
+        Some(kind) => match outcome_stands(kind) {
+            Some(true) => Labelling::Accepted,
+            Some(false) => Labelling::Failed,
+            None => Labelling::Excluded(
+                "never shipped, abandoned for reasons unrelated to quality: no quality label",
+            ),
+        },
     }
 }
 
@@ -375,7 +381,7 @@ pub fn build(
             };
         let accepted_without_escalation =
             accepted && !escalated && route == AcceptanceRoute::Verified;
-        let outcome_stood = outcome_kind.map(outcome_stands);
+        let outcome_stood = outcome_kind.and_then(outcome_stands);
         let correction_magnitude = latest_outcome
             .as_ref()
             .and_then(|stored| stored.outcome.detail.correction_magnitude)
@@ -1163,10 +1169,21 @@ argv = ["true"]
         for kind in OutcomeKind::ALL {
             assert_eq!(
                 labelling_of(State::Accepted, Some(kind)) == Labelling::Accepted,
-                outcome_stands(kind),
+                outcome_stands(kind) == Some(true),
                 "the label and `outcome_stands` disagree about {kind:?}"
             );
         }
+    }
+
+    /// A never-shipped task is no positive example and no negative
+    /// quality label: it is excluded from training, with a reason.
+    #[test]
+    fn a_never_shipped_outcome_is_excluded_from_training() {
+        assert!(matches!(
+            labelling_of(State::Accepted, Some(OutcomeKind::NeverShipped)),
+            Labelling::Excluded(_)
+        ));
+        assert_eq!(outcome_stands(OutcomeKind::NeverShipped), None);
     }
 
     /// L4: a failing ledger read is an error, never an empty dataset. The

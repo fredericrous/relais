@@ -30,6 +30,10 @@ use crate::procs::Ended;
 use crate::tooling::{ProgramVersion, VersionUnknown};
 use crate::workspace::{Git, WorkspaceError};
 
+mod end;
+
+pub use end::CheckEnd;
+
 /// Why verification could not be carried out as the policy declares it.
 /// Distinct from a check that RAN and failed: this is the plan itself
 /// being unusable, which blocks rather than fails (SPEC §10).
@@ -88,8 +92,10 @@ pub struct CheckOutcome {
     pub argv: Vec<String>,
     /// How the check's process ended. A status of zero is the only pass;
     /// a timeout, a cancellation and a signal are each a distinct
-    /// failure, which `exit: None, timed_out: false` could not say.
-    pub ended: Ended,
+    /// failure, which `exit: None, timed_out: false` could not say. A
+    /// receipt written before this field existed reads as unrecorded,
+    /// which never passes (#108).
+    pub ended: CheckEnd,
     pub log_path: String,
     pub log_sha256: String,
 }
@@ -488,7 +494,7 @@ pub fn run_command(
     Ok(CheckOutcome {
         label: label.to_string(),
         argv: spec.argv.clone(),
-        ended,
+        ended: CheckEnd::new(ended),
         log_path: log_path.to_string_lossy().into_owned(),
         log_sha256: sha256_hex(&log_bytes),
     })
@@ -1685,30 +1691,23 @@ mod tests {
     /// `run-65c37c19bbf9a-6c72`, verbatim.
     const PRE_FIELD_RECEIPT_5: &str = r#"{"run_id":"run-65c37c19bbf9a-6c72","candidate_sha":"de92ac635059652489d624b90f4dc8d84a26605e","base_sha":"d931ba8f4349d51d96fc9b3984a380a9212e109b","contract_hash":"33758fefa04dd12414def1df5217602247293dc68b831f3e72d1b180211760d9","policy_hash":"5e5e9d7d08e3d279c63891709b2b657211950e5ee4c0647da6ae8c8bc12be398","outcome":"accepted","verification":{"candidate_sha":"de92ac635059652489d624b90f4dc8d84a26605e","base_sha":"d931ba8f4349d51d96fc9b3984a380a9212e109b","contract_hash":"33758fefa04dd12414def1df5217602247293dc68b831f3e72d1b180211760d9","policy_hash":"5e5e9d7d08e3d279c63891709b2b657211950e5ee4c0647da6ae8c8bc12be398","checks":[{"label":"make@c1c4713f","argv":["make","check"],"ended":{"exited":0},"log_path":"/Users/fredericrous/.local/state/relais/runs/run-65c37c19bbf9a-6c72/logs/attempt1-cmd0.log","log_sha256":"b74a0eb6cf67db1a7499901e1aa8a0afd7aa7163dec30e96b21443bf0a1ba9fb"}],"gaps":[],"baseline_failures":[],"amont_bypasses":[],"amont_downgrades":[],"verification_inputs_changed":["crates/relais/tests/release_scenarios.rs"],"integration_gaps":[],"baseline_cached":false,"baseline_cache_refused":null},"models_used":["claude-sonnet-5"],"attempts":1,"cost_completeness":"actual","cost":9924800,"criteria":[{"id":"c-e2744e354c19","statement":"`make check` passes (fmt, clippy -D warnings, tests, msrv, audit, scripts/check-module-cycles.py).","mandatory":true,"met":true},{"id":"amont-gate-is-evidence","statement":"A declared acceptance criterion can name an amont gate as its evidence, alongside the named check, test, review and sign-off it can name today, and `independent()` counts it as independent ground truth because the gate ran outside this run and its attestation is signed.","mandatory":true,"met":true,"evidence":{"kind":"test","authorship":"model_added"}},{"id":"asks-amont-not-its-notes","statement":"Whether a gate is covered is asked of amont through its documented interface \u2014 `amont attest covered`, run against the candidate's own tree \u2014 and never by reading `refs/notes/amont-attest`, parsing an attestation format, or invoking a signature verifier here. The gate and its attestation stay amont's to own (SPEC \u00a710, \u00a718), and a test asserts relais runs that command rather than reaching for git notes or ssh-keygen.","mandatory":true,"met":true,"evidence":{"kind":"test","authorship":"model_added"}},{"id":"uncovered-gate-is-a-gap","statement":"A mandatory criterion naming a gate that amont does not report as covered becomes a gap in the existing verification report, refused by the mechanism that already refuses gaps \u2014 never a second acceptance path. This is the safe direction even though `amont attest covered` is fail-open by design (it prints nothing and exits 0 on any failure), because a gate whose name does not appear is treated as uncovered whatever the reason.","mandatory":true,"met":true,"evidence":{"kind":"test","authorship":"model_added"}},{"id":"gap-says-what-it-cannot-know","statement":"Because that interface cannot distinguish an absent attestation from one whose signature failed to verify, the gap's message says so rather than asserting a cause it does not know, and names `amont attest covered` as the command a person can run to see the same answer.","mandatory":true,"met":true,"evidence":{"kind":"test","authorship":"model_added"}},{"id":"coverage-is-recorded-as-evidence","statement":"A gate amont reports as covered records an external attestation evidence row against the run and the criterion it answers, naming amont as the tool and the candidate sha as the subject, so the receipt and `relais explain` show what settled the criterion and where it came from.","mandatory":true,"met":true,"evidence":{"kind":"test","authorship":"model_added"}},{"id":"unavailable-amont-is-a-gap","statement":"An amont that is absent, too old to have the subcommand, or fails for any other reason is a gap naming the cause, never a silent pass and never a crash \u2014 relais reports what it could not establish.","mandatory":true,"met":true,"evidence":{"kind":"test","authorship":"model_added"}},{"id":"coherent","statement":"The change reads as one idea, and nothing in it lets relais conclude a gate passed on evidence amont did not give it.","mandatory":false,"met":true,"evidence":{"kind":"llm_review"}},{"id":"c-cca6cd9cef5b","statement":"No new `_ =>` arm over an enum this crate owns, no new bool parameter, no new `#[allow]`, and every new silencing of a fallible operation carries a one-line reason at the site.","mandatory":true,"met":true},{"id":"c-f86c85776acf","statement":"The CHANGELOG gains an entry under the unreleased heading, and docs/SPEC.md says the same where it already describes acceptance evidence and amont ownership.","mandatory":true,"met":true}],"mandatory_evidence_independence":"partly_independent"}"#;
 
-    /// The receipts actually on this machine's disk when `recipe` and
-    /// `verification_profile_hash` were added, verbatim. The test above
-    /// proves a hand-written 11-key document parses; these prove the
-    /// documents that EXIST do — and they turned up a pre-existing bug
-    /// this change did not cause and does not fix.
+    /// The receipts actually on this machine's disk, verbatim, all parse.
     ///
-    /// Three of the five parse, and read the new fields as unrecorded,
-    /// which is what `serde(default)` is here for. TWO DO NOT, and not
-    /// because of anything added here: `CheckOutcome::ended` was
-    /// introduced by `bbc0589` (#24) with no `serde(default)`, so every
-    /// receipt stored before it is unreadable — `relais` cannot
-    /// deserialize its own oldest records. Filed as #108.
-    ///
-    /// The two are asserted to fail for exactly that reason rather than
-    /// being quietly excluded, so that fixing #108 breaks this test and
-    /// whoever fixes it is told to promote them into the parsing set.
+    /// The first two predate `CheckOutcome::ended` (#24), which had no
+    /// default, so they were unreadable (#108); they now read the end
+    /// as unrecorded, never as any `Ended`, and an unrecorded end does
+    /// not pass. All five read the fields added later (`recipe`,
+    /// `verification_profile_hash`) as unrecorded.
     #[test]
     fn receipts_already_on_disk_still_parse() {
         const PARSES: &[&str] = &[
+            PRE_FIELD_RECEIPT_1,
+            PRE_FIELD_RECEIPT_2,
             PRE_FIELD_RECEIPT_3,
             PRE_FIELD_RECEIPT_4,
             PRE_FIELD_RECEIPT_5,
         ];
-        const BLOCKED_BY_ISSUE_108: &[&str] = &[PRE_FIELD_RECEIPT_1, PRE_FIELD_RECEIPT_2];
+        const UNRECORDED_END: &[&str] = &[PRE_FIELD_RECEIPT_1, PRE_FIELD_RECEIPT_2];
 
         for (n, json) in PARSES.iter().enumerate() {
             let receipt: Receipt = serde_json::from_str(json)
@@ -1725,18 +1724,17 @@ mod tests {
             assert!(!receipt.run_id.is_empty(), "receipt {n} keeps its run id");
         }
 
-        for (n, json) in BLOCKED_BY_ISSUE_108.iter().enumerate() {
-            let parsed: Result<Receipt, _> = serde_json::from_str(json);
-            let error = parsed
-                .err()
-                .unwrap_or_else(|| {
-                    panic!("receipt {n} now parses — #108 is fixed, so move it into PARSES")
-                })
-                .to_string();
-            assert!(
-                error.contains("missing field `ended`"),
-                "receipt {n} must still fail for #108's reason and no other: {error}"
-            );
+        for (n, json) in UNRECORDED_END.iter().enumerate() {
+            let receipt: Receipt = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("stored receipt {n} without `ended` must parse: {e}"));
+            assert!(!receipt.verification.checks.is_empty());
+            for check in &receipt.verification.checks {
+                assert_eq!(check.ended.recorded(), None, "no termination is invented");
+                assert!(check.failed(), "an unrecorded end never passes");
+            }
+            let again: Receipt = serde_json::from_str(&serde_json::to_string(&receipt).unwrap())
+                .expect("the receipt round-trips");
+            assert_eq!(again, receipt);
         }
     }
     use super::*;
@@ -2517,7 +2515,7 @@ mod tests {
             checks: vec![CheckOutcome {
                 label: "cmd0".into(),
                 argv: vec!["make".into(), "check".into()],
-                ended: Ended::Exited(0),
+                ended: Ended::Exited(0).into(),
                 log_path: "x.log".into(),
                 log_sha256: "h".into(),
             }],
@@ -2598,7 +2596,7 @@ mod tests {
         let checks = vec![CheckOutcome {
             label: check_label(&profile.commands[0]),
             argv: profile.commands[0].argv.clone(),
-            ended: Ended::Exited(0),
+            ended: Ended::Exited(0).into(),
             log_path: "x.log".into(),
             log_sha256: "h".into(),
         }];
@@ -2657,7 +2655,7 @@ mod tests {
         let checks = vec![CheckOutcome {
             label: check_label(&profile.commands[0]),
             argv: profile.commands[0].argv.clone(),
-            ended: Ended::Exited(0),
+            ended: Ended::Exited(0).into(),
             log_path: "x.log".into(),
             log_sha256: "h".into(),
         }];
@@ -2770,7 +2768,7 @@ mod tests {
         let checks = vec![CheckOutcome {
             label: check_label(&profile.commands[0]),
             argv: profile.commands[0].argv.clone(),
-            ended: Ended::Exited(0),
+            ended: Ended::Exited(0).into(),
             log_path: "x.log".into(),
             log_sha256: "h".into(),
         }];
@@ -2846,7 +2844,7 @@ mod tests {
         let checks = vec![CheckOutcome {
             label: check_label(&profile.commands[0]),
             argv: profile.commands[0].argv.clone(),
-            ended: Ended::Exited(0),
+            ended: Ended::Exited(0).into(),
             log_path: "x.log".into(),
             log_sha256: "h".into(),
         }];
@@ -2935,7 +2933,7 @@ mod tests {
         let checks = vec![CheckOutcome {
             label: check_label(&profile.commands[0]),
             argv: profile.commands[0].argv.clone(),
-            ended: Ended::Exited(0),
+            ended: Ended::Exited(0).into(),
             log_path: "x.log".into(),
             log_sha256: "h".into(),
         }];
@@ -3008,7 +3006,7 @@ mod tests {
         let checks = vec![CheckOutcome {
             label: check_label(&profile.commands[0]),
             argv: profile.commands[0].argv.clone(),
-            ended: Ended::Exited(0),
+            ended: Ended::Exited(0).into(),
             log_path: "x.log".into(),
             log_sha256: "h".into(),
         }];
@@ -3191,7 +3189,7 @@ mod tests {
         let failing_check = CheckOutcome {
             label: "flaky".into(),
             argv: vec![],
-            ended: Ended::Exited(1),
+            ended: Ended::Exited(1).into(),
             log_path: "f.log".into(),
             log_sha256: "h".into(),
         };
