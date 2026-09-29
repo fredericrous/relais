@@ -13,9 +13,10 @@
 use serde::Serialize;
 
 use crate::ledger::{DecisionRecord, Ledger, PhaseCost, TaskOrigin};
-use crate::lifecycle::{Reason, State};
+use crate::lifecycle::{Reason, RunPurpose, State};
 use crate::money::{CostCompleteness, MicroUsd};
 use crate::outcome::OutcomeKind;
+use crate::route::RoutedBy;
 
 /// Whether the transition that landed this run in `Accepted` carries a
 /// person's own answer (`relais decide --answer approve`) rather than
@@ -58,7 +59,7 @@ fn accepted_by_person(
 /// status` prints, so its JSON agrees with the sentence a person sees),
 /// so a downstream parser can tell an old shape from a new one instead of
 /// guessing from key presence.
-pub const REPORT_SCHEMA_VERSION: u32 = 7;
+pub const REPORT_SCHEMA_VERSION: u32 = 8;
 
 /// A dimension `relais report --by` groups the window's tasks over (SPEC
 /// §11: "compare like task classes and policy versions"). Total over the
@@ -72,6 +73,9 @@ pub enum Dimension {
     Model,
     Policy,
     Repository,
+    /// The routing recipe revision that routed the task's first worker
+    /// dispatch (SPEC §11): observational, never a comparison.
+    Recipe,
 }
 
 impl Dimension {
@@ -82,6 +86,7 @@ impl Dimension {
             Self::Model => "model",
             Self::Policy => "policy",
             Self::Repository => "repository",
+            Self::Recipe => "recipe",
         }
     }
 }
@@ -288,7 +293,129 @@ fn cohort_key(
             .task_policy_hash(&task_row.task_id)?
             .map(|hash| hash.chars().take(12).collect())
             .unwrap_or_else(|| UNKNOWN.to_string()),
+        Dimension::Recipe => {
+            let label = recipe_label(
+                ledger.first_dispatch_intent(&task_row.first_run)?.as_ref(),
+                ledger.first_dispatch_routed_by(&task_row.first_run)?,
+            );
+            match ledger.run_purpose(&task_row.first_run)? {
+                Some(RunPurpose::TrialArm) => format!("{label} (trial arm)"),
+                Some(RunPurpose::Replay) | None => label,
+            }
+        }
     })
+}
+
+/// The cohort name of the recipe that routed a task's first worker
+/// dispatch (SPEC §11), read from the intent the runner recorded and the
+/// dispatch's `routed_by`. A task routed with no recipe is named after
+/// how it WAS routed; a task with nothing recorded is `unrecorded`, and
+/// is never folded into either.
+fn recipe_label(intent: Option<&serde_json::Value>, routed_by: Option<RoutedBy>) -> String {
+    let recorded = |key: &str| intent.and_then(|intent| intent.get(key));
+    let name = recorded("recipe_name").and_then(|value| value.as_str());
+    let revision = recorded("recipe_revision").and_then(|value| value.as_u64());
+    let id: String = recorded("recipe_id")
+        .and_then(|value| value.as_str())
+        .map(|id| id.chars().take(12).collect())
+        .unwrap_or_default();
+    match (name, routed_by) {
+        (Some(name), Some(_) | None) => {
+            let revision = revision.map(|revision| format!("@{revision}"));
+            let id = if id.is_empty() {
+                String::new()
+            } else {
+                format!(" [{id}]")
+            };
+            format!("{name}{}{id}", revision.unwrap_or_default())
+        }
+        (None, Some(routed_by)) => format!("no recipe ({})", routed_by.as_str()),
+        (None, None) => "unrecorded".to_string(),
+    }
+}
+
+/// The runs of a task a cohort's figures are drawn from. A replay is an
+/// experiment run inside its source task, and a live trial arm belongs to
+/// its own task: neither is ordinary work, so the recipe dimension keeps a
+/// trial arm only inside the trial-arm cohort of its own task and drops
+/// every replay — their spend is the report's separate trial-spend line.
+/// Every other dimension keeps all of the task's runs, as it always did.
+fn cohort_runs(
+    ledger: &Ledger,
+    dimension: Dimension,
+    task_row: &crate::ledger::TaskRow,
+    runs: &[crate::ids::RunId],
+) -> Result<Vec<crate::ids::RunId>, crate::ledger::LedgerError> {
+    match dimension {
+        Dimension::Recipe => {
+            let trial_task = ledger.run_purpose(&task_row.first_run)? == Some(RunPurpose::TrialArm);
+            let mut kept = Vec::new();
+            for run in runs {
+                let keep = match ledger.run_purpose(run)? {
+                    None => true,
+                    Some(RunPurpose::TrialArm) => trial_task,
+                    Some(RunPurpose::Replay) => false,
+                };
+                if keep {
+                    kept.push(run.clone());
+                }
+            }
+            Ok(kept)
+        }
+        Dimension::TaskClass
+        | Dimension::Tier
+        | Dimension::Model
+        | Dimension::Policy
+        | Dimension::Repository => Ok(runs.to_vec()),
+    }
+}
+
+/// What a `--by recipe` render says about its own figures, once (SPEC
+/// §11). Carried in the JSON too, so a parser is never handed the numbers
+/// without the caveat.
+pub const RECIPE_OBSERVATIONAL_NOTE: &str = "these figures are observational: cohorts differ in \
+which tasks they received, so they are not a comparison between recipes; a comparison is what \
+`relais recipe evaluate` produces";
+
+/// What one purpose's runs spent in the window.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct SpendLine {
+    pub cost: MicroUsd,
+    pub cost_completeness: CostCompleteness,
+    pub runs: usize,
+}
+
+/// Replay and live trial-arm spend in the window (SPEC §11), reported
+/// beside the recipe cohorts and never netted out of or into any of them.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct TrialSpend {
+    pub replay: SpendLine,
+    pub live: SpendLine,
+}
+
+fn spend_line(
+    ledger: &Ledger,
+    since: &str,
+    purpose: RunPurpose,
+) -> Result<SpendLine, crate::ledger::LedgerError> {
+    let (cost, cost_completeness, runs) = ledger.purpose_spend_since(since, purpose)?;
+    Ok(SpendLine {
+        cost,
+        cost_completeness,
+        runs,
+    })
+}
+
+impl TrialSpend {
+    fn line(&self) -> String {
+        format!(
+            "trial spend: replay {} ({} runs), live {} ({} runs)",
+            cost_line(self.replay.cost, self.replay.cost_completeness),
+            self.replay.runs,
+            cost_line(self.live.cost, self.live.cost_completeness),
+            self.live.runs
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -431,6 +558,12 @@ pub struct Report {
     /// accepted change cost, where [`Report::cost_per_accepted_task`]
     /// under-states it by leaving orchestration out entirely.
     pub cost_per_accepted_task_with_orchestration: Option<MicroUsd>,
+    /// Present only for `--by recipe`: replay and live trial-arm spend in
+    /// the window, never part of any cohort's figures.
+    pub trial_spend: Option<TrialSpend>,
+    /// Present only for `--by recipe`: says the cohort figures are
+    /// observational, not a comparison ([`RECIPE_OBSERVATIONAL_NOTE`]).
+    pub observational: Option<String>,
 }
 
 /// Orchestration spend imported from Claude Code session transcripts
@@ -598,6 +731,10 @@ pub fn runs_report(
         let mut escalated = false;
         let mut reviewed = false;
         let mut duration_seconds: Option<f64> = None;
+        let cohort_counts = match by {
+            Some(dimension) => cohort_runs(ledger, dimension, &task_row, &runs_of_task)?,
+            None => Vec::new(),
+        };
         for run_id in &runs_of_task {
             let status = ledger.run_status(run_id)?;
             if status.is_some_and(State::is_accepted) {
@@ -606,7 +743,8 @@ pub fn runs_report(
                     accepted_task_by_person = true;
                 }
             }
-            if by.is_some() {
+            let counted = by.is_some() && cohort_counts.contains(run_id);
+            if counted {
                 if !status.is_some_and(State::is_terminal) {
                     terminal = false;
                 }
@@ -631,19 +769,44 @@ pub fn runs_report(
         let pending_feedback = accepted_task && latest_outcome.is_none();
         if let Some(dimension) = by {
             let key = cohort_key(ledger, dimension, &task_row)?;
+            let cost = ledger.runs_own_cost(&cohort_counts)?;
+            let cost_completeness = ledger.runs_cost_completeness(&cohort_counts)?;
+            // Acceptance and outcome read through the SAME run set as
+            // cost: a replay shares its source task's id, so a task-wide
+            // read would let an accepted replay make an ordinary cohort's
+            // task count as accepted (or standing) on the replay's merit.
+            let mut cohort_accepted = false;
+            let mut cohort_outcome: Option<crate::ledger::StoredOutcome> = None;
+            for run_id in &cohort_counts {
+                if ledger.run_status(run_id)?.is_some_and(State::is_accepted) {
+                    cohort_accepted = true;
+                }
+                if let Some(stored) = ledger.outcome_of_run(run_id)? {
+                    let newer = cohort_outcome
+                        .as_ref()
+                        .is_none_or(|current| stored.at >= current.at);
+                    if newer {
+                        cohort_outcome = Some(stored);
+                    }
+                }
+            }
+            let cohort_standing = cohort_accepted
+                && !cohort_outcome
+                    .as_ref()
+                    .is_some_and(|stored| stored.outcome.kind.withdraws_acceptance());
             cohort_rows.entry(key).or_default().push(CohortTaskRow {
-                accepted: accepted_task,
-                standing: standing_task,
+                accepted: cohort_accepted,
+                standing: cohort_standing,
                 terminal,
                 escalated,
                 reviewed,
-                corrected: latest_outcome
+                corrected: cohort_outcome
                     .as_ref()
                     .is_some_and(|stored| stored.outcome.kind == OutcomeKind::Corrected),
-                regressed: latest_outcome
+                regressed: cohort_outcome
                     .as_ref()
                     .is_some_and(|stored| stored.outcome.kind == OutcomeKind::ConfirmedRegression),
-                pending_feedback,
+                pending_feedback: cohort_accepted && cohort_outcome.is_none(),
                 duration_seconds,
                 cost,
                 cost_completeness,
@@ -668,6 +831,16 @@ pub fn runs_report(
             .map(|(key, rows)| build_cohort(key, rows))
             .collect(),
     });
+    let recipe_view = by == Some(Dimension::Recipe);
+    let trial_spend = if recipe_view {
+        Some(TrialSpend {
+            replay: spend_line(ledger, since, RunPurpose::Replay)?,
+            live: spend_line(ledger, since, RunPurpose::TrialArm)?,
+        })
+    } else {
+        None
+    };
+    let observational = recipe_view.then(|| RECIPE_OBSERVATIONAL_NOTE.to_string());
     let accepted_tasks = tasks.iter().filter(|task| task.accepted).count();
     let accepted_tasks_by_person = tasks
         .iter()
@@ -743,6 +916,8 @@ pub fn runs_report(
         enforcement: EnforcementReport::observed(),
         orchestration,
         cost_per_accepted_task_with_orchestration,
+        trial_spend,
+        observational,
     })
 }
 
@@ -756,6 +931,7 @@ impl Report {
         out.push('\n');
         if self.runs.is_empty() {
             out.push_str("no runs recorded in this window\n");
+            self.push_recipe_lines(&mut out);
             self.push_orchestration_lines(&mut out);
             return out;
         }
@@ -935,12 +1111,28 @@ impl Report {
                 ));
             }
         }
+        self.push_recipe_lines(&mut out);
         out.push('\n');
         self.push_orchestration_lines(&mut out);
         out.push('\n');
         out.push_str(&self.enforcement.sentence);
         out.push('\n');
         out
+    }
+
+    /// The `--by recipe` footer, on every such render — including the
+    /// empty window: trial spend, which no cohort's figures include, and
+    /// the sentence saying the cohorts are observational, not a comparison.
+    fn push_recipe_lines(&self, out: &mut String) {
+        if let Some(trial_spend) = &self.trial_spend {
+            out.push('\n');
+            out.push_str(&trial_spend.line());
+            out.push('\n');
+        }
+        if let Some(note) = &self.observational {
+            out.push_str(note);
+            out.push('\n');
+        }
     }
 
     /// Orchestration spend beside worker spend, on every render (SPEC
@@ -1366,6 +1558,8 @@ mod tests {
             backfilled_tasks: 0,
             open_decisions: vec![],
             cohorts: None,
+            trial_spend: None,
+            observational: None,
             enforcement: EnforcementReport::observed(),
             orchestration: OrchestrationSummary {
                 cost: MicroUsd::ZERO,
@@ -1577,6 +1771,7 @@ mod tests {
                 "cost_per_accepted_task_with_orchestration",
                 "cost_per_standing_change",
                 "enforcement",
+                "observational",
                 "open_decisions",
                 "orchestration",
                 "pending_decisions",
@@ -1589,6 +1784,7 @@ mod tests {
                 "task_cost_completeness",
                 "tasks",
                 "total_cost",
+                "trial_spend",
             ]
         );
         // Best effort: a leftover temp dir costs nothing but disk.
@@ -2214,6 +2410,263 @@ mod tests {
         );
         assert_eq!(report.accepted_tasks_by_person, 1, "{report:?}");
         assert_eq!(report.standing_tasks, 1, "{report:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A run of `task` that spent `cost`, optionally with the first
+    /// worker dispatch the runner would have recorded for it.
+    fn recorded_run(
+        ledger: &Ledger,
+        run_id: &str,
+        task: &crate::ids::TaskId,
+        cost: i64,
+        dispatch: Option<(serde_json::Value, RoutedBy)>,
+        purpose: Option<RunPurpose>,
+    ) -> crate::ids::RunId {
+        let run = crate::ids::RunId::from_stored(run_id);
+        ledger
+            .insert_run(&run, "/repo", None, task, "rk")
+            .expect("run");
+        if let Some(purpose) = purpose {
+            ledger.set_run_purpose(&run, purpose).expect("purpose");
+        }
+        if let Some((intent, routed_by)) = dispatch {
+            ledger
+                .record_dispatch_intent(
+                    &crate::ids::DispatchId::from_stored(format!("d-{run_id}")),
+                    &run,
+                    None,
+                    &intent,
+                    0,
+                    routed_by,
+                )
+                .expect("dispatch");
+        }
+        ledger
+            .record_usage(&crate::ledger::UsageEvent {
+                event_id: format!("e-{run_id}"),
+                run_id: run.clone(),
+                attempt_id: None,
+                parent_event_id: None,
+                model: Some("sonnet".into()),
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                cost: Some(MicroUsd::from_micros(cost)),
+                cost_kind: crate::money::CostKind::ApiSpend,
+                completeness: CostCompleteness::Actual,
+                inclusive: false,
+                at: now_rfc3339(),
+                phase: None,
+                duration_ms: None,
+                requested_model: None,
+                requested_effort: None,
+                harness: None,
+            })
+            .expect("usage");
+        run
+    }
+
+    fn recipe_dispatch() -> Option<(serde_json::Value, RoutedBy)> {
+        Some((
+            serde_json::json!({
+                "model": "sonnet",
+                "recipe_id": "abcdef0123456789ffff",
+                "recipe_name": "change-routing",
+                "recipe_revision": 1,
+            }),
+            RoutedBy::DeterministicRecipe,
+        ))
+    }
+
+    const RECIPE_KEY: &str = "change-routing@1 [abcdef012345]";
+
+    fn cohort<'a>(report: &'a Report, key: &str) -> &'a Cohort {
+        let cohorts = &report.cohorts.as_ref().expect("cohorts").cohorts;
+        cohorts
+            .iter()
+            .find(|cohort| cohort.key == key)
+            .unwrap_or_else(|| panic!("no cohort {key:?} in {cohorts:?}"))
+    }
+
+    /// Two tasks routed by `change-routing@1`, one routed with no recipe
+    /// and one with nothing recorded land in three distinct cohorts, the
+    /// last named `unrecorded` and never folded into another.
+    #[test]
+    fn recipe_cohorts_separate_recipe_no_recipe_and_unrecorded_tasks() {
+        let dir = temp_dir("recipe-cohorts");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let baseline = Some((
+            serde_json::json!({
+                "model": "sonnet",
+                "recipe_id": null,
+                "recipe_name": null,
+                "recipe_revision": null,
+            }),
+            RoutedBy::ConservativeBaseline,
+        ));
+        for (task, run, dispatch) in [
+            ("t-a", "run-a", recipe_dispatch()),
+            ("t-b", "run-b", recipe_dispatch()),
+            ("t-c", "run-c", baseline),
+            ("t-d", "run-d", None),
+        ] {
+            let task = crate::ids::TaskId::from_stored(task);
+            recorded_run(&ledger, run, &task, 10, dispatch, None);
+        }
+        let report = runs_report(
+            &ledger,
+            "2000-01-01T00:00:00+00:00",
+            Some(Dimension::Recipe),
+        )
+        .expect("report");
+        let cohorts = &report.cohorts.as_ref().expect("cohorts").cohorts;
+        assert_eq!(cohorts.len(), 3, "{cohorts:?}");
+        assert_eq!(cohort(&report, RECIPE_KEY).tasks, 2);
+        assert_eq!(
+            cohort(&report, "no recipe (conservative_baseline)").tasks,
+            1
+        );
+        assert_eq!(cohort(&report, "unrecorded").tasks, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A replay run and a live trial-arm run appear on the trial-spend
+    /// line and not in an ordinary cohort's totals; the trial arm's own
+    /// task is a separate, labelled cohort.
+    ///
+    /// Falsified: letting `Replay` runs through `cohort_runs` (keeping
+    /// them) made the ordinary cohort's cost 7100 instead of 100 and this
+    /// test failed on the cost assertion; restored, it passes.
+    #[test]
+    fn replay_and_trial_arm_spend_is_reported_apart_from_ordinary_cohorts() {
+        let dir = temp_dir("recipe-trial-spend");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let ordinary = crate::ids::TaskId::from_stored("t-ordinary");
+        recorded_run(
+            &ledger,
+            "run-ordinary",
+            &ordinary,
+            100,
+            recipe_dispatch(),
+            None,
+        );
+        // A replay runs inside its source task, so it shares the task id.
+        recorded_run(
+            &ledger,
+            "run-replay",
+            &ordinary,
+            7_000,
+            None,
+            Some(RunPurpose::Replay),
+        );
+        let trial = crate::ids::TaskId::from_stored("t-trial");
+        recorded_run(
+            &ledger,
+            "run-trial",
+            &trial,
+            500,
+            recipe_dispatch(),
+            Some(RunPurpose::TrialArm),
+        );
+        let report = runs_report(
+            &ledger,
+            "2000-01-01T00:00:00+00:00",
+            Some(Dimension::Recipe),
+        )
+        .expect("report");
+        let ordinary_cohort = cohort(&report, RECIPE_KEY);
+        assert_eq!(ordinary_cohort.tasks, 1);
+        assert_eq!(ordinary_cohort.cost, MicroUsd::from_micros(100));
+        let trial_cohort = cohort(&report, &format!("{RECIPE_KEY} (trial arm)"));
+        assert_eq!(trial_cohort.cost, MicroUsd::from_micros(500));
+        let spend = report.trial_spend.expect("trial spend on a recipe report");
+        assert_eq!(spend.replay.cost, MicroUsd::from_micros(7_000));
+        assert_eq!(spend.replay.runs, 1);
+        assert_eq!(spend.live.cost, MicroUsd::from_micros(500));
+        assert_eq!(spend.live.runs, 1);
+        let text = report.render();
+        assert!(text.contains("trial spend: replay "), "{text}");
+        assert!(text.contains("(1 runs), live "), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An ACCEPTED replay shares its source task's id, and must not make
+    /// that task's ordinary cohort count it as accepted, standing or
+    /// awaiting feedback: acceptance and outcome read through the same
+    /// run set as cost. The ordinary run here never finished.
+    ///
+    /// Falsified: reading acceptance task-wide again (every run of the
+    /// task, replay included) made the ordinary cohort report 1 accepted
+    /// and 1 pending feedback, and this test failed; restored, it passes.
+    #[test]
+    fn an_accepted_replay_does_not_make_its_ordinary_cohort_accepted() {
+        let dir = temp_dir("recipe-replay-acceptance");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let task = crate::ids::TaskId::from_stored("t-shared");
+        recorded_run(&ledger, "run-own", &task, 100, recipe_dispatch(), None);
+        let replay = recorded_run(
+            &ledger,
+            "run-replayed",
+            &task,
+            900,
+            None,
+            Some(RunPurpose::Replay),
+        );
+        ledger
+            .record_transition(&crate::ledger::Transition {
+                run_id: replay.clone(),
+                attempt_id: None,
+                from_state: Some(State::Prepared),
+                to_state: State::Accepted,
+                reason: "verification_passed".into(),
+                detail: None,
+                at: now_rfc3339(),
+            })
+            .expect("the replay is accepted");
+        assert_eq!(
+            ledger.run_status(&replay).expect("status"),
+            Some(State::Accepted)
+        );
+        let report = runs_report(
+            &ledger,
+            "2000-01-01T00:00:00+00:00",
+            Some(Dimension::Recipe),
+        )
+        .expect("report");
+        let ordinary = cohort(&report, RECIPE_KEY);
+        assert_eq!(ordinary.tasks, 1);
+        assert_eq!(ordinary.accepted, 0, "{ordinary:?}");
+        assert_eq!(ordinary.standing, 0, "{ordinary:?}");
+        assert_eq!(ordinary.pending_feedback, 0, "{ordinary:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The observational sentence rides in the text and in the JSON of a
+    /// `--by recipe` report — including an empty window — and in no other
+    /// dimension's.
+    #[test]
+    fn a_recipe_report_says_in_text_and_json_that_it_is_not_a_comparison() {
+        let dir = temp_dir("recipe-observational");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let since = "2000-01-01T00:00:00+00:00";
+        let empty = runs_report(&ledger, since, Some(Dimension::Recipe)).expect("report");
+        assert_eq!(empty.render().matches(RECIPE_OBSERVATIONAL_NOTE).count(), 1);
+        assert!(empty.render().contains("trial spend: replay"));
+        let task = crate::ids::TaskId::from_stored("t-only");
+        recorded_run(&ledger, "run-only", &task, 10, None, None);
+        let report = runs_report(&ledger, since, Some(Dimension::Recipe)).expect("report");
+        assert_eq!(
+            report.render().matches(RECIPE_OBSERVATIONAL_NOTE).count(),
+            1
+        );
+        let json = serde_json::to_value(&report).expect("serializes");
+        assert_eq!(json["observational"], RECIPE_OBSERVATIONAL_NOTE);
+        assert!(json["trial_spend"]["replay"]["runs"].is_number());
+        let other = runs_report(&ledger, since, Some(Dimension::Tier)).expect("report");
+        assert!(other.observational.is_none() && other.trial_spend.is_none());
+        assert!(!other.render().contains("observational"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

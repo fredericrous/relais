@@ -3931,6 +3931,54 @@ impl Ledger {
         Ok(CostCompleteness::worst(values))
     }
 
+    /// The own cost of exactly these runs, each counted once — a task's
+    /// cost over a chosen subset of its runs (see [`Ledger::task_cost`]
+    /// for why the sum is of own costs, not of trees).
+    pub fn runs_own_cost(&self, runs: &[RunId]) -> Result<MicroUsd> {
+        let mut total = MicroUsd::ZERO;
+        for run in runs {
+            total = total.saturating_add(self.run_own_cost(run)?);
+        }
+        Ok(total)
+    }
+
+    /// Worst-case completeness across exactly these runs.
+    pub fn runs_cost_completeness(&self, runs: &[RunId]) -> Result<CostCompleteness> {
+        let mut values = Vec::new();
+        for run in runs {
+            values.push(self.run_cost_completeness(run)?);
+        }
+        Ok(CostCompleteness::worst(values))
+    }
+
+    /// What runs of one recorded purpose spent, for runs created at or
+    /// after `since` (SPEC §11): own cost of each run, summed once, its
+    /// completeness, and how many runs it is over. Kept apart from every
+    /// cohort's figures because a replay or a trial arm is an experiment's
+    /// expense, not ordinary work.
+    pub fn purpose_spend_since(
+        &self,
+        since: &str,
+        purpose: RunPurpose,
+    ) -> Result<(MicroUsd, CostCompleteness, usize)> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM runs WHERE purpose = ?1 AND created_at >= ?2 ORDER BY id")?;
+        let rows = stmt.query_map(params![purpose.as_str(), since], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let runs: Vec<RunId> = rows
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(RunId::from_stored)
+            .collect();
+        Ok((
+            self.runs_own_cost(&runs)?,
+            self.runs_cost_completeness(&runs)?,
+            runs.len(),
+        ))
+    }
+
     /// Every task created at or after `since` (RFC3339), newest first —
     /// the read side of the tasks table, typed (P6/P8): a row whose
     /// `origin` no version of this binary wrote is a `Corrupt` result,
