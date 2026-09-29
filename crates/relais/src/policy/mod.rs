@@ -289,6 +289,12 @@ pub struct ExecutionPolicy {
     pub max_repairs_before_escalation: u32,
     #[serde(default = "default_max_wall_seconds")]
     pub max_wall_seconds: u64,
+    /// NOT a worker permission. It declares the agent-tree limits the
+    /// coordinator enforces for hook-admitted sessions (SPEC §23), and
+    /// nothing else: a print-mode worker never spawns a subagent whatever
+    /// this says, because the deny floor refuses `Agent` and `Task`
+    /// ([`default_disallowed_tools`]). Do not read `true` as "workers may
+    /// nest".
     #[serde(default = "default_allow_nested_agents")]
     pub allow_nested_agents: bool,
     #[serde(default = "default_max_agent_depth")]
@@ -755,6 +761,16 @@ pub struct Permissions {
 /// and never integrates anything — a worker that did manage to commit
 /// has changed nothing about what gets accepted. Strong confinement
 /// needs the separately configured OS/container backend §8 describes.
+///
+/// `Agent` and `Task` (its legacy name) are denied for a different reason:
+/// model choice belongs to the route. MEASURED 2026-09-28
+/// (run-65c89ac482819-d958): in print mode the Agent tool needs no
+/// permission, and a sonnet worker handed its whole task to a background
+/// `general-purpose` subagent with `model: "opus"` — 124 Opus 5.5 turns
+/// against 14 of its own. That routed around relais's model choice, and
+/// relais noticed only after the spend, as an unapproved substitution.
+/// Falsified: with `Agent` removed from this list the test
+/// `the_floor_denies_subagent_spawning` failed; restored.
 pub fn default_disallowed_tools() -> Vec<String> {
     vec![
         // The operations themselves.
@@ -782,6 +798,10 @@ pub fn default_disallowed_tools() -> Vec<String> {
         "Bash(dash -c:*)".into(),
         "Bash(env git:*)".into(),
         "Bash(eval:*)".into(),
+        // A subagent chooses its own model. Model choice belongs to the
+        // route, so a worker may not hand its task to one.
+        "Agent".into(),
+        "Task".into(),
     ]
 }
 
@@ -1879,6 +1899,13 @@ keys = ["output.contract"]
         );
         assert!(effective.contains(&"WebFetch".to_string()));
         assert!(effective.len() > default_disallowed_tools().len());
+    }
+
+    #[test]
+    fn the_floor_denies_subagent_spawning() {
+        let floor = default_disallowed_tools();
+        assert!(floor.contains(&"Agent".to_string()));
+        assert!(floor.contains(&"Task".to_string()));
     }
 
     /// P4: the hash is derived from the struct, so a field added to

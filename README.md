@@ -132,7 +132,8 @@ worker cannot ask for permission, so the tools it may use are an explicit
 machine-owned allowlist — nothing is granted implicitly, and no
 permission-mode flag is ever passed. `disallowed_tools` here only ADDS to
 the shipped deny floor (commit, merge, push, rebase, reset, tag and the
-wrappers around them); it cannot shorten it:
+wrappers around them, plus `Agent`/`Task`: a worker never spawns subagents,
+since model choice belongs to the route); it cannot shorten it:
 
 ```toml
 schema_version = 1

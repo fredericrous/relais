@@ -177,6 +177,14 @@ would need both a compatibility record confirming the harness reports
 enough to act on and a setting to act on it with, and neither exists
 today.
 
+## Worker deny floor and `disallowed_tools`
+
+The shipped deny floor now includes `Agent` and `Task`, so a print-mode
+worker cannot hand its task to a subagent that picks its own model. A
+machine that added `disallowed_tools = ["Agent", "Task"]` to `machine.toml`
+by hand (as v0.6.0's Upgrading notes advised) may keep or drop it: the
+floor carries it, and the union with `machine.toml` is idempotent.
+
 ## Known limits of the hook path
 
 These four are specific to `--hooks`; the general limits that are not
