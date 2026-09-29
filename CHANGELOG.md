@@ -8,6 +8,17 @@ missing here.
 
 ## Unreleased
 
+### Fixed
+
+- **Replay evidence no longer counts an unchanged incumbent recipe for a
+  candidate (#132).** Replay selection used every recipe id of the
+  candidate, including the base policy's, so a replay whose arm was an
+  unchanged incumbent recipe counted for every candidate built on that
+  base. It now uses the same arm ids as live-trial selection (the
+  candidate's recipe ids minus the incumbent's, one shared function); such
+  replays are excluded from pairing and reported on their own line,
+  `replay trials on an unchanged incumbent recipe set aside: N`.
+
 ### Added
 
 - **Live trials, OFF by default.** A machine can enable `[trials]` in
