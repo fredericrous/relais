@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites name="pytest tests">
+  <testsuite name="pytest" errors="0" failures="0" skipped="0" tests="3" time="0.120" timestamp="2026-09-29T08:00:00.000000" hostname="ci">
+    <testcase classname="tests.test_api" name="test_rejects_malformed_input" time="0.003"/>
+    <testcase classname="tests.test_api.TestLimits" name="test_accepts_the_maximum" time="0.002"/>
+    <testcase classname="" name="test_without_a_class" time="0.001"/>
+  </testsuite>
+</testsuites>

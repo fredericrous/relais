@@ -28,6 +28,22 @@ missing here.
 
 ### Added
 
+- **An acceptance criterion can name the test that settles it (#51).** A
+  verification command may declare `junit`, the path of a JUnit XML report
+  it writes (cargo-nextest, pytest `--junitxml`, vitest/jest junit
+  reporters). A `test` criterion with a `name` is met only when a command's
+  report holds exactly that test id as passed; failed or skipped is not met,
+  is named on the receipt, and refuses acceptance as a gap naming the
+  outcome (a command exits 0 over a skipped test), and a test no report
+  holds — or no declared report at all — is a gap naming the test. The
+  report that settled a criterion is kept beside the check logs, recorded
+  as a `junit_report` evidence row with its sha256, and the receipt names
+  it. A declared report that is
+  missing or unparseable is recorded on the check (`junit: missing`,
+  `junit: unparseable (…)`) and never changes the command's own exit
+  status. Nothing changes for a policy or contract that uses neither; the
+  authority hash of an existing policy is unmoved. relais's own policy
+  does not use it.
 - **`relais feedback --outcome not-shipped` (#99).** A person's statement
   that an accepted candidate was abandoned for reasons unrelated to its
   quality. The task leaves the accepted and standing counts, its cost

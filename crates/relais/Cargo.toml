@@ -33,6 +33,12 @@ globset = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 # Timestamps and report windows; stored as RFC3339 strings / unix seconds.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Per-test results from a verification command's JUnit XML report (SPEC
+# §10, #51). JUnit is XML with entity escapes, CDATA and nesting that
+# differ between nextest, pytest and vitest; hand-rolling a parser for it
+# is the wrong trade. Default features only: no serde, no async, no
+# encoding support — the reader is pure over bytes.
+quick-xml = "0.42"
 
 # Process facts and signals live in `procs`; the endpoint in `ipc`. Each
 # platform gets the one binding crate it needs and nothing else.

@@ -119,6 +119,18 @@ An acceptance entry is either a bare string, judged by the verification profile 
 
 Evidence is a named command in the verification profile (`check`), a test with its authorship recorded as pre-existing, human-added or model-added (`test`), a reviewing model's judgement (`llm_review`), or a person's explicit sign-off (`human_sign_off`). A criterion is mandatory unless it says otherwise, as a bare string always was. Its identity is the author's own id, or one derived from the statement's content, so reordering the list never renumbers a criterion. A criterion naming a check the profile does not define is refused before any dispatch: a criterion nothing can settle is not a narrower contract, it is a broken one.
 
+A `test` criterion can also name the one test that settles it, which a verification command's exit status alone could never check:
+
+```json
+{
+  "statement": "The api rejects malformed input",
+  "evidence": {"kind": "test", "authorship": "pre_existing",
+               "name": "tests.test_api::test_rejects_malformed_input"}
+}
+```
+
+A command declares where its per-test results come from with `junit`, a path relative to the worktree it runs in, of a JUnit XML report it writes (`{ argv = ["make", "check"], junit = "target/nextest/ci/junit.xml" }` in `relais.toml`; INTEGRATIONS.md has the cargo-nextest, pytest and vitest recipes). relais clears that path before the command runs and reads it after, so a report the candidate committed is never mistaken for the run's. The test id is `classname::name`, or `name` when the report gives no classname. The criterion is met only when some command's report holds exactly that id as passed. A failed or skipped test is not met and refuses acceptance as a gap naming the outcome — a command can exit 0 over a skipped test — and the receipt records the test id, the command whose report held it, the outcome and the kept copy of that report. The copy sits beside the check logs and is recorded as a `junit_report` evidence row with its sha256; a report that was missing or unparseable leaves no copy. A test no report holds, or a profile in which no command declares `junit`, is a gap naming the test — as an unproduced check is — never a pass. A declared report that is missing or unparseable is recorded on the check outcome (`junit: missing`, `junit: unparseable (<reason>)`) and never changes the command's own pass or fail, which stays its exit status. A `test` criterion with no `name` settles as it always did, and `authorship` and independence are unchanged. relais's own policy declares no `junit` — its `make check` runs `cargo test` — so nothing changes here until a repository opts in.
+
 Worker-supplied risk hints may increase caution but cannot lower repository risk floors. Acceptance text is checked for contradictions and missing prerequisites during preflight; unresolved requirements return `needs_decision`.
 
 ## 5. Configuration and authority

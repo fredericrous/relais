@@ -204,6 +204,8 @@ pub enum EvidenceKind {
     ExternalAttestation,
     /// A person's sign-off, recorded as evidence like any other kind.
     HumanSignOff,
+    /// The JUnit report a command wrote, kept as its check log is.
+    JunitReport,
 }
 
 impl EvidenceKind {
@@ -218,6 +220,7 @@ impl EvidenceKind {
             Self::SetupLog => "setup_log",
             Self::ExternalAttestation => "external_attestation",
             Self::HumanSignOff => "human_sign_off",
+            Self::JunitReport => "junit_report",
         }
     }
 
@@ -232,6 +235,7 @@ impl EvidenceKind {
             "setup_log" => Some(Self::SetupLog),
             "external_attestation" => Some(Self::ExternalAttestation),
             "human_sign_off" => Some(Self::HumanSignOff),
+            "junit_report" => Some(Self::JunitReport),
             _ => None,
         }
     }

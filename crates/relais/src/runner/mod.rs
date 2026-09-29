@@ -2614,6 +2614,30 @@ impl<'a> RunEngine<'a> {
                 Path::new(&outcome.log_path),
                 Some(&outcome.log_sha256),
             )?;
+            self.record_junit_report(outcome)?;
+        }
+        Ok(())
+    }
+
+    /// Record the kept copy of a check's JUnit report, when one was read,
+    /// under its own kind and with its sha256. A report that was missing
+    /// or unparseable left no copy, so it has no row.
+    pub(crate) fn record_junit_report(
+        &self,
+        outcome: &verify::CheckOutcome,
+    ) -> Result<(), LedgerError> {
+        if let Some(verify::JunitReport::Reported {
+            artifact: Some(kept),
+            ..
+        }) = &outcome.junit
+        {
+            self.config.ledger.record_evidence(
+                &self.run_id,
+                None,
+                EvidenceKind::JunitReport,
+                Path::new(&kept.path),
+                Some(&kept.sha256),
+            )?;
         }
         Ok(())
     }
@@ -2985,6 +3009,13 @@ impl<'a> RunEngine<'a> {
                     Some(&check.log_sha256),
                 )
                 .map_err(|e| format!("the ledger refused a check-log evidence row: {e}"))?;
+            // A reused baseline outcome's report was already recorded when
+            // the baseline ran; recording it again would add an identical
+            // row the ledger has no constraint against.
+            if reuse.is_none() {
+                self.record_junit_report(check)
+                    .map_err(|e| format!("the ledger refused a junit-report evidence row: {e}"))?;
+            }
         }
         let inventory = match (amont_on, holder.as_ref()) {
             (true, Some(holder)) => self.config.hooks.list(holder.path(), verify::Stage::Local),
@@ -4301,6 +4332,7 @@ mod tests {
     fn main_gone_check() -> CommandSpec {
         CommandSpec {
             name: None,
+            junit: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/main.rs".into()],
             timeout_seconds: 30,
         }
@@ -4319,6 +4351,7 @@ mod tests {
         let shell = if cfg!(windows) { "sh" } else { "bash" };
         CommandSpec {
             name: None,
+            junit: None,
             argv: vec![shell.into(), "-c".into(), "test ! -f src/main.rs".into()],
             timeout_seconds: 30,
         }
@@ -4327,6 +4360,7 @@ mod tests {
     fn passing_check() -> CommandSpec {
         CommandSpec {
             name: None,
+            junit: None,
             argv: vec!["sh".into(), "-c".into(), "true".into()],
             timeout_seconds: 30,
         }
@@ -4583,6 +4617,7 @@ mod tests {
         // and the worker never makes a second change.
         let no_evil = CommandSpec {
             name: None,
+            junit: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/evil.txt".into()],
             timeout_seconds: 30,
         };
@@ -5147,6 +5182,7 @@ mod tests {
         // Green at the base, red forever once the worker churns.
         let no_tick0 = CommandSpec {
             name: None,
+            junit: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/tick-0.txt".into()],
             timeout_seconds: 30,
         };
@@ -5203,6 +5239,7 @@ mod tests {
         let fixture = Fixture::new();
         let no_tick0 = CommandSpec {
             name: None,
+            junit: None,
             argv: vec![
                 "sh".into(),
                 "-c".into(),
@@ -5261,6 +5298,7 @@ mod tests {
         // shortcut so the full repair-escalation ladder runs out first.
         let marker = CommandSpec {
             name: None,
+            junit: None,
             argv: vec!["sh".into(), "-c".into(), "test -f src/marker.txt".into()],
             timeout_seconds: 30,
         };
@@ -6223,6 +6261,62 @@ mod tests {
         assert!(evidence.iter().all(|row| row.sha256.is_some()));
     }
 
+    /// A JUnit report a check wrote is kept as evidence like its log: a
+    /// row of its own kind, whose sha256 is that of the copied file.
+    #[test]
+    fn a_junit_report_that_was_read_is_kept_as_evidence_with_its_hash() {
+        let fixture = Fixture::new();
+        let script = "test ! -f src/main.rs && printf '%s' \
+                      '<testsuite><testcase classname=\"a\" name=\"b\"/></testsuite>' > junit.xml";
+        let repo = fixture.repo_policy(
+            vec![CommandSpec {
+                junit: Some("junit.xml".into()),
+                ..sh(script)
+            }],
+            3,
+        );
+        let backend = conditional_worker("relais task");
+        let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Accepted(_),
+        } = outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        let rows = evidence_of(&fixture, &run_id, EvidenceKind::JunitReport);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let (path, sha256) = &rows[0];
+        let kept = std::fs::read(path).expect("the copy exists");
+        assert_eq!(*sha256, crate::ids::sha256_hex(&kept));
+        assert!(kept.starts_with(b"<testsuite>"));
+    }
+
+    /// When the candidate is the base tree the baseline's outcomes are
+    /// reused, and the baseline already recorded its JUnit report: the
+    /// report is recorded once, not a second identical row.
+    ///
+    /// Falsified: recording the report for reused outcomes too made this
+    /// read 2 rows; restored, it reads 1.
+    #[test]
+    fn a_reused_baseline_report_is_recorded_once() {
+        let fixture = Fixture::new();
+        let script = "printf '%s' \
+                      '<testsuite><testcase classname=\"a\" name=\"b\"/></testsuite>' > junit.xml";
+        let repo = fixture.repo_policy(
+            vec![CommandSpec {
+                junit: Some("junit.xml".into()),
+                ..sh(script)
+            }],
+            1,
+        );
+        let backend = conditional_worker("");
+        let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+        let rows = evidence_of(&fixture, &outcome.run_id, EvidenceKind::JunitReport);
+        assert_eq!(rows.len(), 1, "{outcome:?} {rows:?}");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
     #[test]
     fn baseline_results_are_cached_only_when_the_profile_opts_in() {
         let fixture = Fixture::new();
@@ -6340,6 +6434,7 @@ mod tests {
     fn sh(script: &str) -> CommandSpec {
         CommandSpec {
             name: None,
+            junit: None,
             argv: vec!["sh".into(), "-c".into(), script.into()],
             timeout_seconds: 30,
         }
@@ -6383,6 +6478,7 @@ mod tests {
             vec![
                 CommandSpec {
                     name: None,
+                    junit: None,
                     argv: vec!["relais-no-such-binary-4f3a".into()],
                     timeout_seconds: 30,
                 },
@@ -6455,6 +6551,7 @@ mod tests {
         let repo = fixture.repo_policy(
             vec![CommandSpec {
                 name: None,
+                junit: None,
                 argv: vec!["sh".into(), "-c".into(), "sleep 5".into()],
                 timeout_seconds: 1,
             }],
@@ -6578,6 +6675,7 @@ mod tests {
         let flag_for_sh = flag.to_string_lossy().replace('\\', "/");
         let setup = CommandSpec {
             name: None,
+            junit: None,
             argv: vec![
                 shell.into(),
                 "-c".into(),
@@ -7538,6 +7636,7 @@ mod tests {
         ])));
         let no_tick0 = CommandSpec {
             name: None,
+            junit: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/tick-0.txt".into()],
             timeout_seconds: 30,
         };
@@ -7641,6 +7740,7 @@ mod tests {
         let fixture = Fixture::new();
         let green = CommandSpec {
             name: None,
+            junit: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/main.rs".into()],
             timeout_seconds: 30,
         };

@@ -31,8 +31,10 @@ use crate::tooling::{ProgramVersion, VersionUnknown};
 use crate::workspace::{Git, WorkspaceError};
 
 mod end;
+mod junit;
 
 pub use end::CheckEnd;
+pub use junit::{parse_junit, JunitArtifact, JunitError, JunitReport, TestOutcome};
 
 /// Why verification could not be carried out as the policy declares it.
 /// Distinct from a check that RAN and failed: this is the plan itself
@@ -98,6 +100,13 @@ pub struct CheckOutcome {
     pub ended: CheckEnd,
     pub log_path: String,
     pub log_sha256: String,
+    /// The command's JUnit report, when it declared one: the per-test
+    /// results, or the recorded fact that the file was missing or
+    /// unparseable. Absent for a command that declared none, and for a
+    /// receipt written before this field existed. It never changes
+    /// `ended`, which stays the command's own exit status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub junit: Option<JunitReport>,
 }
 
 impl CheckOutcome {
@@ -221,13 +230,48 @@ pub fn acceptance_gaps(
                     },
                 }),
             },
-            // A test runs inside the profile's own commands and an LLM
-            // review is the reviewer's verdict: both are settled by the
-            // report as a whole, so neither can come up empty on its own.
-            // A bare string has declared no evidence to be missing. A
-            // human sign-off already recorded for this id is met, not a
-            // gap.
-            Some(Evidence::Test { .. } | Evidence::LlmReview | Evidence::HumanSignOff) | None => {}
+            // A named test is a gap when no report can settle it: no
+            // command declares one, or none of the reports that were read
+            // contains that id. A test that WAS reported and failed or
+            // was skipped is a gap too: a command can exit 0 over a
+            // skipped test (pytest, nextest), and that is not a pass.
+            Some(Evidence::Test {
+                name: Some(test), ..
+            }) => match find_named_test(test, profile, checks) {
+                NamedTest::NoReportDeclared => gaps.push(AcceptanceGap {
+                    criterion_id: entry.id(),
+                    missing: MissingEvidence::NoPerTestResults { test: test.clone() },
+                }),
+                NamedTest::NotReported { unreadable } => gaps.push(AcceptanceGap {
+                    criterion_id: entry.id(),
+                    missing: MissingEvidence::TestNotReported {
+                        test: test.clone(),
+                        unreadable,
+                    },
+                }),
+                NamedTest::Reported(settlement) => {
+                    if settlement.outcome != TestOutcome::Passed {
+                        gaps.push(AcceptanceGap {
+                            criterion_id: entry.id(),
+                            missing: MissingEvidence::TestNotPassed {
+                                test: test.clone(),
+                                outcome: settlement.outcome,
+                                command: settlement.command,
+                            },
+                        });
+                    }
+                }
+            },
+            // An unnamed test runs inside the profile's own commands and
+            // an LLM review is the reviewer's verdict: both are settled
+            // by the report as a whole, so neither can come up empty on
+            // its own. A bare string has declared no evidence to be
+            // missing. A human sign-off already recorded for this id is
+            // met, not a gap.
+            Some(
+                Evidence::Test { name: None, .. } | Evidence::LlmReview | Evidence::HumanSignOff,
+            )
+            | None => {}
         }
     }
     gaps
@@ -271,6 +315,23 @@ pub enum MissingEvidence {
     /// absent, too old to have the subcommand, or failed some other way.
     /// The cause relais actually observed, never guessed.
     GateUnavailable { gate: String, detail: String },
+    /// A named test, and no verification command declares a JUnit report:
+    /// nothing produced per-test results at all.
+    NoPerTestResults { test: String },
+    /// A named test that no command's JUnit report contains. `unreadable`
+    /// holds the recorded facts of the reports that could not be read
+    /// (`junit: missing`), since those may be why.
+    TestNotReported {
+        test: String,
+        unreadable: Vec<String>,
+    },
+    /// A named test a report contains, whose outcome is not Passed.
+    /// `command` is the one whose report said so.
+    TestNotPassed {
+        test: String,
+        outcome: TestOutcome,
+        command: String,
+    },
 }
 
 impl AcceptanceGap {
@@ -299,7 +360,106 @@ impl AcceptanceGap {
                 "acceptance criterion `{id}` names amont gate `{gate}`, which could not be \
                  asked about: {detail}"
             ),
+            MissingEvidence::NoPerTestResults { test } => format!(
+                "acceptance criterion `{id}` names test `{test}`, but no verification command \
+                 declares a JUnit report, so no per-test results were produced"
+            ),
+            MissingEvidence::TestNotReported { test, unreadable } => {
+                let unreadable = if unreadable.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", unreadable.join("; "))
+                };
+                format!(
+                    "acceptance criterion `{id}` names test `{test}`, which no verification \
+                     command's JUnit report contains{unreadable}"
+                )
+            }
+            MissingEvidence::TestNotPassed {
+                test,
+                outcome,
+                command,
+            } => format!(
+                "acceptance criterion `{id}` names test `{test}`, which `{command}`'s JUnit \
+                 report records as {outcome}, not Passed"
+            ),
         }
+    }
+}
+
+/// What the verification commands' JUnit reports say about one named test.
+enum NamedTest {
+    /// No command in the profile declares a report.
+    NoReportDeclared,
+    /// Reports were declared, and none that could be read contains the
+    /// test. `unreadable` is the recorded fact of each that could not.
+    NotReported {
+        unreadable: Vec<String>,
+    },
+    Reported(TestSettlement),
+}
+
+/// The test a criterion was settled by, and where that result came from —
+/// what lets a receipt say 'by what' for a named test.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestSettlement {
+    pub test: String,
+    /// The label of the command whose JUnit report held the result.
+    pub command: String,
+    pub outcome: TestOutcome,
+    /// Where the kept copy of that report is: what 'by what' points at.
+    /// Absent for a receipt written before the copy was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<String>,
+}
+
+/// Find `test` in the JUnit reports of the checks that ran. When several
+/// commands report it, a Passed result is the one that settles it; else
+/// the first report's outcome stands.
+fn find_named_test(
+    test: &str,
+    profile: &VerificationProfile,
+    checks: &[CheckOutcome],
+) -> NamedTest {
+    if profile.commands.iter().all(|spec| spec.junit.is_none()) {
+        return NamedTest::NoReportDeclared;
+    }
+    let mut found: Option<TestSettlement> = None;
+    let mut unreadable = Vec::new();
+    for check in checks {
+        let Some(report) = &check.junit else { continue };
+        match report {
+            JunitReport::Reported { tests, artifact } => {
+                let Some(&outcome) = tests.get(test) else {
+                    continue;
+                };
+                let settles = match &found {
+                    None => true,
+                    Some(earlier) => {
+                        earlier.outcome != TestOutcome::Passed && outcome == TestOutcome::Passed
+                    }
+                };
+                if settles {
+                    found = Some(TestSettlement {
+                        test: test.to_string(),
+                        command: check.label.clone(),
+                        outcome,
+                        artifact: artifact.as_ref().map(|kept| kept.path.clone()),
+                    });
+                }
+            }
+            JunitReport::Missing | JunitReport::Unparseable { .. } => {
+                unreadable.extend(
+                    report
+                        .fact()
+                        .map(|fact| format!("`{}` {fact}", check.label)),
+                );
+            }
+        }
+    }
+    match found {
+        Some(settlement) => NamedTest::Reported(settlement),
+        None => NamedTest::NotReported { unreadable },
     }
 }
 
@@ -340,6 +500,12 @@ pub struct CriterionOutcome {
     pub met: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Evidence>,
+    /// For a criterion that names a test: the test id, the command whose
+    /// JUnit report held it, and the outcome it had — met or not. Absent
+    /// when no report contained the test (a gap) and for every criterion
+    /// that names none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_by: Option<TestSettlement>,
 }
 
 /// Settle every acceptance criterion against a finished verification
@@ -351,6 +517,12 @@ pub struct CriterionOutcome {
 /// still accepted when the checks pass: relais reports what it knows
 /// (the evidence was not independent) rather than inventing a stricter
 /// rule than the contract asked for (SPEC §10).
+///
+/// A test that names itself (`Evidence::Test { name: Some(_) }`) is the
+/// exception to that: it is met exactly when some command's parsed JUnit
+/// report holds that test id as Passed. Failed or Skipped is not met, and
+/// the outcome is recorded; a test no report holds, or no declared
+/// report at all, is not met either (and `acceptance_gaps` names it).
 ///
 /// A human sign-off is the one kind that passing checks cannot settle,
 /// because it is not a claim about the code: it is met exactly when
@@ -374,7 +546,18 @@ pub fn settle_acceptance(
         .iter()
         .map(|entry| {
             let evidence = entry.evidence().cloned();
+            let mut settled_by = None;
             let met = match &evidence {
+                Some(Evidence::Test {
+                    name: Some(test), ..
+                }) => match find_named_test(test, profile, &report.checks) {
+                    NamedTest::Reported(settlement) => {
+                        let passed = settlement.outcome == TestOutcome::Passed;
+                        settled_by = Some(settlement);
+                        passed
+                    }
+                    NamedTest::NoReportDeclared | NamedTest::NotReported { .. } => false,
+                },
                 Some(Evidence::Check { name }) => {
                     named_command(profile, name).is_some_and(|spec| {
                         let label = check_label(spec);
@@ -384,7 +567,7 @@ pub fn settle_acceptance(
                             .any(|check| check.label == label && !check.failed())
                     })
                 }
-                Some(Evidence::Test { .. } | Evidence::LlmReview) | None => accepted,
+                Some(Evidence::Test { name: None, .. } | Evidence::LlmReview) | None => accepted,
                 Some(Evidence::HumanSignOff) => signoffs.contains(&entry.id()),
                 Some(Evidence::AmontGate { gate }) => {
                     matches!(gate_coverage.get(gate), Some(Ok(true)))
@@ -396,6 +579,7 @@ pub fn settle_acceptance(
                 mandatory: entry.mandatory(),
                 met,
                 evidence,
+                settled_by,
             }
         })
         .collect();
@@ -453,6 +637,19 @@ pub fn run_command(
 ) -> Result<CheckOutcome, VerifyError> {
     let timeout = command_timeout(spec)?;
     std::fs::create_dir_all(logs_dir)?;
+    // A report the candidate itself committed is not this command's
+    // result: clear it, so what is read afterwards was written by the run.
+    let junit_file = spec
+        .junit
+        .as_deref()
+        .and_then(|relative| junit_file(dir, relative));
+    if let Some(file) = &junit_file {
+        match std::fs::remove_file(file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(VerifyError::Io(e)),
+        }
+    }
     let log_path = logs_dir.join(format!("{log_stem}.log"));
     let log_file = std::fs::OpenOptions::new()
         .create(true)
@@ -491,12 +688,68 @@ pub fn run_command(
         Err(e) => return Err(VerifyError::Io(e)),
     };
     let log_bytes = std::fs::read(&log_path)?;
+    let junit = match spec.junit {
+        Some(_) => Some(read_junit(
+            junit_file.as_deref(),
+            &logs_dir.join(format!("{log_stem}.junit.xml")),
+        )?),
+        None => None,
+    };
     Ok(CheckOutcome {
         label: label.to_string(),
         argv: spec.argv.clone(),
         ended: CheckEnd::new(ended),
         log_path: log_path.to_string_lossy().into_owned(),
         log_sha256: sha256_hex(&log_bytes),
+        junit,
+    })
+}
+
+/// Where a command's declared JUnit report lives: the policy's relative
+/// path under the directory the command ran in. `None` for a path that
+/// is absolute or climbs out of it — a report is the command's own
+/// output inside its worktree, and nothing else is read.
+fn junit_file(dir: &Path, relative: &str) -> Option<PathBuf> {
+    let relative = Path::new(relative);
+    relative
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)))
+        .then(|| dir.join(relative))
+}
+
+/// The recorded fact about a declared report, after its command ran. A
+/// report that was read is copied to `kept`, the way a check log is kept;
+/// one that was missing or unparseable leaves nothing behind.
+fn read_junit(file: Option<&Path>, kept: &Path) -> Result<JunitReport, VerifyError> {
+    let Some(file) = file else {
+        return Ok(JunitReport::Unparseable {
+            reason: "the path is not inside the worktree".to_string(),
+        });
+    };
+    Ok(match std::fs::read(file) {
+        Ok(bytes) => match parse_junit(&bytes) {
+            Ok(tests) => {
+                // The hash is of the kept file as written and read back,
+                // not of the bytes in memory, so the evidence row names
+                // what is actually on disk (X5).
+                std::fs::write(kept, &bytes)?;
+                let written = std::fs::read(kept)?;
+                JunitReport::Reported {
+                    tests,
+                    artifact: Some(JunitArtifact {
+                        path: kept.to_string_lossy().into_owned(),
+                        sha256: sha256_hex(&written),
+                    }),
+                }
+            }
+            Err(e) => JunitReport::Unparseable {
+                reason: e.to_string(),
+            },
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => JunitReport::Missing,
+        Err(e) => JunitReport::Unparseable {
+            reason: e.to_string(),
+        },
     })
 }
 
@@ -1744,6 +1997,7 @@ mod tests {
             name: None,
             argv: argv.iter().map(|a| a.to_string()).collect(),
             timeout_seconds,
+            junit: None,
         }
     }
 
@@ -2518,6 +2772,7 @@ mod tests {
                 ended: Ended::Exited(0).into(),
                 log_path: "x.log".into(),
                 log_sha256: "h".into(),
+                junit: None,
             }],
             gaps: vec![],
             baseline_failures: vec![],
@@ -2543,6 +2798,7 @@ mod tests {
             name: Some(name.to_string()),
             argv: argv.iter().map(|a| a.to_string()).collect(),
             timeout_seconds,
+            junit: None,
         }
     }
 
@@ -2599,6 +2855,7 @@ mod tests {
             ended: Ended::Exited(0).into(),
             log_path: "x.log".into(),
             log_sha256: "h".into(),
+            junit: None,
         }];
         let gaps = acceptance_gaps(
             &entries,
@@ -2658,6 +2915,7 @@ mod tests {
             ended: Ended::Exited(0).into(),
             log_path: "x.log".into(),
             log_sha256: "h".into(),
+            junit: None,
         }];
         let report = VerificationReport {
             candidate_sha: "abc".into(),
@@ -2681,6 +2939,7 @@ mod tests {
                 "the new endpoint is exercised",
                 crate::acceptance::Evidence::Test {
                     authorship: crate::acceptance::TestAuthorship::ModelAdded,
+                    name: None,
                 },
             ),
             declared(
@@ -2731,6 +2990,18 @@ mod tests {
             MissingEvidence::CheckUndefined {
                 name: "security-scan".into(),
             },
+            MissingEvidence::NoPerTestResults {
+                test: "api::rejects".into(),
+            },
+            MissingEvidence::TestNotReported {
+                test: "api::rejects".into(),
+                unreadable: vec!["`make@1a2b3c4d` junit: missing".into()],
+            },
+            MissingEvidence::TestNotPassed {
+                test: "api::rejects".into(),
+                outcome: TestOutcome::Skipped,
+                command: "make@1a2b3c4d".into(),
+            },
         ] {
             let gap = AcceptanceGap {
                 criterion_id: "c-0123456789ab".into(),
@@ -2747,6 +3018,336 @@ mod tests {
         // A gap from somewhere else entirely — amont's inventory — is
         // not a criterion at all.
         assert_eq!(sign_off_gap_criterion("amont inventory: unavailable"), None);
+    }
+
+    fn profile_of(commands: Vec<CommandSpec>) -> VerificationProfile {
+        VerificationProfile {
+            setup: Vec::new(),
+            commands,
+            amont_checks: Vec::new(),
+            amont_waivers: Vec::new(),
+            inputs: Vec::new(),
+            cache_baseline: false,
+        }
+    }
+
+    /// A command that declares a JUnit report (or not).
+    fn make_check(junit: Option<&str>) -> CommandSpec {
+        CommandSpec {
+            junit: junit.map(str::to_string),
+            ..named("make check", &["make", "check"], 10)
+        }
+    }
+
+    /// The outcome of `spec` having run and exited 0, with `junit` as
+    /// what its report turned out to be.
+    fn ran_ok(spec: &CommandSpec, junit: Option<JunitReport>) -> CheckOutcome {
+        CheckOutcome {
+            label: check_label(spec),
+            argv: spec.argv.clone(),
+            ended: Ended::Exited(0).into(),
+            log_path: "x.log".into(),
+            log_sha256: "h".into(),
+            junit,
+        }
+    }
+
+    fn reported(tests: &[(&str, TestOutcome)]) -> Option<JunitReport> {
+        Some(JunitReport::Reported {
+            tests: tests
+                .iter()
+                .map(|(id, outcome)| (id.to_string(), *outcome))
+                .collect(),
+            artifact: None,
+        })
+    }
+
+    fn report_of(checks: Vec<CheckOutcome>) -> VerificationReport {
+        VerificationReport {
+            candidate_sha: "abc".into(),
+            base_sha: "def".into(),
+            contract_hash: "ch".into(),
+            policy_hash: "ph".into(),
+            checks,
+            gaps: Vec::new(),
+            baseline_failures: Vec::new(),
+            amont_bypasses: Vec::new(),
+            amont_downgrades: Vec::new(),
+            verification_inputs_changed: Vec::new(),
+            integration_gaps: Vec::new(),
+            baseline_cached: false,
+            baseline_cache_refused: None,
+        }
+    }
+
+    fn names_test(test: Option<&str>) -> AcceptanceEntry {
+        declared(
+            "the api rejects malformed input",
+            crate::acceptance::Evidence::Test {
+                authorship: crate::acceptance::TestAuthorship::PreExisting,
+                name: test.map(str::to_string),
+            },
+        )
+    }
+
+    /// Settle one criterion and return its outcome plus its gaps.
+    fn settle_one(
+        entry: AcceptanceEntry,
+        profile: &VerificationProfile,
+        checks: Vec<CheckOutcome>,
+    ) -> (CriterionOutcome, Vec<AcceptanceGap>) {
+        let entries = vec![entry];
+        let gaps = acceptance_gaps(
+            &entries,
+            profile,
+            &checks,
+            &HashSet::new(),
+            &BTreeMap::new(),
+        );
+        let (mut criteria, _) = settle_acceptance(
+            &entries,
+            profile,
+            &report_of(checks),
+            &HashSet::new(),
+            &BTreeMap::new(),
+        );
+        (criteria.remove(0), gaps)
+    }
+
+    /// (a) A named test that a command's report holds as Passed is met,
+    /// and the receipt says which test and which command's report.
+    #[test]
+    fn a_named_test_that_passed_is_met_and_says_by_what() {
+        let spec = make_check(Some("target/junit.xml"));
+        let profile = profile_of(vec![spec.clone()]);
+        let checks = vec![ran_ok(
+            &spec,
+            reported(&[
+                ("api::rejects", TestOutcome::Passed),
+                ("api::other", TestOutcome::Failed),
+            ]),
+        )];
+        let (outcome, gaps) = settle_one(names_test(Some("api::rejects")), &profile, checks);
+        assert!(outcome.met, "{outcome:?}");
+        assert!(gaps.is_empty(), "{gaps:?}");
+        assert_eq!(
+            outcome.settled_by,
+            Some(TestSettlement {
+                test: "api::rejects".into(),
+                command: check_label(&spec),
+                outcome: TestOutcome::Passed,
+                artifact: None,
+            })
+        );
+    }
+
+    /// (b) A named test that a report holds as Failed (or Skipped) is not
+    /// met, the outcome is named, and the run is refused: it is a gap like
+    /// every other unmet mandatory evidence, because the command that ran
+    /// it may well have exited 0 (pytest and nextest do over a skip).
+    ///
+    /// FALSIFIED: with the `NamedTest::Reported` arm of `acceptance_gaps`
+    /// restored to an empty `Reported(_) => {}`, this test failed on
+    /// `assert_eq!(gaps, …)` and the skipped-test test below on
+    /// `!report.gaps.is_empty()`; restored, both pass.
+    #[test]
+    fn a_named_test_that_failed_or_was_skipped_is_not_met_and_says_which() {
+        let spec = make_check(Some("target/junit.xml"));
+        let profile = profile_of(vec![spec.clone()]);
+        for reported_as in [TestOutcome::Failed, TestOutcome::Skipped] {
+            let checks = vec![ran_ok(&spec, reported(&[("api::rejects", reported_as)]))];
+            let (outcome, gaps) = settle_one(names_test(Some("api::rejects")), &profile, checks);
+            assert!(!outcome.met, "{reported_as}: {outcome:?}");
+            assert_eq!(
+                outcome.settled_by.map(|s| s.outcome),
+                Some(reported_as),
+                "the receipt names the outcome"
+            );
+            assert_eq!(
+                gaps.iter().map(|gap| &gap.missing).collect::<Vec<_>>(),
+                [&MissingEvidence::TestNotPassed {
+                    test: "api::rejects".into(),
+                    outcome: reported_as,
+                    command: check_label(&spec),
+                }]
+            );
+        }
+    }
+
+    /// The command exits 0 and the named mandatory test is Skipped: the
+    /// gap is what refuses the run, and its sentence names the outcome.
+    #[test]
+    fn a_skipped_named_test_under_a_command_that_exited_zero_is_refused() {
+        let spec = make_check(Some("target/junit.xml"));
+        let profile = profile_of(vec![spec.clone()]);
+        let checks = vec![ran_ok(
+            &spec,
+            reported(&[("api::rejects", TestOutcome::Skipped)]),
+        )];
+        assert!(!checks[0].failed(), "the command itself exited 0");
+        let (_, gaps) = settle_one(names_test(Some("api::rejects")), &profile, checks);
+        let mut report = report_of(Vec::new());
+        report.gaps = gaps.iter().map(AcceptanceGap::message).collect();
+        assert!(!report.accepted(), "the run must be refused");
+        assert!(report.gaps[0].contains("Skipped"), "{:?}", report.gaps);
+        assert!(
+            report.gaps[0].contains("`api::rejects`"),
+            "{:?}",
+            report.gaps
+        );
+    }
+
+    /// (c) A named test that no report holds is a gap naming the test —
+    /// exactly as an unproduced check is — and never met, whether the
+    /// report was read without it or could not be read at all.
+    ///
+    /// FALSIFIED: with the `NamedTest::NotReported` arm of
+    /// `settle_acceptance` made to settle as met (`=> true`), this test
+    /// failed on `assert!(!outcome.met …)`; restored, it passes.
+    #[test]
+    fn a_named_test_absent_from_every_report_is_a_gap_naming_it() {
+        let spec = make_check(Some("target/junit.xml"));
+        let profile = profile_of(vec![spec.clone()]);
+
+        let checks = vec![ran_ok(
+            &spec,
+            reported(&[("api::other", TestOutcome::Passed)]),
+        )];
+        let (outcome, gaps) = settle_one(names_test(Some("api::rejects")), &profile, checks);
+        assert!(!outcome.met, "{outcome:?}");
+        assert_eq!(outcome.settled_by, None);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(
+            gaps[0].missing,
+            MissingEvidence::TestNotReported {
+                test: "api::rejects".into(),
+                unreadable: Vec::new()
+            }
+        );
+        assert!(gaps[0].message().contains("`api::rejects`"), "{gaps:?}");
+
+        let checks = vec![ran_ok(&spec, Some(JunitReport::Missing))];
+        let (outcome, gaps) = settle_one(names_test(Some("api::rejects")), &profile, checks);
+        assert!(!outcome.met, "{outcome:?}");
+        assert!(
+            gaps[0].message().contains("junit: missing"),
+            "an unreadable report is named as the likely reason: {}",
+            gaps[0].message()
+        );
+    }
+
+    /// (d) With no command declaring `junit`, nothing produced per-test
+    /// results: a gap that says so, not one blaming the test.
+    #[test]
+    fn a_named_test_with_no_declared_report_is_a_gap_saying_none_were_produced() {
+        let spec = make_check(None);
+        let profile = profile_of(vec![spec.clone()]);
+        let checks = vec![ran_ok(&spec, None)];
+        let (outcome, gaps) = settle_one(names_test(Some("api::rejects")), &profile, checks);
+        assert!(!outcome.met, "{outcome:?}");
+        assert_eq!(
+            gaps.iter().map(|g| g.missing.clone()).collect::<Vec<_>>(),
+            [MissingEvidence::NoPerTestResults {
+                test: "api::rejects".into()
+            }]
+        );
+        assert!(
+            gaps[0]
+                .message()
+                .contains("no per-test results were produced"),
+            "{}",
+            gaps[0].message()
+        );
+    }
+
+    /// (e) A Test criterion with no name settles as it always did: by the
+    /// report as a whole, with no gap and nothing in `settled_by`.
+    #[test]
+    fn an_unnamed_test_criterion_settles_as_before() {
+        let spec = make_check(None);
+        let profile = profile_of(vec![spec.clone()]);
+        let (outcome, gaps) = settle_one(names_test(None), &profile, vec![ran_ok(&spec, None)]);
+        assert!(outcome.met, "{outcome:?}");
+        assert!(gaps.is_empty(), "{gaps:?}");
+        assert_eq!(outcome.settled_by, None);
+
+        let mut failed = ran_ok(&spec, None);
+        failed.ended = Ended::Exited(1).into();
+        let (outcome, _) = settle_one(names_test(None), &profile, vec![failed]);
+        assert!(!outcome.met, "the report as a whole failed: {outcome:?}");
+    }
+
+    /// A declared report is a recorded fact on the outcome, and never
+    /// changes the command's own pass/fail.
+    #[test]
+    fn a_declared_report_is_read_after_the_command_and_leaves_its_exit_alone() {
+        let dir = temp_dir("junit");
+        let logs = dir.join("logs");
+        let ok_report = "<testsuite><testcase classname=\"a\" name=\"b\"/></testsuite>";
+        let script = format!("printf '%s' '{ok_report}' > junit.xml");
+        let spec = CommandSpec {
+            junit: Some("junit.xml".into()),
+            ..command(&["sh", "-c", &script], 10)
+        };
+        let outcome = run_command(&dir, &spec, &logs, "l", "s").expect("runs");
+        assert!(!outcome.failed());
+        // The report is kept beside the log, with the hash of its bytes.
+        let kept = logs.join("s.junit.xml");
+        let Some(JunitReport::Reported { tests, artifact }) = &outcome.junit else {
+            panic!("expected a read report: {:?}", outcome.junit);
+        };
+        assert_eq!(tests["a::b"], TestOutcome::Passed);
+        assert_eq!(
+            artifact,
+            &Some(JunitArtifact {
+                path: kept.to_string_lossy().into_owned(),
+                sha256: sha256_hex(ok_report.as_bytes()),
+            })
+        );
+        assert_eq!(
+            sha256_hex(&std::fs::read(&kept).expect("the copy exists")),
+            sha256_hex(ok_report.as_bytes())
+        );
+
+        // A stale report the candidate committed is not this run's.
+        let stale = CommandSpec {
+            junit: Some("junit.xml".into()),
+            ..command(&["sh", "-c", "exit 3"], 10)
+        };
+        let outcome = run_command(&dir, &stale, &logs, "l", "s2").expect("runs");
+        assert!(outcome.failed(), "the exit status is still the verdict");
+        assert_eq!(outcome.junit, Some(JunitReport::Missing));
+
+        let garbage = CommandSpec {
+            junit: Some("junit.xml".into()),
+            ..command(&["sh", "-c", "echo nope > junit.xml"], 10)
+        };
+        let outcome = run_command(&dir, &garbage, &logs, "l", "s3").expect("runs");
+        assert!(!outcome.failed());
+        assert!(
+            matches!(&outcome.junit, Some(JunitReport::Unparseable { .. })),
+            "{:?}",
+            outcome.junit
+        );
+        assert!(
+            !logs.join("s3.junit.xml").exists(),
+            "an unreadable report leaves no artifact"
+        );
+
+        let outside = CommandSpec {
+            junit: Some("../junit.xml".into()),
+            ..command(&["sh", "-c", "true"], 10)
+        };
+        let outcome = run_command(&dir, &outside, &logs, "l", "s4").expect("runs");
+        assert!(
+            matches!(&outcome.junit, Some(JunitReport::Unparseable { .. })),
+            "{:?}",
+            outcome.junit
+        );
+
+        let undeclared = command(&["sh", "-c", "true"], 10);
+        let outcome = run_command(&dir, &undeclared, &logs, "l", "s5").expect("runs");
+        assert_eq!(outcome.junit, None);
     }
 
     /// The failure this test exists for: a mandatory criterion asking
@@ -2771,6 +3372,7 @@ mod tests {
             ended: Ended::Exited(0).into(),
             log_path: "x.log".into(),
             log_sha256: "h".into(),
+            junit: None,
         }];
         let entries = vec![declared(
             "a person signed off on the migration",
@@ -2847,6 +3449,7 @@ mod tests {
             ended: Ended::Exited(0).into(),
             log_path: "x.log".into(),
             log_sha256: "h".into(),
+            junit: None,
         }];
         let entries = vec![declared(
             "a person signed off on the migration",
@@ -2936,6 +3539,7 @@ mod tests {
             ended: Ended::Exited(0).into(),
             log_path: "x.log".into(),
             log_sha256: "h".into(),
+            junit: None,
         }];
         let entries = vec![declared(
             "the pre-push cargo test gate covers this candidate",
@@ -3009,6 +3613,7 @@ mod tests {
             ended: Ended::Exited(0).into(),
             log_path: "x.log".into(),
             log_sha256: "h".into(),
+            junit: None,
         }];
         let entries = vec![declared(
             "the pre-push cargo test gate covers this candidate",
@@ -3192,6 +3797,7 @@ mod tests {
             ended: Ended::Exited(1).into(),
             log_path: "f.log".into(),
             log_sha256: "h".into(),
+            junit: None,
         };
         let report = VerificationReport {
             candidate_sha: "abc".into(),
