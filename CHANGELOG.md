@@ -6,7 +6,25 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
-## Unreleased
+## v0.6.0
+
+### Upgrading
+
+- **Re-run `relais install --claude`** (with `--user --write` if that is
+  how it was installed): the `/relais` skill no longer tells callers to
+  set `RELAIS_SESSION_ID` to the shell PID.
+- **Add a `[pricing]` table to `~/.config/relais/machine.toml`** to price
+  the orchestrating session's spend (see docs/INTEGRATIONS.md). Without
+  it every orchestration figure is `unknown`, never zero. Prices are
+  maintained by hand.
+- **`relais run`'s stderr now begins with a `session:` line**; the
+  outcome is the line after it. `relais plan`'s stdout is unchanged.
+- The ledger migrates to schema v15 on first open (additive:
+  `orchestration_usage`). An older binary cannot read it afterwards.
+- **Consider denying `Agent` and `Task` to workers** in machine.toml
+  `[permissions] disallowed_tools`: in print mode the Agent tool needs no
+  permission, and a worker used it to hand its task to a subagent on a
+  model of its choosing (#120, not yet fixed in the shipped floor).
 
 ### Added
 
