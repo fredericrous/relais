@@ -6,6 +6,20 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## Unreleased
+
+### Fixed
+
+- **A worker can no longer pick its own model by spawning a subagent
+  (#120).** The deny floor gains `Agent` and `Task`; a measured sonnet
+  worker had delegated its task to an Opus subagent. `allow_nested_agents`
+  is documented as the coordinator's agent-tree limit, not a worker
+  permission.
+- **The worker prompt tells workers to run plain commands (#105).** No
+  pipes, redirects, `;`, `&&`, `$(…)` or `VAR=value` prefixes, since the
+  permission matcher refuses them and a refused command forced the
+  candidate into review. It also says workers cannot spawn subagents.
+
 ## v0.7.0
 
 ### Upgrading

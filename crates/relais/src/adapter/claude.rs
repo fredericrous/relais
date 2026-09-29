@@ -764,6 +764,22 @@ mod tests {
     }
 
     #[test]
+    fn a_default_permissions_worker_is_denied_subagents() {
+        let caps = capabilities_from_help("2.1.278".into(), HELP_2_1);
+        let mut worker = spec(None);
+        worker.disallowed_tools =
+            crate::policy::effective_disallowed_tools(&crate::policy::Permissions::default());
+        let argv = build_argv(&worker, &caps).expect("argv");
+        let denied: Vec<&str> = argv
+            .windows(2)
+            .filter(|pair| pair[0] == "--disallowed-tools")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert!(denied.contains(&"Agent"), "denied: {denied:?}");
+        assert!(denied.contains(&"Task"), "denied: {denied:?}");
+    }
+
+    #[test]
     fn budget_dollars_is_a_plain_decimal() {
         assert_eq!(budget_dollars(1_500_000), "1.5");
         assert_eq!(budget_dollars(3_000_000), "3");
