@@ -28,9 +28,18 @@ missing here.
   block, or `enabled = false`, nothing changes and no row is written.
   Ledger step v16 adds `trials.arms_json`. `relais doctor`'s `trials`
   line is now a status line, and `enabled = true` without a `seed` is a
-  failure. `relais recipe evaluate` sets live trials aside until an
-  unpaired estimator exists (`randomized trials set aside: N`). See
-  docs/SPEC.md §28 and docs/INTEGRATIONS.md.
+  failure. See docs/SPEC.md §28 and docs/INTEGRATIONS.md.
+- **`relais recipe evaluate` estimates live trials.** A candidate can now
+  earn promotion from randomized evidence as well as from replays: live
+  trials whose recorded arm list names the candidate (control rows
+  included) are compared without pairing — Hajek inverse-propensity
+  acceptance and cost per accepted change per arm, and an unpaired
+  bootstrap interval seeded from the sorted trial ids. The randomized
+  section has its own gates (20 observations per arm, no abstaining arm,
+  minimum assignment probability above zero), is rendered as `basis:
+  randomized, control n=…, candidate n=…`, and `ComparisonReport` gains
+  an additive `randomized` field in place of `live_trials_set_aside`. See
+  docs/SPEC.md §25 and §28.
 
 ## v0.6.0
 

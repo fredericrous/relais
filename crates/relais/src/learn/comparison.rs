@@ -148,6 +148,71 @@ pub struct PairedInterval {
     pub resamples: usize,
 }
 
+/// The unpaired bootstrap interval over the candidate-minus-control
+/// acceptance difference of a randomized comparison: tasks are resampled
+/// with replacement WITHIN each arm, independently, each resample weighted
+/// by inverse assignment probability. Seeded from a value carried in the
+/// report, so the same trials give the same interval on any machine
+/// (SPEC §25).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RandomizedInterval {
+    pub point: f64,
+    pub low: f64,
+    pub high: f64,
+    pub seed: u64,
+    pub resamples: usize,
+}
+
+/// The randomized section of a comparison (SPEC §25, §28): live trials in
+/// which the candidate was among the arms at draw time, control included,
+/// estimated without pairing. `n` counts tasks, one earliest settled
+/// non-errored observation per task per arm.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RandomizedComparison {
+    pub control_tasks: usize,
+    pub candidate_tasks: usize,
+    /// Settled live trials of this comparison whose outcome was
+    /// [`TrialOutcome::Errored`], set aside exactly as for replays.
+    pub errored_trials_set_aside: usize,
+    /// The smallest recorded assignment probability among the observations
+    /// (a non-finite one counts as zero); `None` with no observation.
+    pub min_assignment_probability: Option<f64>,
+    pub control: ArmSummary,
+    pub candidate: ArmSummary,
+    pub interval: RandomizedInterval,
+}
+
+impl RandomizedComparison {
+    /// Every randomized gate that does not hold, recomputed from the
+    /// stored figures: each arm has `minimum` observations, neither arm
+    /// abstains, and the minimum recorded assignment probability is > 0.
+    pub fn failures(&self, minimum: usize) -> Vec<GateFailure> {
+        let mut failures = Vec::new();
+        for (arm, observed, summary) in [
+            (WhichArm::Incumbent, self.control_tasks, &self.control),
+            (WhichArm::Arm, self.candidate_tasks, &self.candidate),
+        ] {
+            if observed < minimum {
+                failures.push(GateFailure::RandomizedInsufficientTasks {
+                    arm,
+                    observed,
+                    minimum,
+                });
+            }
+            if let AcceptanceEstimate::Abstained(reason) = summary.acceptance {
+                failures.push(GateFailure::RandomizedNoSupport { arm, reason });
+            }
+        }
+        if !self
+            .min_assignment_probability
+            .is_some_and(|p| p.is_finite() && p > 0.0)
+        {
+            failures.push(GateFailure::RandomizedProbabilityUnusable);
+        }
+        failures
+    }
+}
+
 /// Which arm a gate failure is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -180,6 +245,19 @@ pub enum GateFailure {
         arm: WhichArm,
         reason: AbstentionReason,
     },
+    /// A randomized arm has too few observations (`Incumbent` is control).
+    RandomizedInsufficientTasks {
+        arm: WhichArm,
+        observed: usize,
+        minimum: usize,
+    },
+    /// A randomized arm abstains (`Incumbent` is control).
+    RandomizedNoSupport {
+        arm: WhichArm,
+        reason: AbstentionReason,
+    },
+    /// The minimum recorded assignment probability is not above zero.
+    RandomizedProbabilityUnusable,
 }
 
 impl std::fmt::Display for GateFailure {
@@ -195,7 +273,33 @@ impl std::fmt::Display for GateFailure {
                 "{observed} paired task(s) is below the {minimum} required for promotion"
             ),
             Self::NoSupport { arm, reason } => write!(f, "the {arm} arm has no support: {reason}"),
+            Self::RandomizedInsufficientTasks {
+                arm,
+                observed,
+                minimum,
+            } => write!(
+                f,
+                "randomized: the {} arm has {observed} observation(s), below the {minimum} \
+                 required for promotion",
+                randomized_arm_name(*arm)
+            ),
+            Self::RandomizedNoSupport { arm, reason } => write!(
+                f,
+                "randomized: the {} arm has no support: {reason}",
+                randomized_arm_name(*arm)
+            ),
+            Self::RandomizedProbabilityUnusable => f.write_str(
+                "randomized: the minimum recorded assignment probability is not above zero",
+            ),
         }
+    }
+}
+
+/// The incumbent is the control of a randomized comparison.
+fn randomized_arm_name(arm: WhichArm) -> &'static str {
+    match arm {
+        WhichArm::Incumbent => "control",
+        WhichArm::Arm => "candidate",
     }
 }
 
@@ -214,23 +318,36 @@ pub struct ComparisonReport {
     /// the arm" by that variant's own doc, so they never enter a pair. Set
     /// aside rather than dropped: this count is how they stay visible.
     pub errored_trials_set_aside: usize,
-    /// Settled live (`live_worktree`) trials for this candidate, set aside
-    /// whole: this estimator pairs each trial with a replay SOURCE run,
-    /// which a live trial does not have, so pairing one would compare the
-    /// arm with nothing. They stay counted, not dropped, until an unpaired
-    /// estimator exists. Additive: a report written before this field
-    /// existed reads back as zero.
-    #[serde(default)]
-    pub live_trials_set_aside: usize,
     pub incumbent: ArmSummary,
     pub arm: ArmSummary,
     pub interval: PairedInterval,
+    /// The unpaired estimate from live (randomized) trials, when any
+    /// settled trial drew the candidate among its arms. Additive: a report
+    /// written before this field existed reads back as `None`.
+    #[serde(default)]
+    pub randomized: Option<RandomizedComparison>,
 }
 
 impl ComparisonReport {
     /// Every gate that does not hold, recomputed from the numbers beside
-    /// it. Empty means promotable.
+    /// it. Empty means promotable: the replay section has no failure, or a
+    /// randomized section exists and has none.
     pub fn failures(&self) -> Vec<GateFailure> {
+        let mut failures = self.replay_failures();
+        if failures.is_empty() {
+            return failures;
+        }
+        if let Some(randomized) = &self.randomized {
+            let randomized_failures = randomized.failures(self.min_paired_tasks);
+            if randomized_failures.is_empty() {
+                return Vec::new();
+            }
+            failures.extend(randomized_failures);
+        }
+        failures
+    }
+
+    fn replay_failures(&self) -> Vec<GateFailure> {
         let mut failures = Vec::new();
         if self.basis == ComparisonBasis::Observational {
             failures.push(GateFailure::NonComparableBasis(self.basis));
@@ -272,10 +389,6 @@ impl ComparisonReport {
             "errored trials set aside (not comparable evidence for or against the arm): {}\n",
             self.errored_trials_set_aside
         ));
-        out.push_str(&format!(
-            "randomized trials set aside: {} (unpaired estimator not implemented yet)\n",
-            self.live_trials_set_aside
-        ));
         out.push_str(&format!("incumbent: {}\n", render_arm(&self.incumbent)));
         out.push_str(&format!("candidate arm: {}\n", render_arm(&self.arm)));
         out.push_str(&format!(
@@ -288,6 +401,9 @@ impl ComparisonReport {
             self.interval.resamples,
             self.interval.seed,
         ));
+        if let Some(randomized) = &self.randomized {
+            out.push_str(&render_randomized(randomized));
+        }
         out
     }
 
@@ -300,7 +416,11 @@ impl ComparisonReport {
         out.push_str(&self.render_evidence());
         let failures = self.failures();
         if failures.is_empty() {
-            out.push_str("gates: PASSED\n");
+            if self.replay_failures().is_empty() {
+                out.push_str("gates: PASSED\n");
+            } else {
+                out.push_str("gates: PASSED (basis: randomized)\n");
+            }
         } else {
             out.push_str("gates: FAILED — promotion is refused\n");
             for failure in failures {
@@ -309,6 +429,36 @@ impl ComparisonReport {
         }
         out
     }
+}
+
+fn render_randomized(randomized: &RandomizedComparison) -> String {
+    let mut out = format!(
+        "basis: randomized, control n={}, candidate n={}\n",
+        randomized.control_tasks, randomized.candidate_tasks
+    );
+    out.push_str(&format!(
+        "  errored trials set aside (not comparable evidence for or against the arm): {}\n",
+        randomized.errored_trials_set_aside
+    ));
+    match randomized.min_assignment_probability {
+        Some(p) => out.push_str(&format!("  minimum assignment probability: {p:.3}\n")),
+        None => out.push_str("  minimum assignment probability: none recorded\n"),
+    }
+    out.push_str(&format!("  control: {}\n", render_arm(&randomized.control)));
+    out.push_str(&format!(
+        "  candidate arm: {}\n",
+        render_arm(&randomized.candidate)
+    ));
+    out.push_str(&format!(
+        "  unpaired acceptance difference (candidate - control): {:.3} [{:.3}, {:.3}] \
+         ({} bootstrap resample(s), seed {})\n",
+        randomized.interval.point,
+        randomized.interval.low,
+        randomized.interval.high,
+        randomized.interval.resamples,
+        randomized.interval.seed,
+    ));
+    out
 }
 
 fn render_arm(summary: &ArmSummary) -> String {
@@ -360,8 +510,15 @@ pub use sealed::Promotable;
 /// settled arm whose `arm_recipe_id` names one of the candidate's own
 /// recipes — a candidate is a whole policy, and different tasks may
 /// cover under different recipes within it.
+///
+/// A candidate is the base policy plus appended revisions, so its recipe
+/// ids include the `incumbent`'s own (a recipe id is a content hash). The
+/// live section therefore keys on the candidate's ARM ids: its recipe ids
+/// minus the incumbent's, so a control row counts only when a recipe new in
+/// the candidate was among its non-control arms.
 pub fn evaluate_candidate(
     ledger: &Ledger,
+    incumbent: &RepoPolicy,
     candidate: &RepoPolicy,
     min_paired_tasks: usize,
     resamples: usize,
@@ -371,8 +528,7 @@ pub fn evaluate_candidate(
         .iter()
         .map(RecipeSpec::recipe_id)
         .collect();
-    let (trials, live_trials_set_aside) =
-        set_aside_live_trials(ledger.settled_trials_for_recipes(&recipe_ids)?);
+    let trials = replay_trials(ledger.settled_trials_for_recipes(&recipe_ids)?);
     let (by_task, errored_trials_set_aside) = earliest_non_errored_per_task(trials);
 
     let basis = comparison_basis(by_task.values());
@@ -415,16 +571,28 @@ pub fn evaluate_candidate(
     );
     let interval = bootstrap_paired_interval(&pairs, seed, resamples);
 
+    let incumbent_ids: BTreeSet<String> = incumbent
+        .recipes
+        .iter()
+        .map(RecipeSpec::recipe_id)
+        .collect();
+    let arm_ids: BTreeSet<String> = recipe_ids.difference(&incumbent_ids).cloned().collect();
+    let randomized = randomized_comparison(
+        ledger.settled_live_trials_for_arms(&arm_ids)?,
+        &arm_ids,
+        resamples,
+    );
+
     Ok(ComparisonReport {
         candidate_recipe_ids: recipe_ids,
         basis,
         paired_tasks: pairs.len(),
         min_paired_tasks,
         errored_trials_set_aside,
-        live_trials_set_aside,
         incumbent: incumbent_summary,
         arm: arm_summary_value,
         interval,
+        randomized,
     })
 }
 
@@ -445,19 +613,79 @@ fn trial_cost_from_run(
         .expect("a cost/completeness pair read back from the ledger's own settled values is always a consistent one"))
 }
 
-/// The replay trials, and how many live ones were set aside. A live trial
-/// (SPEC §28) ran in the repository's own worktree and has no replay
-/// source run to be paired with; until an unpaired estimator exists it is
-/// excluded from pairing and from [`comparison_basis`] alike, so a ledger
-/// holding both evaluates exactly as it would holding the replays alone.
-fn set_aside_live_trials(trials: Vec<TrialRow>) -> (Vec<TrialRow>, usize) {
-    let total = trials.len();
-    let replays: Vec<TrialRow> = trials
+/// The replay trials: a live trial (SPEC §28) ran in the repository's own
+/// worktree and has no replay source run to be paired with, so it takes
+/// the unpaired randomized path instead and never enters pairing or
+/// [`comparison_basis`].
+fn replay_trials(trials: Vec<TrialRow>) -> Vec<TrialRow> {
+    trials
         .into_iter()
         .filter(|trial| trial.workspace_isolation != LIVE_WORKTREE)
+        .collect()
+}
+
+/// The unpaired, inverse-propensity comparison over live trials, or `None`
+/// when no settled live trial drew the candidate among its arms. Control
+/// rows (`arm_index` 0) form the control arm; rows whose own arm is one of
+/// the candidate's recipes form the candidate's. Each arm keeps one
+/// observation per task, as replays do, and sets errored trials aside.
+fn randomized_comparison(
+    live: Vec<TrialRow>,
+    arm_ids: &BTreeSet<String>,
+    resamples: usize,
+) -> Option<RandomizedComparison> {
+    if live.is_empty() {
+        return None;
+    }
+    let (control_rows, rest): (Vec<TrialRow>, Vec<TrialRow>) =
+        live.into_iter().partition(|trial| trial.arm_index == 0);
+    let candidate_rows: Vec<TrialRow> = rest
+        .into_iter()
+        .filter(|trial| arm_ids.contains(&trial.arm_recipe_id))
         .collect();
-    let set_aside = total - replays.len();
-    (replays, set_aside)
+    let (control_by_task, control_errored) = earliest_non_errored_per_task(control_rows);
+    let (candidate_by_task, candidate_errored) = earliest_non_errored_per_task(candidate_rows);
+
+    let observe = |by_task: &BTreeMap<TaskId, TrialRow>| -> Vec<(f64, ArmObservation)> {
+        by_task
+            .values()
+            .map(|trial| {
+                (
+                    trial.assignment_probability,
+                    ArmObservation {
+                        accepted: trial.outcome == Some(TrialOutcome::Accepted),
+                        cost: trial.cost,
+                    },
+                )
+            })
+            .collect()
+    };
+    let control = observe(&control_by_task);
+    let candidate = observe(&candidate_by_task);
+
+    let min_assignment_probability = control
+        .iter()
+        .chain(candidate.iter())
+        .map(|(p, _)| if p.is_finite() { *p } else { 0.0 })
+        .fold(None, |min: Option<f64>, p| {
+            Some(min.map_or(p, |m| m.min(p)))
+        });
+    let trial_ids: Vec<&str> = control_by_task
+        .values()
+        .chain(candidate_by_task.values())
+        .map(|trial| trial.trial_id.as_str())
+        .collect();
+    let seed = seed_from_ids(trial_ids);
+
+    Some(RandomizedComparison {
+        control_tasks: control.len(),
+        candidate_tasks: candidate.len(),
+        errored_trials_set_aside: control_errored + candidate_errored,
+        min_assignment_probability,
+        control: hajek_summary(&control),
+        candidate: hajek_summary(&candidate),
+        interval: bootstrap_unpaired_interval(&control, &candidate, seed, resamples),
+    })
 }
 
 /// One trial per task, the earliest settled NON-errored trial, plus how
@@ -565,7 +793,12 @@ fn arm_summary(observations: &[(f64, ArmObservation)]) -> ArmSummary {
 /// tasks, in any order, hands back the same seed on any machine — never
 /// the platform's own randomness, and never iteration order.
 fn derive_seed(task_ids: &[TaskId]) -> u64 {
-    let mut ids: Vec<&str> = task_ids.iter().map(TaskId::as_str).collect();
+    seed_from_ids(task_ids.iter().map(TaskId::as_str).collect())
+}
+
+/// The same hash over any set of ids, sorted first so read order never
+/// matters.
+fn seed_from_ids(mut ids: Vec<&str>) -> u64 {
     ids.sort_unstable();
     const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -581,6 +814,116 @@ fn derive_seed(task_ids: &[TaskId]) -> u64 {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
+}
+
+/// The inverse-probability weight of one draw, or `None` when the recorded
+/// probability cannot carry one (zero, negative, non-finite).
+fn inverse_weight(probability: f64) -> Option<f64> {
+    let weight = 1.0 / probability;
+    (probability.is_finite() && probability > 0.0 && weight.is_finite()).then_some(weight)
+}
+
+/// Hajek estimate Σ(w·y)/Σ(w) over `(weight, value)` pairs; `None` when
+/// there is no weight to divide by.
+fn hajek_mean(weighted: &[(f64, f64)]) -> Option<f64> {
+    let weight_sum: f64 = weighted.iter().map(|(w, _)| w).sum();
+    (weight_sum > 0.0).then(|| weighted.iter().map(|(w, y)| w * y).sum::<f64>() / weight_sum)
+}
+
+/// `(weight, accepted as 0/1)` for every row whose probability can carry a
+/// weight.
+fn weighted_acceptance(observations: &[(f64, ArmObservation)]) -> Vec<(f64, f64)> {
+    observations
+        .iter()
+        .filter_map(|(p, o)| inverse_weight(*p).map(|w| (w, f64::from(u8::from(o.accepted)))))
+        .collect()
+}
+
+/// One randomized arm: Hajek acceptance and Hajek cost per accepted change.
+/// An arm with no rows, or none whose weight is usable, abstains.
+fn hajek_summary(observations: &[(f64, ArmObservation)]) -> ArmSummary {
+    let acceptance = if observations.is_empty() {
+        AcceptanceEstimate::Abstained(AbstentionReason::NoTrials)
+    } else {
+        match hajek_mean(&weighted_acceptance(observations)) {
+            Some(rate) => AcceptanceEstimate::Estimated(rate),
+            None => AcceptanceEstimate::Abstained(AbstentionReason::AssignmentProbabilityUnusable),
+        }
+    };
+    let mut known: Vec<(f64, f64)> = Vec::new();
+    let mut unknown_count = 0usize;
+    let mut known_count = 0usize;
+    for (probability, observation) in observations.iter().filter(|(_, o)| o.accepted) {
+        match observation.cost.and_then(TrialCost::cost) {
+            Some(cost) => {
+                known_count += 1;
+                if let Some(weight) = inverse_weight(*probability) {
+                    known.push((weight, cost.to_micros() as f64));
+                }
+            }
+            None => unknown_count += 1,
+        }
+    }
+    ArmSummary {
+        acceptance,
+        cost_per_acceptance: CostPerAcceptance {
+            known_mean: hajek_mean(&known)
+                .map(|micros| MicroUsd::from_micros(micros.round() as i64)),
+            accepted_with_known_cost: known_count,
+            accepted_with_unknown_cost: unknown_count,
+        },
+    }
+}
+
+/// The unpaired bootstrap over the candidate-minus-control acceptance
+/// difference: each resample redraws tasks with replacement WITHIN each arm,
+/// independently — a row is never paired with one of the other arm — and
+/// re-estimates each arm's Hajek acceptance from the redrawn, weighted rows.
+/// An arm without a usable estimate leaves the interval at a point of zero.
+fn bootstrap_unpaired_interval(
+    control: &[(f64, ArmObservation)],
+    candidate: &[(f64, ArmObservation)],
+    seed: u64,
+    resamples: usize,
+) -> RandomizedInterval {
+    let control = weighted_acceptance(control);
+    let candidate = weighted_acceptance(candidate);
+    let point = match (hajek_mean(&candidate), hajek_mean(&control)) {
+        (Some(c), Some(k)) => c - k,
+        _ => 0.0,
+    };
+    if control.is_empty() || candidate.is_empty() || resamples == 0 {
+        return RandomizedInterval {
+            point,
+            low: point,
+            high: point,
+            seed,
+            resamples,
+        };
+    }
+    let mut rng = SplitMix64::new(seed);
+    let mut redraw = |arm: &[(f64, f64)]| -> f64 {
+        let drawn: Vec<(f64, f64)> = (0..arm.len())
+            .map(|_| arm[rng.below(arm.len() as u64) as usize])
+            .collect();
+        hajek_mean(&drawn).expect("a redraw of positive weights has a positive sum")
+    };
+    let mut diffs: Vec<f64> = Vec::with_capacity(resamples);
+    for _ in 0..resamples {
+        let control_rate = redraw(&control);
+        let candidate_rate = redraw(&candidate);
+        diffs.push(candidate_rate - control_rate);
+    }
+    diffs.sort_by(|a, b| a.partial_cmp(b).expect("bootstrap differences are finite"));
+    let low_index = (diffs.len() as f64 * 0.025) as usize;
+    let high_index = ((diffs.len() as f64 * 0.975) as usize).min(diffs.len() - 1);
+    RandomizedInterval {
+        point,
+        low: diffs[low_index],
+        high: diffs[high_index],
+        seed,
+        resamples,
+    }
 }
 
 fn mean(values: &[f64]) -> f64 {
@@ -731,7 +1074,6 @@ mod tests {
     fn the_rendered_report_names_the_errored_trials_set_aside() {
         let report = ComparisonReport {
             errored_trials_set_aside: 3,
-            live_trials_set_aside: 0,
             ..passing_report()
         };
         let rendered = report.render();
@@ -753,7 +1095,7 @@ mod tests {
             paired_tasks: 25,
             min_paired_tasks: MIN_PAIRED_TASKS,
             errored_trials_set_aside: 0,
-            live_trials_set_aside: 0,
+            randomized: None,
             incumbent: ArmSummary {
                 acceptance: AcceptanceEstimate::Estimated(0.8),
                 cost_per_acceptance: CostPerAcceptance {
@@ -868,7 +1210,7 @@ mod tests {
             paired_tasks: pairs.len(),
             min_paired_tasks: MIN_PAIRED_TASKS,
             errored_trials_set_aside: 0,
-            live_trials_set_aside: 0,
+            randomized: None,
             incumbent: arm_summary(&incumbent_observations),
             arm: arm_summary(&observations),
             interval: bootstrap_paired_interval(&pairs, seed, DEFAULT_BOOTSTRAP_RESAMPLES),
@@ -980,22 +1322,46 @@ mod tests {
         assert_eq!(first, second);
     }
 
-    /// A candidate policy with one recipe, and that recipe's id: the id a
-    /// trial names to count as this candidate's arm.
+    const BASE_RECIPE: &str = "schema_version = 1\n[[recipes]]\nname = \"docs\"\n\
+         scope_within = [\"docs/**\"]\ntier = \"implementation\"\nrevision = 1\n";
+
+    /// The repository's current policy: the incumbent.
+    fn base_policy() -> RepoPolicy {
+        RepoPolicy::from_toml_str(BASE_RECIPE).expect("policy parses")
+    }
+
+    /// The id of the incumbent's own recipe: what a control row names.
+    fn base_recipe_id() -> String {
+        base_policy().recipes[0].recipe_id()
+    }
+
+    /// A candidate built the way real ones are: the base policy plus one
+    /// appended revision. Returns it with the appended recipe's id, the id
+    /// a trial names to count as this candidate's arm.
     fn candidate_with_one_recipe() -> (RepoPolicy, String) {
-        let policy = RepoPolicy::from_toml_str(
-            "schema_version = 1\n[[recipes]]\nname = \"docs\"\nscope_within = [\"docs/**\"]\n\
-             tier = \"implementation\"\nrevision = 1\n",
-        )
-        .expect("policy parses");
-        let arm = policy.recipes[0].recipe_id();
+        let appended = "[[recipes]]\nname = \"docs\"\nscope_within = [\"docs/**\"]\n\
+             tier = \"implementation\"\nrevision = 2\nreview = \"required\"\n";
+        let policy =
+            RepoPolicy::from_toml_str(&[BASE_RECIPE, appended].concat()).expect("policy parses");
+        let arm = policy.recipes[1].recipe_id();
         (policy, arm)
     }
 
+    /// A real recipe id that belongs to neither the base nor the candidate.
+    fn unrelated_recipe_id() -> String {
+        RepoPolicy::from_toml_str(
+            "schema_version = 1\n[[recipes]]\nname = \"src\"\nscope_within = [\"src/**\"]\n\
+             tier = \"implementation\"\nrevision = 1\n",
+        )
+        .expect("policy parses")
+        .recipes[0]
+            .recipe_id()
+    }
+
     /// Settled, accepted replay trials for `arm`, one per task, in a fresh
-    /// ledger; plus, when asked, one settled live trial drawn at p = 0.5.
-    fn ledger_with_trials(arm: &str, replays: usize, live: usize) -> (Ledger, std::path::PathBuf) {
-        use crate::ledger::{NewReplayTrial, NewTrial};
+    /// ledger.
+    fn ledger_with_replays(arm: &str, replays: usize) -> (Ledger, std::path::PathBuf) {
+        use crate::ledger::NewReplayTrial;
         let dir = crate::test_support::short_temp_dir("cmp-live").to_path_buf();
         let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger opens");
         for n in 0..replays {
@@ -1025,17 +1391,33 @@ mod tests {
                 )
                 .expect("settle replay");
         }
-        for n in 0..live {
-            let trial_id = TrialId::from_stored(format!("live-{n}"));
-            let task_id = TaskId::from_stored(format!("live-task-{n}"));
-            // A live row names the arm's OWN run, as `relais run` records
-            // it — here an accepted one, the case in which pairing it as
-            // if it were a replay source would count it as the incumbent's
-            // accepted result and move the figures.
-            let run_id = RunId::from_stored(format!("live-run-{n}"));
-            ledger
-                .insert_run(&run_id, "/repo", None, &task_id, "rk")
-                .expect("live arm's run");
+        (ledger, dir)
+    }
+
+    /// One settled live trial row: which arm ran (`arm_index` 0 is
+    /// control), at what probability, among which `arms`, and how it ended.
+    struct LiveRow<'a> {
+        name: &'a str,
+        arm_index: u32,
+        arm_recipe_id: &'a str,
+        probability: f64,
+        arms: &'a [&'a str],
+        outcome: TrialOutcome,
+    }
+
+    fn insert_live(ledger: &Ledger, row: &LiveRow<'_>) {
+        use crate::ledger::NewTrial;
+        let trial_id = TrialId::from_stored(format!("live-{}", row.name));
+        let task_id = TaskId::from_stored(format!("task-{}", row.name));
+        let run_id = RunId::from_stored(format!("run-{}", row.name));
+        ledger
+            .insert_run(&run_id, "/repo", None, &task_id, "rk")
+            .expect("live arm's run");
+        // The run's own state agrees with the trial's outcome, as `relais
+        // run` leaves it: an accepted arm names an ACCEPTED run, the case
+        // in which leaking a live row into replay pairing would count it
+        // as the incumbent's accepted result and move the figures.
+        if row.outcome == TrialOutcome::Accepted {
             ledger
                 .record_transition(&crate::ledger::Transition {
                     run_id: run_id.clone(),
@@ -1051,73 +1433,352 @@ mod tests {
                 ledger.run_status(&run_id).expect("status"),
                 Some(State::Accepted)
             );
-            ledger
-                .insert_trial(&NewTrial {
-                    trial_id: &trial_id,
-                    task_id: &task_id,
-                    source_run_id: &run_id,
-                    incumbent_recipe_id: "incumbent",
-                    arm_recipe_id: arm,
-                    arm_index: 1,
-                    assignment_probability: 0.5,
-                    seed: 7,
-                    base_sha: "base",
-                    contract_hash: "contract",
-                    verification_profile_hash: "profile",
-                    workspace_isolation: LIVE_WORKTREE,
-                    arms_json: None,
-                })
-                .expect("insert live");
-            ledger
-                .settle_trial(
-                    &trial_id,
-                    TrialOutcome::Accepted,
-                    true,
-                    TrialCost::UNKNOWN,
-                    1,
-                )
-                .expect("settle live");
+        }
+        let arms_json = serde_json::to_string(row.arms).expect("arms serialize");
+        ledger
+            .insert_trial(&NewTrial {
+                trial_id: &trial_id,
+                task_id: &task_id,
+                source_run_id: &run_id,
+                incumbent_recipe_id: "incumbent",
+                arm_recipe_id: row.arm_recipe_id,
+                arm_index: row.arm_index,
+                assignment_probability: row.probability,
+                seed: 7,
+                base_sha: "base",
+                contract_hash: "contract",
+                verification_profile_hash: "profile",
+                workspace_isolation: LIVE_WORKTREE,
+                arms_json: Some(&arms_json),
+            })
+            .expect("insert live");
+        ledger
+            .settle_trial(&trial_id, row.outcome, true, TrialCost::UNKNOWN, 1)
+            .expect("settle live");
+    }
+
+    /// `per_arm` accepted control rows and `per_arm` accepted candidate rows,
+    /// every one drawn at p = 0.5 among `["incumbent", arm]`.
+    fn ledger_with_draws(arm: &str, per_arm: usize) -> (Ledger, std::path::PathBuf) {
+        let dir = crate::test_support::short_temp_dir("cmp-rand").to_path_buf();
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger opens");
+        for n in 0..per_arm {
+            for (side, arm_index, recipe) in [("c", 0, "incumbent"), ("a", 1, arm)] {
+                insert_live(
+                    &ledger,
+                    &LiveRow {
+                        name: &format!("{side}{n}"),
+                        arm_index,
+                        arm_recipe_id: recipe,
+                        probability: 0.5,
+                        arms: &["incumbent", arm],
+                        outcome: TrialOutcome::Accepted,
+                    },
+                );
+            }
         }
         (ledger, dir)
     }
 
-    /// A ledger holding replay AND live trials evaluates exactly as one
-    /// holding the replays alone, plus the count of live trials set aside:
-    /// the basis stays `Replay`, no pair is made with a live trial, and
-    /// the rendered evidence names the count.
-    ///
-    /// FALSIFY: `set_aside_live_trials` was made to keep live trials (its
-    /// filter matched nothing), and this test failed on the count
-    /// (`left: 0, right: 2`): the live trials, drawn at p = 0.5, stayed in
-    /// the pairing and would flip the basis to `Randomized`. Then the
-    /// filter was restored. The live rows name real, ACCEPTED runs (as
-    /// `relais run` records them), so a mis-pairing would also count them
-    /// as the incumbent's accepted results.
+    /// A replay-only ledger evaluates with no randomized section, and its
+    /// rendering carries no trace of one.
     #[test]
-    fn live_trials_are_set_aside_and_never_change_what_replays_show() {
+    fn a_replay_only_ledger_has_no_randomized_section() {
         let (candidate, arm) = candidate_with_one_recipe();
-        let (replays_only, dir_a) = ledger_with_trials(&arm, 3, 0);
-        let (mixed, dir_b) = ledger_with_trials(&arm, 3, 2);
-        let alone = evaluate_candidate(&replays_only, &candidate, 20, 200).expect("evaluates");
-        let both = evaluate_candidate(&mixed, &candidate, 20, 200).expect("evaluates");
-        assert_eq!(alone.live_trials_set_aside, 0);
-        assert_eq!(both.live_trials_set_aside, 2);
-        assert_eq!(
-            both,
-            ComparisonReport {
-                live_trials_set_aside: 2,
-                ..alone
-            }
-        );
-        assert_eq!(both.basis, ComparisonBasis::Replay);
+        let (ledger, dir) = ledger_with_replays(&arm, 3);
+        let report =
+            evaluate_candidate(&ledger, &base_policy(), &candidate, 20, 200).expect("evaluates");
+        assert_eq!(report.randomized, None);
+        assert_eq!(report.basis, ComparisonBasis::Replay);
         assert!(
-            both.render_evidence().contains(
-                "randomized trials set aside: 2 (unpaired estimator not implemented yet)\n"
-            ),
+            !report.render().contains("randomized"),
             "{}",
-            both.render_evidence()
+            report.render()
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Live trials never enter replay pairing: a ledger holding replays AND
+    /// live trials (the live rows naming real, ACCEPTED runs) yields the same replay
+    /// section as the replays alone. Only the randomized section differs.
+    ///
+    /// FALSIFY: `replay_trials` was made to keep live rows, and this test
+    /// failed (the basis read `Randomized`, not `Replay`). The
+    /// `LIVE_WORKTREE` filter was restored.
+    #[test]
+    fn live_trials_leave_the_replay_section_of_a_mixed_ledger_unchanged() {
+        let (candidate, arm) = candidate_with_one_recipe();
+        let base = base_recipe_id();
+        let (alone_ledger, alone_dir) = ledger_with_replays(&arm, 3);
+        let alone = evaluate_candidate(&alone_ledger, &base_policy(), &candidate, 20, 200)
+            .expect("evaluates");
+        let (mixed_ledger, mixed_dir) = ledger_with_replays(&arm, 3);
+        for (name, arm_index, recipe) in [("m-c", 0, base.as_str()), ("m-a", 1, arm.as_str())] {
+            insert_live(
+                &mixed_ledger,
+                &LiveRow {
+                    name,
+                    arm_index,
+                    arm_recipe_id: recipe,
+                    probability: 0.5,
+                    arms: &[&base, &arm],
+                    outcome: TrialOutcome::Accepted,
+                },
+            );
+        }
+        let mixed = evaluate_candidate(&mixed_ledger, &base_policy(), &candidate, 20, 200)
+            .expect("evaluates");
+        assert!(mixed.randomized.is_some(), "the live rows form a section");
+        assert_eq!(mixed.basis, ComparisonBasis::Replay);
+        assert_eq!(alone.paired_tasks, 3);
+        assert_eq!(
+            ComparisonReport {
+                randomized: None,
+                ..mixed
+            },
+            alone
+        );
+        std::fs::remove_dir_all(alone_dir).ok();
+        std::fs::remove_dir_all(mixed_dir).ok();
+    }
+
+    /// A control row counts only when the candidate was among the arms at
+    /// draw time. Rows drawn between `incumbent` and some OTHER recipe say
+    /// nothing about this candidate, control or not.
+    ///
+    /// The candidate's arm ids are its recipe ids MINUS the incumbent's,
+    /// because the candidate carries the base recipe too: a control row
+    /// drawn among `[base_id, other_id]` names the base id, which would
+    /// match by membership against every candidate id.
+    ///
+    /// FALSIFY: membership was matched against all of `arms_json` (and the
+    /// candidate's full recipe ids) again, and this test failed
+    /// (`control_tasks` read 3, not 1): the control row drawn without the
+    /// candidate was counted. The arm-id set and `arms[1..]` were restored.
+    #[test]
+    fn a_control_row_drawn_without_the_candidate_is_not_counted() {
+        let (candidate, arm) = candidate_with_one_recipe();
+        let base = base_recipe_id();
+        let other = unrelated_recipe_id();
+        let dir = crate::test_support::short_temp_dir("cmp-rand-a").to_path_buf();
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger opens");
+        let outcome = TrialOutcome::Accepted;
+        insert_live(
+            &ledger,
+            &LiveRow {
+                name: "in-control",
+                arm_index: 0,
+                arm_recipe_id: &base,
+                probability: 0.5,
+                arms: &[&base, &arm],
+                outcome,
+            },
+        );
+        insert_live(
+            &ledger,
+            &LiveRow {
+                name: "in-arm",
+                arm_index: 1,
+                arm_recipe_id: &arm,
+                probability: 0.5,
+                arms: &[&base, &arm],
+                outcome,
+            },
+        );
+        for name in ["out-control-1", "out-control-2"] {
+            insert_live(
+                &ledger,
+                &LiveRow {
+                    name,
+                    arm_index: 0,
+                    arm_recipe_id: &base,
+                    probability: 0.5,
+                    arms: &[&base, &other],
+                    outcome,
+                },
+            );
+        }
+        let report =
+            evaluate_candidate(&ledger, &base_policy(), &candidate, 20, 200).expect("evaluates");
+        let randomized = report.randomized.expect("a randomized section");
+        assert_eq!(randomized.control_tasks, 1);
+        assert_eq!(randomized.candidate_tasks, 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The Hajek estimate weights each row by 1/p. Control: accepted at
+    /// p = 0.5 (w 2), rejected at p = 0.25 (w 4) is 2/6 = 1/3, where an
+    /// unweighted mean says 1/2. Candidate: accepted at p = 0.25 (w 4) and
+    /// rejected at p = 0.5 (w 2) is 4/6 = 2/3.
+    ///
+    /// FALSIFY: every row was weighted 1.0 in `weighted_acceptance`, and this
+    /// test failed (control read 0.5, not 1/3); the weights were restored.
+    #[test]
+    fn the_hajek_estimate_weights_rows_by_inverse_probability() {
+        let (candidate, arm) = candidate_with_one_recipe();
+        let dir = crate::test_support::short_temp_dir("cmp-rand-b").to_path_buf();
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger opens");
+        let arms: &[&str] = &["incumbent", &arm];
+        for (name, arm_index, recipe, probability, outcome) in [
+            ("c1", 0, "incumbent", 0.5, TrialOutcome::Accepted),
+            ("c2", 0, "incumbent", 0.25, TrialOutcome::Rejected),
+            ("a1", 1, arm.as_str(), 0.25, TrialOutcome::Accepted),
+            ("a2", 1, arm.as_str(), 0.5, TrialOutcome::Rejected),
+        ] {
+            insert_live(
+                &ledger,
+                &LiveRow {
+                    name,
+                    arm_index,
+                    arm_recipe_id: recipe,
+                    probability,
+                    arms,
+                    outcome,
+                },
+            );
+        }
+        let randomized = evaluate_candidate(&ledger, &base_policy(), &candidate, 20, 200)
+            .expect("evaluates")
+            .randomized
+            .expect("a randomized section");
+        let AcceptanceEstimate::Estimated(control) = randomized.control.acceptance else {
+            panic!("control abstained: {:?}", randomized.control);
+        };
+        let AcceptanceEstimate::Estimated(arm_rate) = randomized.candidate.acceptance else {
+            panic!("candidate abstained: {:?}", randomized.candidate);
+        };
+        assert!((control - 1.0 / 3.0).abs() < 1e-12, "{control}");
+        assert!((arm_rate - 2.0 / 3.0).abs() < 1e-12, "{arm_rate}");
+        assert!((randomized.interval.point - 1.0 / 3.0).abs() < 1e-12);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// 20 observations per arm clear every randomized gate, so the report
+    /// promotes on that basis alone and says so; 19 per arm refuses and
+    /// names the gate.
+    #[test]
+    fn twenty_per_arm_promotes_on_randomized_evidence_and_nineteen_refuses() {
+        let (candidate, arm) = candidate_with_one_recipe();
+        let (enough, dir_a) = ledger_with_draws(&arm, 20);
+        let report = evaluate_candidate(&enough, &base_policy(), &candidate, MIN_PAIRED_TASKS, 200)
+            .expect("evaluates");
+        assert!(report.promotable().is_some(), "{:?}", report.failures());
+        let rendered = report.render();
+        assert!(
+            rendered.contains("basis: randomized, control n=20, candidate n=20"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("gates: PASSED (basis: randomized)"),
+            "{rendered}"
+        );
+
+        let (short, dir_b) = ledger_with_draws(&arm, 19);
+        let refused = evaluate_candidate(&short, &base_policy(), &candidate, MIN_PAIRED_TASKS, 200)
+            .expect("evaluates");
+        assert!(refused.promotable().is_none());
+        assert!(
+            refused
+                .failures()
+                .contains(&GateFailure::RandomizedInsufficientTasks {
+                    arm: WhichArm::Incumbent,
+                    observed: 19,
+                    minimum: MIN_PAIRED_TASKS,
+                }),
+            "{:?}",
+            refused.failures()
+        );
+        let rendered = refused.render();
+        assert!(
+            rendered.contains("randomized: the control arm has 19 observation(s)"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("PASSED"), "{rendered}");
         std::fs::remove_dir_all(dir_a).ok();
         std::fs::remove_dir_all(dir_b).ok();
+    }
+
+    /// An arm whose recorded probabilities are all unusable abstains, and a
+    /// zero minimum probability fails its own gate.
+    #[test]
+    fn an_arm_with_no_usable_weight_abstains_and_fails_the_probability_gate() {
+        let (candidate, arm) = candidate_with_one_recipe();
+        let dir = crate::test_support::short_temp_dir("cmp-rand-abstain").to_path_buf();
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger opens");
+        let arms: &[&str] = &["incumbent", &arm];
+        for (name, arm_index, recipe, probability) in
+            [("c1", 0, "incumbent", 0.5), ("a1", 1, arm.as_str(), 0.0)]
+        {
+            insert_live(
+                &ledger,
+                &LiveRow {
+                    name,
+                    arm_index,
+                    arm_recipe_id: recipe,
+                    probability,
+                    arms,
+                    outcome: TrialOutcome::Accepted,
+                },
+            );
+        }
+        let report =
+            evaluate_candidate(&ledger, &base_policy(), &candidate, 1, 200).expect("evaluates");
+        let randomized = report.randomized.as_ref().expect("a randomized section");
+        assert_eq!(
+            randomized.candidate.acceptance,
+            AcceptanceEstimate::Abstained(AbstentionReason::AssignmentProbabilityUnusable)
+        );
+        let failures = randomized.failures(1);
+        assert!(failures.contains(&GateFailure::RandomizedProbabilityUnusable));
+        assert!(report.promotable().is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Same rows, same interval — and the same seed, from the sorted trial
+    /// ids.
+    #[test]
+    fn the_unpaired_bootstrap_is_deterministic_for_the_same_rows() {
+        let (candidate, arm) = candidate_with_one_recipe();
+        let (ledger, dir) = ledger_with_draws(&arm, 25);
+        let first = evaluate_candidate(&ledger, &base_policy(), &candidate, MIN_PAIRED_TASKS, 500)
+            .expect("evaluates");
+        let second = evaluate_candidate(&ledger, &base_policy(), &candidate, MIN_PAIRED_TASKS, 500)
+            .expect("evaluates");
+        assert_eq!(first, second);
+        assert_eq!(
+            first.randomized.expect("randomized").interval.resamples,
+            500
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Errored live trials are set aside and counted, never observed.
+    #[test]
+    fn errored_live_trials_are_set_aside_and_counted() {
+        let (candidate, arm) = candidate_with_one_recipe();
+        let dir = crate::test_support::short_temp_dir("cmp-rand-err").to_path_buf();
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger opens");
+        insert_live(
+            &ledger,
+            &LiveRow {
+                name: "c1",
+                arm_index: 0,
+                arm_recipe_id: "incumbent",
+                probability: 0.5,
+                arms: &["incumbent", &arm],
+                outcome: TrialOutcome::Errored,
+            },
+        );
+        let randomized = evaluate_candidate(&ledger, &base_policy(), &candidate, 20, 200)
+            .expect("evaluates")
+            .randomized
+            .expect("a randomized section");
+        assert_eq!(randomized.errored_trials_set_aside, 1);
+        assert_eq!(randomized.control_tasks, 0);
+        assert_eq!(
+            randomized.control.acceptance,
+            AcceptanceEstimate::Abstained(AbstentionReason::NoTrials)
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 }

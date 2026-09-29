@@ -1292,6 +1292,80 @@ fn promote_refuses_a_three_task_comparison_and_writes_nothing() {
     }
 }
 
+/// `per_arm` accepted control rows and `per_arm` accepted candidate rows,
+/// every one a live draw at p = 0.5 between the incumbent and the arm.
+fn settle_accepted_live_draws(world: &World, arm_recipe_id: &str, per_arm: usize) {
+    use relais::ids::{RunId, TaskId, TrialId};
+    use relais::ledger::{Ledger, NewTrial, TrialCost, TrialOutcome, LIVE_WORKTREE};
+    let ledger = Ledger::open(&world.state.join("ledger.sqlite")).expect("ledger opens");
+    let arms_json = serde_json::to_string(&["incumbent", arm_recipe_id]).expect("arms");
+    for n in 0..per_arm {
+        for (side, arm_index, recipe) in [("c", 0, "incumbent"), ("a", 1, arm_recipe_id)] {
+            let trial_id = TrialId::from_stored(format!("live-{side}{n}"));
+            let task_id = TaskId::from_stored(format!("task-{side}{n}"));
+            let run_id = RunId::from_stored(format!("run-{side}{n}"));
+            ledger
+                .insert_run(&run_id, "/repo", None, &task_id, "rk")
+                .expect("live run");
+            ledger
+                .insert_trial(&NewTrial {
+                    trial_id: &trial_id,
+                    task_id: &task_id,
+                    source_run_id: &run_id,
+                    incumbent_recipe_id: "incumbent",
+                    arm_recipe_id: recipe,
+                    arm_index,
+                    assignment_probability: 0.5,
+                    seed: 7,
+                    base_sha: "base",
+                    contract_hash: "contract",
+                    verification_profile_hash: "profile",
+                    workspace_isolation: LIVE_WORKTREE,
+                    arms_json: Some(&arms_json),
+                })
+                .expect("insert live trial");
+            ledger
+                .settle_trial(
+                    &trial_id,
+                    TrialOutcome::Accepted,
+                    true,
+                    TrialCost::UNKNOWN,
+                    1,
+                )
+                .expect("settle live trial");
+        }
+    }
+}
+
+/// 19 randomized observations per arm is one short of the gate: `promote`
+/// refuses naming it, and relais.toml stays byte-identical, with and
+/// without `--write`.
+#[test]
+fn promote_refuses_nineteen_live_draws_per_arm_and_writes_nothing() {
+    let world = World::new("promote-live-refuse");
+    let base = world.write_policy_with_recipes();
+    let (candidate, arm_id) = write_appending_candidate(&world, &base);
+    settle_accepted_live_draws(&world, &arm_id, 19);
+    let before = policy_text(&world);
+
+    for extra in [&[][..], &["--write"][..]] {
+        let mut args = vec!["recipe", "promote", candidate.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        let out = world.relais(&args);
+        let stderr = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(17), "{stderr}");
+        assert!(
+            stderr.contains("basis: randomized, control n=19, candidate n=19"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("randomized: the control arm has 19 observation(s)"),
+            "{stderr}"
+        );
+        assert_eq!(policy_text(&world), before);
+    }
+}
+
 /// (b) A promotable comparison, with `--write`, appends exactly the new
 /// fragment and issues no grant: `plan` then blocks on
 /// `missing_trust_grant`, on the very key `promote` printed.

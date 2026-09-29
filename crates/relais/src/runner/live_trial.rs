@@ -230,8 +230,9 @@ impl Decision {
             trial_id: &trial_id,
             task_id: facts.task_id,
             // The live run's OWN id, minted before the row is written and
-            // handed to `execute`. It is not a replay source: evaluation
-            // sets live trials aside because that pairing does not exist.
+            // handed to `execute`. It is not a replay source: there is no
+            // paired replay for a live run, so evaluation estimates live
+            // rows unpaired, by the randomized estimator (SPEC §28).
             source_run_id: run_id,
             incumbent_recipe_id: &self.control_recipe_id,
             arm_recipe_id,
