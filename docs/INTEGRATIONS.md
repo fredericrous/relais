@@ -358,8 +358,10 @@ candidates = ["/path/to/candidate-relais.toml"]
 `relais plan` prints the assignment it would make and writes nothing;
 `relais doctor` prints a status line: `off`, or `on` with the seed, the
 admitted and dropped candidates, and today's used/max count and spend.
-`relais recipe evaluate` sets live trials aside until an unpaired
-estimator exists.
+`relais recipe evaluate` estimates live trials unpaired, weighted by
+each row's recorded assignment probability, in a `basis: randomized`
+block beside the replay comparison. A row counts toward a candidate only
+when that candidate was one of the non-control arms of the draw.
 
 ## Troubleshooting
 

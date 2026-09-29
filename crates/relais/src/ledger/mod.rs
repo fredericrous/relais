@@ -3612,6 +3612,44 @@ impl Ledger {
             .collect()
     }
 
+    /// Every SETTLED live (`live_worktree`) trial whose recorded arm list
+    /// (`arms_json`, parsed as the JSON list it is) names one of the given
+    /// recipe ids among its NON-control arms (`arms[1..]`; entry 0 is the
+    /// control's own id, which a candidate shares with its base), oldest
+    /// first. Selection is on the draw, not on the arm
+    /// that ran: a CONTROL row's own `arm_recipe_id` is the incumbent's, yet
+    /// it is comparison evidence for a candidate that was among the arms when
+    /// it was drawn — and a control row drawn without the candidate never is.
+    /// A row whose `arms_json` is not a JSON list of strings is
+    /// [`LedgerError::Corrupt`].
+    pub fn settled_live_trials_for_arms(
+        &self,
+        recipe_ids: &std::collections::BTreeSet<String>,
+    ) -> Result<Vec<TrialRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {}, arms_json FROM trials
+              WHERE outcome IS NOT NULL AND workspace_isolation = ?1 AND arms_json IS NOT NULL
+              ORDER BY created_at, trial_id",
+            Self::TRIAL_COLUMNS
+        ))?;
+        let rows = stmt.query_map([LIVE_WORKTREE], |row| {
+            Ok((Self::trial_columns(row)?, row.get::<_, String>(18)?))
+        })?;
+        let rows: Vec<(TrialColumns, String)> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut kept = Vec::new();
+        for (columns, arms_json) in rows {
+            let arms: Vec<String> =
+                serde_json::from_str(&arms_json).map_err(|e| LedgerError::Corrupt {
+                    what: "trials.arms_json".into(),
+                    detail: e.to_string(),
+                })?;
+            if arms.iter().skip(1).any(|arm| recipe_ids.contains(arm)) {
+                kept.push(parse_trial_row(columns)?);
+            }
+        }
+        Ok(kept)
+    }
+
     /// Maps one `trials` row, in [`Self::TRIAL_COLUMNS`]'s order, into
     /// the raw tuple [`parse_trial_row`] expects.
     fn trial_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrialColumns> {

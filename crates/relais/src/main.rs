@@ -3181,6 +3181,7 @@ fn recipe_evaluate_command(candidate_path: &Path) -> Result<CliOutcome, CliError
     let report = operational(
         evaluate_candidate(
             &ledger,
+            &incumbent,
             candidate.policy(),
             MIN_PAIRED_TASKS,
             DEFAULT_BOOTSTRAP_RESAMPLES,
@@ -3314,6 +3315,7 @@ fn recipe_promote_command(candidate_path: &Path, mode: AmendMode) -> Result<CliO
     let report = operational(
         evaluate_candidate(
             &ledger,
+            &incumbent,
             candidate.policy(),
             MIN_PAIRED_TASKS,
             DEFAULT_BOOTSTRAP_RESAMPLES,
