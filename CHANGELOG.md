@@ -6,7 +6,24 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
-## Unreleased
+## v0.7.0
+
+### Upgrading
+
+- The ledger migrates to schema **v17** on first open (additive:
+  `trials.arms_json` at v16, `trials.arm_run_id` at v17). An older binary
+  cannot read it afterwards.
+- **Live trials exist but stay off.** `[trials]` in machine.toml now does
+  something when `enabled = true`, a `seed` is set, `eligible_kinds` names
+  a kind and the daily caps are above zero; every default leaves it off.
+  `relais doctor` shows `trials off` until then.
+- `relais doctor` gains `models` (alias drift) and `pricing` lines. On a
+  machine whose Claude Code moved an alias (e.g. `sonnet` →
+  `claude-sonnet-5-5`), expect a `!` naming the switch; figures that
+  straddle it mix two models.
+- `relais recipe promote --write` / `rollback --write` append to
+  relais.toml and never issue a grant: the next `relais plan` blocks on
+  `missing_trust_grant` until the printed block is pasted.
 
 ### Fixed
 
