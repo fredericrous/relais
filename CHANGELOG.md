@@ -6,6 +6,32 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## Unreleased
+
+### Added
+
+- **Live trials, OFF by default.** A machine can enable `[trials]` in
+  `machine.toml` so `relais run` draws each eligible task's arm — the
+  incumbent or one candidate recipe policy — with a recorded probability
+  `1/(1+k)`, runs it, and settles the trial, so randomized evidence
+  accrues from ordinary work inside hard daily caps (trial count and
+  recorded spend, counted from the ledger; an unknown cost counts as the
+  full ceiling). Machine-owned: a repository cannot enable it. Every
+  candidate is admitted at run time through `validate_candidate` against
+  the current policy and must hold its own trust grant; one that fails is
+  dropped and named by `plan` and `run`. `plan` prints the assignment it
+  would make and writes nothing; `run` writes one `trials` row at
+  assignment (control included, `workspace_isolation = "live_worktree"`,
+  with the arm list) and settles it once at the terminal state. New keys
+  `seed`, `eligible_kinds` and `candidates`; `max_daily_trials` and
+  `max_trial_cost_micros` now default to 0 (no trial). With no `[trials]`
+  block, or `enabled = false`, nothing changes and no row is written.
+  Ledger step v16 adds `trials.arms_json`. `relais doctor`'s `trials`
+  line is now a status line, and `enabled = true` without a `seed` is a
+  failure. `relais recipe evaluate` sets live trials aside until an
+  unpaired estimator exists (`randomized trials set aside: N`). See
+  docs/SPEC.md §28 and docs/INTEGRATIONS.md.
+
 ## v0.6.0
 
 ### Upgrading

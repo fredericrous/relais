@@ -2989,3 +2989,367 @@ fn outcome_after_session_line(stderr: &str) -> &str {
     );
     rest
 }
+
+// ---------------------------------------------------------------------
+// Live trials (SPEC §28): OFF by default, and a real draw when enabled.
+// ---------------------------------------------------------------------
+
+/// A world whose incumbent policy declares recipe `src` revision 0, with a
+/// candidate file (outside the repository, so the tree stays clean) that
+/// appends revision 1, and grants for both.
+struct TrialWorld {
+    world: World,
+    candidate: PathBuf,
+    incumbent_hash: String,
+    candidate_hash: String,
+    incumbent_recipe: String,
+    candidate_recipe: String,
+}
+
+impl TrialWorld {
+    fn new(tag: &str) -> Self {
+        let world = World::new(tag);
+        let verification = "[[verification.profiles.default.commands]]\n\
+             argv = [\"sh\", \"-c\", \"test ! -f src/main.rs\"]\n\
+             timeout_seconds = 30\n\
+             [[recipes]]\nname = \"src\"\nscope_within = [\"src/**\"]\n\
+             tier = \"implementation\"\nrevision = 0\n";
+        let incumbent_hash = world.write_policy_verifying(3, 120, verification);
+        let incumbent_text =
+            std::fs::read_to_string(world.repo.join("relais.toml")).expect("policy");
+        let candidate_text = format!(
+            "{incumbent_text}[[recipes]]\nname = \"src\"\nscope_within = [\"src/**\"]\n\
+             tier = \"implementation\"\nrevision = 1\n"
+        );
+        let candidate = world.root.join("candidate.toml");
+        std::fs::write(&candidate, &candidate_text).expect("candidate");
+        let incumbent_policy = RepoPolicy::from_toml_str(&incumbent_text).expect("incumbent");
+        let candidate_policy = RepoPolicy::from_toml_str(&candidate_text).expect("candidate");
+        Self {
+            candidate_hash: candidate_policy.authority_hash(),
+            incumbent_recipe: incumbent_policy.recipes[0].recipe_id(),
+            candidate_recipe: candidate_policy.recipes[1].recipe_id(),
+            incumbent_hash,
+            candidate,
+            world,
+        }
+    }
+
+    /// machine.toml granting the incumbent, and the candidate when
+    /// `grant_candidate`, with the given `[trials]` body.
+    fn write_machine(&self, trials: &str, grant_candidate: GrantCandidate) {
+        let identity = relais::repo::identity(&self.world.repo);
+        let grant = |hash: &str| {
+            format!(
+                "[trust.\"{}\"]\ngranted_at = \"2026-09-18\"\nreviewed_by = \"the release suite\"\n",
+                relais::policy::grant_key(hash, &identity)
+            )
+        };
+        let mut text = format!(
+            "schema_version = 1\n{trials}\n{}",
+            grant(&self.incumbent_hash)
+        );
+        if grant_candidate == GrantCandidate::Yes {
+            text.push_str(&grant(&self.candidate_hash));
+        }
+        std::fs::write(self.world.config.join("machine.toml"), text).expect("machine");
+    }
+
+    fn trials_body(&self, seed: Option<u64>) -> String {
+        let seed = seed.map(|s| format!("seed = {s}\n")).unwrap_or_default();
+        format!(
+            "[trials]\nenabled = true\n{seed}eligible_kinds = [\"change\"]\n\
+             max_daily_trials = 10\nmax_trial_cost_micros = 100000000\n\
+             candidates = [{:?}]\n",
+            self.candidate.to_string_lossy()
+        )
+    }
+
+    /// The trial line `relais plan` prints, or `None` when it prints none.
+    fn plan_trial_line(&self, task: &Path) -> Option<String> {
+        let out = self
+            .world
+            .relais(&["plan", "--task", &task.to_string_lossy()]);
+        assert!(out.status.success(), "plan: {}", text(&out.stderr));
+        text(&out.stdout)
+            .lines()
+            .find(|line| line.starts_with("trial: ") && !line.contains(" dropped: "))
+            .map(str::to_string)
+    }
+
+    /// A seed under which `plan` says `wanted` for this task. The task's
+    /// identity depends on where the world lives, so the seed is found,
+    /// not assumed; `plan` is deterministic and writes nothing, so asking
+    /// repeatedly costs nothing.
+    fn seed_drawing(&self, task: &Path, wanted: &str) -> u64 {
+        for seed in 0..200 {
+            self.write_machine(&self.trials_body(Some(seed)), GrantCandidate::Yes);
+            if self
+                .plan_trial_line(task)
+                .is_some_and(|line| line.starts_with(wanted))
+            {
+                return seed;
+            }
+        }
+        panic!("no seed in 0..200 drew `{wanted}`");
+    }
+
+    fn ledger(&self) -> relais::ledger::Ledger {
+        relais::ledger::Ledger::open(&self.world.state.join("ledger.sqlite")).expect("ledger")
+    }
+
+    fn trials_created(&self) -> u32 {
+        self.ledger()
+            .trial_usage_since("0", 0)
+            .expect("usage")
+            .trials
+    }
+
+    /// A live row's `source_run_id` is the run the arm executed as: the
+    /// one `run` printed, one the ledger has on record, and one whose own
+    /// `runs.purpose` says it is a trial arm (control included), so the
+    /// run's record and the trial row never disagree about it. FALSIFIED:
+    /// with `relais run` passing `purpose: None` the purpose assertion
+    /// read `None`; restored.
+    fn assert_row_names_its_own_run(&self, row: &relais::ledger::TrialRow, run_stdout: &str) {
+        assert_eq!(
+            row.source_run_id.as_str(),
+            World::run_id_of(run_stdout),
+            "the row names the run it executed as"
+        );
+        assert!(
+            self.ledger()
+                .task_of_run(&row.source_run_id)
+                .expect("task_of_run")
+                .is_some(),
+            "source_run_id {} names an existing run",
+            row.source_run_id
+        );
+        assert_eq!(
+            self.ledger()
+                .run_purpose(&row.source_run_id)
+                .expect("run_purpose"),
+            Some(relais::lifecycle::RunPurpose::TrialArm),
+            "the run a live row names is recorded as a trial arm"
+        );
+    }
+
+    fn settled_trials(&self) -> Vec<relais::ledger::TrialRow> {
+        let ids = std::collections::BTreeSet::from([
+            self.incumbent_recipe.clone(),
+            self.candidate_recipe.clone(),
+        ]);
+        self.ledger()
+            .settled_trials_for_recipes(&ids)
+            .expect("trials")
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GrantCandidate {
+    Yes,
+    No,
+}
+
+/// OFF BY DEFAULT, BYTE-IDENTICAL WHEN OFF. With no `[trials]` block and
+/// with `enabled = false` (every other field set, a candidate named, a
+/// seed present), `relais plan` prints exactly what it printed before,
+/// `relais run` says nothing about trials, and no `trials` row is written.
+///
+/// FALSIFY: `runner::live_trial::decide` was made to assign even when the
+/// envelope is disabled (its `!enabled` early return removed). This test
+/// failed on `run`, which printed `trial: not eligible (disabled)` to
+/// stderr where a run with no envelope prints nothing. (`plan` has its own
+/// disabled guard, so it stayed silent; that is the second layer, not the
+/// one this falsification removed.) Then the early return was restored.
+#[test]
+fn trials_are_off_by_default_and_change_nothing_when_off() {
+    let tw = TrialWorld::new("trials-off");
+    let task = tw.world.write_task_for("t.json", "an easy one", "off");
+
+    // No `[trials]` block at all.
+    tw.write_machine("", GrantCandidate::Yes);
+    let bare = tw
+        .world
+        .relais(&["plan", "--task", &task.to_string_lossy()]);
+    assert!(bare.status.success(), "{}", text(&bare.stderr));
+
+    // Disabled, but everything else a real envelope would carry.
+    let disabled_body = tw
+        .trials_body(Some(1))
+        .replace("enabled = true", "enabled = false");
+    tw.write_machine(&disabled_body, GrantCandidate::Yes);
+    let disabled = tw
+        .world
+        .relais(&["plan", "--task", &task.to_string_lossy()]);
+    assert!(disabled.status.success(), "{}", text(&disabled.stderr));
+
+    assert_eq!(
+        text(&bare.stdout),
+        text(&disabled.stdout),
+        "plan's stdout is byte-identical with the envelope disabled"
+    );
+    assert!(
+        !text(&bare.stdout).contains("trial:"),
+        "{}",
+        text(&bare.stdout)
+    );
+
+    let run = tw.world.relais(&["run", "--task", &task.to_string_lossy()]);
+    assert!(run.status.success(), "run: {}", text(&run.stderr));
+    assert!(
+        !text(&run.stderr).contains("trial"),
+        "a disabled envelope says nothing on run: {}",
+        text(&run.stderr)
+    );
+    assert_eq!(tw.trials_created(), 0, "no trials row is written when off");
+    tw.world.stop_coordinator();
+}
+
+/// `plan` prints the assignment it WOULD make, names each dropped
+/// candidate and why, and writes nothing: no ledger is even created.
+#[test]
+fn plan_prints_the_assignment_and_the_dropped_candidates_and_writes_nothing() {
+    let tw = TrialWorld::new("trials-plan");
+    let task = tw.world.write_task_for("t.json", "an easy one", "off");
+    tw.write_machine(&tw.trials_body(Some(11)), GrantCandidate::No);
+
+    let out = tw
+        .world
+        .relais(&["plan", "--task", &task.to_string_lossy()]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "trial: candidate {} dropped: no trust grant for its authority hash",
+            tw.candidate.display()
+        )),
+        "an ungranted candidate is dropped, named, with why: {stdout}"
+    );
+    assert!(
+        stdout.contains("trial: not eligible (no admitted candidate)"),
+        "with its only candidate dropped there is no arm: {stdout}"
+    );
+    assert!(
+        !tw.world.state.join("ledger.sqlite").exists(),
+        "plan writes nothing, not even a ledger"
+    );
+
+    let seed = tw.seed_drawing(&task, "trial: ");
+    tw.write_machine(&tw.trials_body(Some(seed)), GrantCandidate::Yes);
+    let line = tw.plan_trial_line(&task).expect("a trial line");
+    assert!(
+        line == "trial: control (p=0.50, arms=2)"
+            || line == format!("trial: candidate {} (p=0.50)", tw.candidate.display()),
+        "{line}"
+    );
+    assert!(!tw.world.state.join("ledger.sqlite").exists());
+
+    // Enabled without a seed: every task is not eligible.
+    tw.write_machine(&tw.trials_body(None), GrantCandidate::Yes);
+    assert_eq!(
+        tw.plan_trial_line(&task).as_deref(),
+        Some("trial: not eligible (enabled without a seed)")
+    );
+    tw.world.stop_coordinator();
+}
+
+/// A drawn candidate runs under ITS policy, the run writes exactly one
+/// `trials` row at assignment, and the row is settled once at the run's
+/// terminal state.
+#[test]
+fn a_drawn_candidate_runs_under_its_own_policy_and_settles_one_row() {
+    let tw = TrialWorld::new("trials-candidate");
+    let task = tw.world.write_task_for("t.json", "an easy one", "off");
+    let seed = tw.seed_drawing(&task, "trial: candidate");
+
+    let run = tw.world.relais(&["run", "--task", &task.to_string_lossy()]);
+    assert!(run.status.success(), "run: {}", text(&run.stderr));
+    assert!(
+        text(&run.stderr).contains(&format!(
+            "trial: candidate {} (p=0.50)",
+            tw.candidate.display()
+        )),
+        "{}",
+        text(&run.stderr)
+    );
+    assert_eq!(tw.trials_created(), 1, "exactly one row");
+    let rows = tw.settled_trials();
+    assert_eq!(rows.len(), 1, "and it is settled");
+    let row = &rows[0];
+    assert_eq!(row.arm_index, 1);
+    assert_eq!(row.arm_recipe_id, tw.candidate_recipe);
+    assert_eq!(row.incumbent_recipe_id, tw.incumbent_recipe);
+    assert_eq!(row.assignment_probability, 0.5);
+    assert_eq!(row.seed, seed);
+    assert_eq!(row.workspace_isolation, "live_worktree");
+    tw.assert_row_names_its_own_run(row, &text(&run.stdout));
+    assert_eq!(row.outcome, Some(relais::ledger::TrialOutcome::Accepted));
+    assert_eq!(
+        tw.ledger().trial_arms(&row.trial_id).expect("arms"),
+        Some(vec![
+            tw.incumbent_recipe.clone(),
+            tw.candidate_recipe.clone()
+        ])
+    );
+
+    let receipt = std::fs::read_to_string(
+        tw.world
+            .run_dir(&World::run_id_of(&text(&run.stdout)))
+            .join("receipt.json"),
+    )
+    .expect("receipt");
+    assert!(
+        receipt.contains(&tw.candidate_hash) && !receipt.contains(&tw.incumbent_hash),
+        "the run executed under the candidate's policy: {receipt}"
+    );
+    tw.world.stop_coordinator();
+}
+
+/// Control is a draw too: it writes its own row, arm 0, naming the
+/// incumbent's recipe, and runs under the incumbent policy.
+#[test]
+fn a_drawn_control_writes_arm_zero_and_runs_the_incumbent() {
+    let tw = TrialWorld::new("trials-control");
+    let task = tw.world.write_task_for("t.json", "an easy one", "off");
+    tw.seed_drawing(&task, "trial: control");
+
+    let run = tw.world.relais(&["run", "--task", &task.to_string_lossy()]);
+    assert!(run.status.success(), "run: {}", text(&run.stderr));
+    assert_eq!(tw.trials_created(), 1);
+    let rows = tw.settled_trials();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].arm_index, 0);
+    assert_eq!(rows[0].arm_recipe_id, tw.incumbent_recipe);
+    assert_eq!(rows[0].assignment_probability, 0.5);
+    tw.assert_row_names_its_own_run(&rows[0], &text(&run.stdout));
+    let receipt = std::fs::read_to_string(
+        tw.world
+            .run_dir(&World::run_id_of(&text(&run.stdout)))
+            .join("receipt.json"),
+    )
+    .expect("receipt");
+    assert!(
+        receipt.contains(&tw.incumbent_hash) && !receipt.contains(&tw.candidate_hash),
+        "{receipt}"
+    );
+    tw.world.stop_coordinator();
+}
+
+/// Enabled without a seed, `run` draws nothing and records nothing: the
+/// incumbent runs as if trials did not exist, and says why.
+#[test]
+fn an_unseeded_envelope_runs_the_incumbent_and_records_no_trial() {
+    let tw = TrialWorld::new("trials-unseeded");
+    let task = tw.world.write_task_for("t.json", "an easy one", "off");
+    tw.write_machine(&tw.trials_body(None), GrantCandidate::Yes);
+    let run = tw.world.relais(&["run", "--task", &task.to_string_lossy()]);
+    assert!(run.status.success(), "run: {}", text(&run.stderr));
+    assert!(
+        text(&run.stderr).contains("trial: not eligible (enabled without a seed)"),
+        "{}",
+        text(&run.stderr)
+    );
+    assert_eq!(tw.trials_created(), 0);
+    tw.world.stop_coordinator();
+}

@@ -8,15 +8,16 @@
 //! and a missing optional integration is reported, not counted as fine.
 //!
 //! Doctor is also where the product admits what it does not do: a turn
-//! ceiling the installed harness cannot take, and a `[trials]` envelope
-//! no code reads.
+//! ceiling the installed harness cannot take, and the standing of the
+//! `[trials]` envelope — off, or on with what it will and will not draw.
 
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::backend::Capabilities;
-use crate::policy::{Dependency, DependencyMode, MachineSettings, RepoPolicy};
+use crate::policy::{Dependency, DependencyMode, MachineSettings, RepoPolicy, TrialEnvelope};
+use crate::runner::live_trial;
 use crate::{ledger::Ledger, paths};
 
 /// How bad one finding is. An enum rather than a string plus a parallel
@@ -294,10 +295,6 @@ pub(crate) fn trust_finding(
     }
 }
 
-/// `[trials] enabled = true` promises randomized assignment with logged
-/// propensities (SPEC §17). This release ships no replay command and no
-/// propensity logging, so the flag does nothing at all. Saying so is the
-/// whole point: a silent no-op reads as a running experiment.
 /// A lockfile at the root and a profile with no setup step: the
 /// profile's commands will run in a bare worktree, where the tree's own
 /// dependencies MAY be missing — may, because a documentation profile
@@ -366,16 +363,86 @@ pub fn setup_finding(
     })
 }
 
-pub(crate) fn trials_finding(settings: &MachineSettings) -> Option<Finding> {
-    settings.trials.enabled.then(|| Finding {
+/// The `[trials]` envelope as a status line (SPEC §28): off; or on, with
+/// whether a seed is set, which candidates are admitted and which are
+/// dropped and why, and today's used/max trial count and spend. `enabled`
+/// without a seed is a failure: every task is then not eligible, and a
+/// machine that believes it is experimenting is not.
+pub(crate) fn trials_finding(
+    settings: &MachineSettings,
+    policy: Option<&RepoPolicy>,
+    repo_dir: &Path,
+) -> Finding {
+    if !settings.trials.enabled {
+        return Finding {
+            component: "trials",
+            level: Level::Ok,
+            detail: "off".into(),
+        };
+    }
+    let ledger = paths::ledger_path()
+        .ok()
+        .filter(|path| path.exists())
+        .and_then(|path| Ledger::open(&path).ok());
+    let identity = crate::repo::identity(repo_dir);
+    match live_trial::status(repo_dir, policy, settings, &identity, ledger.as_ref()) {
+        Ok(status) => trials_status_line(&settings.trials, &status),
+        Err(e) => Finding {
+            component: "trials",
+            level: Level::Warn,
+            detail: format!("on, but today's usage could not be read: {e}"),
+        },
+    }
+}
+
+fn trials_status_line(envelope: &TrialEnvelope, status: &live_trial::Status) -> Finding {
+    let seed = if status.seed_set {
+        "seed set"
+    } else {
+        "NO SEED, so every task is not eligible; set `seed` in [trials]"
+    };
+    let admitted = status
+        .admission
+        .admitted
+        .iter()
+        .map(|candidate| candidate.path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let dropped = status
+        .admission
+        .dropped
+        .iter()
+        .map(|dropped| format!("{} ({})", dropped.path.display(), dropped.why))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Finding {
         component: "trials",
-        level: Level::Warn,
-        detail: "[trials] enabled = true, but routing trials are NOT implemented in this \
-                 release: no replay command, no logged propensity, no randomized assignment. \
-                 The flag has no effect — every run is routed by policy and the learner as \
-                 if it were absent"
-            .into(),
-    })
+        level: if status.seed_set {
+            Level::Ok
+        } else {
+            Level::Fail
+        },
+        detail: format!(
+            "on; {seed}; candidates admitted {}{}, dropped {}{}; today {}/{} trials, {}/{} \
+             micro-USD",
+            status.admission.admitted.len(),
+            if admitted.is_empty() {
+                String::new()
+            } else {
+                format!(" [{admitted}]")
+            },
+            status.admission.dropped.len(),
+            if dropped.is_empty() {
+                String::new()
+            } else {
+                format!(" [{dropped}]")
+            },
+            status.usage.trials,
+            envelope.max_daily_trials,
+            status.usage.spend_micros,
+            envelope.max_trial_cost_micros,
+        ),
+    }
 }
 
 /// Where the machine authority and the state actually live for this
@@ -622,9 +689,7 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
                         detail: format!("valid; {} trust grant(s)", settings.trust.len()),
                     });
                     findings.push(trust_finding(policy.as_ref(), &settings, repo_dir));
-                    if let Some(trials) = trials_finding(&settings) {
-                        findings.push(trials);
-                    }
+                    findings.push(trials_finding(&settings, policy.as_ref(), repo_dir));
                     findings.push(hook_timeout_finding(
                         merged_roots(repo_dir, home.as_deref()),
                         &settings.admission,
@@ -1610,23 +1675,65 @@ mod tests {
         assert_eq!(finding.level, Level::Ok, "{}", finding.detail);
     }
 
+    fn status(seed_set: bool, dropped: &[(&str, &str)]) -> live_trial::Status {
+        live_trial::Status {
+            seed_set,
+            admission: live_trial::Admission {
+                admitted: Vec::new(),
+                dropped: dropped
+                    .iter()
+                    .map(|(path, why)| live_trial::Dropped {
+                        path: PathBuf::from(path),
+                        why: (*why).to_string(),
+                    })
+                    .collect(),
+            },
+            usage: crate::ledger::TrialUsage {
+                trials: 2,
+                spend_micros: 30,
+            },
+        }
+    }
+
     #[test]
-    fn an_enabled_trial_envelope_is_reported_as_inert() {
-        let mut settings =
+    fn the_trial_envelope_reads_off_when_it_is_off() {
+        let settings =
             MachineSettings::from_toml_str("schema_version = 1\n").expect("machine parses");
-        assert!(
-            trials_finding(&settings).is_none(),
-            "nothing to say when the envelope is off"
-        );
-        settings.trials.enabled = true;
-        let finding = trials_finding(&settings).expect("a line");
-        assert_eq!(finding.level, Level::Warn);
-        assert!(
-            finding.detail.contains("NOT implemented in this release"),
-            "{}",
-            finding.detail
-        );
-        assert!(finding.detail.contains("no effect"), "{}", finding.detail);
+        let finding = trials_finding(&settings, None, Path::new("."));
+        assert_eq!(finding.level, Level::Ok);
+        assert_eq!(finding.detail, "off");
+    }
+
+    #[test]
+    fn an_enabled_seeded_envelope_reports_admission_and_todays_usage() {
+        let envelope = TrialEnvelope {
+            enabled: true,
+            seed: Some(1),
+            max_daily_trials: 5,
+            max_trial_cost_micros: 100,
+            ..TrialEnvelope::default()
+        };
+        let finding = trials_status_line(&envelope, &status(true, &[("c.toml", "inadmissible")]));
+        assert_eq!(finding.level, Level::Ok, "{}", finding.detail);
+        for expected in [
+            "seed set",
+            "admitted 0",
+            "dropped 1 [c.toml (inadmissible)]",
+            "today 2/5 trials, 30/100 micro-USD",
+        ] {
+            assert!(finding.detail.contains(expected), "{}", finding.detail);
+        }
+    }
+
+    #[test]
+    fn an_enabled_envelope_without_a_seed_is_a_doctor_failure() {
+        let envelope = TrialEnvelope {
+            enabled: true,
+            ..TrialEnvelope::default()
+        };
+        let finding = trials_status_line(&envelope, &status(false, &[]));
+        assert_eq!(finding.level, Level::Fail);
+        assert!(finding.detail.contains("NO SEED"), "{}", finding.detail);
     }
 
     #[test]

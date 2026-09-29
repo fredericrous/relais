@@ -717,6 +717,7 @@ fn run_package(
         // its own. Naming it here would be a second record of the same
         // fact, free to disagree.
         purpose: None,
+        run_id: None,
     };
     engine.transition(
         State::Running,

@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::ids::TaskId;
-use crate::ledger::{Ledger, LedgerError, TrialCost, TrialOutcome, TrialRow};
+use crate::ledger::{Ledger, LedgerError, TrialCost, TrialOutcome, TrialRow, LIVE_WORKTREE};
 use crate::lifecycle::State;
 use crate::money::MicroUsd;
 use crate::policy::{RecipeSpec, RepoPolicy};
@@ -214,6 +214,14 @@ pub struct ComparisonReport {
     /// the arm" by that variant's own doc, so they never enter a pair. Set
     /// aside rather than dropped: this count is how they stay visible.
     pub errored_trials_set_aside: usize,
+    /// Settled live (`live_worktree`) trials for this candidate, set aside
+    /// whole: this estimator pairs each trial with a replay SOURCE run,
+    /// which a live trial does not have, so pairing one would compare the
+    /// arm with nothing. They stay counted, not dropped, until an unpaired
+    /// estimator exists. Additive: a report written before this field
+    /// existed reads back as zero.
+    #[serde(default)]
+    pub live_trials_set_aside: usize,
     pub incumbent: ArmSummary,
     pub arm: ArmSummary,
     pub interval: PairedInterval,
@@ -263,6 +271,10 @@ impl ComparisonReport {
         out.push_str(&format!(
             "errored trials set aside (not comparable evidence for or against the arm): {}\n",
             self.errored_trials_set_aside
+        ));
+        out.push_str(&format!(
+            "randomized trials set aside: {} (unpaired estimator not implemented yet)\n",
+            self.live_trials_set_aside
         ));
         out.push_str(&format!("incumbent: {}\n", render_arm(&self.incumbent)));
         out.push_str(&format!("candidate arm: {}\n", render_arm(&self.arm)));
@@ -359,7 +371,8 @@ pub fn evaluate_candidate(
         .iter()
         .map(RecipeSpec::recipe_id)
         .collect();
-    let trials = ledger.settled_trials_for_recipes(&recipe_ids)?;
+    let (trials, live_trials_set_aside) =
+        set_aside_live_trials(ledger.settled_trials_for_recipes(&recipe_ids)?);
     let (by_task, errored_trials_set_aside) = earliest_non_errored_per_task(trials);
 
     let basis = comparison_basis(by_task.values());
@@ -408,6 +421,7 @@ pub fn evaluate_candidate(
         paired_tasks: pairs.len(),
         min_paired_tasks,
         errored_trials_set_aside,
+        live_trials_set_aside,
         incumbent: incumbent_summary,
         arm: arm_summary_value,
         interval,
@@ -429,6 +443,21 @@ fn trial_cost_from_run(
     };
     Ok(TrialCost::new(cost, completeness)
         .expect("a cost/completeness pair read back from the ledger's own settled values is always a consistent one"))
+}
+
+/// The replay trials, and how many live ones were set aside. A live trial
+/// (SPEC §28) ran in the repository's own worktree and has no replay
+/// source run to be paired with; until an unpaired estimator exists it is
+/// excluded from pairing and from [`comparison_basis`] alike, so a ledger
+/// holding both evaluates exactly as it would holding the replays alone.
+fn set_aside_live_trials(trials: Vec<TrialRow>) -> (Vec<TrialRow>, usize) {
+    let total = trials.len();
+    let replays: Vec<TrialRow> = trials
+        .into_iter()
+        .filter(|trial| trial.workspace_isolation != LIVE_WORKTREE)
+        .collect();
+    let set_aside = total - replays.len();
+    (replays, set_aside)
 }
 
 /// One trial per task, the earliest settled NON-errored trial, plus how
@@ -702,6 +731,7 @@ mod tests {
     fn the_rendered_report_names_the_errored_trials_set_aside() {
         let report = ComparisonReport {
             errored_trials_set_aside: 3,
+            live_trials_set_aside: 0,
             ..passing_report()
         };
         let rendered = report.render();
@@ -723,6 +753,7 @@ mod tests {
             paired_tasks: 25,
             min_paired_tasks: MIN_PAIRED_TASKS,
             errored_trials_set_aside: 0,
+            live_trials_set_aside: 0,
             incumbent: ArmSummary {
                 acceptance: AcceptanceEstimate::Estimated(0.8),
                 cost_per_acceptance: CostPerAcceptance {
@@ -837,6 +868,7 @@ mod tests {
             paired_tasks: pairs.len(),
             min_paired_tasks: MIN_PAIRED_TASKS,
             errored_trials_set_aside: 0,
+            live_trials_set_aside: 0,
             incumbent: arm_summary(&incumbent_observations),
             arm: arm_summary(&observations),
             interval: bootstrap_paired_interval(&pairs, seed, DEFAULT_BOOTSTRAP_RESAMPLES),
@@ -946,5 +978,146 @@ mod tests {
         let first = bootstrap_paired_interval(&pairs, 7, 500);
         let second = bootstrap_paired_interval(&pairs, 7, 500);
         assert_eq!(first, second);
+    }
+
+    /// A candidate policy with one recipe, and that recipe's id: the id a
+    /// trial names to count as this candidate's arm.
+    fn candidate_with_one_recipe() -> (RepoPolicy, String) {
+        let policy = RepoPolicy::from_toml_str(
+            "schema_version = 1\n[[recipes]]\nname = \"docs\"\nscope_within = [\"docs/**\"]\n\
+             tier = \"implementation\"\nrevision = 1\n",
+        )
+        .expect("policy parses");
+        let arm = policy.recipes[0].recipe_id();
+        (policy, arm)
+    }
+
+    /// Settled, accepted replay trials for `arm`, one per task, in a fresh
+    /// ledger; plus, when asked, one settled live trial drawn at p = 0.5.
+    fn ledger_with_trials(arm: &str, replays: usize, live: usize) -> (Ledger, std::path::PathBuf) {
+        use crate::ledger::{NewReplayTrial, NewTrial};
+        let dir = crate::test_support::short_temp_dir("cmp-live").to_path_buf();
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger opens");
+        for n in 0..replays {
+            let trial_id = TrialId::from_stored(format!("replay-{n}"));
+            let task_id = TaskId::from_stored(format!("task-{n}"));
+            let run_id = RunId::from_stored(format!("run-{n}"));
+            ledger
+                .insert_replay_trial(&NewReplayTrial {
+                    trial_id: &trial_id,
+                    task_id: &task_id,
+                    source_run_id: &run_id,
+                    incumbent_recipe_id: "incumbent",
+                    arm_recipe_id: arm,
+                    base_sha: "base",
+                    contract_hash: "contract",
+                    verification_profile_hash: "profile",
+                    workspace_isolation: "fresh_checkout_no_accepted_answer",
+                })
+                .expect("insert replay");
+            ledger
+                .settle_trial(
+                    &trial_id,
+                    TrialOutcome::Accepted,
+                    true,
+                    TrialCost::UNKNOWN,
+                    1,
+                )
+                .expect("settle replay");
+        }
+        for n in 0..live {
+            let trial_id = TrialId::from_stored(format!("live-{n}"));
+            let task_id = TaskId::from_stored(format!("live-task-{n}"));
+            // A live row names the arm's OWN run, as `relais run` records
+            // it — here an accepted one, the case in which pairing it as
+            // if it were a replay source would count it as the incumbent's
+            // accepted result and move the figures.
+            let run_id = RunId::from_stored(format!("live-run-{n}"));
+            ledger
+                .insert_run(&run_id, "/repo", None, &task_id, "rk")
+                .expect("live arm's run");
+            ledger
+                .record_transition(&crate::ledger::Transition {
+                    run_id: run_id.clone(),
+                    attempt_id: None,
+                    from_state: Some(State::Prepared),
+                    to_state: State::Accepted,
+                    reason: "verification_passed".into(),
+                    detail: None,
+                    at: "2026-09-29T00:00:00+00:00".into(),
+                })
+                .expect("live arm's run accepted");
+            assert_eq!(
+                ledger.run_status(&run_id).expect("status"),
+                Some(State::Accepted)
+            );
+            ledger
+                .insert_trial(&NewTrial {
+                    trial_id: &trial_id,
+                    task_id: &task_id,
+                    source_run_id: &run_id,
+                    incumbent_recipe_id: "incumbent",
+                    arm_recipe_id: arm,
+                    arm_index: 1,
+                    assignment_probability: 0.5,
+                    seed: 7,
+                    base_sha: "base",
+                    contract_hash: "contract",
+                    verification_profile_hash: "profile",
+                    workspace_isolation: LIVE_WORKTREE,
+                    arms_json: None,
+                })
+                .expect("insert live");
+            ledger
+                .settle_trial(
+                    &trial_id,
+                    TrialOutcome::Accepted,
+                    true,
+                    TrialCost::UNKNOWN,
+                    1,
+                )
+                .expect("settle live");
+        }
+        (ledger, dir)
+    }
+
+    /// A ledger holding replay AND live trials evaluates exactly as one
+    /// holding the replays alone, plus the count of live trials set aside:
+    /// the basis stays `Replay`, no pair is made with a live trial, and
+    /// the rendered evidence names the count.
+    ///
+    /// FALSIFY: `set_aside_live_trials` was made to keep live trials (its
+    /// filter matched nothing), and this test failed on the count
+    /// (`left: 0, right: 2`): the live trials, drawn at p = 0.5, stayed in
+    /// the pairing and would flip the basis to `Randomized`. Then the
+    /// filter was restored. The live rows name real, ACCEPTED runs (as
+    /// `relais run` records them), so a mis-pairing would also count them
+    /// as the incumbent's accepted results.
+    #[test]
+    fn live_trials_are_set_aside_and_never_change_what_replays_show() {
+        let (candidate, arm) = candidate_with_one_recipe();
+        let (replays_only, dir_a) = ledger_with_trials(&arm, 3, 0);
+        let (mixed, dir_b) = ledger_with_trials(&arm, 3, 2);
+        let alone = evaluate_candidate(&replays_only, &candidate, 20, 200).expect("evaluates");
+        let both = evaluate_candidate(&mixed, &candidate, 20, 200).expect("evaluates");
+        assert_eq!(alone.live_trials_set_aside, 0);
+        assert_eq!(both.live_trials_set_aside, 2);
+        assert_eq!(
+            both,
+            ComparisonReport {
+                live_trials_set_aside: 2,
+                ..alone
+            }
+        );
+        assert_eq!(both.basis, ComparisonBasis::Replay);
+        assert!(
+            both.render_evidence().contains(
+                "randomized trials set aside: 2 (unpaired estimator not implemented yet)\n"
+            ),
+            "{}",
+            both.render_evidence()
+        );
+        std::fs::remove_dir_all(dir_a).ok();
+        std::fs::remove_dir_all(dir_b).ok();
     }
 }

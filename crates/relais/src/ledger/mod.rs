@@ -24,7 +24,7 @@ use crate::outcome::{Outcome, OutcomeDetail, OutcomeKind};
 use crate::policy::Tier;
 use crate::route::RoutedBy;
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 15;
+pub const LEDGER_SCHEMA_VERSION: u64 = 16;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -514,6 +514,21 @@ impl<'de> Deserialize<'de> for TrialCost {
     }
 }
 
+/// The `workspace_isolation` a live trial arm records: the arm ran in the
+/// repository's own task worktree, where the source run's accepted answer
+/// is NOT hidden, and it has no replay source to pair with.
+pub const LIVE_WORKTREE: &str = "live_worktree";
+
+/// What the trials created since some instant have used (SPEC §28).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrialUsage {
+    pub trials: u32,
+    /// Recorded cost, with every trial whose cost is not on record
+    /// (unsettled, or settled with unknown usage) counted at the figure
+    /// the caller names, never as zero.
+    pub spend_micros: i64,
+}
+
 /// free trial (SPEC §11).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrialRow {
@@ -557,6 +572,9 @@ pub struct NewTrial<'a> {
     pub contract_hash: &'a str,
     pub verification_profile_hash: &'a str,
     pub workspace_isolation: &'a str,
+    /// The JSON list of every arm's recipe id, when the arm was drawn
+    /// among several. `None` for a replay.
+    pub arms_json: Option<&'a str>,
 }
 
 /// What recording a REPLAY's arm needs. Grouped rather than passed
@@ -1259,6 +1277,16 @@ const MIGRATIONS: &[(&str, &str)] = &[
     );
     CREATE INDEX idx_orchestration_usage_session ON orchestration_usage(session_id);
     CREATE INDEX idx_orchestration_usage_at ON orchestration_usage(at);
+    "#,
+    ),
+    (
+        // A live trial draws among several arms, and what the draw was
+        // over is part of the evidence: `arms_json` is the JSON list of
+        // every arm's recipe id, control first, exactly as assigned.
+        // NULL on every existing row: a replay is one arm, not a draw.
+        "v16",
+        r#"
+    ALTER TABLE trials ADD COLUMN arms_json TEXT;
     "#,
     ),
 ];
@@ -3401,6 +3429,49 @@ impl Ledger {
             contract_hash: replay.contract_hash,
             verification_profile_hash: replay.verification_profile_hash,
             workspace_isolation: replay.workspace_isolation,
+            arms_json: None,
+        })
+    }
+
+    /// Every arm recipe id a trial was drawn among, control first, or
+    /// `None` for a trial that was not a draw (a replay) or no such trial.
+    pub fn trial_arms(&self, trial_id: &TrialId) -> Result<Option<Vec<String>>> {
+        let stored: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT arms_json FROM trials WHERE trial_id = ?1",
+                [trial_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        stored
+            .flatten()
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|e| LedgerError::Corrupt {
+                    what: "trials.arms_json".into(),
+                    detail: e.to_string(),
+                })
+            })
+            .transpose()
+    }
+
+    /// How many trials were created at or after `since` (RFC3339, in the
+    /// ledger's own stamp format), and what they cost. The daily caps are
+    /// counted HERE, from the rows, never from a process's memory: two
+    /// concurrent runs and a restart all see the same number.
+    /// `unknown_cost_micros` is what a trial with no recorded figure
+    /// counts as: the caller passes the per-trial ceiling, so an
+    /// unsettled or unpriced trial can never read as free.
+    pub fn trial_usage_since(&self, since: &str, unknown_cost_micros: i64) -> Result<TrialUsage> {
+        let (trials, spend_micros): (i64, i64) = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(COALESCE(cost_micros, ?2)), 0)
+               FROM trials WHERE created_at >= ?1",
+            params![since, unknown_cost_micros],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(TrialUsage {
+            trials: u32::try_from(trials).unwrap_or(u32::MAX),
+            spend_micros,
         })
     }
 
@@ -3411,8 +3482,8 @@ impl Ledger {
                 (trial_id, task_id, source_run_id, incumbent_recipe_id,
                  arm_recipe_id, arm_index, assignment_probability, seed,
                  base_sha, contract_hash, verification_profile_hash,
-                 workspace_isolation, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 workspace_isolation, created_at, arms_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 trial.trial_id.as_str(),
                 trial.task_id.as_str(),
@@ -3427,6 +3498,7 @@ impl Ledger {
                 trial.verification_profile_hash,
                 trial.workspace_isolation,
                 now,
+                trial.arms_json,
             ],
         )?;
         Ok(())
@@ -6037,6 +6109,7 @@ mod tests {
             contract_hash: "contract-hash",
             verification_profile_hash: "profile-hash",
             workspace_isolation: "worktree",
+            arms_json: None,
         }
     }
 

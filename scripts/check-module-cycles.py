@@ -63,6 +63,7 @@ IMPURE = {
 PURE_FILES = {
     "hook/decide.rs",
     "hook/pairing.rs",
+    "route/trial.rs",
 }
 
 PURE_MODULES = {

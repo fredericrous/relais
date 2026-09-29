@@ -3,9 +3,9 @@
 //! Used to shuffle the training set between epochs of the learner's
 //! warm start, so reproducibility is "record seed and settings", not
 //! "hope the platform's RNG agrees". Not cryptographic; nothing that
-//! must be unpredictable goes through it. Routing trials are
-//! configurable but not implemented (`doctor` reports the gap), so
-//! nothing here serves one.
+//! must be unpredictable goes through it. Live trial assignment
+//! (`route::trial`) draws from it, keyed by a stable hash, so a recorded
+//! seed reproduces the draw.
 
 pub struct SplitMix64 {
     state: u64,

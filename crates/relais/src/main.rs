@@ -48,7 +48,7 @@ use relais::learn::comparison::{
 };
 use relais::learn::predict::RegistryPredictor;
 use relais::learn::promote::{admit, Amendment};
-use relais::ledger::{OrchestrationUsageRow, TrialCost, TrialOutcome};
+use relais::ledger::OrchestrationUsageRow;
 use relais::lifecycle::RunPurpose;
 use relais::money::{CostCompleteness, MicroUsd};
 use relais::orchestration::{self, PriceTable, TranscriptSource};
@@ -56,7 +56,7 @@ use relais::policy::{
     effective_authority, grant_key, HookAdmissionSettings, MachineSettings, RecipeSpec,
     RepoIdentity, RepoPolicy,
 };
-use relais::runner::{execute, worktree_root, Reason, RunConfig, State, Terminal};
+use relais::runner::{execute, live_trial, worktree_root, Reason, RunConfig, State, Terminal};
 use relais::verify::{independence_summary, Receipt};
 use relais::{
     doctor,
@@ -2132,11 +2132,15 @@ fn plan_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliErro
     // writes nothing: opening it unconditionally would create the state
     // directory, the database and its migrations as a side effect of a
     // preflight whose whole promise is that nothing happens yet.
+    let mut task_override = None;
     if contract.task_id.is_some() || revise.is_some() {
         let ledger = open_ledger()?;
-        if let Err(detail) = resolve_task_override(&ledger, &contract, revise) {
-            eprintln!("relais plan: {detail}");
-            return Ok(CliOutcome::Blocked);
+        match resolve_task_override(&ledger, &contract, revise) {
+            Ok(resolved) => task_override = resolved,
+            Err(detail) => {
+                eprintln!("relais plan: {detail}");
+                return Ok(CliOutcome::Blocked);
+            }
         }
     }
 
@@ -2238,6 +2242,16 @@ fn plan_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliErro
                 .get(&routed.tier)
                 .map(|profile| profile.id.as_str());
             print!("{}", routed.explain(model));
+            for line in plan_trial_lines(
+                &root,
+                &repo,
+                &machine,
+                &repo_identity,
+                &contract,
+                task_override,
+            )? {
+                println!("{line}");
+            }
             Ok(CliOutcome::Accepted)
         }
         route::Routed::Blocked(blocked) => {
@@ -2248,6 +2262,57 @@ fn plan_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliErro
             Ok(CliOutcome::Blocked)
         }
     }
+}
+
+/// The task identity a run of this contract will have: the one already
+/// confirmed on record, or the one derived from the repository and the
+/// contract, exactly as the runner derives it at preflight.
+fn task_identity(
+    task_override: Option<TaskId>,
+    repo_identity: &RepoIdentity,
+    contract: &TaskContract,
+) -> TaskId {
+    task_override.unwrap_or_else(|| {
+        relais::ids::derive_task_id(&relais::policy::repo_key(repo_identity), &contract.hash())
+    })
+}
+
+/// What `relais plan` prints about live trials (SPEC §28): the assignment
+/// it WOULD make, and every candidate dropped and why. Nothing when the
+/// envelope is off, so plan's output is unchanged. Writes nothing: with no
+/// ledger on disk yet it does not create one to learn that today's usage
+/// is zero.
+fn plan_trial_lines(
+    root: &Path,
+    repo: &RepoPolicy,
+    machine: &MachineSettings,
+    repo_identity: &RepoIdentity,
+    contract: &TaskContract,
+    task_override: Option<TaskId>,
+) -> Result<Vec<String>, CliError> {
+    if !machine.trials.enabled {
+        return Ok(Vec::new());
+    }
+    let ledger_path = paths::ledger_path().map_err(CliError::Home)?;
+    let ledger = if ledger_path.exists() {
+        Some(open_ledger()?)
+    } else {
+        None
+    };
+    let task_id = task_identity(task_override, repo_identity, contract);
+    let decision = operational(
+        live_trial::decide(&live_trial::Environment {
+            root,
+            repo,
+            machine,
+            identity: repo_identity,
+            contract,
+            task_id: &task_id,
+            ledger: ledger.as_ref(),
+        }),
+        "plan trial assignment",
+    )?;
+    Ok(decision.lines())
 }
 
 fn run_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError> {
@@ -2316,10 +2381,79 @@ fn run_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError
             session.source
         );
     }
+    // Live trials (SPEC §28). With the envelope off `decide` answers
+    // without reading a candidate or touching the ledger, `lines` is
+    // empty and `record` writes nothing: the run below is the run it
+    // always was.
+    let repo_identity = relais::repo::identity(&root);
+    let task_id = task_identity(task_override.clone(), &repo_identity, &contract);
+    let trial = operational(
+        live_trial::decide(&live_trial::Environment {
+            root: &root,
+            repo: &repo,
+            machine: &machine,
+            identity: &repo_identity,
+            contract: &contract,
+            task_id: &task_id,
+            ledger: Some(&ledger),
+        }),
+        "trial assignment",
+    )?;
+    for line in trial.lines() {
+        eprintln!("{line}");
+    }
+    // A row is written before the run, so a draw is on record even if the
+    // run dies. Without a resolvable base there is nothing to record, and
+    // then nothing is drawn: the incumbent runs and reports the base
+    // itself. Never a candidate policy without its row.
+    let trial_base = trial
+        .draws()
+        .then(|| workspace::resolve_base(&root, &contract.base_ref).ok())
+        .flatten();
+    let run_id = match ids.run_id() {
+        Ok(run_id) => run_id,
+        Err(e) => {
+            eprintln!("relais run: {e}");
+            return Ok(CliOutcome::OperationalFailure);
+        }
+    };
+    let trial_id = match &trial_base {
+        Some(base_sha) => {
+            let contract_hash = contract.hash();
+            let profile_hash = repo
+                .verification
+                .profiles
+                .get(&contract.verification_profile)
+                .map(|profile| profile.hash())
+                .unwrap_or_default();
+            match trial.record(
+                &ledger,
+                &ids,
+                &live_trial::TrialFacts {
+                    task_id: &task_id,
+                    base_sha,
+                    contract_hash: &contract_hash,
+                    verification_profile_hash: &profile_hash,
+                },
+                &run_id,
+            ) {
+                Ok(trial_id) => trial_id,
+                Err(e) => {
+                    eprintln!("relais run: {e}");
+                    return Ok(CliOutcome::OperationalFailure);
+                }
+            }
+        }
+        None => None,
+    };
+    let run_policy: &RepoPolicy = match &trial_id {
+        Some(_) => trial.candidate_policy().unwrap_or(&repo),
+        None => &repo,
+    };
     let outcome = match execute(&RunConfig {
         repo_dir: &root,
         contract: &contract,
-        repo_policy: &repo,
+        repo_policy: run_policy,
         machine: &machine,
         ledger: &ledger,
         ids: &ids,
@@ -2337,14 +2471,28 @@ fn run_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError
         session_id: session.id.clone(),
         heartbeat_every: std::time::Duration::from_secs(30),
         task_override: task_override.as_ref(),
-        purpose: None,
+        // A run a live trial row names is a trial arm on the run's own
+        // record too — Control included — so `runs.purpose` and
+        // `trials.source_run_id` never disagree about it (SPEC §28).
+        purpose: trial_id.as_ref().map(|_| RunPurpose::TrialArm),
+        run_id: Some(run_id.clone()),
     }) {
         Ok(outcome) => outcome,
         Err(e) => {
+            if let Some(trial_id) = &trial_id {
+                if let Err(settle_error) = live_trial::settle_errored(&ledger, trial_id) {
+                    eprintln!("relais run: could not settle trial {trial_id}: {settle_error}");
+                }
+            }
             eprintln!("relais run: {e}");
             return Ok(CliOutcome::OperationalFailure);
         }
     };
+    if let Some(trial_id) = &trial_id {
+        if let Err(e) = live_trial::settle(&ledger, trial_id, &outcome) {
+            eprintln!("relais run: could not settle trial {trial_id}: {e}");
+        }
+    }
     let run_dir = artifacts_dir.join(outcome.run_id());
     let result = match &outcome.terminal {
         Terminal::Accepted(receipt) => {
@@ -2638,6 +2786,7 @@ fn replay_command(task: &str, recipe: &Path, dry_run: bool) -> Result<CliOutcome
         heartbeat_every: std::time::Duration::from_secs(30),
         task_override: Some(&task_id),
         purpose: Some(RunPurpose::Replay),
+        run_id: None,
     });
     // Bring the replay's own refs into the live repository BEFORE the
     // checkout goes. The runner names its candidate and snapshot refs in
@@ -2673,37 +2822,12 @@ fn replay_command(task: &str, recipe: &Path, dry_run: bool) -> Result<CliOutcome
     // The purpose was written with the run row (see `RunConfig::purpose`),
     // so there is nothing to stamp here.
 
-    let (trial_outcome, accepted_without_escalation) = match &outcome.terminal {
-        Terminal::Accepted(receipt) => (TrialOutcome::Accepted, receipt.attempts <= 1),
-        Terminal::Failed { .. } | Terminal::NeedsReview { .. } | Terminal::NeedsDecision { .. } => {
-            (TrialOutcome::Rejected, false)
-        }
-        Terminal::Blocked { .. }
-        | Terminal::BudgetExhausted { .. }
-        | Terminal::Interrupted { .. }
-        | Terminal::Cancelled { .. } => (TrialOutcome::Errored, false),
-    };
-    let completeness = operational(
-        ledger.run_cost_completeness(&outcome.run_id),
+    let (trial_outcome, accepted_without_escalation) =
+        live_trial::trial_outcome_of(&outcome.terminal);
+    let (trial_cost, duration_ms) = operational(
+        live_trial::settled_figures(&ledger, &outcome.run_id),
         "dataset replay",
     )?;
-    let cost_value = match completeness {
-        CostCompleteness::Unknown => None,
-        _ => Some(operational(
-            ledger.run_cost(&outcome.run_id),
-            "dataset replay",
-        )?),
-    };
-    let trial_cost = TrialCost::new(cost_value, completeness).expect(
-        "a cost/completeness pair read back from the ledger's own settled values is always \
-         a consistent one",
-    );
-    let duration_ms = operational(
-        ledger.run_duration_seconds(&outcome.run_id),
-        "dataset replay",
-    )?
-    .map(|seconds| (seconds * 1000.0) as i64)
-    .unwrap_or(0);
 
     operational(
         ledger.insert_replay_trial(&relais::ledger::NewReplayTrial {

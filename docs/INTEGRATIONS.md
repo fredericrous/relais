@@ -314,6 +314,53 @@ fold it into `relais report` beside worker spend.
   after the window opens spends inside it. The window only narrows which
   `unattributable` / `transcript missing` sessions are counted.
 
+## Live trials (`[trials]`)
+
+Live trials are OFF. Nothing here runs unless `machine.toml` turns it on;
+a repository's `relais.toml` cannot (SPEC §28). When it is on,
+`relais run` draws each eligible task's arm — the incumbent, or one
+candidate recipe policy — with a recorded probability, and settles the
+trial when the run ends.
+
+```toml
+# ~/.config/relais/machine.toml — this example is OFF.
+[trials]
+enabled = false
+# Everything below is inert while `enabled = false`.
+seed = 20260929                  # required once enabled; no seed, no draw
+eligible_kinds = ["change"]      # empty (the default) = no task is eligible
+max_daily_trials = 5             # trials created per UTC day; 0 = none
+max_trial_cost_micros = 2000000  # the day's recorded cost; 0 = none
+candidates = ["/path/to/candidate-relais.toml"]
+```
+
+- **`enabled`** — the master switch. Off, `plan` and `run` are unchanged
+  and no `trials` row is written.
+- **`seed`** — the machine's randomization seed. Together with the task
+  id and the UTC day it fixes the draw. `enabled = true` without one makes
+  every task not eligible and is a `relais doctor` failure. A TOML
+  integer is signed 64-bit, so the largest seed a file can spell is
+  9223372036854775807.
+- **`eligible_kinds`** — task kinds (`change`, `inspect`) that may be
+  drawn. Default empty: none.
+- **`max_daily_trials`**, **`max_trial_cost_micros`** — hard daily caps,
+  counted from the ledger since 00:00 UTC. A trial whose cost is not
+  recorded yet (in flight, or unknown usage) counts as the full
+  `max_trial_cost_micros`, never zero, so a single such trial can use up
+  a cap of that size. Both default to 0: no trial runs.
+- **`candidates`** — paths to candidate `relais.toml` files (relative
+  paths are read from the repository root). Each is admitted at run time:
+  it must parse, be admissible against the repository's current policy
+  (`relais recipe diff` shows the verdict), and hold its own trust grant
+  in `machine.toml`. One that fails is dropped, and `plan` and `run` say
+  which and why.
+
+`relais plan` prints the assignment it would make and writes nothing;
+`relais doctor` prints a status line: `off`, or `on` with the seed, the
+admitted and dropped candidates, and today's used/max count and spend.
+`relais recipe evaluate` sets live trials aside until an unpaired
+estimator exists.
+
 ## Troubleshooting
 
 - **More than one settings file names a hook.** Nothing wins: Claude Code

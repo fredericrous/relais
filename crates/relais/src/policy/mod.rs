@@ -933,25 +933,37 @@ pub enum CoordinatorUnreachableBehavior {
     Refuse,
 }
 
-/// Authorized experimentation envelope (SPEC §13, §17). Automatic trials
-/// and promotion stay inside it; anything wider needs an explicit policy
-/// edit. Risk floors and required checks are never trainable parameters.
+/// Authorized experimentation envelope (SPEC §13, §17, §28). Live trial
+/// assignment stays inside it; anything wider needs an explicit edit of
+/// machine.toml. Risk floors and required checks are never trainable
+/// parameters.
 ///
-/// NOT IMPLEMENTED IN THIS RELEASE. §17's comparative evidence needs a
-/// replay command or randomized assignment with logged propensities, and
-/// this release ships neither: nothing reads these fields, so
-/// `enabled = true` changes no behaviour whatsoever. The struct stays
-/// because `MachineSettings` denies unknown fields — deleting it would
-/// turn a machine.toml that already sets `[trials]` into a parse error
-/// on upgrade — and `doctor` prints a `!` line whenever the flag is on,
-/// so nobody believes a trial is running.
+/// MACHINE-OWNED and OFF by default: this lives in [`MachineSettings`],
+/// never in [`RepoPolicy`], so a repository can neither enable trials nor
+/// widen the envelope. Every field has a safe default that runs nothing:
+/// `enabled = false`, no seed, no eligible kind, no candidate, and caps
+/// of zero — so a machine that sets only `enabled = true` still draws no
+/// arm. `enabled = true` without a `seed` makes every task not eligible;
+/// an unseeded draw is never made.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct TrialEnvelope {
-    /// Inert: see the struct's note. Kept parseable, reported by doctor.
     pub enabled: bool,
-    pub max_daily_trials: Option<u32>,
-    pub max_trial_cost_micros: Option<i64>,
+    /// The machine's own randomization seed. Together with the task id
+    /// and the UTC day it fixes the draw, so an assignment is
+    /// reproducible from what the ledger records. TOML integers are
+    /// signed 64-bit, so the largest seed a file can spell is `i64::MAX`.
+    pub seed: Option<u64>,
+    /// Task kinds that may be drawn into a trial. Empty: none.
+    pub eligible_kinds: Vec<crate::contract::Kind>,
+    /// Trials that may be created per UTC day. 0: none.
+    pub max_daily_trials: u32,
+    /// Ceiling on the day's recorded trial cost, in micro-USD; a trial
+    /// whose cost is unknown counts as this full amount. 0: none.
+    pub max_trial_cost_micros: i64,
+    /// Candidate `relais.toml` files, each admitted at run time against
+    /// the repository's current policy and its own trust grant.
+    pub candidates: Vec<std::path::PathBuf>,
 }
 
 /// Learned-routing switch and the quality requirement estimates are
@@ -1948,6 +1960,31 @@ keys = ["output.contract"]
             grant_key("authority", &identity()),
             "ff25e7845522d451e49c35865572e3a48a295dcf806caecde55b3afa345dcaa5"
         );
+    }
+
+    /// A machine.toml that sets only today's three `[trials]` fields still
+    /// parses, and everything it does not set is the safe default: no
+    /// seed, no eligible kind, no candidate. One that sets none is OFF.
+    #[test]
+    fn a_machine_with_only_the_original_trial_fields_parses_with_safe_defaults() {
+        let machine = MachineSettings::from_toml_str(
+            "schema_version = 1\n[trials]\nenabled = true\nmax_daily_trials = 3\n\
+             max_trial_cost_micros = 500\n",
+        )
+        .expect("the original three fields still parse");
+        let trials = machine.trials;
+        assert!(trials.enabled);
+        assert_eq!(trials.max_daily_trials, 3);
+        assert_eq!(trials.max_trial_cost_micros, 500);
+        assert_eq!(trials.seed, None);
+        assert!(trials.eligible_kinds.is_empty());
+        assert!(trials.candidates.is_empty());
+
+        let bare = MachineSettings::from_toml_str("schema_version = 1\n").expect("parses");
+        assert_eq!(bare.trials, TrialEnvelope::default());
+        assert!(!bare.trials.enabled);
+        assert_eq!(bare.trials.max_daily_trials, 0);
+        assert_eq!(bare.trials.max_trial_cost_micros, 0);
     }
 
     /// `repo_key` hashes only the identity — no authority hash — so a
