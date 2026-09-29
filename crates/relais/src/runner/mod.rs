@@ -3767,6 +3767,8 @@ fn build_prompt(
          `;`, `&&`, `$(…)`, or leading `VAR=value` prefixes. Permission rules are\n\
          matched against the raw command string, so `make check | tail` or\n\
          `MSRV_SKIP_OK=1 make check` is refused even when `make` is allowed.\n\
+         edit files with your file-editing tools, never with `sed -i`, heredocs\n\
+         or inline scripts, and never copy files to /tmp: those are refused too.\n\
          you cannot spawn subagents, and you should not leave scratch files.\n",
     );
     if let Some(failures) = previous_failures {
@@ -7544,6 +7546,13 @@ mod tests {
                 "{kind:?}: {prompt}"
             );
             assert!(prompt.contains("cannot spawn subagents"), "{kind:?}");
+            // The forms measured as refused after the pipe rule landed
+            // (#105): in-place `sed`, heredoc/inline-script edits, /tmp.
+            assert!(
+                prompt.contains("never with `sed -i`, heredocs")
+                    && prompt.contains("never copy files to /tmp"),
+                "{kind:?}: {prompt}"
+            );
         }
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
