@@ -24,7 +24,7 @@ const CREDENTIAL_NAMES_PLACEHOLDER: &str = "<credential-env-names>";
 /// Bump whenever `probe_plan`, `probe_plan_allowlist`, an `Expect` or
 /// `evaluate`'s rules change: a pass earned by the old probe proves nothing
 /// about the new one.
-const PROBE_VERSION: u32 = 4;
+const PROBE_VERSION: u32 = 5;
 
 /// Where the records live under a state directory.
 pub fn store_path(state_dir: &Path) -> PathBuf {
@@ -273,8 +273,8 @@ mod tests {
         assert_eq!(
             (PROBE_VERSION, probe_digest().as_str()),
             (
-                4,
-                "a9cafe8655fb7072322ce176ace4885a8352f52d2ed736b685f9544453716891"
+                5,
+                "8a4a73abb2cccb87c9ca729aca12eb207e4c9dc14cb3e2389a9dd7bcc13f5ed0"
             ),
             "the probe changed: bump PROBE_VERSION and update this digest"
         );

@@ -76,8 +76,8 @@ pub fn worker_launch(inputs: &LaunchInputs) -> SandboxLaunch {
 
 /// The short path a worker's Claude Code temp dir is pointed at:
 /// `<root>/rl-<8 hex of sha256(seed)>` on unix, the scratch itself elsewhere
-/// (no symlink to make there). The same seed names the same link, which is
-/// safe because [`TmpLink`] removes the earlier one.
+/// (no symlink to make there). The same seed names the same link: [`TmpLink`]
+/// replaces an earlier one only if it dangles or names the same scratch.
 pub fn short_tmp_link(root: &Path, seed: &str, scratch: &Path) -> PathBuf {
     if !cfg!(unix) {
         return scratch.to_path_buf();
