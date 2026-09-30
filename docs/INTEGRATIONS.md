@@ -185,6 +185,13 @@ machine that added `disallowed_tools = ["Agent", "Task"]` to `machine.toml`
 by hand (as v0.6.0's Upgrading notes advised) may keep or drop it: the
 floor carries it, and the union with `machine.toml` is idempotent.
 
+The deny floor and the allowlist match command strings. A machine that
+wants an OS boundary instead sets `[sandbox] enabled = true` in
+`machine.toml`: the worker then runs restricted (no user, project or local
+settings, hooks or plugins), with no MCP servers, Bash inside the OS
+sandbox, and the same `--disallowed-tools` floor. SPEC §8 ("Worker OS
+sandbox") is the reference for what that does and does not guarantee.
+
 ## Known limits of the hook path
 
 These four are specific to `--hooks`; the general limits that are not

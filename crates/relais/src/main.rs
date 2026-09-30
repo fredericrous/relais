@@ -2647,6 +2647,7 @@ fn run_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError
         hooks: &hooks,
         attest: &attest,
         worker_env,
+        sandbox_host: &relais::sandbox::RealSandboxHost,
         artifacts_dir: artifacts_dir.clone(),
         aval_resolver: &aval_resolver,
         predictor: predictor
@@ -2963,6 +2964,7 @@ fn replay_command(task: &str, recipe: &Path, dry_run: bool) -> Result<CliOutcome
         hooks: &hooks,
         attest: &attest,
         worker_env,
+        sandbox_host: &relais::sandbox::RealSandboxHost,
         artifacts_dir: artifacts_dir.clone(),
         aval_resolver: &aval_resolver,
         predictor: None,

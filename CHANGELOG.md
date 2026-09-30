@@ -10,11 +10,28 @@ missing here.
 
 ### Added
 
-- `[sandbox]` in machine.toml (#105): configuration for OS-sandboxing a
-  worker (`enabled`, `writable`, `network`, `deny_read`), off by default and
-  outside the authority hash, with a computed credential floor, a judge for
-  managed Claude Code settings that would weaken the sandbox, and the
-  sandbox settings builder. Nothing launches sandboxed yet.
+- `[sandbox]` in machine.toml (#105): OS-sandboxed workers, off by default
+  and outside the authority hash. With `enabled = true` the worker launches
+  `--restricted`, with `--strict-mcp-config`, the tools Bash, Read, Edit,
+  Write, Grep and Glob, its scratch directory as `--add-dir` and `$TMPDIR`,
+  and one `--settings` carrying the sandbox, the credential floor and the
+  network allowlist; its prompt says pipes and redirects work and where
+  scratch output goes. Before any dispatch the run is
+  `blocked (sandbox_unavailable)` on a platform other than macOS or Linux, a
+  harness older than 2.1.285 or of unknown version, or a Linux machine
+  without `bwrap` or `socat`, and `blocked (sandbox_weakened)` when managed
+  Claude Code settings, a managed MCP server or `~/.claude.json` would weaken
+  the sandbox (an unreadable source counts). The context manifest records
+  `sandbox`, `confinement` and `env_protection`; `sandbox.verified` is null
+  until the verification probe exists.
+
+### Changed
+
+- In allowlist mode (`[sandbox]` off) worker subprocesses no longer see
+  provider credentials: the worker is launched with
+  `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`.
+- A sandboxed worker loads no user, project or local settings, hooks or
+  plugins (`--restricted`).
 
 ### Fixed
 

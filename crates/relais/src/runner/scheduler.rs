@@ -709,6 +709,7 @@ fn run_package(
         hooks: engine.config.hooks,
         attest: engine.config.attest,
         worker_env: engine.config.worker_env.clone(),
+        sandbox_host: engine.config.sandbox_host,
         // The package's artifacts hang off the root run's; its
         // worktrees hang off THEIR parent, so a package worker's tree
         // sits under `packages/worktrees/<child-run>/` and no package's
@@ -1172,6 +1173,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
             .max(Duration::from_secs(1)),
         cancel: None,
         pid_slot: None,
+        sandbox: None,
     };
     let budget = Budget {
         attempts_used: 0,

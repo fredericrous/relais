@@ -740,6 +740,29 @@ pub struct SandboxSettings {
     pub deny_read: Vec<String>,
 }
 
+/// The OS this binary was built for, chosen at compile time (`validate()`
+/// reads no environment), spelled like `std::env::consts::OS`.
+const HOST_OS: &str = if cfg!(target_os = "macos") {
+    "macos"
+} else if cfg!(target_os = "linux") {
+    "linux"
+} else {
+    "other"
+};
+
+/// Why the OS sandbox cannot exist on `os` (a `std::env::consts::OS`
+/// value), or `None` where it can. One wording for `validate()` and the
+/// preflight block, so a Windows machine is told what to do instead of
+/// being refused for a "relative path".
+pub fn sandbox_platform_refusal(os: &str) -> Option<&'static str> {
+    match os {
+        "macos" | "linux" => None,
+        _ => Some(
+            "the OS sandbox exists on macOS and Linux only; turn `[sandbox]` off on this machine",
+        ),
+    }
+}
+
 /// A machine.toml path entry made absolute: `~` and `~/…` against `home`,
 /// an absolute path as it is, and `None` for anything else. Pure, so the
 /// validator and the settings builder cannot disagree about spelling.
@@ -1390,6 +1413,14 @@ impl MachineSettings {
         for (key, grant) in &self.trust {
             grant.validate(key)?;
         }
+        if self.sandbox.enabled {
+            if let Some(reason) = sandbox_platform_refusal(HOST_OS) {
+                return Err(PolicyError::InvalidSandbox {
+                    field: "enabled",
+                    detail: reason.to_string(),
+                });
+            }
+        }
         // The REAL directories: checking against a stand-in let an entry
         // that is an ancestor of the actual home or state dir through. An
         // unresolvable one (no HOME) is left to the stand-in.
@@ -1478,6 +1509,13 @@ pub enum BlockCode {
     /// top of the model's admissible set) allows. Never clamped: a spend
     /// the policy did not authorize is refused, not lowered.
     EffortAboveCap,
+    /// `[sandbox]` is on but the OS sandbox cannot be relied on here: the
+    /// platform, the harness version or a Linux helper program is missing.
+    /// A sandboxed worker is launched confined, or not launched.
+    SandboxUnavailable,
+    /// `[sandbox]` is on but the machine's Claude Code configuration
+    /// (managed settings, `~/.claude.json`) would weaken it.
+    SandboxWeakened,
 }
 
 impl BlockCode {
@@ -1511,6 +1549,8 @@ impl BlockCode {
             Self::ReadHintUnresolvable => "read_hint_unresolvable",
             Self::AcceptanceCheckUnknown => "acceptance_check_unknown",
             Self::EffortAboveCap => "effort_above_cap",
+            Self::SandboxUnavailable => "sandbox_unavailable",
+            Self::SandboxWeakened => "sandbox_weakened",
         }
     }
 }
@@ -2071,6 +2111,9 @@ keys = ["output.contract"]
 
     /// `[sandbox]` is machine policy like `[pricing]`: adding it must not
     /// move a repo's authority hash or invalidate a reviewed grant.
+    // Unix only: it enables `[sandbox]`, which `validate()` refuses on a
+    // platform with no OS sandbox (Windows).
+    #[cfg(unix)]
     #[test]
     fn a_sandbox_block_in_machine_settings_does_not_move_the_authority_hash() {
         let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
@@ -2724,6 +2767,18 @@ keys = ["output.contract"]
             a.disallowed_tools.contains(&"Bash(git push:*)".to_string()),
             "naming allowed tools never shortens the deny floor"
         );
+    }
+
+    #[test]
+    fn the_os_sandbox_is_refused_by_name_off_macos_and_linux() {
+        for os in ["macos", "linux"] {
+            assert_eq!(sandbox_platform_refusal(os), None, "{os}");
+        }
+        for os in ["windows", "freebsd", ""] {
+            let reason = sandbox_platform_refusal(os).expect(os);
+            assert!(reason.contains("macOS and Linux only"), "{reason}");
+            assert!(reason.contains("turn `[sandbox]` off"), "{reason}");
+        }
     }
 
     #[test]

@@ -35,6 +35,9 @@ pub struct MockBackend {
     /// Claude Code 2.1.284 lists, so a test that never sets it sees a
     /// harness that accepts every effort a policy names.
     pub accepted_efforts: EffortSet,
+    /// What its probe reports as the harness version. `test` by default,
+    /// which the sandbox preflight cannot compare, so it blocks.
+    pub version: String,
 }
 
 /// The efforts a default mock accepts.
@@ -52,7 +55,14 @@ impl MockBackend {
         Self {
             behavior: Arc::new(behavior),
             accepted_efforts: default_accepted_efforts(),
+            version: "test".to_string(),
         }
+    }
+
+    /// The same backend reporting `version` from its probe.
+    pub fn reporting_version(mut self, version: &str) -> Self {
+        self.version = version.to_string();
+        self
     }
 
     /// The same backend advertising `accepted` as its CLI-accepted efforts.
@@ -70,7 +80,7 @@ impl Backend for MockBackend {
     fn probe(&self) -> Option<Capabilities> {
         Some(Capabilities {
             backend: "mock".into(),
-            version: Some("test".into()),
+            version: Some(self.version.clone()),
             supports_model: true,
             accepted_efforts: self.accepted_efforts.clone(),
             supports_max_turns: true,
