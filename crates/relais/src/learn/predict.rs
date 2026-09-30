@@ -40,9 +40,10 @@ pub struct InferenceResult {
 }
 
 /// Load the registry's active artifact and estimate. Abstains when no
-/// artifact is active, when its schema is unreadable, or when an
-/// eligible arm has no trained coverage — abstention routes to the
-/// conservative baseline, never to a guess.
+/// artifact is active, when its schema is unreadable, or when no eligible
+/// arm has trained coverage (an arm without it is declined, with the
+/// reason recorded, and the others are still estimated) — abstention
+/// routes to the conservative baseline, never to a guess.
 pub fn estimate_from_registry(
     registry: &Registry,
     contract: &TaskContract,

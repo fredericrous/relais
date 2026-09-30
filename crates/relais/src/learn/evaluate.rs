@@ -680,10 +680,11 @@ struct Candidate {
 }
 
 /// The arms the evaluation offers for `record`: for each trained tier at or
-/// above the record's floor, each distinct identity the TRAINING split
-/// observed at that tier, in `identities_per_tier` order.
+/// above the record's floor, one arm per effort the TRAINING split observed
+/// at that tier, each with the observed identity closest to the record's
+/// own, in `identities_per_tier` order.
 ///
-/// Each candidate carries that identity — with the record's own `recipe_id`,
+/// Each candidate carries an observed identity — with the record's own `recipe_id`,
 /// the recipe being a property of the task — never the record's model,
 /// effort or harness, which belong to the tier the record happened to run
 /// at. An identity records an effort only when one was passed, so one
