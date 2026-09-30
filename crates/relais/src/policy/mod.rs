@@ -2116,8 +2116,6 @@ keys = ["output.contract"]
 
     /// `~/..` resolved to the home's parent and passed: `..` is refused in
     /// a `~/` entry as in an absolute one.
-    // Unix only: Unix absolute-path fixtures (see the symlink test).
-    #[cfg(unix)]
     #[test]
     fn a_home_relative_parent_escape_is_refused() {
         for entry in ["~/..", "~/../..", "~/.cache/../../x"] {
@@ -2136,8 +2134,6 @@ keys = ["output.contract"]
 
     /// With no resolvable home, `~/.ssh` is still refused: the floor
     /// defaults are computed against the stand-in `~` expands with.
-    // Unix only: Unix absolute-path fixtures (see the symlink test).
-    #[cfg(unix)]
     #[test]
     fn a_floor_path_is_refused_even_without_a_resolvable_home() {
         let settings = SandboxSettings {
