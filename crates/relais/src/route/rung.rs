@@ -9,10 +9,8 @@
 //!   `allowed_models` — never a fallback to another model.
 //! * A floor binds the initial rung: the effort is the higher of the start
 //!   effort and the floor in the catalog's order, and a model that cannot
-//!   satisfy it blocks the route. An escalation dispatches its tier's
-//!   configured profile, so until the P3 ladder resolves escalation rungs
-//!   the route is blocked when that profile would run below the floor
-//!   ([`check_escalation_floor`]).
+//!   satisfy it blocks the route. The escalation rung is resolved the same
+//!   way (`ladder`), so a floor binds every rung the budget can reach.
 //! * A ceiling is never a clamp: an effort above the smaller of the
 //!   authority ceiling and the top of the dispatched model's admissible set
 //!   blocks the route.
@@ -21,7 +19,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::catalog::{Admissible, EffortCatalog, EffortCatalogs, EffortSet, Fact};
 use crate::policy::{
@@ -34,7 +32,7 @@ use super::RouteReason;
 /// What a dispatch asks of the harness about effort. Three states that a
 /// caller must tell apart, so never an `Option`: `None` would say nothing
 /// about whether the model has no control or nobody asked.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EffortRequest {
     /// `--effort <id>` is passed.
@@ -55,8 +53,8 @@ impl EffortRequest {
     }
 }
 
-/// The first dispatch of a route.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// One dispatch of a route: the tier, model and effort an attempt runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rung {
     pub tier: Tier,
     pub model: String,
@@ -134,8 +132,10 @@ pub fn resolve_catalogs(
 
 pub(super) struct RungRequest<'a> {
     pub tier: Tier,
-    pub authority: &'a EffectiveAuthority,
-    pub machine: &'a MachineSettings,
+    /// The authority policy's model table, already narrowed by the machine.
+    pub models: &'a BTreeMap<Tier, ModelProfile>,
+    /// machine.toml's `allowed_models` (`None`: any).
+    pub allowed_models: Option<&'a [String]>,
     /// The recipe that covers the task, when one does.
     pub recipe: Option<&'a RecipeSpec>,
     /// The `minimum_effort` of every risk rule the scope could touch.
@@ -182,13 +182,13 @@ fn undetermined_text(catalog: Option<&EffortCatalog>) -> String {
 pub(super) fn resolve_rung(request: RungRequest<'_>) -> Result<ResolvedRung, Blocker> {
     let RungRequest {
         tier,
-        authority,
-        machine,
+        models,
+        allowed_models,
         recipe,
         floors,
         catalogs,
     } = request;
-    let Some(authority_profile) = authority.models.get(&tier) else {
+    let Some(authority_profile) = models.get(&tier) else {
         return Err(blocked(
             BlockCode::ModelUnavailable,
             format!("no model configured for the {} tier", tier.as_str()),
@@ -200,7 +200,7 @@ pub(super) fn resolve_rung(request: RungRequest<'_>) -> Result<ResolvedRung, Blo
     let profile = recipe_profile.unwrap_or(authority_profile);
     let mut reasons = Vec::new();
 
-    if let Some(allowed) = &machine.allowed_models {
+    if let Some(allowed) = allowed_models {
         if !allowed.contains(&profile.id) {
             return Err(blocked(
                 BlockCode::ModelNotAllowed,
@@ -264,7 +264,7 @@ pub(super) fn resolve_rung(request: RungRequest<'_>) -> Result<ResolvedRung, Blo
                 &effort,
                 catalog,
                 configured,
-                authority_ceiling(&authority.models, catalogs, tier).as_ref(),
+                authority_ceiling(models, catalogs, tier).as_ref(),
                 &profile.id,
             )?;
             EffortRequest::Explicit(effort)
@@ -368,55 +368,29 @@ fn floor_names(floors: &[EffortId]) -> String {
         .join(", ")
 }
 
-/// Whether the escalation tier's configured profile can carry the risk
-/// floor: [`apply_floor`] on it must leave its configured effort as it is,
-/// and the same ceiling and carve-out rules as the initial rung must pass.
-/// An escalation dispatches that profile as configured, with no floor
-/// applied, so a profile below the floor would run below it.
-///
-/// holds-until: the P3 ladder resolves and validates every reachable rung
-pub(super) fn check_escalation_floor(
-    tier: Tier,
-    authority: &EffectiveAuthority,
+/// A rung the ladder derived (a repair) checked as the initial one is: its
+/// effort must pass [`check_effort`] against the tier's configured effort,
+/// catalog and authority ceiling. A rung with no explicit effort asks
+/// nothing of the model and passes.
+pub(super) fn validate_rung(
+    rung: &Rung,
+    models: &BTreeMap<Tier, ModelProfile>,
     catalogs: &EffortCatalogs,
-    floors: &[EffortId],
 ) -> Result<(), Blocker> {
-    let Some(profile) = authority.models.get(&tier) else {
+    let EffortRequest::Explicit(effort) = &rung.effort else {
         return Ok(());
     };
-    if floors.is_empty() {
-        return Ok(());
-    }
-    let configured = profile.effort.as_ref();
-    let dispatched = configured.map_or_else(|| "no effort".to_string(), EffortId::to_string);
-    let held = |detail: String| {
-        blocked(
-            BlockCode::EffortUnsupported,
-            format!(
-                "the escalation target, the {} tier, is reachable within the attempt budget \
-                 and would run `{}` at {dispatched} (its configured effort): {detail}",
-                tier.as_str(),
-                profile.id
-            ),
-        )
-    };
-    let catalog = catalogs.get(&profile.id);
-    let raised = apply_floor(catalog, &profile.id, configured, floors)
-        .map_err(|blocker| held(blocker.detail))?;
-    if Some(&raised) != configured {
-        return Err(held(format!(
-            "risk floor `{}` requires at least {raised}, and an escalation is not raised",
-            floor_names(floors)
-        )));
-    }
+    let configured = models
+        .get(&rung.tier)
+        .filter(|profile| profile.id == rung.model)
+        .and_then(|profile| profile.effort.as_ref());
     check_effort(
-        &raised,
-        catalog,
+        effort,
+        catalogs.get(&rung.model),
         configured,
-        authority_ceiling(&authority.models, catalogs, tier).as_ref(),
-        &profile.id,
+        authority_ceiling(models, catalogs, rung.tier).as_ref(),
+        &rung.model,
     )
-    .map_err(|blocker| held(blocker.detail))
 }
 
 /// The ceiling and carve-out rules for one effort about to be dispatched.

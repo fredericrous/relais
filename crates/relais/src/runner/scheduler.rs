@@ -30,7 +30,7 @@ use crate::lifecycle::UsagePhase;
 use crate::money::{CostKind, MicroUsd};
 use crate::policy::{BlockCode, EffectiveAuthority, MachineSettings, Tier};
 use crate::procs::Ended;
-use crate::route::{Recipe, Route};
+use crate::route::{Recipe, Route, RungIndex};
 use crate::verify::{self, Receipt, VerificationReport};
 use crate::workspace::{self, WorkspaceError};
 
@@ -230,6 +230,7 @@ pub(crate) fn run_decomposed(
         head: root.base_sha.to_string(),
         attempts_total: 0,
         models_used: Vec::new(),
+        ladders: std::collections::BTreeMap::new(),
     };
     let outcome = execute_waves(engine, root, &plan, &integration, &mut assembly)?;
     // One exit for the integration worktree, the same as a task
@@ -248,6 +249,10 @@ struct Assembly {
     head: String,
     attempts_total: u32,
     models_used: Vec<String>,
+    /// The ladder each accepted package's own run resolved, by package id:
+    /// what the root's receipt records, since the root dispatches no worker
+    /// rungs itself.
+    ladders: std::collections::BTreeMap<String, Vec<crate::route::Rung>>,
 }
 
 /// The plan this run executes, or the end it reached instead.
@@ -383,6 +388,7 @@ fn execute_waves(
             repairs_used: 0,
             max_repairs: 0,
             tier: root.decision.tier,
+            rung: RungIndex::INITIAL,
             escalation_tier: None,
         };
         match workspace::check_scope(integration, &assembly.head, contract) {
@@ -586,6 +592,7 @@ fn run_package(
         repairs_used: 0,
         max_repairs: 0,
         tier: root.decision.tier,
+        rung: RungIndex::INITIAL,
         escalation_tier: None,
     };
 
@@ -747,7 +754,26 @@ fn run_package(
         }),
     )?;
     match outcome.terminal {
-        Terminal::Accepted(receipt) => Ok(PackageEnd::Accepted(receipt.candidate_sha)),
+        Terminal::Accepted(receipt) => {
+            // A package is a single run: its receipt records the one ladder
+            // it ran. Anything else would drop a package that did run from
+            // the integrated receipt's per-package map without a trace, so
+            // it is an error, not a skip.
+            match receipt.ladder {
+                verify::LadderRecord::Single(rungs) => {
+                    assembly.ladders.insert(package.id.clone(), rungs);
+                }
+                verify::LadderRecord::NotRecorded | verify::LadderRecord::PerPackage(_) => {
+                    return Err(RunError::Other(format!(
+                        "package `{}` ({child_run}) was accepted with a receipt that does \
+                         not record a single ladder; its ladder cannot be named on the \
+                         integrated receipt",
+                        package.id
+                    )));
+                }
+            }
+            Ok(PackageEnd::Accepted(receipt.candidate_sha))
+        }
         terminal => {
             let prefix = format!(
                 "package `{}` ({child_run}) ended {}: ",
@@ -890,6 +916,7 @@ fn accept_integrated(
         repairs_used: 0,
         max_repairs: 0,
         tier: root.decision.tier,
+        rung: RungIndex::INITIAL,
         escalation_tier: None,
     };
     // The assembled candidate is judged like any other (SPEC §19):
@@ -1023,6 +1050,7 @@ fn accept_integrated(
         ),
         verification_profile_hash: root.authority.verification_profile.hash(),
         review: super::review_record_of(ledger, &engine.run_id)?,
+        ladder: verify::LadderRecord::PerPackage(std::mem::take(&mut assembly.ladders)),
     };
     engine.seal(&receipt, None, None, &head)?;
     // The assembled revision is named under this run so the retirement
@@ -1056,9 +1084,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
     let contract = engine.config.contract;
     // The route's rung when the planner's tier is the routed one, the
     // authority policy's profile otherwise.
-    let profile = [Tier::Research, Tier::Implementation]
-        .into_iter()
-        .find_map(|tier| root.decision.dispatch_profile(tier, root.authority));
+    let profile = root.decision.planner_profile(root.authority);
     let Some(profile) = profile else {
         return Ok(Proposal::Rejected(
             "no research or implementation model to plan with".into(),
@@ -1139,6 +1165,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         repairs_used: 0,
         max_repairs: 0,
         tier: Tier::Research,
+        rung: RungIndex::INITIAL,
         escalation_tier: None,
     };
     // Around the launch, monotonic: the dispatch's own elapsed time.

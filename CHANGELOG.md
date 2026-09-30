@@ -8,6 +8,58 @@ missing here.
 
 ## Unreleased
 
+### Added
+
+- **The effort ladder: every attempt the budget can reach gets a validated
+  rung (P3).** `route()` now resolves, once, the tier, model and effort of
+  the initial attempt, each repair and the escalation, given the budget that
+  applies (a package's own attempts, not the root's), and the runner
+  dispatches exactly that: the state machine only chooses the kind of the
+  next attempt and the ladder index, and tier, model and effort are read from
+  `ladder[rung]`. A repair climbs to the next admissible effort within its
+  tier's ceiling and stays at the ceiling once there (`execution.repair_effort
+  = "raise"`, the default), or keeps the previous effort (`"same"`, today's
+  sequence). The key is left out of the authority hash while it is the
+  default. Under an unknown effort catalog `raise` holds the configured
+  effort for that model; `relais plan` prints `repair effort held: effort
+  order unknown for <model>` on stderr for the models the run's ladder holds,
+  and `relais doctor`'s effort finding says `repair effort would be held
+  (effort order unknown) for: <models>` for every model a repair could run
+  at. The ladder is printed one rung per line after `effort:` in
+  `plan` and `explain`, carried by `plan --json`, recorded in the run's first
+  dispatch intent (each attempt's intent names the rung it ran) and in the
+  receipt (an additive `ladder` field, the ladder that ran: the run's own, or
+  each package's by id for a decomposed run; older receipts still parse). Falsified:
+  keeping a repair at the initial effort failed the route and runner tests;
+  turning "no next effort" into no effort failed the ceiling test; both
+  restored.
+- **Candidate admission resolves the same ladder as routing.**
+  `validate_candidate` calls the one function `route()` calls, under the
+  incumbent's models, budget and `repair_effort`, and admits a recipe only
+  when every rung validates (`LadderBlocked` otherwise), so a candidate that
+  moves its covering tier below the escalation tier under a floor is no
+  longer admitted and then blocked. A candidate may not change
+  `execution.repair_effort`. Falsified: with the ladder check removed, the
+  escalation-floor cross-check test failed; restored. Admission judges the
+  ladder under the repository's `execution` budget, the one routing reads
+  (a recipe's own `execution` block is declared but not yet read), and picks
+  the escalation tier with the one function routing uses (the strongest
+  eligible tier).
+- A budget that ends on the last repair (`max_attempts` = repairs + 1) ends as
+  it did before the ladder: the runner takes the escalation tier from the
+  route, so the attempt ceiling, not `RepairExhausted`, ends the run.
+
+### Changed
+
+- **A risk floor binds the escalation rung too, instead of blocking the
+  route.** The P2 interim rule blocked a route whose reachable escalation
+  tier was configured below a floor; the escalation rung is now resolved
+  like the initial one, so a tier configured at `medium` under a `high`
+  floor escalates at `high`, and only a tier that cannot carry the floor (or
+  whose ceiling is below it) blocks, before attempt 1. An escalation tier
+  whose model `allowed_models` removed is no rung: the ladder ends before it
+  and no other model is substituted.
+
 ### Fixed
 
 - **Reviewer independence is the model's, and the candidate carve-out matches
@@ -75,7 +127,8 @@ missing here.
   in `allowed_models` or the route is blocked `model_not_allowed`, never
   another model. The runner dispatches the rung's model and effort for the
   initial tier and records exactly them in the dispatch intent; repairs and
-  escalations are unchanged (the ladder is P3).
+  escalations were unchanged then, and now read the P3 ladder (see Added,
+  above).
 - **Per-tier effort ceilings are authoritative.** The rung's effort may not
   exceed the smaller of the authority ceiling (`models.<tier>.max_effort`, else
   the top of the authority model's admissible set) and the top of the
@@ -102,11 +155,9 @@ missing here.
   `[models.<tier>]` profile.** A risk floor binds the initial rung: its effort
   is the higher of its start effort and the floor in catalog order, and a model
   that cannot satisfy it (no effort control, or an unknown catalog) blocks the
-  route naming the floor, the model and the admissible set. An escalation
-  still dispatches its tier's configured profile, so a route whose escalation
-  is reachable within the attempt budget is blocked (exit 3, naming the floor,
-  the escalation tier and its configured effort) when that profile would run
-  below the floor, until the P3 ladder validates escalation rungs. A candidate
+  route naming the floor, the model and the admissible set. (The escalation
+  rung was first held to the floor by an interim block; the P3 ladder, above,
+  resolves it at the floor instead.) A candidate
   recipe that sets no effort under a floor is judged by the same floor check,
   and by the machine's `allowed_models`. `relais plan`'s `route:` line names the
   rung's model. Both keys are

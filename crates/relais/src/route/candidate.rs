@@ -26,8 +26,9 @@ use crate::policy::{
     RecipeSpec, RepoPolicy, RiskRule, Tier,
 };
 
+use super::ladder::{escalation_target, resolve_ladder, LadderBudget, LadderRequest};
 use super::rung::apply_floor;
-use super::{authority_ceiling, recipe_effort_floors, recipe_tier_floor};
+use super::{authority_ceiling, recipe_effort_floors, recipe_tier_floor, tiers_at_or_above};
 
 /// Caps a learner's proposed knobs must respect. Never sourced from the
 /// candidate itself — a self-reported cap is not a cap.
@@ -60,6 +61,9 @@ pub struct TuningBounds {
     /// not a number to tune: `false` here means a candidate cannot turn
     /// it on however it retunes the caps around it.
     pub allow_nested_agents: bool,
+    /// machine.toml's `allowed_models` (`None`: any), which routing
+    /// narrows the policy's models by before it resolves a ladder.
+    pub machine_allowed_models: Option<Vec<String>>,
 }
 
 /// The seal. `CandidateRecipe`'s field is private to THIS module, and
@@ -111,12 +115,7 @@ mod sealed {
         bounds: &TuningBounds,
     ) -> Result<CandidateRecipe, CandidateRejection> {
         fixed_fields_match(incumbent, candidate)?;
-        validate_recipe_history(
-            &incumbent.recipes,
-            &candidate.recipes,
-            &candidate.risk,
-            bounds,
-        )?;
+        validate_recipe_history(incumbent, &candidate.recipes, &candidate.risk, bounds)?;
         Ok(CandidateRecipe {
             policy: candidate.clone(),
         })
@@ -199,6 +198,10 @@ pub enum CandidateRejection {
         model: String,
         detail: String,
     },
+    /// A new recipe entry's ladder — the rung of every attempt the
+    /// incumbent's budget can reach — has a rung routing would block:
+    /// [`super::ladder::resolve_ladder`]'s own refusal, verbatim.
+    LadderBlocked { name: String, detail: String },
     /// A new recipe entry would grant a capability the bounds withhold.
     /// Distinct from a knob above its cap: no number makes this
     /// admissible, so it is not a matter of degree.
@@ -302,6 +305,10 @@ impl std::fmt::Display for CandidateRejection {
                 "recipe `{name}` names `{model}` at the {tier:?} tier with no effort, and routing \
                  would block it: {detail}"
             ),
+            Self::LadderBlocked { name, detail } => write!(
+                f,
+                "recipe `{name}` covers a ladder routing would block: {detail}"
+            ),
             Self::CapabilityNotGranted { name, capability } => write!(
                 f,
                 "recipe `{name}` would grant `{capability}`, which the tuning bounds withhold: \
@@ -402,11 +409,12 @@ fn fixed_fields_match(
 /// point must be a validly tuned new revision of a recipe the incumbent
 /// already declared.
 fn validate_recipe_history(
-    incumbent_recipes: &[RecipeSpec],
+    incumbent: &RepoPolicy,
     candidate_recipes: &[RecipeSpec],
     candidate_risk: &[RiskRule],
     bounds: &TuningBounds,
 ) -> Result<(), CandidateRejection> {
+    let incumbent_recipes = incumbent.recipes.as_slice();
     if candidate_recipes.len() < incumbent_recipes.len() {
         return Err(CandidateRejection::RecipeHistoryRewritten {
             index: candidate_recipes.len(),
@@ -422,19 +430,20 @@ fn validate_recipe_history(
         }
     }
     for new_recipe in &candidate_recipes[incumbent_recipes.len()..] {
-        validate_new_recipe(incumbent_recipes, new_recipe, candidate_risk, bounds)?;
+        validate_new_recipe(incumbent, new_recipe, candidate_risk, bounds)?;
     }
     validate_recipes(candidate_recipes).map_err(CandidateRejection::InvalidRecipe)?;
     Ok(())
 }
 
 fn validate_new_recipe(
-    incumbent_recipes: &[RecipeSpec],
+    incumbent: &RepoPolicy,
     new: &RecipeSpec,
     candidate_risk: &[RiskRule],
     bounds: &TuningBounds,
 ) -> Result<(), CandidateRejection> {
-    let base = incumbent_recipes
+    let base = incumbent
+        .recipes
         .iter()
         .filter(|recipe| recipe.name == new.name)
         .max_by_key(|recipe| recipe.revision)
@@ -564,7 +573,16 @@ fn validate_new_recipe(
             allow_nested_agents,
             max_agent_depth,
             max_agents_total,
+            repair_effort,
         } = execution;
+        // NOT a knob. Raising effort on repair is spend, and a learner
+        // does not choose its own.
+        if *repair_effort != incumbent.execution.repair_effort {
+            return Err(CandidateRejection::FixedRecipeFieldChanged {
+                name: new_name.clone(),
+                field: "execution.repair_effort",
+            });
+        }
         check_cap(
             new_name,
             "execution.max_attempts",
@@ -615,7 +633,60 @@ fn validate_new_recipe(
         )?;
     }
 
-    Ok(())
+    check_ladder(incumbent, new, candidate_risk, bounds)
+}
+
+/// A new recipe is admitted only when routing would not block the ladder it
+/// covers: [`resolve_ladder`], the very function `route()` calls, resolved
+/// under the incumbent's models, budget and repair policy, with the floors
+/// the recipe's own scope could touch. Every rung must validate — the
+/// initial one, each repair, and the escalation the budget reaches.
+///
+/// A recipe whose tier the incumbent configures no model for is never
+/// selected by routing, so it has no ladder to judge.
+fn check_ladder(
+    incumbent: &RepoPolicy,
+    new: &RecipeSpec,
+    candidate_risk: &[RiskRule],
+    bounds: &TuningBounds,
+) -> Result<(), CandidateRejection> {
+    let models = crate::policy::allowed_models_of(
+        &incumbent.models,
+        bounds.machine_allowed_models.as_deref(),
+    );
+    if !models.contains_key(&new.tier) {
+        return Ok(());
+    }
+    let floors = recipe_effort_floors(new.kind, &new.scope_within, candidate_risk);
+    let configured: Vec<Tier> = models.keys().copied().collect();
+    let eligible = tiers_at_or_above(new.tier, &configured);
+    let escalation_tier = escalation_target(&eligible, new.tier);
+    // The budget routing reads: the repository's own `execution`, which a
+    // candidate cannot change (a fixed field). A recipe's `execution` block
+    // is declared and hashed but not yet read by routing or dispatch, so
+    // judging the ladder under it would admit what `route()` then blocks.
+    // holds-until: routing reads a covering recipe's `execution`; then this
+    // takes the recipe's budget, in the same change.
+    let budget = LadderBudget {
+        max_attempts: incumbent.execution.max_attempts,
+        max_repairs_before_escalation: incumbent.execution.max_repairs_before_escalation,
+    };
+    resolve_ladder(LadderRequest {
+        tier: new.tier,
+        escalation_tier,
+        models: &models,
+        allowed_models: bounds.machine_allowed_models.as_deref(),
+        recipe: Some(new),
+        floors: &floors,
+        catalogs: &bounds.catalogs,
+        budget,
+        repair_effort: incumbent.execution.repair_effort,
+    })
+    .map(|_| ())
+    .map_err(|blocker| CandidateRejection::LadderBlocked {
+        name: new.name.clone(),
+        detail: blocker.detail,
+    })
 }
 
 /// One candidate effort to judge against routing's own rules.
@@ -827,6 +898,7 @@ pub fn default_tuning_bounds(
         ceilings,
         configured,
         allow_nested_agents: policy.execution.allow_nested_agents,
+        machine_allowed_models: machine_allowed_models.map(<[String]>::to_vec),
     }
 }
 
@@ -1181,6 +1253,7 @@ mod tests {
             // Withheld, which is the interesting default for a test: a
             // candidate must not be able to grant itself nested agents.
             allow_nested_agents: false,
+            machine_allowed_models: None,
         }
     }
 
