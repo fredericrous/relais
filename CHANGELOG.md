@@ -6,6 +6,16 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## Unreleased
+
+### Fixed
+
+- Opening a fresh ledger from several processes at once no longer fails
+  intermittently with "database is locked" (#147). The switch to WAL, which
+  SQLite refuses without consulting its busy handler, now waits out a
+  concurrent opener for the ledger's 5 s busy timeout, with a short capped
+  backoff, instead of a fixed count of thread yields.
+
 ## v0.8.0
 
 Effort becomes a cost lever beside the model: a repair climbs effort before
