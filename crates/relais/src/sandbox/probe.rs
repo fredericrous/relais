@@ -90,6 +90,10 @@ pub(crate) const PERMISSION_REFUSALS: [&str; 3] = [
 /// Words a probe prints only when the sandbox let something through.
 pub(crate) const LEAK_MARKERS: [&str; 2] = ["PRESENT", "READABLE"];
 const GREP_PATTERN: &str = "relais-probe";
+const SOCKET_BOUND: &str = "unix-socket-bound";
+const SOCKET_BIND: &str = "import os,socket;\
+     socket.socket(socket.AF_UNIX).bind(os.environ[\"TMPDIR\"]+\"/sock/s\");\
+     print(\"unix-socket-bound\")";
 const PRESENCE: &str = ">/dev/null && echo PRESENT || echo absent";
 
 fn bash(id: &'static str, input: String, expect: Expect) -> ProbeStep {
@@ -143,6 +147,16 @@ pub fn probe_plan(inputs: &ProbePlanInputs) -> Result<Vec<ProbeStep>, String> {
             r#"printf 'a\nb\n' | head -1 > "$TMPDIR/relais-probe-pipe" && cat "$TMPDIR/relais-probe-pipe""#
                 .to_string(),
             line("a"),
+        ),
+        // A worker's own tests bind Unix sockets under `$TMPDIR`; the
+        // scratch grant must cover a bind through the short link.
+        bash(
+            "unix-socket",
+            format!(
+                "mkdir -p \"$TMPDIR/sock\" && python3 -c {}",
+                sh_quote(SOCKET_BIND)
+            ),
+            line(SOCKET_BOUND),
         ),
         bash(
             "tmp-write",
@@ -660,6 +674,7 @@ mod tests {
     fn measured(step: &ProbeStep) -> String {
         match step.id {
             "pipe" => "a".to_string(),
+            "unix-socket" => SOCKET_BOUND.to_string(),
             "tmp-write" | "home-write" => format!(
                 "Exit code 1\n(eval):1: operation not permitted: {}",
                 step.input
@@ -1163,6 +1178,7 @@ mod tests {
             ids,
             [
                 "pipe",
+                "unix-socket",
                 "tmp-write",
                 "home-write",
                 "network",
@@ -1176,6 +1192,9 @@ mod tests {
             ]
         );
         let input = |id: &str| steps.iter().find(|s| s.id == id).unwrap().input.clone();
+        let bind = input("unix-socket");
+        assert!(bind.starts_with("mkdir -p \"$TMPDIR/sock\" && python3 -c "));
+        assert!(bind.contains("AF_UNIX") && bind.contains(SOCKET_BOUND));
         assert_eq!(input("tmp-write"), "touch /tmp/relais-probe-n1");
         assert_eq!(input("home-write"), "touch '/home/u/relais-probe-n1'");
         assert_eq!(

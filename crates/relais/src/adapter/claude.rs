@@ -672,6 +672,7 @@ mod tests {
             sandbox: Some(SandboxLaunch {
                 settings: serde_json::json!({"sandbox": {"enabled": true}}),
                 scratch_dir: PathBuf::from("/state/runs/r/attempts/1/scratch"),
+                tmp_link: PathBuf::from("/tmp/rl-0a1b2c3d"),
             }),
             ..spec(Some(500_000))
         }

@@ -18,7 +18,7 @@ use serde_json::Value;
 use super::{
     dispatch_key, evaluate, probe_plan, probe_plan_allowlist, probe_prompt, store_path,
     worker_launch, DispatchKeyInputs, InitExpect, LaunchInputs, ProbePlanInputs, ProbeReport,
-    ProbeStep, StoreError, VerificationKey, VerificationRecord, VerificationStore,
+    ProbeStep, StoreError, TmpLink, VerificationKey, VerificationRecord, VerificationStore,
 };
 use crate::backend::{
     worker_launch_env, BackendError, Capabilities, LaunchEnv, LaunchSpec, ProbeLauncher,
@@ -352,6 +352,9 @@ pub fn verify_sandbox(
         .deny_read
         .push(prepared.fixture.to_string_lossy().into_owned());
     let sandbox = worker_launch(&launch_inputs(&with_fixture));
+    // Held across both sessions: the link the probe's `TMPDIR` names.
+    let _tmp_link = TmpLink::create(&sandbox)
+        .map_err(|why| VerifyError::Prepare(format!("the TMPDIR link: {why}")))?;
     let steps = probe_plan(&ProbePlanInputs {
         nonce,
         fixture: &prepared.fixture,
@@ -472,6 +475,7 @@ mod tests {
                 <sandbox_violations>\ndeny network-outbound example.com:443 \
                 (host is not on the allow list)\n</sandbox_violations>"
                 .to_string(),
+            "unix-socket" => "unix-socket-bound".to_string(),
             "fixture-bash" => "denied".to_string(),
             "synthetic-env" | "scrub-env" => "absent".to_string(),
             "auth-env" => "absent\nabsent".to_string(),
@@ -546,6 +550,8 @@ mod tests {
         launched: Mutex<Vec<LaunchSpec>>,
         /// The fixture as it was on disk at the sandbox launch.
         fixture_at_launch: Mutex<Option<String>>,
+        /// Where the sandbox launch's `TMPDIR` resolved to at launch.
+        tmpdir_at_launch: Mutex<Option<PathBuf>>,
         /// Run once during the first launch: what another process does to
         /// the store while the paid sessions are running.
         meanwhile: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -557,6 +563,7 @@ mod tests {
                 ignored_step,
                 launched: Mutex::new(Vec::new()),
                 fixture_at_launch: Mutex::new(None),
+                tmpdir_at_launch: Mutex::new(None),
                 meanwhile: Mutex::new(None),
             }
         }
@@ -569,6 +576,12 @@ mod tests {
                 action();
             }
             let steps = if spec.sandbox.is_some() {
+                *self.tmpdir_at_launch.lock().unwrap() = spec
+                    .env
+                    .vars()
+                    .iter()
+                    .find(|(name, _)| name == "TMPDIR")
+                    .and_then(|(_, link)| std::fs::canonicalize(link).ok());
                 let fixture = spec
                     .work_dir
                     .parent()
@@ -796,7 +809,18 @@ mod tests {
         );
         assert_eq!(
             var(sandbox, "TMPDIR").as_deref(),
-            Some(&*launch.scratch_dir.to_string_lossy())
+            Some(&*launch.tmp_link.to_string_lossy())
+        );
+        // Suffix, not equality: the scratch is removed once the probe passes,
+        // and the launch-time path is canonical (`/private/tmp` for `/tmp`).
+        let resolved = launcher.tmpdir_at_launch.lock().unwrap().clone();
+        assert!(
+            resolved.is_some_and(|path| path.ends_with(format!("probe/{NONCE}/scratch"))),
+            "the link resolved to the scratch while the probe ran"
+        );
+        assert!(
+            std::fs::symlink_metadata(&launch.tmp_link).is_err(),
+            "and is gone after it"
         );
         assert_eq!(var(sandbox, "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"), None);
         assert!(

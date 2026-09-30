@@ -1500,8 +1500,13 @@ impl<'a> RunEngine<'a> {
 
     /// The sandbox launch for this worker attempt, with a fresh scratch
     /// directory under the run's own: `<state_dir>/runs/<run>/attempts/<n>/
-    /// scratch`. `None` in allowlist mode.
-    fn sandbox_launch(&self, attempt_index: u32) -> Result<Option<SandboxLaunch>, RunError> {
+    /// scratch`, and the guard of the short `TMPDIR` link to it, which the
+    /// caller holds for as long as the dispatch runs. `None` in allowlist
+    /// mode.
+    fn sandbox_launch(
+        &self,
+        attempt_index: u32,
+    ) -> Result<Option<(SandboxLaunch, sandbox::TmpLink)>, RunError> {
         let settings = &self.config.machine.sandbox;
         if WorkerMode::of(settings) == WorkerMode::Allowlist {
             return Ok(None);
@@ -1521,7 +1526,7 @@ impl<'a> RunEngine<'a> {
         // must still reach the floor, lossily, rather than vanish from it.
         let ambient =
             |name: &str| std::env::var_os(name).map(|value| value.to_string_lossy().into_owned());
-        Ok(Some(sandbox::worker_launch(&sandbox::LaunchInputs {
+        let launch = sandbox::worker_launch(&sandbox::LaunchInputs {
             settings,
             home: &crate::paths::home_dir().map_err(home_unset)?,
             config_dir: &crate::paths::config_dir().map_err(home_unset)?,
@@ -1529,7 +1534,9 @@ impl<'a> RunEngine<'a> {
             env: &ambient,
             launch_env_names: &self.config.worker_env.names(),
             scratch: &scratch,
-        })))
+        });
+        let link = sandbox::TmpLink::create(&launch)?;
+        Ok(Some((launch, link)))
     }
 
     /// Record what the sandbox denied this worker attempt and how complete
@@ -2031,7 +2038,11 @@ impl<'a> RunEngine<'a> {
             .map(|ceiling| ceiling.remaining_after(progress.spend.total).to_micros());
         // The worker alone is sandboxed: the reviewer and the planner
         // keep the launch they had.
-        let sandbox = self.sandbox_launch(index)?;
+        // `_tmp_link` lives to the end of this dispatch, whichever way it ends.
+        let (sandbox, _tmp_link) = match self.sandbox_launch(index)? {
+            Some((launch, link)) => (Some(launch), Some(link)),
+            None => (None, None),
+        };
         let spec = LaunchSpec {
             dispatch_id: dispatch_id.as_str().to_string(),
             prompt,
@@ -10120,6 +10131,12 @@ mod tests {
                     0,
                     "and is empty"
                 );
+                let tmpdir = var("TMPDIR").expect("a TMPDIR");
+                assert_eq!(
+                    std::fs::canonicalize(&tmpdir).expect("the link exists at launch"),
+                    std::fs::canonicalize(dir).expect("scratch"),
+                    "TMPDIR is a link to the scratch"
+                );
             }
             record.lock().unwrap().push((
                 reviewer,
@@ -10173,9 +10190,14 @@ mod tests {
             scratch.ends_with("attempts/1/scratch"),
             "under the run's attempts: {scratch:?}"
         );
-        assert_eq!(
-            worker.2.as_deref(),
-            Some(scratch.to_string_lossy().as_ref())
+        let link = worker.2.as_deref().expect("a TMPDIR");
+        assert!(
+            link.starts_with("/tmp/rl-") && link != scratch.to_string_lossy(),
+            "a short link, not the scratch: {link}"
+        );
+        assert!(
+            std::fs::symlink_metadata(link).is_err(),
+            "the link is gone after the dispatch"
         );
         assert!(
             !worker.3,
@@ -10414,7 +10436,7 @@ mod tests {
             .insert_contract_revision(&engine.run_id, "hash", "{}", "HEAD", Some("sha"))
             .expect("revision");
         for round in 1..=2 {
-            let launch = engine
+            let (launch, _link) = engine
                 .sandbox_launch(1)
                 .expect("a launch")
                 .expect("sandboxed");
@@ -10491,8 +10513,30 @@ mod tests {
         let locked: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
         let worker_locked = Arc::clone(&locked);
         let unlock = Unlock(Arc::clone(&locked));
+        // The `TMPDIR` the worker was launched with, once it was seen to
+        // resolve to the attempt's scratch.
+        let seen_link: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
+        let worker_seen = Arc::clone(&seen_link);
         let backend = MockBackend::new(move |spec| {
             if let Some(launch) = &spec.sandbox {
+                let tmpdir = spec
+                    .env
+                    .vars()
+                    .iter()
+                    .find(|(name, _)| name == "TMPDIR")
+                    .map(|(_, value)| PathBuf::from(value))
+                    .expect("a TMPDIR");
+                assert!(
+                    tmpdir.starts_with("/tmp")
+                        && tmpdir
+                            .file_name()
+                            .is_some_and(|n| n.to_string_lossy().starts_with("rl-"))
+                );
+                assert_eq!(
+                    std::fs::canonicalize(&tmpdir).expect("the link exists during the dispatch"),
+                    std::fs::canonicalize(&launch.scratch_dir).expect("scratch"),
+                );
+                *worker_seen.lock().expect("lock") = Some(tmpdir);
                 // scratch is `<run>/attempts/<n>/scratch`: lock `attempts`,
                 // which already exists, so only the report write fails.
                 let attempts = launch
@@ -10552,6 +10596,15 @@ mod tests {
             fixture.ledger.run_cost(&run_id).expect("cost"),
             MicroUsd::from_micros(100),
             "the dispatch's usage is in the ledger"
+        );
+        let link = seen_link
+            .lock()
+            .expect("lock")
+            .take()
+            .expect("a link was seen");
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "the link is gone although the dispatch errored"
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }

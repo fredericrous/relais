@@ -68,15 +68,26 @@ pub fn temp_dir(tag: &str) -> TempDir {
 /// A Unix socket path is capped at 104 bytes on macOS and 108 on Linux,
 /// and the per-user temp directory alone can spend most of that, so an
 /// endpoint goes directly under `/tmp` — still in a directory of this
-/// call's own, never at a fixed path two runs would share (A15).
+/// call's own, never at a fixed path two runs would share (A15). Where the
+/// process's own temp dir is already short (a sandboxed worker's `TMPDIR`
+/// is, and `/tmp` is not writable there) it is used instead.
 pub fn short_temp_dir(tag: &str) -> TempDir {
-    // Both arms go through `make`, so neither can end up outside
-    // `SCRATCH_PREFIX` and therefore outside what doctor's scan counts.
-    TempDir(if cfg!(unix) {
-        make(PathBuf::from("/tmp"), tag)
+    TempDir(make(short_root(std::env::temp_dir()), tag))
+}
+
+/// The longest temp dir, in bytes, that still leaves a socket path room.
+const SHORT_ROOT_MAX: usize = 32;
+
+/// The root for [`short_temp_dir`], given the process's temp dir: that dir
+/// when it is short enough on unix, `/tmp` otherwise, the temp dir itself
+/// elsewhere. Every arm is joined to `SCRATCH_PREFIX` by `make`, so none
+/// can end up outside what doctor's scan counts.
+fn short_root(candidate: PathBuf) -> PathBuf {
+    if !cfg!(unix) || candidate.as_os_str().len() <= SHORT_ROOT_MAX {
+        candidate
     } else {
-        make(std::env::temp_dir(), tag)
-    })
+        PathBuf::from("/tmp")
+    }
 }
 
 /// A directory made by [`short_temp_dir`], removed on drop.
@@ -169,6 +180,17 @@ mod tests {
         }));
         assert!(outcome.is_err());
         assert!(!path.exists());
+    }
+
+    // Unix only: off unix the temp dir is always the root.
+    #[cfg(unix)]
+    #[test]
+    fn a_short_temp_dir_is_the_root_and_a_long_one_gives_way_to_tmp() {
+        let short = PathBuf::from("/tmp/rl-0a1b2c3d");
+        assert_eq!(short_root(short.clone()), short);
+        let long = PathBuf::from("/var/folders/zz/0123456789abcdefghijklmnopqrstuv/T");
+        assert!(long.as_os_str().len() > SHORT_ROOT_MAX);
+        assert_eq!(short_root(long), PathBuf::from("/tmp"));
     }
 
     /// The assertion that would have caught the present hole: a

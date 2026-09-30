@@ -433,12 +433,16 @@ pub struct LaunchSpec {
 }
 
 /// What a sandboxed launch adds: the whole `--settings` JSON (sandbox,
-/// credential floor and permissions in one document) and the scratch
-/// directory the worker writes its own output to.
+/// credential floor and permissions in one document), the scratch
+/// directory the worker writes its own output to, and the short path the
+/// worker's `TMPDIR` names: a symlink to the scratch on unix (a Unix socket
+/// path is capped near 104 bytes, and the scratch path spends most of it),
+/// the scratch itself elsewhere.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SandboxLaunch {
     pub settings: serde_json::Value,
     pub scratch_dir: PathBuf,
+    pub tmp_link: PathBuf,
 }
 
 /// The environment variable that makes Claude Code strip provider
@@ -449,20 +453,20 @@ pub struct SandboxLaunch {
 pub const SUBPROCESS_ENV_SCRUB: &str = "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB";
 
 /// The environment one WORKER dispatch runs with: `base` plus what the
-/// mode adds. Sandbox mode points `TMPDIR` at the scratch directory and
+/// mode adds. Sandbox mode points `TMPDIR` at the short link to the scratch and
 /// carries no scrub (even one the ambient environment brought); allowlist
 /// mode sets the scrub.
 pub fn worker_launch_env(base: &LaunchEnv, sandbox: Option<&SandboxLaunch>) -> LaunchEnv {
-    worker_env_with(base, sandbox.map(|launch| launch.scratch_dir.as_path()))
+    worker_env_with(base, sandbox.map(|launch| launch.tmp_link.as_path()))
 }
 
-/// [`worker_launch_env`] from the scratch directory alone: `Some` is
-/// sandbox mode. The context manifest records the worker env by NAME
+/// [`worker_launch_env`] from the `TMPDIR` path alone: `Some` is sandbox
+/// mode. The context manifest records the worker env by NAME
 /// before any attempt has its own scratch directory, and building it
 /// here, not from `base`, keeps the recorded names and the launched ones
 /// one fact.
-pub fn worker_env_with(base: &LaunchEnv, scratch: Option<&std::path::Path>) -> LaunchEnv {
-    match scratch {
+pub fn worker_env_with(base: &LaunchEnv, tmpdir: Option<&std::path::Path>) -> LaunchEnv {
+    match tmpdir {
         Some(dir) => base
             .without_var(SUBPROCESS_ENV_SCRUB)
             .with_var("TMPDIR", &dir.to_string_lossy()),
@@ -718,6 +722,7 @@ mod tests {
         let launch = SandboxLaunch {
             settings: serde_json::json!({}),
             scratch_dir: PathBuf::from("/state/runs/r/attempts/1/scratch"),
+            tmp_link: PathBuf::from("/tmp/rl-0a1b2c3d"),
         };
         let recorded = worker_env_with(&base, Some(std::path::Path::new("/state/runs/r/attempts")));
         assert_eq!(
@@ -742,15 +747,16 @@ mod tests {
     }
 
     #[test]
-    fn sandboxed_workers_get_the_scratch_as_tmpdir_and_no_scrub() {
+    fn sandboxed_workers_get_the_short_link_as_tmpdir_and_no_scrub() {
         let launch = SandboxLaunch {
             settings: serde_json::json!({}),
             scratch_dir: PathBuf::from("/state/runs/r/attempts/1/scratch"),
+            tmp_link: PathBuf::from("/tmp/rl-0a1b2c3d"),
         };
         let env = worker_launch_env(&ambient(), Some(&launch));
         assert_eq!(
             value_of(&env, "TMPDIR").as_deref(),
-            Some("/state/runs/r/attempts/1/scratch")
+            Some("/tmp/rl-0a1b2c3d")
         );
         assert_eq!(
             value_of(&env, SUBPROCESS_ENV_SCRUB),

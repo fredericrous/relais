@@ -66,6 +66,14 @@ missing here.
 
 ### Fixed
 
+- Sandboxed workers can bind a Unix socket (#158), so relais's own
+  coordinator tests pass in a worker's `make check`. The settings grant
+  `network.allowUnixSockets` for the scratch directory only, and the
+  worker's `$TMPDIR` is now a short `/tmp/rl-<hex>` symlink to the scratch,
+  removed when the dispatch ends, which keeps socket paths under the OS
+  limit. The probe gains a socket-bind step, so sandbox verifications
+  recorded before this release are invalidated: run
+  `relais doctor --verify-sandbox` again.
 - Opening a fresh ledger from several processes at once no longer fails
   intermittently with "database is locked" (#147). The switch to WAL, which
   SQLite refuses without consulting its busy handler, now waits out a

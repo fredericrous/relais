@@ -79,7 +79,14 @@ pub fn build_settings(inputs: &SettingsInputs) -> Value {
             // floor file (machine.toml, authorized_keys). The narrower
             // deny wins over a broader allow.
             "filesystem": {"allowWrite": writable, "denyRead": deny_read, "denyWrite": deny_read},
-            "network": {"allowedDomains": inputs.network, "strictAllowlist": true},
+            // Binding a Unix socket is refused anywhere not listed here
+            // (measured on 2.1.286/macOS); the scratch is the one place
+            // a worker's own tools, tests included, may bind one.
+            "network": {
+                "allowedDomains": inputs.network,
+                "strictAllowlist": true,
+                "allowUnixSockets": [text(inputs.scratch)],
+            },
             "credentials": {"files": files, "envVars": env_vars},
         },
         "permissions": {
@@ -149,6 +156,14 @@ mod tests {
         assert_eq!(
             strings(&sandbox["filesystem"]["allowWrite"]),
             ["/scratch", "/h/cache", "/opt/out"]
+        );
+    }
+
+    #[test]
+    fn unix_sockets_may_be_bound_in_the_scratch_and_nowhere_else() {
+        assert_eq!(
+            built()["sandbox"]["network"]["allowUnixSockets"],
+            json!(["/scratch"])
         );
     }
 

@@ -1,6 +1,7 @@
 //! A worker's sandboxed launch, and which mode a machine runs its workers in.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{build_settings, credential_floor, FloorInputs, SettingsInputs};
 use crate::backend::SandboxLaunch;
@@ -67,7 +68,67 @@ pub fn worker_launch(inputs: &LaunchInputs) -> SandboxLaunch {
     SandboxLaunch {
         settings,
         scratch_dir: inputs.scratch.to_path_buf(),
+        tmp_link: short_tmp_link(inputs.scratch),
     }
+}
+
+static NEXT_LINK: AtomicU64 = AtomicU64::new(0);
+
+/// The short path a worker's `TMPDIR` names: `/tmp/rl-<8 hex>` on unix, the
+/// scratch itself elsewhere (no symlink to make there).
+fn short_tmp_link(scratch: &Path) -> PathBuf {
+    if !cfg!(unix) {
+        return scratch.to_path_buf();
+    }
+    let marker = 0u8;
+    // A clock before 1970 still leaves the process, a counter and an address to tell links apart.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let seed = format!(
+        "{nanos}-{}-{}-{:p}",
+        std::process::id(),
+        NEXT_LINK.fetch_add(1, Ordering::Relaxed),
+        &marker
+    );
+    let hex = crate::ids::sha256_hex(seed.as_bytes());
+    PathBuf::from(format!("/tmp/rl-{}", &hex[..8]))
+}
+
+/// The symlink `tmp_link -> scratch` of one launch, removed when this value
+/// drops: whichever way the dispatch ends, the link does not outlive it.
+/// Holds nothing where the link is the scratch itself.
+#[derive(Debug)]
+pub struct TmpLink(Option<PathBuf>);
+
+impl TmpLink {
+    pub fn create(launch: &SandboxLaunch) -> std::io::Result<Self> {
+        if launch.tmp_link == launch.scratch_dir {
+            return Ok(Self(None));
+        }
+        symlink(&launch.scratch_dir, &launch.tmp_link)?;
+        Ok(Self(Some(launch.tmp_link.clone())))
+    }
+}
+
+impl Drop for TmpLink {
+    fn drop(&mut self) {
+        if let Some(link) = &self.0 {
+            // Best effort: a link that stays is litter under /tmp, not a wrong answer.
+            std::fs::remove_file(link).ok();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+// Never reached: off unix `tmp_link` is the scratch, and `create` returns first.
+#[cfg(not(unix))]
+fn symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 // Unix only: the fixtures are Unix absolute paths.
@@ -103,6 +164,9 @@ mod tests {
             scratch: Path::new("/scratch"),
         });
         assert_eq!(launch.scratch_dir, Path::new("/scratch"));
+        let link = launch.tmp_link.to_string_lossy();
+        let hex = link.strip_prefix("/tmp/rl-").expect("a short /tmp link");
+        assert!(hex.len() == 8 && hex.chars().all(|c| c.is_ascii_hexdigit()));
         let settings = &launch.settings;
         let allow_write = settings["sandbox"]["filesystem"]["allowWrite"].to_string();
         assert!(allow_write.contains("/scratch") && allow_write.contains("/opt/out"));
@@ -120,5 +184,25 @@ mod tests {
             settings["sandbox"]["network"]["allowedDomains"],
             serde_json::json!(["api.anthropic.com"])
         );
+    }
+
+    #[test]
+    fn the_link_exists_while_the_guard_does_and_not_after() {
+        let root = crate::test_support::short_temp_dir("tmp-link");
+        let scratch = root.join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let launch = SandboxLaunch {
+            settings: serde_json::json!({}),
+            scratch_dir: scratch.clone(),
+            tmp_link: root.join("link"),
+        };
+        let guard = TmpLink::create(&launch).expect("link");
+        assert_eq!(
+            std::fs::canonicalize(&launch.tmp_link).unwrap(),
+            std::fs::canonicalize(&scratch).unwrap()
+        );
+        drop(guard);
+        assert!(std::fs::symlink_metadata(&launch.tmp_link).is_err());
+        assert!(scratch.is_dir(), "the scratch is not the link's to remove");
     }
 }
