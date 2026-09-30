@@ -76,7 +76,17 @@ const OS_DENIALS: [&str; 3] = [
     "Operation not permitted",
     "Read-only file system",
 ];
-const PERMISSION_REFUSALS: [&str; 2] = ["denied by your permission settings", "has been denied"];
+/// The ways the harness refuses a tool call: a permission deny rule, or
+/// `--restricted` confining the file tools to the working directories
+/// (measured 2026-09-30 on 2.1.285: Grep outside the worktree answers
+/// "… is outside …; --restricted confines the file tools to the working
+/// directory." — a stronger refusal than a deny rule, and the first real
+/// verification scored it "not refused" before this entry).
+const PERMISSION_REFUSALS: [&str; 3] = [
+    "denied by your permission settings",
+    "has been denied",
+    "--restricted confines the file tools",
+];
 /// Words a probe prints only when the sandbox let something through.
 const LEAK_MARKERS: [&str; 2] = ["PRESENT", "READABLE"];
 const GREP_PATTERN: &str = "relais-probe";
@@ -811,6 +821,18 @@ mod tests {
             assert!(matches!(verdict(&report, id), Verdict::Fail(_)));
             assert_only_failing(&report, id);
         }
+    }
+
+    /// The refusal the first real verification met: `--restricted`
+    /// confining Grep to the working directories counts as refused.
+    #[test]
+    fn a_restricted_confinement_refuses_the_grep_step() {
+        let (_, report) = with_result(
+            "fixture-grep",
+            "/p/fixture is outside /p/worktree, /p/scratch; --restricted confines the file \
+             tools to the working directory.",
+        );
+        assert_eq!(verdict(&report, "fixture-grep"), &Verdict::Pass);
     }
 
     #[test]
