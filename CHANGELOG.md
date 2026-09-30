@@ -74,7 +74,10 @@ missing here.
   scratch, removed when the dispatch ends. Claude Code appends
   `/claude-<uid>`, so sandboxed Bash's `$TMPDIR` is `<link>/claude-<uid>`
   inside the scratch: socket paths stay under the OS limit and the denial
-  scan sees redirected logs. Claude Code silently falls back to
+  scan sees redirected logs (it reads the scratch and `<scratch>/claude-*/`
+  one level down, never following a symlink). A stale link left by a killed
+  relais is replaced; `relais doctor` counts dangling `rl-*` links among
+  its strays. Claude Code silently falls back to
   `/tmp/claude-<uid>` when the path is too long, so the probe's socket-bind
   step passes only when `$TMPDIR` begins with `/tmp/rl-`, and a fallback
   fails verification. Sandbox verifications recorded before this release

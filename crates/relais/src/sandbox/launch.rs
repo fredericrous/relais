@@ -97,9 +97,27 @@ impl TmpLink {
         if launch.tmp_link == launch.scratch_dir {
             return Ok(Self(None));
         }
-        symlink(&launch.scratch_dir, &launch.tmp_link)?;
+        match symlink(&launch.scratch_dir, &launch.tmp_link) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                replace_stale_link(&launch.tmp_link)?;
+                symlink(&launch.scratch_dir, &launch.tmp_link)?;
+            }
+            other => other?,
+        }
         Ok(Self(Some(launch.tmp_link.clone())))
     }
+}
+
+/// Removes a link left by a relais that was killed before its `Drop` ran.
+/// Anything else at the path is not ours to remove.
+fn replace_stale_link(link: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(link)?.is_symlink() {
+        return std::fs::remove_file(link);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("{} exists and is not a symlink", link.display()),
+    ))
 }
 
 impl Drop for TmpLink {
@@ -194,5 +212,44 @@ mod tests {
         drop(guard);
         assert!(std::fs::symlink_metadata(&launch.tmp_link).is_err());
         assert!(scratch.is_dir(), "the scratch is not the link's to remove");
+    }
+
+    #[test]
+    fn a_stale_link_is_replaced() {
+        let root = crate::test_support::short_temp_dir("tmp-link-stale");
+        let scratch = root.join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let launch = SandboxLaunch {
+            settings: serde_json::json!({}),
+            scratch_dir: scratch.clone(),
+            tmp_link: root.join("link"),
+        };
+        symlink(&root.join("long-gone"), &launch.tmp_link).unwrap();
+        let guard = TmpLink::create(&launch).expect("the stale link is replaced");
+        assert_eq!(
+            std::fs::canonicalize(&launch.tmp_link).unwrap(),
+            std::fs::canonicalize(&scratch).unwrap()
+        );
+        drop(guard);
+        assert!(std::fs::symlink_metadata(&launch.tmp_link).is_err());
+    }
+
+    #[test]
+    fn a_regular_file_at_the_link_path_fails_naming_it_and_is_left() {
+        let root = crate::test_support::short_temp_dir("tmp-link-file");
+        let scratch = root.join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let launch = SandboxLaunch {
+            settings: serde_json::json!({}),
+            scratch_dir: scratch,
+            tmp_link: root.join("link"),
+        };
+        std::fs::write(&launch.tmp_link, b"mine").unwrap();
+        let err = TmpLink::create(&launch).expect_err("not ours to replace");
+        assert!(err.to_string().contains("link"), "{err}");
+        assert!(err
+            .to_string()
+            .contains(&launch.tmp_link.display().to_string()));
+        assert_eq!(std::fs::read(&launch.tmp_link).unwrap(), b"mine");
     }
 }

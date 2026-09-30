@@ -4362,29 +4362,59 @@ fn read_attempt_transcript(
 /// The largest scratch file the denial scan reads.
 const SCRATCH_FILE_LIMIT: u64 = 1024 * 1024;
 
-/// The regular files directly in `scratch`, as `(path, text)`, by path. A
+/// The regular files directly in `scratch` and one level down in its
+/// `claude-*` directories (Claude Code's temp dir, where a sandboxed
+/// `$TMPDIR` points), as `(path relative to scratch, text)`, by path. A
 /// symlink of any target is skipped — relais reads outside the sandbox, so
 /// following one would copy a file the worker chose into the evidence. A
 /// file over 1 MiB or not UTF-8 is skipped — it cannot be read line by
 /// line — and so is an unreadable directory: a scratch that cannot be
 /// scanned leaves the report as it is, it never stops the run.
 fn scratch_files(scratch: &Path) -> Vec<(PathBuf, String)> {
-    let Ok(entries) = std::fs::read_dir(scratch) else {
-        return Vec::new();
-    };
-    // An entry that cannot be listed is skipped for the same reason.
-    let mut files: Vec<(PathBuf, String)> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            // `symlink_metadata` does not follow: a link is not a regular file.
-            std::fs::symlink_metadata(path)
-                .is_ok_and(|meta| meta.is_file() && meta.len() <= SCRATCH_FILE_LIMIT)
+    // Claude Code's temp dir, `claude-<uid>`, is where a sandboxed `$TMPDIR`
+    // points; its own session directories live below it and are not read.
+    let mut dirs = vec![scratch.to_path_buf()];
+    dirs.extend(
+        regular_entries(scratch, |meta| meta.is_dir())
+            .into_iter()
+            .filter(|dir| {
+                dir.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("claude-"))
+            }),
+    );
+    let mut files: Vec<(PathBuf, String)> = dirs
+        .iter()
+        .flat_map(|dir| {
+            regular_entries(dir, |meta| {
+                meta.is_file() && meta.len() <= SCRATCH_FILE_LIMIT
+            })
         })
-        .filter_map(|path| std::fs::read_to_string(&path).ok().map(|text| (path, text)))
+        .filter_map(|path| {
+            let text = std::fs::read_to_string(&path).ok()?;
+            // Relative, so the report names which level a line came from
+            // without carrying the state dir's absolute path.
+            let relative = path
+                .strip_prefix(scratch)
+                .map_or(path.clone(), Path::to_path_buf);
+            Some((relative, text))
+        })
         .collect();
     files.sort();
     files
+}
+
+/// The entries of `dir` whose own metadata `keep` accepts. `symlink_metadata`
+/// does not follow, so a link is neither a file nor a directory here. A
+/// directory or entry that cannot be listed yields nothing, as a missing one does.
+fn regular_entries(dir: &Path, keep: impl Fn(&std::fs::Metadata) -> bool) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|meta| keep(&meta)))
+        .collect()
 }
 
 /// Sets an existing scratch directory aside as `scratch-<n>`, the next
@@ -10269,6 +10299,14 @@ mod tests {
                     "cp: Read-only file system\nall fine\n",
                 )
                 .expect("scratch log");
+                // Where sandboxed Bash's `$TMPDIR` lands, and one level deeper,
+                // where Claude Code's own session directories are (not read).
+                let tmp = launch.scratch_dir.join("claude-501");
+                std::fs::create_dir_all(tmp.join("session")).expect("tmpdir");
+                std::fs::write(tmp.join("check.log"), "Operation not permitted\n")
+                    .expect("tmpdir log");
+                std::fs::write(tmp.join("session/deep.log"), "Operation not permitted\n")
+                    .expect("deeper log");
             }
             std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
             MockOutcome {
@@ -10352,8 +10390,12 @@ mod tests {
         let report = recorded_denials(&fixture, &outcome);
         assert_eq!(report.verified.len(), 1, "{report:?}");
         assert_eq!(report.verified[0].source, "tool_result:t1");
-        assert_eq!(report.suspected.len(), 1, "{report:?}");
-        assert_eq!(report.suspected[0].source, "build.log");
+        let sources: Vec<_> = report.suspected.iter().map(|d| d.source.as_str()).collect();
+        assert_eq!(
+            sources,
+            ["build.log", "claude-501/check.log"],
+            "the scratch and `claude-*/` one level down, nothing deeper: {report:?}"
+        );
         assert_eq!(report.coverage, crate::sandbox::Coverage::Complete);
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
@@ -10370,7 +10412,7 @@ mod tests {
             report.coverage,
             crate::sandbox::Coverage::Unknown("no transcript".to_string())
         );
-        assert_eq!(report.suspected.len(), 1, "scratch files are still read");
+        assert_eq!(report.suspected.len(), 2, "scratch files are still read");
         std::fs::remove_dir_all(&fixture.dir).ok();
 
         let fixture = Fixture::new();
@@ -10650,6 +10692,21 @@ mod tests {
         let report = sandbox::scan(None, &files);
         assert_eq!(report.suspected.len(), 1, "{report:?}");
         assert_eq!(report.suspected[0].source, "real.log");
+    }
+
+    /// A `claude-*` directory that is a symlink is not descended into.
+    // Unix only: creating a symlink is `std::os::unix::fs::symlink`.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_claude_dir_is_not_followed() {
+        let dir = crate::test_support::temp_dir("scratch-claude-symlink");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("x.log"), "Operation not permitted\n").expect("target");
+        let scratch = dir.join("scratch");
+        std::fs::create_dir_all(&scratch).expect("scratch");
+        std::os::unix::fs::symlink(&outside, scratch.join("claude-x")).expect("symlink");
+        assert!(scratch_files(&scratch).is_empty());
     }
 
     /// A transcript that is not under the slug of the work dir as given is
