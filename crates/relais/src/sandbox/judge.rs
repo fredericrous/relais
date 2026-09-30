@@ -264,14 +264,21 @@ const MANAGED_MCP: &str = "managed-mcp.json";
 /// `sandbox`, `permissions`, `hooks` or `env` object (top level, or under
 /// `projects.<path>`) is judged, by the rule above, and any
 /// `projects.<path>.allowedTools` entry is a weakening.
-pub fn judge_user_config(claude_json: &Value) -> Vec<Weakening> {
+///
+/// Of the `projects` entries only two are read: the task `worktree`'s and
+/// the `repo_root`'s. A worker session loads its own working directory's
+/// entry and no other, so an unrelated project's `allowedTools` (Claude
+/// Code adds one when a tool is approved interactively in ANY project)
+/// reaches nothing the sandbox protects.
+pub fn judge_user_config(claude_json: &Value, worktree: &Path, repo_root: &Path) -> Vec<Weakening> {
     let mut found = Findings {
         source: Path::new(USER_CONFIG),
         found: Vec::new(),
     };
     judge_user_scope(&mut found, "", claude_json);
     if let Some(projects) = claude_json.get("projects").and_then(Value::as_object) {
-        for (path, project) in projects {
+        let read = |path: &String| Path::new(path) == worktree || Path::new(path) == repo_root;
+        for (path, project) in projects.iter().filter(|(path, _)| read(path)) {
             let prefix = format!("projects.{path}");
             judge_user_scope(&mut found, &prefix, project);
             if project.get("allowedTools").is_some_and(|t| !is_blank(t)) {
@@ -512,7 +519,8 @@ mod tests {
             "mcpServers": {"x": {"command": "x"}},
             "projects": {"/p": {"mcpServers": {"y": {}}, "allowedTools": [], "hooks": {}}}
         });
-        assert_eq!(judge_user_config(&quiet), Vec::new());
+        let judge = |doc: &Value| judge_user_config(doc, Path::new("/p"), Path::new("/repo"));
+        assert_eq!(judge(&quiet), Vec::new());
 
         let loud = json!({
             "projects": {"/p": {
@@ -522,10 +530,7 @@ mod tests {
             }},
             "env": {"X": "1"}
         });
-        let mut keys: Vec<String> = judge_user_config(&loud)
-            .into_iter()
-            .map(|w| w.key)
-            .collect();
+        let mut keys: Vec<String> = judge(&loud).into_iter().map(|w| w.key).collect();
         keys.sort();
         assert_eq!(
             keys,
@@ -535,6 +540,28 @@ mod tests {
                 "projects./p.hooks",
                 "projects./p.sandbox.enabled"
             ]
+        );
+    }
+
+    #[test]
+    fn only_the_worktrees_and_the_repositorys_own_project_entries_are_judged() {
+        let doc = json!({"projects": {
+            "/elsewhere": {"allowedTools": ["Bash(rm:*)"]},
+            "/wt": {"allowedTools": ["Bash(git:*)"]},
+            "/repo": {"hooks": {"Stop": []}},
+        }});
+        let mut keys: Vec<String> = judge_user_config(&doc, Path::new("/wt"), Path::new("/repo"))
+            .into_iter()
+            .map(|w| w.key)
+            .collect();
+        keys.sort();
+        assert_eq!(keys, ["projects./repo.hooks", "projects./wt.allowedTools"]);
+
+        let unrelated = json!({"projects": {"/elsewhere": {"allowedTools": ["Bash"]}}});
+        assert_eq!(
+            judge_user_config(&unrelated, Path::new("/wt"), Path::new("/repo")),
+            Vec::new(),
+            "an unrelated project's approvals reach no worker"
         );
     }
 

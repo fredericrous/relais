@@ -19,11 +19,17 @@ use crate::fsutil::write_atomic;
 use crate::ids::to_hex;
 
 const SCRATCH_PLACEHOLDER: &str = "<scratch>";
+const CREDENTIAL_NAMES_PLACEHOLDER: &str = "<credential-env-names>";
 
 /// Bump whenever `probe_plan`, `probe_plan_allowlist`, an `Expect` or
 /// `evaluate`'s rules change: a pass earned by the old probe proves nothing
 /// about the new one.
 const PROBE_VERSION: u32 = 1;
+
+/// Where the records live under a state directory.
+pub fn store_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("sandbox").join("verified.json")
+}
 
 /// Hex SHA-256 of a verified configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +38,8 @@ pub struct VerificationKey(String);
 impl VerificationKey {
     /// The scratch path is replaced by `<scratch>` in `settings` first: it
     /// differs per attempt and says nothing about how the sandbox behaves.
+    /// `sandbox.credentials.envVars` is replaced too, for the reason given at
+    /// [`abstract_credential_names`].
     pub fn compute(
         harness_version: &str,
         platform: &str,
@@ -58,7 +66,7 @@ impl VerificationKey {
         managed: &[(PathBuf, Vec<u8>)],
     ) -> VerificationKey {
         let scratch = scratch.to_string_lossy();
-        let settings = abstract_scratch(settings, &scratch).to_string();
+        let settings = abstract_credential_names(abstract_scratch(settings, &scratch)).to_string();
 
         let mut managed: Vec<&(PathBuf, Vec<u8>)> = managed.iter().collect();
         managed.sort_by(|a, b| a.0.cmp(&b.0));
@@ -112,6 +120,22 @@ fn abstract_scratch(value: &Value, scratch: &str) -> Value {
         ),
         Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
     }
+}
+
+/// `settings` with `sandbox.credentials.envVars` replaced by a fixed
+/// placeholder. That list is derived from the names in the ambient
+/// environment, which differ between a terminal and a Claude Code session
+/// (`CLAUDE_CODE_*`): they are where the command ran, not configuration, and
+/// hashing them would make a verification done in one shell miss in the
+/// other. The deny mechanism itself (the rest of `credentials`) stays hashed.
+fn abstract_credential_names(mut settings: Value) -> Value {
+    if let Some(env_vars) = settings
+        .pointer_mut("/sandbox/credentials/envVars")
+        .filter(|held| !held.is_null())
+    {
+        *env_vars = Value::String(CREDENTIAL_NAMES_PLACEHOLDER.to_string());
+    }
+    settings
 }
 
 /// One passed probe: the key it holds for and the report that earned it.
@@ -178,6 +202,11 @@ impl VerificationStore {
             path: path.to_path_buf(),
             records,
         })
+    }
+
+    /// Every record, in the order the store holds them.
+    pub fn records(&self) -> &[VerificationRecord] {
+        &self.records
     }
 
     pub fn find(&self, key: &VerificationKey) -> Option<&VerificationRecord> {
@@ -294,6 +323,33 @@ mod tests {
         bytes[1].1 = b"[1]".to_vec();
         let other = VerificationKey::compute("2.1.290", "macos", &s, Path::new("/s/1"), &bytes);
         assert_ne!(base(), other);
+    }
+
+    #[test]
+    fn the_key_ignores_the_credential_env_names_and_nothing_else_in_credentials() {
+        let with = |names: Value, mode: &str| {
+            let mut s = settings("/s/1");
+            s["sandbox"]["credentials"] = json!({"envVars": names, "mechanism": mode});
+            key("2.1.290", "macos", &s, "/s/1")
+        };
+        let terminal = with(
+            json!([{"name": "AWS_SECRET_ACCESS_KEY", "mode": "deny"}]),
+            "deny",
+        );
+        let session = with(
+            json!([
+                {"name": "AWS_SECRET_ACCESS_KEY", "mode": "deny"},
+                {"name": "CLAUDE_CODE_OAUTH_TOKEN", "mode": "deny"}
+            ]),
+            "deny",
+        );
+        assert_eq!(terminal, session, "names differ by shell");
+        assert_ne!(
+            terminal,
+            with(json!([]), "allow"),
+            "the mechanism is hashed"
+        );
+        assert_ne!(terminal, base(), "credentials present at all is hashed");
     }
 
     #[test]

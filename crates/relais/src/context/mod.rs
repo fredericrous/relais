@@ -470,9 +470,10 @@ pub struct ContextManifest {
     /// records which it was instead of implying one was applied.
     #[serde(default)]
     pub turn_ceiling: String,
-    /// Whether the OS sandbox was asked for, and what verified it. Nothing
-    /// verifies it yet, so `verified` is `None` until the verification
-    /// probe exists; a manifest never claims a check that did not run.
+    /// Whether the OS sandbox was asked for, and what verified it: the key
+    /// of the probe record the dispatch gate found (`sandbox::dispatch_key`),
+    /// `None` when no sandbox was asked for; a manifest never claims a check
+    /// that did not run.
     #[serde(default)]
     pub sandbox: SandboxRecord,
     /// What confines each way the worker can act on the machine.

@@ -1516,6 +1516,11 @@ pub enum BlockCode {
     /// `[sandbox]` is on but the machine's Claude Code configuration
     /// (managed settings, `~/.claude.json`) would weaken it.
     SandboxWeakened,
+    /// `[sandbox]` is on and could be relied on, but no probe session has
+    /// shown it holds under this configuration (`relais doctor
+    /// --verify-sandbox`), or the record of one cannot be read. A sandboxed
+    /// worker runs only on a verified configuration.
+    SandboxUnverified,
 }
 
 impl BlockCode {
@@ -1551,6 +1556,7 @@ impl BlockCode {
             Self::EffortAboveCap => "effort_above_cap",
             Self::SandboxUnavailable => "sandbox_unavailable",
             Self::SandboxWeakened => "sandbox_weakened",
+            Self::SandboxUnverified => "sandbox_unverified",
         }
     }
 }
@@ -2131,6 +2137,34 @@ keys = ["output.contract"]
         assert_eq!(repo.authority_hash(), hash);
         let a = effective_authority(&repo, &without, &contract(), &identity());
         let b = effective_authority(&repo, &with, &contract(), &identity());
+        assert_eq!(a.trust_granted, b.trust_granted);
+    }
+
+    /// The same, for a block that is present but off, so it runs on every
+    /// platform: paths are absolute ones `validate()` accepts wherever it
+    /// runs.
+    #[test]
+    fn a_disabled_sandbox_block_does_not_move_the_authority_hash() {
+        let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        let hash = repo.authority_hash();
+        let without =
+            MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo))).expect("parses");
+        let scratch = std::env::temp_dir().join("relais-sandbox-off");
+        let with = MachineSettings::from_toml_str(&format!(
+            "{}\n[sandbox]\nenabled = false\nwritable = ['{scratch}']\n\
+             network = [\"api.anthropic.com\"]\ndeny_read = ['{scratch}']\n",
+            machine_toml(&grant_for(&repo)),
+            scratch = scratch.display(),
+        ))
+        .expect("parses");
+        assert!(!with.sandbox.enabled);
+        assert_eq!(with.sandbox.network, ["api.anthropic.com"]);
+        assert_eq!(with.sandbox.writable.len(), 1);
+        assert_eq!(with.sandbox.deny_read.len(), 1);
+        assert_eq!(repo.authority_hash(), hash);
+        let a = effective_authority(&repo, &without, &contract(), &identity());
+        let b = effective_authority(&repo, &with, &contract(), &identity());
+        assert_eq!(a.authority_hash, b.authority_hash);
         assert_eq!(a.trust_granted, b.trust_granted);
     }
 

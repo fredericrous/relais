@@ -492,7 +492,23 @@ fn run_step(step: &ProbeStep, transcript: &Transcript) -> Verdict {
     }
 }
 
-fn check_init(init: Option<&Value>, expected_tools: &[&str]) -> Result<(), String> {
+/// What a probe expects of the harness's `init` record.
+#[derive(Debug, Clone, Copy)]
+pub enum InitExpect<'a> {
+    /// A confined session: exactly these tools, no MCP servers and built-in
+    /// plugins only.
+    Confined { tools: &'a [&'a str] },
+    /// The probe is about the environment alone (the allowlist launch has no
+    /// `--strict-mcp-config`, so the user's own MCP servers and plugins
+    /// load): the init record is not judged.
+    EnvOnly,
+}
+
+fn check_init(init: Option<&Value>, expect: InitExpect) -> Result<(), String> {
+    let expected_tools = match expect {
+        InitExpect::Confined { tools } => tools,
+        InitExpect::EnvOnly => return Ok(()),
+    };
     let init = init.ok_or("no init record")?;
     let mut problems = Vec::new();
 
@@ -539,12 +555,12 @@ fn check_init(init: Option<&Value>, expected_tools: &[&str]) -> Result<(), Strin
 
 /// Judges a probe session: each step against its call and result in
 /// `transcript_jsonl`, and `init` (the `system`/`init` object of the run)
-/// against `expected_tools`, no MCP servers and built-in plugins only.
+/// as `expect` says.
 pub fn evaluate(
     steps: &[ProbeStep],
     transcript_jsonl: &str,
     init: Option<&Value>,
-    expected_tools: &[&str],
+    expect: InitExpect,
 ) -> ProbeReport {
     let transcript = parse_transcript(transcript_jsonl);
     let steps: Vec<StepResult> = steps
@@ -557,7 +573,7 @@ pub fn evaluate(
             },
         })
         .collect();
-    let init = check_init(init, expected_tools);
+    let init = check_init(init, expect);
     let passed = init.is_ok() && steps.iter().all(|step| step.verdict == Verdict::Pass);
     ProbeReport {
         steps,
@@ -575,6 +591,7 @@ mod tests {
     use super::*;
 
     const TOOLS: [&str; 6] = ["Bash", "Read", "Edit", "Write", "Grep", "Glob"];
+    const CONFINED: InitExpect = InitExpect::Confined { tools: &TOOLS };
 
     fn plan_for(fixture: &str, home: &str) -> Result<Vec<ProbeStep>, String> {
         probe_plan(&ProbePlanInputs {
@@ -660,7 +677,7 @@ mod tests {
     }
 
     fn judged(steps: &[ProbeStep], jsonl: &str, init: &Value) -> ProbeReport {
-        evaluate(steps, jsonl, Some(init), &TOOLS)
+        evaluate(steps, jsonl, Some(init), CONFINED)
     }
 
     fn verdict<'a>(report: &'a ProbeReport, id: &str) -> &'a Verdict {
@@ -916,7 +933,7 @@ mod tests {
     fn assert_init_fails(init: Option<&Value>, mentions: &str) {
         let steps = plan();
         let jsonl = transcript(&steps, |step| Some(measured(step)));
-        let report = evaluate(&steps, &jsonl, init, &TOOLS);
+        let report = evaluate(&steps, &jsonl, init, CONFINED);
         assert!(!report.passed);
         assert!(report.steps.iter().all(|s| s.verdict == Verdict::Pass));
         let why = report.init.expect_err("init must fail");
@@ -944,6 +961,21 @@ mod tests {
         assert_init_fails(Some(&init), "extra [WebFetch]");
         init["tools"] = json!(["Bash", "Read", "Edit", "Write", "Grep"]);
         assert_init_fails(Some(&init), "missing [Glob]");
+    }
+
+    #[test]
+    fn an_env_only_probe_does_not_judge_the_init_record() {
+        let mut init = good_init();
+        init["mcp_servers"] = json!([{"name": "x", "status": "connected"}]);
+        init["plugins"] = json!([{"name": "p", "source": "p@market"}]);
+        init["tools"] = json!(["Bash", "mcp__x__y"]);
+        let steps = plan();
+        let jsonl = transcript(&steps, |step| Some(measured(step)));
+        assert!(!judged(&steps, &jsonl, &init).passed, "confined fails it");
+        let report = evaluate(&steps, &jsonl, Some(&init), InitExpect::EnvOnly);
+        assert!(report.passed, "{}", report.render());
+        let report = evaluate(&steps, &jsonl, None, InitExpect::EnvOnly);
+        assert!(report.passed, "a missing init is not judged either");
     }
 
     #[test]

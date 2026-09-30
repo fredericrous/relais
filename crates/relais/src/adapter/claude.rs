@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use crate::backend::{
     claims_blockage, Backend, BackendError, Capabilities, Cost, LaunchResult, LaunchSpec,
-    PermissionEnforcement, SandboxCapability, SandboxLaunch, UsageReport,
+    PermissionEnforcement, ProbeLauncher, SandboxCapability, SandboxLaunch, UsageReport,
 };
 use crate::money::MicroUsd;
 use crate::procs::{run_with_timeout, Ended, ProcessEnd};
@@ -182,6 +182,64 @@ impl ClaudeBackend {
         }
         Ok(answer)
     }
+
+    /// The capabilities a launch is checked against; a probe that could
+    /// not run means no launch.
+    fn launch_capabilities(&self, spec: &LaunchSpec) -> Result<Capabilities, BackendError> {
+        self.capability_report(spec.cancel.as_deref())
+            .clone()
+            .map_err(|failure| {
+                BackendError::MissingBinary(format!(
+                    "{}: its launch controls cannot be checked — {failure} (probes are bounded \
+                     at {PROBE_TIMEOUT:?})",
+                    self.binary.display()
+                ))
+            })
+    }
+
+    /// Runs `argv` for `spec`: prompt on stdin, the spec's worktree as
+    /// working directory and its environment, entire.
+    fn run_argv(&self, spec: &LaunchSpec, argv: &[String]) -> Result<ProcessEnd, BackendError> {
+        let mut command = Command::new(&self.binary);
+        command
+            .args(argv)
+            .current_dir(&spec.work_dir)
+            // The worker's environment is the spec's, entire. Clearing
+            // first is what removes the ambient `GIT_*` variables that
+            // override a working directory, the machine authority a
+            // nested `relais` would read, and every credential the task
+            // was never given (SPEC §8, audit V4).
+            .env_clear();
+        for (name, value) in spec.env.vars() {
+            command.env(name, value);
+        }
+        let wall = spec.wall_timeout.max(Duration::from_secs(1));
+        Ok(run_with_timeout(
+            command,
+            wall,
+            Some(spec.prompt.clone().into_bytes()),
+            spec.cancel.as_deref(),
+            spec.pid_slot.as_deref(),
+        )?)
+    }
+}
+
+impl ProbeLauncher for ClaudeBackend {
+    fn stream(&self, spec: &LaunchSpec) -> Result<String, BackendError> {
+        let caps = self.launch_capabilities(spec)?;
+        let argv = probe_argv(spec, &caps)?;
+        let end = self.run_argv(spec, &argv)?;
+        // What the session did is in its stdout whatever way it ended (a
+        // budget stop still leaves the transcript); with none, the way it
+        // ended is the only evidence there is.
+        if end.stdout.trim().is_empty() {
+            return Err(BackendError::Launch(failure_detail(
+                &end,
+                &parse_result_json(&end.stdout),
+            )));
+        }
+        Ok(end.stdout)
+    }
 }
 
 impl Backend for ClaudeBackend {
@@ -194,39 +252,9 @@ impl Backend for ClaudeBackend {
     }
 
     fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError> {
-        let caps = self
-            .capability_report(spec.cancel.as_deref())
-            .clone()
-            .map_err(|failure| {
-                BackendError::MissingBinary(format!(
-                    "{}: its launch controls cannot be checked — {failure} (probes are bounded \
-                     at {PROBE_TIMEOUT:?})",
-                    self.binary.display()
-                ))
-            })?;
+        let caps = self.launch_capabilities(spec)?;
         let argv = build_argv(spec, &caps)?;
-
-        let mut command = Command::new(&self.binary);
-        command
-            .args(&argv)
-            .current_dir(&spec.work_dir)
-            // The worker's environment is the spec's, entire. Clearing
-            // first is what removes the ambient `GIT_*` variables that
-            // override a working directory, the machine authority a
-            // nested `relais` would read, and every credential the task
-            // was never given (SPEC §8, audit V4).
-            .env_clear();
-        for (name, value) in spec.env.vars() {
-            command.env(name, value);
-        }
-        let wall = spec.wall_timeout.max(Duration::from_secs(1));
-        let end = run_with_timeout(
-            command,
-            wall,
-            Some(spec.prompt.clone().into_bytes()),
-            spec.cancel.as_deref(),
-            spec.pid_slot.as_deref(),
-        )?;
+        let end = self.run_argv(spec, &argv)?;
 
         let parsed = parse_result_json(&end.stdout);
         let worker_claims_blockage = parsed.result_text.as_deref().is_some_and(claims_blockage);
@@ -349,6 +377,22 @@ pub fn build_argv(spec: &LaunchSpec, caps: &Capabilities) -> Result<Vec<String>,
         }
         None => {}
     }
+    Ok(argv)
+}
+
+/// [`build_argv`] for a probe session: the worker's argv with ONE
+/// difference, `--output-format stream-json --verbose` in place of
+/// `--output-format json`. The single JSON result of a worker's launch
+/// carries neither the `system`/`init` record (tools, MCP servers, plugins)
+/// nor the tool calls and results the probe is judged on; the stream does.
+pub fn probe_argv(spec: &LaunchSpec, caps: &Capabilities) -> Result<Vec<String>, BackendError> {
+    let mut argv = build_argv(spec, caps)?;
+    let Some(at) = argv.iter().position(|arg| arg == "--output-format") else {
+        return Err(BackendError::Unsupported("streamed output"));
+    };
+    // `build_argv` pushes the flag and its value together.
+    argv[at + 1] = "stream-json".into();
+    argv.insert(at + 2, "--verbose".into());
     Ok(argv)
 }
 
@@ -696,6 +740,35 @@ mod tests {
             !argv.iter().any(|arg| arg.contains("Bash(cargo test")),
             "no permissions.allow Bash rule rides along"
         );
+    }
+
+    #[test]
+    fn the_probe_argv_differs_from_the_workers_only_in_the_output_format() {
+        let caps = capabilities_from_help("2.1.285".into(), HELP_2_1);
+        for spec in [sandboxed_spec(), spec(Some(500_000))] {
+            let worker = build_argv(&spec, &caps).expect("argv");
+            let probe = probe_argv(&spec, &caps).expect("argv");
+            let streamed: Vec<String> = probe
+                .iter()
+                .filter(|arg| *arg != "--verbose")
+                .map(|arg| {
+                    if arg == "stream-json" {
+                        "json".to_string()
+                    } else {
+                        arg.clone()
+                    }
+                })
+                .collect();
+            assert_eq!(streamed, worker);
+            assert_eq!(count(&probe, "--verbose"), 1);
+            assert_eq!(value_after(&probe, "--output-format"), "stream-json");
+        }
+        let mut no_format = caps.clone();
+        no_format.supports_output_format_json = false;
+        assert!(matches!(
+            probe_argv(&sandboxed_spec(), &no_format),
+            Err(BackendError::Unsupported(_))
+        ));
     }
 
     #[test]

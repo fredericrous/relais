@@ -22,16 +22,31 @@ missing here.
   without `bwrap` or `socat`, and `blocked (sandbox_weakened)` when managed
   Claude Code settings, a managed MCP server or `~/.claude.json` would weaken
   the sandbox (an unreadable source counts). The context manifest records
-  `sandbox`, `confinement` and `env_protection`; `sandbox.verified` is null
-  until the verification probe exists.
-- The pure half of sandbox verification (#105): the probe plan, an evaluator
-  that judges a probe session's transcript and `init` record step by step (a
-  skipped or altered step is "not run", never a pass), and a verification
-  record keyed by harness version, platform, settings and managed files. The
-  probe itself is not run yet.
+  `sandbox`, `confinement` and `env_protection`.
+- Sandbox verification (#105): `relais doctor --verify-sandbox` runs two real
+  probe sessions — a sandboxed worker's launch with a planted
+  `excludedCommands` project setting, a credential fixture and a synthetic
+  secret, and the allowlist launch — judges their transcripts step by step (a
+  skipped or altered step is "not run", never a pass), prints both reports
+  and the cost, and records a pass only when both hold, keyed by harness
+  version, platform, the settings a worker launches with and the managed
+  files. A sandboxed worker runs only on a recorded key: without one the run
+  is `blocked (sandbox_unverified)` (exit 3), naming the command, and
+  `sandbox.verified` in the context manifest carries the key. `relais
+  doctor` gains a `sandbox` line (off, verified, unverified, weakened,
+  unavailable) and states the scope of the guarantee. The allowlist probe
+  judges the environment only, so a machine with its own MCP servers can
+  verify; the key ignores the ambient credential names, so a verification
+  from a terminal holds in a Claude Code session; a corrupt store fails
+  before any session is paid for and shows as `unavailable: <reason>`; probe
+  directories are pruned to the three most recent; `projects` entries are
+  matched by real path.
 
 ### Changed
 
+- The sandbox preflight judges only the `projects.<path>` entries of
+  `~/.claude.json` for the task worktree and the repository root: an
+  unrelated project's `allowedTools` no longer blocks a run.
 - In allowlist mode (`[sandbox]` off) worker subprocesses no longer see
   provider credentials: the worker is launched with
   `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`.
