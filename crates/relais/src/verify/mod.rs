@@ -1795,6 +1795,13 @@ pub struct Receipt {
     /// before the ladder existed, which still parses.
     #[serde(default, skip_serializing_if = "LadderRecord::is_not_recorded")]
     pub ladder: LadderRecord,
+    /// The distinct efforts the run's worker attempts REQUESTED, in first-use
+    /// order (SPEC §12), each read by the ledger's one reader of an
+    /// attempt's requested effort. Absent on a receipt written before this
+    /// existed, which still parses; empty when no worker attempt is on
+    /// record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub efforts_used: Vec<String>,
 }
 
 /// What a receipt records about the ladder that ran. A decomposed run's
@@ -2020,6 +2027,17 @@ mod tests {
                 "receipt {n} named no verification profile hash"
             );
             assert!(!receipt.run_id.is_empty(), "receipt {n} keeps its run id");
+            assert!(
+                receipt.efforts_used.is_empty(),
+                "receipt {n} predates `efforts_used`, and must read as none recorded"
+            );
+            assert!(
+                serde_json::to_value(&receipt)
+                    .expect("receipt serializes")
+                    .get("efforts_used")
+                    .is_none(),
+                "an empty `efforts_used` is not written back"
+            );
         }
 
         for (n, json) in UNRECORDED_END.iter().enumerate() {
@@ -3832,6 +3850,16 @@ mod tests {
         // when nobody wrote that down.
         assert_eq!(receipt.recipe, crate::policy::RecipeRecord::NotRecorded);
         assert_eq!(receipt.verification_profile_hash, "");
+        assert!(receipt.efforts_used.is_empty());
+        // Recorded efforts survive a round trip; `models_used` is untouched.
+        let with_efforts = Receipt {
+            efforts_used: vec!["a".into(), "b".into()],
+            ..receipt
+        };
+        let again: Receipt = serde_json::from_str(&serde_json::to_string(&with_efforts).unwrap())
+            .expect("the receipt round-trips");
+        assert_eq!(again.efforts_used, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(again.models_used, vec!["sonnet".to_string()]);
     }
 
     #[test]
@@ -3900,6 +3928,7 @@ mod tests {
             verification_profile_hash: "vph".into(),
             review: ReviewRecord::NotRecorded,
             ladder: LadderRecord::NotRecorded,
+            efforts_used: Vec::new(),
         };
         let hash = receipt.hash();
         let mut other = receipt.clone();

@@ -2524,6 +2524,7 @@ impl<'a> RunEngine<'a> {
             verification_profile_hash: preflight.authority.verification_profile.hash(),
             review: review_record_of(self.config.ledger, &self.run_id)?,
             ladder: verify::LadderRecord::Single(preflight.decision.ladder.rungs().to_vec()),
+            efforts_used: self.config.ledger.efforts_used(&self.run_id)?,
         };
         self.seal(
             &receipt,
@@ -2844,6 +2845,7 @@ impl<'a> RunEngine<'a> {
             verification_profile_hash: preflight.authority.verification_profile.hash(),
             review: review_record_of(self.config.ledger, &self.run_id)?,
             ladder: verify::LadderRecord::Single(preflight.decision.ladder.rungs().to_vec()),
+            efforts_used: self.config.ledger.efforts_used(&self.run_id)?,
         };
         // No attempt id: this receipt belongs to the run, and the
         // attempt that earned it is not finished — the run is waiting on
@@ -5182,6 +5184,9 @@ mod tests {
             recorded[1].effort,
             crate::route::EffortRequest::Explicit(EffortId::parse("high").expect("valid"))
         );
+        // The receipt names the efforts the attempts requested, first use
+        // first: the initial attempt and the repair, each once.
+        assert_eq!(receipt.efforts_used, ["medium", "high"]);
     }
 
     /// (d) `repair_effort = "same"` is today's exact sequence: every

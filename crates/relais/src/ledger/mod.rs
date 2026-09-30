@@ -1502,6 +1502,72 @@ pub struct UsageEvent {
     pub harness: Option<String>,
 }
 
+/// A worker attempt as the `attempts` table holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerAttempt {
+    pub id: i64,
+    pub phase: UsagePhase,
+}
+
+/// The effort label of an attempt nothing recorded an effort for.
+pub const EFFORT_UNKNOWN: &str = "unknown";
+/// The effort label of a rung whose model has effort control and was asked
+/// for none.
+pub const EFFORT_NOT_REQUESTED: &str = "none requested";
+/// The effort label of a rung whose model or CLI has no effort control.
+pub const EFFORT_NO_CONTROL: &str = "no effort control";
+
+/// The label a ladder rung's serialized effort request stands for:
+/// `{"explicit": "<id>"}` is the id itself, and the two unit variants are
+/// the labels above. A shape this binary does not know is `None`, so the
+/// reader falls through to the next source instead of guessing.
+fn effort_request_label(request: &serde_json::Value) -> Option<String> {
+    if let Some(name) = request.as_str() {
+        return if name == "not_requested" {
+            Some(EFFORT_NOT_REQUESTED.to_string())
+        } else if name == "control_unsupported" {
+            Some(EFFORT_NO_CONTROL.to_string())
+        } else {
+            None
+        };
+    }
+    request
+        .get("explicit")
+        .and_then(|id| id.as_str())
+        .map(str::to_string)
+}
+
+/// The effort a dispatch intent requested: the ladder's rung at the
+/// intent's `rung` when both are recorded, else its flat `effort`.
+///
+/// The runner writes the ladder on a run's FIRST worker dispatch only;
+/// every later one (each repair, the escalation) records its `rung` and a
+/// null `ladder`. `run_ladder` is that first dispatch's ladder, read when
+/// the intent carries none — without it a repair on a rung that requested
+/// no effort, whose flat `effort` is null, would read as unknown.
+fn intent_effort(
+    intent: &serde_json::Value,
+    run_ladder: Option<&serde_json::Value>,
+) -> Option<String> {
+    let rung = intent.get("rung").and_then(|rung| rung.as_u64());
+    let rungs = intent
+        .get("ladder")
+        .filter(|ladder| !ladder.is_null())
+        .or(run_ladder)
+        .and_then(|ladder| ladder.get("rungs"));
+    let from_ladder = rungs
+        .zip(rung)
+        .and_then(|(rungs, rung)| rungs.get(usize::try_from(rung).ok()?))
+        .and_then(|rung| rung.get("effort"))
+        .and_then(effort_request_label);
+    from_ladder.or_else(|| {
+        intent
+            .get("effort")
+            .and_then(|effort| effort.as_str())
+            .map(str::to_string)
+    })
+}
+
 /// One requested alias and the model the harness reported running for
 /// it, as one `usage_events` row carried them. Both are always present:
 /// a row missing either says nothing about what an alias resolved to.
@@ -2277,6 +2343,128 @@ impl Ledger {
         )?;
         let rows = stmt.query_map([run_id.as_str()], |row| row.get::<_, String>(0))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// A run's worker attempts, first dispatched first. The reviewer and the
+    /// planner are dispatches with no attempt row, so they are not here.
+    pub fn worker_attempts(&self, run_id: &RunId) -> Result<Vec<WorkerAttempt>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, phase FROM attempts WHERE run_id = ?1
+             ORDER BY attempt_index, id",
+        )?;
+        let rows = stmt.query_map([run_id.as_str()], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let rows: Vec<(i64, String)> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(id, phase)| {
+                let phase = UsagePhase::parse(&phase).map_err(|unknown| LedgerError::Corrupt {
+                    what: format!("the phase of attempt {id} of run {run_id}"),
+                    detail: unknown.to_string(),
+                })?;
+                Ok(WorkerAttempt { id, phase })
+            })
+            .collect()
+    }
+
+    /// The effort a worker attempt REQUESTED, as a label — the one reader
+    /// every effort figure goes through (`relais report --by effort`, the
+    /// repair outcomes, a receipt's `efforts_used`), so they cannot
+    /// disagree about what an attempt asked for.
+    ///
+    /// Read from the attempt's worker dispatch intent (the dispatch whose
+    /// `attempt_id` is the attempt, `kind` not `review`), in this order:
+    /// the resolved ladder's effort at the intent's rung, when the intent
+    /// carries both; else the intent's flat `effort`; else the first
+    /// non-review `usage_events.requested_effort` of the attempt; else
+    /// [`EFFORT_UNKNOWN`]. An effort the ladder records as not requested or
+    /// as having no control is labelled so ([`EFFORT_NOT_REQUESTED`],
+    /// [`EFFORT_NO_CONTROL`]), never as an identifier. Nothing here names an
+    /// effort: the label is whatever the ledger recorded.
+    pub fn requested_effort(&self, attempt_id: i64) -> Result<String> {
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT intent_json, run_id FROM dispatches
+                  WHERE attempt_id = ?1
+                    AND json_extract(intent_json, '$.kind') IS NOT 'review'
+                  ORDER BY created_at, dispatch_id LIMIT 1",
+                [attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (intent, run_id) = row.unzip();
+        // A corrupt intent is reported, not read as an absent one: falling
+        // through would file the attempt under another step's effort.
+        let from_intent = intent
+            .map(|text| {
+                serde_json::from_str::<serde_json::Value>(&text).map_err(|e| LedgerError::Corrupt {
+                    what: format!("the dispatch intent of attempt {attempt_id}"),
+                    detail: e.to_string(),
+                })
+            })
+            .transpose()?;
+        // A later dispatch carries only its rung; the ladder it indexes is
+        // the one the run's first worker dispatch recorded.
+        let run_ladder = match (&from_intent, run_id) {
+            (Some(intent), Some(run_id))
+                if intent.get("rung").is_some_and(|rung| !rung.is_null())
+                    && intent.get("ladder").is_none_or(serde_json::Value::is_null) =>
+            {
+                self.first_dispatch_intent(&RunId::from_stored(run_id))?
+                    .and_then(|first| first.get("ladder").cloned())
+                    .filter(|ladder| !ladder.is_null())
+            }
+            (Some(_) | None, Some(_) | None) => None,
+        };
+        let from_intent =
+            from_intent.and_then(|intent| intent_effort(&intent, run_ladder.as_ref()));
+        if let Some(label) = from_intent {
+            return Ok(label);
+        }
+        let from_usage: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT requested_effort FROM usage_events
+                  WHERE attempt_id = ?1 AND requested_effort IS NOT NULL
+                    AND phase IS NOT 'review'
+                  ORDER BY id LIMIT 1",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(from_usage.unwrap_or_else(|| EFFORT_UNKNOWN.to_string()))
+    }
+
+    /// The distinct efforts a run's worker attempts requested, in first-use
+    /// order, each through [`Ledger::requested_effort`].
+    pub fn efforts_used(&self, run_id: &RunId) -> Result<Vec<String>> {
+        let mut used: Vec<String> = Vec::new();
+        for attempt in self.worker_attempts(run_id)? {
+            let effort = self.requested_effort(attempt.id)?;
+            if !used.contains(&effort) {
+                used.push(effort);
+            }
+        }
+        Ok(used)
+    }
+
+    /// What one attempt cost, from the usage rows that name it and whose
+    /// cost was reported. `None` is unknown — no such row — and never
+    /// `$0.00`: an attempt that died before it could report cost something.
+    /// An inclusive parent's covered children are not added again.
+    pub fn attempt_cost(&self, attempt_id: i64) -> Result<Option<MicroUsd>> {
+        let (reported, micros): (i64, i64) = self.conn.query_row(
+            &format!(
+                "{COVERED_BY_AN_INCLUSIVE_PARENT}
+                 SELECT COUNT(cost_micros), COALESCE(SUM(cost_micros), 0) FROM usage_events
+                  WHERE attempt_id = ?1
+                    AND event_id NOT IN (SELECT event_id FROM covered)"
+            ),
+            [attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((reported > 0).then(|| MicroUsd::from_micros(micros)))
     }
 
     /// The candidate the run's last finished attempt produced, if any.
