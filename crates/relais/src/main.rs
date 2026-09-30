@@ -2707,6 +2707,8 @@ fn run_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError
         worker_env,
         sandbox_host: &relais::sandbox::RealSandboxHost,
         artifacts_dir: artifacts_dir.clone(),
+        // Where a sandboxed worker's short temp-dir link goes (unused off unix).
+        tmp_link_root: std::path::PathBuf::from("/tmp"),
         aval_resolver: &aval_resolver,
         predictor: predictor
             .as_ref()
@@ -3024,6 +3026,8 @@ fn replay_command(task: &str, recipe: &Path, dry_run: bool) -> Result<CliOutcome
         worker_env,
         sandbox_host: &relais::sandbox::RealSandboxHost,
         artifacts_dir: artifacts_dir.clone(),
+        // Where a sandboxed worker's short temp-dir link goes (unused off unix).
+        tmp_link_root: std::path::PathBuf::from("/tmp"),
         aval_resolver: &aval_resolver,
         predictor: None,
         gate: Some(&gate),

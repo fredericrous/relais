@@ -166,6 +166,9 @@ pub struct RunConfig<'a> {
     /// and user configuration): [`sandbox::RealSandboxHost`] outside tests.
     pub sandbox_host: &'a dyn sandbox::SandboxHost,
     pub artifacts_dir: PathBuf,
+    /// The directory a sandboxed worker's short temp-dir link is made in
+    /// (`/tmp` on unix), set at the boundary that builds this config.
+    pub tmp_link_root: PathBuf,
     /// aval resolution, injectable so runs are testable without the real
     /// corpus; production wiring passes a `context::AvalCli`.
     pub aval_resolver: &'a dyn context::DecisionResolver,
@@ -1491,6 +1494,7 @@ impl<'a> RunEngine<'a> {
                 env: &ambient,
                 launch_env_names: &self.config.worker_env.names(),
                 scratch: &scratch,
+                tmp_link: &scratch,
             },
             managed_root: &managed,
             extra_managed_root: extra_managed.as_deref(),
@@ -1522,6 +1526,11 @@ impl<'a> RunEngine<'a> {
         // evidence, so they are set aside, not deleted.
         set_scratch_aside(&scratch)?;
         std::fs::create_dir_all(&scratch)?;
+        let tmp_link = sandbox::short_tmp_link(
+            &self.config.tmp_link_root,
+            &format!("{}/{attempt_index}", self.run_id.as_str()),
+            &scratch,
+        );
         // `var_os`, not `var`: a non-UTF-8 relocation (`CARGO_HOME`, …)
         // must still reach the floor, lossily, rather than vanish from it.
         let ambient =
@@ -1534,6 +1543,7 @@ impl<'a> RunEngine<'a> {
             env: &ambient,
             launch_env_names: &self.config.worker_env.names(),
             scratch: &scratch,
+            tmp_link: &tmp_link,
         });
         let link = sandbox::TmpLink::create(&launch)?;
         Ok(Some((launch, link)))
@@ -4649,6 +4659,7 @@ mod tests {
                 worker_env: crate::backend::LaunchEnv::default(),
                 sandbox_host: &crate::sandbox::RealSandboxHost,
                 artifacts_dir: self.artifacts.clone(),
+                tmp_link_root: self.dir.to_path_buf(),
                 aval_resolver: &resolver,
                 predictor: None,
                 gate: None,
@@ -4727,6 +4738,7 @@ mod tests {
                 worker_env,
                 sandbox_host: host,
                 artifacts_dir: self.artifacts.clone(),
+                tmp_link_root: self.dir.to_path_buf(),
                 aval_resolver: &resolver,
                 predictor: None,
                 gate: None,
@@ -4766,6 +4778,7 @@ mod tests {
                 worker_env: crate::backend::LaunchEnv::default(),
                 sandbox_host: &crate::sandbox::RealSandboxHost,
                 artifacts_dir: self.artifacts.clone(),
+                tmp_link_root: self.dir.to_path_buf(),
                 aval_resolver: &resolver,
                 predictor: None,
                 gate: Some(gate),
@@ -6010,6 +6023,7 @@ mod tests {
             worker_env: crate::backend::LaunchEnv::default(),
             sandbox_host: &crate::sandbox::RealSandboxHost,
             artifacts_dir: fixture.artifacts.clone(),
+            tmp_link_root: fixture.dir.to_path_buf(),
             aval_resolver: &resolver,
             predictor: None,
             gate: None,
@@ -9959,6 +9973,7 @@ mod tests {
                 env: &ambient,
                 launch_env_names: names,
                 scratch: Path::new("/scratch"),
+                tmp_link: Path::new("/scratch"),
             },
             managed: &[],
         })
@@ -10131,17 +10146,17 @@ mod tests {
                     0,
                     "and is empty"
                 );
-                let tmpdir = var("TMPDIR").expect("a TMPDIR");
+                let tmpdir = var(crate::backend::CLAUDE_TMPDIR).expect("a CLAUDE_CODE_TMPDIR");
                 assert_eq!(
                     std::fs::canonicalize(&tmpdir).expect("the link exists at launch"),
                     std::fs::canonicalize(dir).expect("scratch"),
-                    "TMPDIR is a link to the scratch"
+                    "CLAUDE_CODE_TMPDIR is a link to the scratch"
                 );
             }
             record.lock().unwrap().push((
                 reviewer,
                 scratch,
-                var("TMPDIR"),
+                var(crate::backend::CLAUDE_TMPDIR),
                 var(crate::backend::SUBPROCESS_ENV_SCRUB).is_some(),
                 spec.env.names(),
             ));
@@ -10190,10 +10205,12 @@ mod tests {
             scratch.ends_with("attempts/1/scratch"),
             "under the run's attempts: {scratch:?}"
         );
-        let link = worker.2.as_deref().expect("a TMPDIR");
-        assert!(
-            link.starts_with("/tmp/rl-") && link != scratch.to_string_lossy(),
-            "a short link, not the scratch: {link}"
+        let link = worker.2.as_deref().expect("a CLAUDE_CODE_TMPDIR");
+        let hash = crate::ids::sha256_hex(format!("{}/1", outcome.run_id()).as_bytes());
+        assert_eq!(
+            Path::new(link),
+            fixture.dir.join(format!("rl-{}", &hash[..8])),
+            "the link is named from the run id and attempt index, under the configured root"
         );
         assert!(
             std::fs::symlink_metadata(link).is_err(),
@@ -10416,6 +10433,7 @@ mod tests {
             worker_env: crate::backend::LaunchEnv::default(),
             sandbox_host: &crate::sandbox::RealSandboxHost,
             artifacts_dir: fixture.artifacts.clone(),
+            tmp_link_root: fixture.dir.to_path_buf(),
             aval_resolver: &resolver,
             predictor: None,
             gate: None,
@@ -10513,21 +10531,22 @@ mod tests {
         let locked: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
         let worker_locked = Arc::clone(&locked);
         let unlock = Unlock(Arc::clone(&locked));
-        // The `TMPDIR` the worker was launched with, once it was seen to
+        // The `CLAUDE_CODE_TMPDIR` the worker was launched with, once it was seen to
         // resolve to the attempt's scratch.
         let seen_link: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
         let worker_seen = Arc::clone(&seen_link);
+        let link_root = fixture.dir.to_path_buf();
         let backend = MockBackend::new(move |spec| {
             if let Some(launch) = &spec.sandbox {
                 let tmpdir = spec
                     .env
                     .vars()
                     .iter()
-                    .find(|(name, _)| name == "TMPDIR")
+                    .find(|(name, _)| name == crate::backend::CLAUDE_TMPDIR)
                     .map(|(_, value)| PathBuf::from(value))
-                    .expect("a TMPDIR");
+                    .expect("a CLAUDE_CODE_TMPDIR");
                 assert!(
-                    tmpdir.starts_with("/tmp")
+                    tmpdir.starts_with(&link_root)
                         && tmpdir
                             .file_name()
                             .is_some_and(|n| n.to_string_lossy().starts_with("rl-"))

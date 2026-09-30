@@ -274,7 +274,7 @@ mod tests {
             (PROBE_VERSION, probe_digest().as_str()),
             (
                 4,
-                "c762960d5789ab5f4f96afbe9758316f42a4f29aa2dc417c00f2ff3d7873254c"
+                "a9cafe8655fb7072322ce176ace4885a8352f52d2ed736b685f9544453716891"
             ),
             "the probe changed: bump PROBE_VERSION and update this digest"
         );

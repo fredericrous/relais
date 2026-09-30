@@ -16,9 +16,10 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::{
-    dispatch_key, evaluate, probe_plan, probe_plan_allowlist, probe_prompt, store_path,
-    worker_launch, DispatchKeyInputs, InitExpect, LaunchInputs, ProbePlanInputs, ProbeReport,
-    ProbeStep, StoreError, TmpLink, VerificationKey, VerificationRecord, VerificationStore,
+    dispatch_key, evaluate, probe_plan, probe_plan_allowlist, probe_prompt, short_tmp_link,
+    store_path, worker_launch, DispatchKeyInputs, InitExpect, LaunchInputs, ProbePlanInputs,
+    ProbeReport, ProbeStep, StoreError, TmpLink, VerificationKey, VerificationRecord,
+    VerificationStore,
 };
 use crate::backend::{
     worker_launch_env, BackendError, Capabilities, LaunchEnv, LaunchSpec, ProbeLauncher,
@@ -55,6 +56,8 @@ pub struct VerifyInputs<'a> {
     /// Random hex, unique to this attempt.
     pub nonce: &'a str,
     pub home: &'a Path,
+    /// The directory the probe's short temp-dir link is made under.
+    pub tmp_link_root: &'a Path,
     pub config_dir: &'a Path,
     pub ledger_path: &'a Path,
     /// Relais's own environment, as the credential floor reads it.
@@ -271,6 +274,7 @@ fn launch_inputs_for<'a>(
     settings: &'a SandboxSettings,
     launch_env_names: &'a [String],
     scratch: &'a Path,
+    tmp_link: &'a Path,
 ) -> LaunchInputs<'a> {
     LaunchInputs {
         settings,
@@ -280,6 +284,7 @@ fn launch_inputs_for<'a>(
         env: inputs.env,
         launch_env_names,
         scratch,
+        tmp_link,
     }
 }
 
@@ -334,8 +339,16 @@ pub fn verify_sandbox(
     if !probe_env_names.iter().any(|name| name == SYNTHETIC_ENV) {
         probe_env_names.push(SYNTHETIC_ENV.to_string());
     }
-    let launch_inputs =
-        |settings| launch_inputs_for(inputs, settings, &probe_env_names, &prepared.scratch);
+    let tmp_link = short_tmp_link(inputs.tmp_link_root, nonce, &prepared.scratch);
+    let launch_inputs = |settings| {
+        launch_inputs_for(
+            inputs,
+            settings,
+            &probe_env_names,
+            &prepared.scratch,
+            &tmp_link,
+        )
+    };
     let stream = |probe: &'static str, spec: &LaunchSpec| {
         launcher
             .stream(spec)
@@ -352,9 +365,9 @@ pub fn verify_sandbox(
         .deny_read
         .push(prepared.fixture.to_string_lossy().into_owned());
     let sandbox = worker_launch(&launch_inputs(&with_fixture));
-    // Held across both sessions: the link the probe's `TMPDIR` names.
+    // Held across both sessions: the link the probe's `CLAUDE_CODE_TMPDIR` names.
     let _tmp_link = TmpLink::create(&sandbox)
-        .map_err(|why| VerifyError::Prepare(format!("the TMPDIR link: {why}")))?;
+        .map_err(|why| VerifyError::Prepare(format!("the temp-dir link: {why}")))?;
     let steps = probe_plan(&ProbePlanInputs {
         nonce,
         fixture: &prepared.fixture,
@@ -414,7 +427,13 @@ pub fn verify_sandbox(
     let key = dispatch_key(&DispatchKeyInputs {
         harness_version,
         platform: inputs.platform,
-        launch: &launch_inputs_for(inputs, inputs.settings, &base_env_names, &prepared.scratch),
+        launch: &launch_inputs_for(
+            inputs,
+            inputs.settings,
+            &base_env_names,
+            &prepared.scratch,
+            &tmp_link,
+        ),
         managed: inputs.managed,
     });
     let outcome = VerifyOutcome {
@@ -456,6 +475,7 @@ mod tests {
     use crate::sandbox::probe::Expect;
 
     use super::*;
+    use crate::backend::CLAUDE_TMPDIR;
     use crate::sandbox::{ProbeTool, Verdict, VerificationKey};
     use crate::test_support::temp_dir;
     use crate::workspace::SystemGit;
@@ -550,7 +570,7 @@ mod tests {
         launched: Mutex<Vec<LaunchSpec>>,
         /// The fixture as it was on disk at the sandbox launch.
         fixture_at_launch: Mutex<Option<String>>,
-        /// Where the sandbox launch's `TMPDIR` resolved to at launch.
+        /// Where the sandbox launch's `CLAUDE_CODE_TMPDIR` resolved to at launch.
         tmpdir_at_launch: Mutex<Option<PathBuf>>,
         /// Run once during the first launch: what another process does to
         /// the store while the paid sessions are running.
@@ -580,7 +600,7 @@ mod tests {
                     .env
                     .vars()
                     .iter()
-                    .find(|(name, _)| name == "TMPDIR")
+                    .find(|(name, _)| name == CLAUDE_TMPDIR)
                     .and_then(|(_, link)| std::fs::canonicalize(link).ok());
                 let fixture = spec
                     .work_dir
@@ -650,6 +670,7 @@ mod tests {
                     state_dir: &self.state,
                     nonce: NONCE,
                     home: Path::new(HOME),
+                    tmp_link_root: self.state.as_ref(),
                     config_dir: Path::new("/nonexistent-home/.config/relais"),
                     ledger_path: Path::new("/nonexistent-home/.local/state/relais/ledger.sqlite"),
                     env: &no_env,
@@ -680,6 +701,7 @@ mod tests {
                     env: &no_env,
                     launch_env_names: &names,
                     scratch: Path::new("/state/runs/run-1/attempts/1/scratch"),
+                    tmp_link: Path::new("/tmp/rl-0a1b2c3d"),
                 },
                 managed: &self.managed,
             })
@@ -808,8 +830,13 @@ mod tests {
             Some("relais-probe-0123456789abcdef")
         );
         assert_eq!(
-            var(sandbox, "TMPDIR").as_deref(),
+            var(sandbox, CLAUDE_TMPDIR).as_deref(),
             Some(&*launch.tmp_link.to_string_lossy())
+        );
+        assert_eq!(
+            var(sandbox, "TMPDIR"),
+            None,
+            "the base env has none, and the launch adds none"
         );
         // Suffix, not equality: the scratch is removed once the probe passes,
         // and the launch-time path is canonical (`/private/tmp` for `/tmp`).
@@ -887,6 +914,7 @@ mod tests {
                 state_dir: &machine.state,
                 nonce: NONCE,
                 home: Path::new(HOME),
+                tmp_link_root: &machine.state,
                 config_dir: Path::new("/c"),
                 ledger_path: Path::new("/l"),
                 env: &no_env,

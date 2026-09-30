@@ -149,11 +149,14 @@ pub fn probe_plan(inputs: &ProbePlanInputs) -> Result<Vec<ProbeStep>, String> {
             line("a"),
         ),
         // A worker's own tests bind Unix sockets under `$TMPDIR`; the
-        // scratch grant must cover a bind through the short link.
+        // scratch grant must cover a bind through the short link. The marker
+        // is printed only when `$TMPDIR` is under `/tmp/rl-`: Claude Code
+        // falls back to `/tmp/claude-<uid>` silently when the link it was
+        // given is unusable, and that is a failed verification.
         bash(
             "unix-socket",
             format!(
-                "mkdir -p \"$TMPDIR/sock\" && python3 -c {}",
+                "case \"$TMPDIR\" in /tmp/rl-*) mkdir -p \"$TMPDIR/sock\" && python3 -c {} ;; esac",
                 sh_quote(SOCKET_BIND)
             ),
             line(SOCKET_BOUND),
@@ -1193,8 +1196,17 @@ mod tests {
         );
         let input = |id: &str| steps.iter().find(|s| s.id == id).unwrap().input.clone();
         let bind = input("unix-socket");
-        assert!(bind.starts_with("mkdir -p \"$TMPDIR/sock\" && python3 -c "));
-        assert!(bind.contains("AF_UNIX") && bind.contains(SOCKET_BOUND));
+        assert!(bind.starts_with("case \"$TMPDIR\" in /tmp/rl-*) mkdir -p \"$TMPDIR/sock\" && "));
+        assert!(bind.contains("AF_UNIX") && bind.ends_with(" ;; esac"));
+        // The marker is what the step expects, and it is printed only inside
+        // the `/tmp/rl-*` branch, so a fallback `$TMPDIR` cannot show it.
+        let expect = |id: &str| steps.iter().find(|s| s.id == id).unwrap().expect.clone();
+        assert_eq!(
+            expect("unix-socket"),
+            Expect::OutputLine(SOCKET_BOUND.to_string())
+        );
+        assert_eq!(bind.matches(SOCKET_BOUND).count(), 1);
+        assert!(bind.find(SOCKET_BOUND) > bind.find("/tmp/rl-*)"));
         assert_eq!(input("tmp-write"), "touch /tmp/relais-probe-n1");
         assert_eq!(input("home-write"), "touch '/home/u/relais-probe-n1'");
         assert_eq!(

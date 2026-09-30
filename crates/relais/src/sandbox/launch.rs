@@ -1,7 +1,6 @@
 //! A worker's sandboxed launch, and which mode a machine runs its workers in.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{build_settings, credential_floor, FloorInputs, SettingsInputs};
 use crate::backend::SandboxLaunch;
@@ -37,6 +36,9 @@ pub struct LaunchInputs<'a> {
     pub env: &'a dyn Fn(&str) -> Option<String>,
     pub launch_env_names: &'a [String],
     pub scratch: &'a Path,
+    /// The short path a worker's Claude Code temp dir is pointed at: a
+    /// symlink to `scratch` (see [`TmpLink`]), or `scratch` itself.
+    pub tmp_link: &'a Path,
 }
 
 /// The sandbox launch for one worker: the credential floor, `[sandbox]`
@@ -68,31 +70,20 @@ pub fn worker_launch(inputs: &LaunchInputs) -> SandboxLaunch {
     SandboxLaunch {
         settings,
         scratch_dir: inputs.scratch.to_path_buf(),
-        tmp_link: short_tmp_link(inputs.scratch),
+        tmp_link: inputs.tmp_link.to_path_buf(),
     }
 }
 
-static NEXT_LINK: AtomicU64 = AtomicU64::new(0);
-
-/// The short path a worker's `TMPDIR` names: `/tmp/rl-<8 hex>` on unix, the
-/// scratch itself elsewhere (no symlink to make there).
-fn short_tmp_link(scratch: &Path) -> PathBuf {
+/// The short path a worker's Claude Code temp dir is pointed at:
+/// `<root>/rl-<8 hex of sha256(seed)>` on unix, the scratch itself elsewhere
+/// (no symlink to make there). The same seed names the same link, which is
+/// safe because [`TmpLink`] removes the earlier one.
+pub fn short_tmp_link(root: &Path, seed: &str, scratch: &Path) -> PathBuf {
     if !cfg!(unix) {
         return scratch.to_path_buf();
     }
-    let marker = 0u8;
-    // A clock before 1970 still leaves the process, a counter and an address to tell links apart.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    let seed = format!(
-        "{nanos}-{}-{}-{:p}",
-        std::process::id(),
-        NEXT_LINK.fetch_add(1, Ordering::Relaxed),
-        &marker
-    );
     let hex = crate::ids::sha256_hex(seed.as_bytes());
-    PathBuf::from(format!("/tmp/rl-{}", &hex[..8]))
+    root.join(format!("rl-{}", &hex[..8]))
 }
 
 /// The symlink `tmp_link -> scratch` of one launch, removed when this value
@@ -162,11 +153,10 @@ mod tests {
             env: &no_env,
             launch_env_names: &names,
             scratch: Path::new("/scratch"),
+            tmp_link: Path::new("/tmp/rl-0a1b2c3d"),
         });
         assert_eq!(launch.scratch_dir, Path::new("/scratch"));
-        let link = launch.tmp_link.to_string_lossy();
-        let hex = link.strip_prefix("/tmp/rl-").expect("a short /tmp link");
-        assert!(hex.len() == 8 && hex.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(launch.tmp_link, Path::new("/tmp/rl-0a1b2c3d"));
         let settings = &launch.settings;
         let allow_write = settings["sandbox"]["filesystem"]["allowWrite"].to_string();
         assert!(allow_write.contains("/scratch") && allow_write.contains("/opt/out"));

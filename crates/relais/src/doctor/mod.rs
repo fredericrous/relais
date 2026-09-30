@@ -419,6 +419,7 @@ pub(crate) fn sandbox_standing(
             launch_env_names: &names,
             // Normalised out of the key: any path stands for a worker's.
             scratch: Path::new("/relais-doctor-scratch"),
+            tmp_link: Path::new("/relais-doctor-scratch"),
         },
         managed_root: &managed_root,
         extra_managed_root: extra_managed_root.as_deref(),
@@ -448,6 +449,8 @@ pub struct VerifyWorld<'a> {
     pub base_env: &'a LaunchEnv,
     pub state_dir: &'a Path,
     pub repo_dir: &'a Path,
+    /// The directory the probe's short temp-dir link is made under.
+    pub tmp_link_root: &'a Path,
     /// Random hex, unique to this attempt.
     pub nonce: &'a str,
 }
@@ -508,6 +511,7 @@ pub fn verify_sandbox_with(
         &VerifyInputs {
             settings,
             state_dir: world.state_dir,
+            tmp_link_root: world.tmp_link_root,
             nonce: world.nonce,
             home: &home,
             config_dir: &config_dir,
@@ -545,6 +549,7 @@ pub fn verify_sandbox_here(
             base_env: &LaunchEnv::from_process_env(),
             state_dir: &state_dir,
             repo_dir,
+            tmp_link_root: Path::new("/tmp"),
             nonce: &probe_nonce(),
         },
         settings,
@@ -3532,6 +3537,7 @@ mod tests {
                 env: &ambient_env,
                 launch_env_names: &[],
                 scratch: Path::new("/some/other/scratch"),
+                tmp_link: Path::new("/some/other/link"),
             },
             managed: &[],
         });
@@ -3652,6 +3658,7 @@ mod tests {
                 base_env: &LaunchEnv::default(),
                 state_dir: Path::new("/state"),
                 repo_dir: Path::new("/repo"),
+                tmp_link_root: Path::new("/state"),
                 nonce: "abc",
             },
             settings,
