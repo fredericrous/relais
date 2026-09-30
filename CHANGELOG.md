@@ -6,7 +6,48 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
-## Unreleased
+## v0.8.0
+
+Effort becomes a cost lever beside the model: a repair climbs effort before
+it escalates the model, recipes and risk rules can set effort, the learner
+chooses a tier AND an effort, and reports attribute every figure to the
+effort an attempt requested.
+
+### Upgrading
+
+- **Machine.toml needs an effort catalog before any effort CHANGE can
+  route.** Add `[efforts] order` and a `[[efforts.models]]` entry
+  (`ids`, `supported`) per model; `relais doctor --effort-template` prints
+  the block for the models this machine configures, and `relais doctor`
+  shows what is still unknown. Nothing is inferred: an order or a model's
+  support that is not configured is unknown.
+- **Without a catalog, today's configured efforts keep working** (the
+  effort `relais.toml` names for a tier dispatches exactly as before), and
+  repairs HOLD their effort: `relais plan` says `repair effort held: effort
+  order unknown for <model>`.
+- **Once the catalog is configured, repairs climb effort by default**
+  (`execution.repair_effort = "raise"`), up to the tier's ceiling — `high`
+  unless the machine's `[routing] max_effort` or the authority profile's
+  `max_effort` says otherwise — and stay at the ceiling. `"same"` keeps
+  today's exact sequence.
+- **Recipe `models` blocks are now read**: a covering recipe's
+  `models.<tier>` sets the dispatched model and effort, and a model outside
+  `allowed_models` blocks (exit 3) instead of being substituted.
+- **An unsupported effort blocks instead of being dropped.** A harness
+  without `--effort` given a configured effort now stops with exit 3; an
+  unknown catalog blocks only effort CHANGES and any new risk floor
+  (`minimum_effort`).
+- **Retrain learned artifacts.** The artifact schema moved to 6 and the
+  evaluation schema to 4 (estimates are per arm, a tier and an effort); an
+  existing artifact is refused by version until a new one is trained
+  (`relais train`, then `relais evaluate` and `relais promote`). The
+  dataset version is unchanged (4).
+- **`relais report` JSON is schema 10** (new top-level `repair_outcomes`);
+  receipts gain the additive `efforts_used`.
+- No authority hash moves (new policy keys are skipped when unset), no
+  trust grant needs re-issuing, and there is no ledger migration (still
+  v17). New keys, once set, are not understood by an older binary.
+
 
 ### Added
 
