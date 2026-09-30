@@ -148,7 +148,10 @@ fn alias(path: &Path) -> Option<PathBuf> {
     (resolved != path).then_some(resolved)
 }
 
-#[cfg(test)]
+// Unix only: the fixtures are Unix absolute paths (`/h/.ssh`), which are
+// not absolute on Windows, and the OS sandbox these paths feed exists on
+// macOS and Linux only.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::test_support::temp_dir;
@@ -331,9 +334,6 @@ mod tests {
         assert!(floor.files.contains(&file));
     }
 
-    // Unix only: it makes a symlink with `std::os::unix`, and the OS
-    // sandbox these paths feed exists on macOS and Linux only.
-    #[cfg(unix)]
     #[test]
     fn a_symlink_alias_appears_in_both_forms() {
         let scratch = temp_dir("floor-alias");

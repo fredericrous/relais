@@ -2116,6 +2116,8 @@ keys = ["output.contract"]
 
     /// `~/..` resolved to the home's parent and passed: `..` is refused in
     /// a `~/` entry as in an absolute one.
+    // Unix only: Unix absolute-path fixtures (see the symlink test).
+    #[cfg(unix)]
     #[test]
     fn a_home_relative_parent_escape_is_refused() {
         for entry in ["~/..", "~/../..", "~/.cache/../../x"] {
@@ -2134,6 +2136,8 @@ keys = ["output.contract"]
 
     /// With no resolvable home, `~/.ssh` is still refused: the floor
     /// defaults are computed against the stand-in `~` expands with.
+    // Unix only: Unix absolute-path fixtures (see the symlink test).
+    #[cfg(unix)]
     #[test]
     fn a_floor_path_is_refused_even_without_a_resolvable_home() {
         let settings = SandboxSettings {
@@ -2149,6 +2153,8 @@ keys = ["output.contract"]
 
     /// A `writable` entry containing relais's config dir (machine.toml, the
     /// trust grants) is refused, relocated or not.
+    // Unix only: Unix absolute-path fixtures (see the symlink test).
+    #[cfg(unix)]
     #[test]
     fn a_writable_entry_over_the_config_dir_is_refused() {
         let settings = SandboxSettings {
@@ -2169,6 +2175,8 @@ keys = ["output.contract"]
             .is_ok());
     }
 
+    // Unix only: Unix absolute-path fixtures (see the symlink test).
+    #[cfg(unix)]
     #[test]
     fn a_sandbox_check_with_known_directories_refuses_their_ancestors() {
         let settings = SandboxSettings {
@@ -2197,6 +2205,8 @@ keys = ["output.contract"]
         settings.check(Some(home), None, None, &default_floor_paths(home))
     }
 
+    // Unix only: Unix absolute-path fixtures (see the symlink test).
+    #[cfg(unix)]
     #[test]
     fn a_writable_entry_that_is_or_contains_a_floor_path_is_refused() {
         let home = Path::new("/Users/me");

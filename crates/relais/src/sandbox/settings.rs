@@ -95,7 +95,10 @@ fn rule(tool: &str, path: &Path, suffix: &str) -> String {
     format!("{tool}(/{}{suffix})", path.display())
 }
 
-#[cfg(test)]
+// Unix only: the fixtures are Unix absolute paths (`/h/.ssh`), which are
+// not absolute on Windows, and the OS sandbox these paths feed exists on
+// macOS and Linux only.
+#[cfg(all(test, unix))]
 mod tests {
     use std::path::PathBuf;
 
