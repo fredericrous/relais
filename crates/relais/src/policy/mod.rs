@@ -2111,6 +2111,9 @@ keys = ["output.contract"]
 
     /// `[sandbox]` is machine policy like `[pricing]`: adding it must not
     /// move a repo's authority hash or invalidate a reviewed grant.
+    // Unix only: it enables `[sandbox]`, which `validate()` refuses on a
+    // platform with no OS sandbox (Windows).
+    #[cfg(unix)]
     #[test]
     fn a_sandbox_block_in_machine_settings_does_not_move_the_authority_hash() {
         let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
