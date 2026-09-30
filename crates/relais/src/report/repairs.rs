@@ -24,6 +24,10 @@ enum NoVerdict {
     Cancelled,
     /// The run stopped asking a person; named by the transition's reason.
     Decision(String),
+    /// The run stopped before the repair's checks ran (a limit reached
+    /// while dispatching, an unapproved substitution); named by the
+    /// transition's reason.
+    Stopped(String),
     /// A transition no repair can end in, or a repair no transition opened.
     Unrecorded,
     InFlight,
@@ -35,7 +39,7 @@ impl NoVerdict {
             Self::Blocked => "blocked".to_string(),
             Self::Crash => "crash".to_string(),
             Self::Cancelled => "cancelled".to_string(),
-            Self::Decision(reason) => reason.clone(),
+            Self::Decision(reason) | Self::Stopped(reason) => reason.clone(),
             Self::Unrecorded => "unrecorded".to_string(),
             Self::InFlight => "in flight".to_string(),
         }
@@ -50,16 +54,23 @@ enum Verdict {
     NoVerdict(NoVerdict),
 }
 
-/// What a transition into `to_state` says about the repair it closes, or
-/// `None` when the repair is still running or being verified. Exhaustive
-/// over [`State`]: a state added later is a decision made here.
-fn closing_verdict(to_state: State, reason: &str) -> Option<Verdict> {
+/// What a transition from `from` into `to_state` says about the repair it
+/// closes, or `None` when the repair is still running or being verified.
+/// Exhaustive over [`State`]: a state added later is a decision made here.
+fn closing_verdict(from: State, to_state: State, reason: &str) -> Option<Verdict> {
     match to_state {
         State::Running | State::Verifying => None,
-        // Another repair, an escalation, or a terminal failure: the checks
-        // ran and did not pass.
+        // Another repair, an escalation, or a terminal failure, reached
+        // from `verifying`: the checks ran and did not pass. Reached from
+        // `running`, the checks never ran — the machine stops a dispatch
+        // there on a limit (`budget_exhausted`, runner/machine.rs) or an
+        // unapproved substitution (`failed`) — so it is no verdict.
         State::Repairing | State::Escalating | State::Failed | State::BudgetExhausted => {
-            Some(Verdict::Failed)
+            Some(if from == State::Verifying {
+                Verdict::Failed
+            } else {
+                Verdict::NoVerdict(NoVerdict::Stopped(reason.to_string()))
+            })
         }
         // `verifying -> accepted | needs_review` is emitted only after the
         // attempt's checks passed with no gaps: `accept_candidate` in
@@ -108,7 +119,7 @@ fn repairs_of_run(ledger: &Ledger, run_id: &RunId) -> Result<Vec<Repair>, Ledger
     let mut repairs = Vec::new();
     for (k, attempt) in repair_attempts.enumerate() {
         let verdict = match openings.get(k) {
-            Some(&opened) => closing_of(&transitions[opened + 1..]),
+            Some(&opened) => closing_of(&transitions[opened..]),
             None => Verdict::NoVerdict(NoVerdict::Unrecorded),
         };
         repairs.push(Repair {
@@ -120,12 +131,17 @@ fn repairs_of_run(ledger: &Ledger, run_id: &RunId) -> Result<Vec<Repair>, Ledger
     Ok(repairs)
 }
 
-/// The verdict of the first transition that closes a repair; a repair with
-/// none yet is in flight.
-fn closing_of(later: &[Transition]) -> Verdict {
-    later
-        .iter()
-        .find_map(|transition| closing_verdict(transition.to_state, &transition.reason))
+/// The verdict of the first transition after `from_opening[0]` (the one
+/// that opened the repair) that closes it; a repair with none yet is in
+/// flight. Each transition is judged with the state it left: its recorded
+/// `from_state`, else the state the previous transition entered.
+fn closing_of(from_opening: &[Transition]) -> Verdict {
+    from_opening
+        .windows(2)
+        .find_map(|pair| {
+            let from = pair[1].from_state.unwrap_or(pair[0].to_state);
+            closing_verdict(from, pair[1].to_state, &pair[1].reason)
+        })
         .unwrap_or(Verdict::NoVerdict(NoVerdict::InFlight))
 }
 

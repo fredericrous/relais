@@ -3256,9 +3256,54 @@ mod tests {
             .unwrap_or_else(|| panic!("no repairs for {effort:?} in {:?}", report.repair_outcomes))
     }
 
-    /// Each outcome class, a run with a second repair (the k-th repairing
-    /// transition opens the k-th repair), a run counted once, and a crash
-    /// with no usage row (unknown cost, not $0).
+    /// A repair the machine stopped while dispatching (a limit reached,
+    /// `running -> budget_exhausted`) never ran its checks: no verdict,
+    /// named by the reason — not a failed verification. The same state
+    /// entered from `verifying` is a failed one.
+    #[test]
+    fn a_repair_stopped_before_its_checks_ran_has_no_verdict() {
+        let dir = temp_dir("repair-stopped");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let running = (State::Running, "worker_dispatched");
+        let verifying = (State::Verifying, "verification_started");
+        let opened = (State::Repairing, "behavioral_failure");
+        run_with_repairs(
+            &ledger,
+            "run-limit",
+            &[("stopped", Some(5))],
+            &[
+                running,
+                verifying,
+                opened,
+                running,
+                (State::BudgetExhausted, "limit_reached"),
+            ],
+        );
+        run_with_repairs(
+            &ledger,
+            "run-checked",
+            &[("checked", Some(5))],
+            &[
+                running,
+                verifying,
+                opened,
+                running,
+                verifying,
+                (State::BudgetExhausted, "limit_reached"),
+            ],
+        );
+        let report = runs_report(&ledger, SINCE, None).expect("report");
+        let stopped = effort_line(&report, "stopped");
+        assert_eq!(stopped.verification_failed, 0);
+        assert_eq!(stopped.no_verdict_kinds.get("limit_reached"), Some(&1));
+        let checked = effort_line(&report, "checked");
+        assert_eq!(checked.verification_failed, 1);
+        assert_eq!(checked.no_verdict, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The report window lists root runs only; a repair inside a package
+    /// run beneath one is walked and counted all the same.
     #[test]
     fn a_repair_inside_a_package_run_is_reported() {
         let dir = temp_dir("repair-in-package");
@@ -3311,6 +3356,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Each outcome class, a run with a second repair (the k-th repairing
+    /// transition opens the k-th repair), a run counted once, and a crash
+    /// with no usage row (unknown cost, not $0).
     #[test]
     fn a_repairs_own_verification_is_reported_apart_from_how_its_run_ended() {
         let dir = temp_dir("repair-outcomes");

@@ -19,8 +19,8 @@ missing here.
   effort id the code has never heard of forms its own cohort. Every report now
   carries `repair_outcomes` (text and JSON): per requested effort, how many
   repairs there were, whether the repair's own verification passed, failed or
-  reached no verdict (blocked, crash, cancelled, a decision's reason, in
-  flight), what the repairs cost (an attempt with no usage row is unknown cost,
+  reached no verdict (blocked, crash, cancelled, a decision's reason, a stop
+  before the checks ran, in flight, unrecorded), what the repairs cost (an attempt with no usage row is unknown cost,
   never `$0.00`), and, on a separate line, how the runs they belong to
   eventually ended. A receipt gains the additive `efforts_used`, the distinct
   requested efforts of the run's worker attempts in first-use order; receipts
