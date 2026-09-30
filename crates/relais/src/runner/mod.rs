@@ -10472,8 +10472,25 @@ mod tests {
         let repo = fixture.repo_policy(vec![main_gone_check()], 3);
         let mut machine = fixture.machine_for(&repo);
         machine.sandbox.enabled = true;
+        // Unlocks whatever the mock locked on every exit, a panic inside
+        // the run included, so the fixture dir can always be removed.
+        struct Unlock(Arc<Mutex<Option<PathBuf>>>);
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                // A poisoned lock still holds the path; take it either way.
+                let mut held = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+                if let Some(attempts) = held.take() {
+                    // Best effort in a destructor: a failure leaves only a
+                    // test fixture behind, and the asserts already ran.
+                    std::fs::set_permissions(&attempts, std::fs::Permissions::from_mode(0o755))
+                        .ok();
+                }
+            }
+        }
+
         let locked: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
         let worker_locked = Arc::clone(&locked);
+        let unlock = Unlock(Arc::clone(&locked));
         let backend = MockBackend::new(move |spec| {
             if let Some(launch) = &spec.sandbox {
                 // scratch is `<run>/attempts/<n>/scratch`: lock `attempts`,
@@ -10514,20 +10531,25 @@ mod tests {
             &host,
             env,
         );
-        if let Some(attempts) = locked.lock().expect("lock").take() {
-            std::fs::set_permissions(&attempts, std::fs::Permissions::from_mode(0o755))
-                .expect("unlock attempts");
-        }
         assert!(
-            !matches!(outcome.terminal, Terminal::Accepted(_)),
-            "the report write must have failed the attempt: {outcome:?}"
+            locked.lock().expect("lock").is_some(),
+            "the sandboxed dispatch locked the attempts dir"
         );
+        drop(unlock);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Interrupted { detail },
+        } = outcome
+        else {
+            panic!("the report write must have interrupted the run, got {outcome:?}");
+        };
+        assert!(detail.contains("the runner could not continue"), "{detail}");
         assert!(
-            evidence_of(&fixture, &outcome.run_id, EvidenceKind::SandboxDenials).is_empty(),
+            evidence_of(&fixture, &run_id, EvidenceKind::SandboxDenials).is_empty(),
             "no report was recorded"
         );
         assert_eq!(
-            fixture.ledger.run_cost(&outcome.run_id).expect("cost"),
+            fixture.ledger.run_cost(&run_id).expect("cost"),
             MicroUsd::from_micros(100),
             "the dispatch's usage is in the ledger"
         );
