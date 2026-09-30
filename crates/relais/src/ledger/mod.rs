@@ -1355,15 +1355,14 @@ const FIRST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(1);
 /// The longest pause between two tries.
 const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// Whether SQLite refused because another connection holds a lock.
+/// Whether SQLite refused because another connection holds a lock
+/// (SQLITE_BUSY). SQLITE_LOCKED is not this: it is a conflict inside one
+/// connection, a bug to report at once rather than wait out.
 fn is_busy(error: &rusqlite::Error) -> bool {
     matches!(
         error,
         rusqlite::Error::SqliteFailure(failure, _)
-            if matches!(
-                failure.code,
-                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-            )
+            if failure.code == rusqlite::ErrorCode::DatabaseBusy
     )
 }
 
@@ -5031,11 +5030,16 @@ mod tests {
     #[test]
     fn an_endless_busy_refusal_gives_up_at_the_deadline() {
         let started = std::time::Instant::now();
+        let mut calls = 0;
         let result: rusqlite::Result<()> =
-            retry_while_busy(std::time::Duration::from_millis(50), || Err(busy()));
+            retry_while_busy(std::time::Duration::from_millis(50), || {
+                calls += 1;
+                Err(busy())
+            });
         let error = result.expect_err("never succeeds");
         assert!(is_busy(&error), "the busy error is returned: {error:?}");
         assert!(started.elapsed() >= std::time::Duration::from_millis(50));
+        assert!(calls > 1, "it retried within the deadline: {calls} calls");
     }
 
     #[test]
@@ -5051,6 +5055,8 @@ mod tests {
     }
 
     /// Many threads switching each fresh file to WAL at the same moment.
+    /// On macOS the old 32-yield loop also passed this; it guards the
+    /// slower Windows runner, where that loop ran out (#147).
     #[test]
     fn many_openers_of_fresh_ledgers_all_succeed() {
         const THREADS: usize = 6;
@@ -5077,6 +5083,7 @@ mod tests {
                 }
             });
         }
+        // Best-effort temp cleanup: a leftover directory fails nothing.
         std::fs::remove_dir_all(&dir).ok();
     }
 
