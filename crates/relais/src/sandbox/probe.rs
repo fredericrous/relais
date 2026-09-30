@@ -470,8 +470,9 @@ fn denies_probe_host(text: &str) -> bool {
     })
 }
 
-/// Negative expectations judge by text alone: a denied command legitimately
-/// has `is_error` true.
+/// OS-denial and network expectations judge by text (a denied command
+/// legitimately has `is_error` true); a refusal also needs the harness's
+/// error result, so output that merely quotes one does not count.
 fn judge(expect: &Expect, result: &ToolResult) -> Verdict {
     let text = result.text.as_str();
     match expect {
@@ -852,11 +853,10 @@ mod tests {
     #[test]
     fn refusal_text_without_an_error_result_is_not_a_refusal() {
         let steps = plan();
-        let jsonl = transcript(&steps, |step| Some(measured(step))).replace(
-            "\"is_error\":true,\"tool_use_id\":\"toolu_fixture-grep\"",
-            "\"tool_use_id\":\"toolu_fixture-grep\"",
-        );
-        assert!(!jsonl.contains("\"is_error\":true,\"tool_use_id\":\"toolu_fixture-grep\""));
+        let marked = "\"is_error\":true,\"tool_use_id\":\"toolu_fixture-grep\"";
+        let jsonl = transcript(&steps, |step| Some(measured(step)));
+        assert!(jsonl.contains(marked), "the builder marks the refusal");
+        let jsonl = jsonl.replace(marked, "\"tool_use_id\":\"toolu_fixture-grep\"");
         let report = judged(&steps, &jsonl, &good_init());
         assert_only_failing(&report, "fixture-grep");
     }
@@ -1174,11 +1174,10 @@ mod tests {
     #[test]
     fn a_denied_command_with_is_error_still_passes_its_negative_control() {
         let steps = plan();
-        let jsonl = transcript(&steps, |step| Some(measured(step))).replace(
-            "\"tool_use_id\":\"toolu_tmp-write\"",
-            "\"tool_use_id\":\"toolu_tmp-write\",\"is_error\":true",
-        );
-        assert!(jsonl.contains("\"is_error\":true"));
+        // The builder marks a denied call as an error result, as the harness
+        // does; the step still passes its negative expectation.
+        let jsonl = transcript(&steps, |step| Some(measured(step)));
+        assert!(jsonl.contains("\"is_error\":true,\"tool_use_id\":\"toolu_tmp-write\""));
         assert!(judged(&steps, &jsonl, &good_init()).passed);
     }
 
