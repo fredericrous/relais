@@ -10,6 +10,162 @@ missing here.
 
 ### Fixed
 
+- Opening a fresh ledger from several processes at once no longer fails
+  intermittently with "database is locked" (#147). The switch to WAL, which
+  SQLite refuses without consulting its busy handler, now waits out a
+  concurrent opener for the ledger's 5 s busy timeout, with a short capped
+  backoff, instead of a fixed count of thread yields.
+
+## v0.8.0
+
+Effort becomes a cost lever beside the model: a repair climbs effort before
+it escalates the model, recipes and risk rules can set effort, the learner
+chooses a tier AND an effort, and reports attribute every figure to the
+effort an attempt requested.
+
+### Upgrading
+
+- **Machine.toml needs an effort catalog before any effort CHANGE can
+  route.** Add `[efforts] order` and a `[[efforts.models]]` entry
+  (`ids`, `supported`) per model; `relais doctor --effort-template` prints
+  the block for the models this machine configures, and `relais doctor`
+  shows what is still unknown. Nothing is inferred: an order or a model's
+  support that is not configured is unknown.
+- **Without a catalog, today's configured efforts keep working** (the
+  effort `relais.toml` names for a tier dispatches exactly as before), and
+  repairs HOLD their effort: `relais plan` says `repair effort held: effort
+  order unknown for <model>`.
+- **Once the catalog is configured, repairs climb effort by default**
+  (`execution.repair_effort = "raise"`), up to the tier's ceiling — `high`
+  unless the machine's `[routing] max_effort` or the authority profile's
+  `max_effort` says otherwise — and stay at the ceiling. `"same"` keeps
+  today's exact sequence.
+- **Recipe `models` blocks are now read**: a covering recipe's
+  `models.<tier>` sets the dispatched model and effort, and a model outside
+  `allowed_models` blocks (exit 3) instead of being substituted.
+- **An unsupported effort blocks instead of being dropped.** A harness
+  without `--effort` given a configured effort now stops with exit 3; an
+  unknown catalog blocks only effort CHANGES and any new risk floor
+  (`minimum_effort`).
+- **Retrain learned artifacts.** The artifact schema moved to 6 and the
+  evaluation schema to 4 (estimates are per arm, a tier and an effort); an
+  existing artifact is refused by version until a new one is trained
+  (`relais train`, then `relais evaluate` and `relais promote`). The
+  dataset version is unchanged (4).
+- **`relais report` JSON is schema 10** (new top-level `repair_outcomes`);
+  receipts gain the additive `efforts_used`.
+- No authority hash moves (new policy keys are skipped when unset), no
+  trust grant needs re-issuing, and there is no ledger migration (still
+  v17). New keys, once set, are not understood by an older binary.
+
+
+### Added
+
+- **Every figure about effort is attributed to what the attempt requested
+  (P5).** One ledger reader, `Ledger::requested_effort`, gives an attempt's
+  requested effort from its worker dispatch intent: the ladder's effort at the
+  intent's rung, else the intent's flat `effort`, else the attempt's usage
+  row's `requested_effort`, else `unknown`. `relais report --by effort` groups
+  tasks by the effort their first run's first worker attempt requested, so an
+  effort id the code has never heard of forms its own cohort. Every report now
+  carries `repair_outcomes` (text and JSON): per requested effort, how many
+  repairs there were, whether the repair's own verification passed, failed or
+  reached no verdict (blocked, crash, cancelled, a decision's reason, a stop
+  before the checks ran, in flight, unrecorded), what the repairs cost (an attempt with no usage row is unknown cost,
+  never `$0.00`), and, on a separate line, how the runs they belong to
+  eventually ended. A receipt gains the additive `efforts_used`, the distinct
+  requested efforts of the run's worker attempts in first-use order; receipts
+  already stored still parse and `models_used` is unchanged. **The report
+  schema version moved 9 → 10** (the new top-level `repair_outcomes` key).
+- **The learner chooses among arms, not tiers (P4).** An arm is a tier and
+  an effort request (`route::Arm`, labelled `implementation@high`,
+  `implementation:not_requested`, `implementation:control_unsupported`).
+  `route::learner_arms` enumerates them through the existing rung resolver:
+  each effort of the tier model's admissible set is tried as the initial
+  rung's start and kept only when it resolves to exactly that effort, so the
+  floor, the authority ceiling, `allowed_models` and the unknown-catalog
+  carve-out stay the resolver's. `RoutePredictor::estimate` takes the arms,
+  `Estimates` holds acceptance and cost per arm, `select_learned` returns the
+  cheapest priced arm that clears the quality floor (a tie goes to the
+  earlier arm), and `route()` starts the ladder at the selected arm's tier
+  and effort; the `learned_artifact` reason names the arm. Inference checks
+  each arm's identity (the tier's profile with the arm's effort) against what
+  training observed, and the evaluation now scores each candidate arm with the
+  identity training observed at its tier, not the test record's own, counting
+  a record as evidence only when its tier, model, effort and harness are the
+  selected arm's. Recipe, cold-start and conservative-baseline routes are
+  unchanged. **The artifact schema version moved 5 → 6 and the evaluation
+  schema version 3 → 4 (the dataset version is unchanged): an existing learned
+  artifact is refused and must be retrained** (`relais train`, then evaluate
+  and promote again).
+- **The effort ladder: every attempt the budget can reach gets a validated
+  rung (P3).** `route()` now resolves, once, the tier, model and effort of
+  the initial attempt, each repair and the escalation, given the budget that
+  applies (a package's own attempts, not the root's), and the runner
+  dispatches exactly that: the state machine only chooses the kind of the
+  next attempt and the ladder index, and tier, model and effort are read from
+  `ladder[rung]`. A repair climbs to the next admissible effort within its
+  tier's ceiling and stays at the ceiling once there (`execution.repair_effort
+  = "raise"`, the default), or keeps the previous effort (`"same"`, today's
+  sequence). The key is left out of the authority hash while it is the
+  default. Under an unknown effort catalog `raise` holds the configured
+  effort for that model; `relais plan` prints `repair effort held: effort
+  order unknown for <model>` on stderr for the models the run's ladder holds,
+  and `relais doctor`'s effort finding says `repair effort would be held
+  (effort order unknown) for: <models>` for every model a repair could run
+  at. The ladder is printed one rung per line after `effort:` in
+  `plan` and `explain`, carried by `plan --json`, recorded in the run's first
+  dispatch intent (each attempt's intent names the rung it ran) and in the
+  receipt (an additive `ladder` field, the ladder that ran: the run's own, or
+  each package's by id for a decomposed run; older receipts still parse). Falsified:
+  keeping a repair at the initial effort failed the route and runner tests;
+  turning "no next effort" into no effort failed the ceiling test; both
+  restored.
+- **Candidate admission resolves the same ladder as routing.**
+  `validate_candidate` calls the one function `route()` calls, under the
+  incumbent's models, budget and `repair_effort`, and admits a recipe only
+  when every rung validates (`LadderBlocked` otherwise), so a candidate that
+  moves its covering tier below the escalation tier under a floor is no
+  longer admitted and then blocked. A candidate may not change
+  `execution.repair_effort`. Falsified: with the ladder check removed, the
+  escalation-floor cross-check test failed; restored. Admission judges the
+  ladder under the repository's `execution` budget, the one routing reads
+  (a recipe's own `execution` block is declared but not yet read), and picks
+  the escalation tier with the one function routing uses (the strongest
+  eligible tier).
+- A budget that ends on the last repair (`max_attempts` = repairs + 1) ends as
+  it did before the ladder: the runner takes the escalation tier from the
+  route, so the attempt ceiling, not `RepairExhausted`, ends the run.
+
+### Changed
+
+- **A risk floor binds the escalation rung too, instead of blocking the
+  route.** The P2 interim rule blocked a route whose reachable escalation
+  tier was configured below a floor; the escalation rung is now resolved
+  like the initial one, so a tier configured at `medium` under a `high`
+  floor escalates at `high`, and only a tier that cannot carry the floor (or
+  whose ceiling is below it) blocks, before attempt 1. An escalation tier
+  whose model `allowed_models` removed is no rung: the ladder ends before it
+  and no other model is substituted.
+
+### Fixed
+
+- **Reviewer independence is the model's, and the candidate carve-out matches
+  the model.** A covering recipe can put any allowed model on the worker's
+  tier, so a review by a different tier can still be the same model marking
+  its own work: `review_candidate` now compares the reviewer's model with the
+  one the candidate was dispatched with, and records `reviewer_same_model`
+  (formerly `reviewer_same_tier`, still read from old ledgers, the one
+  documented legacy spelling). The receipt says so too: a new `review` field
+  (`no_review`, `independent`, `same_model`, or `not_recorded` on receipts
+  written before it), read from the ledger's review dispatch when the
+  receipt is written. Under an
+  unknown effort catalog a candidate recipe is admitted only at the model AND
+  effort the authority policy configures for the tier
+  (`TuningBounds.configured` is tier → (model, effort)), as `route`'s rung
+  resolution already required. Falsified: comparing by tier again failed the
+  same-model runner test; keying by tier only failed the unit and cross-check
+  tests; both restored.
 - **The worker prompt also names the edit habits that get refused (#105).**
   Refusals measured before the plain-command rule reached the worker prompt
   included heredoc and inline-script edits and copies to `/tmp`; the three
@@ -50,8 +206,51 @@ missing here.
   a compatibility carve-out. `Capabilities::supports_effort` became
   `accepted_efforts`: a known set, unsupported, or unknown.
 - **`relais doctor` continuation lines are indented under their finding.**
+- **The route carries the resolved initial rung, and dispatch uses it (P2).**
+  `Route.rung` is tier, model and effort, where the effort is explicit, not
+  requested, or control-unsupported — three states, never an `Option`. A
+  covering recipe's `models.<tier>` is now READ (its model and start effort),
+  so `RecipeSpec::models` is no longer "declared and hashed, not yet read";
+  `execution`, `context` and `review` still are. The recipe's model must be
+  in `allowed_models` or the route is blocked `model_not_allowed`, never
+  another model. The runner dispatches the rung's model and effort for the
+  initial tier and records exactly them in the dispatch intent; repairs and
+  escalations were unchanged then, and now read the P3 ladder (see Added,
+  above).
+- **Per-tier effort ceilings are authoritative.** The rung's effort may not
+  exceed the smaller of the authority ceiling (`models.<tier>.max_effort`, else
+  the top of the authority model's admissible set) and the top of the
+  dispatched model's admissible set. Over it, the route is blocked
+  `effort_above_cap` (exit 3), never clamped. A recipe changing its start
+  effort never moves a ceiling.
+- **A changed effort needs a known catalog.** When the dispatched model's
+  catalog is unknown, exactly the authority's configured effort still runs as
+  today; an effort a recipe or a floor changed is blocked with the
+  machine.toml keys to set.
+- **Candidate recipes are checked against the routing catalog.** A per-tier
+  effort outside the model's admissible set, or above the authority ceiling,
+  is `EffortNotAdmissible` (was `EffortNotAllowed`); below the scope's floor,
+  `EffortBelowFloor`. A candidate may lower an effort. `TuningBounds` carries
+  the resolved catalogs and ceilings instead of `allowed_efforts`, and a
+  candidate may not change `max_effort`.
+- **`relais plan` prints `effort: <model>@<effort>` after the `route:` line**,
+  with the reason when a recipe or a floor set it, and `plan --json` prints the
+  route with its rung.
 
 ### Added
+
+- **`minimum_effort` on a `[[risk]]` rule and `max_effort` on a
+  `[models.<tier>]` profile.** A risk floor binds the initial rung: its effort
+  is the higher of its start effort and the floor in catalog order, and a model
+  that cannot satisfy it (no effort control, or an unknown catalog) blocks the
+  route naming the floor, the model and the admissible set. (The escalation
+  rung was first held to the floor by an interim block; the P3 ladder, above,
+  resolves it at the floor instead.) A candidate
+  recipe that sets no effort under a floor is judged by the same floor check,
+  and by the machine's `allowed_models`. `relais plan`'s `route:` line names the
+  rung's model. Both keys are
+  omitted from the hash when absent, so no existing policy's authority hash
+  moves.
 
 - **An effort catalog, and `relais doctor` reports it (P1).** Per
   (harness version, model id), three independent facts each known,
@@ -257,7 +456,8 @@ missing here.
   saying so in words when there are none rather than printing nothing.
   `show` prints every revision of one recipe, including its `models`,
   `execution`, `context` and `review` blocks when set, each still marked
-  DECLARED AND HASHED, NOT YET READ by routing; an unknown name is
+  DECLARED AND HASHED, NOT YET READ by routing (`models` is read from
+  v0.8.0 on and no longer carries the mark); an unknown name is
   refused, naming the recipes that do exist. `diff` compares a
   candidate's recipes to the repository's own field by field, using each
   side's EFFECTIVE value rather than its compact form, so a field a

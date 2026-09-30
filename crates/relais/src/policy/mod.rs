@@ -156,6 +156,14 @@ pub struct ModelProfile {
     /// Omitted for models without effort control.
     #[serde(default)]
     pub effort: Option<EffortId>,
+    /// The highest effort this tier may ever be dispatched at: the
+    /// AUTHORITY policy's ceiling for the tier (SPEC §6). Read from the
+    /// repository policy only — a recipe's own copy is never consulted, so
+    /// a recipe lowering or raising its start effort cannot move it. Absent,
+    /// the ceiling is the top of the model's admissible set. Omitted from
+    /// the serialized form when absent, so no existing authority hash moves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_effort: Option<EffortId>,
 }
 
 /// Integration dependency: required, optional or off. A missing required
@@ -311,6 +319,12 @@ pub struct RiskRule {
     pub minimum_tier: Tier,
     #[serde(default)]
     pub review: Option<Review>,
+    /// The lowest effort a task touching these paths may be dispatched at.
+    /// Which effort is above which is the catalog's configured order, so
+    /// the router ranks it there. Omitted from the serialized form when
+    /// absent, so no existing authority hash moves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_effort: Option<EffortId>,
 }
 
 /// Path-to-decision mappings live here, because aval resolves exact keys
@@ -352,6 +366,37 @@ pub struct ExecutionPolicy {
     pub max_agent_depth: u32,
     #[serde(default = "default_max_agents_total")]
     pub max_agents_total: u32,
+    /// Whether a repair climbs effort within its tier (`raise`, the
+    /// default) or keeps the previous attempt's (`same`). Left out of the
+    /// serialized declaration while it is the default, so a policy that
+    /// never names it keeps its authority hash.
+    #[serde(default, skip_serializing_if = "RepairEffort::is_default")]
+    pub repair_effort: RepairEffort,
+}
+
+/// How a repair's effort follows the attempt it repairs (SPEC §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairEffort {
+    /// The next admissible effort in the model's order, never above the
+    /// tier's ceiling.
+    #[default]
+    Raise,
+    /// The previous attempt's effort, unchanged.
+    Same,
+}
+
+impl RepairEffort {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Raise => "raise",
+            Self::Same => "same",
+        }
+    }
 }
 
 fn default_max_attempts() -> u32 {
@@ -1227,6 +1272,10 @@ pub enum BlockCode {
     /// profile does not define. Refused before dispatch: a criterion
     /// nothing can settle is not a narrower contract, it is a broken one.
     AcceptanceCheckUnknown,
+    /// The rung's effort is above the ceiling the authority policy (or the
+    /// top of the model's admissible set) allows. Never clamped: a spend
+    /// the policy did not authorize is refused, not lowered.
+    EffortAboveCap,
 }
 
 impl BlockCode {
@@ -1259,6 +1308,7 @@ impl BlockCode {
             Self::ModelUnverified => "model_unverified",
             Self::ReadHintUnresolvable => "read_hint_unresolvable",
             Self::AcceptanceCheckUnknown => "acceptance_check_unknown",
+            Self::EffortAboveCap => "effort_above_cap",
         }
     }
 }
@@ -1306,6 +1356,22 @@ pub struct EffectiveAuthority {
     pub blockers: Vec<Blocker>,
 }
 
+/// The policy's models narrowed by the machine's `allowed_models`
+/// (`None`: any). The one narrowing both routing
+/// ([`effective_authority`]) and candidate admission
+/// (`route::default_tuning_bounds`) use, so what admission judges against
+/// is what a run would dispatch.
+pub fn allowed_models_of(
+    models: &BTreeMap<Tier, ModelProfile>,
+    allowed: Option<&[String]>,
+) -> BTreeMap<Tier, ModelProfile> {
+    let mut narrowed = models.clone();
+    if let Some(allowed) = allowed {
+        narrowed.retain(|_, profile| allowed.contains(&profile.id));
+    }
+    narrowed
+}
+
 /// The authority a run may execute under.
 ///
 /// `repo_identity` is which repository this is, built at a boundary
@@ -1321,10 +1387,7 @@ pub fn effective_authority(
 ) -> EffectiveAuthority {
     let mut blockers = Vec::new();
 
-    let mut models = repo.models.clone();
-    if let Some(allowed) = &machine.allowed_models {
-        models.retain(|_, profile| allowed.contains(&profile.id));
-    }
+    let models = allowed_models_of(&repo.models, machine.allowed_models.as_deref());
     if !repo.models.is_empty() && models.is_empty() {
         blockers.push(Blocker {
             code: BlockCode::ModelNotAllowed,
@@ -2448,6 +2511,38 @@ timeout_seconds = 60
             "d909b85bb81bf97cd2a2415b758cc9cc9d5d74eac087ef3746755ac1d27c74c7",
             "a policy with per-tier efforts must hash as it did with the enum"
         );
+    }
+
+    /// `minimum_effort` and `max_effort` are new keys. Absent, they do not
+    /// appear in the serialized form, which is why the pinned hashes above
+    /// (this repository's `relais.toml`, and REPO_TOML: a `[[risk]]` rule
+    /// and per-tier efforts) did not move; present, they are authority and
+    /// move the hash like any other.
+    #[test]
+    fn the_new_effort_keys_are_hashed_only_when_present() {
+        let plain = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        let serialized = serde_json::to_string(&plain).expect("serializes");
+        assert!(
+            !serialized.contains("minimum_effort") && !serialized.contains("max_effort"),
+            "absent keys are omitted: {serialized}"
+        );
+        let floor = REPO_TOML.replace(
+            "review = \"required\"\n",
+            "review = \"required\"\nminimum_effort = \"high\"\n",
+        );
+        let ceiling = REPO_TOML.replace(
+            "id = \"sonnet\"\neffort = \"medium\"\n",
+            "id = \"sonnet\"\neffort = \"medium\"\nmax_effort = \"high\"\n",
+        );
+        for changed in [floor, ceiling] {
+            assert_ne!(changed, REPO_TOML, "the replacement landed");
+            assert_ne!(
+                RepoPolicy::from_toml_str(&changed)
+                    .expect("parses")
+                    .authority_hash(),
+                plain.authority_hash()
+            );
+        }
     }
 
     #[test]

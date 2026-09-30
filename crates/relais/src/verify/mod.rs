@@ -1784,6 +1784,58 @@ pub struct Receipt {
     /// before this field existed still parses.
     #[serde(default)]
     pub verification_profile_hash: String,
+    /// Whether the review this candidate passed was independent of the
+    /// model that wrote it (SPEC §10). Taken from the ledger when the
+    /// receipt is written, so the two cannot disagree. `NotRecorded` is
+    /// the `serde(default)` for receipts written before this existed.
+    #[serde(default)]
+    pub review: ReviewRecord,
+    /// The rungs that actually ran under this receipt (SPEC §6): tier,
+    /// model and effort, initial first. `NotRecorded` on a receipt written
+    /// before the ladder existed, which still parses.
+    #[serde(default, skip_serializing_if = "LadderRecord::is_not_recorded")]
+    pub ladder: LadderRecord,
+    /// The distinct efforts the run's worker attempts REQUESTED, in first-use
+    /// order (SPEC §12), each read by the ledger's one reader of an
+    /// attempt's requested effort. Absent on a receipt written before this
+    /// existed, which still parses; empty when no worker attempt is on
+    /// record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub efforts_used: Vec<String>,
+}
+
+/// What a receipt records about the ladder that ran. A decomposed run's
+/// root dispatches no worker rungs of its own, so it records each
+/// package's ladder instead — never its own, which nothing ran.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LadderRecord {
+    #[default]
+    NotRecorded,
+    /// The one run's ladder, initial rung first.
+    Single(Vec<crate::route::Rung>),
+    /// A decomposed run: each package's own ladder, keyed by package id.
+    PerPackage(BTreeMap<String, Vec<crate::route::Rung>>),
+}
+
+impl LadderRecord {
+    fn is_not_recorded(&self) -> bool {
+        matches!(self, Self::NotRecorded)
+    }
+}
+
+/// What a receipt records about the review of its candidate. Four states:
+/// a receipt from before this field recorded nothing either way, a run
+/// with review off had none, and a review either came from another model
+/// or from the same model that wrote the candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewRecord {
+    #[default]
+    NotRecorded,
+    NoReview,
+    Independent,
+    SameModel,
 }
 
 impl Receipt {
@@ -1975,6 +2027,17 @@ mod tests {
                 "receipt {n} named no verification profile hash"
             );
             assert!(!receipt.run_id.is_empty(), "receipt {n} keeps its run id");
+            assert!(
+                receipt.efforts_used.is_empty(),
+                "receipt {n} predates `efforts_used`, and must read as none recorded"
+            );
+            assert!(
+                serde_json::to_value(&receipt)
+                    .expect("receipt serializes")
+                    .get("efforts_used")
+                    .is_none(),
+                "an empty `efforts_used` is not written back"
+            );
         }
 
         for (n, json) in UNRECORDED_END.iter().enumerate() {
@@ -3787,6 +3850,16 @@ mod tests {
         // when nobody wrote that down.
         assert_eq!(receipt.recipe, crate::policy::RecipeRecord::NotRecorded);
         assert_eq!(receipt.verification_profile_hash, "");
+        assert!(receipt.efforts_used.is_empty());
+        // Recorded efforts survive a round trip; `models_used` is untouched.
+        let with_efforts = Receipt {
+            efforts_used: vec!["a".into(), "b".into()],
+            ..receipt
+        };
+        let again: Receipt = serde_json::from_str(&serde_json::to_string(&with_efforts).unwrap())
+            .expect("the receipt round-trips");
+        assert_eq!(again.efforts_used, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(again.models_used, vec!["sonnet".to_string()]);
     }
 
     #[test]
@@ -3853,6 +3926,9 @@ mod tests {
             mandatory_evidence_independence: None,
             recipe: crate::policy::RecipeRecord::NotRecorded,
             verification_profile_hash: "vph".into(),
+            review: ReviewRecord::NotRecorded,
+            ladder: LadderRecord::NotRecorded,
+            efforts_used: Vec::new(),
         };
         let hash = receipt.hash();
         let mut other = receipt.clone();

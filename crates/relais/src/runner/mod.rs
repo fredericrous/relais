@@ -41,7 +41,9 @@ use crate::policy::{
     RepoPolicy, Tier, VerificationProfile,
 };
 use crate::procs::Ended;
-use crate::route::{route, Recipe, Route, RouteInputs, RoutePredictor, Routed, RoutedBy};
+use crate::route::{
+    route, Recipe, Route, RouteInputs, RoutePredictor, Routed, RoutedBy, RungIndex,
+};
 use crate::verify::{self, amont_gaps, Receipt, VerificationReport};
 use crate::workspace::{self, TaskWorktree, WorkspaceError};
 
@@ -472,6 +474,9 @@ struct Dispatched {
     attempt_id: i64,
     index: u32,
     tier: Tier,
+    /// The model the attempt was dispatched with: the rung's, which a
+    /// recipe may have set to any allowed model.
+    model: String,
     result: LaunchResult,
 }
 
@@ -479,8 +484,11 @@ struct Dispatched {
 struct Candidate {
     attempt_id: i64,
     index: u32,
-    /// The tier that wrote it — which the reviewer must not be.
+    /// The tier that wrote it.
     tier: Tier,
+    /// The model that wrote it, as dispatched — which the reviewer must
+    /// not be.
+    model: String,
     sha: String,
     /// The copy a reviewer's prompt names.
     latest_patch: PathBuf,
@@ -1345,18 +1353,35 @@ impl<'a> RunEngine<'a> {
             Some(&base_sha),
         )?;
 
-        let manifest = match self.assemble_context(&authority, &contract_hash, &base_sha)? {
+        // One probe: the version, the turn-ceiling capability and the
+        // efforts the CLI accepts are the same answer about the same
+        // installed harness.
+        let capabilities = self.config.backend.probe();
+        let manifest = match self.assemble_context(
+            &authority,
+            &contract_hash,
+            &base_sha,
+            capabilities.as_ref(),
+        )? {
             Phase::Ended(outcome) => return Ok(Phase::Ended(outcome)),
             Phase::Ready(manifest) => manifest,
         };
 
-        // Route (SPEC §6).
+        // Route (SPEC §6). The catalogs are resolved here, from the probe
+        // and machine.toml, so `route` stays pure.
+        let catalogs = crate::route::resolve_catalogs(
+            self.config.repo_policy,
+            &authority,
+            self.config.machine,
+            capabilities.as_ref().map(|c| &c.accepted_efforts),
+        );
         let decision = match route(RouteInputs {
             contract: self.config.contract,
             repo: self.config.repo_policy,
             machine: self.config.machine,
             authority: &authority,
             predictor: self.config.predictor,
+            catalogs: &catalogs,
         }) {
             Routed::Route(route) => route,
             Routed::Blocked(blocked) => {
@@ -1373,15 +1398,7 @@ impl<'a> RunEngine<'a> {
                 &estimates.raw,
             )?;
         }
-        std::fs::write(
-            self.artifacts.join("route.txt"),
-            decision.explain(
-                authority
-                    .models
-                    .get(&decision.tier)
-                    .map(|profile| profile.id.as_str()),
-            ),
-        )?;
+        std::fs::write(self.artifacts.join("route.txt"), decision.explain())?;
 
         Ok(Phase::Ready(Preflight {
             authority,
@@ -1403,10 +1420,8 @@ impl<'a> RunEngine<'a> {
         authority: &EffectiveAuthority,
         contract_hash: &str,
         base_sha: &str,
+        capabilities: Option<&crate::backend::Capabilities>,
     ) -> Result<Phase<ContextManifest>, RunError> {
-        // One probe: the version and the turn-ceiling capability are the
-        // same answer about the same installed harness.
-        let capabilities = self.config.backend.probe();
         // Read hints are fingerprinted from the base tree; one that
         // resolves to nothing would point the worker at a path this
         // revision does not have, which is a preflight problem (V15).
@@ -1435,14 +1450,11 @@ impl<'a> RunEngine<'a> {
                 relais: crate::version().to_string(),
                 aval: crate::tooling::integration_version("aval"),
                 amont: crate::tooling::integration_version("amont"),
-                claude_code: capabilities
-                    .as_ref()
-                    .and_then(|capabilities| capabilities.version.clone()),
+                claude_code: capabilities.and_then(|capabilities| capabilities.version.clone()),
             },
             // Recorded so a receipt says whether a turn ceiling was
             // enforceable at all on this harness (SPEC §11).
             turn_ceiling: capabilities
-                .as_ref()
                 .map(crate::backend::Capabilities::turn_ceiling)
                 .unwrap_or_default(),
             worker_env: &self.config.worker_env,
@@ -1652,6 +1664,11 @@ impl<'a> RunEngine<'a> {
                 repairs_used: 0,
                 max_repairs: authority.max_repairs_before_escalation,
                 tier: decision.tier,
+                rung: RungIndex::INITIAL,
+                // The route's kept tier: `None` when `allowed_models`
+                // removed its model. A budget that cannot reach the rung
+                // still decides an escalation, and the attempt ceiling
+                // ends the run before that rung is ever read.
                 escalation_tier: decision.escalation_tier,
             },
             kind: AttemptKind::Initial,
@@ -1743,7 +1760,19 @@ impl<'a> RunEngine<'a> {
         let authority = &ctx.preflight.authority;
         progress.budget.attempts_used += 1;
         let index = progress.budget.attempts_used;
-        let tier = progress.budget.tier;
+        let rung_index = progress.budget.rung;
+        let rung = ctx
+            .preflight
+            .decision
+            .ladder
+            .rung(rung_index)
+            .ok_or_else(|| {
+                RunError::Other(format!(
+                    "internal error: the ladder has no rung {} for attempt {index}",
+                    rung_index.get()
+                ))
+            })?;
+        let tier = rung.tier;
         let kind = progress.kind;
         let attempt_id = ledger.insert_attempt(
             &self.run_id,
@@ -1753,7 +1782,9 @@ impl<'a> RunEngine<'a> {
             self.attempt_phase(kind),
         )?;
 
-        let model_profile = &authority.models[&tier];
+        // The ladder's rung at the index the machine named, exactly as
+        // `route()` resolved and validated it: tier, model and effort.
+        let model_profile = rung.profile();
         let prompt = build_prompt(
             self.config.contract,
             &ctx.preflight.manifest,
@@ -1765,6 +1796,9 @@ impl<'a> RunEngine<'a> {
         // Dispatch intent is persisted BEFORE the process exists
         // (SPEC §12), keyed so retries cannot duplicate agents.
         let dispatch_id = self.config.ids.dispatch_id()?;
+        // The whole resolved ladder rides on the run's first worker
+        // dispatch, so the intent alone says what every later rung was.
+        let ladder = (index == 1).then_some(&ctx.preflight.decision.ladder);
         ledger.record_dispatch_intent(
             &dispatch_id,
             &self.run_id,
@@ -1774,6 +1808,8 @@ impl<'a> RunEngine<'a> {
                 "effort": model_profile.effort,
                 "harness": self.harness,
                 "tier": tier.as_str(),
+                "rung": rung_index,
+                "ladder": ladder,
                 "kind": kind.as_str(),
                 "prompt_bytes": prompt.len(),
                 "recipe_id": ctx.preflight.decision.covering.as_ref().map(|r| &r.recipe_id),
@@ -1969,6 +2005,7 @@ impl<'a> RunEngine<'a> {
             attempt_id,
             index,
             tier,
+            model: model_profile.id.clone(),
             result,
         }))
     }
@@ -1989,6 +2026,7 @@ impl<'a> RunEngine<'a> {
             attempt_id,
             index,
             tier,
+            model,
             result,
         } = dispatched;
         let worktree_path = ctx.worktree_path;
@@ -2123,6 +2161,7 @@ impl<'a> RunEngine<'a> {
             attempt_id,
             index,
             tier,
+            model,
             sha,
             latest_patch,
             permission_denials: result.permission_denials,
@@ -2343,12 +2382,21 @@ impl<'a> RunEngine<'a> {
                     all_preexisting,
                 },
             )? {
-                Next::Attempt { kind, tier } => {
+                Next::Attempt { kind, rung } => {
                     if kind == AttemptKind::Repair {
                         progress.budget.repairs_used += 1;
                     }
                     progress.kind = kind;
-                    progress.budget.tier = tier;
+                    progress.budget.rung = rung;
+                    // The ladder is read again at dispatch; the tier the
+                    // budget carries is only the rung's, kept for the
+                    // limits that name it.
+                    // A rung the ladder lacks is never substituted: the
+                    // attempt ceiling ends the run before dispatch, and
+                    // dispatch refuses an index out of the ladder.
+                    if let Some(at) = ctx.preflight.decision.ladder.rung(rung) {
+                        progress.budget.tier = at.tier;
+                    }
                     Ok(Step::Again)
                 }
                 Next::Accept => Err(RunError::Other(
@@ -2395,6 +2443,7 @@ impl<'a> RunEngine<'a> {
                     authority: &preflight.authority,
                     candidate_sha: &candidate.sha,
                     candidate_tier: candidate.tier,
+                    candidate_model: &candidate.model,
                     verification_inputs_changed: &verified.verification_inputs_changed,
                     patch_path: candidate.latest_patch.clone(),
                     deadline: ctx.deadline,
@@ -2473,6 +2522,9 @@ impl<'a> RunEngine<'a> {
                     .map(Recipe::covering_identity),
             ),
             verification_profile_hash: preflight.authority.verification_profile.hash(),
+            review: review_record_of(self.config.ledger, &self.run_id)?,
+            ladder: verify::LadderRecord::Single(preflight.decision.ladder.rungs().to_vec()),
+            efforts_used: self.config.ledger.efforts_used(&self.run_id)?,
         };
         self.seal(
             &receipt,
@@ -2791,6 +2843,9 @@ impl<'a> RunEngine<'a> {
                     .map(Recipe::covering_identity),
             ),
             verification_profile_hash: preflight.authority.verification_profile.hash(),
+            review: review_record_of(self.config.ledger, &self.run_id)?,
+            ladder: verify::LadderRecord::Single(preflight.decision.ladder.rungs().to_vec()),
+            efforts_used: self.config.ledger.efforts_used(&self.run_id)?,
         };
         // No attempt id: this receipt belongs to the run, and the
         // attempt that earned it is not finished — the run is waiting on
@@ -3173,9 +3228,11 @@ impl<'a> RunEngine<'a> {
         request: &ReviewRequest<'_>,
         spend: &mut RunSpend,
     ) -> ReviewOutcome {
-        let Some((reviewer_tier, same_tier)) =
-            reviewer_tier(request.authority, request.candidate_tier)
-        else {
+        let Some((reviewer_tier, same_model)) = reviewer_tier(
+            request.authority,
+            request.candidate_tier,
+            request.candidate_model,
+        ) else {
             return ReviewOutcome::Unavailable(
                 "no reviewer model is configured at any tier".into(),
             );
@@ -3197,18 +3254,19 @@ impl<'a> RunEngine<'a> {
             ));
         };
         // "A separate reviewer" (SPEC §10) is separate in fact, not just
-        // in dispatch: on an escalated run the escalation model wrote
-        // the candidate, and asking it for findings asks it about its
-        // own work. When policy leaves no other tier, the review still
-        // happens — a second opinion from the same model is worth more
-        // than none — but the run records that it was not independent
-        // (audit B14).
-        if same_tier {
+        // in dispatch: when the model that wrote the candidate is the one
+        // reviewing it — an escalated run, or a recipe that put the
+        // escalation model on the worker's tier — asking it for findings
+        // asks it about its own work. The review still happens — a second
+        // opinion from the same model is worth more than none — but the
+        // run records that it was not independent (audit B14).
+        if same_model {
             if let Err(e) = self.transition(
                 State::Verifying,
-                Reason::ReviewerSameTier,
+                Reason::ReviewerSameModel,
                 serde_json::json!({
-                    "reviewer_same_tier": true,
+                    "reviewer_same_model": true,
+                    "model": profile.id,
                     "tier": reviewer_tier.as_str(),
                     "candidate": request.candidate_sha,
                 }),
@@ -3401,6 +3459,7 @@ impl<'a> RunEngine<'a> {
             repairs_used: 0,
             max_repairs: 0,
             tier: reviewer_tier,
+            rung: RungIndex::INITIAL,
             escalation_tier: None,
         };
         // Around the launch, monotonic: the dispatch's own elapsed time.
@@ -3491,6 +3550,10 @@ pub(crate) struct ReviewRequest<'r> {
     /// The tier that WROTE the candidate: the reviewer is a different
     /// one wherever policy configures one (SPEC §10).
     pub(crate) candidate_tier: Tier,
+    /// The model the candidate was dispatched with. Independence is
+    /// decided by it, not by the tier: a recipe can put any allowed
+    /// model on the worker's tier.
+    pub(crate) candidate_model: &'r str,
     /// Test-tree paths the candidate changes, which the reviewer is
     /// asked to judge rather than waive.
     pub(crate) verification_inputs_changed: &'r [String],
@@ -3688,31 +3751,62 @@ pub(crate) fn utc_day_start(now_rfc3339: &str) -> Option<String> {
     )
 }
 
-/// Which tier reviews a candidate written at `candidate_tier`, and
-/// whether that is the candidate's own tier.
+/// The review record a receipt carries, read from the ledger that
+/// recorded the review: none ran, it ran from another model, or the model
+/// that wrote the candidate reviewed it (`Reason::ReviewerSameModel`).
+pub(crate) fn review_record_of(
+    ledger: &crate::ledger::Ledger,
+    run_id: &RunId,
+) -> Result<verify::ReviewRecord, crate::ledger::LedgerError> {
+    if !ledger.review_dispatched(run_id)? {
+        return Ok(verify::ReviewRecord::NoReview);
+    }
+    // Through `Reason::parse`, so a row an older ledger spelled
+    // `reviewer_same_tier` (`Reason::LEGACY_SPELLINGS`) is the same reason.
+    let same_model = ledger
+        .transitions(run_id)?
+        .iter()
+        .any(|transition| Reason::parse(&transition.reason) == Ok(Reason::ReviewerSameModel));
+    Ok(if same_model {
+        verify::ReviewRecord::SameModel
+    } else {
+        verify::ReviewRecord::Independent
+    })
+}
+
+/// Which tier reviews a candidate written at `candidate_tier` with
+/// `candidate_model`, and whether the reviewer's model is the one that
+/// wrote it.
 ///
-/// The strongest OTHER configured tier, so a review is a second opinion
-/// rather than a model re-reading itself (SPEC §10: "a separate
+/// The strongest OTHER configured tier, so a review is usually a second
+/// opinion rather than a model re-reading itself (SPEC §10: "a separate
 /// reviewer"). Only when policy configures no other tier at all does the
-/// candidate's own tier review — the caller records that the review was
-/// not independent (audit B14).
+/// candidate's own tier review. Independence is then read off the models:
+/// a recipe can put any allowed model on the worker's tier, so a
+/// different tier is not a different model — the caller records a review
+/// by the same model as not independent (audit B14).
 pub(crate) fn reviewer_tier(
     authority: &EffectiveAuthority,
     candidate_tier: Tier,
+    candidate_model: &str,
 ) -> Option<(Tier, bool)> {
-    authority
+    let tier = authority
         .models
         .keys()
         .copied()
         .filter(|tier| *tier != candidate_tier)
         .max()
-        .map(|tier| (tier, false))
         .or_else(|| {
             authority
                 .models
                 .contains_key(&candidate_tier)
-                .then_some((candidate_tier, true))
-        })
+                .then_some(candidate_tier)
+        })?;
+    let same_model = authority
+        .models
+        .get(&tier)
+        .is_some_and(|profile| profile.id == candidate_model);
+    Some((tier, same_model))
 }
 
 fn build_prompt(
@@ -4062,6 +4156,7 @@ mod tests {
                         ModelProfile {
                             id: "haiku".into(),
                             effort: None,
+                            max_effort: None,
                         },
                     ),
                     (
@@ -4069,6 +4164,7 @@ mod tests {
                         ModelProfile {
                             id: "sonnet".into(),
                             effort: None,
+                            max_effort: None,
                         },
                     ),
                     (
@@ -4076,6 +4172,7 @@ mod tests {
                         ModelProfile {
                             id: "fable".into(),
                             effort: None,
+                            max_effort: None,
                         },
                     ),
                 ]),
@@ -4086,6 +4183,7 @@ mod tests {
                     allow_nested_agents: false,
                     max_agent_depth: 1,
                     max_agents_total: 24,
+                    repair_effort: Default::default(),
                 },
                 integrations: Default::default(),
                 verification: VerificationPolicy {
@@ -4812,6 +4910,489 @@ mod tests {
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
+    /// Runs the fixture's task under a recipe that names `sonnet@<effort>`
+    /// for the implementation tier, with a catalog whose order and
+    /// supported set are `levels` (authorized up to the last), the harness
+    /// accepting them all. Returns every effort a worker was launched
+    /// with, and the first dispatch intent as the ledger holds it.
+    fn run_under_recipe_effort(
+        effort: &str,
+        levels: &[&str],
+    ) -> (Vec<Option<EffortId>>, serde_json::Value) {
+        use crate::catalog::Fact;
+        use crate::policy::{EffortModelEntry, EffortSettings, RecipeSpec};
+        let fixture = Fixture::new();
+        let mut repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        repo.recipes.push(RecipeSpec {
+            models: Some(BTreeMap::from([(
+                Tier::Implementation,
+                ModelProfile {
+                    id: "sonnet".into(),
+                    effort: EffortId::parse(effort).ok(),
+                    max_effort: None,
+                },
+            )])),
+            ..RecipeSpec::covering("fast", Tier::Implementation)
+        });
+        let levels: Vec<EffortId> = levels
+            .iter()
+            .map(|level| EffortId::parse(level).expect("valid"))
+            .collect();
+        let mut machine = fixture.machine_for(&repo);
+        machine.efforts = EffortSettings {
+            order: Some(levels.clone()),
+            models: vec![EffortModelEntry {
+                ids: vec!["sonnet".into()],
+                supported: Some(levels.clone()),
+                order: None,
+            }],
+        };
+        machine.routing.max_effort = levels.last().cloned().expect("a level");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        let backend = MockBackend::new(move |spec| {
+            record
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(spec.effort.clone());
+            MockOutcome::default()
+        })
+        .accepting(Fact::Known(levels));
+        let outcome = fixture.execute_with_machine(
+            &fixture.contract(Review::Optional),
+            &repo,
+            &machine,
+            &backend,
+        );
+        assert!(
+            !matches!(outcome.terminal, Terminal::Blocked { .. }),
+            "{outcome:?}"
+        );
+        let intent = fixture
+            .ledger
+            .first_dispatch_intent(&outcome.run_id)
+            .expect("the intent reads")
+            .expect("a dispatch was recorded");
+        let launched = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        std::fs::remove_dir_all(&fixture.dir).ok();
+        (launched, intent)
+    }
+
+    /// (a) A covering recipe's `models.implementation = sonnet@high`, with
+    /// a catalog admitting `high`, is what the worker is launched with and
+    /// what the dispatch intent records — read from the route's rung, not
+    /// from the authority table (which names no effort at all).
+    #[test]
+    fn a_covering_recipes_model_and_effort_are_dispatched_and_recorded() {
+        let (launched, intent) = run_under_recipe_effort("high", &["low", "medium", "high", "max"]);
+        assert!(!launched.is_empty(), "a worker was dispatched");
+        assert!(
+            launched
+                .iter()
+                .all(|effort| effort.as_ref().map(EffortId::as_str) == Some("high")),
+            "{launched:?}"
+        );
+        assert_eq!(intent["model"], "sonnet");
+        assert_eq!(intent["effort"], "high");
+    }
+
+    /// (g) An identifier no code names, set by a recipe, routes and is
+    /// dispatched and recorded as itself with no code change.
+    #[test]
+    fn an_unfamiliar_recipe_effort_is_dispatched_as_itself() {
+        let (launched, intent) = run_under_recipe_effort("ultra", &["low", "high", "ultra"]);
+        assert!(
+            launched
+                .iter()
+                .all(|effort| effort.as_ref().map(EffortId::as_str) == Some("ultra")),
+            "{launched:?}"
+        );
+        assert_eq!(intent["effort"], "ultra");
+    }
+
+    /// Whether the machine states the models' effort catalog.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Catalog {
+        Known,
+        Unstated,
+    }
+
+    /// What one run of the ladder worker did.
+    struct LadderRun {
+        outcome: RunOutcome,
+        /// The (model, effort) of every launch, in order.
+        launched: Vec<(String, Option<String>)>,
+        /// The run's first dispatch intent, `null` when none was written.
+        intent: serde_json::Value,
+        /// The first repair attempt's own dispatch intent, `null` when the
+        /// run never repaired.
+        repair_intent: serde_json::Value,
+        attempts: u32,
+    }
+
+    fn launches(pairs: &[(&str, &str)]) -> Vec<(String, Option<String>)> {
+        pairs
+            .iter()
+            .map(|(model, effort)| ((*model).to_string(), Some((*effort).to_string())))
+            .collect()
+    }
+
+    /// Runs a worker that changes nothing on its first attempt, adds a
+    /// note on its second and fixes the task on its third, over a policy
+    /// with sonnet and fable both configured at `medium` and three
+    /// attempts. `Catalog::Known` gives both models the order
+    /// low < medium < high < max and every level; `Catalog::Unstated`
+    /// states no effort fact, and the harness lists the four levels.
+    fn run_ladder(
+        edit_repo: impl FnOnce(&mut RepoPolicy),
+        edit_machine: impl FnOnce(&mut MachineSettings),
+        catalog: Catalog,
+    ) -> LadderRun {
+        use crate::catalog::Fact;
+        use crate::policy::{EffortModelEntry, EffortSettings};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let fixture = Fixture::new();
+        let mut repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        for tier in [Tier::Implementation, Tier::Escalation] {
+            repo.models.get_mut(&tier).expect("the tier").effort = EffortId::parse("medium").ok();
+        }
+        edit_repo(&mut repo);
+        let levels: Vec<EffortId> = ["low", "medium", "high", "max"]
+            .iter()
+            .map(|level| EffortId::parse(level).expect("valid"))
+            .collect();
+        let mut machine = fixture.machine_for(&repo);
+        if catalog == Catalog::Known {
+            machine.efforts = EffortSettings {
+                order: Some(levels.clone()),
+                models: vec![EffortModelEntry {
+                    ids: vec!["sonnet".into(), "fable".into()],
+                    supported: Some(levels.clone()),
+                    order: None,
+                }],
+            };
+            machine.routing.max_effort = levels.last().cloned().expect("a level");
+        }
+        edit_machine(&mut machine);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        let count = AtomicUsize::new(0);
+        let backend = MockBackend::new(move |spec| {
+            record.lock().unwrap_or_else(|e| e.into_inner()).push((
+                spec.model.clone(),
+                spec.effort
+                    .as_ref()
+                    .map(|effort| effort.as_str().to_string()),
+            ));
+            match count.fetch_add(1, Ordering::SeqCst) {
+                0 => {}
+                1 => std::fs::write(spec.work_dir.join("src/notes.txt"), "investigation\n")
+                    .expect("write"),
+                _ => {
+                    std::fs::remove_file(spec.work_dir.join("src/main.rs")).ok();
+                }
+            }
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        })
+        .accepting(Fact::Known(levels));
+        let outcome = fixture.execute_with_machine(
+            &fixture.contract(Review::Optional),
+            &repo,
+            &machine,
+            &backend,
+        );
+        let intent = fixture
+            .ledger
+            .first_dispatch_intent(&outcome.run_id)
+            .expect("the intent reads")
+            .unwrap_or(serde_json::Value::Null);
+        let attempts = fixture
+            .ledger
+            .attempt_count(&outcome.run_id)
+            .expect("attempts count") as u32;
+        let launched = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        // The repair attempt's OWN intent: the ledger has no reader for a
+        // later dispatch, so read the row from a second connection.
+        let repair_intent = rusqlite::Connection::open(fixture.dir.join("ledger.sqlite"))
+            .expect("the ledger opens")
+            .query_row(
+                "SELECT intent_json FROM dispatches
+                 WHERE run_id = ?1 AND json_extract(intent_json, '$.kind') = 'repair'
+                 ORDER BY rowid LIMIT 1",
+                [outcome.run_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or(serde_json::Value::Null);
+        std::fs::remove_dir_all(&fixture.dir).ok();
+        LadderRun {
+            outcome,
+            launched,
+            intent,
+            repair_intent,
+            attempts,
+        }
+    }
+
+    /// (a) A failing-then-passing run under `raise` with a known catalog:
+    /// the repair is launched at the next admissible effort, the escalation
+    /// at its own tier's configured effort, and the first dispatch intent
+    /// and the receipt both carry the whole resolved ladder.
+    ///
+    /// FALSIFIED: with the repair kept at the initial effort, the launches
+    /// read `sonnet@medium` twice and this failed at the first assertion;
+    /// restored.
+    #[test]
+    fn a_repair_is_dispatched_at_the_ladders_next_effort() {
+        let run = run_ladder(|_| {}, |_| {}, Catalog::Known);
+        let Terminal::Accepted(receipt) = &run.outcome.terminal else {
+            panic!("expected acceptance, got {:?}", run.outcome);
+        };
+        assert_eq!(
+            run.launched,
+            launches(&[
+                ("sonnet", "medium"),
+                ("sonnet", "high"),
+                ("fable", "medium")
+            ])
+        );
+        let rungs = run.intent["ladder"]["rungs"].as_array().expect("a ladder");
+        let efforts: Vec<&str> = rungs
+            .iter()
+            .map(|rung| rung["effort"]["explicit"].as_str().expect("an effort"))
+            .collect();
+        assert_eq!(efforts, ["medium", "high", "medium"]);
+        assert_eq!(run.intent["rung"], 0);
+        // The repair's own intent, not only the ladder on the first one.
+        assert_eq!(run.repair_intent["rung"], 1);
+        assert_eq!(run.repair_intent["model"], "sonnet");
+        assert_eq!(run.repair_intent["effort"], "high");
+        let verify::LadderRecord::Single(recorded) = &receipt.ladder else {
+            panic!(
+                "a single run records its own ladder, got {:?}",
+                receipt.ladder
+            );
+        };
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(
+            recorded[1].effort,
+            crate::route::EffortRequest::Explicit(EffortId::parse("high").expect("valid"))
+        );
+        // The receipt names the efforts the attempts requested, first use
+        // first: the initial attempt and the repair, each once.
+        assert_eq!(receipt.efforts_used, ["medium", "high"]);
+    }
+
+    /// (d) `repair_effort = "same"` is today's exact sequence: every
+    /// attempt at its tier's configured effort.
+    #[test]
+    fn same_dispatches_today_s_sequence() {
+        let run = run_ladder(
+            |repo| repo.execution.repair_effort = crate::policy::RepairEffort::Same,
+            |_| {},
+            Catalog::Known,
+        );
+        assert!(
+            matches!(run.outcome.terminal, Terminal::Accepted(_)),
+            "{:?}",
+            run.outcome
+        );
+        assert_eq!(
+            run.launched,
+            launches(&[
+                ("sonnet", "medium"),
+                ("sonnet", "medium"),
+                ("fable", "medium")
+            ])
+        );
+    }
+
+    /// (e) With no catalog configured, `raise` holds the repair effort:
+    /// today's exact sequence, and nothing is blocked.
+    #[test]
+    fn an_unknown_catalog_dispatches_today_s_sequence_under_raise() {
+        let run = run_ladder(|_| {}, |_| {}, Catalog::Unstated);
+        assert!(
+            matches!(run.outcome.terminal, Terminal::Accepted(_)),
+            "{:?}",
+            run.outcome
+        );
+        assert_eq!(
+            run.launched,
+            launches(&[
+                ("sonnet", "medium"),
+                ("sonnet", "medium"),
+                ("fable", "medium")
+            ])
+        );
+    }
+
+    /// (c) At the ceiling, two repairs are both dispatched at the
+    /// ceiling: never without an effort.
+    #[test]
+    fn two_repairs_at_the_ceiling_are_both_dispatched_at_it() {
+        let run = run_ladder(
+            |repo| {
+                repo.execution.max_repairs_before_escalation = 2;
+                repo.models
+                    .get_mut(&Tier::Implementation)
+                    .expect("the tier")
+                    .effort = EffortId::parse("max").ok();
+            },
+            |_| {},
+            Catalog::Known,
+        );
+        assert!(
+            matches!(run.outcome.terminal, Terminal::Accepted(_)),
+            "{:?}",
+            run.outcome
+        );
+        assert_eq!(
+            run.launched,
+            launches(&[("sonnet", "max"), ("sonnet", "max"), ("sonnet", "max")])
+        );
+    }
+
+    fn floor_high_over_src() -> crate::policy::RiskRule {
+        crate::policy::RiskRule {
+            paths: vec!["src/**".into()],
+            minimum_tier: Tier::Implementation,
+            review: None,
+            minimum_effort: EffortId::parse("high").ok(),
+        }
+    }
+
+    /// (f) A `high` floor with the escalation tier configured at `medium`:
+    /// the escalation is launched at `high`.
+    #[test]
+    fn an_escalation_under_a_floor_is_dispatched_at_the_floor() {
+        let run = run_ladder(
+            |repo| repo.risk.push(floor_high_over_src()),
+            |_| {},
+            Catalog::Known,
+        );
+        assert!(
+            matches!(run.outcome.terminal, Terminal::Accepted(_)),
+            "{:?}",
+            run.outcome
+        );
+        assert_eq!(
+            run.launched,
+            launches(&[("sonnet", "high"), ("sonnet", "max"), ("fable", "high")])
+        );
+    }
+
+    /// (g) A floor above the escalation tier's ceiling alone blocks the
+    /// run before attempt 1: nothing launched, no attempt, no usage row.
+    #[test]
+    fn a_floor_above_the_escalation_ceiling_blocks_before_any_attempt() {
+        let run = run_ladder(
+            |repo| {
+                repo.risk.push(floor_high_over_src());
+                repo.models
+                    .get_mut(&Tier::Escalation)
+                    .expect("the tier")
+                    .max_effort = EffortId::parse("medium").ok();
+            },
+            |_| {},
+            Catalog::Known,
+        );
+        assert!(
+            matches!(
+                run.outcome.terminal,
+                Terminal::Blocked {
+                    code: BlockCode::EffortAboveCap,
+                    ..
+                }
+            ),
+            "{:?}",
+            run.outcome
+        );
+        assert!(run.launched.is_empty(), "{:?}", run.launched);
+        assert_eq!(run.attempts, 0);
+    }
+
+    /// (h) A machine `allowed_models` that removes the escalation model:
+    /// the ladder has no escalation rung, nothing else is dispatched, and
+    /// the run ends after its repair (the failure also fails at the base,
+    /// so it is a decision, not an escalation) rather than substituting a
+    /// model.
+    #[test]
+    fn a_removed_escalation_model_is_never_dispatched_or_replaced() {
+        let run = run_ladder(
+            |_| {},
+            |machine| machine.allowed_models = Some(vec!["haiku".into(), "sonnet".into()]),
+            Catalog::Known,
+        );
+        assert!(
+            matches!(
+                run.outcome.terminal,
+                Terminal::NeedsDecision {
+                    reason: Reason::BaselineFailureNotWaived,
+                    ..
+                }
+            ),
+            "{:?}",
+            run.outcome
+        );
+        assert_eq!(
+            run.launched,
+            launches(&[("sonnet", "medium"), ("sonnet", "high")])
+        );
+        assert_eq!(run.attempts, 2);
+    }
+
+    /// An attempt budget that ends on the last repair leaves the ladder no
+    /// escalation rung, and the run must still end as it did before the
+    /// ladder: the machine decides an escalation (the policy authorizes
+    /// one) and the attempt ceiling ends the run before that rung is read —
+    /// `BudgetExhausted` on the attempt limit, not `RepairExhausted` or a
+    /// baseline decision at the last repair. Pinned under both repair
+    /// policies.
+    ///
+    /// FALSIFIED: with `Budget.escalation_tier` taken from the ladder's
+    /// escalation rung again, both runs stopped at once with
+    /// `NeedsDecision/BaselineFailureNotWaived` and this failed; restored.
+    #[test]
+    fn a_budget_ending_on_the_last_repair_ends_on_the_attempt_limit() {
+        use crate::policy::RepairEffort;
+        for (repair_effort, second) in [
+            (RepairEffort::Same, ("sonnet", "medium")),
+            (RepairEffort::Raise, ("sonnet", "high")),
+        ] {
+            let run = run_ladder(
+                |repo| {
+                    repo.execution.max_attempts = 2;
+                    repo.execution.repair_effort = repair_effort;
+                },
+                |_| {},
+                Catalog::Known,
+            );
+            let Terminal::BudgetExhausted { detail } = &run.outcome.terminal else {
+                panic!(
+                    "{repair_effort:?}: expected the attempt limit, got {:?}",
+                    run.outcome
+                );
+            };
+            assert!(
+                detail.contains("attempt ceiling reached (2)"),
+                "{repair_effort:?}: {detail}"
+            );
+            assert_eq!(
+                run.launched,
+                launches(&[("sonnet", "medium"), second]),
+                "{repair_effort:?}"
+            );
+            assert_eq!(run.attempts, 2, "{repair_effort:?}");
+        }
+    }
+
     #[test]
     fn missing_terminal_result_is_interrupted_with_worktree_preserved() {
         let fixture = Fixture::new();
@@ -5115,6 +5696,7 @@ mod tests {
             paths: vec!["src/**".into()],
             minimum_tier: Tier::Escalation,
             review: Some(Review::Required),
+            minimum_effort: None,
         });
         let reviewers = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let seen = Arc::clone(&reviewers);
@@ -5144,6 +5726,7 @@ mod tests {
             panic!("expected acceptance, got {outcome:?}");
         };
         assert_eq!(receipt.models_used, vec!["fable".to_string()], "escalated");
+        assert_eq!(receipt.review, verify::ReviewRecord::Independent);
         assert_eq!(
             *reviewers.lock().unwrap(),
             vec!["sonnet".to_string()],
@@ -5157,8 +5740,8 @@ mod tests {
             .map(|t| t.reason)
             .collect();
         assert!(
-            !reasons.contains(&Reason::ReviewerSameTier.as_str().to_string()),
-            "an independent review is not recorded as a same-tier one"
+            !reasons.contains(&Reason::ReviewerSameModel.as_str().to_string()),
+            "an independent review is not recorded as a same-model one"
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
@@ -5167,7 +5750,7 @@ mod tests {
     /// review still happens — and the run records that it was not
     /// independent, rather than implying it was.
     #[test]
-    fn a_single_tier_policy_reviews_with_the_same_tier_and_says_so() {
+    fn a_single_tier_policy_reviews_with_the_same_model_and_says_so() {
         let fixture = Fixture::new();
         let mut repo = fixture.repo_policy(vec![main_gone_check()], 3);
         repo.models.retain(|tier, _| *tier == Tier::Implementation);
@@ -5199,19 +5782,151 @@ mod tests {
             panic!("expected acceptance, got {outcome:?}");
         };
         assert_eq!(*reviewers.lock().unwrap(), vec!["sonnet".to_string()]);
-        let same_tier = fixture
+        let same_model = fixture
             .ledger
             .transitions(&run_id)
             .expect("transitions")
             .into_iter()
-            .find(|t| t.reason == Reason::ReviewerSameTier.as_str())
-            .expect("the run records that the reviewer was the author's tier");
+            .find(|t| t.reason == Reason::ReviewerSameModel.as_str())
+            .expect("the run records that the reviewer was the author's model");
         assert_eq!(
-            same_tier
+            same_model
                 .detail
                 .as_ref()
-                .and_then(|d| d.get("reviewer_same_tier")),
+                .and_then(|d| d.get("reviewer_same_model")),
             Some(&serde_json::json!(true))
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A recipe can put the escalation tier's model on the worker's own
+    /// tier. The reviewer is then a different TIER running the SAME
+    /// model, and the run says so: independence is the model's.
+    #[test]
+    fn a_recipe_that_puts_the_escalation_model_on_the_worker_is_a_same_model_review() {
+        use crate::policy::RecipeSpec;
+        let fixture = Fixture::new();
+        let mut repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let escalation = repo.models[&Tier::Escalation].clone();
+        repo.recipes.push(RecipeSpec {
+            models: Some(BTreeMap::from([(Tier::Implementation, escalation.clone())])),
+            ..RecipeSpec::covering("borrowed", Tier::Implementation)
+        });
+        let launched = Arc::new(std::sync::Mutex::new(Vec::<(bool, String)>::new()));
+        let seen = Arc::clone(&launched);
+        let backend = MockBackend::new(move |spec| {
+            let reviewing = spec.prompt.contains("semantic reviewer");
+            seen.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((reviewing, spec.model.clone()));
+            if reviewing {
+                return MockOutcome {
+                    result_text: Some("FINDINGS: none".into()),
+                    exit_code: Some(0),
+                    ..Default::default()
+                };
+            }
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Accepted(receipt),
+        } = outcome
+        else {
+            panic!("expected acceptance, got {outcome:?}");
+        };
+        // The receipt says so too, in the copy returned AND the one the
+        // ledger stored, so the ledger and the receipt cannot disagree.
+        // Falsified: with `review_record_of` answering `Independent`
+        // regardless, both assertions failed; restored.
+        assert_eq!(receipt.review, verify::ReviewRecord::SameModel);
+        let (stored, _) = fixture
+            .ledger
+            .receipt(&run_id)
+            .expect("receipt read")
+            .expect("receipt stored");
+        assert_eq!(stored["review"], "same_model", "{stored}");
+        let launched = launched.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let model_of = |reviewing: bool| {
+            launched
+                .iter()
+                .find(|(is_review, _)| *is_review == reviewing)
+                .map(|(_, model)| model.clone())
+                .expect("the dispatch happened")
+        };
+        assert_eq!(
+            model_of(false),
+            escalation.id,
+            "the recipe's model wrote it"
+        );
+        assert_eq!(
+            model_of(true),
+            model_of(false),
+            "and the same model reviewed"
+        );
+        assert!(
+            fixture
+                .ledger
+                .transitions(&run_id)
+                .expect("transitions")
+                .iter()
+                .any(|t| t.reason == Reason::ReviewerSameModel.as_str()),
+            "the run records that the review was not independent"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A ledger written before `reviewer_same_tier` was renamed still says
+    /// the review was not independent: the record is read through
+    /// `Reason::parse`, which honours `Reason::LEGACY_SPELLINGS`, not by
+    /// comparing the stored text with the current spelling.
+    ///
+    /// Falsified: with the comparison back on `Reason::as_str()` this
+    /// answered `Independent`; restored.
+    #[test]
+    fn a_legacy_spelled_same_model_transition_is_a_same_model_review() {
+        let fixture = Fixture::new();
+        let run = RunId::from_stored("legacy-run");
+        let task = crate::ids::TaskId::from_stored("legacy-task");
+        fixture
+            .ledger
+            .insert_run(&run, "/repo", None, &task, "rk")
+            .expect("run row");
+        fixture
+            .ledger
+            .record_dispatch_intent(
+                &DispatchId::from_stored("legacy-review"),
+                &run,
+                None,
+                &serde_json::json!({ "kind": "review" }),
+                0,
+                RoutedBy::ConservativeBaseline,
+            )
+            .expect("review dispatch row");
+        let (legacy, renamed_to) = Reason::LEGACY_SPELLINGS[0];
+        assert_eq!(renamed_to, Reason::ReviewerSameModel);
+        fixture
+            .ledger
+            .record_transition(&crate::ledger::Transition {
+                run_id: run.clone(),
+                attempt_id: None,
+                from_state: None,
+                to_state: State::Verifying,
+                reason: legacy.to_string(),
+                detail: None,
+                at: "2026-01-01T00:00:00Z".into(),
+            })
+            .expect("transition row");
+        assert_eq!(
+            review_record_of(&fixture.ledger, &run).expect("review record"),
+            verify::ReviewRecord::SameModel
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
@@ -5367,6 +6082,7 @@ mod tests {
             paths: vec!["src/trust/**".into()],
             minimum_tier: Tier::Escalation,
             review: None,
+            minimum_effort: None,
         });
         let backend = MockBackend::new(|spec| {
             if spec.prompt.contains("semantic reviewer") {
@@ -7155,6 +7871,61 @@ mod tests {
         })
     }
 
+    /// A decomposed run's receipt records what its packages ran: each
+    /// package's own ladder, as its first dispatch intent carried it. The
+    /// root's `max_attempts = 3` would reach an escalation rung; the
+    /// packages' `attempts_per_package = 2` do not, and the root dispatches
+    /// no worker at all.
+    ///
+    /// FALSIFIED: with the root's ladder recorded again, the receipt was
+    /// not `PerPackage` and this failed at the first assertion; restored.
+    #[test]
+    fn a_decomposed_receipt_records_each_packages_own_ladder() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = package_worker(Arc::clone(&launches));
+        let mut plan = plan_json(false);
+        plan["limits"]["attempts_per_package"] = serde_json::json!(2);
+        let contract = decomposed_contract(&fixture, plan);
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Accepted(receipt),
+        } = outcome
+        else {
+            panic!("expected acceptance, got {outcome:?}");
+        };
+        let verify::LadderRecord::PerPackage(recorded) = &receipt.ladder else {
+            panic!(
+                "a decomposed run records its packages' ladders, got {:?}",
+                receipt.ladder
+            );
+        };
+        let children = fixture.ledger.child_runs(&run_id).expect("children");
+        assert_eq!(
+            recorded.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        for child in &children {
+            let intent = fixture
+                .ledger
+                .first_dispatch_intent(&child.run)
+                .expect("the intent reads")
+                .expect("the package dispatched");
+            let rungs = &recorded[child.package.as_str()];
+            assert_eq!(
+                intent["ladder"]["rungs"],
+                serde_json::to_value(rungs).expect("rungs serialize"),
+                "package {} records the ladder it dispatched",
+                child.package
+            );
+            assert_eq!(rungs.len(), 2, "the package budget has no escalation rung");
+            assert!(rungs.iter().all(|rung| rung.model != "fable"), "{rungs:?}");
+        }
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
     #[test]
     fn decomposed_change_assembles_packages_and_verifies_the_integrated_candidate() {
         let fixture = Fixture::new();
@@ -8300,6 +9071,7 @@ mod tests {
             paths: vec!["src/c/**".into()],
             minimum_tier: Tier::Implementation,
             review: Some(Review::Required),
+            minimum_effort: None,
         }];
         repo
     }

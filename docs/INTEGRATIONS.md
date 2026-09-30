@@ -458,6 +458,67 @@ paste. `relais doctor --effort-template` prints just that block. The CLI
 list is filled in from `--help`; the model-support and order lines are
 comments for you to confirm, not assertions.
 
+### Floors and ceilings in relais.toml
+
+Two optional keys in `relais.toml` put effort under the router's control.
+Both read positions in the catalog's order, and neither moves an existing
+policy's authority hash when absent.
+
+- `minimum_effort` on a `[[risk]]` rule: the lowest effort a task touching
+  the rule's `paths` may be dispatched at. A floor always binds: the rung's
+  effort becomes the higher of its own and the floor, and a model that
+  cannot satisfy it (no effort control, or an unknown catalog) blocks the
+  route (exit 3), naming the floor, the model and its admissible set.
+- `max_effort` on a `[models.<tier>]` profile: the highest effort that tier
+  may ever be dispatched at. Without it the ceiling is the top of the
+  model's admissible set. It is read from the repository policy only; a
+  recipe's own effort, or a candidate's, can be lower and never moves it.
+  An effort above the ceiling is blocked as `effort_above_cap`, never
+  lowered.
+
+```toml
+[[risk]]
+paths = ["**/trust/**"]
+minimum_tier = "escalation"
+minimum_effort = "high"
+
+[models.implementation]
+id = "sonnet"
+effort = "medium"
+max_effort = "high"
+```
+
+With the catalog unknown for a model, only the configured `effort` runs; an
+effort a recipe or a floor changed is blocked until `[efforts] order` and
+`[[efforts.models]] supported` are set for that model.
+
+### Repairs and escalations: `repair_effort`
+
+`route()` resolves an effort for every attempt the budget can reach (the
+ladder, printed one rung per line by `relais plan`). One optional key in
+`relais.toml` says how a repair's effort follows the attempt it repairs:
+
+```toml
+[execution]
+repair_effort = "raise"   # default; or "same"
+```
+
+- `raise` steps the effort to the next admissible one in the model's order
+  and stays at the tier's ceiling once there; it never drops the effort.
+- `same` keeps the previous attempt's effort: the sequence before the
+  ladder existed.
+
+An escalation runs the escalation tier at its configured effort, raised to a
+risk floor when one applies, and every rung is checked against the same
+sets and ceilings as the first. When a model's catalog is unknown, `raise`
+holds the effort (as `same`) for that model. `relais plan` says `repair
+effort held: effort order unknown for <model>` for the models this run's
+ladder holds; `relais doctor`, with no task or budget, says `repair effort
+would be held (effort order unknown) for: <models>` for every model a repair
+could run at;
+set `[efforts] order` and `[[efforts.models]] supported` to let it climb.
+Leaving the key out keeps the authority hash of a policy that never named it.
+
 The adapter never drops an effort. A dispatch that requests one the CLI is
 known not to accept (no `--effort`, or a listed set without it) stops with
 `EffortUnsupported { effort, model, harness_version }` and the run is

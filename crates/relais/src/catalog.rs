@@ -279,6 +279,85 @@ impl EffortCatalog {
             .find(|entry| set.contains(entry))
             .cloned()
     }
+
+    /// Where `effort` sits in the configured order, lowest first; `None`
+    /// when the order is unknown or does not name it.
+    pub fn position(&self, effort: &EffortId) -> Option<usize> {
+        let Fact::Known(order) = &self.order else {
+            return None;
+        };
+        order.iter().position(|entry| entry == effort)
+    }
+
+    /// The highest of `efforts` in the configured order. `None` for an
+    /// empty list; `Err` naming the first effort the order cannot place,
+    /// because a floor that cannot be ranked is not a floor that was met.
+    pub fn highest(&self, efforts: &[EffortId]) -> Result<Option<EffortId>, EffortId> {
+        let mut best: Option<(usize, &EffortId)> = None;
+        for effort in efforts {
+            let at = self.position(effort).ok_or_else(|| effort.clone())?;
+            if best.is_none_or(|(held, _)| at > held) {
+                best = Some((at, effort));
+            }
+        }
+        Ok(best.map(|(_, effort)| effort.clone()))
+    }
+
+    /// The top of the admissible set; `None` when it is empty or not
+    /// decidable.
+    pub fn top(&self) -> Option<EffortId> {
+        match self.admissible() {
+            Admissible::Set(set) => set.last().cloned(),
+            Admissible::Undetermined(_) => None,
+        }
+    }
+}
+
+/// The resolved catalog of every model in play for one decision: the
+/// authority tiers' models and the covering recipe's. Computed by the
+/// caller from the harness probe and machine.toml and handed to the router,
+/// which stays pure. A model with no catalog here is a model whose facts
+/// are all unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EffortCatalogs {
+    catalogs: Vec<EffortCatalog>,
+}
+
+impl EffortCatalogs {
+    /// The catalog of each of `models` (duplicates resolved once) under
+    /// what the harness accepts and machine.toml states.
+    pub fn resolve_all<'m>(
+        cli: &EffortSet,
+        settings: &EffortSettings,
+        max_effort: &EffortId,
+        models: impl IntoIterator<Item = &'m str>,
+    ) -> Self {
+        let mut resolved = Self::default();
+        for model in models {
+            if resolved.get(model).is_none() {
+                resolved
+                    .catalogs
+                    .push(resolve(cli, settings, max_effort, model));
+            }
+        }
+        resolved
+    }
+
+    /// The catalog for `model`, matched like machine.toml's entries:
+    /// trimmed and case-insensitive.
+    pub fn get(&self, model: &str) -> Option<&EffortCatalog> {
+        self.catalogs
+            .iter()
+            .find(|catalog| catalog.model.trim().eq_ignore_ascii_case(model.trim()))
+    }
+
+    /// Add one catalog, replacing a resolved one for the same model.
+    pub fn with(mut self, catalog: EffortCatalog) -> Self {
+        self.catalogs
+            .retain(|held| !held.model.trim().eq_ignore_ascii_case(catalog.model.trim()));
+        self.catalogs.push(catalog);
+        self
+    }
 }
 
 #[cfg(test)]

@@ -10,7 +10,11 @@
 //! cohort. Savings are reported as measured comparisons only; nothing
 //! here converts token savings into subscription fee savings.
 
+mod repairs;
+
 use serde::Serialize;
+
+pub use repairs::{EffortRepairs, RepairCost};
 
 use crate::ledger::{DecisionRecord, Ledger, PhaseCost, TaskOrigin};
 use crate::lifecycle::{Reason, RunPurpose, State};
@@ -58,8 +62,9 @@ fn accepted_by_person(
 /// (this task added `enforcement`, the same summary `relais coordinator
 /// status` prints, so its JSON agrees with the sentence a person sees),
 /// so a downstream parser can tell an old shape from a new one instead of
-/// guessing from key presence. 9: `never_shipped_tasks`.
-pub const REPORT_SCHEMA_VERSION: u32 = 9;
+/// guessing from key presence. 9: `never_shipped_tasks`. 10:
+/// `repair_outcomes`.
+pub const REPORT_SCHEMA_VERSION: u32 = 10;
 
 /// A dimension `relais report --by` groups the window's tasks over (SPEC
 /// §11: "compare like task classes and policy versions"). Total over the
@@ -76,6 +81,9 @@ pub enum Dimension {
     /// The routing recipe revision that routed the task's first worker
     /// dispatch (SPEC §11): observational, never a comparison.
     Recipe,
+    /// The effort the task's first run's first worker attempt REQUESTED
+    /// (SPEC §11), through the ledger's one reader of it.
+    Effort,
 }
 
 impl Dimension {
@@ -87,6 +95,7 @@ impl Dimension {
             Self::Policy => "policy",
             Self::Repository => "repository",
             Self::Recipe => "recipe",
+            Self::Effort => "effort",
         }
     }
 }
@@ -314,6 +323,10 @@ fn cohort_key(
                 Some(RunPurpose::Replay) | None => label,
             }
         }
+        Dimension::Effort => match ledger.worker_attempts(&task_row.first_run)?.first() {
+            Some(attempt) => ledger.requested_effort(attempt.id)?,
+            None => UNKNOWN.to_string(),
+        },
     })
 }
 
@@ -377,7 +390,8 @@ fn cohort_runs(
         | Dimension::Tier
         | Dimension::Model
         | Dimension::Policy
-        | Dimension::Repository => Ok(runs.to_vec()),
+        | Dimension::Repository
+        | Dimension::Effort => Ok(runs.to_vec()),
     }
 }
 
@@ -558,6 +572,11 @@ pub struct Report {
     /// Present only when `--by <dimension>` was given; the default report
     /// is unchanged when it is absent.
     pub cohorts: Option<CohortReport>,
+    /// Every repair attempt of the window's runs, one entry per effort it
+    /// REQUESTED: how the repair's own verification ended, what it cost, and
+    /// — apart from that — how its run eventually ended. Empty when the
+    /// window has no repair; present in every report, `--by` or not.
+    pub repair_outcomes: Vec<EffortRepairs>,
     /// The same enforcement summary `relais coordinator status` prints,
     /// carried as structured data (SPEC §23) so a later tool reading this
     /// report's JSON is never told something the coordinator disagrees
@@ -651,6 +670,9 @@ pub fn runs_report(
     by: Option<Dimension>,
 ) -> Result<Report, crate::ledger::LedgerError> {
     let mut runs = Vec::new();
+    // The window's runs with the status each ended in: what the repair
+    // section attributes a repair's run to.
+    let mut window_runs: Vec<(crate::ids::RunId, State)> = Vec::new();
     // One pass over the window's outcomes instead of a `latest_outcome`
     // per accepted run: the rows are ordered oldest first, so the last
     // one written for a task is the one that stands. A task with no row
@@ -696,6 +718,7 @@ pub fn runs_report(
                 }
             }
         }
+        window_runs.push((run_id.clone(), status));
         runs.push(RunLine {
             run_id: run_id.to_string(),
             status,
@@ -872,6 +895,7 @@ pub fn runs_report(
         None
     };
     let observational = recipe_view.then(|| RECIPE_OBSERVATIONAL_NOTE.to_string());
+    let repair_outcomes = repairs::repair_outcomes(ledger, &window_runs)?;
     let accepted_tasks = tasks.iter().filter(|task| task.accepted).count();
     let accepted_tasks_by_person = tasks
         .iter()
@@ -946,6 +970,7 @@ pub fn runs_report(
         backfilled_tasks,
         open_decisions,
         cohorts,
+        repair_outcomes,
         enforcement: EnforcementReport::observed(),
         orchestration,
         cost_per_accepted_task_with_orchestration,
@@ -964,6 +989,7 @@ impl Report {
         out.push('\n');
         if self.runs.is_empty() {
             out.push_str("no runs recorded in this window\n");
+            self.push_repair_lines(&mut out);
             self.push_recipe_lines(&mut out);
             self.push_orchestration_lines(&mut out);
             return out;
@@ -1158,6 +1184,7 @@ impl Report {
                 ));
             }
         }
+        self.push_repair_lines(&mut out);
         self.push_recipe_lines(&mut out);
         out.push('\n');
         self.push_orchestration_lines(&mut out);
@@ -1165,6 +1192,20 @@ impl Report {
         out.push_str(&self.enforcement.sentence);
         out.push('\n');
         out
+    }
+
+    /// The repair section, on every render: one block per requested effort,
+    /// the repairs' own verification kept apart from how their runs ended.
+    fn push_repair_lines(&self, out: &mut String) {
+        out.push('\n');
+        if self.repair_outcomes.is_empty() {
+            out.push_str("repairs by requested effort: none in this window\n");
+            return;
+        }
+        out.push_str("repairs by requested effort:\n");
+        for effort in &self.repair_outcomes {
+            out.push_str(&effort.render());
+        }
     }
 
     /// The `--by recipe` footer, on every such render — including the
@@ -1547,6 +1588,7 @@ mod tests {
     }
 
     use crate::ledger::{now_rfc3339, Transition};
+    use crate::lifecycle::UsagePhase;
 
     /// A test directory nobody else can collide with, pre-cleaned so a
     /// crashed earlier run cannot decide this one. The pid alone is not
@@ -1608,6 +1650,7 @@ mod tests {
             backfilled_tasks: 0,
             open_decisions: vec![],
             cohorts: None,
+            repair_outcomes: Vec::new(),
             trial_spend: None,
             observational: None,
             enforcement: EnforcementReport::observed(),
@@ -1827,6 +1870,7 @@ mod tests {
                 "orchestration",
                 "pending_decisions",
                 "pending_feedback",
+                "repair_outcomes",
                 "runs",
                 "schema_version",
                 "since",
@@ -2858,6 +2902,665 @@ mod tests {
             "{}",
             report.render()
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- requested effort (P5) ----
+
+    /// One worker attempt as the runner records it: the attempt row, the
+    /// dispatch intent keyed to it, and — when given — one usage row.
+    struct AttemptSpec<'a> {
+        phase: UsagePhase,
+        intent: serde_json::Value,
+        /// `(cost, requested_effort)` of the attempt's usage row.
+        usage: Option<(Option<i64>, Option<&'a str>)>,
+    }
+
+    fn attempt_of(phase: UsagePhase, effort: &str, cost: Option<i64>) -> AttemptSpec<'_> {
+        AttemptSpec {
+            phase,
+            intent: serde_json::json!({ "effort": effort }),
+            usage: cost.map(|cost| (Some(cost), None)),
+        }
+    }
+
+    /// Record `spec` as attempt `index` of `run`; returns the attempt id.
+    fn record_attempt(
+        ledger: &Ledger,
+        run: &crate::ids::RunId,
+        index: i64,
+        spec: &AttemptSpec,
+    ) -> i64 {
+        let attempt_id = ledger
+            .insert_attempt(run, 1, index, "implementation", spec.phase)
+            .expect("attempt");
+        ledger
+            .record_dispatch_intent(
+                &crate::ids::DispatchId::from_stored(format!("d-{}-{index}", run.as_str())),
+                run,
+                Some(attempt_id),
+                &spec.intent,
+                0,
+                RoutedBy::ConservativeBaseline,
+            )
+            .expect("dispatch");
+        if let Some((cost, requested_effort)) = spec.usage {
+            ledger
+                .record_usage(&crate::ledger::UsageEvent {
+                    event_id: format!("e-{}-{index}", run.as_str()),
+                    run_id: run.clone(),
+                    attempt_id: Some(attempt_id),
+                    parent_event_id: None,
+                    model: Some("sonnet".into()),
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    cost: cost.map(MicroUsd::from_micros),
+                    cost_kind: crate::money::CostKind::ApiSpend,
+                    completeness: CostCompleteness::Actual,
+                    inclusive: false,
+                    at: now_rfc3339(),
+                    phase: Some(spec.phase),
+                    duration_ms: None,
+                    requested_model: None,
+                    requested_effort: requested_effort.map(String::from),
+                    harness: None,
+                })
+                .expect("usage");
+        }
+        attempt_id
+    }
+
+    fn new_run(ledger: &Ledger, run_id: &str) -> crate::ids::RunId {
+        let run = crate::ids::RunId::from_stored(run_id);
+        let task = crate::ids::TaskId::from_stored(format!("task-{run_id}"));
+        ledger
+            .insert_run(&run, "/repo", None, &task, "rk")
+            .expect("run");
+        run
+    }
+
+    fn go(ledger: &Ledger, run: &crate::ids::RunId, to_state: State, reason: &str) {
+        ledger
+            .record_transition(&Transition {
+                run_id: run.clone(),
+                attempt_id: None,
+                from_state: None,
+                to_state,
+                reason: reason.into(),
+                detail: None,
+                at: now_rfc3339(),
+            })
+            .expect("transition");
+    }
+
+    const SINCE: &str = "2000-01-01T00:00:00+00:00";
+
+    /// An effort id the report has never heard of forms its own cohort, and
+    /// a task that recorded no effort — or no attempt — lands in `unknown`.
+    /// Nothing in the report names an effort, so `ultra` needs no code.
+    #[test]
+    fn an_unfamiliar_effort_gets_its_own_cohort_and_a_task_with_none_is_unknown() {
+        let dir = temp_dir("effort-cohorts");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let ultra = new_run(&ledger, "run-ultra");
+        record_attempt(
+            &ledger,
+            &ultra,
+            1,
+            &attempt_of(UsagePhase::Initial, "ultra", Some(10)),
+        );
+        // A repair of the same first run asked for something else: the
+        // cohort is the FIRST worker attempt's.
+        record_attempt(
+            &ledger,
+            &ultra,
+            2,
+            &attempt_of(UsagePhase::Repair, "other", Some(10)),
+        );
+        let silent = new_run(&ledger, "run-silent");
+        record_attempt(
+            &ledger,
+            &silent,
+            1,
+            &AttemptSpec {
+                phase: UsagePhase::Initial,
+                intent: serde_json::json!({ "model": "sonnet" }),
+                usage: Some((Some(10), None)),
+            },
+        );
+        new_run(&ledger, "run-undispatched");
+        let report = runs_report(&ledger, SINCE, Some(Dimension::Effort)).expect("report");
+        let cohorts = &report.cohorts.as_ref().expect("cohorts").cohorts;
+        assert_eq!(cohorts.len(), 2, "{cohorts:?}");
+        assert_eq!(cohort(&report, "ultra").tasks, 1);
+        assert_eq!(cohort(&report, "unknown").tasks, 2);
+        assert!(
+            report.render().contains("by effort:"),
+            "{}",
+            report.render()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The shape the runner writes: the ladder rides on the first worker
+    /// dispatch only, and a repair records its rung with a null ladder and,
+    /// on a rung that requested no effort, a null flat `effort` and no usage
+    /// effort. The repair still reads as what its rung requested, and the
+    /// run's `efforts_used` holds no `unknown`.
+    #[test]
+    fn a_repair_reads_its_rung_from_the_runs_first_ladder() {
+        let dir = temp_dir("effort-first-ladder");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let run = new_run(&ledger, "run-first-ladder");
+        let ladder = serde_json::json!({ "rungs": [
+            { "effort": "not_requested" },
+            { "effort": "not_requested" },
+        ]});
+        record_attempt(
+            &ledger,
+            &run,
+            1,
+            &AttemptSpec {
+                phase: UsagePhase::Initial,
+                intent: serde_json::json!({ "effort": null, "ladder": ladder, "rung": 0 }),
+                usage: Some((Some(1), None)),
+            },
+        );
+        let repair = record_attempt(
+            &ledger,
+            &run,
+            2,
+            &AttemptSpec {
+                phase: UsagePhase::Repair,
+                intent: serde_json::json!({ "effort": null, "ladder": null, "rung": 1 }),
+                usage: Some((Some(1), None)),
+            },
+        );
+        assert_eq!(
+            ledger.requested_effort(repair).expect("effort"),
+            "none requested"
+        );
+        assert_eq!(
+            ledger.efforts_used(&run).expect("efforts"),
+            vec!["none requested".to_string()]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The reader's order: ladder rung, then the intent's flat `effort`,
+    /// then the attempt's own non-review usage row, then `unknown`.
+    #[test]
+    fn the_requested_effort_follows_its_documented_precedence() {
+        let dir = temp_dir("effort-precedence");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let run = new_run(&ledger, "run-precedence");
+        let ladder = serde_json::json!({ "rungs": [
+            { "effort": { "explicit": "from-rung" } },
+            { "effort": "not_requested" },
+            { "effort": "control_unsupported" },
+        ]});
+        let effort_of = |index: i64, spec: AttemptSpec| {
+            let id = record_attempt(&ledger, &run, index, &spec);
+            ledger.requested_effort(id).expect("effort")
+        };
+        let with_intent = |intent: serde_json::Value, usage| AttemptSpec {
+            phase: UsagePhase::Initial,
+            intent,
+            usage,
+        };
+        // The rung wins over the flat field.
+        assert_eq!(
+            effort_of(
+                1,
+                with_intent(
+                    serde_json::json!({ "effort": "flat", "ladder": ladder, "rung": 0 }),
+                    Some((Some(1), Some("from-usage"))),
+                )
+            ),
+            "from-rung"
+        );
+        assert_eq!(
+            effort_of(
+                2,
+                with_intent(serde_json::json!({ "ladder": ladder, "rung": 1 }), None)
+            ),
+            "none requested"
+        );
+        assert_eq!(
+            effort_of(
+                3,
+                with_intent(serde_json::json!({ "ladder": ladder, "rung": 2 }), None)
+            ),
+            "no effort control"
+        );
+        // A later dispatch carries no ladder (the runner writes it on the
+        // first only): its rung indexes the run's first ladder, which
+        // still wins over the flat field.
+        assert_eq!(
+            effort_of(
+                4,
+                with_intent(
+                    serde_json::json!({ "effort": "flat", "ladder": null, "rung": 1 }),
+                    Some((Some(1), Some("from-usage"))),
+                )
+            ),
+            "none requested"
+        );
+        // A rung the ladder lacks falls through to the flat field.
+        assert_eq!(
+            effort_of(
+                5,
+                with_intent(
+                    serde_json::json!({ "effort": "flat", "ladder": ladder, "rung": 9 }),
+                    None
+                )
+            ),
+            "flat"
+        );
+        // No effort in the intent: the attempt's usage row.
+        assert_eq!(
+            effort_of(
+                6,
+                with_intent(
+                    serde_json::json!({ "effort": null }),
+                    Some((Some(1), Some("from-usage")))
+                )
+            ),
+            "from-usage"
+        );
+        // Nothing recorded at all.
+        assert_eq!(
+            effort_of(7, with_intent(serde_json::json!({}), Some((Some(1), None)))),
+            "unknown"
+        );
+        // A review's usage row never answers for the worker attempt.
+        let reviewed = record_attempt(&ledger, &run, 8, &with_intent(serde_json::json!({}), None));
+        ledger
+            .record_usage(&crate::ledger::UsageEvent {
+                event_id: "e-review".into(),
+                run_id: run.clone(),
+                attempt_id: Some(reviewed),
+                parent_event_id: None,
+                model: Some("sonnet".into()),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                cost: None,
+                cost_kind: crate::money::CostKind::ApiSpend,
+                completeness: CostCompleteness::Unknown,
+                inclusive: false,
+                at: now_rfc3339(),
+                phase: Some(UsagePhase::Review),
+                duration_ms: None,
+                requested_model: None,
+                requested_effort: Some("reviewer".into()),
+                harness: None,
+            })
+            .expect("review usage");
+        assert_eq!(
+            ledger.requested_effort(reviewed).expect("effort"),
+            "unknown"
+        );
+        // First use, once each.
+        assert_eq!(
+            ledger.efforts_used(&run).expect("efforts"),
+            vec![
+                "from-rung".to_string(),
+                "none requested".to_string(),
+                "no effort control".to_string(),
+                "flat".to_string(),
+                "from-usage".to_string(),
+                "unknown".to_string(),
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One run with an initial attempt and one repair per entry of
+    /// `repairs` (its effort and cost), and the transitions `script` names.
+    fn run_with_repairs(
+        ledger: &Ledger,
+        run_id: &str,
+        repairs: &[(&str, Option<i64>)],
+        script: &[(State, &str)],
+    ) -> crate::ids::RunId {
+        let run = new_run(ledger, run_id);
+        record_attempt(
+            ledger,
+            &run,
+            1,
+            &attempt_of(UsagePhase::Initial, "first", Some(1)),
+        );
+        for (offset, (effort, cost)) in repairs.iter().enumerate() {
+            record_attempt(
+                ledger,
+                &run,
+                offset as i64 + 2,
+                &attempt_of(UsagePhase::Repair, effort, *cost),
+            );
+        }
+        for (state, reason) in script {
+            go(ledger, &run, *state, reason);
+        }
+        run
+    }
+
+    fn effort_line<'a>(report: &'a Report, effort: &str) -> &'a EffortRepairs {
+        report
+            .repair_outcomes
+            .iter()
+            .find(|line| line.effort == effort)
+            .unwrap_or_else(|| panic!("no repairs for {effort:?} in {:?}", report.repair_outcomes))
+    }
+
+    /// A repair the machine stopped while dispatching (a limit reached,
+    /// `running -> budget_exhausted`) never ran its checks: no verdict,
+    /// named by the reason — not a failed verification. The same state
+    /// entered from `verifying` is a failed one.
+    #[test]
+    fn a_repair_stopped_before_its_checks_ran_has_no_verdict() {
+        let dir = temp_dir("repair-stopped");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let running = (State::Running, "worker_dispatched");
+        let verifying = (State::Verifying, "verification_started");
+        let opened = (State::Repairing, "behavioral_failure");
+        run_with_repairs(
+            &ledger,
+            "run-limit",
+            &[("stopped", Some(5))],
+            &[
+                running,
+                verifying,
+                opened,
+                running,
+                (State::BudgetExhausted, "limit_reached"),
+            ],
+        );
+        run_with_repairs(
+            &ledger,
+            "run-checked",
+            &[("checked", Some(5))],
+            &[
+                running,
+                verifying,
+                opened,
+                running,
+                verifying,
+                (State::BudgetExhausted, "limit_reached"),
+            ],
+        );
+        let report = runs_report(&ledger, SINCE, None).expect("report");
+        let stopped = effort_line(&report, "stopped");
+        assert_eq!(stopped.verification_failed, 0);
+        assert_eq!(stopped.no_verdict_kinds.get("limit_reached"), Some(&1));
+        let checked = effort_line(&report, "checked");
+        assert_eq!(checked.verification_failed, 1);
+        assert_eq!(checked.no_verdict, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The report window lists root runs only; a repair inside a package
+    /// run beneath one is walked and counted all the same.
+    #[test]
+    fn a_repair_inside_a_package_run_is_reported() {
+        let dir = temp_dir("repair-in-package");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let root = new_run(&ledger, "run-root");
+        let child = crate::ids::RunId::from_stored("run-root-package");
+        ledger
+            .insert_child_run(
+                &child,
+                "/repo",
+                None,
+                crate::ledger::ChildOf {
+                    parent_run: &root,
+                    package_id: &crate::ids::PackageId::from_stored("p1"),
+                },
+                &crate::ids::TaskId::from_stored("task-run-root"),
+                "rk",
+            )
+            .expect("child run");
+        record_attempt(
+            &ledger,
+            &child,
+            1,
+            &attempt_of(UsagePhase::Initial, "medium", Some(10)),
+        );
+        record_attempt(
+            &ledger,
+            &child,
+            2,
+            &attempt_of(UsagePhase::Repair, "medium", Some(20)),
+        );
+        for (to_state, reason) in [
+            (State::Running, "worker_dispatched"),
+            (State::Verifying, "verification_started"),
+            (State::Repairing, "behavioral_failure"),
+            (State::Running, "worker_dispatched"),
+            (State::Verifying, "verification_started"),
+            (State::NeedsReview, "review_findings"),
+        ] {
+            go(&ledger, &child, to_state, reason);
+        }
+        let report = runs_report(&ledger, SINCE, None).expect("report");
+        let medium = report
+            .repair_outcomes
+            .iter()
+            .find(|effort| effort.effort == "medium")
+            .unwrap_or_else(|| panic!("no medium repairs in {:?}", report.repair_outcomes));
+        assert_eq!(medium.repairs, 1, "the window lists the root only");
+        assert_eq!(medium.verification_passed, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Each outcome class, a run with a second repair (the k-th repairing
+    /// transition opens the k-th repair), a run counted once, and a crash
+    /// with no usage row (unknown cost, not $0).
+    #[test]
+    fn a_repairs_own_verification_is_reported_apart_from_how_its_run_ended() {
+        let dir = temp_dir("repair-outcomes");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let running = (State::Running, "worker_dispatched");
+        let verifying = (State::Verifying, "verification_started");
+        // A: the first repair (low) fails its checks, the second (high)
+        // passes; the run is accepted.
+        run_with_repairs(
+            &ledger,
+            "run-a",
+            &[("low", Some(50)), ("high", Some(100))],
+            &[
+                running,
+                verifying,
+                (State::Repairing, "behavioral_failure"),
+                running,
+                verifying,
+                (State::Repairing, "behavioral_failure"),
+                running,
+                verifying,
+                (State::Accepted, "checks_and_review_passed"),
+            ],
+        );
+        // B: the repair is blocked.
+        run_with_repairs(
+            &ledger,
+            "run-b",
+            &[("high", Some(300))],
+            &[
+                running,
+                verifying,
+                (State::Repairing, "behavioral_failure"),
+                running,
+                (State::Blocked, "env_missing"),
+            ],
+        );
+        // C: the repair crashed before it reported any usage.
+        run_with_repairs(
+            &ledger,
+            "run-c",
+            &[("high", None)],
+            &[
+                running,
+                verifying,
+                (State::Repairing, "behavioral_failure"),
+                running,
+                (State::Interrupted, "process_crash"),
+            ],
+        );
+        // D: two `high` repairs in one run — the first fails, the second
+        // passes its checks and then meets review findings. The run must be
+        // counted once.
+        run_with_repairs(
+            &ledger,
+            "run-d",
+            &[("high", Some(200)), ("high", Some(400))],
+            &[
+                running,
+                verifying,
+                (State::Repairing, "behavioral_failure"),
+                running,
+                verifying,
+                (State::Repairing, "behavioral_failure"),
+                running,
+                verifying,
+                (State::NeedsReview, "review_findings"),
+            ],
+        );
+        // E: a repair that is still running, and F: one that ended asking
+        // for a decision.
+        run_with_repairs(
+            &ledger,
+            "run-e",
+            &[("wip", Some(5))],
+            &[
+                running,
+                verifying,
+                (State::Repairing, "behavioral_failure"),
+                running,
+            ],
+        );
+        run_with_repairs(
+            &ledger,
+            "run-f",
+            &[("wip", Some(7))],
+            &[
+                running,
+                verifying,
+                (State::Repairing, "behavioral_failure"),
+                running,
+                verifying,
+                (State::NeedsDecision, "verification_gap"),
+            ],
+        );
+        let report = runs_report(&ledger, SINCE, None).expect("report");
+
+        let low = effort_line(&report, "low");
+        assert_eq!((low.repairs, low.verification_failed), (1, 1), "{low:?}");
+        assert_eq!(low.run_statuses.get(&State::Accepted), Some(&1));
+
+        let high = effort_line(&report, "high");
+        assert_eq!(high.repairs, 5, "{high:?}");
+        assert_eq!(high.verification_passed, 2, "A's second and D's second");
+        assert_eq!(high.verification_failed, 1, "D's first");
+        assert_eq!(high.no_verdict, 2, "{high:?}");
+        assert_eq!(high.no_verdict_kinds.get("blocked"), Some(&1));
+        assert_eq!(high.no_verdict_kinds.get("crash"), Some(&1));
+        // The crashed repair has no usage row: unknown, out of the mean.
+        assert_eq!(high.cost.with_usage, 4);
+        assert_eq!(high.cost.unknown, 1);
+        assert_eq!(high.cost.mean, Some(MicroUsd::from_micros(250)));
+        assert_eq!(high.cost.min, Some(MicroUsd::from_micros(100)));
+        assert_eq!(high.cost.max, Some(MicroUsd::from_micros(400)));
+        // Four runs, D once although two of its repairs asked for `high`.
+        let statuses: Vec<(State, usize)> =
+            high.run_statuses.iter().map(|(s, n)| (*s, *n)).collect();
+        assert_eq!(
+            statuses,
+            vec![
+                (State::Accepted, 1),
+                (State::NeedsReview, 1),
+                (State::Blocked, 1),
+                (State::Interrupted, 1),
+            ]
+        );
+
+        let wip = effort_line(&report, "wip");
+        assert_eq!(wip.no_verdict_kinds.get("in flight"), Some(&1), "{wip:?}");
+        assert_eq!(
+            wip.no_verdict_kinds.get("verification_gap"),
+            Some(&1),
+            "a decision is named by its reason"
+        );
+
+        let text = report.render();
+        assert!(
+            text.contains(
+                "high: 5 repairs — verification passed 2, failed 1, no verdict 2 \
+                 (blocked 1, crash 1)\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "  cost mean $0.00025, range $0.0001–$0.0004 (4 with usage, 1 unknown)\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("  their runs: accepted 1, needs review 1, blocked 1, interrupted 1\n"),
+            "{text}"
+        );
+        let json = serde_json::to_value(&report).expect("serializes");
+        assert_eq!(json["schema_version"], 10);
+        assert!(json["repair_outcomes"].is_array());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A repair that crashed without reporting usage is unknown cost: no
+    /// mean, no range, and never `$0`.
+    #[test]
+    fn a_crashed_repair_with_no_usage_row_is_unknown_cost_never_zero() {
+        let dir = temp_dir("repair-unknown-cost");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        run_with_repairs(
+            &ledger,
+            "run-crash",
+            &[("solo", None)],
+            &[
+                (State::Running, "worker_dispatched"),
+                (State::Verifying, "verification_started"),
+                (State::Repairing, "behavioral_failure"),
+                (State::Running, "worker_dispatched"),
+                (State::Interrupted, "process_crash"),
+            ],
+        );
+        let report = runs_report(&ledger, SINCE, None).expect("report");
+        let solo = effort_line(&report, "solo");
+        assert_eq!(solo.cost.with_usage, 0);
+        assert_eq!(solo.cost.unknown, 1);
+        assert_eq!(
+            (solo.cost.mean, solo.cost.min, solo.cost.max),
+            (None, None, None)
+        );
+        assert!(solo.render().contains("cost unknown"), "{}", solo.render());
+        assert!(!solo.render().contains("$0"), "{}", solo.render());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A window without a repair still says so, in text and in JSON.
+    #[test]
+    fn a_report_with_no_repairs_says_so() {
+        let dir = temp_dir("repair-none");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let report = runs_report(&ledger, SINCE, None).expect("report");
+        assert!(report.repair_outcomes.is_empty());
+        assert!(report
+            .render()
+            .contains("repairs by requested effort: none in this window"));
+        let json = serde_json::to_value(&report).expect("serializes");
+        assert_eq!(json["repair_outcomes"], serde_json::json!([]));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

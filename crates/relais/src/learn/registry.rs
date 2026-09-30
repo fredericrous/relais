@@ -30,9 +30,12 @@ use super::learner::{CostModel, LogisticModel, SolverSettings};
 /// harness, so a model swap AND a recipe revision bump both start with no
 /// inherited evidence. None of these fields can be defaulted into an
 /// older artifact, so older artifacts are refused by version rather than
-/// silently reinterpreted. Retrain to get a version-5 artifact; the
+/// silently reinterpreted. Version 6 makes the estimates per ARM (tier and
+/// effort) rather than per tier: `observed_identities` is now consulted for
+/// each arm's own effort, so a version-5 artifact's evidence would be read
+/// against arms it never priced. Retrain to get a version-6 artifact; the
 /// previous one stays promotable only by the relais that wrote it.
-pub const ARTIFACT_SCHEMA_VERSION: u32 = 5;
+pub const ARTIFACT_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {

@@ -1344,11 +1344,52 @@ const COVERED_BY_AN_INCLUSIVE_PARENT: &str = "WITH RECURSIVE covered(event_id) A
           JOIN covered ON covered.event_id = child.parent_event_id
      )";
 
-/// How many times to ask for WAL before giving up. Each refusal means
-/// another connection is setting the same mode right now — one pragma
-/// on one connection, microseconds long — so a handful of attempts is
-/// generous and a hang is impossible.
-const WAL_ATTEMPTS: u32 = 32;
+/// How long any wait on the ledger's locks lasts before it is an error:
+/// the busy handler's timeout, and the deadline for the WAL switch that
+/// the busy handler does not cover.
+const LEDGER_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The pause after the first busy refusal; it doubles up to the cap.
+const FIRST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// The longest pause between two tries.
+const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Whether SQLite refused because another connection holds a lock
+/// (SQLITE_BUSY). SQLITE_LOCKED is not this: it is a conflict inside one
+/// connection, a bug to report at once rather than wait out.
+fn is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if failure.code == rusqlite::ErrorCode::DatabaseBusy
+    )
+}
+
+/// Run `operation` until it stops being refused as busy, for at most
+/// `deadline`. Between tries it sleeps 1 ms, doubling to a 25 ms cap, so
+/// a waiting caller does not spin a core. Any other error returns at
+/// once; when the deadline passes, the last busy refusal is returned.
+fn retry_while_busy<T>(
+    deadline: std::time::Duration,
+    mut operation: impl FnMut() -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    let started = std::time::Instant::now();
+    let mut pause = FIRST_BACKOFF;
+    loop {
+        match operation() {
+            Err(e) if is_busy(&e) => {
+                let left = deadline.saturating_sub(started.elapsed());
+                if left.is_zero() {
+                    return Err(e);
+                }
+                std::thread::sleep(pause.min(left));
+                pause = (pause * 2).min(BACKOFF_CAP);
+            }
+            other => return other,
+        }
+    }
+}
 
 /// Put the ledger in WAL mode (SPEC §23: several processes share it).
 ///
@@ -1359,37 +1400,25 @@ const WAL_ATTEMPTS: u32 = 32;
 /// processes opening the same ledger in the same instant had one of them
 /// die at the door with "database is locked" before it read a row. A
 /// refusal here is not a broken ledger, it is somebody else setting the
-/// same mode, so it is retried — and `PRAGMA journal_mode = WAL` answers
-/// with the mode in force, which is the check and the change in one
-/// statement.
+/// same mode, so it is retried with a short backoff until
+/// `LEDGER_BUSY_TIMEOUT` — the same time any other lock is waited for, so
+/// a hang is bounded by that deadline, not by a count of tries. Any other
+/// error returns at once. `PRAGMA journal_mode = WAL` answers with the
+/// mode in force, which is the check and the change in one statement.
 fn use_wal(conn: &Connection) -> Result<()> {
-    let mut refusal = None;
-    for _ in 0..WAL_ATTEMPTS {
-        match conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+    let mode = retry_while_busy(LEDGER_BUSY_TIMEOUT, || {
+        conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
             row.get::<_, String>(0)
-        }) {
-            Ok(mode) if mode.eq_ignore_ascii_case("wal") => return Ok(()),
-            Ok(mode) => {
-                return Err(LedgerError::Corrupt {
-                    what: "the ledger's journal mode".into(),
-                    detail: format!("SQLite kept `{mode}` when asked for WAL"),
-                })
-            }
-            Err(e) => {
-                refusal = Some(e);
-                // Not a wait for time to pass: the other connection is
-                // runnable now, and this hands it the core to finish on.
-                std::thread::yield_now();
-            }
-        }
-    }
-    Err(refusal.map_or_else(
-        || LedgerError::Corrupt {
+        })
+    })?;
+    if mode.eq_ignore_ascii_case("wal") {
+        Ok(())
+    } else {
+        Err(LedgerError::Corrupt {
             what: "the ledger's journal mode".into(),
-            detail: "WAL was never asked for".into(),
-        },
-        LedgerError::from,
-    ))
+            detail: format!("SQLite kept `{mode}` when asked for WAL"),
+        })
+    }
 }
 
 /// How many migration steps this ledger has applied.
@@ -1500,6 +1529,72 @@ pub struct UsageEvent {
     pub requested_effort: Option<String>,
     /// The harness identity the run probed.
     pub harness: Option<String>,
+}
+
+/// A worker attempt as the `attempts` table holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerAttempt {
+    pub id: i64,
+    pub phase: UsagePhase,
+}
+
+/// The effort label of an attempt nothing recorded an effort for.
+pub const EFFORT_UNKNOWN: &str = "unknown";
+/// The effort label of a rung whose model has effort control and was asked
+/// for none.
+pub const EFFORT_NOT_REQUESTED: &str = "none requested";
+/// The effort label of a rung whose model or CLI has no effort control.
+pub const EFFORT_NO_CONTROL: &str = "no effort control";
+
+/// The label a ladder rung's serialized effort request stands for:
+/// `{"explicit": "<id>"}` is the id itself, and the two unit variants are
+/// the labels above. A shape this binary does not know is `None`, so the
+/// reader falls through to the next source instead of guessing.
+fn effort_request_label(request: &serde_json::Value) -> Option<String> {
+    if let Some(name) = request.as_str() {
+        return if name == "not_requested" {
+            Some(EFFORT_NOT_REQUESTED.to_string())
+        } else if name == "control_unsupported" {
+            Some(EFFORT_NO_CONTROL.to_string())
+        } else {
+            None
+        };
+    }
+    request
+        .get("explicit")
+        .and_then(|id| id.as_str())
+        .map(str::to_string)
+}
+
+/// The effort a dispatch intent requested: the ladder's rung at the
+/// intent's `rung` when both are recorded, else its flat `effort`.
+///
+/// The runner writes the ladder on a run's FIRST worker dispatch only;
+/// every later one (each repair, the escalation) records its `rung` and a
+/// null `ladder`. `run_ladder` is that first dispatch's ladder, read when
+/// the intent carries none — without it a repair on a rung that requested
+/// no effort, whose flat `effort` is null, would read as unknown.
+fn intent_effort(
+    intent: &serde_json::Value,
+    run_ladder: Option<&serde_json::Value>,
+) -> Option<String> {
+    let rung = intent.get("rung").and_then(|rung| rung.as_u64());
+    let rungs = intent
+        .get("ladder")
+        .filter(|ladder| !ladder.is_null())
+        .or(run_ladder)
+        .and_then(|ladder| ladder.get("rungs"));
+    let from_ladder = rungs
+        .zip(rung)
+        .and_then(|(rungs, rung)| rungs.get(usize::try_from(rung).ok()?))
+        .and_then(|rung| rung.get("effort"))
+        .and_then(effort_request_label);
+    from_ladder.or_else(|| {
+        intent
+            .get("effort")
+            .and_then(|effort| effort.as_str())
+            .map(str::to_string)
+    })
 }
 
 /// One requested alias and the model the harness reported running for
@@ -1853,7 +1948,7 @@ impl Ledger {
         // of its own. Set after it, as it used to be, two processes
         // opening the same ledger at the same moment raced and one died
         // with "database is locked" before it had opened anything.
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(LEDGER_BUSY_TIMEOUT)?;
         use_wal(&conn)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         migrate(&conn, clock.as_ref())?;
@@ -2279,6 +2374,128 @@ impl Ledger {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// A run's worker attempts, first dispatched first. The reviewer and the
+    /// planner are dispatches with no attempt row, so they are not here.
+    pub fn worker_attempts(&self, run_id: &RunId) -> Result<Vec<WorkerAttempt>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, phase FROM attempts WHERE run_id = ?1
+             ORDER BY attempt_index, id",
+        )?;
+        let rows = stmt.query_map([run_id.as_str()], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let rows: Vec<(i64, String)> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(id, phase)| {
+                let phase = UsagePhase::parse(&phase).map_err(|unknown| LedgerError::Corrupt {
+                    what: format!("the phase of attempt {id} of run {run_id}"),
+                    detail: unknown.to_string(),
+                })?;
+                Ok(WorkerAttempt { id, phase })
+            })
+            .collect()
+    }
+
+    /// The effort a worker attempt REQUESTED, as a label — the one reader
+    /// every effort figure goes through (`relais report --by effort`, the
+    /// repair outcomes, a receipt's `efforts_used`), so they cannot
+    /// disagree about what an attempt asked for.
+    ///
+    /// Read from the attempt's worker dispatch intent (the dispatch whose
+    /// `attempt_id` is the attempt, `kind` not `review`), in this order:
+    /// the resolved ladder's effort at the intent's rung, when the intent
+    /// carries both; else the intent's flat `effort`; else the first
+    /// non-review `usage_events.requested_effort` of the attempt; else
+    /// [`EFFORT_UNKNOWN`]. An effort the ladder records as not requested or
+    /// as having no control is labelled so ([`EFFORT_NOT_REQUESTED`],
+    /// [`EFFORT_NO_CONTROL`]), never as an identifier. Nothing here names an
+    /// effort: the label is whatever the ledger recorded.
+    pub fn requested_effort(&self, attempt_id: i64) -> Result<String> {
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT intent_json, run_id FROM dispatches
+                  WHERE attempt_id = ?1
+                    AND json_extract(intent_json, '$.kind') IS NOT 'review'
+                  ORDER BY created_at, dispatch_id LIMIT 1",
+                [attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (intent, run_id) = row.unzip();
+        // A corrupt intent is reported, not read as an absent one: falling
+        // through would file the attempt under another step's effort.
+        let from_intent = intent
+            .map(|text| {
+                serde_json::from_str::<serde_json::Value>(&text).map_err(|e| LedgerError::Corrupt {
+                    what: format!("the dispatch intent of attempt {attempt_id}"),
+                    detail: e.to_string(),
+                })
+            })
+            .transpose()?;
+        // A later dispatch carries only its rung; the ladder it indexes is
+        // the one the run's first worker dispatch recorded.
+        let run_ladder = match (&from_intent, run_id) {
+            (Some(intent), Some(run_id))
+                if intent.get("rung").is_some_and(|rung| !rung.is_null())
+                    && intent.get("ladder").is_none_or(serde_json::Value::is_null) =>
+            {
+                self.first_dispatch_intent(&RunId::from_stored(run_id))?
+                    .and_then(|first| first.get("ladder").cloned())
+                    .filter(|ladder| !ladder.is_null())
+            }
+            (Some(_) | None, Some(_) | None) => None,
+        };
+        let from_intent =
+            from_intent.and_then(|intent| intent_effort(&intent, run_ladder.as_ref()));
+        if let Some(label) = from_intent {
+            return Ok(label);
+        }
+        let from_usage: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT requested_effort FROM usage_events
+                  WHERE attempt_id = ?1 AND requested_effort IS NOT NULL
+                    AND phase IS NOT 'review'
+                  ORDER BY id LIMIT 1",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(from_usage.unwrap_or_else(|| EFFORT_UNKNOWN.to_string()))
+    }
+
+    /// The distinct efforts a run's worker attempts requested, in first-use
+    /// order, each through [`Ledger::requested_effort`].
+    pub fn efforts_used(&self, run_id: &RunId) -> Result<Vec<String>> {
+        let mut used: Vec<String> = Vec::new();
+        for attempt in self.worker_attempts(run_id)? {
+            let effort = self.requested_effort(attempt.id)?;
+            if !used.contains(&effort) {
+                used.push(effort);
+            }
+        }
+        Ok(used)
+    }
+
+    /// What one attempt cost, from the usage rows that name it and whose
+    /// cost was reported. `None` is unknown — no such row — and never
+    /// `$0.00`: an attempt that died before it could report cost something.
+    /// An inclusive parent's covered children are not added again.
+    pub fn attempt_cost(&self, attempt_id: i64) -> Result<Option<MicroUsd>> {
+        let (reported, micros): (i64, i64) = self.conn.query_row(
+            &format!(
+                "{COVERED_BY_AN_INCLUSIVE_PARENT}
+                 SELECT COUNT(cost_micros), COALESCE(SUM(cost_micros), 0) FROM usage_events
+                  WHERE attempt_id = ?1
+                    AND event_id NOT IN (SELECT event_id FROM covered)"
+            ),
+            [attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((reported > 0).then(|| MicroUsd::from_micros(micros)))
+    }
+
     /// The candidate the run's last finished attempt produced, if any.
     ///
     /// The ledger's own answer to "what did this run actually build",
@@ -2360,6 +2577,21 @@ impl Ledger {
             |row| row.get(0),
         )?;
         Ok(count as usize)
+    }
+
+    /// Whether a reviewer was DISPATCHED for this run: a review dispatch
+    /// intent is written before the launch, so a review whose model
+    /// reported no usage, or whose launch failed, still counts. This is
+    /// the fact a receipt's review record rests on; `review_attempted`
+    /// counts billed review usage, for the review-correction rate.
+    pub fn review_dispatched(&self, run_id: &RunId) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM dispatches
+             WHERE run_id = ?1 AND json_extract(intent_json, '$.kind') = 'review'",
+            [run_id.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     /// Whether a run's reviewer actually ran, from usage events tagged
@@ -4762,6 +4994,96 @@ mod tests {
             ledger.schema_version().expect("count"),
             LEDGER_SCHEMA_VERSION
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn busy() -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is locked".into()),
+        )
+    }
+
+    /// A refusal that outlasts any count of yields is waited out — by
+    /// sleeping, not spinning: a backoff of 1, 2, 4, 8, 16, 25 ms covers
+    /// 60 ms in about seven calls, where a loop of thread yields either
+    /// gives up within microseconds or burns every try.
+    #[test]
+    fn a_busy_refusal_lasting_60ms_is_waited_out() {
+        let started = std::time::Instant::now();
+        let mut calls = 0;
+        let result = retry_while_busy(std::time::Duration::from_secs(5), || {
+            calls += 1;
+            if started.elapsed() < std::time::Duration::from_millis(60) {
+                Err(busy())
+            } else {
+                Ok(7)
+            }
+        });
+        assert_eq!(result.expect("the refusal ends before the deadline"), 7);
+        assert!(
+            calls <= 12,
+            "a waiting opener sleeps between tries instead of spinning: {calls} calls"
+        );
+    }
+
+    #[test]
+    fn an_endless_busy_refusal_gives_up_at_the_deadline() {
+        let started = std::time::Instant::now();
+        let mut calls = 0;
+        let result: rusqlite::Result<()> =
+            retry_while_busy(std::time::Duration::from_millis(50), || {
+                calls += 1;
+                Err(busy())
+            });
+        let error = result.expect_err("never succeeds");
+        assert!(is_busy(&error), "the busy error is returned: {error:?}");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(50));
+        assert!(calls > 1, "it retried within the deadline: {calls} calls");
+    }
+
+    #[test]
+    fn a_non_busy_error_is_returned_after_one_call() {
+        let mut calls = 0;
+        let result: rusqlite::Result<()> =
+            retry_while_busy(std::time::Duration::from_secs(5), || {
+                calls += 1;
+                Err(rusqlite::Error::QueryReturnedNoRows)
+            });
+        assert!(matches!(result, Err(rusqlite::Error::QueryReturnedNoRows)));
+        assert_eq!(calls, 1);
+    }
+
+    /// Many threads switching each fresh file to WAL at the same moment.
+    /// On macOS the old 32-yield loop also passed this; it guards the
+    /// slower Windows runner, where that loop ran out (#147).
+    #[test]
+    fn many_openers_of_fresh_ledgers_all_succeed() {
+        const THREADS: usize = 6;
+        let dir = temp_dir("stampede");
+        for round in 0..30 {
+            let path = dir.join(format!("ledger-{round}.sqlite"));
+            let start = std::sync::Barrier::new(THREADS);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..THREADS)
+                    .map(|_| {
+                        let path = &path;
+                        let start = &start;
+                        scope.spawn(move || {
+                            start.wait();
+                            Ledger::open(path).map(|_| ())
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    handle
+                        .join()
+                        .expect("no panic")
+                        .expect("every opener succeeds");
+                }
+            });
+        }
+        // Best-effort temp cleanup: a leftover directory fails nothing.
         std::fs::remove_dir_all(&dir).ok();
     }
 

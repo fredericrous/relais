@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::lifecycle::{Reason, State, UsagePhase};
 use crate::policy::{BlockCode, Tier};
+use crate::route::RungIndex;
 
 /// What kind of attempt is being dispatched (SPEC §9: initial, one
 /// repair, one stronger attempt).
@@ -125,8 +126,15 @@ pub struct Budget {
     pub max_attempts: u32,
     pub repairs_used: u32,
     pub max_repairs: u32,
+    /// The tier of the rung the run is on.
     pub tier: Tier,
-    /// The stronger tier escalation may buy, when authorized.
+    /// The rung of the ladder the run is on: the attempt just dispatched.
+    pub rung: RungIndex,
+    /// The stronger tier escalation may buy: the route's escalation tier,
+    /// set even when the budget cannot reach its rung. The machine may then
+    /// decide an escalation, and the attempt ceiling ends the run before
+    /// the missing rung is read, which is the end state before the ladder
+    /// existed.
     pub escalation_tier: Option<Tier>,
 }
 
@@ -206,10 +214,12 @@ pub enum Observation {
 /// What to do after recording the transition.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Next {
-    /// Dispatch another attempt of this kind at this tier.
+    /// Dispatch another attempt of this kind at this rung of the ladder.
+    /// The machine chooses the kind and the index; what is at the index
+    /// (tier, model, effort) is the ladder's, resolved at route time.
     Attempt {
         kind: AttemptKind,
-        tier: Tier,
+        rung: RungIndex,
     },
     /// Build the receipt for the verified candidate.
     Accept,
@@ -284,7 +294,7 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
                     }),
                     next: Next::Attempt {
                         kind: AttemptKind::Repair,
-                        tier: budget.tier,
+                        rung: budget.rung.next(),
                     },
                 };
             }
@@ -302,7 +312,7 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
                     }),
                     next: Next::Attempt {
                         kind: AttemptKind::Escalation,
-                        tier: stronger,
+                        rung: budget.rung.next(),
                     },
                 };
             }
@@ -494,6 +504,12 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
 mod tests {
     use super::*;
 
+    /// The rung a run that has repaired `repairs_used` times is on: each
+    /// repair moved one rung down the ladder.
+    fn rung_after(repairs_used: u32) -> RungIndex {
+        (0..repairs_used).fold(RungIndex::INITIAL, |rung, _| rung.next())
+    }
+
     fn budget(repairs_used: u32, escalation: Option<Tier>) -> Budget {
         Budget {
             attempts_used: 1,
@@ -501,6 +517,7 @@ mod tests {
             repairs_used,
             max_repairs: 1,
             tier: Tier::Implementation,
+            rung: rung_after(repairs_used),
             escalation_tier: escalation,
         }
     }
@@ -517,7 +534,7 @@ mod tests {
     // SPEC §9 rows, one assertion each.
 
     #[test]
-    fn a_behavioural_failure_with_allowance_repairs_at_the_same_tier() {
+    fn a_behavioural_failure_with_allowance_repairs_at_the_next_rung() {
         let d = decide(
             &budget(0, Some(Tier::Escalation)),
             failed(false, false, false),
@@ -528,7 +545,7 @@ mod tests {
             d.next,
             Next::Attempt {
                 kind: AttemptKind::Repair,
-                tier: Tier::Implementation
+                rung: RungIndex::INITIAL.next()
             }
         );
     }
@@ -545,7 +562,7 @@ mod tests {
             d.next,
             Next::Attempt {
                 kind: AttemptKind::Escalation,
-                tier: Tier::Escalation
+                rung: RungIndex::INITIAL.next().next()
             }
         );
     }

@@ -1624,6 +1624,94 @@ fn an_unrunnable_baseline_and_a_failed_setup_block_before_any_launch() {
     assert_eq!(candidates, 0, "no blocked run reached a candidate");
 }
 
+// P3 (e): a repository that configures an effort and no effort catalog
+// still plans, exit 0, with the same route line as before. `raise` cannot
+// step an order nobody stated, so the repair is held at the configured
+// effort — printed on the ladder, and said on stderr, nothing blocked.
+#[test]
+fn plan_holds_the_repair_effort_when_no_effort_order_is_stated() {
+    let world = World::new("held-repair");
+    let policy = r#"schema_version = 1
+
+[models.research]
+id = "haiku"
+
+[models.implementation]
+id = "sonnet"
+effort = "medium"
+
+[models.escalation]
+id = "fable"
+effort = "medium"
+
+[execution]
+max_attempts = 3
+max_repairs_before_escalation = 1
+max_wall_seconds = 120
+
+[integrations]
+aval = "off"
+amont = "off"
+amont_agent = "off"
+
+[verification.profiles.default]
+commands = []
+"#;
+    std::fs::write(world.repo.join("relais.toml"), policy).expect("policy");
+    git(&world.repo, &["add", "relais.toml"]);
+    git(&world.repo, &["commit", "-q", "-m", "policy"]);
+    let hash = RepoPolicy::from_toml_str(policy)
+        .expect("valid policy")
+        .authority_hash();
+    world.write_machine(&hash, "");
+    let task = world.write_task("task.json", "off");
+
+    let plan = world.relais(&["plan", "--task", task.to_str().unwrap()]);
+    assert_eq!(plan.status.code(), Some(0), "{}", text(&plan.stderr));
+    let stdout = text(&plan.stdout);
+    assert!(
+        stdout.contains(
+            "route: implementation / sonnet\neffort: sonnet@medium\n\
+             on failure: repair sonnet@medium\nthen: escalation fable@medium\n"
+        ),
+        "the route line is unchanged and the ladder holds the effort: {stdout}"
+    );
+    let stderr = text(&plan.stderr);
+    let held_lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("repair effort held"))
+        .collect();
+    assert_eq!(
+        held_lines,
+        ["repair effort held: effort order unknown for sonnet"],
+        "plan names exactly the models this run's ladder holds: {stderr}"
+    );
+    assert!(
+        !stdout.contains("repair effort held"),
+        "the advisory is on stderr, not stdout: {stdout}"
+    );
+    // `plan --json` carries the same ladder, one entry per rung.
+    let json = world.relais(&["plan", "--task", task.to_str().unwrap(), "--json"]);
+    assert_eq!(json.status.code(), Some(0), "{}", text(&json.stderr));
+    let document: serde_json::Value =
+        serde_json::from_str(text(&json.stdout).trim()).expect("plan --json is a document");
+    let rungs = document["route"]["ladder"]["rungs"]
+        .as_array()
+        .expect("the route carries its ladder");
+    let models: Vec<&str> = rungs
+        .iter()
+        .map(|rung| rung["model"].as_str().expect("a model"))
+        .collect();
+    assert_eq!(models, ["sonnet", "sonnet", "fable"], "{document}");
+    let doctor = world.relais(&["doctor"]);
+    assert!(
+        text(&doctor.stdout)
+            .contains("repair effort would be held (effort order unknown) for: sonnet, fable"),
+        "doctor's effort finding says which repairs could be held: {}",
+        text(&doctor.stdout)
+    );
+}
+
 // relais#97: `plan` performs the same read-hint fingerprint check `run`
 // performs in `assemble_context`, so a contract `run` would refuse is
 // never routed by `plan` first.
