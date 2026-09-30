@@ -1750,6 +1750,45 @@ mod tests {
         );
     }
 
+    /// A selected arm that passes no effort routes as the resolver's own
+    /// answer for that tier: a model without effort control is dispatched
+    /// `ControlUnsupported`, never given an effort the learner invented.
+    #[test]
+    fn a_learned_arm_without_effort_control_routes_as_one() {
+        let mut repo = repo_policy();
+        repo.models
+            .get_mut(&Tier::Implementation)
+            .expect("the implementation tier")
+            .effort = None;
+        let machine = machine_for(&repo);
+        let contract = change_contract(&["crates/amont/**"]);
+        let authority = effective_authority(&repo, &machine, &contract, &identity());
+        let catalogs = catalog_of("sonnet", &LEVELS, &LEVELS, &[], "max");
+        let favoured = arm(Tier::Implementation, EffortRequest::ControlUnsupported);
+        let predictor = FavouringPredictor {
+            favoured: favoured.clone(),
+        };
+        let d = expect_route(route(RouteInputs {
+            contract: &contract,
+            repo: &repo,
+            machine: &machine,
+            authority: &authority,
+            predictor: Some(&predictor),
+            catalogs: &catalogs,
+        }));
+        assert_eq!(d.routed_by, RoutedBy::LearnedArtifact);
+        assert_eq!(d.tier, Tier::Implementation);
+        assert_eq!(d.rung.effort, EffortRequest::ControlUnsupported);
+        assert!(
+            d.reasons
+                .iter()
+                .any(|reason| reason.id == "learned_artifact"
+                    && reason.text.contains("implementation:control_unsupported")),
+            "{:?}",
+            d.reasons
+        );
+    }
+
     /// The cheapest arm that clears the floor wins, not the cheapest arm.
     #[test]
     fn select_learned_prices_efforts_of_one_tier_apart() {

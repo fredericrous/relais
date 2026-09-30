@@ -3,7 +3,8 @@
 //! Training and inference share the same feature extraction code; the
 //! artifact carries its own standardization so the transform is the same
 //! bytes at train and inference. An inference result carries the artifact
-//! ID, schema version, input hash, estimates per eligible profile, the
+//! ID, schema version, input hash, estimates per eligible arm (a tier and
+//! an effort), the
 //! supported cohorts and an abstention reason when the artifact cannot
 //! honestly estimate. Predictions are not guarantees; the deterministic
 //! runner still owns policy and acceptance. Neither predictor invents
@@ -40,7 +41,7 @@ pub struct InferenceResult {
 
 /// Load the registry's active artifact and estimate. Abstains when no
 /// artifact is active, when its schema is unreadable, or when an
-/// eligible tier has no trained coverage — abstention routes to the
+/// eligible arm has no trained coverage — abstention routes to the
 /// conservative baseline, never to a guess.
 pub fn estimate_from_registry(
     registry: &Registry,

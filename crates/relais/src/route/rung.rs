@@ -254,6 +254,10 @@ pub(super) fn resolve_rung(request: RungRequest<'_>) -> Result<ResolvedRung, Blo
         start.cloned()
     } else {
         let raised = apply_floor(catalog, &profile.id, start, floors)?;
+        // The reason says a floor MOVED the start. A learned arm already at
+        // or above the floor was bound by it (lower arms were never
+        // offered) but not moved, so it gets none: `learner_arms` drops
+        // every start the floor would raise.
         if Some(&raised) != start {
             reasons.push(RouteReason::new(
                 EFFORT_FLOOR,

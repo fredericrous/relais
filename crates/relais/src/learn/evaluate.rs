@@ -697,6 +697,10 @@ struct Candidate {
 /// unconditionally scored a training split that spans a harness upgrade or
 /// a model swap under the OLD profile, and never counted a record of the
 /// current one as support.
+///
+/// Candidates come in the order training observed the identities, while
+/// inference orders a tier's arms by the effort catalog; the two orders
+/// differ only in which of two equally priced arms wins a tie.
 fn candidates_for(
     record: &TrainingExample,
     tiers: &[Tier],
@@ -766,14 +770,21 @@ fn is_evidence_for(record: &TrainingExample, candidate: &Candidate) -> bool {
 ///
 /// For each test task the artifact SELECTS an arm (a tier and an effort),
 /// through the router's own `select_learned`. The arms are what inference
-/// would score: for each trained tier at or above the record's floor, each
-/// distinct (model, effort, harness) identity the training split observed at
-/// that tier, scored with THAT identity ([`candidates_for`]) — never with
-/// the test record's own, which belongs to the tier it ran at and is not the
+/// would score: for each trained tier at or above the record's floor, one
+/// arm per effort the training split observed at that tier, scored with an
+/// identity training observed for it ([`candidates_for`]) — never with the
+/// test record's own, which belongs to the tier it ran at and is not the
 /// model and effort inference would use anywhere else. A test record is
 /// evidence for the selected policy only when its tier equals the selected
 /// arm's tier and its (model, effort, harness) equals the arm's; a record at
 /// another tier or profile says nothing about it.
+///
+/// What is NOT replayed: the effort floor, the authority ceiling and the
+/// admissible set that `route::learner_arms` applies at inference. A record
+/// carries neither the risk floor its scope had nor the catalog in force,
+/// so the evaluation may select an arm (a `low` effort under a floor) that
+/// inference would never offer. It is symmetric in how an arm is scored,
+/// not in which arms exist.
 ///
 /// The baseline is what cold-start routing does for that same record: its
 /// floor tier. Pooling research and implementation records regardless of
