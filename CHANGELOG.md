@@ -34,7 +34,13 @@ missing here.
   is `blocked (sandbox_unverified)` (exit 3), naming the command, and
   `sandbox.verified` in the context manifest carries the key. `relais
   doctor` gains a `sandbox` line (off, verified, unverified, weakened,
-  unavailable) and states the scope of the guarantee.
+  unavailable) and states the scope of the guarantee. The allowlist probe
+  judges the environment only, so a machine with its own MCP servers can
+  verify; the key ignores the ambient credential names, so a verification
+  from a terminal holds in a Claude Code session; a corrupt store fails
+  before any session is paid for and shows as `unavailable: <reason>`; probe
+  directories are pruned to the three most recent; `projects` entries are
+  matched by real path.
 
 ### Changed
 

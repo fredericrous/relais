@@ -101,7 +101,36 @@ pub fn preflight(inputs: &PreflightInputs) -> Option<Blocker> {
     platform_blocker(inputs.platform)
         .or_else(|| harness_blocker(inputs.harness_version))
         .or_else(|| helpers_blocker(inputs.platform, inputs.on_path))
+        .or_else(|| unreadable_blocker(inputs))
         .or_else(|| weakened_blocker(inputs))
+}
+
+/// A managed root, managed file or `~/.claude.json` that cannot be read is
+/// UNAVAILABLE, naming the file and why: relais cannot judge what it cannot
+/// read, and "weakened" would point a person at settings to remove when
+/// the fix is a permission or a half-written file.
+pub fn unreadable_blocker(inputs: &PreflightInputs) -> Option<Blocker> {
+    let unreadable = |path: &Path, reason: &str| {
+        Some(unavailable(format!(
+            "`{}` cannot be read ({reason}), so the sandbox configuration cannot be \
+             judged; fix its permissions or contents, or turn `[sandbox]` off",
+            path.display()
+        )))
+    };
+    match managed_sources(inputs.managed_root, inputs.extra_managed_root) {
+        Err((path, error)) => return unreadable(&path, &error.to_string()),
+        Ok(sources) => {
+            for source in sources {
+                if let Err(reason) = read_json(&source) {
+                    return unreadable(&source, &reason);
+                }
+            }
+        }
+    }
+    match read_json(inputs.user_config) {
+        Err(reason) => unreadable(inputs.user_config, &reason),
+        Ok(_) => None,
+    }
 }
 
 fn unavailable(detail: String) -> Blocker {
@@ -230,11 +259,22 @@ pub fn weakenings(inputs: &PreflightInputs) -> Option<Vec<Weakening>> {
         found.extend(weakenings);
     }
     match read_json(inputs.user_config) {
-        Ok(Some(doc)) => found.extend(judge_user_config(&doc, inputs.worktree, inputs.repo_root)),
+        Ok(Some(doc)) => found.extend(judge_user_config(
+            &doc,
+            &real_path(inputs.worktree),
+            &real_path(inputs.repo_root),
+        )),
         Ok(None) => {}
         Err(reason) => found.push(unreadable(inputs.user_config.to_path_buf(), &reason)),
     }
     (!found.is_empty()).then_some(found)
+}
+
+/// `path` as the filesystem names it: Claude Code keys `projects` by real
+/// paths (`/private/tmp/...` on macOS, not `/tmp/...`). A path that cannot
+/// be resolved (not created yet) is compared as given.
+fn real_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn unreadable(source: PathBuf, reason: &str) -> Weakening {
@@ -269,6 +309,41 @@ mod tests {
 
     fn everything(_: &str) -> bool {
         true
+    }
+
+    /// An unreadable managed file or `~/.claude.json` is UNAVAILABLE and
+    /// names the file, not "weakened".
+    #[test]
+    fn an_unreadable_configuration_is_unavailable_and_named() {
+        let root = temp_dir("preflight-unreadable");
+        let managed = root.join("managed");
+        std::fs::create_dir_all(&managed).expect("managed root");
+        let bad = managed.join("managed-settings.json");
+        std::fs::write(&bad, "{ half written").expect("write");
+        let user_config = root.join(".claude.json");
+        let inputs = |user_config: &Path| {
+            preflight(&PreflightInputs {
+                platform: "macos",
+                harness_version: Some(SANDBOX_MIN_HARNESS),
+                on_path: &everything,
+                managed_root: &managed,
+                extra_managed_root: None,
+                user_config,
+                worktree: Path::new("/repo"),
+                repo_root: Path::new("/repo"),
+            })
+        };
+        let blocker = inputs(&user_config).expect("blocked");
+        assert_eq!(blocker.code, BlockCode::SandboxUnavailable, "{blocker:?}");
+        assert!(
+            blocker.detail.contains("managed-settings.json"),
+            "{blocker:?}"
+        );
+        std::fs::remove_file(&bad).expect("remove");
+        std::fs::write(&user_config, "not json").expect("write");
+        let blocker = inputs(&user_config).expect("blocked");
+        assert_eq!(blocker.code, BlockCode::SandboxUnavailable, "{blocker:?}");
+        assert!(blocker.detail.contains(".claude.json"), "{blocker:?}");
     }
 
     #[test]
@@ -335,6 +410,39 @@ mod tests {
             worktree: Path::new("/p"),
             repo_root: Path::new("/repo"),
         })
+    }
+
+    // Unix only: the test makes a symlink, as macOS's `/tmp` is one.
+    #[cfg(unix)]
+    #[test]
+    fn the_entry_under_the_real_path_of_a_symlinked_worktree_is_judged() {
+        let root = temp_dir("preflight-symlink");
+        let real = root.join("real-worktree");
+        std::fs::create_dir_all(&real).expect("real worktree");
+        let link = root.join("linked-worktree");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let real = std::fs::canonicalize(&real).expect("canonical");
+        let user_config = root.join(".claude.json");
+        let doc = serde_json::json!({"projects": {
+            real.to_string_lossy(): {"allowedTools": ["Bash(git:*)"]}
+        }});
+        std::fs::write(&user_config, doc.to_string()).expect("write");
+        let found = weakenings(&PreflightInputs {
+            platform: "macos",
+            harness_version: Some(SANDBOX_MIN_HARNESS),
+            on_path: &everything,
+            managed_root: &root.join("managed"),
+            extra_managed_root: None,
+            user_config: &user_config,
+            worktree: &link,
+            repo_root: Path::new("/repo"),
+        })
+        .expect("the real path's entry is judged");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].key,
+            format!("projects.{}.allowedTools", real.display())
+        );
     }
 
     #[test]

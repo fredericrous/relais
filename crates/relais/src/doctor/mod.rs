@@ -379,24 +379,34 @@ pub(crate) fn sandbox_standing(
         repo_root: repo_dir,
     };
     if let Some(blocker) = sandbox::preflight(&preflight) {
-        return if blocker.code == BlockCode::SandboxWeakened {
-            let found = sandbox::weakenings(&preflight).unwrap_or_default();
-            SandboxStanding::Weakened(
-                found
-                    .iter()
-                    .map(|w| format!("{}: {}", w.source.display(), w.key))
-                    .collect(),
-            )
-        } else {
-            SandboxStanding::Unavailable(blocker.detail)
-        };
+        if blocker.code == BlockCode::SandboxWeakened {
+            if let Some(found) = sandbox::weakenings(&preflight) {
+                return SandboxStanding::Weakened(
+                    found
+                        .iter()
+                        .map(|w| format!("{}: {}", w.source.display(), w.key))
+                        .collect(),
+                );
+            }
+        }
+        // The blocker is the reason either way; a weakened verdict whose
+        // list cannot be listed again still has its own detail to show.
+        return SandboxStanding::Unavailable(blocker.detail);
     }
     // The preflight refuses a harness version it cannot read.
-    let (Some(version), Ok(store)) = (harness_version, host.verification_store()) else {
+    let Some(version) = harness_version else {
         return SandboxStanding::Unverified;
     };
+    let store = match host.verification_store() {
+        Ok(store) => store,
+        Err(e) => {
+            return SandboxStanding::Unavailable(format!(
+                "the verification record cannot be located ({e}); set HOME"
+            ))
+        }
+    };
     let names = worker_env.names();
-    let gate = sandbox::dispatch_gate(&sandbox::GateInputs {
+    let gate = sandbox::dispatch_lookup(&sandbox::GateInputs {
         store: &store,
         harness_version: version,
         platform,
@@ -414,7 +424,7 @@ pub(crate) fn sandbox_standing(
         extra_managed_root: extra_managed_root.as_deref(),
     });
     match gate {
-        Ok(_) => SandboxStanding::Verified {
+        Ok(Some(_)) => SandboxStanding::Verified {
             harness_version: version
                 .split_whitespace()
                 .next()
@@ -422,7 +432,8 @@ pub(crate) fn sandbox_standing(
                 .to_string(),
             platform: platform.to_string(),
         },
-        Err(_) => SandboxStanding::Unverified,
+        Ok(None) => SandboxStanding::Unverified,
+        Err(reason) => SandboxStanding::Unavailable(reason),
     }
 }
 
@@ -553,11 +564,28 @@ fn probe_nonce() -> String {
 }
 
 /// Words wrapped to `width` columns; continuation lines start with
-/// `indent`. A word longer than the width stays whole.
+/// `indent`. A word longer than a line is broken across lines.
 fn wrap(text: &str, width: usize, indent: &str) -> Vec<String> {
+    let room = width.saturating_sub(indent.len()).max(1);
     let mut lines: Vec<String> = Vec::new();
     let mut current = String::new();
     for word in text.split_whitespace() {
+        if word.len() > room {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            let chars: Vec<char> = word.chars().collect();
+            for piece in chars.chunks(room) {
+                if !current.is_empty() {
+                    lines.push(std::mem::take(&mut current));
+                }
+                if !lines.is_empty() {
+                    current.push_str(indent);
+                }
+                current.extend(piece);
+            }
+            continue;
+        }
         if !current.is_empty() && current.len() + 1 + word.len() > width {
             lines.push(std::mem::take(&mut current));
             current.push_str(indent);
@@ -3555,6 +3583,44 @@ mod tests {
                 && flat.contains("machine-wide");
             assert_eq!(scoped, standing != SandboxStanding::Off, "{text}");
         }
+    }
+
+    #[test]
+    fn a_path_longer_than_80_columns_is_broken_across_lines() {
+        let long_key = format!(
+            "projects.{}.allowedTools",
+            "/very/long/path/to/a/project/checkout/".repeat(4)
+        );
+        assert!(long_key.len() > 80);
+        let finding = sandbox_finding(&SandboxStanding::Weakened(vec![format!(
+            "/home/someone/.claude.json: {long_key}"
+        )]));
+        no_line_is_wider_than_80(&finding.detail);
+        let joined: String = finding
+            .detail
+            .lines()
+            .take_while(|line| !line.trim_start().starts_with("scope:"))
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            joined.contains(&long_key),
+            "no character was lost: {joined}"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_store_is_unavailable_with_its_reason_not_unverified() {
+        let (_dir, host) = host("standing-corrupt-store", "macos");
+        std::fs::write(&host.store, "{ not a store").expect("write");
+        let standing = standing_of(&host, &on());
+        let SandboxStanding::Unavailable(reason) = &standing else {
+            panic!("expected unavailable, got {standing:?}");
+        };
+        assert!(reason.contains("corrupt"), "{reason}");
+        let finding = sandbox_finding(&standing);
+        assert_eq!(finding.level, Level::Warn);
+        assert!(finding.detail.starts_with("unavailable: "), "{finding:?}");
     }
 
     /// A launcher no `--verify-sandbox` that stops early may reach.

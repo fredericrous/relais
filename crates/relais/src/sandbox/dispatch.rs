@@ -57,11 +57,27 @@ fn unverified(detail: String) -> Blocker {
 /// the reason it may not run. Fails closed: a store that cannot be read, or
 /// managed files that cannot be read, verify nothing.
 pub fn dispatch_gate(inputs: &GateInputs) -> Result<VerificationKey, Blocker> {
+    match dispatch_lookup(inputs) {
+        Ok(Some(key)) => Ok(key),
+        Ok(None) => Err(unverified(format!(
+            "no probe session has verified the sandbox for Claude Code {} on {} with this \
+             configuration; run `relais doctor --verify-sandbox` (a change to the harness, the \
+             platform, `[sandbox]` or the managed settings needs it again)",
+            inputs.harness_version, inputs.platform
+        ))),
+        Err(why) => Err(unverified(why)),
+    }
+}
+
+/// The key when a record holds for this configuration, `None` when none
+/// does, and the reason when the store or the managed files cannot be read
+/// at all: the two answers `relais doctor` words differently.
+pub fn dispatch_lookup(inputs: &GateInputs) -> Result<Option<VerificationKey>, String> {
     let managed = managed_bytes(inputs.managed_root, inputs.extra_managed_root).map_err(|why| {
-        unverified(format!(
+        format!(
             "the managed configuration the verification is keyed by cannot be read ({why}); \
-                 relais fails closed"
-        ))
+             relais fails closed"
+        )
     })?;
     let key = dispatch_key(&DispatchKeyInputs {
         harness_version: inputs.harness_version,
@@ -70,18 +86,10 @@ pub fn dispatch_gate(inputs: &GateInputs) -> Result<VerificationKey, Blocker> {
         managed: &managed,
     });
     let store = VerificationStore::load(inputs.store).map_err(|why| {
-        unverified(format!(
+        format!(
             "{why} ({}); delete it and run `relais doctor --verify-sandbox`",
             inputs.store.display()
-        ))
+        )
     })?;
-    match store.find(&key) {
-        Some(_) => Ok(key),
-        None => Err(unverified(format!(
-            "no probe session has verified the sandbox for Claude Code {} on {} with this \
-             configuration; run `relais doctor --verify-sandbox` (a change to the harness, the \
-             platform, `[sandbox]` or the managed settings needs it again)",
-            inputs.harness_version, inputs.platform
-        ))),
-    }
+    Ok(store.find(&key).map(|_| key))
 }

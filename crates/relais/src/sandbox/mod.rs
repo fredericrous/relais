@@ -39,7 +39,7 @@ mod settings;
 mod verification;
 mod verify;
 
-pub use dispatch::{dispatch_gate, dispatch_key, DispatchKeyInputs, GateInputs};
+pub use dispatch::{dispatch_gate, dispatch_key, dispatch_lookup, DispatchKeyInputs, GateInputs};
 pub use floor::{credential_floor, Floor, FloorInputs};
 pub use judge::{judge_managed, judge_user_config, managed_sources, Weakening};
 pub use launch::{worker_launch, LaunchInputs, WorkerMode};
@@ -48,8 +48,8 @@ pub use preflight::{
     SandboxHost, SANDBOX_MIN_HARNESS,
 };
 pub use probe::{
-    evaluate, probe_plan, probe_plan_allowlist, probe_prompt, Expect, ProbePlanInputs, ProbeReport,
-    ProbeStep, ProbeTool, StepResult, Verdict,
+    evaluate, probe_plan, probe_plan_allowlist, probe_prompt, Expect, InitExpect, ProbePlanInputs,
+    ProbeReport, ProbeStep, ProbeTool, StepResult, Verdict,
 };
 pub use settings::{build_settings, SettingsInputs};
 pub use verification::{

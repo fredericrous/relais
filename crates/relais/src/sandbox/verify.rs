@@ -17,8 +17,8 @@ use serde_json::Value;
 
 use super::{
     dispatch_key, evaluate, probe_plan, probe_plan_allowlist, probe_prompt, store_path,
-    worker_launch, DispatchKeyInputs, LaunchInputs, ProbePlanInputs, ProbeReport, ProbeStep,
-    StoreError, VerificationKey, VerificationRecord, VerificationStore,
+    worker_launch, DispatchKeyInputs, InitExpect, LaunchInputs, ProbePlanInputs, ProbeReport,
+    ProbeStep, StoreError, VerificationKey, VerificationRecord, VerificationStore,
 };
 use crate::backend::{
     worker_launch_env, BackendError, Capabilities, LaunchEnv, LaunchSpec, ProbeLauncher,
@@ -208,6 +208,33 @@ fn prepare(git: &dyn Git, state_dir: &Path, nonce: &str) -> Result<Prepared, Ver
     })
 }
 
+/// Probe directories kept before a new attempt: failed ones stay for
+/// diagnosis until this many newer ones exist.
+const PROBE_DIRS_KEPT: usize = 3;
+
+/// Removes all but the most recent [`PROBE_DIRS_KEPT`] directories (by
+/// mtime) under `<state_dir>/sandbox/probe`.
+fn prune_probe_dirs(state_dir: &Path) {
+    let root = state_dir.join("sandbox").join("probe");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        // No probe directory yet, or none readable: nothing to prune.
+        return;
+    };
+    let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = entries
+        // An entry that cannot be read is left alone, not counted.
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let modified = entry.metadata().and_then(|meta| meta.modified()).ok()?;
+            Some((modified, entry.path()))
+        })
+        .collect();
+    dirs.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, stale) in dirs.into_iter().skip(PROBE_DIRS_KEPT) {
+        // Best effort: a probe directory that stays is litter, not a wrong answer.
+        std::fs::remove_dir_all(&stale).ok();
+    }
+}
+
 /// A probe launch: haiku, a $0.50 cap and the prompt for `steps`, in the
 /// probe worktree.
 fn probe_spec(
@@ -291,6 +318,12 @@ pub fn verify_sandbox(
         .as_deref()
         .ok_or(VerifyError::Harness)?;
     let nonce = inputs.nonce;
+    // Loaded first, as a check only: a store that cannot be read must not
+    // cost two paid sessions whose result could not be recorded. It is
+    // loaded AGAIN just before the record is written, so a record another
+    // verification wrote meanwhile is kept, not overwritten.
+    VerificationStore::load(&store_path(inputs.state_dir)).map_err(VerifyError::Store)?;
+    prune_probe_dirs(inputs.state_dir);
     let prepared = prepare(git, inputs.state_dir, nonce)?;
     let synthetic = format!("relais-probe-{nonce}");
     // The probe launches with the synthetic credential on top of the
@@ -341,7 +374,9 @@ pub fn verify_sandbox(
         &steps,
         &sandbox_stream,
         init_record(&sandbox_stream).as_ref(),
-        &SANDBOX_TOOLS,
+        InitExpect::Confined {
+            tools: &SANDBOX_TOOLS,
+        },
     );
 
     // The allowlist probe: the launch relais uses with `[sandbox]` off.
@@ -357,16 +392,15 @@ pub fn verify_sandbox(
         None,
     );
     let allowlist_stream = stream("allowlist", &spec)?;
-    // This probe is about the environment only: whatever tools the harness
-    // lists are the ones it is expected to list.
-    let init = init_record(&allowlist_stream);
-    let listed: Vec<&str> = init
-        .as_ref()
-        .and_then(|record| record.get("tools"))
-        .and_then(Value::as_array)
-        .map(|tools| tools.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
-    let allowlist_report = evaluate(&steps, &allowlist_stream, init.as_ref(), &listed);
+    // This probe is about the environment only: its launch has no
+    // `--strict-mcp-config`, so the user's own MCP servers and plugins show
+    // in the init record, and that record is not judged.
+    let allowlist_report = evaluate(
+        &steps,
+        &allowlist_stream,
+        init_record(&allowlist_stream).as_ref(),
+        InitExpect::EnvOnly,
+    );
 
     let cost = session_cost(&sandbox_stream)
         .zip(session_cost(&allowlist_stream))
@@ -387,8 +421,8 @@ pub fn verify_sandbox(
         key,
     };
     if outcome.passed() {
-        let path = store_path(inputs.state_dir);
-        let mut store = VerificationStore::load(&path).map_err(VerifyError::Store)?;
+        let mut store =
+            VerificationStore::load(&store_path(inputs.state_dir)).map_err(VerifyError::Store)?;
         store.record(VerificationRecord {
             key: outcome.key.as_str().to_string(),
             verified_at: inputs.verified_at.to_string(),
@@ -501,6 +535,9 @@ mod tests {
         launched: Mutex<Vec<LaunchSpec>>,
         /// The fixture as it was on disk at the sandbox launch.
         fixture_at_launch: Mutex<Option<String>>,
+        /// Run once during the first launch: what another process does to
+        /// the store while the paid sessions are running.
+        meanwhile: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     impl Canned {
@@ -509,6 +546,7 @@ mod tests {
                 ignored_step,
                 launched: Mutex::new(Vec::new()),
                 fixture_at_launch: Mutex::new(None),
+                meanwhile: Mutex::new(None),
             }
         }
     }
@@ -516,6 +554,9 @@ mod tests {
     impl ProbeLauncher for Canned {
         fn stream(&self, spec: &LaunchSpec) -> Result<String, BackendError> {
             self.launched.lock().unwrap().push(spec.clone());
+            if let Some(action) = self.meanwhile.lock().unwrap().take() {
+                action();
+            }
             let steps = if spec.sandbox.is_some() {
                 let fixture = spec
                     .work_dir
@@ -843,6 +884,84 @@ mod tests {
         machine.capabilities.version = None;
         let err = machine.verify(&Canned::new(None)).expect_err("no version");
         assert!(matches!(err, VerifyError::Harness));
+    }
+
+    #[test]
+    fn a_corrupt_store_is_an_error_before_anything_launches() {
+        let machine = Machine::new("verify-corrupt-store");
+        let path = store_path(&machine.state);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ not a store").unwrap();
+        let launcher = Canned::new(None);
+        let err = machine.verify(&launcher).expect_err("corrupt store");
+        assert!(
+            matches!(err, VerifyError::Store(StoreError::Corrupt(_))),
+            "{err}"
+        );
+        assert!(launcher.launched.lock().unwrap().is_empty(), "no launch");
+        assert!(
+            !machine.state.join("sandbox/probe").exists(),
+            "no probe directory was prepared"
+        );
+    }
+
+    /// A record another verification writes while this one's paid sessions
+    /// run is kept: the store is loaded again just before the save.
+    #[test]
+    fn a_record_written_meanwhile_survives_the_save() {
+        let machine = Machine::new("verify-meanwhile");
+        let launcher = Canned::new(None);
+        let path = store_path(&machine.state);
+        *launcher.meanwhile.lock().unwrap() = Some(Box::new(move || {
+            let mut other = VerificationStore::load(&path).expect("loads");
+            other.record(VerificationRecord {
+                key: "other-key".to_string(),
+                verified_at: "2026-09-30T09:00:00Z".to_string(),
+                harness_version: "2.1.285".to_string(),
+                platform: "linux".to_string(),
+                report: Vec::new(),
+            });
+            other.save().expect("saves");
+        }));
+        let outcome = machine.verify(&launcher).expect("verified");
+        assert!(outcome.passed(), "{}", outcome.render());
+        let store = machine.store();
+        assert!(store.find(&machine.dispatch_key()).is_some(), "this record");
+        assert!(
+            store
+                .records()
+                .iter()
+                .any(|record| record.key == "other-key"),
+            "the other verification's record survived"
+        );
+    }
+
+    #[test]
+    fn only_the_three_most_recent_probe_dirs_survive_a_new_attempt() {
+        let machine = Machine::new("verify-prune");
+        let root = machine.state.join("sandbox/probe");
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        for (index, name) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::File::open(&dir)
+                .unwrap()
+                .set_modified(epoch + Duration::from_secs(1_000 * (index as u64 + 1)))
+                .unwrap();
+        }
+        machine
+            .verify(&Canned::new(Some("tmp-write")))
+            .expect("ran");
+        let mut left: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [NONCE, "c", "d", "e"],
+            "the newest three, and this attempt's"
+        );
     }
 
     #[test]
