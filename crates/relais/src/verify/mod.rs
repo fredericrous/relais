@@ -1790,6 +1790,31 @@ pub struct Receipt {
     /// the `serde(default)` for receipts written before this existed.
     #[serde(default)]
     pub review: ReviewRecord,
+    /// The rungs that actually ran under this receipt (SPEC §6): tier,
+    /// model and effort, initial first. `NotRecorded` on a receipt written
+    /// before the ladder existed, which still parses.
+    #[serde(default, skip_serializing_if = "LadderRecord::is_not_recorded")]
+    pub ladder: LadderRecord,
+}
+
+/// What a receipt records about the ladder that ran. A decomposed run's
+/// root dispatches no worker rungs of its own, so it records each
+/// package's ladder instead — never its own, which nothing ran.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LadderRecord {
+    #[default]
+    NotRecorded,
+    /// The one run's ladder, initial rung first.
+    Single(Vec<crate::route::Rung>),
+    /// A decomposed run: each package's own ladder, keyed by package id.
+    PerPackage(BTreeMap<String, Vec<crate::route::Rung>>),
+}
+
+impl LadderRecord {
+    fn is_not_recorded(&self) -> bool {
+        matches!(self, Self::NotRecorded)
+    }
 }
 
 /// What a receipt records about the review of its candidate. Four states:
@@ -3874,6 +3899,7 @@ mod tests {
             recipe: crate::policy::RecipeRecord::NotRecorded,
             verification_profile_hash: "vph".into(),
             review: ReviewRecord::NotRecorded,
+            ladder: LadderRecord::NotRecorded,
         };
         let hash = receipt.hash();
         let mut other = receipt.clone();

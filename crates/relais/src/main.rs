@@ -2039,8 +2039,46 @@ fn resolve_task_override(
     }
 }
 
+/// Say on doctor's `effort` finding which models a `raise` repair WOULD hold
+/// because their effort order is unknown. Doctor has no task or budget, so
+/// the line is conditional and lists every model a repair could run at;
+/// `relais plan` states the models one run's ladder actually holds. Holding
+/// the effort never changes the finding's level — nothing is blocked. A
+/// repository or machine.toml that cannot be read says nothing here: doctor
+/// reports those on findings of their own.
+fn note_held_repair_effort(report: &mut doctor::DoctorReport) {
+    let (Ok((_, repo)), Ok(machine)) = (load_repo_policy(), load_machine()) else {
+        return;
+    };
+    let cli = relais::adapter::claude::ClaudeBackend::discover()
+        .ok()
+        .and_then(|backend| backend.probe())
+        .map_or(relais::catalog::Fact::Unknown, |capabilities| {
+            capabilities.accepted_efforts
+        });
+    let catalogs = relais::catalog::EffortCatalogs::resolve_all(
+        &cli,
+        &machine.efforts,
+        &machine.routing.max_effort,
+        repo.models.values().map(|profile| profile.id.as_str()),
+    );
+    let held = route::held_repair_models(&repo.models, &catalogs, repo.execution.repair_effort);
+    if held.is_empty() {
+        return;
+    }
+    if let Some(finding) = report
+        .findings
+        .iter_mut()
+        .find(|finding| finding.component == "effort")
+    {
+        finding.detail.push('\n');
+        finding.detail.push_str(&route::held_would_text(&held));
+    }
+}
+
 fn doctor_command(json: bool) -> Result<CliOutcome, CliError> {
-    let report = doctor::doctor(&project_dir()?);
+    let mut report = doctor::doctor(&project_dir()?);
+    note_held_repair_effort(&mut report);
     if json {
         print_document(&report)?;
     } else {
@@ -2232,6 +2270,7 @@ fn plan_json(
                 "route": {
                     "tier": routed.tier.as_str(),
                     "rung": routed.rung,
+                    "ladder": routed.ladder,
                     "routed_by": routed.routed_by.as_str(),
                     "escalation_tier": routed.escalation_tier.map(|tier| tier.as_str()),
                     "reasons": routed.reasons.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
@@ -2383,6 +2422,11 @@ fn plan_command(
     match &decision {
         route::Routed::Route(routed) => {
             print!("{}", routed.explain());
+            // Stderr, like the other advisories: the route line and the
+            // ladder on stdout are unchanged by holding the effort.
+            for model in routed.ladder.held() {
+                eprintln!("{}", route::held_text(model));
+            }
             for line in plan_trial_lines(
                 &root,
                 &repo,

@@ -492,6 +492,33 @@ With the catalog unknown for a model, only the configured `effort` runs; an
 effort a recipe or a floor changed is blocked until `[efforts] order` and
 `[[efforts.models]] supported` are set for that model.
 
+### Repairs and escalations: `repair_effort`
+
+`route()` resolves an effort for every attempt the budget can reach (the
+ladder, printed one rung per line by `relais plan`). One optional key in
+`relais.toml` says how a repair's effort follows the attempt it repairs:
+
+```toml
+[execution]
+repair_effort = "raise"   # default; or "same"
+```
+
+- `raise` steps the effort to the next admissible one in the model's order
+  and stays at the tier's ceiling once there; it never drops the effort.
+- `same` keeps the previous attempt's effort: the sequence before the
+  ladder existed.
+
+An escalation runs the escalation tier at its configured effort, raised to a
+risk floor when one applies, and every rung is checked against the same
+sets and ceilings as the first. When a model's catalog is unknown, `raise`
+holds the effort (as `same`) for that model. `relais plan` says `repair
+effort held: effort order unknown for <model>` for the models this run's
+ladder holds; `relais doctor`, with no task or budget, says `repair effort
+would be held (effort order unknown) for: <models>` for every model a repair
+could run at;
+set `[efforts] order` and `[[efforts.models]] supported` to let it climb.
+Leaving the key out keeps the authority hash of a policy that never named it.
+
 The adapter never drops an effort. A dispatch that requests one the CLI is
 known not to accept (no `--effort`, or a listed set without it) stops with
 `EffortUnsupported { effort, model, harness_version }` and the run is

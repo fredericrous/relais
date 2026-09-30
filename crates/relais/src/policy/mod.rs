@@ -366,6 +366,37 @@ pub struct ExecutionPolicy {
     pub max_agent_depth: u32,
     #[serde(default = "default_max_agents_total")]
     pub max_agents_total: u32,
+    /// Whether a repair climbs effort within its tier (`raise`, the
+    /// default) or keeps the previous attempt's (`same`). Left out of the
+    /// serialized declaration while it is the default, so a policy that
+    /// never names it keeps its authority hash.
+    #[serde(default, skip_serializing_if = "RepairEffort::is_default")]
+    pub repair_effort: RepairEffort,
+}
+
+/// How a repair's effort follows the attempt it repairs (SPEC §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairEffort {
+    /// The next admissible effort in the model's order, never above the
+    /// tier's ceiling.
+    #[default]
+    Raise,
+    /// The previous attempt's effort, unchanged.
+    Same,
+}
+
+impl RepairEffort {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Raise => "raise",
+            Self::Same => "same",
+        }
+    }
 }
 
 fn default_max_attempts() -> u32 {
