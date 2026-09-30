@@ -53,8 +53,8 @@ use relais::lifecycle::RunPurpose;
 use relais::money::{CostCompleteness, MicroUsd};
 use relais::orchestration::{self, PriceTable, TranscriptSource};
 use relais::policy::{
-    effective_authority, grant_key, HookAdmissionSettings, MachineSettings, RecipeSpec,
-    RepoIdentity, RepoPolicy,
+    effective_authority, grant_key, EffectiveAuthority, HookAdmissionSettings, MachineSettings,
+    RecipeSpec, RepoIdentity, RepoPolicy,
 };
 use relais::runner::{execute, live_trial, worktree_root, Reason, RunConfig, State, Terminal};
 use relais::verify::{independence_summary, Receipt};
@@ -110,6 +110,9 @@ enum Command {
         /// record.
         #[arg(long = "revise")]
         revise: Option<String>,
+        /// Print the decision as one JSON object, the route with its rung
+        #[arg(long)]
+        json: bool,
     },
     /// Validate the contract and start an execution (SPEC §3)
     Run {
@@ -784,7 +787,14 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             }),
         },
         Command::Init => init_command(),
-        Command::Plan { task, revise } => plan_command(&task, revise.as_deref()),
+        Command::Plan { task, revise, json } => {
+            let format = if json {
+                PlanFormat::Json
+            } else {
+                PlanFormat::Text
+            };
+            plan_command(&task, revise.as_deref(), format)
+        }
         Command::Run { task, revise } => run_command(&task, revise.as_deref()),
         Command::Status { run_id } => status_command(run_id.as_deref()),
         Command::Explain { run_id } => explain_command(&run_id),
@@ -1254,26 +1264,40 @@ fn learned_registry(machine: &MachineSettings) -> Option<relais::learn::registry
 /// answer: unknown when it is not installed. Which of "not installed"
 /// and "installed and would not answer" it was goes to stderr — the
 /// plan is still printed either way.
-fn harness_identity() -> Option<String> {
+fn harness_identity() -> HarnessProbe {
+    let unknown = HarnessProbe {
+        identity: None,
+        efforts: None,
+    };
     let backend = match relais::adapter::claude::ClaudeBackend::discover() {
         Ok(backend) => backend,
         Err(e) => {
             eprintln!("relais plan: the harness is unknown ({e})");
-            return None;
+            return unknown;
         }
     };
     let capabilities = match backend.probe_report() {
         Ok(capabilities) => capabilities,
         Err(failure) => {
             eprintln!("relais plan: the harness is unknown ({failure})");
-            return None;
+            return unknown;
         }
     };
-    Some(format!(
-        "{} {}",
-        backend.name(),
-        capabilities.version.as_deref().unwrap_or("?")
-    ))
+    HarnessProbe {
+        identity: Some(format!(
+            "{} {}",
+            backend.name(),
+            capabilities.version.as_deref().unwrap_or("?")
+        )),
+        efforts: Some(capabilities.accepted_efforts),
+    }
+}
+
+/// What one probe of the harness told `plan`: who it is, and which efforts
+/// its CLI accepts. Both `None` when it could not be probed.
+struct HarnessProbe {
+    identity: Option<String>,
+    efforts: Option<relais::catalog::EffortSet>,
 }
 
 /// The identifier source this process mints with: the wall clock and
@@ -1928,6 +1952,46 @@ fn load_machine() -> Result<MachineSettings, CliError> {
     })
 }
 
+/// The bounds a candidate recipe is admitted under: the incumbent's own,
+/// with effort catalogs resolved as routing resolves them — from the
+/// harness probe and machine.toml. A machine.toml that is absent or invalid
+/// states no effort fact, and a harness that does not answer accepts none:
+/// both leave the catalogs unknown, which admits only the incumbent's
+/// configured efforts, never more.
+fn tuning_bounds(incumbent: &RepoPolicy) -> route::TuningBounds {
+    let settings = paths::machine_settings_path()
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| MachineSettings::from_toml_str(&text).ok())
+        .map(|machine| {
+            (
+                machine.efforts,
+                machine.routing.max_effort,
+                machine.allowed_models,
+            )
+        });
+    let (efforts, max_effort, allowed_models) = settings.unwrap_or_else(|| {
+        (
+            relais::policy::EffortSettings::default(),
+            relais::policy::RoutingSettings::default().max_effort,
+            None,
+        )
+    });
+    let cli = relais::adapter::claude::ClaudeBackend::discover()
+        .ok()
+        .and_then(|backend| backend.probe())
+        .map_or(relais::catalog::Fact::Unknown, |capabilities| {
+            capabilities.accepted_efforts
+        });
+    let catalogs = relais::catalog::EffortCatalogs::resolve_all(
+        &cli,
+        &efforts,
+        &max_effort,
+        incumbent.models.values().map(|profile| profile.id.as_str()),
+    );
+    route::default_tuning_bounds(incumbent, allowed_models.as_deref(), &catalogs)
+}
+
 fn load_contract(task: &Path) -> Result<TaskContract, CliError> {
     let text = std::fs::read_to_string(task).map_err(|cause| CliError::Read {
         what: "the task contract",
@@ -2146,7 +2210,60 @@ fn init_command() -> Result<CliOutcome, CliError> {
     }
 }
 
-fn plan_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError> {
+/// How `plan` prints its decision.
+#[derive(Clone, Copy)]
+enum PlanFormat {
+    Text,
+    Json,
+}
+
+/// `plan --json`: the decision as one JSON object — the route with its
+/// rung, or every blocker with its code.
+fn plan_json(
+    decision: &route::Routed,
+    authority: &EffectiveAuthority,
+    contract: &TaskContract,
+) -> Result<CliOutcome, CliError> {
+    let (value, outcome) = match decision {
+        route::Routed::Route(routed) => (
+            serde_json::json!({
+                "contract_hash": contract.hash(),
+                "policy_hash": authority.authority_hash,
+                "route": {
+                    "tier": routed.tier.as_str(),
+                    "rung": routed.rung,
+                    "routed_by": routed.routed_by.as_str(),
+                    "escalation_tier": routed.escalation_tier.map(|tier| tier.as_str()),
+                    "reasons": routed.reasons.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+                },
+            }),
+            CliOutcome::Accepted,
+        ),
+        route::Routed::Blocked(blocked) => (
+            serde_json::json!({
+                "contract_hash": contract.hash(),
+                "policy_hash": authority.authority_hash,
+                "blocked": blocked
+                    .blockers()
+                    .iter()
+                    .map(|b| serde_json::json!({"code": b.code.as_str(), "detail": b.detail}))
+                    .collect::<Vec<_>>(),
+            }),
+            CliOutcome::Blocked,
+        ),
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value).expect("a plan decision serializes")
+    );
+    Ok(outcome)
+}
+
+fn plan_command(
+    task: &Path,
+    revise: Option<&str>,
+    format: PlanFormat,
+) -> Result<CliOutcome, CliError> {
     let (root, repo) = load_repo_policy()?;
     let machine = load_machine()?;
     let contract = load_contract(task)?;
@@ -2212,11 +2329,13 @@ fn plan_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliErro
     }
     let repo_identity = relais::repo::identity(&root);
     let authority = effective_authority(&repo, &machine, &contract, &repo_identity);
-    let harness = harness_identity();
+    let probe = harness_identity();
+    let harness = probe.identity;
     let registry = learned_registry(&machine);
     let predictor = registry
         .as_ref()
         .map(|registry| RegistryPredictor::new(registry, &repo, harness.as_deref()));
+    let catalogs = route::resolve_catalogs(&repo, &authority, &machine, probe.efforts.as_ref());
     let decision = route::route(route::RouteInputs {
         contract: &contract,
         repo: &repo,
@@ -2225,7 +2344,11 @@ fn plan_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliErro
         predictor: predictor
             .as_ref()
             .map(|predictor| predictor as &dyn route::RoutePredictor),
+        catalogs: &catalogs,
     });
+    if let PlanFormat::Json = format {
+        return plan_json(&decision, &authority, &contract);
+    }
     let session = relais::coordinator::resolve_session();
     println!("contract hash: {}", contract.hash());
     println!("policy hash: {}", authority.authority_hash);
@@ -2259,11 +2382,7 @@ fn plan_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliErro
     }
     match &decision {
         route::Routed::Route(routed) => {
-            let model = authority
-                .models
-                .get(&routed.tier)
-                .map(|profile| profile.id.as_str());
-            print!("{}", routed.explain(model));
+            print!("{}", routed.explain());
             for line in plan_trial_lines(
                 &root,
                 &repo,
@@ -2604,7 +2723,7 @@ fn replay_command(task: &str, recipe: &Path, dry_run: bool) -> Result<CliOutcome
         })?;
     // Admitted through the same door a learner's proposal is — never a
     // second, looser one for replay.
-    let bounds = route::default_tuning_bounds(&incumbent);
+    let bounds = tuning_bounds(&incumbent);
     let candidate = match route::validate_candidate(&incumbent, &candidate_policy, &bounds) {
         Ok(candidate) => candidate,
         Err(rejection) => {
@@ -2962,18 +3081,18 @@ fn recipe_show_command(name: &str) -> Result<CliOutcome, CliError> {
             kind = kind_label(recipe.kind),
             scope = scope_label(&recipe.scope_within),
         );
-        // DECLARED AND HASHED, NOT YET READ by routing: the exact caveat
-        // `RecipeSpec::models`'s field doc carries, repeated here rather
-        // than left implicit, so this command cannot be read as saying
-        // these blocks take effect.
+        // `models` is read by routing. `execution`, `context` and `review`
+        // are DECLARED AND HASHED, NOT YET READ by routing: the exact
+        // caveat `RecipeSpec::execution`'s field doc carries, repeated
+        // here rather than left implicit, so this command cannot be read
+        // as saying those blocks take effect.
+        if let Some(models) = &recipe.models {
+            println!(
+                "  models: {}",
+                serde_json::to_string(models).unwrap_or_default()
+            );
+        }
         for (label, json) in [
-            (
-                "models",
-                recipe
-                    .models
-                    .as_ref()
-                    .map(|v| serde_json::to_string(v).unwrap_or_default()),
-            ),
             (
                 "execution",
                 recipe
@@ -3154,7 +3273,7 @@ fn recipe_diff_command(candidate_path: &Path) -> Result<CliOutcome, CliError> {
         println!("no differences between the repository's recipes and the candidate's");
     }
 
-    let bounds = route::default_tuning_bounds(&incumbent);
+    let bounds = tuning_bounds(&incumbent);
     match route::validate_candidate(&incumbent, &candidate_policy, &bounds) {
         Ok(_) => println!(
             "admissible: route::validate_candidate would ADMIT this candidate — admissible is \
@@ -3191,7 +3310,7 @@ fn recipe_evaluate_command(candidate_path: &Path) -> Result<CliOutcome, CliError
         })?;
     // Admitted through the same door a learner's proposal, or a replay's
     // candidate, is — never a second, looser one for evaluation.
-    let bounds = route::default_tuning_bounds(&incumbent);
+    let bounds = tuning_bounds(&incumbent);
     let candidate = match route::validate_candidate(&incumbent, &candidate_policy, &bounds) {
         Ok(candidate) => candidate,
         Err(rejection) => {
@@ -3323,7 +3442,7 @@ fn recipe_promote_command(candidate_path: &Path, mode: AmendMode) -> Result<CliO
             path: candidate_path.to_path_buf(),
             cause: Box::new(cause),
         })?;
-    let bounds = route::default_tuning_bounds(&incumbent);
+    let bounds = tuning_bounds(&incumbent);
     let candidate = match route::validate_candidate(&incumbent, &candidate_policy, &bounds) {
         Ok(candidate) => candidate,
         Err(rejection) => {
@@ -5094,6 +5213,7 @@ mod tests {
                         relais::policy::ModelProfile {
                             id: "sonnet".to_string(),
                             effort: None,
+                            max_effort: None,
                         },
                     )])),
                     ..base.clone()

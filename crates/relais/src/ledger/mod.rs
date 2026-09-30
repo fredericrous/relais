@@ -2362,6 +2362,21 @@ impl Ledger {
         Ok(count as usize)
     }
 
+    /// Whether a reviewer was DISPATCHED for this run: a review dispatch
+    /// intent is written before the launch, so a review whose model
+    /// reported no usage, or whose launch failed, still counts. This is
+    /// the fact a receipt's review record rests on; `review_attempted`
+    /// counts billed review usage, for the review-correction rate.
+    pub fn review_dispatched(&self, run_id: &RunId) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM dispatches
+             WHERE run_id = ?1 AND json_extract(intent_json, '$.kind') = 'review'",
+            [run_id.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Whether a run's reviewer actually ran, from usage events tagged
     /// with the review phase. The review-correction rate's denominator
     /// counts only tasks a reviewer looked at (SPEC §11): a rate over

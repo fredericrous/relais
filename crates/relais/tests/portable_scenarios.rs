@@ -1052,15 +1052,22 @@ id = "sonnet"
     let stdout = text(&out.stdout);
     assert!(stdout.contains("models:"), "{stdout}");
     assert!(stdout.contains("review:"), "{stdout}");
-    for label in ["models:", "review:"] {
-        assert!(
-            stdout
-                .lines()
-                .find(|line| line.trim_start().starts_with(label))
-                .is_some_and(|line| line.contains("DECLARED AND HASHED, NOT YET READ")),
-            "{label} must carry the same caveat its field doc does: {stdout}"
-        );
-    }
+    let line_of = |label: &str| {
+        stdout
+            .lines()
+            .find(|line| line.trim_start().starts_with(label))
+            .map(str::to_string)
+    };
+    // `review` is still declared and hashed only; `models` is read by
+    // routing and no longer carries the caveat.
+    assert!(
+        line_of("review:").is_some_and(|line| line.contains("DECLARED AND HASHED, NOT YET READ")),
+        "review: must carry the same caveat its field doc does: {stdout}"
+    );
+    assert!(
+        line_of("models:").is_some_and(|line| !line.contains("NOT YET READ")),
+        "models: is read by routing and carries no caveat: {stdout}"
+    );
 }
 
 #[test]

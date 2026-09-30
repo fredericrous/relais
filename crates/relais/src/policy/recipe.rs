@@ -70,30 +70,33 @@ pub struct RecipeSpec {
         skip_serializing_if = "is_default_recipe_enabled"
     )]
     pub enabled: bool,
-    /// Per-recipe models — DECLARED AND HASHED, NOT YET READ. No routing
-    /// or dispatch path consults this today; `route` takes the recipe's
-    /// `tier` and nothing else. Setting it therefore moves the authority
-    /// hash, and costs a trust re-grant, while changing nothing that
-    /// runs. It is here so the shape and the hash settle in one release
-    /// rather than two. The release that reads it must delete this
-    /// paragraph, and `CHANGELOG.md` says the same thing — if these two
-    /// ever disagree, the code is right and the prose is stale.
+    /// Per-recipe models: when this recipe covers a task, the profile for
+    /// the routed tier (model and start effort) is read from here instead
+    /// of the repository's `models` table. The model must still be in the
+    /// machine's `allowed_models`, and the effort stays under the
+    /// authority ceiling (SPEC §6).
     ///
     /// Omitted from the serialized form when absent, like every optional
     /// field here, so a recipe that never set one leaves the authority
     /// hash exactly where it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<BTreeMap<Tier, ModelProfile>>,
-    /// Per-recipe execution limits — DECLARED AND HASHED, NOT YET READ;
-    /// see [`RecipeSpec::models`] for what that costs and why.
+    /// Per-recipe execution limits — DECLARED AND HASHED, NOT YET READ.
+    /// No routing or dispatch path consults this today. Setting it
+    /// therefore moves the authority hash, and costs a trust re-grant,
+    /// while changing nothing that runs. It is here so the shape and the
+    /// hash settle in one release rather than two. The release that reads
+    /// it must delete this paragraph, and `CHANGELOG.md` says the same
+    /// thing — if these two ever disagree, the code is right and the prose
+    /// is stale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<ExecutionPolicy>,
     /// Per-recipe context budget — DECLARED AND HASHED, NOT YET READ;
-    /// see [`RecipeSpec::models`] for what that costs and why.
+    /// see [`RecipeSpec::execution`] for what that costs and why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextPolicy>,
     /// Per-recipe review floor override — DECLARED AND HASHED, NOT YET
-    /// READ; see [`RecipeSpec::models`] for what that costs and why. A
+    /// READ; see [`RecipeSpec::execution`] for what that costs and why. A
     /// tunable knob a candidate revision may raise but never lower (SPEC
     /// §17): the same shape as [`super::RiskRule::review`], one level
     /// down, so a recipe can demand more caution than the risk rules its

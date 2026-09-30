@@ -937,6 +937,7 @@ fn accept_integrated(
                 authority: root.authority,
                 candidate_sha: &head,
                 candidate_tier: root.decision.tier,
+                candidate_model: &root.decision.rung.model,
                 verification_inputs_changed: &verification_inputs_changed,
                 // The file this path names is the one the assembled
                 // candidate was exported to a moment ago; the reviewer
@@ -1021,6 +1022,7 @@ fn accept_integrated(
                 .map(Recipe::covering_identity),
         ),
         verification_profile_hash: root.authority.verification_profile.hash(),
+        review: super::review_record_of(ledger, &engine.run_id)?,
     };
     engine.seal(&receipt, None, None, &head)?;
     // The assembled revision is named under this run so the retirement
@@ -1052,12 +1054,11 @@ enum Proposal {
 /// human with the raw proposal preserved.
 fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Proposal, RunError> {
     let contract = engine.config.contract;
-    let profile = root
-        .authority
-        .models
-        .get(&Tier::Research)
-        .or_else(|| root.authority.models.get(&Tier::Implementation))
-        .cloned();
+    // The route's rung when the planner's tier is the routed one, the
+    // authority policy's profile otherwise.
+    let profile = [Tier::Research, Tier::Implementation]
+        .into_iter()
+        .find_map(|tier| root.decision.dispatch_profile(tier, root.authority));
     let Some(profile) = profile else {
         return Ok(Proposal::Rejected(
             "no research or implementation model to plan with".into(),

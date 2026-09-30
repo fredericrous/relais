@@ -14,19 +14,22 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::EffortCatalogs;
 use crate::contract::scope::{scope_contained_in, write_scope_could_touch};
 use crate::contract::{Kind, Review, Task, TaskContract};
 use crate::money::MicroUsd;
 use crate::policy::{
-    BlockCode, Blocker, EffectiveAuthority, MachineSettings, ModelProfile, RecipeSpec, RepoPolicy,
-    RiskRule, Tier,
+    BlockCode, Blocker, EffectiveAuthority, EffortId, MachineSettings, ModelProfile, RecipeSpec,
+    RepoPolicy, RiskRule, Tier,
 };
 
 mod candidate;
+mod rung;
 pub mod trial;
 pub use candidate::{
     default_tuning_bounds, validate_candidate, CandidateRecipe, CandidateRejection, TuningBounds,
 };
+pub use rung::{authority_ceiling, models_in_play, resolve_catalogs, EffortRequest, Rung};
 
 /// Estimates from an owned, Relais-trained artifact (SPEC §16). The
 /// predictor abstains (returns `None`) when it has no supported coverage
@@ -62,6 +65,11 @@ pub struct RouteInputs<'a> {
     pub machine: &'a MachineSettings,
     pub authority: &'a EffectiveAuthority,
     pub predictor: Option<&'a dyn RoutePredictor>,
+    /// The resolved effort catalog of each model in play
+    /// ([`models_in_play`]), computed by the caller from the harness probe
+    /// and machine.toml so this function stays pure. A model with no
+    /// catalog here has every fact unknown.
+    pub catalogs: &'a EffortCatalogs,
 }
 
 /// One reason the router gives for what it did: a stable id the ledger
@@ -102,6 +110,9 @@ pub enum Routed {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Route {
     pub tier: Tier,
+    /// The first dispatch: `rung.tier` is `tier`. Repairs and escalations
+    /// leave it (the ladder is P3); dispatch reads it for the initial tier.
+    pub rung: Rung,
     /// The stronger tier a failure may escalate to, when policy
     /// authorizes one.
     pub escalation_tier: Option<Tier>,
@@ -112,7 +123,9 @@ pub struct Route {
     pub routed_by: RoutedBy,
     /// What the artifact estimated, when one was consulted — recorded by
     /// the runner as a prediction row whatever it decided.
-    pub estimates: Option<Estimates>,
+    /// Boxed: the estimates are the bulk of a route, and `Routed` holds a
+    /// `Route` beside a much smaller `Blocked`.
+    pub estimates: Option<Box<Estimates>>,
     /// The deterministic recipe that produced this route, when one fully
     /// covered the task; `None` when the learner or the conservative
     /// baseline decided instead. Named on the run's receipt and dispatch
@@ -229,30 +242,49 @@ impl std::fmt::Display for RoutedBy {
 /// disjunct that asked whether the scope could touch the empty pattern —
 /// a rule nobody wrote, applied to the one scope that matches everything.
 /// Policy validation rejects a pathless rule outright.
-fn risk_floor(contract: &TaskContract, risk: &[RiskRule]) -> (Option<Tier>, Vec<RouteReason>) {
-    let mut floor: Option<Tier> = None;
-    let mut fired = Vec::new();
+///
+/// The effort floor rides alongside the tier. Which effort is above which
+/// is the dispatched model's catalog order, unknown here, so every touched
+/// rule's `minimum_effort` is returned and the rung takes the highest in
+/// that order.
+fn risk_floor(contract: &TaskContract, risk: &[RiskRule]) -> RiskFloor {
+    let mut floor = RiskFloor::default();
     for (index, rule) in risk.iter().enumerate() {
         let touches = rule
             .paths
             .iter()
             .any(|pattern| write_scope_could_touch(contract, pattern));
         if touches {
-            fired.push(RouteReason::new(
+            let effort_clause = rule
+                .minimum_effort
+                .as_ref()
+                .map(|effort| format!(" and at least effort {effort}"))
+                .unwrap_or_default();
+            floor.reasons.push(RouteReason::new(
                 format!("risk[{}]:{}", index, rule.minimum_tier.as_str()),
                 format!(
-                    "risk rule {index} ({}) requires at least the {} tier",
+                    "risk rule {index} ({}) requires at least the {} tier{effort_clause}",
                     rule.paths.join(", "),
                     rule.minimum_tier.as_str()
                 ),
             ));
-            floor = Some(match floor {
+            floor.tier = Some(match floor.tier {
                 Some(current) if current >= rule.minimum_tier => current,
                 Some(_) | None => rule.minimum_tier,
             });
+            floor.efforts.extend(rule.minimum_effort.clone());
         }
     }
-    (floor, fired)
+    floor
+}
+
+/// What the risk rules a scope could touch demand.
+#[derive(Debug, Default)]
+struct RiskFloor {
+    tier: Option<Tier>,
+    /// Each touched rule's `minimum_effort`, in rule order.
+    efforts: Vec<EffortId>,
+    reasons: Vec<RouteReason>,
 }
 
 /// An explicitly configured deterministic recipe, used only when it FULLY
@@ -367,7 +399,45 @@ fn recipe_tier_floor(kind: Option<Kind>, scope_within: &[String], risk: &[RiskRu
             Err(_) => return Tier::Escalation,
         },
     };
-    let contract = TaskContract {
+    match risk_floor(&floor_contract(task), risk).tier {
+        Some(rule_floor) if rule_floor > floor => rule_floor,
+        _ => floor,
+    }
+}
+
+/// The `minimum_effort` of every risk rule a RECIPE's own kind and scope
+/// could touch, judged exactly as [`recipe_tier_floor`] judges the tier
+/// floor: the same scope reading, the same [`risk_floor`]. The caller ranks
+/// them in the model's catalog order.
+fn recipe_effort_floors(
+    kind: Option<Kind>,
+    scope_within: &[String],
+    risk: &[RiskRule],
+) -> Vec<EffortId> {
+    let patterns = if scope_within.is_empty() {
+        vec!["**".to_string()]
+    } else {
+        scope_within.to_vec()
+    };
+    let task = match kind.unwrap_or(Kind::Change) {
+        Kind::Inspect => Task::Inspect,
+        Kind::Change => match Task::change(patterns) {
+            Ok(task) => task,
+            // An unreadable scope is judged against every rule, as the
+            // tier floor judges it at the top of the ladder.
+            Err(_) => {
+                return risk
+                    .iter()
+                    .filter_map(|rule| rule.minimum_effort.clone())
+                    .collect()
+            }
+        },
+    };
+    risk_floor(&floor_contract(task), risk).efforts
+}
+
+fn floor_contract(task: Task) -> TaskContract {
+    TaskContract {
         schema_version: crate::contract::SCHEMA_VERSION,
         task,
         objective: String::new(),
@@ -381,11 +451,6 @@ fn recipe_tier_floor(kind: Option<Kind>, scope_within: &[String], risk: &[RiskRu
         review: Default::default(),
         decomposition: None,
         task_id: None,
-    };
-    let (rule_floor, _reasons) = risk_floor(&contract, risk);
-    match rule_floor {
-        Some(rule_floor) if rule_floor > floor => rule_floor,
-        _ => floor,
     }
 }
 
@@ -421,7 +486,11 @@ pub fn eligible_tiers(
             "inspection task; research tier eligible",
         )),
     }
-    let (rule_floor, fired_rules) = risk_floor(contract, &repo.risk);
+    let RiskFloor {
+        tier: rule_floor,
+        efforts: _ranked_by_the_rung,
+        reasons: fired_rules,
+    } = risk_floor(contract, &repo.risk);
     reasons.extend(fired_rules);
     if let Some(rule_floor) = rule_floor {
         if rule_floor > floor {
@@ -502,6 +571,7 @@ pub fn route(inputs: RouteInputs<'_>) -> Routed {
         machine,
         authority,
         predictor,
+        catalogs,
     } = inputs;
 
     let mut reasons = Vec::new();
@@ -581,8 +651,9 @@ pub fn route(inputs: RouteInputs<'_>) -> Routed {
     // kept them agreeing, which is the shape of defect this codebase has
     // paid for repeatedly. This is the only caller, so the rule's own
     // unit tests now cover production rather than a parallel copy.
-    let mut estimates_seen: Option<Estimates> = None;
-    let covering = covering_recipe_spec(contract, repo, &eligible).map(Recipe::from);
+    let mut estimates_seen: Option<Box<Estimates>> = None;
+    let covering_spec = covering_recipe_spec(contract, repo, &eligible);
+    let covering = covering_spec.map(Recipe::from);
     let selected: (Tier, RoutedBy) = if let Some(recipe) = &covering {
         reasons.push(RouteReason::new(
             "deterministic_recipe",
@@ -597,7 +668,7 @@ pub fn route(inputs: RouteInputs<'_>) -> Routed {
             Some(estimates) => {
                 let quality_floor = machine.routing.quality_floor.unwrap_or(0.75);
                 let selection = select_learned(&estimates, &eligible, quality_floor);
-                estimates_seen = Some(estimates.clone());
+                estimates_seen = Some(Box::new(estimates.clone()));
                 match selection {
                     Some(tier) => {
                         reasons.push(RouteReason::new(
@@ -643,8 +714,55 @@ pub fn route(inputs: RouteInputs<'_>) -> Routed {
         .find(|tier| **tier > selected.0)
         .copied();
 
+    // A covering recipe chose the tier, so its `models[tier]` is the
+    // profile; with none, the authority policy's is.
+    let floors = risk_floor(contract, &repo.risk).efforts;
+    let resolved = match rung::resolve_rung(rung::RungRequest {
+        tier: selected.0,
+        authority,
+        machine,
+        recipe: covering_spec,
+        floors: &floors,
+        catalogs,
+    }) {
+        Ok(resolved) => resolved,
+        Err(blocker) => {
+            reasons.push(RouteReason::new(
+                "rung_blocked",
+                format!("the initial rung cannot be dispatched: {}", blocker.detail),
+            ));
+            return Routed::Blocked(Blocked::new(blocker, Vec::new(), review, reasons));
+        }
+    };
+    reasons.extend(resolved.reasons);
+
+    // An escalation is reachable when the attempts outlast the repairs: the
+    // initial attempt, every repair, then the escalated one.
+    let reachable_escalation = escalation_tier.filter(|_| {
+        authority.max_attempts > authority.max_repairs_before_escalation.saturating_add(1)
+    });
+    // holds-until: the P3 ladder resolves and validates every reachable rung.
+    // Until then candidate admission (`validate_candidate`) does not mirror
+    // this check: a candidate that moves its covering tier below the
+    // escalation tier under a floor can be admitted and still blocked here.
+    // P3 shares one ladder validation between routing and admission.
+    if let Some(escalation) = reachable_escalation {
+        if let Err(blocker) = rung::check_escalation_floor(escalation, authority, catalogs, &floors)
+        {
+            reasons.push(RouteReason::new(
+                "escalation_blocked",
+                format!(
+                    "the escalation rung cannot honour the risk floor: {}",
+                    blocker.detail
+                ),
+            ));
+            return Routed::Blocked(Blocked::new(blocker, Vec::new(), review, reasons));
+        }
+    }
+
     Routed::Route(Route {
         tier: selected.0,
+        rung: resolved.rung,
         escalation_tier,
         review,
         max_attempts: authority.max_attempts,
@@ -685,25 +803,63 @@ pub fn select_learned(
 
 impl Routed {
     /// The explanation block (SPEC §6 example shape), whichever this is.
-    pub fn explain(&self, model: Option<&str>) -> String {
+    pub fn explain(&self) -> String {
         match self {
-            Self::Route(route) => route.explain(model),
+            Self::Route(route) => route.explain(),
             Self::Blocked(blocked) => blocked.explain(),
         }
     }
 }
 
 impl Route {
-    /// The route's terms, in the shape SPEC §6 gives as an example. The
-    /// model is the one policy names for the selected tier; when nothing
-    /// names one the tier still prints, because the tuple match this
-    /// replaces fell through to the blocked arm and reported a perfectly
-    /// good route as blocked.
-    pub fn explain(&self, model: Option<&str>) -> String {
-        let mut out = match model {
-            Some(model) => format!("route: {} / {model}\n", self.tier.as_str()),
-            None => format!("route: {}\n", self.tier.as_str()),
+    /// The profile a worker at `tier` is dispatched with: this route's
+    /// rung for its own tier, and the authority policy's profile for any
+    /// other (a repair keeps the rung's tier; an escalation leaves it, and
+    /// the ladder is P3). `None` when neither names a model.
+    pub fn dispatch_profile(
+        &self,
+        tier: Tier,
+        authority: &EffectiveAuthority,
+    ) -> Option<ModelProfile> {
+        if tier == self.rung.tier {
+            Some(self.rung.profile())
+        } else {
+            authority.models.get(&tier).cloned()
+        }
+    }
+
+    /// `effort: <model>@<effort>` (or the two states without one), with
+    /// who set the effort when a recipe or a risk floor did. Within 80
+    /// columns: a longer line puts the reason on a line of its own.
+    fn effort_line(&self) -> String {
+        let model = &self.rung.model;
+        let head = match &self.rung.effort {
+            EffortRequest::Explicit(effort) => format!("effort: {model}@{effort}"),
+            EffortRequest::ControlUnsupported => format!("effort: {model}, no effort control"),
+            EffortRequest::NotRequested => format!("effort: {model}, none requested"),
         };
+        let by_recipe = self.reasons.iter().any(|r| r.id == rung::RECIPE_RUNG);
+        let by_floor = self.reasons.iter().any(|r| r.id == rung::EFFORT_FLOOR);
+        let why = match (by_recipe, by_floor) {
+            (true, true) => "set by recipe, raised by risk floor",
+            (true, false) => "set by recipe",
+            (false, true) => "raised by risk floor",
+            (false, false) => return format!("{head}\n"),
+        };
+        if head.chars().count() + why.len() + 3 <= 80 {
+            format!("{head} ({why})\n")
+        } else {
+            format!("{head}\n  ({why})\n")
+        }
+    }
+
+    /// The route's terms, in the shape SPEC §6 gives as an example. The
+    /// model is the RUNG's — the one dispatched, which a covering recipe may
+    /// have swapped for the policy's — so the `route:` and `effort:` lines
+    /// cannot name different models.
+    pub fn explain(&self) -> String {
+        let mut out = format!("route: {} / {}\n", self.tier.as_str(), self.rung.model);
+        out.push_str(&self.effort_line());
         out.push_str(&format!("reason: {}\n", joined(&self.reasons)));
         match self.review {
             Review::Required => out.push_str("review: required\n"),
@@ -784,6 +940,7 @@ mod tests {
                     ModelProfile {
                         id: "haiku".into(),
                         effort: None,
+                        max_effort: None,
                     },
                 ),
                 (
@@ -791,6 +948,7 @@ mod tests {
                     ModelProfile {
                         id: "sonnet".into(),
                         effort: crate::policy::EffortId::parse("medium").ok(),
+                        max_effort: None,
                     },
                 ),
                 (
@@ -798,6 +956,7 @@ mod tests {
                     ModelProfile {
                         id: "fable".into(),
                         effort: crate::policy::EffortId::parse("medium").ok(),
+                        max_effort: None,
                     },
                 ),
             ]),
@@ -897,6 +1056,15 @@ mod tests {
     }
 
     fn decide(contract: &TaskContract, repo: &RepoPolicy, machine: &MachineSettings) -> Routed {
+        decide_with(contract, repo, machine, &EffortCatalogs::default())
+    }
+
+    fn decide_with(
+        contract: &TaskContract,
+        repo: &RepoPolicy,
+        machine: &MachineSettings,
+        catalogs: &EffortCatalogs,
+    ) -> Routed {
         let authority = effective_authority(repo, machine, contract, &identity());
         route(RouteInputs {
             contract,
@@ -904,6 +1072,7 @@ mod tests {
             machine,
             authority: &authority,
             predictor: None,
+            catalogs,
         })
     }
 
@@ -992,6 +1161,7 @@ mod tests {
             paths: vec!["**/trust/**".into()],
             minimum_tier: Tier::Escalation,
             review: Some(Review::Required),
+            minimum_effort: None,
         });
         let machine = machine_for(&repo);
         let d = route_with(
@@ -1014,6 +1184,7 @@ mod tests {
             paths: vec!["**/trust/**".into()],
             minimum_tier: Tier::Escalation,
             review: None,
+            minimum_effort: None,
         });
         let machine = machine_for(&repo);
         // `crates/**` could touch `**/trust/**`: the overlap test must fire.
@@ -1032,6 +1203,7 @@ mod tests {
             paths: vec!["**/trust/**".into()],
             minimum_tier: Tier::Escalation,
             review: Some(Review::Required),
+            minimum_effort: None,
         });
         let machine = machine_for(&repo);
         let d = route_with(&change_contract(&["docs/README.md"]), &repo, &machine);
@@ -1050,6 +1222,7 @@ mod tests {
             paths: vec!["crates/other/**".into()],
             minimum_tier: Tier::Escalation,
             review: None,
+            minimum_effort: None,
         });
         let machine = machine_for(&repo);
         let d = route_with(&change_contract(&["crates/amont/**"]), &repo, &machine);
@@ -1078,6 +1251,7 @@ mod tests {
             paths: Vec::new(),
             minimum_tier: Tier::Escalation,
             review: None,
+            minimum_effort: None,
         });
         let machine = machine_for(&repo);
         let everything = route_with(&change_contract(&["**"]), &repo, &machine);
@@ -1105,6 +1279,7 @@ mod tests {
             paths: vec!["**/trust/**".into()],
             minimum_tier: Tier::Escalation,
             review: None,
+            minimum_effort: None,
         });
         let machine = machine_for(&repo);
         let contract = change_contract(&["crates/amont/trust/**"]);
@@ -1254,6 +1429,7 @@ mod tests {
             machine: &machine,
             authority: &authority,
             predictor: Some(&predictor),
+            catalogs: &EffortCatalogs::default(),
         }));
         assert_eq!(d.tier, Tier::Implementation);
         assert_eq!(d.routed_by, RoutedBy::LearnedArtifact);
@@ -1279,6 +1455,7 @@ mod tests {
             machine: &machine,
             authority: &authority,
             predictor: Some(&predictor),
+            catalogs: &EffortCatalogs::default(),
         }));
         assert_eq!(d.tier, Tier::Implementation);
         assert_eq!(d.routed_by, RoutedBy::ConservativeBaseline);
@@ -1349,6 +1526,7 @@ mod tests {
             machine: &machine,
             authority: &authority,
             predictor: Some(&Abstainer),
+            catalogs: &EffortCatalogs::default(),
         }));
         assert_eq!(d.tier, Tier::Implementation);
         assert_eq!(d.routed_by, RoutedBy::ConservativeBaseline);
@@ -1359,7 +1537,7 @@ mod tests {
         let repo = repo_policy();
         let machine = machine_for(&repo);
         let d = route_with(&change_contract(&["crates/amont/**"]), &repo, &machine);
-        let text = d.explain(Some("sonnet"));
+        let text = d.explain();
         assert!(
             text.starts_with("route: implementation / sonnet\n"),
             "{text}"
@@ -1561,6 +1739,642 @@ mod tests {
             covering_recipe_id(&docs, &no_recipe, &eligible),
             None,
             "no configured recipe covers this task"
+        );
+    }
+
+    fn eid(text: &str) -> EffortId {
+        EffortId::parse(text).expect("a valid effort identifier")
+    }
+
+    /// The catalog of `model`: the harness accepts `cli`, the order is
+    /// `order`, the model supports `supported` (`&[]` is no effort
+    /// control), authorized up to `max`.
+    fn catalog_of(
+        model: &str,
+        cli: &[&str],
+        order: &[&str],
+        supported: &[&str],
+        max: &str,
+    ) -> EffortCatalogs {
+        use crate::catalog::Fact;
+        use crate::policy::{EffortModelEntry, EffortSettings};
+        let ids = |list: &[&str]| -> Vec<EffortId> { list.iter().copied().map(eid).collect() };
+        let settings = EffortSettings {
+            order: Some(ids(order)),
+            models: vec![EffortModelEntry {
+                ids: vec![model.into()],
+                supported: Some(ids(supported)),
+                order: None,
+            }],
+        };
+        EffortCatalogs::resolve_all(&Fact::Known(ids(cli)), &settings, &eid(max), [model])
+    }
+
+    const LEVELS: [&str; 4] = ["low", "medium", "high", "max"];
+
+    fn sonnet_catalog() -> EffortCatalogs {
+        catalog_of("sonnet", &LEVELS, &LEVELS, &LEVELS, "max")
+    }
+
+    /// A recipe covering every task that sets the implementation tier to
+    /// `model` at `effort`.
+    fn recipe_setting(model: &str, effort: Option<&str>) -> RecipeSpec {
+        RecipeSpec {
+            models: Some(BTreeMap::from([(
+                Tier::Implementation,
+                ModelProfile {
+                    id: model.into(),
+                    effort: effort.map(eid),
+                    max_effort: None,
+                },
+            )])),
+            ..RecipeSpec::covering("fast", Tier::Implementation)
+        }
+    }
+
+    fn floor_rule(effort: &str) -> RiskRule {
+        RiskRule {
+            paths: vec!["crates/amont/**".into()],
+            minimum_tier: Tier::Implementation,
+            review: None,
+            minimum_effort: Some(eid(effort)),
+        }
+    }
+
+    fn blocker_of(decision: Routed) -> Blocker {
+        expect_blocked(decision).first().clone()
+    }
+
+    fn decide_amont(
+        repo: &RepoPolicy,
+        machine: &MachineSettings,
+        catalogs: &EffortCatalogs,
+    ) -> Routed {
+        decide_with(
+            &change_contract(&["crates/amont/**"]),
+            repo,
+            machine,
+            catalogs,
+        )
+    }
+
+    /// (a) A covering recipe's `models.implementation` is READ: the rung
+    /// is its model at its effort, the catalog admitting it, and the
+    /// rung's tier is the route's.
+    #[test]
+    fn a_covering_recipe_sets_the_rung_model_and_effort() {
+        let mut repo = repo_policy();
+        repo.recipes.push(recipe_setting("sonnet", Some("high")));
+        let machine = machine_for(&repo);
+        let d = expect_route(decide_amont(&repo, &machine, &sonnet_catalog()));
+        assert_eq!(d.routed_by, RoutedBy::DeterministicRecipe);
+        assert_eq!(
+            d.rung,
+            Rung {
+                tier: Tier::Implementation,
+                model: "sonnet".into(),
+                effort: EffortRequest::Explicit(eid("high")),
+            }
+        );
+        assert_eq!(d.rung.tier, d.tier);
+        assert!(d
+            .reasons
+            .iter()
+            .any(|reason| reason.id == rung::RECIPE_RUNG));
+    }
+
+    /// (b) A recipe naming a model the machine does not allow is blocked
+    /// `model_not_allowed` — never routed to another model.
+    #[test]
+    fn a_recipe_model_outside_allowed_models_blocks_the_route() {
+        let mut repo = repo_policy();
+        repo.recipes.push(recipe_setting("opus", None));
+        let mut machine = machine_for(&repo);
+        machine.allowed_models = Some(vec!["haiku".into(), "sonnet".into(), "fable".into()]);
+        let blocker = blocker_of(decide_amont(&repo, &machine, &EffortCatalogs::default()));
+        assert_eq!(blocker.code, BlockCode::ModelNotAllowed);
+        assert!(blocker.detail.contains("opus"), "{}", blocker.detail);
+    }
+
+    /// (c) A floor `high` on a model with `supported = []` blocks, naming
+    /// the floor and the model.
+    ///
+    /// FALSIFIED: with the empty-set guards in both `apply_floor` and
+    /// `check_effort` opened (a `ControlUnsupported` model passing the
+    /// floor), this test failed at `expect_blocked` — the route came back
+    /// as a route; the guards were restored. Opening only `apply_floor`'s
+    /// still blocked, through `check_effort`'s guard, which is why the
+    /// assertion names the floor's own wording (`risk floor `high``).
+    #[test]
+    fn a_floor_on_a_model_with_no_effort_control_blocks_naming_both() {
+        let mut repo = repo_policy();
+        repo.risk.push(floor_rule("high"));
+        let machine = machine_for(&repo);
+        let none = catalog_of("sonnet", &LEVELS, &LEVELS, &[], "max");
+        let blocker = blocker_of(decide_amont(&repo, &machine, &none));
+        assert_eq!(blocker.code, BlockCode::EffortUnsupported);
+        assert!(
+            blocker.detail.contains("risk floor `high`") && blocker.detail.contains("sonnet"),
+            "the floor and the model are named: {}",
+            blocker.detail
+        );
+        assert!(blocker.detail.contains("admissible"), "{}", blocker.detail);
+    }
+
+    /// (d) A floor above the configured effort raises the rung to it, and
+    /// says so.
+    #[test]
+    fn a_floor_raises_the_configured_effort_in_catalog_order() {
+        let mut repo = repo_policy();
+        repo.risk.push(floor_rule("high"));
+        // The initial rung alone: no escalation is reachable.
+        repo.execution.max_attempts = 1;
+        let machine = machine_for(&repo);
+        let d = expect_route(decide_amont(&repo, &machine, &sonnet_catalog()));
+        assert_eq!(d.rung.effort, EffortRequest::Explicit(eid("high")));
+        assert!(d
+            .reasons
+            .iter()
+            .any(|reason| reason.id == rung::EFFORT_FLOOR));
+        assert!(d.explain().contains("raised by risk floor"));
+    }
+
+    /// Every model of `models` at all four levels, the harness accepting
+    /// them all, authorized up to `max`.
+    fn levels_catalog(models: &[&str]) -> EffortCatalogs {
+        let supporting: Vec<(&str, &[&str])> =
+            models.iter().map(|model| (*model, &LEVELS[..])).collect();
+        catalogs_supporting(&supporting)
+    }
+
+    /// [`levels_catalog`] where each model supports its own set (`&[]` is
+    /// no effort control); a model not listed has no catalog at all.
+    fn catalogs_supporting(models: &[(&str, &[&str])]) -> EffortCatalogs {
+        use crate::catalog::Fact;
+        use crate::policy::{EffortModelEntry, EffortSettings};
+        let ids = |list: &[&str]| -> Vec<EffortId> { list.iter().copied().map(eid).collect() };
+        let settings = EffortSettings {
+            order: Some(ids(&LEVELS)),
+            models: models
+                .iter()
+                .map(|(model, supported)| EffortModelEntry {
+                    ids: vec![(*model).into()],
+                    supported: Some(ids(supported)),
+                    order: None,
+                })
+                .collect(),
+        };
+        EffortCatalogs::resolve_all(
+            &Fact::Known(ids(&LEVELS)),
+            &settings,
+            &eid("max"),
+            models.iter().map(|(model, _)| *model),
+        )
+    }
+
+    /// A repo with a `high` floor over the amont scope, the escalation tier
+    /// configured at `escalation_effort` and `max_attempts` attempts.
+    fn floored_repo(escalation_effort: &str, max_attempts: u32) -> RepoPolicy {
+        let mut repo = repo_policy();
+        repo.risk.push(floor_rule("high"));
+        repo.execution.max_attempts = max_attempts;
+        repo.models
+            .get_mut(&Tier::Escalation)
+            .expect("the escalation tier")
+            .effort = Some(eid(escalation_effort));
+        repo
+    }
+
+    /// A floor binds the initial rung only; an escalation dispatches its
+    /// tier's configured profile. While that is so, a route whose reachable
+    /// escalation would run below the floor is blocked, naming the floor,
+    /// the escalation tier and its configured effort.
+    ///
+    /// FALSIFIED: with the `check_escalation_floor` call removed from
+    /// `route()`, the first assertion failed at `expect_blocked` — the
+    /// route came back as a route that escalates to `fable@medium` under a
+    /// `high` floor; the call was restored.
+    #[test]
+    fn a_reachable_escalation_below_the_floor_blocks_the_route() {
+        let repo = floored_repo("medium", 3);
+        let machine = machine_for(&repo);
+        let catalogs = levels_catalog(&["haiku", "sonnet", "fable"]);
+        let blocker = blocker_of(decide_amont(&repo, &machine, &catalogs));
+        assert_eq!(blocker.code, BlockCode::EffortUnsupported);
+        for named in ["high", "escalation", "fable", "medium"] {
+            assert!(
+                blocker.detail.contains(named),
+                "`{named}` is named: {}",
+                blocker.detail
+            );
+        }
+    }
+
+    /// The same policy, where the attempt budget cannot reach the
+    /// escalation, routes: the initial rung is raised to the floor.
+    #[test]
+    fn an_escalation_the_budget_cannot_reach_does_not_block() {
+        let repo = floored_repo("medium", 1);
+        let machine = machine_for(&repo);
+        let catalogs = levels_catalog(&["haiku", "sonnet", "fable"]);
+        let d = expect_route(decide_amont(&repo, &machine, &catalogs));
+        assert_eq!(d.rung.effort, EffortRequest::Explicit(eid("high")));
+        assert_eq!(d.escalation_tier, Some(Tier::Escalation));
+    }
+
+    /// Repairs come first: with one repair before escalation, two attempts
+    /// end on the repair and the escalation needs a third.
+    #[test]
+    fn an_escalation_behind_the_repairs_is_reachable_only_with_room_for_it() {
+        let catalogs = levels_catalog(&["haiku", "sonnet", "fable"]);
+        let repo = floored_repo("medium", 2);
+        let machine = machine_for(&repo);
+        expect_route(decide_amont(&repo, &machine, &catalogs));
+        let repo = floored_repo("medium", 3);
+        let machine = machine_for(&repo);
+        expect_blocked(decide_amont(&repo, &machine, &catalogs));
+    }
+
+    /// An escalation configured at the floor, in a catalog that knows it,
+    /// is fine — and one whose catalog is unknown cannot carry a floor.
+    #[test]
+    fn an_escalation_at_the_floor_routes_and_an_unknown_one_blocks() {
+        let repo = floored_repo("high", 3);
+        let machine = machine_for(&repo);
+        let d = expect_route(decide_amont(
+            &repo,
+            &machine,
+            &levels_catalog(&["haiku", "sonnet", "fable"]),
+        ));
+        assert_eq!(d.escalation_tier, Some(Tier::Escalation));
+
+        let blocker = blocker_of(decide_amont(&repo, &machine, &sonnet_catalog()));
+        assert_eq!(blocker.code, BlockCode::EffortUnsupported);
+        assert!(
+            blocker.detail.contains("fable") && blocker.detail.contains("escalation"),
+            "{}",
+            blocker.detail
+        );
+    }
+
+    /// `route:` names the model the rung dispatches, as `effort:` does, so
+    /// a recipe swapping the model changes both; with no recipe setting a
+    /// model it is the policy's, as it always was.
+    #[test]
+    fn the_route_line_names_the_rungs_model() {
+        let mut swapped = repo_policy();
+        swapped.recipes.push(recipe_setting("haiku", Some("low")));
+        let machine = machine_for(&swapped);
+        let catalogs = levels_catalog(&["haiku", "sonnet", "fable"]);
+        let text = expect_route(decide_amont(&swapped, &machine, &catalogs)).explain();
+        let mut lines = text.lines();
+        assert_eq!(lines.next(), Some("route: implementation / haiku"));
+        assert!(
+            lines
+                .next()
+                .is_some_and(|line| line.starts_with("effort: haiku@low")),
+            "{text}"
+        );
+
+        let plain = repo_policy();
+        let machine = machine_for(&plain);
+        let text = expect_route(decide_amont(&plain, &machine, &catalogs)).explain();
+        assert!(
+            text.starts_with("route: implementation / sonnet\neffort: sonnet@medium\n"),
+            "{text}"
+        );
+    }
+
+    /// A floor below the configured effort leaves it alone: max(start,
+    /// floor) in catalog order, not the floor.
+    #[test]
+    fn a_floor_below_the_start_effort_keeps_the_start() {
+        let mut repo = repo_policy();
+        repo.risk.push(floor_rule("low"));
+        // The initial rung alone: no escalation is reachable.
+        repo.execution.max_attempts = 1;
+        let machine = machine_for(&repo);
+        let d = expect_route(decide_amont(&repo, &machine, &sonnet_catalog()));
+        assert_eq!(d.rung.effort, EffortRequest::Explicit(eid("medium")));
+    }
+
+    /// The highest of several touched rules' floors wins, in the catalog's
+    /// order — `max` is not "above" `high` by its name.
+    #[test]
+    fn the_highest_floor_is_ranked_by_the_catalog_not_the_name() {
+        let mut repo = repo_policy();
+        repo.risk.push(floor_rule("high"));
+        repo.risk.push(floor_rule("max"));
+        // The initial rung alone: no escalation is reachable.
+        repo.execution.max_attempts = 1;
+        let machine = machine_for(&repo);
+        let order = ["low", "medium", "max", "high"];
+        let catalogs = catalog_of("sonnet", &order, &order, &order, "high");
+        let d = expect_route(decide_amont(&repo, &machine, &catalogs));
+        assert_eq!(
+            d.rung.effort,
+            EffortRequest::Explicit(eid("high")),
+            "in this catalog `high` is the top"
+        );
+    }
+
+    /// (e) An unknown catalog lets exactly the configured effort through,
+    /// as before.
+    ///
+    /// FALSIFIED (the second half, in the test below): with `check_effort`
+    /// allowing any effort under an unknown catalog, the changed-effort
+    /// test failed at `expect_blocked` (this test and the floor test kept
+    /// passing); the guard was restored.
+    #[test]
+    fn an_unknown_catalog_allows_the_configured_effort() {
+        let repo = repo_policy();
+        let machine = machine_for(&repo);
+        let d = expect_route(decide_amont(&repo, &machine, &EffortCatalogs::default()));
+        assert_eq!(d.rung.effort, EffortRequest::Explicit(eid("medium")));
+    }
+
+    /// (e) Under an unknown catalog an effort a recipe CHANGED needs a
+    /// known catalog: blocked, naming the machine.toml keys.
+    #[test]
+    fn an_unknown_catalog_blocks_an_effort_a_recipe_changed() {
+        let mut repo = repo_policy();
+        repo.recipes.push(recipe_setting("sonnet", Some("high")));
+        let machine = machine_for(&repo);
+        let blocker = blocker_of(decide_amont(&repo, &machine, &EffortCatalogs::default()));
+        assert_eq!(blocker.code, BlockCode::EffortUnsupported);
+        assert!(
+            blocker.detail.contains("[efforts]") && blocker.detail.contains("machine.toml"),
+            "the keys to set are named: {}",
+            blocker.detail
+        );
+    }
+
+    /// Under an unknown catalog `validate_candidate` admits exactly the
+    /// recipes whose rung `route()` resolves: the carve-out is the
+    /// configured model at its configured effort, in both.
+    #[test]
+    fn candidate_validation_admits_what_an_unknown_catalog_route_resolves() {
+        let mut incumbent = repo_policy();
+        incumbent
+            .recipes
+            .push(recipe_setting("sonnet", Some("medium")));
+        let none = EffortCatalogs::default();
+        let bounds = default_tuning_bounds(&incumbent, None, &none);
+        let cases = [
+            ("sonnet", "medium", true),
+            ("haiku", "medium", false),
+            ("fable", "medium", false),
+            ("sonnet", "high", false),
+        ];
+        for (model, effort, admitted) in cases {
+            let mut tuned = recipe_setting(model, Some(effort));
+            tuned.revision = 1;
+            let mut candidate = incumbent.clone();
+            candidate.recipes.push(tuned.clone());
+            let validated = validate_candidate(&incumbent, &candidate, &bounds).is_ok();
+
+            let mut routed = incumbent.clone();
+            routed.recipes = vec![tuned];
+            let machine = machine_for(&routed);
+            let resolves = matches!(
+                decide_amont(&routed, &machine, &none),
+                Routed::Route(route) if route.rung.model == model
+            );
+            assert_eq!(validated, admitted, "validate_candidate: {model}@{effort}");
+            assert_eq!(resolves, admitted, "route: {model}@{effort}");
+        }
+    }
+
+    /// Whether `validate_candidate` admits the recipe `tuned` (a revision
+    /// of the incumbent's) and whether `route()` resolves a rung from it,
+    /// under `machine` and `catalogs`.
+    fn admitted_and_routed(
+        incumbent: &RepoPolicy,
+        tuned: RecipeSpec,
+        machine_allowed: Option<Vec<String>>,
+        catalogs: &EffortCatalogs,
+    ) -> (bool, bool) {
+        let bounds = default_tuning_bounds(incumbent, machine_allowed.as_deref(), catalogs);
+        let mut candidate = incumbent.clone();
+        candidate.recipes.push(tuned.clone());
+        let admitted = validate_candidate(incumbent, &candidate, &bounds).is_ok();
+
+        let mut routed = incumbent.clone();
+        routed.recipes = vec![tuned];
+        let mut machine = machine_for(&routed);
+        machine.allowed_models = machine_allowed;
+        let resolves = matches!(decide_amont(&routed, &machine, catalogs), Routed::Route(_));
+        (admitted, resolves)
+    }
+
+    /// A candidate whose profile sets no effort, in a scope a floor applies
+    /// to, is admitted exactly when routing resolves it: a model with
+    /// `supported = []` or an unknown catalog cannot meet the floor, so it
+    /// is refused as routing would block it.
+    ///
+    /// FALSIFIED: with `check_floor_without_effort` returning `Ok(())`
+    /// for an absent effort, the `supported = []` and unknown-catalog cases
+    /// were admitted while routing blocked them, and this failed; restored.
+    #[test]
+    fn candidate_validation_admits_what_a_floored_route_resolves() {
+        let mut incumbent = repo_policy();
+        incumbent.risk.push(floor_rule("high"));
+        // One attempt: no escalation is reachable, so the P2 escalation-
+        // floor block does not apply. Admission does not mirror that block
+        // yet (see the holds-until at it); P3's shared ladder validation
+        // closes the gap and this pin goes.
+        incumbent.execution.max_attempts = 1;
+        incumbent
+            .recipes
+            .push(recipe_setting("sonnet", Some("high")));
+        let catalogs = catalogs_supporting(&[
+            ("haiku", &[]),
+            ("sonnet", &LEVELS),
+            ("fable", &["low", "medium"]),
+        ]);
+        let cases = [
+            ("sonnet", true),
+            ("haiku", false),
+            // Its set tops out under the floor.
+            ("fable", false),
+            // No catalog at all.
+            ("opus", false),
+        ];
+        for (model, expected) in cases {
+            let mut tuned = recipe_setting(model, None);
+            tuned.revision = 1;
+            let mut repo = incumbent.clone();
+            repo.models.insert(
+                Tier::Research,
+                ModelProfile {
+                    id: model.into(),
+                    effort: None,
+                    max_effort: None,
+                },
+            );
+            // Only a model the repository configures can be admitted.
+            let (admitted, resolves) = admitted_and_routed(&repo, tuned, None, &catalogs);
+            assert_eq!(admitted, expected, "validate_candidate: {model}");
+            assert_eq!(resolves, expected, "route: {model}");
+        }
+    }
+
+    /// The models a candidate may name are the machine's `allowed_models`
+    /// intersected with the repository's — what routing dispatches from.
+    #[test]
+    fn candidate_validation_admits_what_the_machines_allowed_models_route_resolves() {
+        let incumbent = {
+            let mut repo = repo_policy();
+            repo.recipes.push(recipe_setting("sonnet", Some("medium")));
+            repo
+        };
+        let catalogs = levels_catalog(&["haiku", "sonnet", "fable"]);
+        let allowed = || Some(vec!["haiku".to_string(), "sonnet".to_string()]);
+        let cases = [
+            ("sonnet", true),
+            ("haiku", true),
+            // Configured by the repository, excluded by the machine.
+            ("fable", false),
+        ];
+        for (model, expected) in cases {
+            let mut tuned = recipe_setting(model, Some("medium"));
+            tuned.revision = 1;
+            let (admitted, resolves) = admitted_and_routed(&incumbent, tuned, allowed(), &catalogs);
+            assert_eq!(admitted, expected, "validate_candidate: {model}");
+            assert_eq!(resolves, expected, "route: {model}");
+        }
+    }
+
+    /// An unknown catalog cannot satisfy a floor either: a floor raising
+    /// the effort is a change.
+    #[test]
+    fn an_unknown_catalog_blocks_a_floor() {
+        let mut repo = repo_policy();
+        repo.risk.push(floor_rule("high"));
+        let machine = machine_for(&repo);
+        let blocker = blocker_of(decide_amont(&repo, &machine, &EffortCatalogs::default()));
+        assert_eq!(blocker.code, BlockCode::EffortUnsupported);
+        assert!(blocker.detail.contains("high"), "{}", blocker.detail);
+    }
+
+    /// (g) An identifier no code names, in the catalog and set by a
+    /// recipe, routes as itself.
+    #[test]
+    fn an_unfamiliar_recipe_effort_routes_as_itself() {
+        let mut repo = repo_policy();
+        repo.recipes.push(recipe_setting("sonnet", Some("ultra")));
+        let machine = machine_for(&repo);
+        let levels = ["low", "high", "ultra"];
+        let catalogs = catalog_of("sonnet", &levels, &levels, &levels, "ultra");
+        let d = expect_route(decide_amont(&repo, &machine, &catalogs));
+        assert_eq!(d.rung.effort, EffortRequest::Explicit(eid("ultra")));
+    }
+
+    /// An effort above the authority's per-tier ceiling is blocked, never
+    /// clamped; lowering it is fine; and neither moves the ceiling.
+    #[test]
+    fn an_effort_above_the_authority_ceiling_is_blocked_and_never_clamped() {
+        let mut authority_repo = repo_policy();
+        authority_repo
+            .models
+            .get_mut(&Tier::Implementation)
+            .expect("the implementation tier")
+            .max_effort = Some(eid("medium"));
+
+        let mut raised = authority_repo.clone();
+        raised.recipes.push(recipe_setting("sonnet", Some("high")));
+        let machine = machine_for(&raised);
+        let blocker = blocker_of(decide_amont(&raised, &machine, &sonnet_catalog()));
+        assert_eq!(blocker.code, BlockCode::EffortAboveCap);
+        assert!(blocker.detail.contains("medium"), "{}", blocker.detail);
+
+        let mut lowered = authority_repo.clone();
+        lowered.recipes.push(recipe_setting("sonnet", Some("low")));
+        let machine = machine_for(&lowered);
+        let d = expect_route(decide_amont(&lowered, &machine, &sonnet_catalog()));
+        assert_eq!(d.rung.effort, EffortRequest::Explicit(eid("low")));
+
+        let ceiling = |repo: &RepoPolicy| {
+            let machine = machine_for(repo);
+            let authority = effective_authority(
+                repo,
+                &machine,
+                &change_contract(&["crates/amont/**"]),
+                &identity(),
+            );
+            authority_ceiling(&authority.models, &sonnet_catalog(), Tier::Implementation)
+        };
+        assert_eq!(ceiling(&raised), Some(eid("medium")));
+        assert_eq!(
+            ceiling(&raised),
+            ceiling(&lowered),
+            "a recipe's start effort never moves a ceiling"
+        );
+    }
+
+    /// Without a policy ceiling the ceiling is the top of the authority
+    /// model's admissible set, so an effort above the dispatched model's
+    /// own top is blocked too.
+    #[test]
+    fn an_effort_above_the_admissible_top_is_blocked() {
+        let mut repo = repo_policy();
+        repo.recipes.push(recipe_setting("sonnet", Some("max")));
+        let machine = machine_for(&repo);
+        let capped = catalog_of("sonnet", &LEVELS, &LEVELS, &LEVELS, "high");
+        let blocker = blocker_of(decide_amont(&repo, &machine, &capped));
+        assert_eq!(blocker.code, BlockCode::EffortAboveCap);
+    }
+
+    /// The three effort states stay apart: a model with no control is
+    /// `ControlUnsupported`, one with control and no request is
+    /// `NotRequested`, and a configured effort on a model with no control
+    /// is blocked at route time.
+    #[test]
+    fn the_three_effort_states_are_distinct() {
+        let mut repo = repo_policy();
+        repo.models
+            .get_mut(&Tier::Implementation)
+            .expect("the implementation tier")
+            .effort = None;
+        let machine = machine_for(&repo);
+        let none = catalog_of("sonnet", &LEVELS, &LEVELS, &[], "max");
+        let d = expect_route(decide_amont(&repo, &machine, &none));
+        assert_eq!(d.rung.effort, EffortRequest::ControlUnsupported);
+        assert!(d.explain().contains("sonnet, no effort control"));
+
+        let d = expect_route(decide_amont(&repo, &machine, &sonnet_catalog()));
+        assert_eq!(d.rung.effort, EffortRequest::NotRequested);
+        assert!(d.explain().contains("sonnet, none requested"));
+
+        let configured = repo_policy();
+        let machine = machine_for(&configured);
+        let blocker = blocker_of(decide_amont(&configured, &machine, &none));
+        assert_eq!(blocker.code, BlockCode::EffortUnsupported);
+    }
+
+    /// `route:` is byte-identical, the effort line follows it directly,
+    /// and every line fits in 80 columns.
+    #[test]
+    fn the_effort_line_follows_the_route_line_within_80_columns() {
+        let mut repo = repo_policy();
+        repo.recipes.push(recipe_setting("sonnet", Some("high")));
+        repo.risk.push(floor_rule("max"));
+        // The initial rung alone: no escalation is reachable.
+        repo.execution.max_attempts = 1;
+        let machine = machine_for(&repo);
+        let d = expect_route(decide_amont(&repo, &machine, &sonnet_catalog()));
+        let text = d.explain();
+        let mut lines = text.lines();
+        assert_eq!(lines.next(), Some("route: implementation / sonnet"));
+        assert_eq!(
+            lines.next(),
+            Some("effort: sonnet@max (set by recipe, raised by risk floor)")
+        );
+        assert!(
+            text.lines()
+                .filter(|line| !line.starts_with("reason:"))
+                .all(|line| line.chars().count() <= 80),
+            "{text}"
         );
     }
 

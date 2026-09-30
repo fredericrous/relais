@@ -2785,6 +2785,7 @@ mod tests {
         ModelProfile {
             id: id.to_string(),
             effort: effort_id.map(effort),
+            max_effort: None,
         }
     }
 
