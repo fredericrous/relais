@@ -39,8 +39,12 @@ impl ProbeTool {
 /// What a step's `tool_result` must show.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expect {
-    /// The text, with no permission refusal and no leak marker.
-    OutputContains(String),
+    /// A whole line equal to the text, in a result that shows no failure
+    /// (OS denial, `Exit code` line, permission refusal) and no leak marker.
+    OutputLine(String),
+    /// As [`Expect::OutputLine`], but a line ending with the text: a
+    /// `git status --short` line carries a status prefix.
+    OutputLineEndsWith(String),
     /// The operating system refused the operation.
     OsDenied,
     /// The network proxy reported a denied outbound connection.
@@ -87,8 +91,8 @@ fn bash(id: &'static str, input: String, expect: Expect) -> ProbeStep {
     }
 }
 
-fn contains(text: &str) -> Expect {
-    Expect::OutputContains(text.to_string())
+fn line(text: &str) -> Expect {
+    Expect::OutputLine(text.to_string())
 }
 
 /// The steps of a probe run in sandbox mode, in the order they are asked.
@@ -102,7 +106,7 @@ pub fn probe_plan(inputs: &ProbePlanInputs) -> Vec<ProbeStep> {
             "pipe",
             r#"printf 'a\nb\n' | head -1 > "$TMPDIR/relais-probe-pipe" && cat "$TMPDIR/relais-probe-pipe""#
                 .to_string(),
-            contains("a"),
+            line("a"),
         ),
         bash(
             "tmp-write",
@@ -122,25 +126,25 @@ pub fn probe_plan(inputs: &ProbePlanInputs) -> Vec<ProbeStep> {
         bash(
             "fixture-bash",
             format!("test -r {fixture} && echo READABLE || echo denied"),
-            contains("denied"),
+            line("denied"),
         ),
         bash(
             "synthetic-env",
             format!("printenv AWS_SECRET_ACCESS_KEY {PRESENCE}"),
-            contains("absent"),
+            line("absent"),
         ),
         bash(
             "auth-env",
             format!(
                 "printenv CLAUDE_CODE_OAUTH_TOKEN {PRESENCE}; printenv ANTHROPIC_API_KEY {PRESENCE}"
             ),
-            contains("absent"),
+            line("absent"),
         ),
         bash(
             "git",
             "touch relais-probe-git && git add -N relais-probe-git && git status --short"
                 .to_string(),
-            contains("relais-probe-git"),
+            Expect::OutputLineEndsWith(" relais-probe-git".to_string()),
         ),
         // The probe plants a project settings file excluding python3 from the
         // sandbox; an OS denial here shows `--restricted` ignored it.
@@ -171,7 +175,7 @@ pub fn probe_plan_allowlist(_nonce: &str) -> Vec<ProbeStep> {
     vec![bash(
         "scrub-env",
         format!("printenv AWS_SECRET_ACCESS_KEY {PRESENCE}"),
-        contains("absent"),
+        line("absent"),
     )]
 }
 
@@ -267,53 +271,71 @@ struct Transcript {
     results: HashMap<String, String>,
 }
 
-fn result_text(content: Option<&Value>) -> String {
+fn result_text(content: Option<&Value>) -> Result<String, String> {
     match content {
-        Some(Value::String(text)) => text.clone(),
+        Some(Value::String(text)) => Ok(text.clone()),
         Some(Value::Array(items)) => items
             .iter()
-            .filter_map(|item| item.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
+            .map(|item| {
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "tool_result content item has no text".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|texts| texts.join("\n")),
+        Some(_) | None => Err("tool_result content is neither text nor a list".to_string()),
     }
 }
 
-/// Every line must be a JSON object; one that is not fails the whole
-/// transcript, since a skipped line could be the one that mattered.
+/// Adds what one `message.content` item says to `transcript`; an item that
+/// claims to be a call or a result but lacks its identifying fields is an
+/// error, since it could be the one that mattered.
+fn read_item(item: &Value, transcript: &mut Transcript) -> Result<(), String> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("tool_use") => {
+            let field = |name: &str| item.get(name).and_then(Value::as_str);
+            let (Some(id), Some(name)) = (field("id"), field("name")) else {
+                return Err("tool_use without id or name".to_string());
+            };
+            transcript.uses.push(ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input: item.get("input").cloned().unwrap_or(Value::Null),
+            });
+        }
+        Some("tool_result") => {
+            let Some(id) = item.get("tool_use_id").and_then(Value::as_str) else {
+                return Err("tool_result without tool_use_id".to_string());
+            };
+            let text = result_text(item.get("content"))?;
+            transcript.results.entry(id.to_string()).or_insert(text);
+        }
+        Some(_) | None => {}
+    }
+    Ok(())
+}
+
+/// Every line must be a JSON object and every call or result in it well
+/// formed; one that is not fails the whole transcript, since a skipped line
+/// could be the one that mattered.
 fn parse_transcript(jsonl: &str) -> Result<Transcript, String> {
     let mut transcript = Transcript::default();
     for (n, line) in jsonl.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let value: Value = serde_json::from_str(line)
-            .map_err(|err| format!("malformed transcript line {}: {err}", n + 1))?;
+        let malformed = |why: String| format!("malformed transcript line {}: {why}", n + 1);
+        let value: Value = serde_json::from_str(line).map_err(|err| malformed(err.to_string()))?;
+        if !value.is_object() {
+            return Err(malformed("not a JSON object".to_string()));
+        }
+        // A record with no content array (a system or summary line, a
+        // text-only message) carries no tool call: nothing to read.
         let Some(items) = value.pointer("/message/content").and_then(Value::as_array) else {
             continue;
         };
         for item in items {
-            match item.get("type").and_then(Value::as_str) {
-                Some("tool_use") => {
-                    let field = |name: &str| item.get(name).and_then(Value::as_str);
-                    if let (Some(id), Some(name)) = (field("id"), field("name")) {
-                        transcript.uses.push(ToolUse {
-                            id: id.to_string(),
-                            name: name.to_string(),
-                            input: item.get("input").cloned().unwrap_or(Value::Null),
-                        });
-                    }
-                }
-                Some("tool_result") => {
-                    if let Some(id) = item.get("tool_use_id").and_then(Value::as_str) {
-                        transcript
-                            .results
-                            .entry(id.to_string())
-                            .or_insert_with(|| result_text(item.get("content")));
-                    }
-                }
-                Some(_) | None => {}
-            }
+            read_item(item, &mut transcript).map_err(malformed)?;
         }
     }
     Ok(transcript)
@@ -352,18 +374,34 @@ fn has_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
 }
 
+/// A positive control: a failed command never passes, and some line of the
+/// result must satisfy `line_matches` (given the trimmed line).
+fn judge_output(text: &str, want: &str, line_matches: impl Fn(&str) -> bool) -> Verdict {
+    if has_any(text, &PERMISSION_REFUSALS) {
+        return Verdict::Fail("permission refusal, not output".to_string());
+    }
+    if has_any(text, &OS_DENIALS) {
+        return Verdict::Fail(format!("command was denied: {}", snippet(text)));
+    }
+    if text
+        .lines()
+        .any(|line| line.trim_start().starts_with("Exit code"))
+    {
+        return Verdict::Fail(format!("command failed: {}", snippet(text)));
+    }
+    if let Some(marker) = LEAK_MARKERS.iter().find(|marker| text.contains(**marker)) {
+        return Verdict::Fail(format!("output shows {marker}"));
+    }
+    require(text.lines().any(|line| line_matches(line.trim())), || {
+        format!("no line {want:?} in: {}", snippet(text))
+    })
+}
+
 fn judge(expect: &Expect, text: &str) -> Verdict {
     match expect {
-        Expect::OutputContains(want) => {
-            if has_any(text, &PERMISSION_REFUSALS) {
-                return Verdict::Fail("permission refusal, not output".to_string());
-            }
-            if let Some(marker) = LEAK_MARKERS.iter().find(|marker| text.contains(**marker)) {
-                return Verdict::Fail(format!("output shows {marker}"));
-            }
-            require(text.contains(want.as_str()), || {
-                format!("no {want:?} in: {}", snippet(text))
-            })
+        Expect::OutputLine(want) => judge_output(text, want, |line| line == want),
+        Expect::OutputLineEndsWith(suffix) => {
+            judge_output(text, suffix, |line| line.ends_with(suffix.as_str()))
         }
         Expect::OsDenied => require(has_any(text, &OS_DENIALS), || {
             format!("no OS denial: {}", snippet(text))
@@ -712,6 +750,96 @@ mod tests {
         assert_only_failing(&judged(&steps, &jsonl, &good_init()), "pipe");
     }
 
+    /// The plan's transcript with `id`'s result replaced by `text`.
+    fn with_result(id: &str, text: &str) -> (Vec<ProbeStep>, ProbeReport) {
+        let steps = plan();
+        let jsonl = transcript(&steps, |step| {
+            Some(if step.id == id {
+                text.to_string()
+            } else {
+                measured(step)
+            })
+        });
+        let report = judged(&steps, &jsonl, &good_init());
+        (steps, report)
+    }
+
+    #[test]
+    fn a_failed_command_never_passes_a_positive_control() {
+        let failures = [
+            (
+                "pipe",
+                "Exit code 1\n(eval):1: operation not permitted: /var/x/relais-probe-pipe",
+            ),
+            ("git", "touch: relais-probe-git: Operation not permitted"),
+            (
+                "git",
+                "fatal: pathspec 'relais-probe-git' did not match any files",
+            ),
+            ("pipe", "a b"),
+            // The expected line is there, but so is a denial or a failure:
+            // only the guard, not the line match, fails these.
+            (
+                "pipe",
+                "a\n(eval):1: operation not permitted: /var/x/relais-probe-pipe",
+            ),
+            ("pipe", "a\nExit code 1"),
+            ("git", " A relais-probe-git\nfatal: Operation not permitted"),
+        ];
+        for (id, text) in failures {
+            let (_, report) = with_result(id, text);
+            assert!(matches!(verdict(&report, id), Verdict::Fail(_)), "{id}");
+            assert_only_failing(&report, id);
+        }
+    }
+
+    #[test]
+    fn the_git_step_passes_on_a_status_line_for_the_file() {
+        let (_, report) = with_result("git", " M .claude/settings.json\n A relais-probe-git");
+        assert!(report.passed, "{}", report.render());
+        let (_, report) = with_result("git", "AN relais-probe-git");
+        assert!(report.passed, "{}", report.render());
+    }
+
+    fn assert_malformed(jsonl: &str) {
+        let steps = plan();
+        let report = judged(&steps, jsonl, &good_init());
+        assert!(!report.passed);
+        for step in &report.steps {
+            match &step.verdict {
+                Verdict::Fail(why) => assert!(why.contains("malformed"), "{why}"),
+                other => panic!("{} was {other:?}", step.id),
+            }
+        }
+    }
+
+    #[test]
+    fn a_line_that_is_not_an_object_fails_the_report() {
+        assert_malformed("5");
+    }
+
+    #[test]
+    fn a_tool_use_without_id_or_name_fails_the_report() {
+        for item in [
+            json!({"type": "tool_use", "name": "Bash", "input": {}}),
+            json!({"type": "tool_use", "id": "t", "input": {}}),
+        ] {
+            assert_malformed(&json!({"message": {"content": [item]}}).to_string());
+        }
+    }
+
+    #[test]
+    fn a_tool_result_without_an_id_or_readable_content_fails_the_report() {
+        for item in [
+            json!({"type": "tool_result", "content": "x"}),
+            json!({"type": "tool_result", "tool_use_id": "t", "content": 7}),
+            json!({"type": "tool_result", "tool_use_id": "t"}),
+            json!({"type": "tool_result", "tool_use_id": "t", "content": [{"type": "image"}]}),
+        ] {
+            assert_malformed(&json!({"message": {"content": [item]}}).to_string());
+        }
+    }
+
     fn assert_init_fails(init: Option<&Value>, mentions: &str) {
         let steps = plan();
         let jsonl = transcript(&steps, |step| Some(measured(step)));
@@ -842,7 +970,7 @@ mod tests {
         assert_eq!(allowlist.len(), 1);
         assert_eq!(allowlist[0].id, "scrub-env");
         assert!(allowlist[0].input.ends_with(PRESENCE));
-        assert_eq!(allowlist[0].expect, contains("absent"));
+        assert_eq!(allowlist[0].expect, line("absent"));
     }
 
     #[test]

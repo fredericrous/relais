@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::fsutil::write_atomic;
 use crate::ids::to_hex;
 
 const SCRATCH_PLACEHOLDER: &str = "<scratch>";
@@ -108,6 +109,8 @@ pub enum StoreError {
     /// The file exists but is not a store. Never read as empty: an empty
     /// store would quietly discard every verification it held.
     Corrupt(serde_json::Error),
+    /// The records could not be turned into text; the file on disk is fine.
+    Serialize(serde_json::Error),
 }
 
 impl fmt::Display for StoreError {
@@ -115,6 +118,9 @@ impl fmt::Display for StoreError {
         match self {
             StoreError::Io(err) => write!(f, "verification store: {err}"),
             StoreError::Corrupt(err) => write!(f, "verification store is corrupt: {err}"),
+            StoreError::Serialize(err) => {
+                write!(f, "verification store could not be serialised: {err}")
+            }
         }
     }
 }
@@ -161,18 +167,14 @@ impl VerificationStore {
         }
     }
 
-    /// Writes a temporary file beside the store and renames it over, so a
-    /// reader sees the old records or the new, never half of either.
+    /// Writes through [`write_atomic`], so a reader sees the old records or
+    /// the new, never half of either.
     pub fn save(&self) -> Result<(), StoreError> {
+        let text = serde_json::to_string_pretty(&self.records).map_err(StoreError::Serialize)?;
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let mut temp = self.path.clone().into_os_string();
-        temp.push(".tmp");
-        let temp = PathBuf::from(temp);
-        let text = serde_json::to_string_pretty(&self.records).map_err(StoreError::Corrupt)?;
-        std::fs::write(&temp, text)?;
-        std::fs::rename(&temp, &self.path)?;
+        write_atomic(&self.path, &text)?;
         Ok(())
     }
 }
