@@ -10236,16 +10236,21 @@ mod tests {
             "under the run's attempts: {scratch:?}"
         );
         let link = worker.2.as_deref().expect("a CLAUDE_CODE_TMPDIR");
-        let hash = crate::ids::sha256_hex(format!("{}/1", outcome.run_id()).as_bytes());
-        assert_eq!(
-            Path::new(link),
-            fixture.dir.join(format!("rl-{}", &hash[..8])),
-            "the link is named from the run id and attempt index, under the configured root"
-        );
-        assert!(
-            std::fs::symlink_metadata(link).is_err(),
-            "the link is gone after the dispatch"
-        );
+        if cfg!(unix) {
+            let hash = crate::ids::sha256_hex(format!("{}/1", outcome.run_id()).as_bytes());
+            assert_eq!(
+                Path::new(link),
+                fixture.dir.join(format!("rl-{}", &hash[..8])),
+                "the link is named from the run id and attempt index, under the configured root"
+            );
+            assert!(
+                std::fs::symlink_metadata(link).is_err(),
+                "the link is gone after the dispatch"
+            );
+        } else {
+            // Off unix there is no link to make: the scratch is named directly.
+            assert_eq!(Path::new(link), scratch.as_path());
+        }
         assert!(
             !worker.3,
             "no scrub in sandbox mode: it disables auto-allow"

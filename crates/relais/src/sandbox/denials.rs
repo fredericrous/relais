@@ -224,7 +224,13 @@ pub fn scan(transcript_jsonl: Option<&str>, scratch_files: &[(PathBuf, String)])
         };
     }
     for (path, text) in scratch_files {
-        sort_lines(text, &path.to_string_lossy(), &mut report);
+        // `/`-joined on every platform, so a report reads the same anywhere.
+        let source = path
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        sort_lines(text, &source, &mut report);
     }
     report
 }
