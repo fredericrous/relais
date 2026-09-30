@@ -27,5 +27,7 @@ mod settings;
 pub use floor::{credential_floor, Floor, FloorInputs};
 pub use judge::{judge_managed, judge_user_config, managed_sources, Weakening};
 pub use launch::{worker_launch, LaunchInputs, WorkerMode};
-pub use preflight::{managed_root, preflight, PreflightInputs, SANDBOX_MIN_HARNESS};
+pub use preflight::{
+    managed_root, preflight, PreflightInputs, RealSandboxHost, SandboxHost, SANDBOX_MIN_HARNESS,
+};
 pub use settings::{build_settings, SettingsInputs};

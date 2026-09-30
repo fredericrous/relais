@@ -29,6 +29,47 @@ pub fn managed_root(platform: &str) -> &'static str {
     }
 }
 
+/// The host facts the sandbox preflight reads, behind one seam so a run
+/// can be driven past the preflight in a test (the real host has no
+/// bubblewrap on a CI runner, and its own `~/.claude.json`).
+pub trait SandboxHost: Sync {
+    /// A `std::env::consts::OS` value.
+    fn platform(&self) -> &str;
+    /// Is this program on PATH?
+    fn on_path(&self, program: &str) -> bool;
+    /// The managed-settings root for this platform.
+    fn managed_root(&self) -> std::path::PathBuf;
+    /// The test root that ADDS to the real one (`RELAIS_TEST_MANAGED_ROOT`).
+    fn extra_managed_root(&self) -> Option<std::path::PathBuf>;
+    /// `~/.claude.json` under `home`.
+    fn user_config(&self, home: &Path) -> std::path::PathBuf;
+}
+
+/// The machine relais runs on.
+pub struct RealSandboxHost;
+
+impl SandboxHost for RealSandboxHost {
+    fn platform(&self) -> &str {
+        std::env::consts::OS
+    }
+
+    fn on_path(&self, program: &str) -> bool {
+        crate::tooling::binary_available(program)
+    }
+
+    fn managed_root(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(managed_root(self.platform()))
+    }
+
+    fn extra_managed_root(&self) -> Option<std::path::PathBuf> {
+        std::env::var_os("RELAIS_TEST_MANAGED_ROOT").map(std::path::PathBuf::from)
+    }
+
+    fn user_config(&self, home: &Path) -> std::path::PathBuf {
+        home.join(".claude.json")
+    }
+}
+
 /// Everything the sandbox preflight reads.
 pub struct PreflightInputs<'a> {
     /// A `std::env::consts::OS` value.

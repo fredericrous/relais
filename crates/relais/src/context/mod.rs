@@ -515,7 +515,7 @@ impl Confinement {
             WorkerMode::Allowlist => all("allowlist"),
             WorkerMode::Sandbox => Self {
                 bash: "os".into(),
-                file_tools: "worktree".into(),
+                file_tools: "worktree+scratch".into(),
                 web: "none".into(),
                 mcp: "none".into(),
             },
@@ -998,7 +998,7 @@ mod tests {
             sandboxed.confinement,
             Confinement {
                 bash: "os".into(),
-                file_tools: "worktree".into(),
+                file_tools: "worktree+scratch".into(),
                 web: "none".into(),
                 mcp: "none".into(),
             }

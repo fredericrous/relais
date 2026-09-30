@@ -162,6 +162,9 @@ pub struct RunConfig<'a> {
     pub attest: &'a dyn verify::HookAttest,
     /// The environment every worker this run dispatches will run with.
     pub worker_env: crate::backend::LaunchEnv,
+    /// The host facts the sandbox preflight reads (platform, PATH, managed
+    /// and user configuration): [`sandbox::RealSandboxHost`] outside tests.
+    pub sandbox_host: &'a dyn sandbox::SandboxHost,
     pub artifacts_dir: PathBuf,
     /// aval resolution, injectable so runs are testable without the real
     /// corpus; production wiring passes a `context::AvalCli`.
@@ -1430,7 +1433,8 @@ impl<'a> RunEngine<'a> {
         if WorkerMode::of(&self.config.machine.sandbox) == WorkerMode::Allowlist {
             return None;
         }
-        let platform = std::env::consts::OS;
+        let host = self.config.sandbox_host;
+        let platform = host.platform();
         // Every path the launch needs is resolved HERE, so an unresolvable
         // one is a preflight block with something to do, not an internal
         // error at dispatch after the preflight passed.
@@ -1442,13 +1446,13 @@ impl<'a> RunEngine<'a> {
             Ok(home) => home,
             Err(blocker) => return Some(blocker),
         };
-        let user_config = home.join(".claude.json");
-        let managed = PathBuf::from(sandbox::managed_root(platform));
-        let extra_managed = std::env::var_os("RELAIS_TEST_MANAGED_ROOT").map(PathBuf::from);
+        let user_config = host.user_config(&home);
+        let managed = host.managed_root();
+        let extra_managed = host.extra_managed_root();
         sandbox::preflight(&sandbox::PreflightInputs {
             platform,
             harness_version: capabilities.and_then(|caps| caps.version.as_deref()),
-            on_path: &crate::tooling::binary_available,
+            on_path: &|program| host.on_path(program),
             managed_root: &managed,
             extra_managed_root: extra_managed.as_deref(),
             user_config: &user_config,
@@ -1477,7 +1481,10 @@ impl<'a> RunEngine<'a> {
             Err(e) => return Err(e.into()),
         }
         std::fs::create_dir_all(&scratch)?;
-        let ambient = |name: &str| std::env::var(name).ok();
+        // `var_os`, not `var`: a non-UTF-8 relocation (`CARGO_HOME`, …)
+        // must still reach the floor, lossily, rather than vanish from it.
+        let ambient =
+            |name: &str| std::env::var_os(name).map(|value| value.to_string_lossy().into_owned());
         Ok(Some(sandbox::worker_launch(&sandbox::LaunchInputs {
             settings,
             home: &crate::paths::home_dir().map_err(home_unset)?,
@@ -4435,6 +4442,7 @@ mod tests {
                 hooks: &crate::verify::FixedInventory(None),
                 attest: &crate::verify::FixedAttest::default(),
                 worker_env: crate::backend::LaunchEnv::default(),
+                sandbox_host: &crate::sandbox::RealSandboxHost,
                 artifacts_dir: self.artifacts.clone(),
                 aval_resolver: &resolver,
                 predictor: None,
@@ -4455,6 +4463,25 @@ mod tests {
             machine: &MachineSettings,
             backend: &dyn Backend,
         ) -> RunOutcome {
+            self.execute_with_host(
+                contract,
+                repo,
+                machine,
+                backend,
+                &crate::sandbox::RealSandboxHost,
+            )
+        }
+
+        /// `execute_with_machine` on an explicit sandbox host, so a run
+        /// can be driven past the sandbox preflight.
+        fn execute_with_host(
+            &self,
+            contract: &TaskContract,
+            repo: &RepoPolicy,
+            machine: &MachineSettings,
+            backend: &dyn Backend,
+            host: &dyn crate::sandbox::SandboxHost,
+        ) -> RunOutcome {
             let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
                 adr: "ADR-0001".into(),
                 choice: None,
@@ -4472,6 +4499,7 @@ mod tests {
                 hooks: &crate::verify::FixedInventory(None),
                 attest: &crate::verify::FixedAttest::default(),
                 worker_env: crate::backend::LaunchEnv::default(),
+                sandbox_host: host,
                 artifacts_dir: self.artifacts.clone(),
                 aval_resolver: &resolver,
                 predictor: None,
@@ -4510,6 +4538,7 @@ mod tests {
                 hooks: &crate::verify::FixedInventory(None),
                 attest: &crate::verify::FixedAttest::default(),
                 worker_env: crate::backend::LaunchEnv::default(),
+                sandbox_host: &crate::sandbox::RealSandboxHost,
                 artifacts_dir: self.artifacts.clone(),
                 aval_resolver: &resolver,
                 predictor: None,
@@ -5753,6 +5782,7 @@ mod tests {
             hooks: &crate::verify::FixedInventory(None),
             attest: &crate::verify::FixedAttest::default(),
             worker_env: crate::backend::LaunchEnv::default(),
+            sandbox_host: &crate::sandbox::RealSandboxHost,
             artifacts_dir: fixture.artifacts.clone(),
             aval_resolver: &resolver,
             predictor: None,
@@ -9629,6 +9659,157 @@ mod tests {
         };
         assert_eq!(*code, BlockCode::SandboxUnavailable, "{detail}");
         assert_eq!(launches.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// The first file named `name` under `dir`, depth-first.
+    fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
+        // Test helper: an unreadable entry is simply not a match.
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = find_file(&path, name) {
+                    return Some(found);
+                }
+            } else if path.file_name().is_some_and(|file| file == name) {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    /// A host the sandbox preflight passes on: macOS, every program on
+    /// PATH, an empty managed root and no `~/.claude.json`.
+    struct PassingHost {
+        managed: PathBuf,
+    }
+
+    impl crate::sandbox::SandboxHost for PassingHost {
+        fn platform(&self) -> &str {
+            "macos"
+        }
+        fn on_path(&self, _program: &str) -> bool {
+            true
+        }
+        fn managed_root(&self) -> PathBuf {
+            self.managed.clone()
+        }
+        fn extra_managed_root(&self) -> Option<PathBuf> {
+            None
+        }
+        fn user_config(&self, _home: &Path) -> PathBuf {
+            self.managed.join("no-such-claude.json")
+        }
+    }
+
+    /// With `[sandbox]` on and the preflight passing, the WORKER is
+    /// launched sandboxed — a fresh, empty scratch dir under the run's
+    /// attempts, `TMPDIR` pointing at it, no scrub — and the reviewer is
+    /// not.
+    #[test]
+    fn with_a_sandbox_only_the_worker_launches_sandboxed() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let mut machine = fixture.machine_for(&repo);
+        machine.sandbox.enabled = true;
+        // (is the reviewer, scratch dir if sandboxed, TMPDIR, has the scrub,
+        // env names)
+        type Seen = (bool, Option<PathBuf>, Option<String>, bool, Vec<String>);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Seen>::new()));
+        let record = Arc::clone(&seen);
+        let backend = MockBackend::new(move |spec| {
+            let var = |name: &str| {
+                spec.env
+                    .vars()
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, v)| v.clone())
+            };
+            let reviewer = spec.prompt.contains("semantic reviewer");
+            let scratch = spec
+                .sandbox
+                .as_ref()
+                .map(|launch| launch.scratch_dir.clone());
+            if let Some(dir) = &scratch {
+                assert!(dir.is_dir(), "the scratch dir exists at launch");
+                assert_eq!(
+                    std::fs::read_dir(dir).expect("readable").count(),
+                    0,
+                    "and is empty"
+                );
+            }
+            record.lock().unwrap().push((
+                reviewer,
+                scratch,
+                var("TMPDIR"),
+                var(crate::backend::SUBPROCESS_ENV_SCRUB).is_some(),
+                spec.env.names(),
+            ));
+            if reviewer {
+                return MockOutcome {
+                    result_text: Some("FINDINGS: none".into()),
+                    exit_code: Some(0),
+                    ..Default::default()
+                };
+            }
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        })
+        .reporting_version(crate::sandbox::SANDBOX_MIN_HARNESS);
+        let managed = fixture.dir.join("managed");
+        std::fs::create_dir_all(&managed).expect("managed root");
+        let host = PassingHost { managed };
+        let outcome = fixture.execute_with_host(
+            &fixture.contract(Review::Required),
+            &repo,
+            &machine,
+            &backend,
+            &host,
+        );
+        assert!(
+            matches!(outcome.terminal, Terminal::Accepted(_)),
+            "{outcome:?}"
+        );
+        let seen = seen.lock().unwrap();
+        let worker = seen
+            .iter()
+            .find(|(reviewer, ..)| !*reviewer)
+            .expect("a worker launched");
+        let scratch = worker.1.as_ref().expect("the worker is sandboxed");
+        assert!(
+            scratch.ends_with("attempts/1/scratch"),
+            "under the run's attempts: {scratch:?}"
+        );
+        assert_eq!(
+            worker.2.as_deref(),
+            Some(scratch.to_string_lossy().as_ref())
+        );
+        assert!(
+            !worker.3,
+            "no scrub in sandbox mode: it disables auto-allow"
+        );
+        // The manifest names exactly the env the worker was launched with.
+        let manifest_path = find_file(&fixture.artifacts, "manifest.json").expect("a manifest");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("readable"))
+                .expect("json");
+        let recorded: Vec<String> =
+            serde_json::from_value(manifest["worker_env"].clone()).expect("names");
+        assert_eq!(
+            recorded, worker.4,
+            "manifest worker_env == launched env names"
+        );
+        assert_eq!(manifest["sandbox"]["requested"], true);
+        let reviewer = seen
+            .iter()
+            .find(|(reviewer, ..)| *reviewer)
+            .expect("a reviewer launched");
+        assert!(reviewer.1.is_none(), "the reviewer is never sandboxed");
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
