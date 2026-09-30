@@ -73,6 +73,13 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+      # Skips `cargo test` only when a signature by a key in
+      # .github/allowed_signers covers this exact tree on this leg's
+      # platform; anything else runs it. Not on `schedule`: that run exists
+      # to catch drift no push made, so it must never skip.
+      - id: attest
+        if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+        uses: fredericrous/attest@v1
       - uses: actions/cache@v4
         with:
           path: |
@@ -85,7 +92,8 @@ jobs:
       - run: |
           git config --global user.email "ci@relais.invalid"
           git config --global user.name "relais ci"
-      - run: cargo test
+      - if: ${{ !contains(fromJSON(steps.attest.outputs.gates || '[]'), 'pre-push-cargo-test') }}
+        run: cargo test
 
   # `make msrv`: the floor `rust-version` claims, actually compiled
   # against. Without this, `rust-version` is a string nothing tests.
