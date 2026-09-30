@@ -16,13 +16,20 @@
 //! gets, and [`preflight`] says whether the sandbox can be relied on at all
 //! (platform, harness version, Linux helpers, weakening configuration).
 //!
+//! Whether the sandbox holds is judged from what a real probe session did,
+//! never assumed: [`probe_plan`] and [`evaluate`] say what the session is
+//! asked to do and whether its transcript shows it, and
+//! [`VerificationStore`] keeps the passes by [`VerificationKey`].
+//!
 //! Nothing here launches anything; the runner wires these together.
 
 mod floor;
 mod judge;
 mod launch;
 mod preflight;
+mod probe;
 mod settings;
+mod verification;
 
 pub use floor::{credential_floor, Floor, FloorInputs};
 pub use judge::{judge_managed, judge_user_config, managed_sources, Weakening};
@@ -30,4 +37,9 @@ pub use launch::{worker_launch, LaunchInputs, WorkerMode};
 pub use preflight::{
     managed_root, preflight, PreflightInputs, RealSandboxHost, SandboxHost, SANDBOX_MIN_HARNESS,
 };
+pub use probe::{
+    evaluate, probe_plan, probe_plan_allowlist, probe_prompt, Expect, ProbePlanInputs, ProbeReport,
+    ProbeStep, ProbeTool, StepResult, Verdict,
+};
 pub use settings::{build_settings, SettingsInputs};
+pub use verification::{StoreError, VerificationKey, VerificationRecord, VerificationStore};

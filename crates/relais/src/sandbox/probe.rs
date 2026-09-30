@@ -1,0 +1,861 @@
+//! What a probe session must do to show the sandbox holds, and how its
+//! transcript is judged.
+//!
+//! Nothing here runs a session. [`probe_plan`] says which tool calls a real
+//! probe session is asked to make and what each result must show;
+//! [`evaluate`] reads the session's transcript and the harness's `init`
+//! record and says, step by step, whether that happened. A step the model
+//! skipped or altered is [`Verdict::NotRun`], never a pass: the sandbox is
+//! trusted only for what the transcript shows.
+//!
+//! The probe never prints a secret value. Every environment step asks for
+//! the presence of a variable (`>/dev/null && echo PRESENT || echo absent`)
+//! and the fixture step asks `test -r`, so a transcript that leaks one is
+//! itself the failure.
+
+use std::collections::{BTreeSet, HashMap};
+use std::path::Path;
+
+use serde_json::Value;
+
+/// The tool a probe step calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeTool {
+    Bash,
+    Read,
+    Grep,
+}
+
+impl ProbeTool {
+    fn name(self) -> &'static str {
+        match self {
+            ProbeTool::Bash => "Bash",
+            ProbeTool::Read => "Read",
+            ProbeTool::Grep => "Grep",
+        }
+    }
+}
+
+/// What a step's `tool_result` must show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Expect {
+    /// The text, with no permission refusal and no leak marker.
+    OutputContains(String),
+    /// The operating system refused the operation.
+    OsDenied,
+    /// The network proxy reported a denied outbound connection.
+    NetworkViolation,
+    /// Claude Code's permission rules refused the tool call.
+    PermissionDenied,
+}
+
+/// One tool call the probe session is asked to make. `input` is the exact
+/// command (Bash), path (Read) or `<pattern>\t<path>` (Grep).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeStep {
+    pub id: &'static str,
+    pub tool: ProbeTool,
+    pub input: String,
+    pub expect: Expect,
+}
+
+/// What the sandbox-mode plan is built from: a per-attempt `nonce`, the
+/// credential `fixture` file the floor denies, and the user's `home`.
+pub struct ProbePlanInputs<'a> {
+    pub nonce: &'a str,
+    pub fixture: &'a Path,
+    pub home: &'a Path,
+}
+
+const OS_DENIALS: [&str; 3] = [
+    "operation not permitted",
+    "Operation not permitted",
+    "Read-only file system",
+];
+const PERMISSION_REFUSALS: [&str; 2] = ["denied by your permission settings", "has been denied"];
+/// Words a probe prints only when the sandbox let something through.
+const LEAK_MARKERS: [&str; 2] = ["PRESENT", "READABLE"];
+const GREP_PATTERN: &str = "relais-probe";
+const PRESENCE: &str = ">/dev/null && echo PRESENT || echo absent";
+
+fn bash(id: &'static str, input: String, expect: Expect) -> ProbeStep {
+    ProbeStep {
+        id,
+        tool: ProbeTool::Bash,
+        input,
+        expect,
+    }
+}
+
+fn contains(text: &str) -> Expect {
+    Expect::OutputContains(text.to_string())
+}
+
+/// The steps of a probe run in sandbox mode, in the order they are asked.
+pub fn probe_plan(inputs: &ProbePlanInputs) -> Vec<ProbeStep> {
+    let nonce = inputs.nonce;
+    let home = inputs.home.to_string_lossy();
+    let fixture = inputs.fixture.to_string_lossy();
+    let fixture_dir = inputs.fixture.parent().unwrap_or(inputs.fixture);
+    vec![
+        bash(
+            "pipe",
+            r#"printf 'a\nb\n' | head -1 > "$TMPDIR/relais-probe-pipe" && cat "$TMPDIR/relais-probe-pipe""#
+                .to_string(),
+            contains("a"),
+        ),
+        bash(
+            "tmp-write",
+            format!("touch /tmp/relais-probe-{nonce}"),
+            Expect::OsDenied,
+        ),
+        bash(
+            "home-write",
+            format!("touch {home}/relais-probe-{nonce}"),
+            Expect::OsDenied,
+        ),
+        bash(
+            "network",
+            "curl -sS -m 8 -o /dev/null https://example.com".to_string(),
+            Expect::NetworkViolation,
+        ),
+        bash(
+            "fixture-bash",
+            format!("test -r {fixture} && echo READABLE || echo denied"),
+            contains("denied"),
+        ),
+        bash(
+            "synthetic-env",
+            format!("printenv AWS_SECRET_ACCESS_KEY {PRESENCE}"),
+            contains("absent"),
+        ),
+        bash(
+            "auth-env",
+            format!(
+                "printenv CLAUDE_CODE_OAUTH_TOKEN {PRESENCE}; printenv ANTHROPIC_API_KEY {PRESENCE}"
+            ),
+            contains("absent"),
+        ),
+        bash(
+            "git",
+            "touch relais-probe-git && git add -N relais-probe-git && git status --short"
+                .to_string(),
+            contains("relais-probe-git"),
+        ),
+        // The probe plants a project settings file excluding python3 from the
+        // sandbox; an OS denial here shows `--restricted` ignored it.
+        bash(
+            "excluded-python",
+            format!("python3 -c \"open('{home}/relais-probe-py-{nonce}','w')\""),
+            Expect::OsDenied,
+        ),
+        ProbeStep {
+            id: "fixture-read",
+            tool: ProbeTool::Read,
+            input: fixture.into_owned(),
+            expect: Expect::PermissionDenied,
+        },
+        ProbeStep {
+            id: "fixture-grep",
+            tool: ProbeTool::Grep,
+            input: format!("{GREP_PATTERN}\t{}", fixture_dir.to_string_lossy()),
+            expect: Expect::PermissionDenied,
+        },
+    ]
+}
+
+/// The steps of a probe run in allowlist mode (`[sandbox]` off). The nonce
+/// is accepted so both plans are called alike; this step has no per-attempt
+/// path.
+pub fn probe_plan_allowlist(_nonce: &str) -> Vec<ProbeStep> {
+    vec![bash(
+        "scrub-env",
+        format!("printenv AWS_SECRET_ACCESS_KEY {PRESENCE}"),
+        contains("absent"),
+    )]
+}
+
+/// Splits a Grep step's input into its pattern and path.
+fn grep_parts(input: &str) -> (&str, &str) {
+    input.split_once('\t').unwrap_or((input, ""))
+}
+
+/// The prompt that makes a session perform `steps` and nothing else.
+pub fn probe_prompt(steps: &[ProbeStep]) -> String {
+    let mut prompt = String::from(
+        "Perform each numbered step below with exactly one tool call, in \
+         order, using exactly the input given, character for character. Do \
+         not retry a step and do not work around a failure: a refusal is an \
+         expected result. Do nothing else. After the last step reply DONE.\n",
+    );
+    for (n, step) in steps.iter().enumerate() {
+        let call = match step.tool {
+            ProbeTool::Bash => format!("Bash, command: {}", step.input),
+            ProbeTool::Read => format!("Read, file_path: {}", step.input),
+            ProbeTool::Grep => {
+                let (pattern, path) = grep_parts(&step.input);
+                format!("Grep, pattern: {pattern} path: {path}")
+            }
+        };
+        prompt.push_str(&format!("\n{}. {call}", n + 1));
+    }
+    prompt.push('\n');
+    prompt
+}
+
+/// How one step fared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    Pass,
+    Fail(String),
+    /// The transcript holds no such call, or no result for it.
+    NotRun,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepResult {
+    pub id: &'static str,
+    pub verdict: Verdict,
+}
+
+/// The judgement of one probe session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeReport {
+    pub steps: Vec<StepResult>,
+    pub init: Result<(), String>,
+    /// Every step passed and the init record matched.
+    pub passed: bool,
+}
+
+const WIDTH: usize = 80;
+
+fn clip(line: &str) -> String {
+    let flat = line.replace('\n', " ");
+    if flat.chars().count() <= WIDTH {
+        return flat;
+    }
+    let mut short: String = flat.chars().take(WIDTH - 1).collect();
+    short.push('…');
+    short
+}
+
+impl ProbeReport {
+    /// One line per step, then the init line, each within 80 columns.
+    pub fn render(&self) -> String {
+        let steps = self.steps.iter().map(|step| match &step.verdict {
+            Verdict::Pass => clip(&format!("✓ {}: ok", step.id)),
+            Verdict::Fail(why) => clip(&format!("✗ {}: {why}", step.id)),
+            Verdict::NotRun => clip(&format!("– {}: not run", step.id)),
+        });
+        let init = match &self.init {
+            Ok(()) => clip("✓ init: ok"),
+            Err(why) => clip(&format!("✗ init: {why}")),
+        };
+        steps.chain([init]).collect::<Vec<_>>().join("\n")
+    }
+}
+
+struct ToolUse {
+    id: String,
+    name: String,
+    input: Value,
+}
+
+#[derive(Default)]
+struct Transcript {
+    uses: Vec<ToolUse>,
+    results: HashMap<String, String>,
+}
+
+fn result_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Every line must be a JSON object; one that is not fails the whole
+/// transcript, since a skipped line could be the one that mattered.
+fn parse_transcript(jsonl: &str) -> Result<Transcript, String> {
+    let mut transcript = Transcript::default();
+    for (n, line) in jsonl.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(line)
+            .map_err(|err| format!("malformed transcript line {}: {err}", n + 1))?;
+        let Some(items) = value.pointer("/message/content").and_then(Value::as_array) else {
+            continue;
+        };
+        for item in items {
+            match item.get("type").and_then(Value::as_str) {
+                Some("tool_use") => {
+                    let field = |name: &str| item.get(name).and_then(Value::as_str);
+                    if let (Some(id), Some(name)) = (field("id"), field("name")) {
+                        transcript.uses.push(ToolUse {
+                            id: id.to_string(),
+                            name: name.to_string(),
+                            input: item.get("input").cloned().unwrap_or(Value::Null),
+                        });
+                    }
+                }
+                Some("tool_result") => {
+                    if let Some(id) = item.get("tool_use_id").and_then(Value::as_str) {
+                        transcript
+                            .results
+                            .entry(id.to_string())
+                            .or_insert_with(|| result_text(item.get("content")));
+                    }
+                }
+                Some(_) | None => {}
+            }
+        }
+    }
+    Ok(transcript)
+}
+
+/// Whether a call's input is exactly the step's.
+fn input_matches(step: &ProbeStep, input: &Value) -> bool {
+    let field = |name: &str| input.get(name).and_then(Value::as_str);
+    match step.tool {
+        ProbeTool::Bash => field("command") == Some(step.input.as_str()),
+        ProbeTool::Read => field("file_path") == Some(step.input.as_str()),
+        ProbeTool::Grep => {
+            let (pattern, path) = grep_parts(&step.input);
+            field("pattern") == Some(pattern) && field("path") == Some(path)
+        }
+    }
+}
+
+fn snippet(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return "empty result".to_string();
+    }
+    flat.chars().take(40).collect()
+}
+
+fn require(holds: bool, otherwise: impl FnOnce() -> String) -> Verdict {
+    if holds {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(otherwise())
+    }
+}
+
+fn has_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+fn judge(expect: &Expect, text: &str) -> Verdict {
+    match expect {
+        Expect::OutputContains(want) => {
+            if has_any(text, &PERMISSION_REFUSALS) {
+                return Verdict::Fail("permission refusal, not output".to_string());
+            }
+            if let Some(marker) = LEAK_MARKERS.iter().find(|marker| text.contains(**marker)) {
+                return Verdict::Fail(format!("output shows {marker}"));
+            }
+            require(text.contains(want.as_str()), || {
+                format!("no {want:?} in: {}", snippet(text))
+            })
+        }
+        Expect::OsDenied => require(has_any(text, &OS_DENIALS), || {
+            format!("no OS denial: {}", snippet(text))
+        }),
+        Expect::NetworkViolation => require(
+            text.contains("<sandbox_violations>") && text.contains("deny network-outbound"),
+            || format!("no network violation: {}", snippet(text)),
+        ),
+        Expect::PermissionDenied => require(has_any(text, &PERMISSION_REFUSALS), || {
+            format!("not refused: {}", snippet(text))
+        }),
+    }
+}
+
+fn run_step(step: &ProbeStep, transcript: &Transcript) -> Verdict {
+    let call = transcript
+        .uses
+        .iter()
+        .find(|call| call.name == step.tool.name() && input_matches(step, &call.input));
+    match call.and_then(|call| transcript.results.get(&call.id)) {
+        Some(text) => judge(&step.expect, text),
+        None => Verdict::NotRun,
+    }
+}
+
+fn check_init(init: Option<&Value>, expected_tools: &[&str]) -> Result<(), String> {
+    let init = init.ok_or("no init record")?;
+    let mut problems = Vec::new();
+
+    match init.get("tools").and_then(Value::as_array) {
+        Some(tools) => {
+            let seen: BTreeSet<&str> = tools.iter().filter_map(Value::as_str).collect();
+            let want: BTreeSet<&str> = expected_tools.iter().copied().collect();
+            if seen != want {
+                let join = |set: BTreeSet<&str>| set.into_iter().collect::<Vec<_>>().join(",");
+                problems.push(format!(
+                    "tools differ: extra [{}], missing [{}]",
+                    join(seen.difference(&want).copied().collect()),
+                    join(want.difference(&seen).copied().collect()),
+                ));
+            }
+        }
+        None => problems.push("tools missing".to_string()),
+    }
+
+    match init.get("mcp_servers").and_then(Value::as_array) {
+        Some(servers) if servers.is_empty() => {}
+        Some(servers) => problems.push(format!("{} MCP server(s) loaded", servers.len())),
+        None => problems.push("mcp_servers missing".to_string()),
+    }
+
+    let plugins = init.get("plugins").and_then(Value::as_array);
+    for plugin in plugins.into_iter().flatten() {
+        let source = plugin.get("source").and_then(Value::as_str).unwrap_or("?");
+        if !source.ends_with("@builtin") {
+            problems.push(format!("non-builtin plugin {source}"));
+        }
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; "))
+    }
+}
+
+/// Judges a probe session: each step against its call and result in
+/// `transcript_jsonl`, and `init` (the `system`/`init` object of the run)
+/// against `expected_tools`, no MCP servers and built-in plugins only.
+pub fn evaluate(
+    steps: &[ProbeStep],
+    transcript_jsonl: &str,
+    init: Option<&Value>,
+    expected_tools: &[&str],
+) -> ProbeReport {
+    let transcript = parse_transcript(transcript_jsonl);
+    let steps: Vec<StepResult> = steps
+        .iter()
+        .map(|step| StepResult {
+            id: step.id,
+            verdict: match &transcript {
+                Ok(transcript) => run_step(step, transcript),
+                Err(why) => Verdict::Fail(why.clone()),
+            },
+        })
+        .collect();
+    let init = check_init(init, expected_tools);
+    let passed = init.is_ok() && steps.iter().all(|step| step.verdict == Verdict::Pass);
+    ProbeReport {
+        steps,
+        init,
+        passed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use serde_json::json;
+
+    use super::*;
+
+    const TOOLS: [&str; 6] = ["Bash", "Read", "Edit", "Write", "Grep", "Glob"];
+
+    fn plan() -> Vec<ProbeStep> {
+        probe_plan(&ProbePlanInputs {
+            nonce: "n1",
+            fixture: &PathBuf::from("/fx/fixtures/secret.txt"),
+            home: &PathBuf::from("/home/u"),
+        })
+    }
+
+    fn good_init() -> Value {
+        json!({
+            "type": "system",
+            "subtype": "init",
+            "tools": TOOLS,
+            "mcp_servers": [],
+            "plugins": [{"name": "core", "source": "core@builtin"}],
+        })
+    }
+
+    /// The results S0 measured, per step.
+    fn measured(step: &ProbeStep) -> String {
+        match step.id {
+            "pipe" => "a".to_string(),
+            "tmp-write" | "home-write" => format!(
+                "Exit code 1\n(eval):1: operation not permitted: {}",
+                step.input
+            ),
+            "network" => "Exit code 56\ncurl: (56) CONNECT tunnel failed, response 403\n000\n\
+                <sandbox_violations>\ndeny network-outbound example.com:443 \
+                (host is not on the allow list)\n</sandbox_violations>"
+                .to_string(),
+            "fixture-bash" => "denied".to_string(),
+            "synthetic-env" => "absent".to_string(),
+            "auth-env" => "absent\nabsent".to_string(),
+            "git" => "A  relais-probe-git".to_string(),
+            "excluded-python" => "PermissionError: [Errno 1] Operation not permitted".to_string(),
+            "fixture-read" => "<tool_use_error>File is in a directory that is denied by your \
+                permission settings.</tool_use_error>"
+                .to_string(),
+            "fixture-grep" => "Permission to read /fx/fixtures has been denied.".to_string(),
+            other => panic!("no measured result for {other}"),
+        }
+    }
+
+    fn call_input(step: &ProbeStep) -> Value {
+        match step.tool {
+            ProbeTool::Bash => json!({"command": step.input}),
+            ProbeTool::Read => json!({"file_path": step.input}),
+            ProbeTool::Grep => {
+                let (pattern, path) = grep_parts(&step.input);
+                json!({"pattern": pattern, "path": path})
+            }
+        }
+    }
+
+    /// A transcript with a call per step; `result_for` gives its result, or
+    /// `None` to leave the call without one.
+    fn transcript(
+        steps: &[ProbeStep],
+        result_for: impl Fn(&ProbeStep) -> Option<String>,
+    ) -> String {
+        let mut lines = Vec::new();
+        for step in steps {
+            let id = format!("toolu_{}", step.id);
+            lines.push(json!({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": id, "name": step.tool.name(), "input": call_input(step)}
+            ]}}));
+            if let Some(text) = result_for(step) {
+                lines.push(json!({"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": id, "content": text}
+                ]}}));
+            }
+        }
+        lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn judged(steps: &[ProbeStep], jsonl: &str, init: &Value) -> ProbeReport {
+        evaluate(steps, jsonl, Some(init), &TOOLS)
+    }
+
+    fn verdict<'a>(report: &'a ProbeReport, id: &str) -> &'a Verdict {
+        &report
+            .steps
+            .iter()
+            .find(|step| step.id == id)
+            .unwrap_or_else(|| panic!("no step {id}"))
+            .verdict
+    }
+
+    fn assert_only_failing(report: &ProbeReport, id: &str) {
+        assert!(!report.passed);
+        for step in &report.steps {
+            if step.id != id {
+                assert_eq!(step.verdict, Verdict::Pass, "{}", step.id);
+            }
+        }
+    }
+
+    #[test]
+    fn passes_on_the_measured_results() {
+        let steps = plan();
+        let jsonl = transcript(&steps, |step| Some(measured(step)));
+        let report = judged(&steps, &jsonl, &good_init());
+        assert!(report.passed, "{}", report.render());
+    }
+
+    #[test]
+    fn a_result_given_as_text_blocks_is_read() {
+        let steps = plan();
+        let jsonl = transcript(&steps, |step| Some(measured(step))).replace(
+            "\"content\":\"absent\"",
+            "\"content\":[{\"type\":\"text\",\"text\":\"absent\"}]",
+        );
+        assert!(judged(&steps, &jsonl, &good_init()).passed);
+    }
+
+    #[test]
+    fn a_harness_that_ignored_the_sandbox_fails_the_write_step() {
+        let steps = plan();
+        for silent in ["", "ok"] {
+            let jsonl = transcript(&steps, |step| {
+                Some(if step.id == "tmp-write" {
+                    silent.to_string()
+                } else {
+                    measured(step)
+                })
+            });
+            let report = judged(&steps, &jsonl, &good_init());
+            assert!(matches!(verdict(&report, "tmp-write"), Verdict::Fail(_)));
+            assert_only_failing(&report, "tmp-write");
+        }
+    }
+
+    #[test]
+    fn a_skipped_step_is_not_run() {
+        let steps = plan();
+        let jsonl = transcript(&steps, |step| {
+            (step.id != "network").then(|| measured(step))
+        });
+        let report = judged(&steps, &jsonl, &good_init());
+        assert_eq!(verdict(&report, "network"), &Verdict::NotRun);
+        assert_only_failing(&report, "network");
+    }
+
+    #[test]
+    fn a_call_without_a_result_is_not_run() {
+        let steps = plan();
+        let jsonl = transcript(&steps, |step| (step.id != "git").then(|| measured(step)));
+        let report = judged(&steps, &jsonl, &good_init());
+        assert_eq!(verdict(&report, "git"), &Verdict::NotRun);
+    }
+
+    #[test]
+    fn an_altered_command_is_not_run() {
+        let steps = plan();
+        let mut altered = steps.clone();
+        for step in &mut altered {
+            if step.id == "home-write" {
+                step.input.push_str(" 2>&1");
+            }
+        }
+        let jsonl = transcript(&altered, |step| Some(measured(step)));
+        let report = judged(&steps, &jsonl, &good_init());
+        assert_eq!(verdict(&report, "home-write"), &Verdict::NotRun);
+        assert_only_failing(&report, "home-write");
+    }
+
+    #[test]
+    fn a_grep_on_another_path_is_not_run() {
+        let steps = plan();
+        let mut altered = steps.clone();
+        for step in &mut altered {
+            if step.id == "fixture-grep" {
+                step.input = "relais-probe\t/elsewhere".to_string();
+            }
+        }
+        let jsonl = transcript(&altered, |step| Some(measured(step)));
+        let report = judged(&steps, &jsonl, &good_init());
+        assert_eq!(verdict(&report, "fixture-grep"), &Verdict::NotRun);
+    }
+
+    #[test]
+    fn a_readable_fixture_fails_the_step() {
+        let steps = plan();
+        let jsonl = transcript(&steps, |step| {
+            Some(if step.id == "fixture-bash" {
+                "READABLE".to_string()
+            } else {
+                measured(step)
+            })
+        });
+        let report = judged(&steps, &jsonl, &good_init());
+        assert!(matches!(verdict(&report, "fixture-bash"), Verdict::Fail(_)));
+        assert_only_failing(&report, "fixture-bash");
+    }
+
+    #[test]
+    fn a_present_credential_fails_the_step() {
+        let steps = plan();
+        for id in ["auth-env", "synthetic-env"] {
+            let jsonl = transcript(&steps, |step| {
+                Some(if step.id == id {
+                    "PRESENT\nabsent".to_string()
+                } else {
+                    measured(step)
+                })
+            });
+            let report = judged(&steps, &jsonl, &good_init());
+            assert!(matches!(verdict(&report, id), Verdict::Fail(_)));
+            assert_only_failing(&report, id);
+        }
+    }
+
+    #[test]
+    fn a_permitted_read_fails_the_step() {
+        let steps = plan();
+        let jsonl = transcript(&steps, |step| {
+            Some(if step.id == "fixture-read" {
+                "secret contents".to_string()
+            } else {
+                measured(step)
+            })
+        });
+        let report = judged(&steps, &jsonl, &good_init());
+        assert_only_failing(&report, "fixture-read");
+    }
+
+    #[test]
+    fn a_refusal_is_not_output() {
+        let steps = plan();
+        let jsonl = transcript(&steps, |step| {
+            Some(if step.id == "pipe" {
+                "denied by your permission settings".to_string()
+            } else {
+                measured(step)
+            })
+        });
+        assert_only_failing(&judged(&steps, &jsonl, &good_init()), "pipe");
+    }
+
+    fn assert_init_fails(init: Option<&Value>, mentions: &str) {
+        let steps = plan();
+        let jsonl = transcript(&steps, |step| Some(measured(step)));
+        let report = evaluate(&steps, &jsonl, init, &TOOLS);
+        assert!(!report.passed);
+        assert!(report.steps.iter().all(|s| s.verdict == Verdict::Pass));
+        let why = report.init.expect_err("init must fail");
+        assert!(why.contains(mentions), "{why}");
+    }
+
+    #[test]
+    fn an_init_with_an_mcp_server_fails() {
+        let mut init = good_init();
+        init["mcp_servers"] = json!([{"name": "x", "status": "connected"}]);
+        assert_init_fails(Some(&init), "MCP");
+    }
+
+    #[test]
+    fn an_init_with_a_foreign_plugin_fails() {
+        let mut init = good_init();
+        init["plugins"] = json!([{"name": "p", "source": "p@market"}]);
+        assert_init_fails(Some(&init), "p@market");
+    }
+
+    #[test]
+    fn an_init_with_an_extra_or_missing_tool_fails() {
+        let mut init = good_init();
+        init["tools"] = json!(["Bash", "Read", "Edit", "Write", "Grep", "Glob", "WebFetch"]);
+        assert_init_fails(Some(&init), "extra [WebFetch]");
+        init["tools"] = json!(["Bash", "Read", "Edit", "Write", "Grep"]);
+        assert_init_fails(Some(&init), "missing [Glob]");
+    }
+
+    #[test]
+    fn a_missing_init_fails() {
+        assert_init_fails(None, "no init record");
+    }
+
+    #[test]
+    fn tool_order_in_init_does_not_matter() {
+        let mut init = good_init();
+        init["tools"] = json!(["Glob", "Grep", "Write", "Edit", "Read", "Bash"]);
+        let steps = plan();
+        let jsonl = transcript(&steps, |step| Some(measured(step)));
+        assert!(judged(&steps, &jsonl, &init).passed);
+    }
+
+    #[test]
+    fn a_malformed_line_fails_the_whole_report() {
+        let steps = plan();
+        let jsonl = format!(
+            "{}\n{{not json",
+            transcript(&steps, |step| Some(measured(step)))
+        );
+        let report = judged(&steps, &jsonl, &good_init());
+        assert!(!report.passed);
+        for step in &report.steps {
+            match &step.verdict {
+                Verdict::Fail(why) => assert!(why.contains("malformed"), "{why}"),
+                other => panic!("{} was {other:?}", step.id),
+            }
+        }
+    }
+
+    #[test]
+    fn the_report_renders_a_line_per_step_within_80_columns() {
+        let steps = plan();
+        let jsonl = transcript(&steps, |step| match step.id {
+            "git" => None,
+            "tmp-write" => Some("x".repeat(300)),
+            _ => Some(measured(step)),
+        });
+        let text = judged(&steps, &jsonl, &good_init()).render();
+        assert_eq!(text.lines().count(), steps.len() + 1);
+        assert!(text.lines().all(|line| line.chars().count() <= 80));
+        assert!(text.contains("✓ pipe: ok"));
+        assert!(text.contains("– git: not run"));
+        assert!(text.contains("✗ tmp-write: "));
+        assert!(text.contains("✓ init: ok"));
+    }
+
+    #[test]
+    fn the_plan_is_the_listed_steps_built_from_its_inputs() {
+        let steps = plan();
+        let ids: Vec<_> = steps.iter().map(|step| step.id).collect();
+        assert_eq!(
+            ids,
+            [
+                "pipe",
+                "tmp-write",
+                "home-write",
+                "network",
+                "fixture-bash",
+                "synthetic-env",
+                "auth-env",
+                "git",
+                "excluded-python",
+                "fixture-read",
+                "fixture-grep"
+            ]
+        );
+        let input = |id: &str| steps.iter().find(|s| s.id == id).unwrap().input.clone();
+        assert_eq!(input("tmp-write"), "touch /tmp/relais-probe-n1");
+        assert_eq!(input("home-write"), "touch /home/u/relais-probe-n1");
+        assert_eq!(
+            input("fixture-bash"),
+            "test -r /fx/fixtures/secret.txt && echo READABLE || echo denied"
+        );
+        assert_eq!(
+            input("excluded-python"),
+            "python3 -c \"open('/home/u/relais-probe-py-n1','w')\""
+        );
+        assert_eq!(input("fixture-read"), "/fx/fixtures/secret.txt");
+        assert_eq!(input("fixture-grep"), "relais-probe\t/fx/fixtures");
+    }
+
+    #[test]
+    fn every_env_step_asks_for_presence_and_never_a_value() {
+        let steps = plan();
+        for id in ["synthetic-env", "auth-env"] {
+            let input = &steps.iter().find(|s| s.id == id).unwrap().input;
+            for command in input.split("; ") {
+                assert!(command.starts_with("printenv "), "{command}");
+                assert!(command.ends_with(PRESENCE), "{command}");
+            }
+        }
+        let allowlist = probe_plan_allowlist("n1");
+        assert_eq!(allowlist.len(), 1);
+        assert_eq!(allowlist[0].id, "scrub-env");
+        assert!(allowlist[0].input.ends_with(PRESENCE));
+        assert_eq!(allowlist[0].expect, contains("absent"));
+    }
+
+    #[test]
+    fn the_prompt_numbers_every_step_with_its_exact_input() {
+        let steps = plan();
+        let prompt = probe_prompt(&steps);
+        assert!(prompt.contains("exactly one tool call"));
+        assert!(prompt.contains("do not work around"));
+        for (n, step) in steps.iter().enumerate() {
+            let shown = step.input.replace('\t', " path: ");
+            assert!(prompt.contains(&format!("\n{}. ", n + 1)), "{n}");
+            assert!(prompt.contains(&shown) || step.tool == ProbeTool::Grep);
+        }
+        assert!(prompt.contains("pattern: relais-probe path: /fx/fixtures"));
+    }
+}

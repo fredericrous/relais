@@ -24,6 +24,11 @@ missing here.
   the sandbox (an unreadable source counts). The context manifest records
   `sandbox`, `confinement` and `env_protection`; `sandbox.verified` is null
   until the verification probe exists.
+- The pure half of sandbox verification (#105): the probe plan, an evaluator
+  that judges a probe session's transcript and `init` record step by step (a
+  skipped or altered step is "not run", never a pass), and a verification
+  record keyed by harness version, platform, settings and managed files. The
+  probe itself is not run yet.
 
 ### Changed
 
