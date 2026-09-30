@@ -99,7 +99,7 @@ impl TmpLink {
         }
         match symlink(&launch.scratch_dir, &launch.tmp_link) {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                replace_stale_link(&launch.tmp_link)?;
+                replace_stale_link(&launch.tmp_link, &launch.scratch_dir)?;
                 symlink(&launch.scratch_dir, &launch.tmp_link)?;
             }
             other => other?,
@@ -108,11 +108,25 @@ impl TmpLink {
     }
 }
 
-/// Removes a link left by a relais that was killed before its `Drop` ran.
-/// Anything else at the path is not ours to remove.
-fn replace_stale_link(link: &Path) -> std::io::Result<()> {
+/// Removes a link left by a relais that was killed before its `Drop` ran:
+/// one that dangles, or one that already names this launch's own scratch
+/// (a resumed or redispatched attempt). A live link to another scratch may
+/// be a concurrent worker's `CLAUDE_CODE_TMPDIR` and is never repointed;
+/// that, and anything that is not a symlink, fails naming the path.
+fn replace_stale_link(link: &Path, scratch: &Path) -> std::io::Result<()> {
     if std::fs::symlink_metadata(link)?.is_symlink() {
-        return std::fs::remove_file(link);
+        let target = std::fs::read_link(link)?;
+        if target == scratch || !link.exists() {
+            return std::fs::remove_file(link);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "{} is a live link to {}, not this attempt's scratch",
+                link.display(),
+                target.display()
+            ),
+        ));
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::AlreadyExists,
@@ -123,7 +137,9 @@ fn replace_stale_link(link: &Path) -> std::io::Result<()> {
 impl Drop for TmpLink {
     fn drop(&mut self) {
         if let Some(link) = &self.0 {
-            // Best effort: a link that stays is litter under /tmp, not a wrong answer.
+            // Best effort: a link that stays is litter under /tmp that the
+            // next create of the same attempt replaces, and that blocks any
+            // other attempt from taking the name rather than repointing it.
             std::fs::remove_file(link).ok();
         }
     }
@@ -232,6 +248,28 @@ mod tests {
         );
         drop(guard);
         assert!(std::fs::symlink_metadata(&launch.tmp_link).is_err());
+    }
+
+    #[test]
+    fn a_link_to_this_scratch_is_replaced_and_a_live_link_elsewhere_is_not() {
+        let root = crate::test_support::short_temp_dir("tmp-link-live");
+        let scratch = root.join("scratch");
+        let other = root.join("other");
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let launch = SandboxLaunch {
+            settings: serde_json::json!({}),
+            scratch_dir: scratch.clone(),
+            tmp_link: root.join("link"),
+        };
+        // A resumed attempt: the killed run's link names this same scratch.
+        symlink(&scratch, &launch.tmp_link).unwrap();
+        drop(TmpLink::create(&launch).expect("our own leftover is replaced"));
+        // Another worker's live link is left pointing where it did.
+        symlink(&other, &launch.tmp_link).unwrap();
+        let err = TmpLink::create(&launch).expect_err("never repointed");
+        assert!(err.to_string().contains("live link"), "{err}");
+        assert_eq!(std::fs::read_link(&launch.tmp_link).unwrap(), other);
     }
 
     #[test]

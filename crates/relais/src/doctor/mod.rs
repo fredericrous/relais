@@ -2117,7 +2117,7 @@ pub(crate) fn strays_finding(strays: std::io::Result<(u64, u64)>) -> Finding {
             level: Level::Warn,
             detail: format!(
                 "{count} /tmp/{}* {} left over (a killed test run's directory, or \
-                 a killed relais's dangling TMPDIR link), {bytes} bytes; safe to \
+                 a TMPDIR link whose scratch is gone), {bytes} bytes; safe to \
                  remove by hand",
                 crate::test_support::SCRATCH_PREFIX,
                 if count == 1 { "entry" } else { "entries" }
@@ -2139,7 +2139,8 @@ pub(crate) fn strays_finding(strays: std::io::Result<(u64, u64)>) -> Finding {
 
 /// The count and total bytes of `{SCRATCH_PREFIX}*` directories directly
 /// under `root`, plus `{SCRATCH_PREFIX}*` symlinks whose target is gone (a
-/// sandboxed worker's TMPDIR link a killed relais never removed) — the one prefix `test_support::short_temp_dir`, the
+/// sandboxed worker's TMPDIR link whose scratch is gone; one that still
+/// resolves may be a running worker's, so it is not counted) — the one prefix `test_support::short_temp_dir`, the
 /// integration suites' own world types and this scan all read from
 /// [`crate::test_support::SCRATCH_PREFIX`], so this counts exactly what
 /// any of them can strand. `pub`, not `pub(crate)`: an integration suite
