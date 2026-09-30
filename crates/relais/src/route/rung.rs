@@ -141,6 +141,10 @@ pub(super) struct RungRequest<'a> {
     /// The `minimum_effort` of every risk rule the scope could touch.
     pub floors: &'a [EffortId],
     pub catalogs: &'a EffortCatalogs,
+    /// An effort that replaces the profile's own as the start, when the
+    /// learner has chosen one. The floor, the ceiling and the unknown-catalog
+    /// carve-out judge it exactly as they judge the profile's.
+    pub start_effort: Option<&'a EffortId>,
 }
 
 pub(super) struct ResolvedRung {
@@ -187,6 +191,7 @@ pub(super) fn resolve_rung(request: RungRequest<'_>) -> Result<ResolvedRung, Blo
         recipe,
         floors,
         catalogs,
+        start_effort,
     } = request;
     let Some(authority_profile) = models.get(&tier) else {
         return Err(blocked(
@@ -244,11 +249,15 @@ pub(super) fn resolve_rung(request: RungRequest<'_>) -> Result<ResolvedRung, Blo
         None
     };
 
-    let start = profile.effort.as_ref();
+    let start = start_effort.or(profile.effort.as_ref());
     let effort = if floors.is_empty() {
         start.cloned()
     } else {
         let raised = apply_floor(catalog, &profile.id, start, floors)?;
+        // The reason says a floor MOVED the start. A learned arm already at
+        // or above the floor was bound by it (lower arms were never
+        // offered) but not moved, so it gets none: `learner_arms` drops
+        // every start the floor would raise.
         if Some(&raised) != start {
             reasons.push(RouteReason::new(
                 EFFORT_FLOOR,

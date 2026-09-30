@@ -10,8 +10,6 @@
 //! separate. Unclassified writes use the conservative configured route,
 //! never the research tier.
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::EffortCatalogs;
@@ -23,10 +21,12 @@ use crate::policy::{
     RepoPolicy, RiskRule, Tier,
 };
 
+mod arm;
 mod candidate;
 mod ladder;
 mod rung;
 pub mod trial;
+pub use arm::{learner_arms, Arm};
 pub use candidate::{
     default_tuning_bounds, validate_candidate, CandidateRecipe, CandidateRejection, TuningBounds,
 };
@@ -42,7 +42,7 @@ pub trait RoutePredictor {
         &self,
         contract: &TaskContract,
         authority: &EffectiveAuthority,
-        eligible: &[Tier],
+        arms: &[Arm],
     ) -> Option<Estimates>;
 }
 
@@ -52,11 +52,12 @@ pub struct Estimates {
     /// Hash of the exact inputs the artifact saw, so the ledger's
     /// prediction row can be matched to a later outcome.
     pub input_hash: String,
-    /// Acceptance-without-escalation estimate per tier; complete-strategy
-    /// cost per tier. Predictions are not guarantees; the deterministic
+    /// Acceptance-without-escalation estimate per arm; complete-strategy
+    /// cost per arm. Ordered lists, not maps: an effort has no order of its
+    /// own to key on. Predictions are not guarantees; the deterministic
     /// runner still owns policy and acceptance.
-    pub acceptance: BTreeMap<Tier, f64>,
-    pub cost: BTreeMap<Tier, MicroUsd>,
+    pub acceptance: Vec<(Arm, f64)>,
+    pub cost: Vec<(Arm, MicroUsd)>,
     /// The full inference result, recorded as evidence.
     pub raw: serde_json::Value,
 }
@@ -658,6 +659,9 @@ pub fn route(inputs: RouteInputs<'_>) -> Routed {
     // paid for repeatedly. This is the only caller, so the rule's own
     // unit tests now cover production rather than a parallel copy.
     let mut estimates_seen: Option<Box<Estimates>> = None;
+    // The effort the learner chose for the initial rung, when it chose one.
+    let mut start_effort: Option<EffortId> = None;
+    let floors = risk_floor(contract, &repo.risk).efforts;
     let covering_spec = covering_recipe_spec(contract, repo, &eligible);
     let covering = covering_spec.map(Recipe::from);
     let selected: (Tier, RoutedBy) = if let Some(recipe) = &covering {
@@ -670,22 +674,30 @@ pub fn route(inputs: RouteInputs<'_>) -> Routed {
         ));
         (recipe.tier, RoutedBy::DeterministicRecipe)
     } else if let (true, Some(predictor)) = (machine.routing.learned_enabled, predictor) {
-        match predictor.estimate(contract, authority, &eligible) {
+        let arms = learner_arms(
+            &eligible,
+            &authority.models,
+            machine.allowed_models.as_deref(),
+            &floors,
+            catalogs,
+        );
+        match predictor.estimate(contract, authority, &arms) {
             Some(estimates) => {
                 let quality_floor = machine.routing.quality_floor.unwrap_or(0.75);
-                let selection = select_learned(&estimates, &eligible, quality_floor);
+                let selection = select_learned(&estimates, &arms, quality_floor);
                 estimates_seen = Some(Box::new(estimates.clone()));
                 match selection {
-                    Some(tier) => {
+                    Some(arm) => {
                         reasons.push(RouteReason::new(
                             "learned_artifact",
                             format!(
                                 "learned artifact {} estimated acceptance/cost and selected {}",
                                 estimates.artifact_id,
-                                tier.as_str()
+                                arm.label()
                             ),
                         ));
-                        (tier, RoutedBy::LearnedArtifact)
+                        start_effort = arm.effort.id().cloned();
+                        (arm.tier, RoutedBy::LearnedArtifact)
                     }
                     None => {
                         reasons.push(RouteReason::new(
@@ -718,7 +730,6 @@ pub fn route(inputs: RouteInputs<'_>) -> Routed {
 
     // A covering recipe chose the tier, so its `models[tier]` is the
     // profile; with none, the authority policy's is.
-    let floors = risk_floor(contract, &repo.risk).efforts;
     let resolved = match ladder::resolve_ladder(ladder::LadderRequest {
         tier: selected.0,
         escalation_tier,
@@ -732,6 +743,7 @@ pub fn route(inputs: RouteInputs<'_>) -> Routed {
             max_repairs_before_escalation: authority.max_repairs_before_escalation,
         },
         repair_effort: repo.execution.repair_effort,
+        start_effort: start_effort.as_ref(),
     }) {
         Ok(resolved) => resolved,
         Err(blocker) => {
@@ -762,31 +774,31 @@ pub fn route(inputs: RouteInputs<'_>) -> Routed {
     })
 }
 
-/// The tier a learned artifact selects: the cheapest ELIGIBLE tier whose
+/// The arm a learned artifact selects: the cheapest of `arms` whose
 /// estimated acceptance clears the quality floor and that the artifact can
-/// price. `None` abstains to the conservative baseline. The evaluator calls
-/// this too, so what it measures is what the router will do.
-pub fn select_learned(
-    estimates: &Estimates,
-    eligible: &[Tier],
-    quality_floor: f64,
-) -> Option<Tier> {
-    eligible
-        .iter()
-        .filter(|tier| {
-            estimates
-                .acceptance
-                .get(*tier)
-                .is_some_and(|acceptance| *acceptance >= quality_floor)
+/// price, a tie going to the arm earlier in `arms`. `None` abstains to the
+/// conservative baseline. The evaluator calls this too, so what it measures
+/// is what the router will do.
+pub fn select_learned(estimates: &Estimates, arms: &[Arm], quality_floor: f64) -> Option<Arm> {
+    let estimate_of = |arm: &Arm| {
+        let acceptance = estimates
+            .acceptance
+            .iter()
+            .find_map(|(held, value)| (held == arm).then_some(*value))?;
+        let cost = estimates
+            .cost
+            .iter()
+            .find_map(|(held, value)| (held == arm).then_some(value.to_micros()))?;
+        Some((acceptance, cost))
+    };
+    arms.iter()
+        .filter_map(|arm| {
+            let (acceptance, cost_micros) = estimate_of(arm)?;
+            (acceptance >= quality_floor).then_some((arm, cost_micros))
         })
-        .filter_map(|tier| {
-            estimates
-                .cost
-                .get(tier)
-                .map(|cost| (tier, cost.to_micros()))
-        })
+        // `min_by_key` keeps the first of equal minima: the earlier arm.
         .min_by_key(|(_, cost_micros)| *cost_micros)
-        .map(|(tier, _)| *tier)
+        .map(|(arm, _)| arm.clone())
 }
 
 impl Routed {
@@ -922,6 +934,7 @@ mod tests {
         effective_authority, CommandSpec, ConcurrencyLimits, Dependency, DependencyMode,
         ExecutionPolicy, ModelProfile, RiskRule, VerificationPolicy, VerificationProfile,
     };
+    use std::collections::BTreeMap;
 
     #[test]
     fn routed_by_round_trips_through_its_string_form() {
@@ -1383,6 +1396,8 @@ mod tests {
             .any(|b| b.code == BlockCode::MissingTrustGrant));
     }
 
+    /// A predictor that prices every offered arm of a tier alike:
+    /// (tier, acceptance, cost in micros).
     struct FixedPredictor(Vec<(Tier, f64, i64)>);
 
     impl RoutePredictor for FixedPredictor {
@@ -1390,18 +1405,18 @@ mod tests {
             &self,
             _contract: &TaskContract,
             _authority: &EffectiveAuthority,
-            eligible: &[Tier],
+            arms: &[Arm],
         ) -> Option<Estimates> {
-            let mut acceptance = BTreeMap::new();
-            let mut cost = BTreeMap::new();
-            for tier in eligible {
+            let mut acceptance = Vec::new();
+            let mut cost = Vec::new();
+            for arm in arms {
                 if let Some((_, acceptance_value, cost_micros)) = self
                     .0
                     .iter()
-                    .find(|(predictor_tier, _, _)| predictor_tier == tier)
+                    .find(|(predictor_tier, _, _)| *predictor_tier == arm.tier)
                 {
-                    acceptance.insert(*tier, *acceptance_value);
-                    cost.insert(*tier, MicroUsd::from_micros(*cost_micros));
+                    acceptance.push((arm.clone(), *acceptance_value));
+                    cost.push((arm.clone(), MicroUsd::from_micros(*cost_micros)));
                 }
             }
             if acceptance.is_empty() {
@@ -1475,40 +1490,324 @@ mod tests {
 
     #[test]
     fn select_learned_skips_a_tier_with_no_cost_estimate() {
-        let mut acceptance = BTreeMap::new();
-        acceptance.insert(Tier::Research, 0.9);
-        acceptance.insert(Tier::Implementation, 0.9);
-        let mut cost = BTreeMap::new();
+        let research = arm(Tier::Research, EffortRequest::NotRequested);
+        let implementation = arm(Tier::Implementation, EffortRequest::NotRequested);
         // Research clears the floor and has no cost estimate; if `None`
         // costs sorted first it would win despite being unpriced.
-        cost.insert(Tier::Implementation, MicroUsd::from_micros(400));
         let estimates = Estimates {
             artifact_id: "artifact-test-1".into(),
             input_hash: "in".into(),
-            acceptance,
-            cost,
+            acceptance: vec![(research.clone(), 0.9), (implementation.clone(), 0.9)],
+            cost: vec![(implementation.clone(), MicroUsd::from_micros(400))],
             raw: serde_json::Value::Null,
         };
-        let eligible = [Tier::Research, Tier::Implementation];
-        let selected = select_learned(&estimates, &eligible, 0.5);
-        assert_eq!(selected, Some(Tier::Implementation));
+        let selected = select_learned(&estimates, &[research, implementation.clone()], 0.5);
+        assert_eq!(selected, Some(implementation));
     }
 
     #[test]
     fn select_learned_abstains_when_no_eligible_tier_has_a_cost_estimate() {
-        let mut acceptance = BTreeMap::new();
-        acceptance.insert(Tier::Research, 0.9);
-        acceptance.insert(Tier::Implementation, 0.9);
+        let research = arm(Tier::Research, EffortRequest::NotRequested);
+        let implementation = arm(Tier::Implementation, EffortRequest::NotRequested);
         let estimates = Estimates {
             artifact_id: "artifact-test-1".into(),
             input_hash: "in".into(),
-            acceptance,
-            cost: BTreeMap::new(),
+            acceptance: vec![(research.clone(), 0.9), (implementation.clone(), 0.9)],
+            cost: Vec::new(),
             raw: serde_json::Value::Null,
         };
-        let eligible = [Tier::Research, Tier::Implementation];
-        let selected = select_learned(&estimates, &eligible, 0.5);
+        let selected = select_learned(&estimates, &[research, implementation], 0.5);
         assert_eq!(selected, None);
+    }
+
+    fn arm(tier: Tier, effort: EffortRequest) -> Arm {
+        Arm { tier, effort }
+    }
+
+    fn arm_at(tier: Tier, effort: &str) -> Arm {
+        arm(tier, EffortRequest::Explicit(eid(effort)))
+    }
+
+    /// Two arms priced alike: the one earlier in the slice wins, whichever
+    /// order the estimates list them in.
+    #[test]
+    fn select_learned_breaks_a_tie_by_position_in_the_arm_slice() {
+        let low = arm_at(Tier::Implementation, "low");
+        let high = arm_at(Tier::Implementation, "high");
+        let estimates = Estimates {
+            artifact_id: "artifact-test-1".into(),
+            input_hash: "in".into(),
+            acceptance: vec![(high.clone(), 0.9), (low.clone(), 0.9)],
+            cost: vec![
+                (high.clone(), MicroUsd::from_micros(300)),
+                (low.clone(), MicroUsd::from_micros(300)),
+            ],
+            raw: serde_json::Value::Null,
+        };
+        assert_eq!(
+            select_learned(&estimates, &[low.clone(), high.clone()], 0.5),
+            Some(low.clone())
+        );
+        assert_eq!(
+            select_learned(&estimates, &[high.clone(), low], 0.5),
+            Some(high)
+        );
+    }
+
+    /// The arms `learner_arms` offers for `tier` alone.
+    fn arms_of(
+        tier: Tier,
+        models: &BTreeMap<Tier, ModelProfile>,
+        floors: &[EffortId],
+        catalogs: &EffortCatalogs,
+    ) -> Vec<Arm> {
+        learner_arms(&[tier], models, None, floors, catalogs)
+    }
+
+    /// An effort id nothing in the code names, placed by the catalog's order
+    /// alone between `high` and `max`.
+    const ULTRA_ORDER: [&str; 5] = ["low", "medium", "high", "ultra", "max"];
+
+    #[test]
+    fn an_unfamiliar_effort_id_in_the_catalog_is_an_arm() {
+        let catalogs = catalog_of("sonnet", &ULTRA_ORDER, &ULTRA_ORDER, &ULTRA_ORDER, "max");
+        let arms = arms_of(Tier::Implementation, &repo_policy().models, &[], &catalogs);
+        assert_eq!(
+            arms,
+            ULTRA_ORDER
+                .iter()
+                .map(|effort| arm_at(Tier::Implementation, effort))
+                .collect::<Vec<_>>(),
+            "every admissible effort, in the catalog's order"
+        );
+        assert!(arms.contains(&arm_at(Tier::Implementation, "ultra")));
+    }
+
+    #[test]
+    fn a_sparse_admissible_set_yields_exactly_its_efforts() {
+        let catalogs = catalog_of("sonnet", &LEVELS, &LEVELS, &["low", "high"], "max");
+        assert_eq!(
+            arms_of(Tier::Implementation, &repo_policy().models, &[], &catalogs),
+            vec![
+                arm_at(Tier::Implementation, "low"),
+                arm_at(Tier::Implementation, "high"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_model_with_no_effort_control_yields_one_arm_and_none_under_a_floor() {
+        // The research model configures no effort, so the resolver's own
+        // answer for it is `ControlUnsupported`.
+        let catalogs = catalog_of("haiku", &LEVELS, &LEVELS, &[], "max");
+        let models = repo_policy().models;
+        assert_eq!(
+            arms_of(Tier::Research, &models, &[], &catalogs),
+            vec![arm(Tier::Research, EffortRequest::ControlUnsupported)]
+        );
+        assert_eq!(
+            arms_of(Tier::Research, &models, &[eid("high")], &catalogs),
+            Vec::<Arm>::new(),
+            "a floor a model without effort control cannot meet leaves it no arm"
+        );
+    }
+
+    #[test]
+    fn an_unknown_catalog_yields_only_the_configured_effort() {
+        assert_eq!(
+            arms_of(
+                Tier::Implementation,
+                &repo_policy().models,
+                &[],
+                &EffortCatalogs::default()
+            ),
+            vec![arm_at(Tier::Implementation, "medium")]
+        );
+        assert_eq!(
+            arms_of(
+                Tier::Research,
+                &repo_policy().models,
+                &[],
+                &EffortCatalogs::default()
+            ),
+            vec![arm(Tier::Research, EffortRequest::NotRequested)]
+        );
+    }
+
+    #[test]
+    fn a_floor_removes_the_arms_below_it() {
+        let catalogs = catalog_of("sonnet", &LEVELS, &LEVELS, &LEVELS, "max");
+        let arms = arms_of(
+            Tier::Implementation,
+            &repo_policy().models,
+            &[eid("medium")],
+            &catalogs,
+        );
+        assert!(!arms.contains(&arm_at(Tier::Implementation, "low")));
+        assert_eq!(
+            arms,
+            vec![
+                arm_at(Tier::Implementation, "medium"),
+                arm_at(Tier::Implementation, "high"),
+                arm_at(Tier::Implementation, "max"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_authority_ceiling_removes_the_arms_above_it() {
+        let catalogs = catalog_of("sonnet", &LEVELS, &LEVELS, &LEVELS, "max");
+        let mut models = repo_policy().models;
+        models
+            .get_mut(&Tier::Implementation)
+            .expect("the implementation tier")
+            .max_effort = Some(eid("high"));
+        assert_eq!(
+            arms_of(Tier::Implementation, &models, &[], &catalogs),
+            vec![
+                arm_at(Tier::Implementation, "low"),
+                arm_at(Tier::Implementation, "medium"),
+                arm_at(Tier::Implementation, "high"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tier_whose_model_is_not_allowed_offers_no_arm() {
+        let catalogs = catalog_of("sonnet", &LEVELS, &LEVELS, &LEVELS, "max");
+        let allowed = ["haiku".to_string()];
+        assert_eq!(
+            learner_arms(
+                &[Tier::Implementation],
+                &repo_policy().models,
+                Some(&allowed),
+                &[],
+                &catalogs
+            ),
+            Vec::<Arm>::new()
+        );
+    }
+
+    /// A predictor that finds every offered arm acceptable and `favoured`
+    /// the cheapest.
+    struct FavouringPredictor {
+        favoured: Arm,
+    }
+
+    impl RoutePredictor for FavouringPredictor {
+        fn estimate(
+            &self,
+            _contract: &TaskContract,
+            _authority: &EffectiveAuthority,
+            arms: &[Arm],
+        ) -> Option<Estimates> {
+            Some(Estimates {
+                artifact_id: "artifact-test-1".into(),
+                input_hash: "in".into(),
+                acceptance: arms.iter().map(|arm| (arm.clone(), 0.9)).collect(),
+                cost: arms
+                    .iter()
+                    .map(|arm| {
+                        let micros = if *arm == self.favoured { 10 } else { 1_000 };
+                        (arm.clone(), MicroUsd::from_micros(micros))
+                    })
+                    .collect(),
+                raw: serde_json::Value::Null,
+            })
+        }
+    }
+
+    #[test]
+    fn a_learned_arm_starts_the_ladder_at_its_effort() {
+        let repo = repo_policy();
+        let machine = machine_for(&repo);
+        let contract = change_contract(&["crates/amont/**"]);
+        let authority = effective_authority(&repo, &machine, &contract, &identity());
+        let catalogs = catalog_of("sonnet", &ULTRA_ORDER, &ULTRA_ORDER, &ULTRA_ORDER, "max");
+        let favoured = arm_at(Tier::Implementation, "ultra");
+        let predictor = FavouringPredictor {
+            favoured: favoured.clone(),
+        };
+        let d = expect_route(route(RouteInputs {
+            contract: &contract,
+            repo: &repo,
+            machine: &machine,
+            authority: &authority,
+            predictor: Some(&predictor),
+            catalogs: &catalogs,
+        }));
+        assert_eq!(d.routed_by, RoutedBy::LearnedArtifact);
+        assert_eq!(d.tier, Tier::Implementation);
+        assert_eq!(d.rung.effort, EffortRequest::Explicit(eid("ultra")));
+        assert_eq!(d.ladder.initial().effort, d.rung.effort);
+        assert!(
+            d.reasons
+                .iter()
+                .any(|reason| reason.id == "learned_artifact"
+                    && reason.text.contains("implementation@ultra")),
+            "{:?}",
+            d.reasons
+        );
+    }
+
+    /// A selected arm that passes no effort routes as the resolver's own
+    /// answer for that tier: a model without effort control is dispatched
+    /// `ControlUnsupported`, never given an effort the learner invented.
+    #[test]
+    fn a_learned_arm_without_effort_control_routes_as_one() {
+        let mut repo = repo_policy();
+        repo.models
+            .get_mut(&Tier::Implementation)
+            .expect("the implementation tier")
+            .effort = None;
+        let machine = machine_for(&repo);
+        let contract = change_contract(&["crates/amont/**"]);
+        let authority = effective_authority(&repo, &machine, &contract, &identity());
+        let catalogs = catalog_of("sonnet", &LEVELS, &LEVELS, &[], "max");
+        let favoured = arm(Tier::Implementation, EffortRequest::ControlUnsupported);
+        let predictor = FavouringPredictor {
+            favoured: favoured.clone(),
+        };
+        let d = expect_route(route(RouteInputs {
+            contract: &contract,
+            repo: &repo,
+            machine: &machine,
+            authority: &authority,
+            predictor: Some(&predictor),
+            catalogs: &catalogs,
+        }));
+        assert_eq!(d.routed_by, RoutedBy::LearnedArtifact);
+        assert_eq!(d.tier, Tier::Implementation);
+        assert_eq!(d.rung.effort, EffortRequest::ControlUnsupported);
+        assert!(
+            d.reasons
+                .iter()
+                .any(|reason| reason.id == "learned_artifact"
+                    && reason.text.contains("implementation:control_unsupported")),
+            "{:?}",
+            d.reasons
+        );
+    }
+
+    /// The cheapest arm that clears the floor wins, not the cheapest arm.
+    #[test]
+    fn select_learned_prices_efforts_of_one_tier_apart() {
+        let low = arm_at(Tier::Implementation, "low");
+        let high = arm_at(Tier::Implementation, "high");
+        let estimates = Estimates {
+            artifact_id: "artifact-test-1".into(),
+            input_hash: "in".into(),
+            acceptance: vec![(low.clone(), 0.4), (high.clone(), 0.9)],
+            cost: vec![
+                (low.clone(), MicroUsd::from_micros(100)),
+                (high.clone(), MicroUsd::from_micros(300)),
+            ],
+            raw: serde_json::Value::Null,
+        };
+        assert_eq!(
+            select_learned(&estimates, &[low, high.clone()], 0.5),
+            Some(high)
+        );
     }
 
     #[test]
@@ -1519,7 +1818,7 @@ mod tests {
                 &self,
                 _contract: &TaskContract,
                 _authority: &EffectiveAuthority,
-                _eligible: &[Tier],
+                _arms: &[Arm],
             ) -> Option<Estimates> {
                 None
             }
@@ -2827,28 +3126,33 @@ mod tests {
                     cost.insert(ladder[index], MicroUsd::from_micros(price));
                 }
             }
+            let arm_of = |tier: Tier| arm(tier, EffortRequest::NotRequested);
+            let arms: Vec<Arm> = eligible.iter().copied().map(arm_of).collect();
             let estimates = Estimates {
                 artifact_id: "artifact-property".into(),
                 input_hash: "in".into(),
-                acceptance,
-                cost,
+                acceptance: acceptance
+                    .iter()
+                    .map(|(tier, value)| (arm_of(*tier), *value))
+                    .collect(),
+                cost: cost.iter().map(|(tier, price)| (arm_of(*tier), *price)).collect(),
                 raw: serde_json::Value::Null,
             };
-            let selected = select_learned(&estimates, &eligible, quality_floor);
-            if let Some(tier) = selected {
+            let selected = select_learned(&estimates, &arms, quality_floor);
+            if let Some(chosen_arm) = selected {
+                let tier = chosen_arm.tier;
                 prop_assert!(eligible.contains(&tier), "{tier:?} is not eligible");
-                prop_assert!(estimates.acceptance[&tier] >= quality_floor);
-                prop_assert!(estimates.cost.contains_key(&tier), "an unpriced tier won");
+                prop_assert!(acceptance[&tier] >= quality_floor);
+                prop_assert!(cost.contains_key(&tier), "an unpriced tier won");
                 // And it is the cheapest such tier: nothing eligible that
                 // clears the floor is priced below it.
-                let chosen = estimates.cost[&tier];
+                let chosen = cost[&tier];
                 for other in &eligible {
-                    let clears = estimates
-                        .acceptance
+                    let clears = acceptance
                         .get(other)
                         .is_some_and(|value| *value >= quality_floor);
                     if clears {
-                        if let Some(price) = estimates.cost.get(other) {
+                        if let Some(price) = cost.get(other) {
                             prop_assert!(*price >= chosen);
                         }
                     }
@@ -2857,11 +3161,10 @@ mod tests {
                 // Abstention means nothing eligible was both good enough
                 // and priced.
                 for tier in &eligible {
-                    let clears = estimates
-                        .acceptance
+                    let clears = acceptance
                         .get(tier)
                         .is_some_and(|value| *value >= quality_floor);
-                    prop_assert!(!(clears && estimates.cost.contains_key(tier)));
+                    prop_assert!(!(clears && cost.contains_key(tier)));
                 }
             }
         }

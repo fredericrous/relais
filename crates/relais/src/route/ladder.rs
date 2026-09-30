@@ -181,6 +181,9 @@ pub(super) struct LadderRequest<'a> {
     pub catalogs: &'a EffortCatalogs,
     pub budget: LadderBudget,
     pub repair_effort: RepairEffort,
+    /// The effort the learner chose for the INITIAL rung; repairs and the
+    /// escalation derive from that rung as they do from any other.
+    pub start_effort: Option<&'a EffortId>,
 }
 
 pub(super) struct ResolvedLadder {
@@ -204,6 +207,7 @@ pub(super) fn resolve_ladder(request: LadderRequest<'_>) -> Result<ResolvedLadde
         catalogs,
         budget,
         repair_effort,
+        start_effort,
     } = request;
     let ResolvedRung {
         rung: initial,
@@ -215,6 +219,7 @@ pub(super) fn resolve_ladder(request: LadderRequest<'_>) -> Result<ResolvedLadde
         recipe,
         floors,
         catalogs,
+        start_effort,
     })?;
 
     let mut held = Vec::new();
@@ -238,6 +243,7 @@ pub(super) fn resolve_ladder(request: LadderRequest<'_>) -> Result<ResolvedLadde
             recipe,
             floors,
             catalogs,
+            start_effort: None,
         };
         if removed_by_allowed_models(&request) {
             kept_tier = None;
