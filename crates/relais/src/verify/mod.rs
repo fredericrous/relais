@@ -1784,6 +1784,26 @@ pub struct Receipt {
     /// before this field existed still parses.
     #[serde(default)]
     pub verification_profile_hash: String,
+    /// Whether the review this candidate passed was independent of the
+    /// model that wrote it (SPEC §10). Taken from the ledger when the
+    /// receipt is written, so the two cannot disagree. `NotRecorded` is
+    /// the `serde(default)` for receipts written before this existed.
+    #[serde(default)]
+    pub review: ReviewRecord,
+}
+
+/// What a receipt records about the review of its candidate. Four states:
+/// a receipt from before this field recorded nothing either way, a run
+/// with review off had none, and a review either came from another model
+/// or from the same model that wrote the candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewRecord {
+    #[default]
+    NotRecorded,
+    NoReview,
+    Independent,
+    SameModel,
 }
 
 impl Receipt {
@@ -3853,6 +3873,7 @@ mod tests {
             mandatory_evidence_independence: None,
             recipe: crate::policy::RecipeRecord::NotRecorded,
             verification_profile_hash: "vph".into(),
+            review: ReviewRecord::NotRecorded,
         };
         let hash = receipt.hash();
         let mut other = receipt.clone();

@@ -10,6 +10,22 @@ missing here.
 
 ### Fixed
 
+- **Reviewer independence is the model's, and the candidate carve-out matches
+  the model.** A covering recipe can put any allowed model on the worker's
+  tier, so a review by a different tier can still be the same model marking
+  its own work: `review_candidate` now compares the reviewer's model with the
+  one the candidate was dispatched with, and records `reviewer_same_model`
+  (formerly `reviewer_same_tier`, still read from old ledgers, the one
+  documented legacy spelling). The receipt says so too: a new `review` field
+  (`no_review`, `independent`, `same_model`, or `not_recorded` on receipts
+  written before it), read from the ledger's review dispatch when the
+  receipt is written. Under an
+  unknown effort catalog a candidate recipe is admitted only at the model AND
+  effort the authority policy configures for the tier
+  (`TuningBounds.configured` is tier → (model, effort)), as `route`'s rung
+  resolution already required. Falsified: comparing by tier again failed the
+  same-model runner test; keying by tier only failed the unit and cross-check
+  tests; both restored.
 - **The worker prompt also names the edit habits that get refused (#105).**
   Refusals measured before the plain-command rule reached the worker prompt
   included heredoc and inline-script edits and copies to `/tmp`; the three
@@ -50,8 +66,52 @@ missing here.
   a compatibility carve-out. `Capabilities::supports_effort` became
   `accepted_efforts`: a known set, unsupported, or unknown.
 - **`relais doctor` continuation lines are indented under their finding.**
+- **The route carries the resolved initial rung, and dispatch uses it (P2).**
+  `Route.rung` is tier, model and effort, where the effort is explicit, not
+  requested, or control-unsupported — three states, never an `Option`. A
+  covering recipe's `models.<tier>` is now READ (its model and start effort),
+  so `RecipeSpec::models` is no longer "declared and hashed, not yet read";
+  `execution`, `context` and `review` still are. The recipe's model must be
+  in `allowed_models` or the route is blocked `model_not_allowed`, never
+  another model. The runner dispatches the rung's model and effort for the
+  initial tier and records exactly them in the dispatch intent; repairs and
+  escalations are unchanged (the ladder is P3).
+- **Per-tier effort ceilings are authoritative.** The rung's effort may not
+  exceed the smaller of the authority ceiling (`models.<tier>.max_effort`, else
+  the top of the authority model's admissible set) and the top of the
+  dispatched model's admissible set. Over it, the route is blocked
+  `effort_above_cap` (exit 3), never clamped. A recipe changing its start
+  effort never moves a ceiling.
+- **A changed effort needs a known catalog.** When the dispatched model's
+  catalog is unknown, exactly the authority's configured effort still runs as
+  today; an effort a recipe or a floor changed is blocked with the
+  machine.toml keys to set.
+- **Candidate recipes are checked against the routing catalog.** A per-tier
+  effort outside the model's admissible set, or above the authority ceiling,
+  is `EffortNotAdmissible` (was `EffortNotAllowed`); below the scope's floor,
+  `EffortBelowFloor`. A candidate may lower an effort. `TuningBounds` carries
+  the resolved catalogs and ceilings instead of `allowed_efforts`, and a
+  candidate may not change `max_effort`.
+- **`relais plan` prints `effort: <model>@<effort>` after the `route:` line**,
+  with the reason when a recipe or a floor set it, and `plan --json` prints the
+  route with its rung.
 
 ### Added
+
+- **`minimum_effort` on a `[[risk]]` rule and `max_effort` on a
+  `[models.<tier>]` profile.** A risk floor binds the initial rung: its effort
+  is the higher of its start effort and the floor in catalog order, and a model
+  that cannot satisfy it (no effort control, or an unknown catalog) blocks the
+  route naming the floor, the model and the admissible set. An escalation
+  still dispatches its tier's configured profile, so a route whose escalation
+  is reachable within the attempt budget is blocked (exit 3, naming the floor,
+  the escalation tier and its configured effort) when that profile would run
+  below the floor, until the P3 ladder validates escalation rungs. A candidate
+  recipe that sets no effort under a floor is judged by the same floor check,
+  and by the machine's `allowed_models`. `relais plan`'s `route:` line names the
+  rung's model. Both keys are
+  omitted from the hash when absent, so no existing policy's authority hash
+  moves.
 
 - **An effort catalog, and `relais doctor` reports it (P1).** Per
   (harness version, model id), three independent facts each known,
@@ -257,7 +317,8 @@ missing here.
   saying so in words when there are none rather than printing nothing.
   `show` prints every revision of one recipe, including its `models`,
   `execution`, `context` and `review` blocks when set, each still marked
-  DECLARED AND HASHED, NOT YET READ by routing; an unknown name is
+  DECLARED AND HASHED, NOT YET READ by routing (`models` is read from
+  v0.8.0 on and no longer carries the mark); an unknown name is
   refused, naming the recipes that do exist. `diff` compares a
   candidate's recipes to the repository's own field by field, using each
   side's EFFECTIVE value rather than its compact form, so a field a

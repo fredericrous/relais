@@ -76,9 +76,12 @@ pub enum Reason {
     /// The candidate carries the base tree: verification is the
     /// baseline's, not re-run.
     CandidateIdenticalToBase,
-    /// Policy configures no tier but the candidate's own, so the review
-    /// was not an independent opinion (SPEC §10).
-    ReviewerSameTier,
+    /// The model that reviewed is the model that wrote the candidate, so
+    /// the review was not an independent opinion (SPEC §10). Ledgers
+    /// written before the comparison was by model spell it
+    /// `reviewer_same_tier`.
+    #[serde(alias = "reviewer_same_tier")]
+    ReviewerSameModel,
     /// A run's worktree could not be retired at its terminal state: the
     /// directory stays, and whatever it holds that no patch has is in it.
     WorktreeNotReleased,
@@ -181,7 +184,7 @@ impl Reason {
         Self::DuplicateDispatch,
         Self::PermissionDenied,
         Self::CandidateIdenticalToBase,
-        Self::ReviewerSameTier,
+        Self::ReviewerSameModel,
         Self::WorktreeNotReleased,
         Self::WorktreeRetired,
         Self::WriteLeaseWait,
@@ -235,7 +238,7 @@ impl Reason {
             Self::DuplicateDispatch => "duplicate_dispatch",
             Self::PermissionDenied => "permission_denied",
             Self::CandidateIdenticalToBase => "candidate_identical_to_base",
-            Self::ReviewerSameTier => "reviewer_same_tier",
+            Self::ReviewerSameModel => "reviewer_same_model",
             Self::WorktreeNotReleased => "worktree_not_released",
             Self::WorktreeRetired => "worktree_retired",
             Self::WriteLeaseWait => "write_lease_wait",
@@ -255,9 +258,15 @@ impl Reason {
         }
     }
 
-    /// The inverse of [`Reason::as_str`]. A name this binary does not
-    /// know is an error the caller must decide about, never a silently
-    /// dropped reason.
+    /// Spellings older ledgers wrote for a reason that has since been
+    /// renamed, each with the reason it now parses as. The complete list:
+    /// `parse` accepts exactly `ALL`'s own spellings and these.
+    pub const LEGACY_SPELLINGS: [(&'static str, Reason); 1] =
+        [("reviewer_same_tier", Reason::ReviewerSameModel)];
+
+    /// The inverse of [`Reason::as_str`], plus [`Reason::LEGACY_SPELLINGS`].
+    /// A name this binary does not know is an error the caller must decide
+    /// about, never a silently dropped reason.
     pub fn parse(text: &str) -> Result<Self, UnknownVariant> {
         serde_json::from_value(serde_json::Value::String(text.to_string())).map_err(|_| {
             UnknownVariant {
@@ -642,17 +651,29 @@ mod tests {
             prop_assert_eq!(RunPurpose::parse(purpose.as_str()).expect("its own spelling"), purpose);
         }
 
-        /// …and a spelling no variant has is refused, never guessed into
-        /// the nearest one.
+        /// …and a spelling no variant has, and no documented legacy
+        /// spelling names, is refused, never guessed into the nearest one.
         #[test]
         fn an_unknown_spelling_is_refused(text in "[a-z_]{0,24}") {
             use proptest::prelude::*;
             let known_state = State::ALL.iter().any(|state| state.as_str() == text);
             prop_assert_eq!(State::parse(&text).is_ok(), known_state, "{}", text);
-            let known_reason = Reason::ALL.iter().any(|reason| reason.as_str() == text);
+            let known_reason = Reason::ALL.iter().any(|reason| reason.as_str() == text)
+                || Reason::LEGACY_SPELLINGS.iter().any(|(legacy, _)| *legacy == text);
             prop_assert_eq!(Reason::parse(&text).is_ok(), known_reason, "{}", text);
             let known_phase = UsagePhase::ALL.iter().any(|phase| phase.as_str() == text);
             prop_assert_eq!(UsagePhase::parse(&text).is_ok(), known_phase, "{}", text);
+        }
+    }
+
+    /// Each documented legacy spelling parses to the reason it was renamed
+    /// to, explicitly: the property test samples `[a-z_]{0,24}` at random
+    /// and would almost never draw one. Falsified: without the serde alias
+    /// `reviewer_same_tier` stopped parsing and this failed; restored.
+    #[test]
+    fn documented_legacy_spellings_parse_to_their_renamed_reason() {
+        for (legacy, reason) in Reason::LEGACY_SPELLINGS {
+            assert_eq!(Reason::parse(legacy), Ok(reason), "{legacy}");
         }
     }
 }

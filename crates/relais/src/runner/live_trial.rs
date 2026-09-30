@@ -81,6 +81,22 @@ pub fn admit_candidates(
     admission
 }
 
+/// The bounds a live-trial candidate is admitted under: the incumbent's
+/// own, with the effort catalogs machine.toml states. Admission runs
+/// without a harness probe, so what the CLI accepts is unknown here: a
+/// candidate whose effort differs from the incumbent's is not admitted to a
+/// trial: the conservative answer, never a widened one. (`relais recipe
+/// replay` does probe, and judges the same candidate with the real sets.)
+fn trial_bounds(repo: &RepoPolicy, machine: &MachineSettings) -> route::TuningBounds {
+    let catalogs = crate::catalog::EffortCatalogs::resolve_all(
+        &crate::catalog::Fact::Unknown,
+        &machine.efforts,
+        &machine.routing.max_effort,
+        repo.models.values().map(|profile| profile.id.as_str()),
+    );
+    route::default_tuning_bounds(repo, machine.allowed_models.as_deref(), &catalogs)
+}
+
 fn admit_one(
     path: &Path,
     repo: &RepoPolicy,
@@ -89,7 +105,7 @@ fn admit_one(
 ) -> Result<CandidateRecipe, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read it: {e}"))?;
     let parsed = RepoPolicy::from_toml_str(&text).map_err(|e| format!("does not parse: {e}"))?;
-    let bounds = route::default_tuning_bounds(repo);
+    let bounds = trial_bounds(repo, machine);
     let candidate = route::validate_candidate(repo, &parsed, &bounds)
         .map_err(|rejection| format!("inadmissible: {rejection}"))?;
     let authority_hash = candidate.policy().authority_hash();

@@ -17,15 +17,17 @@
 //! back into `route` would be exactly the cycle that script exists to
 //! catch.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
+use crate::catalog::{Admissible, EffortCatalogs};
 use crate::contract::Review;
 use crate::policy::{
     validate_recipes, ContextPolicy, EffortId, ExecutionPolicy, ModelProfile, RecipeError,
     RecipeSpec, RepoPolicy, RiskRule, Tier,
 };
 
-use super::recipe_tier_floor;
+use super::rung::apply_floor;
+use super::{authority_ceiling, recipe_effort_floors, recipe_tier_floor};
 
 /// Caps a learner's proposed knobs must respect. Never sourced from the
 /// candidate itself — a self-reported cap is not a cap.
@@ -39,10 +41,21 @@ pub struct TuningBounds {
     pub max_agent_depth: u32,
     pub max_agents_total: u32,
     pub max_context_budget_bytes: usize,
-    /// Efforts a recipe's own `models` table may name. `effort` was
-    /// unbounded, so a candidate could raise every tier's effort — spend
-    /// a learner must not choose for itself.
-    pub allowed_efforts: HashSet<EffortId>,
+    /// The resolved effort catalog of every model a recipe's `models` may
+    /// name: the SAME admissible sets routing checks a rung against, so a
+    /// candidate is admitted exactly when its rung would not be blocked.
+    /// `effort` was unbounded, so a candidate could raise every tier's
+    /// effort — spend a learner must not choose for itself.
+    pub catalogs: EffortCatalogs,
+    /// The authority ceiling per tier ([`authority_ceiling`]), resolved
+    /// from the incumbent policy before any candidate effort is applied.
+    /// A candidate lowering or raising its start effort never moves it.
+    pub ceilings: BTreeMap<Tier, EffortId>,
+    /// The model and effort the incumbent policy configures per tier: the
+    /// only pair a model whose catalog is unknown can admit, as routing's
+    /// carve-out, which applies only when the dispatched model IS the
+    /// configured one.
+    pub configured: BTreeMap<Tier, (String, EffortId)>,
     /// Whether a candidate may grant nested agent spawning. A CAPABILITY,
     /// not a number to tune: `false` here means a candidate cannot turn
     /// it on however it retunes the caps around it.
@@ -157,11 +170,34 @@ pub enum CandidateRejection {
         to: Review,
     },
     /// A new recipe entry's `models` table names an effort outside the
-    /// allowed set. Effort is spend; a learner does not raise its own.
-    EffortNotAllowed {
+    /// model's admissible set, or above the authority ceiling for the
+    /// tier. Effort is spend; a learner does not raise its own.
+    EffortNotAdmissible {
         name: String,
         tier: Tier,
+        model: String,
         effort: EffortId,
+        /// The admissible set in order, or why there is none.
+        admissible: String,
+    },
+    /// A new recipe entry's `models` table names an effort below the
+    /// floor the risk rules its scope could touch demand.
+    EffortBelowFloor {
+        name: String,
+        tier: Tier,
+        model: String,
+        effort: EffortId,
+        floor: String,
+    },
+    /// A new recipe entry names a model for a tier and no effort, in a
+    /// scope a risk floor applies to, and routing would raise the effort
+    /// to the floor and be unable to: [`super::rung::apply_floor`]'s own
+    /// refusal, verbatim.
+    FloorUnmet {
+        name: String,
+        tier: Tier,
+        model: String,
+        detail: String,
     },
     /// A new recipe entry would grant a capability the bounds withhold.
     /// Distinct from a knob above its cap: no number makes this
@@ -233,10 +269,38 @@ impl std::fmt::Display for CandidateRejection {
                 "recipe `{name}` review moved from {from:?} to {to:?}; a candidate may raise a \
                  recipe's review floor, never lower it"
             ),
-            Self::EffortNotAllowed { name, tier, effort } => write!(
+            Self::EffortNotAdmissible {
+                name,
+                tier,
+                model,
+                effort,
+                admissible,
+            } => write!(
                 f,
-                "recipe `{name}` names effort `{effort}` for the {tier:?} tier, which the \
-                 tuning bounds do not allow: effort is spend, and a learner does not raise its own"
+                "recipe `{name}` names effort `{effort}` for `{model}` at the {tier:?} tier, \
+                 which is not admissible (admissible: {admissible}) or is above the tier's \
+                 ceiling: effort is spend, and a learner does not raise its own"
+            ),
+            Self::EffortBelowFloor {
+                name,
+                tier,
+                model,
+                effort,
+                floor,
+            } => write!(
+                f,
+                "recipe `{name}` names effort `{effort}` for `{model}` at the {tier:?} tier, \
+                 below the floor `{floor}` its scope's risk rules demand"
+            ),
+            Self::FloorUnmet {
+                name,
+                tier,
+                model,
+                detail,
+            } => write!(
+                f,
+                "recipe `{name}` names `{model}` at the {tier:?} tier with no effort, and routing \
+                 would block it: {detail}"
             ),
             Self::CapabilityNotGranted { name, capability } => write!(
                 f,
@@ -445,8 +509,16 @@ fn validate_new_recipe(
     }
 
     if let Some(models) = new_models {
+        let floors = recipe_effort_floors(*new_kind, new_scope, candidate_risk);
         for (tier, profile) in models {
-            let ModelProfile { id, effort } = profile;
+            // EXHAUSTIVE, like the destructures around it: a field added
+            // to `ModelProfile` fails to compile here until someone
+            // decides whether it is a knob or fixed.
+            let ModelProfile {
+                id,
+                effort,
+                max_effort,
+            } = profile;
             if !bounds.allowed_models.contains(id) {
                 return Err(CandidateRejection::ModelNotAllowed {
                     name: new_name.clone(),
@@ -454,17 +526,32 @@ fn validate_new_recipe(
                     model: id.clone(),
                 });
             }
+            // NOT a knob. A ceiling is the authority's, and a candidate
+            // may neither set nor move one.
+            let base_max_effort = base
+                .models
+                .as_ref()
+                .and_then(|models| models.get(tier))
+                .and_then(|base_profile| base_profile.max_effort.as_ref());
+            if max_effort.as_ref() != base_max_effort {
+                return Err(CandidateRejection::FixedRecipeFieldChanged {
+                    name: new_name.clone(),
+                    field: "models.max_effort",
+                });
+            }
             // `effort` was unbounded: a candidate could raise every
             // tier's effort, which is spend a learner must not choose
             // for itself.
-            if let Some(effort) = effort {
-                if !bounds.allowed_efforts.contains(effort) {
-                    return Err(CandidateRejection::EffortNotAllowed {
-                        name: new_name.clone(),
-                        tier: *tier,
-                        effort: effort.clone(),
-                    });
-                }
+            match effort {
+                Some(effort) => check_effort(&EffortCheck {
+                    name: new_name,
+                    tier: *tier,
+                    model: id,
+                    effort,
+                    floors: &floors,
+                    bounds,
+                })?,
+                None => check_floor_without_effort(new_name, *tier, id, &floors, bounds)?,
             }
         }
     }
@@ -531,6 +618,139 @@ fn validate_new_recipe(
     Ok(())
 }
 
+/// One candidate effort to judge against routing's own rules.
+struct EffortCheck<'a> {
+    name: &'a str,
+    tier: Tier,
+    model: &'a str,
+    effort: &'a EffortId,
+    /// The `minimum_effort` of every risk rule the recipe's scope could
+    /// touch.
+    floors: &'a [EffortId],
+    bounds: &'a TuningBounds,
+}
+
+/// A recipe's profile that sets NO effort: with a floor in its scope,
+/// routing starts from nothing and raises to the floor
+/// ([`super::rung::apply_floor`], the very function routing calls), then
+/// judges the raised effort as any other. So a model that cannot meet the
+/// floor — no effort control, an unknown catalog — is refused here as
+/// routing would block it. No floor: nothing is raised and nothing to check.
+fn check_floor_without_effort(
+    name: &str,
+    tier: Tier,
+    model: &str,
+    floors: &[EffortId],
+    bounds: &TuningBounds,
+) -> Result<(), CandidateRejection> {
+    if floors.is_empty() {
+        return Ok(());
+    }
+    let raised =
+        apply_floor(bounds.catalogs.get(model), model, None, floors).map_err(|blocker| {
+            CandidateRejection::FloorUnmet {
+                name: name.to_string(),
+                tier,
+                model: model.to_string(),
+                detail: blocker.detail,
+            }
+        })?;
+    check_effort(&EffortCheck {
+        name,
+        tier,
+        model,
+        effort: &raised,
+        floors,
+        bounds,
+    })
+}
+
+/// The admissible set, the authority ceiling and the floor, read from the
+/// same catalog routing reads. A model whose catalog is unknown admits only
+/// the incumbent's configured effort (routing's carve-out) and can meet no
+/// floor, because nothing ranks it.
+fn check_effort(check: &EffortCheck<'_>) -> Result<(), CandidateRejection> {
+    let EffortCheck {
+        name,
+        tier,
+        model,
+        effort,
+        floors,
+        bounds,
+    } = check;
+    let not_admissible = |admissible: String| CandidateRejection::EffortNotAdmissible {
+        name: (*name).to_string(),
+        tier: *tier,
+        model: (*model).to_string(),
+        effort: (*effort).clone(),
+        admissible,
+    };
+    let below_floor = |floor: String| CandidateRejection::EffortBelowFloor {
+        name: (*name).to_string(),
+        tier: *tier,
+        model: (*model).to_string(),
+        effort: (*effort).clone(),
+        floor,
+    };
+    let known = bounds
+        .catalogs
+        .get(model)
+        .and_then(|catalog| match catalog.admissible() {
+            Admissible::Set(set) => Some((catalog, set)),
+            Admissible::Undetermined(_) => None,
+        });
+    let Some((catalog, set)) = known else {
+        let configured = bounds
+            .configured
+            .get(tier)
+            .is_some_and(|(id, configured)| id == *model && configured == *effort);
+        if !configured {
+            return Err(not_admissible("unknown catalog".to_string()));
+        }
+        return match floors.is_empty() {
+            true => Ok(()),
+            false => Err(below_floor(
+                "a floor no unknown catalog can rank".to_string(),
+            )),
+        };
+    };
+    let listed = || {
+        set.iter()
+            .map(EffortId::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !set.contains(effort) {
+        return Err(not_admissible(listed()));
+    }
+    if let Some(ceiling) = bounds.ceilings.get(tier) {
+        // Above it, or a ceiling the model's order cannot place: neither
+        // is an effort routing would dispatch.
+        let within = catalog
+            .position(effort)
+            .zip(catalog.position(ceiling))
+            .is_some_and(|(at, cap)| at <= cap);
+        if !within {
+            return Err(not_admissible(format!("{}; ceiling {ceiling}", listed())));
+        }
+    }
+    match catalog.highest(floors) {
+        Ok(Some(floor)) => {
+            let met = catalog
+                .position(effort)
+                .zip(catalog.position(&floor))
+                .is_some_and(|(at, needed)| at >= needed);
+            if met {
+                Ok(())
+            } else {
+                Err(below_floor(floor.to_string()))
+            }
+        }
+        Ok(None) => Ok(()),
+        Err(unplaced) => Err(below_floor(format!("{unplaced} (not in the order)"))),
+    }
+}
+
 fn check_cap(
     name: &str,
     knob: &'static str,
@@ -562,18 +782,38 @@ fn check_cap(
 /// `fixed_fields_match` never lets a candidate move, so reading the bounds
 /// from the incumbent is reading them from values the candidate is
 /// byte-identical to in the first place.
-pub fn default_tuning_bounds(policy: &RepoPolicy) -> TuningBounds {
-    let allowed_models: BTreeSet<String> = policy
-        .models
-        .values()
-        .map(|profile| profile.id.clone())
+///
+/// The effort catalogs are the caller's, resolved from the harness probe
+/// and machine.toml exactly as routing's are: the ceilings and the sets a
+/// candidate is judged against are the ones a run would be blocked by.
+///
+/// `machine_allowed_models` is machine.toml's `allowed_models` (`None`: any).
+/// The models, the ceilings and the configured pairs are read from the
+/// policy's models narrowed by it, which is what
+/// [`crate::policy::effective_authority`] hands routing — never the
+/// repository's table alone, which would admit a model routing then blocks.
+pub fn default_tuning_bounds(
+    policy: &RepoPolicy,
+    machine_allowed_models: Option<&[String]>,
+    catalogs: &EffortCatalogs,
+) -> TuningBounds {
+    let models = crate::policy::allowed_models_of(&policy.models, machine_allowed_models);
+    let allowed_models: BTreeSet<String> =
+        models.values().map(|profile| profile.id.clone()).collect();
+    let ceilings: BTreeMap<Tier, EffortId> = models
+        .keys()
+        .filter_map(|tier| {
+            authority_ceiling(&models, catalogs, *tier).map(|ceiling| (*tier, ceiling))
+        })
         .collect();
-    // A set: which effort is above which is the catalog's configured
-    // order, so nothing here sorts.
-    let allowed_efforts: HashSet<EffortId> = policy
-        .models
-        .values()
-        .filter_map(|profile| profile.effort.clone())
+    let configured: BTreeMap<Tier, (String, EffortId)> = models
+        .iter()
+        .filter_map(|(tier, profile)| {
+            profile
+                .effort
+                .clone()
+                .map(|effort| (*tier, (profile.id.clone(), effort)))
+        })
         .collect();
     TuningBounds {
         allowed_models,
@@ -583,7 +823,9 @@ pub fn default_tuning_bounds(policy: &RepoPolicy) -> TuningBounds {
         max_agent_depth: policy.execution.max_agent_depth,
         max_agents_total: policy.execution.max_agents_total,
         max_context_budget_bytes: policy.context.budget_bytes,
-        allowed_efforts,
+        catalogs: catalogs.clone(),
+        ceilings,
+        configured,
         allow_nested_agents: policy.execution.allow_nested_agents,
     }
 }
@@ -640,17 +882,207 @@ mod tests {
             ModelProfile {
                 id: "sonnet".into(),
                 effort: Some(effort("high")),
+                max_effort: None,
             },
         )]));
         candidate.recipes.push(tuned);
         assert!(
             matches!(
                 validate_candidate(&incumbent, &candidate, &bounds()),
-                Err(CandidateRejection::EffortNotAllowed { effort, .. })
+                Err(CandidateRejection::EffortNotAdmissible { effort, .. })
                     if effort.as_str() == "high"
             ),
-            "an effort outside the allowed set is refused"
+            "an effort outside the admissible set is refused"
         );
+    }
+
+    /// A candidate revision whose `models.implementation` is `sonnet` at
+    /// `effort`, appended to an incumbent whose only recipe is the base.
+    fn appended(incumbent: &RepoPolicy, effort_name: &str) -> RepoPolicy {
+        appended_model(incumbent, "sonnet", effort_name)
+    }
+
+    /// [`appended`] with the model named too.
+    fn appended_model(incumbent: &RepoPolicy, model: &str, effort_name: &str) -> RepoPolicy {
+        let mut candidate = incumbent.clone();
+        let mut tuned = base_recipe();
+        tuned.revision = 1;
+        tuned.models = Some(BTreeMap::from([(
+            Tier::Implementation,
+            ModelProfile {
+                id: model.into(),
+                effort: Some(effort(effort_name)),
+                max_effort: None,
+            },
+        )]));
+        candidate.recipes.push(tuned);
+        candidate
+    }
+
+    /// (f) The admissible set is routing's own: an effort the model does
+    /// not support is refused even though it sits below the authorized
+    /// top, and one it supports is admitted.
+    #[test]
+    fn an_effort_the_model_does_not_support_is_not_admissible() {
+        let incumbent = policy_with_recipes(vec![base_recipe()]);
+        let mut bounds = bounds();
+        bounds.catalogs = catalogs(&["low", "high"], "max");
+        assert!(matches!(
+            validate_candidate(&incumbent, &appended(&incumbent, "medium"), &bounds),
+            Err(CandidateRejection::EffortNotAdmissible { .. })
+        ));
+        assert!(validate_candidate(&incumbent, &appended(&incumbent, "high"), &bounds).is_ok());
+    }
+
+    /// (f) An effort under the floor the recipe's scope demands is
+    /// `EffortBelowFloor`, and lowering to the floor itself is fine.
+    #[test]
+    fn an_effort_below_the_scopes_floor_is_refused_and_the_floor_itself_is_not() {
+        let mut incumbent = policy_with_recipes(vec![base_recipe()]);
+        incumbent.risk.push(RiskRule {
+            paths: vec!["docs/**".into()],
+            minimum_tier: Tier::Implementation,
+            review: None,
+            minimum_effort: Some(effort("medium")),
+        });
+        let mut bounds = bounds();
+        bounds.catalogs = catalogs(&["low", "medium", "high", "max"], "max");
+        let mut low = appended(&incumbent, "low");
+        low.risk = incumbent.risk.clone();
+        assert!(matches!(
+            validate_candidate(&incumbent, &low, &bounds),
+            Err(CandidateRejection::EffortBelowFloor { floor, .. }) if floor == "medium"
+        ));
+        let mut at_floor = appended(&incumbent, "medium");
+        at_floor.risk = incumbent.risk.clone();
+        assert!(validate_candidate(&incumbent, &at_floor, &bounds).is_ok());
+    }
+
+    /// (f) The ceiling is the AUTHORITY's, and a candidate's start effort —
+    /// lowered or raised — never moves it. The incumbent sets no
+    /// `max_effort`, so the ceiling is the top of `sonnet`'s admissible set
+    /// (`high`); `haiku` admits `max`, so an effort above that ceiling is
+    /// admissible for the model and refused only by the ceiling.
+    ///
+    /// Falsified: with `check_effort` taking its ceiling from the
+    /// candidate's own start effort (the lowest admissible effort at or
+    /// above it) instead of `bounds.ceilings`, the `haiku@max` candidate
+    /// was admitted and this failed at its last assertion; restored.
+    #[test]
+    fn a_candidate_start_effort_never_moves_the_authority_ceiling() {
+        let mut incumbent = policy_with_recipes(vec![base_recipe()]);
+        let profile = |id: &str, effort_name: &str| ModelProfile {
+            id: id.into(),
+            effort: Some(effort(effort_name)),
+            max_effort: None,
+        };
+        incumbent
+            .models
+            .insert(Tier::Implementation, profile("sonnet", "medium"));
+        incumbent
+            .models
+            .insert(Tier::Research, profile("haiku", "low"));
+        let catalogs = catalogs_for(
+            &[
+                ("sonnet", &["low", "medium", "high"]),
+                ("haiku", &["low", "medium", "high", "max"]),
+            ],
+            "max",
+        );
+        let bounds = default_tuning_bounds(&incumbent, None, &catalogs);
+        assert_eq!(
+            bounds.ceilings.get(&Tier::Implementation),
+            Some(&effort("high")),
+            "no max_effort: the ceiling is the top of the authority model's admissible set"
+        );
+
+        let lowered = appended(&incumbent, "low");
+        let raised = appended(&incumbent, "high");
+        assert!(validate_candidate(&incumbent, &lowered, &bounds).is_ok());
+        assert!(validate_candidate(&incumbent, &raised, &bounds).is_ok());
+        // The ceiling is read from the authority models alone, never from a
+        // recipe, so there is no candidate-dependent ceiling to compare: what
+        // this test proves is the refusal below, at the authority-derived
+        // ceiling, whichever way the candidate moved its start effort.
+
+        let above = appended_model(&incumbent, "haiku", "max");
+        assert!(
+            matches!(
+                validate_candidate(&incumbent, &above, &bounds),
+                Err(CandidateRejection::EffortNotAdmissible { effort, .. })
+                    if effort.as_str() == "max"
+            ),
+            "above the authority ceiling is refused though the model admits it"
+        );
+    }
+
+    /// A candidate may neither set nor move a ceiling: `max_effort` is an
+    /// authority field, refused by name like the nested-agents capability.
+    #[test]
+    fn a_candidate_cannot_set_a_max_effort() {
+        let incumbent = policy_with_recipes(vec![base_recipe()]);
+        let mut candidate = incumbent.clone();
+        let mut tuned = base_recipe();
+        tuned.revision = 1;
+        tuned.models = Some(BTreeMap::from([(
+            Tier::Implementation,
+            ModelProfile {
+                id: "sonnet".into(),
+                effort: None,
+                max_effort: Some(effort("max")),
+            },
+        )]));
+        candidate.recipes.push(tuned);
+        assert!(matches!(
+            validate_candidate(&incumbent, &candidate, &bounds()),
+            Err(CandidateRejection::FixedRecipeFieldChanged {
+                field: "models.max_effort",
+                ..
+            })
+        ));
+    }
+
+    /// An unknown catalog admits only the incumbent's configured effort.
+    #[test]
+    fn an_unknown_catalog_admits_only_the_configured_effort() {
+        let incumbent = policy_with_recipes(vec![base_recipe()]);
+        let mut bounds = bounds();
+        bounds.catalogs = EffortCatalogs::default();
+        bounds
+            .configured
+            .insert(Tier::Implementation, ("sonnet".into(), effort("medium")));
+        assert!(validate_candidate(&incumbent, &appended(&incumbent, "medium"), &bounds).is_ok());
+        assert!(matches!(
+            validate_candidate(&incumbent, &appended(&incumbent, "low"), &bounds),
+            Err(CandidateRejection::EffortNotAdmissible { .. })
+        ));
+    }
+
+    /// The carve-out is for the configured MODEL at its configured effort:
+    /// a candidate naming another model at the same effort is not the
+    /// pair the authority policy configures, and routing would block it.
+    #[test]
+    fn an_unknown_catalog_admits_only_the_configured_model_at_its_effort() {
+        let incumbent = policy_with_recipes(vec![base_recipe()]);
+        let mut bounds = bounds();
+        bounds.catalogs = EffortCatalogs::default();
+        bounds
+            .configured
+            .insert(Tier::Implementation, ("sonnet".into(), effort("medium")));
+        assert!(matches!(
+            validate_candidate(
+                &incumbent,
+                &appended_model(&incumbent, "haiku", "medium"),
+                &bounds
+            ),
+            Err(CandidateRejection::EffortNotAdmissible { .. })
+        ));
+        assert!(validate_candidate(
+            &incumbent,
+            &appended_model(&incumbent, "sonnet", "medium"),
+            &bounds
+        )
+        .is_ok());
     }
 
     /// `Review::default()` is `Optional`, not `Off`. Reading an absent
@@ -697,6 +1129,40 @@ mod tests {
         EffortId::parse(name).expect("a valid effort identifier")
     }
 
+    /// The catalog routing would resolve for `sonnet`: the order low <
+    /// medium < high < max, the CLI accepting all four, the model
+    /// supporting `supported`, authorized up to `max_effort`.
+    fn catalogs(supported: &[&str], max_effort: &str) -> EffortCatalogs {
+        catalogs_for(&[("sonnet", supported)], max_effort)
+    }
+
+    /// [`catalogs`] for several models, each with its own supported set.
+    fn catalogs_for(models: &[(&str, &[&str])], max_effort: &str) -> EffortCatalogs {
+        use crate::catalog::Fact;
+        use crate::policy::{EffortModelEntry, EffortSettings};
+        let order: Vec<EffortId> = ["low", "medium", "high", "max"]
+            .into_iter()
+            .map(effort)
+            .collect();
+        let settings = EffortSettings {
+            order: Some(order.clone()),
+            models: models
+                .iter()
+                .map(|(id, supported)| EffortModelEntry {
+                    ids: vec![(*id).into()],
+                    supported: Some(supported.iter().copied().map(effort).collect()),
+                    order: None,
+                })
+                .collect(),
+        };
+        EffortCatalogs::resolve_all(
+            &Fact::Known(order),
+            &settings,
+            &effort(max_effort),
+            models.iter().map(|(id, _)| *id),
+        )
+    }
+
     fn bounds() -> TuningBounds {
         TuningBounds {
             allowed_models: ["haiku", "sonnet", "fable"]
@@ -709,7 +1175,9 @@ mod tests {
             max_agent_depth: 4,
             max_agents_total: 32,
             max_context_budget_bytes: 128 * 1024,
-            allowed_efforts: HashSet::from([effort("low"), effort("medium")]),
+            catalogs: catalogs(&["low", "medium", "high", "max"], "medium"),
+            ceilings: BTreeMap::new(),
+            configured: BTreeMap::new(),
             // Withheld, which is the interesting default for a test: a
             // candidate must not be able to grant itself nested agents.
             allow_nested_agents: false,
@@ -779,6 +1247,7 @@ mod tests {
             ModelProfile {
                 id: "haiku".into(),
                 effort: None,
+                max_effort: None,
             },
         );
         assert_eq!(
@@ -826,6 +1295,7 @@ mod tests {
             paths: vec!["**/trust/**".into()],
             minimum_tier: Tier::Escalation,
             review: None,
+            minimum_effort: None,
         });
         assert_eq!(
             validate_candidate(&incumbent, &risk, &bounds()).unwrap_err(),
@@ -938,6 +1408,7 @@ mod tests {
             paths: vec!["docs/**".into()],
             minimum_tier: Tier::Escalation,
             review: None,
+            minimum_effort: None,
         });
         let mut tuned = base.clone();
         tuned.revision = 1;
@@ -987,6 +1458,7 @@ mod tests {
             ModelProfile {
                 id: "not-allowed-model".into(),
                 effort: Some(effort("medium")),
+                max_effort: None,
             },
         )]));
         let candidate = policy_with_recipes(vec![base, tuned]);
@@ -1203,8 +1675,7 @@ mod tests {
             decomposition: None,
             task_id: None,
         };
-        let (rule_floor, _) = crate::route::risk_floor(&contract, risk);
-        match rule_floor {
+        match crate::route::risk_floor(&contract, risk).tier {
             Some(rule_floor) if rule_floor > floor => rule_floor,
             _ => floor,
         }
@@ -1222,11 +1693,13 @@ mod tests {
                 paths: scope.clone(),
                 minimum_tier: Tier::Escalation,
                 review: Some(Review::Required),
+                minimum_effort: None,
             }]),
             Just(vec![RiskRule {
                 paths: scope,
                 minimum_tier: Tier::Implementation,
                 review: None,
+                minimum_effort: None,
             }]),
         ]
     }
@@ -1263,6 +1736,7 @@ mod tests {
                 paths: vec!["**".to_string()],
                 minimum_tier: Tier::Research,
                 review: None,
+                minimum_effort: None,
             }),
             Tamper::DropRiskRules => policy.risk.clear(),
             Tamper::WeakenVerification => {
@@ -1480,6 +1954,7 @@ mod tests {
                     paths: vec!["**".into()],
                     minimum_tier: Tier::Research,
                     review: None,
+                    minimum_effort: None,
                 });
             }
 
