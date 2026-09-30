@@ -94,9 +94,10 @@ const SOCKET_BOUND: &str = "unix-socket-bound";
 /// The bind step's program. It checks `$TMPDIR` itself, in Python: the
 /// harness asks for approval of a shell `case` (measured on 2.1.286,
 /// "Contains case_statement"), and a probe step that needs approval fails.
-const SOCKET_BIND: &str = "import os,socket;\
+/// Not an `assert`, which `-O` or `PYTHONOPTIMIZE` would strip.
+const SOCKET_BIND: &str = "import os,socket,sys;\
      d=os.environ[\"TMPDIR\"];\
-     assert d.startswith(\"/tmp/rl-\"),\"fallback TMPDIR \"+d;\
+     d.startswith(\"/tmp/rl-\") or sys.exit(\"fallback TMPDIR \"+d);\
      socket.socket(socket.AF_UNIX).bind(d+\"/sock/s\");\
      print(\"unix-socket-bound\")";
 const PRESENCE: &str = ">/dev/null && echo PRESENT || echo absent";
