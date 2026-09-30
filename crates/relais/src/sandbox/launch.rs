@@ -36,6 +36,9 @@ pub struct LaunchInputs<'a> {
     pub env: &'a dyn Fn(&str) -> Option<String>,
     pub launch_env_names: &'a [String],
     pub scratch: &'a Path,
+    /// The short path a worker's Claude Code temp dir is pointed at: a
+    /// symlink to `scratch` (see [`TmpLink`]), or `scratch` itself.
+    pub tmp_link: &'a Path,
 }
 
 /// The sandbox launch for one worker: the credential floor, `[sandbox]`
@@ -67,7 +70,90 @@ pub fn worker_launch(inputs: &LaunchInputs) -> SandboxLaunch {
     SandboxLaunch {
         settings,
         scratch_dir: inputs.scratch.to_path_buf(),
+        tmp_link: inputs.tmp_link.to_path_buf(),
     }
+}
+
+/// The short path a worker's Claude Code temp dir is pointed at:
+/// `<root>/rl-<8 hex of sha256(seed)>` on unix, the scratch itself elsewhere
+/// (no symlink to make there). The same seed names the same link, which is
+/// safe because [`TmpLink`] removes the earlier one.
+pub fn short_tmp_link(root: &Path, seed: &str, scratch: &Path) -> PathBuf {
+    if !cfg!(unix) {
+        return scratch.to_path_buf();
+    }
+    let hex = crate::ids::sha256_hex(seed.as_bytes());
+    root.join(format!("rl-{}", &hex[..8]))
+}
+
+/// The symlink `tmp_link -> scratch` of one launch, removed when this value
+/// drops: whichever way the dispatch ends, the link does not outlive it.
+/// Holds nothing where the link is the scratch itself.
+#[derive(Debug)]
+pub struct TmpLink(Option<PathBuf>);
+
+impl TmpLink {
+    pub fn create(launch: &SandboxLaunch) -> std::io::Result<Self> {
+        if launch.tmp_link == launch.scratch_dir {
+            return Ok(Self(None));
+        }
+        match symlink(&launch.scratch_dir, &launch.tmp_link) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                replace_stale_link(&launch.tmp_link, &launch.scratch_dir)?;
+                symlink(&launch.scratch_dir, &launch.tmp_link)?;
+            }
+            other => other?,
+        }
+        Ok(Self(Some(launch.tmp_link.clone())))
+    }
+}
+
+/// Removes a link left by a relais that was killed before its `Drop` ran:
+/// one that dangles, or one that already names this launch's own scratch
+/// (a resumed or redispatched attempt). A live link to another scratch may
+/// be a concurrent worker's `CLAUDE_CODE_TMPDIR` and is never repointed;
+/// that, and anything that is not a symlink, fails naming the path.
+fn replace_stale_link(link: &Path, scratch: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(link)?.is_symlink() {
+        let target = std::fs::read_link(link)?;
+        if target == scratch || !link.exists() {
+            return std::fs::remove_file(link);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "{} is a live link to {}, not this attempt's scratch",
+                link.display(),
+                target.display()
+            ),
+        ));
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("{} exists and is not a symlink", link.display()),
+    ))
+}
+
+impl Drop for TmpLink {
+    fn drop(&mut self) {
+        if let Some(link) = &self.0 {
+            // Best effort: a link that stays is litter under /tmp that the
+            // next create of the same attempt replaces, and that blocks any
+            // other attempt from taking the name rather than repointing it.
+            std::fs::remove_file(link).ok();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+// Never reached: off unix `tmp_link` is the scratch, and `create` returns first.
+#[cfg(not(unix))]
+fn symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 // Unix only: the fixtures are Unix absolute paths.
@@ -101,8 +187,10 @@ mod tests {
             env: &no_env,
             launch_env_names: &names,
             scratch: Path::new("/scratch"),
+            tmp_link: Path::new("/tmp/rl-0a1b2c3d"),
         });
         assert_eq!(launch.scratch_dir, Path::new("/scratch"));
+        assert_eq!(launch.tmp_link, Path::new("/tmp/rl-0a1b2c3d"));
         let settings = &launch.settings;
         let allow_write = settings["sandbox"]["filesystem"]["allowWrite"].to_string();
         assert!(allow_write.contains("/scratch") && allow_write.contains("/opt/out"));
@@ -120,5 +208,86 @@ mod tests {
             settings["sandbox"]["network"]["allowedDomains"],
             serde_json::json!(["api.anthropic.com"])
         );
+    }
+
+    #[test]
+    fn the_link_exists_while_the_guard_does_and_not_after() {
+        let root = crate::test_support::short_temp_dir("tmp-link");
+        let scratch = root.join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let launch = SandboxLaunch {
+            settings: serde_json::json!({}),
+            scratch_dir: scratch.clone(),
+            tmp_link: root.join("link"),
+        };
+        let guard = TmpLink::create(&launch).expect("link");
+        assert_eq!(
+            std::fs::canonicalize(&launch.tmp_link).unwrap(),
+            std::fs::canonicalize(&scratch).unwrap()
+        );
+        drop(guard);
+        assert!(std::fs::symlink_metadata(&launch.tmp_link).is_err());
+        assert!(scratch.is_dir(), "the scratch is not the link's to remove");
+    }
+
+    #[test]
+    fn a_stale_link_is_replaced() {
+        let root = crate::test_support::short_temp_dir("tmp-link-stale");
+        let scratch = root.join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let launch = SandboxLaunch {
+            settings: serde_json::json!({}),
+            scratch_dir: scratch.clone(),
+            tmp_link: root.join("link"),
+        };
+        symlink(&root.join("long-gone"), &launch.tmp_link).unwrap();
+        let guard = TmpLink::create(&launch).expect("the stale link is replaced");
+        assert_eq!(
+            std::fs::canonicalize(&launch.tmp_link).unwrap(),
+            std::fs::canonicalize(&scratch).unwrap()
+        );
+        drop(guard);
+        assert!(std::fs::symlink_metadata(&launch.tmp_link).is_err());
+    }
+
+    #[test]
+    fn a_link_to_this_scratch_is_replaced_and_a_live_link_elsewhere_is_not() {
+        let root = crate::test_support::short_temp_dir("tmp-link-live");
+        let scratch = root.join("scratch");
+        let other = root.join("other");
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let launch = SandboxLaunch {
+            settings: serde_json::json!({}),
+            scratch_dir: scratch.clone(),
+            tmp_link: root.join("link"),
+        };
+        // A resumed attempt: the killed run's link names this same scratch.
+        symlink(&scratch, &launch.tmp_link).unwrap();
+        drop(TmpLink::create(&launch).expect("our own leftover is replaced"));
+        // Another worker's live link is left pointing where it did.
+        symlink(&other, &launch.tmp_link).unwrap();
+        let err = TmpLink::create(&launch).expect_err("never repointed");
+        assert!(err.to_string().contains("live link"), "{err}");
+        assert_eq!(std::fs::read_link(&launch.tmp_link).unwrap(), other);
+    }
+
+    #[test]
+    fn a_regular_file_at_the_link_path_fails_naming_it_and_is_left() {
+        let root = crate::test_support::short_temp_dir("tmp-link-file");
+        let scratch = root.join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let launch = SandboxLaunch {
+            settings: serde_json::json!({}),
+            scratch_dir: scratch,
+            tmp_link: root.join("link"),
+        };
+        std::fs::write(&launch.tmp_link, b"mine").unwrap();
+        let err = TmpLink::create(&launch).expect_err("not ours to replace");
+        assert!(err.to_string().contains("link"), "{err}");
+        assert!(err
+            .to_string()
+            .contains(&launch.tmp_link.display().to_string()));
+        assert_eq!(std::fs::read(&launch.tmp_link).unwrap(), b"mine");
     }
 }

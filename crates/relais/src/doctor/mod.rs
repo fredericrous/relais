@@ -419,6 +419,7 @@ pub(crate) fn sandbox_standing(
             launch_env_names: &names,
             // Normalised out of the key: any path stands for a worker's.
             scratch: Path::new("/relais-doctor-scratch"),
+            tmp_link: Path::new("/relais-doctor-scratch"),
         },
         managed_root: &managed_root,
         extra_managed_root: extra_managed_root.as_deref(),
@@ -448,6 +449,8 @@ pub struct VerifyWorld<'a> {
     pub base_env: &'a LaunchEnv,
     pub state_dir: &'a Path,
     pub repo_dir: &'a Path,
+    /// The directory the probe's short temp-dir link is made under.
+    pub tmp_link_root: &'a Path,
     /// Random hex, unique to this attempt.
     pub nonce: &'a str,
 }
@@ -508,6 +511,7 @@ pub fn verify_sandbox_with(
         &VerifyInputs {
             settings,
             state_dir: world.state_dir,
+            tmp_link_root: world.tmp_link_root,
             nonce: world.nonce,
             home: &home,
             config_dir: &config_dir,
@@ -545,6 +549,7 @@ pub fn verify_sandbox_here(
             base_env: &LaunchEnv::from_process_env(),
             state_dir: &state_dir,
             repo_dir,
+            tmp_link_root: Path::new("/tmp"),
             nonce: &probe_nonce(),
         },
         settings,
@@ -2103,7 +2108,7 @@ pub(crate) fn strays_finding(strays: std::io::Result<(u64, u64)>) -> Finding {
             component: "temp-strays",
             level: Level::Ok,
             detail: format!(
-                "no /tmp/{}* directory is left over",
+                "no /tmp/{}* directory or dangling link is left over",
                 crate::test_support::SCRATCH_PREFIX
             ),
         },
@@ -2111,10 +2116,11 @@ pub(crate) fn strays_finding(strays: std::io::Result<(u64, u64)>) -> Finding {
             component: "temp-strays",
             level: Level::Warn,
             detail: format!(
-                "{count} /tmp/{}* director{} left over from a killed test run, {bytes} \
-                 bytes; safe to remove by hand",
+                "{count} /tmp/{}* {} left over (a killed test run's directory, or \
+                 a TMPDIR link whose scratch is gone), {bytes} bytes; safe to \
+                 remove by hand",
                 crate::test_support::SCRATCH_PREFIX,
-                if count == 1 { "y" } else { "ies" }
+                if count == 1 { "entry" } else { "entries" }
             ),
         },
         // A count of leftover scratch directories is information, never a
@@ -2132,7 +2138,9 @@ pub(crate) fn strays_finding(strays: std::io::Result<(u64, u64)>) -> Finding {
 }
 
 /// The count and total bytes of `{SCRATCH_PREFIX}*` directories directly
-/// under `root` — the one prefix `test_support::short_temp_dir`, the
+/// under `root`, plus `{SCRATCH_PREFIX}*` symlinks whose target is gone (a
+/// sandboxed worker's TMPDIR link whose scratch is gone; one that still
+/// resolves may be a running worker's, so it is not counted) — the one prefix `test_support::short_temp_dir`, the
 /// integration suites' own world types and this scan all read from
 /// [`crate::test_support::SCRATCH_PREFIX`], so this counts exactly what
 /// any of them can strand. `pub`, not `pub(crate)`: an integration suite
@@ -2173,6 +2181,9 @@ pub fn count_strays(root: &Path) -> std::io::Result<(u64, u64)> {
         if stray && file_type.is_dir() {
             count += 1;
             bytes += crate::workspace::dir_size(&entry.path()).unwrap_or(0);
+        } else if stray && file_type.is_symlink() && !entry.path().exists() {
+            // A sandbox `TmpLink` a killed relais never removed: its scratch is gone.
+            count += 1;
         }
     }
     Ok((count, bytes))
@@ -2674,11 +2685,12 @@ mod tests {
         assert!(!report.failed(), "an unscannable /tmp must not fail doctor");
     }
 
-    /// `count_strays` counts only `{SCRATCH_PREFIX}*` directories
-    /// directly under the root, and a root that does not exist is none,
+    /// `count_strays` counts only `{SCRATCH_PREFIX}*` directories and
+    /// dangling `{SCRATCH_PREFIX}*` links directly under the root, and a
+    /// root that does not exist is none,
     /// not a failure.
     #[test]
-    fn count_strays_finds_only_scratch_prefixed_directories() {
+    fn count_strays_finds_scratch_prefixed_directories_and_dangling_links() {
         let dir = crate::test_support::short_temp_dir("doctor-strays");
         let root = dir.to_path_buf();
         std::fs::create_dir(root.join("rl-a-1-1")).expect("a stray");
@@ -2693,6 +2705,17 @@ mod tests {
         let (count, bytes) = count_strays(&root).expect("scan");
         assert_eq!(count, 3, "both the current prefix and the legacy one");
         assert_eq!(bytes, 5);
+        #[cfg(unix)]
+        {
+            // A link whose target is gone is counted; one that still resolves is not.
+            std::os::unix::fs::symlink(root.join("gone"), root.join("rl-dangling"))
+                .expect("a dangling link");
+            std::os::unix::fs::symlink(root.join("not-rl"), root.join("rl-live"))
+                .expect("a live link");
+            let (count, bytes) = count_strays(&root).expect("scan");
+            assert_eq!(count, 4, "the dangling link joins the directories");
+            assert_eq!(bytes, 5);
+        }
         assert_eq!(
             count_strays(&root.join("absent")).expect("absent is none"),
             (0, 0)
@@ -3532,6 +3555,7 @@ mod tests {
                 env: &ambient_env,
                 launch_env_names: &[],
                 scratch: Path::new("/some/other/scratch"),
+                tmp_link: Path::new("/some/other/link"),
             },
             managed: &[],
         });
@@ -3652,6 +3676,7 @@ mod tests {
                 base_env: &LaunchEnv::default(),
                 state_dir: Path::new("/state"),
                 repo_dir: Path::new("/repo"),
+                tmp_link_root: Path::new("/state"),
                 nonce: "abc",
             },
             settings,

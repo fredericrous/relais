@@ -29,7 +29,8 @@ const LISTED: usize = 5;
 /// One denial line and where it was read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Denial {
-    /// `tool_result:<tool_use_id>`, or the scratch file's name.
+    /// `tool_result:<tool_use_id>`, or the scratch file's path relative to
+    /// the scratch (`check.log`, `claude-501/check.log`).
     pub source: String,
     /// The matching line, at most 200 characters.
     pub text: String,
@@ -205,7 +206,8 @@ fn read_transcript(jsonl: &str, report: &mut DenialReport) -> Transcript {
 }
 
 /// What the sandbox denied, from the transcript (when there is one) and
-/// the scratch files as `(path, text)`. Scratch files add suspected
+/// the scratch files as `(path relative to the scratch, text)`, the path
+/// being each denial's source. Scratch files add suspected
 /// denials and never change coverage: a worker's own logs are not the
 /// harness's account.
 pub fn scan(transcript_jsonl: Option<&str>, scratch_files: &[(PathBuf, String)]) -> DenialReport {
@@ -222,10 +224,13 @@ pub fn scan(transcript_jsonl: Option<&str>, scratch_files: &[(PathBuf, String)])
         };
     }
     for (path, text) in scratch_files {
-        let name = path
-            .file_name()
-            .map_or_else(|| path.to_string_lossy(), |name| name.to_string_lossy());
-        sort_lines(text, &name, &mut report);
+        // `/`-joined on every platform, so a report reads the same anywhere.
+        let source = path
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        sort_lines(text, &source, &mut report);
     }
     report
 }
@@ -329,14 +334,15 @@ mod tests {
 
     #[test]
     fn the_same_text_in_a_scratch_log_is_suspected_with_the_file_as_source() {
+        // Paths come relative to the scratch; the source is that path.
         let files = vec![(
-            PathBuf::from("/s/attempts/1/scratch/build.log"),
+            PathBuf::from("claude-501/build.log"),
             "cp: Read-only file system\nfine".to_string(),
         )];
         let report = scan(None, &files);
         assert!(report.verified.is_empty());
         assert_eq!(report.suspected.len(), 1);
-        assert_eq!(report.suspected[0].source, "build.log");
+        assert_eq!(report.suspected[0].source, "claude-501/build.log");
         assert_eq!(report.suspected[0].text, "cp: Read-only file system");
     }
 

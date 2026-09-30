@@ -47,7 +47,7 @@ pub use denials::{scan, transcript_path, Coverage, Denial, DenialReport};
 pub use dispatch::{dispatch_gate, dispatch_key, dispatch_lookup, DispatchKeyInputs, GateInputs};
 pub use floor::{credential_floor, Floor, FloorInputs};
 pub use judge::{judge_managed, judge_user_config, managed_sources, Weakening};
-pub use launch::{worker_launch, LaunchInputs, WorkerMode};
+pub use launch::{short_tmp_link, worker_launch, LaunchInputs, TmpLink, WorkerMode};
 pub use preflight::{
     managed_bytes, managed_root, preflight, weakenings, PreflightInputs, RealSandboxHost,
     SandboxHost, SANDBOX_MIN_HARNESS,

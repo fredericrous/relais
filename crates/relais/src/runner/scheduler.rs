@@ -715,6 +715,7 @@ fn run_package(
         // sits under `packages/worktrees/<child-run>/` and no package's
         // record — its own or a sibling's — is its cwd's parent (B6).
         artifacts_dir: engine.artifacts.join("packages").join(&package.id),
+        tmp_link_root: engine.config.tmp_link_root.clone(),
         aval_resolver: engine.config.aval_resolver,
         predictor: engine.config.predictor,
         gate: engine.config.gate,
