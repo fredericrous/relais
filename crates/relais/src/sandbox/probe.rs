@@ -435,8 +435,6 @@ fn judge_output(result: &ToolResult, want: &str, line_matches: impl Fn(&str) -> 
     })
 }
 
-/// Negative expectations judge by text alone: a denied command legitimately
-/// has `is_error` true.
 /// The host the `network` step reaches for.
 const PROBE_HOST: &str = "example.com";
 
@@ -452,11 +450,18 @@ fn denies_probe_host(text: &str) -> bool {
     let block = block
         .find("</sandbox_violations>")
         .map_or(block, |end| &block[..end]);
+    // The host is its own token after the verb, `<host>:<port>`: a
+    // substring would let `notexample.com:443` pass.
     block.lines().any(|line| {
-        line.contains("deny network-outbound") && line.contains(&format!("{PROBE_HOST}:"))
+        line.split_once("deny network-outbound")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .and_then(|target| target.rsplit_once(':'))
+            .is_some_and(|(host, _port)| host == PROBE_HOST)
     })
 }
 
+/// Negative expectations judge by text alone: a denied command legitimately
+/// has `is_error` true.
 fn judge(expect: &Expect, result: &ToolResult) -> Verdict {
     let text = result.text.as_str();
     match expect {
@@ -1112,6 +1117,13 @@ mod tests {
             "network",
             "Exit code 6\ncurl: (6) Could not resolve host: example.com\n\
              <sandbox_violations>\ndeny network-outbound evil.test:443\n</sandbox_violations>",
+        );
+        assert!(matches!(verdict(&report, "network"), Verdict::Fail(_)));
+        // A host that merely contains the probe host is another host.
+        let (_, report) = with_result(
+            "network",
+            "Exit code 56\n<sandbox_violations>\ndeny network-outbound notexample.com:443\n\
+             </sandbox_violations>",
         );
         assert!(matches!(verdict(&report, "network"), Verdict::Fail(_)));
     }

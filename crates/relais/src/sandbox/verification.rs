@@ -206,6 +206,42 @@ impl VerificationStore {
 
 #[cfg(test)]
 mod tests {
+    /// The probe as fixed inputs build it: every step's id, tool, input
+    /// and expectation. Pinned beside `PROBE_VERSION` so changing the probe
+    /// without bumping the version fails here until both are updated.
+    fn probe_digest() -> String {
+        use crate::sandbox::probe::{probe_plan, probe_plan_allowlist, ProbePlanInputs};
+        let plan = probe_plan(&ProbePlanInputs {
+            nonce: "n",
+            fixture: std::path::Path::new("/f/fixture"),
+            home: std::path::Path::new("/h"),
+        })
+        .expect("fixed inputs build a plan");
+        let text: String = plan
+            .iter()
+            .chain(probe_plan_allowlist("n").iter())
+            .map(|step| {
+                format!(
+                    "{}|{:?}|{}|{:?}\n",
+                    step.id, step.tool, step.input, step.expect
+                )
+            })
+            .collect();
+        crate::ids::sha256_hex(text.as_bytes())
+    }
+
+    #[test]
+    fn the_probe_is_pinned_to_its_version() {
+        assert_eq!(
+            (PROBE_VERSION, probe_digest().as_str()),
+            (
+                1,
+                "3b1f7ecaea65556c2703451b7a91d47bdff63ec5510ed25962832d062fc5a72f"
+            ),
+            "the probe changed: bump PROBE_VERSION and update this digest"
+        );
+    }
+
     use serde_json::json;
 
     use super::*;
