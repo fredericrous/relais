@@ -1363,16 +1363,20 @@ impl<'a> RunEngine<'a> {
         let capabilities = self.config.backend.probe();
         // A sandboxed worker is launched confined, or not launched: the
         // check runs before anything is assembled or dispatched.
-        if let Some(blocker) = self.sandbox_blocker(capabilities.as_ref()) {
-            return Ok(Phase::Ended(
-                self.fail_preflight(blocker.code, blocker.detail)?,
-            ));
-        }
+        let sandbox_verified = match self.sandbox_gate(capabilities.as_ref()) {
+            Ok(verified) => verified,
+            Err(blocker) => {
+                return Ok(Phase::Ended(
+                    self.fail_preflight(blocker.code, blocker.detail)?,
+                ))
+            }
+        };
         let manifest = match self.assemble_context(
             &authority,
             &contract_hash,
             &base_sha,
             capabilities.as_ref(),
+            sandbox_verified.as_ref(),
         )? {
             Phase::Ended(outcome) => return Ok(Phase::Ended(outcome)),
             Phase::Ready(manifest) => manifest,
@@ -1423,40 +1427,75 @@ impl<'a> RunEngine<'a> {
     }
 
     /// Whether the OS sandbox can be relied on here, when `[sandbox]` asks
-    /// for it: the real platform, harness version, PATH and managed
-    /// configuration, read at this boundary and judged by
-    /// [`sandbox::preflight`].
-    fn sandbox_blocker(
+    /// for it, and whether a probe has verified this configuration: the
+    /// real platform, harness version, PATH and managed configuration, read
+    /// at this boundary, judged by [`sandbox::preflight`] and then looked
+    /// up by [`sandbox::dispatch_gate`]. The key it was verified under, or
+    /// `None` in allowlist mode, where there is nothing to verify.
+    fn sandbox_gate(
         &self,
         capabilities: Option<&crate::backend::Capabilities>,
-    ) -> Option<crate::policy::Blocker> {
-        if WorkerMode::of(&self.config.machine.sandbox) == WorkerMode::Allowlist {
-            return None;
+    ) -> Result<Option<sandbox::VerificationKey>, crate::policy::Blocker> {
+        let settings = &self.config.machine.sandbox;
+        if WorkerMode::of(settings) == WorkerMode::Allowlist {
+            return Ok(None);
         }
         let host = self.config.sandbox_host;
         let platform = host.platform();
         // Every path the launch needs is resolved HERE, so an unresolvable
         // one is a preflight block with something to do, not an internal
         // error at dispatch after the preflight passed.
-        let home = match sandbox_home(
+        let paths = sandbox_home(
             crate::paths::home_dir(),
             crate::paths::config_dir(),
             crate::paths::ledger_path(),
-        ) {
-            Ok(home) => home,
-            Err(blocker) => return Some(blocker),
-        };
-        let user_config = host.user_config(&home);
+        )?;
+        let user_config = host.user_config(&paths.home);
         let managed = host.managed_root();
         let extra_managed = host.extra_managed_root();
-        sandbox::preflight(&sandbox::PreflightInputs {
+        let harness_version = capabilities.and_then(|caps| caps.version.as_deref());
+        if let Some(blocker) = sandbox::preflight(&sandbox::PreflightInputs {
             platform,
-            harness_version: capabilities.and_then(|caps| caps.version.as_deref()),
+            harness_version,
             on_path: &|program| host.on_path(program),
             managed_root: &managed,
             extra_managed_root: extra_managed.as_deref(),
             user_config: &user_config,
+            worktree: &self.worktrees.join("task"),
+            repo_root: self.config.repo_dir,
+        }) {
+            return Err(blocker);
+        }
+        let store = host
+            .verification_store()
+            .map_err(|e| crate::policy::Blocker {
+                code: BlockCode::SandboxUnverified,
+                detail: format!("the verification record cannot be located ({e}); set HOME"),
+            })?;
+        // The preflight refused an unreadable version, so this is `Some`.
+        let harness_version = harness_version.unwrap_or_default();
+        let ambient =
+            |name: &str| std::env::var_os(name).map(|value| value.to_string_lossy().into_owned());
+        // The scratch path is normalised out of the key, so any one stands
+        // for every attempt's.
+        let scratch = self.artifacts.join("attempts").join("1").join("scratch");
+        sandbox::dispatch_gate(&sandbox::GateInputs {
+            store: &store,
+            harness_version,
+            platform,
+            launch: &sandbox::LaunchInputs {
+                settings,
+                home: &paths.home,
+                config_dir: &paths.config_dir,
+                ledger_path: &paths.ledger_path,
+                env: &ambient,
+                launch_env_names: &self.config.worker_env.names(),
+                scratch: &scratch,
+            },
+            managed_root: &managed,
+            extra_managed_root: extra_managed.as_deref(),
         })
+        .map(Some)
     }
 
     /// The sandbox launch for this worker attempt, with a fresh scratch
@@ -1506,6 +1545,7 @@ impl<'a> RunEngine<'a> {
         contract_hash: &str,
         base_sha: &str,
         capabilities: Option<&crate::backend::Capabilities>,
+        sandbox_verified: Option<&sandbox::VerificationKey>,
     ) -> Result<Phase<ContextManifest>, RunError> {
         // Read hints are fingerprinted from the base tree; one that
         // resolves to nothing would point the worker at a path this
@@ -1560,7 +1600,8 @@ impl<'a> RunEngine<'a> {
             resolver: self.config.aval_resolver,
         });
         match assembled {
-            Ok(manifest) => {
+            Ok(mut manifest) => {
+                manifest.sandbox.verified = sandbox_verified.map(|key| key.as_str().to_string());
                 let manifest_path = self.artifacts.join("manifest.json");
                 std::fs::write(
                     &manifest_path,
@@ -4168,6 +4209,14 @@ fn unrunnable_baseline_detail(
     detail
 }
 
+/// The machine paths the sandbox launch resolves everything protected from.
+#[derive(Debug)]
+struct SandboxPaths {
+    home: PathBuf,
+    config_dir: PathBuf,
+    ledger_path: PathBuf,
+}
+
 /// The home the sandbox launch resolves every protected path from, or the
 /// preflight block when any of them cannot be resolved: an unresolvable
 /// path is a block with something to do, never an internal error at
@@ -4176,9 +4225,13 @@ fn sandbox_home(
     home: Result<PathBuf, crate::paths::HomeUnset>,
     config_dir: Result<PathBuf, crate::paths::HomeUnset>,
     ledger_path: Result<PathBuf, crate::paths::HomeUnset>,
-) -> Result<PathBuf, crate::policy::Blocker> {
+) -> Result<SandboxPaths, crate::policy::Blocker> {
     match (home, config_dir, ledger_path) {
-        (Ok(home), Ok(_), Ok(_)) => Ok(home),
+        (Ok(home), Ok(config_dir), Ok(ledger_path)) => Ok(SandboxPaths {
+            home,
+            config_dir,
+            ledger_path,
+        }),
         (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(crate::policy::Blocker {
             code: BlockCode::SandboxUnavailable,
             detail: format!(
@@ -4203,7 +4256,7 @@ mod tests {
             .expect_err("no ledger path blocks");
         assert_eq!(blocker.code, BlockCode::SandboxUnavailable);
         assert_eq!(
-            sandbox_home(ok(), ok(), ok()).expect("resolves"),
+            sandbox_home(ok(), ok(), ok()).expect("resolves").home,
             PathBuf::from("/h")
         );
     }
@@ -9679,9 +9732,11 @@ mod tests {
     }
 
     /// A host the sandbox preflight passes on: macOS, every program on
-    /// PATH, an empty managed root and no `~/.claude.json`.
+    /// PATH, an empty managed root and no `~/.claude.json`. Its
+    /// verification records are kept in `store`.
     struct PassingHost {
         managed: PathBuf,
+        store: PathBuf,
     }
 
     impl crate::sandbox::SandboxHost for PassingHost {
@@ -9700,6 +9755,163 @@ mod tests {
         fn user_config(&self, _home: &Path) -> PathBuf {
             self.managed.join("no-such-claude.json")
         }
+        fn verification_store(&self) -> Result<PathBuf, crate::paths::HomeUnset> {
+            Ok(self.store.clone())
+        }
+    }
+
+    /// The key the runner's dispatch gate computes for `machine` on a
+    /// harness reporting `version`, under [`PassingHost`]'s empty managed
+    /// root: the same real paths, the fixture's empty worker environment.
+    fn gate_key(machine: &MachineSettings, version: &str) -> crate::sandbox::VerificationKey {
+        let ambient =
+            |name: &str| std::env::var_os(name).map(|value| value.to_string_lossy().into_owned());
+        crate::sandbox::dispatch_key(&crate::sandbox::DispatchKeyInputs {
+            harness_version: version,
+            platform: "macos",
+            launch: &crate::sandbox::LaunchInputs {
+                settings: &machine.sandbox,
+                home: &crate::paths::home_dir().expect("a home"),
+                config_dir: &crate::paths::config_dir().expect("a config dir"),
+                ledger_path: &crate::paths::ledger_path().expect("a ledger path"),
+                env: &ambient,
+                launch_env_names: &[],
+                scratch: Path::new("/scratch"),
+            },
+            managed: &[],
+        })
+    }
+
+    /// A store at `path` holding one record for `key`.
+    fn store_with_record(path: &Path, key: &crate::sandbox::VerificationKey) {
+        let mut store = crate::sandbox::VerificationStore::load(path).expect("an empty store");
+        store.record(crate::sandbox::VerificationRecord {
+            key: key.as_str().to_string(),
+            verified_at: "2026-09-30T10:00:00Z".to_string(),
+            harness_version: crate::sandbox::SANDBOX_MIN_HARNESS.to_string(),
+            platform: "macos".to_string(),
+            report: vec!["✓ pipe: ok".to_string()],
+        });
+        store.save().expect("saved");
+    }
+
+    /// One run of a sandboxed machine on a passing host whose store is
+    /// `store`; the launches it made, and how it ended.
+    fn sandboxed_run(
+        fixture: &Fixture,
+        store: &Path,
+        harness_version: &str,
+    ) -> (RunOutcome, usize) {
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let mut machine = fixture.machine_for(&repo);
+        machine.sandbox.enabled = true;
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&launches);
+        let backend = MockBackend::new(move |spec| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).ok();
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        })
+        .reporting_version(harness_version);
+        let managed = fixture.dir.join("managed");
+        std::fs::create_dir_all(&managed).expect("managed root");
+        let host = PassingHost {
+            managed,
+            store: store.to_path_buf(),
+        };
+        let outcome = fixture.execute_with_host(
+            &fixture.contract(Review::Off),
+            &repo,
+            &machine,
+            &backend,
+            &host,
+        );
+        (outcome, launches.load(Ordering::SeqCst))
+    }
+
+    fn assert_unverified(outcome: &RunOutcome, launches: usize) -> String {
+        let Terminal::Blocked { code, detail } = &outcome.terminal else {
+            panic!("expected blocked, got {outcome:?}");
+        };
+        assert_eq!(*code, BlockCode::SandboxUnverified, "{detail}");
+        assert_eq!(launches, 0, "nothing launched before the gate");
+        detail.clone()
+    }
+
+    /// An enabled sandbox nobody has probed is refused, naming the command
+    /// that verifies it, before anything is launched.
+    #[test]
+    fn a_sandbox_without_a_record_blocks_before_any_launch() {
+        let fixture = Fixture::new();
+        let store = fixture.dir.join("verified.json");
+        let (outcome, launches) =
+            sandboxed_run(&fixture, &store, crate::sandbox::SANDBOX_MIN_HARNESS);
+        let detail = assert_unverified(&outcome, launches);
+        assert!(
+            detail.contains("relais doctor --verify-sandbox"),
+            "{detail}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A record for another configuration (here another harness version)
+    /// verifies nothing about this one.
+    #[test]
+    fn a_record_for_another_key_blocks() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let mut machine = fixture.machine_for(&repo);
+        machine.sandbox.enabled = true;
+        let store = fixture.dir.join("verified.json");
+        store_with_record(&store, &gate_key(&machine, "2.1.999"));
+        let (outcome, launches) =
+            sandboxed_run(&fixture, &store, crate::sandbox::SANDBOX_MIN_HARNESS);
+        assert_unverified(&outcome, launches);
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A store that cannot be read verifies nothing: fail closed.
+    #[test]
+    fn a_corrupt_store_blocks() {
+        let fixture = Fixture::new();
+        let store = fixture.dir.join("verified.json");
+        std::fs::write(&store, "{ not a store").expect("write");
+        let (outcome, launches) =
+            sandboxed_run(&fixture, &store, crate::sandbox::SANDBOX_MIN_HARNESS);
+        let detail = assert_unverified(&outcome, launches);
+        assert!(detail.contains("corrupt"), "{detail}");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// With a record for the matching key the run dispatches, and its
+    /// manifest names the key it was verified under.
+    #[test]
+    fn a_verified_sandbox_dispatches_and_the_manifest_carries_the_key() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let mut machine = fixture.machine_for(&repo);
+        machine.sandbox.enabled = true;
+        let key = gate_key(&machine, crate::sandbox::SANDBOX_MIN_HARNESS);
+        let store = fixture.dir.join("verified.json");
+        store_with_record(&store, &key);
+        let (outcome, launches) =
+            sandboxed_run(&fixture, &store, crate::sandbox::SANDBOX_MIN_HARNESS);
+        assert!(
+            matches!(outcome.terminal, Terminal::Accepted(_)),
+            "{outcome:?}"
+        );
+        assert!(launches > 0);
+        let manifest_path = find_file(&fixture.artifacts, "manifest.json").expect("a manifest");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("readable"))
+                .expect("json");
+        assert_eq!(manifest["sandbox"]["verified"], key.as_str());
+        std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
     /// With `[sandbox]` on and the preflight passing, the WORKER is
@@ -9763,7 +9975,12 @@ mod tests {
         .reporting_version(crate::sandbox::SANDBOX_MIN_HARNESS);
         let managed = fixture.dir.join("managed");
         std::fs::create_dir_all(&managed).expect("managed root");
-        let host = PassingHost { managed };
+        let store = fixture.dir.join("verified.json");
+        store_with_record(
+            &store,
+            &gate_key(&machine, crate::sandbox::SANDBOX_MIN_HARNESS),
+        );
+        let host = PassingHost { managed, store };
         let outcome = fixture.execute_with_host(
             &fixture.contract(Review::Required),
             &repo,

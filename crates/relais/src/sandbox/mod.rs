@@ -21,8 +21,15 @@
 //! asked to do and whether its transcript shows it, and
 //! [`VerificationStore`] keeps the passes by [`VerificationKey`].
 //!
-//! Nothing here launches anything; the runner wires these together.
+//! A sandboxed worker runs only on a configuration a probe has verified.
+//! [`dispatch_key`] names that configuration once, for the probe that
+//! records it ([`verify_sandbox`], behind `relais doctor --verify-sandbox`) and
+//! for the dispatch gate ([`dispatch_gate`]) that requires the record.
+//!
+//! Nothing here launches a session itself; the runner and the doctor wire
+//! the real launcher in.
 
+mod dispatch;
 mod floor;
 mod judge;
 mod launch;
@@ -30,16 +37,22 @@ mod preflight;
 mod probe;
 mod settings;
 mod verification;
+mod verify;
 
+pub use dispatch::{dispatch_gate, dispatch_key, DispatchKeyInputs, GateInputs};
 pub use floor::{credential_floor, Floor, FloorInputs};
 pub use judge::{judge_managed, judge_user_config, managed_sources, Weakening};
 pub use launch::{worker_launch, LaunchInputs, WorkerMode};
 pub use preflight::{
-    managed_root, preflight, PreflightInputs, RealSandboxHost, SandboxHost, SANDBOX_MIN_HARNESS,
+    managed_bytes, managed_root, preflight, weakenings, PreflightInputs, RealSandboxHost,
+    SandboxHost, SANDBOX_MIN_HARNESS,
 };
 pub use probe::{
     evaluate, probe_plan, probe_plan_allowlist, probe_prompt, Expect, ProbePlanInputs, ProbeReport,
     ProbeStep, ProbeTool, StepResult, Verdict,
 };
 pub use settings::{build_settings, SettingsInputs};
-pub use verification::{StoreError, VerificationKey, VerificationRecord, VerificationStore};
+pub use verification::{
+    store_path, StoreError, VerificationKey, VerificationRecord, VerificationStore,
+};
+pub use verify::{verify_sandbox, VerifyError, VerifyInputs, VerifyOutcome};

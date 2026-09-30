@@ -43,6 +43,8 @@ pub trait SandboxHost: Sync {
     fn extra_managed_root(&self) -> Option<std::path::PathBuf>;
     /// `~/.claude.json` under `home`.
     fn user_config(&self, home: &Path) -> std::path::PathBuf;
+    /// The file the verification records are kept in.
+    fn verification_store(&self) -> Result<std::path::PathBuf, crate::paths::HomeUnset>;
 }
 
 /// The machine relais runs on.
@@ -68,6 +70,10 @@ impl SandboxHost for RealSandboxHost {
     fn user_config(&self, home: &Path) -> std::path::PathBuf {
         home.join(".claude.json")
     }
+
+    fn verification_store(&self) -> Result<std::path::PathBuf, crate::paths::HomeUnset> {
+        crate::paths::state_dir().map(|dir| super::store_path(&dir))
+    }
 }
 
 /// Everything the sandbox preflight reads.
@@ -83,6 +89,11 @@ pub struct PreflightInputs<'a> {
     pub extra_managed_root: Option<&'a Path>,
     /// `~/.claude.json`.
     pub user_config: &'a Path,
+    /// The task worktree the worker will run in and the repository root:
+    /// the only two `projects.<path>` entries of `~/.claude.json` a worker
+    /// session reads.
+    pub worktree: &'a Path,
+    pub repo_root: &'a Path,
 }
 
 /// The first reason the sandbox cannot be relied on, or `None`.
@@ -158,10 +169,47 @@ pub fn helpers_blocker(platform: &str, on_path: &dyn Fn(&str) -> bool) -> Option
     })
 }
 
+/// The bytes of every managed file the preflight judges, each with the path
+/// it was read from: what a verification is keyed by, so a change to any
+/// of them is a change to the configuration that was probed.
+pub fn managed_bytes(
+    root: &Path,
+    extra_root: Option<&Path>,
+) -> Result<Vec<(PathBuf, Vec<u8>)>, String> {
+    let sources = managed_sources(root, extra_root)
+        .map_err(|(path, error)| format!("{} cannot be listed: {error}", path.display()))?;
+    sources
+        .into_iter()
+        .map(|source| match std::fs::read(&source) {
+            Ok(bytes) => Ok((source, bytes)),
+            Err(error) => Err(format!("{} cannot be read: {error}", source.display())),
+        })
+        .collect()
+}
+
 /// The managed roots and `~/.claude.json`, judged. A file that cannot be
 /// read or parsed is a finding, not an absence: only `NotFound` means
 /// there is nothing to judge.
 pub fn weakened_blocker(inputs: &PreflightInputs) -> Option<Blocker> {
+    weakenings(inputs).map(|found| {
+        let listed: Vec<String> = found
+            .iter()
+            .map(|w| format!("{}: {} — {}", w.source.display(), w.key, w.reason))
+            .collect();
+        Blocker {
+            code: BlockCode::SandboxWeakened,
+            detail: format!(
+                "the machine's Claude Code configuration would weaken the worker sandbox: {}. \
+                 Remove those settings, or turn `[sandbox]` off",
+                listed.join("; ")
+            ),
+        }
+    })
+}
+
+/// Every way the managed roots and `~/.claude.json` weaken the sandbox, or
+/// `None` when nothing does.
+pub fn weakenings(inputs: &PreflightInputs) -> Option<Vec<Weakening>> {
     let mut found: Vec<Weakening> = Vec::new();
     let mut settings = Vec::new();
     let mut mcp = Vec::new();
@@ -182,25 +230,11 @@ pub fn weakened_blocker(inputs: &PreflightInputs) -> Option<Blocker> {
         found.extend(weakenings);
     }
     match read_json(inputs.user_config) {
-        Ok(Some(doc)) => found.extend(judge_user_config(&doc)),
+        Ok(Some(doc)) => found.extend(judge_user_config(&doc, inputs.worktree, inputs.repo_root)),
         Ok(None) => {}
         Err(reason) => found.push(unreadable(inputs.user_config.to_path_buf(), &reason)),
     }
-    if found.is_empty() {
-        return None;
-    }
-    let listed: Vec<String> = found
-        .iter()
-        .map(|w| format!("{}: {} — {}", w.source.display(), w.key, w.reason))
-        .collect();
-    Some(Blocker {
-        code: BlockCode::SandboxWeakened,
-        detail: format!(
-            "the machine's Claude Code configuration would weaken the worker sandbox: {}. \
-             Remove those settings, or turn `[sandbox]` off",
-            listed.join("; ")
-        ),
-    })
+    (!found.is_empty()).then_some(found)
 }
 
 fn unreadable(source: PathBuf, reason: &str) -> Weakening {
@@ -298,6 +332,8 @@ mod tests {
             managed_root: real,
             extra_managed_root: extra,
             user_config,
+            worktree: Path::new("/p"),
+            repo_root: Path::new("/repo"),
         })
     }
 
@@ -429,6 +465,8 @@ mod tests {
             managed_root: &root,
             extra_managed_root: None,
             user_config: &root.join(".claude.json"),
+            worktree: Path::new("/p"),
+            repo_root: Path::new("/repo"),
         };
         let blocker = preflight(&inputs).expect("blocked");
         assert!(blocker.detail.contains("macOS and Linux only"));

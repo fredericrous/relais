@@ -162,8 +162,12 @@ the `network` domains you list. A credential floor (SSH, cloud, git, docker,
 cargo and Claude credentials, relais's own config and ledger) is never
 readable whatever you list. A run whose sandbox cannot be relied on ends
 `blocked (sandbox_unavailable)` or `blocked (sandbox_weakened)` before any
-worker starts; SPEC §8 has the launch, the checks and the scope of the
-guarantee.
+worker starts, and one whose sandbox no probe has verified ends
+`blocked (sandbox_unverified)`: run `relais doctor --verify-sandbox` (two
+short real sessions, a few cents) once per harness version, platform and
+sandbox configuration, and it records the pass the run then looks up.
+`relais doctor` shows where the sandbox stands. SPEC §8 has the launch, the
+checks, the verification and the scope of the guarantee.
 
 A verification worktree is a checkout of one revision and nothing else.
 In a repository whose dependencies live in the tree (npm, pnpm, yarn,

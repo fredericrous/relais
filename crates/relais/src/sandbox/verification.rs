@@ -25,6 +25,11 @@ const SCRATCH_PLACEHOLDER: &str = "<scratch>";
 /// about the new one.
 const PROBE_VERSION: u32 = 1;
 
+/// Where the records live under a state directory.
+pub fn store_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("sandbox").join("verified.json")
+}
+
 /// Hex SHA-256 of a verified configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationKey(String);

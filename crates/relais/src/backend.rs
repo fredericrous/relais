@@ -674,6 +674,13 @@ pub trait Backend {
     fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError>;
 }
 
+/// One probe session (SPEC §8, `relais doctor --verify-sandbox`): `spec`
+/// launched exactly as a worker is, except that the harness streams its
+/// transcript. Returns that stream (one JSON record per line).
+pub trait ProbeLauncher {
+    fn stream(&self, spec: &LaunchSpec) -> Result<String, BackendError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

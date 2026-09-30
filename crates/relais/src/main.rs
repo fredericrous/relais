@@ -87,13 +87,30 @@ enum Command {
         /// one real `claude -p` session through it, and write a
         /// compatibility record of what fired. Costs money and touches
         /// the network; never part of `make check`.
-        #[arg(long = "probe-hooks", conflicts_with = "effort_template")]
+        #[arg(
+            long = "probe-hooks",
+            conflicts_with_all = ["effort_template", "verify_sandbox"]
+        )]
         probe_hooks: bool,
+        /// Verify the worker OS sandbox with two real `claude -p` probe
+        /// sessions (a sandboxed worker's launch, and the allowlist
+        /// launch), and record the pass under the configuration it was
+        /// measured on; a sandboxed worker runs only on a recorded one.
+        /// Costs money (a few cents) and touches the network; never part
+        /// of `make check`.
+        #[arg(
+            long = "verify-sandbox",
+            conflicts_with_all = ["probe_hooks", "effort_template"]
+        )]
+        verify_sandbox: bool,
         /// Print the machine.toml block that states the effort facts
         /// `doctor` reports unknown: the CLI-accepted list pre-filled from
         /// `--help`, the model-support and order lines left for you to
         /// confirm.
-        #[arg(long = "effort-template", conflicts_with = "json")]
+        #[arg(
+            long = "effort-template",
+            conflicts_with_all = ["json", "verify_sandbox"]
+        )]
         effort_template: bool,
     },
     /// Create a relais.toml policy for this repository
@@ -770,11 +787,13 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
         Command::Doctor {
             json,
             probe_hooks,
+            verify_sandbox,
             effort_template,
-        } => match (probe_hooks, effort_template) {
-            (true, _) => doctor_probe_hooks_command(),
-            (false, true) => doctor_effort_template_command(),
-            (false, false) => doctor_command(json),
+        } => match (probe_hooks, verify_sandbox, effort_template) {
+            (true, _, _) => doctor_probe_hooks_command(),
+            (false, true, _) => doctor_verify_sandbox_command(),
+            (false, false, true) => doctor_effort_template_command(),
+            (false, false, false) => doctor_command(json),
         },
         Command::Hook { probe, record } => match (probe, record) {
             (true, Some(dir)) => hook_command(&dir),
@@ -2095,6 +2114,45 @@ fn doctor_effort_template_command() -> Result<CliOutcome, CliError> {
     let (_, policy) = load_repo_policy()?;
     print!("{}", doctor::effort_template_for(&policy));
     Ok(CliOutcome::Accepted)
+}
+
+/// `relais doctor --verify-sandbox`: two real probe sessions, and the
+/// record of a pass. With `[sandbox]` off nothing is launched and the
+/// answer is the exit-0 statement of that; a sandbox that cannot be relied
+/// on blocks (exit 3); a probe that fails or cannot run exits 1.
+fn doctor_verify_sandbox_command() -> Result<CliOutcome, CliError> {
+    let settings = match load_machine() {
+        Ok(machine) => machine.sandbox,
+        // No machine.toml: the sandbox is off, as for a run.
+        Err(CliError::Read { cause, .. }) if cause.kind() == std::io::ErrorKind::NotFound => {
+            relais::policy::SandboxSettings::default()
+        }
+        Err(other) => return Err(other),
+    };
+    match doctor::verify_sandbox_here(&settings, &project_dir()?) {
+        Ok(doctor::SandboxVerification::Off) => {
+            println!("the OS sandbox is off ([sandbox] enabled = false); nothing was launched");
+            Ok(CliOutcome::Accepted)
+        }
+        Ok(doctor::SandboxVerification::Blocked(blocker)) => {
+            println!(
+                "blocked ({}): {}; nothing was launched",
+                blocker.code, blocker.detail
+            );
+            Ok(CliOutcome::Blocked)
+        }
+        Ok(doctor::SandboxVerification::Ran(outcome)) => {
+            print!("{}", outcome.render());
+            match outcome.passed() {
+                true => Ok(CliOutcome::Accepted),
+                false => Ok(CliOutcome::OperationalFailure),
+            }
+        }
+        Err(why) => {
+            eprintln!("relais doctor --verify-sandbox: {why}");
+            Ok(CliOutcome::OperationalFailure)
+        }
+    }
 }
 
 /// `relais hook --probe --record <dir>`: the record-only handler

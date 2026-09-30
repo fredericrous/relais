@@ -15,15 +15,19 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::backend::Capabilities;
+use crate::backend::{Capabilities, LaunchEnv, ProbeLauncher};
 use crate::catalog::{self, Admissible, EffortCatalog, EffortSet, Fact};
 use crate::learn::drift::{alias_switches, AliasSwitch};
 use crate::orchestration::PriceTable;
 use crate::policy::{
-    Dependency, DependencyMode, EffortId, EffortSettings, MachineSettings, ModelProfile,
-    RepoPolicy, TrialEnvelope,
+    BlockCode, Blocker, Dependency, DependencyMode, EffortId, EffortSettings, MachineSettings,
+    ModelProfile, RepoPolicy, SandboxSettings, TrialEnvelope,
 };
 use crate::runner::live_trial;
+use crate::sandbox::{
+    self, PreflightInputs, RealSandboxHost, SandboxHost, VerifyInputs, VerifyOutcome, WorkerMode,
+};
+use crate::workspace::Git;
 use crate::{ledger::Ledger, paths};
 
 /// How bad one finding is. An enum rather than a string plus a parallel
@@ -265,6 +269,287 @@ pub fn policy_models(policy: &RepoPolicy) -> Vec<String> {
         }
     }
     models
+}
+
+/// What the `sandbox` finding reports about `[sandbox]` on this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SandboxStanding {
+    Off,
+    /// The reason the OS sandbox cannot be relied on here.
+    Unavailable(String),
+    /// Each weakening, as `source: key`.
+    Weakened(Vec<String>),
+    /// No probe session has verified the current configuration.
+    Unverified,
+    Verified {
+        harness_version: String,
+        platform: String,
+    },
+}
+
+/// What a sandboxed worker is and is not confined by, stated wherever the
+/// sandbox is on: the claim relais makes and no more.
+const SANDBOX_SCOPE: &str = "scope: Bash confined; file tools worktree+scratch; web/MCP none; \
+                             reads outside the floor machine-wide";
+
+/// The `sandbox` line of the report: `off`, `os, verified <harness> on
+/// <platform>` or one warning saying what to do, then the scope. Every line
+/// inside [`DETAIL_COLUMNS`].
+pub(crate) fn sandbox_finding(standing: &SandboxStanding) -> Finding {
+    let (level, text) = match standing {
+        SandboxStanding::Off => {
+            return Finding {
+                component: "sandbox",
+                level: Level::Ok,
+                detail: "off".to_string(),
+            }
+        }
+        SandboxStanding::Verified {
+            harness_version,
+            platform,
+        } => (
+            Level::Ok,
+            format!("os, verified {harness_version} on {platform}"),
+        ),
+        SandboxStanding::Unverified => (
+            Level::Warn,
+            "unverified — run relais doctor --verify-sandbox".to_string(),
+        ),
+        SandboxStanding::Weakened(found) => {
+            (Level::Warn, format!("weakened: {}", found.join("; ")))
+        }
+        SandboxStanding::Unavailable(reason) => (Level::Warn, format!("unavailable: {reason}")),
+    };
+    let mut lines = wrap(&text, DETAIL_COLUMNS, "");
+    lines.extend(wrap(SANDBOX_SCOPE, DETAIL_COLUMNS, "       "));
+    Finding {
+        component: "sandbox",
+        level,
+        detail: lines.join("\n"),
+    }
+}
+
+/// The machine paths every protected path of the sandbox is resolved from.
+fn sandbox_machine_paths() -> Result<(PathBuf, PathBuf, PathBuf), String> {
+    let unresolved = |e: paths::HomeUnset| {
+        format!("the sandbox cannot resolve the paths it protects ({e}); set HOME")
+    };
+    Ok((
+        paths::home_dir().map_err(unresolved)?,
+        paths::config_dir().map_err(unresolved)?,
+        paths::ledger_path().map_err(unresolved)?,
+    ))
+}
+
+/// Relais's own environment, as the credential floor reads it.
+fn ambient_env(name: &str) -> Option<String> {
+    std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
+}
+
+/// Where `[sandbox]` stands here: off, or the first thing that keeps a
+/// worker from running on it — the preflight's verdict, then the
+/// verification record for the configuration a dispatch would launch with.
+/// There is no task worktree, so the repository stands in for it.
+pub(crate) fn sandbox_standing(
+    host: &dyn SandboxHost,
+    settings: &SandboxSettings,
+    harness_version: Option<&str>,
+    repo_dir: &Path,
+    worker_env: &LaunchEnv,
+) -> SandboxStanding {
+    if WorkerMode::of(settings) == WorkerMode::Allowlist {
+        return SandboxStanding::Off;
+    }
+    let (home, config_dir, ledger_path) = match sandbox_machine_paths() {
+        Ok(found) => found,
+        Err(reason) => return SandboxStanding::Unavailable(reason),
+    };
+    let user_config = host.user_config(&home);
+    let managed_root = host.managed_root();
+    let extra_managed_root = host.extra_managed_root();
+    let platform = host.platform();
+    let preflight = PreflightInputs {
+        platform,
+        harness_version,
+        on_path: &|program| host.on_path(program),
+        managed_root: &managed_root,
+        extra_managed_root: extra_managed_root.as_deref(),
+        user_config: &user_config,
+        worktree: repo_dir,
+        repo_root: repo_dir,
+    };
+    if let Some(blocker) = sandbox::preflight(&preflight) {
+        return if blocker.code == BlockCode::SandboxWeakened {
+            let found = sandbox::weakenings(&preflight).unwrap_or_default();
+            SandboxStanding::Weakened(
+                found
+                    .iter()
+                    .map(|w| format!("{}: {}", w.source.display(), w.key))
+                    .collect(),
+            )
+        } else {
+            SandboxStanding::Unavailable(blocker.detail)
+        };
+    }
+    // The preflight refuses a harness version it cannot read.
+    let (Some(version), Ok(store)) = (harness_version, host.verification_store()) else {
+        return SandboxStanding::Unverified;
+    };
+    let names = worker_env.names();
+    let gate = sandbox::dispatch_gate(&sandbox::GateInputs {
+        store: &store,
+        harness_version: version,
+        platform,
+        launch: &sandbox::LaunchInputs {
+            settings,
+            home: &home,
+            config_dir: &config_dir,
+            ledger_path: &ledger_path,
+            env: &ambient_env,
+            launch_env_names: &names,
+            // Normalised out of the key: any path stands for a worker's.
+            scratch: Path::new("/relais-doctor-scratch"),
+        },
+        managed_root: &managed_root,
+        extra_managed_root: extra_managed_root.as_deref(),
+    });
+    match gate {
+        Ok(_) => SandboxStanding::Verified {
+            harness_version: version
+                .split_whitespace()
+                .next()
+                .unwrap_or(version)
+                .to_string(),
+            platform: platform.to_string(),
+        },
+        Err(_) => SandboxStanding::Unverified,
+    }
+}
+
+/// What `relais doctor --verify-sandbox` reads and runs, behind seams: the
+/// host, git, and whatever launches a probe session.
+pub struct VerifyWorld<'a> {
+    pub host: &'a dyn SandboxHost,
+    pub git: &'a dyn Git,
+    pub launcher: &'a dyn ProbeLauncher,
+    /// What the installed harness reported, when it answered.
+    pub capabilities: Option<&'a Capabilities>,
+    pub base_env: &'a LaunchEnv,
+    pub state_dir: &'a Path,
+    pub repo_dir: &'a Path,
+    /// Random hex, unique to this attempt.
+    pub nonce: &'a str,
+}
+
+/// How `--verify-sandbox` ended, short of a probe session that could not
+/// run at all.
+#[derive(Debug)]
+pub enum SandboxVerification {
+    /// `[sandbox]` is off: nothing was launched.
+    Off,
+    /// The sandbox cannot be relied on here: nothing was launched.
+    Blocked(Blocker),
+    /// Both probes ran; the record is written when both passed.
+    Ran(VerifyOutcome),
+}
+
+/// `relais doctor --verify-sandbox`: the preflight, then the two probe
+/// sessions. `Err` is a verification that could not be carried out.
+pub fn verify_sandbox_with(
+    world: &VerifyWorld,
+    settings: &SandboxSettings,
+) -> Result<SandboxVerification, String> {
+    if WorkerMode::of(settings) == WorkerMode::Allowlist {
+        return Ok(SandboxVerification::Off);
+    }
+    let host = world.host;
+    let (home, config_dir, ledger_path) = match sandbox_machine_paths() {
+        Ok(found) => found,
+        Err(detail) => {
+            return Ok(SandboxVerification::Blocked(Blocker {
+                code: BlockCode::SandboxUnavailable,
+                detail,
+            }))
+        }
+    };
+    let user_config = host.user_config(&home);
+    let managed_root = host.managed_root();
+    let extra_managed_root = host.extra_managed_root();
+    let harness_version = world.capabilities.and_then(|caps| caps.version.as_deref());
+    if let Some(blocker) = sandbox::preflight(&PreflightInputs {
+        platform: host.platform(),
+        harness_version,
+        on_path: &|program| host.on_path(program),
+        managed_root: &managed_root,
+        extra_managed_root: extra_managed_root.as_deref(),
+        user_config: &user_config,
+        worktree: world.repo_dir,
+        repo_root: world.repo_dir,
+    }) {
+        return Ok(SandboxVerification::Blocked(blocker));
+    }
+    let capabilities = world
+        .capabilities
+        .ok_or("the harness did not report its capabilities")?;
+    let managed = sandbox::managed_bytes(&managed_root, extra_managed_root.as_deref())?;
+    let verified_at = crate::ledger::now_rfc3339();
+    sandbox::verify_sandbox(
+        &VerifyInputs {
+            settings,
+            state_dir: world.state_dir,
+            nonce: world.nonce,
+            home: &home,
+            config_dir: &config_dir,
+            ledger_path: &ledger_path,
+            env: &ambient_env,
+            base_env: world.base_env,
+            capabilities,
+            platform: host.platform(),
+            managed: &managed,
+            verified_at: &verified_at,
+        },
+        world.git,
+        world.launcher,
+    )
+    .map(SandboxVerification::Ran)
+    .map_err(|e| e.to_string())
+}
+
+/// `relais doctor --verify-sandbox` on this machine: the real host, git,
+/// harness and state directory.
+pub fn verify_sandbox_here(
+    settings: &SandboxSettings,
+    repo_dir: &Path,
+) -> Result<SandboxVerification, String> {
+    let backend = crate::adapter::claude::ClaudeBackend::discover().map_err(|e| e.to_string())?;
+    // A probe that failed leaves no version, which the preflight reports as a block.
+    let capabilities = backend.probe_report().ok();
+    let state_dir = paths::state_dir().map_err(|e| e.to_string())?;
+    verify_sandbox_with(
+        &VerifyWorld {
+            host: &RealSandboxHost,
+            git: &crate::workspace::SystemGit,
+            launcher: &backend,
+            capabilities: capabilities.as_ref(),
+            base_env: &LaunchEnv::from_process_env(),
+            state_dir: &state_dir,
+            repo_dir,
+            nonce: &probe_nonce(),
+        },
+        settings,
+    )
+}
+
+/// Sixteen hex digits no two attempts share: the clock, this process and a
+/// stack address, hashed.
+fn probe_nonce() -> String {
+    let marker = 0u8;
+    // A clock before 1970 still leaves the process id and address to tell attempts apart.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let seed = format!("{nanos}-{}-{:p}", std::process::id(), &marker);
+    crate::ids::sha256_hex(seed.as_bytes())[..16].to_string()
 }
 
 /// Words wrapped to `width` columns; continuation lines start with
@@ -973,6 +1258,8 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
     // invalid states no effort fact, which is how the finding reads it.
     let mut effort_settings = EffortSettings::default();
     let mut max_effort = crate::policy::RoutingSettings::default().max_effort;
+    // Off unless a valid machine.toml turns it on, as for a run.
+    let mut sandbox_settings = SandboxSettings::default();
     match paths::machine_settings_path() {
         Err(e) => findings.push(Finding {
             component: "machine.toml",
@@ -1000,6 +1287,7 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
                     });
                     effort_settings = settings.efforts.clone();
                     max_effort = settings.routing.max_effort.clone();
+                    sandbox_settings = settings.sandbox.clone();
                     pricing = match &settings.pricing {
                         Some(table) => PricingConfig::Table(table.clone()),
                         None => PricingConfig::Unconfigured,
@@ -1019,6 +1307,14 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
             },
         },
     }
+
+    findings.push(sandbox_finding(&sandbox_standing(
+        &RealSandboxHost,
+        &sandbox_settings,
+        installed_claude_version.as_deref(),
+        repo_dir,
+        &LaunchEnv::from_process_env(),
+    )));
 
     if let Some(policy) = &policy {
         findings.push(effort_finding(
@@ -3078,5 +3374,238 @@ mod tests {
         );
         no_line_is_wider_than_80(&text);
         assert!(text.contains("level-13"), "{text}");
+    }
+
+    /// A host on `platform` with an empty managed root and no
+    /// `~/.claude.json`; its records live in `store`.
+    struct StandingHost {
+        platform: &'static str,
+        managed: PathBuf,
+        store: PathBuf,
+    }
+
+    impl SandboxHost for StandingHost {
+        fn platform(&self) -> &str {
+            self.platform
+        }
+        fn on_path(&self, _program: &str) -> bool {
+            true
+        }
+        fn managed_root(&self) -> PathBuf {
+            self.managed.clone()
+        }
+        fn extra_managed_root(&self) -> Option<PathBuf> {
+            None
+        }
+        fn user_config(&self, _home: &Path) -> PathBuf {
+            self.managed.join("no-such-claude.json")
+        }
+        fn verification_store(&self) -> Result<PathBuf, paths::HomeUnset> {
+            Ok(self.store.clone())
+        }
+    }
+
+    fn on() -> SandboxSettings {
+        SandboxSettings {
+            enabled: true,
+            ..SandboxSettings::default()
+        }
+    }
+
+    fn standing_of(host: &StandingHost, settings: &SandboxSettings) -> SandboxStanding {
+        sandbox_standing(
+            host,
+            settings,
+            Some("2.1.285 (Claude Code)"),
+            Path::new("/repo"),
+            &LaunchEnv::default(),
+        )
+    }
+
+    fn host(tag: &str, platform: &'static str) -> (crate::test_support::TempDir, StandingHost) {
+        let dir = crate::test_support::temp_dir(tag);
+        let managed = dir.join("managed");
+        std::fs::create_dir_all(&managed).expect("managed root");
+        let store = dir.join("verified.json");
+        let host = StandingHost {
+            platform,
+            managed,
+            store,
+        };
+        (dir, host)
+    }
+
+    #[test]
+    fn a_sandbox_that_is_off_says_so_and_nothing_else() {
+        let (_dir, host) = host("standing-off", "macos");
+        let standing = standing_of(&host, &SandboxSettings::default());
+        assert_eq!(standing, SandboxStanding::Off);
+        let finding = sandbox_finding(&standing);
+        assert_eq!((finding.level, finding.detail.as_str()), (Level::Ok, "off"));
+    }
+
+    #[test]
+    fn an_unavailable_platform_is_named_with_its_reason() {
+        let (_dir, host) = host("standing-unavailable", "windows");
+        let standing = standing_of(&host, &on());
+        let SandboxStanding::Unavailable(reason) = &standing else {
+            panic!("expected unavailable, got {standing:?}");
+        };
+        assert!(reason.contains("macOS and Linux only"), "{reason}");
+        let finding = sandbox_finding(&standing);
+        assert_eq!(finding.level, Level::Warn);
+        assert!(finding.detail.starts_with("unavailable: "), "{finding:?}");
+    }
+
+    #[test]
+    fn a_weakening_setting_is_named_by_source_and_key() {
+        let (_dir, host) = host("standing-weakened", "macos");
+        std::fs::write(
+            host.managed.join("managed-settings.json"),
+            r#"{"sandbox": {"allowUnsandboxedCommands": true}}"#,
+        )
+        .expect("write");
+        let standing = standing_of(&host, &on());
+        let SandboxStanding::Weakened(found) = &standing else {
+            panic!("expected weakened, got {standing:?}");
+        };
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].ends_with("managed-settings.json: sandbox.allowUnsandboxedCommands"),
+            "{found:?}"
+        );
+        // A path longer than the column budget wraps onto its own line.
+        assert!(sandbox_finding(&standing).detail.starts_with("weakened:"));
+    }
+
+    #[test]
+    fn a_configuration_nobody_probed_is_unverified_and_a_recorded_one_is_verified() {
+        let (_dir, host) = host("standing-verified", "macos");
+        let settings = on();
+        let standing = standing_of(&host, &settings);
+        assert_eq!(standing, SandboxStanding::Unverified);
+        let finding = sandbox_finding(&standing);
+        assert_eq!(finding.level, Level::Warn);
+        assert!(
+            finding
+                .detail
+                .starts_with("unverified — run relais doctor --verify-sandbox"),
+            "{finding:?}"
+        );
+
+        let key = sandbox::dispatch_key(&sandbox::DispatchKeyInputs {
+            harness_version: "2.1.285 (Claude Code)",
+            platform: "macos",
+            launch: &sandbox::LaunchInputs {
+                settings: &settings,
+                home: &paths::home_dir().expect("a home"),
+                config_dir: &paths::config_dir().expect("a config dir"),
+                ledger_path: &paths::ledger_path().expect("a ledger path"),
+                env: &ambient_env,
+                launch_env_names: &[],
+                scratch: Path::new("/some/other/scratch"),
+            },
+            managed: &[],
+        });
+        let mut store = sandbox::VerificationStore::load(&host.store).expect("empty");
+        store.record(sandbox::VerificationRecord {
+            key: key.as_str().to_string(),
+            verified_at: "2026-09-30T10:00:00Z".to_string(),
+            harness_version: "2.1.285 (Claude Code)".to_string(),
+            platform: "macos".to_string(),
+            report: Vec::new(),
+        });
+        store.save().expect("saved");
+
+        let standing = standing_of(&host, &settings);
+        let finding = sandbox_finding(&standing);
+        assert_eq!(finding.level, Level::Ok);
+        assert!(
+            finding
+                .detail
+                .starts_with("os, verified 2.1.285 on macos\nscope: "),
+            "{finding:?}"
+        );
+    }
+
+    #[test]
+    fn every_sandbox_line_fits_in_80_columns_and_states_the_scope() {
+        let long = "x".repeat(150);
+        for standing in [
+            SandboxStanding::Off,
+            SandboxStanding::Unavailable(long.replace('x', "word ")),
+            SandboxStanding::Weakened(vec![
+                "/Library/Application Support/ClaudeCode/managed-settings.json: sandbox.enabled"
+                    .to_string(),
+                "/home/someone/.claude.json: projects./repo.allowedTools".to_string(),
+            ]),
+            SandboxStanding::Unverified,
+            SandboxStanding::Verified {
+                harness_version: "2.1.285".to_string(),
+                platform: "macos".to_string(),
+            },
+        ] {
+            let text = rendered(sandbox_finding(&standing));
+            no_line_is_wider_than_80(&text);
+            // The scope wraps: read it as one sentence.
+            let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let scoped = flat.contains("Bash confined")
+                && flat.contains("worktree+scratch")
+                && flat.contains("web/MCP none")
+                && flat.contains("machine-wide");
+            assert_eq!(scoped, standing != SandboxStanding::Off, "{text}");
+        }
+    }
+
+    /// A launcher no `--verify-sandbox` that stops early may reach.
+    struct Unreachable;
+
+    impl ProbeLauncher for Unreachable {
+        fn stream(
+            &self,
+            _spec: &crate::backend::LaunchSpec,
+        ) -> Result<String, crate::backend::BackendError> {
+            panic!("a probe session was launched")
+        }
+    }
+
+    fn verified_with(
+        host: &StandingHost,
+        settings: &SandboxSettings,
+    ) -> Result<SandboxVerification, String> {
+        let caps = Capabilities {
+            version: Some("2.1.285".to_string()),
+            ..Capabilities::default()
+        };
+        verify_sandbox_with(
+            &VerifyWorld {
+                host,
+                git: &crate::workspace::SystemGit,
+                launcher: &Unreachable,
+                capabilities: Some(&caps),
+                base_env: &LaunchEnv::default(),
+                state_dir: Path::new("/state"),
+                repo_dir: Path::new("/repo"),
+                nonce: "abc",
+            },
+            settings,
+        )
+    }
+
+    #[test]
+    fn verifying_with_the_sandbox_off_launches_nothing_and_says_so() {
+        let (_dir, host) = host("verify-off", "macos");
+        let result = verified_with(&host, &SandboxSettings::default());
+        assert!(matches!(result, Ok(SandboxVerification::Off)), "{result:?}");
+    }
+
+    #[test]
+    fn verifying_where_the_preflight_blocks_launches_nothing() {
+        let (_dir, host) = host("verify-blocked", "windows");
+        let result = verified_with(&host, &on());
+        let Ok(SandboxVerification::Blocked(blocker)) = result else {
+            panic!("expected a block, got {result:?}");
+        };
+        assert_eq!(blocker.code, BlockCode::SandboxUnavailable);
     }
 }
