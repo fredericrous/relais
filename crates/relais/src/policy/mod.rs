@@ -2212,6 +2212,9 @@ keys = ["output.contract"]
         assert!(writable_check("~/work", home).is_ok());
     }
 
+    // Unix only: it makes a symlink with `std::os::unix`, and the OS
+    // sandbox these paths feed exists on macOS and Linux only.
+    #[cfg(unix)]
     #[test]
     fn a_symlink_to_a_floor_dir_is_refused_as_writable() {
         let scratch = crate::test_support::temp_dir("writable-alias");

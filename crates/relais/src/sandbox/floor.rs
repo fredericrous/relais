@@ -331,6 +331,9 @@ mod tests {
         assert!(floor.files.contains(&file));
     }
 
+    // Unix only: it makes a symlink with `std::os::unix`, and the OS
+    // sandbox these paths feed exists on macOS and Linux only.
+    #[cfg(unix)]
     #[test]
     fn a_symlink_alias_appears_in_both_forms() {
         let scratch = temp_dir("floor-alias");
