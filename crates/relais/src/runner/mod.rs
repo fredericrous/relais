@@ -4317,14 +4317,33 @@ fn read_attempt_transcript(
             .join(".claude"),
     };
     let path = sandbox::transcript_path(&config_dir, &scene.work_dir, session_id);
-    std::fs::read_to_string(&path)
-        .map_err(|e| format!("transcript unreadable at {}: {e}", path.display()))
+    let error = match std::fs::read_to_string(&path) {
+        Ok(text) => return Ok(text),
+        Err(error) => error,
+    };
+    // Claude Code's derivation of the slug from the cwd is not measured for
+    // a symlinked path (`/tmp` → `/private/tmp`): the canonical one is the
+    // second place to look.
+    if let Ok(canonical) = std::fs::canonicalize(&scene.work_dir) {
+        if canonical != scene.work_dir {
+            let other = sandbox::transcript_path(&config_dir, &canonical, session_id);
+            if let Ok(text) = std::fs::read_to_string(&other) {
+                return Ok(text);
+            }
+        }
+    }
+    Err(format!(
+        "transcript unreadable at {}: {error}",
+        path.display()
+    ))
 }
 
 /// The largest scratch file the denial scan reads.
 const SCRATCH_FILE_LIMIT: u64 = 1024 * 1024;
 
 /// The regular files directly in `scratch`, as `(path, text)`, by path. A
+/// symlink of any target is skipped — relais reads outside the sandbox, so
+/// following one would copy a file the worker chose into the evidence. A
 /// file over 1 MiB or not UTF-8 is skipped — it cannot be read line by
 /// line — and so is an unreadable directory: a scratch that cannot be
 /// scanned leaves the report as it is, it never stops the run.
@@ -4337,7 +4356,8 @@ fn scratch_files(scratch: &Path) -> Vec<(PathBuf, String)> {
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| {
-            std::fs::metadata(path)
+            // `symlink_metadata` does not follow: a link is not a regular file.
+            std::fs::symlink_metadata(path)
                 .is_ok_and(|meta| meta.is_file() && meta.len() <= SCRATCH_FILE_LIMIT)
         })
         .filter_map(|path| std::fs::read_to_string(&path).ok().map(|text| (path, text)))
@@ -10342,6 +10362,155 @@ mod tests {
         let kept = |n: u32| std::fs::read_to_string(dir.join(format!("scratch-{n}/log")));
         assert_eq!(kept(1).expect("first kept"), "round 1");
         assert_eq!(kept(2).expect("second kept"), "round 2");
+    }
+
+    /// A second dispatch of the same attempt index keeps the first one's
+    /// scratch as `scratch-1` and records its own report: two evidence rows
+    /// on two different files, each row's hash the hash of its file.
+    #[test]
+    fn a_redispatch_of_the_same_index_records_a_second_report() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let mut machine = fixture.machine_for(&repo);
+        machine.sandbox.enabled = true;
+        let contract = fixture.contract(Review::Off);
+        let backend = MockBackend::new(|_| MockOutcome::default());
+        let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
+            adr: "ADR-0001".into(),
+            choice: None,
+            reason: None,
+        };
+        let config = RunConfig {
+            repo_dir: &fixture.repo,
+            contract: &contract,
+            repo_policy: &repo,
+            machine: &machine,
+            ledger: &fixture.ledger,
+            ids: &fixture.ids,
+            backend: &backend,
+            git: &crate::workspace::SystemGit,
+            hooks: &crate::verify::FixedInventory(None),
+            attest: &crate::verify::FixedAttest::default(),
+            worker_env: crate::backend::LaunchEnv::default(),
+            sandbox_host: &crate::sandbox::RealSandboxHost,
+            artifacts_dir: fixture.artifacts.clone(),
+            aval_resolver: &resolver,
+            predictor: None,
+            gate: None,
+            session_id: "test-session".into(),
+            heartbeat_every: Duration::from_millis(50),
+            task_override: None,
+            purpose: None,
+            run_id: None,
+        };
+        let engine = RunEngine::new(&config, None).expect("an engine");
+        let task = crate::ids::TaskId::from_stored("redispatch-task");
+        fixture
+            .ledger
+            .insert_run(&engine.run_id, "/repo", None, &task, "rk")
+            .expect("run row");
+        let revision = fixture
+            .ledger
+            .insert_contract_revision(&engine.run_id, "hash", "{}", "HEAD", Some("sha"))
+            .expect("revision");
+        for round in 1..=2 {
+            let launch = engine
+                .sandbox_launch(1)
+                .expect("a launch")
+                .expect("sandboxed");
+            std::fs::write(
+                launch.scratch_dir.join("build.log"),
+                format!("round {round}: cp: Read-only file system\n"),
+            )
+            .expect("scratch log");
+            let attempt_id = fixture
+                .ledger
+                .insert_attempt(
+                    &engine.run_id,
+                    revision,
+                    1,
+                    "implementation",
+                    UsagePhase::Initial,
+                )
+                .expect("attempt row");
+            let scene = SandboxScene {
+                scratch: launch.scratch_dir.clone(),
+                work_dir: fixture.repo.clone(),
+                config_dir: None,
+            };
+            engine
+                .record_sandbox_denials(attempt_id, &scene, None)
+                .expect("recorded");
+        }
+        let rows = evidence_of(&fixture, &engine.run_id, EvidenceKind::SandboxDenials);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_ne!(rows[0].0, rows[1].0, "two dispatches, two files");
+        for (path, sha256) in &rows {
+            assert!(Path::new(path).is_file(), "{path} exists");
+            assert_eq!(
+                &workspace::sha256_file(Path::new(path)).expect("hashable"),
+                sha256,
+                "{path} still has the hash its row stored"
+            );
+        }
+        let kept = engine.artifacts.join("attempts/1/scratch-1/build.log");
+        assert!(kept.is_file(), "the first dispatch's scratch survives");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// The scratch scan reads regular files only: a symlink the worker
+    /// planted, whatever it points at, contributes nothing.
+    // Unix only: creating a symlink is `std::os::unix::fs::symlink`.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_the_scratch_dir_is_never_followed() {
+        let dir = crate::test_support::temp_dir("scratch-symlink");
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, "secret: Operation not permitted\n").expect("target");
+        let scratch = dir.join("scratch");
+        std::fs::create_dir_all(&scratch).expect("scratch");
+        std::os::unix::fs::symlink(&outside, scratch.join("planted.log")).expect("symlink");
+        std::fs::write(scratch.join("real.log"), "Operation not permitted\n").expect("regular");
+        let files = scratch_files(&scratch);
+        let names: Vec<_> = files
+            .iter()
+            .map(|(path, _)| path.file_name().expect("a name").to_string_lossy())
+            .collect();
+        assert_eq!(names, ["real.log"], "{files:?}");
+        let report = sandbox::scan(None, &files);
+        assert_eq!(report.suspected.len(), 1, "{report:?}");
+        assert_eq!(report.suspected[0].source, "real.log");
+    }
+
+    /// A transcript that is not under the slug of the work dir as given is
+    /// looked for under the slug of its canonical path.
+    // Unix only: creating a symlink is `std::os::unix::fs::symlink`.
+    #[cfg(unix)]
+    #[test]
+    fn the_transcript_is_found_under_the_canonical_slug() {
+        let dir = crate::test_support::temp_dir("transcript-canonical");
+        let root = std::fs::canonicalize(&*dir).expect("canonical temp dir");
+        let real = root.join("real");
+        let link = root.join("link");
+        std::fs::create_dir_all(&real).expect("real work dir");
+        std::os::unix::fs::symlink(&real, &link).expect("symlinked work dir");
+        let config_dir = root.join("claude");
+        let canonical_path = sandbox::transcript_path(&config_dir, &real, "sess");
+        std::fs::create_dir_all(canonical_path.parent().expect("a slug dir")).expect("slug dir");
+        std::fs::write(&canonical_path, "{}").expect("transcript");
+        assert!(
+            !sandbox::transcript_path(&config_dir, &link, "sess").exists(),
+            "nothing under the slug as given"
+        );
+        let scene = SandboxScene {
+            scratch: root.join("scratch"),
+            work_dir: link,
+            config_dir: Some(config_dir.to_string_lossy().into_owned()),
+        };
+        assert_eq!(
+            read_attempt_transcript(&scene, Some("sess")),
+            Ok("{}".to_string())
+        );
     }
 
     /// With `[sandbox]` off the worker is launched as it always was, plus

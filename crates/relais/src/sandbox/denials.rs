@@ -89,11 +89,11 @@ fn reads_as_refusal(line: &str) -> bool {
         .any(|needle| line.contains(needle))
 }
 
-/// Sorts the lines of one text into `report`, each under `source`.
-/// `in_block` says whether `<sandbox_violations>` is open: only a network
-/// denial inside it is verified, and a line is never both.
-fn sort_lines(text: &str, source: &str, in_block: bool, report: &mut DenialReport) {
-    let mut in_block = in_block;
+/// Sorts the lines of one text into `report`, each under `source`. Only a
+/// network denial inside a `<sandbox_violations>` block is verified, and a
+/// line is never both.
+fn sort_lines(text: &str, source: &str, report: &mut DenialReport) {
+    let mut in_block = false;
     for line in text.lines() {
         if line.contains(VIOLATIONS_OPEN) {
             in_block = true;
@@ -113,8 +113,11 @@ fn sort_lines(text: &str, source: &str, in_block: bool, report: &mut DenialRepor
     }
 }
 
+/// The text of a result's `content`; a result with none holds no denial
+/// line, and content of any other shape is unreadable (`None`).
 fn result_text(content: Option<&Value>) -> Option<String> {
     match content {
+        None => Some(String::new()),
         Some(Value::String(text)) => Some(text.clone()),
         // An item with no text (an image) holds no denial line.
         Some(Value::Array(items)) => Some(
@@ -124,7 +127,7 @@ fn result_text(content: Option<&Value>) -> Option<String> {
                 .collect::<Vec<_>>()
                 .join("\n"),
         ),
-        Some(_) | None => None,
+        Some(_) => None,
     }
 }
 
@@ -172,7 +175,7 @@ fn read_item(item: &Value, transcript: &mut Transcript, report: &mut DenialRepor
             };
             *transcript.results.entry(id.to_string()).or_insert(0) += 1;
             match result_text(item.get("content")) {
-                Some(text) => sort_lines(&text, &format!("tool_result:{id}"), false, report),
+                Some(text) => sort_lines(&text, &format!("tool_result:{id}"), report),
                 None => transcript.flag(format!("line {line_no}: tool_result {id} has no text")),
             }
         }
@@ -222,7 +225,7 @@ pub fn scan(transcript_jsonl: Option<&str>, scratch_files: &[(PathBuf, String)])
         let name = path
             .file_name()
             .map_or_else(|| path.to_string_lossy(), |name| name.to_string_lossy());
-        sort_lines(text, &name, false, &mut report);
+        sort_lines(text, &name, &mut report);
     }
     report
 }
@@ -238,6 +241,12 @@ impl Coverage {
 }
 
 impl DenialReport {
+    /// The line said for a recorded report that cannot be read, within 80
+    /// columns.
+    pub fn render_unreadable(why: &str) -> String {
+        clip(&format!("sandbox denials: unreadable ({why})"))
+    }
+
     /// The summary line, then up to five lines of each kind, each within
     /// 80 columns.
     pub fn render(&self) -> String {
@@ -384,6 +393,36 @@ mod tests {
             reason.contains("t1") && reason.contains("2 tool_results"),
             "{reason}"
         );
+    }
+
+    #[test]
+    fn a_tool_result_with_no_content_is_empty_text_not_incomplete() {
+        let bare = line(serde_json::json!({"message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t1"}
+        ]}}));
+        let jsonl = transcript(&[tool_use("t1"), bare]);
+        let report = scan(Some(&jsonl), &[]);
+        assert_eq!(report.coverage, Coverage::Complete, "{report:?}");
+        assert!(report.verified.is_empty() && report.suspected.is_empty());
+    }
+
+    #[test]
+    fn a_tool_result_with_content_of_another_shape_is_incomplete() {
+        let odd = line(serde_json::json!({"message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": 7}
+        ]}}));
+        let jsonl = transcript(&[tool_use("t1"), odd]);
+        assert!(matches!(
+            scan(Some(&jsonl), &[]).coverage,
+            Coverage::Incomplete(_)
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_report_line_is_within_80_columns() {
+        let rendered = DenialReport::render_unreadable(&"e".repeat(300));
+        assert_eq!(rendered.chars().count(), 80, "{rendered}");
+        assert!(rendered.starts_with("sandbox denials: unreadable ("));
     }
 
     #[test]
