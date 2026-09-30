@@ -10458,6 +10458,104 @@ mod tests {
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
+    /// SPEC §11: a dispatch's cost is recorded however the attempt ends. The
+    /// denial report is written after the usage row, so a report that
+    /// cannot be written fails the attempt without losing the dispatch's cost.
+    // Unix only: the report is made unwritable with `PermissionsExt` mode bits.
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_denial_report_does_not_lose_the_dispatch_usage() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Arc, Mutex};
+
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let mut machine = fixture.machine_for(&repo);
+        machine.sandbox.enabled = true;
+        // Unlocks whatever the mock locked on every exit, a panic inside
+        // the run included, so the fixture dir can always be removed.
+        struct Unlock(Arc<Mutex<Option<PathBuf>>>);
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                // A poisoned lock still holds the path; take it either way.
+                let mut held = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+                if let Some(attempts) = held.take() {
+                    // Best effort in a destructor: a failure leaves only a
+                    // test fixture behind, and the asserts already ran.
+                    std::fs::set_permissions(&attempts, std::fs::Permissions::from_mode(0o755))
+                        .ok();
+                }
+            }
+        }
+
+        let locked: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
+        let worker_locked = Arc::clone(&locked);
+        let unlock = Unlock(Arc::clone(&locked));
+        let backend = MockBackend::new(move |spec| {
+            if let Some(launch) = &spec.sandbox {
+                // scratch is `<run>/attempts/<n>/scratch`: lock `attempts`,
+                // which already exists, so only the report write fails.
+                let attempts = launch
+                    .scratch_dir
+                    .parent()
+                    .and_then(Path::parent)
+                    .expect("the attempts dir")
+                    .to_path_buf();
+                std::fs::set_permissions(&attempts, std::fs::Permissions::from_mode(0o555))
+                    .expect("lock attempts");
+                *worker_locked.lock().expect("lock") = Some(attempts);
+            }
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        })
+        .reporting_version(crate::sandbox::SANDBOX_MIN_HARNESS);
+        let managed = fixture.dir.join("managed");
+        std::fs::create_dir_all(&managed).expect("managed root");
+        let store = fixture.dir.join("verified.json");
+        let env = crate::backend::LaunchEnv::default();
+        store_with_record(
+            &store,
+            &gate_key_with_env(&machine, crate::sandbox::SANDBOX_MIN_HARNESS, &env.names()),
+        );
+        let host = PassingHost { managed, store };
+        let outcome = fixture.execute_with_env(
+            &fixture.contract(Review::Off),
+            &repo,
+            &machine,
+            &backend,
+            &host,
+            env,
+        );
+        assert!(
+            locked.lock().expect("lock").is_some(),
+            "the sandboxed dispatch locked the attempts dir"
+        );
+        drop(unlock);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Interrupted { detail },
+        } = outcome
+        else {
+            panic!("the report write must have interrupted the run, got {outcome:?}");
+        };
+        assert!(detail.contains("the runner could not continue"), "{detail}");
+        assert!(
+            evidence_of(&fixture, &run_id, EvidenceKind::SandboxDenials).is_empty(),
+            "no report was recorded"
+        );
+        assert_eq!(
+            fixture.ledger.run_cost(&run_id).expect("cost"),
+            MicroUsd::from_micros(100),
+            "the dispatch's usage is in the ledger"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
     /// The scratch scan reads regular files only: a symlink the worker
     /// planted, whatever it points at, contributes nothing.
     // Unix only: creating a symlink is `std::os::unix::fs::symlink`.
