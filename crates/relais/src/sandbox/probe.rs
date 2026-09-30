@@ -91,8 +91,13 @@ pub(crate) const PERMISSION_REFUSALS: [&str; 3] = [
 pub(crate) const LEAK_MARKERS: [&str; 2] = ["PRESENT", "READABLE"];
 const GREP_PATTERN: &str = "relais-probe";
 const SOCKET_BOUND: &str = "unix-socket-bound";
+/// The bind step's program. It checks `$TMPDIR` itself, in Python: the
+/// harness asks for approval of a shell `case` (measured on 2.1.286,
+/// "Contains case_statement"), and a probe step that needs approval fails.
 const SOCKET_BIND: &str = "import os,socket;\
-     socket.socket(socket.AF_UNIX).bind(os.environ[\"TMPDIR\"]+\"/sock/s\");\
+     d=os.environ[\"TMPDIR\"];\
+     assert d.startswith(\"/tmp/rl-\"),\"fallback TMPDIR \"+d;\
+     socket.socket(socket.AF_UNIX).bind(d+\"/sock/s\");\
      print(\"unix-socket-bound\")";
 const PRESENCE: &str = ">/dev/null && echo PRESENT || echo absent";
 
@@ -150,13 +155,14 @@ pub fn probe_plan(inputs: &ProbePlanInputs) -> Result<Vec<ProbeStep>, String> {
         ),
         // A worker's own tests bind Unix sockets under `$TMPDIR`; the
         // scratch grant must cover a bind through the short link. The marker
-        // is printed only when `$TMPDIR` is under `/tmp/rl-`: Claude Code
-        // falls back to `/tmp/claude-<uid>` silently when the link it was
-        // given is unusable, and that is a failed verification.
+        // is printed only when `$TMPDIR` is under `/tmp/rl-` (checked in the
+        // program): Claude Code falls back to `/tmp/claude-<uid>` silently
+        // when the link it was given is unusable, and that is a failed
+        // verification.
         bash(
             "unix-socket",
             format!(
-                "case \"$TMPDIR\" in /tmp/rl-*) mkdir -p \"$TMPDIR/sock\" && python3 -c {} ;; esac",
+                "mkdir -p \"$TMPDIR/sock\" && python3 -c {}",
                 sh_quote(SOCKET_BIND)
             ),
             line(SOCKET_BOUND),
@@ -1196,17 +1202,21 @@ mod tests {
         );
         let input = |id: &str| steps.iter().find(|s| s.id == id).unwrap().input.clone();
         let bind = input("unix-socket");
-        assert!(bind.starts_with("case \"$TMPDIR\" in /tmp/rl-*) mkdir -p \"$TMPDIR/sock\" && "));
-        assert!(bind.contains("AF_UNIX") && bind.ends_with(" ;; esac"));
-        // The marker is what the step expects, and it is printed only inside
-        // the `/tmp/rl-*` branch, so a fallback `$TMPDIR` cannot show it.
+        assert!(bind.starts_with("mkdir -p \"$TMPDIR/sock\" && python3 -c "));
+        assert!(bind.contains("AF_UNIX"));
+        assert!(
+            !bind.contains("case "),
+            "the harness asks approval for a case"
+        );
+        // The marker is what the step expects, and the program prints it only
+        // after asserting `$TMPDIR` is under `/tmp/rl-`, so a fallback cannot.
         let expect = |id: &str| steps.iter().find(|s| s.id == id).unwrap().expect.clone();
         assert_eq!(
             expect("unix-socket"),
             Expect::OutputLine(SOCKET_BOUND.to_string())
         );
         assert_eq!(bind.matches(SOCKET_BOUND).count(), 1);
-        assert!(bind.find(SOCKET_BOUND) > bind.find("/tmp/rl-*)"));
+        assert!(bind.find(SOCKET_BOUND) > bind.find("startswith(\"/tmp/rl-\")"));
         assert_eq!(input("tmp-write"), "touch /tmp/relais-probe-n1");
         assert_eq!(input("home-write"), "touch '/home/u/relais-probe-n1'");
         assert_eq!(
