@@ -29,7 +29,7 @@ use crate::admission::{
     BindOutcome, Decision, DispatchRequest, DispatchSource, Gate, GateError, Refusal,
     ReleaseWriteOutcome, ResourceClass, RunRegistration, WriteLeaseOutcome,
 };
-use crate::backend::{Backend, LaunchResult, LaunchSpec};
+use crate::backend::{Backend, LaunchResult, LaunchSpec, SandboxLaunch};
 use crate::context::{self, ContextError, ContextManifest};
 use crate::contract::{Review, TaskContract};
 use crate::ids::{derive_task_id, DispatchId, PackageId, Pid, RunId};
@@ -44,6 +44,7 @@ use crate::procs::Ended;
 use crate::route::{
     route, Recipe, Route, RouteInputs, RoutePredictor, Routed, RoutedBy, RungIndex,
 };
+use crate::sandbox::{self, WorkerMode};
 use crate::verify::{self, amont_gaps, Receipt, VerificationReport};
 use crate::workspace::{self, TaskWorktree, WorkspaceError};
 
@@ -1357,6 +1358,13 @@ impl<'a> RunEngine<'a> {
         // efforts the CLI accepts are the same answer about the same
         // installed harness.
         let capabilities = self.config.backend.probe();
+        // A sandboxed worker is launched confined, or not launched: the
+        // check runs before anything is assembled or dispatched.
+        if let Some(blocker) = self.sandbox_blocker(capabilities.as_ref()) {
+            return Ok(Phase::Ended(
+                self.fail_preflight(blocker.code, blocker.detail)?,
+            ));
+        }
         let manifest = match self.assemble_context(
             &authority,
             &contract_hash,
@@ -1411,6 +1419,76 @@ impl<'a> RunEngine<'a> {
         }))
     }
 
+    /// Whether the OS sandbox can be relied on here, when `[sandbox]` asks
+    /// for it: the real platform, harness version, PATH and managed
+    /// configuration, read at this boundary and judged by
+    /// [`sandbox::preflight`].
+    fn sandbox_blocker(
+        &self,
+        capabilities: Option<&crate::backend::Capabilities>,
+    ) -> Option<crate::policy::Blocker> {
+        if WorkerMode::of(&self.config.machine.sandbox) == WorkerMode::Allowlist {
+            return None;
+        }
+        let platform = std::env::consts::OS;
+        // Every path the launch needs is resolved HERE, so an unresolvable
+        // one is a preflight block with something to do, not an internal
+        // error at dispatch after the preflight passed.
+        let home = match sandbox_home(
+            crate::paths::home_dir(),
+            crate::paths::config_dir(),
+            crate::paths::ledger_path(),
+        ) {
+            Ok(home) => home,
+            Err(blocker) => return Some(blocker),
+        };
+        let user_config = home.join(".claude.json");
+        let managed = PathBuf::from(sandbox::managed_root(platform));
+        let extra_managed = std::env::var_os("RELAIS_TEST_MANAGED_ROOT").map(PathBuf::from);
+        sandbox::preflight(&sandbox::PreflightInputs {
+            platform,
+            harness_version: capabilities.and_then(|caps| caps.version.as_deref()),
+            on_path: &crate::tooling::binary_available,
+            managed_root: &managed,
+            extra_managed_root: extra_managed.as_deref(),
+            user_config: &user_config,
+        })
+    }
+
+    /// The sandbox launch for this worker attempt, with a fresh scratch
+    /// directory under the run's own: `<state_dir>/runs/<run>/attempts/<n>/
+    /// scratch`. `None` in allowlist mode.
+    fn sandbox_launch(&self, attempt_index: u32) -> Result<Option<SandboxLaunch>, RunError> {
+        let settings = &self.config.machine.sandbox;
+        if WorkerMode::of(settings) == WorkerMode::Allowlist {
+            return Ok(None);
+        }
+        let home_unset = |e: crate::paths::HomeUnset| RunError::Other(e.to_string());
+        let scratch = self
+            .artifacts
+            .join("attempts")
+            .join(attempt_index.to_string())
+            .join("scratch");
+        // Fresh: a retry of the same attempt must not inherit the last
+        // one's leftovers. Nothing to remove the first time.
+        match std::fs::remove_dir_all(&scratch) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        std::fs::create_dir_all(&scratch)?;
+        let ambient = |name: &str| std::env::var(name).ok();
+        Ok(Some(sandbox::worker_launch(&sandbox::LaunchInputs {
+            settings,
+            home: &crate::paths::home_dir().map_err(home_unset)?,
+            config_dir: &crate::paths::config_dir().map_err(home_unset)?,
+            ledger_path: &crate::paths::ledger_path().map_err(home_unset)?,
+            env: &ambient,
+            launch_env_names: &self.config.worker_env.names(),
+            scratch: &scratch,
+        })))
+    }
+
     /// Context: verdicts and tool failures are distinct, contradictions
     /// block, missing answers gate dependents only (SPEC §7). The
     /// assembled package is evidence, written next to the run and
@@ -1439,6 +1517,14 @@ impl<'a> RunEngine<'a> {
                 )?))
             }
         };
+        let attempts_dir = self.artifacts.join("attempts");
+        let launched_env = crate::backend::worker_env_with(
+            &self.config.worker_env,
+            match WorkerMode::of(&self.config.machine.sandbox) {
+                WorkerMode::Sandbox => Some(attempts_dir.as_path()),
+                WorkerMode::Allowlist => None,
+            },
+        );
         let assembled = context::assemble(context::ContextInputs {
             contract: self.config.contract,
             repo: self.config.repo_policy,
@@ -1457,7 +1543,13 @@ impl<'a> RunEngine<'a> {
             turn_ceiling: capabilities
                 .map(crate::backend::Capabilities::turn_ceiling)
                 .unwrap_or_default(),
-            worker_env: &self.config.worker_env,
+            mode: WorkerMode::of(&self.config.machine.sandbox),
+            // The env the worker is LAUNCHED with, not the base it is
+            // built from: the mode adds the scrub or `TMPDIR` and may
+            // remove an ambient scrub, and the manifest names exactly what
+            // the worker process was given (V4). The per-attempt scratch
+            // path differs from this one, but only names are recorded.
+            worker_env: &launched_env,
             resolver: self.config.aval_resolver,
         });
         match assembled {
@@ -1861,6 +1953,9 @@ impl<'a> RunEngine<'a> {
             .spending
             .per_run_micros
             .map(|ceiling| ceiling.remaining_after(progress.spend.total).to_micros());
+        // The worker alone is sandboxed: the reviewer and the planner
+        // keep the launch they had.
+        let sandbox = self.sandbox_launch(index)?;
         let spec = LaunchSpec {
             dispatch_id: dispatch_id.as_str().to_string(),
             prompt,
@@ -1871,10 +1966,11 @@ impl<'a> RunEngine<'a> {
             disallowed_tools: authority.disallowed_tools.clone(),
             allowed_tools: authority.allowed_tools.clone(),
             work_dir: ctx.worktree_path.to_path_buf(),
-            env: self.config.worker_env.clone(),
+            env: crate::backend::worker_launch_env(&self.config.worker_env, sandbox.as_ref()),
             wall_timeout: remaining_wall,
             cancel: None,
             pid_slot: None,
+            sandbox,
         };
 
         let requested_model = model_profile.id.clone();
@@ -3428,6 +3524,7 @@ impl<'a> RunEngine<'a> {
                 .max(REVIEW_MIN_WALL),
             cancel: None,
             pid_slot: None,
+            sandbox: None,
         };
         let recorded = self.config.ledger.record_dispatch_intent(
             &dispatch_id,
@@ -3809,6 +3906,39 @@ pub(crate) fn reviewer_tier(
     Some((tier, same_model))
 }
 
+/// The worker's rules. The prohibitions are the same in both modes; what
+/// differs is how commands are run and where output goes, because a
+/// sandboxed Bash is bounded by the OS rather than by matching the command
+/// string.
+fn worker_rules(mode: WorkerMode) -> String {
+    let how_to_work = match mode {
+        WorkerMode::Allowlist => {
+            "run each command as a single plain invocation: no pipes (`|`), redirects,\n\
+             `;`, `&&`, `$(…)`, or leading `VAR=value` prefixes. Permission rules are\n\
+             matched against the raw command string, so `make check | tail` or\n\
+             `MSRV_SKIP_OK=1 make check` is refused even when `make` is allowed.\n\
+             edit files with your file-editing tools, never with `sed -i`, heredocs\n\
+             or inline scripts, and never copy files to /tmp: those are refused too.\n\
+             you cannot spawn subagents, and you should not leave scratch files.\n"
+        }
+        WorkerMode::Sandbox => {
+            "commands run in an OS sandbox, so pipes, redirects and `&&` work.\n\
+             write logs and scratch output under $TMPDIR (your scratch dir), never in\n\
+             this directory or /tmp. writes elsewhere, and requests to hosts that are\n\
+             not listed, fail. `git -C`, `sh -c`, leading `VAR=value` prefixes and\n\
+             loops over shell-assigned variables are still refused.\n\
+             you cannot spawn subagents.\n"
+        }
+    };
+    format!(
+        "\nrules: you cannot commit, merge, push or publish; do not modify policy,\n\
+         verification commands or fixtures; work only in this directory.\n\
+         finish with a line starting DONE when you believe the criteria are met,\n\
+         or relais-blocked: <reason> when something outside the task blocks you.\n\
+         {how_to_work}"
+    )
+}
+
 fn build_prompt(
     contract: &TaskContract,
     manifest: &ContextManifest,
@@ -3850,19 +3980,12 @@ fn build_prompt(
         "verification profile: {} ({verification_commands} command(s) judge the result)\n",
         contract.verification_profile
     ));
-    prompt.push_str(
-        "\nrules: you cannot commit, merge, push or publish; do not modify policy,\n\
-         verification commands or fixtures; work only in this directory.\n\
-         finish with a line starting DONE when you believe the criteria are met,\n\
-         or relais-blocked: <reason> when something outside the task blocks you.\n\
-         run each command as a single plain invocation: no pipes (`|`), redirects,\n\
-         `;`, `&&`, `$(…)`, or leading `VAR=value` prefixes. Permission rules are\n\
-         matched against the raw command string, so `make check | tail` or\n\
-         `MSRV_SKIP_OK=1 make check` is refused even when `make` is allowed.\n\
-         edit files with your file-editing tools, never with `sed -i`, heredocs\n\
-         or inline scripts, and never copy files to /tmp: those are refused too.\n\
-         you cannot spawn subagents, and you should not leave scratch files.\n",
-    );
+    let mode = if manifest.sandbox.requested {
+        WorkerMode::Sandbox
+    } else {
+        WorkerMode::Allowlist
+    };
+    prompt.push_str(&worker_rules(mode));
     if let Some(failures) = previous_failures {
         match kind {
             AttemptKind::Repair => {
@@ -4038,8 +4161,46 @@ fn unrunnable_baseline_detail(
     detail
 }
 
+/// The home the sandbox launch resolves every protected path from, or the
+/// preflight block when any of them cannot be resolved: an unresolvable
+/// path is a block with something to do, never an internal error at
+/// dispatch after the preflight passed.
+fn sandbox_home(
+    home: Result<PathBuf, crate::paths::HomeUnset>,
+    config_dir: Result<PathBuf, crate::paths::HomeUnset>,
+    ledger_path: Result<PathBuf, crate::paths::HomeUnset>,
+) -> Result<PathBuf, crate::policy::Blocker> {
+    match (home, config_dir, ledger_path) {
+        (Ok(home), Ok(_), Ok(_)) => Ok(home),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(crate::policy::Blocker {
+            code: BlockCode::SandboxUnavailable,
+            detail: format!(
+                "the sandbox cannot resolve the paths it protects ({e}); set HOME, or turn \
+                 [sandbox] off on this machine"
+            ),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// No resolvable home is a `SandboxUnavailable` block at preflight,
+    /// not an internal error at dispatch.
+    #[test]
+    fn an_unresolvable_home_blocks_the_sandbox_at_preflight() {
+        let ok = || Ok(PathBuf::from("/h"));
+        let blocker =
+            sandbox_home(Err(crate::paths::HomeUnset), ok(), ok()).expect_err("no home blocks");
+        assert_eq!(blocker.code, BlockCode::SandboxUnavailable);
+        let blocker = sandbox_home(ok(), ok(), Err(crate::paths::HomeUnset))
+            .expect_err("no ledger path blocks");
+        assert_eq!(blocker.code, BlockCode::SandboxUnavailable);
+        assert_eq!(
+            sandbox_home(ok(), ok(), ok()).expect("resolves"),
+            PathBuf::from("/h")
+        );
+    }
+
     use super::*;
     use crate::adapter::{MockBackend, MockOutcome};
     use crate::context::AvalVerdict;
@@ -8348,7 +8509,71 @@ mod tests {
             budget_bytes: 100_000,
             package_bytes: 0,
             turn_ceiling: crate::backend::TurnCeiling::Unavailable.as_str().into(),
+            sandbox: Default::default(),
+            confinement: Default::default(),
+            env_protection: String::new(),
         }
+    }
+
+    /// The prompt's rules paragraph, from `rules:` to the end.
+    fn rules_of(prompt: &str) -> &str {
+        let at = prompt.find("\nrules:").expect("a rules paragraph");
+        &prompt[at..]
+    }
+
+    #[test]
+    fn the_allowlist_rules_are_pinned() {
+        let fixture = Fixture::new();
+        let contract = fixture.contract(Review::Off);
+        let prompt = build_prompt(
+            &contract,
+            &manifest_with(Vec::new()),
+            1,
+            None,
+            AttemptKind::Initial,
+        );
+        assert_eq!(
+            rules_of(&prompt),
+            "\nrules: you cannot commit, merge, push or publish; do not modify policy,\n\
+             verification commands or fixtures; work only in this directory.\n\
+             finish with a line starting DONE when you believe the criteria are met,\n\
+             or relais-blocked: <reason> when something outside the task blocks you.\n\
+             run each command as a single plain invocation: no pipes (`|`), redirects,\n\
+             `;`, `&&`, `$(…)`, or leading `VAR=value` prefixes. Permission rules are\n\
+             matched against the raw command string, so `make check | tail` or\n\
+             `MSRV_SKIP_OK=1 make check` is refused even when `make` is allowed.\n\
+             edit files with your file-editing tools, never with `sed -i`, heredocs\n\
+             or inline scripts, and never copy files to /tmp: those are refused too.\n\
+             you cannot spawn subagents, and you should not leave scratch files.\n"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn the_sandbox_rules_are_pinned_and_keep_every_prohibition() {
+        let fixture = Fixture::new();
+        let contract = fixture.contract(Review::Off);
+        let mut manifest = manifest_with(Vec::new());
+        manifest.sandbox.requested = true;
+        let prompt = build_prompt(&contract, &manifest, 1, None, AttemptKind::Initial);
+        assert_eq!(
+            rules_of(&prompt),
+            "\nrules: you cannot commit, merge, push or publish; do not modify policy,\n\
+             verification commands or fixtures; work only in this directory.\n\
+             finish with a line starting DONE when you believe the criteria are met,\n\
+             or relais-blocked: <reason> when something outside the task blocks you.\n\
+             commands run in an OS sandbox, so pipes, redirects and `&&` work.\n\
+             write logs and scratch output under $TMPDIR (your scratch dir), never in\n\
+             this directory or /tmp. writes elsewhere, and requests to hosts that are\n\
+             not listed, fail. `git -C`, `sh -c`, leading `VAR=value` prefixes and\n\
+             loops over shell-assigned variables are still refused.\n\
+             you cannot spawn subagents.\n"
+        );
+        assert!(
+            !prompt.contains("no pipes"),
+            "the plain-invocation rule does not apply inside the sandbox"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
     /// Everything between the fence lines of `label`, or None.
@@ -8710,6 +8935,9 @@ mod tests {
             budget_bytes: 64 * 1024,
             package_bytes: 0,
             turn_ceiling: "unavailable".into(),
+            sandbox: Default::default(),
+            confinement: Default::default(),
+            env_protection: String::new(),
         };
         let prompt = build_prompt(&contract, &manifest, 2, None, AttemptKind::Initial);
         assert!(
@@ -9376,6 +9604,87 @@ mod tests {
         assert!(
             review.contains("is usually not the event that caused it"),
             "{review}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// An enabled sandbox on a harness whose version relais cannot compare
+    /// (the mock reports `test`) is refused before anything is launched.
+    #[test]
+    fn an_enabled_sandbox_on_an_unknown_harness_blocks_before_any_launch() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let mut machine = fixture.machine_for(&repo);
+        machine.sandbox.enabled = true;
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&launches);
+        let backend = MockBackend::new(move |_spec| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            MockOutcome::default()
+        });
+        let outcome =
+            fixture.execute_with_machine(&fixture.contract(Review::Off), &repo, &machine, &backend);
+        let Terminal::Blocked { code, detail } = &outcome.terminal else {
+            panic!("expected blocked, got {outcome:?}");
+        };
+        assert_eq!(*code, BlockCode::SandboxUnavailable, "{detail}");
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// With `[sandbox]` off the worker is launched as it always was, plus
+    /// the credential scrub; and neither launch carries a sandbox.
+    #[test]
+    fn without_a_sandbox_the_worker_and_the_reviewer_launch_unsandboxed() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        // (is the reviewer, carries a sandbox, has the scrub)
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(bool, bool, bool)>::new()));
+        let record = Arc::clone(&seen);
+        let backend = MockBackend::new(move |spec| {
+            let scrubbed =
+                spec.env.vars().iter().any(|(name, value)| {
+                    name == crate::backend::SUBPROCESS_ENV_SCRUB && value == "1"
+                });
+            let reviewer = spec.prompt.contains("semantic reviewer");
+            record
+                .lock()
+                .unwrap()
+                .push((reviewer, spec.sandbox.is_some(), scrubbed));
+            if reviewer {
+                return MockOutcome {
+                    result_text: Some("FINDINGS: none".into()),
+                    exit_code: Some(0),
+                    ..Default::default()
+                };
+            }
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &backend);
+        assert!(
+            matches!(outcome.terminal, Terminal::Accepted(_)),
+            "{outcome:?}"
+        );
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter().any(|(reviewer, ..)| *reviewer) && seen.iter().any(|(r, ..)| !*r),
+            "a worker and a reviewer launched: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|(_, sandboxed, _)| !*sandboxed),
+            "no launch carries a sandbox: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .filter(|(reviewer, ..)| !*reviewer)
+                .all(|(_, _, scrubbed)| *scrubbed),
+            "the allowlist worker runs with the credential scrub: {seen:?}"
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }

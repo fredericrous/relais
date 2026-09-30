@@ -1172,6 +1172,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
             .max(Duration::from_secs(1)),
         cancel: None,
         pid_slot: None,
+        sandbox: None,
     };
     let budget = Budget {
         attempts_used: 0,

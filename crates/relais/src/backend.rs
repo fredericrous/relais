@@ -367,6 +367,28 @@ impl LaunchEnv {
         &self.passed
     }
 
+    /// This environment with `name` set to `value`, replacing any earlier
+    /// value.
+    pub fn with_var(&self, name: &str, value: &str) -> Self {
+        let mut passed = self.without_var(name).passed;
+        passed.push((name.to_string(), value.to_string()));
+        passed.sort();
+        Self { passed }
+    }
+
+    /// This environment without `name`, whatever the ambient environment
+    /// carried.
+    pub fn without_var(&self, name: &str) -> Self {
+        Self {
+            passed: self
+                .passed
+                .iter()
+                .filter(|(passed, _)| passed != name)
+                .cloned()
+                .collect(),
+        }
+    }
+
     /// The NAMES only — what the context manifest records. A value here
     /// is a credential; the manifest says which variables reached the
     /// worker, never what was in them.
@@ -404,6 +426,48 @@ pub struct LaunchSpec {
     /// bind it to the lease and the ledger while the worker runs
     /// (SPEC §12: persist the PID after the dispatch intent).
     pub pid_slot: Option<Arc<AtomicU32>>,
+    /// The OS-sandbox launch, for a worker on a machine with `[sandbox]`
+    /// on (SPEC §8). `None` is the allowlist launch, and every dispatch
+    /// that is not a worker's.
+    pub sandbox: Option<SandboxLaunch>,
+}
+
+/// What a sandboxed launch adds: the whole `--settings` JSON (sandbox,
+/// credential floor and permissions in one document) and the scratch
+/// directory the worker writes its own output to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SandboxLaunch {
+    pub settings: serde_json::Value,
+    pub scratch_dir: PathBuf,
+}
+
+/// The environment variable that makes Claude Code strip provider
+/// credentials from the subprocesses it starts. Allowlist mode sets it.
+/// Sandbox mode must not: measured on 2.1.285, it disables the sandbox's
+/// auto-allow, and the `credentials.envVars` deny protects the environment
+/// there instead.
+pub const SUBPROCESS_ENV_SCRUB: &str = "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB";
+
+/// The environment one WORKER dispatch runs with: `base` plus what the
+/// mode adds. Sandbox mode points `TMPDIR` at the scratch directory and
+/// carries no scrub (even one the ambient environment brought); allowlist
+/// mode sets the scrub.
+pub fn worker_launch_env(base: &LaunchEnv, sandbox: Option<&SandboxLaunch>) -> LaunchEnv {
+    worker_env_with(base, sandbox.map(|launch| launch.scratch_dir.as_path()))
+}
+
+/// [`worker_launch_env`] from the scratch directory alone: `Some` is
+/// sandbox mode. The context manifest records the worker env by NAME
+/// before any attempt has its own scratch directory, and building it
+/// here, not from `base`, keeps the recorded names and the launched ones
+/// one fact.
+pub fn worker_env_with(base: &LaunchEnv, scratch: Option<&std::path::Path>) -> LaunchEnv {
+    match scratch {
+        Some(dir) => base
+            .without_var(SUBPROCESS_ENV_SCRUB)
+            .with_var("TMPDIR", &dir.to_string_lossy()),
+        None => base.with_var(SUBPROCESS_ENV_SCRUB, "1"),
+    }
 }
 
 /// What the harness said one dispatch cost. `inclusive` describes a
@@ -617,6 +681,76 @@ mod tests {
 
     fn effort(name: &str) -> EffortId {
         EffortId::parse(name).expect("a valid effort identifier")
+    }
+
+    fn ambient() -> LaunchEnv {
+        LaunchEnv::from_ambient(&[
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("TMPDIR".to_string(), "/var/tmp".to_string()),
+            (SUBPROCESS_ENV_SCRUB.to_string(), "0".to_string()),
+        ])
+    }
+
+    fn value_of(env: &LaunchEnv, name: &str) -> Option<String> {
+        env.vars()
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+    }
+
+    /// The manifest names the env the worker is LAUNCHED with, per mode:
+    /// the names `worker_env_with` gives before any attempt exists are the
+    /// names `worker_launch_env` gives at dispatch.
+    #[test]
+    fn the_recorded_worker_env_names_are_the_launched_ones() {
+        let base = ambient();
+        assert_eq!(
+            worker_env_with(&base, None).names(),
+            worker_launch_env(&base, None).names()
+        );
+        let launch = SandboxLaunch {
+            settings: serde_json::json!({}),
+            scratch_dir: PathBuf::from("/state/runs/r/attempts/1/scratch"),
+        };
+        let recorded = worker_env_with(&base, Some(std::path::Path::new("/state/runs/r/attempts")));
+        assert_eq!(
+            recorded.names(),
+            worker_launch_env(&base, Some(&launch)).names()
+        );
+        assert!(!recorded
+            .names()
+            .iter()
+            .any(|name| name == SUBPROCESS_ENV_SCRUB));
+        assert!(worker_env_with(&base, None)
+            .names()
+            .iter()
+            .any(|name| name == SUBPROCESS_ENV_SCRUB));
+    }
+
+    #[test]
+    fn allowlist_workers_run_with_the_credential_scrub() {
+        let env = worker_launch_env(&ambient(), None);
+        assert_eq!(value_of(&env, SUBPROCESS_ENV_SCRUB).as_deref(), Some("1"));
+        assert_eq!(value_of(&env, "TMPDIR").as_deref(), Some("/var/tmp"));
+    }
+
+    #[test]
+    fn sandboxed_workers_get_the_scratch_as_tmpdir_and_no_scrub() {
+        let launch = SandboxLaunch {
+            settings: serde_json::json!({}),
+            scratch_dir: PathBuf::from("/state/runs/r/attempts/1/scratch"),
+        };
+        let env = worker_launch_env(&ambient(), Some(&launch));
+        assert_eq!(
+            value_of(&env, "TMPDIR").as_deref(),
+            Some("/state/runs/r/attempts/1/scratch")
+        );
+        assert_eq!(
+            value_of(&env, SUBPROCESS_ENV_SCRUB),
+            None,
+            "the scrub disables the sandbox's auto-allow, even when the ambient env has it"
+        );
+        assert_eq!(value_of(&env, "PATH").as_deref(), Some("/usr/bin"));
     }
 
     #[test]

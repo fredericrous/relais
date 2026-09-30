@@ -11,12 +11,21 @@
 //! - [`build_settings`]: the `--settings` JSON that turns the sandbox on
 //!   with the floor in it.
 //!
-//! Nothing here launches anything; the launch path wires these together.
+//! Two more answer the launch path's own questions, again over explicit
+//! inputs: [`worker_launch`] folds the three above into the launch a worker
+//! gets, and [`preflight`] says whether the sandbox can be relied on at all
+//! (platform, harness version, Linux helpers, weakening configuration).
+//!
+//! Nothing here launches anything; the runner wires these together.
 
 mod floor;
 mod judge;
+mod launch;
+mod preflight;
 mod settings;
 
 pub use floor::{credential_floor, Floor, FloorInputs};
 pub use judge::{judge_managed, judge_user_config, managed_sources, Weakening};
+pub use launch::{worker_launch, LaunchInputs, WorkerMode};
+pub use preflight::{managed_root, preflight, PreflightInputs, SANDBOX_MIN_HARNESS};
 pub use settings::{build_settings, SettingsInputs};
