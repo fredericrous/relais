@@ -681,6 +681,7 @@ fn check_ladder(
         catalogs: &bounds.catalogs,
         budget,
         repair_effort: incumbent.execution.repair_effort,
+        start_effort: None,
     })
     .map(|_| ())
     .map_err(|blocker| CandidateRejection::LadderBlocked {

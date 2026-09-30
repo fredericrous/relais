@@ -10,6 +10,27 @@ missing here.
 
 ### Added
 
+- **The learner chooses among arms, not tiers (P4).** An arm is a tier and
+  an effort request (`route::Arm`, labelled `implementation@high`,
+  `implementation:not_requested`, `implementation:control_unsupported`).
+  `route::learner_arms` enumerates them through the existing rung resolver:
+  each effort of the tier model's admissible set is tried as the initial
+  rung's start and kept only when it resolves to exactly that effort, so the
+  floor, the authority ceiling, `allowed_models` and the unknown-catalog
+  carve-out stay the resolver's. `RoutePredictor::estimate` takes the arms,
+  `Estimates` holds acceptance and cost per arm, `select_learned` returns the
+  cheapest priced arm that clears the quality floor (a tie goes to the
+  earlier arm), and `route()` starts the ladder at the selected arm's tier
+  and effort; the `learned_artifact` reason names the arm. Inference checks
+  each arm's identity (the tier's profile with the arm's effort) against what
+  training observed, and the evaluation now scores each candidate arm with the
+  identity training observed at its tier, not the test record's own, counting
+  a record as evidence only when its tier, model, effort and harness are the
+  selected arm's. Recipe, cold-start and conservative-baseline routes are
+  unchanged. **The artifact schema version moved 5 → 6 and the evaluation
+  schema version 3 → 4 (the dataset version is unchanged): an existing learned
+  artifact is refused and must be retrained** (`relais train`, then evaluate
+  and promote again).
 - **The effort ladder: every attempt the budget can reach gets a validated
   rung (P3).** `route()` now resolves, once, the tier, model and effort of
   the initial attempt, each repair and the escalation, given the budget that

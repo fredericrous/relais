@@ -20,16 +20,19 @@ use super::features::{
 };
 use super::learner::{CostModel, FitReport, LogisticModel, SolverSettings};
 use crate::money::MicroUsd;
-use crate::policy::Tier;
-use crate::route::{select_learned, tiers_at_or_above, Estimates};
+use crate::policy::{EffortId, Tier};
+use crate::route::{select_learned, tiers_at_or_above, Arm, EffortRequest, Estimates};
 
 /// Version 2 adds the fit reports, the calibration temperature, the
 /// supported-record count and the thresholds behind every gate, so the
 /// verdict can be RECOMPUTED from the report instead of believed. Version 3
 /// moves with `RecipeIdentity` (formerly `ProfileIdentity`): the identities
 /// this report's dataset and artifact were fitted on now carry the recipe
-/// that produced each run, alongside its model/effort/harness.
-pub const EVAL_SCHEMA_VERSION: u32 = 3;
+/// that produced each run, alongside its model/effort/harness. Version 4
+/// moves with the arm: the evaluation selects (tier, effort) arms, each
+/// scored with its own observed identity, so a version-3 report measured a
+/// different policy than the one inference now runs.
+pub const EVAL_SCHEMA_VERSION: u32 = 4;
 
 pub const DEFAULT_MIN_RECORDS_PER_TIER: usize = 5;
 pub const DEFAULT_QUALITY_FLOOR: f64 = 0.75;
@@ -545,6 +548,7 @@ pub fn train_and_evaluate(
     let measured = measure(Measurement {
         test: &test,
         tiers: &tiers,
+        identities: &observed_identities,
         schema: &schema,
         standardization: &standardization,
         acceptance: &acceptance,
@@ -646,6 +650,9 @@ fn calibration_curve(
 struct Measurement<'a> {
     test: &'a [&'a TrainingExample],
     tiers: &'a [Tier],
+    /// What the training split observed per tier: the identities the arms
+    /// are scored with.
+    identities: &'a [(Tier, Vec<RecipeIdentity>)],
     schema: &'a FeatureSchema,
     standardization: &'a Standardization,
     acceptance: &'a LogisticModel,
@@ -665,37 +672,137 @@ struct Measured {
     abstention_rate: f64,
 }
 
+/// An arm the evaluation offers for one record, with the identity inference
+/// would score it under.
+struct Candidate {
+    arm: Arm,
+    identity: RecipeIdentity,
+}
+
+/// The arms the evaluation offers for `record`: for each trained tier at or
+/// above the record's floor, each distinct identity the TRAINING split
+/// observed at that tier, in `identities_per_tier` order.
+///
+/// Each candidate carries that identity — with the record's own `recipe_id`,
+/// the recipe being a property of the task — never the record's model,
+/// effort or harness, which belong to the tier the record happened to run
+/// at. An identity records an effort only when one was passed, so one
+/// without it is the `NotRequested` arm.
+///
+/// Two identities of a tier that differ only in model or harness name the
+/// same arm, and inference scores only the profile in force when it runs.
+/// For this record that is the one it ran under, so the arm takes the
+/// observed identity closest to the record's own: same model and harness,
+/// else same harness, else the first observed. Keeping the first observed
+/// unconditionally scored a training split that spans a harness upgrade or
+/// a model swap under the OLD profile, and never counted a record of the
+/// current one as support.
+fn candidates_for(
+    record: &TrainingExample,
+    tiers: &[Tier],
+    identities: &[(Tier, Vec<RecipeIdentity>)],
+) -> Vec<Candidate> {
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for tier in tiers_at_or_above(record.floor, tiers) {
+        let observed = identities
+            .iter()
+            .filter(|(observed_tier, _)| *observed_tier == tier)
+            .flat_map(|(_, identities)| identities);
+        for identity in observed {
+            let effort = match &identity.effort {
+                // An observed token that no longer parses as an effort id
+                // names no arm, so the identity is skipped.
+                Some(text) => match EffortId::parse(text) {
+                    Ok(effort) => EffortRequest::Explicit(effort),
+                    Err(_) => continue,
+                },
+                None => EffortRequest::NotRequested,
+            };
+            let arm = Arm { tier, effort };
+            let candidate = Candidate {
+                arm,
+                identity: RecipeIdentity {
+                    recipe_id: record.identity.recipe_id.clone(),
+                    ..identity.clone()
+                },
+            };
+            match candidates.iter_mut().find(|held| held.arm == candidate.arm) {
+                Some(held) => {
+                    if closeness(record, &candidate.identity) > closeness(record, &held.identity) {
+                        *held = candidate;
+                    }
+                }
+                None => candidates.push(candidate),
+            }
+        }
+    }
+    candidates
+}
+
+/// How close an observed identity is to the profile `record` ran under:
+/// 2 for the same model and harness, 1 for the same harness, else 0.
+fn closeness(record: &TrainingExample, identity: &RecipeIdentity) -> u8 {
+    match (
+        identity.harness == record.identity.harness,
+        identity.model == record.identity.model,
+    ) {
+        (true, true) => 2,
+        (true, false) => 1,
+        (false, _) => 0,
+    }
+}
+
+/// Whether `record` is evidence for a selection of `candidate`: it ran at
+/// the candidate's tier with the candidate's model, effort and harness.
+fn is_evidence_for(record: &TrainingExample, candidate: &Candidate) -> bool {
+    record.tier == candidate.arm.tier
+        && record.identity.model == candidate.identity.model
+        && record.identity.effort == candidate.identity.effort
+        && record.identity.harness == candidate.identity.harness
+}
+
 /// Evaluation on the test split, on observed support only (SPEC §17: "do
 /// not infer performance for profiles with zero observation probability").
 ///
-/// For each test task the artifact SELECTS a tier, through the router's
-/// own `select_learned` over the router's own eligibility for THAT record
-/// — its floor and every trained tier above it. A test record is evidence
-/// for the selected policy only when its observed tier IS the selection;
-/// a record at another tier says nothing about it.
+/// For each test task the artifact SELECTS an arm (a tier and an effort),
+/// through the router's own `select_learned`. The arms are what inference
+/// would score: for each trained tier at or above the record's floor, each
+/// distinct (model, effort, harness) identity the training split observed at
+/// that tier, scored with THAT identity ([`candidates_for`]) — never with
+/// the test record's own, which belongs to the tier it ran at and is not the
+/// model and effort inference would use anywhere else. A test record is
+/// evidence for the selected policy only when its tier equals the selected
+/// arm's tier and its (model, effort, harness) equals the arm's; a record at
+/// another tier or profile says nothing about it.
 ///
 /// The baseline is what cold-start routing does for that same record: its
 /// floor tier. Pooling research and implementation records regardless of
 /// each record's own floor made the baseline a mixture no route produces.
 fn measure(inputs: Measurement<'_>) -> Measured {
-    let select = |record: &TrainingExample| -> Option<Tier> {
-        let eligible = tiers_at_or_above(record.floor, inputs.tiers);
-        let mut acceptance = std::collections::BTreeMap::new();
-        let mut cost = std::collections::BTreeMap::new();
-        for tier in &eligible {
+    let select = |record: &TrainingExample| -> Option<Candidate> {
+        let mut candidates = candidates_for(record, inputs.tiers, inputs.identities);
+        let mut acceptance = Vec::new();
+        let mut cost = Vec::new();
+        for candidate in &candidates {
             let features = inputs.standardization.apply(&expand(
                 &record.task,
-                *tier,
+                candidate.arm.tier,
                 &record.objective,
-                &record.identity,
+                &candidate.identity,
                 inputs.schema,
             ));
-            acceptance.insert(*tier, inputs.acceptance.predict_proba(&features));
-            // A tier the cost model cannot price is left unpriced, exactly
+            acceptance.push((
+                candidate.arm.clone(),
+                inputs.acceptance.predict_proba(&features),
+            ));
+            // An arm the cost model cannot price is left unpriced, exactly
             // as inference leaves it: the router skips it rather than
             // treating an absent price as free.
             if let Some(estimate) = inputs.cost.predict(&features, Some(record.task.cohort())) {
-                cost.insert(*tier, MicroUsd::from_micros(estimate.max(0.0) as i64));
+                cost.push((
+                    candidate.arm.clone(),
+                    MicroUsd::from_micros(estimate.max(0.0) as i64),
+                ));
             }
         }
         // The router's input type, with the evidence fields the selection
@@ -707,7 +814,15 @@ fn measure(inputs: Measurement<'_>) -> Measured {
             cost,
             raw: serde_json::Value::Null,
         };
-        select_learned(&estimates, &eligible, inputs.quality_floor)
+        let arms: Vec<Arm> = candidates
+            .iter()
+            .map(|candidate| candidate.arm.clone())
+            .collect();
+        let selected = select_learned(&estimates, &arms, inputs.quality_floor)?;
+        let at = candidates
+            .iter()
+            .position(|candidate| candidate.arm == selected)?;
+        Some(candidates.swap_remove(at))
     };
 
     let mut test_records = 0;
@@ -722,7 +837,7 @@ fn measure(inputs: Measurement<'_>) -> Measured {
         test_records += 1;
         match select(record) {
             None => abstentions += 1,
-            Some(selected) if selected == record.tier => {
+            Some(selected) if is_evidence_for(record, &selected) => {
                 supported += 1;
                 if record.accepted_without_escalation {
                     accepted_on_support += 1;
@@ -1325,6 +1440,128 @@ mod tests {
                 }]
             )]
         );
+    }
+
+    fn identity_of(model: &str, effort: Option<&str>) -> RecipeIdentity {
+        RecipeIdentity {
+            model: model.into(),
+            effort: effort.map(str::to_string),
+            harness: None,
+            recipe_id: None,
+        }
+    }
+
+    /// The asymmetry the evaluation used to have: a record at one tier was
+    /// scored at every other tier with ITS OWN identity, a model and effort
+    /// inference would never use there. Here a record run on `sonnet` at the
+    /// implementation tier is offered the escalation tier with the identity
+    /// training observed there — `fable` at `high` — and the recipe of the
+    /// task, and is evidence for the implementation arm alone.
+    #[test]
+    fn a_record_is_scored_at_another_tier_with_that_tiers_observed_identity() {
+        let identities = vec![
+            (Tier::Implementation, vec![identity_of("sonnet", None)]),
+            (Tier::Escalation, vec![identity_of("fable", Some("high"))]),
+        ];
+        let mut test_record = record("t", "2026-09-01", true, Tier::Implementation);
+        test_record.identity.recipe_id = Some("recipe-1".into());
+
+        let candidates = candidates_for(
+            &test_record,
+            &[Tier::Implementation, Tier::Escalation],
+            &identities,
+        );
+        let arms: Vec<&Arm> = candidates.iter().map(|candidate| &candidate.arm).collect();
+        let high = EffortId::parse("high").expect("an effort id");
+        assert_eq!(
+            arms,
+            vec![
+                &Arm {
+                    tier: Tier::Implementation,
+                    effort: EffortRequest::NotRequested
+                },
+                &Arm {
+                    tier: Tier::Escalation,
+                    effort: EffortRequest::Explicit(high)
+                },
+            ]
+        );
+        assert_eq!(
+            candidates[1].identity,
+            RecipeIdentity {
+                recipe_id: Some("recipe-1".into()),
+                ..identity_of("fable", Some("high"))
+            },
+            "scored with the escalation tier's identity, not the record's own"
+        );
+        assert_ne!(candidates[1].identity.model, test_record.identity.model);
+
+        assert!(is_evidence_for(&test_record, &candidates[0]));
+        assert!(
+            !is_evidence_for(&test_record, &candidates[1]),
+            "a record at another tier says nothing about that arm"
+        );
+    }
+
+    /// A tier the training split saw at two efforts offers two arms, and a
+    /// record is evidence only for the one whose effort it ran with.
+    #[test]
+    fn each_observed_effort_of_a_tier_is_its_own_arm() {
+        let identities = vec![(
+            Tier::Implementation,
+            vec![
+                identity_of("sonnet", Some("low")),
+                identity_of("sonnet", Some("high")),
+            ],
+        )];
+        let mut test_record = record("t", "2026-09-01", true, Tier::Implementation);
+        test_record.identity = identity_of("sonnet", Some("high"));
+        let candidates = candidates_for(&test_record, &[Tier::Implementation], &identities);
+        assert_eq!(candidates.len(), 2);
+        assert!(!is_evidence_for(&test_record, &candidates[0]));
+        assert!(is_evidence_for(&test_record, &candidates[1]));
+    }
+
+    /// A training split spanning a harness upgrade observed one tier and
+    /// effort under two harnesses. They are one arm, and a record run on
+    /// the newer harness is scored under it and counts as its support —
+    /// keeping the first observed scored the OLD profile and never counted
+    /// the current one.
+    #[test]
+    fn an_arm_seen_under_two_harnesses_takes_the_records_own() {
+        let on = |harness: &str| RecipeIdentity {
+            harness: Some(harness.into()),
+            ..identity_of("sonnet", Some("high"))
+        };
+        let identities = vec![(Tier::Implementation, vec![on("2.1"), on("2.2")])];
+        let mut test_record = record("t", "2026-09-01", true, Tier::Implementation);
+        test_record.identity = on("2.2");
+        let candidates = candidates_for(&test_record, &[Tier::Implementation], &identities);
+        assert_eq!(candidates.len(), 1, "one arm per tier and effort");
+        assert_eq!(candidates[0].identity.harness.as_deref(), Some("2.2"));
+        assert!(is_evidence_for(&test_record, &candidates[0]));
+
+        test_record.identity = on("2.1");
+        let candidates = candidates_for(&test_record, &[Tier::Implementation], &identities);
+        assert_eq!(candidates[0].identity.harness.as_deref(), Some("2.1"));
+        assert!(is_evidence_for(&test_record, &candidates[0]));
+    }
+
+    /// Only tiers at or above the record's own floor are offered.
+    #[test]
+    fn candidates_start_at_the_records_floor() {
+        let identities = vec![
+            (Tier::Research, vec![identity_of("haiku", None)]),
+            (Tier::Implementation, vec![identity_of("sonnet", None)]),
+        ];
+        let test_record = record("t", "2026-09-01", true, Tier::Implementation);
+        let candidates = candidates_for(
+            &test_record,
+            &[Tier::Research, Tier::Implementation],
+            &identities,
+        );
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].arm.tier, Tier::Implementation);
     }
 
     /// L10: a dataset that cannot cover one tier is a training failure
