@@ -5,6 +5,10 @@ use std::path::{Path, PathBuf};
 
 use crate::backend::WORKER_ENV_PREFIXES;
 use crate::paths::CLAUDE_CONFIG_DIR_ENV;
+use crate::policy::{
+    FLOOR_CARGO_DIR, FLOOR_CLAUDE_DIR, FLOOR_CONFIG_DIRS, FLOOR_DOCKER_DIR, FLOOR_HOME_DIRS,
+    FLOOR_HOME_FILES, FLOOR_RELAIS_CONFIG, FLOOR_RELAIS_LEDGER,
+};
 
 /// Everything the floor is computed from. `env` is relais's OWN
 /// environment (where its credentials were relocated to), not the
@@ -29,17 +33,10 @@ pub struct Floor {
     pub env_names: Vec<String>,
 }
 
-/// Credential directories under `$HOME`.
-const HOME_DIRS: &[&str] = &[".ssh", ".gnupg", ".aws", ".kube", "Library/Keychains"];
-/// Credential directories under the config root (`~/.config`, or
-/// `$XDG_CONFIG_HOME`).
-const CONFIG_DIRS: &[&str] = &["gh", "gcloud", "mtls"];
-/// Credential files directly under `$HOME`.
-const HOME_FILES: &[&str] = &[".netrc", ".npmrc", ".pypirc"];
-
 /// The credential floor for one machine. A relocation variable ADDS its
 /// path: the default stays in the floor, because a worker that can read
-/// the default has been given a credential the operator did not move.
+/// the default has been given a credential the operator did not move. That
+/// holds for relais's own config dir and ledger too.
 pub fn credential_floor(inputs: &FloorInputs) -> Floor {
     let home = inputs.home;
     let raw = |name: &str| (inputs.env)(name).filter(|value| !value.is_empty());
@@ -51,25 +48,25 @@ pub fn credential_floor(inputs: &FloorInputs) -> Floor {
         roots
     };
 
-    let mut dirs: Vec<PathBuf> = HOME_DIRS.iter().map(|d| home.join(d)).collect();
+    let mut dirs: Vec<PathBuf> = FLOOR_HOME_DIRS.iter().map(|d| home.join(d)).collect();
     for root in roots(home.join(".config"), "XDG_CONFIG_HOME") {
-        dirs.extend(CONFIG_DIRS.iter().map(|d| root.join(d)));
+        dirs.extend(FLOOR_CONFIG_DIRS.iter().map(|d| root.join(d)));
     }
+    dirs.push(home.join(FLOOR_RELAIS_CONFIG));
     dirs.push(inputs.config_dir.to_path_buf());
     for var in ["GNUPGHOME", "GH_CONFIG_DIR", "CLOUDSDK_CONFIG"] {
         dirs.extend(absolute(var));
     }
 
-    let mut files: Vec<PathBuf> = HOME_FILES.iter().map(|f| home.join(f)).collect();
-    for cargo in roots(home.join(".cargo"), "CARGO_HOME") {
-        files.push(cargo.join("credentials"));
-        files.push(cargo.join("credentials.toml"));
-    }
-    for docker in roots(home.join(".docker"), "DOCKER_CONFIG") {
-        files.push(docker.join("config.json"));
-    }
-    for claude in roots(home.join(".claude"), CLAUDE_CONFIG_DIR_ENV) {
-        files.push(claude.join(".credentials.json"));
+    let mut files: Vec<PathBuf> = FLOOR_HOME_FILES.iter().map(|f| home.join(f)).collect();
+    for ((default_dir, names), var) in [
+        (FLOOR_CARGO_DIR, "CARGO_HOME"),
+        (FLOOR_DOCKER_DIR, "DOCKER_CONFIG"),
+        (FLOOR_CLAUDE_DIR, CLAUDE_CONFIG_DIR_ENV),
+    ] {
+        for root in roots(home.join(default_dir), var) {
+            files.extend(names.iter().map(|name| root.join(name)));
+        }
     }
     if let Some(list) = raw("KUBECONFIG") {
         files.extend(
@@ -99,8 +96,17 @@ pub fn credential_floor(inputs: &FloorInputs) -> Floor {
 
     // `ledger.sqlite*` covers the -wal and -shm siblings.
     let ledger_glob = |path: &Path| format!("{}*", path.display());
-    let mut globs = vec![ledger_glob(inputs.ledger_path)];
-    globs.extend(alias(inputs.ledger_path).map(|path| ledger_glob(&path)));
+    let ledgers = [
+        home.join(FLOOR_RELAIS_LEDGER),
+        inputs.ledger_path.to_path_buf(),
+    ];
+    let mut globs: Vec<String> = ledgers.iter().map(|path| ledger_glob(path)).collect();
+    globs.extend(
+        ledgers
+            .iter()
+            .filter_map(|path| alias(path))
+            .map(|path| ledger_glob(&path)),
+    );
 
     let env_names = inputs
         .launch_env_names
@@ -196,6 +202,8 @@ mod tests {
             ".cargo/credentials",
             ".cargo/credentials.toml",
             ".claude/.credentials.json",
+            ".git-credentials",
+            ".claude.json",
         ] {
             assert!(
                 has_file(&floor, &format!("/nonexistent/h/{file}")),
@@ -207,6 +215,37 @@ mod tests {
             vec!["/nonexistent/h/.local/state/relais/ledger.sqlite*".to_string()]
         );
         assert!(floor.env_names.is_empty());
+    }
+
+    #[test]
+    fn relocated_config_and_ledger_keep_the_defaults() {
+        let home = Path::new("/nonexistent/h");
+        let floor = credential_floor(&FloorInputs {
+            home,
+            config_dir: Path::new("/r/config"),
+            ledger_path: Path::new("/r/state/ledger.sqlite"),
+            env: &|_| None,
+            launch_env_names: &[],
+            extra_deny: &[],
+        });
+        assert!(has_dir(&floor, "/r/config"));
+        assert!(has_dir(&floor, "/nonexistent/h/.config/relais"));
+        assert!(floor.globs.contains(&"/r/state/ledger.sqlite*".to_string()));
+        assert!(floor
+            .globs
+            .contains(&"/nonexistent/h/.local/state/relais/ledger.sqlite*".to_string()));
+    }
+
+    #[test]
+    fn the_default_paths_are_all_in_the_floor() {
+        let home = Path::new("/nonexistent/h");
+        let floor = floor_with(home, &[], &[], &[]);
+        for path in crate::policy::default_floor_paths(home) {
+            let listed = floor.dirs.contains(&path)
+                || floor.files.contains(&path)
+                || floor.globs.contains(&format!("{}*", path.display()));
+            assert!(listed, "{}", path.display());
+        }
     }
 
     #[test]

@@ -773,18 +773,69 @@ fn is_plain_domain(name: &str) -> bool {
         })
 }
 
+/// Credential directories under `$HOME`: the credential floor's defaults
+/// (`crate::sandbox`), named here so `writable` can be checked against them
+/// without this module depending on the sandbox.
+pub const FLOOR_HOME_DIRS: &[&str] = &[".ssh", ".gnupg", ".aws", ".kube", "Library/Keychains"];
+/// Credential directories under the config root (`~/.config`).
+pub const FLOOR_CONFIG_DIRS: &[&str] = &["gh", "gcloud", "mtls"];
+/// Credential files directly under `$HOME`.
+pub const FLOOR_HOME_FILES: &[&str] = &[
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+    ".claude.json",
+];
+/// Where the credential files of cargo, docker and Claude Code live under
+/// `$HOME` by default, each with the files inside it.
+pub const FLOOR_CARGO_DIR: (&str, &[&str]) = (".cargo", &["credentials", "credentials.toml"]);
+pub const FLOOR_DOCKER_DIR: (&str, &[&str]) = (".docker", &["config.json"]);
+pub const FLOOR_CLAUDE_DIR: (&str, &[&str]) = (".claude", &[".credentials.json"]);
+/// relais's own default config dir and ledger, relative to `$HOME`.
+pub const FLOOR_RELAIS_CONFIG: &str = ".config/relais";
+pub const FLOOR_RELAIS_LEDGER: &str = ".local/state/relais/ledger.sqlite";
+
+/// Every default credential-floor directory and file under `home`, and
+/// nothing an environment variable relocated.
+pub fn default_floor_paths(home: &Path) -> Vec<PathBuf> {
+    let config = home.join(".config");
+    let mut paths: Vec<PathBuf> = FLOOR_HOME_DIRS.iter().map(|d| home.join(d)).collect();
+    paths.extend(FLOOR_CONFIG_DIRS.iter().map(|d| config.join(d)));
+    paths.push(home.join(FLOOR_RELAIS_CONFIG));
+    paths.push(home.join(FLOOR_RELAIS_LEDGER));
+    paths.extend(FLOOR_HOME_FILES.iter().map(|f| home.join(f)));
+    for (dir, files) in [FLOOR_CARGO_DIR, FLOOR_DOCKER_DIR, FLOOR_CLAUDE_DIR] {
+        paths.extend(files.iter().map(|f| home.join(dir).join(f)));
+    }
+    paths
+}
+
+/// `path` and, when it resolves, its symlink-free form.
+fn spellings(path: &Path) -> Vec<PathBuf> {
+    // `Path::canonicalize` fails for a path that does not exist yet; such
+    // a path has only its given form to compare.
+    let mut forms = vec![path.to_path_buf()];
+    forms.extend(path.canonicalize().ok().filter(|c| c != path));
+    forms
+}
+
 impl SandboxSettings {
-    /// Refuse what a sandbox could not honour or must not grant. `home`
-    /// and `state_dir` are parameters — this module never reads the
-    /// environment — so `MachineSettings::validate`, which has neither,
-    /// passes `None` and gets the checks that need no directory (`~`
-    /// itself is still the home directory, whatever it is). A caller that
-    /// knows both passes them to also refuse an ancestor of either.
+    /// Refuse what a sandbox could not honour or must not grant. `home`,
+    /// `state_dir` and `config_dir` are parameters, so a caller that knows
+    /// them gets the checks that need them; `home` absent falls back to a
+    /// stand-in (`~` itself is still the home directory, whatever it is).
+    /// `floor_defaults` is the default credential floor: a `writable`
+    /// entry equal to, or containing, any of it is refused, in its given
+    /// and its symlink-resolved form. `MachineSettings::validate` calls
+    /// this with the REAL home, state and config directories (it reads
+    /// `crate::paths`).
     pub fn check(
         &self,
         home: Option<&Path>,
         state_dir: Option<&Path>,
         config_dir: Option<&Path>,
+        floor_defaults: &[PathBuf],
     ) -> Result<(), PolicyError> {
         let invalid =
             |field: &'static str, entry: &str, detail: &str| PolicyError::InvalidSandbox {
@@ -793,7 +844,7 @@ impl SandboxSettings {
             };
         // A stand-in home keeps `~` entries expandable, and comparable to
         // the guarded directories, when the real one is not known.
-        let base = home.unwrap_or(Path::new("/~home"));
+        let base = home.unwrap_or(Path::new(STAND_IN_HOME));
         let expand = |field: &'static str, entry: &str| -> Result<PathBuf, PolicyError> {
             expand_home(entry, base).ok_or_else(|| {
                 invalid(
@@ -810,17 +861,21 @@ impl SandboxSettings {
             let path = expand("writable", entry)?;
             // The config dir holds machine.toml and its trust grants: a
             // worker able to write it could grant itself authority.
-            let guarded = [Some(Path::new("/")), Some(base), state_dir, config_dir];
-            if guarded
+            let guarded = [Some(Path::new("/")), Some(base), state_dir, config_dir]
                 .into_iter()
                 .flatten()
-                .any(|dir| dir.starts_with(&path))
-            {
+                .chain(floor_defaults.iter().map(PathBuf::as_path));
+            let written = spellings(&path);
+            if guarded.into_iter().any(|dir| {
+                spellings(dir)
+                    .iter()
+                    .any(|form| written.iter().any(|w| form.starts_with(w)))
+            }) {
                 return Err(invalid(
                     "writable",
                     entry,
-                    "is, or contains, `/`, the home directory, the state directory or the \
-                     config directory",
+                    "is, or contains, `/`, the home directory, the state directory, the \
+                     config directory or a credential-floor path",
                 ));
             }
         }
@@ -1341,11 +1396,25 @@ impl MachineSettings {
         let home = crate::paths::home_dir().ok();
         let state_dir = crate::paths::state_dir().ok();
         let config_dir = crate::paths::config_dir().ok();
-        self.sandbox
-            .check(home.as_deref(), state_dir.as_deref(), config_dir.as_deref())?;
+        // With no resolvable home the floor is computed against the same
+        // stand-in `check` expands `~` with, so `~/.ssh` is still refused
+        // rather than the floor check being skipped.
+        let floor_defaults =
+            default_floor_paths(home.as_deref().unwrap_or(Path::new(STAND_IN_HOME)));
+        self.sandbox.check(
+            home.as_deref(),
+            state_dir.as_deref(),
+            config_dir.as_deref(),
+            &floor_defaults,
+        )?;
         Ok(())
     }
 }
+
+/// The home `[sandbox]` checks expand `~` against when the real one cannot
+/// be resolved: one value, so the `writable` guard and the floor defaults
+/// it compares against always agree.
+const STAND_IN_HOME: &str = "/~home";
 
 /// Why execution is blocked before any model is launched. Each blocker is
 /// a stable code plus a human explanation; `blocked:*` codes surface in
@@ -2056,11 +2125,26 @@ keys = ["output.contract"]
             };
             assert!(
                 settings
-                    .check(Some(Path::new("/Users/me")), None, None)
+                    .check(Some(Path::new("/Users/me")), None, None, &[])
                     .is_err(),
                 "{entry} must be refused"
             );
         }
+    }
+
+    /// With no resolvable home, `~/.ssh` is still refused: the floor
+    /// defaults are computed against the stand-in `~` expands with.
+    #[test]
+    fn a_floor_path_is_refused_even_without_a_resolvable_home() {
+        let settings = SandboxSettings {
+            writable: vec!["~/.ssh".to_string()],
+            ..SandboxSettings::default()
+        };
+        let floor = default_floor_paths(Path::new(STAND_IN_HOME));
+        assert!(
+            settings.check(None, None, None, &floor).is_err(),
+            "the floor defaults use the same stand-in `~` expands against"
+        );
     }
 
     /// A `writable` entry containing relais's config dir (machine.toml, the
@@ -2076,11 +2160,12 @@ keys = ["output.contract"]
             .check(
                 Some(home),
                 None,
-                Some(Path::new("/Users/me/.config/relais"))
+                Some(Path::new("/Users/me/.config/relais")),
+                &[]
             )
             .is_err());
         assert!(settings
-            .check(Some(home), None, Some(Path::new("/etc/relais")))
+            .check(Some(home), None, Some(Path::new("/etc/relais")), &[])
             .is_ok());
     }
 
@@ -2091,17 +2176,53 @@ keys = ["output.contract"]
             ..SandboxSettings::default()
         };
         let home = Path::new("/Users/me");
-        assert!(settings.check(Some(home), None, None).is_err());
+        assert!(settings.check(Some(home), None, None, &[]).is_err());
         let state = SandboxSettings {
             writable: vec!["/var/lib".to_string()],
             ..SandboxSettings::default()
         };
         assert!(state
-            .check(Some(home), Some(Path::new("/var/lib/relais")), None)
+            .check(Some(home), Some(Path::new("/var/lib/relais")), None, &[])
             .is_err());
         assert!(state
-            .check(Some(home), Some(Path::new("/srv/relais")), None)
+            .check(Some(home), Some(Path::new("/srv/relais")), None, &[])
             .is_ok());
+    }
+
+    fn writable_check(entry: &str, home: &Path) -> Result<(), PolicyError> {
+        let settings = SandboxSettings {
+            writable: vec![entry.to_string()],
+            ..SandboxSettings::default()
+        };
+        settings.check(Some(home), None, None, &default_floor_paths(home))
+    }
+
+    #[test]
+    fn a_writable_entry_that_is_or_contains_a_floor_path_is_refused() {
+        let home = Path::new("/Users/me");
+        for entry in [
+            "~/.ssh",
+            "~/.aws",
+            "~/.config",
+            "~/.cargo",
+            "~/.claude.json",
+        ] {
+            assert!(writable_check(entry, home).is_err(), "{entry}");
+        }
+        assert!(writable_check("~/work", home).is_ok());
+    }
+
+    #[test]
+    fn a_symlink_to_a_floor_dir_is_refused_as_writable() {
+        let scratch = crate::test_support::temp_dir("writable-alias");
+        let home = scratch.join("home");
+        std::fs::create_dir_all(home.join(".ssh")).expect("mkdir");
+        let link = scratch.join("link");
+        std::os::unix::fs::symlink(home.join(".ssh"), &link).expect("symlink");
+        assert!(writable_check(&link.display().to_string(), &home).is_err());
+        let sibling = scratch.join("plain");
+        std::fs::create_dir(&sibling).expect("mkdir");
+        assert!(writable_check(&sibling.display().to_string(), &home).is_ok());
     }
 
     /// `CommandSpec.name` is what a declared criterion's evidence names;

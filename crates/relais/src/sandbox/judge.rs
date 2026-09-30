@@ -48,9 +48,16 @@ impl Findings<'_> {
         });
     }
 
-    /// Record `key` unless `accepted`, naming the value it may have.
-    fn require(&mut self, key: &str, accepted: bool, stated: &str) {
-        if !accepted {
+    /// Record `key` unless `accepts` its `value`, naming the value it may
+    /// have.
+    fn require(
+        &mut self,
+        key: &str,
+        value: &Value,
+        stated: &str,
+        accepts: impl Fn(&Value) -> bool,
+    ) {
+        if !accepts(value) {
             self.weaken(key, &format!("is accepted only as {stated}"));
         }
     }
@@ -71,6 +78,10 @@ fn dotted(prefix: &str, key: &str) -> String {
     } else {
         format!("{prefix}.{key}")
     }
+}
+
+fn is_true(value: &Value) -> bool {
+    *value == Value::Bool(true)
 }
 
 fn is_string_array(value: &Value) -> bool {
@@ -97,7 +108,7 @@ fn judge_settings(found: &mut Findings, prefix: &str, doc: &Value) {
         let key = dotted(prefix, name);
         match name.as_str() {
             "$schema" | "model" | "cleanupPeriodDays" | "companyAnnouncements" => {}
-            "disableAllHooks" => found.require(&key, *value == Value::Bool(true), "true"),
+            "disableAllHooks" => found.require(&key, value, "true", is_true),
             "sandbox" => judge_sandbox(found, &key, value),
             "permissions" => judge_permissions(found, &key, value),
             _ => found.weaken(&key, NOT_ACCEPTED),
@@ -112,13 +123,13 @@ fn judge_sandbox(found: &mut Findings, prefix: &str, value: &Value) {
     for (name, value) in map {
         let key = dotted(prefix, name);
         match name.as_str() {
-            "enabled" | "failIfUnavailable" => {
-                found.require(&key, *value == Value::Bool(true), "true");
-            }
+            "enabled" | "failIfUnavailable" => found.require(&key, value, "true", is_true),
             "allowUnsandboxedCommands" => {
-                found.require(&key, *value == Value::Bool(false), "false");
+                found.require(&key, value, "false", |v| *v == Value::Bool(false));
             }
-            "autoAllowBashIfSandboxed" => found.require(&key, value.is_boolean(), "a boolean"),
+            "autoAllowBashIfSandboxed" => {
+                found.require(&key, value, "a boolean", Value::is_boolean);
+            }
             "filesystem" => judge_filesystem(found, &key, value),
             "network" => judge_network(found, &key, value),
             "credentials" => judge_credentials(found, &key, value),
@@ -135,7 +146,7 @@ fn judge_filesystem(found: &mut Findings, prefix: &str, value: &Value) {
         let key = dotted(prefix, name);
         match name.as_str() {
             "denyRead" | "denyWrite" => {
-                found.require(&key, is_string_array(value), "an array of strings");
+                found.require(&key, value, "an array of strings", is_string_array);
             }
             _ => found.weaken(&key, NOT_ACCEPTED),
         }
@@ -150,7 +161,7 @@ fn judge_network(found: &mut Findings, prefix: &str, value: &Value) {
         let key = dotted(prefix, name);
         match name.as_str() {
             "deniedDomains" => {}
-            "strictAllowlist" => found.require(&key, *value == Value::Bool(true), "true"),
+            "strictAllowlist" => found.require(&key, value, "true", is_true),
             _ => found.weaken(&key, NOT_ACCEPTED),
         }
     }
@@ -178,13 +189,15 @@ fn judge_credential_entries(found: &mut Findings, prefix: &str, value: &Value) {
         return;
     };
     for (index, entry) in entries.iter().enumerate() {
-        let denies = entry.as_object().is_some_and(|map| {
-            map.get("mode") == Some(&Value::from("deny"))
-                && map
-                    .keys()
-                    .all(|k| matches!(k.as_str(), "mode" | "path" | "name"))
-        });
-        found.require(&format!("{prefix}[{index}]"), denies, "a deny entry");
+        let denies = |entry: &Value| {
+            entry.as_object().is_some_and(|map| {
+                map.get("mode") == Some(&Value::from("deny"))
+                    && map
+                        .keys()
+                        .all(|k| matches!(k.as_str(), "mode" | "path" | "name"))
+            })
+        };
+        found.require(&format!("{prefix}[{index}]"), entry, "a deny entry", denies);
     }
 }
 
@@ -195,23 +208,22 @@ fn judge_permissions(found: &mut Findings, prefix: &str, value: &Value) {
     for (name, value) in map {
         let key = dotted(prefix, name);
         match name.as_str() {
-            "deny" => found.require(&key, value.is_array(), "an array"),
+            "deny" => found.require(&key, value, "an array", Value::is_array),
             "disableBypassPermissionsMode" => {}
-            "defaultMode" => found.require(
-                &key,
-                matches!(value.as_str(), Some("default" | "dontAsk")),
-                "\"default\" or \"dontAsk\"",
-            ),
+            "defaultMode" => found.require(&key, value, "\"default\" or \"dontAsk\"", |v| {
+                matches!(v.as_str(), Some("default" | "dontAsk"))
+            }),
             _ => found.weaken(&key, NOT_ACCEPTED),
         }
     }
 }
 
-/// Judge the managed settings files (`settings`, each with the path it was
-/// read from) and the managed MCP file's contents.
+/// Judge the managed settings files and the managed MCP files (`mcp`: one
+/// entry per file found, real root and extra root), each with the path it
+/// was read from.
 pub fn judge_managed(
     settings: &[(PathBuf, Value)],
-    mcp: Option<&Value>,
+    mcp: &[(PathBuf, Value)],
 ) -> Result<(), Vec<Weakening>> {
     let mut all = Vec::new();
     for (source, doc) in settings {
@@ -222,14 +234,14 @@ pub fn judge_managed(
         judge_settings(&mut found, "", doc);
         all.extend(found.found);
     }
-    if let Some(mcp) = mcp {
-        let has_server = mcp
+    for (source, doc) in mcp {
+        let has_server = doc
             .get("mcpServers")
             .and_then(Value::as_object)
             .is_some_and(|servers| !servers.is_empty());
         if has_server {
             let mut found = Findings {
-                source: Path::new(MANAGED_MCP),
+                source,
                 found: Vec::new(),
             };
             found.weaken("mcpServers", "a managed MCP server reaches the worker");
@@ -290,29 +302,39 @@ fn judge_user_scope(found: &mut Findings, prefix: &str, scope: &Value) {
 /// The managed configuration files under `root` (and `extra_root`, a test
 /// root that ADDS to the real one and never replaces it): the settings
 /// file, its `managed-settings.d/*.json` drop-ins sorted by name, and the
-/// managed MCP file. Only those that exist.
-pub fn managed_sources(root: &Path, extra_root: Option<&Path>) -> Vec<PathBuf> {
+/// managed MCP file. Only those that exist. Fails closed: a directory that
+/// cannot be read, or an entry that cannot be listed, is an `Err` naming
+/// the path — only `NotFound` means absent, because a drop-in we could not
+/// list is a drop-in we did not judge.
+pub fn managed_sources(
+    root: &Path,
+    extra_root: Option<&Path>,
+) -> Result<Vec<PathBuf>, (PathBuf, std::io::Error)> {
     let mut found = Vec::new();
     for dir in std::iter::once(root).chain(extra_root) {
         found.push(dir.join("managed-settings.json"));
-        found.extend(drop_ins(&dir.join("managed-settings.d")));
+        found.extend(drop_ins(&dir.join("managed-settings.d"))?);
         found.push(dir.join(MANAGED_MCP));
     }
     found.retain(|path| path.is_file());
-    found
+    Ok(found)
 }
 
-fn drop_ins(dir: &Path) -> Vec<PathBuf> {
-    // An unreadable or absent directory has no drop-ins to judge.
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+fn drop_ins(dir: &Path) -> Result<Vec<PathBuf>, (PathBuf, std::io::Error)> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err((dir.to_path_buf(), e)),
     };
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-        .collect();
+    let mut files = Vec::new();
+    for entry in entries {
+        let path = entry.map_err(|e| (dir.to_path_buf(), e))?.path();
+        if path.extension().is_some_and(|ext| ext == "json") {
+            files.push(path);
+        }
+    }
     files.sort();
-    files
+    Ok(files)
 }
 
 #[cfg(test)]
@@ -364,7 +386,7 @@ mod tests {
     }
 
     fn judged(doc: Value) -> Vec<Weakening> {
-        match judge_managed(&[(PathBuf::from("managed-settings.json"), doc)], None) {
+        match judge_managed(&[(PathBuf::from("managed-settings.json"), doc)], &[]) {
             Ok(()) => Vec::new(),
             Err(found) => found,
         }
@@ -441,10 +463,46 @@ mod tests {
     #[test]
     fn a_managed_mcp_server_is_a_weakening_and_an_empty_file_is_not() {
         let with_server = json!({"mcpServers": {"x": {"command": "x"}}});
-        let found = judge_managed(&[], Some(&with_server)).expect_err("a server weakens");
+        let one = [(PathBuf::from("/real/managed-mcp.json"), with_server.clone())];
+        let found = judge_managed(&[], &one).expect_err("a server weakens");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].key, "mcpServers");
-        assert_eq!(judge_managed(&[], Some(&json!({"mcpServers": {}}))), Ok(()));
+        let empty = [(
+            PathBuf::from("/real/managed-mcp.json"),
+            json!({"mcpServers": {}}),
+        )];
+        assert_eq!(judge_managed(&[], &empty), Ok(()));
+    }
+
+    #[test]
+    fn each_managed_mcp_file_is_judged_and_named_by_its_own_path() {
+        let server = json!({"mcpServers": {"x": {"command": "x"}}});
+        let files = [
+            (PathBuf::from("/real/managed-mcp.json"), server.clone()),
+            (PathBuf::from("/extra/managed-mcp.json"), server),
+        ];
+        let found = judge_managed(&[], &files).expect_err("both weaken");
+        let sources: Vec<&Path> = found.iter().map(|w| w.source.as_path()).collect();
+        assert_eq!(
+            sources,
+            [
+                Path::new("/real/managed-mcp.json"),
+                Path::new("/extra/managed-mcp.json")
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_drop_in_directory_fails_closed_and_an_absent_one_does_not() {
+        let root = temp_dir("managed-unreadable");
+        assert_eq!(
+            managed_sources(&root, None).expect("absent is fine"),
+            Vec::<PathBuf>::new()
+        );
+        let not_a_dir = root.join("managed-settings.d");
+        std::fs::write(&not_a_dir, "").expect("write");
+        let (path, _) = managed_sources(&root, None).expect_err("a file is not a directory");
+        assert_eq!(path, not_a_dir);
     }
 
     #[test]
@@ -492,7 +550,7 @@ mod tests {
         std::fs::write(extra.join("managed-mcp.json"), "{}").expect("write");
 
         assert_eq!(
-            managed_sources(&real, Some(&extra)),
+            managed_sources(&real, Some(&extra)).expect("readable"),
             vec![
                 real.join("managed-settings.json"),
                 real.join("managed-settings.d/10-a.json"),
@@ -500,6 +558,6 @@ mod tests {
                 extra.join("managed-mcp.json"),
             ]
         );
-        assert_eq!(managed_sources(&real, None).len(), 3);
+        assert_eq!(managed_sources(&real, None).expect("readable").len(), 3);
     }
 }
