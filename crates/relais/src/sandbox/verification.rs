@@ -256,7 +256,15 @@ mod tests {
                 )
             })
             .collect();
-        crate::ids::sha256_hex(text.as_bytes())
+        // The evaluator's text sets are part of the probe too: changing
+        // what counts as a denial, a refusal or a leak changes the verdict.
+        let markers = format!(
+            "{:?}|{:?}|{:?}",
+            crate::sandbox::probe::OS_DENIALS,
+            crate::sandbox::probe::PERMISSION_REFUSALS,
+            crate::sandbox::probe::LEAK_MARKERS
+        );
+        crate::ids::sha256_hex(format!("{text}{markers}").as_bytes())
     }
 
     #[test]
@@ -265,7 +273,7 @@ mod tests {
             (PROBE_VERSION, probe_digest().as_str()),
             (
                 2,
-                "3b1f7ecaea65556c2703451b7a91d47bdff63ec5510ed25962832d062fc5a72f"
+                "70a1c6792a18beb415ca72d7b109a63317386a9a455e2a3a54625009dbc362f3"
             ),
             "the probe changed: bump PROBE_VERSION and update this digest"
         );

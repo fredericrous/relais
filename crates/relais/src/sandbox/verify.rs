@@ -450,6 +450,8 @@ mod tests {
 
     use serde_json::json;
 
+    use crate::sandbox::probe::Expect;
+
     use super::*;
     use crate::sandbox::{ProbeTool, Verdict, VerificationKey};
     use crate::test_support::temp_dir;
@@ -515,9 +517,18 @@ mod tests {
             lines.push(json!({"type": "assistant", "message": {"content": [
                 {"type": "tool_use", "id": id, "name": tool_name(step), "input": call_input(step)}
             ]}}));
-            lines.push(json!({"type": "user", "message": {"content": [
-                {"type": "tool_result", "tool_use_id": id, "content": result(step)}
-            ]}}));
+            // As the harness records it (S0, 2.1.285): a denied or refused
+            // call is an error result; a successful one is not.
+            let denied = match step.expect {
+                Expect::OsDenied | Expect::NetworkViolation | Expect::PermissionDenied => true,
+                Expect::OutputLine(_) | Expect::OutputLineEndsWith(_) => false,
+            };
+            let mut item =
+                json!({"type": "tool_result", "tool_use_id": id, "content": result(step)});
+            if denied {
+                item["is_error"] = json!(true);
+            }
+            lines.push(json!({"type": "user", "message": {"content": [item]}}));
         }
         lines.push(json!({"type": "result", "subtype": "success", "total_cost_usd": 0.02}));
         lines
