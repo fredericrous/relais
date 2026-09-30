@@ -26,9 +26,13 @@
 //! records it ([`verify_sandbox`], behind `relais doctor --verify-sandbox`) and
 //! for the dispatch gate ([`dispatch_gate`]) that requires the record.
 //!
+//! What a sandboxed attempt was denied, and how complete that account is,
+//! is [`scan`]'s answer over its transcript and scratch files.
+//!
 //! Nothing here launches a session itself; the runner and the doctor wire
 //! the real launcher in.
 
+mod denials;
 mod dispatch;
 mod floor;
 mod judge;
@@ -39,6 +43,7 @@ mod settings;
 mod verification;
 mod verify;
 
+pub use denials::{scan, transcript_path, Coverage, Denial, DenialReport};
 pub use dispatch::{dispatch_gate, dispatch_key, dispatch_lookup, DispatchKeyInputs, GateInputs};
 pub use floor::{credential_floor, Floor, FloorInputs};
 pub use judge::{judge_managed, judge_user_config, managed_sources, Weakening};

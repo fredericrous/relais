@@ -206,6 +206,9 @@ pub enum EvidenceKind {
     HumanSignOff,
     /// The JUnit report a command wrote, kept as its check log is.
     JunitReport,
+    /// What a sandboxed worker attempt was denied and how complete that
+    /// account is (SPEC §8).
+    SandboxDenials,
 }
 
 impl EvidenceKind {
@@ -221,6 +224,7 @@ impl EvidenceKind {
             Self::ExternalAttestation => "external_attestation",
             Self::HumanSignOff => "human_sign_off",
             Self::JunitReport => "junit_report",
+            Self::SandboxDenials => "sandbox_denials",
         }
     }
 
@@ -236,6 +240,7 @@ impl EvidenceKind {
             "external_attestation" => Some(Self::ExternalAttestation),
             "human_sign_off" => Some(Self::HumanSignOff),
             "junit_report" => Some(Self::JunitReport),
+            "sandbox_denials" => Some(Self::SandboxDenials),
             _ => None,
         }
     }

@@ -3750,9 +3750,26 @@ fn explain_command(run_id: &str) -> Result<CliOutcome, CliError> {
                 print!(" for {criterion_id}");
             }
             println!();
+            if row.kind == EvidenceKind::SandboxDenials {
+                println!("{}", sandbox_denials_text(&row.path));
+            }
         }
     }
     Ok(CliOutcome::Accepted)
+}
+
+/// The denial report a sandboxed attempt recorded, rendered; a file that
+/// cannot be read or parsed is said so rather than skipped.
+fn sandbox_denials_text(path: &str) -> String {
+    let report = std::fs::read_to_string(path)
+        .map_err(|e| e.to_string())
+        .and_then(|body| {
+            serde_json::from_str::<relais::sandbox::DenialReport>(&body).map_err(|e| e.to_string())
+        });
+    match report {
+        Ok(report) => report.render(),
+        Err(why) => format!("sandbox denials: unreadable ({why})"),
+    }
 }
 
 /// Whether `resume` also retires the worktree once the run is terminal
