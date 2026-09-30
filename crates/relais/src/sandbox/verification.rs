@@ -20,6 +20,11 @@ use crate::ids::to_hex;
 
 const SCRATCH_PLACEHOLDER: &str = "<scratch>";
 
+/// Bump whenever `probe_plan`, `probe_plan_allowlist`, an `Expect` or
+/// `evaluate`'s rules change: a pass earned by the old probe proves nothing
+/// about the new one.
+const PROBE_VERSION: u32 = 1;
+
 /// Hex SHA-256 of a verified configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationKey(String);
@@ -34,6 +39,24 @@ impl VerificationKey {
         scratch: &Path,
         managed: &[(PathBuf, Vec<u8>)],
     ) -> VerificationKey {
+        Self::compute_for_probe(
+            PROBE_VERSION,
+            harness_version,
+            platform,
+            settings,
+            scratch,
+            managed,
+        )
+    }
+
+    fn compute_for_probe(
+        probe_version: u32,
+        harness_version: &str,
+        platform: &str,
+        settings: &Value,
+        scratch: &Path,
+        managed: &[(PathBuf, Vec<u8>)],
+    ) -> VerificationKey {
         let scratch = scratch.to_string_lossy();
         let settings = abstract_scratch(settings, &scratch).to_string();
 
@@ -41,6 +64,7 @@ impl VerificationKey {
         managed.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut hasher = Sha256::new();
+        feed(&mut hasher, &probe_version.to_le_bytes());
         feed(&mut hasher, harness_version.as_bytes());
         feed(&mut hasher, platform.as_bytes());
         feed(&mut hasher, settings.as_bytes());
@@ -133,7 +157,8 @@ impl From<io::Error> for StoreError {
     }
 }
 
-/// The verification records on disk at one path.
+/// The verification records on disk at one path. Two concurrent saves can
+/// lose one record; accepted, since the cost is one re-verification.
 #[derive(Debug)]
 pub struct VerificationStore {
     path: PathBuf,
@@ -233,6 +258,23 @@ mod tests {
         bytes[1].1 = b"[1]".to_vec();
         let other = VerificationKey::compute("2.1.290", "macos", &s, Path::new("/s/1"), &bytes);
         assert_ne!(base(), other);
+    }
+
+    #[test]
+    fn the_key_changes_with_the_probe_version() {
+        let s = settings("/s/1");
+        let at = |probe_version| {
+            VerificationKey::compute_for_probe(
+                probe_version,
+                "2.1.290",
+                "macos",
+                &s,
+                Path::new("/s/1"),
+                &managed(),
+            )
+        };
+        assert_eq!(at(PROBE_VERSION), base());
+        assert_ne!(at(PROBE_VERSION), at(PROBE_VERSION + 1));
     }
 
     #[test]

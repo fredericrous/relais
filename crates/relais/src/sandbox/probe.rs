@@ -95,13 +95,39 @@ fn line(text: &str) -> Expect {
     Expect::OutputLine(text.to_string())
 }
 
+fn auth_env_step() -> ProbeStep {
+    bash(
+        "auth-env",
+        format!(
+            "printenv CLAUDE_CODE_OAUTH_TOKEN {PRESENCE}; printenv ANTHROPIC_API_KEY {PRESENCE}"
+        ),
+        line("absent"),
+    )
+}
+
+/// `text` as one POSIX shell word: single-quoted, each `'` written `'\''`.
+fn sh_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
 /// The steps of a probe run in sandbox mode, in the order they are asked.
-pub fn probe_plan(inputs: &ProbePlanInputs) -> Vec<ProbeStep> {
+/// A home or fixture path with a newline, or a home path with `"` or `\`
+/// (which the python step would have to escape), is refused.
+pub fn probe_plan(inputs: &ProbePlanInputs) -> Result<Vec<ProbeStep>, String> {
     let nonce = inputs.nonce;
     let home = inputs.home.to_string_lossy();
     let fixture = inputs.fixture.to_string_lossy();
+    if home.contains('\n') || fixture.contains('\n') {
+        return Err("probe path contains a newline".to_string());
+    }
+    if home.contains(['"', '\\']) {
+        return Err("home path contains a quote or backslash".to_string());
+    }
+    let home_file = sh_quote(&format!("{home}/relais-probe-{nonce}"));
+    let python = format!("open(\"{home}/relais-probe-py-{nonce}\",\"w\")");
+    let fixture_arg = sh_quote(&fixture);
     let fixture_dir = inputs.fixture.parent().unwrap_or(inputs.fixture);
-    vec![
+    Ok(vec![
         bash(
             "pipe",
             r#"printf 'a\nb\n' | head -1 > "$TMPDIR/relais-probe-pipe" && cat "$TMPDIR/relais-probe-pipe""#
@@ -115,7 +141,7 @@ pub fn probe_plan(inputs: &ProbePlanInputs) -> Vec<ProbeStep> {
         ),
         bash(
             "home-write",
-            format!("touch {home}/relais-probe-{nonce}"),
+            format!("touch {home_file}"),
             Expect::OsDenied,
         ),
         bash(
@@ -125,7 +151,7 @@ pub fn probe_plan(inputs: &ProbePlanInputs) -> Vec<ProbeStep> {
         ),
         bash(
             "fixture-bash",
-            format!("test -r {fixture} && echo READABLE || echo denied"),
+            format!("test -r {fixture_arg} && echo READABLE || echo denied"),
             line("denied"),
         ),
         bash(
@@ -133,13 +159,7 @@ pub fn probe_plan(inputs: &ProbePlanInputs) -> Vec<ProbeStep> {
             format!("printenv AWS_SECRET_ACCESS_KEY {PRESENCE}"),
             line("absent"),
         ),
-        bash(
-            "auth-env",
-            format!(
-                "printenv CLAUDE_CODE_OAUTH_TOKEN {PRESENCE}; printenv ANTHROPIC_API_KEY {PRESENCE}"
-            ),
-            line("absent"),
-        ),
+        auth_env_step(),
         bash(
             "git",
             "touch relais-probe-git && git add -N relais-probe-git && git status --short"
@@ -150,7 +170,7 @@ pub fn probe_plan(inputs: &ProbePlanInputs) -> Vec<ProbeStep> {
         // sandbox; an OS denial here shows `--restricted` ignored it.
         bash(
             "excluded-python",
-            format!("python3 -c \"open('{home}/relais-probe-py-{nonce}','w')\""),
+            format!("python3 -c {}", sh_quote(&python)),
             Expect::OsDenied,
         ),
         ProbeStep {
@@ -165,18 +185,21 @@ pub fn probe_plan(inputs: &ProbePlanInputs) -> Vec<ProbeStep> {
             input: format!("{GREP_PATTERN}\t{}", fixture_dir.to_string_lossy()),
             expect: Expect::PermissionDenied,
         },
-    ]
+    ])
 }
 
 /// The steps of a probe run in allowlist mode (`[sandbox]` off). The nonce
-/// is accepted so both plans are called alike; this step has no per-attempt
-/// path.
+/// is accepted so both plans are called alike; these steps have no
+/// per-attempt path.
 pub fn probe_plan_allowlist(_nonce: &str) -> Vec<ProbeStep> {
-    vec![bash(
-        "scrub-env",
-        format!("printenv AWS_SECRET_ACCESS_KEY {PRESENCE}"),
-        line("absent"),
-    )]
+    vec![
+        bash(
+            "scrub-env",
+            format!("printenv AWS_SECRET_ACCESS_KEY {PRESENCE}"),
+            line("absent"),
+        ),
+        auth_env_step(),
+    ]
 }
 
 /// Splits a Grep step's input into its pattern and path.
@@ -265,10 +288,16 @@ struct ToolUse {
     input: Value,
 }
 
+/// A `tool_result`: its text and the harness's own `is_error` flag.
+struct ToolResult {
+    text: String,
+    is_error: bool,
+}
+
 #[derive(Default)]
 struct Transcript {
     uses: Vec<ToolUse>,
-    results: HashMap<String, String>,
+    results: HashMap<String, ToolResult>,
 }
 
 fn result_text(content: Option<&Value>) -> Result<String, String> {
@@ -308,7 +337,11 @@ fn read_item(item: &Value, transcript: &mut Transcript) -> Result<(), String> {
                 return Err("tool_result without tool_use_id".to_string());
             };
             let text = result_text(item.get("content"))?;
-            transcript.results.entry(id.to_string()).or_insert(text);
+            let is_error = item.get("is_error").and_then(Value::as_bool) == Some(true);
+            transcript
+                .results
+                .entry(id.to_string())
+                .or_insert(ToolResult { text, is_error });
         }
         Some(_) | None => {}
     }
@@ -374,9 +407,14 @@ fn has_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
 }
 
-/// A positive control: a failed command never passes, and some line of the
-/// result must satisfy `line_matches` (given the trimmed line).
-fn judge_output(text: &str, want: &str, line_matches: impl Fn(&str) -> bool) -> Verdict {
+/// A positive control: a failed command never passes, whatever its text, and
+/// some line of the result must satisfy `line_matches` (given the trimmed
+/// line).
+fn judge_output(result: &ToolResult, want: &str, line_matches: impl Fn(&str) -> bool) -> Verdict {
+    let text = result.text.as_str();
+    if result.is_error {
+        return Verdict::Fail(format!("tool reported an error: {}", snippet(text)));
+    }
     if has_any(text, &PERMISSION_REFUSALS) {
         return Verdict::Fail("permission refusal, not output".to_string());
     }
@@ -397,19 +435,41 @@ fn judge_output(text: &str, want: &str, line_matches: impl Fn(&str) -> bool) -> 
     })
 }
 
-fn judge(expect: &Expect, text: &str) -> Verdict {
+/// Negative expectations judge by text alone: a denied command legitimately
+/// has `is_error` true.
+/// The host the `network` step reaches for.
+const PROBE_HOST: &str = "example.com";
+
+/// Whether the harness's violation block denies the probe host itself: a
+/// `deny network-outbound` line INSIDE `<sandbox_violations>` naming it.
+/// curl's own error line can name the host too (`Could not resolve host:
+/// example.com`), so the host counts only on the denial line.
+fn denies_probe_host(text: &str) -> bool {
+    let Some(start) = text.find("<sandbox_violations>") else {
+        return false;
+    };
+    let block = &text[start..];
+    let block = block
+        .find("</sandbox_violations>")
+        .map_or(block, |end| &block[..end]);
+    block.lines().any(|line| {
+        line.contains("deny network-outbound") && line.contains(&format!("{PROBE_HOST}:"))
+    })
+}
+
+fn judge(expect: &Expect, result: &ToolResult) -> Verdict {
+    let text = result.text.as_str();
     match expect {
-        Expect::OutputLine(want) => judge_output(text, want, |line| line == want),
+        Expect::OutputLine(want) => judge_output(result, want, |line| line == want),
         Expect::OutputLineEndsWith(suffix) => {
-            judge_output(text, suffix, |line| line.ends_with(suffix.as_str()))
+            judge_output(result, suffix, |line| line.ends_with(suffix.as_str()))
         }
         Expect::OsDenied => require(has_any(text, &OS_DENIALS), || {
             format!("no OS denial: {}", snippet(text))
         }),
-        Expect::NetworkViolation => require(
-            text.contains("<sandbox_violations>") && text.contains("deny network-outbound"),
-            || format!("no network violation: {}", snippet(text)),
-        ),
+        Expect::NetworkViolation => require(denies_probe_host(text), || {
+            format!("no network violation for {PROBE_HOST}: {}", snippet(text))
+        }),
         Expect::PermissionDenied => require(has_any(text, &PERMISSION_REFUSALS), || {
             format!("not refused: {}", snippet(text))
         }),
@@ -422,7 +482,7 @@ fn run_step(step: &ProbeStep, transcript: &Transcript) -> Verdict {
         .iter()
         .find(|call| call.name == step.tool.name() && input_matches(step, &call.input));
     match call.and_then(|call| transcript.results.get(&call.id)) {
-        Some(text) => judge(&step.expect, text),
+        Some(result) => judge(&step.expect, result),
         None => Verdict::NotRun,
     }
 }
@@ -453,12 +513,16 @@ fn check_init(init: Option<&Value>, expected_tools: &[&str]) -> Result<(), Strin
         None => problems.push("mcp_servers missing".to_string()),
     }
 
-    let plugins = init.get("plugins").and_then(Value::as_array);
-    for plugin in plugins.into_iter().flatten() {
-        let source = plugin.get("source").and_then(Value::as_str).unwrap_or("?");
-        if !source.ends_with("@builtin") {
-            problems.push(format!("non-builtin plugin {source}"));
+    match init.get("plugins").and_then(Value::as_array) {
+        Some(plugins) => {
+            for plugin in plugins {
+                let source = plugin.get("source").and_then(Value::as_str).unwrap_or("?");
+                if !source.ends_with("@builtin") {
+                    problems.push(format!("non-builtin plugin {source}"));
+                }
+            }
         }
+        None => problems.push("plugins missing".to_string()),
     }
 
     if problems.is_empty() {
@@ -507,12 +571,16 @@ mod tests {
 
     const TOOLS: [&str; 6] = ["Bash", "Read", "Edit", "Write", "Grep", "Glob"];
 
-    fn plan() -> Vec<ProbeStep> {
+    fn plan_for(fixture: &str, home: &str) -> Result<Vec<ProbeStep>, String> {
         probe_plan(&ProbePlanInputs {
             nonce: "n1",
-            fixture: &PathBuf::from("/fx/fixtures/secret.txt"),
-            home: &PathBuf::from("/home/u"),
+            fixture: &PathBuf::from(fixture),
+            home: &PathBuf::from(home),
         })
+    }
+
+    fn plan() -> Vec<ProbeStep> {
+        plan_for("/fx/fixtures/secret.txt", "/home/u").unwrap()
     }
 
     fn good_init() -> Value {
@@ -943,14 +1011,14 @@ mod tests {
         );
         let input = |id: &str| steps.iter().find(|s| s.id == id).unwrap().input.clone();
         assert_eq!(input("tmp-write"), "touch /tmp/relais-probe-n1");
-        assert_eq!(input("home-write"), "touch /home/u/relais-probe-n1");
+        assert_eq!(input("home-write"), "touch '/home/u/relais-probe-n1'");
         assert_eq!(
             input("fixture-bash"),
-            "test -r /fx/fixtures/secret.txt && echo READABLE || echo denied"
+            "test -r '/fx/fixtures/secret.txt' && echo READABLE || echo denied"
         );
         assert_eq!(
             input("excluded-python"),
-            "python3 -c \"open('/home/u/relais-probe-py-n1','w')\""
+            "python3 -c 'open(\"/home/u/relais-probe-py-n1\",\"w\")'"
         );
         assert_eq!(input("fixture-read"), "/fx/fixtures/secret.txt");
         assert_eq!(input("fixture-grep"), "relais-probe\t/fx/fixtures");
@@ -967,10 +1035,94 @@ mod tests {
             }
         }
         let allowlist = probe_plan_allowlist("n1");
-        assert_eq!(allowlist.len(), 1);
-        assert_eq!(allowlist[0].id, "scrub-env");
-        assert!(allowlist[0].input.ends_with(PRESENCE));
-        assert_eq!(allowlist[0].expect, line("absent"));
+        let ids: Vec<_> = allowlist.iter().map(|step| step.id).collect();
+        assert_eq!(ids, ["scrub-env", "auth-env"]);
+        for step in &allowlist {
+            for command in step.input.split("; ") {
+                assert!(command.starts_with("printenv "), "{command}");
+                assert!(command.ends_with(PRESENCE), "{command}");
+            }
+            assert_eq!(step.expect, line("absent"));
+        }
+        let plan_auth = steps.iter().find(|s| s.id == "auth-env").unwrap();
+        assert_eq!(&allowlist[1], plan_auth);
+    }
+
+    #[test]
+    fn a_path_with_a_space_is_one_shell_word() {
+        let steps = plan_for("/fx dir/secret.txt", "/home/my user").unwrap();
+        let input = |id: &str| steps.iter().find(|s| s.id == id).unwrap().input.clone();
+        assert!(input("fixture-bash").starts_with("test -r '/fx dir/secret.txt' &&"));
+        assert_eq!(input("home-write"), "touch '/home/my user/relais-probe-n1'");
+    }
+
+    #[test]
+    fn a_single_quote_in_a_path_is_escaped_for_the_shell() {
+        let steps = plan_for("/fx/it's.txt", "/home/u").unwrap();
+        let bash = steps.iter().find(|s| s.id == "fixture-bash").unwrap();
+        assert!(bash.input.starts_with(r"test -r '/fx/it'\''s.txt' &&"));
+    }
+
+    #[test]
+    fn a_path_with_a_newline_is_refused() {
+        assert!(plan_for("/fx/a\nb", "/home/u").is_err());
+        assert!(plan_for("/fx/a", "/home/u\nx").is_err());
+    }
+
+    #[test]
+    fn a_home_the_python_step_cannot_quote_is_refused() {
+        assert!(plan_for("/fx/a", "/home/\"u").is_err());
+        assert!(plan_for("/fx/a", "/home/u\\x").is_err());
+    }
+
+    #[test]
+    fn a_positive_control_whose_result_is_an_error_fails() {
+        let steps = plan();
+        let jsonl = transcript(&steps, |step| Some(measured(step)))
+            .replace("\"content\":\"a\"", "\"content\":\"a\",\"is_error\":true");
+        assert!(jsonl.contains("\"is_error\":true"));
+        let report = judged(&steps, &jsonl, &good_init());
+        assert!(matches!(verdict(&report, "pipe"), Verdict::Fail(_)));
+        assert_only_failing(&report, "pipe");
+    }
+
+    #[test]
+    fn a_denied_command_with_is_error_still_passes_its_negative_control() {
+        let steps = plan();
+        let jsonl = transcript(&steps, |step| Some(measured(step))).replace(
+            "\"tool_use_id\":\"toolu_tmp-write\"",
+            "\"tool_use_id\":\"toolu_tmp-write\",\"is_error\":true",
+        );
+        assert!(jsonl.contains("\"is_error\":true"));
+        assert!(judged(&steps, &jsonl, &good_init()).passed);
+    }
+
+    #[test]
+    fn a_violation_for_another_host_fails_the_network_step() {
+        let (_, report) = with_result(
+            "network",
+            "Exit code 56\n<sandbox_violations>\ndeny network-outbound \
+             evil.test:443\n</sandbox_violations>",
+        );
+        assert!(matches!(verdict(&report, "network"), Verdict::Fail(_)));
+        assert_only_failing(&report, "network");
+        // curl names the probe host in its own error, but the harness
+        // denied another host: still a failure.
+        let (_, report) = with_result(
+            "network",
+            "Exit code 6\ncurl: (6) Could not resolve host: example.com\n\
+             <sandbox_violations>\ndeny network-outbound evil.test:443\n</sandbox_violations>",
+        );
+        assert!(matches!(verdict(&report, "network"), Verdict::Fail(_)));
+    }
+
+    #[test]
+    fn an_init_without_plugins_fails() {
+        let mut init = good_init();
+        init.as_object_mut().unwrap().remove("plugins");
+        assert_init_fails(Some(&init), "plugins missing");
+        init["plugins"] = json!("none");
+        assert_init_fails(Some(&init), "plugins missing");
     }
 
     #[test]
