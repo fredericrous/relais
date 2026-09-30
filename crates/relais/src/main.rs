@@ -3750,9 +3750,26 @@ fn explain_command(run_id: &str) -> Result<CliOutcome, CliError> {
                 print!(" for {criterion_id}");
             }
             println!();
+            if row.kind == EvidenceKind::SandboxDenials {
+                println!("{}", sandbox_denials_text(&row.path));
+            }
         }
     }
     Ok(CliOutcome::Accepted)
+}
+
+/// The denial report a sandboxed attempt recorded, rendered; a file that
+/// cannot be read or parsed is said so rather than skipped.
+fn sandbox_denials_text(path: &str) -> String {
+    let report = std::fs::read_to_string(path)
+        .map_err(|e| e.to_string())
+        .and_then(|body| {
+            serde_json::from_str::<relais::sandbox::DenialReport>(&body).map_err(|e| e.to_string())
+        });
+    match report {
+        Ok(report) => report.render(),
+        Err(why) => relais::sandbox::DenialReport::render_unreadable(&why),
+    }
 }
 
 /// Whether `resume` also retires the worktree once the run is terminal
@@ -4933,6 +4950,24 @@ mod tests {
         let dir = relais::test_support::short_temp_dir(&format!("main-{label}"));
         let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger opens");
         (ledger, dir)
+    }
+
+    /// `relais explain` says a report it cannot parse in one line within 80
+    /// columns, however long the parse error is.
+    #[test]
+    fn an_unreadable_denial_report_is_one_line_within_80_columns() {
+        let dir = relais::test_support::short_temp_dir("main-denials-text");
+        let path = dir.join("sandbox-denials-1.json");
+        let coverage = "x".repeat(300);
+        std::fs::write(
+            &path,
+            format!(r#"{{"verified":[],"suspected":[],"coverage":"{coverage}"}}"#),
+        )
+        .expect("report written");
+        let text = sandbox_denials_text(&path.to_string_lossy());
+        assert!(text.starts_with("sandbox denials: unreadable ("), "{text}");
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.chars().count() <= 80, "{text}");
     }
 
     /// A session that started its run BEFORE the report window and kept

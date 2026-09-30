@@ -266,7 +266,7 @@ pub struct ProbeReport {
 
 const WIDTH: usize = 80;
 
-fn clip(line: &str) -> String {
+pub(super) fn clip(line: &str) -> String {
     let flat = line.replace('\n', " ");
     if flat.chars().count() <= WIDTH {
         return flat;

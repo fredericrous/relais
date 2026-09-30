@@ -41,6 +41,17 @@ missing here.
   before any session is paid for and shows as `unavailable: <reason>`; probe
   directories are pruned to the three most recent; `projects` entries are
   matched by real path.
+- Sandbox denial evidence (#105): every sandboxed worker attempt records
+  `attempts/sandbox-denials-<attempt id>.json` (evidence kind `sandbox_denials`) from
+  its transcript and scratch files. A `deny network-outbound` line inside a
+  `<sandbox_violations>` block is verified; any other operation-not-permitted,
+  read-only-file-system, proxy-403 or `bwrap:` line is only suspected, since
+  an application can print the same words. Coverage says how far to trust an
+  empty report: `complete` only for a fully parsed transcript whose every
+  tool call has exactly one result, `incomplete` with the reason, `unknown`
+  without a transcript (never a run error). `relais explain` prints the
+  report. A redispatch of the same attempt keeps the earlier scratch
+  directory as `scratch-<n>` instead of deleting it.
 
 ### Changed
 

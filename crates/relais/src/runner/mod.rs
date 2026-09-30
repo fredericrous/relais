@@ -1513,12 +1513,9 @@ impl<'a> RunEngine<'a> {
             .join(attempt_index.to_string())
             .join("scratch");
         // Fresh: a retry of the same attempt must not inherit the last
-        // one's leftovers. Nothing to remove the first time.
-        match std::fs::remove_dir_all(&scratch) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
+        // one's leftovers, but they are the earlier dispatch's denial
+        // evidence, so they are set aside, not deleted.
+        set_scratch_aside(&scratch)?;
         std::fs::create_dir_all(&scratch)?;
         // `var_os`, not `var`: a non-UTF-8 relocation (`CARGO_HOME`, …)
         // must still reach the floor, lossily, rather than vanish from it.
@@ -1533,6 +1530,37 @@ impl<'a> RunEngine<'a> {
             launch_env_names: &self.config.worker_env.names(),
             scratch: &scratch,
         })))
+    }
+
+    /// Record what the sandbox denied this worker attempt and how complete
+    /// that account is (SPEC §8): the transcript at the session's path
+    /// under the worker's Claude config dir, and the scratch directory's
+    /// files, as `<run>/attempts/sandbox-denials-<attempt id>.json`. A transcript that
+    /// cannot be read makes the coverage `Unknown`; it never stops the run.
+    fn record_sandbox_denials(
+        &self,
+        attempt_id: i64,
+        scene: &SandboxScene,
+        session_id: Option<&str>,
+    ) -> Result<(), RunError> {
+        let files = scratch_files(&scene.scratch);
+        let report = match read_attempt_transcript(scene, session_id) {
+            Ok(text) => sandbox::scan(Some(&text), &files),
+            Err(reason) => sandbox::DenialReport {
+                coverage: sandbox::Coverage::Unknown(reason),
+                ..sandbox::scan(None, &files)
+            },
+        };
+        let body =
+            serde_json::to_string_pretty(&report).map_err(|e| RunError::Other(e.to_string()))?;
+        // Keyed by the attempt ROW, not its index: a redispatch reuses the
+        // index, and a report per index would overwrite the earlier
+        // dispatch's report under its evidence row (and its hash).
+        let path = self
+            .artifacts
+            .join("attempts")
+            .join(format!("sandbox-denials-{attempt_id}.json"));
+        self.record_artifact(Some(attempt_id), EvidenceKind::SandboxDenials, &path, &body)
     }
 
     /// Context: verdicts and tool failures are distinct, contradictions
@@ -2020,6 +2048,7 @@ impl<'a> RunEngine<'a> {
             pid_slot: None,
             sandbox,
         };
+        let scene = SandboxScene::of(&spec);
 
         let requested_model = model_profile.id.clone();
         let requested_effort = effort_str(model_profile.effort.as_ref());
@@ -2071,6 +2100,14 @@ impl<'a> RunEngine<'a> {
         };
         ledger.record_usage(&event)?;
         progress.spend.fold(event.cost, usage.cost.completeness());
+
+        // What the sandbox denied, however the attempt went: AFTER the cost
+        // is recorded (a failure to write the report must not lose it),
+        // before the result is judged and before any redispatch sets the
+        // scratch aside.
+        if let Some(scene) = &scene {
+            self.record_sandbox_denials(attempt_id, scene, result.session_id.as_deref())?;
+        }
         if let Some(model) = &result.effective_model {
             if !progress.models_used.contains(model) {
                 progress.models_used.push(model.clone());
@@ -4242,6 +4279,110 @@ fn sandbox_home(
     }
 }
 
+/// What one sandboxed worker attempt ran in, taken before its launch spec
+/// is handed to the backend: where its transcript and scratch files are.
+struct SandboxScene {
+    scratch: PathBuf,
+    work_dir: PathBuf,
+    /// `CLAUDE_CONFIG_DIR` from the worker's environment, when it had one.
+    config_dir: Option<String>,
+}
+
+impl SandboxScene {
+    fn of(spec: &LaunchSpec) -> Option<Self> {
+        let launch = spec.sandbox.as_ref()?;
+        Some(Self {
+            scratch: launch.scratch_dir.clone(),
+            work_dir: spec.work_dir.clone(),
+            config_dir: spec
+                .env
+                .vars()
+                .iter()
+                .find(|(name, _)| name == crate::paths::CLAUDE_CONFIG_DIR_ENV)
+                .map(|(_, value)| value.clone()),
+        })
+    }
+}
+
+/// The attempt's Claude Code transcript, or why there is none to read.
+fn read_attempt_transcript(
+    scene: &SandboxScene,
+    session_id: Option<&str>,
+) -> Result<String, String> {
+    let session_id = session_id.ok_or("no transcript")?;
+    let config_dir = match &scene.config_dir {
+        Some(dir) => PathBuf::from(dir),
+        None => crate::paths::home_dir()
+            .map_err(|e| format!("no transcript: {e}"))?
+            .join(".claude"),
+    };
+    let path = sandbox::transcript_path(&config_dir, &scene.work_dir, session_id);
+    let error = match std::fs::read_to_string(&path) {
+        Ok(text) => return Ok(text),
+        Err(error) => error,
+    };
+    // Claude Code's derivation of the slug from the cwd is not measured for
+    // a symlinked path (`/tmp` → `/private/tmp`): the canonical one is the
+    // second place to look.
+    if let Ok(canonical) = std::fs::canonicalize(&scene.work_dir) {
+        if canonical != scene.work_dir {
+            let other = sandbox::transcript_path(&config_dir, &canonical, session_id);
+            if let Ok(text) = std::fs::read_to_string(&other) {
+                return Ok(text);
+            }
+        }
+    }
+    Err(format!(
+        "transcript unreadable at {}: {error}",
+        path.display()
+    ))
+}
+
+/// The largest scratch file the denial scan reads.
+const SCRATCH_FILE_LIMIT: u64 = 1024 * 1024;
+
+/// The regular files directly in `scratch`, as `(path, text)`, by path. A
+/// symlink of any target is skipped — relais reads outside the sandbox, so
+/// following one would copy a file the worker chose into the evidence. A
+/// file over 1 MiB or not UTF-8 is skipped — it cannot be read line by
+/// line — and so is an unreadable directory: a scratch that cannot be
+/// scanned leaves the report as it is, it never stops the run.
+fn scratch_files(scratch: &Path) -> Vec<(PathBuf, String)> {
+    let Ok(entries) = std::fs::read_dir(scratch) else {
+        return Vec::new();
+    };
+    // An entry that cannot be listed is skipped for the same reason.
+    let mut files: Vec<(PathBuf, String)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            // `symlink_metadata` does not follow: a link is not a regular file.
+            std::fs::symlink_metadata(path)
+                .is_ok_and(|meta| meta.is_file() && meta.len() <= SCRATCH_FILE_LIMIT)
+        })
+        .filter_map(|path| std::fs::read_to_string(&path).ok().map(|text| (path, text)))
+        .collect();
+    files.sort();
+    files
+}
+
+/// Sets an existing scratch directory aside as `scratch-<n>`, the next
+/// free number, so a redispatch of the same attempt starts with an empty
+/// one and the earlier dispatch's evidence survives. Nothing to do when
+/// there is none yet.
+fn set_scratch_aside(scratch: &Path) -> std::io::Result<()> {
+    if !scratch.try_exists()? {
+        return Ok(());
+    }
+    for n in 1u32.. {
+        let target = scratch.with_file_name(format!("scratch-{n}"));
+        if !target.try_exists()? {
+            return std::fs::rename(scratch, target);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     /// No resolvable home is a `SandboxUnavailable` block at preflight,
@@ -4535,6 +4676,27 @@ mod tests {
             backend: &dyn Backend,
             host: &dyn crate::sandbox::SandboxHost,
         ) -> RunOutcome {
+            self.execute_with_env(
+                contract,
+                repo,
+                machine,
+                backend,
+                host,
+                crate::backend::LaunchEnv::default(),
+            )
+        }
+
+        /// `execute_with_host` with the worker environment the run is
+        /// configured with.
+        fn execute_with_env(
+            &self,
+            contract: &TaskContract,
+            repo: &RepoPolicy,
+            machine: &MachineSettings,
+            backend: &dyn Backend,
+            host: &dyn crate::sandbox::SandboxHost,
+            worker_env: crate::backend::LaunchEnv,
+        ) -> RunOutcome {
             let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
                 adr: "ADR-0001".into(),
                 choice: None,
@@ -4551,7 +4713,7 @@ mod tests {
                 git: &crate::workspace::SystemGit,
                 hooks: &crate::verify::FixedInventory(None),
                 attest: &crate::verify::FixedAttest::default(),
-                worker_env: crate::backend::LaunchEnv::default(),
+                worker_env,
                 sandbox_host: host,
                 artifacts_dir: self.artifacts.clone(),
                 aval_resolver: &resolver,
@@ -9764,6 +9926,15 @@ mod tests {
     /// harness reporting `version`, under [`PassingHost`]'s empty managed
     /// root: the same real paths, the fixture's empty worker environment.
     fn gate_key(machine: &MachineSettings, version: &str) -> crate::sandbox::VerificationKey {
+        gate_key_with_env(machine, version, &[])
+    }
+
+    /// [`gate_key`] for a run whose worker environment carries `names`.
+    fn gate_key_with_env(
+        machine: &MachineSettings,
+        version: &str,
+        names: &[String],
+    ) -> crate::sandbox::VerificationKey {
         let ambient =
             |name: &str| std::env::var_os(name).map(|value| value.to_string_lossy().into_owned());
         crate::sandbox::dispatch_key(&crate::sandbox::DispatchKeyInputs {
@@ -9775,7 +9946,7 @@ mod tests {
                 config_dir: &crate::paths::config_dir().expect("a config dir"),
                 ledger_path: &crate::paths::ledger_path().expect("a ledger path"),
                 env: &ambient,
-                launch_env_names: &[],
+                launch_env_names: names,
                 scratch: Path::new("/scratch"),
             },
             managed: &[],
@@ -10030,6 +10201,318 @@ mod tests {
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
+    /// A sandboxed one-attempt run whose worker reports `session_id` and,
+    /// when given `transcript`, leaves those JSONL lines where Claude Code
+    /// would have written them under the worker's `CLAUDE_CONFIG_DIR`; it
+    /// also leaves a `build.log` in its scratch directory.
+    fn run_sandboxed_with_transcript(
+        fixture: &Fixture,
+        session_id: Option<&'static str>,
+        transcript: Option<Vec<String>>,
+    ) -> RunOutcome {
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let mut machine = fixture.machine_for(&repo);
+        machine.sandbox.enabled = true;
+        let config_dir = fixture.dir.join("claude");
+        let env = crate::backend::LaunchEnv::from_ambient(&[(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            config_dir.to_string_lossy().into_owned(),
+        )]);
+        let backend = MockBackend::new(move |spec| {
+            if let (Some(lines), Some(id)) = (&transcript, session_id) {
+                let path = crate::sandbox::transcript_path(&config_dir, &spec.work_dir, id);
+                std::fs::create_dir_all(path.parent().expect("a slug dir")).expect("slug dir");
+                std::fs::write(&path, lines.join("\n")).expect("transcript");
+            }
+            if let Some(launch) = &spec.sandbox {
+                std::fs::write(
+                    launch.scratch_dir.join("build.log"),
+                    "cp: Read-only file system\nall fine\n",
+                )
+                .expect("scratch log");
+            }
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                session_id: session_id.map(str::to_string),
+                ..Default::default()
+            }
+        })
+        .reporting_version(crate::sandbox::SANDBOX_MIN_HARNESS);
+        let managed = fixture.dir.join("managed");
+        std::fs::create_dir_all(&managed).expect("managed root");
+        let store = fixture.dir.join("verified.json");
+        store_with_record(
+            &store,
+            &gate_key_with_env(&machine, crate::sandbox::SANDBOX_MIN_HARNESS, &env.names()),
+        );
+        let host = PassingHost { managed, store };
+        let outcome = fixture.execute_with_env(
+            &fixture.contract(Review::Off),
+            &repo,
+            &machine,
+            &backend,
+            &host,
+            env,
+        );
+        assert!(
+            matches!(outcome.terminal, Terminal::Accepted(_)),
+            "{outcome:?}"
+        );
+        outcome
+    }
+
+    /// The one denial report the run recorded, for attempt 1.
+    fn recorded_denials(fixture: &Fixture, outcome: &RunOutcome) -> crate::sandbox::DenialReport {
+        let rows = evidence_of(fixture, &outcome.run_id, EvidenceKind::SandboxDenials);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        // Keyed by the attempt row, so a redispatch of the same index can
+        // never overwrite an earlier dispatch's report under its evidence.
+        let report_path = Path::new(&rows[0].0);
+        let file = report_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a file name");
+        let id = file
+            .strip_prefix("sandbox-denials-")
+            .and_then(|rest| rest.strip_suffix(".json"))
+            .expect("sandbox-denials-<attempt id>.json");
+        assert!(id.parse::<i64>().is_ok(), "{rows:?}");
+        assert!(
+            report_path
+                .parent()
+                .is_some_and(|dir| dir.ends_with("attempts")),
+            "{rows:?}"
+        );
+        serde_json::from_str(&std::fs::read_to_string(&rows[0].0).expect("readable"))
+            .expect("a denial report")
+    }
+
+    /// Every sandboxed attempt says what the sandbox denied: a network
+    /// violation in the transcript (found by the slug rule under the
+    /// worker's `CLAUDE_CONFIG_DIR`) is verified, a refusal in a scratch
+    /// log is suspected, and a whole transcript makes the account complete.
+    #[test]
+    fn a_sandboxed_attempt_records_its_denials_with_their_coverage() {
+        let fixture = Fixture::new();
+        let use_line = serde_json::json!({"message": {"content": [
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}
+        ]}});
+        let result_line = serde_json::json!({"message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content":
+                "Exit code 56\n<sandbox_violations>\ndeny network-outbound evil.test:443\n\
+                 </sandbox_violations>"}
+        ]}});
+        let outcome = run_sandboxed_with_transcript(
+            &fixture,
+            Some("sess-1"),
+            Some(vec![use_line.to_string(), result_line.to_string()]),
+        );
+        let report = recorded_denials(&fixture, &outcome);
+        assert_eq!(report.verified.len(), 1, "{report:?}");
+        assert_eq!(report.verified[0].source, "tool_result:t1");
+        assert_eq!(report.suspected.len(), 1, "{report:?}");
+        assert_eq!(report.suspected[0].source, "build.log");
+        assert_eq!(report.coverage, crate::sandbox::Coverage::Complete);
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A transcript that is not there is an unknown coverage, never a run
+    /// error — whether the harness named no session or named one whose
+    /// file is missing.
+    #[test]
+    fn a_missing_transcript_is_unknown_coverage_not_a_run_error() {
+        let fixture = Fixture::new();
+        let outcome = run_sandboxed_with_transcript(&fixture, None, None);
+        let report = recorded_denials(&fixture, &outcome);
+        assert_eq!(
+            report.coverage,
+            crate::sandbox::Coverage::Unknown("no transcript".to_string())
+        );
+        assert_eq!(report.suspected.len(), 1, "scratch files are still read");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+
+        let fixture = Fixture::new();
+        let outcome = run_sandboxed_with_transcript(&fixture, Some("sess-2"), None);
+        let report = recorded_denials(&fixture, &outcome);
+        assert!(
+            matches!(&report.coverage, crate::sandbox::Coverage::Unknown(why)
+                if why.contains("transcript unreadable")),
+            "{report:?}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A redispatch of the same attempt starts with an empty scratch and
+    /// keeps the earlier one as `scratch-<n>`, the next free number.
+    #[test]
+    fn a_redispatch_sets_the_previous_scratch_aside() {
+        let dir = crate::test_support::temp_dir("scratch-aside");
+        let scratch = dir.join("scratch");
+        set_scratch_aside(&scratch).expect("nothing to set aside the first time");
+        assert!(!dir.join("scratch-1").exists());
+        for round in 1..=2 {
+            std::fs::create_dir_all(&scratch).expect("scratch");
+            std::fs::write(scratch.join("log"), format!("round {round}")).expect("log");
+            set_scratch_aside(&scratch).expect("set aside");
+            assert!(!scratch.exists());
+        }
+        let kept = |n: u32| std::fs::read_to_string(dir.join(format!("scratch-{n}/log")));
+        assert_eq!(kept(1).expect("first kept"), "round 1");
+        assert_eq!(kept(2).expect("second kept"), "round 2");
+    }
+
+    /// A second dispatch of the same attempt index keeps the first one's
+    /// scratch as `scratch-1` and records its own report: two evidence rows
+    /// on two different files, each row's hash the hash of its file.
+    #[test]
+    fn a_redispatch_of_the_same_index_records_a_second_report() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let mut machine = fixture.machine_for(&repo);
+        machine.sandbox.enabled = true;
+        let contract = fixture.contract(Review::Off);
+        let backend = MockBackend::new(|_| MockOutcome::default());
+        let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
+            adr: "ADR-0001".into(),
+            choice: None,
+            reason: None,
+        };
+        let config = RunConfig {
+            repo_dir: &fixture.repo,
+            contract: &contract,
+            repo_policy: &repo,
+            machine: &machine,
+            ledger: &fixture.ledger,
+            ids: &fixture.ids,
+            backend: &backend,
+            git: &crate::workspace::SystemGit,
+            hooks: &crate::verify::FixedInventory(None),
+            attest: &crate::verify::FixedAttest::default(),
+            worker_env: crate::backend::LaunchEnv::default(),
+            sandbox_host: &crate::sandbox::RealSandboxHost,
+            artifacts_dir: fixture.artifacts.clone(),
+            aval_resolver: &resolver,
+            predictor: None,
+            gate: None,
+            session_id: "test-session".into(),
+            heartbeat_every: Duration::from_millis(50),
+            task_override: None,
+            purpose: None,
+            run_id: None,
+        };
+        let engine = RunEngine::new(&config, None).expect("an engine");
+        let task = crate::ids::TaskId::from_stored("redispatch-task");
+        fixture
+            .ledger
+            .insert_run(&engine.run_id, "/repo", None, &task, "rk")
+            .expect("run row");
+        let revision = fixture
+            .ledger
+            .insert_contract_revision(&engine.run_id, "hash", "{}", "HEAD", Some("sha"))
+            .expect("revision");
+        for round in 1..=2 {
+            let launch = engine
+                .sandbox_launch(1)
+                .expect("a launch")
+                .expect("sandboxed");
+            std::fs::write(
+                launch.scratch_dir.join("build.log"),
+                format!("round {round}: cp: Read-only file system\n"),
+            )
+            .expect("scratch log");
+            let attempt_id = fixture
+                .ledger
+                .insert_attempt(
+                    &engine.run_id,
+                    revision,
+                    1,
+                    "implementation",
+                    UsagePhase::Initial,
+                )
+                .expect("attempt row");
+            let scene = SandboxScene {
+                scratch: launch.scratch_dir.clone(),
+                work_dir: fixture.repo.clone(),
+                config_dir: None,
+            };
+            engine
+                .record_sandbox_denials(attempt_id, &scene, None)
+                .expect("recorded");
+        }
+        let rows = evidence_of(&fixture, &engine.run_id, EvidenceKind::SandboxDenials);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_ne!(rows[0].0, rows[1].0, "two dispatches, two files");
+        for (path, sha256) in &rows {
+            assert!(Path::new(path).is_file(), "{path} exists");
+            assert_eq!(
+                &workspace::sha256_file(Path::new(path)).expect("hashable"),
+                sha256,
+                "{path} still has the hash its row stored"
+            );
+        }
+        let kept = engine.artifacts.join("attempts/1/scratch-1/build.log");
+        assert!(kept.is_file(), "the first dispatch's scratch survives");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// The scratch scan reads regular files only: a symlink the worker
+    /// planted, whatever it points at, contributes nothing.
+    // Unix only: creating a symlink is `std::os::unix::fs::symlink`.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_the_scratch_dir_is_never_followed() {
+        let dir = crate::test_support::temp_dir("scratch-symlink");
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, "secret: Operation not permitted\n").expect("target");
+        let scratch = dir.join("scratch");
+        std::fs::create_dir_all(&scratch).expect("scratch");
+        std::os::unix::fs::symlink(&outside, scratch.join("planted.log")).expect("symlink");
+        std::fs::write(scratch.join("real.log"), "Operation not permitted\n").expect("regular");
+        let files = scratch_files(&scratch);
+        let names: Vec<_> = files
+            .iter()
+            .map(|(path, _)| path.file_name().expect("a name").to_string_lossy())
+            .collect();
+        assert_eq!(names, ["real.log"], "{files:?}");
+        let report = sandbox::scan(None, &files);
+        assert_eq!(report.suspected.len(), 1, "{report:?}");
+        assert_eq!(report.suspected[0].source, "real.log");
+    }
+
+    /// A transcript that is not under the slug of the work dir as given is
+    /// looked for under the slug of its canonical path.
+    // Unix only: creating a symlink is `std::os::unix::fs::symlink`.
+    #[cfg(unix)]
+    #[test]
+    fn the_transcript_is_found_under_the_canonical_slug() {
+        let dir = crate::test_support::temp_dir("transcript-canonical");
+        let root = std::fs::canonicalize(&*dir).expect("canonical temp dir");
+        let real = root.join("real");
+        let link = root.join("link");
+        std::fs::create_dir_all(&real).expect("real work dir");
+        std::os::unix::fs::symlink(&real, &link).expect("symlinked work dir");
+        let config_dir = root.join("claude");
+        let canonical_path = sandbox::transcript_path(&config_dir, &real, "sess");
+        std::fs::create_dir_all(canonical_path.parent().expect("a slug dir")).expect("slug dir");
+        std::fs::write(&canonical_path, "{}").expect("transcript");
+        assert!(
+            !sandbox::transcript_path(&config_dir, &link, "sess").exists(),
+            "nothing under the slug as given"
+        );
+        let scene = SandboxScene {
+            scratch: root.join("scratch"),
+            work_dir: link,
+            config_dir: Some(config_dir.to_string_lossy().into_owned()),
+        };
+        assert_eq!(
+            read_attempt_transcript(&scene, Some("sess")),
+            Ok("{}".to_string())
+        );
+    }
+
     /// With `[sandbox]` off the worker is launched as it always was, plus
     /// the credential scrub; and neither launch carries a sandbox.
     #[test]
@@ -10083,6 +10566,10 @@ mod tests {
                 .filter(|(reviewer, ..)| !*reviewer)
                 .all(|(_, _, scrubbed)| *scrubbed),
             "the allowlist worker runs with the credential scrub: {seen:?}"
+        );
+        assert!(
+            evidence_of(&fixture, &outcome.run_id, EvidenceKind::SandboxDenials).is_empty(),
+            "an allowlist attempt records no denial report"
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
