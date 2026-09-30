@@ -71,14 +71,24 @@ pub struct ProbePlanInputs<'a> {
     pub home: &'a Path,
 }
 
-const OS_DENIALS: [&str; 3] = [
+pub(crate) const OS_DENIALS: [&str; 3] = [
     "operation not permitted",
     "Operation not permitted",
     "Read-only file system",
 ];
-const PERMISSION_REFUSALS: [&str; 2] = ["denied by your permission settings", "has been denied"];
+/// The ways the harness refuses a tool call: a permission deny rule, or
+/// `--restricted` confining the file tools to the working directories
+/// (measured 2026-09-30 on 2.1.285: Grep outside the worktree answers
+/// "… is outside …; --restricted confines the file tools to the working
+/// directory." — a stronger refusal than a deny rule, and the first real
+/// verification scored it "not refused" before this entry).
+pub(crate) const PERMISSION_REFUSALS: [&str; 3] = [
+    "denied by your permission settings",
+    "has been denied",
+    "--restricted confines the file tools",
+];
 /// Words a probe prints only when the sandbox let something through.
-const LEAK_MARKERS: [&str; 2] = ["PRESENT", "READABLE"];
+pub(crate) const LEAK_MARKERS: [&str; 2] = ["PRESENT", "READABLE"];
 const GREP_PATTERN: &str = "relais-probe";
 const PRESENCE: &str = ">/dev/null && echo PRESENT || echo absent";
 
@@ -460,8 +470,9 @@ fn denies_probe_host(text: &str) -> bool {
     })
 }
 
-/// Negative expectations judge by text alone: a denied command legitimately
-/// has `is_error` true.
+/// OS-denial and network expectations judge by text (a denied command
+/// legitimately has `is_error` true); a refusal also needs the harness's
+/// error result, so output that merely quotes one does not count.
 fn judge(expect: &Expect, result: &ToolResult) -> Verdict {
     let text = result.text.as_str();
     match expect {
@@ -475,9 +486,13 @@ fn judge(expect: &Expect, result: &ToolResult) -> Verdict {
         Expect::NetworkViolation => require(denies_probe_host(text), || {
             format!("no network violation for {PROBE_HOST}: {}", snippet(text))
         }),
-        Expect::PermissionDenied => require(has_any(text, &PERMISSION_REFUSALS), || {
-            format!("not refused: {}", snippet(text))
-        }),
+        // A refusal is the harness's error result (measured: every refusal
+        // on 2.1.285 carries `is_error: true`), in one of its known
+        // wordings; text alone could be output that merely quotes one.
+        Expect::PermissionDenied => require(
+            result.is_error && has_any(text, &PERMISSION_REFUSALS),
+            || format!("not refused: {}", snippet(text)),
+        ),
     }
 }
 
@@ -664,9 +679,17 @@ mod tests {
                 {"type": "tool_use", "id": id, "name": step.tool.name(), "input": call_input(step)}
             ]}}));
             if let Some(text) = result_for(step) {
-                lines.push(json!({"type": "user", "message": {"content": [
-                    {"type": "tool_result", "tool_use_id": id, "content": text}
-                ]}}));
+                // As the harness records it (S0, 2.1.285): a denied or
+                // refused call is an error result; a successful one is not.
+                let denied = match step.expect {
+                    Expect::OsDenied | Expect::NetworkViolation | Expect::PermissionDenied => true,
+                    Expect::OutputLine(_) | Expect::OutputLineEndsWith(_) => false,
+                };
+                let mut result = json!({"type": "tool_result", "tool_use_id": id, "content": text});
+                if denied {
+                    result["is_error"] = json!(true);
+                }
+                lines.push(json!({"type": "user", "message": {"content": [result]}}));
             }
         }
         lines
@@ -811,6 +834,31 @@ mod tests {
             assert!(matches!(verdict(&report, id), Verdict::Fail(_)));
             assert_only_failing(&report, id);
         }
+    }
+
+    /// The refusal the first real verification met: `--restricted`
+    /// confining Grep to the working directories counts as refused.
+    #[test]
+    fn a_restricted_confinement_refuses_the_grep_step() {
+        let (_, report) = with_result(
+            "fixture-grep",
+            "/p/fixture is outside /p/worktree, /p/scratch; --restricted confines the file \
+             tools to the working directory.",
+        );
+        assert_eq!(verdict(&report, "fixture-grep"), &Verdict::Pass);
+    }
+
+    /// Output that merely QUOTES a refusal is not one: a refusal is the
+    /// harness's error result.
+    #[test]
+    fn refusal_text_without_an_error_result_is_not_a_refusal() {
+        let steps = plan();
+        let marked = "\"is_error\":true,\"tool_use_id\":\"toolu_fixture-grep\"";
+        let jsonl = transcript(&steps, |step| Some(measured(step)));
+        assert!(jsonl.contains(marked), "the builder marks the refusal");
+        let jsonl = jsonl.replace(marked, "\"tool_use_id\":\"toolu_fixture-grep\"");
+        let report = judged(&steps, &jsonl, &good_init());
+        assert_only_failing(&report, "fixture-grep");
     }
 
     #[test]
@@ -1126,11 +1174,10 @@ mod tests {
     #[test]
     fn a_denied_command_with_is_error_still_passes_its_negative_control() {
         let steps = plan();
-        let jsonl = transcript(&steps, |step| Some(measured(step))).replace(
-            "\"tool_use_id\":\"toolu_tmp-write\"",
-            "\"tool_use_id\":\"toolu_tmp-write\",\"is_error\":true",
-        );
-        assert!(jsonl.contains("\"is_error\":true"));
+        // The builder marks a denied call as an error result, as the harness
+        // does; the step still passes its negative expectation.
+        let jsonl = transcript(&steps, |step| Some(measured(step)));
+        assert!(jsonl.contains("\"is_error\":true,\"tool_use_id\":\"toolu_tmp-write\""));
         assert!(judged(&steps, &jsonl, &good_init()).passed);
     }
 

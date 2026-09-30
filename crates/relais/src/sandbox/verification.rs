@@ -24,7 +24,7 @@ const CREDENTIAL_NAMES_PLACEHOLDER: &str = "<credential-env-names>";
 /// Bump whenever `probe_plan`, `probe_plan_allowlist`, an `Expect` or
 /// `evaluate`'s rules change: a pass earned by the old probe proves nothing
 /// about the new one.
-const PROBE_VERSION: u32 = 1;
+const PROBE_VERSION: u32 = 2;
 
 /// Where the records live under a state directory.
 pub fn store_path(state_dir: &Path) -> PathBuf {
@@ -256,7 +256,15 @@ mod tests {
                 )
             })
             .collect();
-        crate::ids::sha256_hex(text.as_bytes())
+        // The evaluator's text sets are part of the probe too: changing
+        // what counts as a denial, a refusal or a leak changes the verdict.
+        let markers = format!(
+            "{:?}|{:?}|{:?}",
+            crate::sandbox::probe::OS_DENIALS,
+            crate::sandbox::probe::PERMISSION_REFUSALS,
+            crate::sandbox::probe::LEAK_MARKERS
+        );
+        crate::ids::sha256_hex(format!("{text}{markers}").as_bytes())
     }
 
     #[test]
@@ -264,8 +272,8 @@ mod tests {
         assert_eq!(
             (PROBE_VERSION, probe_digest().as_str()),
             (
-                1,
-                "3b1f7ecaea65556c2703451b7a91d47bdff63ec5510ed25962832d062fc5a72f"
+                2,
+                "70a1c6792a18beb415ca72d7b109a63317386a9a455e2a3a54625009dbc362f3"
             ),
             "the probe changed: bump PROBE_VERSION and update this digest"
         );
