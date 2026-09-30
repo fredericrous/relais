@@ -230,6 +230,7 @@ pub(crate) fn run_decomposed(
         head: root.base_sha.to_string(),
         attempts_total: 0,
         models_used: Vec::new(),
+        efforts_used: Vec::new(),
         ladders: std::collections::BTreeMap::new(),
     };
     let outcome = execute_waves(engine, root, &plan, &integration, &mut assembly)?;
@@ -249,6 +250,8 @@ struct Assembly {
     head: String,
     attempts_total: u32,
     models_used: Vec<String>,
+    /// The efforts the packages' worker attempts requested, first use first.
+    efforts_used: Vec<String>,
     /// The ladder each accepted package's own run resolved, by package id:
     /// what the root's receipt records, since the root dispatches no worker
     /// rungs itself.
@@ -744,6 +747,11 @@ fn run_package(
             assembly.models_used.push(model);
         }
     }
+    for effort in ledger.efforts_used(&child_run)? {
+        if !assembly.efforts_used.contains(&effort) {
+            assembly.efforts_used.push(effort);
+        }
+    }
     engine.transition(
         State::Running,
         Reason::PackageFinished,
@@ -946,6 +954,11 @@ fn accept_integrated(
             assembly.models_used.push(model);
         }
     }
+    for effort in ledger.efforts_used(&engine.run_id)? {
+        if !assembly.efforts_used.contains(&effort) {
+            assembly.efforts_used.push(effort);
+        }
+    }
     // The run's real spend, read from the ledger: the reviewer is a
     // dispatch like any other and the ceiling that stopped the packages
     // stops it too. Handing `review_candidate` a fresh zero let a run
@@ -1051,6 +1064,7 @@ fn accept_integrated(
         verification_profile_hash: root.authority.verification_profile.hash(),
         review: super::review_record_of(ledger, &engine.run_id)?,
         ladder: verify::LadderRecord::PerPackage(std::mem::take(&mut assembly.ladders)),
+        efforts_used: std::mem::take(&mut assembly.efforts_used),
     };
     engine.seal(&receipt, None, None, &head)?;
     // The assembled revision is named under this run so the retirement

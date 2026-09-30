@@ -10,6 +10,22 @@ missing here.
 
 ### Added
 
+- **Every figure about effort is attributed to what the attempt requested
+  (P5).** One ledger reader, `Ledger::requested_effort`, gives an attempt's
+  requested effort from its worker dispatch intent: the ladder's effort at the
+  intent's rung, else the intent's flat `effort`, else the attempt's usage
+  row's `requested_effort`, else `unknown`. `relais report --by effort` groups
+  tasks by the effort their first run's first worker attempt requested, so an
+  effort id the code has never heard of forms its own cohort. Every report now
+  carries `repair_outcomes` (text and JSON): per requested effort, how many
+  repairs there were, whether the repair's own verification passed, failed or
+  reached no verdict (blocked, crash, cancelled, a decision's reason, a stop
+  before the checks ran, in flight, unrecorded), what the repairs cost (an attempt with no usage row is unknown cost,
+  never `$0.00`), and, on a separate line, how the runs they belong to
+  eventually ended. A receipt gains the additive `efforts_used`, the distinct
+  requested efforts of the run's worker attempts in first-use order; receipts
+  already stored still parse and `models_used` is unchanged. **The report
+  schema version moved 9 → 10** (the new top-level `repair_outcomes` key).
 - **The learner chooses among arms, not tiers (P4).** An arm is a tier and
   an effort request (`route::Arm`, labelled `implementation@high`,
   `implementation:not_requested`, `implementation:control_unsupported`).
