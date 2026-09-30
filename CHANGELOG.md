@@ -8,6 +8,14 @@ missing here.
 
 ## Unreleased
 
+### Added
+
+- `[sandbox]` in machine.toml (#105): configuration for OS-sandboxing a
+  worker (`enabled`, `writable`, `network`, `deny_read`), off by default and
+  outside the authority hash, with a computed credential floor, a judge for
+  managed Claude Code settings that would weaken the sandbox, and the
+  sandbox settings builder. Nothing launches sandboxed yet.
+
 ### Fixed
 
 - Opening a fresh ledger from several processes at once no longer fails

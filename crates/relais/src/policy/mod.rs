@@ -11,6 +11,7 @@
 //! invalidates them.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -638,6 +639,12 @@ pub enum PolicyError {
     /// A `[[recipes]]` table with two recipes sharing `(name, revision)`
     /// or two recipes sharing a [`RecipeSpec::recipe_id`].
     InvalidRecipe(RecipeError),
+    /// A `[sandbox]` entry the worker sandbox could not honour or must
+    /// not grant.
+    InvalidSandbox {
+        field: &'static str,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for PolicyError {
@@ -659,6 +666,7 @@ impl std::fmt::Display for PolicyError {
                 write!(f, "trust grant [trust.\"{key}\"]: {detail}")
             }
             Self::InvalidRecipe(err) => write!(f, "{err}"),
+            Self::InvalidSandbox { field, detail } => write!(f, "[sandbox] {field}: {detail}"),
         }
     }
 }
@@ -711,6 +719,123 @@ pub struct MachineSettings {
     /// and `doctor` reports what is missing.
     #[serde(default)]
     pub efforts: EffortSettings,
+    /// Worker OS sandbox configuration (SPEC §8). Machine-owned like
+    /// `[pricing]`: it feeds no authority hash.
+    #[serde(default)]
+    pub sandbox: SandboxSettings,
+}
+
+/// `[sandbox]` in machine.toml: what an OS-sandboxed worker may touch
+/// beyond its own worktree. Disabled unless the machine says otherwise;
+/// the credential floor is not configurable away (see `crate::sandbox`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SandboxSettings {
+    pub enabled: bool,
+    /// Extra writable directories, absolute or `~/`-relative.
+    pub writable: Vec<String>,
+    /// Domains the worker may reach, e.g. `api.anthropic.com`.
+    pub network: Vec<String>,
+    /// Extra paths the worker may not read, absolute or `~/`-relative.
+    pub deny_read: Vec<String>,
+}
+
+/// A machine.toml path entry made absolute: `~` and `~/…` against `home`,
+/// an absolute path as it is, and `None` for anything else. Pure, so the
+/// validator and the settings builder cannot disagree about spelling.
+pub fn expand_home(entry: &str, home: &Path) -> Option<PathBuf> {
+    let path = if entry == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = entry.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        PathBuf::from(entry)
+    };
+    // `..` is refused in EVERY form: `~/..` joined as written became the
+    // home's parent, and `Path::starts_with` compares components without
+    // resolving `..`, so the ancestor guard below never saw it.
+    let clean = path.is_absolute()
+        && !path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir));
+    clean.then_some(path)
+}
+
+/// Whether `name` is a plain domain: letters, digits, `-` and `.`, at
+/// least one dot, no empty label, no scheme, path or wildcard.
+fn is_plain_domain(name: &str) -> bool {
+    name.contains('.')
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+}
+
+impl SandboxSettings {
+    /// Refuse what a sandbox could not honour or must not grant. `home`
+    /// and `state_dir` are parameters — this module never reads the
+    /// environment — so `MachineSettings::validate`, which has neither,
+    /// passes `None` and gets the checks that need no directory (`~`
+    /// itself is still the home directory, whatever it is). A caller that
+    /// knows both passes them to also refuse an ancestor of either.
+    pub fn check(
+        &self,
+        home: Option<&Path>,
+        state_dir: Option<&Path>,
+        config_dir: Option<&Path>,
+    ) -> Result<(), PolicyError> {
+        let invalid =
+            |field: &'static str, entry: &str, detail: &str| PolicyError::InvalidSandbox {
+                field,
+                detail: format!("{entry:?}: {detail}"),
+            };
+        // A stand-in home keeps `~` entries expandable, and comparable to
+        // the guarded directories, when the real one is not known.
+        let base = home.unwrap_or(Path::new("/~home"));
+        let expand = |field: &'static str, entry: &str| -> Result<PathBuf, PolicyError> {
+            expand_home(entry, base).ok_or_else(|| {
+                invalid(
+                    field,
+                    entry,
+                    "must be absolute (or start with `~/`), without `..`",
+                )
+            })
+        };
+        for entry in &self.deny_read {
+            expand("deny_read", entry)?;
+        }
+        for entry in &self.writable {
+            let path = expand("writable", entry)?;
+            // The config dir holds machine.toml and its trust grants: a
+            // worker able to write it could grant itself authority.
+            let guarded = [Some(Path::new("/")), Some(base), state_dir, config_dir];
+            if guarded
+                .into_iter()
+                .flatten()
+                .any(|dir| dir.starts_with(&path))
+            {
+                return Err(invalid(
+                    "writable",
+                    entry,
+                    "is, or contains, `/`, the home directory, the state directory or the \
+                     config directory",
+                ));
+            }
+        }
+        for name in &self.network {
+            if !is_plain_domain(name) {
+                return Err(invalid(
+                    "network",
+                    name,
+                    "is not a plain domain (letters, digits, `-`, `.`, at least one dot; \
+                     no scheme, path or wildcard)",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `[efforts]` in machine.toml: the order and per-model support the
@@ -1210,6 +1335,14 @@ impl MachineSettings {
         for (key, grant) in &self.trust {
             grant.validate(key)?;
         }
+        // The REAL directories: checking against a stand-in let an entry
+        // that is an ancestor of the actual home or state dir through. An
+        // unresolvable one (no HOME) is left to the stand-in.
+        let home = crate::paths::home_dir().ok();
+        let state_dir = crate::paths::state_dir().ok();
+        let config_dir = crate::paths::config_dir().ok();
+        self.sandbox
+            .check(home.as_deref(), state_dir.as_deref(), config_dir.as_deref())?;
         Ok(())
     }
 }
@@ -1865,6 +1998,110 @@ keys = ["output.contract"]
             a.trust_granted, b.trust_granted,
             "a pricing block must not affect whether the existing grant still holds"
         );
+    }
+
+    /// `[sandbox]` is machine policy like `[pricing]`: adding it must not
+    /// move a repo's authority hash or invalidate a reviewed grant.
+    #[test]
+    fn a_sandbox_block_in_machine_settings_does_not_move_the_authority_hash() {
+        let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        let hash = repo.authority_hash();
+        let without =
+            MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo))).expect("parses");
+        let with = MachineSettings::from_toml_str(&format!(
+            "{}\n[sandbox]\nenabled = true\nwritable = [\"~/scratch\"]\n\
+             network = [\"api.anthropic.com\"]\ndeny_read = [\"~/secrets\"]\n",
+            machine_toml(&grant_for(&repo))
+        ))
+        .expect("parses");
+        assert!(!without.sandbox.enabled, "disabled unless stated");
+        assert!(with.sandbox.enabled);
+        assert_eq!(repo.authority_hash(), hash);
+        let a = effective_authority(&repo, &without, &contract(), &identity());
+        let b = effective_authority(&repo, &with, &contract(), &identity());
+        assert_eq!(a.trust_granted, b.trust_granted);
+    }
+
+    fn sandbox_refusal(body: &str) -> String {
+        let text = machine_toml(&format!("[sandbox]\n{body}\n"));
+        match MachineSettings::from_toml_str(&text) {
+            Err(PolicyError::InvalidSandbox { field, .. }) => field.to_string(),
+            other => panic!("expected a sandbox refusal for {body:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_sandbox_block_refuses_what_it_cannot_honour() {
+        assert_eq!(sandbox_refusal("writable = [\"~\"]"), "writable");
+        assert_eq!(sandbox_refusal("writable = [\"/\"]"), "writable");
+        assert_eq!(sandbox_refusal("writable = [\"scratch\"]"), "writable");
+        assert_eq!(sandbox_refusal("writable = [\"/a/../b\"]"), "writable");
+        assert_eq!(sandbox_refusal("deny_read = [\"secrets\"]"), "deny_read");
+        for bad in ["localhost", "https://a.com", "a.com/x", "*.a.com", "a..com"] {
+            assert_eq!(
+                sandbox_refusal(&format!("network = [\"{bad}\"]")),
+                "network"
+            );
+        }
+    }
+
+    /// `~/..` resolved to the home's parent and passed: `..` is refused in
+    /// a `~/` entry as in an absolute one.
+    #[test]
+    fn a_home_relative_parent_escape_is_refused() {
+        for entry in ["~/..", "~/../..", "~/.cache/../../x"] {
+            let settings = SandboxSettings {
+                writable: vec![entry.to_string()],
+                ..SandboxSettings::default()
+            };
+            assert!(
+                settings
+                    .check(Some(Path::new("/Users/me")), None, None)
+                    .is_err(),
+                "{entry} must be refused"
+            );
+        }
+    }
+
+    /// A `writable` entry containing relais's config dir (machine.toml, the
+    /// trust grants) is refused, relocated or not.
+    #[test]
+    fn a_writable_entry_over_the_config_dir_is_refused() {
+        let settings = SandboxSettings {
+            writable: vec!["~/.config".to_string()],
+            ..SandboxSettings::default()
+        };
+        let home = Path::new("/Users/me");
+        assert!(settings
+            .check(
+                Some(home),
+                None,
+                Some(Path::new("/Users/me/.config/relais"))
+            )
+            .is_err());
+        assert!(settings
+            .check(Some(home), None, Some(Path::new("/etc/relais")))
+            .is_ok());
+    }
+
+    #[test]
+    fn a_sandbox_check_with_known_directories_refuses_their_ancestors() {
+        let settings = SandboxSettings {
+            writable: vec!["/Users".to_string()],
+            ..SandboxSettings::default()
+        };
+        let home = Path::new("/Users/me");
+        assert!(settings.check(Some(home), None, None).is_err());
+        let state = SandboxSettings {
+            writable: vec!["/var/lib".to_string()],
+            ..SandboxSettings::default()
+        };
+        assert!(state
+            .check(Some(home), Some(Path::new("/var/lib/relais")), None)
+            .is_err());
+        assert!(state
+            .check(Some(home), Some(Path::new("/srv/relais")), None)
+            .is_ok());
     }
 
     /// `CommandSpec.name` is what a declared criterion's evidence names;

@@ -4246,6 +4246,7 @@ mod tests {
                 admission: Default::default(),
                 pricing: None,
                 efforts: Default::default(),
+                sandbox: Default::default(),
             }
         }
 
