@@ -1344,11 +1344,52 @@ const COVERED_BY_AN_INCLUSIVE_PARENT: &str = "WITH RECURSIVE covered(event_id) A
           JOIN covered ON covered.event_id = child.parent_event_id
      )";
 
-/// How many times to ask for WAL before giving up. Each refusal means
-/// another connection is setting the same mode right now — one pragma
-/// on one connection, microseconds long — so a handful of attempts is
-/// generous and a hang is impossible.
-const WAL_ATTEMPTS: u32 = 32;
+/// How long any wait on the ledger's locks lasts before it is an error:
+/// the busy handler's timeout, and the deadline for the WAL switch that
+/// the busy handler does not cover.
+const LEDGER_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The pause after the first busy refusal; it doubles up to the cap.
+const FIRST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// The longest pause between two tries.
+const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Whether SQLite refused because another connection holds a lock
+/// (SQLITE_BUSY). SQLITE_LOCKED is not this: it is a conflict inside one
+/// connection, a bug to report at once rather than wait out.
+fn is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if failure.code == rusqlite::ErrorCode::DatabaseBusy
+    )
+}
+
+/// Run `operation` until it stops being refused as busy, for at most
+/// `deadline`. Between tries it sleeps 1 ms, doubling to a 25 ms cap, so
+/// a waiting caller does not spin a core. Any other error returns at
+/// once; when the deadline passes, the last busy refusal is returned.
+fn retry_while_busy<T>(
+    deadline: std::time::Duration,
+    mut operation: impl FnMut() -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    let started = std::time::Instant::now();
+    let mut pause = FIRST_BACKOFF;
+    loop {
+        match operation() {
+            Err(e) if is_busy(&e) => {
+                let left = deadline.saturating_sub(started.elapsed());
+                if left.is_zero() {
+                    return Err(e);
+                }
+                std::thread::sleep(pause.min(left));
+                pause = (pause * 2).min(BACKOFF_CAP);
+            }
+            other => return other,
+        }
+    }
+}
 
 /// Put the ledger in WAL mode (SPEC §23: several processes share it).
 ///
@@ -1359,37 +1400,25 @@ const WAL_ATTEMPTS: u32 = 32;
 /// processes opening the same ledger in the same instant had one of them
 /// die at the door with "database is locked" before it read a row. A
 /// refusal here is not a broken ledger, it is somebody else setting the
-/// same mode, so it is retried — and `PRAGMA journal_mode = WAL` answers
-/// with the mode in force, which is the check and the change in one
-/// statement.
+/// same mode, so it is retried with a short backoff until
+/// `LEDGER_BUSY_TIMEOUT` — the same time any other lock is waited for, so
+/// a hang is bounded by that deadline, not by a count of tries. Any other
+/// error returns at once. `PRAGMA journal_mode = WAL` answers with the
+/// mode in force, which is the check and the change in one statement.
 fn use_wal(conn: &Connection) -> Result<()> {
-    let mut refusal = None;
-    for _ in 0..WAL_ATTEMPTS {
-        match conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+    let mode = retry_while_busy(LEDGER_BUSY_TIMEOUT, || {
+        conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
             row.get::<_, String>(0)
-        }) {
-            Ok(mode) if mode.eq_ignore_ascii_case("wal") => return Ok(()),
-            Ok(mode) => {
-                return Err(LedgerError::Corrupt {
-                    what: "the ledger's journal mode".into(),
-                    detail: format!("SQLite kept `{mode}` when asked for WAL"),
-                })
-            }
-            Err(e) => {
-                refusal = Some(e);
-                // Not a wait for time to pass: the other connection is
-                // runnable now, and this hands it the core to finish on.
-                std::thread::yield_now();
-            }
-        }
-    }
-    Err(refusal.map_or_else(
-        || LedgerError::Corrupt {
+        })
+    })?;
+    if mode.eq_ignore_ascii_case("wal") {
+        Ok(())
+    } else {
+        Err(LedgerError::Corrupt {
             what: "the ledger's journal mode".into(),
-            detail: "WAL was never asked for".into(),
-        },
-        LedgerError::from,
-    ))
+            detail: format!("SQLite kept `{mode}` when asked for WAL"),
+        })
+    }
 }
 
 /// How many migration steps this ledger has applied.
@@ -1919,7 +1948,7 @@ impl Ledger {
         // of its own. Set after it, as it used to be, two processes
         // opening the same ledger at the same moment raced and one died
         // with "database is locked" before it had opened anything.
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(LEDGER_BUSY_TIMEOUT)?;
         use_wal(&conn)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         migrate(&conn, clock.as_ref())?;
@@ -4965,6 +4994,96 @@ mod tests {
             ledger.schema_version().expect("count"),
             LEDGER_SCHEMA_VERSION
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn busy() -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is locked".into()),
+        )
+    }
+
+    /// A refusal that outlasts any count of yields is waited out — by
+    /// sleeping, not spinning: a backoff of 1, 2, 4, 8, 16, 25 ms covers
+    /// 60 ms in about seven calls, where a loop of thread yields either
+    /// gives up within microseconds or burns every try.
+    #[test]
+    fn a_busy_refusal_lasting_60ms_is_waited_out() {
+        let started = std::time::Instant::now();
+        let mut calls = 0;
+        let result = retry_while_busy(std::time::Duration::from_secs(5), || {
+            calls += 1;
+            if started.elapsed() < std::time::Duration::from_millis(60) {
+                Err(busy())
+            } else {
+                Ok(7)
+            }
+        });
+        assert_eq!(result.expect("the refusal ends before the deadline"), 7);
+        assert!(
+            calls <= 12,
+            "a waiting opener sleeps between tries instead of spinning: {calls} calls"
+        );
+    }
+
+    #[test]
+    fn an_endless_busy_refusal_gives_up_at_the_deadline() {
+        let started = std::time::Instant::now();
+        let mut calls = 0;
+        let result: rusqlite::Result<()> =
+            retry_while_busy(std::time::Duration::from_millis(50), || {
+                calls += 1;
+                Err(busy())
+            });
+        let error = result.expect_err("never succeeds");
+        assert!(is_busy(&error), "the busy error is returned: {error:?}");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(50));
+        assert!(calls > 1, "it retried within the deadline: {calls} calls");
+    }
+
+    #[test]
+    fn a_non_busy_error_is_returned_after_one_call() {
+        let mut calls = 0;
+        let result: rusqlite::Result<()> =
+            retry_while_busy(std::time::Duration::from_secs(5), || {
+                calls += 1;
+                Err(rusqlite::Error::QueryReturnedNoRows)
+            });
+        assert!(matches!(result, Err(rusqlite::Error::QueryReturnedNoRows)));
+        assert_eq!(calls, 1);
+    }
+
+    /// Many threads switching each fresh file to WAL at the same moment.
+    /// On macOS the old 32-yield loop also passed this; it guards the
+    /// slower Windows runner, where that loop ran out (#147).
+    #[test]
+    fn many_openers_of_fresh_ledgers_all_succeed() {
+        const THREADS: usize = 6;
+        let dir = temp_dir("stampede");
+        for round in 0..30 {
+            let path = dir.join(format!("ledger-{round}.sqlite"));
+            let start = std::sync::Barrier::new(THREADS);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..THREADS)
+                    .map(|_| {
+                        let path = &path;
+                        let start = &start;
+                        scope.spawn(move || {
+                            start.wait();
+                            Ledger::open(path).map(|_| ())
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    handle
+                        .join()
+                        .expect("no panic")
+                        .expect("every opener succeeds");
+                }
+            });
+        }
+        // Best-effort temp cleanup: a leftover directory fails nothing.
         std::fs::remove_dir_all(&dir).ok();
     }
 
