@@ -384,7 +384,10 @@ fn parse_transcript(jsonl: &str) -> Result<Transcript, String> {
     Ok(transcript)
 }
 
-/// Whether a call's input is exactly the step's.
+/// Whether a call targets the step: only the identifying fields are
+/// compared (`command`; `file_path`; `pattern` and `path`), extra keys are
+/// ignored — so a call the harness rejected for an extra key still matches
+/// and is then skipped by [`run_step`].
 fn input_matches(step: &ProbeStep, input: &Value) -> bool {
     let field = |name: &str| input.get(name).and_then(Value::as_str);
     match step.tool {
@@ -496,15 +499,38 @@ fn judge(expect: &Expect, result: &ToolResult) -> Verdict {
     }
 }
 
+/// The harness's answer to a call whose INPUT it rejected before running
+/// the tool (measured on 2.1.285: haiku adds a `description` parameter to
+/// Read, gets "InputValidationError: … An unexpected parameter …", then
+/// retries correctly). Such a call ran nothing, so it is evidence of
+/// nothing: the step is judged on the next matching call.
+pub(crate) const INPUT_REJECTED: &str = "<tool_use_error>InputValidationError";
+
+/// Every matching call, in order: a call with NO result (interrupted, or
+/// cut from the transcript) makes the step `NotRun` — it may have run and
+/// shown anything; a call rejected for its input ran nothing and is
+/// skipped; EVERY call that ran must pass, so a leak on a retry is not
+/// hidden behind an earlier refusal. No call that ran is `NotRun`. A
+/// change to how calls are selected here needs a `PROBE_VERSION` bump.
 fn run_step(step: &ProbeStep, transcript: &Transcript) -> Verdict {
-    let call = transcript
+    let mut judged: Option<Verdict> = None;
+    for call in transcript
         .uses
         .iter()
-        .find(|call| call.name == step.tool.name() && input_matches(step, &call.input));
-    match call.and_then(|call| transcript.results.get(&call.id)) {
-        Some(result) => judge(&step.expect, result),
-        None => Verdict::NotRun,
+        .filter(|call| call.name == step.tool.name() && input_matches(step, &call.input))
+    {
+        let Some(result) = transcript.results.get(&call.id) else {
+            return Verdict::NotRun;
+        };
+        if result.is_error && result.text.starts_with(INPUT_REJECTED) {
+            continue;
+        }
+        match judge(&step.expect, result) {
+            Verdict::Pass => judged = Some(Verdict::Pass),
+            failed @ (Verdict::Fail(_) | Verdict::NotRun) => return failed,
+        }
     }
+    judged.unwrap_or(Verdict::NotRun)
 }
 
 /// What a probe expects of the harness's `init` record.
@@ -859,6 +885,61 @@ mod tests {
         let jsonl = jsonl.replace(marked, "\"tool_use_id\":\"toolu_fixture-grep\"");
         let report = judged(&steps, &jsonl, &good_init());
         assert_only_failing(&report, "fixture-grep");
+    }
+
+    /// The first real run's shape: Read called once with an input the
+    /// harness rejected (it ran nothing), then again, refused. The step is
+    /// judged on the call that ran; every attempt rejected is `NotRun`.
+    #[test]
+    fn a_call_rejected_for_its_input_is_skipped() {
+        let steps = plan();
+        let rejected = json!({"type": "user", "message": {"content": [{
+            "type": "tool_result", "tool_use_id": "toolu_bad", "is_error": true,
+            "content": "<tool_use_error>InputValidationError: Read failed due to the following \
+                        issue:\nAn unexpected parameter `description` was provided</tool_use_error>"
+        }]}});
+        let fixture = steps
+            .iter()
+            .find(|step| step.id == "fixture-read")
+            .expect("a fixture-read step");
+        let bad_call = json!({"type": "assistant", "message": {"content": [{
+            "type": "tool_use", "id": "toolu_bad", "name": "Read",
+            "input": {"file_path": fixture.input, "description": "Step 10"}
+        }]}});
+        let prefix = format!("{bad_call}\n{rejected}\n");
+        let jsonl = transcript(&steps, |step| Some(measured(step)));
+        let report = judged(&steps, &format!("{prefix}{jsonl}"), &good_init());
+        assert!(report.passed, "{}", report.render());
+        // A call with no result at all, then a refused retry: the first may
+        // have run and shown anything, so the step is not run.
+        let resultless = json!({"type": "assistant", "message": {"content": [{
+            "type": "tool_use", "id": "toolu_lost", "name": "Read",
+            "input": {"file_path": fixture.input}
+        }]}});
+        let jsonl2 = transcript(&steps, |step| Some(measured(step)));
+        let report = judged(&steps, &format!("{resultless}\n{jsonl2}"), &good_init());
+        assert_eq!(verdict(&report, "fixture-read"), &Verdict::NotRun);
+        // A refusal, then a retry that LEAKED: every call that ran must pass.
+        let leak = json!({"type": "user", "message": {"content": [{
+            "type": "tool_result", "tool_use_id": "toolu_leak", "content": "relais-probe-secret"
+        }]}});
+        let leak_call = json!({"type": "assistant", "message": {"content": [{
+            "type": "tool_use", "id": "toolu_leak", "name": "Read",
+            "input": {"file_path": fixture.input}
+        }]}});
+        let jsonl3 = transcript(&steps, |step| Some(measured(step)));
+        let report = judged(
+            &steps,
+            &format!("{jsonl3}\n{leak_call}\n{leak}"),
+            &good_init(),
+        );
+        assert!(matches!(verdict(&report, "fixture-read"), Verdict::Fail(_)));
+        // Only the rejected attempt: nothing ran.
+        let only_bad = transcript(&steps, |step| {
+            (step.id != "fixture-read").then(|| measured(step))
+        });
+        let report = judged(&steps, &format!("{prefix}{only_bad}"), &good_init());
+        assert_eq!(verdict(&report, "fixture-read"), &Verdict::NotRun);
     }
 
     #[test]
