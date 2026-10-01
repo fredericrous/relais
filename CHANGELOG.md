@@ -55,10 +55,10 @@ missing here.
 
 ### Changed
 
-- Sandbox denial scanning (#105) reads only the results of `Bash`,
-  `PowerShell` and `Monitor`, or of a tool the transcript does not name: file
-  contents shown by Read, Grep or Edit no longer show up as suspected denials.
-  Coverage is unchanged.
+- Sandbox denial scanning (#105) skips the results of the file tools (Read,
+  Grep, Glob, Edit, Write, NotebookEdit): file contents they show no longer
+  show up as suspected denials. Every other tool is still scanned, and
+  coverage is unchanged.
 
 - The sandbox preflight judges only the `projects.<path>` entries of
   `~/.claude.json` for the task worktree and the repository root: an

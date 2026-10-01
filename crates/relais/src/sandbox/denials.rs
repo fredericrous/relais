@@ -23,10 +23,13 @@ const VIOLATIONS_CLOSE: &str = "</sandbox_violations>";
 const NETWORK_DENIAL: &str = "deny network-outbound";
 /// Wordings, besides [`OS_DENIALS`], that say the sandbox refused something.
 const OTHER_DENIALS: [&str; 2] = ["CONNECT tunnel failed, response 403", "bwrap:"];
-/// The tools whose commands the OS sandbox runs, so the only ones whose
-/// output can carry a sandbox refusal. The file tools (Read, Grep, Edit, …)
-/// are confined by permission rules, and what they print is file content.
-const SANDBOXED_TOOLS: [&str; 3] = ["Bash", "PowerShell", "Monitor"];
+/// The file tools, whose results are not scanned: they are confined by
+/// permission rules, not the OS sandbox, and what they print is file
+/// content, which can say the denial words without any refusal. Every other
+/// tool is scanned, so output that reaches the transcript under a name not
+/// listed here (a background command's `BashOutput`, a tool a later harness
+/// adds) keeps its evidence.
+const FILE_TOOLS: [&str; 6] = ["Read", "Grep", "Glob", "Edit", "Write", "NotebookEdit"];
 const TEXT_LIMIT: usize = 200;
 const LISTED: usize = 5;
 
@@ -185,11 +188,11 @@ fn read_item(item: &Value, transcript: &mut Transcript, report: &mut DenialRepor
                 return;
             };
             *transcript.results.entry(id.to_string()).or_insert(0) += 1;
-            // A tool the transcript never named is scanned: unknown evidence is kept.
+            // Only a known file tool is skipped: an unnamed or unlisted tool is scanned.
             let scanned = transcript
                 .names
                 .get(id)
-                .is_none_or(|name| SANDBOXED_TOOLS.contains(&name.as_str()));
+                .is_none_or(|name| !FILE_TOOLS.contains(&name.as_str()));
             match result_text(item.get("content")) {
                 Some(text) if scanned => sort_lines(&text, &format!("tool_result:{id}"), report),
                 Some(_) => {}
@@ -396,12 +399,21 @@ mod tests {
     #[test]
     fn file_tool_results_with_denial_words_add_nothing() {
         let text = "fixture: Operation not permitted\nRead-only file system";
-        for name in ["Read", "Grep", "Edit"] {
+        for name in FILE_TOOLS {
             let jsonl = transcript(&[named_tool_use("t1", name), tool_result("t1", text)]);
             let report = scan(Some(&jsonl), &[]);
             assert!(report.suspected.is_empty(), "{name}: {report:?}");
             assert!(report.verified.is_empty(), "{name}: {report:?}");
             assert_eq!(report.coverage, Coverage::Complete, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_tool_outside_the_file_tools_is_scanned() {
+        let text = "fixture: Operation not permitted";
+        for name in ["BashOutput", "PowerShell", "Monitor", "SomeFutureTool"] {
+            let jsonl = transcript(&[named_tool_use("t1", name), tool_result("t1", text)]);
+            assert_eq!(scan(Some(&jsonl), &[]).suspected.len(), 1, "{name}");
         }
     }
 
