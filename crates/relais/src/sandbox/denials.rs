@@ -23,6 +23,10 @@ const VIOLATIONS_CLOSE: &str = "</sandbox_violations>";
 const NETWORK_DENIAL: &str = "deny network-outbound";
 /// Wordings, besides [`OS_DENIALS`], that say the sandbox refused something.
 const OTHER_DENIALS: [&str; 2] = ["CONNECT tunnel failed, response 403", "bwrap:"];
+/// The tools whose commands the OS sandbox runs, so the only ones whose
+/// output can carry a sandbox refusal. The file tools (Read, Grep, Edit, …)
+/// are confined by permission rules, and what they print is file content.
+const SANDBOXED_TOOLS: [&str; 3] = ["Bash", "PowerShell", "Monitor"];
 const TEXT_LIMIT: usize = 200;
 const LISTED: usize = 5;
 
@@ -137,6 +141,7 @@ fn result_text(content: Option<&Value>) -> Option<String> {
 #[derive(Default)]
 struct Transcript {
     uses: Vec<String>,
+    names: HashMap<String, String>,
     results: HashMap<String, usize>,
     problem: Option<String>,
 }
@@ -166,7 +171,12 @@ fn read_item(item: &Value, transcript: &mut Transcript, report: &mut DenialRepor
     let field = |name: &str| item.get(name).and_then(Value::as_str);
     match field("type") {
         Some("tool_use") => match field("id") {
-            Some(id) => transcript.uses.push(id.to_string()),
+            Some(id) => {
+                transcript.uses.push(id.to_string());
+                if let Some(name) = field("name") {
+                    transcript.names.insert(id.to_string(), name.to_string());
+                }
+            }
             None => transcript.flag(format!("line {line_no}: tool_use without id")),
         },
         Some("tool_result") => {
@@ -175,8 +185,14 @@ fn read_item(item: &Value, transcript: &mut Transcript, report: &mut DenialRepor
                 return;
             };
             *transcript.results.entry(id.to_string()).or_insert(0) += 1;
+            // A tool the transcript never named is scanned: unknown evidence is kept.
+            let scanned = transcript
+                .names
+                .get(id)
+                .is_none_or(|name| SANDBOXED_TOOLS.contains(&name.as_str()));
             match result_text(item.get("content")) {
-                Some(text) => sort_lines(&text, &format!("tool_result:{id}"), report),
+                Some(text) if scanned => sort_lines(&text, &format!("tool_result:{id}"), report),
+                Some(_) => {}
                 None => transcript.flag(format!("line {line_no}: tool_result {id} has no text")),
             }
         }
@@ -285,8 +301,12 @@ mod tests {
     }
 
     fn tool_use(id: &str) -> String {
+        named_tool_use(id, "Bash")
+    }
+
+    fn named_tool_use(id: &str, name: &str) -> String {
         line(serde_json::json!({"message": {"content": [
-            {"type": "tool_use", "id": id, "name": "Bash", "input": {}}
+            {"type": "tool_use", "id": id, "name": name, "input": {}}
         ]}}))
     }
 
@@ -371,6 +391,51 @@ mod tests {
         let report = scan(Some(&jsonl), &[]);
         assert_eq!(report.verified.len(), 1);
         assert!(report.suspected.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn file_tool_results_with_denial_words_add_nothing() {
+        let text = "fixture: Operation not permitted\nRead-only file system";
+        for name in ["Read", "Grep", "Edit"] {
+            let jsonl = transcript(&[named_tool_use("t1", name), tool_result("t1", text)]);
+            let report = scan(Some(&jsonl), &[]);
+            assert!(report.suspected.is_empty(), "{name}: {report:?}");
+            assert!(report.verified.is_empty(), "{name}: {report:?}");
+            assert_eq!(report.coverage, Coverage::Complete, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_bash_result_with_the_same_text_is_suspected() {
+        let text = "fixture: Operation not permitted";
+        let jsonl = transcript(&[named_tool_use("t1", "Bash"), tool_result("t1", text)]);
+        assert_eq!(scan(Some(&jsonl), &[]).suspected.len(), 1);
+    }
+
+    #[test]
+    fn a_violation_block_in_a_bash_result_is_still_verified() {
+        let jsonl = transcript(&[named_tool_use("t1", "Bash"), tool_result("t1", VIOLATION)]);
+        assert_eq!(scan(Some(&jsonl), &[]).verified.len(), 1);
+    }
+
+    #[test]
+    fn a_result_whose_tool_use_is_missing_is_scanned_and_incomplete_as_before() {
+        let jsonl = transcript(&[
+            tool_use("t2"),
+            tool_result("t1", "x: Operation not permitted"),
+        ]);
+        let report = scan(Some(&jsonl), &[]);
+        assert_eq!(report.suspected.len(), 1, "{report:?}");
+        assert!(matches!(report.coverage, Coverage::Incomplete(_)));
+    }
+
+    #[test]
+    fn a_tool_use_with_no_name_is_scanned() {
+        let unnamed = line(serde_json::json!({"message": {"content": [
+            {"type": "tool_use", "id": "t1", "input": {}}
+        ]}}));
+        let jsonl = transcript(&[unnamed, tool_result("t1", "x: Operation not permitted")]);
+        assert_eq!(scan(Some(&jsonl), &[]).suspected.len(), 1);
     }
 
     #[test]
