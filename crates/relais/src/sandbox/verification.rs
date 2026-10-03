@@ -150,6 +150,46 @@ pub struct VerificationRecord {
     pub report: Vec<String>,
 }
 
+/// Why a store holding `records` has no pass for this harness on this
+/// platform, from the most recent record for the platform alone: a harness
+/// that changed is routine, the same harness under a different key means the
+/// configuration did.
+pub fn explain_miss(
+    records: &[VerificationRecord],
+    harness_version: &str,
+    platform: &str,
+) -> String {
+    let release = |version: &str| {
+        version
+            .split_whitespace()
+            .next()
+            .unwrap_or(version)
+            .to_string()
+    };
+    let Some(last) = records
+        .iter()
+        .filter(|record| record.platform == platform)
+        .max_by(|a, b| a.verified_at.cmp(&b.verified_at))
+    else {
+        return format!("never verified on {platform}");
+    };
+    let (old, new) = (release(&last.harness_version), release(harness_version));
+    let date = last
+        .verified_at
+        .split('T')
+        .next()
+        .unwrap_or(&last.verified_at);
+    if old == new {
+        format!(
+            "the configuration changed since the last verification for {new} ({date}): \
+             [sandbox], the managed settings, or a relais upgrade (its generated \
+             settings or the probe)"
+        )
+    } else {
+        format!("Claude Code changed from {old} to {new} since the last verification ({date})")
+    }
+}
+
 /// Why a store could not be loaded or saved.
 #[derive(Debug)]
 pub enum StoreError {
@@ -468,6 +508,65 @@ mod tests {
         assert_eq!(
             loaded.find(&base()).unwrap().verified_at,
             "2026-10-01T10:00:00Z"
+        );
+    }
+
+    fn record_at(version: &str, platform: &str, at: &str) -> VerificationRecord {
+        VerificationRecord {
+            harness_version: version.to_string(),
+            platform: platform.to_string(),
+            ..record("k", at)
+        }
+    }
+
+    #[test]
+    fn a_miss_after_a_harness_upgrade_names_both_versions_and_the_date() {
+        let records = [record_at(
+            "2.1.286 (Claude Code)",
+            "macos",
+            "2026-10-01T10:00:00Z",
+        )];
+        assert_eq!(
+            explain_miss(&records, "2.1.288 (Claude Code)", "macos"),
+            "Claude Code changed from 2.1.286 to 2.1.288 since the last verification (2026-10-01)"
+        );
+    }
+
+    #[test]
+    fn a_miss_at_the_same_version_is_a_configuration_change() {
+        let records = [record_at("2.1.288", "macos", "2026-10-01T10:00:00Z")];
+        assert_eq!(
+            explain_miss(&records, "2.1.288 (Claude Code)", "macos"),
+            "the configuration changed since the last verification for 2.1.288 (2026-10-01): \
+             [sandbox], the managed settings, or a relais upgrade (its generated \
+             settings or the probe)"
+        );
+    }
+
+    #[test]
+    fn a_platform_never_verified_says_so_and_ignores_other_platforms() {
+        assert_eq!(
+            explain_miss(&[], "2.1.288", "macos"),
+            "never verified on macos"
+        );
+        let records = [record_at("2.1.286", "linux", "2026-10-01T10:00:00Z")];
+        assert_eq!(
+            explain_miss(&records, "2.1.288", "macos"),
+            "never verified on macos"
+        );
+    }
+
+    #[test]
+    fn the_most_recent_record_for_the_platform_explains_the_miss() {
+        let records = [
+            record_at("2.1.284", "macos", "2026-09-01T10:00:00Z"),
+            record_at("2.1.286", "macos", "2026-10-01T10:00:00Z"),
+            record_at("2.1.287", "linux", "2026-10-02T10:00:00Z"),
+            record_at("2.1.285", "macos", "2026-09-15T10:00:00Z"),
+        ];
+        assert_eq!(
+            explain_miss(&records, "2.1.288", "macos"),
+            "Claude Code changed from 2.1.286 to 2.1.288 since the last verification (2026-10-01)"
         );
     }
 }

@@ -10,7 +10,9 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{managed_bytes, worker_launch, LaunchInputs, VerificationKey, VerificationStore};
+use super::{
+    explain_miss, managed_bytes, worker_launch, LaunchInputs, VerificationKey, VerificationStore,
+};
 use crate::policy::{BlockCode, Blocker};
 
 /// What the key is computed from. `launch` is a worker's launch inputs (no
@@ -58,21 +60,28 @@ fn unverified(detail: String) -> Blocker {
 /// managed files that cannot be read, verify nothing.
 pub fn dispatch_gate(inputs: &GateInputs) -> Result<VerificationKey, Blocker> {
     match dispatch_lookup(inputs) {
-        Ok(Some(key)) => Ok(key),
-        Ok(None) => Err(unverified(format!(
-            "no probe session has verified the sandbox for Claude Code {} on {} with this \
-             configuration; run `relais doctor --verify-sandbox` (a change to the harness, the \
-             platform, `[sandbox]` or the managed settings needs it again)",
+        Ok(Lookup::Verified(key)) => Ok(key),
+        Ok(Lookup::Unverified(reason)) => Err(unverified(format!(
+            "the sandbox is unverified for Claude Code {} on {}: {reason}; run `relais doctor \
+             --verify-sandbox`",
             inputs.harness_version, inputs.platform
         ))),
         Err(why) => Err(unverified(why)),
     }
 }
 
-/// The key when a record holds for this configuration, `None` when none
-/// does, and the reason when the store or the managed files cannot be read
+/// What the store says about this configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lookup {
+    Verified(VerificationKey),
+    /// No record holds; the reason, from [`explain_miss`].
+    Unverified(String),
+}
+
+/// The key when a record holds for this configuration, why none does
+/// otherwise, and the reason when the store or the managed files cannot be read
 /// at all: the two answers `relais doctor` words differently.
-pub fn dispatch_lookup(inputs: &GateInputs) -> Result<Option<VerificationKey>, String> {
+pub fn dispatch_lookup(inputs: &GateInputs) -> Result<Lookup, String> {
     let managed = managed_bytes(inputs.managed_root, inputs.extra_managed_root).map_err(|why| {
         format!(
             "the managed configuration the verification is keyed by cannot be read ({why}); \
@@ -91,5 +100,12 @@ pub fn dispatch_lookup(inputs: &GateInputs) -> Result<Option<VerificationKey>, S
             inputs.store.display()
         )
     })?;
-    Ok(store.find(&key).map(|_| key))
+    Ok(match store.find(&key) {
+        Some(_) => Lookup::Verified(key),
+        None => Lookup::Unverified(explain_miss(
+            store.records(),
+            inputs.harness_version,
+            inputs.platform,
+        )),
+    })
 }
