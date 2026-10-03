@@ -10102,6 +10102,35 @@ mod tests {
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
+    /// A record from an older harness is why the gate misses, and the detail
+    /// says so while still naming the command that verifies.
+    #[test]
+    fn a_record_from_an_older_harness_is_named_in_the_block() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let mut machine = fixture.machine_for(&repo);
+        machine.sandbox.enabled = true;
+        let store = fixture.dir.join("verified.json");
+        store_with_record(&store, &gate_key(&machine, "2.1.284"));
+        let mut records = crate::sandbox::VerificationStore::load(&store).expect("store");
+        let mut older = records.records()[0].clone();
+        older.harness_version = "2.1.284 (Claude Code)".to_string();
+        records.record(older);
+        records.save().expect("saved");
+        let (outcome, launches) =
+            sandboxed_run(&fixture, &store, crate::sandbox::SANDBOX_MIN_HARNESS);
+        let detail = assert_unverified(&outcome, launches);
+        assert!(
+            detail.contains("Claude Code changed from 2.1.284 to 2.1.285 since the last verification (2026-09-30)"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("relais doctor --verify-sandbox"),
+            "{detail}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
     /// A store that cannot be read verifies nothing: fail closed.
     #[test]
     fn a_corrupt_store_blocks() {

@@ -279,8 +279,8 @@ pub(crate) enum SandboxStanding {
     Unavailable(String),
     /// Each weakening, as `source: key`.
     Weakened(Vec<String>),
-    /// No probe session has verified the current configuration.
-    Unverified,
+    /// No probe session has verified the current configuration; why.
+    Unverified(String),
     Verified {
         harness_version: String,
         platform: String,
@@ -311,9 +311,9 @@ pub(crate) fn sandbox_finding(standing: &SandboxStanding) -> Finding {
             Level::Ok,
             format!("os, verified {harness_version} on {platform}"),
         ),
-        SandboxStanding::Unverified => (
+        SandboxStanding::Unverified(reason) => (
             Level::Warn,
-            "unverified — run relais doctor --verify-sandbox".to_string(),
+            format!("unverified — {reason}; run relais doctor --verify-sandbox"),
         ),
         SandboxStanding::Weakened(found) => {
             (Level::Warn, format!("weakened: {}", found.join("; ")))
@@ -395,7 +395,7 @@ pub(crate) fn sandbox_standing(
     }
     // The preflight refuses a harness version it cannot read.
     let Some(version) = harness_version else {
-        return SandboxStanding::Unverified;
+        return SandboxStanding::Unverified("the harness version cannot be read".to_string());
     };
     let store = match host.verification_store() {
         Ok(store) => store,
@@ -425,7 +425,7 @@ pub(crate) fn sandbox_standing(
         extra_managed_root: extra_managed_root.as_deref(),
     });
     match gate {
-        Ok(Some(_)) => SandboxStanding::Verified {
+        Ok(sandbox::Lookup::Verified(_)) => SandboxStanding::Verified {
             harness_version: version
                 .split_whitespace()
                 .next()
@@ -433,7 +433,7 @@ pub(crate) fn sandbox_standing(
                 .to_string(),
             platform: platform.to_string(),
         },
-        Ok(None) => SandboxStanding::Unverified,
+        Ok(sandbox::Lookup::Unverified(reason)) => SandboxStanding::Unverified(reason),
         Err(reason) => SandboxStanding::Unavailable(reason),
     }
 }
@@ -3534,13 +3534,16 @@ mod tests {
         let (_dir, host) = host("standing-verified", "macos");
         let settings = on();
         let standing = standing_of(&host, &settings);
-        assert_eq!(standing, SandboxStanding::Unverified);
+        assert_eq!(
+            standing,
+            SandboxStanding::Unverified("never verified on macos".to_string())
+        );
         let finding = sandbox_finding(&standing);
         assert_eq!(finding.level, Level::Warn);
         assert!(
             finding
                 .detail
-                .starts_with("unverified — run relais doctor --verify-sandbox"),
+                .starts_with("unverified — never verified on macos; run relais doctor"),
             "{finding:?}"
         );
 
@@ -3581,6 +3584,35 @@ mod tests {
     }
 
     #[test]
+    fn a_record_from_an_older_harness_says_the_harness_changed() {
+        let (_dir, host) = host("standing-older", "macos");
+        let mut store = sandbox::VerificationStore::load(&host.store).expect("empty");
+        store.record(sandbox::VerificationRecord {
+            key: "another".to_string(),
+            verified_at: "2026-09-30T10:00:00Z".to_string(),
+            harness_version: "2.1.284 (Claude Code)".to_string(),
+            platform: "macos".to_string(),
+            report: Vec::new(),
+        });
+        store.save().expect("saved");
+        let finding = sandbox_finding(&standing_of(&host, &on()));
+        assert_eq!(finding.level, Level::Warn);
+        let flat = finding
+            .detail
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains(
+                "unverified — Claude Code changed from 2.1.284 to 2.1.285 since the last \
+                 verification (2026-09-30); run relais doctor --verify-sandbox"
+            ),
+            "{flat}"
+        );
+        no_line_is_wider_than_80(&finding.detail);
+    }
+
+    #[test]
     fn every_sandbox_line_fits_in_80_columns_and_states_the_scope() {
         let long = "x".repeat(150);
         for standing in [
@@ -3591,7 +3623,10 @@ mod tests {
                     .to_string(),
                 "/home/someone/.claude.json: projects./repo.allowedTools".to_string(),
             ]),
-            SandboxStanding::Unverified,
+            SandboxStanding::Unverified(
+                "Claude Code changed from 2.1.286 to 2.1.288 since the last verification (2026-10-01)"
+                    .to_string(),
+            ),
             SandboxStanding::Verified {
                 harness_version: "2.1.285".to_string(),
                 platform: "macos".to_string(),

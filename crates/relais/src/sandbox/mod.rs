@@ -44,7 +44,9 @@ mod verification;
 mod verify;
 
 pub use denials::{scan, transcript_path, Coverage, Denial, DenialReport};
-pub use dispatch::{dispatch_gate, dispatch_key, dispatch_lookup, DispatchKeyInputs, GateInputs};
+pub use dispatch::{
+    dispatch_gate, dispatch_key, dispatch_lookup, DispatchKeyInputs, GateInputs, Lookup,
+};
 pub use floor::{credential_floor, Floor, FloorInputs};
 pub use judge::{judge_managed, judge_user_config, managed_sources, Weakening};
 pub use launch::{short_tmp_link, worker_launch, LaunchInputs, TmpLink, WorkerMode};
@@ -58,6 +60,6 @@ pub use probe::{
 };
 pub use settings::{build_settings, SettingsInputs};
 pub use verification::{
-    store_path, StoreError, VerificationKey, VerificationRecord, VerificationStore,
+    explain_miss, store_path, StoreError, VerificationKey, VerificationRecord, VerificationStore,
 };
 pub use verify::{verify_sandbox, VerifyError, VerifyInputs, VerifyOutcome};

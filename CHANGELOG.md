@@ -55,6 +55,11 @@ missing here.
 
 ### Changed
 
+- An unverified sandbox now says why (#105): a harness upgrade (`Claude Code
+  changed from 2.1.286 to 2.1.288 since the last verification (2026-10-01)`),
+  a configuration change at the same version, or `never verified on <platform>`,
+  in both the `sandbox_unverified` block and `relais doctor`.
+
 - Sandbox denial scanning (#105) skips the results of the file tools (Read,
   Grep, Glob, Edit, Write, NotebookEdit): file contents they show no longer
   show up as suspected denials. Every other tool is still scanned, and
