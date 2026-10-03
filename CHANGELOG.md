@@ -60,6 +60,12 @@ missing here.
   a configuration change at the same version, or `never verified on <platform>`,
   in both the `sandbox_unverified` block and `relais doctor`.
 
+- The sandbox-mode worker rules (#105) name the shapes the harness still
+  refuses: `sleep` and polling loops (run the check in the foreground and
+  read its log after); awk programs, `sed -i` scripts with `$` and `case`
+  statements (use `python3`); and `sh -c` under `timeout` and backticks in
+  arguments, which are refused.
+
 - Sandbox denial scanning (#105) skips the results of the file tools (Read,
   Grep, Glob, Edit, Write, NotebookEdit): file contents they show no longer
   show up as suspected denials. Every other tool is still scanned, and
