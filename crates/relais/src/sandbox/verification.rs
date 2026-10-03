@@ -182,7 +182,8 @@ pub fn explain_miss(
     if old == new {
         format!(
             "the configuration changed since the last verification for {new} ({date}): \
-             [sandbox], the managed settings or the probe itself"
+             [sandbox], the managed settings, or a relais upgrade (its generated \
+             settings or the probe)"
         )
     } else {
         format!("Claude Code changed from {old} to {new} since the last verification ({date})")
@@ -537,7 +538,8 @@ mod tests {
         assert_eq!(
             explain_miss(&records, "2.1.288 (Claude Code)", "macos"),
             "the configuration changed since the last verification for 2.1.288 (2026-10-01): \
-             [sandbox], the managed settings or the probe itself"
+             [sandbox], the managed settings, or a relais upgrade (its generated \
+             settings or the probe)"
         );
     }
 
