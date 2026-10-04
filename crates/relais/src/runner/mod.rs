@@ -487,6 +487,19 @@ struct Dispatched {
     result: LaunchResult,
 }
 
+/// Split a candidate's gaps into the acceptance-evidence ones, which
+/// keep stopping the run, and those about the profile's own checks.
+fn split_profile_gaps(
+    gaps: Vec<String>,
+    acceptance_gaps: &[verify::AcceptanceGap],
+) -> (Vec<String>, Vec<String>) {
+    let evidence: Vec<String> = acceptance_gaps
+        .iter()
+        .map(verify::AcceptanceGap::message)
+        .collect();
+    gaps.into_iter().partition(|gap| evidence.contains(gap))
+}
+
 /// An attempt's candidate: snapshotted, named, exported and in scope.
 struct Candidate {
     attempt_id: i64,
@@ -501,6 +514,8 @@ struct Candidate {
     latest_patch: PathBuf,
     /// Tools the harness refused during the attempt.
     permission_denials: Vec<String>,
+    /// What the worker answered: an inspection's deliverable.
+    result_text: Option<String>,
 }
 
 /// What the profile's checks established about a candidate that passed
@@ -508,6 +523,7 @@ struct Candidate {
 struct Verified {
     checks: Vec<verify::CheckOutcome>,
     gaps: Vec<String>,
+    gaps_not_judged: Vec<String>,
     amont_bypasses: Vec<String>,
     amont_downgrades: Vec<String>,
     verification_inputs_changed: Vec<String>,
@@ -2367,6 +2383,7 @@ impl<'a> RunEngine<'a> {
             sha,
             latest_patch,
             permission_denials: result.permission_denials,
+            result_text: result.result_text,
         }))
     }
 
@@ -2469,9 +2486,20 @@ impl<'a> RunEngine<'a> {
         // once there is one: from attempt 2 the previous attempt's work
         // is already in the tree, so comparing to the BASE says every
         // refused repair worker produced something (R2).
-        let produced_nothing = match progress.last_candidate.as_deref() {
-            Some(previous) => previous == candidate.sha,
-            None => identical,
+        //
+        // An inspection's tree is always unchanged: what it produces is
+        // its final message, and only an empty one is nothing.
+        let inspecting = self.config.contract.kind() == crate::contract::Kind::Inspect;
+        let produced_nothing = if inspecting {
+            candidate
+                .result_text
+                .as_deref()
+                .is_none_or(|text| text.trim().is_empty())
+        } else {
+            match progress.last_candidate.as_deref() {
+                Some(previous) => previous == candidate.sha,
+                None => identical,
+            }
         };
         if !candidate.permission_denials.is_empty() {
             if produced_nothing {
@@ -2508,7 +2536,7 @@ impl<'a> RunEngine<'a> {
         };
         let verify::Verified {
             checks,
-            gaps,
+            mut gaps,
             acceptance_gaps,
             amont_bypasses,
             amont_downgrades,
@@ -2527,6 +2555,13 @@ impl<'a> RunEngine<'a> {
                 ));
             }
         };
+        // An inspection judges its report: a gap about the profile's own
+        // checks is recorded, not a stop. The acceptance-evidence gaps
+        // keep their handling below.
+        let mut gaps_not_judged = Vec::new();
+        if inspecting {
+            (gaps, gaps_not_judged) = split_profile_gaps(gaps, &acceptance_gaps);
+        }
         if !gaps.is_empty() {
             // Every other gap here is either unfixable from `relais
             // decide` (a missing/undefined check) or already a second
@@ -2561,6 +2596,11 @@ impl<'a> RunEngine<'a> {
             .filter(|check| check.failed())
             .map(|check| check.label.clone())
             .collect();
+        // An inspection changes nothing, so a check already failing at
+        // the base is not its to repair (SPEC §10).
+        if inspecting {
+            failures.retain(|label| !ctx.baseline.failures.contains(label));
+        }
         // A change task whose candidate changes nothing has not met
         // its objective, whatever the baseline says: a behavioural
         // failure the worker can repair, never an acceptance.
@@ -2618,6 +2658,7 @@ impl<'a> RunEngine<'a> {
             Verified {
                 checks,
                 gaps,
+                gaps_not_judged,
                 amont_bypasses,
                 amont_downgrades,
                 verification_inputs_changed,
@@ -2680,6 +2721,7 @@ impl<'a> RunEngine<'a> {
             policy_hash: preflight.authority.authority_hash.clone(),
             checks: verified.checks,
             gaps: verified.gaps,
+            gaps_not_judged: verified.gaps_not_judged,
             baseline_failures: ctx.baseline.failures.clone(),
             amont_bypasses: verified.amont_bypasses,
             amont_downgrades: verified.amont_downgrades,
@@ -2701,6 +2743,7 @@ impl<'a> RunEngine<'a> {
             &report,
             &signoffs,
             &verified.gate_coverage,
+            self.config.contract.kind(),
         );
         let receipt = Receipt {
             run_id: self.run_id.as_str().to_string(),
@@ -3001,6 +3044,7 @@ impl<'a> RunEngine<'a> {
             policy_hash: preflight.authority.authority_hash.clone(),
             checks,
             gaps,
+            gaps_not_judged: Vec::new(),
             baseline_failures: ctx.baseline.failures.clone(),
             amont_bypasses: Vec::new(),
             amont_downgrades: Vec::new(),
@@ -3022,6 +3066,7 @@ impl<'a> RunEngine<'a> {
             &report,
             &signoffs,
             &gate_coverage,
+            self.config.contract.kind(),
         );
         let receipt = Receipt {
             run_id: self.run_id.as_str().to_string(),
@@ -4104,6 +4149,12 @@ fn build_prompt(
         WorkerMode::Allowlist
     };
     prompt.push_str(&worker_rules(mode));
+    if contract.kind() == crate::contract::Kind::Inspect {
+        prompt.push_str(
+            "your final message is the deliverable: do not create files, install dependencies \
+             or change the tree.\n",
+        );
+    }
     if let Some(failures) = previous_failures {
         match kind {
             AttemptKind::Repair => {
@@ -6664,6 +6715,115 @@ mod tests {
             vec!["haiku".to_string()],
             "research tier"
         );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    fn inspect_contract() -> TaskContract {
+        TaskContract::from_json_str(
+            &serde_json::json!({
+                "schema_version": 1,
+                "kind": "inspect",
+                "objective": "Investigate why a check is inactive",
+                "base_ref": "HEAD",
+                "acceptance": ["evidence of why the check is inert"],
+                "verification_profile": "profile",
+            })
+            .to_string(),
+        )
+        .expect("contract")
+    }
+
+    #[test]
+    fn an_inspection_on_a_red_base_is_accepted_without_a_repair() {
+        let fixture = Fixture::new();
+        // main_gone_check fails at the base and at the (identical)
+        // candidate: the inspection is judged by its report.
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let launches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&launches);
+        let backend = MockBackend::new(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            MockOutcome {
+                result_text: Some("DONE: src/main.rs exists, so the check fails".into()),
+                exit_code: Some(0),
+                usage: Some(usage(50)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&inspect_contract(), &repo, &backend);
+        let RunOutcome {
+            terminal: Terminal::Accepted(receipt),
+            ..
+        } = outcome
+        else {
+            panic!("an inspection on a red base is accepted, got {outcome:?}");
+        };
+        assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(receipt.attempts, 1);
+        assert_eq!(receipt.verification.baseline_failures.len(), 1);
+        assert!(receipt.verification.accepted_inspection());
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn an_inspection_that_answers_nothing_produced_nothing() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let backend = MockBackend::new(|_| MockOutcome {
+            result_text: Some("  \n".into()),
+            exit_code: Some(0),
+            usage: Some(usage(50)),
+            permission_denials: vec!["Bash".into()],
+            ..Default::default()
+        });
+        let outcome = fixture.execute(&inspect_contract(), &repo, &backend);
+        let RunOutcome {
+            terminal: Terminal::Blocked { code, .. },
+            ..
+        } = outcome
+        else {
+            panic!("an empty report is nothing, got {outcome:?}");
+        };
+        assert_eq!(code, BlockCode::PermissionDenied);
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn an_inspection_stops_on_acceptance_gaps_only() {
+        let gap = |id: &str| verify::AcceptanceGap {
+            criterion_id: id.into(),
+            missing: verify::MissingEvidence::SignOffUnrecorded,
+        };
+        let evidence = vec![gap("c-1")];
+        let profile = "amont inventory: unavailable".to_string();
+        let (stopping, not_judged) =
+            split_profile_gaps(vec![evidence[0].message(), profile.clone()], &evidence);
+        assert_eq!(stopping, vec![evidence[0].message()]);
+        assert_eq!(not_judged, vec![profile]);
+    }
+
+    #[test]
+    fn only_an_inspect_prompt_names_the_deliverable() {
+        let fixture = Fixture::new();
+        let manifest = manifest_with(Vec::new());
+        let line = "your final message is the deliverable: do not create files, install \
+                    dependencies or change the tree.\n";
+        let inspect = build_prompt(
+            &inspect_contract(),
+            &manifest,
+            1,
+            None,
+            AttemptKind::Initial,
+        );
+        assert!(inspect.contains(line), "{inspect}");
+        let change = build_prompt(
+            &fixture.contract(Review::Off),
+            &manifest,
+            1,
+            None,
+            AttemptKind::Initial,
+        );
+        assert!(!change.contains("the deliverable"), "{change}");
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 

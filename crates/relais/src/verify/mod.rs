@@ -21,6 +21,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::acceptance::{independent, AcceptanceEntry, Evidence};
+use crate::contract::Kind;
 use crate::ids::{canonical_json_hash, sha256_hex};
 use crate::money::{CostCompleteness, MicroUsd};
 use crate::policy::{
@@ -125,6 +126,11 @@ pub struct VerificationReport {
     /// Required checks that were skipped, inert, unavailable or
     /// untrusted: gaps, never passes (SPEC §10).
     pub gaps: Vec<String>,
+    /// Gaps about the profile's own checks that an inspection does not
+    /// judge: its report is the deliverable (SPEC §10). Visible, never
+    /// a pass.
+    #[serde(default)]
+    pub gaps_not_judged: Vec<String>,
     /// Failures that also failed at the base: visible, not waived
     /// automatically (SPEC §10).
     pub baseline_failures: Vec<String>,
@@ -151,6 +157,26 @@ pub struct VerificationReport {
 impl VerificationReport {
     pub fn accepted(&self) -> bool {
         self.gaps.is_empty() && self.checks.iter().all(|check| !check.failed())
+    }
+
+    /// An inspection is accepted when nothing is a gap and every failed
+    /// check already failed at the base: it changes nothing, so a base
+    /// failure is not its to repair (SPEC §10).
+    pub fn accepted_inspection(&self) -> bool {
+        self.gaps.is_empty()
+            && self
+                .checks
+                .iter()
+                .filter(|check| check.failed())
+                .all(|check| self.baseline_failures.contains(&check.label))
+    }
+
+    /// The acceptance rule of this kind of contract.
+    pub fn accepted_for(&self, kind: Kind) -> bool {
+        match kind {
+            Kind::Change => self.accepted(),
+            Kind::Inspect => self.accepted_inspection(),
+        }
     }
 
     pub fn new_failures(&self) -> Vec<String> {
@@ -540,8 +566,9 @@ pub fn settle_acceptance(
     report: &VerificationReport,
     signoffs: &HashSet<String>,
     gate_coverage: &BTreeMap<String, Result<bool, AttestError>>,
+    kind: Kind,
 ) -> (Vec<CriterionOutcome>, Option<IndependenceSummary>) {
-    let accepted = report.accepted();
+    let accepted = report.accepted_for(kind);
     let criteria: Vec<CriterionOutcome> = entries
         .iter()
         .map(|entry| {
@@ -2839,6 +2866,7 @@ mod tests {
             }],
             gaps: vec![],
             baseline_failures: vec![],
+            gaps_not_judged: Vec::new(),
             amont_bypasses: vec![],
             amont_downgrades: vec![],
             verification_inputs_changed: Vec::new(),
@@ -2945,6 +2973,7 @@ mod tests {
             checks,
             gaps,
             baseline_failures: Vec::new(),
+            gaps_not_judged: Vec::new(),
             amont_bypasses: Vec::new(),
             amont_downgrades: Vec::new(),
             verification_inputs_changed: Vec::new(),
@@ -2988,6 +3017,7 @@ mod tests {
             checks,
             gaps: Vec::new(),
             baseline_failures: Vec::new(),
+            gaps_not_judged: Vec::new(),
             amont_bypasses: Vec::new(),
             amont_downgrades: Vec::new(),
             verification_inputs_changed: Vec::new(),
@@ -3016,6 +3046,7 @@ mod tests {
             &report,
             &HashSet::new(),
             &BTreeMap::new(),
+            Kind::Change,
         );
         assert!(
             criteria.iter().all(|c| c.met),
@@ -3134,6 +3165,7 @@ mod tests {
             checks,
             gaps: Vec::new(),
             baseline_failures: Vec::new(),
+            gaps_not_judged: Vec::new(),
             amont_bypasses: Vec::new(),
             amont_downgrades: Vec::new(),
             verification_inputs_changed: Vec::new(),
@@ -3173,6 +3205,7 @@ mod tests {
             &report_of(checks),
             &HashSet::new(),
             &BTreeMap::new(),
+            Kind::Change,
         );
         (criteria.remove(0), gaps)
     }
@@ -3466,6 +3499,7 @@ mod tests {
             checks,
             gaps,
             baseline_failures: Vec::new(),
+            gaps_not_judged: Vec::new(),
             amont_bypasses: Vec::new(),
             amont_downgrades: Vec::new(),
             verification_inputs_changed: Vec::new(),
@@ -3484,6 +3518,7 @@ mod tests {
             &report,
             &HashSet::new(),
             &BTreeMap::new(),
+            Kind::Change,
         );
         assert!(
             !criteria[0].met,
@@ -3532,6 +3567,7 @@ mod tests {
             checks,
             gaps,
             baseline_failures: Vec::new(),
+            gaps_not_judged: Vec::new(),
             amont_bypasses: Vec::new(),
             amont_downgrades: Vec::new(),
             verification_inputs_changed: Vec::new(),
@@ -3541,8 +3577,14 @@ mod tests {
         };
         assert!(report.accepted());
 
-        let (criteria, summary) =
-            settle_acceptance(&entries, &profile, &report, &signed_off, &BTreeMap::new());
+        let (criteria, summary) = settle_acceptance(
+            &entries,
+            &profile,
+            &report,
+            &signed_off,
+            &BTreeMap::new(),
+            Kind::Change,
+        );
         assert!(criteria[0].met, "a recorded sign-off is met: {criteria:?}");
         assert_eq!(
             summary,
@@ -3636,6 +3678,7 @@ mod tests {
             checks,
             gaps: Vec::new(),
             baseline_failures: Vec::new(),
+            gaps_not_judged: Vec::new(),
             amont_bypasses: Vec::new(),
             amont_downgrades: Vec::new(),
             verification_inputs_changed: Vec::new(),
@@ -3643,8 +3686,14 @@ mod tests {
             baseline_cached: false,
             baseline_cache_refused: None,
         };
-        let (criteria, summary) =
-            settle_acceptance(&entries, &profile, &report, &HashSet::new(), &coverage);
+        let (criteria, summary) = settle_acceptance(
+            &entries,
+            &profile,
+            &report,
+            &HashSet::new(),
+            &coverage,
+            Kind::Change,
+        );
         assert!(criteria[0].met, "a covered gate is met: {criteria:?}");
         assert_eq!(
             summary,
@@ -3709,6 +3758,7 @@ mod tests {
             checks,
             gaps: vec![message],
             baseline_failures: Vec::new(),
+            gaps_not_judged: Vec::new(),
             amont_bypasses: Vec::new(),
             amont_downgrades: Vec::new(),
             verification_inputs_changed: Vec::new(),
@@ -3717,8 +3767,14 @@ mod tests {
             baseline_cache_refused: None,
         };
         assert!(!report.accepted());
-        let (criteria, _) =
-            settle_acceptance(&entries, &profile, &report, &HashSet::new(), &coverage);
+        let (criteria, _) = settle_acceptance(
+            &entries,
+            &profile,
+            &report,
+            &HashSet::new(),
+            &coverage,
+            Kind::Change,
+        );
         assert!(
             !criteria[0].met,
             "an uncovered gate is not met: {criteria:?}"
@@ -3767,6 +3823,7 @@ mod tests {
             checks: Vec::new(),
             gaps: Vec::new(),
             baseline_failures: Vec::new(),
+            gaps_not_judged: Vec::new(),
             amont_bypasses: Vec::new(),
             amont_downgrades: Vec::new(),
             verification_inputs_changed: Vec::new(),
@@ -3780,6 +3837,7 @@ mod tests {
             &accepted,
             &HashSet::new(),
             &BTreeMap::new(),
+            Kind::Change,
         );
         assert_eq!(all_independent, Some(IndependenceSummary::AllIndependent));
 
@@ -3796,6 +3854,7 @@ mod tests {
             &accepted,
             &HashSet::new(),
             &BTreeMap::new(),
+            Kind::Change,
         );
         assert_eq!(partly, Some(IndependenceSummary::PartlyIndependent));
 
@@ -3810,6 +3869,7 @@ mod tests {
             &accepted,
             &HashSet::new(),
             &BTreeMap::new(),
+            Kind::Change,
         );
         assert_eq!(none_mandatory, None);
     }
@@ -3880,6 +3940,7 @@ mod tests {
             checks: vec![failing_check],
             gaps: vec![],
             baseline_failures: vec!["flaky".into()],
+            gaps_not_judged: Vec::new(),
             amont_bypasses: vec![],
             amont_downgrades: vec![],
             verification_inputs_changed: Vec::new(),
@@ -3892,6 +3953,25 @@ mod tests {
             report.new_failures().is_empty(),
             "the pre-existing failure is visible, not new"
         );
+        assert!(
+            report.accepted_inspection(),
+            "an inspection does not repair what failed at the base"
+        );
+        assert!(report.accepted_for(Kind::Inspect));
+        assert!(!report.accepted_for(Kind::Change));
+        let new_failure = VerificationReport {
+            baseline_failures: Vec::new(),
+            ..report.clone()
+        };
+        assert!(
+            !new_failure.accepted_inspection(),
+            "a failure that is not at the base still fails an inspection"
+        );
+        let gapped = VerificationReport {
+            gaps: vec!["gap".into()],
+            ..report
+        };
+        assert!(!gapped.accepted_inspection(), "a gap is never a pass");
     }
 
     #[test]
@@ -3911,6 +3991,7 @@ mod tests {
                 checks: vec![],
                 gaps: vec![],
                 baseline_failures: vec![],
+                gaps_not_judged: Vec::new(),
                 amont_bypasses: vec![],
                 amont_downgrades: vec![],
                 verification_inputs_changed: Vec::new(),

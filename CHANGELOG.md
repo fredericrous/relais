@@ -8,6 +8,15 @@ missing here.
 
 ## Unreleased
 
+### Changed
+
+- An inspection on a red base behaves as on a green one (#167): a check that
+  already fails at the base is recorded on the receipt and no longer sends
+  the inspection to repair, a gap about the profile's checks is recorded in
+  the new `gaps_not_judged` field instead of stopping it, and "produced
+  nothing" means an empty final message. The inspect prompt now says the
+  final message is the deliverable. Change tasks keep every rule.
+
 ### Added
 
 - `[sandbox]` in machine.toml (#105): OS-sandboxed workers, off by default

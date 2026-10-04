@@ -1018,6 +1018,7 @@ fn accept_integrated(
         policy_hash: root.authority.authority_hash.clone(),
         checks: assembled.checks,
         gaps: Vec::new(),
+        gaps_not_judged: Vec::new(),
         baseline_failures: root.baseline_failures.to_vec(),
         amont_bypasses: assembled.amont_bypasses,
         amont_downgrades: assembled.amont_downgrades,
@@ -1042,6 +1043,7 @@ fn accept_integrated(
         &report,
         &signoffs,
         &assembled.gate_coverage,
+        engine.config.contract.kind(),
     );
     let receipt = Receipt {
         run_id: engine.run_id.as_str().to_string(),
