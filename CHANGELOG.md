@@ -61,9 +61,10 @@ missing here.
   in both the `sandbox_unverified` block and `relais doctor`.
 
 - Sandbox-mode worker rules (#105): files go to `$TMPDIR` by a plain redirect
-  or python3, never a heredoc or `{ ...; }` group redirected there (refused on
-  2.1.289) nor the Write tool (it cannot reach the short `$TMPDIR` link), and
-  findings go in the final message, not a file.
+  or from python via `os.environ['TMPDIR']`, never a heredoc with any file
+  redirect or a `{ ...; }` group redirected there (refused on 2.1.289), nor
+  the Write tool (it cannot reach the short `$TMPDIR` link); findings go in
+  the final message, not a file.
 
 - The sandbox-mode worker rules (#105) name the shapes the harness still
   refuses: `sleep` and polling loops (run the check in the foreground and
