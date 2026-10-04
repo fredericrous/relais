@@ -4036,7 +4036,11 @@ fn worker_rules(mode: WorkerMode) -> String {
              is fine), not awk programs, `sed -i` scripts with `$` or `case`\n\
              statements, which need approval.\n\
              write logs and scratch output under $TMPDIR (your scratch dir), never in\n\
-             this directory or /tmp. writes elsewhere, and requests to hosts that are\n\
+             this directory or /tmp, with a plain redirect (`cmd > $TMPDIR/x.log`)\n\
+             or python3: a heredoc or `{ ...; }` group redirected into $TMPDIR is\n\
+             refused, and the Write tool cannot reach $TMPDIR. give findings and\n\
+             reports in your final message, not in a file.\n\
+             writes elsewhere, and requests to hosts that are\n\
              not listed, fail. `git -C`, `sh -c` (also under `timeout`), leading\n\
              `VAR=value` prefixes, loops over shell-assigned variables and backticks\n\
              in arguments (even in a grep pattern) are still refused.\n\
@@ -8877,7 +8881,11 @@ mod tests {
              is fine), not awk programs, `sed -i` scripts with `$` or `case`\n\
              statements, which need approval.\n\
              write logs and scratch output under $TMPDIR (your scratch dir), never in\n\
-             this directory or /tmp. writes elsewhere, and requests to hosts that are\n\
+             this directory or /tmp, with a plain redirect (`cmd > $TMPDIR/x.log`)\n\
+             or python3: a heredoc or `{ ...; }` group redirected into $TMPDIR is\n\
+             refused, and the Write tool cannot reach $TMPDIR. give findings and\n\
+             reports in your final message, not in a file.\n\
+             writes elsewhere, and requests to hosts that are\n\
              not listed, fail. `git -C`, `sh -c` (also under `timeout`), leading\n\
              `VAR=value` prefixes, loops over shell-assigned variables and backticks\n\
              in arguments (even in a grep pattern) are still refused.\n\
