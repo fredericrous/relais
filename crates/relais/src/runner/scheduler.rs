@@ -1019,6 +1019,7 @@ fn accept_integrated(
         checks: assembled.checks,
         gaps: Vec::new(),
         gaps_not_judged: Vec::new(),
+        notes: Vec::new(),
         baseline_failures: root.baseline_failures.to_vec(),
         amont_bypasses: assembled.amont_bypasses,
         amont_downgrades: assembled.amont_downgrades,

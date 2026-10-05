@@ -131,6 +131,10 @@ pub struct VerificationReport {
     /// a pass.
     #[serde(default)]
     pub gaps_not_judged: Vec<String>,
+    /// What the report is read with that is not a gap in the profile's
+    /// checks: a note on how the run was judged (SPEC §10).
+    #[serde(default)]
+    pub notes: Vec<String>,
     /// Failures that also failed at the base: visible, not waived
     /// automatically (SPEC §10).
     pub baseline_failures: Vec<String>,
@@ -3043,6 +3047,7 @@ mod tests {
             gaps: vec![],
             baseline_failures: vec![],
             gaps_not_judged: Vec::new(),
+            notes: Vec::new(),
             amont_bypasses: vec![],
             amont_downgrades: vec![],
             verification_inputs_changed: Vec::new(),
@@ -3150,6 +3155,7 @@ mod tests {
             gaps,
             baseline_failures: Vec::new(),
             gaps_not_judged: Vec::new(),
+            notes: Vec::new(),
             amont_bypasses: Vec::new(),
             amont_downgrades: Vec::new(),
             verification_inputs_changed: Vec::new(),
@@ -3194,6 +3200,7 @@ mod tests {
             gaps: Vec::new(),
             baseline_failures: Vec::new(),
             gaps_not_judged: Vec::new(),
+            notes: Vec::new(),
             amont_bypasses: Vec::new(),
             amont_downgrades: Vec::new(),
             verification_inputs_changed: Vec::new(),
@@ -3343,6 +3350,7 @@ mod tests {
             gaps: Vec::new(),
             baseline_failures: Vec::new(),
             gaps_not_judged: Vec::new(),
+            notes: Vec::new(),
             amont_bypasses: Vec::new(),
             amont_downgrades: Vec::new(),
             verification_inputs_changed: Vec::new(),
@@ -3678,6 +3686,7 @@ mod tests {
             gaps,
             baseline_failures: Vec::new(),
             gaps_not_judged: Vec::new(),
+            notes: Vec::new(),
             amont_bypasses: Vec::new(),
             amont_downgrades: Vec::new(),
             verification_inputs_changed: Vec::new(),
@@ -3747,6 +3756,7 @@ mod tests {
             gaps,
             baseline_failures: Vec::new(),
             gaps_not_judged: Vec::new(),
+            notes: Vec::new(),
             amont_bypasses: Vec::new(),
             amont_downgrades: Vec::new(),
             verification_inputs_changed: Vec::new(),
@@ -3859,6 +3869,7 @@ mod tests {
             gaps: Vec::new(),
             baseline_failures: Vec::new(),
             gaps_not_judged: Vec::new(),
+            notes: Vec::new(),
             amont_bypasses: Vec::new(),
             amont_downgrades: Vec::new(),
             verification_inputs_changed: Vec::new(),
@@ -3940,6 +3951,7 @@ mod tests {
             gaps: vec![message],
             baseline_failures: Vec::new(),
             gaps_not_judged: Vec::new(),
+            notes: Vec::new(),
             amont_bypasses: Vec::new(),
             amont_downgrades: Vec::new(),
             verification_inputs_changed: Vec::new(),
@@ -4172,6 +4184,7 @@ mod tests {
             gaps: Vec::new(),
             baseline_failures: Vec::new(),
             gaps_not_judged: Vec::new(),
+            notes: Vec::new(),
             amont_bypasses: Vec::new(),
             amont_downgrades: Vec::new(),
             verification_inputs_changed: Vec::new(),
@@ -4292,6 +4305,7 @@ mod tests {
             gaps: vec![],
             baseline_failures: vec!["flaky".into()],
             gaps_not_judged: Vec::new(),
+            notes: Vec::new(),
             amont_bypasses: vec![],
             amont_downgrades: vec![],
             verification_inputs_changed: Vec::new(),
@@ -4343,6 +4357,7 @@ mod tests {
                 gaps: vec![],
                 baseline_failures: vec![],
                 gaps_not_judged: Vec::new(),
+                notes: Vec::new(),
                 amont_bypasses: vec![],
                 amont_downgrades: vec![],
                 verification_inputs_changed: Vec::new(),

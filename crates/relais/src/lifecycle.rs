@@ -462,6 +462,9 @@ pub enum UsagePhase {
     Repair,
     Escalation,
     Review,
+    /// An inspection's report review: not the patch review, and the
+    /// ledger does not count it as one.
+    ReportReview,
     Planning,
     Integration,
 }
@@ -472,11 +475,12 @@ impl UsagePhase {
     ///
     /// The length is fixed, so a variant added to the enum without being
     /// added here does not compile the `match` that walks it.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Initial,
         Self::Repair,
         Self::Escalation,
         Self::Review,
+        Self::ReportReview,
         Self::Planning,
         Self::Integration,
     ];
@@ -487,6 +491,7 @@ impl UsagePhase {
             Self::Repair => "repair",
             Self::Escalation => "escalation",
             Self::Review => "review",
+            Self::ReportReview => "report_review",
             Self::Planning => "planning",
             Self::Integration => "integration",
         }
@@ -579,11 +584,7 @@ mod tests {
             assert_eq!(State::parse(state.as_str()), Ok(state));
         }
         assert!(State::Accepted.is_terminal() && !State::Verifying.is_terminal());
-        for phase in [
-            UsagePhase::Initial,
-            UsagePhase::Review,
-            UsagePhase::Integration,
-        ] {
+        for phase in UsagePhase::ALL {
             assert_eq!(UsagePhase::parse(phase.as_str()), Ok(phase));
         }
         for purpose in [RunPurpose::Replay, RunPurpose::TrialArm] {

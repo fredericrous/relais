@@ -24,7 +24,8 @@ missing here.
   `Read,Grep,Glob` in sandbox and allowlist mode) settles its bare,
   `llm_review` and unnamed-`test` criteria, failing closed on a missing,
   unparseable, duplicated or omitted line, and `review: off` does not turn it
-  off. A red `check` or named-`test` criterion fails the run `criteria_unmet`
+  off (the receipt's new `notes` says so). Each review is kept per attempt,
+  and its usage phase is the new `report_review`, not `review`. A red `check` or named-`test` criterion fails the run `criteria_unmet`
   with no repair; an unmet report criterion is repaired once on the same
   tier, never escalated, then fails `criteria_unmet`; a pending sign-off is
   `needs_decision` listing only the sign-offs, and the sign-off re-seal

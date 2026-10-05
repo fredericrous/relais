@@ -5576,6 +5576,7 @@ mod tests {
                 checks: Vec::new(),
                 gaps,
                 gaps_not_judged: vec!["amont gap, not judged".into()],
+                notes: Vec::new(),
                 baseline_failures: vec!["base@1".into()],
                 amont_bypasses: Vec::new(),
                 amont_downgrades: Vec::new(),

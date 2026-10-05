@@ -507,6 +507,7 @@ struct PendingEvidence {
     checks: Vec<verify::CheckOutcome>,
     gaps: Vec<String>,
     gaps_not_judged: Vec<String>,
+    notes: Vec<String>,
     gate_coverage: BTreeMap<String, Result<bool, verify::AttestError>>,
     /// An inspection's report review, which the pending receipt keeps.
     verdict: Option<verify::ReportVerdict>,
@@ -536,6 +537,8 @@ struct Verified {
     checks: Vec<verify::CheckOutcome>,
     gaps: Vec<String>,
     gaps_not_judged: Vec<String>,
+    /// How the run was judged, when that is worth saying; not a gap.
+    notes: Vec<String>,
     amont_bypasses: Vec<String>,
     amont_downgrades: Vec<String>,
     verification_inputs_changed: Vec<String>,
@@ -2601,6 +2604,7 @@ impl<'a> RunEngine<'a> {
                         checks: checks.clone(),
                         gaps: gaps.clone(),
                         gaps_not_judged: gaps_not_judged.clone(),
+                        notes: Vec::new(),
                         gate_coverage: gate_coverage.clone(),
                         verdict: None,
                     },
@@ -2657,6 +2661,7 @@ impl<'a> RunEngine<'a> {
             checks,
             gaps,
             gaps_not_judged,
+            notes: Vec::new(),
             amont_bypasses,
             amont_downgrades,
             verification_inputs_changed,
@@ -2762,6 +2767,7 @@ impl<'a> RunEngine<'a> {
             checks: verified.checks,
             gaps: verified.gaps,
             gaps_not_judged: verified.gaps_not_judged,
+            notes: verified.notes,
             baseline_failures: ctx.baseline.failures.clone(),
             amont_bypasses: verified.amont_bypasses,
             amont_downgrades: verified.amont_downgrades,
@@ -2860,13 +2866,12 @@ impl<'a> RunEngine<'a> {
     ) -> Result<Step, RunError> {
         let preflight = ctx.preflight;
         if self.config.contract.review == Review::Off {
-            verified.gaps_not_judged.push(
+            verified.notes.push(
                 "the contract says `review: off`, which governs the patch review only: an \
                  inspection has no patch, and its report review ran"
                     .into(),
             );
         }
-        let report_text = candidate.result_text.clone().unwrap_or_default();
         let request = ReviewRequest {
             manifest: &preflight.manifest,
             authority: &preflight.authority,
@@ -2879,19 +2884,15 @@ impl<'a> RunEngine<'a> {
             routed_by: preflight.decision.routed_by,
             covering: preflight.decision.covering.clone(),
         };
-        let verdict = match self.review_report(
-            &request,
-            ctx.worktree_path,
-            &report_text,
-            &mut progress.spend,
-        ) {
-            Ok(verdict) => verdict,
-            Err(detail) => {
-                return Ok(Step::Ended(
-                    self.stop(&progress.budget, Observation::ReviewUnavailable(detail))?,
-                ));
-            }
-        };
+        let verdict =
+            match self.review_report(&request, candidate, ctx.worktree_path, &mut progress.spend) {
+                Ok(verdict) => verdict,
+                Err(detail) => {
+                    return Ok(Step::Ended(
+                        self.stop(&progress.budget, Observation::ReviewUnavailable(detail))?,
+                    ));
+                }
+            };
         let report = verification_report(ctx, candidate, &verified);
         let (criteria, _) = self.settle(ctx, &report, &verified.gate_coverage, Some(&verdict))?;
         let unmet: Vec<(usize, &verify::CriterionOutcome)> = criteria
@@ -2949,6 +2950,7 @@ impl<'a> RunEngine<'a> {
                     checks: verified.checks,
                     gaps: verified.gaps.clone(),
                     gaps_not_judged: verified.gaps_not_judged,
+                    notes: verified.notes,
                     gate_coverage: verified.gate_coverage,
                     verdict: Some(verdict),
                 },
@@ -2969,8 +2971,8 @@ impl<'a> RunEngine<'a> {
     fn review_report(
         &mut self,
         request: &ReviewRequest<'_>,
+        candidate: &Candidate,
         worktree: &Path,
-        report: &str,
         spend: &mut RunSpend,
     ) -> Result<verify::ReportVerdict, String> {
         let Some(profile) = request
@@ -2988,6 +2990,7 @@ impl<'a> RunEngine<'a> {
             return Err(exhausted);
         }
         let statements = self.config.contract.acceptance_statements();
+        let report = candidate.result_text.as_deref().unwrap_or_default();
         let prompt = report_review_prompt(&self.config.contract.objective, &statements, report);
         let seat = ReviewSeat {
             profile: &profile,
@@ -3004,9 +3007,11 @@ impl<'a> RunEngine<'a> {
         };
         let text = result.result_text.unwrap_or_default();
         self.record_artifact(
-            None,
+            Some(candidate.attempt_id),
             EvidenceKind::ReviewResult,
-            &self.artifacts.join("report-review.txt"),
+            &self
+                .artifacts
+                .join(format!("report-review-{}.txt", candidate.index)),
             &text,
         )
         .map_err(|e| format!("the report review could not be recorded as evidence: {e}"))?;
@@ -3268,6 +3273,7 @@ impl<'a> RunEngine<'a> {
             checks,
             gaps,
             gaps_not_judged,
+            notes,
             gate_coverage,
             verdict,
         } = pending;
@@ -3280,6 +3286,7 @@ impl<'a> RunEngine<'a> {
             checks,
             gaps,
             gaps_not_judged,
+            notes,
             baseline_failures: ctx.baseline.failures.clone(),
             amont_bypasses: Vec::new(),
             amont_downgrades: Vec::new(),
@@ -3996,7 +4003,7 @@ impl<'a> RunEngine<'a> {
             completeness: result.usage.cost.completeness(),
             inclusive: result.usage.cost.inclusive(),
             at: self.config.ledger.now(),
-            phase: Some(UsagePhase::Review),
+            phase: Some(purpose.usage_phase()),
             duration_ms: Some(dispatch_start.elapsed().as_millis() as i64),
             requested_model: Some(profile.id.clone()),
             requested_effort: effort_str(profile.effort.as_ref()),
@@ -4019,7 +4026,9 @@ impl<'a> RunEngine<'a> {
 
 /// What a reviewer dispatch is for. A report review reads the worktree and
 /// nothing else; it is not the patch review, and the ledger does not count
-/// it as one.
+/// it as one: its intent kind is `report_review`, so `review_dispatched`
+/// is false, and its usage is tagged `UsagePhase::ReportReview`, so
+/// `review_attempted` is false too.
 #[derive(Debug, Clone, Copy)]
 enum ReviewPurpose {
     Patch,
@@ -4040,6 +4049,13 @@ impl ReviewPurpose {
         match self {
             Self::Patch => ToolSet::ModeDefault,
             Self::Report => ToolSet::ReadOnly,
+        }
+    }
+
+    fn usage_phase(self) -> UsagePhase {
+        match self {
+            Self::Patch => UsagePhase::Review,
+            Self::Report => UsagePhase::ReportReview,
         }
     }
 
@@ -4275,6 +4291,7 @@ fn verification_report(
         checks: verified.checks.clone(),
         gaps: verified.gaps.clone(),
         gaps_not_judged: verified.gaps_not_judged.clone(),
+        notes: verified.notes.clone(),
         baseline_failures: ctx.baseline.failures.clone(),
         amont_bypasses: verified.amont_bypasses.clone(),
         amont_downgrades: verified.amont_downgrades.clone(),
@@ -7306,6 +7323,46 @@ mod tests {
             repair.prompt
         );
         assert_eq!(fixture.ledger.attempt_count(&run_id).expect("attempts"), 2);
+        let reviews = evidence_of(&fixture, &run_id, EvidenceKind::ReviewResult);
+        assert_eq!(reviews.len(), 2, "one report review per attempt");
+        assert_ne!(reviews[0].0, reviews[1].0, "no review overwrites another");
+        for (path, sha256) in &reviews {
+            let sha = workspace::sha256_file(Path::new(path)).expect("the review file exists");
+            assert_eq!(&sha, sha256, "{path}");
+        }
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn an_accepted_inspection_is_not_counted_as_a_patch_review() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let (backend, _) = inspecting_backend("DONE: the report", "[1] met: read it");
+        let outcome = fixture.execute(&inspect_contract(), &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Accepted(_),
+        } = outcome
+        else {
+            panic!("expected acceptance, got {outcome:?}");
+        };
+        assert!(!fixture
+            .ledger
+            .review_dispatched(&run_id)
+            .expect("dispatched"));
+        assert!(!fixture.ledger.review_attempted(&run_id).expect("attempted"));
+        let phases: Vec<Option<UsagePhase>> = fixture
+            .ledger
+            .run_cost_by_phase(&run_id)
+            .expect("cost by phase")
+            .into_iter()
+            .map(|cost| cost.phase)
+            .collect();
+        assert!(
+            phases.contains(&Some(UsagePhase::ReportReview)),
+            "{phases:?}"
+        );
+        assert!(!phases.contains(&Some(UsagePhase::Review)), "{phases:?}");
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
@@ -7497,9 +7554,14 @@ mod tests {
         assert!(
             receipt
                 .verification
-                .gaps_not_judged
+                .notes
                 .iter()
                 .any(|note| note.contains("review: off")),
+            "{:?}",
+            receipt.verification.notes
+        );
+        assert!(
+            receipt.verification.gaps_not_judged.is_empty(),
             "{:?}",
             receipt.verification.gaps_not_judged
         );
