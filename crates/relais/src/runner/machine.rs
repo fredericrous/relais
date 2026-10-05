@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::lifecycle::{Reason, State, UsagePhase};
 use crate::policy::{BlockCode, Tier};
 use crate::route::RungIndex;
+use crate::sandbox::Refusal;
 
 /// What kind of attempt is being dispatched (SPEC §9: initial, one
 /// repair, one stronger attempt).
@@ -186,6 +187,13 @@ pub enum Observation {
     },
     /// A required check is a gap: skipped, inert, unavailable, untrusted.
     VerificationGap(Vec<String>),
+    /// An inspection's report review did not meet these criteria. A
+    /// repair can change the report; it never escalates (SPEC §9).
+    CriteriaUnmet(Vec<String>),
+    /// An inspection's `Check` or named-`Test` criteria are not met, each
+    /// entry naming the criterion and the check. The report cannot turn a
+    /// check green, so no repair is bought.
+    CheckCriteriaUnmet(Vec<String>),
     /// The diff leaves the contract's write scope.
     ScopeViolation(Vec<String>),
     /// The worker proposed that something outside the task blocks it.
@@ -200,6 +208,10 @@ pub enum Observation {
     /// The harness refused the worker these tools. A worker that could
     /// not act is blocked, not failed, and never escalated (SPEC §8).
     PermissionDenied(Vec<String>),
+    /// Every refusal was of a command's form, not of a permission: the
+    /// worker is told the rewrite and repaired at the same tier. Never an
+    /// escalation, and never the end of the run while a repair remains.
+    ShapeRefused(Vec<Refusal>),
     /// The dispatch was cancelled through the coordinator.
     Cancelled(String),
     /// The provider ran a model other than the one requested.
@@ -346,6 +358,43 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
             )
         }
 
+        Observation::CriteriaUnmet(criteria) => {
+            if budget.repairs_used < budget.max_repairs {
+                return Decision {
+                    state: State::Repairing,
+                    reason: Reason::BehavioralFailure,
+                    detail: serde_json::json!({
+                        "criteria": criteria,
+                        "attempt": budget.attempts_used,
+                    }),
+                    next: Next::Attempt {
+                        kind: AttemptKind::Repair,
+                        rung: budget.rung.next(),
+                    },
+                };
+            }
+            let detail = format!(
+                "the report still does not meet: {}; no repair remains",
+                criteria.join("; ")
+            );
+            Decision::stop(
+                State::Failed,
+                Reason::CriteriaUnmet,
+                serde_json::json!({ "criteria": criteria }),
+                Terminal::Failed { detail },
+            )
+        }
+
+        Observation::CheckCriteriaUnmet(unmet) => {
+            let detail = format!("criteria whose check is red: {}", unmet.join("; "));
+            Decision::stop(
+                State::Failed,
+                Reason::CriteriaUnmet,
+                serde_json::json!({ "criteria": unmet }),
+                Terminal::Failed { detail },
+            )
+        }
+
         Observation::VerificationGap(gaps) => {
             let detail = format!("required checks are gaps, not passes: {}", gaps.join("; "));
             Decision::stop(
@@ -432,6 +481,41 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
                 State::Blocked,
                 Reason::PermissionDenied,
                 serde_json::json!({ "tools": tools }),
+                Terminal::Blocked {
+                    code: BlockCode::PermissionDenied,
+                    detail,
+                },
+            )
+        }
+
+        Observation::ShapeRefused(refusals) => {
+            let commands: Vec<String> = refusals
+                .iter()
+                .map(|refusal| refusal.command.clone())
+                .collect();
+            if budget.repairs_used < budget.max_repairs {
+                return Decision {
+                    state: State::Repairing,
+                    reason: Reason::ShapeRefused,
+                    detail: serde_json::json!({
+                        "commands": commands,
+                        "refusals": refusals,
+                        "attempt": budget.attempts_used,
+                    }),
+                    next: Next::Attempt {
+                        kind: AttemptKind::Repair,
+                        rung: budget.rung.next(),
+                    },
+                };
+            }
+            let detail = format!(
+                "the harness refused the form of these commands and no repair remains: {}",
+                commands.join(", ")
+            );
+            Decision::stop(
+                State::Blocked,
+                Reason::PermissionDenied,
+                serde_json::json!({ "commands": commands }),
                 Terminal::Blocked {
                     code: BlockCode::PermissionDenied,
                     detail,
@@ -585,6 +669,35 @@ mod tests {
     }
 
     #[test]
+    fn unmet_criteria_repair_once_at_the_same_tier_and_never_escalate() {
+        let unmet = || Observation::CriteriaUnmet(vec!["[1] the layout".into()]);
+        let d = decide(&budget(0, Some(Tier::Escalation)), unmet());
+        assert_eq!(d.state, State::Repairing);
+        assert_eq!(
+            d.next,
+            Next::Attempt {
+                kind: AttemptKind::Repair,
+                rung: RungIndex::INITIAL.next()
+            }
+        );
+        let spent = decide(&budget(1, Some(Tier::Escalation)), unmet());
+        assert_eq!(spent.state, State::Failed);
+        assert_eq!(spent.reason, Reason::CriteriaUnmet);
+        assert!(matches!(spent.next, Next::Stop(Terminal::Failed { .. })));
+    }
+
+    #[test]
+    fn a_red_check_criterion_fails_without_a_repair() {
+        let d = decide(
+            &budget(0, Some(Tier::Escalation)),
+            Observation::CheckCriteriaUnmet(vec!["c-1 (check make@1)".into()]),
+        );
+        assert_eq!(d.state, State::Failed);
+        assert_eq!(d.reason, Reason::CriteriaUnmet);
+        assert!(matches!(d.next, Next::Stop(Terminal::Failed { .. })));
+    }
+
+    #[test]
     fn refused_tools_are_blocked_never_escalated() {
         let b = budget(0, Some(Tier::Escalation));
         let d = decide(&b, Observation::PermissionDenied(vec!["Edit".into()]));
@@ -592,6 +705,38 @@ mod tests {
         assert_eq!(d.reason, Reason::PermissionDenied);
         assert!(matches!(
             d.next,
+            Next::Stop(Terminal::Blocked {
+                code: BlockCode::PermissionDenied,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_shape_refusal_repairs_once_at_the_same_tier_and_never_escalates() {
+        let refused = || {
+            Observation::ShapeRefused(vec![Refusal {
+                tool_use_id: Some("t1".into()),
+                command: "cat <<E > $TMPDIR/x".into(),
+                reason: "This command requires approval".into(),
+                class: crate::sandbox::RefusalClass::Shape,
+            }])
+        };
+        let d = decide(&budget(0, Some(Tier::Escalation)), refused());
+        assert_eq!(d.state, State::Repairing);
+        assert_eq!(d.reason, Reason::ShapeRefused);
+        assert_eq!(
+            d.next,
+            Next::Attempt {
+                kind: AttemptKind::Repair,
+                rung: RungIndex::INITIAL.next()
+            }
+        );
+        let spent = decide(&budget(1, Some(Tier::Escalation)), refused());
+        assert_eq!(spent.state, State::Blocked);
+        assert_eq!(spent.reason, Reason::PermissionDenied);
+        assert!(matches!(
+            spent.next,
             Next::Stop(Terminal::Blocked {
                 code: BlockCode::PermissionDenied,
                 ..

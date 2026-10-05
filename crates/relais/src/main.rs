@@ -57,7 +57,7 @@ use relais::policy::{
     RecipeSpec, RepoIdentity, RepoPolicy,
 };
 use relais::runner::{execute, live_trial, worktree_root, Reason, RunConfig, State, Terminal};
-use relais::verify::{independence_summary, Receipt};
+use relais::verify::{independence_summary, Receipt, SettledVia};
 use relais::{
     doctor,
     ledger::{EvidenceKind, EvidenceOrigin, Ledger},
@@ -4869,6 +4869,18 @@ fn reseal_receipt_with_signoff(
     run: &RunId,
     criterion_id: &str,
 ) -> Result<(), CliError> {
+    let runs_dir = paths::runs_dir().map_err(CliError::Home)?;
+    reseal_receipt_in(ledger, &runs_dir, run, criterion_id)
+}
+
+/// [`reseal_receipt_with_signoff`] against an explicit `runs_dir`, the one
+/// place a run's `receipt.json` lives.
+fn reseal_receipt_in(
+    ledger: &Ledger,
+    runs_dir: &Path,
+    run: &RunId,
+    criterion_id: &str,
+) -> Result<(), CliError> {
     let Some((stored, _hash)) = operational(ledger.receipt(run), "decide")? else {
         return Ok(());
     };
@@ -4884,6 +4896,7 @@ fn reseal_receipt_with_signoff(
             // records which evidence settled it, never a rewrite of what
             // the contract asked for.
             criterion.evidence = Some(Evidence::HumanSignOff);
+            criterion.settled_via = Some(SettledVia::HumanSignOff);
         }
     }
     receipt.mandatory_evidence_independence = independence_summary(&receipt.criteria);
@@ -4898,7 +4911,7 @@ fn reseal_receipt_with_signoff(
         .verification
         .gaps
         .retain(|gap| relais::verify::sign_off_gap_criterion(gap) != Some(criterion_id));
-    if receipt.verification.accepted() {
+    if receipt.accepted_by_settlement() {
         receipt.outcome = State::Accepted.as_str().to_string();
     }
     let receipt_hash = receipt.hash();
@@ -4914,10 +4927,7 @@ fn reseal_receipt_with_signoff(
     // would leave `receipt.json` — the copy a person actually opens, and
     // the one the evidence row's hash names — reading `needs_decision`
     // for a run this command just accepted.
-    let receipt_path = paths::runs_dir()
-        .map_err(CliError::Home)?
-        .join(run.as_str())
-        .join("receipt.json");
+    let receipt_path = runs_dir.join(run.as_str()).join("receipt.json");
     if receipt_path.exists() {
         operational(
             std::fs::write(
@@ -5527,5 +5537,164 @@ mod tests {
         assert_eq!(found, salvaged);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    const SIGN_OFF_GAP: &str =
+        "acceptance criterion `read` names a human sign-off, which nothing has recorded";
+
+    /// A pending receipt as the runner stores it for a run waiting only on
+    /// a sign-off: one criterion settled by the report review, one
+    /// waiting on `read`.
+    fn pending_receipt(kind: relais::contract::Kind, extra_gap: bool) -> Receipt {
+        let criterion = |id: &str, evidence: Option<Evidence>, met: bool, via| {
+            relais::verify::CriterionOutcome {
+                id: id.into(),
+                statement: id.into(),
+                mandatory: true,
+                met,
+                evidence,
+                settled_by: None,
+                settled_via: Some(via),
+            }
+        };
+        let mut gaps = vec![SIGN_OFF_GAP.to_string()];
+        if extra_gap {
+            gaps.push("another gap".into());
+        }
+        Receipt {
+            run_id: "run-seal".into(),
+            candidate_sha: "abc".into(),
+            base_sha: "def".into(),
+            contract_hash: "ch".into(),
+            policy_hash: "ph".into(),
+            outcome: State::NeedsDecision.as_str().into(),
+            verification: relais::verify::VerificationReport {
+                candidate_sha: "abc".into(),
+                base_sha: "def".into(),
+                contract_hash: "ch".into(),
+                policy_hash: "ph".into(),
+                checks: Vec::new(),
+                gaps,
+                gaps_not_judged: vec!["amont gap, not judged".into()],
+                notes: Vec::new(),
+                baseline_failures: vec!["base@1".into()],
+                amont_bypasses: Vec::new(),
+                amont_downgrades: Vec::new(),
+                verification_inputs_changed: Vec::new(),
+                integration_gaps: Vec::new(),
+                baseline_cached: false,
+                baseline_cache_refused: None,
+            },
+            kind,
+            models_used: vec!["haiku".into()],
+            attempts: 1,
+            cost_completeness: relais::money::CostCompleteness::Actual,
+            cost: MicroUsd::from_micros(1),
+            criteria: vec![
+                criterion("report", None, true, SettledVia::ReportReview),
+                criterion(
+                    "read",
+                    Some(Evidence::HumanSignOff),
+                    false,
+                    SettledVia::HumanSignOff,
+                ),
+            ],
+            mandatory_evidence_independence: Some(
+                relais::verify::IndependenceSummary::PartlyIndependent,
+            ),
+            recipe: relais::policy::RecipeRecord::NotRecorded,
+            verification_profile_hash: "vph".into(),
+            review: relais::verify::ReviewRecord::NoReview,
+            ladder: relais::verify::LadderRecord::NotRecorded,
+            efforts_used: Vec::new(),
+        }
+    }
+
+    /// Store `stored` as the pending receipt of a fresh run, beside its
+    /// `receipt.json`, re-seal it with the sign-off on `read`, and read
+    /// back the ledger's row and the file's outcome.
+    fn resealed(stored: &serde_json::Value) -> serde_json::Value {
+        let (ledger, dir) = temp_ledger("reseal");
+        let run = RunId::from_stored("run-seal");
+        let task = relais::ids::TaskId::from_stored("t");
+        ledger
+            .insert_run(&run, "/repo", None, &task, "rk")
+            .expect("run");
+        ledger
+            .store_receipt(&run, stored, "pending")
+            .expect("stored");
+        let runs = dir.join("runs");
+        let file_path = runs.join("run-seal").join("receipt.json");
+        std::fs::create_dir_all(runs.join("run-seal")).expect("run dir");
+        std::fs::write(&file_path, stored.to_string()).expect("receipt.json");
+        reseal_receipt_in(&ledger, &runs, &run, "read").expect("reseal");
+        let (row, _) = ledger.receipt(&run).expect("read").expect("row");
+        let file = std::fs::read_to_string(&file_path).expect("receipt.json");
+        let file: serde_json::Value = serde_json::from_str(&file).expect("json");
+        assert_eq!(
+            row["outcome"], file["outcome"],
+            "the row and the file agree"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        row
+    }
+
+    #[test]
+    fn a_signed_off_inspection_is_accepted_by_its_recorded_settlements() {
+        let receipt = pending_receipt(relais::contract::Kind::Inspect, false);
+        let row = resealed(&serde_json::to_value(&receipt).expect("receipt"));
+        assert_eq!(row["outcome"], "accepted", "{row}");
+        let read = &row["criteria"][1];
+        assert_eq!(read["met"], true, "{read}");
+        assert_eq!(read["settled_via"], "human_sign_off", "{read}");
+        assert_eq!(row["criteria"][0]["settled_via"], "report_review");
+        assert_eq!(
+            row["mandatory_evidence_independence"], "partly_independent",
+            "a re-seal recomputes what the runner computed: {row}"
+        );
+    }
+
+    #[test]
+    fn a_signed_off_change_still_needs_every_gap_closed() {
+        let open = pending_receipt(relais::contract::Kind::Change, true);
+        let row = resealed(&serde_json::to_value(&open).expect("receipt"));
+        assert_eq!(row["outcome"], "needs_decision", "{row}");
+        let closed = pending_receipt(relais::contract::Kind::Change, false);
+        let row = resealed(&serde_json::to_value(&closed).expect("receipt"));
+        assert_eq!(row["outcome"], "accepted", "{row}");
+    }
+
+    /// A receipt written before `kind` and `settled_via` existed carries
+    /// neither: it parses, is a change, and re-seals as it always did.
+    #[test]
+    fn a_receipt_without_kind_or_settled_via_reseals_as_a_change() {
+        let receipt = pending_receipt(relais::contract::Kind::Change, true);
+        let mut stored = serde_json::to_value(&receipt).expect("receipt");
+        stored.as_object_mut().expect("object").remove("kind");
+        for criterion in stored["criteria"].as_array_mut().expect("criteria") {
+            criterion
+                .as_object_mut()
+                .expect("object")
+                .remove("settled_via");
+        }
+        stored["criteria"][0]["settled_by"] = serde_json::json!({
+            "test": "suite::case",
+            "command": "cargo-test@1",
+            "outcome": "passed",
+        });
+        stored["mandatory_evidence_independence"] = serde_json::json!("all_independent");
+        let parsed: Receipt =
+            serde_json::from_value(stored.clone()).expect("an old receipt parses");
+        assert_eq!(parsed.kind, relais::contract::Kind::Change);
+        assert_eq!(parsed.criteria[1].settled_via, None);
+        let row = resealed(&stored);
+        assert_eq!(
+            row["outcome"], "needs_decision",
+            "the other gap is still open: {row}"
+        );
+        assert_eq!(
+            row["mandatory_evidence_independence"], "all_independent",
+            "no settled_via: today's evidence rule: {row}"
+        );
     }
 }

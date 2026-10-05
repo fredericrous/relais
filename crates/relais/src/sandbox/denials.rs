@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::probe::{clip, OS_DENIALS};
+use super::probe::{clip, OS_DENIALS, PERMISSION_REFUSALS};
 
 const VIOLATIONS_OPEN: &str = "<sandbox_violations>";
 const VIOLATIONS_CLOSE: &str = "</sandbox_violations>";
@@ -30,7 +30,22 @@ const OTHER_DENIALS: [&str; 2] = ["CONNECT tunnel failed, response 403", "bwrap:
 /// listed here (a background command's `BashOutput`, a tool a later harness
 /// adds) keeps its evidence.
 const FILE_TOOLS: [&str; 6] = ["Read", "Grep", "Glob", "Edit", "Write", "NotebookEdit"];
+/// The harness's sentences for a refusal of a command's SHAPE, not of a
+/// permission: the harness cannot analyse the command, or wants it split
+/// (measured on Claude Code 2.1.288-2.1.289). They are kept here and not
+/// beside [`PERMISSION_REFUSALS`] because the probe's pinned digest hashes
+/// that module's marker sets. The full sentences, not fragments: a bare
+/// "requires approval" could also be a real missing permission.
+pub(crate) const SHAPE_REFUSALS: [&str; 6] = [
+    "can't be checked before it runs",
+    "This Bash command contains multiple operations. The following part requires approval",
+    "This command requires approval",
+    "Contains case_statement",
+    "Contains brace with quote character",
+    "Blocked: sleep",
+];
 const TEXT_LIMIT: usize = 200;
+const REASON_LIMIT: usize = 400;
 const LISTED: usize = 5;
 
 /// One denial line and where it was read.
@@ -59,6 +74,40 @@ pub struct DenialReport {
     pub verified: Vec<Denial>,
     pub suspected: Vec<Denial>,
     pub coverage: Coverage,
+    /// Each refused call and how it was classified; absent from reports
+    /// written before the classification was kept.
+    #[serde(default)]
+    pub refusals: Vec<Refusal>,
+}
+
+/// What a refusal asks of the worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalClass {
+    /// The harness refused the command's form: a rewrite is accepted.
+    Shape,
+    /// A missing permission, or anything that cannot be shown to be a
+    /// shape refusal.
+    Capability,
+}
+
+/// One refused tool call, with the harness's reason from the transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refusal {
+    /// `None` when the harness named no call for the denial.
+    pub tool_use_id: Option<String>,
+    /// The Bash command, empty when it is not known.
+    pub command: String,
+    /// The harness's refusal text, empty when it is not known.
+    pub reason: String,
+    pub class: RefusalClass,
+}
+
+/// A tool call the harness reported as denied.
+#[derive(Debug, Clone, Copy)]
+pub struct DeniedCall<'a> {
+    pub tool: &'a str,
+    pub tool_use_id: Option<&'a str>,
 }
 
 /// Where Claude Code keeps a session's transcript: under the project slug
@@ -145,6 +194,10 @@ fn result_text(content: Option<&Value>) -> Option<String> {
 struct Transcript {
     uses: Vec<String>,
     names: HashMap<String, String>,
+    /// Each Bash call's command.
+    commands: HashMap<String, String>,
+    /// The text of each Bash result the harness marked `is_error`.
+    errors: HashMap<String, String>,
     results: HashMap<String, usize>,
     problem: Option<String>,
 }
@@ -179,6 +232,12 @@ fn read_item(item: &Value, transcript: &mut Transcript, report: &mut DenialRepor
                 if let Some(name) = field("name") {
                     transcript.names.insert(id.to_string(), name.to_string());
                 }
+                let command = item.pointer("/input/command").and_then(Value::as_str);
+                if let (Some("Bash"), Some(command)) = (field("name"), command) {
+                    transcript
+                        .commands
+                        .insert(id.to_string(), command.to_string());
+                }
             }
             None => transcript.flag(format!("line {line_no}: tool_use without id")),
         },
@@ -193,8 +252,15 @@ fn read_item(item: &Value, transcript: &mut Transcript, report: &mut DenialRepor
                 .names
                 .get(id)
                 .is_none_or(|name| !FILE_TOOLS.contains(&name.as_str()));
+            let bash = transcript.names.get(id).is_some_and(|name| name == "Bash");
+            let is_error = item.get("is_error").and_then(Value::as_bool) == Some(true);
             match result_text(item.get("content")) {
-                Some(text) if scanned => sort_lines(&text, &format!("tool_result:{id}"), report),
+                Some(text) if scanned => {
+                    sort_lines(&text, &format!("tool_result:{id}"), report);
+                    if bash && is_error {
+                        transcript.errors.insert(id.to_string(), text);
+                    }
+                }
                 Some(_) => {}
                 None => transcript.flag(format!("line {line_no}: tool_result {id} has no text")),
             }
@@ -234,6 +300,7 @@ pub fn scan(transcript_jsonl: Option<&str>, scratch_files: &[(PathBuf, String)])
         verified: Vec::new(),
         suspected: Vec::new(),
         coverage: Coverage::Unknown("no transcript".to_string()),
+        refusals: Vec::new(),
     };
     if let Some(jsonl) = transcript_jsonl {
         let transcript = read_transcript(jsonl, &mut report);
@@ -252,6 +319,69 @@ pub fn scan(transcript_jsonl: Option<&str>, scratch_files: &[(PathBuf, String)])
         sort_lines(text, &source, &mut report);
     }
     report
+}
+
+fn has_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+/// Shape only when the text positively says so and says nothing of a
+/// missing permission; every other text is a capability refusal.
+fn classify_text(text: &str) -> RefusalClass {
+    if has_any(text, &PERMISSION_REFUSALS) || !has_any(text, &SHAPE_REFUSALS) {
+        RefusalClass::Capability
+    } else {
+        RefusalClass::Shape
+    }
+}
+
+/// Each denied call classified from the transcript, joined on the call's
+/// id. Fail closed: a call is a shape refusal only when it is a Bash call
+/// the transcript holds, whose `is_error` result carries a shape sentence
+/// and no capability one, and the transcript is whole. A denial with no id
+/// or an id the transcript lacks, a tool other than Bash, an unreadable or
+/// partial transcript are all capability refusals.
+pub fn classify_refusals(
+    transcript_jsonl: Option<&str>,
+    denied: &[DeniedCall<'_>],
+) -> Vec<Refusal> {
+    let transcript = transcript_jsonl.map(|jsonl| {
+        let mut scratch = DenialReport {
+            verified: Vec::new(),
+            suspected: Vec::new(),
+            coverage: Coverage::Complete,
+            refusals: Vec::new(),
+        };
+        let transcript = read_transcript(jsonl, &mut scratch);
+        let whole = transcript.incompleteness().is_none();
+        (transcript, whole)
+    });
+    denied
+        .iter()
+        .map(|call| {
+            let known = transcript.as_ref().zip(call.tool_use_id);
+            let command = known
+                .and_then(|((read, _), id)| read.commands.get(id))
+                .cloned()
+                .unwrap_or_default();
+            let reason = known
+                .and_then(|((read, _), id)| read.errors.get(id))
+                .cloned()
+                .unwrap_or_default();
+            let whole = transcript.as_ref().is_some_and(|(_, whole)| *whole);
+            let class = if call.tool == "Bash" && whole && !command.is_empty() {
+                classify_text(&reason)
+            } else {
+                RefusalClass::Capability
+            };
+            Refusal {
+                tool_use_id: call.tool_use_id.map(str::to_string),
+                command,
+                reason: reason.trim().chars().take(REASON_LIMIT).collect(),
+                class,
+            }
+        })
+        .collect()
 }
 
 impl Coverage {
@@ -321,6 +451,34 @@ mod tests {
 
     fn transcript(lines: &[String]) -> String {
         lines.join("\n")
+    }
+
+    fn bash_call(id: &str, command: &str) -> String {
+        line(serde_json::json!({"message": {"content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": command}}
+        ]}}))
+    }
+
+    fn error_result(id: &str, text: &str) -> String {
+        line(serde_json::json!({"message": {"content": [
+            {"type": "tool_result", "tool_use_id": id, "content": text, "is_error": true}
+        ]}}))
+    }
+
+    fn classify_one(lines: &[String], tool: &str, id: Option<&str>) -> Refusal {
+        let jsonl = transcript(lines);
+        let denied = [DeniedCall {
+            tool,
+            tool_use_id: id,
+        }];
+        let mut refusals = classify_refusals(Some(&jsonl), &denied);
+        assert_eq!(refusals.len(), 1);
+        refusals.remove(0)
+    }
+
+    fn class_of_text(text: &str) -> RefusalClass {
+        let lines = [bash_call("t1", "x"), error_result("t1", text)];
+        classify_one(&lines, "Bash", Some("t1")).class
     }
 
     const VIOLATION: &str = "Exit code 56\n<sandbox_violations>\ndeny network-outbound \
@@ -570,6 +728,7 @@ mod tests {
             verified: (0..7).map(denial).collect(),
             suspected: vec![denial(9)],
             coverage: Coverage::Incomplete("tool_use toolu_long has no tool_result".to_string()),
+            refusals: vec![],
         };
         let rendered = report.render();
         assert!(
@@ -590,6 +749,7 @@ mod tests {
                 verified: vec![],
                 suspected: vec![],
                 coverage,
+                refusals: vec![],
             }
             .render()
         };
@@ -601,5 +761,117 @@ mod tests {
             render(Coverage::Unknown("no transcript".into())),
             "sandbox denials: 0 verified, 0 suspected (coverage: unknown — no transcript)"
         );
+    }
+
+    #[test]
+    fn each_measured_shape_text_is_a_shape_refusal() {
+        for text in [
+            "A variable/file redirect in this command can't be checked before it runs",
+            "This Bash command contains multiple operations. The following part requires approval: tail x",
+            "This command requires approval",
+            "Contains case_statement",
+            "Contains brace with quote character",
+            "Blocked: sleep 5 is not allowed",
+        ] {
+            assert_eq!(class_of_text(text), RefusalClass::Shape, "{text}");
+        }
+    }
+
+    #[test]
+    fn each_measured_capability_text_is_a_capability_refusal() {
+        for text in [
+            "Permission to use Bash has been denied.",
+            "path is outside; --restricted confines the file tools to the working directory.",
+            "Bash(git push) was denied by your permission settings",
+        ] {
+            assert_eq!(class_of_text(text), RefusalClass::Capability, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_shape_refusal_keeps_its_command_and_reason() {
+        let lines = [
+            bash_call("t1", "cat <<E > $TMPDIR/x"),
+            error_result("t1", "This command requires approval"),
+        ];
+        let refusal = classify_one(&lines, "Bash", Some("t1"));
+        assert_eq!(refusal.command, "cat <<E > $TMPDIR/x");
+        assert_eq!(refusal.reason, "This command requires approval");
+        assert_eq!(refusal.tool_use_id.as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn an_unknown_text_and_a_text_in_both_sets_are_capability() {
+        assert_eq!(class_of_text("something else"), RefusalClass::Capability);
+        let both = "This command requires approval; Bash has been denied";
+        assert_eq!(class_of_text(both), RefusalClass::Capability);
+    }
+
+    #[test]
+    fn a_denial_without_a_known_call_is_capability() {
+        let lines = [
+            bash_call("t1", "x"),
+            error_result("t1", "Contains case_statement"),
+        ];
+        assert_eq!(
+            classify_one(&lines, "Bash", None).class,
+            RefusalClass::Capability
+        );
+        assert_eq!(
+            classify_one(&lines, "Bash", Some("nope")).class,
+            RefusalClass::Capability
+        );
+    }
+
+    #[test]
+    fn a_non_bash_denial_is_capability() {
+        let lines = [
+            bash_call("t1", "x"),
+            error_result("t1", "Contains case_statement"),
+        ];
+        assert_eq!(
+            classify_one(&lines, "Edit", Some("t1")).class,
+            RefusalClass::Capability
+        );
+    }
+
+    #[test]
+    fn a_result_that_is_not_an_error_is_capability() {
+        let lines = [
+            bash_call("t1", "x"),
+            tool_result("t1", "Contains case_statement"),
+        ];
+        assert_eq!(
+            classify_one(&lines, "Bash", Some("t1")).class,
+            RefusalClass::Capability
+        );
+    }
+
+    #[test]
+    fn incomplete_or_missing_coverage_makes_every_refusal_capability() {
+        let lines = [
+            bash_call("t1", "x"),
+            error_result("t1", "Contains case_statement"),
+            bash_call("t2", "y"),
+        ];
+        assert_eq!(
+            classify_one(&lines, "Bash", Some("t1")).class,
+            RefusalClass::Capability
+        );
+        let denied = [DeniedCall {
+            tool: "Bash",
+            tool_use_id: Some("t1"),
+        }];
+        let refusals = classify_refusals(None, &denied);
+        assert_eq!(refusals[0].class, RefusalClass::Capability);
+    }
+
+    #[test]
+    fn a_long_reason_is_cut_after_it_is_classified() {
+        let text = format!("{} Bash has been denied", "x ".repeat(300));
+        assert_eq!(class_of_text(&text), RefusalClass::Capability);
+        let lines = [bash_call("t1", "x"), error_result("t1", &text)];
+        let refusal = classify_one(&lines, "Bash", Some("t1"));
+        assert_eq!(refusal.reason.chars().count(), REASON_LIMIT);
     }
 }

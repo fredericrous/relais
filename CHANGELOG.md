@@ -8,6 +8,49 @@ missing here.
 
 ## Unreleased
 
+### Changed
+
+- A sandboxed worker refused the shape of a command is repaired, not
+  stopped (#167): a refusal the harness words as "can't be checked before it
+  runs", "multiple operations", "requires approval", `case_statement`, a brace
+  with a quote character or `sleep` is read from the transcript, joined to the
+  refused call, and costs one same-tier repair whose prompt names the command,
+  the harness's reason and the rewrite (new `shape_refused` reason). It never
+  buys a stronger model, and a `relais-blocked:` claim after only such
+  refusals no longer ends the run. A reason that is not positively a shape
+  refusal, an incomplete transcript and allowlist mode stay blocked as before.
+  The sandbox worker rules now also say to edit files with the Edit and Write
+  tools and never to start a command with `cd`.
+  A shape-refused attempt never enters `verifying`, so the repair report no
+  longer counts it as a failed check run; each refusal's command, reason and
+  class are kept on the `shape_refused` transition and in the attempt's
+  `sandbox-denials` artifact (`refusals`); a tool denied twice is named once
+  in the blocked detail; and a repair with both refusals and earlier failures
+  carries both addenda.
+- An inspection on a red base behaves as on a green one (#167): a check that
+  already fails at the base is recorded on the receipt and no longer sends
+  the inspection to repair, a gap about the profile's checks is recorded in
+  the new `gaps_not_judged` field (also on the pending receipt of a
+  sign-off-only inspection) instead of stopping it, an empty final message
+  is a failure the worker may repair once (and, with a permission denial,
+  "produced nothing"), and a check that fails only on the candidate still
+  stops it. The inspect prompt now says the
+  final message is the deliverable. Change tasks keep every rule.
+- An inspection is judged by its report (#167): one read-only report review
+  (research tier, the worker's model, the candidate worktree, tools exactly
+  `Read,Grep,Glob` in sandbox and allowlist mode) settles its bare,
+  `llm_review` and unnamed-`test` criteria, failing closed on a missing,
+  unparseable, duplicated or omitted line, and `review: off` does not turn it
+  off (the receipt's new `notes` says so). Each review is kept per attempt,
+  and its usage phase is the new `report_review`, not `review`. The reviewer is also given the candidate's tracked tree from git (top-level entries, directories marked `/`, and up to 400 tracked file paths), because its `Glob` cannot see directories and sees untracked ones. A red `check` or named-`test` criterion fails the run `criteria_unmet`
+  with no repair; an unmet report criterion is repaired once on the same
+  tier, never escalated, then fails `criteria_unmet`; a pending sign-off is
+  `needs_decision` listing only the sign-offs, and the sign-off re-seal
+  accepts an inspection by its recorded settlements. Receipts gain `kind` and
+  each criterion `settled_via`, from which independence is derived (a report
+  verdict is not independent); older receipts read as before. `LaunchSpec`
+  carries the tool set to request.
+
 ### Added
 
 - `[sandbox]` in machine.toml (#105): OS-sandboxed workers, off by default
@@ -60,6 +103,10 @@ missing here.
   a configuration change at the same version, or `never verified on <platform>`,
   in both the `sandbox_unverified` block and `relais doctor`.
 
+- The sandbox probe also checks the two shapes the worker rules recommend (a
+  log redirect read back, a file written from python), so a harness upgrade
+  that starts refusing either fails verification (probe version 6: run
+  `relais doctor --verify-sandbox` once).
 - Sandbox-mode worker rules (#105): files go to `$TMPDIR` by a plain redirect
   or from python via `os.environ['TMPDIR']`, never a heredoc with any file
   redirect or a `{ ...; }` group redirected there (refused on 2.1.289), nor

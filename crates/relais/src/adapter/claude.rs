@@ -24,7 +24,8 @@ use std::time::Duration;
 
 use crate::backend::{
     claims_blockage, Backend, BackendError, Capabilities, Cost, LaunchResult, LaunchSpec,
-    PermissionEnforcement, ProbeLauncher, SandboxCapability, SandboxLaunch, UsageReport,
+    PermissionDenial, PermissionEnforcement, ProbeLauncher, SandboxCapability, SandboxLaunch,
+    ToolSet, UsageReport,
 };
 use crate::money::MicroUsd;
 use crate::procs::{run_with_timeout, Ended, ProcessEnd};
@@ -368,14 +369,25 @@ pub fn build_argv(spec: &LaunchSpec, caps: &Capabilities) -> Result<Vec<String>,
         argv.push(tool.clone());
     }
     match &spec.sandbox {
-        Some(launch) => argv.extend(sandbox_args(launch)),
-        None if !spec.allowed_tools.is_empty() => {
-            argv.push("--settings".into());
-            argv.push(
-                serde_json::json!({ "permissions": { "allow": spec.allowed_tools } }).to_string(),
-            );
+        Some(launch) => argv.extend(sandbox_args(launch, sandbox_tools(spec.tools))),
+        None => {
+            match spec.tools {
+                ToolSet::ReadOnly => {
+                    argv.push("--tools".into());
+                    argv.push(READ_ONLY_TOOLS.into());
+                }
+                // Allowlist mode has no tool flag of its own: the
+                // permission rules below decide.
+                ToolSet::ModeDefault => {}
+            }
+            if !spec.allowed_tools.is_empty() {
+                argv.push("--settings".into());
+                argv.push(
+                    serde_json::json!({ "permissions": { "allow": spec.allowed_tools } })
+                        .to_string(),
+                );
+            }
         }
-        None => {}
     }
     Ok(argv)
 }
@@ -400,15 +412,27 @@ pub fn probe_argv(spec: &LaunchSpec, caps: &Capabilities) -> Result<Vec<String>,
 /// measured harness (S0), so it is not listed.
 const SANDBOX_TOOLS: &str = "Bash,Read,Edit,Write,Grep,Glob";
 
+/// What a launch that can only look asks for, in either mode.
+const READ_ONLY_TOOLS: &str = "Read,Grep,Glob";
+
+/// The `--tools` value a launch in sandbox mode passes: what it asked for,
+/// or the sandbox worker's own set.
+fn sandbox_tools(asked: ToolSet) -> &'static str {
+    match asked {
+        ToolSet::ModeDefault => SANDBOX_TOOLS,
+        ToolSet::ReadOnly => READ_ONLY_TOOLS,
+    }
+}
+
 /// What a sandboxed launch adds: no user, project or local settings,
 /// hooks or plugins (`--restricted`), no MCP servers but the ones named
 /// here (none), the tools above, the scratch directory, and ONE
 /// `--settings` document that replaces the allowlist-only one.
-fn sandbox_args(launch: &SandboxLaunch) -> Vec<String> {
+fn sandbox_args(launch: &SandboxLaunch, tools: &str) -> Vec<String> {
     vec![
         "--restricted".into(),
         "--tools".into(),
-        SANDBOX_TOOLS.into(),
+        tools.into(),
         "--strict-mcp-config".into(),
         "--add-dir".into(),
         launch.scratch_dir.to_string_lossy().into_owned(),
@@ -487,8 +511,8 @@ pub struct ParsedClaudeResult {
     pub usage: UsageReport,
     /// `is_error` as the harness reported it.
     pub is_error: bool,
-    /// Tool names from `permission_denials`, deduplicated, in order.
-    pub permission_denials: Vec<String>,
+    /// The harness's `permission_denials`, in order, one per refused call.
+    pub permission_denials: Vec<PermissionDenial>,
 }
 
 pub fn parse_result_json(stdout: &str) -> ParsedClaudeResult {
@@ -534,7 +558,7 @@ pub fn parse_result_json(stdout: &str) -> ParsedClaudeResult {
         .get("permission_denials")
         .and_then(|denials| denials.as_array())
         .map(|denials| {
-            let mut tools: Vec<String> = Vec::new();
+            let mut refused: Vec<PermissionDenial> = Vec::new();
             for denial in denials {
                 let name = denial
                     .get("tool_name")
@@ -552,11 +576,10 @@ pub fn parse_result_json(stdout: &str) -> ParsedClaudeResult {
                     }
                     _ => name.to_string(),
                 };
-                if !tools.contains(&entry) {
-                    tools.push(entry);
-                }
+                let tool_use_id = denial.get("tool_use_id").and_then(|id| id.as_str());
+                refused.push(PermissionDenial::new(entry, tool_use_id));
             }
-            tools
+            refused
         })
         .unwrap_or_default();
     ParsedClaudeResult {
@@ -664,6 +687,7 @@ mod tests {
             cancel: None,
             pid_slot: None,
             sandbox: None,
+            tools: crate::backend::ToolSet::ModeDefault,
         }
     }
 
@@ -685,6 +709,29 @@ mod tests {
     fn value_after<'a>(argv: &'a [String], flag: &str) -> &'a str {
         let at = argv.iter().position(|arg| arg == flag).expect(flag);
         &argv[at + 1]
+    }
+
+    #[test]
+    fn a_read_only_launch_asks_for_exactly_three_tools_in_both_modes() {
+        let caps = capabilities_from_help("2.1.278".into(), HELP_2_1);
+        let read_only = |spec: LaunchSpec| LaunchSpec {
+            tools: ToolSet::ReadOnly,
+            allowed_tools: Vec::new(),
+            ..spec
+        };
+        for spec in [read_only(spec(Some(500_000))), read_only(sandboxed_spec())] {
+            let argv = build_argv(&spec, &caps).expect("argv");
+            assert_eq!(count(&argv, "--tools"), 1, "{argv:?}");
+            assert_eq!(value_after(&argv, "--tools"), "Read,Grep,Glob");
+        }
+        // The launches that never asked keep what they always had.
+        let worker = build_argv(&spec(Some(500_000)), &caps).expect("argv");
+        assert_eq!(count(&worker, "--tools"), 0, "{worker:?}");
+        let sandboxed = build_argv(&sandboxed_spec(), &caps).expect("argv");
+        assert_eq!(
+            value_after(&sandboxed, "--tools"),
+            "Bash,Read,Edit,Write,Grep,Glob"
+        );
     }
 
     #[test]
@@ -873,8 +920,13 @@ mod tests {
         let parsed = parse_result_json(json);
         assert_eq!(
             parsed.permission_denials,
-            vec!["Edit", "Bash(git diff --stat)"]
+            vec![
+                PermissionDenial::new("Edit", Some("a")),
+                PermissionDenial::new("Edit", Some("b")),
+                PermissionDenial::new("Bash(git diff --stat)", Some("c")),
+            ]
         );
+        assert_eq!(parsed.permission_denials[2].tool_name(), "Bash");
         let parsed = parse_result_json(r#"{"result":"boom","is_error":true}"#);
         assert!(parsed.is_error);
     }
