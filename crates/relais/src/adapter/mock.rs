@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::backend::{
     check_effort, claims_blockage, Backend, BackendError, Capabilities, LaunchResult, LaunchSpec,
-    PermissionEnforcement, SandboxCapability, UsageReport,
+    PermissionDenial, PermissionEnforcement, SandboxCapability, UsageReport,
 };
 use crate::catalog::{EffortSet, Fact};
 use crate::policy::EffortId;
@@ -25,7 +25,7 @@ pub struct MockOutcome {
     pub usage: Option<UsageReport>,
     pub session_id: Option<String>,
     /// Tools the scripted harness "refused" the worker.
-    pub permission_denials: Vec<String>,
+    pub permission_denials: Vec<PermissionDenial>,
 }
 
 pub struct MockBackend {

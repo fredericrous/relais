@@ -561,6 +561,29 @@ impl UsageReport {
     }
 }
 
+/// One tool call the harness refused the worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionDenial {
+    /// The tool, and for Bash the command: `Edit`, `Bash(git diff)`.
+    pub entry: String,
+    /// The refused call's id in the transcript, when the harness named it.
+    pub tool_use_id: Option<String>,
+}
+
+impl PermissionDenial {
+    pub fn new(entry: impl Into<String>, tool_use_id: Option<&str>) -> Self {
+        Self {
+            entry: entry.into(),
+            tool_use_id: tool_use_id.map(str::to_string),
+        }
+    }
+
+    /// The tool's name, without a Bash command.
+    pub fn tool_name(&self) -> &str {
+        self.entry.split('(').next().unwrap_or(&self.entry)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LaunchResult {
     pub dispatch_id: String,
@@ -583,7 +606,7 @@ pub struct LaunchResult {
     /// worker that could not act is not a worker that chose not to:
     /// missing permissions produce a blocked result (SPEC §8).
     #[serde(default)]
-    pub permission_denials: Vec<String>,
+    pub permission_denials: Vec<PermissionDenial>,
     /// Why the harness ended without a usable result — its stderr, or
     /// the error it reported — for the interrupted transition's evidence.
     #[serde(default)]

@@ -74,6 +74,9 @@ pub enum Reason {
     DuplicateDispatch,
     /// The harness refused the worker a tool it needed (SPEC §8).
     PermissionDenied,
+    /// The harness refused the form of a command, not a permission: the
+    /// worker is told the rewrite and repaired at the same tier (SPEC §8).
+    ShapeRefused,
     /// The candidate carries the base tree: verification is the
     /// baseline's, not re-run.
     CandidateIdenticalToBase,
@@ -151,7 +154,7 @@ impl Reason {
     ///
     /// The length is fixed, so a variant added to the enum without being
     /// added here does not compile the `match` that walks it.
-    pub const ALL: [Self; 51] = [
+    pub const ALL: [Self; 52] = [
         Self::ChecksAndReviewPassed,
         Self::BehavioralFailure,
         Self::RepairExhausted,
@@ -185,6 +188,7 @@ impl Reason {
         Self::AdmissionRefused,
         Self::DuplicateDispatch,
         Self::PermissionDenied,
+        Self::ShapeRefused,
         Self::CandidateIdenticalToBase,
         Self::ReviewerSameModel,
         Self::WorktreeNotReleased,
@@ -240,6 +244,7 @@ impl Reason {
             Self::AdmissionRefused => "admission_refused",
             Self::DuplicateDispatch => "duplicate_dispatch",
             Self::PermissionDenied => "permission_denied",
+            Self::ShapeRefused => "shape_refused",
             Self::CandidateIdenticalToBase => "candidate_identical_to_base",
             Self::ReviewerSameModel => "reviewer_same_model",
             Self::WorktreeNotReleased => "worktree_not_released",

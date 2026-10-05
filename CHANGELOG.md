@@ -10,6 +10,17 @@ missing here.
 
 ### Changed
 
+- A sandboxed worker refused the shape of a command is repaired, not
+  stopped (#167): a refusal the harness words as "can't be checked before it
+  runs", "multiple operations", "requires approval", `case_statement`, a brace
+  with a quote character or `sleep` is read from the transcript, joined to the
+  refused call, and costs one same-tier repair whose prompt names the command,
+  the harness's reason and the rewrite (new `shape_refused` reason). It never
+  buys a stronger model, and a `relais-blocked:` claim after only such
+  refusals no longer ends the run. A reason that is not positively a shape
+  refusal, an incomplete transcript and allowlist mode stay blocked as before.
+  The sandbox worker rules now also say to edit files with the Edit and Write
+  tools and never to start a command with `cd`.
 - An inspection on a red base behaves as on a green one (#167): a check that
   already fails at the base is recorded on the receipt and no longer sends
   the inspection to repair, a gap about the profile's checks is recorded in

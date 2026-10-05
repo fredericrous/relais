@@ -24,7 +24,8 @@ use std::time::Duration;
 
 use crate::backend::{
     claims_blockage, Backend, BackendError, Capabilities, Cost, LaunchResult, LaunchSpec,
-    PermissionEnforcement, ProbeLauncher, SandboxCapability, SandboxLaunch, ToolSet, UsageReport,
+    PermissionDenial, PermissionEnforcement, ProbeLauncher, SandboxCapability, SandboxLaunch,
+    ToolSet, UsageReport,
 };
 use crate::money::MicroUsd;
 use crate::procs::{run_with_timeout, Ended, ProcessEnd};
@@ -505,8 +506,8 @@ pub struct ParsedClaudeResult {
     pub usage: UsageReport,
     /// `is_error` as the harness reported it.
     pub is_error: bool,
-    /// Tool names from `permission_denials`, deduplicated, in order.
-    pub permission_denials: Vec<String>,
+    /// The harness's `permission_denials`, in order, one per refused call.
+    pub permission_denials: Vec<PermissionDenial>,
 }
 
 pub fn parse_result_json(stdout: &str) -> ParsedClaudeResult {
@@ -552,7 +553,7 @@ pub fn parse_result_json(stdout: &str) -> ParsedClaudeResult {
         .get("permission_denials")
         .and_then(|denials| denials.as_array())
         .map(|denials| {
-            let mut tools: Vec<String> = Vec::new();
+            let mut refused: Vec<PermissionDenial> = Vec::new();
             for denial in denials {
                 let name = denial
                     .get("tool_name")
@@ -570,11 +571,10 @@ pub fn parse_result_json(stdout: &str) -> ParsedClaudeResult {
                     }
                     _ => name.to_string(),
                 };
-                if !tools.contains(&entry) {
-                    tools.push(entry);
-                }
+                let tool_use_id = denial.get("tool_use_id").and_then(|id| id.as_str());
+                refused.push(PermissionDenial::new(entry, tool_use_id));
             }
-            tools
+            refused
         })
         .unwrap_or_default();
     ParsedClaudeResult {
@@ -915,8 +915,13 @@ mod tests {
         let parsed = parse_result_json(json);
         assert_eq!(
             parsed.permission_denials,
-            vec!["Edit", "Bash(git diff --stat)"]
+            vec![
+                PermissionDenial::new("Edit", Some("a")),
+                PermissionDenial::new("Edit", Some("b")),
+                PermissionDenial::new("Bash(git diff --stat)", Some("c")),
+            ]
         );
+        assert_eq!(parsed.permission_denials[2].tool_name(), "Bash");
         let parsed = parse_result_json(r#"{"result":"boom","is_error":true}"#);
         assert!(parsed.is_error);
     }

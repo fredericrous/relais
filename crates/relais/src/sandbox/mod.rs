@@ -43,7 +43,10 @@ mod settings;
 mod verification;
 mod verify;
 
-pub use denials::{scan, transcript_path, Coverage, Denial, DenialReport};
+pub use denials::{
+    classify_refusals, scan, transcript_path, Coverage, Denial, DenialReport, DeniedCall, Refusal,
+    RefusalClass,
+};
 pub use dispatch::{
     dispatch_gate, dispatch_key, dispatch_lookup, DispatchKeyInputs, GateInputs, Lookup,
 };
