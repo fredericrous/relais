@@ -163,12 +163,7 @@ impl VerificationReport {
     /// check already failed at the base: it changes nothing, so a base
     /// failure is not its to repair (SPEC §10).
     pub fn accepted_inspection(&self) -> bool {
-        self.gaps.is_empty()
-            && self
-                .checks
-                .iter()
-                .filter(|check| check.failed())
-                .all(|check| self.baseline_failures.contains(&check.label))
+        self.gaps.is_empty() && self.new_failures().is_empty()
     }
 
     /// The acceptance rule of this kind of contract.
@@ -180,13 +175,19 @@ impl VerificationReport {
     }
 
     pub fn new_failures(&self) -> Vec<String> {
-        self.checks
-            .iter()
-            .filter(|check| check.failed())
-            .filter(|check| !self.baseline_failures.contains(&check.label))
-            .map(|check| check.label.clone())
-            .collect()
+        new_failure_labels(&self.checks, &self.baseline_failures)
     }
+}
+
+/// The checks that failed and did not fail at the base: the one
+/// definition of a new failure (SPEC §10).
+pub fn new_failure_labels(checks: &[CheckOutcome], baseline_failures: &[String]) -> Vec<String> {
+    checks
+        .iter()
+        .filter(|check| check.failed())
+        .filter(|check| !baseline_failures.contains(&check.label))
+        .map(|check| check.label.clone())
+        .collect()
 }
 
 /// Mandatory criteria whose declared evidence produced nothing to

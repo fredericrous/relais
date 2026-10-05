@@ -500,6 +500,15 @@ fn split_profile_gaps(
     gaps.into_iter().partition(|gap| evidence.contains(gap))
 }
 
+/// What a candidate stopped only by sign-offs has established, for the
+/// pending receipt that keeps it.
+struct PendingEvidence {
+    checks: Vec<verify::CheckOutcome>,
+    gaps: Vec<String>,
+    gaps_not_judged: Vec<String>,
+    gate_coverage: BTreeMap<String, Result<bool, verify::AttestError>>,
+}
+
 /// An attempt's candidate: snapshotted, named, exported and in scope.
 struct Candidate {
     attempt_id: i64,
@@ -2490,17 +2499,16 @@ impl<'a> RunEngine<'a> {
         // An inspection's tree is always unchanged: what it produces is
         // its final message, and only an empty one is nothing.
         let inspecting = self.config.contract.kind() == crate::contract::Kind::Inspect;
-        let produced_nothing = if inspecting {
-            candidate
+        let unchanged = match progress.last_candidate.as_deref() {
+            Some(previous) => previous == candidate.sha,
+            None => identical,
+        };
+        let empty_report = inspecting
+            && candidate
                 .result_text
                 .as_deref()
-                .is_none_or(|text| text.trim().is_empty())
-        } else {
-            match progress.last_candidate.as_deref() {
-                Some(previous) => previous == candidate.sha,
-                None => identical,
-            }
-        };
+                .is_none_or(|text| text.trim().is_empty());
+        let produced_nothing = if inspecting { empty_report } else { unchanged };
         if !candidate.permission_denials.is_empty() {
             if produced_nothing {
                 ledger.finish_attempt(
@@ -2582,24 +2590,34 @@ impl<'a> RunEngine<'a> {
                     ctx,
                     progress,
                     &candidate,
-                    checks.clone(),
-                    gaps.clone(),
-                    gate_coverage.clone(),
+                    PendingEvidence {
+                        checks: checks.clone(),
+                        gaps: gaps.clone(),
+                        gaps_not_judged: gaps_not_judged.clone(),
+                        gate_coverage: gate_coverage.clone(),
+                    },
                 )?;
             }
             return Ok(Step::Ended(
                 self.stop(&progress.budget, Observation::VerificationGap(gaps))?,
             ));
         }
-        let mut failures: Vec<String> = checks
-            .iter()
-            .filter(|check| check.failed())
-            .map(|check| check.label.clone())
-            .collect();
         // An inspection changes nothing, so a check already failing at
         // the base is not its to repair (SPEC §10).
-        if inspecting {
-            failures.retain(|label| !ctx.baseline.failures.contains(label));
+        let mut failures: Vec<String> = if inspecting {
+            verify::new_failure_labels(&checks, &ctx.baseline.failures)
+        } else {
+            checks
+                .iter()
+                .filter(|check| check.failed())
+                .map(|check| check.label.clone())
+                .collect()
+        };
+        // An inspection's deliverable is its report: an empty one is a
+        // failure the worker may repair once, as an empty candidate is
+        // for a change.
+        if empty_report {
+            failures.push("empty_report".into());
         }
         // A change task whose candidate changes nothing has not met
         // its objective, whatever the baseline says: a behavioural
@@ -2619,7 +2637,7 @@ impl<'a> RunEngine<'a> {
                 &progress.budget,
                 Observation::VerificationFailed {
                     failures,
-                    unchanged_candidate: produced_nothing,
+                    unchanged_candidate: unchanged,
                     same_failures,
                     all_preexisting,
                 },
@@ -3032,10 +3050,14 @@ impl<'a> RunEngine<'a> {
         ctx: &AttemptContext<'_>,
         progress: &mut Progress,
         candidate: &Candidate,
-        checks: Vec<verify::CheckOutcome>,
-        gaps: Vec<String>,
-        gate_coverage: BTreeMap<String, Result<bool, verify::AttestError>>,
+        pending: PendingEvidence,
     ) -> Result<(), RunError> {
+        let PendingEvidence {
+            checks,
+            gaps,
+            gaps_not_judged,
+            gate_coverage,
+        } = pending;
         let preflight = ctx.preflight;
         let report = VerificationReport {
             candidate_sha: candidate.sha.clone(),
@@ -3044,7 +3066,7 @@ impl<'a> RunEngine<'a> {
             policy_hash: preflight.authority.authority_hash.clone(),
             checks,
             gaps,
-            gaps_not_judged: Vec::new(),
+            gaps_not_judged,
             baseline_failures: ctx.baseline.failures.clone(),
             amont_bypasses: Vec::new(),
             amont_downgrades: Vec::new(),
@@ -6785,6 +6807,192 @@ mod tests {
             panic!("an empty report is nothing, got {outcome:?}");
         };
         assert_eq!(code, BlockCode::PermissionDenied);
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    fn inspect_contract_accepting(acceptance: serde_json::Value) -> TaskContract {
+        TaskContract::from_json_str(
+            &serde_json::json!({
+                "schema_version": 1,
+                "kind": "inspect",
+                "objective": "Investigate why a check is inactive",
+                "base_ref": "HEAD",
+                "acceptance": acceptance,
+                "verification_profile": "profile",
+            })
+            .to_string(),
+        )
+        .expect("contract")
+    }
+
+    fn reporting_backend(text: &'static str) -> MockBackend {
+        MockBackend::new(move |_| MockOutcome {
+            result_text: Some(text.into()),
+            exit_code: Some(0),
+            usage: Some(usage(50)),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn an_inspection_with_a_profile_gap_is_accepted_and_lists_it() {
+        let fixture = Fixture::new();
+        let mut repo = fixture.repo_policy(vec![passing_check()], 3);
+        repo.verification
+            .profiles
+            .get_mut("profile")
+            .expect("profile")
+            .amont_checks = vec!["inventory-check".into()];
+        let backend = reporting_backend("DONE: the report");
+        let outcome = fixture.execute(&inspect_contract(), &repo, &backend);
+        let RunOutcome {
+            terminal: Terminal::Accepted(receipt),
+            ..
+        } = outcome
+        else {
+            panic!("a profile gap does not stop an inspection, got {outcome:?}");
+        };
+        assert!(receipt.verification.gaps.is_empty());
+        assert!(
+            receipt
+                .verification
+                .gaps_not_judged
+                .iter()
+                .any(|gap| gap.contains("inventory-check")),
+            "{:?}",
+            receipt.verification.gaps_not_judged
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_sign_off_only_inspection_stores_its_profile_gaps_in_the_pending_receipt() {
+        let fixture = Fixture::new();
+        let mut repo = fixture.repo_policy(vec![passing_check()], 3);
+        repo.verification
+            .profiles
+            .get_mut("profile")
+            .expect("profile")
+            .amont_checks = vec!["inventory-check".into()];
+        let contract = inspect_contract_accepting(serde_json::json!([{
+            "statement": "a person read the report",
+            "id": "read",
+            "mandatory": true,
+            "evidence": {"kind": "human_sign_off"},
+        }]));
+        let backend = reporting_backend("DONE: the report");
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::NeedsDecision { .. },
+        } = outcome
+        else {
+            panic!("an unmet sign-off ends needs_decision, got {outcome:?}");
+        };
+        let (stored, _) = fixture
+            .ledger
+            .receipt(&run_id)
+            .expect("receipt")
+            .expect("the pending receipt is stored");
+        let not_judged = stored["verification"]["gaps_not_judged"].to_string();
+        assert!(not_judged.contains("inventory-check"), "{stored}");
+        let file =
+            std::fs::read_to_string(fixture.artifacts.join(run_id.as_str()).join("receipt.json"))
+                .expect("receipt.json");
+        assert!(file.contains("inventory-check"), "{file}");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn an_empty_inspect_report_is_repaired_once_then_fails() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let launches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&launches);
+        let backend = MockBackend::new(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            MockOutcome {
+                result_text: Some(" \n".into()),
+                exit_code: Some(0),
+                usage: Some(usage(50)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&inspect_contract(), &repo, &backend);
+        let RunOutcome {
+            terminal: Terminal::Failed { detail },
+            ..
+        } = outcome
+        else {
+            panic!("an empty report is not accepted, got {outcome:?}");
+        };
+        assert!(detail.contains("empty_report"), "{detail}");
+        assert_eq!(
+            launches.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "initial, then one repair"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A check green at the base and red on the candidate is a new
+    /// failure: the inspection is not accepted, and the same one again
+    /// on the repair ends the run with no further dispatch. A cached
+    /// baseline is what lets the candidate be verified for real on the
+    /// base tree: the flag turns the check red after the cache was filled.
+    #[test]
+    fn an_inspection_that_meets_a_new_failure_is_not_accepted_and_fails_on_its_repeat() {
+        let fixture = Fixture::new();
+        let flag = fixture.dir.join("red-flag");
+        let shell = if cfg!(windows) { "sh" } else { "bash" };
+        let check = CommandSpec {
+            name: None,
+            junit: None,
+            argv: vec![
+                shell.into(),
+                "-c".into(),
+                format!("test ! -f '{}'", flag.display()),
+            ],
+            timeout_seconds: 30,
+        };
+        let mut repo = fixture.repo_policy(vec![check], 4);
+        repo.verification
+            .profiles
+            .get_mut("profile")
+            .expect("profile")
+            .cache_baseline = true;
+        let machine = fixture.machine_for(&repo);
+        let backend = reporting_backend("DONE: the report");
+        let first = fixture.execute_with_machine(&inspect_contract(), &repo, &machine, &backend);
+        assert!(
+            matches!(first.terminal, Terminal::Accepted(_)),
+            "a green base fills the cache: {first:?}"
+        );
+        std::fs::write(&flag, "red").expect("flag");
+        let launches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&launches);
+        let counting = MockBackend::new(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            MockOutcome {
+                result_text: Some("DONE: the report".into()),
+                exit_code: Some(0),
+                usage: Some(usage(50)),
+                ..Default::default()
+            }
+        });
+        let second = fixture.execute_with_machine(&inspect_contract(), &repo, &machine, &counting);
+        let RunOutcome {
+            terminal: Terminal::Failed { .. },
+            ..
+        } = second
+        else {
+            panic!("a base-green candidate-red check is not accepted, got {second:?}");
+        };
+        assert_eq!(
+            launches.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "initial, one repair, then the same failure on the same tree stops"
+        );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 

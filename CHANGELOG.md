@@ -13,8 +13,11 @@ missing here.
 - An inspection on a red base behaves as on a green one (#167): a check that
   already fails at the base is recorded on the receipt and no longer sends
   the inspection to repair, a gap about the profile's checks is recorded in
-  the new `gaps_not_judged` field instead of stopping it, and "produced
-  nothing" means an empty final message. The inspect prompt now says the
+  the new `gaps_not_judged` field (also on the pending receipt of a
+  sign-off-only inspection) instead of stopping it, an empty final message
+  is a failure the worker may repair once (and, with a permission denial,
+  "produced nothing"), and a check that fails only on the candidate still
+  stops it. The inspect prompt now says the
   final message is the deliverable. Change tasks keep every rule.
 
 ### Added
