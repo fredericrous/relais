@@ -100,6 +100,10 @@ const SOCKET_BIND: &str = "import os,socket,sys;\
      d.startswith(\"/tmp/rl-\") or sys.exit(\"fallback TMPDIR \"+d);\
      socket.socket(socket.AF_UNIX).bind(d+\"/sock/s\");\
      print(\"unix-socket-bound\")";
+/// The python-write step's command: python writes a file under
+/// `$TMPDIR` itself, the way the worker rules say to.
+const PYTHON_WRITE: &str = "python3 -c \"import os;p=os.environ['TMPDIR']+'/p.txt';\
+     open(p,'w').write('y\\n');print(open(p).read().strip())\"";
 const PRESENCE: &str = ">/dev/null && echo PRESENT || echo absent";
 
 fn bash(id: &'static str, input: String, expect: Expect) -> ProbeStep {
@@ -167,6 +171,21 @@ pub fn probe_plan(inputs: &ProbePlanInputs) -> Result<Vec<ProbeStep>, String> {
                 sh_quote(SOCKET_BIND)
             ),
             line(SOCKET_BOUND),
+        ),
+        // The shapes the worker rules recommend, so an upgrade of the
+        // harness that starts asking approval for one fails verification
+        // instead of silently making the rules wrong. Both measured
+        // allowed on 2.1.289. Single-line: each input reaches the model
+        // character for character.
+        bash(
+            "log-redirect",
+            "echo x > $TMPDIR/l.log 2>&1; tail -1 $TMPDIR/l.log".to_string(),
+            line("x"),
+        ),
+        bash(
+            "python-write",
+            PYTHON_WRITE.to_string(),
+            line("y"),
         ),
         bash(
             "tmp-write",
@@ -685,6 +704,8 @@ mod tests {
         match step.id {
             "pipe" => "a".to_string(),
             "unix-socket" => SOCKET_BOUND.to_string(),
+            "log-redirect" => "x".to_string(),
+            "python-write" => "y".to_string(),
             "tmp-write" | "home-write" => format!(
                 "Exit code 1\n(eval):1: operation not permitted: {}",
                 step.input
@@ -1189,6 +1210,8 @@ mod tests {
             [
                 "pipe",
                 "unix-socket",
+                "log-redirect",
+                "python-write",
                 "tmp-write",
                 "home-write",
                 "network",
@@ -1218,6 +1241,18 @@ mod tests {
         );
         assert_eq!(bind.matches(SOCKET_BOUND).count(), 1);
         assert!(bind.find(SOCKET_BOUND) > bind.find("startswith(\"/tmp/rl-\")"));
+        assert_eq!(
+            input("log-redirect"),
+            "echo x > $TMPDIR/l.log 2>&1; tail -1 $TMPDIR/l.log"
+        );
+        assert_eq!(
+            input("python-write"),
+            "python3 -c \"import os;p=os.environ['TMPDIR']+'/p.txt';open(p,'w').write('y\\n');print(open(p).read().strip())\""
+        );
+        assert!(
+            steps.iter().all(|s| !s.input.contains('\n')),
+            "every step is a single line"
+        );
         assert_eq!(input("tmp-write"), "touch /tmp/relais-probe-n1");
         assert_eq!(input("home-write"), "touch '/home/u/relais-probe-n1'");
         assert_eq!(

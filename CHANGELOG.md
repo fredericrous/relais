@@ -103,6 +103,10 @@ missing here.
   a configuration change at the same version, or `never verified on <platform>`,
   in both the `sandbox_unverified` block and `relais doctor`.
 
+- The sandbox probe also checks the two shapes the worker rules recommend (a
+  log redirect read back, a file written from python), so a harness upgrade
+  that starts refusing either fails verification (probe version 6: run
+  `relais doctor --verify-sandbox` once).
 - Sandbox-mode worker rules (#105): files go to `$TMPDIR` by a plain redirect
   or from python via `os.environ['TMPDIR']`, never a heredoc with any file
   redirect or a `{ ...; }` group redirected there (refused on 2.1.289), nor

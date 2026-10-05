@@ -497,6 +497,8 @@ mod tests {
                 (host is not on the allow list)\n</sandbox_violations>"
                 .to_string(),
             "unix-socket" => "unix-socket-bound".to_string(),
+            "log-redirect" => "x".to_string(),
+            "python-write" => "y".to_string(),
             "fixture-bash" => "denied".to_string(),
             "synthetic-env" | "scrub-env" => "absent".to_string(),
             "auth-env" => "absent\nabsent".to_string(),
