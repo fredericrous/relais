@@ -186,6 +186,13 @@ pub enum Observation {
     },
     /// A required check is a gap: skipped, inert, unavailable, untrusted.
     VerificationGap(Vec<String>),
+    /// An inspection's report review did not meet these criteria. A
+    /// repair can change the report; it never escalates (SPEC §9).
+    CriteriaUnmet(Vec<String>),
+    /// An inspection's `Check` or named-`Test` criteria are not met, each
+    /// entry naming the criterion and the check. The report cannot turn a
+    /// check green, so no repair is bought.
+    CheckCriteriaUnmet(Vec<String>),
     /// The diff leaves the contract's write scope.
     ScopeViolation(Vec<String>),
     /// The worker proposed that something outside the task blocks it.
@@ -342,6 +349,43 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
                 State::Failed,
                 Reason::RepairExhausted,
                 serde_json::json!({ "failures": failures }),
+                Terminal::Failed { detail },
+            )
+        }
+
+        Observation::CriteriaUnmet(criteria) => {
+            if budget.repairs_used < budget.max_repairs {
+                return Decision {
+                    state: State::Repairing,
+                    reason: Reason::BehavioralFailure,
+                    detail: serde_json::json!({
+                        "criteria": criteria,
+                        "attempt": budget.attempts_used,
+                    }),
+                    next: Next::Attempt {
+                        kind: AttemptKind::Repair,
+                        rung: budget.rung.next(),
+                    },
+                };
+            }
+            let detail = format!(
+                "the report still does not meet: {}; no repair remains",
+                criteria.join("; ")
+            );
+            Decision::stop(
+                State::Failed,
+                Reason::CriteriaUnmet,
+                serde_json::json!({ "criteria": criteria }),
+                Terminal::Failed { detail },
+            )
+        }
+
+        Observation::CheckCriteriaUnmet(unmet) => {
+            let detail = format!("criteria whose check is red: {}", unmet.join("; "));
+            Decision::stop(
+                State::Failed,
+                Reason::CriteriaUnmet,
+                serde_json::json!({ "criteria": unmet }),
                 Terminal::Failed { detail },
             )
         }
@@ -582,6 +626,35 @@ mod tests {
             decide(&top, failed(false, false, false)).state,
             State::Failed
         );
+    }
+
+    #[test]
+    fn unmet_criteria_repair_once_at_the_same_tier_and_never_escalate() {
+        let unmet = || Observation::CriteriaUnmet(vec!["[1] the layout".into()]);
+        let d = decide(&budget(0, Some(Tier::Escalation)), unmet());
+        assert_eq!(d.state, State::Repairing);
+        assert_eq!(
+            d.next,
+            Next::Attempt {
+                kind: AttemptKind::Repair,
+                rung: RungIndex::INITIAL.next()
+            }
+        );
+        let spent = decide(&budget(1, Some(Tier::Escalation)), unmet());
+        assert_eq!(spent.state, State::Failed);
+        assert_eq!(spent.reason, Reason::CriteriaUnmet);
+        assert!(matches!(spent.next, Next::Stop(Terminal::Failed { .. })));
+    }
+
+    #[test]
+    fn a_red_check_criterion_fails_without_a_repair() {
+        let d = decide(
+            &budget(0, Some(Tier::Escalation)),
+            Observation::CheckCriteriaUnmet(vec!["c-1 (check make@1)".into()]),
+        );
+        assert_eq!(d.state, State::Failed);
+        assert_eq!(d.reason, Reason::CriteriaUnmet);
+        assert!(matches!(d.next, Next::Stop(Terminal::Failed { .. })));
     }
 
     #[test]

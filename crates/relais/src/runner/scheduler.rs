@@ -1044,6 +1044,7 @@ fn accept_integrated(
         &signoffs,
         &assembled.gate_coverage,
         engine.config.contract.kind(),
+        None,
     );
     let receipt = Receipt {
         run_id: engine.run_id.as_str().to_string(),
@@ -1053,6 +1054,7 @@ fn accept_integrated(
         policy_hash: root.authority.authority_hash.clone(),
         outcome: State::Accepted.as_str().to_string(),
         verification: report,
+        kind: engine.config.contract.kind(),
         models_used: std::mem::take(&mut assembly.models_used),
         attempts: assembly.attempts_total,
         cost_completeness: spend.completeness,
@@ -1177,6 +1179,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         cancel: None,
         pid_slot: None,
         sandbox: None,
+        tools: crate::backend::ToolSet::ModeDefault,
     };
     let budget = Budget {
         attempts_used: 0,

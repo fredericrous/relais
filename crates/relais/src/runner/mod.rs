@@ -25,11 +25,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::acceptance::Evidence;
 use crate::admission::{
     BindOutcome, Decision, DispatchRequest, DispatchSource, Gate, GateError, Refusal,
     ReleaseWriteOutcome, ResourceClass, RunRegistration, WriteLeaseOutcome,
 };
-use crate::backend::{Backend, LaunchResult, LaunchSpec, SandboxLaunch};
+use crate::backend::{Backend, LaunchResult, LaunchSpec, SandboxLaunch, ToolSet};
 use crate::context::{self, ContextError, ContextManifest};
 use crate::contract::{Review, TaskContract};
 use crate::ids::{derive_task_id, DispatchId, PackageId, Pid, RunId};
@@ -507,6 +508,8 @@ struct PendingEvidence {
     gaps: Vec<String>,
     gaps_not_judged: Vec<String>,
     gate_coverage: BTreeMap<String, Result<bool, verify::AttestError>>,
+    /// An inspection's report review, which the pending receipt keeps.
+    verdict: Option<verify::ReportVerdict>,
 }
 
 /// An attempt's candidate: snapshotted, named, exported and in scope.
@@ -2093,6 +2096,7 @@ impl<'a> RunEngine<'a> {
             cancel: None,
             pid_slot: None,
             sandbox,
+            tools: ToolSet::ModeDefault,
         };
         let scene = SandboxScene::of(&spec);
 
@@ -2570,7 +2574,15 @@ impl<'a> RunEngine<'a> {
         if inspecting {
             (gaps, gaps_not_judged) = split_profile_gaps(gaps, &acceptance_gaps);
         }
-        if !gaps.is_empty() {
+        let sign_off_only = !acceptance_gaps.is_empty()
+            && acceptance_gaps.len() == gaps.len()
+            && acceptance_gaps
+                .iter()
+                .all(|gap| gap.missing == verify::MissingEvidence::SignOffUnrecorded);
+        // An inspection with only sign-offs open is judged first: its
+        // report may still be unmet, which a person's answer cannot fix.
+        let judged_first = inspecting && sign_off_only;
+        if !gaps.is_empty() && !judged_first {
             // Every other gap here is either unfixable from `relais
             // decide` (a missing/undefined check) or already a second
             // problem alongside one; a human-sign-off gap is the one
@@ -2580,12 +2592,7 @@ impl<'a> RunEngine<'a> {
             // receipt they would have produced now, `needs_decision`,
             // rather than losing that work and making the eventual
             // approval re-derive it from nothing.
-            if !acceptance_gaps.is_empty()
-                && acceptance_gaps.len() == gaps.len()
-                && acceptance_gaps
-                    .iter()
-                    .all(|gap| gap.missing == verify::MissingEvidence::SignOffUnrecorded)
-            {
+            if sign_off_only {
                 self.store_pending_receipt(
                     ctx,
                     progress,
@@ -2595,6 +2602,7 @@ impl<'a> RunEngine<'a> {
                         gaps: gaps.clone(),
                         gaps_not_judged: gaps_not_judged.clone(),
                         gate_coverage: gate_coverage.clone(),
+                        verdict: None,
                     },
                 )?;
             }
@@ -2633,58 +2641,69 @@ impl<'a> RunEngine<'a> {
                 .iter()
                 .all(|label| ctx.baseline.failures.contains(label));
             progress.last_failures = Some(failures.clone());
-            return match self.decide(
-                &progress.budget,
+            return self.follow(
+                ctx,
+                progress,
                 Observation::VerificationFailed {
                     failures,
                     unchanged_candidate: unchanged,
                     same_failures,
                     all_preexisting,
                 },
-            )? {
-                Next::Attempt { kind, rung } => {
-                    if kind == AttemptKind::Repair {
-                        progress.budget.repairs_used += 1;
-                    }
-                    progress.kind = kind;
-                    progress.budget.rung = rung;
-                    // The ladder is read again at dispatch; the tier the
-                    // budget carries is only the rung's, kept for the
-                    // limits that name it.
-                    // A rung the ladder lacks is never substituted: the
-                    // attempt ceiling ends the run before dispatch, and
-                    // dispatch refuses an index out of the ladder.
-                    if let Some(at) = ctx.preflight.decision.ladder.rung(rung) {
-                        progress.budget.tier = at.tier;
-                    }
-                    Ok(Step::Again)
-                }
-                Next::Accept => Err(RunError::Other(
-                    "the machine accepted a failing candidate".into(),
-                )),
-                Next::Stop(terminal) => Ok(Step::Ended(RunOutcome {
-                    run_id: self.run_id.clone(),
-                    terminal,
-                })),
-            };
+            );
         }
 
-        self.accept_candidate(
-            ctx,
-            progress,
-            &candidate,
-            Verified {
-                checks,
-                gaps,
-                gaps_not_judged,
-                amont_bypasses,
-                amont_downgrades,
-                verification_inputs_changed,
-                review_required,
-                gate_coverage,
-            },
-        )
-        .map(Step::Ended)
+        let verified = Verified {
+            checks,
+            gaps,
+            gaps_not_judged,
+            amont_bypasses,
+            amont_downgrades,
+            verification_inputs_changed,
+            review_required,
+            gate_coverage,
+        };
+        if inspecting {
+            return self.judge_inspection(ctx, progress, &candidate, verified);
+        }
+        self.accept_candidate(ctx, progress, &candidate, verified, None)
+            .map(Step::Ended)
+    }
+
+    /// Record the machine's decision on an observation and follow it:
+    /// another attempt, or the end of the run.
+    fn follow(
+        &mut self,
+        ctx: &AttemptContext<'_>,
+        progress: &mut Progress,
+        observation: Observation,
+    ) -> Result<Step, RunError> {
+        match self.decide(&progress.budget, observation)? {
+            Next::Attempt { kind, rung } => {
+                if kind == AttemptKind::Repair {
+                    progress.budget.repairs_used += 1;
+                }
+                progress.kind = kind;
+                progress.budget.rung = rung;
+                // The ladder is read again at dispatch; the tier the
+                // budget carries is only the rung's, kept for the
+                // limits that name it.
+                // A rung the ladder lacks is never substituted: the
+                // attempt ceiling ends the run before dispatch, and
+                // dispatch refuses an index out of the ladder.
+                if let Some(at) = ctx.preflight.decision.ladder.rung(rung) {
+                    progress.budget.tier = at.tier;
+                }
+                Ok(Step::Again)
+            }
+            Next::Accept => Err(RunError::Other(
+                "the machine accepted a failing candidate".into(),
+            )),
+            Next::Stop(terminal) => Ok(Step::Ended(RunOutcome {
+                run_id: self.run_id.clone(),
+                terminal,
+            })),
+        }
     }
 
     /// Checks pass: semantic review where the risk asks for it, then a
@@ -2695,9 +2714,12 @@ impl<'a> RunEngine<'a> {
         progress: &mut Progress,
         candidate: &Candidate,
         verified: Verified,
+        verdict: Option<&verify::ReportVerdict>,
     ) -> Result<RunOutcome, RunError> {
         let preflight = ctx.preflight;
-        if verified.review_required {
+        // An inspection has no patch to review: its report review has
+        // already run (`judge_inspection`).
+        if verified.review_required && verdict.is_none() {
             let review = self.review_candidate(
                 &ReviewRequest {
                     manifest: &preflight.manifest,
@@ -2748,21 +2770,8 @@ impl<'a> RunEngine<'a> {
             baseline_cached: ctx.baseline.cached,
             baseline_cache_refused: ctx.baseline.cache_refused.clone(),
         };
-        let signoffs = self
-            .config
-            .ledger
-            .human_signoffs(&self.run_id)?
-            .into_iter()
-            .map(|(criterion_id, _actor)| criterion_id)
-            .collect();
-        let (criteria, mandatory_evidence_independence) = verify::settle_acceptance(
-            &self.config.contract.acceptance,
-            &preflight.authority.verification_profile,
-            &report,
-            &signoffs,
-            &verified.gate_coverage,
-            self.config.contract.kind(),
-        );
+        let (criteria, mandatory_evidence_independence) =
+            self.settle(ctx, &report, &verified.gate_coverage, verdict)?;
         let receipt = Receipt {
             run_id: self.run_id.as_str().to_string(),
             candidate_sha: candidate.sha.clone(),
@@ -2771,6 +2780,7 @@ impl<'a> RunEngine<'a> {
             policy_hash: preflight.authority.authority_hash.clone(),
             outcome: State::Accepted.as_str().to_string(),
             verification: report,
+            kind: self.config.contract.kind(),
             models_used: std::mem::take(&mut progress.models_used),
             attempts: candidate.index,
             cost_completeness: progress.spend.completeness,
@@ -2799,6 +2809,208 @@ impl<'a> RunEngine<'a> {
             run_id: self.run_id.clone(),
             terminal: Terminal::Accepted(Box::new(receipt)),
         })
+    }
+
+    /// Settle the contract's criteria against a report, reading the
+    /// sign-offs the ledger holds. `verdict` is an inspection's report
+    /// review; a change has none.
+    fn settle(
+        &self,
+        ctx: &AttemptContext<'_>,
+        report: &VerificationReport,
+        gate_coverage: &BTreeMap<String, Result<bool, verify::AttestError>>,
+        verdict: Option<&verify::ReportVerdict>,
+    ) -> Result<
+        (
+            Vec<verify::CriterionOutcome>,
+            Option<verify::IndependenceSummary>,
+        ),
+        RunError,
+    > {
+        let signoffs = self
+            .config
+            .ledger
+            .human_signoffs(&self.run_id)?
+            .into_iter()
+            .map(|(criterion_id, _actor)| criterion_id)
+            .collect();
+        Ok(verify::settle_acceptance(
+            &self.config.contract.acceptance,
+            &ctx.preflight.authority.verification_profile,
+            report,
+            &signoffs,
+            gate_coverage,
+            self.config.contract.kind(),
+            verdict,
+        ))
+    }
+
+    /// An inspection is judged by its report (SPEC §10): the checks and
+    /// their gaps were already read as information, and one read-only
+    /// review of the report settles the criteria no check names. In
+    /// order, the first that holds decides: a red check criterion fails
+    /// the run, an unmet report criterion is repaired once, a pending
+    /// sign-off is a person's, and anything else is accepted.
+    fn judge_inspection(
+        &mut self,
+        ctx: &AttemptContext<'_>,
+        progress: &mut Progress,
+        candidate: &Candidate,
+        mut verified: Verified,
+    ) -> Result<Step, RunError> {
+        let preflight = ctx.preflight;
+        if self.config.contract.review == Review::Off {
+            verified.gaps_not_judged.push(
+                "the contract says `review: off`, which governs the patch review only: an \
+                 inspection has no patch, and its report review ran"
+                    .into(),
+            );
+        }
+        let report_text = candidate.result_text.clone().unwrap_or_default();
+        let request = ReviewRequest {
+            manifest: &preflight.manifest,
+            authority: &preflight.authority,
+            candidate_sha: &candidate.sha,
+            candidate_tier: candidate.tier,
+            candidate_model: &candidate.model,
+            verification_inputs_changed: &[],
+            patch_path: candidate.latest_patch.clone(),
+            deadline: ctx.deadline,
+            routed_by: preflight.decision.routed_by,
+            covering: preflight.decision.covering.clone(),
+        };
+        let verdict = match self.review_report(
+            &request,
+            ctx.worktree_path,
+            &report_text,
+            &mut progress.spend,
+        ) {
+            Ok(verdict) => verdict,
+            Err(detail) => {
+                return Ok(Step::Ended(
+                    self.stop(&progress.budget, Observation::ReviewUnavailable(detail))?,
+                ));
+            }
+        };
+        let report = verification_report(ctx, candidate, &verified);
+        let (criteria, _) = self.settle(ctx, &report, &verified.gate_coverage, Some(&verdict))?;
+        let unmet: Vec<(usize, &verify::CriterionOutcome)> = criteria
+            .iter()
+            .enumerate()
+            .filter(|(_, criterion)| criterion.mandatory && !criterion.met)
+            .collect();
+        let by_checks: Vec<String> = unmet
+            .iter()
+            .filter(|(_, criterion)| match criterion.settled_via {
+                Some(verify::SettledVia::ProfileChecks | verify::SettledVia::DeclaredEvidence) => {
+                    true
+                }
+                Some(verify::SettledVia::ReportReview | verify::SettledVia::HumanSignOff)
+                | None => false,
+            })
+            .map(|(_, criterion)| {
+                format!(
+                    "criterion `{}` is not met: {}",
+                    criterion.id,
+                    unmet_evidence(criterion.evidence.as_ref())
+                )
+            })
+            .collect();
+        if !by_checks.is_empty() {
+            return self.follow(ctx, progress, Observation::CheckCriteriaUnmet(by_checks));
+        }
+        let by_report: Vec<String> = unmet
+            .iter()
+            .filter(|(_, criterion)| {
+                criterion.settled_via == Some(verify::SettledVia::ReportReview)
+            })
+            .map(|(at, criterion)| {
+                format!(
+                    "[{}] {}: {}",
+                    at + 1,
+                    criterion.statement,
+                    verdict.of(*at).reason()
+                )
+            })
+            .collect();
+        if !by_report.is_empty() {
+            progress.last_candidate = Some(candidate.sha.clone());
+            progress.last_failures = Some(by_report.clone());
+            return self.follow(ctx, progress, Observation::CriteriaUnmet(by_report));
+        }
+        if !unmet.is_empty() {
+            // What is left is a sign-off no one has recorded: the gaps
+            // listed are those alone, never the profile's.
+            self.store_pending_receipt(
+                ctx,
+                progress,
+                candidate,
+                PendingEvidence {
+                    checks: verified.checks,
+                    gaps: verified.gaps.clone(),
+                    gaps_not_judged: verified.gaps_not_judged,
+                    gate_coverage: verified.gate_coverage,
+                    verdict: Some(verdict),
+                },
+            )?;
+            return Ok(Step::Ended(self.stop(
+                &progress.budget,
+                Observation::VerificationGap(verified.gaps),
+            )?));
+        }
+        self.accept_candidate(ctx, progress, candidate, verified, Some(&verdict))
+            .map(Step::Ended)
+    }
+
+    /// An inspection's verification: one read-only dispatch that checks
+    /// the worker's report against the files in the candidate worktree,
+    /// on the worker's own tier and model. `Err` is the reason it could
+    /// not be had, which ends the run `needs_review`, never accepted.
+    fn review_report(
+        &mut self,
+        request: &ReviewRequest<'_>,
+        worktree: &Path,
+        report: &str,
+        spend: &mut RunSpend,
+    ) -> Result<verify::ReportVerdict, String> {
+        let Some(profile) = request
+            .authority
+            .models
+            .get(&request.candidate_tier)
+            .cloned()
+        else {
+            return Err(format!(
+                "no model configured at the {} tier to review the report",
+                request.candidate_tier.as_str()
+            ));
+        };
+        if let Some(exhausted) = self.review_spend_blocked(spend.total) {
+            return Err(exhausted);
+        }
+        let statements = self.config.contract.acceptance_statements();
+        let prompt = report_review_prompt(&self.config.contract.objective, &statements, report);
+        let seat = ReviewSeat {
+            profile: &profile,
+            tier: request.candidate_tier,
+            dir: worktree.to_path_buf(),
+            purpose: ReviewPurpose::Report,
+        };
+        let result = match self.dispatch_reviewer(request, seat, prompt, spend) {
+            Ok(result) => result,
+            Err(ReviewOutcome::Unavailable(detail)) => return Err(detail),
+            Err(ReviewOutcome::NoFindings | ReviewOutcome::Findings(_)) => {
+                return Err("the report review dispatch answered with a verdict".into());
+            }
+        };
+        let text = result.result_text.unwrap_or_default();
+        self.record_artifact(
+            None,
+            EvidenceKind::ReviewResult,
+            &self.artifacts.join("report-review.txt"),
+            &text,
+        )
+        .map_err(|e| format!("the report review could not be recorded as evidence: {e}"))?;
+        Ok(verify::ReportVerdict::parse(&text, statements.len()))
     }
 
     /// Is a spending ceiling already reached, so the review must not be
@@ -3057,6 +3269,7 @@ impl<'a> RunEngine<'a> {
             gaps,
             gaps_not_judged,
             gate_coverage,
+            verdict,
         } = pending;
         let preflight = ctx.preflight;
         let report = VerificationReport {
@@ -3075,21 +3288,8 @@ impl<'a> RunEngine<'a> {
             baseline_cached: ctx.baseline.cached,
             baseline_cache_refused: ctx.baseline.cache_refused.clone(),
         };
-        let signoffs = self
-            .config
-            .ledger
-            .human_signoffs(&self.run_id)?
-            .into_iter()
-            .map(|(criterion_id, _actor)| criterion_id)
-            .collect();
-        let (criteria, mandatory_evidence_independence) = verify::settle_acceptance(
-            &self.config.contract.acceptance,
-            &preflight.authority.verification_profile,
-            &report,
-            &signoffs,
-            &gate_coverage,
-            self.config.contract.kind(),
-        );
+        let (criteria, mandatory_evidence_independence) =
+            self.settle(ctx, &report, &gate_coverage, verdict.as_ref())?;
         let receipt = Receipt {
             run_id: self.run_id.as_str().to_string(),
             candidate_sha: candidate.sha.clone(),
@@ -3098,6 +3298,7 @@ impl<'a> RunEngine<'a> {
             policy_hash: preflight.authority.authority_hash.clone(),
             outcome: State::NeedsDecision.as_str().to_string(),
             verification: report,
+            kind: self.config.contract.kind(),
             models_used: progress.models_used.clone(),
             attempts: candidate.index,
             cost_completeness: progress.spend.completeness,
@@ -3547,14 +3748,13 @@ impl<'a> RunEngine<'a> {
         }
         let review_dir = self.review_dir();
         let prompt = self.review_prompt(request, &review_dir);
-        let result = match self.dispatch_reviewer(
-            request,
-            &profile,
-            reviewer_tier,
-            prompt,
-            review_dir,
-            spend,
-        ) {
+        let seat = ReviewSeat {
+            profile: &profile,
+            tier: reviewer_tier,
+            dir: review_dir,
+            purpose: ReviewPurpose::Patch,
+        };
+        let result = match self.dispatch_reviewer(request, seat, prompt, spend) {
             Ok(result) => result,
             Err(unavailable) => return unavailable,
         };
@@ -3656,12 +3856,16 @@ impl<'a> RunEngine<'a> {
     fn dispatch_reviewer(
         &mut self,
         request: &ReviewRequest<'_>,
-        profile: &crate::policy::ModelProfile,
-        reviewer_tier: Tier,
+        seat: ReviewSeat<'_>,
         prompt: String,
-        review_dir: PathBuf,
         spend: &mut RunSpend,
     ) -> Result<LaunchResult, ReviewOutcome> {
+        let ReviewSeat {
+            profile,
+            tier: reviewer_tier,
+            dir: review_dir,
+            purpose,
+        } = seat;
         // A reviewer the runner cannot even name is a reviewer it
         // cannot dispatch: `Unavailable`, never a silent acceptance.
         let dispatch_id = match self.config.ids.dispatch_id() {
@@ -3698,6 +3902,7 @@ impl<'a> RunEngine<'a> {
             cancel: None,
             pid_slot: None,
             sandbox: None,
+            tools: purpose.tools(),
         };
         let recorded = self.config.ledger.record_dispatch_intent(
             &dispatch_id,
@@ -3708,7 +3913,7 @@ impl<'a> RunEngine<'a> {
                 "effort": profile.effort,
                 "harness": self.harness,
                 "tier": reviewer_tier.as_str(),
-                "kind": "review",
+                "kind": purpose.intent_kind(),
                 "recipe_id": request.covering.as_ref().map(|r| &r.recipe_id),
                 "recipe_name": request.covering.as_ref().map(|r| &r.name),
                 "recipe_revision": request.covering.as_ref().map(|r| r.revision),
@@ -3809,6 +4014,40 @@ impl<'a> RunEngine<'a> {
             ));
         }
         Ok(result)
+    }
+}
+
+/// What a reviewer dispatch is for. A report review reads the worktree and
+/// nothing else; it is not the patch review, and the ledger does not count
+/// it as one.
+#[derive(Debug, Clone, Copy)]
+enum ReviewPurpose {
+    Patch,
+    Report,
+}
+
+/// Who a reviewer dispatch is seated as: the model, its tier, where it
+/// reads, and what it is for.
+struct ReviewSeat<'p> {
+    profile: &'p crate::policy::ModelProfile,
+    tier: Tier,
+    dir: PathBuf,
+    purpose: ReviewPurpose,
+}
+
+impl ReviewPurpose {
+    fn tools(self) -> ToolSet {
+        match self {
+            Self::Patch => ToolSet::ModeDefault,
+            Self::Report => ToolSet::ReadOnly,
+        }
+    }
+
+    fn intent_kind(self) -> &'static str {
+        match self {
+            Self::Patch => "review",
+            Self::Report => "report_review",
+        }
     }
 }
 
@@ -4021,6 +4260,70 @@ pub(crate) fn utc_day_start(now_rfc3339: &str) -> Option<String> {
     )
 }
 
+/// The report a candidate's checks, gaps and amont findings add up to.
+fn verification_report(
+    ctx: &AttemptContext<'_>,
+    candidate: &Candidate,
+    verified: &Verified,
+) -> VerificationReport {
+    let preflight = ctx.preflight;
+    VerificationReport {
+        candidate_sha: candidate.sha.clone(),
+        base_sha: preflight.base_sha.clone(),
+        contract_hash: preflight.contract_hash.clone(),
+        policy_hash: preflight.authority.authority_hash.clone(),
+        checks: verified.checks.clone(),
+        gaps: verified.gaps.clone(),
+        gaps_not_judged: verified.gaps_not_judged.clone(),
+        baseline_failures: ctx.baseline.failures.clone(),
+        amont_bypasses: verified.amont_bypasses.clone(),
+        amont_downgrades: verified.amont_downgrades.clone(),
+        verification_inputs_changed: verified.verification_inputs_changed.clone(),
+        integration_gaps: preflight.integration_gaps.clone(),
+        baseline_cached: ctx.baseline.cached,
+        baseline_cache_refused: ctx.baseline.cache_refused.clone(),
+    }
+}
+
+/// What an unmet criterion that no report can settle names as its
+/// evidence, for the run's failure detail.
+fn unmet_evidence(evidence: Option<&Evidence>) -> String {
+    match evidence {
+        Some(Evidence::Check { name }) => format!("check `{name}` is not green"),
+        Some(Evidence::Test {
+            name: Some(test), ..
+        }) => format!("test `{test}` did not pass"),
+        Some(Evidence::AmontGate { gate }) => format!("amont gate `{gate}` is not covered"),
+        Some(Evidence::Test { name: None, .. } | Evidence::LlmReview | Evidence::HumanSignOff)
+        | None => "its evidence is not met".into(),
+    }
+}
+
+/// What an inspection's report reviewer is asked: the objective, the
+/// numbered criteria and the worker's report, all quoted as data.
+fn report_review_prompt(objective: &str, criteria: &[String], report: &str) -> String {
+    let mut prompt = String::from(
+        "You are verifying an inspection. A worker investigated the files in this directory \
+         and wrote the report below. You can only read: you cannot edit, run or waive \
+         anything.\n\
+         Verify each claim you rely on against the files in this directory; a report that \
+         is well formed but describes files that are not there meets nothing.\n\n",
+    );
+    prompt.push_str(&data_block("objective", objective));
+    let numbered: Vec<String> = criteria
+        .iter()
+        .enumerate()
+        .map(|(at, statement)| format!("[{}] {statement}", at + 1))
+        .collect();
+    prompt.push_str(&data_list_block("acceptance criteria", &numbered));
+    prompt.push_str(&data_block("worker report", report));
+    prompt.push_str(
+        "\nAnswer with exactly one line per criterion, and nothing else: `[n] met: <what you \
+         checked>` or `[n] not_met: <what you checked>`.\n",
+    );
+    prompt
+}
+
 /// The review record a receipt carries, read from the ledger that
 /// recorded the review: none ran, it ran from another model, or the model
 /// that wrote the candidate reviewed it (`Reason::ReviewerSameModel`).
@@ -4179,6 +4482,15 @@ fn build_prompt(
     }
     if let Some(failures) = previous_failures {
         match kind {
+            AttemptKind::Repair if contract.kind() == crate::contract::Kind::Inspect => {
+                prompt.push_str("\n[repair addendum]\n");
+                prompt.push_str("the previous report was not accepted:\n");
+                prompt.push_str(&data_list_block("unmet criteria and reasons", failures));
+                prompt.push_str(
+                    "answer in your final message; do not create files, install dependencies \
+                     or change the tree.\n",
+                );
+            }
             AttemptKind::Repair => {
                 prompt.push_str("\n[repair addendum]\n");
                 prompt.push_str("the previous candidate failed verification on these checks:\n");
@@ -6701,17 +7013,10 @@ mod tests {
     fn inspect_contract_runs_the_research_tier() {
         let fixture = Fixture::new();
         let repo = fixture.repo_policy(vec![passing_check()], 3);
-        let backend = MockBackend::new(|_| {
-            MockOutcome {
-            result_text: Some(
-                "DONE: the check is inert because its declaration is untrusted. Evidence: amont trust --show"
-                    .into(),
-            ),
-            exit_code: Some(0),
-            usage: Some(usage(50)),
-            ..Default::default()
-        }
-        });
+        let (backend, _) = inspecting_backend(
+            "DONE: the check is inert because its declaration is untrusted. Evidence: amont trust --show",
+            "[1] met: read the trust file",
+        );
         let contract = TaskContract::from_json_str(
             &serde_json::json!({
                 "schema_version": 1,
@@ -6761,17 +7066,10 @@ mod tests {
         // main_gone_check fails at the base and at the (identical)
         // candidate: the inspection is judged by its report.
         let repo = fixture.repo_policy(vec![main_gone_check()], 3);
-        let launches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = std::sync::Arc::clone(&launches);
-        let backend = MockBackend::new(move |_| {
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            MockOutcome {
-                result_text: Some("DONE: src/main.rs exists, so the check fails".into()),
-                exit_code: Some(0),
-                usage: Some(usage(50)),
-                ..Default::default()
-            }
-        });
+        let (backend, launches) = inspecting_backend(
+            "DONE: src/main.rs exists, so the check fails",
+            "[1] met: src/main.rs is there",
+        );
         let outcome = fixture.execute(&inspect_contract(), &repo, &backend);
         let RunOutcome {
             terminal: Terminal::Accepted(receipt),
@@ -6780,10 +7078,22 @@ mod tests {
         else {
             panic!("an inspection on a red base is accepted, got {outcome:?}");
         };
-        assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            launches.lock().expect("launches").len(),
+            2,
+            "the worker and the report review"
+        );
         assert_eq!(receipt.attempts, 1);
+        assert_eq!(receipt.kind, crate::contract::Kind::Inspect);
         assert_eq!(receipt.verification.baseline_failures.len(), 1);
-        assert!(receipt.verification.accepted_inspection());
+        assert_eq!(
+            receipt.criteria[0].settled_via,
+            Some(verify::SettledVia::ReportReview)
+        );
+        assert_eq!(
+            receipt.mandatory_evidence_independence,
+            Some(verify::IndependenceSummary::NoneIndependent)
+        );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
@@ -6834,6 +7144,34 @@ mod tests {
         })
     }
 
+    /// A scripted inspection: the worker reports `report`, and the report
+    /// review, the one launch that asks for read-only tools, answers
+    /// `review`. Every launch is kept, in order.
+    fn inspecting_backend(
+        report: &'static str,
+        review: &'static str,
+    ) -> (
+        MockBackend,
+        std::sync::Arc<std::sync::Mutex<Vec<LaunchSpec>>>,
+    ) {
+        let launches = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&launches);
+        let backend = MockBackend::new(move |spec| {
+            seen.lock().expect("launches").push(spec.clone());
+            let answer = match spec.tools {
+                ToolSet::ReadOnly => review,
+                ToolSet::ModeDefault => report,
+            };
+            MockOutcome {
+                result_text: Some(answer.into()),
+                exit_code: Some(0),
+                usage: Some(usage(50)),
+                ..Default::default()
+            }
+        });
+        (backend, launches)
+    }
+
     #[test]
     fn an_inspection_with_a_profile_gap_is_accepted_and_lists_it() {
         let fixture = Fixture::new();
@@ -6843,7 +7181,7 @@ mod tests {
             .get_mut("profile")
             .expect("profile")
             .amont_checks = vec!["inventory-check".into()];
-        let backend = reporting_backend("DONE: the report");
+        let (backend, _) = inspecting_backend("DONE: the report", "[1] met: read it");
         let outcome = fixture.execute(&inspect_contract(), &repo, &backend);
         let RunOutcome {
             terminal: Terminal::Accepted(receipt),
@@ -6900,6 +7238,271 @@ mod tests {
             std::fs::read_to_string(fixture.artifacts.join(run_id.as_str()).join("receipt.json"))
                 .expect("receipt.json");
         assert!(file.contains("inventory-check"), "{file}");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    fn named_main_gone_check() -> CommandSpec {
+        CommandSpec {
+            name: Some("gate".into()),
+            ..main_gone_check()
+        }
+    }
+
+    fn ended_reason(fixture: &Fixture, run_id: &RunId) -> String {
+        let transitions = fixture.ledger.transitions(run_id).expect("history");
+        ending(&transitions).reason.clone()
+    }
+
+    #[test]
+    fn an_unmet_report_is_repaired_once_at_the_same_tier_then_fails_without_escalating() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 4);
+        let (backend, launches) = inspecting_backend(
+            "DONE: the layout is src/ and tests/",
+            "[1] not_met: no tests/ directory exists",
+        );
+        let outcome = fixture.execute(&inspect_contract(), &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Failed { detail },
+        } = outcome
+        else {
+            panic!("an unmet report ends failed, got {outcome:?}");
+        };
+        assert!(detail.contains("no tests/ directory exists"), "{detail}");
+        assert_eq!(
+            ended_reason(&fixture, &run_id),
+            Reason::CriteriaUnmet.as_str()
+        );
+        let launches = launches.lock().expect("launches");
+        assert_eq!(
+            launches.len(),
+            4,
+            "worker, review, one repair, review: no escalation dispatch"
+        );
+        assert!(launches.iter().all(|spec| spec.model != "fable"));
+        let repair = &launches[2];
+        assert_eq!(repair.model, launches[0].model, "the repair keeps the tier");
+        assert!(
+            repair.prompt.contains("[repair addendum]"),
+            "{}",
+            repair.prompt
+        );
+        assert!(
+            repair.prompt.contains("no tests/ directory exists"),
+            "{}",
+            repair.prompt
+        );
+        assert!(
+            repair.prompt.contains("do not create files"),
+            "{}",
+            repair.prompt
+        );
+        assert!(
+            !repair
+                .prompt
+                .contains(&verify::check_label(&main_gone_check())),
+            "base check failures never reach an inspect repair: {}",
+            repair.prompt
+        );
+        assert_eq!(fixture.ledger.attempt_count(&run_id).expect("attempts"), 2);
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn the_report_review_reads_the_worktree_with_three_tools_and_sees_the_report_as_data() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let (backend, launches) = inspecting_backend("DONE: src/main.rs exists", "[1] met: ls");
+        let contract = inspect_contract_accepting(serde_json::json!([
+            "the entry point is described",
+            "nothing else is claimed"
+        ]));
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        assert!(
+            matches!(outcome.terminal, Terminal::Failed { .. }),
+            "the second criterion is omitted, so not met: {outcome:?}"
+        );
+        let launches = launches.lock().expect("launches");
+        let (worker, review) = (&launches[0], &launches[1]);
+        assert_eq!(worker.tools, ToolSet::ModeDefault);
+        assert_eq!(review.tools, ToolSet::ReadOnly);
+        assert_eq!(review.model, worker.model);
+        assert!(review.allowed_tools.is_empty());
+        assert!(review.prompt.contains("[1] the entry point is described"));
+        assert!(review.prompt.contains("[2] nothing else is claimed"));
+        let report = fenced(&review.prompt, "worker report").expect("the report is fenced");
+        assert!(report.contains("src/main.rs exists"), "{report}");
+        assert_eq!(review.work_dir, worker.work_dir, "the candidate worktree");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_review_that_is_missing_unparseable_duplicated_or_omits_a_criterion_meets_nothing() {
+        for answer in [
+            "",
+            "all criteria are met",
+            "[1] maybe: unsure",
+            "[1] met: once\n[1] met: twice",
+            "[2] met: the other one",
+        ] {
+            let fixture = Fixture::new();
+            let repo = fixture.repo_policy(vec![passing_check()], 3);
+            let (backend, _) = inspecting_backend("DONE: the report", answer);
+            let outcome = fixture.execute(&inspect_contract(), &repo, &backend);
+            assert!(
+                matches!(outcome.terminal, Terminal::Failed { .. }),
+                "`{answer}` settles the criterion not met: {outcome:?}"
+            );
+            std::fs::remove_dir_all(&fixture.dir).ok();
+        }
+    }
+
+    #[test]
+    fn a_report_review_that_cannot_be_dispatched_is_needs_review() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let backend = MockBackend::new(|spec| match spec.tools {
+            ToolSet::ReadOnly => MockOutcome::default(),
+            ToolSet::ModeDefault => MockOutcome {
+                result_text: Some("DONE: the report".into()),
+                exit_code: Some(0),
+                usage: Some(usage(50)),
+                ..Default::default()
+            },
+        });
+        let outcome = fixture.execute(&inspect_contract(), &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::NeedsReview { .. },
+        } = outcome
+        else {
+            panic!("a review that never answered is needs_review, got {outcome:?}");
+        };
+        assert_eq!(
+            ended_reason(&fixture, &run_id),
+            Reason::ReviewUnavailable.as_str()
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_red_check_criterion_fails_the_inspection_without_a_repair_even_beside_an_unmet_report() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![named_main_gone_check()], 4);
+        let contract = inspect_contract_accepting(serde_json::json!([
+            {"statement": "the gate is green", "id": "gate-green",
+             "evidence": {"kind": "check", "name": "gate"}},
+            "the layout is listed",
+        ]));
+        let (backend, launches) =
+            inspecting_backend("DONE: the layout", "[1] met: ok\n[2] not_met: made up");
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Failed { detail },
+        } = outcome
+        else {
+            panic!("a red check criterion fails the run, got {outcome:?}");
+        };
+        assert!(detail.contains("gate-green"), "{detail}");
+        assert!(detail.contains("check `gate`"), "{detail}");
+        assert_eq!(
+            ended_reason(&fixture, &run_id),
+            Reason::CriteriaUnmet.as_str()
+        );
+        assert_eq!(fixture.ledger.attempt_count(&run_id).expect("attempts"), 1);
+        assert_eq!(launches.lock().expect("launches").len(), 2, "no repair");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn an_inspection_waiting_on_a_sign_off_keeps_the_verdict_and_lists_only_that_gap() {
+        let fixture = Fixture::new();
+        let mut repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        repo.verification
+            .profiles
+            .get_mut("profile")
+            .expect("profile")
+            .amont_checks = vec!["inventory-check".into()];
+        let contract = inspect_contract_accepting(serde_json::json!([
+            "the layout is listed",
+            {"statement": "a person read the report", "id": "read",
+             "evidence": {"kind": "human_sign_off"}},
+        ]));
+        let (backend, launches) = inspecting_backend("DONE: the layout", "[1] met: listed src/");
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::NeedsDecision { reason, detail },
+        } = outcome
+        else {
+            panic!("a missing sign-off is needs_decision, got {outcome:?}");
+        };
+        assert_eq!(reason, Reason::VerificationGap);
+        assert!(detail.contains("human sign-off"), "{detail}");
+        assert!(!detail.contains("inventory-check"), "{detail}");
+        assert_eq!(launches.lock().expect("launches").len(), 2);
+        let transitions = fixture.ledger.transitions(&run_id).expect("history");
+        let gap = transitions
+            .iter()
+            .find(|t| t.reason == Reason::VerificationGap.as_str())
+            .expect("the gap transition");
+        let gaps = gap.detail.as_ref().expect("detail")["gaps"].to_string();
+        assert!(gaps.contains("`read`"), "{gaps}");
+        assert!(!gaps.contains("inventory-check"), "{gaps}");
+        let (stored, _) = fixture
+            .ledger
+            .receipt(&run_id)
+            .expect("receipt")
+            .expect("the pending receipt");
+        assert_eq!(stored["kind"], "inspect");
+        assert_eq!(stored["outcome"], "needs_decision");
+        assert_eq!(stored["criteria"][0]["met"], true, "{stored}");
+        assert_eq!(stored["criteria"][0]["settled_via"], "report_review");
+        assert_eq!(stored["criteria"][1]["met"], false);
+        assert!(stored["verification"]["gaps_not_judged"]
+            .to_string()
+            .contains("inventory-check"));
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_review_off_inspection_still_runs_its_report_review_and_says_so() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![passing_check()], 3);
+        let contract = TaskContract::from_json_str(
+            &serde_json::json!({
+                "schema_version": 1,
+                "kind": "inspect",
+                "objective": "Investigate why a check is inactive",
+                "base_ref": "HEAD",
+                "acceptance": ["evidence of why the check is inert"],
+                "verification_profile": "profile",
+                "review": "off",
+            })
+            .to_string(),
+        )
+        .expect("a stored review: off inspect contract still loads");
+        let (backend, launches) = inspecting_backend("DONE: the report", "[1] met: read it");
+        let outcome = fixture.execute(&contract, &repo, &backend);
+        let RunOutcome {
+            terminal: Terminal::Accepted(receipt),
+            ..
+        } = outcome
+        else {
+            panic!("expected acceptance, got {outcome:?}");
+        };
+        assert_eq!(launches.lock().expect("launches").len(), 2);
+        assert!(
+            receipt
+                .verification
+                .gaps_not_judged
+                .iter()
+                .any(|note| note.contains("review: off")),
+            "{:?}",
+            receipt.verification.gaps_not_judged
+        );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
@@ -6962,7 +7565,7 @@ mod tests {
             .expect("profile")
             .cache_baseline = true;
         let machine = fixture.machine_for(&repo);
-        let backend = reporting_backend("DONE: the report");
+        let (backend, _) = inspecting_backend("DONE: the report", "[1] met: read it");
         let first = fixture.execute_with_machine(&inspect_contract(), &repo, &machine, &backend);
         assert!(
             matches!(first.terminal, Terminal::Accepted(_)),
@@ -7312,12 +7915,10 @@ mod tests {
     fn an_inspect_answer_is_kept_and_its_identical_tree_reuses_the_baseline() {
         let fixture = Fixture::new();
         let repo = fixture.repo_policy(vec![passing_check()], 3);
-        let backend = MockBackend::new(|_| MockOutcome {
-            result_text: Some("REPORT: the check is inert because its trust entry is stale".into()),
-            exit_code: Some(0),
-            usage: Some(usage(50)),
-            ..Default::default()
-        });
+        let (backend, _) = inspecting_backend(
+            "REPORT: the check is inert because its trust entry is stale",
+            "[1] met: read the trust entry",
+        );
         let contract = TaskContract::from_json_str(
             &serde_json::json!({
                 "schema_version": 1,

@@ -533,6 +533,128 @@ pub struct CriterionOutcome {
     /// that names none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled_by: Option<TestSettlement>,
+    /// What settled the criterion. It sits beside the declared `evidence`,
+    /// which it never overwrites. Absent on a receipt written before it
+    /// existed, whose independence is read off the evidence alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_via: Option<SettledVia>,
+}
+
+/// The kind of a receipt that records none.
+fn change_kind() -> Kind {
+    Kind::Change
+}
+
+/// The source of a criterion's verdict (SPEC §10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettledVia {
+    /// The profile's checks: a named check, or the whole profile.
+    ProfileChecks,
+    /// An inspection's report review: model judgment of the report.
+    ReportReview,
+    /// The evidence the contract declared, read as it always was.
+    DeclaredEvidence,
+    /// A person's recorded sign-off.
+    HumanSignOff,
+}
+
+/// One criterion's answer from the report review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CriterionVerdict {
+    Met(String),
+    NotMet(String),
+}
+
+impl CriterionVerdict {
+    pub fn is_met(&self) -> bool {
+        match self {
+            Self::Met(_) => true,
+            Self::NotMet(_) => false,
+        }
+    }
+
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Met(reason) | Self::NotMet(reason) => reason,
+        }
+    }
+}
+
+/// What the report review said, one verdict per criterion in contract
+/// order. Failing closed: a criterion with no line, an unparseable line
+/// or a duplicated number is not met, and a number outside `1..=n` is
+/// ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportVerdict {
+    criteria: Vec<CriterionVerdict>,
+}
+
+/// What the answer held for one number while it was being read.
+enum Line {
+    Absent,
+    One(CriterionVerdict),
+    Spoiled(&'static str),
+}
+
+impl ReportVerdict {
+    /// Read `answer` against `criteria` numbered from 1: one line
+    /// `[n] met: <reason>` or `[n] not_met: <reason>` each.
+    pub fn parse(answer: &str, criteria: usize) -> Self {
+        let mut lines: Vec<Line> = (0..criteria).map(|_| Line::Absent).collect();
+        for line in answer.lines() {
+            let Some((number, rest)) = numbered(line.trim()) else {
+                continue;
+            };
+            let Some(slot) = number.checked_sub(1).and_then(|at| lines.get_mut(at)) else {
+                continue;
+            };
+            *slot = match (&*slot, verdict_of(rest)) {
+                (Line::Absent, Some(verdict)) => Line::One(verdict),
+                (Line::Absent, None) => Line::Spoiled("the line for this criterion is unparseable"),
+                (Line::One(_) | Line::Spoiled(_), _) => {
+                    Line::Spoiled("the review answered this criterion more than once")
+                }
+            };
+        }
+        Self {
+            criteria: lines
+                .into_iter()
+                .map(|line| match line {
+                    Line::One(verdict) => verdict,
+                    Line::Spoiled(why) => CriterionVerdict::NotMet(why.into()),
+                    Line::Absent => CriterionVerdict::NotMet(
+                        "the review gave no line for this criterion".into(),
+                    ),
+                })
+                .collect(),
+        }
+    }
+
+    /// The verdict for the criterion at `index` (0-based, contract
+    /// order); a criterion past the end is not met.
+    pub fn of(&self, index: usize) -> CriterionVerdict {
+        self.criteria.get(index).cloned().unwrap_or_else(|| {
+            CriterionVerdict::NotMet("the review gave no line for this criterion".into())
+        })
+    }
+}
+
+/// `[n] rest` as `(n, rest)`.
+fn numbered(line: &str) -> Option<(usize, &str)> {
+    let inner = line.strip_prefix('[')?;
+    let (number, rest) = inner.split_once(']')?;
+    Some((number.trim().parse().ok()?, rest.trim_start()))
+}
+
+/// `met: why` or `not_met: why`.
+fn verdict_of(rest: &str) -> Option<CriterionVerdict> {
+    if let Some(reason) = rest.strip_prefix("not_met:") {
+        Some(CriterionVerdict::NotMet(reason.trim().to_string()))
+    } else {
+        rest.strip_prefix("met:")
+            .map(|reason| CriterionVerdict::Met(reason.trim().to_string()))
+    }
 }
 
 /// Settle every acceptance criterion against a finished verification
@@ -568,38 +690,62 @@ pub fn settle_acceptance(
     signoffs: &HashSet<String>,
     gate_coverage: &BTreeMap<String, Result<bool, AttestError>>,
     kind: Kind,
+    review: Option<&ReportVerdict>,
 ) -> (Vec<CriterionOutcome>, Option<IndependenceSummary>) {
     let accepted = report.accepted_for(kind);
+    // An inspection has no patch: what the checks cannot say about its
+    // report, the report review does. A missing review settles nothing.
+    let by_report = |at: usize| match review {
+        Some(verdict) => verdict.of(at).is_met(),
+        None => false,
+    };
     let criteria: Vec<CriterionOutcome> = entries
         .iter()
-        .map(|entry| {
+        .enumerate()
+        .map(|(at, entry)| {
             let evidence = entry.evidence().cloned();
             let mut settled_by = None;
-            let met = match &evidence {
-                Some(Evidence::Test {
-                    name: Some(test), ..
-                }) => match find_named_test(test, profile, &report.checks) {
+            let (met, via) = match (&evidence, kind) {
+                (
+                    Some(Evidence::Test {
+                        name: Some(test), ..
+                    }),
+                    _,
+                ) => match find_named_test(test, profile, &report.checks) {
                     NamedTest::Reported(settlement) => {
                         let passed = settlement.outcome == TestOutcome::Passed;
                         settled_by = Some(settlement);
-                        passed
+                        (passed, SettledVia::DeclaredEvidence)
                     }
-                    NamedTest::NoReportDeclared | NamedTest::NotReported { .. } => false,
+                    NamedTest::NoReportDeclared | NamedTest::NotReported { .. } => {
+                        (false, SettledVia::DeclaredEvidence)
+                    }
                 },
-                Some(Evidence::Check { name }) => {
+                (Some(Evidence::Check { name }), _) => (
                     named_command(profile, name).is_some_and(|spec| {
                         let label = check_label(spec);
                         report
                             .checks
                             .iter()
                             .any(|check| check.label == label && !check.failed())
-                    })
+                    }),
+                    SettledVia::ProfileChecks,
+                ),
+                (
+                    Some(Evidence::Test { name: None, .. } | Evidence::LlmReview) | None,
+                    Kind::Inspect,
+                ) => (by_report(at), SettledVia::ReportReview),
+                (Some(Evidence::Test { name: None, .. } | Evidence::LlmReview), Kind::Change) => {
+                    (accepted, SettledVia::DeclaredEvidence)
                 }
-                Some(Evidence::Test { name: None, .. } | Evidence::LlmReview) | None => accepted,
-                Some(Evidence::HumanSignOff) => signoffs.contains(&entry.id()),
-                Some(Evidence::AmontGate { gate }) => {
-                    matches!(gate_coverage.get(gate), Some(Ok(true)))
+                (None, Kind::Change) => (accepted, SettledVia::ProfileChecks),
+                (Some(Evidence::HumanSignOff), _) => {
+                    (signoffs.contains(&entry.id()), SettledVia::HumanSignOff)
                 }
+                (Some(Evidence::AmontGate { gate }), _) => (
+                    matches!(gate_coverage.get(gate), Some(Ok(true))),
+                    SettledVia::DeclaredEvidence,
+                ),
             };
             CriterionOutcome {
                 id: entry.id(),
@@ -608,6 +754,7 @@ pub fn settle_acceptance(
                 met,
                 evidence,
                 settled_by,
+                settled_via: Some(via),
             }
         })
         .collect();
@@ -627,12 +774,22 @@ pub fn independence_summary(criteria: &[CriterionOutcome]) -> Option<Independenc
     let mandatory_independence: Vec<bool> = criteria
         .iter()
         .filter(|criterion| criterion.mandatory)
-        .map(|criterion| match &criterion.evidence {
-            Some(evidence) => independent(evidence),
-            // Settled by the verification profile as a whole: a check,
-            // in spirit, and so independent.
-            None => true,
-        })
+        .map(
+            |criterion| match (criterion.settled_via, &criterion.evidence) {
+                // Model judgment of the report, whatever evidence is declared.
+                (Some(SettledVia::ReportReview), _) => false,
+                (Some(SettledVia::ProfileChecks), _) => true,
+                (
+                    Some(SettledVia::DeclaredEvidence | SettledVia::HumanSignOff) | None,
+                    Some(evidence),
+                ) => independent(evidence),
+                // Settled by the verification profile as a whole: a check,
+                // in spirit, and so independent.
+                (Some(SettledVia::DeclaredEvidence | SettledVia::HumanSignOff) | None, None) => {
+                    true
+                }
+            },
+        )
         .collect();
     if mandatory_independence.is_empty() {
         None
@@ -1781,6 +1938,10 @@ pub struct Receipt {
     pub policy_hash: String,
     pub outcome: String,
     pub verification: VerificationReport,
+    /// What the run was for. A receipt without it is a change, which is
+    /// what every receipt written before it was.
+    #[serde(default = "change_kind")]
+    pub kind: Kind,
     pub models_used: Vec<String>,
     pub attempts: u32,
     pub cost_completeness: CostCompleteness,
@@ -1867,6 +2028,20 @@ pub enum ReviewRecord {
 }
 
 impl Receipt {
+    /// Whether the receipt's own record accepts the run. An inspection is
+    /// accepted when every mandatory criterion is met by its recorded
+    /// settlement; a change, and a receipt that records no kind, also
+    /// needs every check green, as it always did.
+    pub fn accepted_by_settlement(&self) -> bool {
+        match self.kind {
+            Kind::Inspect => self
+                .criteria
+                .iter()
+                .all(|criterion| !criterion.mandatory || criterion.met),
+            Kind::Change => self.verification.accepted(),
+        }
+    }
+
     /// A canonical-JSON hash over every field above, computed once at
     /// store time and written beside the row in `receipts.hash` — nothing
     /// ever recomputes it and compares, so it is not the authority hash,
@@ -3048,6 +3223,7 @@ mod tests {
             &HashSet::new(),
             &BTreeMap::new(),
             Kind::Change,
+            None,
         );
         assert!(
             criteria.iter().all(|c| c.met),
@@ -3207,6 +3383,7 @@ mod tests {
             &HashSet::new(),
             &BTreeMap::new(),
             Kind::Change,
+            None,
         );
         (criteria.remove(0), gaps)
     }
@@ -3520,6 +3697,7 @@ mod tests {
             &HashSet::new(),
             &BTreeMap::new(),
             Kind::Change,
+            None,
         );
         assert!(
             !criteria[0].met,
@@ -3585,6 +3763,7 @@ mod tests {
             &signed_off,
             &BTreeMap::new(),
             Kind::Change,
+            None,
         );
         assert!(criteria[0].met, "a recorded sign-off is met: {criteria:?}");
         assert_eq!(
@@ -3694,6 +3873,7 @@ mod tests {
             &HashSet::new(),
             &coverage,
             Kind::Change,
+            None,
         );
         assert!(criteria[0].met, "a covered gate is met: {criteria:?}");
         assert_eq!(
@@ -3775,6 +3955,7 @@ mod tests {
             &HashSet::new(),
             &coverage,
             Kind::Change,
+            None,
         );
         assert!(
             !criteria[0].met,
@@ -3814,6 +3995,172 @@ mod tests {
     }
 
     #[test]
+    fn a_report_review_answer_settles_by_number_and_fails_closed() {
+        let met = |text: &str| CriterionVerdict::Met(text.into());
+        let not_met = |text: &str| CriterionVerdict::NotMet(text.into());
+        let answer = "[1] met: read src/\n[2] not_met: no tests dir\n[4] met: out of range\n";
+        let verdict = ReportVerdict::parse(answer, 3);
+        assert_eq!(verdict.of(0), met("read src/"));
+        assert_eq!(verdict.of(1), not_met("no tests dir"));
+        assert!(
+            !verdict.of(2).is_met(),
+            "a criterion the review omits is not met"
+        );
+        assert!(!verdict.of(7).is_met(), "nor one past the end");
+
+        let duplicated = ReportVerdict::parse("[1] met: a\n[1] met: b\n", 1);
+        assert!(!duplicated.of(0).is_met(), "a duplicate number is not met");
+        let contradicted = ReportVerdict::parse("[1] not_met: a\n[1] met: b\n", 1);
+        assert!(!contradicted.of(0).is_met());
+        let unparseable = ReportVerdict::parse("[1] maybe: a\n", 1);
+        assert!(
+            !unparseable.of(0).is_met(),
+            "an unparseable line is not met"
+        );
+        let late_met = ReportVerdict::parse("[1] maybe\n[1] met: a\n", 1);
+        assert!(!late_met.of(0).is_met());
+        assert!(!ReportVerdict::parse("all good", 1).of(0).is_met());
+        assert!(!ReportVerdict::parse("", 2).of(1).is_met());
+    }
+
+    fn inspect_settling(
+        entries: &[AcceptanceEntry],
+        profile: &VerificationProfile,
+        checks: Vec<CheckOutcome>,
+        verdict: &ReportVerdict,
+    ) -> (Vec<CriterionOutcome>, Option<IndependenceSummary>) {
+        let report = VerificationReport {
+            baseline_failures: checks.iter().map(|check| check.label.clone()).collect(),
+            ..report_of(checks)
+        };
+        settle_acceptance(
+            entries,
+            profile,
+            &report,
+            &HashSet::new(),
+            &BTreeMap::new(),
+            Kind::Inspect,
+            Some(verdict),
+        )
+    }
+
+    /// An inspection's bare criteria are the review's to settle, never
+    /// the profile's, and the receipt says so.
+    #[test]
+    fn an_inspections_bare_criteria_take_the_reports_verdict_and_read_as_not_independent() {
+        let profile = VerificationProfile::default();
+        let entries = vec![
+            AcceptanceEntry::Bare("the layout is listed".into()),
+            declared("the tour is sound", crate::acceptance::Evidence::LlmReview),
+        ];
+        let verdict = ReportVerdict::parse("[1] met: ls\n[2] not_met: guessed\n", 2);
+        let (criteria, summary) = inspect_settling(&entries, &profile, Vec::new(), &verdict);
+        assert!(criteria[0].met && !criteria[1].met, "{criteria:?}");
+        assert!(criteria
+            .iter()
+            .all(|criterion| criterion.settled_via == Some(SettledVia::ReportReview)));
+        assert_eq!(summary, Some(IndependenceSummary::NoneIndependent));
+
+        let (without, _) = settle_acceptance(
+            &entries,
+            &profile,
+            &report_of(Vec::new()),
+            &HashSet::new(),
+            &BTreeMap::new(),
+            Kind::Inspect,
+            None,
+        );
+        assert!(
+            without.iter().all(|criterion| !criterion.met),
+            "no review settles nothing: {without:?}"
+        );
+    }
+
+    #[test]
+    fn mixed_report_and_check_criteria_read_partly_independent_and_a_red_check_stays_unmet() {
+        let profile = VerificationProfile {
+            setup: Vec::new(),
+            commands: vec![named("check", &["sh", "-c", "false"], 10)],
+            amont_checks: Vec::new(),
+            amont_waivers: Vec::new(),
+            inputs: Vec::new(),
+            cache_baseline: false,
+        };
+        let red = CheckOutcome {
+            label: check_label(&profile.commands[0]),
+            argv: profile.commands[0].argv.clone(),
+            ended: Ended::Exited(1).into(),
+            log_path: "x.log".into(),
+            log_sha256: "h".into(),
+            junit: None,
+        };
+        let entries = vec![
+            AcceptanceEntry::Bare("the layout is listed".into()),
+            declared(
+                "the check is green",
+                crate::acceptance::Evidence::Check {
+                    name: "check".into(),
+                },
+            ),
+        ];
+        let verdict = ReportVerdict::parse("[1] met: ls\n[2] met: the report says so\n", 2);
+        let (criteria, summary) = inspect_settling(&entries, &profile, vec![red], &verdict);
+        assert!(criteria[0].met, "{criteria:?}");
+        assert!(
+            !criteria[1].met,
+            "a Check criterion keeps its arm: the report cannot turn it green"
+        );
+        assert_eq!(criteria[1].settled_via, Some(SettledVia::ProfileChecks));
+        assert_eq!(summary, Some(IndependenceSummary::PartlyIndependent));
+        // A re-seal recomputes the same from what the receipt stores.
+        assert_eq!(independence_summary(&criteria), summary);
+    }
+
+    /// A criterion of a receipt written before `settled_via` is read off
+    /// its evidence alone, exactly as it always was.
+    #[test]
+    fn a_criterion_without_settled_via_keeps_the_evidence_rule() {
+        let outcome = |evidence: Option<crate::acceptance::Evidence>| CriterionOutcome {
+            id: "c".into(),
+            statement: "c".into(),
+            mandatory: true,
+            met: true,
+            evidence,
+            settled_by: None,
+            settled_via: None,
+        };
+        let json = serde_json::to_value(outcome(None)).expect("serializes");
+        assert!(json.get("settled_via").is_none(), "{json}");
+        let old: CriterionOutcome = serde_json::from_value(json).expect("an old outcome parses");
+        assert_eq!(old.settled_via, None);
+        assert_eq!(
+            independence_summary(&[old]),
+            Some(IndependenceSummary::AllIndependent)
+        );
+        assert_eq!(
+            independence_summary(&[outcome(Some(crate::acceptance::Evidence::LlmReview))]),
+            Some(IndependenceSummary::NoneIndependent)
+        );
+    }
+
+    #[test]
+    fn a_receipt_without_a_kind_is_a_change() {
+        let json = r#"{
+            "run_id": "run-1", "candidate_sha": "abc", "base_sha": "def",
+            "contract_hash": "ch", "policy_hash": "ph", "outcome": "accepted",
+            "verification": {
+                "candidate_sha": "abc", "base_sha": "def", "contract_hash": "ch",
+                "policy_hash": "ph", "checks": [], "gaps": [],
+                "baseline_failures": [], "amont_bypasses": [], "amont_downgrades": []
+            },
+            "models_used": ["sonnet"], "attempts": 1,
+            "cost_completeness": "actual", "cost": 12345
+        }"#;
+        let receipt: Receipt = serde_json::from_str(json).expect("parses");
+        assert_eq!(receipt.kind, Kind::Change);
+    }
+
+    #[test]
     fn an_all_independent_and_a_mixed_mandatory_set_summarize_honestly() {
         let profile = VerificationProfile::default();
         let accepted = VerificationReport {
@@ -3839,6 +4186,7 @@ mod tests {
             &HashSet::new(),
             &BTreeMap::new(),
             Kind::Change,
+            None,
         );
         assert_eq!(all_independent, Some(IndependenceSummary::AllIndependent));
 
@@ -3856,6 +4204,7 @@ mod tests {
             &HashSet::new(),
             &BTreeMap::new(),
             Kind::Change,
+            None,
         );
         assert_eq!(partly, Some(IndependenceSummary::PartlyIndependent));
 
@@ -3871,6 +4220,7 @@ mod tests {
             &HashSet::new(),
             &BTreeMap::new(),
             Kind::Change,
+            None,
         );
         assert_eq!(none_mandatory, None);
     }
@@ -4000,6 +4350,7 @@ mod tests {
                 baseline_cached: false,
                 baseline_cache_refused: None,
             },
+            kind: Kind::Change,
             models_used: vec!["sonnet".into()],
             attempts: 1,
             cost_completeness: CostCompleteness::Actual,

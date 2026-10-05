@@ -43,6 +43,7 @@ pub enum Reason {
     ChecksAndReviewPassed,
     BehavioralFailure,
     RepairExhausted,
+    CriteriaUnmet,
     AmbiguousDiagnosis,
     SameFailureRecurrence,
     EnvMissing,
@@ -150,10 +151,11 @@ impl Reason {
     ///
     /// The length is fixed, so a variant added to the enum without being
     /// added here does not compile the `match` that walks it.
-    pub const ALL: [Self; 50] = [
+    pub const ALL: [Self; 51] = [
         Self::ChecksAndReviewPassed,
         Self::BehavioralFailure,
         Self::RepairExhausted,
+        Self::CriteriaUnmet,
         Self::AmbiguousDiagnosis,
         Self::SameFailureRecurrence,
         Self::EnvMissing,
@@ -208,6 +210,7 @@ impl Reason {
             Self::ChecksAndReviewPassed => "checks_and_review_passed",
             Self::BehavioralFailure => "behavioral_failure",
             Self::RepairExhausted => "repair_exhausted",
+            Self::CriteriaUnmet => "criteria_unmet",
             Self::AmbiguousDiagnosis => "ambiguous_diagnosis",
             Self::SameFailureRecurrence => "same_failure_recurrence",
             Self::EnvMissing => "env_missing",

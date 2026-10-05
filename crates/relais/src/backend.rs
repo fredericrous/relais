@@ -397,6 +397,17 @@ impl LaunchEnv {
     }
 }
 
+/// The tool set a launch asks the harness for (`--tools`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolSet {
+    /// What the launch mode has always asked for: the sandbox worker's
+    /// tools, and nothing at all in allowlist mode.
+    ModeDefault,
+    /// `Read,Grep,Glob` in either mode: a launch that can look and never
+    /// write or run anything (SPEC §10, the report review).
+    ReadOnly,
+}
+
 /// One model dispatch. The prompt travels via stdin; arguments are an
 /// argv array; the working directory is the owned task worktree.
 #[derive(Debug, Clone)]
@@ -430,6 +441,8 @@ pub struct LaunchSpec {
     /// on (SPEC §8). `None` is the allowlist launch, and every dispatch
     /// that is not a worker's.
     pub sandbox: Option<SandboxLaunch>,
+    /// The tools the harness is asked to expose.
+    pub tools: ToolSet,
 }
 
 /// What a sandboxed launch adds: the whole `--settings` JSON (sandbox,

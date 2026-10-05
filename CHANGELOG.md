@@ -19,6 +19,19 @@ missing here.
   "produced nothing"), and a check that fails only on the candidate still
   stops it. The inspect prompt now says the
   final message is the deliverable. Change tasks keep every rule.
+- An inspection is judged by its report (#167): one read-only report review
+  (research tier, the worker's model, the candidate worktree, tools exactly
+  `Read,Grep,Glob` in sandbox and allowlist mode) settles its bare,
+  `llm_review` and unnamed-`test` criteria, failing closed on a missing,
+  unparseable, duplicated or omitted line, and `review: off` does not turn it
+  off. A red `check` or named-`test` criterion fails the run `criteria_unmet`
+  with no repair; an unmet report criterion is repaired once on the same
+  tier, never escalated, then fails `criteria_unmet`; a pending sign-off is
+  `needs_decision` listing only the sign-offs, and the sign-off re-seal
+  accepts an inspection by its recorded settlements. Receipts gain `kind` and
+  each criterion `settled_via`, from which independence is derived (a report
+  verdict is not independent); older receipts read as before. `LaunchSpec`
+  carries the tool set to request.
 
 ### Added
 

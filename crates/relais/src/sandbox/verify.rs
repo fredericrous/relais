@@ -264,6 +264,7 @@ fn probe_spec(
         cancel: None,
         pid_slot: None,
         sandbox,
+        tools: crate::backend::ToolSet::ModeDefault,
     }
 }
 
