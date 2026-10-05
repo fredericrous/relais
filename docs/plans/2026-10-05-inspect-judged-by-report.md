@@ -159,7 +159,7 @@ Each package gets `make check`, falsification of its key test with a forced rebu
 - **A:** a runner test with an inspect contract and `main_gone_check()` (red base) and a mock worker that returns a report.
   - With the mock report review saying met: `Accepted` with exactly 2 dispatches (the worker and the report review), no repair, and the receipt listing the base failure as not judged.
   - Saying not met: one repair whose addendum names the criterion and contains no check failure.
-  - An empty report: blocked as today.
+  - An empty report: one repair, then failed (`empty_report`). This was "blocked as today" before A1; see the Decision log.
   - Fail-closed settling: each of a review verdict that is missing, unparseable, or omits a criterion settles that criterion not met; a failed review dispatch → `NeedsReview`.
   - `CriteriaUnmet`: a not-met verdict on the last allowed attempt ends `Failed` with no escalation dispatch.
   - An inspect contract with a `Check` criterion on a red base ends `Failed` with `Reason::CriteriaUnmet`, naming the criterion and the check, and no repair attempt row. The same holds when a report criterion is also unmet.
@@ -199,12 +199,28 @@ Each package gets `make check`, falsification of its key test with a forced rebu
   Both came from a worker editing Rust through python scripts. So B's rewrite for them is "use the Edit tool", and the sandbox rules regain "edit files with your Edit/Write tools" and "never start a command with `cd`".
 - 2026-10-05: **A contract fault (mine).** A2's follow-up stopped on `scope_exceeded`: a one-line `notes: Vec::new()` in a `main.rs` test literal. The pre-flight grep had listed `main.rs`, but I launched in the same command without reading its output. I verified the candidate by hand: `make check`, plus the key tests falsified.
 - 2026-10-05: **A hand fix in B's review round.** A shape-refused attempt that touched the profile's tests still entered `verifying` through the `VerificationInputsChanged` transition. That transition now comes after the shape decision, with a regression test, falsified.
+- 2026-10-05: **An empty inspect report is a failure the worker may repair once** (`empty_report`), then the run fails, mirroring `empty_candidate` for a change. This replaces the plan's "blocked as today". After A1 an inspection's tree is always unchanged, so "produced nothing" is judged by the report, and an empty report is the inspection's empty candidate.
 - 2026-10-05: **The person's default for the low item.** A claimed shape-refused attempt's row is finished `repairing`.
 
 - 2026-10-05: **A defect found by the end-to-end check, fixed in 4fb44ac.** Read-only tools cannot see directory structure: Glob never matches a directory, Read on one fails with EISDIR, and Glob `*` returns untracked `node_modules` paths. So a correct layout report was judged not met, and a needless repair followed. relais now gives the reviewer the candidate's tracked tree from git (top level with directories marked `/`, up to 400 tracked files) as data. This keeps the design's intent, checking claims against the tree, with a mechanism that works.
 
 ## Verification (observed, 2026-10-05, Claude Code 2.1.289, macOS)
 Each check: what was driven → what was expected → what was observed.
+- **Each planned check has a named test** (input → expected → observed: the test passes):
+  - red base, review met → `an_inspection_on_a_red_base_is_accepted_without_a_repair`;
+  - review not met → `an_unmet_report_is_repaired_once_at_the_same_tier_then_fails_without_escalating`, `unmet_criteria_repair_once_at_the_same_tier_and_never_escalate`;
+  - empty report → `an_empty_inspect_report_is_repaired_once_then_fails`;
+  - fail-closed settling → `a_review_that_is_missing_unparseable_duplicated_or_omits_a_criterion_meets_nothing`, `a_report_review_answer_settles_by_number_and_fails_closed`;
+  - red `Check` criterion → `a_red_check_criterion_fails_without_a_repair`, `a_red_check_criterion_fails_the_inspection_without_a_repair_even_beside_an_unmet_report`;
+  - sign-off → `an_inspection_waiting_on_a_sign_off_keeps_the_verdict_and_lists_only_that_gap`, `a_signed_off_inspection_is_accepted_by_its_recorded_settlements`, `a_sign_off_only_inspection_stores_its_profile_gaps_in_the_pending_receipt`;
+  - old receipts and change re-seal → `a_receipt_without_kind_or_settled_via_reseals_as_a_change`, `a_criterion_without_settled_via_keeps_the_evidence_rule`, `a_signed_off_change_still_needs_every_gap_closed`;
+  - independence → `an_inspections_bare_criteria_take_the_reports_verdict_and_read_as_not_independent`, `mixed_report_and_check_criteria_read_partly_independent_and_a_red_check_stays_unmet`;
+  - `review: off` → `a_review_off_inspection_still_runs_its_report_review_and_says_so`;
+  - change tasks → `baseline_failure_is_visible_and_not_waived` (untouched);
+  - tool set → `a_read_only_launch_asks_for_exactly_three_tools_in_both_modes`, `the_report_review_reads_the_worktree_with_three_tools_and_sees_the_report_as_data`;
+  - B classifier → `each_measured_shape_text_is_a_shape_refusal`, `an_unknown_text_and_a_text_in_both_sets_are_capability`, `a_non_bash_denial_is_capability`, `incomplete_or_missing_coverage_makes_every_refusal_capability`;
+  - B runner → `a_shape_refusal_with_nothing_produced_costs_one_same_tier_repair`, `a_capability_refusal_in_the_sandbox_is_blocked_as_before`, `a_shape_refusal_in_allowlist_mode_is_blocked_as_before`, and the four `a_blockage_claim_…` tests;
+  - repair addenda → `a_repair_with_refusals_and_failures_carries_both_addenda`, `an_inspect_repair_is_told_what_caused_it`.
 - **Unit and runner tests:** `make check` green after every package. Key tests were falsified with a forced rebuild:
   - sign-off pending receipt keeps `gaps_not_judged`;
   - a repeated new failure on an inspection fails;
@@ -213,10 +229,12 @@ Each check: what was driven → what was expected → what was observed.
   - a shape-refused attempt that touched tests never enters `verifying`;
   - the probe digest.
 - **C, against reality:** this build's `relais doctor --verify-sandbox` → all steps pass, including `log-redirect` and `python-write` → all 18 steps passed, record `bd8e52761988`, $0.11.
+- **Read-only tools in allowlist mode without allow rules:** `claude -p --tools Read,Grep,Glob` in a temp dir, doing Glob, Read and Grep → no prompt or denial → all three ran, `permission_denials: []`.
+- **Init record, deliberately substituted.** relais launches a reviewer with `--output-format json`, which carries no `system/init` record, so a relais review dispatch cannot show it. Two checks cover it instead: the runner test pins the argv to exactly `--tools Read,Grep,Glob` in both modes, and the bare harness measurement below shows what that argv yields.
 - **Tool set, against reality:** `claude -p --tools Read,Grep,Glob`, without and with `--restricted` → `system/init` lists exactly those tools → `['Glob','Grep','Read']` in both modes, no MCP server.
 - **End to end:** the inspect tasks of 2026-10-04 re-run with this build on today's `main`:
   - kb-vision → accepted, 2 dispatches → **accepted** (worker $0.04, review $0.09);
-  - application-landscape → accepted → **accepted** (before 4fb44ac: worker $0.02, review $0.14);
+  - application-landscape → accepted, 2 dispatches → on this build, **accepted, 2 dispatches, $0.11** (worker $0.02, review $0.09; it was $0.14 before 4fb44ac). run-65d11c11e6ff7-5a45;
   - duro-design-system → accepted, 2 dispatches → **accepted, 2 dispatches, $0.10**. Before 4fb44ac it was a false not met, then a repair: $0.44.
   - social-planner was not run, because its checkout has uncommitted work.
   - **Not exercised:** all three bases are green today, so the red-base path is proven only by the runner tests.

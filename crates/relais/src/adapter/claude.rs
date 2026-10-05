@@ -371,9 +371,14 @@ pub fn build_argv(spec: &LaunchSpec, caps: &Capabilities) -> Result<Vec<String>,
     match &spec.sandbox {
         Some(launch) => argv.extend(sandbox_args(launch, sandbox_tools(spec.tools))),
         None => {
-            if let ToolSet::ReadOnly = spec.tools {
-                argv.push("--tools".into());
-                argv.push(READ_ONLY_TOOLS.into());
+            match spec.tools {
+                ToolSet::ReadOnly => {
+                    argv.push("--tools".into());
+                    argv.push(READ_ONLY_TOOLS.into());
+                }
+                // Allowlist mode has no tool flag of its own: the
+                // permission rules below decide.
+                ToolSet::ModeDefault => {}
             }
             if !spec.allowed_tools.is_empty() {
                 argv.push("--settings".into());

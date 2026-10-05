@@ -4654,7 +4654,30 @@ fn build_prompt(
             AttemptKind::Repair if contract.kind() == crate::contract::Kind::Inspect => {
                 prompt.push_str("\n[repair addendum]\n");
                 prompt.push_str("the previous report was not accepted:\n");
-                prompt.push_str(&data_list_block("unmet criteria and reasons", failures));
+                // Labelled by what caused the repair: a report criterion
+                // (`[n] …`, from the report review), an empty report, or
+                // a check that newly failed on the unchanged tree.
+                let (criteria, rest): (Vec<String>, Vec<String>) =
+                    failures.iter().cloned().partition(|failure| {
+                        failure.starts_with('[')
+                            && failure[1..].starts_with(|c: char| c.is_ascii_digit())
+                    });
+                let empty = rest.iter().any(|failure| failure == "empty_report");
+                let checks: Vec<String> = rest
+                    .into_iter()
+                    .filter(|failure| failure != "empty_report")
+                    .collect();
+                if !criteria.is_empty() {
+                    prompt.push_str(&data_list_block("unmet criteria and reasons", &criteria));
+                }
+                if empty {
+                    prompt.push_str(
+                        "your previous final message was empty: the report is the deliverable.\n",
+                    );
+                }
+                if !checks.is_empty() {
+                    prompt.push_str(&data_list_block("checks that newly failed", &checks));
+                }
                 prompt.push_str(
                     "answer in your final message; do not create files, install dependencies \
                      or change the tree.\n",
@@ -7936,6 +7959,42 @@ mod tests {
         );
         assert!(!change.contains("the deliverable"), "{change}");
         std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn an_inspect_repair_is_told_what_caused_it() {
+        let manifest = manifest_with(Vec::new());
+        let repair = |failures: Vec<String>| {
+            build_prompt(
+                &inspect_contract(),
+                &manifest,
+                2,
+                Some(&failures),
+                &[],
+                AttemptKind::Repair,
+            )
+        };
+        let empty = repair(vec!["empty_report".into()]);
+        assert!(
+            empty.contains("your previous final message was empty"),
+            "{empty}"
+        );
+        assert!(!empty.contains("unmet criteria"), "{empty}");
+        assert!(
+            !empty.contains("empty_report"),
+            "no label posing as a criterion: {empty}"
+        );
+        let mixed = repair(vec![
+            "[1] the layout is listed: no `docs/` in the tree".into(),
+            "npm@1a2b".into(),
+        ]);
+        assert!(mixed.contains("unmet criteria and reasons"), "{mixed}");
+        assert!(mixed.contains("checks that newly failed"), "{mixed}");
+        let criteria_only = repair(vec!["[1] the layout is listed: missing".into()]);
+        assert!(
+            !criteria_only.contains("checks that newly failed"),
+            "{criteria_only}"
+        );
     }
 
     // -- the harness boundary (SPEC §8, §9, §11) --------------------------
