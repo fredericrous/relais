@@ -21,6 +21,12 @@ missing here.
   refusal, an incomplete transcript and allowlist mode stay blocked as before.
   The sandbox worker rules now also say to edit files with the Edit and Write
   tools and never to start a command with `cd`.
+  A shape-refused attempt never enters `verifying`, so the repair report no
+  longer counts it as a failed check run; each refusal's command, reason and
+  class are kept on the `shape_refused` transition and in the attempt's
+  `sandbox-denials` artifact (`refusals`); a tool denied twice is named once
+  in the blocked detail; and a repair with both refusals and earlier failures
+  carries both addenda.
 - An inspection on a red base behaves as on a green one (#167): a check that
   already fails at the base is recorded on the receipt and no longer sends
   the inspection to repair, a gap about the profile's checks is recorded in

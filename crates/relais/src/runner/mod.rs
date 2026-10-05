@@ -1635,6 +1635,10 @@ impl<'a> RunEngine<'a> {
             })
             .collect();
         let refusals = sandbox::classify_refusals(transcript.as_deref().ok(), &denied);
+        let report = sandbox::DenialReport {
+            refusals: refusals.clone(),
+            ..report
+        };
         let body =
             serde_json::to_string_pretty(&report).map_err(|e| RunError::Other(e.to_string()))?;
         // Keyed by the attempt ROW, not its index: a redispatch reuses the
@@ -2514,26 +2518,7 @@ impl<'a> RunEngine<'a> {
         let verification_inputs_changed = touched_inputs.tests;
         let review_required = ctx.preflight.decision.review >= Review::Required
             || !verification_inputs_changed.is_empty();
-        if !verification_inputs_changed.is_empty()
-            && ctx.preflight.decision.review < Review::Required
-        {
-            self.transition(
-                State::Verifying,
-                Reason::VerificationInputsChanged,
-                serde_json::json!({ "paths": verification_inputs_changed }),
-            )?;
-        }
 
-        // Verification against an immutable copy of the candidate
-        // (SPEC §10). Entering `verifying` is a transition like every
-        // other: assigned straight to the field, the ledger never
-        // showed the state it then recorded as the next row's origin
-        // (R7).
-        self.transition(
-            State::Verifying,
-            Reason::VerificationStarted,
-            serde_json::json!({ "candidate": candidate.sha, "attempt": candidate.index }),
-        )?;
         // A candidate that carries the base tree has the baseline's
         // results by identity: the commands are not spent again, and
         // the receipt says so.
@@ -2574,33 +2559,59 @@ impl<'a> RunEngine<'a> {
         // worker refused only that way, with nothing produced or having
         // said it was blocked, is repaired at the same tier and told the
         // rewrite. It is never verified for acceptance on this attempt.
+        if !candidate.permission_denials.is_empty()
+            && refused_only_by_shape(&candidate.permission_denials, &candidate.refusals)
+            && (produced_nothing || candidate.claimed_blockage)
+        {
+            // Nothing was verified: the attempt never enters `verifying`.
+            progress.last_candidate = Some(candidate.sha.clone());
+            progress.last_refusals = candidate.refusals.clone();
+            let step = self.follow(
+                ctx,
+                progress,
+                Observation::ShapeRefused(candidate.refusals.clone()),
+            )?;
+            let row = match step {
+                Step::Again => State::Repairing,
+                Step::Ended(_) => State::Blocked,
+            };
+            ledger.finish_attempt(
+                candidate.attempt_id,
+                row,
+                Some(&held_worktree),
+                Some(&candidate.sha),
+            )?;
+            return Ok(step);
+        }
+        // Entered only once the candidate is to be verified: a
+        // shape-refused attempt above never shows `verifying`, even when
+        // it touched the profile's tests.
+        if !verification_inputs_changed.is_empty()
+            && ctx.preflight.decision.review < Review::Required
+        {
+            self.transition(
+                State::Verifying,
+                Reason::VerificationInputsChanged,
+                serde_json::json!({ "paths": verification_inputs_changed }),
+            )?;
+        }
+
+        // Verification against an immutable copy of the candidate
+        // (SPEC §10). Entering `verifying` is a transition like every
+        // other: assigned straight to the field, the ledger never
+        // showed the state it then recorded as the next row's origin
+        // (R7).
+        self.transition(
+            State::Verifying,
+            Reason::VerificationStarted,
+            serde_json::json!({ "candidate": candidate.sha, "attempt": candidate.index }),
+        )?;
         if !candidate.permission_denials.is_empty() {
-            let denied_tools: Vec<String> = candidate
-                .permission_denials
-                .iter()
-                .map(|denial| denial.entry.clone())
-                .collect();
-            let shape_only =
-                refused_only_by_shape(&candidate.permission_denials, &candidate.refusals);
-            if shape_only && (produced_nothing || candidate.claimed_blockage) {
-                progress.last_candidate = Some(candidate.sha.clone());
-                progress.last_refusals = candidate.refusals.clone();
-                let step = self.follow(
-                    ctx,
-                    progress,
-                    Observation::ShapeRefused(candidate.refusals.clone()),
-                )?;
-                let row = match step {
-                    Step::Again => State::Repairing,
-                    Step::Ended(_) => State::Blocked,
-                };
-                ledger.finish_attempt(
-                    candidate.attempt_id,
-                    row,
-                    Some(&held_worktree),
-                    Some(&candidate.sha),
-                )?;
-                return Ok(step);
+            let mut denied_tools: Vec<String> = Vec::new();
+            for denial in &candidate.permission_denials {
+                if !denied_tools.contains(&denial.entry) {
+                    denied_tools.push(denial.entry.clone());
+                }
             }
             if produced_nothing {
                 ledger.finish_attempt(
@@ -4588,7 +4599,8 @@ fn build_prompt(
     }
     if kind == AttemptKind::Repair && !refusals.is_empty() {
         prompt.push_str(&refusal_addendum(refusals));
-    } else if let Some(failures) = previous_failures {
+    }
+    if let Some(failures) = previous_failures {
         match kind {
             AttemptKind::Repair if contract.kind() == crate::contract::Kind::Inspect => {
                 prompt.push_str("\n[repair addendum]\n");
@@ -11608,7 +11620,27 @@ mod tests {
         fixture: &Fixture,
         script: impl Fn(usize, &LaunchSpec, &Path) -> MockOutcome + Send + Sync + 'static,
     ) -> RunOutcome {
-        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        run_sandboxed_scripted_with(fixture, |_| {}, script)
+    }
+
+    /// [`run_sandboxed_scripted`] under a repo policy `tune` has adjusted.
+    fn run_sandboxed_scripted_with(
+        fixture: &Fixture,
+        tune: impl FnOnce(&mut RepoPolicy),
+        script: impl Fn(usize, &LaunchSpec, &Path) -> MockOutcome + Send + Sync + 'static,
+    ) -> RunOutcome {
+        run_sandboxed_contract(fixture, &fixture.contract(Review::Off), tune, script)
+    }
+
+    /// [`run_sandboxed_scripted_with`] for a given `contract`.
+    fn run_sandboxed_contract(
+        fixture: &Fixture,
+        contract: &TaskContract,
+        tune: impl FnOnce(&mut RepoPolicy),
+        script: impl Fn(usize, &LaunchSpec, &Path) -> MockOutcome + Send + Sync + 'static,
+    ) -> RunOutcome {
+        let mut repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        tune(&mut repo);
         let mut machine = fixture.machine_for(&repo);
         machine.sandbox.enabled = true;
         let config_dir = fixture.dir.join("claude");
@@ -11630,14 +11662,7 @@ mod tests {
             &gate_key_with_env(&machine, crate::sandbox::SANDBOX_MIN_HARNESS, &env.names()),
         );
         let host = PassingHost { managed, store };
-        fixture.execute_with_env(
-            &fixture.contract(Review::Off),
-            &repo,
-            &machine,
-            &backend,
-            &host,
-            env,
-        )
+        fixture.execute_with_env(contract, &repo, &machine, &backend, &host, env)
     }
 
     /// What the worker leaves when the harness refuses its Bash `command`
@@ -11921,6 +11946,201 @@ mod tests {
             assert_eq!(launches_seen(&seen).len(), 1, "capability {capability}");
             std::fs::remove_dir_all(&fixture.dir).ok();
         }
+    }
+
+    #[test]
+    fn a_shape_refused_repair_never_enters_verifying_and_is_not_reported_failed() {
+        let fixture = Fixture::new();
+        let outcome = run_sandboxed_scripted_with(
+            &fixture,
+            |repo| repo.execution.max_repairs_before_escalation = 2,
+            |attempt, spec, config_dir| match attempt {
+                // The initial attempt fails the check; repair 1 is refused
+                // only for shape and changes nothing; repair 2 fixes it.
+                1 => MockOutcome {
+                    result_text: Some("tried".into()),
+                    exit_code: Some(0),
+                    usage: Some(usage(100)),
+                    ..Default::default()
+                },
+                2 => refused(spec, config_dir, "sleep 5", "Blocked: sleep 5", "waiting"),
+                _ => fixes(spec),
+            },
+        );
+        assert!(
+            matches!(outcome.terminal, Terminal::Accepted(_)),
+            "{outcome:?}"
+        );
+        let transitions = fixture
+            .ledger
+            .transitions(&outcome.run_id)
+            .expect("transitions");
+        let shape: Vec<&crate::ledger::Transition> = transitions
+            .iter()
+            .filter(|t| t.reason == Reason::ShapeRefused.as_str())
+            .collect();
+        assert_eq!(shape.len(), 1, "{transitions:?}");
+        assert_eq!(shape[0].to_state, State::Repairing);
+        assert_ne!(
+            shape[0].from_state,
+            Some(State::Verifying),
+            "no check ran for a shape-refused attempt"
+        );
+        let efforts =
+            crate::report::runs_report(&fixture.ledger, "2000-01-01T00:00:00+00:00", None)
+                .expect("report")
+                .repair_outcomes;
+        let failed: usize = efforts.iter().map(|e| e.verification_failed).sum();
+        let repairs: usize = efforts.iter().map(|e| e.repairs).sum();
+        assert_eq!(repairs, 2, "{efforts:?}");
+        assert_eq!(failed, 0, "{efforts:?}");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A shape-refused attempt that touched the profile's tests and then
+    /// said it was blocked still never shows `verifying`: the
+    /// verification-inputs transition is entered only by a candidate that
+    /// is going to be verified.
+    #[test]
+    fn a_shape_refused_attempt_that_touched_tests_never_enters_verifying() {
+        let fixture = Fixture::new();
+        // The test tree is in scope, so the scope check lets the attempt
+        // through to the refusal path rather than stopping it first.
+        let contract = fixture.contract_with_scope(&["src/**", "tests/**"]);
+        let outcome = run_sandboxed_contract(
+            &fixture,
+            &contract,
+            |_| {},
+            |_, spec, config_dir| {
+                let tests = spec.work_dir.join("tests");
+                std::fs::create_dir_all(&tests).expect("tests dir");
+                std::fs::write(tests.join("regression.rs"), "#[test] fn t() {}\n")
+                    .expect("a test file");
+                refused(spec, config_dir, "sleep 5", "Blocked: sleep 5", BLOCKED)
+            },
+        );
+        let transitions = fixture
+            .ledger
+            .transitions(&outcome.run_id)
+            .expect("transitions");
+        assert!(
+            transitions
+                .iter()
+                .any(|t| t.reason == Reason::ShapeRefused.as_str()),
+            "{:?} {transitions:?}",
+            outcome.terminal
+        );
+        assert!(
+            transitions.iter().all(|t| t.to_state != State::Verifying),
+            "a shape-refused attempt that touched tests never shows verifying: {transitions:?}"
+        );
+        let failed: usize =
+            crate::report::runs_report(&fixture.ledger, "2000-01-01T00:00:00+00:00", None)
+                .expect("report")
+                .repair_outcomes
+                .iter()
+                .map(|e| e.verification_failed)
+                .sum();
+        assert_eq!(failed, 0);
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_shape_repair_persists_each_refusals_reason_and_class() {
+        let fixture = Fixture::new();
+        let outcome = run_sandboxed_scripted(&fixture, |attempt, spec, config_dir| {
+            if attempt == 1 {
+                return refused(spec, config_dir, "sleep 5", "Blocked: sleep 5", "waiting");
+            }
+            fixes(spec)
+        });
+        assert!(
+            matches!(outcome.terminal, Terminal::Accepted(_)),
+            "{outcome:?}"
+        );
+        let transitions = fixture
+            .ledger
+            .transitions(&outcome.run_id)
+            .expect("transitions");
+        let detail = transitions
+            .iter()
+            .find(|t| t.reason == Reason::ShapeRefused.as_str())
+            .and_then(|t| t.detail.clone())
+            .expect("a shape_refused transition");
+        let expected = serde_json::json!([{
+            "tool_use_id": "t1",
+            "command": "sleep 5",
+            "reason": "Blocked: sleep 5",
+            "class": "shape",
+        }]);
+        assert_eq!(detail["refusals"], expected, "{detail}");
+        // The refused attempt's report is the first of the run's two.
+        let rows = evidence_of(&fixture, &outcome.run_id, EvidenceKind::SandboxDenials);
+        let report: crate::sandbox::DenialReport =
+            serde_json::from_str(&std::fs::read_to_string(&rows[0].0).expect("readable"))
+                .expect("a denial report");
+        assert_eq!(
+            serde_json::to_value(&report.refusals).expect("json"),
+            expected
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_tool_denied_twice_is_named_once() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let backend = MockBackend::new(move |_| MockOutcome {
+            result_text: Some("could not".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            permission_denials: vec![
+                PermissionDenial::new("Edit", Some("t1")),
+                PermissionDenial::new("Edit", Some("t2")),
+            ],
+            ..Default::default()
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Off), &repo, &backend);
+        let Terminal::Blocked { detail, .. } = &outcome.terminal else {
+            panic!("expected blocked, got {outcome:?}");
+        };
+        assert!(detail.contains("these tools: Edit;"), "{detail}");
+        let transitions = fixture
+            .ledger
+            .transitions(&outcome.run_id)
+            .expect("transitions");
+        let tools = transitions
+            .iter()
+            .find(|t| t.reason == Reason::PermissionDenied.as_str())
+            .and_then(|t| t.detail.clone())
+            .expect("a permission_denied transition");
+        assert_eq!(tools["tools"], serde_json::json!(["Edit"]), "{tools}");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_repair_with_refusals_and_failures_carries_both_addenda() {
+        let fixture = Fixture::new();
+        let contract = fixture.contract(Review::Off);
+        let refusals = [sandbox::Refusal {
+            tool_use_id: Some("t1".into()),
+            command: "sleep 5".into(),
+            reason: "Blocked: sleep 5".into(),
+            class: sandbox::RefusalClass::Shape,
+        }];
+        let failures = ["main_gone".to_string()];
+        let prompt = build_prompt(
+            &contract,
+            &manifest_with(Vec::new()),
+            1,
+            Some(&failures),
+            &refusals,
+            AttemptKind::Repair,
+        );
+        assert!(prompt.contains("[refusal addendum]"), "{prompt}");
+        assert!(prompt.contains("[repair addendum]"), "{prompt}");
+        assert!(prompt.contains("main_gone"), "{prompt}");
+        std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
     #[test]

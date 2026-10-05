@@ -499,6 +499,7 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
                     reason: Reason::ShapeRefused,
                     detail: serde_json::json!({
                         "commands": commands,
+                        "refusals": refusals,
                         "attempt": budget.attempts_used,
                     }),
                     next: Next::Attempt {

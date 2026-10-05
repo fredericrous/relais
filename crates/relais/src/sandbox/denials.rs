@@ -74,10 +74,15 @@ pub struct DenialReport {
     pub verified: Vec<Denial>,
     pub suspected: Vec<Denial>,
     pub coverage: Coverage,
+    /// Each refused call and how it was classified; absent from reports
+    /// written before the classification was kept.
+    #[serde(default)]
+    pub refusals: Vec<Refusal>,
 }
 
 /// What a refusal asks of the worker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RefusalClass {
     /// The harness refused the command's form: a rewrite is accepted.
     Shape,
@@ -87,7 +92,7 @@ pub enum RefusalClass {
 }
 
 /// One refused tool call, with the harness's reason from the transcript.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Refusal {
     /// `None` when the harness named no call for the denial.
     pub tool_use_id: Option<String>,
@@ -295,6 +300,7 @@ pub fn scan(transcript_jsonl: Option<&str>, scratch_files: &[(PathBuf, String)])
         verified: Vec::new(),
         suspected: Vec::new(),
         coverage: Coverage::Unknown("no transcript".to_string()),
+        refusals: Vec::new(),
     };
     if let Some(jsonl) = transcript_jsonl {
         let transcript = read_transcript(jsonl, &mut report);
@@ -344,6 +350,7 @@ pub fn classify_refusals(
             verified: Vec::new(),
             suspected: Vec::new(),
             coverage: Coverage::Complete,
+            refusals: Vec::new(),
         };
         let transcript = read_transcript(jsonl, &mut scratch);
         let whole = transcript.incompleteness().is_none();
@@ -721,6 +728,7 @@ mod tests {
             verified: (0..7).map(denial).collect(),
             suspected: vec![denial(9)],
             coverage: Coverage::Incomplete("tool_use toolu_long has no tool_result".to_string()),
+            refusals: vec![],
         };
         let rendered = report.render();
         assert!(
@@ -741,6 +749,7 @@ mod tests {
                 verified: vec![],
                 suspected: vec![],
                 coverage,
+                refusals: vec![],
             }
             .render()
         };
