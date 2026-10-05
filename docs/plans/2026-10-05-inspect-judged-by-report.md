@@ -201,4 +201,29 @@ Each package gets `make check`, falsification of its key test with a forced rebu
 - 2026-10-05: **A hand fix in B's review round.** A shape-refused attempt that touched the profile's tests still entered `verifying` through the `VerificationInputsChanged` transition. That transition now comes after the shape decision, with a regression test, falsified.
 - 2026-10-05: **The person's default for the low item.** A claimed shape-refused attempt's row is finished `repairing`.
 
+- 2026-10-05: **A defect found by the end-to-end check, fixed in 4fb44ac.** Read-only tools cannot see directory structure: Glob never matches a directory, Read on one fails with EISDIR, and Glob `*` returns untracked `node_modules` paths. So a correct layout report was judged not met, and a needless repair followed. relais now gives the reviewer the candidate's tracked tree from git (top level with directories marked `/`, up to 400 tracked files) as data. This keeps the design's intent, checking claims against the tree, with a mechanism that works.
+
+## Verification (observed, 2026-10-05, Claude Code 2.1.289, macOS)
+Each check: what was driven → what was expected → what was observed.
+- **Unit and runner tests:** `make check` green after every package. Key tests were falsified with a forced rebuild:
+  - sign-off pending receipt keeps `gaps_not_judged`;
+  - a repeated new failure on an inspection fails;
+  - each report review is kept per attempt;
+  - the `report_review` phase;
+  - a shape-refused attempt that touched tests never enters `verifying`;
+  - the probe digest.
+- **C, against reality:** this build's `relais doctor --verify-sandbox` → all steps pass, including `log-redirect` and `python-write` → all 18 steps passed, record `bd8e52761988`, $0.11.
+- **Tool set, against reality:** `claude -p --tools Read,Grep,Glob`, without and with `--restricted` → `system/init` lists exactly those tools → `['Glob','Grep','Read']` in both modes, no MCP server.
+- **End to end:** the inspect tasks of 2026-10-04 re-run with this build on today's `main`:
+  - kb-vision → accepted, 2 dispatches → **accepted** (worker $0.04, review $0.09);
+  - application-landscape → accepted → **accepted** (before 4fb44ac: worker $0.02, review $0.14);
+  - duro-design-system → accepted, 2 dispatches → **accepted, 2 dispatches, $0.10**. Before 4fb44ac it was a false not met, then a repair: $0.44.
+  - social-planner was not run, because its checkout has uncommitted work.
+  - **Not exercised:** all three bases are green today, so the red-base path is proven only by the runner tests.
+- **Fabricated report, against reality:** an inspect contract tells the worker to list a non-existent `kubernetes-operators/` → not met, naming the path, one same-tier repair, then `failed (criteria_unmet)` with no escalation → exactly that: worker, review, haiku repair, review, `criteria_unmet`. $0.14.
+- **Cost:** each report review cost $0.04–0.09 after 4fb44ac, against a $0.02–0.04 worker. That is above the plan's estimate of about $0.02, and below the $0.12–0.25 before the tree listing.
+
+## Outcome
+Shipped A1, A2, B and C, plus the tree listing found in end-to-end verification. A read-only inspection is judged by a reviewer that checks the report against git's view of the tree. It is never repaired because the base's checks were already failing. A shape refusal in the sandbox costs one same-tier repair instead of the run. The probe pins the shapes the worker rules recommend. Surprise: read-only tools cannot see directories, so the reviewer needed relais to hand it the tree.
+
 <!-- panel: repos=relais adds= reviewers=backend body-sha=0207cc81f05b -->
