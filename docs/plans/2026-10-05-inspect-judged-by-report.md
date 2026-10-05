@@ -182,4 +182,23 @@ Each package gets `make check`, falsification of its key test with a forced rebu
 - **C:** the probe plan test and pinned digest; then a real `relais doctor --verify-sandbox` on 2.1.289 passes all steps, including the two new ones.
 - **End to end:** re-run the four failed inspect tasks of 2026-10-04 against their red bases. All four must be accepted, each with 2 dispatches (worker and report review) and 0 repairs, and the base failure listed as not judged. Then the next ordinary sandboxed run is #105's run 8.
 
+## Phases
+- [x] 0 — issue #167 opened; plan landed as the first commit (5689380).
+- [x] A1 — an inspection on a red base behaves as on a green base (43f4162, e3043bd).
+- [x] A2 — the report review judges an inspection (561b3bc, 8fbc761).
+- [x] B — a sandbox shape refusal costs a same-tier repair (8a376ab, e11a9ac).
+- [x] C — the probe checks the shapes the rules recommend; PROBE_VERSION 6 (743fa7a).
+
+## Decision log
+- 2026-10-05: **A1 makes a red base behave as a green one,** not a half-state. On a green base an inspection was already accepted with nobody judging its report, so A1 gives red bases that same guarantee, and A1 alone is releasable. A2 then tightens both with the report review. This supersedes the plan's "A1 on its own is not releasable" note.
+- 2026-10-05: **A2's scope gained `sandbox/verify.rs`.** Its `LaunchSpec` literal breaks once the tool set is a launch field. The plan's scope missed it; the contract pre-flight grep caught it before the run.
+- 2026-10-05: **Two shapes added to B, newly measured in A1's own sandboxed run** (Claude Code 2.1.289):
+  - "Contains brace with quote character (expansion obfuscation)", from a python heredoc with a `{'` dict literal;
+  - a leading `cd …;`, refused as needing approval.
+
+  Both came from a worker editing Rust through python scripts. So B's rewrite for them is "use the Edit tool", and the sandbox rules regain "edit files with your Edit/Write tools" and "never start a command with `cd`".
+- 2026-10-05: **A contract fault (mine).** A2's follow-up stopped on `scope_exceeded`: a one-line `notes: Vec::new()` in a `main.rs` test literal. The pre-flight grep had listed `main.rs`, but I launched in the same command without reading its output. I verified the candidate by hand: `make check`, plus the key tests falsified.
+- 2026-10-05: **A hand fix in B's review round.** A shape-refused attempt that touched the profile's tests still entered `verifying` through the `VerificationInputsChanged` transition. That transition now comes after the shape decision, with a regression test, falsified.
+- 2026-10-05: **The person's default for the low item.** A claimed shape-refused attempt's row is finished `repairing`.
+
 <!-- panel: repos=relais adds= reviewers=backend body-sha=0207cc81f05b -->
