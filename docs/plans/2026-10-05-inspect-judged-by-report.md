@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/inspect-judged-by-report
 repos: [relais]
 adrs: []
@@ -243,5 +243,12 @@ Each check: what was driven → what was expected → what was observed.
 
 ## Outcome
 Shipped A1, A2, B and C, plus the tree listing found in end-to-end verification. A read-only inspection is judged by a reviewer that checks the report against git's view of the tree. It is never repaired because the base's checks were already failing. A shape refusal in the sandbox costs one same-tier repair instead of the run. The probe pins the shapes the worker rules recommend. Surprise: read-only tools cannot see directories, so the reviewer needed relais to hand it the tree.
+
+## Implementation review
+**approve**, on tree 803404c2, in two rounds:
+- Round 1 (approve-with-changes, 89k tokens, 112 s): six findings, all fixed in 859f03d. They were the empty-report record, per-check test names, the application-landscape re-run on this build, an exhaustive `ToolSet` match, and the repair addendum labelled by its cause. The init record was substituted deliberately: reviewers emit no init record, so an argv pin plus a harness measurement stand in.
+- Delta (approve, 48k tokens, 29 s): all resolved, nothing new.
+- Kept as deliberate: "This command requires approval" is classed as shape (sandbox-only; worst case is one bounded repair).
+- Left open: a red base end to end on a real repo, and whether the 400-file listing is worth a report review costing $0.04–0.09.
 
 <!-- panel: repos=relais adds= reviewers=backend body-sha=0207cc81f05b -->
