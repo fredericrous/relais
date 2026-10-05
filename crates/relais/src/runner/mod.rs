@@ -2980,15 +2980,23 @@ impl<'a> RunEngine<'a> {
             routed_by: preflight.decision.routed_by,
             covering: preflight.decision.covering.clone(),
         };
-        let verdict =
-            match self.review_report(&request, candidate, ctx.worktree_path, &mut progress.spend) {
-                Ok(verdict) => verdict,
-                Err(detail) => {
-                    return Ok(Step::Ended(
-                        self.stop(&progress.budget, Observation::ReviewUnavailable(detail))?,
-                    ));
-                }
-            };
+        // Not fatal: without the listing the reviewer works as it did before,
+        // and the prompt says so.
+        let tree = ctx.worktree.tracked_tree_in(&candidate.sha).ok();
+        let verdict = match self.review_report(
+            &request,
+            candidate,
+            ctx.worktree_path,
+            tree.as_ref(),
+            &mut progress.spend,
+        ) {
+            Ok(verdict) => verdict,
+            Err(detail) => {
+                return Ok(Step::Ended(
+                    self.stop(&progress.budget, Observation::ReviewUnavailable(detail))?,
+                ));
+            }
+        };
         let report = verification_report(ctx, candidate, &verified);
         let (criteria, _) = self.settle(ctx, &report, &verified.gate_coverage, Some(&verdict))?;
         let unmet: Vec<(usize, &verify::CriterionOutcome)> = criteria
@@ -3069,6 +3077,7 @@ impl<'a> RunEngine<'a> {
         request: &ReviewRequest<'_>,
         candidate: &Candidate,
         worktree: &Path,
+        tree: Option<&workspace::TrackedTree>,
         spend: &mut RunSpend,
     ) -> Result<verify::ReportVerdict, String> {
         let Some(profile) = request
@@ -3087,7 +3096,8 @@ impl<'a> RunEngine<'a> {
         }
         let statements = self.config.contract.acceptance_statements();
         let report = candidate.result_text.as_deref().unwrap_or_default();
-        let prompt = report_review_prompt(&self.config.contract.objective, &statements, report);
+        let prompt =
+            report_review_prompt(&self.config.contract.objective, &statements, report, tree);
         let seat = ReviewSeat {
             profile: &profile,
             tier: request.candidate_tier,
@@ -4414,7 +4424,12 @@ fn unmet_evidence(evidence: Option<&Evidence>) -> String {
 
 /// What an inspection's report reviewer is asked: the objective, the
 /// numbered criteria and the worker's report, all quoted as data.
-fn report_review_prompt(objective: &str, criteria: &[String], report: &str) -> String {
+fn report_review_prompt(
+    objective: &str,
+    criteria: &[String],
+    report: &str,
+    tree: Option<&workspace::TrackedTree>,
+) -> String {
     let mut prompt = String::from(
         "You are verifying an inspection. A worker investigated the files in this directory \
          and wrote the report below. You can only read: you cannot edit, run or waive \
@@ -4430,11 +4445,45 @@ fn report_review_prompt(objective: &str, criteria: &[String], report: &str) -> S
         .collect();
     prompt.push_str(&data_list_block("acceptance criteria", &numbered));
     prompt.push_str(&data_block("worker report", report));
+    prompt.push_str(&tracked_tree_section(tree));
     prompt.push_str(
         "\nAnswer with exactly one line per criterion, and nothing else: `[n] met: <what you \
          checked>` or `[n] not_met: <what you checked>`.\n",
     );
     prompt
+}
+
+/// How many tracked file paths the report reviewer is shown.
+const REPORT_REVIEW_FILE_CAP: usize = 400;
+
+/// The candidate's tracked tree for the report reviewer, taken from git by
+/// relais: its file tools cannot see directories and do see untracked ones.
+fn tracked_tree_section(tree: Option<&workspace::TrackedTree>) -> String {
+    let Some(tree) = tree else {
+        return "\nThe candidate's tracked listing is unavailable; check the claims with your \
+                tools alone.\n"
+            .into();
+    };
+    let mut section = String::from(
+        "\nThis listing is the candidate's tracked content, taken from git by relais and not \
+         by the worker; use it to decide which files and directories exist (the Glob tool \
+         matches files, not directories, and also sees untracked folders such as \
+         `node_modules`); read files for anything about their contents.\n",
+    );
+    section.push_str(&data_list_block("tracked top level", &tree.top_level));
+    let mut files: Vec<String> = tree
+        .files
+        .iter()
+        .take(REPORT_REVIEW_FILE_CAP)
+        .cloned()
+        .collect();
+    if let Some(more) = tree.files.len().checked_sub(REPORT_REVIEW_FILE_CAP) {
+        if more > 0 {
+            files.push(format!("(... {more} more)"));
+        }
+    }
+    section.push_str(&data_list_block("tracked files", &files));
+    section
 }
 
 /// The review record a receipt carries, read from the ledger that
@@ -7547,6 +7596,38 @@ mod tests {
         assert!(report.contains("src/main.rs exists"), "{report}");
         assert_eq!(review.work_dir, worker.work_dir, "the candidate worktree");
         std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn the_report_review_prompt_carries_the_tracked_tree_from_git() {
+        let criteria = vec!["the layout is described".to_string()];
+        let files: Vec<String> = (0..450).map(|n| format!("src/f{n:03}.rs")).collect();
+        let tree = workspace::TrackedTree {
+            top_level: vec![".adr/".into(), "README.md".into(), "src/".into()],
+            files,
+        };
+        let prompt = report_review_prompt("Report the layout.", &criteria, "DONE", Some(&tree));
+        let top = fenced(&prompt, "tracked top level").expect("top level block");
+        assert!(top.contains("- .adr/") && top.contains("- src/"), "{top}");
+        assert!(
+            top.contains("- README.md") && !top.contains("README.md/"),
+            "{top}"
+        );
+        let listed = fenced(&prompt, "tracked files").expect("files block");
+        assert!(listed.contains("- src/f399.rs"), "{listed}");
+        assert!(!listed.contains("src/f400.rs"), "capped at 400: {listed}");
+        assert!(listed.contains("(... 50 more)"), "{listed}");
+        assert!(prompt.contains("taken from git by relais and not by the worker"));
+        assert!(prompt.contains("the Glob tool matches files, not directories"));
+        assert!(fenced(&prompt, "worker report").is_some());
+        assert!(prompt.contains("[1] the layout is described"));
+        assert!(prompt.ends_with(
+            "Answer with exactly one line per criterion, and nothing else: `[n] met: <what you \
+             checked>` or `[n] not_met: <what you checked>`.\n"
+        ));
+        let unavailable = report_review_prompt("o", &criteria, "DONE", None);
+        assert!(unavailable.contains("listing is unavailable"));
+        assert!(fenced(&unavailable, "tracked files").is_none());
     }
 
     #[test]

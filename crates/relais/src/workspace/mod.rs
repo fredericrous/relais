@@ -250,6 +250,16 @@ pub struct TaskWorktree {
     pub base_sha: String,
 }
 
+/// What git tracks in a candidate: the ground truth a read-only reviewer
+/// cannot get from its file tools.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackedTree {
+    /// Top-level entries, sorted; a directory carries a trailing `/`.
+    pub top_level: Vec<String>,
+    /// Every tracked file path, sorted.
+    pub files: Vec<String>,
+}
+
 pub fn create_worktree(
     repo_dir: &Path,
     base_sha: &str,
@@ -357,6 +367,38 @@ impl TaskWorktree {
         paths.sort();
         paths.dedup();
         Ok(paths)
+    }
+
+    /// The candidate's tracked content, read from the commit object: its
+    /// top-level entries (a directory ends in `/`) and every tracked file
+    /// path. NUL-separated for the same reason as `changed_paths_in`.
+    pub fn tracked_tree_in(&self, candidate_sha: &str) -> Result<TrackedTree> {
+        let top = git_raw(&self.path, &["ls-tree", "-z", candidate_sha])?;
+        let files = git_raw(
+            &self.path,
+            &["ls-tree", "-r", "-z", "--name-only", candidate_sha],
+        )?;
+        let mut top_level: Vec<String> = top
+            .split('\0')
+            .filter(|entry| !entry.is_empty())
+            .filter_map(|entry| {
+                // `<mode> SP <type> SP <sha> TAB <name>`
+                let (meta, name) = entry.split_once('\t')?;
+                Some(if meta.starts_with("040000 ") {
+                    format!("{name}/")
+                } else {
+                    name.to_string()
+                })
+            })
+            .collect();
+        top_level.sort();
+        let mut files: Vec<String> = files
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(|path| path.to_string())
+            .collect();
+        files.sort();
+        Ok(TrackedTree { top_level, files })
     }
 
     /// Does the candidate carry the same tree as the base? Knowable from
@@ -1246,6 +1288,31 @@ mod tests {
         assert!(
             err.to_string().contains("réglages.json (protected"),
             "{err}"
+        );
+        remove_worktree(&repo, &wt_path);
+    }
+
+    #[test]
+    fn the_tracked_tree_marks_directories_and_lists_tracked_files_only() {
+        let (_dir, repo) = temp_repo();
+        let sha = resolve_base(&repo, "HEAD").expect("base");
+        let wt_path = repo.parent().unwrap().join("wt-tree");
+        let wt = create_worktree(&repo, &sha, &wt_path).expect("worktree");
+        std::fs::create_dir_all(wt_path.join(".hidden")).expect("mkdir");
+        std::fs::write(wt_path.join(".hidden/a.txt"), "a\n").expect("write");
+        let candidate = wt.snapshot_candidate("attempt-1").expect("snapshot");
+        // Untracked after the snapshot: the listing is the commit's.
+        std::fs::write(wt_path.join("untracked.txt"), "u\n").expect("write");
+        let tree = wt.tracked_tree_in(&candidate).expect("tree");
+        assert_eq!(
+            tree.top_level,
+            vec![".hidden/", "file.txt", "src/"],
+            "directories, the hidden one included, end in a slash"
+        );
+        assert_eq!(
+            tree.files,
+            vec![".hidden/a.txt", "file.txt", "src/main.rs"],
+            "tracked files only"
         );
         remove_worktree(&repo, &wt_path);
     }
