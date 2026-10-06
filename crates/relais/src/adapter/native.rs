@@ -25,7 +25,7 @@ use crate::backend::{
 };
 use crate::money::MicroUsd;
 use crate::native::{has_worker_definition, marker_line, worker_agent_type};
-use crate::orchestration::{parse_transcript, price, PriceTable, UsageRecord};
+use crate::orchestration::{parse_transcript, price, unpriced_reason, PriceTable, UsageRecord};
 use crate::policy::EffortId;
 use crate::procs::Ended;
 
@@ -186,6 +186,9 @@ enum Awaited {
 struct Booked {
     usage: UsageReport,
     effective_model: Option<String>,
+    /// Why records could not be priced, one line per model and reason,
+    /// in transcript order: what the runner's backstop names.
+    unpriced: Vec<String>,
 }
 
 /// Usage of the records not booked yet: tokens summed, cost estimated from
@@ -196,7 +199,23 @@ fn usage_of(records: &[UsageRecord], prices: Option<&PriceTable>) -> Booked {
         return Booked {
             usage: UsageReport::unknown(),
             effective_model: None,
+            unpriced: Vec::new(),
         };
+    }
+    let mut unpriced: Vec<String> = Vec::new();
+    for record in records {
+        let reason = match prices {
+            Some(table) => unpriced_reason(record, table),
+            None => Some(format!(
+                "{}: this machine has no [pricing] table",
+                record.model
+            )),
+        };
+        if let Some(reason) = reason {
+            if !unpriced.contains(&reason) {
+                unpriced.push(reason);
+            }
+        }
     }
     let sum = |of: fn(&UsageRecord) -> u64| {
         let total: u64 = records.iter().map(of).sum();
@@ -224,6 +243,7 @@ fn usage_of(records: &[UsageRecord], prices: Option<&PriceTable>) -> Booked {
             cost,
         },
         effective_model: records.last().map(|record| record.model.clone()),
+        unpriced,
     }
 }
 
@@ -242,6 +262,7 @@ fn ended_result(spec: &LaunchSpec, ended: Ended, detail: String) -> LaunchResult
         permission_denials: Vec::new(),
         failure_detail: Some(detail),
         booked_message_ids: Vec::new(),
+        unpriced: Vec::new(),
     }
 }
 
@@ -479,6 +500,7 @@ impl<'a> NativeBackend<'a> {
             permission_denials: Vec::new(),
             failure_detail: None,
             booked_message_ids: fresh.into_iter().map(|record| record.message_id).collect(),
+            unpriced: booked.unpriced,
         }
     }
 
@@ -829,6 +851,34 @@ mod tests {
         };
         assert_eq!(stop().booked_message_ids, ["m1", "m2"]);
         assert!(stop().booked_message_ids.is_empty());
+    }
+
+    /// The reasons are said record by record, never inferred from the
+    /// total: a fast-mode record of a priced model lacks a fast rate, it
+    /// does not lack an entry; and an unpriced model followed by a priced
+    /// one is the one named.
+    #[test]
+    fn unpriced_records_are_named_with_their_own_reason() {
+        let mut fast = record("m1", "sonnet-x", 10, 5);
+        fast.speed = Speed::Other("fast".into());
+        let booked = usage_of(&[fast], Some(&table()));
+        assert_eq!(booked.usage.cost, Cost::Unknown);
+        assert_eq!(
+            booked.unpriced,
+            vec![
+                "sonnet-x's [pricing.models] entry has no fast-mode rate (fast_input, fast_output)"
+                    .to_string()
+            ]
+        );
+        let mixed = [record("m1", "other", 1, 1), record("m2", "sonnet-x", 10, 5)];
+        let booked = usage_of(&mixed, Some(&table()));
+        assert_eq!(booked.effective_model.as_deref(), Some("sonnet-x"));
+        assert_eq!(
+            booked.unpriced,
+            vec!["other has no [pricing.models] entry".to_string()]
+        );
+        let priced = usage_of(&[record("m1", "sonnet-x", 10, 5)], Some(&table()));
+        assert!(priced.unpriced.is_empty());
     }
 
     #[test]

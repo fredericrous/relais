@@ -2684,6 +2684,24 @@ fn run_command(
         Some(_) => Some(load_price_table()?),
         None => None,
     };
+    if let Some(table) = &prices {
+        let mut aliases: Vec<String> = repo.models.values().map(|m| m.id.clone()).collect();
+        aliases.sort();
+        aliases.dedup();
+        let observations = operational(ledger.model_observations(), "model observations")?;
+        let machine_toml = paths::machine_settings_path().map_err(CliError::Home)?;
+        let decided =
+            relais::native_pricing::preflight(&aliases, table, &observations, &machine_toml);
+        for warning in &decided.warnings {
+            eprintln!("{warning}");
+        }
+        if !decided.refusals.is_empty() {
+            for refusal in &decided.refusals {
+                eprintln!("relais run: {refusal}");
+            }
+            return Ok(CliOutcome::Blocked);
+        }
+    }
     let native_backend = native.map(|spawn_wait| {
         relais::adapter::native::NativeBackend::new(
             backend.as_ref(),

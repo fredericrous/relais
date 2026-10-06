@@ -616,6 +616,22 @@ struct Progress {
     last_candidate: Option<String>,
     spend: RunSpend,
     models_used: Vec<String>,
+    /// The model the last attempt booked a native record of that has no
+    /// price: its cost settled as the whole reservation, so no further
+    /// attempt is admitted (SPEC §11).
+    unpriced_model: Option<Vec<String>>,
+}
+
+/// The model a native attempt's booked usage could not price, if any. A
+/// headless attempt keeps the unknown-cost rule it always had.
+fn unpriced_native_model(presentation: Presentation, result: &LaunchResult) -> Option<Vec<String>> {
+    match presentation {
+        Presentation::Headless => None,
+        // Named record by record where they were priced, never inferred
+        // from the total: a fast-mode record of a priced model, or an
+        // earlier record of another model, is said as what it is.
+        Presentation::Native => (!result.unpriced.is_empty()).then(|| result.unpriced.clone()),
+    }
 }
 
 impl<'a> RunEngine<'a> {
@@ -1945,6 +1961,7 @@ impl<'a> RunEngine<'a> {
             last_candidate: None,
             spend: RunSpend::zero(),
             models_used: Vec::new(),
+            unpriced_model: None,
         };
 
         loop {
@@ -1960,8 +1977,20 @@ impl<'a> RunEngine<'a> {
                 Phase::Ready(candidate) => candidate,
             };
             match self.judge_candidate(ctx, &mut progress, candidate)? {
-                Step::Again => continue,
                 Step::Ended(outcome) => return Ok(outcome),
+                // The attempt is booked and judged; only a further dispatch
+                // is replaced by the block.
+                Step::Again => {
+                    if let Some(model) = progress.unpriced_model.take() {
+                        let machine_toml = crate::paths::machine_settings_path()
+                            .unwrap_or_else(|_| PathBuf::from("machine.toml")); // detail only names the file
+                        return self.block(
+                            Reason::BlockedPreflight,
+                            BlockCode::NativeUnpriced,
+                            crate::native_pricing::backstop_detail(&model, &machine_toml),
+                        );
+                    }
+                }
             }
         }
     }
@@ -2246,6 +2275,7 @@ impl<'a> RunEngine<'a> {
             ledger.record_native_usage(&event, &result.booked_message_ids)?;
         }
         progress.spend.fold(event.cost, usage.cost.completeness());
+        progress.unpriced_model = unpriced_native_model(self.config.worker_presentation, &result);
 
         // What the sandbox denied, however the attempt went: AFTER the cost
         // is recorded (a failure to write the report must not lose it),
@@ -13688,6 +13718,135 @@ mod tests {
             assert_eq!(rows[0].2, None, "an unpriced cost is not zero: {rows:?}");
             assert!(rows[0].4.contains("unknown"), "{rows:?}");
             std::fs::remove_dir_all(&fixture.dir).ok();
+        }
+
+        /// The test prices without the sonnet id: the model attempt 1 runs as.
+        fn prices_without_sonnet() -> PriceTable {
+            let mut table = prices();
+            table
+                .models
+                .retain(|price| price.ids != [concrete("sonnet")]);
+            table
+        }
+
+        #[test]
+        fn an_unpriced_model_that_fails_verification_ends_blocked_with_no_second_dispatch() {
+            let fixture = Fixture::new();
+            let run = run_native(
+                &fixture,
+                Review::Optional,
+                3,
+                Parent::Obeys,
+                fixes_on_escalation,
+                Some(prices_without_sonnet()),
+                |_| {},
+            );
+            let Terminal::Blocked { code, detail } = &run.outcome.terminal else {
+                panic!("expected a blocked run, got {:?}", run.outcome);
+            };
+            assert_eq!(*code, BlockCode::NativeUnpriced);
+            assert!(detail.contains("native_unpriced"), "{detail}");
+            assert!(detail.contains("claude-sonnet-5"), "{detail}");
+            assert!(detail.contains("[pricing.models]"), "{detail}");
+            assert!(
+                matches!(run.seen.as_slice(), [Seen::Spawn { .. }]),
+                "no request line after the first: {:?}",
+                run.seen
+            );
+            assert_eq!(
+                dispatch_rows(&fixture, &run.outcome.run_id).len(),
+                1,
+                "no second admission request"
+            );
+            // The attempt itself was booked, its cost unknown.
+            let rows = native_usage(&fixture, &run.outcome.run_id);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].2, None, "{rows:?}");
+            std::fs::remove_dir_all(&fixture.dir).ok();
+        }
+
+        #[test]
+        fn a_priced_model_that_fails_verification_repairs_as_before() {
+            let fixture = Fixture::new();
+            let run = run_native(
+                &fixture,
+                Review::Optional,
+                3,
+                Parent::Obeys,
+                fixes_on_escalation,
+                Some(prices()),
+                |_| {},
+            );
+            assert!(
+                matches!(run.outcome.terminal, Terminal::Accepted(_)),
+                "{:?}",
+                run.outcome
+            );
+            assert!(
+                run.seen
+                    .iter()
+                    .any(|seen| matches!(seen, Seen::Continue { .. })),
+                "the repair continued the agent: {:?}",
+                run.seen
+            );
+            std::fs::remove_dir_all(&fixture.dir).ok();
+        }
+
+        #[test]
+        fn an_attempt_accepted_with_an_unpriced_record_stays_accepted() {
+            let fixture = Fixture::new();
+            let run = run_native(
+                &fixture,
+                Review::Optional,
+                3,
+                Parent::Obeys,
+                fixes_at_once,
+                Some(prices_without_sonnet()),
+                |_| {},
+            );
+            assert!(
+                matches!(run.outcome.terminal, Terminal::Accepted(_)),
+                "{:?}",
+                run.outcome
+            );
+            std::fs::remove_dir_all(&fixture.dir).ok();
+        }
+
+        #[test]
+        fn a_headless_attempt_with_an_unknown_cost_is_never_an_unpriced_native_model() {
+            let result = LaunchResult {
+                dispatch_id: "d".into(),
+                ended: Ended::Exited(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                result_text: Some("done".into()),
+                session_id: None,
+                effective_model: Some("claude-sonnet-5".into()),
+                usage: crate::backend::UsageReport::unknown(),
+                worker_claims_blockage: false,
+                permission_denials: Vec::new(),
+                failure_detail: None,
+                booked_message_ids: Vec::new(),
+                unpriced: Vec::new(),
+            };
+            assert_eq!(unpriced_native_model(Presentation::Headless, &result), None);
+            assert_eq!(
+                unpriced_native_model(Presentation::Native, &result),
+                None,
+                "no booked record, nothing to price"
+            );
+            let booked = LaunchResult {
+                booked_message_ids: vec!["m1".into()],
+                unpriced: vec!["claude-sonnet-5 has no [pricing.models] entry".into()],
+                ..result
+            };
+            assert_eq!(unpriced_native_model(Presentation::Headless, &booked), None);
+            assert_eq!(
+                unpriced_native_model(Presentation::Native, &booked),
+                Some(vec![
+                    "claude-sonnet-5 has no [pricing.models] entry".to_string()
+                ])
+            );
         }
 
         #[test]

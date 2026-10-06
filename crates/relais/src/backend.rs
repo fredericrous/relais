@@ -644,6 +644,11 @@ pub struct LaunchResult {
     /// records them so `usage import` does not count them again (SPEC §11).
     #[serde(default)]
     pub booked_message_ids: Vec<String>,
+    /// Why some of those messages could not be priced, one line per model
+    /// and reason (`orchestration::unpriced_reason`): only a native
+    /// worker's, empty when every booked message priced.
+    #[serde(default)]
+    pub unpriced: Vec<String>,
 }
 
 impl LaunchResult {
@@ -906,6 +911,7 @@ mod tests {
             permission_denials: Vec::new(),
             failure_detail: None,
             booked_message_ids: Vec::new(),
+            unpriced: Vec::new(),
         };
         assert!(result.terminal_result_missing());
         let completed = LaunchResult {
@@ -954,6 +960,7 @@ mod tests {
             permission_denials: Vec::new(),
             failure_detail: None,
             booked_message_ids: vec!["m1".into()],
+            unpriced: Vec::new(),
         })
         .expect("serializes");
         stored

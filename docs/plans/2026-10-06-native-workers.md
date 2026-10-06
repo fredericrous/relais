@@ -248,6 +248,12 @@ Checks green, then `needs_review` with two findings, fixed by hand:
 
 <!-- panel: repos=relais adds= reviewers=backend body-sha=ebe649d81b94 -->
 
+**2026-10-06, N5, an unpriced model** (the person chose "refuse up front"; run-65d2db015ef2d-8c0f, sonnet@medium, one attempt, $1.85). It added:
+- a preflight: each tier's model, resolved through the ledger's latest observation, must be priced, or the run refuses `native_unpriced` naming alias, id and the rates page; a model never observed passes with a warning;
+- a runtime backstop: an attempt with unpriced records is booked and judged, and the run ends `blocked (native_unpriced)` instead of requesting another admission.
+
+Checks green, then `needs_review` with one finding, fixed by hand: the backstop inferred "unpriced" from the total and named the last record's model, so a fast-mode record of a priced model was reported as "no entry", and an earlier unpriced model went unnamed. Now `orchestration::unpriced_reason` says it record by record (no entry / no fast-mode rate / no price table), carried on `LaunchResult.unpriced`. `make check` green (1,322 lib tests); falsified the fast-rate reason and the backstop. Also: `claude-sonnet-5-5` added to the machine's price table (same rates as Sonnet 5, per the published pricing page), with a backup beside it. Decision left open, to answer `salvaged` with the merge sha.
+
 ## Verification record (2026-10-06, before push)
 
 Against reality: a `claude -p --model sonnet` parent in a scratch repo, project settings only (hooks on this branch's binary), `RELAIS_CONFIG_DIR`/`RELAIS_STATE_DIR` isolated (scratch grant, `[sandbox]` off), driven through the installed `/relais` skill. Input → expected → actual:

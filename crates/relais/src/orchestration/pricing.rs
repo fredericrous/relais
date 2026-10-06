@@ -55,6 +55,11 @@ impl PriceTable {
         }
     }
 
+    /// Whether an entry names `model`: a record of that model prices.
+    pub fn prices(&self, model: &str) -> bool {
+        self.rate_for(model).is_some()
+    }
+
     fn rate_for(&self, model: &str) -> Option<&ModelPrice> {
         self.models.iter().find(|price| price.matches(model))
     }
@@ -84,6 +89,25 @@ fn micros_for(tokens: u64, rate_per_million_micros: i64) -> MicroUsd {
 /// non-standard speed the table has no fast rate for, prices as
 /// `cost: None` with `completeness: Unknown` — a missing price is never
 /// zero (SPEC §11).
+/// Why [`price`] could not price a record, said the way a person fixes it:
+/// the model has no entry at all, or its entry has no fast-mode rate for a
+/// fast-mode record. `None` when the record prices.
+pub fn unpriced_reason(record: &UsageRecord, table: &PriceTable) -> Option<String> {
+    let Some(rate) = table.rate_for(&record.model) else {
+        return Some(format!("{} has no [pricing.models] entry", record.model));
+    };
+    match &record.speed {
+        Speed::Standard => None,
+        Speed::Other(_) => match (rate.fast_input, rate.fast_output) {
+            (Some(_), Some(_)) => None,
+            _ => Some(format!(
+                "{}'s [pricing.models] entry has no fast-mode rate (fast_input, fast_output)",
+                record.model
+            )),
+        },
+    }
+}
+
 pub fn price(record: &UsageRecord, table: &PriceTable) -> Priced {
     let pricing_version = table.version.clone();
     let unknown = || Priced {

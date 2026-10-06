@@ -129,6 +129,7 @@ impl Backend for MockBackend {
             permission_denials: outcome.permission_denials,
             failure_detail: None,
             booked_message_ids: Vec::new(),
+            unpriced: Vec::new(),
         })
     }
 }

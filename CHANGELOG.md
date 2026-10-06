@@ -10,6 +10,13 @@ missing here.
 
 ### Added
 
+- `relais run --native` refuses up front, `native_unpriced`, when a model it
+  can dispatch has no `[pricing.models]` entry (the effective model the ledger
+  last saw for the alias, or no price table at all), naming the alias, the id
+  and `machine.toml`; a never-seen alias goes on with a warning. If an attempt
+  still books a record it cannot price, the run ends `blocked:native_unpriced`
+  after that attempt instead of on a `budget_exceeded` refusal: an unknown
+  cost settles as the attempt's whole reservation, the run's budget.
 - The hook can read and answer native-worker payloads (groundwork for
   native workers; nothing installs the new event yet). It parses an Agent
   call's `tool_input`, `SendMessage` calls, `WorktreeCreate`, and the

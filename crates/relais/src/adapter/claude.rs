@@ -282,6 +282,7 @@ impl Backend for ClaudeBackend {
             permission_denials: parsed.permission_denials,
             failure_detail,
             booked_message_ids: Vec::new(),
+            unpriced: Vec::new(),
         })
     }
 }
