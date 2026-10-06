@@ -104,6 +104,9 @@ const SOCKET_BIND: &str = "import os,socket,sys;\
 /// `$TMPDIR` itself, the way the worker rules say to.
 const PYTHON_WRITE: &str = "python3 -c \"import os;p=os.environ['TMPDIR']+'/p.txt';\
      open(p,'w').write('y\\n');print(open(p).read().strip())\"";
+/// The local-bind step's command: listen on an ephemeral loopback port.
+const LOCAL_BIND: &str = "python3 -c \"import socket;s=socket.socket();\
+     s.bind(('127.0.0.1',0));s.listen();print('local-bound')\"";
 const PRESENCE: &str = ">/dev/null && echo PRESENT || echo absent";
 
 fn bash(id: &'static str, input: String, expect: Expect) -> ProbeStep {
@@ -187,6 +190,9 @@ pub fn probe_plan(inputs: &ProbePlanInputs) -> Result<Vec<ProbeStep>, String> {
             PYTHON_WRITE.to_string(),
             line("y"),
         ),
+        // A worker's tests may start a local server: binding a local TCP
+        // port must work (measured on 2.1.291 with `allowLocalBinding`).
+        bash("local-bind", LOCAL_BIND.to_string(), line("local-bound")),
         bash(
             "tmp-write",
             format!("touch /tmp/relais-probe-{nonce}"),
@@ -706,6 +712,7 @@ mod tests {
             "unix-socket" => SOCKET_BOUND.to_string(),
             "log-redirect" => "x".to_string(),
             "python-write" => "y".to_string(),
+            "local-bind" => "local-bound".to_string(),
             "tmp-write" | "home-write" => format!(
                 "Exit code 1\n(eval):1: operation not permitted: {}",
                 step.input
@@ -1212,6 +1219,7 @@ mod tests {
                 "unix-socket",
                 "log-redirect",
                 "python-write",
+                "local-bind",
                 "tmp-write",
                 "home-write",
                 "network",
@@ -1248,6 +1256,10 @@ mod tests {
         assert_eq!(
             input("python-write"),
             "python3 -c \"import os;p=os.environ['TMPDIR']+'/p.txt';open(p,'w').write('y\\n');print(open(p).read().strip())\""
+        );
+        assert_eq!(
+            input("local-bind"),
+            "python3 -c \"import socket;s=socket.socket();s.bind(('127.0.0.1',0));s.listen();print('local-bound')\""
         );
         assert!(
             steps.iter().all(|s| !s.input.contains('\n')),

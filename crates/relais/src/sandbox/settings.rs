@@ -82,10 +82,17 @@ pub fn build_settings(inputs: &SettingsInputs) -> Value {
             // Binding a Unix socket is refused anywhere not listed here
             // (measured on 2.1.286/macOS); the scratch is the one place
             // a worker's own tools, tests included, may bind one.
+            // A worker's tests may start a local server (Go `httptest`,
+            // envtest, a Node test server): binding a local TCP port is
+            // refused unless `allowLocalBinding` is set (measured on
+            // 2.1.291). It covers `0.0.0.0` too, so such a server is
+            // reachable from the LAN while it runs; outbound stays limited
+            // to `allowedDomains` (the owner's decision, #105).
             "network": {
                 "allowedDomains": inputs.network,
                 "strictAllowlist": true,
                 "allowUnixSockets": [text(inputs.scratch)],
+                "allowLocalBinding": true,
             },
             "credentials": {"files": files, "envVars": env_vars},
         },
@@ -149,6 +156,7 @@ mod tests {
         assert_eq!(sandbox["failIfUnavailable"], true);
         assert_eq!(sandbox["excludedCommands"], json!([]));
         assert_eq!(sandbox["network"]["strictAllowlist"], true);
+        assert_eq!(sandbox["network"]["allowLocalBinding"], true);
         assert_eq!(
             sandbox["network"]["allowedDomains"],
             json!(["api.anthropic.com"])
