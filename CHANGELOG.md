@@ -8,6 +8,14 @@ missing here.
 
 ## Unreleased
 
+### Fixed
+
+- A native attempt whose cost could not be priced is booked as
+  `estimated_api_equivalent` with an unknown figure, not as `api_spend`.
+- A `RELAIS_STATE_DIR` whose coordinator socket path is longer than the OS
+  can bind (103 bytes on macOS, 107 on Linux) is refused with that reason and
+  the remedy, instead of "it did not answer within the start timeout".
+
 ### Added
 
 - `relais run --native` refuses up front, `native_unpriced`, when a model it

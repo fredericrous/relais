@@ -2259,7 +2259,13 @@ impl<'a> RunEngine<'a> {
             cache_read_tokens: usage.cache_read_tokens,
             cache_write_tokens: usage.cache_write_tokens,
             cost: usage.cost.micros(),
-            cost_kind: usage.cost.kind(),
+            // A native attempt's cost is always tokens times the price table,
+            // known or not: an unpriced one is still an estimate that could
+            // not be made, never API spend somebody reported.
+            cost_kind: match self.config.worker_presentation {
+                Presentation::Headless => usage.cost.kind(),
+                Presentation::Native => crate::money::CostKind::EstimatedApiEquivalent,
+            },
             completeness: usage.cost.completeness(),
             inclusive: usage.cost.inclusive(),
             at: self.config.ledger.now(),
@@ -13762,6 +13768,10 @@ mod tests {
             let rows = native_usage(&fixture, &run.outcome.run_id);
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].2, None, "{rows:?}");
+            assert!(
+                rows[0].3.contains("EstimatedApiEquivalent"),
+                "an unpriced native cost is still an estimate: {rows:?}"
+            );
             std::fs::remove_dir_all(&fixture.dir).ok();
         }
 
