@@ -247,3 +247,26 @@ Checks green, then `needs_review` with two findings, fixed by hand:
 `make check` green (1,309 lib tests). Falsified: the insert guard. Decision left open, to answer `salvaged` with the merge sha.
 
 <!-- panel: repos=relais adds= reviewers=backend body-sha=ebe649d81b94 -->
+
+## Verification record (2026-10-06, before push)
+
+Against reality: a `claude -p --model sonnet` parent in a scratch repo, project settings only (hooks on this branch's binary), `RELAIS_CONFIG_DIR`/`RELAIS_STATE_DIR` isolated (scratch grant, `[sandbox]` off), driven through the installed `/relais` skill. Input → expected → actual:
+
+| Check | Expected | Actual |
+|---|---|---|
+| `/relais` on a one-file change | the parent runs `relais run --native` in the background, spawns from `RELAIS-SPAWN`, accepted | run-65d2cb2b5afa8-a23e: `relais-worker-sonnet-medium` spawned with the line's fields, edited `greet.py` in relais's worktree (`/tmp/rne2e/state/worktrees/…/task`), **accepted** |
+| ledger row | one dispatch `native_run` with a non-null agent id | `native_run`, `a75cf9020242d8ddb` |
+| usage once | tokens = transcript's sum over distinct `message.id` (last usage) | 3 ids booked; in 6 / out 182 = 2+2+2 / 88+16+78, the duplicated record counted once |
+| repair continues the agent | first attempt red → one `RELAIS-CONTINUE` to the same agent → accepted | run-65d2cf0fc2887-cf55: `SendMessage` to `a221768be79795230`; both dispatch rows `native_run` with that agent; **accepted** on attempt 2 |
+| repair booked only what it added | attempts 1+2 = whole transcript, nothing twice | 3 + 3 ids; in 14 / out 1,191 booked = transcript's distinct-id sum 14 / 1,191; `estimated_api_equivalent`, ¢1.40 + ¢1.37 |
+| parent changes the model | the agent runs relais's model | run-65d2cfab81dcc-da41: Agent called with `model: haiku`; transcript model `claude-sonnet-5-5`, meta `agentType` relais's, `worktreePath` relais's; accepted |
+| headless unchanged | `relais run` without `--native` → accepted, `managed_run` | run-65d2cfa66669f-d8ad: accepted, `managed_run`, `ApiSpend` $0.105, no native message rows |
+| marked spawn with the coordinator down; unknown/second marker | denied | hook tests on 2.1.291 fixtures (N1b); not re-driven live |
+
+Not observed here: the agents-panel row and Enter opening the transcript need an interactive session (the person's check after install). Latency: spawn line → bind took the parent 8–25 s per run (it reads the output file or arms Monitor first), well inside the 120 s spawn wait.
+
+Found by the end-to-end runs:
+- **An unpriced model breaks repairs.** A native attempt whose model has no `[pricing.models]` entry (here `claude-sonnet-5-5`; the machine lists `claude-sonnet-5`) has an unknown cost. It settles as its whole reservation, the run's budget, so the repair is refused: `budget_exceeded`, run-65d2ce4caa98b-c4d2. Pricing the id fixed it. Open for the person, with this branch.
+- An unknown native cost is labelled `api_spend` (the `Cost::Unknown` default kind), not `estimated_api_equivalent`. Follow-up.
+- A state dir whose socket path exceeds macOS's 104 bytes fails as "did not answer within the start timeout". Follow-up for a clearer error.
+- `relais install --hooks` refuses project hooks while user settings hold a relais hook. That is correct; the person updates the user-level hook with `relais install --claude --hooks --user --write`.
