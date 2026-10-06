@@ -36,6 +36,20 @@ missing here.
   on the agent's stop when nothing changed in it and kept otherwise. A tree
   that cannot be made fails the spawn with the reason, exit status 1.
 
+- `relais run --native` launches each worker attempt as a native subagent the
+  parent Claude Code session spawns, and judges it exactly as a headless one.
+  relais prints one `RELAIS-SPAWN <json>` line per spawn (or
+  `RELAIS-CONTINUE <json>` for a repair that continues the same agent) that is
+  exactly the tool input to send; an escalation to another model is a fresh
+  spawn. `--native-spawn-wait <SECONDS>` (default 120) bounds the wait for the
+  session: no spawn ends the attempt `native_spawn_missing` and the run stops
+  interrupted. It needs a parent Claude Code session and is refused without
+  one. A native worker's usage is read from its transcript, each message
+  booked once, and its cost is an API-equivalent estimate from the machine's
+  price table (unknown without one); its dispatch row is `native_run` and
+  names the agent. Headless `relais run` is unchanged. The worker agent
+  definitions and the skill flow that sends these lines come next.
+
 ### Changed
 
 - A sandboxed worker may bind a local TCP port (#105): the worker settings

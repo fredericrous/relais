@@ -23,7 +23,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::{Admission, EffortSet};
-use crate::money::{CostCompleteness, MicroUsd};
+use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::policy::EffortId;
 use crate::procs::{Ended, RunError};
 
@@ -408,6 +408,18 @@ pub enum ToolSet {
     ReadOnly,
 }
 
+/// How a launch is presented to the person running relais (SPEC §23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Presentation {
+    /// A child process relais starts and supervises: every launch but a
+    /// native worker's.
+    #[default]
+    Headless,
+    /// A subagent the parent Claude Code session spawns on relais's
+    /// behalf, so Claude Code renders it.
+    Native,
+}
+
 /// One model dispatch. The prompt travels via stdin; arguments are an
 /// argv array; the working directory is the owned task worktree.
 #[derive(Debug, Clone)]
@@ -443,6 +455,9 @@ pub struct LaunchSpec {
     pub sandbox: Option<SandboxLaunch>,
     /// The tools the harness is asked to expose.
     pub tools: ToolSet,
+    /// Who runs the launch: relais's own child process, or a native
+    /// subagent of the parent session.
+    pub presentation: Presentation,
 }
 
 /// What a sandboxed launch adds: the whole `--settings` JSON (sandbox,
@@ -510,6 +525,10 @@ pub enum Cost {
         /// inclusive parent: SPEC §11), so it is never summed with them.
         inclusive: bool,
     },
+    /// A figure relais computed from the usage it read (tokens times the
+    /// machine's price table), not one the harness reported: what the
+    /// same usage would cost at API rates.
+    Estimated { micros: MicroUsd },
     /// The harness reported no cost. Unknown, never zero (SPEC §11).
     #[default]
     Unknown,
@@ -519,8 +538,16 @@ impl Cost {
     /// The figure, when one was reported.
     pub fn micros(self) -> Option<MicroUsd> {
         match self {
-            Self::Reported { micros, .. } => Some(micros),
+            Self::Reported { micros, .. } | Self::Estimated { micros } => Some(micros),
             Self::Unknown => None,
+        }
+    }
+
+    /// What kind of money the figure is, as the ledger books it.
+    pub fn kind(self) -> CostKind {
+        match self {
+            Self::Reported { .. } | Self::Unknown => CostKind::ApiSpend,
+            Self::Estimated { .. } => CostKind::EstimatedApiEquivalent,
         }
     }
 
@@ -529,6 +556,7 @@ impl Cost {
     pub fn completeness(self) -> CostCompleteness {
         match self {
             Self::Reported { .. } => CostCompleteness::Actual,
+            Self::Estimated { .. } => CostCompleteness::Estimated,
             Self::Unknown => CostCompleteness::Unknown,
         }
     }
@@ -538,7 +566,7 @@ impl Cost {
     pub fn inclusive(self) -> bool {
         match self {
             Self::Reported { inclusive, .. } => inclusive,
-            Self::Unknown => false,
+            Self::Estimated { .. } | Self::Unknown => false,
         }
     }
 }
@@ -922,6 +950,16 @@ mod tests {
         assert!(reported.inclusive());
         assert_eq!(reported.completeness(), CostCompleteness::Actual);
         assert_eq!(UsageReport::unknown().cost, Cost::Unknown);
+
+        let estimated = Cost::Estimated {
+            micros: MicroUsd::from_micros(900),
+        };
+        assert_eq!(estimated.micros(), Some(MicroUsd::from_micros(900)));
+        assert!(!estimated.inclusive());
+        assert_eq!(estimated.completeness(), CostCompleteness::Estimated);
+        assert_eq!(estimated.kind(), CostKind::EstimatedApiEquivalent);
+        assert_eq!(reported.kind(), CostKind::ApiSpend);
+        assert_eq!(Cost::Unknown.kind(), CostKind::ApiSpend);
     }
 
     #[test]

@@ -209,6 +209,9 @@ pub enum EvidenceKind {
     /// What a sandboxed worker attempt was denied and how complete that
     /// account is (SPEC §8).
     SandboxDenials,
+    /// What relais did differently for a native worker than it asked
+    /// (SPEC §23): a continuation keeps its agent's own effort.
+    NativeNote,
 }
 
 impl EvidenceKind {
@@ -225,6 +228,7 @@ impl EvidenceKind {
             Self::HumanSignOff => "human_sign_off",
             Self::JunitReport => "junit_report",
             Self::SandboxDenials => "sandbox_denials",
+            Self::NativeNote => "native_note",
         }
     }
 
@@ -241,6 +245,7 @@ impl EvidenceKind {
             "human_sign_off" => Some(Self::HumanSignOff),
             "junit_report" => Some(Self::JunitReport),
             "sandbox_denials" => Some(Self::SandboxDenials),
+            "native_note" => Some(Self::NativeNote),
             _ => None,
         }
     }
@@ -3255,10 +3260,12 @@ impl Ledger {
     /// dispatch this function ever writes is a root managed worker a
     /// runner launches directly (SPEC §23) — a deeper, hook-admitted
     /// spawn never calls this, and never has a ledger row to adopt at
-    /// all. `source` is always `managed_run` for the same reason: this
-    /// function IS the managed path. Recording the three as constants
-    /// here is stating what is already true at the point of writing, not
-    /// a guess `live_dispatches` would otherwise have to make later.
+    /// all. `source` is written `managed_run`, the managed path's kind; a
+    /// native worker's row is relabelled `native_run` by
+    /// [`Self::record_native_dispatch`] right after, before its launch.
+    /// Recording these as constants here is stating what is true at the
+    /// point of writing, not a guess `live_dispatches` would otherwise
+    /// have to make later.
     pub fn record_dispatch_intent(
         &self,
         dispatch_id: &DispatchId,
@@ -3305,6 +3312,29 @@ impl Ledger {
                 pid.map(|pid| i64::from(pid.get())),
                 session_id,
                 "launched",
+                self.now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The dispatch's worker is a native subagent of the parent session:
+    /// its row says so, from before the launch (`agent_id` NULL), and
+    /// names the agent once the launch returns one. A NULL never
+    /// overwrites an agent already named.
+    pub fn record_native_dispatch(
+        &self,
+        dispatch_id: &DispatchId,
+        agent_id: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE dispatches SET source = ?2, agent_id = COALESCE(?3, agent_id),
+                 updated_at = ?4
+             WHERE dispatch_id = ?1",
+            params![
+                dispatch_id.as_str(),
+                crate::admission::DispatchSource::NativeRun.as_str(),
+                agent_id,
                 self.now()
             ],
         )?;

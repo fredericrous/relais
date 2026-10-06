@@ -688,6 +688,7 @@ mod tests {
             pid_slot: None,
             sandbox: None,
             tools: crate::backend::ToolSet::ModeDefault,
+            presentation: crate::backend::Presentation::Headless,
         }
     }
 

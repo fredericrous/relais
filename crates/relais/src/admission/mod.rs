@@ -29,6 +29,10 @@ pub use native::{
     RegisterOutcome, StopNativeOutcome, WorktreeOutcome,
 };
 
+/// Poll period while waiting on the coordinator: queued for admission, or
+/// for a native dispatch to progress.
+pub const ADMISSION_POLL: Duration = Duration::from_millis(250);
+
 /// A queued entry older than this jumps the session round-robin (SPEC
 /// §23: queue aging). It never jumps a cap.
 pub const AGING_AFTER: Duration = Duration::from_secs(30);
@@ -216,6 +220,9 @@ pub enum DispatchSource {
     ManagedRun,
     HookAdmitted,
     Observed,
+    /// A worker attempt of a `relais run --native`: a managed dispatch
+    /// whose worker is a subagent the parent session spawns (SPEC §23).
+    NativeRun,
 }
 
 impl DispatchSource {
@@ -224,6 +231,7 @@ impl DispatchSource {
             Self::ManagedRun => "managed_run",
             Self::HookAdmitted => "hook_admitted",
             Self::Observed => "observed",
+            Self::NativeRun => "native_run",
         }
     }
 }

@@ -142,6 +142,19 @@ enum Command {
         /// record.
         #[arg(long = "revise")]
         revise: Option<String>,
+        /// Launch each worker attempt as a native subagent the parent
+        /// Claude Code session spawns, so Claude Code renders it (SPEC §23).
+        /// Needs a parent Claude Code session
+        #[arg(long)]
+        native: bool,
+        /// How long to wait for the parent session to spawn a requested
+        /// native worker before the attempt ends `native_spawn_missing`
+        #[arg(
+            long = "native-spawn-wait",
+            value_name = "SECONDS",
+            requires = "native"
+        )]
+        native_spawn_wait: Option<u64>,
     },
     /// Show recent runs, or one run's current state
     Status { run_id: Option<String> },
@@ -814,7 +827,20 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             };
             plan_command(&task, revise.as_deref(), format)
         }
-        Command::Run { task, revise } => run_command(&task, revise.as_deref()),
+        Command::Run {
+            task,
+            revise,
+            native,
+            native_spawn_wait,
+        } => run_command(
+            &task,
+            revise.as_deref(),
+            native.then(|| {
+                std::time::Duration::from_secs(
+                    native_spawn_wait.unwrap_or(DEFAULT_NATIVE_SPAWN_WAIT),
+                )
+            }),
+        ),
         Command::Status { run_id } => status_command(run_id.as_deref()),
         Command::Explain { run_id } => explain_command(&run_id),
         Command::Resume {
@@ -2570,7 +2596,35 @@ fn plan_trial_lines(
     Ok(decision.lines())
 }
 
-fn run_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError> {
+/// Seconds `relais run --native` waits for the parent session to spawn a
+/// requested worker.
+const DEFAULT_NATIVE_SPAWN_WAIT: u64 = 120;
+
+/// Why a `--native` run cannot start under this session, if it cannot: a
+/// native worker is spawned by a parent Claude Code session, which a
+/// session id guessed from the parent process is not.
+fn native_session_refusal(
+    native: Option<std::time::Duration>,
+    session: &relais::coordinator::ResolvedSessionId,
+) -> Option<String> {
+    (native.is_some() && session.source.is_fallback()).then(|| {
+        "native workers need to run inside Claude Code: no CLAUDE_CODE_SESSION_ID in the \
+         environment names a parent session to spawn them"
+            .to_string()
+    })
+}
+
+/// `native` is the spawn wait of a `--native` run, `None` for a headless one.
+fn run_command(
+    task: &Path,
+    revise: Option<&str>,
+    native: Option<std::time::Duration>,
+) -> Result<CliOutcome, CliError> {
+    let session = relais::coordinator::resolve_session();
+    if let Some(detail) = native_session_refusal(native, &session) {
+        eprintln!("relais run: {detail}");
+        return Ok(CliOutcome::Blocked);
+    }
     let (root, repo) = load_repo_policy()?;
     let machine = load_machine()?;
     let contract = load_contract(task)?;
@@ -2623,7 +2677,29 @@ fn run_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError
         .as_ref()
         .map(|registry| RegistryPredictor::new(registry, &repo, harness.as_deref()));
     let ids = id_source();
-    let session = relais::coordinator::resolve_session();
+    // The worker attempts of a `--native` run go to the parent session;
+    // everything else stays on the Claude backend.
+    let prices = match native {
+        Some(_) => Some(load_price_table()?),
+        None => None,
+    };
+    let native_backend = native.map(|spawn_wait| {
+        relais::adapter::native::NativeBackend::new(
+            backend.as_ref(),
+            &gate,
+            session.id.clone(),
+            spawn_wait,
+            prices,
+        )
+    });
+    let run_backend: &dyn relais::backend::Backend = match &native_backend {
+        Some(native_backend) => native_backend,
+        None => backend.as_ref(),
+    };
+    let worker_presentation = match native {
+        Some(_) => relais::backend::Presentation::Native,
+        None => relais::backend::Presentation::Headless,
+    };
     // Printed here, before `execute`, so it is visible on every path —
     // including the `Err` arm below that returns early — and only once:
     // a run can take minutes, and deferring this to the end read as
@@ -2712,7 +2788,7 @@ fn run_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError
         machine: &machine,
         ledger: &ledger,
         ids: &ids,
-        backend: backend.as_ref(),
+        backend: run_backend,
         git: &git,
         hooks: &hooks,
         attest: &attest,
@@ -2734,6 +2810,7 @@ fn run_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError
         // `trials.source_run_id` never disagree about it (SPEC §28).
         purpose: trial_id.as_ref().map(|_| RunPurpose::TrialArm),
         run_id: Some(run_id.clone()),
+        worker_presentation,
     }) {
         Ok(outcome) => outcome,
         Err(e) => {
@@ -3048,6 +3125,7 @@ fn replay_command(task: &str, recipe: &Path, dry_run: bool) -> Result<CliOutcome
         task_override: Some(&task_id),
         purpose: Some(RunPurpose::Replay),
         run_id: None,
+        worker_presentation: relais::backend::Presentation::Headless,
     });
     // Bring the replay's own refs into the live repository BEFORE the
     // checkout goes. The runner names its candidate and snapshot refs in
@@ -4976,6 +5054,49 @@ mod tests {
         let dir = relais::test_support::short_temp_dir(&format!("main-{label}"));
         let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger opens");
         (ledger, dir)
+    }
+
+    fn session(
+        source: relais::coordinator::SessionSource,
+    ) -> relais::coordinator::ResolvedSessionId {
+        relais::coordinator::ResolvedSessionId {
+            id: "s1".into(),
+            source,
+        }
+    }
+
+    /// A native worker is spawned by a parent Claude Code session: a
+    /// session id guessed from the parent process is refused, and a
+    /// headless run never asks.
+    #[test]
+    fn a_native_run_needs_a_parent_claude_code_session() {
+        use relais::coordinator::SessionSource;
+        let wait = Some(std::time::Duration::from_secs(120));
+        let refusal = native_session_refusal(wait, &session(SessionSource::ParentPidFallback))
+            .expect("a fallback session is refused");
+        assert!(refusal.contains("inside Claude Code"), "{refusal}");
+        assert_eq!(
+            native_session_refusal(wait, &session(SessionSource::ClaudeCode)),
+            None
+        );
+        assert_eq!(
+            native_session_refusal(None, &session(SessionSource::ParentPidFallback)),
+            None
+        );
+    }
+
+    #[test]
+    fn the_native_spawn_wait_is_only_accepted_with_native() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(["relais", "run", "--task", "t.json"].iter().chain(args))
+        };
+        assert!(parse(&["--native", "--native-spawn-wait", "30"]).is_ok());
+        assert!(parse(&["--native"]).is_ok());
+        assert!(parse(&[]).is_ok());
+        assert!(
+            parse(&["--native-spawn-wait", "30"]).is_err(),
+            "the wait means nothing without --native"
+        );
     }
 
     /// `relais explain` says a report it cannot parse in one line within 80

@@ -30,7 +30,9 @@ use crate::admission::{
     BindOutcome, Decision, DispatchRequest, DispatchSource, Gate, GateError, Refusal,
     ReleaseWriteOutcome, ResourceClass, RunRegistration, WriteLeaseOutcome,
 };
-use crate::backend::{Backend, LaunchResult, LaunchSpec, PermissionDenial, SandboxLaunch, ToolSet};
+use crate::backend::{
+    Backend, LaunchResult, LaunchSpec, PermissionDenial, Presentation, SandboxLaunch, ToolSet,
+};
 use crate::context::{self, ContextError, ContextManifest};
 use crate::contract::{Review, TaskContract};
 use crate::ids::{derive_task_id, DispatchId, PackageId, Pid, RunId};
@@ -200,12 +202,18 @@ pub struct RunConfig<'a> {
     /// `execute` — a live trial row names its own run and is written
     /// before any worker is dispatched. `None` mints one here.
     pub run_id: Option<RunId>,
+    /// How the worker attempts of this run are launched (SPEC §23):
+    /// `Native` under `relais run --native`. Reviews, the report review,
+    /// planning and probes are always headless.
+    pub worker_presentation: Presentation,
 }
 
 /// Poll period while queued for admission. `pub(crate)`: `hook::respond`
 /// polls a queued spawn at the same cadence, reusing this constant rather
-/// than inventing a second one beside it.
-pub(crate) const ADMISSION_POLL: Duration = Duration::from_millis(250);
+/// than inventing a second one beside it. It lives with the coordinator's
+/// types (`admission`), so the native backend polls at the same cadence
+/// without depending on the runner.
+pub(crate) use crate::admission::ADMISSION_POLL;
 
 /// How many consecutive unanswered heartbeats make a coordinator
 /// unreachable rather than slow (R6). Cancellation travels on the
@@ -765,7 +773,10 @@ impl<'a> RunEngine<'a> {
             depth,
             resource: ResourceClass::ModelWork,
             reserve_micros,
-            source: DispatchSource::ManagedRun,
+            source: match spec.presentation {
+                Presentation::Headless => DispatchSource::ManagedRun,
+                Presentation::Native => DispatchSource::NativeRun,
+            },
             // A managed dispatch self-reports its parent through
             // `parent_dispatch` above; `caller_agent_id` exists only for
             // the hook path, which has a caller's agent id and no
@@ -2079,6 +2090,13 @@ impl<'a> RunEngine<'a> {
             0,
             ctx.preflight.decision.routed_by,
         )?;
+        // The row says what the coordinator is told (`NativeRun`) from the
+        // moment it exists, so the two never disagree during the wait, and
+        // a launch that fails before any agent binds keeps the right kind.
+        match self.config.worker_presentation {
+            Presentation::Headless => {}
+            Presentation::Native => ledger.record_native_dispatch(&dispatch_id, None)?,
+        }
         ledger.record_features(
             &dispatch_id,
             &serde_json::json!({
@@ -2124,7 +2142,13 @@ impl<'a> RunEngine<'a> {
         // The worker alone is sandboxed: the reviewer and the planner
         // keep the launch they had.
         // `_tmp_link` lives to the end of this dispatch, whichever way it ends.
-        let (sandbox, _tmp_link) = match self.sandbox_launch(index)? {
+        // A native worker is a subagent of the parent session, which
+        // inherits that session's sandbox: relais's own cannot apply.
+        let sandbox_launch = match self.config.worker_presentation {
+            Presentation::Headless => self.sandbox_launch(index)?,
+            Presentation::Native => None,
+        };
+        let (sandbox, _tmp_link) = match sandbox_launch {
             Some((launch, link)) => (Some(launch), Some(link)),
             None => (None, None),
         };
@@ -2144,6 +2168,7 @@ impl<'a> RunEngine<'a> {
             pid_slot: None,
             sandbox,
             tools: ToolSet::ModeDefault,
+            presentation: self.config.worker_presentation,
         };
         let scene = SandboxScene::of(&spec);
 
@@ -2170,6 +2195,25 @@ impl<'a> RunEngine<'a> {
         };
         let duration_ms = dispatch_start.elapsed().as_millis() as i64;
         ledger.finish_dispatch(&dispatch_id, "completed")?;
+        match self.config.worker_presentation {
+            Presentation::Headless => {}
+            Presentation::Native => {
+                ledger.record_native_dispatch(&dispatch_id, result.session_id.as_deref())?;
+                // What the backend says it did differently from what was
+                // asked is evidence of the attempt.
+                if !result.stderr.is_empty() {
+                    let note_path = self
+                        .artifacts
+                        .join(format!("attempt-{index}-native-note.txt"));
+                    self.record_artifact(
+                        Some(attempt_id),
+                        EvidenceKind::NativeNote,
+                        &note_path,
+                        &result.stderr,
+                    )?;
+                }
+            }
+        }
 
         // Usage is recorded even when the attempt went nowhere: all
         // recorded cost, failed runs included (SPEC §11).
@@ -2185,7 +2229,7 @@ impl<'a> RunEngine<'a> {
             cache_read_tokens: usage.cache_read_tokens,
             cache_write_tokens: usage.cache_write_tokens,
             cost: usage.cost.micros(),
-            cost_kind: CostKind::ApiSpend,
+            cost_kind: usage.cost.kind(),
             completeness: usage.cost.completeness(),
             inclusive: usage.cost.inclusive(),
             at: self.config.ledger.now(),
@@ -4016,6 +4060,7 @@ impl<'a> RunEngine<'a> {
             pid_slot: None,
             sandbox: None,
             tools: purpose.tools(),
+            presentation: Presentation::Headless,
         };
         let recorded = self.config.ledger.record_dispatch_intent(
             &dispatch_id,
@@ -5339,6 +5384,7 @@ mod tests {
                 task_override: None,
                 purpose: None,
                 run_id: None,
+                worker_presentation: Presentation::Headless,
             })
             .expect("the fixture's id source mints identifiers")
         }
@@ -5418,6 +5464,7 @@ mod tests {
                 task_override: None,
                 purpose: None,
                 run_id: None,
+                worker_presentation: Presentation::Headless,
             })
             .expect("the fixture's id source mints identifiers")
         }
@@ -5429,6 +5476,25 @@ mod tests {
             machine: &MachineSettings,
             backend: &dyn Backend,
             gate: &(dyn Gate + Sync),
+        ) -> RunOutcome {
+            self.execute_presented(
+                contract,
+                repo,
+                machine,
+                backend,
+                gate,
+                Presentation::Headless,
+            )
+        }
+
+        fn execute_presented(
+            &self,
+            contract: &TaskContract,
+            repo: &RepoPolicy,
+            machine: &MachineSettings,
+            backend: &dyn Backend,
+            gate: &(dyn Gate + Sync),
+            worker_presentation: Presentation,
         ) -> RunOutcome {
             let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
                 adr: "ADR-0001".into(),
@@ -5458,6 +5524,7 @@ mod tests {
                 task_override: None,
                 purpose: None,
                 run_id: None,
+                worker_presentation,
             })
             .expect("the fixture's id source mints identifiers")
         }
@@ -6703,6 +6770,7 @@ mod tests {
             task_override: None,
             purpose: None,
             run_id: None,
+            worker_presentation: Presentation::Headless,
         })
         .expect("the fixture's id source mints identifiers");
         let RunOutcome {
@@ -12456,6 +12524,7 @@ mod tests {
             task_override: None,
             purpose: None,
             run_id: None,
+            worker_presentation: Presentation::Headless,
         };
         let engine = RunEngine::new(&config, None).expect("an engine");
         let task = crate::ids::TaskId::from_stored("redispatch-task");
@@ -12897,5 +12966,748 @@ mod tests {
             Dependency::Mode(DependencyMode::Optional).mode(),
             DependencyMode::Optional
         );
+    }
+
+    // -- relais run --native (SPEC §23) ------------------------------------
+
+    mod native {
+        // The engine over a `NativeBackend`, a real `LocalGate`, and a scripted
+        // parent session that does what the hook would on each request line it
+        // reads (SPEC §23).
+
+        use std::collections::BTreeMap;
+        use std::io::Write;
+        use std::sync::mpsc;
+        use std::sync::Arc;
+
+        use super::*;
+        use crate::adapter::native::NativeBackend;
+        use crate::admission::{BindNativeOutcome, ClaimOutcome, LocalGate, WorktreeOutcome};
+        use crate::orchestration::{ModelPrice, PriceTable};
+
+        const SESSION: &str = "test-session";
+
+        /// Every flush is one request line, sent to the scripted parent.
+        struct LineSink {
+            lines: mpsc::Sender<String>,
+            pending: Vec<u8>,
+        }
+
+        impl Write for LineSink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.pending.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                let line = String::from_utf8_lossy(&self.pending)
+                    .trim_end()
+                    .to_string();
+                self.pending.clear();
+                self.lines.send(line).map_err(std::io::Error::other)
+            }
+        }
+
+        /// What the parent session was asked, and did.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        enum Seen {
+            Spawn {
+                dispatch_id: String,
+                agent_id: String,
+                subagent_type: String,
+                model: String,
+            },
+            Continue {
+                dispatch_id: String,
+                agent_id: String,
+            },
+        }
+
+        /// How the scripted parent treats a request.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Parent {
+            /// Spawns or continues as asked, works, binds and stops.
+            Obeys,
+            /// Claims the spawn, then hands out a tree named for another agent.
+            WrongTree,
+            /// Spawns and binds, and the agent never stops.
+            NeverStops,
+            /// Cancels the run as soon as it reads a request.
+            CancelsTheRun,
+        }
+
+        /// The agent's work on its tree, given the prompt it was sent: the task
+        /// fixture's change worker, fixing on the first attempt only when the
+        /// prompt says so.
+        type Work = fn(&Path, &str);
+
+        fn fixes_at_once(tree: &Path, _prompt: &str) {
+            std::fs::remove_file(tree.join("src/main.rs")).expect("fix");
+        }
+
+        /// Nothing at first, something on a repair, the fix on an escalation.
+        fn fixes_on_escalation(tree: &Path, prompt: &str) {
+            if prompt.contains("escalation addendum") {
+                std::fs::remove_file(tree.join("src/main.rs")).expect("remove");
+            } else if prompt.contains("repair addendum") {
+                std::fs::write(tree.join("src/notes.txt"), "investigation\n").expect("write");
+            }
+        }
+
+        struct Agent {
+            tree: PathBuf,
+            model: String,
+            messages: u32,
+        }
+
+        /// The messages an agent's turn adds to its transcript. Each message is
+        /// written twice, its output growing, as Claude Code does.
+        const SPAWN_MESSAGES: u32 = 2;
+        const CONTINUE_MESSAGES: u32 = 1;
+
+        fn append_messages(file: &Path, agent_id: &str, agent: &mut Agent, count: u32) {
+            let mut out = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(file)
+                .expect("transcript opens");
+            for _ in 0..count {
+                agent.messages += 1;
+                for output in [5, 9] {
+                    writeln!(
+                out,
+                r#"{{"type":"assistant","timestamp":"2026-10-06T00:00:00Z","message":{{"id":"{agent_id}-m{}","model":"{}","usage":{{"input_tokens":10,"output_tokens":{output},"cache_read_input_tokens":0}}}}}}"#,
+                agent.messages, agent.model
+            )
+            .expect("transcript line");
+                }
+            }
+        }
+
+        /// The concrete id Claude Code reports for an alias.
+        fn concrete(model: &str) -> String {
+            format!("claude-{model}-5")
+        }
+
+        fn run_parent(
+            gate: Arc<LocalGate>,
+            lines: mpsc::Receiver<String>,
+            dir: PathBuf,
+            parent: Parent,
+            work: Work,
+        ) -> Vec<Seen> {
+            let mut seen = Vec::new();
+            let mut agents: BTreeMap<String, Agent> = BTreeMap::new();
+            let mut spawned = 0;
+            while let Ok(line) = lines.recv_timeout(Duration::from_secs(30)) {
+                let (word, json) = line.split_once(' ').expect("a request line");
+                let input: serde_json::Value = serde_json::from_str(json).expect("the line's json");
+                let dispatch_id = input["dispatch_id"]
+                    .as_str()
+                    .expect("dispatch_id")
+                    .to_string();
+                if parent == Parent::CancelsTheRun {
+                    let runs: Vec<String> = gate.status().runs.keys().cloned().collect();
+                    for run in runs {
+                        gate.cancel_run(&run);
+                    }
+                    continue;
+                }
+                let (agent_id, prompt) = match word {
+                    "RELAIS-SPAWN" => {
+                        spawned += 1;
+                        let agent_id = format!("ag{spawned}");
+                        let ClaimOutcome::Spawn {
+                            subagent_type,
+                            model,
+                            prompt,
+                        } = gate
+                            .claim_native(SESSION, &dispatch_id, None)
+                            .expect("claim")
+                        else {
+                            panic!("the spawn was not claimable");
+                        };
+                        // What the parent was asked is what the hook runs.
+                        assert_eq!(input["prompt"], prompt.as_str());
+                        assert_eq!(input["model"], model.as_str());
+                        assert_eq!(input["subagent_type"], subagent_type.as_str());
+                        let name = if parent == Parent::WrongTree {
+                            "agent-someone-else".to_string()
+                        } else {
+                            format!("agent-{agent_id}")
+                        };
+                        let WorktreeOutcome::Path { path } =
+                            gate.native_worktree(SESSION, &name).expect("tree")
+                        else {
+                            panic!("no tree was given");
+                        };
+                        seen.push(Seen::Spawn {
+                            dispatch_id: dispatch_id.clone(),
+                            agent_id: agent_id.clone(),
+                            subagent_type,
+                            model: model.clone(),
+                        });
+                        agents.insert(
+                            agent_id.clone(),
+                            Agent {
+                                tree: path,
+                                model: concrete(&model),
+                                messages: 0,
+                            },
+                        );
+                        (agent_id, prompt)
+                    }
+                    "RELAIS-CONTINUE" => {
+                        let to = input["to"].as_str().expect("to");
+                        let ClaimOutcome::Continue { agent_id, message } = gate
+                            .claim_native(SESSION, &dispatch_id, Some(to))
+                            .expect("claim")
+                        else {
+                            panic!("the continuation was not claimable");
+                        };
+                        assert_eq!(input["message"], message.as_str());
+                        seen.push(Seen::Continue {
+                            dispatch_id: dispatch_id.clone(),
+                            agent_id: agent_id.clone(),
+                        });
+                        (agent_id, message)
+                    }
+                    other => panic!("an unknown request {other}"),
+                };
+                let fresh = word == "RELAIS-SPAWN";
+                let agent = agents.get_mut(&agent_id).expect("a known agent");
+                work(&agent.tree, &prompt);
+                let transcript = dir.join(format!("agent-{agent_id}.jsonl"));
+                let count = if fresh {
+                    SPAWN_MESSAGES
+                } else {
+                    CONTINUE_MESSAGES
+                };
+                append_messages(&transcript, &agent_id, agent, count);
+                if fresh {
+                    match gate
+                        .bind_native(SESSION, &dispatch_id, &agent_id)
+                        .expect("bind")
+                    {
+                        BindNativeOutcome::Bound => {}
+                        BindNativeOutcome::Failed { .. } | BindNativeOutcome::NotNative => continue,
+                    }
+                }
+                if parent != Parent::NeverStops {
+                    gate.stop_native(SESSION, &agent_id, Some(&transcript), Some("DONE"))
+                        .expect("stop");
+                }
+            }
+            seen
+        }
+
+        fn prices() -> PriceTable {
+            // One micro-dollar per input token and two per output token.
+            PriceTable {
+                version: "test".into(),
+                models: ["sonnet", "fable"]
+                    .iter()
+                    .map(|model| ModelPrice {
+                        ids: vec![concrete(model)],
+                        input: 1_000_000,
+                        output: 2_000_000,
+                        cache_read: 0,
+                        cache_write_5m: 0,
+                        cache_write_1h: 0,
+                        fast_input: None,
+                        fast_output: None,
+                    })
+                    .collect(),
+            }
+        }
+
+        /// What a native run left behind.
+        struct Native {
+            outcome: RunOutcome,
+            seen: Vec<Seen>,
+            /// The prompts the headless backend underneath was launched with.
+            headless: Vec<String>,
+        }
+
+        fn run_native(
+            fixture: &Fixture,
+            review: Review,
+            attempts: u32,
+            parent: Parent,
+            work: Work,
+            prices: Option<PriceTable>,
+            configure: impl FnOnce(&mut RepoPolicy),
+        ) -> Native {
+            let mut repo = fixture.repo_policy(vec![main_gone_check()], attempts);
+            configure(&mut repo);
+            let machine = fixture.machine_for(&repo);
+            let gate = Arc::new(LocalGate::new(ConcurrencyLimits::default()));
+            let headless_log =
+                Arc::new(std::sync::Mutex::new(Vec::<(String, Presentation)>::new()));
+            let log = Arc::clone(&headless_log);
+            let headless = MockBackend::new(move |spec| {
+                log.lock()
+                    .unwrap()
+                    .push((spec.prompt.clone(), spec.presentation));
+                MockOutcome {
+                    result_text: Some("review ok\nFINDINGS: none".into()),
+                    exit_code: Some(0),
+                    ..Default::default()
+                }
+            });
+            let (tx, rx) = mpsc::channel();
+            let sink = LineSink {
+                lines: tx,
+                pending: Vec::new(),
+            };
+            let backend = NativeBackend::writing_to(
+                &headless,
+                gate.as_ref(),
+                SESSION.to_string(),
+                Duration::from_secs(5),
+                prices,
+                Box::new(sink),
+            );
+            let dir = fixture.dir.join("agents");
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let parent_gate = Arc::clone(&gate);
+            let session =
+                std::thread::spawn(move || run_parent(parent_gate, rx, dir, parent, work));
+            let outcome = fixture.execute_presented(
+                &fixture.contract(review),
+                &repo,
+                &machine,
+                &backend,
+                gate.as_ref(),
+                Presentation::Native,
+            );
+            // The backend holds the sink: dropping it ends the parent's loop.
+            drop(backend);
+            let seen = session.join().expect("the scripted parent");
+            let headless = headless_log
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(prompt, presentation)| {
+                    assert_eq!(*presentation, Presentation::Headless, "{prompt}");
+                    prompt.clone()
+                })
+                .collect();
+            Native {
+                outcome,
+                seen,
+                headless,
+            }
+        }
+
+        fn ledger_of(fixture: &Fixture) -> rusqlite::Connection {
+            rusqlite::Connection::open(fixture.dir.join("ledger.sqlite")).expect("the ledger opens")
+        }
+
+        /// The run's worker dispatches, oldest first: source and agent id.
+        fn dispatch_rows(fixture: &Fixture, run_id: &RunId) -> Vec<(String, Option<String>)> {
+            let conn = ledger_of(fixture);
+            let mut stmt = conn
+                .prepare(
+                    "SELECT source, agent_id FROM dispatches
+             WHERE run_id = ?1 AND attempt_id IS NOT NULL ORDER BY created_at, rowid",
+                )
+                .expect("prepare");
+            stmt.query_map([run_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query")
+                .map(|row| row.expect("row"))
+                .collect()
+        }
+
+        /// A native run's usage rows: input, output, cost, kind and completeness.
+        type UsageRow = (Option<i64>, Option<i64>, Option<i64>, String, String);
+
+        fn native_usage(fixture: &Fixture, run_id: &RunId) -> Vec<UsageRow> {
+            let conn = ledger_of(fixture);
+            let mut stmt = conn
+                .prepare(
+                    "SELECT input_tokens, output_tokens, cost_micros, cost_kind, completeness
+             FROM usage_events
+             WHERE run_id = ?1 AND attempt_id IS NOT NULL AND phase != 'review'
+             ORDER BY rowid",
+                )
+                .expect("prepare");
+            stmt.query_map([run_id.as_str()], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .expect("query")
+            .map(|row| row.expect("row"))
+            .collect()
+        }
+
+        fn interrupted_detail(outcome: &RunOutcome) -> &str {
+            let Terminal::Interrupted { detail } = &outcome.terminal else {
+                panic!("expected an interrupted run, got {outcome:?}");
+            };
+            detail
+        }
+
+        #[test]
+        fn a_change_task_is_accepted_after_one_spawn_and_its_review_stays_headless() {
+            let fixture = Fixture::new();
+            let run = run_native(
+                &fixture,
+                Review::Required,
+                3,
+                Parent::Obeys,
+                fixes_at_once,
+                Some(prices()),
+                |_| {},
+            );
+            assert!(
+                matches!(run.outcome.terminal, Terminal::Accepted(_)),
+                "expected acceptance, got {:?}",
+                run.outcome
+            );
+            let [Seen::Spawn {
+                subagent_type,
+                model,
+                agent_id,
+                ..
+            }] = run.seen.as_slice()
+            else {
+                panic!("one spawn expected, saw {:?}", run.seen);
+            };
+            assert_eq!(subagent_type, "relais-worker-sonnet-default");
+            assert_eq!(model, "sonnet");
+            assert!(
+                !run.headless.is_empty()
+                    && run
+                        .headless
+                        .iter()
+                        .all(|prompt| prompt.contains("semantic reviewer")),
+                "the headless backend saw only the review: {:?}",
+                run.headless
+            );
+            // The worker's dispatch row is native and names its agent; the
+            // review's row is the headless kind it always was.
+            assert_eq!(
+                dispatch_rows(&fixture, &run.outcome.run_id),
+                vec![("native_run".to_string(), Some(agent_id.clone()))]
+            );
+            std::fs::remove_dir_all(&fixture.dir).ok();
+        }
+
+        #[test]
+        fn a_repair_continues_the_same_agent_and_an_escalation_spawns_on_the_next_model() {
+            let fixture = Fixture::new();
+            let run = run_native(
+                &fixture,
+                Review::Optional,
+                3,
+                Parent::Obeys,
+                fixes_on_escalation,
+                Some(prices()),
+                |_| {},
+            );
+            let RunOutcome {
+                run_id,
+                terminal: Terminal::Accepted(receipt),
+            } = &run.outcome
+            else {
+                panic!("expected acceptance, got {:?}", run.outcome);
+            };
+            assert_eq!(receipt.attempts, 3);
+            assert_eq!(
+                receipt.models_used,
+                vec!["claude-sonnet-5", "claude-fable-5"],
+                "the models the transcripts reported"
+            );
+            let kinds: Vec<_> = run
+                .seen
+                .iter()
+                .map(|seen| match seen {
+                    Seen::Spawn {
+                        subagent_type,
+                        agent_id,
+                        ..
+                    } => format!("spawn {subagent_type} {agent_id}"),
+                    Seen::Continue { agent_id, .. } => format!("continue {agent_id}"),
+                })
+                .collect();
+            assert_eq!(
+                kinds,
+                vec![
+                    "spawn relais-worker-sonnet-default ag1",
+                    "continue ag1",
+                    "spawn relais-worker-fable-default ag2",
+                ]
+            );
+            assert_eq!(
+                dispatch_rows(&fixture, run_id),
+                vec![
+                    ("native_run".to_string(), Some("ag1".to_string())),
+                    ("native_run".to_string(), Some("ag1".to_string())),
+                    ("native_run".to_string(), Some("ag2".to_string())),
+                ]
+            );
+            assert!(run.headless.is_empty(), "no review was asked for");
+            std::fs::remove_dir_all(&fixture.dir).ok();
+        }
+
+        #[test]
+        fn usage_is_booked_once_per_message_id_across_an_attempt_and_its_continuation() {
+            let fixture = Fixture::new();
+            let run = run_native(
+                &fixture,
+                Review::Optional,
+                3,
+                Parent::Obeys,
+                fixes_on_escalation,
+                Some(prices()),
+                |_| {},
+            );
+            assert!(matches!(run.outcome.terminal, Terminal::Accepted(_)));
+            let rows = native_usage(&fixture, &run.outcome.run_id);
+            // ag1's file holds 3 distinct messages over two attempts (2, then the
+            // continuation's 1), each written twice; ag2's holds 2.
+            let tokens: Vec<_> = rows.iter().map(|row| (row.0, row.1)).collect();
+            assert_eq!(
+                tokens,
+                vec![
+                    (Some(20), Some(18)),
+                    (Some(10), Some(9)),
+                    (Some(20), Some(18))
+                ],
+                "each attempt books only the messages the earlier ones had not: {rows:?}"
+            );
+            let total_input: i64 = rows.iter().filter_map(|row| row.0).sum();
+            let total_output: i64 = rows.iter().filter_map(|row| row.1).sum();
+            assert_eq!(
+                (total_input, total_output),
+                (10 * 5, 9 * 5),
+                "the sum over distinct message ids, each at its last record"
+            );
+            let costs: Vec<_> = rows.iter().map(|row| row.2).collect();
+            assert_eq!(costs, vec![Some(56), Some(28), Some(56)]);
+            for row in &rows {
+                assert!(
+                    row.3.contains("EstimatedApiEquivalent"),
+                    "booked as an estimate: {row:?}"
+                );
+                assert!(row.4.contains("estimated"), "{row:?}");
+            }
+            std::fs::remove_dir_all(&fixture.dir).ok();
+        }
+
+        #[test]
+        fn without_a_price_table_the_cost_is_unknown_never_zero() {
+            let fixture = Fixture::new();
+            let run = run_native(
+                &fixture,
+                Review::Optional,
+                3,
+                Parent::Obeys,
+                fixes_at_once,
+                None,
+                |_| {},
+            );
+            assert!(matches!(run.outcome.terminal, Terminal::Accepted(_)));
+            let rows = native_usage(&fixture, &run.outcome.run_id);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].0, Some(20), "the tokens are still known");
+            assert_eq!(rows[0].2, None, "an unpriced cost is not zero: {rows:?}");
+            assert!(rows[0].4.contains("unknown"), "{rows:?}");
+            std::fs::remove_dir_all(&fixture.dir).ok();
+        }
+
+        #[test]
+        fn no_spawn_within_the_wait_ends_the_attempt_interrupted_and_the_run_stops() {
+            let fixture = Fixture::new();
+            let mut repo = fixture.repo_policy(vec![main_gone_check()], 3);
+            repo.execution.max_wall_seconds = 60;
+            let machine = fixture.machine_for(&repo);
+            let gate = LocalGate::new(ConcurrencyLimits::default());
+            let headless = MockBackend::new(|_| MockOutcome::default());
+            let (tx, rx) = mpsc::channel();
+            let backend = NativeBackend::writing_to(
+                &headless,
+                &gate,
+                SESSION.to_string(),
+                Duration::from_millis(600),
+                Some(prices()),
+                Box::new(LineSink {
+                    lines: tx,
+                    pending: Vec::new(),
+                }),
+            );
+            let outcome = fixture.execute_presented(
+                &fixture.contract(Review::Optional),
+                &repo,
+                &machine,
+                &backend,
+                &gate,
+                Presentation::Native,
+            );
+            let detail = interrupted_detail(&outcome);
+            assert!(detail.contains("native_spawn_missing"), "{detail}");
+            assert!(detail.contains("no session spawned it"), "{detail}");
+            assert_eq!(
+                rx.try_iter().count(),
+                1,
+                "the request was asked once, and the run did not go on to a second attempt"
+            );
+            std::fs::remove_dir_all(&fixture.dir).ok();
+        }
+
+        /// The request line cannot be written: the launch fails before any
+        /// agent exists, and the dispatch row still says what the
+        /// coordinator was told, `native_run`, with no agent.
+        #[test]
+        fn a_native_launch_that_fails_keeps_its_row_native() {
+            struct Broken;
+            impl std::io::Write for Broken {
+                fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                    Err(std::io::Error::other("the parent's pipe is gone"))
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Err(std::io::Error::other("the parent's pipe is gone"))
+                }
+            }
+            let fixture = Fixture::new();
+            let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+            let machine = fixture.machine_for(&repo);
+            let gate = LocalGate::new(ConcurrencyLimits::default());
+            let headless = MockBackend::new(|_| MockOutcome::default());
+            let backend = NativeBackend::writing_to(
+                &headless,
+                &gate,
+                SESSION.to_string(),
+                Duration::from_millis(600),
+                Some(prices()),
+                Box::new(Broken),
+            );
+            let outcome = fixture.execute_presented(
+                &fixture.contract(Review::Optional),
+                &repo,
+                &machine,
+                &backend,
+                &gate,
+                Presentation::Native,
+            );
+            assert!(
+                !matches!(outcome.terminal, Terminal::Accepted(_)),
+                "{:?}",
+                outcome.terminal
+            );
+            assert_eq!(
+                dispatch_rows(&fixture, &outcome.run_id),
+                vec![("native_run".to_string(), None)]
+            );
+            std::fs::remove_dir_all(&fixture.dir).ok();
+        }
+
+        #[test]
+        fn a_failed_native_dispatch_ends_the_attempt_interrupted_with_its_reason() {
+            let fixture = Fixture::new();
+            let run = run_native(
+                &fixture,
+                Review::Optional,
+                3,
+                Parent::WrongTree,
+                fixes_at_once,
+                Some(prices()),
+                |_| {},
+            );
+            let detail = interrupted_detail(&run.outcome);
+            assert!(detail.contains("native_tree_mismatch"), "{detail}");
+            std::fs::remove_dir_all(&fixture.dir).ok();
+        }
+
+        #[test]
+        fn an_agent_that_never_stops_ends_at_the_wall_timeout() {
+            let fixture = Fixture::new();
+            let run = run_native(
+                &fixture,
+                Review::Optional,
+                3,
+                Parent::NeverStops,
+                fixes_at_once,
+                Some(prices()),
+                // The attempt's wall time is what is left of the run's: one second.
+                |repo| repo.execution.max_wall_seconds = 1,
+            );
+            let detail = interrupted_detail(&run.outcome);
+            assert!(detail.contains("wall time"), "{detail}");
+            let transitions = fixture
+                .ledger
+                .transitions(&run.outcome.run_id)
+                .expect("history");
+            assert!(
+                transitions.iter().any(|transition| transition
+                    .detail
+                    .as_ref()
+                    .is_some_and(|detail| detail["timed_out"] == true)),
+                "the wait was recorded as a timeout: {transitions:?}"
+            );
+            std::fs::remove_dir_all(&fixture.dir).ok();
+        }
+
+        #[test]
+        fn a_cancelled_run_ends_the_native_attempt_cancelled() {
+            let fixture = Fixture::new();
+            let run = run_native(
+                &fixture,
+                Review::Optional,
+                3,
+                Parent::CancelsTheRun,
+                fixes_at_once,
+                Some(prices()),
+                |_| {},
+            );
+            assert!(
+                matches!(run.outcome.terminal, Terminal::Cancelled { .. }),
+                "expected a cancelled run, got {:?}",
+                run.outcome
+            );
+            std::fs::remove_dir_all(&fixture.dir).ok();
+        }
+
+        #[test]
+        fn a_headless_run_builds_headless_launch_specs() {
+            let fixture = Fixture::new();
+            let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+            let machine = fixture.machine_for(&repo);
+            let gate = LocalGate::new(ConcurrencyLimits::default());
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = Arc::clone(&seen);
+            let backend = MockBackend::new(move |spec| {
+                log.lock().unwrap().push(spec.presentation);
+                // The reviewer's tree has no such file to remove.
+                std::fs::remove_file(spec.work_dir.join("src/main.rs")).ok();
+                MockOutcome {
+                    result_text: Some("DONE\nFINDINGS: none".into()),
+                    exit_code: Some(0),
+                    ..Default::default()
+                }
+            });
+            let outcome = fixture.execute_managed(
+                &fixture.contract(Review::Required),
+                &repo,
+                &machine,
+                &backend,
+                &gate,
+            );
+            assert!(matches!(outcome.terminal, Terminal::Accepted(_)));
+            let seen = seen.lock().unwrap();
+            assert!(seen.len() >= 2, "a worker and a reviewer: {seen:?}");
+            assert!(seen
+                .iter()
+                .all(|presentation| *presentation == Presentation::Headless));
+            let rows = dispatch_rows(&fixture, &outcome.run_id);
+            assert_eq!(rows, vec![("managed_run".to_string(), None)]);
+            std::fs::remove_dir_all(&fixture.dir).ok();
+        }
     }
 }

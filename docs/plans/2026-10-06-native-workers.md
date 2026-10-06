@@ -211,4 +211,15 @@ Not measured, and why it does not matter: a marked spawn with the coordinator st
 
 `make check` green (1,270 lib tests). Four key tests falsified: the rewrite puts back relais's model, an unreachable coordinator denies a marked spawn, a cancelled dispatch is refused, the racing stop still stops. Decision left open, to answer `salvaged` with the merge sha. For #105: 0 verified denials, coverage complete, 4 recovered shape refusals, none fatal.
 
+**2026-10-06, N2** (run-65d2ad90fddb4-14758, sonnet@medium, one attempt, $5.00). Design choices made in the contract:
+- `LaunchSpec.presentation` (`Headless`/`Native`) marks the worker attempts of a `--native` run; reviews, the report review and planning stay headless `claude -p`.
+- A repair CONTINUES the last agent when the model is unchanged. It keeps the effort that agent was spawned with even when the repair asks for more (Claude Code cannot change a running agent's effort), and the attempt's evidence says so. A different model spawns fresh.
+- The cost is `Cost::Estimated`, priced from the transcript at machine prices, booked `estimated_api_equivalent`.
+
+Checks green, then `needs_review` with two findings, both real, fixed by hand:
+- the remembered effort was overwritten by each continuation's request, so a second raised repair's note named the wrong effort → an agent already on record keeps its spawn effort;
+- the dispatch row read `managed_run` until the launch returned, and kept it when the launch failed → relabelled `native_run` right after the intent is written, before the launch.
+
+`make check` green (1,288 lib tests). Falsified: both fixes and booking once per message id. Decision left open, to answer `salvaged` with the merge sha.
+
 <!-- panel: repos=relais adds= reviewers=backend body-sha=ebe649d81b94 -->

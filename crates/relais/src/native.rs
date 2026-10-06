@@ -25,6 +25,12 @@ pub fn marker_line(dispatch_id: &str) -> String {
     format!("{MARKER_OPEN} {dispatch_id}]")
 }
 
+/// The agent definition a native worker runs as: `relais-worker-<model>-<effort>`,
+/// with the effort `default` when the route chose none.
+pub fn worker_agent_type(model: &str, effort: Option<&str>) -> String {
+    format!("relais-worker-{model}-{}", effort.unwrap_or("default"))
+}
+
 /// Read the marker out of `text`.
 pub fn find_marker(text: &str) -> Marker {
     let mut found: Option<&str> = None;
@@ -68,6 +74,18 @@ mod tests {
         for id in ["d1", "dispatch_9-x", &"a".repeat(128)] {
             assert_eq!(find_marker(&marker_line(id)), Marker::One(id.to_string()));
         }
+    }
+
+    #[test]
+    fn a_worker_agent_type_names_its_model_and_effort() {
+        assert_eq!(
+            worker_agent_type("sonnet", Some("medium")),
+            "relais-worker-sonnet-medium"
+        );
+        assert_eq!(
+            worker_agent_type("haiku", None),
+            "relais-worker-haiku-default"
+        );
     }
 
     #[test]
