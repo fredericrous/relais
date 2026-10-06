@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/native-workers
 repos: [relais]
 adrs: []
@@ -268,6 +268,8 @@ Against reality: a `claude -p --model sonnet` parent in a scratch repo, project 
 | parent changes the model | the agent runs relais's model | run-65d2cfab81dcc-da41: Agent called with `model: haiku`; transcript model `claude-sonnet-5-5`, meta `agentType` relais's, `worktreePath` relais's; accepted |
 | headless unchanged | `relais run` without `--native` → accepted, `managed_run` | run-65d2cfa66669f-d8ad: accepted, `managed_run`, `ApiSpend` $0.105, no native message rows |
 | marked spawn with the coordinator down; unknown/second marker | denied | hook tests on 2.1.291 fixtures (N1b); not re-driven live |
+| native inspect task | a natively rendered worker, then relais's report review → `accepted`, `settled_via = report_review` | run-65d2f23191508-1f93: `relais-worker-haiku-default` spawned, report review headless, **accepted**, receipt `criteria[0].settled_via = report_review` |
+| relais killed 10 s into the spawn wait (binding N2 item) | the unbound dispatch is held past `LEASE_GRACE`, then freed after `UNBINDABLE_AFTER` rounds | disp-65d2f17937339-100014cdd: killed 19:11:49, seat held through 19:17:24, gone at 19:17:39 (≈300 s grace + 3 × 15 s rounds after the last heartbeat); the reservation settled as an uncertain lower bound ($12), never zero |
 
 Not observed here: the agents-panel row and Enter opening the transcript need an interactive session (the person's check after install). Latency: spawn line → bind took the parent 8–25 s per run (it reads the output file or arms Monitor first), well inside the 120 s spawn wait.
 
@@ -275,4 +277,24 @@ Found by the end-to-end runs:
 - **An unpriced model breaks repairs.** A native attempt whose model has no `[pricing.models]` entry (here `claude-sonnet-5-5`; the machine lists `claude-sonnet-5`) has an unknown cost. It settles as its whole reservation, the run's budget, so the repair is refused: `budget_exceeded`, run-65d2ce4caa98b-c4d2. Pricing the id fixed it. Open for the person, with this branch.
 - An unknown native cost is labelled `api_spend` (the `Cost::Unknown` default kind), not `estimated_api_equivalent`. Follow-up.
 - A state dir whose socket path exceeds macOS's 104 bytes fails as "did not answer within the start timeout". Follow-up for a clearer error.
+- A parent session that ends while relais is still verifying takes the run with it (the first inspect run, run-65d2f186c8fbe-14e51, ended mid report review when its `claude -p` parent finished its turn). The `/relais` skill now says a worker finishing is not the run finishing, and not to end the turn before relais prints its outcome line.
 - `relais install --hooks` refuses project hooks while user settings hold a relais hook. That is correct; the person updates the user-level hook with `relais install --claude --hooks --user --write`.
+
+## Implementation review
+
+Round 1 (implementation-review, 75k tokens, 88 s): **approve-with-changes**, four findings, all fixed:
+- a marked spawn's `WorktreeCreate` that could not reach the coordinator fell back to a default tree → a rewritten relais spawn leaves a per-session note, and such a `WorktreeCreate` is refused with the cause (`tree_unreachable`); anyone else's still gets the default tree;
+- two Verification rows had no result → the native inspect task and the kill-in-the-spawn-wait check run live (rows above);
+- an unreachable coordinator was journalled as "not native" → `tree_unreachable` / `stop_unreachable`;
+- `undo` swallowed its failures → what it leaves behind joins the error.
+
+Delta (implementation-review, 38k tokens, 29 s): **approve-with-changes**; round-1 findings 1–4 resolved. One new low finding, kept deliberate: the per-session note is written best effort (`let _ = note_native_spawn`). If it cannot be written, an unreachable `WorktreeCreate` falls back to the default tree. The marked spawn's bind then refuses that tree's name (`native_tree_mismatch`), so the run ends rather than judging it; changing the reviewed tree for this was not worth a third pass. Known limits, same fallback:
+- two marked spawns of one session whose hooks run concurrently can lose one increment of the note;
+- a claimed spawn whose `WorktreeCreate` never comes leaves a note that refuses at most one later unreachable `WorktreeCreate` of that session, with the reason.
+
+## Outcome
+
+`relais run --native` runs each worker as a native Claude Code subagent, spawned by the parent session from relais's request, enforced by the hook and judged by relais as before. Measured end to end on Claude Code 2.1.291: spawn, repair as a continuation, model override, inspect, headless unchanged, usage booked once, an unpriced model refused. The `/relais` skill uses it by default. Left for the person after install, in an interactive session: the worker row in the agents panel, and Enter opening its transcript; updating the user-level hook with `relais install --claude --hooks --user --write`. Follow-ups:
+- an unknown native cost is labelled `api_spend`;
+- a socket path over 104 bytes fails as a start timeout.
+
