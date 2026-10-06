@@ -74,6 +74,7 @@ PURE_MODULES = {
     "ids",
     "lifecycle",
     "money",
+    "native",
     "orchestration",
     "outcome",
     "policy",

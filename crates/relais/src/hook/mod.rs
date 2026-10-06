@@ -12,7 +12,7 @@
 //!   surfaced.
 //! - [`probe`] is `relais doctor --probe-hooks`: it wires [`record`] into
 //!   a throwaway settings file, runs one real `claude -p` session through
-//!   it, and reads the recordings back to say which of the seven targets
+//!   it, and reads the recordings back to say which of the eight targets
 //!   fired and which top-level fields their payloads carried. That
 //!   reading is metadata about the recording (field names, not values;
 //!   never a relais type), not the interpretation the packages this probe
@@ -27,8 +27,10 @@
 
 pub mod decide;
 pub mod event;
+pub mod native;
 pub mod pairing;
 pub mod respond;
+pub mod worktree;
 
 use std::fs;
 use std::io::Read;
@@ -46,11 +48,11 @@ use crate::procs::{run_with_timeout, Ended};
 /// an oversized payload is refused.
 pub const MAX_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
-/// The seven hook targets `relais doctor --probe-hooks` wires: the three
-/// tool-scoped events, matched to the Agent tool, plus the four
-/// lifecycle events. Named once so the settings file, the compatibility
+/// The eight hook targets `relais doctor --probe-hooks` wires: the three
+/// tool-scoped events, plus the five lifecycle events (`WorktreeCreate`
+/// among them). Named once so the settings file, the compatibility
 /// record and its staleness check cannot disagree about the list.
-pub const TARGETS: [&str; 7] = [
+pub const TARGETS: [&str; 8] = [
     "PreToolUse",
     "PostToolUse",
     "PostToolUseFailure",
@@ -58,6 +60,7 @@ pub const TARGETS: [&str; 7] = [
     "SubagentStop",
     "SessionStart",
     "SessionEnd",
+    "WorktreeCreate",
 ];
 
 /// One recorded hook invocation.
@@ -435,7 +438,7 @@ pub struct ProbeHooksReport {
     pub recording_dir: PathBuf,
 }
 
-/// Wire the seven targets into a throwaway settings file, run one real
+/// Wire the eight targets into a throwaway settings file, run one real
 /// `claude -p` session through it forcing a nested agent call, and read
 /// back which targets fired and what their payloads carried. Never edits
 /// the user's own settings.json: everything here lives under a
@@ -624,6 +627,7 @@ fn settings_document(relais_binary: &Path, recording_dir: &Path) -> Value {
             "SubagentStop": [hook_entry(None)],
             "SessionStart": [hook_entry(None)],
             "SessionEnd": [hook_entry(None)],
+            "WorktreeCreate": [hook_entry(None)],
         }
     })
 }
@@ -909,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_document_wires_all_seven_targets() {
+    fn settings_document_wires_all_eight_targets() {
         let doc = settings_document(Path::new("/usr/local/bin/relais"), Path::new("/tmp/rec"));
         let hooks = doc.get("hooks").unwrap().as_object().unwrap();
         for target in TARGETS {

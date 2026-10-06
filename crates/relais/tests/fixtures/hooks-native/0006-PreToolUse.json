@@ -1,0 +1,18 @@
+{
+  "cwd": "/REPO",
+  "hook_event_name": "PreToolUse",
+  "permission_mode": "bypassPermissions",
+  "prompt_id": "prompt-0000",
+  "session_id": "session-0000",
+  "tool_input": {
+    "content": "<redacted: real content, shape preserved>",
+    "message": "Run echo SECOND with Bash and reply with its output.",
+    "recipient": "agent-01",
+    "summary": "Run second command",
+    "to": "agent-01",
+    "type": "message"
+  },
+  "tool_name": "SendMessage",
+  "tool_use_id": "toolu-02",
+  "transcript_path": "/REDACTED/transcript.jsonl"
+}

@@ -22,10 +22,12 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::admission::{
-    AdmissionState, AgentSettleOutcome, Attribution, BindOutcome, Decision, DispatchRequest,
-    DispatchSource, Enforcement, Gate, GateError, HeartbeatStatus, LifecycleOutcome, PendingSignal,
-    Provenance, ReleaseWriteOutcome, ResourceClass, ResumeOutcome, RunRegistration, Signal,
-    StatusSnapshot, WaitOutcome, WithdrawOutcome, WriteLeaseOutcome,
+    AdmissionState, AgentSettleOutcome, Attribution, BindNativeOutcome, BindOutcome, ClaimOutcome,
+    Decision, DispatchRequest, DispatchSource, Enforcement, Gate, GateError, HeartbeatStatus,
+    LifecycleOutcome, NativeAnswer, NativeAsk, NativeProgress, PendingSignal, Provenance,
+    RegisterOutcome, ReleaseWriteOutcome, ResourceClass, ResumeOutcome, RunRegistration, Signal,
+    StatusSnapshot, StopNativeOutcome, WaitOutcome, WithdrawOutcome, WorktreeOutcome,
+    WriteLeaseOutcome,
 };
 use crate::ipc::{Listener, Stream};
 use crate::ledger::Ledger;
@@ -90,7 +92,12 @@ const DESCRIPTOR_RETRIES: u32 = 20;
 /// v3 added `bind_agent_lease` and `settle_by_agent`: a hook-admitted
 /// agent's seat is bound on its `PostToolUse` and given back on its
 /// `SubagentStop`, and a v2 daemon has neither call.
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// v4 added the native-dispatch calls (`register_native`, `claim_native`,
+/// `native_worktree`, `bind_native`, `stop_native`, `is_native_agent`,
+/// `native_status`) and their one `native` reply: a v3 daemon has none of
+/// them, and a marked call it cannot answer must be refused, not guessed.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Why a coordinator call, election or startup failed. Every variant
 /// names the operation and the entity it was about, so a caller can tell
@@ -254,6 +261,46 @@ pub enum Request {
         agent_id: String,
         spent_micros: Option<i64>,
     },
+    /// Relais asked the parent session to run this admitted dispatch as a
+    /// native subagent (`admission::AdmissionState::register_native`).
+    RegisterNative {
+        session_id: String,
+        dispatch_id: String,
+        ask: NativeAsk,
+    },
+    /// The hook's question on a marked `PreToolUse`; `to` is a
+    /// `SendMessage`'s recipient and absent for a spawn.
+    ClaimNative {
+        session_id: String,
+        dispatch_id: String,
+        to: Option<String>,
+    },
+    /// `WorktreeCreate`: the tree of the spawn just claimed, if any.
+    NativeWorktree {
+        session_id: String,
+        name: String,
+    },
+    /// A marked spawn returned and named its agent.
+    BindNative {
+        session_id: String,
+        dispatch_id: String,
+        agent_id: String,
+    },
+    /// A subagent ended: the native dispatch bound to it stops, unsettled.
+    StopNative {
+        session_id: String,
+        agent_id: String,
+        transcript_path: Option<PathBuf>,
+        last_assistant_message: Option<String>,
+    },
+    IsNativeAgent {
+        session_id: String,
+        agent_id: String,
+    },
+    /// Where a native dispatch is.
+    NativeStatus {
+        dispatch_id: String,
+    },
     /// The run reached an end state; nothing is cancelled or signalled.
     /// Until a run is finished (or cancelled) it keeps the daemon from
     /// idle-exiting under a run that is merely verifying.
@@ -406,6 +453,10 @@ pub enum Response {
     },
     Heartbeat {
         status: HeartbeatStatus,
+    },
+    /// The answer to any native-dispatch call.
+    Native {
+        answer: NativeAnswer,
     },
     WriteLease {
         holder: Option<String>,
@@ -1204,6 +1255,66 @@ pub fn handle(
         } => Response::AgentSettled {
             outcome: state.settle_by_agent(&session_id, &agent_id, spent_micros, now),
         },
+        Request::RegisterNative {
+            session_id,
+            dispatch_id,
+            ask,
+        } => Response::Native {
+            answer: NativeAnswer::Registered {
+                outcome: state.register_native(&session_id, &dispatch_id, &ask),
+            },
+        },
+        Request::ClaimNative {
+            session_id,
+            dispatch_id,
+            to,
+        } => Response::Native {
+            answer: NativeAnswer::Claimed {
+                outcome: state.claim_native(&session_id, &dispatch_id, to.as_deref(), now),
+            },
+        },
+        Request::NativeWorktree { session_id, name } => Response::Native {
+            answer: NativeAnswer::Worktree {
+                outcome: state.native_worktree(&session_id, &name),
+            },
+        },
+        Request::BindNative {
+            session_id,
+            dispatch_id,
+            agent_id,
+        } => Response::Native {
+            answer: NativeAnswer::Bound {
+                outcome: state.bind_native(&session_id, &dispatch_id, &agent_id, now),
+            },
+        },
+        Request::StopNative {
+            session_id,
+            agent_id,
+            transcript_path,
+            last_assistant_message,
+        } => Response::Native {
+            answer: NativeAnswer::Stopped {
+                outcome: state.stop_native(
+                    &session_id,
+                    &agent_id,
+                    transcript_path,
+                    last_assistant_message,
+                ),
+            },
+        },
+        Request::IsNativeAgent {
+            session_id,
+            agent_id,
+        } => Response::Native {
+            answer: NativeAnswer::Agent {
+                native: state.is_native_agent(&session_id, &agent_id),
+            },
+        },
+        Request::NativeStatus { dispatch_id } => Response::Native {
+            answer: NativeAnswer::Progress {
+                progress: state.native_status(&dispatch_id),
+            },
+        },
         Request::FinishRun { run_id } => lifecycle(state.finish_run(&run_id), Entity::Run, &run_id),
         Request::AcquireWrite {
             dispatch_id,
@@ -1371,6 +1482,40 @@ impl RemoteGate {
         GateError::Protocol {
             operation,
             detail: format!("unexpected reply: {response:?}"),
+        }
+    }
+
+    /// A native-dispatch call: every one answers with `Response::Native`,
+    /// and `pick` reads the answer this call expects out of it. Anything
+    /// else is a daemon this build does not understand.
+    fn native_call<T>(
+        &self,
+        operation: &'static str,
+        request: Request,
+        pick: fn(NativeAnswer) -> Option<T>,
+    ) -> Result<T, GateError> {
+        match self.call(operation, request)? {
+            Response::Native { answer } => {
+                let kept = answer.clone();
+                pick(answer).ok_or_else(|| GateError::Protocol {
+                    operation,
+                    detail: format!("unexpected native answer: {kept:?}"),
+                })
+            }
+            Response::Refused { refusal } => {
+                Err(Self::refused(operation, "native dispatch", &refusal))
+            }
+            unexpected @ (Response::Ack
+            | Response::Unknown { .. }
+            | Response::Error { .. }
+            | Response::ShuttingDown
+            | Response::Pong { .. }
+            | Response::Decision { .. }
+            | Response::AgentSettled { .. }
+            | Response::Heartbeat { .. }
+            | Response::WriteLease { .. }
+            | Response::Cancelled { .. }
+            | Response::Status { .. }) => Err(Self::unexpected(operation, &unexpected)),
         }
     }
 
@@ -1601,6 +1746,7 @@ impl Gate for RemoteGate {
             | Response::Pong { .. }
             | Response::Decision { .. }
             | Response::Heartbeat { .. }
+            | Response::Native { .. }
             | Response::WriteLease { .. }
             | Response::Cancelled { .. }
             | Response::Status { .. }) => Err(Self::unexpected("bind_agent_lease", &unexpected)),
@@ -1637,10 +1783,113 @@ impl Gate for RemoteGate {
             | Response::Pong { .. }
             | Response::Decision { .. }
             | Response::Heartbeat { .. }
+            | Response::Native { .. }
             | Response::WriteLease { .. }
             | Response::Cancelled { .. }
             | Response::Status { .. }) => Err(Self::unexpected("settle_by_agent", &unexpected)),
         }
+    }
+
+    fn register_native(
+        &self,
+        session_id: &str,
+        dispatch_id: &str,
+        ask: &NativeAsk,
+    ) -> Result<RegisterOutcome, GateError> {
+        self.native_call(
+            "register_native",
+            Request::RegisterNative {
+                session_id: session_id.into(),
+                dispatch_id: dispatch_id.into(),
+                ask: ask.clone(),
+            },
+            NativeAnswer::registered,
+        )
+    }
+
+    fn claim_native(
+        &self,
+        session_id: &str,
+        dispatch_id: &str,
+        to: Option<&str>,
+    ) -> Result<ClaimOutcome, GateError> {
+        self.native_call(
+            "claim_native",
+            Request::ClaimNative {
+                session_id: session_id.into(),
+                dispatch_id: dispatch_id.into(),
+                to: to.map(str::to_string),
+            },
+            NativeAnswer::claimed,
+        )
+    }
+
+    fn native_worktree(&self, session_id: &str, name: &str) -> Result<WorktreeOutcome, GateError> {
+        self.native_call(
+            "native_worktree",
+            Request::NativeWorktree {
+                session_id: session_id.into(),
+                name: name.into(),
+            },
+            NativeAnswer::worktree,
+        )
+    }
+
+    fn bind_native(
+        &self,
+        session_id: &str,
+        dispatch_id: &str,
+        agent_id: &str,
+    ) -> Result<BindNativeOutcome, GateError> {
+        self.native_call(
+            "bind_native",
+            Request::BindNative {
+                session_id: session_id.into(),
+                dispatch_id: dispatch_id.into(),
+                agent_id: agent_id.into(),
+            },
+            NativeAnswer::bound,
+        )
+    }
+
+    fn stop_native(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        transcript_path: Option<&Path>,
+        last_assistant_message: Option<&str>,
+    ) -> Result<StopNativeOutcome, GateError> {
+        self.native_call(
+            "stop_native",
+            Request::StopNative {
+                session_id: session_id.into(),
+                agent_id: agent_id.into(),
+                transcript_path: transcript_path.map(Path::to_path_buf),
+                last_assistant_message: last_assistant_message.map(str::to_string),
+            },
+            NativeAnswer::stopped,
+        )
+    }
+
+    fn is_native_agent(&self, session_id: &str, agent_id: &str) -> Result<bool, GateError> {
+        self.native_call(
+            "is_native_agent",
+            Request::IsNativeAgent {
+                session_id: session_id.into(),
+                agent_id: agent_id.into(),
+            },
+            NativeAnswer::agent,
+        )
+    }
+
+    fn native_status(&self, dispatch_id: &str) -> Result<NativeProgress, GateError> {
+        self.native_call(
+            "native_status",
+            Request::NativeStatus {
+                dispatch_id: dispatch_id.into(),
+            },
+            NativeAnswer::progress,
+        )
     }
 
     fn finish_run(&self, run_id: &str) -> Result<LifecycleOutcome, GateError> {
@@ -2184,6 +2433,88 @@ mod tests {
             state.lock().expect("lock").status(Instant::now()).runs["run-1"].admitted_total,
             2
         );
+    }
+
+    // The native-dispatch calls over a real socket: each request reaches
+    // the registry and each answer comes back as the outcome the registry
+    // gave, and a stop leaves the dispatch for the runner to settle.
+    #[test]
+    fn a_native_dispatch_is_followed_over_the_wire() {
+        let dir = temp_dir("native-wire");
+        let socket = dir.join("relais.sock");
+        let (coordinator, listener) = Coordinator::start(
+            &socket,
+            limits(),
+            None,
+            crate::admission::DEFAULT_AGENT_LEASE_TTL,
+        )
+        .expect("start");
+        let server = std::thread::spawn(move || coordinator.serve(listener));
+        let gate = RemoteGate::new(socket.clone());
+        gate.register_run(&registration("run-n", "sess-n"))
+            .expect("register");
+        assert_eq!(
+            gate.admit(&request("d-n", "run-n", "sess-n"))
+                .expect("admit"),
+            Decision::Granted
+        );
+        let ask = NativeAsk::Spawn {
+            subagent_type: "relais-worker".into(),
+            model: "sonnet".into(),
+            prompt: format!("go\n{}", crate::native::marker_line("d-n")),
+            worktree: PathBuf::from("/trees/n"),
+        };
+        assert_eq!(
+            gate.register_native("sess-n", "d-n", &ask).expect("native"),
+            RegisterOutcome::Registered
+        );
+        assert!(matches!(
+            gate.claim_native("sess-n", "d-n", None).expect("claim"),
+            ClaimOutcome::Spawn { .. }
+        ));
+        assert_eq!(
+            gate.claim_native("sess-n", "d-n", None).expect("claim"),
+            ClaimOutcome::AlreadyClaimed
+        );
+        assert_eq!(
+            gate.native_worktree("sess-n", "agent-a1").expect("tree"),
+            WorktreeOutcome::Path {
+                path: PathBuf::from("/trees/n")
+            }
+        );
+        assert_eq!(
+            gate.bind_native("sess-n", "d-n", "a1").expect("bind"),
+            BindNativeOutcome::Bound
+        );
+        assert!(gate.is_native_agent("sess-n", "a1").expect("agent"));
+        assert_eq!(
+            gate.stop_native("sess-n", "a1", Some(Path::new("/t/a1.jsonl")), Some("done"))
+                .expect("stop"),
+            StopNativeOutcome::Stopped {
+                dispatch_id: "d-n".into()
+            }
+        );
+        assert!(matches!(
+            gate.native_status("d-n").expect("status"),
+            NativeProgress::Known {
+                state: crate::admission::NativeState::Stopped { .. }
+            }
+        ));
+        gate.settle("d-n", Some(1)).expect("settle");
+        gate.release("d-n").expect("release");
+        assert_eq!(
+            gate.native_status("d-n").expect("status"),
+            NativeProgress::Finished
+        );
+
+        assert!(matches!(
+            Client::new(socket.clone())
+                .request(&Request::Shutdown)
+                .expect("shutdown"),
+            Response::Ack
+        ));
+        let _ = Client::new(socket).ping();
+        server.join().expect("server thread").expect("serve");
     }
 
     // C9: every other "simultaneous" test is sequential calls on the

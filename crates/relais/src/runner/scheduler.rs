@@ -730,6 +730,7 @@ fn run_package(
         // fact, free to disagree.
         purpose: None,
         run_id: None,
+        worker_presentation: engine.config.worker_presentation,
     };
     engine.transition(
         State::Running,
@@ -1181,6 +1182,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         pid_slot: None,
         sandbox: None,
         tools: crate::backend::ToolSet::ModeDefault,
+        presentation: crate::backend::Presentation::Headless,
     };
     let budget = Budget {
         attempts_used: 0,

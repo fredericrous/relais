@@ -1521,6 +1521,11 @@ pub enum BlockCode {
     /// --verify-sandbox`), or the record of one cannot be read. A sandboxed
     /// worker runs only on a verified configuration.
     SandboxUnverified,
+    /// A native worker's model has no `[pricing.models]` entry, so its cost
+    /// is unknown and settles as the attempt's whole reservation: the run
+    /// is refused up front, or ends after the attempt that showed it,
+    /// rather than on a budget refusal it did not earn (SPEC §11).
+    NativeUnpriced,
 }
 
 impl BlockCode {
@@ -1557,6 +1562,7 @@ impl BlockCode {
             Self::SandboxUnavailable => "sandbox_unavailable",
             Self::SandboxWeakened => "sandbox_weakened",
             Self::SandboxUnverified => "sandbox_unverified",
+            Self::NativeUnpriced => "native_unpriced",
         }
     }
 }

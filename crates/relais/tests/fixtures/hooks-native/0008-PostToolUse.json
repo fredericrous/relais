@@ -1,0 +1,26 @@
+{
+  "cwd": "/REPO",
+  "duration_ms": 73,
+  "hook_event_name": "PostToolUse",
+  "permission_mode": "bypassPermissions",
+  "prompt_id": "prompt-0000",
+  "session_id": "session-0000",
+  "tool_input": {
+    "message": "Run echo SECOND with Bash and reply with its output.",
+    "summary": "Run second command",
+    "to": "agent-01"
+  },
+  "tool_name": "SendMessage",
+  "tool_response": {
+    "message": "Resuming agent agent-01",
+    "pin": {
+      "id": "agent-01",
+      "name": "agent-01",
+      "ref": "ref-0000"
+    },
+    "resumedAgentId": "agent-01",
+    "success": true
+  },
+  "tool_use_id": "toolu-02",
+  "transcript_path": "/REDACTED/transcript.jsonl"
+}

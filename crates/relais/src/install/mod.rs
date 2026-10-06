@@ -179,9 +179,19 @@ fn read_block(text: &str) -> BlockRead {
     })
 }
 
-/// Files relais owns, in install order.
+/// Files relais owns, in install order: the advisory agents, one native
+/// worker per shipped (model, effort), then the skills.
 pub fn owned_files() -> Vec<(PathBuf, String)> {
-    vec![
+    let workers = crate::native::worker_agent_types()
+        .into_iter()
+        .map(|(model, effort)| {
+            let agent_type = crate::native::worker_agent_type(&model, effort.as_deref());
+            (
+                Path::new("agents").join(format!("{agent_type}.md")),
+                agent_native_worker(&agent_type, &model, effort.as_deref()),
+            )
+        });
+    let mut files = vec![
         (
             Path::new("agents").join("relais-research.md"),
             agent_research(),
@@ -191,6 +201,9 @@ pub fn owned_files() -> Vec<(PathBuf, String)> {
             agent_implementation(),
         ),
         (Path::new("agents").join("relais-review.md"), agent_review()),
+    ];
+    files.extend(workers);
+    files.extend([
         (
             Path::new("skills").join("relais").join("SKILL.md"),
             skill_relais(),
@@ -207,7 +220,35 @@ pub fn owned_files() -> Vec<(PathBuf, String)> {
                 .join("SKILL.md"),
             skill_relais_architecture_conflict(),
         ),
-    ]
+    ]);
+    files
+}
+
+/// A native worker definition: the subagent a `RELAIS-SPAWN` line asks the
+/// session to start. No `Agent` among its tools, so a worker cannot spawn.
+/// `isolation: worktree` as the plan's decision log says (the spawn's own
+/// input sets it too). No `maxTurns`, deliberately: the attempt's wall
+/// time and the budget checked between attempts bound it, and a turn cap
+/// would stop a worker in the middle of an edit.
+fn agent_native_worker(agent_type: &str, model: &str, effort: Option<&str>) -> String {
+    let effort_line = effort.map_or(String::new(), |effort| format!("effort: {effort}\n"));
+    let body = format!(
+        r#"---
+name: {agent_type}
+description: relais native worker. Spawned only from a RELAIS-SPAWN line printed by `relais run --native`; never pick it yourself.
+tools: Read, Grep, Glob, Edit, Write, Bash
+model: {model}
+{effort_line}isolation: worktree
+---
+
+You are a relais worker. The task, the rules and the acceptance criteria
+arrive in your prompt; follow them exactly.
+
+Verification, not your own summary, decides acceptance. You do not
+commit, push or publish anything.
+"#
+    );
+    body.trim_end().to_string()
 }
 
 fn agent_research() -> String {
@@ -335,11 +376,31 @@ must not edit files.
 
 3. Preflight without spending: `relais plan --task .relais/task.json`
 
-4. Execute — relais reads `CLAUDE_CODE_SESSION_ID` from the environment
-   on its own, so the coordinator's per-session limits and attribution
-   are per TAB rather than per shell (SPEC §23) without naming anything
-   explicitly:
-   `relais run --task .relais/task.json`
+4. Execute natively, so the worker shows as Claude Code's own agent.
+   relais reads `CLAUDE_CODE_SESSION_ID` from the environment on its
+   own, so the coordinator's per-session limits and attribution are per
+   TAB rather than per shell (SPEC §23) without naming anything
+   explicitly. Run
+   `relais run --native --task .relais/task.json`
+   with the Bash tool's `run_in_background: true`, and follow its
+   output: the Monitor tool on a `tail -f` of the output file, or read
+   the output file. relais asks for each worker on one line:
+   - on a line `RELAIS-SPAWN <json>`, call the Agent tool once with
+     exactly that JSON's fields (`subagent_type`, `model`,
+     `description`, `prompt`, `isolation`, `run_in_background`), the
+     prompt unchanged;
+   - on a line `RELAIS-CONTINUE <json>`, call SendMessage (load it with
+     ToolSearch first if it is deferred) with that JSON's `to` and
+     `message`, exactly.
+   Never send anything else to relais's agents, and never spawn one
+   request twice: the hook refuses both. Do not work on the task
+   yourself while the run is going. A worker finishing is not the run
+   finishing: relais still verifies, and may review, repair or escalate.
+   Keep following the output until relais prints its outcome line, and
+   do not end your turn before it: a run whose session ends goes with it.
+   Then read the outcome as in step 5.
+   For a terminal or an unattended run, without Claude Code's agent
+   rendering, run `relais run --task .relais/task.json` instead.
 
 5. Read the outcome: accepted (receipt + patch), needs_decision,
 needs_review, blocked, failed, budget_exhausted or interrupted. The
@@ -935,7 +996,7 @@ impl InstallRoot {
     /// read it, a directory in its place, an I/O failure mid-read — is
     /// returned, because "I could not see what is there" is not "there
     /// is nothing there", and the caller's answer to the second is to
-    /// write a fresh seven-handler document. Collapsing the two would
+    /// write a fresh eight-handler document. Collapsing the two would
     /// mean a settings.json relais could not read got replaced by one it
     /// composed, which is the opposite of this module's promise.
     fn read_settings(&self) -> std::io::Result<Option<String>> {
@@ -1163,7 +1224,7 @@ mod tests {
     fn install_is_preview_first_and_merge_safe() {
         let (root, dir) = temp_root();
         let plan = root.plan();
-        assert_eq!(plan.actions.len(), 6);
+        assert_eq!(plan.actions.len(), owned_files().len());
         assert!(plan
             .actions
             .iter()
@@ -1171,7 +1232,7 @@ mod tests {
         // Preview wrote nothing.
         assert!(!root.claude_dir.exists());
         let applied = root.apply(&plan).expect("apply");
-        assert_eq!(applied.applied.len(), 6);
+        assert_eq!(applied.applied.len(), owned_files().len());
         assert!(applied.not_applied.is_empty(), "{applied:?}");
         let skill = root.claude_dir.join("skills/relais/SKILL.md");
         assert!(skill.is_file());
@@ -1244,7 +1305,7 @@ mod tests {
         // The three unchanged agents are removed entirely; the skill's
         // owned block is removed but the user's note survives; the
         // foreign agent was never ours.
-        assert_eq!(applied.len(), 6, "{applied:?}");
+        assert_eq!(applied.len(), owned_files().len(), "{applied:?}");
         assert!(!root.claude_dir.join("agents/relais-research.md").exists());
         let remaining = std::fs::read_to_string(&owned).expect("kept file");
         assert!(
@@ -1733,14 +1794,14 @@ mod tests {
     fn an_action_the_write_cannot_carry_out_is_reported() {
         let (root, dir) = temp_root();
         let plan = root.plan();
-        assert_eq!(plan.applicable_count(), 6);
+        assert_eq!(plan.applicable_count(), owned_files().len());
         // Between plan and apply, somebody else writes one of the files.
         let agent = root.claude_dir.join("agents/relais-review.md");
         std::fs::create_dir_all(agent.parent().expect("parent")).expect("mkdir");
         std::fs::write(&agent, "# mine now\n").expect("foreign");
 
         let done = root.apply(&plan).expect("apply");
-        assert_eq!(done.applied.len(), 5, "{done:?}");
+        assert_eq!(done.applied.len(), owned_files().len() - 1, "{done:?}");
         assert_eq!(
             done.not_applied
                 .iter()
@@ -1762,14 +1823,14 @@ mod tests {
         let (root, dir) = temp_root();
         root.apply(&root.plan()).expect("apply");
         let plan = root.uninstall_plan();
-        assert_eq!(plan.applicable_count(), 6);
+        assert_eq!(plan.applicable_count(), owned_files().len());
         // The user edits inside the block after previewing the removal.
         let agent = root.claude_dir.join("agents/relais-research.md");
         let text = std::fs::read_to_string(&agent).expect("read");
         std::fs::write(&agent, text.replace("advisory set", "MY set")).expect("edit inside");
 
         let done = root.apply_uninstall(&plan).expect("uninstall");
-        assert_eq!(done.applied.len(), 5, "{done:?}");
+        assert_eq!(done.applied.len(), owned_files().len() - 1, "{done:?}");
         assert_eq!(
             done.not_applied
                 .iter()
@@ -1801,7 +1862,7 @@ mod tests {
         assert_eq!(request.scope_label(), "user level");
         let preview = install(&request, &home).expect("preview");
         assert_eq!(preview.mode, Mode::Preview);
-        assert_eq!(preview.plan.applicable_count(), 6);
+        assert_eq!(preview.plan.applicable_count(), owned_files().len());
         assert!(preview.applied.is_empty(), "a preview writes nothing");
         assert!(
             !home.join(".claude").exists(),
@@ -1813,7 +1874,7 @@ mod tests {
             mode: Mode::Apply,
         };
         let written = install(&request, &home).expect("apply");
-        assert_eq!(written.applied.len(), 6, "{written:?}");
+        assert_eq!(written.applied.len(), owned_files().len(), "{written:?}");
         assert!(written.not_applied.is_empty(), "{written:?}");
         assert!(home.join(".claude/skills/relais/SKILL.md").is_file());
         assert!(home.join(".claude/agents/relais-research.md").is_file());
@@ -1826,7 +1887,7 @@ mod tests {
             &home,
         )
         .expect("uninstall");
-        assert_eq!(removed.applied.len(), 6, "{removed:?}");
+        assert_eq!(removed.applied.len(), owned_files().len(), "{removed:?}");
         assert!(!home.join(".claude/agents/relais-research.md").exists());
 
         // A project request is the same shape with the directory named.
@@ -1880,13 +1941,13 @@ mod tests {
     }
 
     #[test]
-    fn hooks_apply_wires_all_seven_targets_into_a_fresh_settings_file() {
+    fn hooks_apply_wires_all_eight_targets_into_a_fresh_settings_file() {
         let (root, dir) = temp_root();
         let binary = relais_binary_for_test();
         let plan = root
             .plan_hooks(&binary, Duration::from_secs(2), no_other_roots())
             .expect("plan hooks");
-        assert_eq!(plan.applicable_count(), 7);
+        assert_eq!(plan.applicable_count(), 8);
 
         let applied = root
             .apply_hooks(&binary, Duration::from_secs(2), no_other_roots())
@@ -1894,7 +1955,7 @@ mod tests {
         let HooksApplied::Applied(events) = applied else {
             panic!("expected events to be wired: {applied:?}");
         };
-        assert_eq!(events.len(), 7, "{events:?}");
+        assert_eq!(events.len(), 8, "{events:?}");
 
         // A re-run is a no-op.
         let replan = root
@@ -2088,12 +2149,12 @@ mod tests {
             .expect("write foreign hook");
 
         let plan = root.plan_hooks_removal(&binary).expect("plan removal");
-        assert_eq!(plan.applicable_count(), 7);
+        assert_eq!(plan.applicable_count(), 8);
         let removed = root.apply_hooks_removal(&binary).expect("apply removal");
         let HooksRemoved::Removed(events) = removed else {
             panic!("expected removal: {removed:?}");
         };
-        assert_eq!(events.len(), 7, "{events:?}");
+        assert_eq!(events.len(), 8, "{events:?}");
 
         let after: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
@@ -2119,5 +2180,110 @@ mod tests {
             .expect("apply removal again");
         assert_eq!(reremoved, HooksRemoved::AlreadyAbsent);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The `key: value` lines of a file's frontmatter, comments dropped.
+    fn frontmatter(file: &str) -> Vec<(String, String)> {
+        file.strip_prefix("---\n")
+            .and_then(|rest| rest.split("\n---").next())
+            .expect("frontmatter")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .filter_map(|line| line.split_once(": "))
+            .map(|(key, value)| (key.to_string(), value.trim().to_string()))
+            .collect()
+    }
+
+    fn value_of<'a>(front: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        front
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn install_writes_one_worker_definition_per_shipped_model_and_effort() {
+        let (root, dir) = temp_root();
+        root.apply(&root.plan()).expect("apply");
+        let shipped = crate::native::worker_agent_types();
+        assert_eq!(shipped.len(), 19);
+        for (model, effort) in shipped {
+            // The name a RELAIS-SPAWN line carries is the file's name.
+            let agent_type = crate::native::worker_agent_type(&model, effort.as_deref());
+            let path = root.claude_dir.join(format!("agents/{agent_type}.md"));
+            let file = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{agent_type} is not installed: {e}"));
+            let front = frontmatter(&file);
+            assert_eq!(value_of(&front, "name"), Some(agent_type.as_str()));
+            assert_eq!(value_of(&front, "model"), Some(model.as_str()));
+            assert_eq!(
+                value_of(&front, "effort"),
+                effort.as_deref(),
+                "{agent_type}"
+            );
+            let tools = value_of(&front, "tools").expect("tools");
+            assert!(
+                !tools.contains("Agent"),
+                "{agent_type} must not spawn: {tools}"
+            );
+            assert_eq!(tools, "Read, Grep, Glob, Edit, Write, Bash");
+            assert_eq!(
+                value_of(&front, "isolation"),
+                Some("worktree"),
+                "{agent_type}"
+            );
+            assert!(
+                value_of(&front, "description")
+                    .expect("description")
+                    .starts_with("relais native worker."),
+                "{agent_type}"
+            );
+            assert!(file.contains("commit, push or publish"), "{agent_type}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn uninstall_removes_the_worker_definitions() {
+        let (root, dir) = temp_root();
+        root.apply(&root.plan()).expect("apply");
+        root.apply_uninstall(&root.uninstall_plan())
+            .expect("uninstall");
+        for (model, effort) in crate::native::worker_agent_types() {
+            let agent_type = crate::native::worker_agent_type(&model, effort.as_deref());
+            assert!(
+                !root
+                    .claude_dir
+                    .join(format!("agents/{agent_type}.md"))
+                    .exists(),
+                "{agent_type}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_relais_skill_runs_native_workers_exactly_as_asked() {
+        let skill = skill_relais();
+        for instruction in [
+            "relais run --native --task .relais/task.json",
+            "`run_in_background: true`",
+            "Monitor tool on a `tail -f`",
+            "`RELAIS-SPAWN <json>`",
+            "call the Agent tool once with",
+            "`subagent_type`, `model`,",
+            "`run_in_background`), the\n     prompt unchanged",
+            "`RELAIS-CONTINUE <json>`",
+            "SendMessage",
+            "ToolSearch",
+            "`to` and\n     `message`, exactly",
+            "Never send anything else to relais's agents",
+            "never spawn one\n   request twice",
+            "relais run --task .relais/task.json",
+            "A worker finishing is not the run\n   finishing",
+            "do not end your turn before it",
+        ] {
+            assert!(skill.contains(instruction), "{instruction}\n{skill}");
+        }
     }
 }

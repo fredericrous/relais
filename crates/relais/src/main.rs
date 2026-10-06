@@ -142,6 +142,19 @@ enum Command {
         /// record.
         #[arg(long = "revise")]
         revise: Option<String>,
+        /// Launch each worker attempt as a native subagent the parent
+        /// Claude Code session spawns, so Claude Code renders it (SPEC §23).
+        /// Needs a parent Claude Code session
+        #[arg(long)]
+        native: bool,
+        /// How long to wait for the parent session to spawn a requested
+        /// native worker before the attempt ends `native_spawn_missing`
+        #[arg(
+            long = "native-spawn-wait",
+            value_name = "SECONDS",
+            requires = "native"
+        )]
+        native_spawn_wait: Option<u64>,
     },
     /// Show recent runs, or one run's current state
     Status { run_id: Option<String> },
@@ -814,7 +827,20 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             };
             plan_command(&task, revise.as_deref(), format)
         }
-        Command::Run { task, revise } => run_command(&task, revise.as_deref()),
+        Command::Run {
+            task,
+            revise,
+            native,
+            native_spawn_wait,
+        } => run_command(
+            &task,
+            revise.as_deref(),
+            native.then(|| {
+                std::time::Duration::from_secs(
+                    native_spawn_wait.unwrap_or(DEFAULT_NATIVE_SPAWN_WAIT),
+                )
+            }),
+        ),
         Command::Status { run_id } => status_command(run_id.as_deref()),
         Command::Explain { run_id } => explain_command(&run_id),
         Command::Resume {
@@ -1140,6 +1166,7 @@ fn render_hooks_preview(plan: relais::install::HooksPlan) -> CliOutcome {
                     match event.action {
                         relais::install::HookEventAction::Current => "keep",
                         relais::install::HookEventAction::CorrectTimeout => "retime",
+                        relais::install::HookEventAction::MigrateMatcher => "migrate",
                         relais::install::HookEventAction::JoinExisting => "join",
                         relais::install::HookEventAction::NewEntry => "add",
                     },
@@ -2167,24 +2194,47 @@ fn hook_command(dir: &Path) -> Result<CliOutcome, CliError> {
 }
 
 /// `relais hook`, run with no flags: read one payload on stdin, decide
-/// what to say about it, and say it (SPEC §23). Always accepts — a
-/// non-zero exit from a hook is reported to the session as a failure of
-/// the tool call it was watching, so a relais that cannot answer must be
-/// indistinguishable from a relais that had nothing to say. Every path
-/// that could fail (an unreadable settings file, an unreachable
-/// coordinator, a payload that is not JSON, a panic anywhere inside) is
-/// swallowed rather than surfaced; `relais doctor` is where any of that
-/// is reported as a finding.
+/// what to say about it, and say it (SPEC §23). Exits 0 except when the
+/// answer itself asks otherwise: a `WorktreeCreate` relais could not make
+/// a tree for exits 1 with the reason, because Claude Code refuses that
+/// agent either way and the reason is the only thing worth adding. For
+/// everything else a non-zero exit is reported to the session as a
+/// failure of the tool call it was watching, so a relais that cannot
+/// answer must be indistinguishable from a relais that had nothing to
+/// say. Every path that could fail (an unreadable settings file, an
+/// unreachable coordinator, a payload that is not JSON, a panic anywhere
+/// inside) is swallowed rather than surfaced; `relais doctor` is where
+/// any of that is reported as a finding.
 fn hook_respond_command() -> CliOutcome {
     // The whole body, not just `respond::handle`: reading stdin,
     // loading settings and journalling all run here too, and none of
     // them may take the process down with them any more than the
     // decision itself may.
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook_respond));
+    // An answer may ask for a non-zero exit (a worktree that could not be
+    // made); a panic still exits 0, as every hook failure always has.
+    let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook_respond)).unwrap_or(0);
+    if code != 0 {
+        std::process::exit(code);
+    }
     CliOutcome::Accepted
 }
 
-fn hook_respond() {
+/// Print an answer: stdout as rendered (one trailing newline), stderr
+/// when it has something to say. Returns the exit status it asks for.
+fn write_answer(answer: &relais::hook::decide::HookAnswer) -> i32 {
+    if let Some(mut text) = answer.stdout_payload() {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        print!("{text}");
+    }
+    if let Some(reason) = answer.stderr_payload() {
+        eprintln!("{reason}");
+    }
+    answer.exit_code()
+}
+
+fn hook_respond() -> i32 {
     use std::io::Read;
     let mut payload = Vec::new();
     // A truncated read leaves `payload` with whatever arrived so far;
@@ -2196,27 +2246,15 @@ fn hook_respond() {
 
     let Ok(socket) = relais::coordinator::socket_path() else {
         // No home directory: nothing to connect to and nowhere to
-        // journal. `decide_or_silent` still owes an answer for "the
-        // coordinator could not be reached" under this machine's own
-        // stance, so build one directly rather than skip the decision
-        // entirely.
-        let event = relais::hook::event::parse(&payload);
-        let answer = relais::hook::decide::decide_or_silent(
-            &event,
-            &settings,
-            None,
-            std::time::Duration::ZERO,
-        );
-        if let Some(text) = answer.stdout_payload() {
-            println!("{text}");
-        }
-        return;
+        // journal. The hook still owes an answer for "the coordinator
+        // could not be reached" under this machine's own stance, and a
+        // `WorktreeCreate` still owes a path or a reason.
+        let answer = relais::hook::respond::answer_without_home(&payload, &settings);
+        return write_answer(&answer);
     };
     let gate = relais::coordinator::RemoteGate::new(socket);
     let handled = relais::hook::respond::handle(&payload, &settings, &gate);
-    if let Some(text) = handled.answer.stdout_payload() {
-        println!("{text}");
-    }
+    let code = write_answer(&handled.answer);
     if let Ok(path) = paths::hook_journal_path() {
         let entry = relais::hook::respond::journal_entry(&payload, &handled);
         // Best effort, like every other step here: a journal write
@@ -2224,6 +2262,7 @@ fn hook_respond() {
         // answered above.
         let _ = relais::hook::respond::append_journal(&path, &entry);
     }
+    code
 }
 
 /// The machine's hook-admission settings, or the stated defaults when
@@ -2558,7 +2597,35 @@ fn plan_trial_lines(
     Ok(decision.lines())
 }
 
-fn run_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError> {
+/// Seconds `relais run --native` waits for the parent session to spawn a
+/// requested worker.
+const DEFAULT_NATIVE_SPAWN_WAIT: u64 = 120;
+
+/// Why a `--native` run cannot start under this session, if it cannot: a
+/// native worker is spawned by a parent Claude Code session, which a
+/// session id guessed from the parent process is not.
+fn native_session_refusal(
+    native: Option<std::time::Duration>,
+    session: &relais::coordinator::ResolvedSessionId,
+) -> Option<String> {
+    (native.is_some() && session.source.is_fallback()).then(|| {
+        "native workers need to run inside Claude Code: no CLAUDE_CODE_SESSION_ID in the \
+         environment names a parent session to spawn them"
+            .to_string()
+    })
+}
+
+/// `native` is the spawn wait of a `--native` run, `None` for a headless one.
+fn run_command(
+    task: &Path,
+    revise: Option<&str>,
+    native: Option<std::time::Duration>,
+) -> Result<CliOutcome, CliError> {
+    let session = relais::coordinator::resolve_session();
+    if let Some(detail) = native_session_refusal(native, &session) {
+        eprintln!("relais run: {detail}");
+        return Ok(CliOutcome::Blocked);
+    }
     let (root, repo) = load_repo_policy()?;
     let machine = load_machine()?;
     let contract = load_contract(task)?;
@@ -2611,7 +2678,47 @@ fn run_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError
         .as_ref()
         .map(|registry| RegistryPredictor::new(registry, &repo, harness.as_deref()));
     let ids = id_source();
-    let session = relais::coordinator::resolve_session();
+    // The worker attempts of a `--native` run go to the parent session;
+    // everything else stays on the Claude backend.
+    let prices = match native {
+        Some(_) => Some(load_price_table()?),
+        None => None,
+    };
+    if let Some(table) = &prices {
+        let mut aliases: Vec<String> = repo.models.values().map(|m| m.id.clone()).collect();
+        aliases.sort();
+        aliases.dedup();
+        let observations = operational(ledger.model_observations(), "model observations")?;
+        let machine_toml = paths::machine_settings_path().map_err(CliError::Home)?;
+        let decided =
+            relais::native_pricing::preflight(&aliases, table, &observations, &machine_toml);
+        for warning in &decided.warnings {
+            eprintln!("{warning}");
+        }
+        if !decided.refusals.is_empty() {
+            for refusal in &decided.refusals {
+                eprintln!("relais run: {refusal}");
+            }
+            return Ok(CliOutcome::Blocked);
+        }
+    }
+    let native_backend = native.map(|spawn_wait| {
+        relais::adapter::native::NativeBackend::new(
+            backend.as_ref(),
+            &gate,
+            session.id.clone(),
+            spawn_wait,
+            prices,
+        )
+    });
+    let run_backend: &dyn relais::backend::Backend = match &native_backend {
+        Some(native_backend) => native_backend,
+        None => backend.as_ref(),
+    };
+    let worker_presentation = match native {
+        Some(_) => relais::backend::Presentation::Native,
+        None => relais::backend::Presentation::Headless,
+    };
     // Printed here, before `execute`, so it is visible on every path —
     // including the `Err` arm below that returns early — and only once:
     // a run can take minutes, and deferring this to the end read as
@@ -2700,7 +2807,7 @@ fn run_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError
         machine: &machine,
         ledger: &ledger,
         ids: &ids,
-        backend: backend.as_ref(),
+        backend: run_backend,
         git: &git,
         hooks: &hooks,
         attest: &attest,
@@ -2722,6 +2829,7 @@ fn run_command(task: &Path, revise: Option<&str>) -> Result<CliOutcome, CliError
         // `trials.source_run_id` never disagree about it (SPEC §28).
         purpose: trial_id.as_ref().map(|_| RunPurpose::TrialArm),
         run_id: Some(run_id.clone()),
+        worker_presentation,
     }) {
         Ok(outcome) => outcome,
         Err(e) => {
@@ -3036,6 +3144,7 @@ fn replay_command(task: &str, recipe: &Path, dry_run: bool) -> Result<CliOutcome
         task_override: Some(&task_id),
         purpose: Some(RunPurpose::Replay),
         run_id: None,
+        worker_presentation: relais::backend::Presentation::Headless,
     });
     // Bring the replay's own refs into the live repository BEFORE the
     // checkout goes. The runner names its candidate and snapshot refs in
@@ -4155,6 +4264,9 @@ fn is_bare_shell_pid(session_id: &str) -> bool {
 /// One session's message count, token totals and cost, imported.
 struct ImportSummary {
     messages: usize,
+    /// Records left out because a relais run booked them (a native
+    /// worker's messages, SPEC §11); not part of any other figure.
+    skipped_native: usize,
     input_tokens: u64,
     output_tokens: u64,
     cache_read_tokens: u64,
@@ -4240,6 +4352,7 @@ fn import_session(
     }
     let mut summary = ImportSummary {
         messages: 0,
+        skipped_native: 0,
         input_tokens: 0,
         output_tokens: 0,
         cache_read_tokens: 0,
@@ -4261,6 +4374,10 @@ fn import_session(
             }
         };
         for record in orchestration::parse_transcript(&text) {
+            if operational(ledger.is_native_booked(&record.message_id), "usage import")? {
+                summary.skipped_native += 1;
+                continue;
+            }
             let priced = orchestration::price(&record, price_table);
             summary.messages += 1;
             summary.input_tokens += record.input_tokens;
@@ -4299,6 +4416,14 @@ fn import_session(
     Ok(SessionImportOutcome::Imported(summary))
 }
 
+/// The summary line's tail when records were left to the run that booked them.
+fn skipped_note(skipped: usize) -> String {
+    match skipped {
+        0 => String::new(),
+        n => format!("; {n} record(s) skipped, already booked to a relais run"),
+    }
+}
+
 fn usage_import_command(
     session: Option<&str>,
     projects_dir: Option<&Path>,
@@ -4320,11 +4445,12 @@ fn usage_import_command(
         match import_session(&ledger, &projects_dir, &price_table, &session_id)? {
             SessionImportOutcome::Imported(summary) => {
                 println!(
-                    "{session_id}: {} message(s), {} input + {} output tokens: {}",
+                    "{session_id}: {} message(s), {} input + {} output tokens: {}{}",
                     summary.messages,
                     summary.input_tokens,
                     summary.output_tokens,
                     report::cost_line(summary.cost, summary.completeness),
+                    skipped_note(summary.skipped_native),
                 );
             }
             SessionImportOutcome::Unattributable => {
@@ -4966,6 +5092,49 @@ mod tests {
         (ledger, dir)
     }
 
+    fn session(
+        source: relais::coordinator::SessionSource,
+    ) -> relais::coordinator::ResolvedSessionId {
+        relais::coordinator::ResolvedSessionId {
+            id: "s1".into(),
+            source,
+        }
+    }
+
+    /// A native worker is spawned by a parent Claude Code session: a
+    /// session id guessed from the parent process is refused, and a
+    /// headless run never asks.
+    #[test]
+    fn a_native_run_needs_a_parent_claude_code_session() {
+        use relais::coordinator::SessionSource;
+        let wait = Some(std::time::Duration::from_secs(120));
+        let refusal = native_session_refusal(wait, &session(SessionSource::ParentPidFallback))
+            .expect("a fallback session is refused");
+        assert!(refusal.contains("inside Claude Code"), "{refusal}");
+        assert_eq!(
+            native_session_refusal(wait, &session(SessionSource::ClaudeCode)),
+            None
+        );
+        assert_eq!(
+            native_session_refusal(None, &session(SessionSource::ParentPidFallback)),
+            None
+        );
+    }
+
+    #[test]
+    fn the_native_spawn_wait_is_only_accepted_with_native() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(["relais", "run", "--task", "t.json"].iter().chain(args))
+        };
+        assert!(parse(&["--native", "--native-spawn-wait", "30"]).is_ok());
+        assert!(parse(&["--native"]).is_ok());
+        assert!(parse(&[]).is_ok());
+        assert!(
+            parse(&["--native-spawn-wait", "30"]).is_err(),
+            "the wait means nothing without --native"
+        );
+    }
+
     /// `relais explain` says a report it cannot parse in one line within 80
     /// columns, however long the parse error is.
     #[test]
@@ -5040,6 +5209,94 @@ mod tests {
             .orchestration_spend_since(since)
             .expect("spend in the window");
         assert_eq!(cost, MicroUsd::from_micros(5_000_000));
+    }
+
+    /// Run first: the native attempt booked the worker's messages from
+    /// its subagent transcript, so importing the session inserts the
+    /// session's own messages only and reports what it left to the run.
+    #[test]
+    fn import_leaves_a_native_workers_messages_to_the_run_that_booked_them() {
+        use relais::ids::{RunId, TaskId};
+        use relais::ledger::UsageEvent;
+        use relais::money::CostKind;
+        let (ledger, dir) = temp_ledger("import-native");
+        let run = RunId::from_stored("run-n");
+        ledger
+            .insert_run(
+                &run,
+                "/repo",
+                Some("sess-n"),
+                &TaskId::from_stored("task-n"),
+                "rk",
+            )
+            .expect("run");
+        let line = |id: &str| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"2026-10-06T10:00:00Z","message":{{"id":"{id}","model":"claude-opus-5","usage":{{"input_tokens":1000000,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation":{{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}}}}}}"#
+            )
+        };
+        let slug = dir.join("projects").join("-slug");
+        let subagents = slug.join("sess-n").join("subagents");
+        std::fs::create_dir_all(&subagents).expect("subagents dir");
+        std::fs::write(slug.join("sess-n.jsonl"), line("msg-session")).expect("main");
+        std::fs::write(subagents.join("agent-a1.jsonl"), line("msg-worker")).expect("agent");
+        let table = PriceTable {
+            version: "test".into(),
+            models: vec![relais::orchestration::ModelPrice {
+                ids: vec!["claude-opus-5".into()],
+                input: 5_000_000,
+                output: 25_000_000,
+                cache_read: 500_000,
+                cache_write_5m: 6_250_000,
+                cache_write_1h: 10_000_000,
+                fast_input: None,
+                fast_output: None,
+            }],
+        };
+        let booked = UsageEvent {
+            event_id: "d1".into(),
+            run_id: run.clone(),
+            attempt_id: None,
+            parent_event_id: None,
+            model: Some("claude-opus-5".into()),
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(0),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost: Some(MicroUsd::from_micros(5_000_000)),
+            cost_kind: CostKind::EstimatedApiEquivalent,
+            completeness: CostCompleteness::Estimated,
+            inclusive: false,
+            at: ledger.now(),
+            phase: None,
+            duration_ms: None,
+            requested_model: None,
+            requested_effort: None,
+            harness: None,
+        };
+        ledger
+            .record_native_usage(&booked, &["msg-worker".to_string()])
+            .expect("native booking");
+        let SessionImportOutcome::Imported(summary) =
+            import_session(&ledger, &dir.join("projects"), &table, "sess-n").expect("imports")
+        else {
+            panic!("the session has a transcript");
+        };
+        assert_eq!(summary.messages, 1);
+        assert_eq!(summary.skipped_native, 1);
+        assert!(skipped_note(summary.skipped_native).contains("1 record(s) skipped"));
+        let (session_cost, _) = ledger
+            .orchestration_spend_since("2026-01-01T00:00:00Z")
+            .expect("spend");
+        assert_eq!(
+            session_cost,
+            MicroUsd::from_micros(5_000_000),
+            "the session's own only"
+        );
+        assert_eq!(
+            ledger.run_cost(&run).expect("run cost"),
+            MicroUsd::from_micros(5_000_000)
+        );
     }
 
     /// Walks every `DecideAnswer` and asserts the terminal state it

@@ -281,6 +281,8 @@ impl Backend for ClaudeBackend {
             worker_claims_blockage,
             permission_denials: parsed.permission_denials,
             failure_detail,
+            booked_message_ids: Vec::new(),
+            unpriced: Vec::new(),
         })
     }
 }
@@ -688,6 +690,7 @@ mod tests {
             pid_slot: None,
             sandbox: None,
             tools: crate::backend::ToolSet::ModeDefault,
+            presentation: crate::backend::Presentation::Headless,
         }
     }
 

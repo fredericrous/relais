@@ -78,9 +78,15 @@ fn expected(path: &Path, bytes: &[u8]) -> &'static str {
         // call, carrying the phase inside it — `0002` and `0007` are the
         // two halves of one spawn and both land here.
         "PreToolUse" | "PostToolUse" if is_agent_tool => "AgentToolCall",
+        // `hooks-native/0006` and `0008`: a continuation of a subagent.
+        "PreToolUse" | "PostToolUse" | "PostToolUseFailure" if tool == "SendMessage" => {
+            "SendMessageCall"
+        }
         // A tool event for any other tool is a real event relais simply
         // does not act on — `0001` is a `Read`.
         "PreToolUse" | "PostToolUse" | "PostToolUseFailure" => "NotOurs",
+        // `hooks-native/0002`: the tree an isolated agent works in.
+        "WorktreeCreate" => "WorktreeCreate",
         other => panic!("fixture names an event this test does not map: {other}"),
     }
 }
@@ -92,6 +98,8 @@ fn variant_of(event: &HookEvent) -> &'static str {
         HookEvent::SubagentStart(_) => "SubagentStart",
         HookEvent::SubagentStop(_) => "SubagentStop",
         HookEvent::AgentToolCall(_) => "AgentToolCall",
+        HookEvent::SendMessageCall(_) => "SendMessageCall",
+        HookEvent::WorktreeCreate(_) => "WorktreeCreate",
         HookEvent::NotOurs => "NotOurs",
     }
 }

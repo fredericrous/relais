@@ -483,3 +483,21 @@ fn a_world_is_countable_by_doctors_scan() {
         "the world's own root must be counted among {parent:?}'s strays"
     );
 }
+
+/// A tree that cannot be made fails the spawn the way Claude Code reads
+/// it: nothing on stdout, the reason on stderr, exit status 1.
+#[test]
+fn a_worktree_create_that_fails_exits_one_with_the_reason_on_stderr() {
+    let world = World::new("worktree-fail");
+    let payload = serde_json::json!({
+        "hook_event_name": "WorktreeCreate",
+        "session_id": "session-w",
+        "name": "../escape",
+        "cwd": world.state,
+    })
+    .to_string();
+    let (code, stdout, stderr) = world.hook(payload.as_bytes());
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("refusing"), "{stderr}");
+}

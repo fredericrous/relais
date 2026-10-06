@@ -1,0 +1,28 @@
+{
+  "cwd": "/REPO",
+  "duration_ms": 168,
+  "hook_event_name": "PostToolUse",
+  "permission_mode": "bypassPermissions",
+  "prompt_id": "prompt-0000",
+  "session_id": "session-0000",
+  "tool_input": {
+    "description": "e12 worker",
+    "isolation": "worktree",
+    "prompt": "Run pwd with Bash and reply with its output.",
+    "run_in_background": true,
+    "subagent_type": "s0-worker-b"
+  },
+  "tool_name": "Agent",
+  "tool_response": {
+    "agentId": "agent-01",
+    "canReadOutputFile": true,
+    "description": "e12 worker",
+    "isAsync": true,
+    "outputFile": "/REDACTED/tasks/agent-01.output",
+    "prompt": "Run pwd with Bash and reply with its output.",
+    "resolvedModel": "claude-haiku-4-5-20251001",
+    "status": "async_launched"
+  },
+  "tool_use_id": "toolu-01",
+  "transcript_path": "/REDACTED/transcript.jsonl"
+}

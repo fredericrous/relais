@@ -23,7 +23,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::{Admission, EffortSet};
-use crate::money::{CostCompleteness, MicroUsd};
+use crate::money::{CostCompleteness, CostKind, MicroUsd};
 use crate::policy::EffortId;
 use crate::procs::{Ended, RunError};
 
@@ -408,6 +408,18 @@ pub enum ToolSet {
     ReadOnly,
 }
 
+/// How a launch is presented to the person running relais (SPEC §23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Presentation {
+    /// A child process relais starts and supervises: every launch but a
+    /// native worker's.
+    #[default]
+    Headless,
+    /// A subagent the parent Claude Code session spawns on relais's
+    /// behalf, so Claude Code renders it.
+    Native,
+}
+
 /// One model dispatch. The prompt travels via stdin; arguments are an
 /// argv array; the working directory is the owned task worktree.
 #[derive(Debug, Clone)]
@@ -443,6 +455,9 @@ pub struct LaunchSpec {
     pub sandbox: Option<SandboxLaunch>,
     /// The tools the harness is asked to expose.
     pub tools: ToolSet,
+    /// Who runs the launch: relais's own child process, or a native
+    /// subagent of the parent session.
+    pub presentation: Presentation,
 }
 
 /// What a sandboxed launch adds: the whole `--settings` JSON (sandbox,
@@ -510,6 +525,10 @@ pub enum Cost {
         /// inclusive parent: SPEC §11), so it is never summed with them.
         inclusive: bool,
     },
+    /// A figure relais computed from the usage it read (tokens times the
+    /// machine's price table), not one the harness reported: what the
+    /// same usage would cost at API rates.
+    Estimated { micros: MicroUsd },
     /// The harness reported no cost. Unknown, never zero (SPEC §11).
     #[default]
     Unknown,
@@ -519,8 +538,16 @@ impl Cost {
     /// The figure, when one was reported.
     pub fn micros(self) -> Option<MicroUsd> {
         match self {
-            Self::Reported { micros, .. } => Some(micros),
+            Self::Reported { micros, .. } | Self::Estimated { micros } => Some(micros),
             Self::Unknown => None,
+        }
+    }
+
+    /// What kind of money the figure is, as the ledger books it.
+    pub fn kind(self) -> CostKind {
+        match self {
+            Self::Reported { .. } | Self::Unknown => CostKind::ApiSpend,
+            Self::Estimated { .. } => CostKind::EstimatedApiEquivalent,
         }
     }
 
@@ -529,6 +556,7 @@ impl Cost {
     pub fn completeness(self) -> CostCompleteness {
         match self {
             Self::Reported { .. } => CostCompleteness::Actual,
+            Self::Estimated { .. } => CostCompleteness::Estimated,
             Self::Unknown => CostCompleteness::Unknown,
         }
     }
@@ -538,7 +566,7 @@ impl Cost {
     pub fn inclusive(self) -> bool {
         match self {
             Self::Reported { inclusive, .. } => inclusive,
-            Self::Unknown => false,
+            Self::Estimated { .. } | Self::Unknown => false,
         }
     }
 }
@@ -611,6 +639,16 @@ pub struct LaunchResult {
     /// the error it reported — for the interrupted transition's evidence.
     #[serde(default)]
     pub failure_detail: Option<String>,
+    /// The transcript message ids this attempt's usage was booked from:
+    /// only a native worker's, empty for every other launch. The runner
+    /// records them so `usage import` does not count them again (SPEC §11).
+    #[serde(default)]
+    pub booked_message_ids: Vec<String>,
+    /// Why some of those messages could not be priced, one line per model
+    /// and reason (`orchestration::unpriced_reason`): only a native
+    /// worker's, empty when every booked message priced.
+    #[serde(default)]
+    pub unpriced: Vec<String>,
 }
 
 impl LaunchResult {
@@ -872,6 +910,8 @@ mod tests {
             worker_claims_blockage: false,
             permission_denials: Vec::new(),
             failure_detail: None,
+            booked_message_ids: Vec::new(),
+            unpriced: Vec::new(),
         };
         assert!(result.terminal_result_missing());
         let completed = LaunchResult {
@@ -905,6 +945,32 @@ mod tests {
         assert!(unreadable.terminal_result_missing());
     }
 
+    #[test]
+    fn a_stored_result_without_booked_message_ids_still_parses() {
+        let mut stored = serde_json::to_value(LaunchResult {
+            dispatch_id: "disp-1".into(),
+            ended: Ended::Exited(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            result_text: None,
+            session_id: None,
+            effective_model: None,
+            usage: UsageReport::unknown(),
+            worker_claims_blockage: false,
+            permission_denials: Vec::new(),
+            failure_detail: None,
+            booked_message_ids: vec!["m1".into()],
+            unpriced: Vec::new(),
+        })
+        .expect("serializes");
+        stored
+            .as_object_mut()
+            .expect("an object")
+            .remove("booked_message_ids");
+        let parsed: LaunchResult = serde_json::from_value(stored).expect("an old result parses");
+        assert!(parsed.booked_message_ids.is_empty());
+    }
+
     /// `inclusive` described a cost, so it meant nothing without one,
     /// and a reported figure with `Unknown` completeness was dropped
     /// from the settlement without a word. Neither state exists now.
@@ -922,6 +988,16 @@ mod tests {
         assert!(reported.inclusive());
         assert_eq!(reported.completeness(), CostCompleteness::Actual);
         assert_eq!(UsageReport::unknown().cost, Cost::Unknown);
+
+        let estimated = Cost::Estimated {
+            micros: MicroUsd::from_micros(900),
+        };
+        assert_eq!(estimated.micros(), Some(MicroUsd::from_micros(900)));
+        assert!(!estimated.inclusive());
+        assert_eq!(estimated.completeness(), CostCompleteness::Estimated);
+        assert_eq!(estimated.kind(), CostKind::EstimatedApiEquivalent);
+        assert_eq!(reported.kind(), CostKind::ApiSpend);
+        assert_eq!(Cost::Unknown.kind(), CostKind::ApiSpend);
     }
 
     #[test]

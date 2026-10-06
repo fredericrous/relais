@@ -12,5 +12,5 @@
 pub mod pricing;
 pub mod transcript;
 
-pub use pricing::{price, ModelPrice, PriceTable, Priced};
+pub use pricing::{price, unpriced_reason, ModelPrice, PriceTable, Priced};
 pub use transcript::{parse_transcript, CacheWrites, Speed, TranscriptSource, UsageRecord};

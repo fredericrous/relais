@@ -8,6 +8,81 @@ missing here.
 
 ## Unreleased
 
+### Added
+
+- `relais run --native` refuses up front, `native_unpriced`, when a model it
+  can dispatch has no `[pricing.models]` entry (the effective model the ledger
+  last saw for the alias, or no price table at all), naming the alias, the id
+  and `machine.toml`; a never-seen alias goes on with a warning. If an attempt
+  still books a record it cannot price, the run ends `blocked:native_unpriced`
+  after that attempt instead of on a `budget_exceeded` refusal: an unknown
+  cost settles as the attempt's whole reservation, the run's budget.
+- The hook can read and answer native-worker payloads (groundwork for
+  native workers; nothing installs the new event yet). It parses an Agent
+  call's `tool_input`, `SendMessage` calls, `WorktreeCreate`, and the
+  transcript path, last message and `cwd` of a `SubagentStop`. It may rewrite
+  a marked spawn's input to what relais asked for (`updatedInput` with no
+  permission decision, so the hook still never says yes for the person), and
+  `relais::native` defines the `[relais-dispatch: <id>]` run marker.
+- The coordinator knows the native dispatches relais asked for, and the hook
+  makes a spawn or continuation run exactly as asked (groundwork; nothing
+  registers a request yet). A marked spawn or message is claimed once, and
+  runs with relais's subagent type, model and prompt (or agent and message)
+  whatever the call asked for. It gets relais's prepared tree, binds on its
+  `PostToolUse`, and its `SubagentStop` is recorded without settling the
+  dispatch. A marked call is refused when the dispatch is unknown, already
+  claimed, finished, no longer heartbeated, or the marker is ambiguous, and
+  also when the coordinator is unreachable, whatever
+  `on_coordinator_unreachable` says; it is charged once, never again under
+  the session's own run. A message to relais's worker that carries no marker
+  is refused. The coordinator wire protocol is now 4: after upgrading, run
+  `relais coordinator stop` once so the next command starts a matching daemon.
+- Once relais answers `WorktreeCreate`, it does so for every isolated spawn
+  on the machine: an unmarked one gets Claude Code's default tree
+  (`.claude/worktrees/<name>` on `worktree-<name>` from HEAD), removed again
+  on the agent's stop when nothing changed in it and kept otherwise. A tree
+  that cannot be made fails the spawn with the reason, exit status 1.
+
+- `relais run --native` launches each worker attempt as a native subagent the
+  parent Claude Code session spawns, and judges it exactly as a headless one.
+  relais prints one `RELAIS-SPAWN <json>` line per spawn (or
+  `RELAIS-CONTINUE <json>` for a repair that continues the same agent) that is
+  exactly the tool input to send; an escalation to another model is a fresh
+  spawn. `--native-spawn-wait <SECONDS>` (default 120) bounds the wait for the
+  session: no spawn ends the attempt `native_spawn_missing` and the run stops
+  interrupted. It needs a parent Claude Code session and is refused without
+  one. A native worker's usage is read from its transcript, each message
+  booked once, and its cost is an API-equivalent estimate from the machine's
+  price table (unknown without one); its dispatch row is `native_run` and
+  names the agent. Headless `relais run` is unchanged.
+
+- `relais install --claude` ships the native workers: 19 agent definitions,
+  `relais-worker-<model>-<effort>`, for `haiku` (default effort only),
+  `sonnet`, `opus` and `fable` (default, low, medium, high, xhigh, max), with
+  no `Agent` tool. A `--native` launch of a model with no definition ends
+  interrupted with `native_worker_missing`, before anything is printed. A
+  native worker's prompt has its own rules (a subagent in the task worktree,
+  no sandbox wording). `/relais` now runs `relais run --native` in the
+  background and answers each `RELAIS-SPAWN` with the Agent tool and each
+  `RELAIS-CONTINUE` with SendMessage, exactly as asked; `relais run --task …`
+  stays the terminal and unattended way.
+- `relais install --claude --hooks` wires eight events: the tool events now
+  match `Agent|Task|SendMessage`, and `WorktreeCreate` joins with a 60 s
+  handler timeout. Installing over a file an earlier relais wrote moves
+  relais's command off the old `Agent|Task` entry (the entry goes if it held
+  nothing else), so `relais hook` never runs twice for one Agent call;
+  uninstall removes it from both matchers. `relais doctor` reports a file
+  still on the old matcher (`hook-wiring`). Run
+  `relais install --claude --hooks --write` after upgrading.
+
+- A native worker's messages are counted once, whichever of `relais run
+  --native` and `relais usage import` reads its transcript first. The run
+  records the message ids it booked (ledger step v18, new table
+  `native_usage_messages`; an older binary does not understand it) and
+  removes any `orchestration_usage` row an earlier import made of them;
+  `usage import` skips those ids and its summary line says how many records
+  it skipped as already booked to a relais run.
+
 ### Changed
 
 - A sandboxed worker may bind a local TCP port (#105): the worker settings

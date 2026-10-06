@@ -13,5 +13,6 @@
 
 pub mod claude;
 pub mod mock;
+pub mod native;
 
 pub use mock::{MockBackend, MockOutcome};
