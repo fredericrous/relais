@@ -183,4 +183,15 @@ Not measured, and why it does not matter: a marked spawn with the coordinator st
 - **No `allow`.** The rewrite answers `updatedInput` alone, with no `permissionDecision`. SPEC §23's rule "the hook never says yes on a person's behalf" therefore stays as it is; the per-mode allow/ask table above is not built. SPEC gains one sentence: the hook may rewrite a marked call's input to what relais itself asked for, which grants nothing.
 - The hook matcher gains `SendMessage` and the `WorktreeCreate` event; `SendMessage` input is `to` and `message`.
 
+**2026-10-06, the WorktreeCreate hook is machine-wide** (E8–E11):
+
+| # | Question | Result |
+|---|---|---|
+| E8 | The hook prints nothing for an unmarked `isolation: worktree` spawn | Claude Code refuses the agent: "WorktreeCreate hook failed: hook succeeded but returned no worktree path". |
+| E9 | Claude Code's default, with no hook | `<repo>/.claude/worktrees/agent-<id>` on a new branch `worktree-agent-<id>` from HEAD. A tree with no changes is removed with its branch when the agent ends; a changed one is kept. |
+| E10 | A `WorktreeCreate` hook in a skill's frontmatter | Never fires, during or after the skill. Only a hook in settings works. |
+| E11 | `WorktreeRemove` for a tree the hook created | Never fires (clean or changed). The payload of `WorktreeCreate` is `cwd`, `name`, `session_id`, `prompt_id`, `transcript_path`, with no tool call id. |
+
+**Decision (the person, 2026-10-06): A, with a fallback that reproduces the default.** relais's `WorktreeCreate` answers a marked spawn with relais's prepared tree. For every other spawn, it does what Claude Code does by default (E9): `git worktree add -b worktree-<name> <repo root of cwd>/.claude/worktrees/<name> HEAD`, and prints the path. `WorktreeRemove` never fires, so relais removes such a tree on that agent's `SubagentStop` (`name` is `agent-<agent_id>`) when it has no changes and no new commits, branch included, and keeps it otherwise. A failure to create is reported to Claude Code (non-zero exit with the reason), never a silent empty answer. Accepted risk: if Claude Code changes its default (a `worktree.baseRef` setting, `.worktreeinclude`), relais's copy differs until updated.
+
 <!-- panel: repos=relais adds= reviewers=backend body-sha=ebe649d81b94 -->

@@ -1,0 +1,8 @@
+{
+  "cwd": "/REPO",
+  "hook_event_name": "WorktreeCreate",
+  "name": "agent-agent-01",
+  "prompt_id": "prompt-0000",
+  "session_id": "session-0000",
+  "transcript_path": "/REDACTED/transcript.jsonl"
+}

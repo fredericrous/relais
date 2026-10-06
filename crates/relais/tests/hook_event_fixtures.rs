@@ -81,6 +81,8 @@ fn expected(path: &Path, bytes: &[u8]) -> &'static str {
         // A tool event for any other tool is a real event relais simply
         // does not act on — `0001` is a `Read`.
         "PreToolUse" | "PostToolUse" | "PostToolUseFailure" => "NotOurs",
+        // `hooks-native/0002`: an event relais does not act on yet.
+        "WorktreeCreate" => "NotOurs",
         other => panic!("fixture names an event this test does not map: {other}"),
     }
 }

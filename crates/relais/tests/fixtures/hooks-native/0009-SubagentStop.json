@@ -1,0 +1,23 @@
+{
+  "agent_id": "agent-01",
+  "agent_transcript_path": "/REDACTED/transcript.jsonl",
+  "agent_type": "s0-worker-b",
+  "background_tasks": [
+    {
+      "agent_type": "s0-worker-b",
+      "description": "e12 worker",
+      "id": "agent-01",
+      "status": "running",
+      "type": "subagent"
+    }
+  ],
+  "cwd": "/RELAIS-TREE",
+  "hook_event_name": "SubagentStop",
+  "last_assistant_message": "<redacted: real content, shape preserved>",
+  "permission_mode": "bypassPermissions",
+  "prompt_id": "prompt-0000",
+  "session_crons": [],
+  "session_id": "session-0000",
+  "stop_hook_active": false,
+  "transcript_path": "/REDACTED/transcript.jsonl"
+}
