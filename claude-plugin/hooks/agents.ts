@@ -1,0 +1,206 @@
+// relais's requests to spawn, continue and stop agents, and what comes back:
+// each turn's usage, and the one `stopped` a dispatch ends with.
+
+import type { Fx } from './fx.ts'
+import { type Dispatch, observe, openDispatch, stoppedPayload, withTurn } from './dispatches.ts'
+import { sendBound, sendStopped } from './callbacks.ts'
+import { detach, every, type Child, type Store } from './store.ts'
+
+const POLL_MS = 2000
+
+const text = (value: unknown): string | undefined =>
+  typeof value === 'string' && value.length > 0 ? value : undefined
+
+// The dispatch id a spawn's `description` carries: `relais <dispatch>`.
+export const dispatchOfDescription = (description: unknown): string | undefined => {
+  const match = /^relais (\S+)$/.exec(typeof description === 'string' ? description : '')
+  return match ? match[1] : undefined
+}
+
+const failureText = (reason: unknown): string =>
+  reason instanceof Error ? reason.message : String(reason)
+
+// The reason a tool call was refused or errored, or undefined when it went through.
+const refusal = (result: any): string | undefined => {
+  if (result?.deny) return String(result.deny)
+  if (result?.isError) return text(result.text) ?? 'the call errored'
+  return undefined
+}
+
+function open(store: Store, child: Child, d: Dispatch) {
+  store.dispatches.set(d.id, d)
+  store.dispatchChild.set(d.id, child)
+  store.agentDispatch.set(d.agent, d.id)
+}
+
+// A dispatch that ended without an agent run to report: relais is told it failed.
+function failDispatch(fx: Fx, store: Store, child: Child, dispatch: string, agent: string, why: string) {
+  const d = { ...openDispatch(dispatch, agent), isStopped: true, answer: why }
+  store.dispatches.set(dispatch, d)
+  store.dispatchChild.set(dispatch, child)
+  sendStopped(fx, store, child, dispatch, stoppedPayload(d, 'failed'))
+}
+
+export async function handleSpawn(fx: Fx, store: Store, child: Child, line: any) {
+  const dispatch = text(line.dispatch)
+  const prompt = text(line.prompt)
+  if (!dispatch || !prompt) return
+  // The `agent.spawn` hook reads this, so it is set before the call.
+  store.pending.set(dispatch, { cwd: text(line.cwd) ?? child.cwd })
+  const request: Record<string, unknown> = { prompt, description: `relais ${dispatch}` }
+  const type = text(line.subagent_type) ?? text(line.subagentType)
+  if (type) request.subagentType = type
+  if (text(line.model)) request.model = line.model
+  let spawned: any
+  try {
+    spawned = await fx.agent.spawn(request)
+  } catch (reason) {
+    spawned = { deny: failureText(reason) }
+  } finally {
+    store.pending.delete(dispatch)
+  }
+  const agent: string | undefined = spawned?.deny ? undefined : spawned?.agentId ?? (await agentOf(fx, dispatch))
+  if (!agent) {
+    failDispatch(fx, store, child, dispatch, '', spawned?.deny ?? 'the agent did not start')
+    return
+  }
+  open(store, child, { ...openDispatch(dispatch, agent), isBound: true })
+  markAgent(store, dispatch, agent)
+  sendBound(fx, store, child, dispatch, agent)
+  startPoll(fx, store)
+}
+
+// The spawn's answer names the agent; should it not, the agent is the one in
+// the list whose description is this dispatch's.
+async function agentOf(fx: Fx, dispatch: string): Promise<string | undefined> {
+  try {
+    const listed: any[] = await fx.agent.list()
+    return listed.find(a => a.description === `relais ${dispatch}`)?.id
+  } catch {
+    return undefined
+  }
+}
+
+export async function handleContinue(fx: Fx, store: Store, child: Child, line: any) {
+  const dispatch = text(line.dispatch)
+  const agent = text(line.agent) ?? text(line.agent_id)
+  const message = text(line.message) ?? text(line.prompt)
+  if (!dispatch || !agent || !message) return
+  // The status now, so that a stale `completed` is not taken for this run's end.
+  let listed: any[] = []
+  try {
+    listed = await fx.agent.list()
+  } catch {
+    listed = []
+  }
+  const startStatus = listed.find((a: any) => a.id === agent)?.status
+  const previous = store.agentDispatch.get(agent)
+  open(store, child, openDispatch(dispatch, agent, startStatus))
+  // The agent type is hidden from the model, and a hidden type cannot be
+  // resumed: the offer hook lets it through while this call is in flight.
+  store.resuming += 1
+  let why: string | undefined
+  try {
+    why = refusal(await fx.tool.call({ tool: 'SendMessage', to: agent, message }))
+  } catch (reason) {
+    why = failureText(reason)
+  } finally {
+    store.resuming -= 1
+  }
+  if (why !== undefined) {
+    if (previous === undefined) store.agentDispatch.delete(agent)
+    else store.agentDispatch.set(agent, previous)
+    failDispatch(fx, store, child, dispatch, agent, why)
+    return
+  }
+  markAgent(store, dispatch, agent)
+  const d = store.dispatches.get(dispatch)
+  if (d) store.dispatches.set(dispatch, { ...d, isBound: true })
+  sendBound(fx, store, child, dispatch, agent)
+  startPoll(fx, store)
+}
+
+export async function handleStop(fx: Fx, line: any) {
+  const agent = text(line.agent) ?? text(line.agent_id)
+  if (!agent) return
+  try {
+    await fx.tool.call({ tool: 'TaskStop', task_id: agent })
+  } catch {
+    // Already gone: the end signal reports it.
+  }
+}
+
+// The pane's agent rows carry the agent id once it is known.
+function markAgent(store: Store, dispatch: string, agent: string) {
+  for (const model of Object.values(store.models)) {
+    const row = model.agents.find(a => a.dispatch === dispatch)
+    if (row) row.agentId = agent
+  }
+  store.isDirty = true
+}
+
+// The pane's agent rows follow the list's status.
+function showStatus(store: Store, listed: any[]) {
+  for (const model of Object.values(store.models)) {
+    for (const row of model.agents) {
+      const seen = row.agentId ? listed.find((a: any) => a.id === row.agentId) : undefined
+      if (seen && seen.status !== row.status) {
+        row.status = seen.status
+        store.isDirty = true
+      }
+    }
+  }
+}
+
+// `turn.complete` of an agent a dispatch owns: its usage joins the total.
+export function onTurn(fx: Fx, store: Store, e: any) {
+  const dispatch = store.agentDispatch.get(e.agentId)
+  const d = dispatch ? store.dispatches.get(dispatch) : undefined
+  if (!d || d.isStopped) return
+  store.dispatches.set(d.id, withTurn(d, { usage: e.usage, answer: e.answer }))
+  detach(check(fx, store))
+}
+
+// One look at the agent list: every open dispatch that ended is reported, once.
+export async function check(fx: Fx, store: Store) {
+  const open = [...store.dispatches.values()].filter(d => !d.isStopped)
+  if (open.length === 0) return
+  let listed: any[]
+  try {
+    listed = await fx.agent.list()
+  } catch {
+    return
+  }
+  showStatus(store, listed)
+  for (const d of open) {
+    // Re-read: a turn may have landed while the list was awaited.
+    const current = store.dispatches.get(d.id)
+    if (!current || current.isStopped) continue
+    const seen = listed.find((a: any) => a.id === current.agent)
+    const { dispatch, ended } = observe(current, seen && { id: seen.id, status: seen.status })
+    if (ended === undefined) {
+      store.dispatches.set(d.id, dispatch)
+      continue
+    }
+    const stopped = { ...dispatch, isStopped: true }
+    store.dispatches.set(d.id, stopped)
+    const child = store.dispatchChild.get(d.id)
+    if (child) sendStopped(fx, store, child, d.id, stoppedPayload(stopped, ended))
+  }
+}
+
+// Every 2 s while a dispatch is open; the timer is cleared when none is.
+function startPoll(fx: Fx, store: Store) {
+  if (store.poll || store.closed) return
+  store.poll = every(fx, store, POLL_MS, () => {
+    detach(
+      check(fx, store).then(() => {
+        const isOpen = [...store.dispatches.values()].some(d => !d.isStopped)
+        if (!isOpen && store.poll) {
+          store.poll.cancel()
+          store.poll = undefined
+        }
+      }),
+    )
+  })
+}

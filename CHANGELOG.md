@@ -132,6 +132,18 @@ missing here.
   removes any `orchestration_usage` row an earlier import made of them;
   `usage import` skips those ids and its summary line says how many records
   it skipped as already booked to a relais run.
+- The relais Claude Code plugin (`claude-plugin/`, a Claude Code mod, tested
+  on Claude Code >= 2.1.291 and < 2.2.0). It registers a `run` and a `status`
+  tool and `/relais-status`, starts `relais run --protocol`, and does what
+  relais asks over that channel: spawns, continues and stops native agents
+  (each in the directory relais chose), adds each turn's usage and reports the
+  dispatch once when its agent's run ends (`relais native bound|stopped`,
+  retried until acknowledged), and tells the model the run's outcome. It
+  hides relais's agent types, messages and completion notices from the
+  model, and shows the run live in a pane and the status line. 19 worker
+  definitions ship with it, one per `native::worker_agent_types()` pair.
+  Nothing installs it yet: `make plugin` (validate and test, now part of
+  `make check` and of CI) is its gate, and it needs `claude` on the PATH.
 
 ### Changed
 

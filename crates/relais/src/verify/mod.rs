@@ -3046,20 +3046,18 @@ mod tests {
         const PRINTED: u64 = 10 * 1024 * 1024;
         let dir = temp_dir("flood");
         let flood = command(&["sh", "-c", "head -c 10485760 /dev/zero | tr '\\0' x"], 60);
-        // The best of three on each side: a loaded machine slows a run,
-        // and what is compared is what the follower adds, not the load.
+        // The best of three on each side, the two sides interleaved: a
+        // loaded machine slows a run, and alternating them puts both under
+        // the same load, so what is compared is what the follower adds.
         let mut silent_took = std::time::Duration::MAX;
         let mut silent = None;
-        for _ in 0..3 {
+        let mut followed_took = std::time::Duration::MAX;
+        let mut followed = None;
+        for round in 0..3 {
             let start = std::time::Instant::now();
             silent =
                 Some(run_command(&dir, &flood, &dir.join("logs"), "flood", "plain").expect("runs"));
             silent_took = silent_took.min(start.elapsed());
-        }
-        let silent = silent.expect("ran");
-        let mut followed_took = std::time::Duration::MAX;
-        let mut followed = None;
-        for round in 0..3 {
             let events = Events::for_run("run-f", &dir.join(format!("art{round}")));
             let start = std::time::Instant::now();
             followed = Some(
@@ -3068,6 +3066,7 @@ mod tests {
             );
             followed_took = followed_took.min(start.elapsed());
         }
+        let silent = silent.expect("ran");
         let followed = followed.expect("ran");
 
         assert_eq!(

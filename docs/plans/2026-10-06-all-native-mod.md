@@ -332,3 +332,16 @@ Finished by hand:
 - **the late-write scenario** was racy under load because the scripted plugin killed agent process groups only at run end → an agent's group is killed as soon as it answers, as the agent is then over.
 
 No relais review ran on this package (the run ended before it); the branch's implementation review covers it. `make check` green (1,359 lib tests, 41 scenarios). Falsified: the stale-hello refusal (fails) and `mod_gone` (the test hangs to the wall clock instead of passing).
+
+**2026-10-06, M1** (run-65d322006dd13-c35c, sonnet@medium, run in parallel with M2b; **also interrupted at the 45-minute wall clock**, during its final `make check`). Salvaged by hand. `claude-plugin/` contains:
+- the plugin manifest (tested range `>= 2.1.291 < 2.2.0`) and the 21 worker agents;
+- `register.ts` with small modules (`lines`, `dispatches`, `callbacks`, `guards`, `runs`, `timeline`, `pane`, `ui`, `store`, `agents`, `fx`), effects behind a deps object;
+- 49 tests across 7 files, including `tests/views/relais-pane.test.ts`.
+
+Also: `make plugin` (validate + test) in `make check`; a CI job installing Claude Code 2.1.291; `crates/relais/tests/plugin_agents.rs`.
+
+The worker had falsified two behaviours, the end signal's turn requirement and the notification match, before the clock ran out. Finished by hand:
+- **the outcome test** advanced the mock clock a full minute (600 flushes), which hit the 5 s test timeout under load → 10 s, which outlasts the 3 s merge and a poll;
+- **M2a's 10 MB timing test** (flagged by the M1 worker as flaky under load) measured its two sides one after the other → they are now interleaved, so both are measured under the same load, still at 5% or 200 ms.
+
+`make check` green (with `make plugin`: 49 pass). No relais review ran (the run ended before it); the branch's implementation review covers it.

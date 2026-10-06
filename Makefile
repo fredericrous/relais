@@ -5,7 +5,7 @@
 # shim, which reads the pin.
 CARGO := $(shell command -v rustup >/dev/null 2>&1 && test -x "$(HOME)/.cargo/bin/cargo" && echo "$(HOME)/.cargo/bin/cargo" || echo cargo)
 
-.PHONY: all check lint test build fmt toolchain msrv audit probe-hooks
+.PHONY: all check lint test build fmt toolchain msrv audit plugin probe-hooks
 
 all: check
 
@@ -14,11 +14,11 @@ all: check
 ## `lint` ends with the architecture gates, which the compiler cannot
 ## state: a cycle between two modules of one crate compiles happily.
 ##
-## All four gates, and green means all four RAN: `msrv` and `audit` fail
-## rather than skipping unless MSRV_SKIP_OK / AUDIT_SKIP_OK say otherwise,
-## because a target that exits 0 on "I could not check" is worse than no
-## target at all.
-check: toolchain lint test msrv audit
+## All five gates, and green means all five RAN: `msrv`, `audit` and `plugin`
+## fail rather than skipping unless MSRV_SKIP_OK / AUDIT_SKIP_OK /
+## PLUGIN_SKIP_OK say otherwise, because a target that exits 0 on "I could
+## not check" is worse than no target at all.
+check: toolchain lint test msrv audit plugin
 
 ## Say which toolchain is about to be used, so a mismatch is visible.
 toolchain:
@@ -73,6 +73,31 @@ audit:
 	fi; \
 	$(CARGO) audit --color never || \
 		echo "audit: advisories above. Advisory here and in CI; the RELEASE workflow blocks on a vulnerability."
+
+## The Claude Code the relais plugin (claude-plugin/) is tested on: the
+## range its manifest names, and the exact version CI installs. Raising the
+## range means re-running the plugin's probes first (plan: all-native-mod §9).
+CLAUDE_CODE_MIN := 2.1.291
+CLAUDE_CODE_MAX := 2.2.0
+CLAUDE_CODE_PIN := 2.1.291
+
+## The relais Claude Code plugin: `claude plugin validate` reads the manifest
+## and the hooks module the way the engine will, `claude plugin test` runs
+## its tests (no sign-in, no network). A missing `claude` FAILS rather than
+## skips, as `msrv` and `audit` do; `PLUGIN_SKIP_OK=1` opts out explicitly.
+plugin:
+	@if ! command -v claude > /dev/null 2>&1; then \
+		echo "plugin: claude is not on PATH — install it with 'npm i -g @anthropic-ai/claude-code@$(CLAUDE_CODE_PIN)'"; \
+		if [ -n "$$PLUGIN_SKIP_OK" ]; then \
+			echo "plugin: SKIPPED by PLUGIN_SKIP_OK, so this run does not prove the plugin"; \
+			exit 0; \
+		fi; \
+		echo "plugin: FAILED — the plugin was not checked (set PLUGIN_SKIP_OK=1 to skip anyway)"; \
+		exit 1; \
+	fi; \
+	echo "plugin: claude $$(claude --version) (plugin tested on >= $(CLAUDE_CODE_MIN) < $(CLAUDE_CODE_MAX); CI pins $(CLAUDE_CODE_PIN))"
+	claude plugin validate claude-plugin
+	cd claude-plugin && claude plugin test
 
 build:
 	$(CARGO) build --release

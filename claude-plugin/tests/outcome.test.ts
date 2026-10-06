@@ -1,0 +1,129 @@
+import { expect, test } from 'claude-code/testing'
+import { event, line, settle, startedRun, startQueued } from './support.ts'
+
+const RUN = 'run-65d322006dd13-c35c'
+
+const phase = (seq: number, state: string) => event(RUN, seq, { kind: 'phase', state, reason: 'ok', detail: {} })
+const done = (outcome = 'accepted') =>
+  line({ relais: 'done', run: RUN, outcome, receipt: '/runs/r1/receipt.json', summary: 'one file changed, +3 -1' })
+
+const lastStatus = (engine: any) => engine.calls.statuses[engine.calls.statuses.length - 1]
+
+const tick = async (engine: any, ms = 200) => {
+  await engine.clock.advance(ms)
+  await settle(engine)
+}
+
+test('while a run is live the status line carries the count, phase, attempt, elapsed time and the command', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.stream.push(
+    'stdout',
+    phase(0, 'running') +
+      event(RUN, 1, { kind: 'dispatch_started', dispatch: 'd1', agent_kind: 'worker', attempt: 2, model: 'sonnet', effort: null }),
+  )
+  await settle(engine)
+  await tick(engine, 5000)
+  const status = lastStatus(engine)
+  expect(status).toContain('1 run')
+  expect(status).toContain('running')
+  expect(status).toContain('attempt 2')
+  expect(/0:0[45]/.test(status)).toBe(true)
+  expect(status).toContain('/relais-status')
+})
+
+test('done toasts the outcome, tells the model, and the status line keeps the outcome', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.stream.push('stdout', phase(0, 'running') + phase(1, 'accepted') + done())
+  await settle(engine)
+  await tick(engine)
+  expect(engine.calls.toasts.some((t: string) => t.includes('accepted') && t.includes('receipt.json'))).toBe(true)
+  expect(engine.calls.prompts.length).toBe(1)
+  const text = engine.calls.prompts[0].text
+  expect(text).toContain('accepted')
+  expect(text).toContain('/runs/r1/receipt.json')
+  expect(text).toContain('one file changed, +3 -1')
+  expect(lastStatus(engine)).toContain('accepted')
+  // It stays: nothing wipes it while time passes. Ten seconds outlasts
+  // the 3 s toast merge and a 2 s poll; a full minute of 100 ms flushes
+  // costs seconds of real time and proves nothing more.
+  await tick(engine, 10000)
+  expect(lastStatus(engine)).toContain('accepted')
+})
+
+test('the kept outcome goes when the pane is opened', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.stream.push('stdout', phase(0, 'running') + done())
+  await settle(engine)
+  await tick(engine)
+  expect(lastStatus(engine)).toContain('accepted')
+  await $.command.run({ command: 'relais-status' })
+  await tick(engine)
+  expect(lastStatus(engine)).toBe(undefined)
+})
+
+test('the kept outcome goes when the next run starts', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.stream.push('stdout', phase(0, 'running') + done())
+  await settle(engine)
+  await tick(engine)
+  expect(lastStatus(engine)).toContain('accepted')
+  await $.tool.call({ tool: 'mcp__relais__run', task: 'next', cwd: '/repo' })
+  await startQueued(engine)
+  await tick(engine)
+  expect(lastStatus(engine)).not.toContain('accepted')
+  expect(lastStatus(engine)).toContain('1 run')
+})
+
+test('escalations are toasted, and decisions within 3 s merge into one toast', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  const decision = (seq: number, what: string, reason: string) => event(RUN, seq, { kind: 'decision', what, reason })
+  engine.stream.push(
+    'stdout',
+    decision(0, 'repair', 'checks_failed') + decision(1, 'escalate', 'tier_too_low') + decision(2, 'escalate', 'still_red'),
+  )
+  await settle(engine)
+  const before = engine.calls.toasts.length
+  await tick(engine, 1000)
+  expect(engine.calls.toasts.length).toBe(before)
+  await tick(engine, 2500)
+  const merged = engine.calls.toasts.slice(before)
+  expect(merged.length).toBe(1)
+  expect(merged[0]).toContain('tier_too_low')
+  expect(merged[0]).toContain('still_red')
+  expect(merged[0]).not.toContain('checks_failed')
+})
+
+test('after /clear the timeline is reloaded from relais native status', async ($: any, on: any) => {
+  on('classic.SessionStart', () => ({}))
+  const engine = await startedRun($, on)
+  const timeline = {
+    run: 'run-old',
+    events: [
+      { seq: 0, at: '2026-10-06T11:00:00Z', event: { kind: 'phase', state: 'running', reason: 'ok', detail: {} } },
+      { seq: 1, at: '2026-10-06T11:00:05Z', event: { kind: 'decision', what: 'repair', reason: 'checks_failed' } },
+    ],
+  }
+  engine.script.runResult = (argv: string[]) =>
+    argv[2] === 'status'
+      ? { exitCode: 0, stdout: JSON.stringify(timeline), stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+      : { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+  await $.classic.SessionStart({ source: 'clear' })
+  await settle(engine)
+  const reply = await $.tool.call({ tool: 'mcp__relais__status', run: 'run-old' })
+  const [run] = JSON.parse(reply.result)
+  expect(run.run).toBe('run-old')
+  expect(run.decisions).toEqual(['repair · checks_failed'])
+  expect(engine.calls.run.some((c: any) => c.argv.join(' ') === 'relais native status')).toBe(true)
+})
+
+test('a child that exits with its run unfinished ends that run as interrupted', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.stream.push('stdout', phase(0, 'running'))
+  await settle(engine)
+  engine.stream.end(137)
+  await settle(engine)
+  await tick(engine)
+  const reply = await $.tool.call({ tool: 'mcp__relais__status' })
+  const [run] = JSON.parse(reply.result)
+  expect(run.outcome.state).toBe('interrupted')
+})

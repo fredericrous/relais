@@ -1,0 +1,193 @@
+// relais as a Claude Code plugin: it starts relais runs and shows every
+// agent they dispatch as a native one, with the run's timeline live in a
+// pane. relais keeps the run, verification and the decisions; this module
+// spawns, continues, stops and shows. See ../README.md.
+
+import { dispatchOfDescription, onTurn } from './agents.ts'
+import { HELLO_EVERY_MS, sendHello } from './callbacks.ts'
+import type { Fx } from './fx.ts'
+import { DENY_MESSAGE, isRelaisNotification, isRelaisType, relaisAddresses } from './guards.ts'
+import { childOf, onChunk, pump, reloadTimeline, startRun, statusOf } from './runs.ts'
+import { close, createStore, detach, every } from './store.ts'
+import { FLUSH_MS, openPane, renderPane, timelineLines } from './ui.ts'
+
+const RUN_TOOL = 'mcp__relais__run'
+const STATUS_TOOL = 'mcp__relais__status'
+
+// Every effect the sibling modules use, spelled on `$` here: `claude plugin
+// validate` follows `$` within a file, not across an import.
+const effects = ($: any): Fx => ({
+  session: { id: () => $.session.id() },
+  process: {
+    run: (argv: string[], init: unknown) => $.process.run(argv, init),
+    spawn: (request: unknown) => $.process.spawn(request),
+  },
+  agent: {
+    spawn: (request: unknown) => $.agent.spawn(request),
+    list: () => $.agent.list(),
+  },
+  tool: { call: (input: unknown) => $.tool.call(input) },
+  clock: {
+    now: () => $.clock.now(),
+    every: (ms: number, fn: () => void) => $.clock.every(ms, fn),
+    after: (ms: number, fn: () => void) => $.clock.after(ms, fn),
+  },
+  ui: {
+    open: (pane: unknown) => $.ui.open(pane),
+    toast: (text: string) => $.ui.toast(text),
+    status: (text: string | undefined) => $.ui.status(text),
+    resolve: (e: unknown) => $.ui.resolve(e),
+  },
+  prompt: { submit: (args: unknown) => $.prompt.submit(args) },
+  pane: {
+    read: () => $.state.get({ plugin: 'relais', key: 'pane' }),
+    write: (value: unknown) => $.state.set({ plugin: 'relais', key: 'pane' }, value),
+  },
+})
+
+export function register(on: any) {
+  const store = createStore()
+
+  // The timer that writes the pane's state and sends the verdicts as prompts.
+  // Made in `session.start`: a prompt cannot be submitted from under a tool hook.
+  const ensurePump = (fx: Fx) => {
+    if (store.hasPump) return
+    store.hasPump = true
+    every(fx, store, FLUSH_MS, () => detach(pump(fx, store)))
+  }
+
+  on('session.start', async ($: any, e: any, next: any) => {
+    const fx = effects($)
+    store.sessions.add(await fx.session.id())
+    await $.tool.register({
+      name: 'run',
+      description:
+        'Start a relais run for a task in a repository: relais works on it in an isolated worktree with native agents, verifies the result and reports the outcome. Returns at once; the outcome arrives as a message.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          task: { type: 'string', description: 'The task, as one clear instruction.' },
+          cwd: { type: 'string', description: 'The repository to work in (absolute path).' },
+        },
+        required: ['task', 'cwd'],
+      },
+    })
+    await $.tool.register({
+      name: 'status',
+      description:
+        "The phases, decisions, cost and latest output of relais runs: one run by id, or all of this session's.",
+      inputSchema: {
+        type: 'object',
+        properties: { run: { type: 'string', description: 'A run id; all runs when left out.' } },
+      },
+    })
+    await $.command.register({
+      name: 'relais-status',
+      description: "Open the relais pane: this session's runs, live.",
+    })
+    ensurePump(fx)
+    detach(sendHello(fx, store))
+    every(fx, store, HELLO_EVERY_MS, () => detach(sendHello(fx, store)))
+    return next(e)
+  })
+
+  on('session.end', ($: any, e: any, next: any) => {
+    // /clear and /resume go on in this module under a new session id.
+    if (e.reason !== 'clear' && e.reason !== 'resume') close(store)
+    return next(e)
+  })
+
+  on('tool.call', { tool: RUN_TOOL }, async ($: any, e: any) => {
+    if (typeof e.task !== 'string' || typeof e.cwd !== 'string') {
+      return { deny: 'relais run needs a task and a cwd (both text).' }
+    }
+    const fx = effects($)
+    ensurePump(fx)
+    return { result: await startRun(fx, store, { task: e.task, cwd: e.cwd }) }
+  })
+
+  on('tool.call', { tool: STATUS_TOOL }, async ($: any, e: any) => ({
+    result: await statusOf(effects($), store, typeof e.run === 'string' ? e.run : undefined),
+  }))
+
+  on('command.run', { command: 'relais-status' }, async ($: any) => {
+    const fx = effects($)
+    if (Object.keys(store.models).length === 0) await reloadTimeline(fx, store)
+    const opened = await openPane(fx, store)
+    if (opened.isPlaced) return { text: 'relais pane opened.' }
+    const lines = timelineLines(store, await fx.clock.now())
+    return { text: lines.length > 0 ? lines.join('\n') : 'No relais run is known in this session.' }
+  })
+
+  // The child's output passes through here, and what relais asks for in it
+  // (spawn, continue, stop) is done from inside this hook: a call made from a
+  // detached loop would skip this plugin's own `agent.spawn` hook, which is
+  // what sets each agent's directory. Chunks are forwarded unchanged.
+  on('process.spawn', async function* ($: any, e: any, next: any) {
+    const child = childOf(store, e)
+    if (!child) return yield* next(e)
+    const fx = effects($)
+    const carry = { out: '', err: '' }
+    const stream = next(e)
+    let step = await stream.next()
+    while (!step.done) {
+      await onChunk(fx, store, child, carry, step.value)
+      yield step.value
+      step = await stream.next()
+    }
+    return step.value
+  })
+
+  // Runs in the directory relais chose for the dispatch: the attempt's
+  // worktree, the review directory, the repo. Only this plugin's own spawn
+  // of a pending dispatch is touched.
+  on('agent.spawn', async ($: any, e: any, next: any) => {
+    const dispatch = dispatchOfDescription(e.description)
+    const pending = dispatch ? store.pending.get(dispatch) : undefined
+    const isOurs = next.origin.plugin === $.plugin.name
+    return isOurs && pending ? next({ ...e, cwd: pending.cwd }) : next(e)
+  })
+
+  on('turn.complete', ($: any, e: any, next: any) => {
+    onTurn(effects($), store, e)
+    return next(e)
+  })
+
+  // Hidden from the model; fails closed. While this module resumes its own
+  // agent the type is let through, or Claude Code refuses the resume.
+  on('agent.offer', (_$: any, e: any, next: any) =>
+    isRelaisType(e.agent) && store.resuming === 0 ? { isOffered: false } : next(e),
+  ).catch((_$: any, e: any, next: any) => (isRelaisType(e.agent) ? { isOffered: false } : next(e)))
+
+  // The model may not message or stop a relais agent; this module may.
+  on('tool.call', { tool: ['SendMessage', 'TaskStop'] }, async ($: any, e: any, next: any) => {
+    if (next.origin.plugin === $.plugin.name) return next(e)
+    const target = String(e.tool === 'SendMessage' ? e.to : e.task_id)
+    const addresses = relaisAddresses(await $.agent.list(), $.plugin.name)
+    return addresses.has(target) || store.agentDispatch.has(target) ? { deny: DENY_MESSAGE } : next(e)
+  }).catch(($: any, e: any, next: any) => {
+    const target = String(e.tool === 'SendMessage' ? e.to : e.task_id)
+    return store.agentDispatch.has(target) ? { deny: DENY_MESSAGE } : next(e)
+  })
+
+  // relais's agents' completion notices are for relais; any other prompt,
+  // one that only mentions an id included, is kept.
+  on('prompt.submit', async ($: any, e: any, next: any) => {
+    if (e.origin?.kind !== 'task-notification') return next(e)
+    const ids = new Set(store.agentDispatch.keys())
+    for (const id of relaisAddresses(await $.agent.list(), $.plugin.name)) ids.add(id)
+    return isRelaisNotification(e.text, ids) ? { drop: 'relais agent notification' } : next(e)
+  })
+
+  on('ui.render', { component: 'Pane', requestId: 'relais' }, ($: any, e: any) =>
+    renderPane(effects($), e),
+  )
+
+  // After /clear, /resume or /branch the module's buffers may be gone or stale.
+  on('classic.SessionStart', async ($: any, e: any, next: any) => {
+    if (e.source === 'clear' || e.source === 'resume' || e.source === 'fork') {
+      await reloadTimeline(effects($), store)
+    }
+    return next(e)
+  })
+}

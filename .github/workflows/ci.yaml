@@ -1,11 +1,12 @@
 name: CI
 
-# `make check` — toolchain, lint, test, msrv, audit — on every push to
+# `make check` — toolchain, lint, test, msrv, audit, plugin — on every push to
 # main and every pull request, so a green check on the PR means what a
 # green `make check` means on the workstation. The jobs mirror the
 # Makefile targets one for one; change a flag in one place, change it in
-# the other. The msrv floor and the audit command are READ from the
-# repository (Cargo.toml, the Makefile) rather than restated here.
+# the other. The msrv floor, the audit command and the Claude Code version
+# the plugin job installs are READ from the repository (Cargo.toml, the
+# Makefile) rather than restated here.
 
 on:
   push:
@@ -117,6 +118,30 @@ jobs:
           echo "msrv=$msrv" >> "$GITHUB_OUTPUT"
       - run: rustup toolchain install "${{ steps.floor.outputs.msrv }}" --profile minimal --no-self-update
       - run: cargo "+${{ steps.floor.outputs.msrv }}" build
+
+  # `make plugin`: the relais Claude Code plugin (claude-plugin/) validated and
+  # tested by the Claude Code it claims to be tested on. The version is READ
+  # from the Makefile (CLAUDE_CODE_PIN, 2.1.291 today), so the workstation
+  # range and this install cannot drift. `claude plugin test` needs no
+  # sign-in and no network, so nothing here is a secret.
+  plugin:
+    name: plugin (validate, test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - id: pin
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^CLAUDE_CODE_PIN := //p' Makefile | head -n 1)
+          [ -n "$version" ] || { echo "::error::the Makefile declares no CLAUDE_CODE_PIN"; exit 1; }
+          echo "pinned Claude Code: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - run: npm i -g @anthropic-ai/claude-code@${{ steps.pin.outputs.version }}
+      - run: make plugin
 
   # The dependency tree, watched. `make audit` — the same target a
   # workstation runs, so `make check` and CI cannot drift (C12).
