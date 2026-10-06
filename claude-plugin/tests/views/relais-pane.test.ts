@@ -8,6 +8,7 @@ import { event, settle, spawnLine, startedRun, startQueued } from '../support.ts
 const RUN = 'run-65d322006dd13-c35c'
 
 const phase = (seq: number, state: string, reason = 'ok') => event(RUN, seq, { kind: 'phase', state, reason, detail: {} })
+const step = (seq: number, name: string, detail = '') => event(RUN, seq, { kind: 'step', name, detail })
 const started = (seq: number, dispatch: string, attempt: number | null = 1) =>
   event(RUN, seq, { kind: 'dispatch_started', dispatch, agent_kind: 'worker', attempt, model: 'sonnet', effort: 'medium' })
 const checkStarted = (seq: number, label: string) =>
@@ -48,33 +49,67 @@ test('before the first event the pane says it is waiting', async ($: any, on: an
   await settle(engine)
   const { texts } = await drawn($, engine, [])
   expect(texts.some(t => t.includes('waiting for the first event'))).toBe(true)
+  expect(texts.some(t => t.includes('starting-'))).toBe(false)
 })
 
 test('phases draw in order, finished ones on one line, the current one expanded', async ($: any, on: any) => {
   const engine = await startedRun($, on)
+  // The shapes relais emits: steps that are not transitions, a baseline
+  // check labelled by its program, then the transitions.
   const { texts } = await drawn($, engine, [
-    phase(0, 'prepared'),
-    checkStarted(1, 'baseline'),
-    event(RUN, 2, { kind: 'check_ended', label: 'baseline', exit: 1, duration_ms: 900 }),
-    phase(3, 'running'),
-    started(4, 'd1'),
-    event(RUN, 5, { kind: 'dispatch_ended', dispatch: 'd1', outcome: 'completed', usage: null, cost: null }),
-    phase(6, 'verifying'),
-    checkStarted(7, 'unit'),
-    output(8, 'unit', 'test_greet ... ok\nRan 1 test\nOK\n'),
+    step(0, 'preflight'),
+    event(RUN, 1, { kind: 'step', name: 'preflight', detail: 'route implementation · sonnet@medium', max_attempts: 3 }),
+    step(2, 'baseline'),
+    checkStarted(3, 'check.sh@4a7b'),
+    event(RUN, 4, { kind: 'check_ended', label: 'check.sh@4a7b', exit: 1, duration_ms: 900 }),
+    step(5, 'baseline', '1 check · 1 red on base'),
+    step(6, 'worktree · setup'),
+    phase(7, 'running'),
+    started(8, 'd1'),
+    event(RUN, 9, { kind: 'dispatch_ended', dispatch: 'd1', outcome: 'exit 0', usage: null, cost: null }),
+    phase(10, 'verifying'),
+    checkStarted(11, 'unit'),
+    output(12, 'unit', 'test_greet ... ok\nRan 1 test\nOK\n'),
   ])
-  const order = ['preflight', 'baseline', 'attempt 1 · worker', 'verification'].map(name => indexOf(texts, name))
+  const order = ['preflight', 'baseline', 'worktree · setup', 'attempt 1 · worker', 'verification'].map(name =>
+    indexOf(texts, name),
+  )
   expect(order.every(i => i >= 0)).toBe(true)
   expect([...order].sort((a, b) => a - b)).toEqual(order)
   // Finished phases are one line; the current one carries its live output.
   expect(texts[order[0]].startsWith('✓')).toBe(true)
-  expect(texts[order[3]].startsWith('▸')).toBe(true)
+  expect(texts[order[0]]).toContain('route implementation · sonnet@medium')
+  expect(texts[order[1]]).toContain('1 check · 1 red on base')
+  expect(texts[order[4]].startsWith('▸')).toBe(true)
   const outputAt = indexOf(texts, '│ test_greet ... ok')
-  expect(outputAt).toBeGreaterThan(order[3])
+  expect(outputAt).toBeGreaterThan(order[4])
   expect(indexOf(texts, '· review')).toBeGreaterThan(outputAt)
   expect(indexOf(texts, '· receipt')).toBeGreaterThan(indexOf(texts, '· review'))
   expect(texts[0]).toContain('verifying')
-  expect(texts[0]).toContain('attempt 1')
+  expect(texts[0]).toContain('attempt 1/3')
+  expect(texts.some(t => t.includes('completed'))).toBe(true)
+})
+
+test('review and receipt steps replace their placeholders', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  const { texts } = await drawn($, engine, [
+    step(0, 'preflight'),
+    phase(1, 'running'),
+    started(2, 'd1'),
+    phase(3, 'verifying'),
+    step(4, 'review', 'strong tier'),
+    event(RUN, 5, { kind: 'decision', what: 'accept', reason: 'checks_and_review_passed' }),
+    step(6, 'receipt', '/state/runs/r/receipt.json'),
+    step(7, 'worktree · setup'),
+  ])
+  expect(texts.some(t => t.startsWith('decision accept · checks_and_review_passed'))).toBe(true)
+  // A step with no detail shows its time alone, with no dangling separator.
+  expect(texts[indexOf(texts, 'worktree · setup')]).not.toContain(' · ·')
+  expect(texts[indexOf(texts, 'worktree · setup')].trimEnd().endsWith('·')).toBe(false)
+  expect(indexOf(texts, '· review')).toBe(-1)
+  expect(indexOf(texts, '· receipt')).toBe(-1)
+  expect(texts[indexOf(texts, 'review')].startsWith('✓')).toBe(true)
+  expect(texts[indexOf(texts, 'receipt')]).toContain('/state/runs/r/receipt.json')
 })
 
 test('the live output is capped by the rows the pane gets; the extra lines are dropped', async ($: any, on: any) => {

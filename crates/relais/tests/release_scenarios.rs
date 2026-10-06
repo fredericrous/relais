@@ -1433,6 +1433,24 @@ fn a_protocol_run_keeps_stdout_for_events_and_events_jsonl_holds_the_same() {
         );
     }
     assert_eq!(kinds.last().map(String::as_str), Some("outcome"));
+    // Every step the pane draws, in the order the run takes them; a name
+    // seen twice is its detail being filled in.
+    let mut steps: Vec<&str> = protocol_events
+        .iter()
+        .filter(|event| event["event"]["kind"] == "step")
+        .filter_map(|event| event["event"]["name"].as_str())
+        .collect();
+    steps.dedup();
+    assert_eq!(
+        steps,
+        ["preflight", "baseline", "worktree · setup", "receipt"],
+        "{kinds:?}"
+    );
+    let preflight = protocol_events
+        .iter()
+        .rfind(|event| event["event"]["name"] == "preflight")
+        .expect("a preflight step");
+    assert_eq!(preflight["event"]["max_attempts"], 3);
     let outcome = &protocol_events.last().expect("an event")["event"];
     assert_eq!(outcome["state"], "accepted");
     assert!(outcome["receipt"]

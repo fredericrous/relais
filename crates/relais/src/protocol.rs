@@ -78,6 +78,15 @@ pub enum Event {
         reason: String,
         detail: serde_json::Value,
     },
+    /// A step of the run that is not a state transition: preflight, the
+    /// baseline, the task worktree and its setup, the review, the
+    /// receipt. A second `step` of the same name updates its detail.
+    Step {
+        name: String,
+        detail: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_attempts: Option<u32>,
+    },
     DispatchStarted {
         dispatch: String,
         agent_kind: AgentKind,
@@ -135,6 +144,7 @@ impl Event {
         match self {
             Self::Stderr { .. } => false,
             Self::Phase { .. }
+            | Self::Step { .. }
             | Self::DispatchStarted { .. }
             | Self::DispatchEnded { .. }
             | Self::Cost { .. }

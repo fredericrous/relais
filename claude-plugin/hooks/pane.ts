@@ -29,7 +29,8 @@ const pad = (text: string, width: number) => (text.length >= width ? text + ' ' 
 const rule = (columns: number): Row => ({ text: '─'.repeat(Math.max(1, columns)), dim: true })
 
 function stepRow(step: Step): Row {
-  const span = step.endedAt !== undefined ? ` · ${mmss(step.endedAt - step.startedAt)}` : ''
+  const time = step.endedAt !== undefined ? mmss(step.endedAt - step.startedAt) : ''
+  const span = time && step.detail ? ` · ${time}` : time
   const body = `${pad(step.title, TITLE_WIDTH)}${step.detail}${span}`
   if (step.state === 'fail') return { text: `FAIL ${body}`, color: 'error', bold: true }
   if (step.state === 'active') return { text: `▸ ${body}`, bold: true }
@@ -40,7 +41,14 @@ function stepRow(step: Step): Row {
 function frame(m: RunModel, room: Room): { head: Row[]; steps: Row[]; tail: Row[] } {
   const head: Row[] = [
     {
-      text: ['relais', `run ${shortId(m.run)}`, m.phase || 'starting', attemptText(m), mmss(elapsedOf(m, room.now))]
+      // Before relais names the run, the plugin's placeholder key is no id.
+      text: [
+        'relais',
+        m.run.startsWith('starting-') ? '' : `run ${shortId(m.run)}`,
+        m.phase || 'starting',
+        attemptText(m),
+        mmss(elapsedOf(m, room.now)),
+      ]
         .filter(Boolean)
         .join(' · '),
       bold: true,
@@ -57,7 +65,12 @@ function frame(m: RunModel, room: Room): { head: Row[]; steps: Row[]; tail: Row[
     }
   }
   const stderr = m.events.filter(e => e.kind === 'stderr').slice(-MAX_STDERR_ROWS)
-  const tail: Row[] = stderr.map(e => ({ text: `stderr │ ${e.text}`, color: 'error' }))
+  const tail: Row[] = []
+  // The latest decision (repair, escalate, accept…) with its reason; every
+  // one is in the timeline `/relais-status` prints.
+  const decision = m.decisions[m.decisions.length - 1]
+  if (decision) tail.push({ text: `decision ${decision.text}`, bold: true })
+  tail.push(...stderr.map(e => ({ text: `stderr │ ${e.text}`, color: 'error' })))
   tail.push(rule(room.columns))
   const shown = m.agents.slice(0, MAX_AGENT_ROWS)
   if (shown.length === 0) tail.push({ text: 'agents  none', dim: true })

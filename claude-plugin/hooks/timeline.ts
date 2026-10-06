@@ -128,12 +128,6 @@ function titleOfState(state: string, attempt: number): string {
   }
 }
 
-function titleOfCheck(label: string): string | undefined {
-  if (/setup/i.test(label)) return 'worktree · setup'
-  if (/baseline/i.test(label)) return 'baseline'
-  return undefined
-}
-
 const lastStep = (m: RunModel): Step | undefined => m.steps[m.steps.length - 1]
 
 const replaceLast = (steps: Step[], step: Step): Step[] => [...steps.slice(0, -1), step]
@@ -180,7 +174,7 @@ const maxAttemptsOf = (detail: any): number | undefined => {
 }
 
 const agentStatusOf = (outcome: string) =>
-  outcome === 'completed' || outcome === 'ok' ? 'completed' : outcome
+  outcome === 'completed' || outcome === 'ok' || outcome === 'exit 0' ? 'completed' : outcome
 
 // One event line (`{relais:'event', run, at, event}`) folded into the model.
 export function applyEvent(model: RunModel, event: any, at: number): RunModel {
@@ -196,6 +190,20 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
         m = mapLast(m, s => ({ ...s, detail: event.reason ?? '' }))
       }
       return withEntry(m, at, 'phase', `${event.state}${event.reason ? ` · ${event.reason}` : ''}`)
+    }
+    case 'step': {
+      // A step that is not a transition (preflight, baseline, the task
+      // worktree, review, receipt); the same name again updates its detail.
+      const current = lastStep(m)
+      m = { ...m, maxAttempts: typeof event.max_attempts === 'number' ? event.max_attempts : m.maxAttempts }
+      if (current && current.state === 'active' && current.title === event.name) {
+        m = mapLast(m, s => ({ ...s, detail: event.detail || s.detail }))
+      } else {
+        m = closeStep(m, at, 'done')
+        m = openStep(m, event.name, m.phase, at)
+        m = mapLast(m, s => ({ ...s, detail: event.detail ?? '' }))
+      }
+      return withEntry(m, at, 'step', `${event.name}${event.detail ? ` · ${event.detail}` : ''}`)
     }
     case 'dispatch_started': {
       const attempt = typeof event.attempt === 'number' ? event.attempt : m.attempt
@@ -232,12 +240,6 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
       return withEntry({ ...m, cost: { booked, completeness } }, at, 'cost', formatCost({ booked, completeness }))
     }
     case 'check_started': {
-      const title = titleOfCheck(event.label)
-      const current = lastStep(m)
-      if (title && current && current.title !== title) {
-        m = closeStep(m, at, 'done')
-        m = openStep(m, title, current.phase, at)
-      }
       const check: Check = {
         label: event.label,
         argv: event.argv ?? [],
@@ -359,11 +361,12 @@ export function statusLine(
   heldOutcome: string | undefined,
 ): string | undefined {
   const live = Object.values(models).filter(isLive)
-  if (live.length === 0) return heldOutcome ? `relais · ${heldOutcome} · /relais-status` : undefined
+  // Claude Code draws the line under the plugin's name, so it does not repeat it.
+  if (live.length === 0) return heldOutcome ? `${heldOutcome} · /relais-status` : undefined
   const latest = live[live.length - 1]
   const count = live.length === 1 ? '1 run' : `${live.length} runs`
   const parts = [count, latest.phase || 'starting', attemptText(latest), mmss(elapsedOf(latest, now))]
-  return `relais · ${parts.filter(Boolean).join(' · ')} · /relais-status`
+  return `${parts.filter(Boolean).join(' · ')} · /relais-status`
 }
 
 // The same timeline as text, for the transcript and the `status` tool.

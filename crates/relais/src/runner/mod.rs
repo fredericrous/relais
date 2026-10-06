@@ -1237,6 +1237,15 @@ impl<'a> RunEngine<'a> {
         }
     }
 
+    /// A step of the run the pane shows (`protocol::Event::Step`).
+    pub(crate) fn step(&self, name: &str, detail: String) {
+        self.events.emit(Event::Step {
+            name: name.to_string(),
+            detail,
+            max_attempts: None,
+        });
+    }
+
     fn run(mut self) -> RunOutcome {
         let outcome = self.run_to_outcome();
         // Whatever `persist_receipt` wrote, whichever way the run ended: an
@@ -1294,14 +1303,17 @@ impl<'a> RunEngine<'a> {
     /// (SPEC §3, §9). Each phase either hands the next one what it
     /// established, or ends the run.
     fn run_inner(&mut self) -> Result<RunOutcome, RunError> {
+        self.step("preflight", String::new());
         let preflight = match self.preflight()? {
             Phase::Ended(outcome) => return Ok(outcome),
             Phase::Ready(preflight) => preflight,
         };
+        self.step("baseline", String::new());
         let baseline = match self.baseline(&preflight)? {
             Phase::Ended(outcome) => return Ok(outcome),
             Phase::Ready(baseline) => baseline,
         };
+        self.step("baseline", baseline_summary(&baseline));
 
         let deadline = Instant::now() + Duration::from_secs(preflight.authority.max_wall_seconds);
         // The harness identity every dispatch of this run records, probed
@@ -1342,6 +1354,7 @@ impl<'a> RunEngine<'a> {
         // candidate whose scope and integrity passed; a scope violation
         // stops everything (SPEC §8, §9).
         let worktree_path = self.worktrees.join("task");
+        self.step("worktree · setup", String::new());
         let worktree = match workspace::create_worktree(
             self.config.repo_dir,
             &preflight.base_sha,
@@ -1608,6 +1621,15 @@ impl<'a> RunEngine<'a> {
             )?;
         }
         std::fs::write(self.artifacts.join("route.txt"), decision.explain())?;
+        let rung = &decision.rung;
+        let effort = effort_str(rung.effort.id())
+            .map(|effort| format!("@{effort}"))
+            .unwrap_or_default();
+        self.events.emit(Event::Step {
+            name: "preflight".to_string(),
+            detail: format!("route {} · {}{effort}", decision.tier.as_str(), rung.model),
+            max_attempts: Some(decision.max_attempts),
+        });
 
         Ok(Phase::Ready(Preflight {
             authority,
@@ -3562,6 +3584,7 @@ impl<'a> RunEngine<'a> {
             &receipt_path,
             serde_json::to_string_pretty(receipt).expect("a receipt serializes"),
         )?;
+        self.step("receipt", receipt_path.display().to_string());
         ledger.record_evidence(
             &self.run_id,
             attempt_id,
@@ -4044,6 +4067,7 @@ impl<'a> RunEngine<'a> {
         if let Some(exhausted) = self.review_spend_blocked(spend.total) {
             return ReviewOutcome::Unavailable(exhausted);
         }
+        self.step("review", format!("{} tier", reviewer_tier.as_str()));
         let Some(profile) = request.authority.models.get(&reviewer_tier).cloned() else {
             return ReviewOutcome::Unavailable(format!(
                 "no reviewer model configured at the {} tier",
@@ -4581,6 +4605,21 @@ pub(crate) fn spend_limit(spent: MicroUsd, ceiling: MicroUsd, which: Ceiling) ->
 
 /// A route's requested effort, spelled the way a usage event stores it.
 /// `None` for a model without effort control — omitted, never guessed.
+/// What the pane says of a baseline: how many checks ran and how many
+/// were already red on the base.
+fn baseline_summary(baseline: &Baseline) -> String {
+    let red = match baseline.failures.len() {
+        0 => "green on base".to_string(),
+        n => format!("{n} red on base"),
+    };
+    match &baseline.checks {
+        _ if baseline.cached => format!("cached · {red}"),
+        Some(checks) if checks.len() == 1 => format!("1 check · {red}"),
+        Some(checks) => format!("{} checks · {red}", checks.len()),
+        None => red,
+    }
+}
+
 pub(crate) fn effort_str(effort: Option<&EffortId>) -> Option<String> {
     effort.map(EffortId::as_str).map(str::to_string)
 }
