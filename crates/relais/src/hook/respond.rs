@@ -7,6 +7,10 @@
 //! decision, and release whatever a refused spawn's own request may
 //! have reserved before the caller prints anything. This is the one
 //! caller `decide.rs`'s module doc used to say did not exist yet.
+//!
+//! A firing that belongs to a native dispatch relais asked for is answered
+//! first, by [`native`](super::native), and never reaches the rest: a
+//! marked call is not admitted under the session's own run.
 
 use std::io::Write;
 use std::path::Path;
@@ -14,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use super::decide::{decide_or_silent, CoordinatorAnswer, HookAnswer};
 use super::event::{self, HookEvent, ToolCallPhase};
+use super::native::{self, Native, NativePath};
 use super::worktree;
 use crate::admission::{
     Decision, DispatchRequest, DispatchSource, Gate, Provenance, Refusal, ResourceClass,
@@ -41,6 +46,9 @@ pub struct Handled {
     /// the journal. `None` for every other firing, and for a stop that
     /// had no tree of ours.
     pub worktree: Option<String>,
+    /// Which native path this firing took (`hook::native`), for the
+    /// journal. `None` when nothing about it was native.
+    pub native: Option<NativePath>,
 }
 
 /// Handle one hook payload: parse it, ask the coordinator about a
@@ -78,6 +86,7 @@ pub fn handle_in(
         answer: HookAnswer::Silent,
         waited: Duration::ZERO,
         worktree: None,
+        native: None,
     })
 }
 
@@ -90,7 +99,14 @@ pub fn handle_in(
 pub fn answer_without_home(payload: &[u8], settings: &HookAdmissionSettings) -> HookAnswer {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let event = event::parse(payload);
-        let answer = decide_or_silent(&event, settings, None, Duration::ZERO);
+        // No coordinator to ask: a marked call is refused, whatever the
+        // machine's stance says.
+        let answer = match native::handle(&event, settings, None) {
+            Native::Answered { answer, .. } => return answer,
+            Native::Passed { .. } | Native::Unconcerned => {
+                decide_or_silent(&event, settings, None, Duration::ZERO)
+            }
+        };
         tend_default_trees(&event, answer, None).0
     }))
     .unwrap_or(HookAnswer::Silent)
@@ -103,6 +119,23 @@ fn handle_inner(
     records: Option<&Path>,
 ) -> Handled {
     let event = event::parse(payload);
+    let native = match native::handle(&event, settings, Some(gate)) {
+        // A native firing is answered here and goes no further: a marked
+        // call is never admitted under the session's own run, so it is
+        // charged once, and its dispatch is never withdrawn from here.
+        Native::Answered { answer, path } => {
+            return Handled {
+                event,
+                coordinator: None,
+                answer,
+                waited: Duration::ZERO,
+                worktree: None,
+                native: Some(path),
+            };
+        }
+        Native::Passed { path } => Some(path),
+        Native::Unconcerned => None,
+    };
     let (coordinator, waited) = ask_coordinator(&event, settings, gate);
     let answer = decide_or_silent(&event, settings, coordinator.clone(), waited);
     follow_agent_lifecycle(&event, gate);
@@ -126,6 +159,7 @@ fn handle_inner(
         answer,
         waited,
         worktree,
+        native,
     }
 }
 
@@ -497,6 +531,7 @@ pub fn journal_entry(payload: &[u8], handled: &Handled) -> serde_json::Value {
         "waited_ms": handled.waited.as_millis() as u64,
         "outcome": wait_outcome(handled),
         "worktree": handled.worktree,
+        "native": handled.native.map(NativePath::label),
     })
 }
 
@@ -1659,6 +1694,7 @@ mod tests {
             },
             waited: Duration::ZERO,
             worktree: None,
+            native: None,
         };
         let entry = journal_entry(&payload, &handled);
         assert_eq!(entry["decision"], "refuse");
@@ -1690,6 +1726,7 @@ mod tests {
             answer: HookAnswer::Silent,
             waited: Duration::ZERO,
             worktree: None,
+            native: None,
         };
         let entry = journal_entry(b"not json {{{", &handled);
         assert_eq!(entry["payload"], "not json {{{");
@@ -1711,6 +1748,7 @@ mod tests {
             answer: HookAnswer::Silent,
             waited: Duration::from_millis(900),
             worktree: None,
+            native: None,
         };
         let entry = journal_entry(&payload, &admitted);
         assert_eq!(entry["waited_ms"], 900);
@@ -1728,6 +1766,7 @@ mod tests {
             },
             waited: Duration::from_secs(2),
             worktree: None,
+            native: None,
         };
         let entry = journal_entry(&payload, &refused);
         assert_eq!(entry["waited_ms"], 2_000);

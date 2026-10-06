@@ -44,7 +44,9 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use super::event::{HookEvent, ToolCallPhase};
-use crate::admission::{Decision, Refusal as AdmissionRefusal};
+use crate::admission::{
+    ClaimOutcome, Decision, Refusal as AdmissionRefusal, StopNativeOutcome, WorktreeOutcome,
+};
 use crate::policy::{CoordinatorUnreachableBehavior, HookAdmissionSettings};
 
 /// Which rule produced a refusal. Spans both this module's own rules — a
@@ -62,6 +64,105 @@ pub enum RefusalRule {
     CoordinatorUnreachable,
     /// The coordinator was reached and refused outright, for this code.
     Admission(AdmissionRefusal),
+    /// A call tied to a relais dispatch (a marked call, or a message to
+    /// relais's worker) that relais will not let through.
+    Native(NativeRefusal),
+}
+
+/// Why relais refused a call that belongs to a native dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeRefusal {
+    /// The marker is malformed, or names two dispatches.
+    AmbiguousMarker,
+    /// The coordinator could not be reached: a marked call is refused
+    /// whatever `on_coordinator_unreachable` says, because nothing else
+    /// can vouch for it.
+    CoordinatorUnreachable,
+    UnknownDispatch,
+    WrongSession,
+    AlreadyClaimed,
+    Finished,
+    Cancelled,
+    LeaseLapsed,
+    WrongRecipient,
+    NotLeasable,
+    /// An unmarked message to the agent behind a native dispatch.
+    BehindRelais,
+}
+
+impl NativeRefusal {
+    fn label(self) -> &'static str {
+        match self {
+            Self::AmbiguousMarker => "ambiguous_marker",
+            Self::CoordinatorUnreachable => "coordinator_unreachable",
+            Self::UnknownDispatch => "unknown_dispatch",
+            Self::WrongSession => "wrong_session",
+            Self::AlreadyClaimed => "already_claimed",
+            Self::Finished => "finished",
+            Self::Cancelled => "cancelled",
+            Self::LeaseLapsed => "lease_lapsed",
+            Self::WrongRecipient => "wrong_recipient",
+            Self::NotLeasable => "not_leasable",
+            Self::BehindRelais => "behind_relais",
+        }
+    }
+
+    /// What was wrong with the call, and what the person can do about it.
+    fn reason_and_remedy(self) -> (&'static str, &'static str) {
+        match self {
+            Self::AmbiguousMarker => (
+                "this call carries a malformed relais dispatch marker, or two different ones",
+                "send the prompt or message exactly as relais printed it, with its one \
+                 `[relais-dispatch: <id>]` line",
+            ),
+            Self::CoordinatorUnreachable => (
+                "relais could not reach its coordinator, and this call belongs to a relais \
+                 dispatch that only the coordinator can vouch for",
+                "retry once the coordinator is reachable (`relais doctor` reports its status); \
+                 `on_coordinator_unreachable` does not apply to a call relais asked for",
+            ),
+            Self::UnknownDispatch => (
+                "no relais dispatch of this session asked for this call",
+                "spawn or continue only with the exact request relais printed \
+                 (`RELAIS-SPAWN` or `RELAIS-CONTINUE`)",
+            ),
+            Self::WrongSession => (
+                "the dispatch this call names belongs to another session",
+                "make the call in the session that started the relais run",
+            ),
+            Self::AlreadyClaimed => (
+                "an earlier call already claimed this dispatch, and relais asked for one",
+                "do not repeat the call; wait for the run's next request",
+            ),
+            Self::Finished => (
+                "the dispatch this call names already ran and settled",
+                "wait for the run's next `RELAIS-SPAWN` or `RELAIS-CONTINUE`",
+            ),
+            Self::Cancelled => (
+                "the relais run this call belongs to was cancelled",
+                "do not make this call; start the run again if the work is still wanted",
+            ),
+            Self::LeaseLapsed => (
+                "relais is no longer heartbeating this dispatch, so nothing may run under it",
+                "check that the `relais run` that printed the request is still running \
+                 (`relais coordinator status`), and start it again if it is not",
+            ),
+            Self::WrongRecipient => (
+                "relais did not ask for this call: its recipient or its kind differs from \
+                 the request",
+                "send exactly what relais printed, to the agent it names",
+            ),
+            Self::NotLeasable => (
+                "the dispatch this call names is bound to a process, which an agent cannot \
+                 take over",
+                "start the run again",
+            ),
+            Self::BehindRelais => (
+                "that agent is relais's worker, and relais speaks to it itself",
+                "let the run finish, or cancel it, before talking to that agent",
+            ),
+        }
+    }
 }
 
 impl RefusalRule {
@@ -73,6 +174,7 @@ impl RefusalRule {
             RefusalRule::QueueTimeout => "queue_timeout".to_string(),
             RefusalRule::CoordinatorUnreachable => "coordinator_unreachable".to_string(),
             RefusalRule::Admission(code) => format!("admission_{}", code.as_str()),
+            RefusalRule::Native(kind) => format!("native_{}", kind.label()),
         }
     }
 }
@@ -126,6 +228,12 @@ impl Refusal {
             RefusalRule::Admission(_) => {
                 format!(
                     "relais refused this agent: {}. {}.",
+                    self.reason, self.remedy
+                )
+            }
+            RefusalRule::Native(_) => {
+                format!(
+                    "relais refused this call: {}. {}.",
                     self.reason, self.remedy
                 )
             }
@@ -288,6 +396,129 @@ pub fn rewrite_spawn(tool_input: &Value, subagent_type: &str, model: &str, promp
     Value::Object(fields)
 }
 
+/// The `SendMessage` call's input as relais asked for it: `to` and
+/// `message` replaced, every other field kept as sent.
+pub fn rewrite_continue(tool_input: &Value, agent_id: &str, message: &str) -> Value {
+    let mut fields = tool_input.as_object().cloned().unwrap_or_default();
+    fields.insert("to".into(), json!(agent_id));
+    fields.insert("message".into(), json!(message));
+    Value::Object(fields)
+}
+
+fn refuse_native(kind: NativeRefusal) -> HookAnswer {
+    let (reason, remedy) = kind.reason_and_remedy();
+    HookAnswer::Refuse {
+        refusal: Refusal {
+            rule: RefusalRule::Native(kind),
+            reason: reason.to_string(),
+            remedy: remedy.to_string(),
+        },
+    }
+}
+
+/// Why a claim that did not run this call was refused. A claim for the
+/// other kind of call (a continuation answered to a spawn, or the other
+/// way round) is a wrong recipient: relais asked for something else.
+fn claim_refusal(claim: &ClaimOutcome) -> NativeRefusal {
+    match claim {
+        ClaimOutcome::Spawn { .. } | ClaimOutcome::Continue { .. } => NativeRefusal::WrongRecipient,
+        ClaimOutcome::UnknownDispatch => NativeRefusal::UnknownDispatch,
+        ClaimOutcome::WrongSession => NativeRefusal::WrongSession,
+        ClaimOutcome::AlreadyClaimed => NativeRefusal::AlreadyClaimed,
+        ClaimOutcome::Finished => NativeRefusal::Finished,
+        ClaimOutcome::Cancelled => NativeRefusal::Cancelled,
+        ClaimOutcome::LeaseLapsed => NativeRefusal::LeaseLapsed,
+        ClaimOutcome::WrongRecipient => NativeRefusal::WrongRecipient,
+        ClaimOutcome::NotLeasable => NativeRefusal::NotLeasable,
+    }
+}
+
+/// A call whose marker is malformed or names two dispatches.
+pub fn decide_ambiguous_marker() -> HookAnswer {
+    refuse_native(NativeRefusal::AmbiguousMarker)
+}
+
+/// A marked spawn (`PreToolUse` on the Agent tool), given what the
+/// coordinator answered when asked to claim its dispatch: `None` when it
+/// could not be reached, which refuses whatever `on_coordinator_unreachable`
+/// says, because only the coordinator can vouch for a marked call. A claim
+/// answers with the spawn relais asked for, and the call runs as that.
+pub fn decide_marked_spawn(tool_input: Option<&Value>, claim: Option<ClaimOutcome>) -> HookAnswer {
+    match claim {
+        Some(ClaimOutcome::Spawn {
+            subagent_type,
+            model,
+            prompt,
+        }) => HookAnswer::Rewrite {
+            input: rewrite_spawn(
+                tool_input.unwrap_or(&Value::Null),
+                &subagent_type,
+                &model,
+                &prompt,
+            ),
+        },
+        Some(refused) => refuse_native(claim_refusal(&refused)),
+        None => refuse_native(NativeRefusal::CoordinatorUnreachable),
+    }
+}
+
+/// A marked `SendMessage`, as [`decide_marked_spawn`] decides a spawn.
+pub fn decide_marked_message(
+    tool_input: Option<&Value>,
+    claim: Option<ClaimOutcome>,
+) -> HookAnswer {
+    match claim {
+        Some(ClaimOutcome::Continue { agent_id, message }) => HookAnswer::Rewrite {
+            input: rewrite_continue(tool_input.unwrap_or(&Value::Null), &agent_id, &message),
+        },
+        Some(refused) => refuse_native(claim_refusal(&refused)),
+        None => refuse_native(NativeRefusal::CoordinatorUnreachable),
+    }
+}
+
+/// Who an unmarked `SendMessage` is addressed to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recipient {
+    /// An agent bound, now or before, to a native dispatch on record.
+    RelaisWorker,
+    /// Any other agent.
+    Other,
+}
+
+/// A `SendMessage` with no marker, given who its recipient is (`None`: the
+/// coordinator could not be reached). Talking to relais's worker behind its back is refused; any
+/// other agent is none of relais's business, and an outage is the
+/// machine's own stance.
+pub fn decide_unmarked_message(
+    settings: &HookAdmissionSettings,
+    recipient: Option<Recipient>,
+) -> HookAnswer {
+    match recipient {
+        Some(Recipient::RelaisWorker) => refuse_native(NativeRefusal::BehindRelais),
+        Some(Recipient::Other) => HookAnswer::Silent,
+        None => decide_unreachable(settings),
+    }
+}
+
+/// `WorktreeCreate`, given whether relais has a claimed spawn waiting for
+/// its tree: the tree is relais's, or `None` and the default tree is made.
+pub fn decide_native_tree(outcome: Option<WorktreeOutcome>) -> Option<HookAnswer> {
+    match outcome {
+        Some(WorktreeOutcome::Path { path }) => Some(HookAnswer::WorktreePath { path }),
+        Some(WorktreeOutcome::NotNative) | None => None,
+    }
+}
+
+/// `SubagentStop`, given whether the agent was a native dispatch's: its
+/// stop is recorded and nothing else is done (the dispatch settles with
+/// the runner, and its tree is relais's). `None` and today's handling.
+pub fn decide_native_stop(outcome: Option<StopNativeOutcome>) -> Option<HookAnswer> {
+    match outcome {
+        Some(StopNativeOutcome::Stopped { .. }) => Some(HookAnswer::Silent),
+        Some(StopNativeOutcome::NotNative) | None => None,
+    }
+}
+
 /// Decide about one spawn (a `PreToolUse` on the Agent tool), given what
 /// the coordinator answered and how long this firing already waited for
 /// it.
@@ -297,28 +528,7 @@ fn decide_spawn(
     waited: Duration,
 ) -> HookAnswer {
     match coordinator {
-        None => match settings.on_coordinator_unreachable {
-            // Carrying on records the outage elsewhere and stays silent
-            // here; refusing declines and says the coordinator is
-            // unreachable (SPEC §23).
-            CoordinatorUnreachableBehavior::CarryOn => HookAnswer::Silent,
-            CoordinatorUnreachableBehavior::Refuse => HookAnswer::Refuse {
-                refusal: Refusal {
-                    rule: RefusalRule::CoordinatorUnreachable,
-                    reason: "relais could not reach its coordinator, and this machine is \
-                             configured to refuse admission rather than carry on unmanaged"
-                        .to_string(),
-                    remedy: "Retry once the coordinator is reachable (`relais doctor` reports \
-                             its status), or set `on_coordinator_unreachable = \"carry_on\"` \
-                             under `[admission]` in machine.toml if an unmanaged spawn is \
-                             acceptable here."
-                        .to_string(),
-                    // relais never learned what the coordinator would
-                    // have said — this is not a decision on the merits,
-                    // it is a stance taken in the absence of one.
-                },
-            },
-        },
+        None => decide_unreachable(settings),
         // Neither says yes on the person's behalf — see the module doc —
         // they simply have nothing to refuse.
         Some(Decision::Granted | Decision::AlreadyAdmitted) => HookAnswer::Silent,
@@ -353,6 +563,33 @@ fn decide_spawn(
         },
         Some(Decision::Refused { code, detail }) => HookAnswer::Refuse {
             refusal: refusal_for(code, detail),
+        },
+    }
+}
+
+/// What an unreachable coordinator means for a call that is not tied to a
+/// relais dispatch: the machine's own `on_coordinator_unreachable` stance.
+fn decide_unreachable(settings: &HookAdmissionSettings) -> HookAnswer {
+    match settings.on_coordinator_unreachable {
+        // Carrying on records the outage elsewhere and stays silent
+        // here; refusing declines and says the coordinator is
+        // unreachable (SPEC §23).
+        CoordinatorUnreachableBehavior::CarryOn => HookAnswer::Silent,
+        CoordinatorUnreachableBehavior::Refuse => HookAnswer::Refuse {
+            refusal: Refusal {
+                rule: RefusalRule::CoordinatorUnreachable,
+                reason: "relais could not reach its coordinator, and this machine is \
+                         configured to refuse admission rather than carry on unmanaged"
+                    .to_string(),
+                remedy: "Retry once the coordinator is reachable (`relais doctor` reports \
+                         its status), or set `on_coordinator_unreachable = \"carry_on\"` \
+                         under `[admission]` in machine.toml if an unmanaged spawn is \
+                         acceptable here."
+                    .to_string(),
+                // relais never learned what the coordinator would
+                // have said — this is not a decision on the merits,
+                // it is a stance taken in the absence of one.
+            },
         },
     }
 }
@@ -438,9 +675,22 @@ impl RefusalRule {
     pub fn availability(self) -> Availability {
         match self {
             // The coordinator never answered, so nothing was decided.
-            RefusalRule::CoordinatorUnreachable => Availability::Unknown,
+            RefusalRule::CoordinatorUnreachable
+            | RefusalRule::Native(NativeRefusal::CoordinatorUnreachable) => Availability::Unknown,
             // It answered, and relais chose to stop waiting for it.
             RefusalRule::QueueTimeout => Availability::Decided,
+            RefusalRule::Native(
+                NativeRefusal::AmbiguousMarker
+                | NativeRefusal::UnknownDispatch
+                | NativeRefusal::WrongSession
+                | NativeRefusal::AlreadyClaimed
+                | NativeRefusal::Finished
+                | NativeRefusal::Cancelled
+                | NativeRefusal::LeaseLapsed
+                | NativeRefusal::WrongRecipient
+                | NativeRefusal::NotLeasable
+                | NativeRefusal::BehindRelais,
+            ) => Availability::Decided,
             RefusalRule::Admission(code) => match code {
                 AdmissionRefusal::UnknownRun
                 | AdmissionRefusal::RunCancelled

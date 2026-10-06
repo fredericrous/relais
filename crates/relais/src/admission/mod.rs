@@ -16,11 +16,18 @@
 //! that supplies both.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use crate::policy::ConcurrencyLimits;
+
+mod native;
+pub use native::{
+    BindNativeOutcome, ClaimOutcome, NativeAnswer, NativeAsk, NativeProgress, NativeState,
+    RegisterOutcome, StopNativeOutcome, WorktreeOutcome,
+};
 
 /// A queued entry older than this jumps the session round-robin (SPEC
 /// §23: queue aging). It never jumps a cap.
@@ -980,6 +987,9 @@ pub struct AdmissionState {
     /// settled dispatch is removed from that map, and the enforcement
     /// line's "admitted total" would otherwise forget it existed.
     admitted_by_source: BTreeMap<DispatchSource, u32>,
+    /// The native dispatches relais asked the parent session to run
+    /// (`native.rs`), each keyed by a dispatch above.
+    native: native::NativeRegistry,
 }
 
 /// Default duration a hook-admitted agent's lease is held before it
@@ -1015,6 +1025,7 @@ impl AdmissionState {
             stopped_order: VecDeque::new(),
             stopped: BTreeSet::new(),
             admitted_by_source: BTreeMap::new(),
+            native: native::NativeRegistry::default(),
         }
     }
 
@@ -1433,6 +1444,7 @@ impl AdmissionState {
         let Some(dispatch) = self.dispatches.remove(dispatch_id) else {
             return;
         };
+        self.native.forget(dispatch_id);
         if let Some(run) = self.runs.get_mut(&dispatch.run_id) {
             run.admitted_total = run.admitted_total.saturating_sub(1);
             run.last_activity = now;
@@ -1582,6 +1594,38 @@ impl AdmissionState {
         provenance: Provenance,
         now: Instant,
     ) -> BindOutcome {
+        let outcome = self.bind_lease_only(dispatch_id, agent_id, provenance, now);
+        if outcome != BindOutcome::Bound {
+            return outcome;
+        }
+        // The agent may already be over: a synchronous spawn's
+        // `SubagentStop` arrives before the `PostToolUse` that binds it,
+        // and found nothing to settle then. Its end was remembered, so
+        // it is applied now rather than left to hold the seat until the
+        // lease lapses.
+        let key = self
+            .dispatches
+            .get(dispatch_id)
+            .map(|dispatch| (dispatch.session_id.clone(), agent_id.to_string()));
+        if let Some(key) = key {
+            if self.stopped.remove(&key) {
+                self.stopped_order.retain(|stopped| stopped != &key);
+                self.settle(dispatch_id, None, now);
+                self.release(dispatch_id, now);
+            }
+        }
+        BindOutcome::Bound
+    }
+
+    /// The binding half of [`Self::bind_agent_lease`]: the lease and the
+    /// agent id, with no look at the ends `settle_by_agent` remembered.
+    fn bind_lease_only(
+        &mut self,
+        dispatch_id: &str,
+        agent_id: &str,
+        provenance: Provenance,
+        now: Instant,
+    ) -> BindOutcome {
         let Some(dispatch) = self.dispatches.get_mut(dispatch_id) else {
             return BindOutcome::UnknownDispatch;
         };
@@ -1598,17 +1642,6 @@ impl AdmissionState {
             provenance,
             since: now,
         };
-        // The agent may already be over: a synchronous spawn's
-        // `SubagentStop` arrives before the `PostToolUse` that binds it,
-        // and found nothing to settle then. Its end was remembered, so
-        // it is applied now rather than left to hold the seat until the
-        // lease lapses.
-        let key = (dispatch.session_id.clone(), agent_id.to_string());
-        if self.stopped.remove(&key) {
-            self.stopped_order.retain(|stopped| stopped != &key);
-            self.settle(dispatch_id, None, now);
-            self.release(dispatch_id, now);
-        }
         BindOutcome::Bound
     }
 
@@ -1855,6 +1888,7 @@ impl AdmissionState {
     /// it, and its ID is remembered as finished.
     fn forget_settled(&mut self, dispatch_id: &str) {
         self.dispatches.remove(dispatch_id);
+        self.native.forget(dispatch_id);
         // A worker that is over does not still hold a worktree
         // (SPEC §23: verification waits for write leases to be
         // released, and a lease nobody can release never is).
@@ -2590,6 +2624,64 @@ pub trait Gate {
     ) -> Result<AgentSettleOutcome, GateError> {
         Ok(AgentSettleOutcome::NothingBound)
     }
+    /// Record what relais asked the parent session to run for an
+    /// admitted dispatch (see `AdmissionState::register_native`). The
+    /// native calls below default to a gate that holds no native
+    /// dispatches: nothing is registered, claimed or bound.
+    fn register_native(
+        &self,
+        _session_id: &str,
+        _dispatch_id: &str,
+        _ask: &NativeAsk,
+    ) -> Result<RegisterOutcome, GateError> {
+        Ok(RegisterOutcome::UnknownDispatch)
+    }
+    /// A marked call asks what to run (see `AdmissionState::claim_native`).
+    fn claim_native(
+        &self,
+        _session_id: &str,
+        _dispatch_id: &str,
+        _to: Option<&str>,
+    ) -> Result<ClaimOutcome, GateError> {
+        Ok(ClaimOutcome::UnknownDispatch)
+    }
+    /// `WorktreeCreate`: the tree of the spawn just claimed, if any (see
+    /// `AdmissionState::native_worktree`).
+    fn native_worktree(
+        &self,
+        _session_id: &str,
+        _name: &str,
+    ) -> Result<WorktreeOutcome, GateError> {
+        Ok(WorktreeOutcome::NotNative)
+    }
+    /// A marked spawn returned and named its agent (see
+    /// `AdmissionState::bind_native`).
+    fn bind_native(
+        &self,
+        _session_id: &str,
+        _dispatch_id: &str,
+        _agent_id: &str,
+    ) -> Result<BindNativeOutcome, GateError> {
+        Ok(BindNativeOutcome::NotNative)
+    }
+    /// A subagent ended (see `AdmissionState::stop_native`).
+    fn stop_native(
+        &self,
+        _session_id: &str,
+        _agent_id: &str,
+        _transcript_path: Option<&Path>,
+        _last_assistant_message: Option<&str>,
+    ) -> Result<StopNativeOutcome, GateError> {
+        Ok(StopNativeOutcome::NotNative)
+    }
+    /// Is the agent bound, or was it, to a native dispatch on record?
+    fn is_native_agent(&self, _session_id: &str, _agent_id: &str) -> Result<bool, GateError> {
+        Ok(false)
+    }
+    /// Where a native dispatch is: what the backend polls.
+    fn native_status(&self, _dispatch_id: &str) -> Result<NativeProgress, GateError> {
+        Ok(NativeProgress::Unknown)
+    }
     /// The run reached an end state and will dispatch nothing more. Until
     /// a root runner says so, a registered run keeps the coordinator from
     /// idling out (see `AdmissionState::is_idle`), so a runner that owns a
@@ -2842,6 +2934,66 @@ impl Gate for LocalGate {
         Ok(self
             .admission()
             .settle_by_agent(session_id, agent_id, spent_micros, Instant::now()))
+    }
+
+    fn register_native(
+        &self,
+        session_id: &str,
+        dispatch_id: &str,
+        ask: &NativeAsk,
+    ) -> Result<RegisterOutcome, GateError> {
+        Ok(self
+            .admission()
+            .register_native(session_id, dispatch_id, ask))
+    }
+
+    fn claim_native(
+        &self,
+        session_id: &str,
+        dispatch_id: &str,
+        to: Option<&str>,
+    ) -> Result<ClaimOutcome, GateError> {
+        Ok(self
+            .admission()
+            .claim_native(session_id, dispatch_id, to, Instant::now()))
+    }
+
+    fn native_worktree(&self, session_id: &str, name: &str) -> Result<WorktreeOutcome, GateError> {
+        Ok(self.admission().native_worktree(session_id, name))
+    }
+
+    fn bind_native(
+        &self,
+        session_id: &str,
+        dispatch_id: &str,
+        agent_id: &str,
+    ) -> Result<BindNativeOutcome, GateError> {
+        Ok(self
+            .admission()
+            .bind_native(session_id, dispatch_id, agent_id, Instant::now()))
+    }
+
+    fn stop_native(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        transcript_path: Option<&Path>,
+        last_assistant_message: Option<&str>,
+    ) -> Result<StopNativeOutcome, GateError> {
+        Ok(self.admission().stop_native(
+            session_id,
+            agent_id,
+            transcript_path.map(Path::to_path_buf),
+            last_assistant_message.map(str::to_string),
+        ))
+    }
+
+    fn is_native_agent(&self, session_id: &str, agent_id: &str) -> Result<bool, GateError> {
+        Ok(self.admission().is_native_agent(session_id, agent_id))
+    }
+
+    fn native_status(&self, dispatch_id: &str) -> Result<NativeProgress, GateError> {
+        Ok(self.admission().native_status(dispatch_id))
     }
 
     fn finish_run(&self, run_id: &str) -> Result<LifecycleOutcome, GateError> {

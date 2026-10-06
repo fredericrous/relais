@@ -27,6 +27,7 @@
 
 pub mod decide;
 pub mod event;
+pub mod native;
 pub mod pairing;
 pub mod respond;
 pub mod worktree;

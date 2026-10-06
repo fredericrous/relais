@@ -17,6 +17,19 @@ missing here.
   a marked spawn's input to what relais asked for (`updatedInput` with no
   permission decision, so the hook still never says yes for the person), and
   `relais::native` defines the `[relais-dispatch: <id>]` run marker.
+- The coordinator knows the native dispatches relais asked for, and the hook
+  makes a spawn or continuation run exactly as asked (groundwork; nothing
+  registers a request yet). A marked spawn or message is claimed once, and
+  runs with relais's subagent type, model and prompt (or agent and message)
+  whatever the call asked for. It gets relais's prepared tree, binds on its
+  `PostToolUse`, and its `SubagentStop` is recorded without settling the
+  dispatch. A marked call is refused when the dispatch is unknown, already
+  claimed, finished, no longer heartbeated, or the marker is ambiguous, and
+  also when the coordinator is unreachable, whatever
+  `on_coordinator_unreachable` says; it is charged once, never again under
+  the session's own run. A message to relais's worker that carries no marker
+  is refused. The coordinator wire protocol is now 4: after upgrading, run
+  `relais coordinator stop` once so the next command starts a matching daemon.
 - Once relais answers `WorktreeCreate`, it does so for every isolated spawn
   on the machine: an unmarked one gets Claude Code's default tree
   (`.claude/worktrees/<name>` on `worktree-<name>` from HEAD), removed again

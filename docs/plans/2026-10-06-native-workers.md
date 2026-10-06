@@ -205,4 +205,10 @@ Not measured, and why it does not matter: a marked spawn with the coordinator st
 
 `make check` green; two key tests falsified (no-home `WorktreeCreate`, keep a tree with a new commit). Decision left open, to answer `salvaged` with the merge sha. For #105: 0 verified denials, coverage complete, 3 recovered refusals (a long heredoc, a `$TMPDIR` heredoc, a heredoc append), none fatal; no local-server test in it.
 
+**2026-10-06, N1b** (run-65d29fc2dcda5-d1, sonnet@medium, one attempt, $5.99; an earlier launch, run-65d29561797b5-4f42, never reached the API, $0, discarded). Checks green, then `needs_review` with two findings, both real races no criterion covered, fixed by hand:
+- a cancelled run's dispatch could still be registered and claimed between the cancel and its acknowledgement → `Cancelled`, refused like `RunCancelled`;
+- a `SubagentStop` handled before the binding `PostToolUse` (separate hook processes) fell through to `settle_by_agent`, leaving the record `Bound` forever → the stop matches a `TreeGiven` record by its `agent-<id>` name, and the late bind keeps the stop.
+
+`make check` green (1,270 lib tests). Four key tests falsified: the rewrite puts back relais's model, an unreachable coordinator denies a marked spawn, a cancelled dispatch is refused, the racing stop still stops. Decision left open, to answer `salvaged` with the merge sha. For #105: 0 verified denials, coverage complete, 4 recovered shape refusals, none fatal.
+
 <!-- panel: repos=relais adds= reviewers=backend body-sha=ebe649d81b94 -->
