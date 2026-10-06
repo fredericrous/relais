@@ -300,3 +300,5 @@ Each package: `make check` (which now includes `claude plugin test claude-plugin
 - The pane opens with focus left out, never `focus:false`. Placement follows `isPlaced`.
 - `$.prompt.submit` carries the verdict, called from the stream handler, never from inside a command hook.
 - No type check in the gate; the plugin's tests carry it.
+
+**2026-10-06, the pane's direction** (the person, from three text-cell directions: timeline, split, dashboard): **A, timeline**. The artboard is `2026-10-06-all-native-mod.pane.txt`, which M1's pane view tests follow.
