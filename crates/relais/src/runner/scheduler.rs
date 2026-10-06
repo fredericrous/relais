@@ -30,14 +30,15 @@ use crate::lifecycle::UsagePhase;
 use crate::money::{CostKind, MicroUsd};
 use crate::policy::{BlockCode, EffectiveAuthority, MachineSettings, Tier};
 use crate::procs::Ended;
+use crate::protocol::AgentKind;
 use crate::route::{Recipe, Route, RungIndex};
 use crate::verify::{self, Receipt, VerificationReport};
 use crate::workspace::{self, WorkspaceError};
 
 use super::{
-    data_block, data_list_block, effort_str, execute_child, AttemptLabel, Budget, Limit,
-    ManagedDispatch, Next, Observation, Reason, ReviewOutcome, RunConfig, RunEngine, RunError,
-    RunOutcome, State, Terminal,
+    cost_booked, data_block, data_list_block, effort_str, execute_child, AttemptLabel, Budget,
+    Limit, ManagedDispatch, Next, Observation, Reason, ReviewOutcome, RunConfig, RunEngine,
+    RunError, RunOutcome, State, Terminal,
 };
 
 /// The patch an accepted decomposed run exports its assembled revision
@@ -1197,6 +1198,8 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
     let dispatch_start = Instant::now();
     let result = match engine.managed_launch(ManagedDispatch {
         spec,
+        agent: AgentKind::Planner,
+        attempt: None,
         depth: 0,
         parent: None,
         reserve_micros: remaining_budget.unwrap_or(0),
@@ -1219,7 +1222,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         .ledger
         .finish_dispatch(&dispatch_id, "completed")?;
     // Planning overhead is the run's cost (SPEC §19).
-    engine.config.ledger.record_usage(&UsageEvent {
+    let planning_usage = UsageEvent {
         event_id: dispatch_id.as_str().to_string(),
         run_id: engine.run_id.clone(),
         attempt_id: None,
@@ -1239,7 +1242,9 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         requested_model: Some(profile.id.clone()),
         requested_effort: effort_str(profile.effort.as_ref()),
         harness: engine.harness.clone(),
-    })?;
+    };
+    engine.config.ledger.record_usage(&planning_usage)?;
+    engine.events.emit(cost_booked(&planning_usage));
     if result.ended == Ended::Cancelled {
         return Ok(Proposal::Failed(engine.stop(
             &budget,

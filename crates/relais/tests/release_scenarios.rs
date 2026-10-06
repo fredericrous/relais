@@ -1072,6 +1072,157 @@ fn repair_then_escalation_all_attributed_to_one_run() {
     assert!(explained.contains("escalating"), "{explained}");
 }
 
+/// Every stdout line of a `--protocol` run, each of which must be a JSON
+/// object carrying a `relais` key (SPEC §29).
+fn protocol_lines(stdout: &str) -> Vec<serde_json::Value> {
+    stdout
+        .lines()
+        .map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("stdout line is not JSON ({e}): {line}"));
+            assert!(value.get("relais").is_some(), "no `relais` key: {line}");
+            value
+        })
+        .collect()
+}
+
+/// What a run wrote to its `events.jsonl`, in order.
+fn events_jsonl(run_dir: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(run_dir.join("events.jsonl"))
+        .expect("events.jsonl")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("an event line is JSON"))
+        .collect()
+}
+
+fn event_kinds(events: &[serde_json::Value]) -> Vec<String> {
+    events
+        .iter()
+        .map(|event| event["event"]["kind"].as_str().expect("a kind").to_string())
+        .collect()
+}
+
+/// The channel's numbering: gapless over the events a reader sees. A
+/// mirrored `stderr` line carries no `seq` (it is numbered apart).
+fn assert_seq_counts_from_zero(events: &[serde_json::Value]) {
+    let seqs: Vec<u64> = events
+        .iter()
+        .filter(|event| event["event"]["kind"] != "stderr")
+        .map(|event| event["seq"].as_u64().expect("a seq"))
+        .collect();
+    assert_eq!(seqs, (0..seqs.len() as u64).collect::<Vec<_>>());
+    assert!(events
+        .iter()
+        .filter(|event| event["event"]["kind"] == "stderr")
+        .all(|event| event.get("seq").is_none()));
+}
+
+// SPEC §29: under `--protocol` stdout carries protocol lines only; the
+// run's events are the same, in the same order, in `events.jsonl`, and a
+// run without the flag writes that file and leaves stdout alone.
+#[test]
+fn a_protocol_run_keeps_stdout_for_events_and_events_jsonl_holds_the_same() {
+    let protocol_world = World::new("proto");
+    let hash = protocol_world.write_policy(3);
+    protocol_world.write_machine(&hash, "");
+    let task = protocol_world.write_task("task.json", "off");
+    let run = protocol_world.relais(&["run", "--task", task.to_str().unwrap(), "--protocol"]);
+    let stdout = text(&run.stdout);
+    let stderr = text(&run.stderr);
+    assert_eq!(run.status.code(), Some(0), "{stdout}\n{stderr}");
+    let on_stdout = protocol_lines(&stdout);
+    assert!(
+        stderr.contains("accepted: "),
+        "the human lines went to stderr: {stderr}"
+    );
+    let run_id = on_stdout[0]["run"].as_str().expect("a run id").to_string();
+    let written = events_jsonl(&protocol_world.run_dir(&run_id));
+    assert_seq_counts_from_zero(&written);
+    let protocol_events: Vec<_> = written
+        .iter()
+        .filter(|event| event["event"]["kind"] != "stderr")
+        .cloned()
+        .collect();
+    assert_eq!(
+        on_stdout, protocol_events,
+        "stdout and events.jsonl hold the same events in the same order"
+    );
+    let kinds = event_kinds(&protocol_events);
+    for expected in [
+        "phase",
+        "dispatch_started",
+        "dispatch_ended",
+        "cost",
+        "check_started",
+        "check_ended",
+        "decision",
+        "outcome",
+    ] {
+        assert!(
+            kinds.iter().any(|kind| kind == expected),
+            "{expected}: {kinds:?}"
+        );
+    }
+    assert_eq!(kinds.last().map(String::as_str), Some("outcome"));
+    let outcome = &protocol_events.last().expect("an event")["event"];
+    assert_eq!(outcome["state"], "accepted");
+    assert!(outcome["receipt"]
+        .as_str()
+        .expect("a receipt path")
+        .ends_with("receipt.json"));
+    assert!(
+        written
+            .iter()
+            .filter(|event| event["event"]["kind"] == "stderr")
+            .any(|event| event["event"]["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("accepted: "))),
+        "the run's own human lines are mirrored into events.jsonl"
+    );
+
+    let plain_world = World::new("plain");
+    let hash = plain_world.write_policy(3);
+    plain_world.write_machine(&hash, "");
+    let task = plain_world.write_task("task.json", "off");
+    let plain = plain_world.relais(&["run", "--task", task.to_str().unwrap()]);
+    let plain_stdout = text(&plain.stdout);
+    assert_eq!(plain.status.code(), Some(0), "{plain_stdout}");
+    assert!(plain_stdout.starts_with("accepted: "), "{plain_stdout}");
+    let plain_events = events_jsonl(&plain_world.run_dir(&World::run_id_of(&plain_stdout)));
+    assert_seq_counts_from_zero(&plain_events);
+    assert_eq!(
+        event_kinds(&plain_events),
+        kinds,
+        "the same events with or without --protocol"
+    );
+}
+
+// SPEC §29: a run that ends failed is as much a protocol run as one that
+// is accepted: every stdout line is a protocol object and the last is its
+// outcome.
+#[test]
+fn a_failed_protocol_run_ends_with_its_outcome_on_stdout() {
+    let world = World::new("proto-fail");
+    let hash = world.write_policy(3);
+    world.write_machine(&hash, "[spending]\nper_run_micros = 20000\n");
+    let task = world.write_task("task.json", "off");
+    let run = world.relais(&["run", "--task", task.to_str().unwrap(), "--protocol"]);
+    let stdout = text(&run.stdout);
+    assert_eq!(
+        run.status.code(),
+        Some(5),
+        "{stdout}\n{}",
+        text(&run.stderr)
+    );
+    let lines = protocol_lines(&stdout);
+    assert_seq_counts_from_zero(&lines);
+    let last = lines.last().expect("an event");
+    assert_eq!(last["event"]["kind"], "outcome");
+    assert_eq!(last["event"]["state"], "budget_exhausted");
+    assert!(last["event"]["receipt"].is_null());
+    assert!(lines.iter().any(|line| line["event"]["kind"] == "decision"));
+}
+
 // SPEC §14: budget exhaustion preserves the patch and evidence and
 // prevents further dispatch; reports distinguish the outcome.
 #[test]

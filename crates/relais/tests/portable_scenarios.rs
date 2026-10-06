@@ -1518,3 +1518,19 @@ fn rollback_of_a_single_revision_recipe_is_refused() {
         text(&unknown.stderr)
     );
 }
+
+// SPEC §29: `--protocol` needs the descriptors of a Unix process; where it
+// cannot be honoured it is refused before anything runs, not ignored.
+#[cfg(windows)]
+#[test]
+fn run_protocol_is_refused_on_windows_before_anything_runs() {
+    let world = World::new("proto-win");
+    let run = world.relais(&["run", "--task", "no-such-task.json", "--protocol"]);
+    assert_eq!(run.status.code(), Some(2), "{}", text(&run.stderr));
+    assert!(
+        text(&run.stderr).contains("not supported on Windows yet"),
+        "{}",
+        text(&run.stderr)
+    );
+    assert!(text(&run.stdout).is_empty(), "{}", text(&run.stdout));
+}

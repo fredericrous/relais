@@ -18,6 +18,17 @@ missing here.
 
 ### Added
 
+- `relais run --protocol` keeps stdout for protocol lines only: one JSON
+  object per line, each with a `relais` key, and every other byte the
+  process writes (`println!`, `eprintln!`, a panic's message) goes to stderr.
+  It is the channel a Claude Code plugin will read; Windows refuses it for
+  now (exit 2). See SPEC §29.
+- Every run now records its events — phases, dispatches, cost, each check's
+  start, bounded streamed output and end, decisions and the outcome — as
+  numbered lines in `<artifacts>/<run>/events.jsonl`, with or without
+  `--protocol`. A check's output goes into events at most 64 KB per check
+  (4 KB per event); the rest is counted, and the full log stays in the
+  artifacts directory.
 - `relais run --native` refuses up front, `native_unpriced`, when a model it
   can dispatch has no `[pricing.models]` entry (the effective model the ledger
   last saw for the alias, or no price table at all), naming the alias, the id

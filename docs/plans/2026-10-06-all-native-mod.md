@@ -302,3 +302,16 @@ Each package: `make check` (which now includes `claude plugin test claude-plugin
 - No type check in the gate; the plugin's tests carry it.
 
 **2026-10-06, the pane's direction** (the person, from three text-cell directions: timeline, split, dashboard): **A, timeline**. The artboard is `2026-10-06-all-native-mod.pane.txt`, which M1's pane view tests follow.
+
+**2026-10-06, M2a** (run-65d30ca7288f0-c40b, sonnet@medium, one attempt, $3.78). It added:
+- `relais run --protocol`: stdout kept by `dup` for protocol lines; fd 1 and fd 2 piped through a mirror thread to the real stderr and to `events.jsonl`; refused on Windows;
+- the `event` lines (`phase` from every transition, `dispatch_started`/`dispatch_ended`, `cost`, `check_started`/`output`/`check_ended`, `decision`, `outcome`), all also in `<artifacts>/<run>/events.jsonl`;
+- check output followed from the check's own log file: 4 KB chunks merged every 100 ms, 64 KB per check, the rest counted as `elided_bytes`, never blocking.
+
+Checks green, then `needs_review` with four findings, fixed by hand:
+- the `outcome` event dropped the receipt a sign-off-pending run wrote → it names the receipt whenever the run wrote one;
+- an uncaught panic under `--protocol` could exit before the mirror drained → `main` closes the channel (drains it) before resuming the panic. This path has no test: it would need a test-only panic trigger in production code;
+- `check_started` without `check_ended` when a spawn or the wait failed → every path ends the check, with `exit: null` on error; a missing program's "command not found" line is sent as `output`;
+- stderr events took `seq` numbers the channel skips → they carry `stderr_seq` instead, and `seq` is gapless on stdout and in the file.
+
+`make check` green (1,337 lib tests). Falsified: the receipt naming and `check_ended` on a failed spawn.

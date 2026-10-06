@@ -919,6 +919,37 @@ Without `--write`, a promotable candidate prints the `[[recipes]]` fragment(s) i
 
 **Evaluation.** `relais recipe evaluate` pairs each replay trial with a replay SOURCE run (§25), which a live trial does not have. Live trials take the randomized estimator instead (§25): rows selected by `arms_json` membership, control included, Hajek inverse-propensity estimates per arm, an unpaired bootstrap, and its own gates. A ledger holding only replays evaluates as before.
 
+## 29. The protocol channel and the run's events
+
+Nothing a run does is out of sight. Every step is an **event**, appended as one JSON line to `<artifacts>/<run>/events.jsonl` whether or not anything is listening — a file, not a ledger table, so there is no migration — and, under `relais run --protocol`, also written to stdout.
+
+**The channel.** `--protocol` keeps the real stdout for protocol lines only. At startup, before anything prints, relais duplicates fd 1 for its one protocol writer (a mutex around the kept stdout, so lines never interleave), then points fd 1 and fd 2 at a pipe. A reader thread copies each line of that pipe to the real stderr, which relais also keeps by duplication, and, once the run's artifacts directory is known, appends it to `events.jsonl` as a `stderr` event (lines before that are only copied). Every `println!`, every `eprintln!` and a panic's message therefore reach stderr and never stdout, and a panic is in the run's record. Each `stderr` event carries at most 4 KB of one line. At exit the descriptors are restored and the pipe drained, for a bounded time. Without `--protocol` nothing changes: stdout and stderr are as they were, and `events.jsonl` is still written. On Windows `--protocol` is refused before anything runs, saying it is not supported there yet (exit 2).
+
+**The line.** Every protocol line is a JSON object with a `relais` key naming its kind. This section defines `event`:
+
+```
+{"relais":"event","run":"<run id>","seq":0,"at":"<RFC 3339>","event":{"kind":"…", …}}
+```
+
+`seq` starts at 0 for each run and rises by one per event, in `events.jsonl` and on stdout alike, so the two hold the same events in the same order. The `stderr` events are the one exception: they exist in the file only (a reader of the channel has the child's stderr itself), carry no `seq`, and are numbered apart by `stderr_seq`, so a mirrored line never takes a number the channel would skip. Field names are `snake_case`.
+
+**The event kinds.**
+
+| `kind` | fields | emitted |
+|---|---|---|
+| `phase` | `state`, `reason`, `detail` | by every transition the runner records, with the ledger's own values |
+| `dispatch_started` | `dispatch`, `agent_kind` (`worker`, `reviewer`, `planner`), `attempt` (a worker's number, else `null`), `model`, `effort` | before a managed launch |
+| `dispatch_ended` | `dispatch`, `outcome`, `usage`, `cost` | after it; `usage` and `cost` are `null` when the dispatch never ran |
+| `cost` | `booked` (micro-USD, `null` when unknown), `completeness` | after each usage event is recorded |
+| `check_started` | `label`, `argv` | before a verification or setup command |
+| `output` | `label`, `text`, `elided_bytes` | while it runs |
+| `check_ended` | `label`, `exit` (`null` when it timed out or was killed), `duration_ms` | after it |
+| `decision` | `what` (`repair`, `escalate`, `accept`, `stop`, …), `reason` | where the machine picks the next step; the `phase` of the same decision follows |
+| `outcome` | `state`, `receipt` (the path, when accepted) | at the end of each run |
+| `stderr` | `text` | for each line the process wrote under `--protocol`; file only |
+
+**Streaming check output.** A command's stdout and stderr go to its log file, which stays the record. While it runs, a follower reads the growing file with a descriptor of its own: it never touches the command's pipes, so it cannot slow or block the check. New bytes are merged every 100 ms into `output` events of at most 4 KB of text each. A check puts at most 64 KB of output into events in all; the rest is skipped, counted, and reported in one final `output` event with empty `text` and `elided_bytes` set. When the follower falls behind it skips ahead and counts what it skipped. It stops, after one last read, when the command ends. The log file holds all of the output, and a check is no slower with the follower than without it.
+
 ---
 
 Companion repositories: [amont](https://github.com/fredericrous/amont), [aval](https://github.com/fredericrous/aval), [amont-agent](https://github.com/fredericrous/amont-agent).

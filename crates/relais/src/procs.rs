@@ -170,6 +170,34 @@ pub fn peer_uid(stream: &std::os::unix::net::UnixStream) -> io::Result<u32> {
     imp::peer_uid(stream.as_raw_fd())
 }
 
+/// This process's stdout and stderr, moved aside and replaced by one pipe:
+/// the protocol channel's way of keeping the real stdout for itself
+/// (`protocol::install`).
+#[cfg(unix)]
+pub struct DivertedStdio {
+    /// What fd 1 was before the diversion.
+    pub stdout: std::fs::File,
+    /// What fd 2 was before the diversion.
+    pub stderr: std::fs::File,
+    /// The pipe's read end: every byte written to fd 1 or fd 2 since.
+    pub reader: std::fs::File,
+}
+
+/// Keep the current stdout and stderr (as duplicated descriptors), then
+/// make fd 1 and fd 2 the write end of a new pipe. All of the descriptors
+/// handed back are close-on-exec, so a child process holds none of them.
+#[cfg(unix)]
+pub fn divert_stdio() -> io::Result<DivertedStdio> {
+    imp::divert_stdio()
+}
+
+/// Put the kept stdout and stderr back onto fd 1 and fd 2, which closes
+/// the pipe's last write end in this process.
+#[cfg(unix)]
+pub fn restore_stdio(stdout: &std::fs::File, stderr: &std::fs::File) -> io::Result<()> {
+    imp::restore_stdio(stdout, stderr)
+}
+
 /// The process umask, narrowed to `mask` for as long as the returned
 /// value lives.
 ///
@@ -805,6 +833,77 @@ mod imp {
                 return Err(io::Error::last_os_error());
             }
             Ok(uid)
+        }
+    }
+
+    /// A descriptor equal to `fd` that is not inherited across exec.
+    fn dup_cloexec(fd: libc::c_int) -> io::Result<std::os::fd::OwnedFd> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: `fcntl` with F_DUPFD_CLOEXEC reads no memory; the new
+        // descriptor, when there is one, is owned by nothing else.
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `duplicate` is a fresh descriptor this call owns.
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicate) })
+    }
+
+    fn make_cloexec(fd: &std::os::fd::OwnedFd) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `fcntl` with F_SETFD on a descriptor `fd` keeps open.
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn duplicate_onto(from: &std::os::fd::OwnedFd, onto: libc::c_int) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `dup2` replaces descriptor `onto` with a copy of `from`,
+        // which `from`'s owner keeps open for the call.
+        if unsafe { libc::dup2(from.as_raw_fd(), onto) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub fn divert_stdio() -> io::Result<super::DivertedStdio> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let stdout = dup_cloexec(libc::STDOUT_FILENO)?;
+        let stderr = dup_cloexec(libc::STDERR_FILENO)?;
+        let mut ends: [libc::c_int; 2] = [0; 2];
+        // SAFETY: `pipe` writes two descriptors into the array it is given.
+        if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: both descriptors were just created and nothing else
+        // owns them.
+        let (reader, writer) =
+            unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+        make_cloexec(&reader)?;
+        make_cloexec(&writer)?;
+        duplicate_onto(&writer, libc::STDOUT_FILENO)?;
+        duplicate_onto(&writer, libc::STDERR_FILENO)?;
+        Ok(super::DivertedStdio {
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            reader: reader.into(),
+        })
+    }
+
+    pub fn restore_stdio(stdout: &std::fs::File, stderr: &std::fs::File) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `dup2` onto the standard descriptors from descriptors
+        // the caller keeps open.
+        let restored = unsafe {
+            libc::dup2(stdout.as_raw_fd(), libc::STDOUT_FILENO) >= 0
+                && libc::dup2(stderr.as_raw_fd(), libc::STDERR_FILENO) >= 0
+        };
+        if restored {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
     }
 

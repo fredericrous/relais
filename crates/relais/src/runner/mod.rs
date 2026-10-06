@@ -44,6 +44,7 @@ use crate::policy::{
     RepoPolicy, Tier, VerificationProfile,
 };
 use crate::procs::Ended;
+use crate::protocol::{AgentKind, CostFigure, Event, Events, TokenUsage};
 use crate::route::{
     route, Recipe, Route, RouteInputs, RoutePredictor, Routed, RoutedBy, RungIndex,
 };
@@ -357,6 +358,11 @@ pub(crate) type Launched = Result<LaunchResult, RunOutcome>;
 /// in the agent tree, what it may spend and how long it has.
 pub(crate) struct ManagedDispatch<'d> {
     pub(crate) spec: LaunchSpec,
+    /// What kind of agent this is, for the run's events.
+    pub(crate) agent: AgentKind,
+    /// The attempt this dispatch is, for a worker; reviews and plans have
+    /// none.
+    pub(crate) attempt: Option<u32>,
     /// Depth in the agent tree; a root dispatch is 0 (SPEC §23).
     pub(crate) depth: u32,
     /// The dispatch that asked for this one, when one did.
@@ -392,6 +398,8 @@ pub(crate) struct RunEngine<'a> {
     /// that held it has ended, so the tree is still, and waiting would
     /// be the run waiting on itself until its own deadline.
     own_write_leases: std::collections::BTreeSet<String>,
+    /// Everything this run does, as events (SPEC §29).
+    pub(crate) events: Events,
 }
 
 /// What a run has spent so far, and how well that figure is known.
@@ -622,6 +630,42 @@ struct Progress {
     unpriced_model: Option<Vec<String>>,
 }
 
+/// How a managed dispatch ended, as the run's event: what the agent
+/// reported when it ran, or the state the run ended in when the dispatch
+/// never got that far.
+fn dispatch_ended(dispatch: String, launched: &Launched) -> Event {
+    match launched {
+        Ok(result) => Event::DispatchEnded {
+            dispatch,
+            outcome: result.ended.describe(),
+            usage: Some(TokenUsage {
+                input_tokens: result.usage.input_tokens,
+                output_tokens: result.usage.output_tokens,
+                cache_read_tokens: result.usage.cache_read_tokens,
+                cache_write_tokens: result.usage.cache_write_tokens,
+            }),
+            cost: Some(CostFigure {
+                booked: result.usage.cost.micros().map(MicroUsd::to_micros),
+                completeness: result.usage.cost.completeness(),
+            }),
+        },
+        Err(outcome) => Event::DispatchEnded {
+            dispatch,
+            outcome: outcome.state().as_str().to_string(),
+            usage: None,
+            cost: None,
+        },
+    }
+}
+
+/// What a usage event just recorded booked, for the run's events.
+fn cost_booked(event: &UsageEvent) -> Event {
+    Event::Cost {
+        booked: event.cost.map(MicroUsd::to_micros),
+        completeness: event.completeness,
+    }
+}
+
 /// The model a native attempt's booked usage could not price, if any. A
 /// headless attempt keeps the unknown-cost rule it always had.
 fn unpriced_native_model(presentation: Presentation, result: &LaunchResult) -> Option<Vec<String>> {
@@ -656,6 +700,11 @@ impl<'a> RunEngine<'a> {
         let artifacts = config.artifacts_dir.join(run_id.as_str());
         let worktrees = worktree_root(&config.artifacts_dir).join(run_id.as_str());
         let verify_dir = verify_root(&config.artifacts_dir).join(run_id.as_str());
+        let events = Events::for_run(run_id.as_str(), &artifacts);
+        if parent.is_none() {
+            // The process's own stderr belongs to the root run.
+            events.mirror_stderr();
+        }
         Ok(Self {
             config,
             run_id,
@@ -666,6 +715,7 @@ impl<'a> RunEngine<'a> {
             parent,
             harness: None,
             own_write_leases: std::collections::BTreeSet::new(),
+            events,
         })
     }
 
@@ -684,10 +734,15 @@ impl<'a> RunEngine<'a> {
             from_state: Some(from),
             to_state: to,
             reason: reason.as_str().to_string(),
-            detail: Some(detail),
+            detail: Some(detail.clone()),
             at: self.config.ledger.now(),
         })?;
         self.state = to;
+        self.events.emit(Event::Phase {
+            state: to.as_str().to_string(),
+            reason: reason.as_str().to_string(),
+            detail,
+        });
         Ok(())
     }
 
@@ -712,6 +767,15 @@ impl<'a> RunEngine<'a> {
         observation: Observation,
     ) -> Result<Next, RunError> {
         let decision = decide(budget, observation);
+        let what = match &decision.next {
+            Next::Attempt { kind, .. } => kind.as_str(),
+            Next::Accept => "accept",
+            Next::Stop(_) => "stop",
+        };
+        self.events.emit(Event::Decision {
+            what: what.to_string(),
+            reason: decision.reason.as_str().to_string(),
+        });
         self.transition(decision.state, decision.reason, decision.detail)?;
         Ok(decision.next)
     }
@@ -756,6 +820,20 @@ impl<'a> RunEngine<'a> {
         &mut self,
         dispatch: ManagedDispatch<'_>,
     ) -> Result<Launched, RunError> {
+        let dispatch_id = dispatch.spec.dispatch_id.clone();
+        self.events.emit(Event::DispatchStarted {
+            dispatch: dispatch_id.clone(),
+            agent_kind: dispatch.agent,
+            attempt: dispatch.attempt,
+            model: dispatch.spec.model.clone(),
+            effort: effort_str(dispatch.spec.effort.as_ref()),
+        });
+        let launched = self.launch_admitted(dispatch)?;
+        self.events.emit(dispatch_ended(dispatch_id, &launched));
+        Ok(launched)
+    }
+
+    fn launch_admitted(&mut self, dispatch: ManagedDispatch<'_>) -> Result<Launched, RunError> {
         let ManagedDispatch {
             mut spec,
             depth,
@@ -764,6 +842,7 @@ impl<'a> RunEngine<'a> {
             deadline,
             budget,
             write_lease,
+            ..
         } = dispatch;
         // The dispatch is `launched` in the ledger BEFORE the process
         // exists (SPEC §12): a runner crash from here on leaves a live
@@ -1156,6 +1235,21 @@ impl<'a> RunEngine<'a> {
     }
 
     fn run(mut self) -> RunOutcome {
+        let outcome = self.run_to_outcome();
+        // Whatever `persist_receipt` wrote, whichever way the run ended: an
+        // accepted run's receipt, and the pending one a run stopped only by
+        // an unmet sign-off stores (`store_pending_receipt`). The artifacts
+        // directory is this run's own, so the file is this run's receipt.
+        let written = self.artifacts.join("receipt.json");
+        let receipt = written.is_file().then_some(written);
+        self.events.emit(Event::Outcome {
+            state: outcome.state().as_str().to_string(),
+            receipt: receipt.map(|path| path.to_string_lossy().into_owned()),
+        });
+        outcome
+    }
+
+    fn run_to_outcome(&mut self) -> RunOutcome {
         match self.run_inner() {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -1249,6 +1343,7 @@ impl<'a> RunEngine<'a> {
             &preflight.authority.verification_profile,
             &baseline.logs_dir,
             "task",
+            &self.events,
         )?;
         self.record_logs(None, EvidenceKind::SetupLog, &setup)?;
         let outcome = match verify::setup_failure(&setup) {
@@ -1847,6 +1942,7 @@ impl<'a> RunEngine<'a> {
                         &authority.verification_profile,
                         &logs_dir,
                         "base",
+                        &self.events,
                     )?;
                     self.record_logs(None, EvidenceKind::SetupLog, &setup)?;
                     if let Some(failed) = verify::setup_failure(&setup) {
@@ -1863,6 +1959,7 @@ impl<'a> RunEngine<'a> {
                         &authority.verification_profile,
                         &logs_dir,
                         "base",
+                        &self.events,
                     )?;
                     self.record_logs(None, EvidenceKind::CheckLog, &checks)?;
                     // A check that gave no verdict at the base — the
@@ -2209,6 +2306,8 @@ impl<'a> RunEngine<'a> {
         let dispatch_start = Instant::now();
         let result = match self.managed_launch(ManagedDispatch {
             spec,
+            agent: AgentKind::Worker,
+            attempt: Some(index),
             depth: 0,
             parent: None,
             reserve_micros: remaining_budget.unwrap_or(0),
@@ -2281,6 +2380,7 @@ impl<'a> RunEngine<'a> {
             ledger.record_native_usage(&event, &result.booked_message_ids)?;
         }
         progress.spend.fold(event.cost, usage.cost.completeness());
+        self.events.emit(cost_booked(&event));
         progress.unpriced_model = unpriced_native_model(self.config.worker_presentation, &result);
 
         // What the sandbox denied, however the attempt went: AFTER the cost
@@ -3673,6 +3773,7 @@ impl<'a> RunEngine<'a> {
                     &authority.verification_profile,
                     logs_dir,
                     &label.log_prefix(),
+                    &self.events,
                 )
                 .map_err(|e| e.to_string())?;
                 self.record_logs(None, EvidenceKind::SetupLog, &setup)
@@ -3698,6 +3799,7 @@ impl<'a> RunEngine<'a> {
                         &authority.verification_profile,
                         logs_dir,
                         &label.log_prefix(),
+                        &self.events,
                     )
                     .map_err(|e| e.to_string())?,
                 }
@@ -4140,6 +4242,8 @@ impl<'a> RunEngine<'a> {
         let dispatch_start = Instant::now();
         let result = match self.managed_launch(ManagedDispatch {
             spec,
+            agent: AgentKind::Reviewer,
+            attempt: None,
             depth: 0,
             parent: None,
             reserve_micros: remaining_budget.unwrap_or(0),
@@ -4207,6 +4311,7 @@ impl<'a> RunEngine<'a> {
             )));
         }
         spend.fold(event.cost, result.usage.cost.completeness());
+        self.events.emit(cost_booked(&event));
         if result.terminal_result_missing() {
             return Err(ReviewOutcome::Unavailable(
                 "the reviewer ended without a terminal result".into(),
@@ -7645,6 +7750,23 @@ mod tests {
             std::fs::read_to_string(fixture.artifacts.join(run_id.as_str()).join("receipt.json"))
                 .expect("receipt.json");
         assert!(file.contains("inventory-check"), "{file}");
+        // The outcome event names the pending receipt the run wrote, as
+        // the ledger and the file do.
+        let events =
+            std::fs::read_to_string(fixture.artifacts.join(run_id.as_str()).join("events.jsonl"))
+                .expect("events.jsonl");
+        let outcome_line: serde_json::Value = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json"))
+            .rfind(|line| line["event"]["kind"] == "outcome")
+            .expect("an outcome event");
+        assert_eq!(outcome_line["event"]["state"], "needs_decision");
+        assert!(
+            outcome_line["event"]["receipt"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("receipt.json")),
+            "{outcome_line}"
+        );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 

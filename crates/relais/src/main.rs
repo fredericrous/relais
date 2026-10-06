@@ -155,6 +155,11 @@ enum Command {
             requires = "native"
         )]
         native_spawn_wait: Option<u64>,
+        /// Keep stdout for protocol lines (one JSON object per line, each
+        /// with a `relais` key) and send everything else to stderr
+        /// (SPEC §29). Not supported on Windows yet
+        #[arg(long)]
+        protocol: bool,
     },
     /// Show recent runs, or one run's current state
     Status { run_id: Option<String> },
@@ -783,14 +788,50 @@ where
 
 fn main() {
     let cli = Cli::parse();
-    let outcome = match dispatch(cli.command) {
-        Ok(outcome) => outcome,
+    // Before anything runs, or prints: `--protocol` takes stdout over.
+    let channel = match open_protocol(&cli.command) {
+        Ok(channel) => channel,
         Err(e) => {
+            eprintln!("relais: {e}");
+            std::process::exit(exit_code(&e.outcome()));
+        }
+    };
+    // A panic's message is written to fd 2, which `--protocol` points at
+    // the mirror's pipe; the channel is closed (the pipe drained into the
+    // real stderr and `events.jsonl`) before the panic carries on, so the
+    // message is never lost to an exit that beat the mirror thread.
+    let dispatched =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(cli.command)));
+    let outcome = match dispatched {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(e)) => {
             eprintln!("relais: {e}");
             e.outcome()
         }
+        Err(panic) => {
+            if let Some(channel) = channel {
+                channel.close();
+            }
+            std::panic::resume_unwind(panic);
+        }
     };
+    if let Some(channel) = channel {
+        channel.close();
+    }
     std::process::exit(exit_code(&outcome));
+}
+
+/// The protocol channel of `relais run --protocol` (SPEC §29): installed
+/// before the run starts, or refused on a platform that cannot.
+fn open_protocol(command: &Command) -> Result<Option<relais::protocol::Channel>, CliError> {
+    if let Command::Run { protocol: true, .. } = command {
+        return relais::protocol::install()
+            .map(Some)
+            .map_err(|e| CliError::Usage {
+                detail: format!("run --protocol: {e}"),
+            });
+    }
+    Ok(None)
 }
 
 /// Route one parsed invocation to its handler. Every handler returns the
@@ -832,6 +873,7 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             revise,
             native,
             native_spawn_wait,
+            protocol: _,
         } => run_command(
             &task,
             revise.as_deref(),
