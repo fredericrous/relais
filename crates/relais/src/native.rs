@@ -31,6 +31,37 @@ pub fn worker_agent_type(model: &str, effort: Option<&str>) -> String {
     format!("relais-worker-{model}-{}", effort.unwrap_or("default"))
 }
 
+/// The models relais ships worker definitions for. `haiku` has no effort
+/// levels, so it ships only the default.
+const MODELS: [&str; 4] = ["haiku", "sonnet", "opus", "fable"];
+
+/// The efforts every model but `haiku` ships besides its default.
+const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// Every (model, effort) relais ships a native worker definition for, in
+/// install order; `None` is the model's default effort.
+pub fn worker_agent_types() -> Vec<(String, Option<String>)> {
+    let mut types = Vec::new();
+    for model in MODELS {
+        types.push((model.to_string(), None));
+        if model != "haiku" {
+            types.extend(
+                EFFORTS
+                    .iter()
+                    .map(|effort| (model.to_string(), Some(effort.to_string()))),
+            );
+        }
+    }
+    types
+}
+
+/// Whether relais ships a definition for this (model, effort).
+pub fn has_worker_definition(model: &str, effort: Option<&str>) -> bool {
+    worker_agent_types()
+        .iter()
+        .any(|(m, e)| m == model && e.as_deref() == effort)
+}
+
 /// Read the marker out of `text`.
 pub fn find_marker(text: &str) -> Marker {
     let mut found: Option<&str> = None;
@@ -86,6 +117,16 @@ mod tests {
             worker_agent_type("haiku", None),
             "relais-worker-haiku-default"
         );
+    }
+
+    #[test]
+    fn the_shipped_set_is_haiku_default_and_six_efforts_for_the_rest() {
+        assert_eq!(worker_agent_types().len(), 1 + 3 * 6);
+        assert!(has_worker_definition("haiku", None));
+        assert!(!has_worker_definition("haiku", Some("high")));
+        assert!(has_worker_definition("fable", Some("max")));
+        assert!(has_worker_definition("opus", None));
+        assert!(!has_worker_definition("claude-sonnet-5-5", None));
     }
 
     #[test]

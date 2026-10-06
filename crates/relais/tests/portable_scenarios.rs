@@ -296,7 +296,7 @@ fn install_is_preview_first_and_uninstall_keeps_foreign_and_modified_files() {
 }
 
 // The objective this suite exists for: `relais install --claude` alone
-// never touches settings.json, `--hooks` wires all seven targets in and
+// never touches settings.json, `--hooks` wires all eight targets in and
 // a re-run says nothing is left to do, and `relais doctor` exercises the
 // recorded command — spawning it for real against a scratch environment
 // — rather than merely reading the file back.
@@ -333,6 +333,7 @@ fn install_hooks_wires_settings_json_and_a_rerun_is_current() {
         "SubagentStop",
         "SessionStart",
         "SessionEnd",
+        "WorktreeCreate",
     ] {
         assert!(
             settings["hooks"][event]
@@ -342,7 +343,7 @@ fn install_hooks_wires_settings_json_and_a_rerun_is_current() {
         );
     }
     assert_eq!(
-        settings["hooks"]["PreToolUse"][0]["matcher"], "Agent|Task",
+        settings["hooks"]["PreToolUse"][0]["matcher"], "Agent|Task|SendMessage",
         "{settings}"
     );
     assert!(settings["hooks"]["SessionStart"][0]

@@ -222,4 +222,17 @@ Checks green, then `needs_review` with two findings, both real, fixed by hand:
 
 `make check` green (1,288 lib tests). Falsified: both fixes and booking once per message id. Decision left open, to answer `salvaged` with the merge sha.
 
+**2026-10-06, N3** (run-65d2b8b30e64e-59d8, sonnet@medium, one attempt, $3.28). It added:
+- 21 worker definitions (haiku default; sonnet, opus and fable at default and five efforts), with no Agent tool;
+- `native_worker_missing` for any other model;
+- the `Agent|Task|SendMessage` matcher and `WorktreeCreate` (60 s), migrating relais's command off the old `Agent|Task` entry;
+- the native rules text;
+- the `/relais` skill native by default.
+
+Checks green, then `needs_review` with two findings, fixed by hand:
+- a test that a command with no `timeout` gets one had been turned into the migration test → restored on the current matcher;
+- the definitions lacked `isolation: worktree`, which this log says they carry → added and asserted.
+
+Deliberate: no `maxTurns`. The attempt's wall time and the budget checked between attempts bound it, and a turn cap would stop a worker mid-edit. `make check` green (1,303 lib tests). Falsified: the matcher migration and the missing-definition refusal. Decision left open, to answer `salvaged` with the merge sha.
+
 <!-- panel: repos=relais adds= reviewers=backend body-sha=ebe649d81b94 -->

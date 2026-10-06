@@ -24,13 +24,16 @@ use crate::backend::{
     Presentation, UsageReport,
 };
 use crate::money::MicroUsd;
-use crate::native::{marker_line, worker_agent_type};
+use crate::native::{has_worker_definition, marker_line, worker_agent_type};
 use crate::orchestration::{parse_transcript, price, PriceTable, UsageRecord};
 use crate::policy::EffortId;
 use crate::procs::Ended;
 
 /// The label a worker that was never spawned ends with.
 const SPAWN_MISSING: &str = "native_spawn_missing";
+
+/// The label an attempt whose model has no shipped worker definition ends with.
+const WORKER_MISSING: &str = "native_worker_missing";
 
 /// Consecutive unanswered status polls that end the wait: a coordinator
 /// that has stopped answering cannot tell this attempt anything.
@@ -91,6 +94,27 @@ fn effort_note(agent: &KnownAgent, spec: &LaunchSpec) -> Option<String> {
         "the continuation keeps agent {}'s own effort ({kept}); the attempt asked for {asked}",
         agent.agent_id
     ))
+}
+
+/// Why a spawn cannot be asked for: relais ships no definition for the
+/// attempt's (model, effort). A continuation names an agent that already
+/// exists, so it needs none.
+fn missing_definition(route: &Route, spec: &LaunchSpec) -> Option<String> {
+    match route {
+        Route::Continue { .. } => None,
+        Route::Spawn => {
+            let effort = spec.effort.as_ref().map(EffortId::as_str);
+            if has_worker_definition(&spec.model, effort) {
+                return None;
+            }
+            Some(format!(
+                "{WORKER_MISSING}: relais ships no native worker for model {} at effort {}; \
+                 use a model alias (haiku, sonnet, opus, fable) or run without --native",
+                spec.model,
+                effort.unwrap_or("default")
+            ))
+        }
+    }
 }
 
 /// The request registered with the coordinator for this attempt.
@@ -459,6 +483,9 @@ impl<'a> NativeBackend<'a> {
     fn launch_native(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError> {
         let known = self.memory().agents.get(&spec.work_dir).cloned();
         let route = route_for(known.as_ref(), spec);
+        if let Some(refusal) = missing_definition(&route, spec) {
+            return Ok(ended_result(spec, Ended::Exited(1), refusal));
+        }
         let ask = ask_for(&route, spec);
         match self
             .gate
@@ -611,6 +638,38 @@ mod tests {
             Route::Spawn
         );
         assert_eq!(route_for(None, &spec("sonnet", None)), Route::Spawn);
+    }
+
+    #[test]
+    fn a_spawn_without_a_shipped_definition_is_refused_naming_model_and_effort() {
+        let refusal = missing_definition(&Route::Spawn, &spec("claude-sonnet-5-5", Some("high")))
+            .expect("not shipped");
+        assert!(refusal.starts_with("native_worker_missing:"), "{refusal}");
+        assert!(refusal.contains("claude-sonnet-5-5"), "{refusal}");
+        assert!(refusal.contains("high"), "{refusal}");
+        assert!(refusal.contains("haiku, sonnet, opus, fable"), "{refusal}");
+        assert!(refusal.contains("without --native"), "{refusal}");
+        assert!(missing_definition(&Route::Spawn, &spec("haiku", Some("high"))).is_some());
+        assert!(missing_definition(&Route::Spawn, &spec("haiku", None)).is_none());
+        assert!(missing_definition(&Route::Spawn, &spec("opus", Some("max"))).is_none());
+    }
+
+    #[test]
+    fn every_name_a_shipped_pair_can_print_has_an_install_file() {
+        let files: Vec<String> = crate::install::owned_files()
+            .into_iter()
+            .map(|(path, _)| path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        for (model, effort) in crate::native::worker_agent_types() {
+            let ask = ask_for(&Route::Spawn, &spec(&model, effort.as_deref()));
+            let NativeAsk::Spawn { subagent_type, .. } = ask else {
+                panic!("a spawn route asks for a spawn");
+            };
+            assert!(
+                files.contains(&format!("agents/{subagent_type}.md")),
+                "{subagent_type}"
+            );
+        }
     }
 
     #[test]

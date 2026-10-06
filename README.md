@@ -221,6 +221,16 @@ or the reason it was kept, and a scorecard re-measured afterwards.
   verify (no `SHA256SUMS`, no sha256 tool). `RELAIS_SKIP_CHECKSUM=1` is
   the explicit way to accept an unverified binary.
 
+`relais install --claude` writes the `/relais`, `/relais-verified-push` and
+`/relais-architecture-conflict` skills, the three advisory agents
+(`relais-research`, `relais-implementation`, `relais-review`) and 19 native
+worker definitions, `agents/relais-worker-<model>-<effort>.md`, for the models
+`haiku` (effort `default` only), `sonnet`, `opus` and `fable` (efforts
+`default`, `low`, `medium`, `high`, `xhigh`, `max`). Inside Claude Code,
+`/relais` runs `relais run --native`, so the worker shows as Claude Code's own
+agent; a terminal or unattended run uses `relais run --task …` as before.
+`--hooks` also wires the eight hook events a native run needs.
+
 The `relais install --claude --hooks` integration — what it wires, its
 handler timeouts, how to remove it, what `relais doctor` reports on it,
 and the four limits specific to that path (subagents admitted but never

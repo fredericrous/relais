@@ -1364,6 +1364,7 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
     findings.push(strays_finding_on_disk());
     findings.push(coordinator_finding());
     findings.push(hook_live_finding(merged_roots(repo_dir, home.as_deref())));
+    findings.extend(hook_wiring_finding(merged_roots(repo_dir, home.as_deref())));
 
     DoctorReport { findings }
 }
@@ -1777,6 +1778,32 @@ fn hook_timeout_finding(
             ),
         },
     }
+}
+
+/// Whether every settings file that records a relais hook wires the
+/// current set: the tool matcher `Agent|Task|SendMessage` and a
+/// `WorktreeCreate` handler. A file an older relais wrote still has the
+/// old matcher, which native workers need replaced; nothing is said when
+/// no file records a hook, because `hook-live` already says so.
+fn hook_wiring_finding(roots: crate::install::settings::MergedRoots<'_>) -> Option<Finding> {
+    let scan = recorded_hooks(roots);
+    let stale: Vec<RecordedHook> = scan
+        .hooks
+        .into_iter()
+        .filter(|hook| !crate::install::settings::wiring_is_current(&hook.text))
+        .collect();
+    if !stale.is_empty() {
+        return Some(Finding {
+            component: "hook-wiring",
+            level: Level::Warn,
+            detail: format!(
+                "{} still wires the old tool matcher (or no WorktreeCreate handler), which \
+                 native workers need updated; run `relais install --claude --hooks --write`",
+                describe_hook_locations(&stale)
+            ),
+        });
+    }
+    None
 }
 
 /// `relais doctor` exercising the live hook (SPEC criteria), checked
@@ -2940,6 +2967,43 @@ mod tests {
             "{}",
             finding.detail
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hook_wiring_finding_flags_the_old_matcher_and_accepts_the_new_set() {
+        let dir = crate::test_support::temp_dir("doctor-hook-wiring");
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("mkdir");
+        let settings = claude_dir.join("settings.json");
+        let old = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Agent|Task", "hooks": [
+                        {"type": "command", "command": "/opt/relais/bin/relais hook"}
+                    ]}
+                ]
+            }
+        });
+        std::fs::write(&settings, old.to_string()).expect("write");
+        let finding = hook_wiring_finding(merged_roots(&dir, None)).expect("a finding");
+        assert_eq!(finding.level, Level::Warn, "{}", finding.detail);
+        assert!(
+            finding
+                .detail
+                .contains("relais install --claude --hooks --write"),
+            "{}",
+            finding.detail
+        );
+
+        let mut current = serde_json::json!({});
+        crate::install::settings::apply_hooks(
+            &mut current,
+            std::path::Path::new("/opt/relais/bin/relais"),
+            Duration::from_secs(2),
+        );
+        std::fs::write(&settings, current.to_string()).expect("write");
+        assert!(hook_wiring_finding(merged_roots(&dir, None)).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 

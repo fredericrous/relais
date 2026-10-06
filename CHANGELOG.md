@@ -47,8 +47,26 @@ missing here.
   one. A native worker's usage is read from its transcript, each message
   booked once, and its cost is an API-equivalent estimate from the machine's
   price table (unknown without one); its dispatch row is `native_run` and
-  names the agent. Headless `relais run` is unchanged. The worker agent
-  definitions and the skill flow that sends these lines come next.
+  names the agent. Headless `relais run` is unchanged.
+
+- `relais install --claude` ships the native workers: 19 agent definitions,
+  `relais-worker-<model>-<effort>`, for `haiku` (default effort only),
+  `sonnet`, `opus` and `fable` (default, low, medium, high, xhigh, max), with
+  no `Agent` tool. A `--native` launch of a model with no definition ends
+  interrupted with `native_worker_missing`, before anything is printed. A
+  native worker's prompt has its own rules (a subagent in the task worktree,
+  no sandbox wording). `/relais` now runs `relais run --native` in the
+  background and answers each `RELAIS-SPAWN` with the Agent tool and each
+  `RELAIS-CONTINUE` with SendMessage, exactly as asked; `relais run --task …`
+  stays the terminal and unattended way.
+- `relais install --claude --hooks` wires eight events: the tool events now
+  match `Agent|Task|SendMessage`, and `WorktreeCreate` joins with a 60 s
+  handler timeout. Installing over a file an earlier relais wrote moves
+  relais's command off the old `Agent|Task` entry (the entry goes if it held
+  nothing else), so `relais hook` never runs twice for one Agent call;
+  uninstall removes it from both matchers. `relais doctor` reports a file
+  still on the old matcher (`hook-wiring`). Run
+  `relais install --claude --hooks --write` after upgrading.
 
 ### Changed
 

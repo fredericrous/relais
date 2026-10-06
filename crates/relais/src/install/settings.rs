@@ -4,7 +4,7 @@
 //! reads or writes `settings.json` at all — that file is a person's own,
 //! hand-maintained, and wiring a hook into it is a separate, explicit
 //! ask (`--hooks`). This module plans and applies exactly that: one
-//! relais handler on each of the seven targets named in
+//! relais handler on each of the eight targets named in
 //! [`crate::hook::TARGETS`], appended into whatever is already there
 //! rather than replacing it.
 //!
@@ -48,6 +48,13 @@
 //! this program did not create is not its call to remove, and it cannot
 //! tell "empty because I un-joined it" from "empty because someone else
 //! left it that way" apart.
+//!
+//! One exception, a migration: an earlier relais installed its tool
+//! matcher as `Agent|Task` (`LEGACY_TOOL_MATCHER`), and the matcher is
+//! now `Agent|Task|SendMessage`. Left alone, an upgraded file would run
+//! `relais hook` twice for one Agent call. So install removes relais's
+//! command from an entry on the legacy matcher, and that entry goes only
+//! when relais's command was its one hook; another hook on it stays.
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -67,6 +74,18 @@ pub const HANDLER_TIMEOUT_MARGIN: Duration = Duration::from_secs(5);
 /// §23), so every handler relais installs carries one explicitly, this
 /// one included.
 pub const OTHER_HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The `WorktreeCreate` handler runs `git worktree add`, which the modest
+/// timeout above does not cover.
+pub const WORKTREE_HANDLER_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The matcher relais installs on the three tool events: the Agent tool,
+/// its legacy name `Task` (the harness still sends either), and
+/// `SendMessage`, which continues a native worker.
+pub const TOOL_MATCHER: &str = "Agent|Task|SendMessage";
+
+/// The tool matcher an earlier relais installed, migrated away on install.
+pub const LEGACY_TOOL_MATCHER: &str = "Agent|Task";
 
 /// The `PreToolUse` handler timeout the installer must write so relais
 /// always answers before the harness stops listening. An expired hook is
@@ -88,37 +107,39 @@ pub fn derived_pretooluse_timeout(queue_wait: Duration) -> Duration {
 }
 
 /// The handler timeout, in whole seconds, [`apply_hooks`] must record for
-/// one event: the derived budget for `PreToolUse`, the modest explicit
-/// one for everything else. Not a match over an enum — `event` is a
+/// one event: the derived budget for `PreToolUse`, a minute for
+/// `WorktreeCreate`, the modest explicit one for everything else. Not a match over an enum — `event` is a
 /// plain name out of [`HOOK_TARGETS`], never a type this crate owns — so
 /// there is no exhaustiveness concern to trade away here.
 fn handler_timeout_secs(event: &str, queue_wait: Duration) -> u64 {
     if event == "PreToolUse" {
         derived_pretooluse_timeout(queue_wait).as_secs()
+    } else if event == "WorktreeCreate" {
+        WORKTREE_HANDLER_TIMEOUT.as_secs()
     } else {
         OTHER_HANDLER_TIMEOUT.as_secs()
     }
 }
 
-/// The seven live targets, paired with the matcher relais installs for
-/// each. The three tool-scoped events are matched to the Agent tool and
-/// its legacy name `Task` (the harness still sends either); the four
+/// The eight live targets, paired with the matcher relais installs for
+/// each. The three tool-scoped events get [`TOOL_MATCHER`]; the five
 /// lifecycle events get no matcher at all, because they are not tool
 /// calls. This is the SAME set of names as [`crate::hook::TARGETS`] —
 /// never a second list to keep in step by hand — differing only in the
 /// matcher column, which is where it parts company with the probe: the
 /// handlers `hook::probe` writes (`hook::settings_document`) install no
-/// matcher on any of the seven, deliberately, and the comment there says
+/// matcher on any of the eight, deliberately, and the comment there says
 /// why. Matched to `Agent` alone, a probe would record the top-level
 /// spawn and nothing a subagent then does.
-pub const HOOK_TARGETS: [(&str, Option<&str>); 7] = [
-    ("PreToolUse", Some("Agent|Task")),
-    ("PostToolUse", Some("Agent|Task")),
-    ("PostToolUseFailure", Some("Agent|Task")),
+pub const HOOK_TARGETS: [(&str, Option<&str>); 8] = [
+    ("PreToolUse", Some(TOOL_MATCHER)),
+    ("PostToolUse", Some(TOOL_MATCHER)),
+    ("PostToolUseFailure", Some(TOOL_MATCHER)),
     ("SubagentStart", None),
     ("SubagentStop", None),
     ("SessionStart", None),
     ("SessionEnd", None),
+    ("WorktreeCreate", None),
 ];
 
 /// The exact command relais installs: the absolute path of the binary
@@ -135,6 +156,9 @@ pub enum HookEventAction {
     /// relais's command is already on this event, with the timeout
     /// currently required: nothing to do.
     Current,
+    /// relais's command sits on an entry with the legacy tool matcher: it
+    /// moves to the current matcher's entry.
+    MigrateMatcher,
     /// relais's command is already on this event, but its recorded
     /// `timeout` is absent or no longer covers `queue_wait_secs`: it is
     /// corrected in place, nothing else about the entry changes.
@@ -162,7 +186,7 @@ pub struct HookEventPlan {
 #[derive(Debug, Clone, PartialEq)]
 pub enum HooksPlan {
     /// The file (or its absence) is safe to edit: here is what each of
-    /// the seven targets needs.
+    /// the eight targets needs.
     Ready { events: Vec<HookEventPlan> },
     /// The file cannot be re-rendered byte for byte, so nothing will be
     /// written. `paste_block` is the fragment a person can merge in by
@@ -359,6 +383,13 @@ fn event_action(
     required_timeout_secs: u64,
 ) -> HookEventAction {
     let entries = entries(value, event);
+    if matcher == Some(TOOL_MATCHER)
+        && entries.iter().any(|entry| {
+            entry_matcher(entry) == Some(LEGACY_TOOL_MATCHER) && entry_has_command(entry, command)
+        })
+    {
+        return HookEventAction::MigrateMatcher;
+    }
     if let Some(recorded) = entry_command_timeout_secs(entries, command) {
         return if recorded == Some(required_timeout_secs) {
             HookEventAction::Current
@@ -401,11 +432,17 @@ pub fn apply_hooks(
             .or_insert_with(|| serde_json::json!([]))
             .as_array_mut()
             .expect("an event's hooks are always an array");
+        let migrated = matcher == Some(TOOL_MATCHER) && drop_legacy_command(array, &command);
+        if migrated {
+            changed.push(event);
+        }
         if let Some(hook) = entry_command_hook_mut(array, &command) {
             let recorded = hook.get("timeout").and_then(Value::as_u64);
             if recorded != Some(required) {
                 hook["timeout"] = serde_json::json!(required);
-                changed.push(event);
+                if !migrated {
+                    changed.push(event);
+                }
             }
             continue;
         }
@@ -430,13 +467,41 @@ pub fn apply_hooks(
                 array.push(new_entry);
             }
         }
-        changed.push(event);
+        if !migrated {
+            changed.push(event);
+        }
     }
     changed
 }
 
+/// Remove relais's command from every entry on the legacy tool matcher; an
+/// entry that held nothing else goes with it. Returns whether any entry
+/// held the command. Entries on other matchers, and legacy entries that
+/// never held relais's command, are untouched.
+fn drop_legacy_command(array: &mut Vec<Value>, command: &str) -> bool {
+    let mut removed = false;
+    array.retain_mut(|entry| {
+        if entry_matcher(entry) != Some(LEGACY_TOOL_MATCHER) || !entry_has_command(entry, command) {
+            return true;
+        }
+        removed = true;
+        let Some(hooks) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
+            return true;
+        };
+        hooks.retain(|hook| !is_command_hook(hook, command));
+        !hooks.is_empty()
+    });
+    removed
+}
+
+fn is_command_hook(hook: &Value, command: &str) -> bool {
+    hook.get("type").and_then(Value::as_str) == Some("command")
+        && hook.get("command").and_then(Value::as_str) == Some(command)
+}
+
 /// Remove exactly what [`apply_hooks`] would have added: the leaf hook
-/// object whose command is relais's own, wherever it sits. Entry objects
+/// object whose command is relais's own, wherever it sits, on the current
+/// tool matcher or the legacy one. Entry objects
 /// and event arrays are never deleted, whatever they are left holding —
 /// an entry relais did not create is not its call to remove, and it
 /// cannot tell an entry it emptied apart from one that was already empty
@@ -457,10 +522,7 @@ pub fn remove_hooks(value: &mut Value, relais_binary: &Path) -> Vec<&'static str
                 continue;
             };
             let before = hooks.len();
-            hooks.retain(|hook| {
-                !(hook.get("type").and_then(Value::as_str) == Some("command")
-                    && hook.get("command").and_then(Value::as_str) == Some(command.as_str()))
-            });
+            hooks.retain(|hook| !is_command_hook(hook, &command));
             if hooks.len() != before {
                 touched = true;
             }
@@ -658,6 +720,42 @@ pub(crate) fn recorded_pretooluse_timeout_secs(settings_text: &str) -> Option<Op
     })
 }
 
+/// Whether a settings file's relais wiring is the current set: a relais
+/// command on the current tool matcher of `PreToolUse` and none on the
+/// legacy one, and a relais command on `WorktreeCreate`. The command is
+/// read back the way [`recorded_hook_command`] reads it. False for a file
+/// an older relais wrote, which `relais install --claude --hooks --write`
+/// migrates.
+pub(crate) fn wiring_is_current(settings_text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(settings_text) else {
+        return false;
+    };
+    let relais_on = |event: &str, matcher: Option<&str>| {
+        entries(&value, event)
+            .iter()
+            .filter(|entry| entry_matcher(entry) == matcher)
+            .any(entry_has_relais_hook)
+    };
+    relais_on("PreToolUse", Some(TOOL_MATCHER))
+        && !relais_on("PreToolUse", Some(LEGACY_TOOL_MATCHER))
+        && relais_on("WorktreeCreate", None)
+}
+
+fn entry_has_relais_hook(entry: &Value) -> bool {
+    entry
+        .get("hooks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|hook| {
+            hook.get("type").and_then(Value::as_str) == Some("command")
+                && hook
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|command| command.trim_end().ends_with(" hook"))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,21 +880,22 @@ mod tests {
         probed.sort();
         assert_eq!(
             installed, probed,
-            "install and the compatibility record must name the same seven targets"
+            "install and the compatibility record must name the same eight targets"
         );
     }
 
     #[test]
-    fn tool_scoped_events_are_matched_to_the_agent_tool_and_its_legacy_name() {
+    fn tool_scoped_events_are_matched_to_the_agent_tool_its_legacy_name_and_send_message() {
         for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
             let (_, matcher) = HOOK_TARGETS.iter().find(|(e, _)| *e == event).unwrap();
-            assert_eq!(*matcher, Some("Agent|Task"), "{event}");
+            assert_eq!(*matcher, Some("Agent|Task|SendMessage"), "{event}");
         }
         for event in [
             "SubagentStart",
             "SubagentStop",
             "SessionStart",
             "SessionEnd",
+            "WorktreeCreate",
         ] {
             let (_, matcher) = HOOK_TARGETS.iter().find(|(e, _)| *e == event).unwrap();
             assert_eq!(*matcher, None, "{event} must install with no matcher");
@@ -804,12 +903,12 @@ mod tests {
     }
 
     #[test]
-    fn planning_an_absent_file_wants_all_seven_as_new_entries() {
+    fn planning_an_absent_file_wants_all_eight_as_new_entries() {
         let plan = plan_hooks(None, binary(), Duration::from_secs(2));
         let HooksPlan::Ready { events } = plan else {
             panic!("an absent file is always renderable");
         };
-        assert_eq!(events.len(), 7);
+        assert_eq!(events.len(), 8);
         assert!(events.iter().all(|e| e.action == HookEventAction::NewEntry));
     }
 
@@ -817,7 +916,7 @@ mod tests {
     fn applying_then_planning_again_finds_nothing_left_to_do() {
         let mut value = serde_json::json!({});
         let changed = apply_hooks(&mut value, binary(), Duration::from_secs(2));
-        assert_eq!(changed.len(), 7, "{changed:?}");
+        assert_eq!(changed.len(), 8, "{changed:?}");
         let rendered = render_canonical(&value);
         let plan = plan_hooks(Some(&rendered), binary(), Duration::from_secs(2));
         let HooksPlan::Ready { events } = plan else {
@@ -834,7 +933,7 @@ mod tests {
         let mut value = serde_json::json!({
             "hooks": {
                 "PreToolUse": [
-                    {"matcher": "Agent|Task", "hooks": [{"type": "command", "command": "/usr/bin/someone-elses-tool"}]}
+                    {"matcher": "Agent|Task|SendMessage", "hooks": [{"type": "command", "command": "/usr/bin/someone-elses-tool"}]}
                 ]
             }
         });
@@ -1062,6 +1161,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("{event} has no timeout: {:?}", hooks[0]));
             let expected = if event == "PreToolUse" {
                 derived_pretooluse_timeout(queue_wait).as_secs()
+            } else if event == "WorktreeCreate" {
+                WORKTREE_HANDLER_TIMEOUT.as_secs()
             } else {
                 OTHER_HANDLER_TIMEOUT.as_secs()
             };
@@ -1121,16 +1222,116 @@ mod tests {
     }
 
     /// An entry an OLDER relais installed — before `timeout` existed at
-    /// all — is corrected on the next `--hooks` re-run rather than left
-    /// with an absent timeout: `install --claude --hooks` re-run over a
-    /// settings file an older relais wrote must add one, not skip it as
-    /// "already current".
+    /// all, on the legacy matcher — is migrated on the next `--hooks`
+    /// re-run: its command moves to the current matcher's entry, with a
+    /// timeout, and the entry that held nothing else goes.
     #[test]
-    fn reapplying_over_an_older_entry_with_no_timeout_field_adds_one() {
+    fn reapplying_over_an_older_entry_migrates_it_to_the_current_matcher() {
         let mut value = serde_json::json!({
             "hooks": {
                 "PreToolUse": [
                     {"matcher": "Agent|Task", "hooks": [
+                        {"type": "command", "command": hook_command(binary())}
+                    ]}
+                ]
+            }
+        });
+        let plan = plan_events(&value, binary(), Duration::from_secs(2));
+        let pre = plan.iter().find(|e| e.event == "PreToolUse").unwrap();
+        assert_eq!(pre.action, HookEventAction::MigrateMatcher);
+
+        let changed = apply_hooks(&mut value, binary(), Duration::from_secs(2));
+        assert_eq!(
+            changed.iter().filter(|e| **e == "PreToolUse").count(),
+            1,
+            "{changed:?}"
+        );
+        let entries = value["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["matcher"], "Agent|Task|SendMessage");
+        assert_eq!(
+            entries[0]["hooks"][0]["timeout"].as_u64().unwrap(),
+            derived_pretooluse_timeout(Duration::from_secs(2)).as_secs()
+        );
+    }
+
+    /// Over a file the old relais wrote, an install leaves exactly one
+    /// relais command per event, and a foreign hook on the old entry stays.
+    #[test]
+    fn migration_leaves_one_relais_command_per_event_and_keeps_a_foreign_hook() {
+        let command = hook_command(binary());
+        let mut value = serde_json::json!({"hooks": {}});
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+            value["hooks"][event] = serde_json::json!([
+                {"matcher": "Agent|Task", "hooks": [
+                    {"type": "command", "command": "/usr/bin/someone-elses-tool"},
+                    {"type": "command", "command": command}
+                ]}
+            ]);
+        }
+        apply_hooks(&mut value, binary(), Duration::from_secs(2));
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+            let entries = value["hooks"][event].as_array().unwrap();
+            let relais_count = entries
+                .iter()
+                .flat_map(|e| e["hooks"].as_array().unwrap())
+                .filter(|h| h["command"] == command.as_str())
+                .count();
+            assert_eq!(relais_count, 1, "{event}: {entries:?}");
+            let old = entries
+                .iter()
+                .find(|e| e["matcher"] == "Agent|Task")
+                .expect("the foreign hook's entry stays");
+            assert_eq!(old["hooks"].as_array().unwrap().len(), 1);
+            assert_eq!(old["hooks"][0]["command"], "/usr/bin/someone-elses-tool");
+        }
+    }
+
+    #[test]
+    fn uninstall_leaves_no_relais_command_on_either_matcher() {
+        let command = hook_command(binary());
+        let mut value = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Agent|Task", "hooks": [{"type": "command", "command": command}]},
+                    {"matcher": "Agent|Task|SendMessage", "hooks": [{"type": "command", "command": command}]}
+                ]
+            }
+        });
+        remove_hooks(&mut value, binary());
+        assert!(!render_canonical(&value).contains(&command));
+    }
+
+    #[test]
+    fn a_fresh_install_gives_worktree_create_a_sixty_second_timeout() {
+        let mut value = serde_json::json!({});
+        apply_hooks(&mut value, binary(), Duration::from_secs(2));
+        assert_eq!(
+            value["hooks"]["WorktreeCreate"][0]["hooks"][0]["timeout"],
+            60
+        );
+        assert!(value["hooks"]["WorktreeCreate"][0].get("matcher").is_none());
+    }
+
+    #[test]
+    fn wiring_is_current_only_on_the_new_matcher_with_worktree_create() {
+        let mut value = serde_json::json!({});
+        apply_hooks(&mut value, binary(), Duration::from_secs(2));
+        assert!(wiring_is_current(&render_canonical(&value)));
+        let old = serde_json::json!({"hooks": {"PreToolUse": [
+            {"matcher": "Agent|Task", "hooks": [{"type": "command", "command": hook_command(binary())}]}
+        ]}});
+        assert!(!wiring_is_current(&old.to_string()));
+    }
+
+    /// The current matcher with no `timeout` field: the timeout is added,
+    /// with nothing to migrate (the legacy-matcher case is its own test).
+    #[test]
+    fn reapplying_over_a_current_entry_with_no_timeout_field_adds_one() {
+        let mut value = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Agent|Task|SendMessage", "hooks": [
                         {"type": "command", "command": hook_command(binary())}
                     ]}
                 ]
@@ -1152,8 +1353,6 @@ mod tests {
             timeout,
             derived_pretooluse_timeout(Duration::from_secs(2)).as_secs()
         );
-        // The foreign matcher entry it joined is otherwise untouched:
-        // still one entry, still the same matcher.
         let entries = value["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
     }

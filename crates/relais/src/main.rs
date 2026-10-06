@@ -1166,6 +1166,7 @@ fn render_hooks_preview(plan: relais::install::HooksPlan) -> CliOutcome {
                     match event.action {
                         relais::install::HookEventAction::Current => "keep",
                         relais::install::HookEventAction::CorrectTimeout => "retime",
+                        relais::install::HookEventAction::MigrateMatcher => "migrate",
                         relais::install::HookEventAction::JoinExisting => "join",
                         relais::install::HookEventAction::NewEntry => "add",
                     },
