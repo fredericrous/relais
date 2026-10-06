@@ -203,10 +203,9 @@ pub struct RunConfig<'a> {
     /// `execute` — a live trial row names its own run and is written
     /// before any worker is dispatched. `None` mints one here.
     pub run_id: Option<RunId>,
-    /// How the worker attempts of this run are launched (SPEC §23):
-    /// `Native` under `relais run --native`. Reviews, the report review,
-    /// planning and probes are always headless.
-    pub worker_presentation: Presentation,
+    /// How every dispatch of this run is launched (SPEC §23): the workers,
+    /// the reviewers and the planner. `Native` under `relais run`.
+    pub presentation: Presentation,
     /// Where this run's protocol lines go (SPEC §29): its events, and its
     /// `done`. The process's own stdout under `relais run --protocol`.
     pub wire: Wire,
@@ -361,8 +360,6 @@ pub(crate) type Launched = Result<LaunchResult, RunOutcome>;
 /// in the agent tree, what it may spend and how long it has.
 pub(crate) struct ManagedDispatch<'d> {
     pub(crate) spec: LaunchSpec,
-    /// What kind of agent this is, for the run's events.
-    pub(crate) agent: AgentKind,
     /// The attempt this dispatch is, for a worker; reviews and plans have
     /// none.
     pub(crate) attempt: Option<u32>,
@@ -804,6 +801,60 @@ impl<'a> RunEngine<'a> {
         )
     }
 
+    /// Marks a dispatch row `native_run` when this run's dispatches are
+    /// native, with the agent once one is bound: from the moment the row
+    /// exists, so it never disagrees with what the coordinator is told.
+    pub(crate) fn record_native_row(
+        &self,
+        dispatch_id: &DispatchId,
+        agent_id: Option<&str>,
+    ) -> Result<(), LedgerError> {
+        match self.config.presentation {
+            Presentation::Headless => Ok(()),
+            Presentation::Native => self
+                .config
+                .ledger
+                .record_native_dispatch(dispatch_id, agent_id),
+        }
+    }
+
+    /// What a dispatch's usage is: a native one's cost is always tokens
+    /// times the price table, known or not, never API spend somebody
+    /// reported.
+    pub(crate) fn usage_cost_kind(&self, cost: &crate::backend::Cost) -> CostKind {
+        match self.config.presentation {
+            Presentation::Headless => cost.kind(),
+            Presentation::Native => CostKind::EstimatedApiEquivalent,
+        }
+    }
+
+    /// Books a dispatch's usage. A native dispatch's goes in with its
+    /// agent's message ids, so an older relais's usage import skips them;
+    /// without the ids the usage is booked anyway and the run says so.
+    pub(crate) fn book_usage(
+        &self,
+        event: &UsageEvent,
+        result: &LaunchResult,
+    ) -> Result<(), LedgerError> {
+        let ledger = self.config.ledger;
+        if result.booked_message_ids.is_empty() {
+            ledger.record_usage(event)?;
+        } else {
+            ledger.record_native_usage(event, &result.booked_message_ids)?;
+        }
+        self.events.emit(cost_booked(event));
+        if self.config.presentation == Presentation::Native
+            && result.session_id.is_some()
+            && result.booked_message_ids.is_empty()
+        {
+            self.events.emit(Event::Decision {
+                what: "rollback_ids_missing".into(),
+                reason: event.event_id.clone(),
+            });
+        }
+        Ok(())
+    }
+
     /// Managed dispatch (SPEC §23): admission before launch, heartbeats
     /// during, release and settlement after. A coordinator outage blocks
     /// the launch rather than making it unmanaged; a queue wait counts
@@ -826,7 +877,7 @@ impl<'a> RunEngine<'a> {
         let dispatch_id = dispatch.spec.dispatch_id.clone();
         self.events.emit(Event::DispatchStarted {
             dispatch: dispatch_id.clone(),
-            agent_kind: dispatch.agent,
+            agent_kind: dispatch.spec.agent,
             attempt: dispatch.attempt,
             model: dispatch.spec.model.clone(),
             effort: effort_str(dispatch.spec.effort.as_ref()),
@@ -2226,7 +2277,7 @@ impl<'a> RunEngine<'a> {
             // Told once: the next attempt, whatever it repairs, starts clean.
             &std::mem::take(&mut progress.last_refusals),
             kind,
-            self.config.worker_presentation,
+            self.config.presentation,
         );
 
         // Dispatch intent is persisted BEFORE the process exists
@@ -2258,10 +2309,7 @@ impl<'a> RunEngine<'a> {
         // The row says what the coordinator is told (`NativeRun`) from the
         // moment it exists, so the two never disagree during the wait, and
         // a launch that fails before any agent binds keeps the right kind.
-        match self.config.worker_presentation {
-            Presentation::Headless => {}
-            Presentation::Native => ledger.record_native_dispatch(&dispatch_id, None)?,
-        }
+        self.record_native_row(&dispatch_id, None)?;
         ledger.record_features(
             &dispatch_id,
             &serde_json::json!({
@@ -2309,7 +2357,7 @@ impl<'a> RunEngine<'a> {
         // `_tmp_link` lives to the end of this dispatch, whichever way it ends.
         // A native worker is a subagent of the parent session, which
         // inherits that session's sandbox: relais's own cannot apply.
-        let sandbox_launch = match self.config.worker_presentation {
+        let sandbox_launch = match self.config.presentation {
             Presentation::Headless => self.sandbox_launch(index)?,
             Presentation::Native => None,
         };
@@ -2333,7 +2381,8 @@ impl<'a> RunEngine<'a> {
             pid_slot: None,
             sandbox,
             tools: ToolSet::ModeDefault,
-            presentation: self.config.worker_presentation,
+            presentation: self.config.presentation,
+            agent: AgentKind::Worker,
         };
         let scene = SandboxScene::of(&spec);
 
@@ -2344,7 +2393,6 @@ impl<'a> RunEngine<'a> {
         let dispatch_start = Instant::now();
         let result = match self.managed_launch(ManagedDispatch {
             spec,
-            agent: AgentKind::Worker,
             attempt: Some(index),
             depth: 0,
             parent: None,
@@ -2362,7 +2410,7 @@ impl<'a> RunEngine<'a> {
         };
         let duration_ms = dispatch_start.elapsed().as_millis() as i64;
         ledger.finish_dispatch(&dispatch_id, "completed")?;
-        match self.config.worker_presentation {
+        match self.config.presentation {
             Presentation::Headless => {}
             Presentation::Native => {
                 ledger.record_native_dispatch(&dispatch_id, result.session_id.as_deref())?;
@@ -2399,10 +2447,7 @@ impl<'a> RunEngine<'a> {
             // A native attempt's cost is always tokens times the price table,
             // known or not: an unpriced one is still an estimate that could
             // not be made, never API spend somebody reported.
-            cost_kind: match self.config.worker_presentation {
-                Presentation::Headless => usage.cost.kind(),
-                Presentation::Native => crate::money::CostKind::EstimatedApiEquivalent,
-            },
+            cost_kind: self.usage_cost_kind(&usage.cost),
             completeness: usage.cost.completeness(),
             inclusive: usage.cost.inclusive(),
             at: self.config.ledger.now(),
@@ -2412,25 +2457,9 @@ impl<'a> RunEngine<'a> {
             requested_effort,
             harness: self.harness.clone(),
         };
-        if result.booked_message_ids.is_empty() {
-            ledger.record_usage(&event)?;
-        } else {
-            ledger.record_native_usage(&event, &result.booked_message_ids)?;
-        }
+        self.book_usage(&event, &result)?;
         progress.spend.fold(event.cost, usage.cost.completeness());
-        self.events.emit(cost_booked(&event));
-        // The usage is booked either way; without the agent's message ids
-        // an older relais's usage import would book it a second time.
-        if self.config.worker_presentation == Presentation::Native
-            && result.session_id.is_some()
-            && result.booked_message_ids.is_empty()
-        {
-            self.events.emit(Event::Decision {
-                what: "rollback_ids_missing".into(),
-                reason: dispatch_id.as_str().to_string(),
-            });
-        }
-        progress.unpriced_model = unpriced_native_model(self.config.worker_presentation, &result);
+        progress.unpriced_model = unpriced_native_model(self.config.presentation, &result);
 
         // What the sandbox denied, however the attempt went: AFTER the cost
         // is recorded (a failure to write the report must not lose it),
@@ -4254,7 +4283,8 @@ impl<'a> RunEngine<'a> {
             pid_slot: None,
             sandbox: None,
             tools: purpose.tools(),
-            presentation: Presentation::Headless,
+            presentation: self.config.presentation,
+            agent: AgentKind::Reviewer,
         };
         let recorded = self.config.ledger.record_dispatch_intent(
             &dispatch_id,
@@ -4273,6 +4303,7 @@ impl<'a> RunEngine<'a> {
             remaining_budget.unwrap_or(0),
             request.routed_by,
         );
+        let recorded = recorded.and_then(|_| self.record_native_row(&dispatch_id, None));
         if let Err(e) = recorded {
             return Err(ReviewOutcome::Unavailable(format!(
                 "the ledger refused the review intent: {e}"
@@ -4293,7 +4324,6 @@ impl<'a> RunEngine<'a> {
         let dispatch_start = Instant::now();
         let result = match self.managed_launch(ManagedDispatch {
             spec,
-            agent: AgentKind::Reviewer,
             attempt: None,
             depth: 0,
             parent: None,
@@ -4330,6 +4360,7 @@ impl<'a> RunEngine<'a> {
             .config
             .ledger
             .finish_dispatch(&dispatch_id, "completed")
+            .and_then(|()| self.record_native_row(&dispatch_id, result.session_id.as_deref()))
         {
             return Err(ReviewOutcome::Unavailable(format!(
                 "the ledger refused the review record: {e}"
@@ -4346,7 +4377,7 @@ impl<'a> RunEngine<'a> {
             cache_read_tokens: result.usage.cache_read_tokens,
             cache_write_tokens: result.usage.cache_write_tokens,
             cost: result.usage.cost.micros(),
-            cost_kind: CostKind::ApiSpend,
+            cost_kind: self.usage_cost_kind(&result.usage.cost),
             completeness: result.usage.cost.completeness(),
             inclusive: result.usage.cost.inclusive(),
             at: self.config.ledger.now(),
@@ -4356,13 +4387,12 @@ impl<'a> RunEngine<'a> {
             requested_effort: effort_str(profile.effort.as_ref()),
             harness: self.harness.clone(),
         };
-        if let Err(e) = self.config.ledger.record_usage(&event) {
+        if let Err(e) = self.book_usage(&event, &result) {
             return Err(ReviewOutcome::Unavailable(format!(
                 "the ledger refused the review usage: {e}"
             )));
         }
         spend.fold(event.cost, result.usage.cost.completeness());
-        self.events.emit(cost_booked(&event));
         if result.terminal_result_missing() {
             return Err(ReviewOutcome::Unavailable(
                 "the reviewer ended without a terminal result".into(),
@@ -5393,7 +5423,7 @@ mod tests {
     /// How a fixture's run presents its workers, and where its protocol
     /// lines go.
     struct Presented {
-        worker_presentation: Presentation,
+        presentation: Presentation,
         wire: Wire,
     }
 
@@ -5630,7 +5660,7 @@ mod tests {
                 task_override: None,
                 purpose: None,
                 run_id: None,
-                worker_presentation: Presentation::Headless,
+                presentation: Presentation::Headless,
                 wire: Wire::process(),
             })
             .expect("the fixture's id source mints identifiers")
@@ -5711,7 +5741,7 @@ mod tests {
                 task_override: None,
                 purpose: None,
                 run_id: None,
-                worker_presentation: Presentation::Headless,
+                presentation: Presentation::Headless,
                 wire: Wire::process(),
             })
             .expect("the fixture's id source mints identifiers")
@@ -5732,7 +5762,7 @@ mod tests {
                 backend,
                 gate,
                 Presented {
-                    worker_presentation: Presentation::Headless,
+                    presentation: Presentation::Headless,
                     wire: Wire::process(),
                 },
             )
@@ -5747,10 +5777,7 @@ mod tests {
             gate: &(dyn Gate + Sync),
             presented: Presented,
         ) -> RunOutcome {
-            let Presented {
-                worker_presentation,
-                wire,
-            } = presented;
+            let Presented { presentation, wire } = presented;
             let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
                 adr: "ADR-0001".into(),
                 choice: None,
@@ -5779,7 +5806,7 @@ mod tests {
                 task_override: None,
                 purpose: None,
                 run_id: None,
-                worker_presentation,
+                presentation,
                 wire,
             })
             .expect("the fixture's id source mints identifiers")
@@ -7026,7 +7053,7 @@ mod tests {
             task_override: None,
             purpose: None,
             run_id: None,
-            worker_presentation: Presentation::Headless,
+            presentation: Presentation::Headless,
             wire: Wire::process(),
         })
         .expect("the fixture's id source mints identifiers");
@@ -12934,7 +12961,7 @@ mod tests {
             task_override: None,
             purpose: None,
             run_id: None,
-            worker_presentation: Presentation::Headless,
+            presentation: Presentation::Headless,
             wire: Wire::process(),
         };
         let engine = RunEngine::new(&config, None).expect("an engine");

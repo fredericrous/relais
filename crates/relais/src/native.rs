@@ -5,6 +5,8 @@
 //! prompt, so the prompt carries one line, `[relais-dispatch: <id>]`, and
 //! the hook reads it back. Pure: text in, text or a verdict out.
 
+use crate::protocol::AgentKind;
+
 const MARKER_OPEN: &str = "[relais-dispatch:";
 const MAX_ID_CHARS: usize = 128;
 
@@ -25,10 +27,29 @@ pub fn marker_line(dispatch_id: &str) -> String {
     format!("{MARKER_OPEN} {dispatch_id}]")
 }
 
-/// The agent definition a native worker runs as: `relais-worker-<model>-<effort>`,
-/// with the effort `default` when the route chose none.
+/// The agent definition a native dispatch runs as:
+/// `relais-<kind>-<model>-<effort>`, with the effort `default` when the
+/// route chose none.
+pub fn agent_type(kind: AgentKind, model: &str, effort: Option<&str>) -> String {
+    format!(
+        "relais-{}-{model}-{}",
+        kind_word(kind),
+        effort.unwrap_or("default")
+    )
+}
+
+/// The worker's agent definition, for what installs only workers.
 pub fn worker_agent_type(model: &str, effort: Option<&str>) -> String {
-    format!("relais-worker-{model}-{}", effort.unwrap_or("default"))
+    agent_type(AgentKind::Worker, model, effort)
+}
+
+/// How a kind of agent is named in its definition and in a refusal.
+pub fn kind_word(kind: AgentKind) -> &'static str {
+    match kind {
+        AgentKind::Worker => "worker",
+        AgentKind::Reviewer => "reviewer",
+        AgentKind::Planner => "planner",
+    }
 }
 
 /// The name the relais plugin gives an agent definition it ships.
@@ -110,35 +131,60 @@ pub fn hello_refusal(age: Option<std::time::Duration>) -> Option<String> {
     })
 }
 
-/// The models relais ships worker definitions for. `haiku` has no effort
+/// The models relais ships agent definitions for. `haiku` has no effort
 /// levels, so it ships only the default.
 const MODELS: [&str; 4] = ["haiku", "sonnet", "opus", "fable"];
 
 /// The efforts every model but `haiku` ships besides its default.
 const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
-/// Every (model, effort) relais ships a native worker definition for, in
-/// install order; `None` is the model's default effort.
-pub fn worker_agent_types() -> Vec<(String, Option<String>)> {
-    let mut types = Vec::new();
+/// The kinds of agent relais ships definitions for.
+const KINDS: [AgentKind; 3] = [AgentKind::Worker, AgentKind::Reviewer, AgentKind::Planner];
+
+/// Every (model, effort) relais ships a definition for, the same for every
+/// kind, in install order; `None` is the model's default effort.
+fn model_efforts() -> Vec<(String, Option<String>)> {
+    let mut pairs = Vec::new();
     for model in MODELS {
-        types.push((model.to_string(), None));
+        pairs.push((model.to_string(), None));
         if model != "haiku" {
-            types.extend(
+            pairs.extend(
                 EFFORTS
                     .iter()
                     .map(|effort| (model.to_string(), Some(effort.to_string()))),
             );
         }
     }
-    types
+    pairs
 }
 
-/// Whether relais ships a definition for this (model, effort).
-pub fn has_worker_definition(model: &str, effort: Option<&str>) -> bool {
-    worker_agent_types()
+/// Every (kind, model, effort) relais ships a native agent definition for.
+pub fn agent_types() -> Vec<(AgentKind, String, Option<String>)> {
+    KINDS
+        .into_iter()
+        .flat_map(|kind| {
+            model_efforts()
+                .into_iter()
+                .map(move |(model, effort)| (kind, model, effort))
+        })
+        .collect()
+}
+
+/// The (model, effort) pairs of the worker definitions, for what installs
+/// only workers.
+pub fn worker_agent_types() -> Vec<(String, Option<String>)> {
+    agent_types()
+        .into_iter()
+        .filter(|(kind, _, _)| *kind == AgentKind::Worker)
+        .map(|(_, model, effort)| (model, effort))
+        .collect()
+}
+
+/// Whether relais ships a definition of this kind for this (model, effort).
+pub fn has_definition(kind: AgentKind, model: &str, effort: Option<&str>) -> bool {
+    agent_types()
         .iter()
-        .any(|(m, e)| m == model && e.as_deref() == effort)
+        .any(|(k, m, e)| *k == kind && m == model && e.as_deref() == effort)
 }
 
 /// Read the marker out of `text`.
@@ -199,13 +245,28 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_set_is_haiku_default_and_six_efforts_for_the_rest() {
+    fn the_shipped_set_is_haiku_default_and_six_efforts_for_the_rest_of_every_kind() {
+        assert_eq!(agent_types().len(), 3 * (1 + 3 * 6));
         assert_eq!(worker_agent_types().len(), 1 + 3 * 6);
-        assert!(has_worker_definition("haiku", None));
-        assert!(!has_worker_definition("haiku", Some("high")));
-        assert!(has_worker_definition("fable", Some("max")));
-        assert!(has_worker_definition("opus", None));
-        assert!(!has_worker_definition("claude-sonnet-5-5", None));
+        for kind in [AgentKind::Worker, AgentKind::Reviewer, AgentKind::Planner] {
+            assert!(has_definition(kind, "haiku", None));
+            assert!(!has_definition(kind, "haiku", Some("high")));
+            assert!(has_definition(kind, "fable", Some("max")));
+            assert!(has_definition(kind, "opus", None));
+            assert!(!has_definition(kind, "claude-sonnet-5-5", None));
+        }
+    }
+
+    #[test]
+    fn an_agent_type_names_its_kind_model_and_effort() {
+        assert_eq!(
+            agent_type(AgentKind::Reviewer, "opus", Some("high")),
+            "relais-reviewer-opus-high"
+        );
+        assert_eq!(
+            agent_type(AgentKind::Planner, "haiku", None),
+            "relais-planner-haiku-default"
+        );
     }
 
     #[test]

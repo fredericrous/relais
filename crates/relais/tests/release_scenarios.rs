@@ -799,7 +799,7 @@ minimum_tier = "escalation"
         "{explained}"
     );
     assert!(
-        explained.contains("cost: $0.012 (estimated)"),
+        explained.contains("cost: $0.0111 (estimated)"),
         "{explained}"
     );
     let report = world.relais(&["report", "--since", "2026-01-01", "--json"]);
@@ -3216,30 +3216,25 @@ fn coordinator_cancel_and_stop_leave_state_consistent() {
     assert_eq!(again.status.code(), Some(0), "{}", text(&again.stderr));
 }
 
-// SPEC §8, §11: a launch relais still makes itself — the reviewer, since the
-// worker is a native agent now — carries the dollar ceiling as the CLI's own
-// flag and a tool deny list, and no permission-mode or bypass flag ever
-// appears on the argv.
+// SPEC §8, §11: every dispatch of a run is a native agent the plugin starts,
+// the worker and the reviewer alike, so relais launches nothing itself: the
+// harness is started only as the plugin starts it, with no dollar flag, no
+// deny list and no permission-mode or bypass flag on the argv.
 #[test]
-fn launch_argv_carries_the_budget_flag_and_no_bypass() {
+fn a_run_launches_no_harness_itself_and_no_bypass_ever_appears() {
     let world = World::new("argv");
     let hash = world.write_policy(1);
     world.write_machine(&hash, "[spending]\nper_run_micros = 2500000\n");
     let task = world.write_task_for("task.json", "an easy one", "required");
     let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
     assert_eq!(run.status.code(), Some(0), "{}", text(&run.stderr));
-    // The last harness launch of the run is the review's.
+    // The last harness launch of the run is the reviewer's, as the plugin
+    // starts it.
     let argv = std::fs::read_to_string(world.root.join("argv-last.log")).expect("argv log");
     let args: Vec<&str> = argv.lines().collect();
     assert_eq!(args[0], "-p", "{argv}");
-    let budget_at = args
-        .iter()
-        .position(|arg| *arg == "--max-budget-usd")
-        .unwrap_or_else(|| panic!("budget flag missing: {argv}"));
-    let budget: f64 = args[budget_at + 1].parse().expect("a dollar figure");
-    assert!(budget > 0.0 && budget <= 2.5, "{argv}");
-    assert!(!args.contains(&"--budget"), "{argv}");
-    assert!(args.contains(&"--disallowed-tools"), "{argv}");
+    assert!(!args.contains(&"--max-budget-usd"), "{argv}");
+    assert!(!args.contains(&"--disallowed-tools"), "{argv}");
     assert!(
         !argv.contains("permission-mode") && !argv.contains("dangerously"),
         "{argv}"

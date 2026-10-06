@@ -27,7 +27,7 @@ use crate::contract::{Decomposition, DecompositionMode, Kind, TaskContract, Work
 use crate::contract::{Review, WorkPackage};
 use crate::ledger::UsageEvent;
 use crate::lifecycle::UsagePhase;
-use crate::money::{CostKind, MicroUsd};
+use crate::money::MicroUsd;
 use crate::policy::{BlockCode, EffectiveAuthority, MachineSettings, Tier};
 use crate::procs::Ended;
 use crate::protocol::AgentKind;
@@ -36,9 +36,9 @@ use crate::verify::{self, Receipt, VerificationReport};
 use crate::workspace::{self, WorkspaceError};
 
 use super::{
-    cost_booked, data_block, data_list_block, effort_str, execute_child, AttemptLabel, Budget,
-    Limit, ManagedDispatch, Next, Observation, Reason, ReviewOutcome, RunConfig, RunEngine,
-    RunError, RunOutcome, State, Terminal,
+    data_block, data_list_block, effort_str, execute_child, AttemptLabel, Budget, Limit,
+    ManagedDispatch, Next, Observation, Reason, ReviewOutcome, RunConfig, RunEngine, RunError,
+    RunOutcome, State, Terminal,
 };
 
 /// The patch an accepted decomposed run exports its assembled revision
@@ -731,7 +731,7 @@ fn run_package(
         // fact, free to disagree.
         purpose: None,
         run_id: None,
-        worker_presentation: engine.config.worker_presentation,
+        presentation: engine.config.presentation,
         wire: engine.config.wire.clone(),
     };
     engine.transition(
@@ -1160,6 +1160,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         remaining_budget.unwrap_or(0),
         root.decision.routed_by,
     )?;
+    engine.record_native_row(&dispatch_id, None)?;
     let spec = LaunchSpec {
         dispatch_id: dispatch_id.as_str().to_string(),
         prompt,
@@ -1184,7 +1185,8 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         pid_slot: None,
         sandbox: None,
         tools: crate::backend::ToolSet::ModeDefault,
-        presentation: crate::backend::Presentation::Headless,
+        presentation: engine.config.presentation,
+        agent: AgentKind::Planner,
     };
     let budget = Budget {
         attempts_used: 0,
@@ -1199,7 +1201,6 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
     let dispatch_start = Instant::now();
     let result = match engine.managed_launch(ManagedDispatch {
         spec,
-        agent: AgentKind::Planner,
         attempt: None,
         depth: 0,
         parent: None,
@@ -1222,6 +1223,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         .config
         .ledger
         .finish_dispatch(&dispatch_id, "completed")?;
+    engine.record_native_row(&dispatch_id, result.session_id.as_deref())?;
     // Planning overhead is the run's cost (SPEC §19).
     let planning_usage = UsageEvent {
         event_id: dispatch_id.as_str().to_string(),
@@ -1234,7 +1236,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         cache_read_tokens: result.usage.cache_read_tokens,
         cache_write_tokens: result.usage.cache_write_tokens,
         cost: result.usage.cost.micros(),
-        cost_kind: CostKind::ApiSpend,
+        cost_kind: engine.usage_cost_kind(&result.usage.cost),
         completeness: result.usage.cost.completeness(),
         inclusive: result.usage.cost.inclusive(),
         at: engine.config.ledger.now(),
@@ -1244,8 +1246,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         requested_effort: effort_str(profile.effort.as_ref()),
         harness: engine.harness.clone(),
     };
-    engine.config.ledger.record_usage(&planning_usage)?;
-    engine.events.emit(cost_booked(&planning_usage));
+    engine.book_usage(&planning_usage, &result)?;
     if result.ended == Ended::Cancelled {
         return Ok(Proposal::Failed(engine.stop(
             &budget,

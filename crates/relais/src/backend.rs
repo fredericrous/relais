@@ -458,6 +458,9 @@ pub struct LaunchSpec {
     /// Who runs the launch: relais's own child process, or a native
     /// subagent of the parent session.
     pub presentation: Presentation,
+    /// What kind of agent this dispatch is: the native agent definition it
+    /// runs as, and the kind its run events name.
+    pub agent: crate::protocol::AgentKind,
 }
 
 /// What a sandboxed launch adds: the whole `--settings` JSON (sandbox,

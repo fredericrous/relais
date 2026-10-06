@@ -1,12 +1,13 @@
-//! The native presentation of a worker attempt (SPEC §23).
+//! The native presentation of a dispatch (SPEC §23).
 //!
-//! `relais run` does not start the worker: it asks the relais plugin of the
-//! parent Claude Code session to spawn it as a subagent, so Claude Code
-//! renders it as its own. This backend writes that request as a protocol
+//! `relais run` does not start the worker, the reviewer or the planner: it
+//! asks the relais plugin of the parent Claude Code session to spawn it as a
+//! subagent of its kind, so
+//! Claude Code renders it as its own. This backend writes that request as a protocol
 //! line (SPEC §29), registers it with the coordinator, and waits for the
 //! plugin's `relais native bound` and `relais native stopped` calls, which
 //! carry the agent and what it spent. The engine then judges the attempt as
-//! it judges any other. Every launch that is not a native worker's goes to
+//! it judges any other. Every launch that is not native goes to
 //! the headless backend untouched.
 
 use std::collections::BTreeMap;
@@ -24,7 +25,7 @@ use crate::backend::{
     Presentation, UsageReport,
 };
 use crate::money::MicroUsd;
-use crate::native::{has_worker_definition, plugin_agent_type, worker_agent_type, HELLO_FRESH};
+use crate::native::{agent_type, has_definition, kind_word, plugin_agent_type, HELLO_FRESH};
 use crate::orchestration::{
     parse_transcript, price, unpriced_reason, CacheWrites, PriceTable, Speed, UsageRecord,
 };
@@ -35,7 +36,9 @@ use crate::protocol::{AgentKind, Request, Wire};
 /// The label a worker that was never spawned ends with.
 const SPAWN_MISSING: &str = "native_spawn_missing";
 
-/// The label an attempt whose model has no shipped worker definition ends with.
+/// The label an attempt whose model has no shipped agent definition of its
+/// kind ends with. The label keeps the name it has had since workers were
+/// the only native dispatch.
 const WORKER_MISSING: &str = "native_worker_missing";
 
 /// The label an attempt ends with when the session's plugin stopped saying hello.
@@ -102,14 +105,17 @@ enum Route {
 
 /// A repair continues the agent that bound for the last attempt as long as
 /// the model is the same; an escalation to another model, a first attempt,
-/// or an agent never learned of is a fresh spawn.
+/// or an agent never learned of is a fresh spawn. Only a worker is repaired:
+/// a reviewer or a planner always spawns fresh.
 fn route_for(known: Option<&KnownAgent>, spec: &LaunchSpec) -> Route {
-    match known {
-        Some(agent) if agent.model == spec.model => Route::Continue {
+    match (spec.agent, known) {
+        (AgentKind::Worker, Some(agent)) if agent.model == spec.model => Route::Continue {
             agent_id: agent.agent_id.clone(),
             effort_note: effort_note(agent, spec),
         },
-        Some(_) | None => Route::Spawn,
+        (AgentKind::Worker, Some(_) | None) | (AgentKind::Reviewer | AgentKind::Planner, _) => {
+            Route::Spawn
+        }
     }
 }
 
@@ -136,12 +142,13 @@ fn missing_definition(route: &Route, spec: &LaunchSpec) -> Option<String> {
         Route::Continue { .. } => None,
         Route::Spawn => {
             let effort = spec.effort.as_ref().map(EffortId::as_str);
-            if has_worker_definition(&spec.model, effort) {
+            if has_definition(spec.agent, &spec.model, effort) {
                 return None;
             }
             Some(format!(
-                "{WORKER_MISSING}: relais ships no native worker for model {} at effort {}; \
+                "{WORKER_MISSING}: relais ships no native {} for model {} at effort {}; \
                  use a model alias (haiku, sonnet, opus, fable)",
+                kind_word(spec.agent),
                 spec.model,
                 effort.unwrap_or("default")
             ))
@@ -153,7 +160,8 @@ fn missing_definition(route: &Route, spec: &LaunchSpec) -> Option<String> {
 fn ask_for(route: &Route, spec: &LaunchSpec) -> NativeAsk {
     match route {
         Route::Spawn => NativeAsk::Spawn {
-            subagent_type: plugin_agent_type(&worker_agent_type(
+            subagent_type: plugin_agent_type(&agent_type(
+                spec.agent,
                 &spec.model,
                 spec.effort.as_ref().map(EffortId::as_str),
             )),
@@ -179,7 +187,7 @@ fn request_for<'a>(run: &'a str, spec: &'a LaunchSpec, ask: &'a NativeAsk) -> Re
         } => Request::Spawn {
             run,
             dispatch: &spec.dispatch_id,
-            agent_kind: AgentKind::Worker,
+            agent_kind: spec.agent,
             subagent_type,
             model,
             description: format!("relais {}", spec.dispatch_id),
@@ -568,7 +576,7 @@ impl<'a> NativeBackend<'a> {
             AgentStatus::Killed => Some("killed"),
         }
         .map(|how| format!("the native agent {agent_id} {how}"));
-        if failure.is_none() {
+        if failure.is_none() && spec.agent == AgentKind::Worker {
             // A continuation runs at the effort its agent was spawned with,
             // whatever this attempt asked for, so the agent already on
             // record keeps its effort; only a fresh spawn records the
@@ -701,6 +709,7 @@ mod tests {
             sandbox: None,
             tools: crate::backend::ToolSet::ModeDefault,
             presentation: Presentation::Native,
+            agent: AgentKind::Worker,
         }
     }
 
@@ -809,7 +818,7 @@ mod tests {
             .map(|(path, _)| path.to_string_lossy().replace('\\', "/"))
             .collect();
         for (model, effort) in crate::native::worker_agent_types() {
-            let agent_type = worker_agent_type(&model, effort.as_deref());
+            let agent_type = crate::native::worker_agent_type(&model, effort.as_deref());
             assert!(
                 files.contains(&format!("agents/{agent_type}.md")),
                 "{agent_type}"
@@ -846,6 +855,42 @@ mod tests {
         assert_eq!(input["prompt"], "do the work");
         assert!(!line.contains("relais-dispatch"), "{line}");
         assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn a_reviewer_and_a_planner_spawn_as_their_own_kind_and_are_never_continued() {
+        let known = agent("sonnet", Some("medium"));
+        for (kind, word) in [
+            (AgentKind::Reviewer, "reviewer"),
+            (AgentKind::Planner, "planner"),
+        ] {
+            let spec = LaunchSpec {
+                agent: kind,
+                ..spec("sonnet", Some("medium"))
+            };
+            assert_eq!(route_for(Some(&known), &spec), Route::Spawn);
+            let ask = ask_for(&Route::Spawn, &spec);
+            let line = serde_json::to_string(&request_for("run-1", &spec, &ask)).expect("json");
+            let input: serde_json::Value = serde_json::from_str(&line).expect("json");
+            assert_eq!(input["agent_kind"], word);
+            assert_eq!(
+                input["subagent_type"],
+                format!("relais:relais-{word}-sonnet-medium")
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_names_the_kind_that_has_no_definition() {
+        let reviewer = LaunchSpec {
+            agent: AgentKind::Reviewer,
+            ..spec("claude-sonnet-5-5", None)
+        };
+        let refusal = missing_definition(&Route::Spawn, &reviewer).expect("not shipped");
+        assert!(
+            refusal.contains("relais ships no native reviewer for model claude-sonnet-5-5"),
+            "{refusal}"
+        );
     }
 
     #[test]

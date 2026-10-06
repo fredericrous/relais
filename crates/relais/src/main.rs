@@ -2930,7 +2930,7 @@ fn run_command(
         Some(prices),
     );
     let run_backend: &dyn relais::backend::Backend = &native_backend;
-    let worker_presentation = relais::backend::Presentation::Native;
+    let presentation = relais::backend::Presentation::Native;
     // Printed here, before `execute`, so it is visible on every path —
     // including the `Err` arm below that returns early — and only once:
     // a run can take minutes, and deferring this to the end read as
@@ -3034,7 +3034,7 @@ fn run_command(
         // `trials.source_run_id` never disagree about it (SPEC §28).
         purpose: trial_id.as_ref().map(|_| RunPurpose::TrialArm),
         run_id: Some(run_id.clone()),
-        worker_presentation,
+        presentation,
         wire: relais::protocol::Wire::process(),
     }) {
         Ok(outcome) => outcome,
@@ -3350,7 +3350,7 @@ fn replay_command(task: &str, recipe: &Path, dry_run: bool) -> Result<CliOutcome
         task_override: Some(&task_id),
         purpose: Some(RunPurpose::Replay),
         run_id: None,
-        worker_presentation: relais::backend::Presentation::Headless,
+        presentation: relais::backend::Presentation::Headless,
         wire: relais::protocol::Wire::process(),
     });
     // Bring the replay's own refs into the live repository BEFORE the

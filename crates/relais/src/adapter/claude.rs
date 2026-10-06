@@ -691,6 +691,7 @@ mod tests {
             sandbox: None,
             tools: crate::backend::ToolSet::ModeDefault,
             presentation: crate::backend::Presentation::Headless,
+            agent: crate::protocol::AgentKind::Worker,
         }
     }
 

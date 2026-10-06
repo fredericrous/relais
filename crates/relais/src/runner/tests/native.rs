@@ -57,8 +57,10 @@ enum Seen {
     Spawn {
         dispatch_id: String,
         agent_id: String,
+        agent_kind: String,
         subagent_type: String,
         model: String,
+        cwd: PathBuf,
     },
     Continue {
         dispatch_id: String,
@@ -108,6 +110,7 @@ fn fixes_on_escalation(tree: &Path, prompt: &str) {
 }
 
 struct Agent {
+    kind: String,
     tree: PathBuf,
     model: String,
     messages: u32,
@@ -202,18 +205,21 @@ fn run_plugin(
                 let agent_id = format!("ag{spawned}");
                 let cwd = PathBuf::from(text("cwd").expect("cwd"));
                 assert!(cwd.is_dir(), "the spawn names the attempt's worktree");
-                assert_eq!(value["agent_kind"], "worker");
                 assert!(!text("prompt").expect("prompt").contains("relais-dispatch"));
                 let model = text("model").expect("model");
+                let kind = text("agent_kind").expect("agent_kind");
                 script.seen.push(Seen::Spawn {
                     dispatch_id: text("dispatch").expect("dispatch"),
                     agent_id: agent_id.clone(),
+                    agent_kind: kind.clone(),
                     subagent_type: text("subagent_type").expect("subagent_type"),
                     model: model.clone(),
+                    cwd: cwd.clone(),
                 });
                 agents.insert(
                     agent_id.clone(),
                     Agent {
+                        kind,
                         tree: cwd,
                         model: concrete(&model),
                         messages: 0,
@@ -242,7 +248,10 @@ fn run_plugin(
             other => panic!("an unknown request {other}"),
         };
         let agent = agents.get_mut(&agent_id).expect("a known agent");
-        work(&agent.tree, &prompt);
+        // Only a worker changes its tree; a reviewer and a planner read.
+        if agent.kind == "worker" {
+            work(&agent.tree, &prompt);
+        }
         let count = if fresh {
             SPAWN_MESSAGES
         } else {
@@ -268,7 +277,7 @@ fn run_plugin(
                 cache_creation_input_tokens: Some(0),
                 model: Some(agent.model.clone()),
             }),
-            answer: Some("DONE".into()),
+            answer: Some(answer_of(&agent.kind).into()),
         };
         match plugin {
             Plugin::StopsBeforeBound => {
@@ -305,6 +314,15 @@ fn run_plugin(
         }
     }
     script
+}
+
+/// What an agent of this kind ends its turn with.
+fn answer_of(kind: &str) -> &'static str {
+    match kind {
+        "reviewer" => "review ok\nFINDINGS: none",
+        "planner" => r#"{"packages":[],"integration_acceptance":[]}"#,
+        _ => "DONE",
+    }
 }
 
 fn prices() -> PriceTable {
@@ -385,6 +403,26 @@ fn run_native_waiting(
     waits: Waits,
     configure: impl FnOnce(&mut RepoPolicy),
 ) -> Native {
+    run_native_contract(
+        fixture,
+        &fixture.contract(review),
+        attempts,
+        cast,
+        prices,
+        waits,
+        configure,
+    )
+}
+
+fn run_native_contract(
+    fixture: &Fixture,
+    contract: &TaskContract,
+    attempts: u32,
+    cast: Cast,
+    prices: Option<PriceTable>,
+    waits: Waits,
+    configure: impl FnOnce(&mut RepoPolicy),
+) -> Native {
     let mut repo = fixture.repo_policy(vec![main_gone_check()], attempts);
     configure(&mut repo);
     let machine = fixture.machine_for(&repo);
@@ -420,13 +458,13 @@ fn run_native_waiting(
     let session =
         std::thread::spawn(move || run_plugin(parent_gate, rx, projects, cast.plugin, cast.work));
     let outcome = fixture.execute_presented(
-        &fixture.contract(review),
+        contract,
         &repo,
         &machine,
         &backend,
         gate.as_ref(),
         Presented {
-            worker_presentation: Presentation::Native,
+            presentation: Presentation::Native,
             wire: wire.clone(),
         },
     );
@@ -538,7 +576,7 @@ fn assert_protocol_stream(run: &Native) -> &serde_json::Value {
 }
 
 #[test]
-fn a_change_task_is_accepted_after_one_spawn_and_its_review_stays_headless() {
+fn a_change_task_is_accepted_after_a_worker_spawn_and_a_reviewer_spawn() {
     let fixture = Fixture::new();
     let run = run_native(
         &fixture,
@@ -554,34 +592,78 @@ fn a_change_task_is_accepted_after_one_spawn_and_its_review_stays_headless() {
         "expected acceptance, got {:?}",
         run.outcome
     );
-    let [Seen::Spawn {
-        subagent_type,
-        model,
-        agent_id,
-        ..
-    }] = run.seen()
+    let spawns: Vec<_> = run
+        .seen()
+        .iter()
+        .filter_map(|seen| match seen {
+            Seen::Spawn {
+                agent_id,
+                agent_kind,
+                subagent_type,
+                model,
+                cwd,
+                ..
+            } => Some((agent_id, agent_kind, subagent_type, model, cwd)),
+            Seen::Continue { .. } | Seen::Stop { .. } => None,
+        })
+        .collect();
+    let [(agent_id, worker, worker_type, model, worker_cwd), (reviewer_id, reviewer, reviewer_type, reviewer_model, reviewer_cwd)] =
+        spawns.as_slice()
     else {
-        panic!("one spawn expected, saw {:?}", run.seen());
+        panic!("a worker and a reviewer expected, saw {:?}", run.seen());
     };
-    assert_eq!(subagent_type, "relais:relais-worker-sonnet-default");
-    assert_eq!(model, "sonnet");
+    assert_eq!(worker.as_str(), "worker");
+    assert_eq!(worker_type.as_str(), "relais:relais-worker-sonnet-default");
+    assert_eq!(model.as_str(), "sonnet");
+    assert_eq!(reviewer.as_str(), "reviewer");
+    assert_eq!(
+        reviewer_type.as_str(),
+        format!("relais:relais-reviewer-{reviewer_model}-default")
+    );
+    // The reviewer reads the review directory: the task worktree the
+    // worker left its candidate in.
+    assert_eq!(reviewer_cwd, worker_cwd);
     assert!(
-        !run.headless.is_empty()
-            && run
-                .headless
-                .iter()
-                .all(|prompt| prompt.contains("semantic reviewer")),
-        "the headless backend saw only the review: {:?}",
+        run.headless.is_empty(),
+        "no dispatch went headless: {:?}",
         run.headless
     );
-    // The worker's dispatch row is native and names its agent; the
-    // review's row is the headless kind it always was.
+    // The worker's dispatch row is native and names its agent.
     assert_eq!(
         dispatch_rows(&fixture, &run.outcome.run_id),
-        vec![("native_run".to_string(), Some(agent_id.clone()))]
+        vec![("native_run".to_string(), Some((*agent_id).clone()))]
     );
-    assert_eq!(run.script.bound, [BoundOutcome::Bound]);
-    assert_eq!(run.script.stopped, [StoppedOutcome::Recorded]);
+    // The reviewer's row is native too and names its agent, and its cost
+    // is the price table's estimate, like the worker's.
+    let conn = ledger_of(&fixture);
+    let review_row: (String, Option<String>) = conn
+        .query_row(
+            "SELECT source, agent_id FROM dispatches WHERE run_id = ?1 AND attempt_id IS NULL",
+            [run.outcome.run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("one reviewer row");
+    assert_eq!(
+        review_row,
+        ("native_run".to_string(), Some((*reviewer_id).clone()))
+    );
+    let review_kind: String = conn
+        .query_row(
+            "SELECT cost_kind FROM usage_events WHERE run_id = ?1 AND phase = 'review'",
+            [run.outcome.run_id.as_str()],
+            |row| row.get(0),
+        )
+        .expect("the review's usage row");
+    assert!(
+        review_kind.contains("EstimatedApiEquivalent"),
+        "{review_kind}"
+    );
+    // One bind and one stop for each of the two agents.
+    assert_eq!(run.script.bound, [BoundOutcome::Bound, BoundOutcome::Bound]);
+    assert_eq!(
+        run.script.stopped,
+        [StoppedOutcome::Recorded, StoppedOutcome::Recorded]
+    );
     let done = assert_protocol_stream(&run);
     let receipt = done["receipt"].as_str().expect("a receipt path");
     assert!(receipt.ends_with("receipt.json"), "{receipt}");
@@ -590,6 +672,86 @@ fn a_change_task_is_accepted_after_one_spawn_and_its_review_stays_headless() {
     assert!(
         done["summary"]["deletions"].as_u64().unwrap_or(0) > 0,
         "{done}"
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+#[test]
+fn a_decomposed_task_spawns_its_planner_in_the_repository_before_its_worker() {
+    let fixture = Fixture::new();
+    let contract = TaskContract::from_json_str(
+        &serde_json::json!({
+            "schema_version": 1,
+            "kind": "change",
+            "objective": "Remove the obsolete entry point",
+            "base_ref": "HEAD",
+            "write_scope": ["src/**"],
+            "acceptance": ["src/main.rs no longer exists"],
+            "verification_profile": "profile",
+            "decomposition": "propose",
+        })
+        .to_string(),
+    )
+    .expect("contract");
+    let run = run_native_contract(
+        &fixture,
+        &contract,
+        3,
+        Cast {
+            plugin: Plugin::Obeys,
+            work: fixes_at_once,
+        },
+        Some(prices()),
+        waits(Duration::from_secs(60)),
+        |_| {},
+    );
+    assert!(
+        matches!(run.outcome.terminal, Terminal::Accepted(_)),
+        "expected acceptance, got {:?}",
+        run.outcome
+    );
+    let spawns: Vec<_> = run
+        .seen()
+        .iter()
+        .filter_map(|seen| match seen {
+            Seen::Spawn {
+                agent_kind,
+                subagent_type,
+                cwd,
+                ..
+            } => Some((agent_kind.as_str(), subagent_type.as_str(), cwd)),
+            Seen::Continue { .. } | Seen::Stop { .. } => None,
+        })
+        .collect();
+    let [("planner", planner_type, planner_cwd), ("worker", worker_type, _)] = spawns.as_slice()
+    else {
+        panic!("a planner then a worker expected, saw {:?}", run.seen());
+    };
+    assert_eq!(*planner_type, "relais:relais-planner-haiku-default");
+    assert_eq!(*worker_type, "relais:relais-worker-sonnet-default");
+    assert_eq!(*planner_cwd, &fixture.repo);
+    assert!(run.headless.is_empty(), "{:?}", run.headless);
+    // Every dispatch row of the run, the planner's included, is native
+    // and names its agent; the planning usage is the price table's estimate.
+    let conn = ledger_of(&fixture);
+    let managed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM dispatches WHERE source != 'native_run' OR agent_id IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert_eq!(managed, 0, "every dispatch row is native with its agent");
+    let planning_kind: String = conn
+        .query_row(
+            "SELECT cost_kind FROM usage_events WHERE phase = 'planning'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the planning usage row");
+    assert!(
+        planning_kind.contains("EstimatedApiEquivalent"),
+        "{planning_kind}"
     );
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
@@ -981,7 +1143,7 @@ fn no_bind_within_the_wait_ends_the_attempt_interrupted_and_the_run_stops() {
         &backend,
         &gate,
         Presented {
-            worker_presentation: Presentation::Native,
+            presentation: Presentation::Native,
             wire: Wire::process(),
         },
     );
@@ -1028,7 +1190,7 @@ fn a_model_without_a_shipped_definition_ends_interrupted_before_any_spawn_line()
         &backend,
         &gate,
         Presented {
-            worker_presentation: Presentation::Native,
+            presentation: Presentation::Native,
             wire: Wire::process(),
         },
     );
@@ -1078,7 +1240,7 @@ fn a_native_launch_that_fails_keeps_its_row_native() {
         &backend,
         &gate,
         Presented {
-            worker_presentation: Presentation::Native,
+            presentation: Presentation::Native,
             wire: Wire::process(),
         },
     );

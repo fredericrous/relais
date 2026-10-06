@@ -1,13 +1,14 @@
-//! The relais Claude Code plugin ships one worker agent definition per
-//! (model, effort) that `native::worker_agent_types()` names, and nothing
-//! else in `claude-plugin/agents/`. A pair added there without a file here
-//! (or a file nothing names) is a dispatch Claude Code cannot start.
+//! The relais Claude Code plugin ships one agent definition per (kind,
+//! model, effort) that `native::agent_types()` names, and nothing else in
+//! `claude-plugin/agents/`. A triple added there without a file here (or a
+//! file nothing names) is a dispatch Claude Code cannot start.
 
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
-use relais::native::{worker_agent_type, worker_agent_types};
+use relais::native::{agent_type, agent_types, kind_word};
+use relais::protocol::AgentKind;
 
 fn agents_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../claude-plugin/agents")
@@ -35,11 +36,28 @@ fn field<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
+/// The tools each kind of agent may use; none has Agent.
+fn tools_of(kind: AgentKind) -> &'static [&'static str] {
+    match kind {
+        AgentKind::Worker => &["Read", "Grep", "Glob", "Edit", "Write", "Bash"],
+        AgentKind::Reviewer => &["Read", "Grep", "Glob"],
+        AgentKind::Planner => &["Read", "Grep", "Glob", "Bash"],
+    }
+}
+
+/// The turns each kind of agent is capped at, when it is.
+fn max_turns_of(kind: AgentKind) -> Option<&'static str> {
+    match kind {
+        AgentKind::Planner => Some("8"),
+        AgentKind::Worker | AgentKind::Reviewer => None,
+    }
+}
+
 #[test]
-fn the_plugin_ships_exactly_the_worker_definitions_relais_names() {
-    let expected: BTreeSet<String> = worker_agent_types()
+fn the_plugin_ships_exactly_the_agent_definitions_relais_names() {
+    let expected: BTreeSet<String> = agent_types()
         .iter()
-        .map(|(model, effort)| format!("{}.md", worker_agent_type(model, effort.as_deref())))
+        .map(|(kind, model, effort)| format!("{}.md", agent_type(*kind, model, effort.as_deref())))
         .collect();
     let shipped: BTreeSet<String> = fs::read_dir(agents_dir())
         .expect("claude-plugin/agents exists")
@@ -53,14 +71,14 @@ fn the_plugin_ships_exactly_the_worker_definitions_relais_names() {
         .collect();
     assert_eq!(
         shipped, expected,
-        "claude-plugin/agents/ must hold one file per native::worker_agent_types() pair"
+        "claude-plugin/agents/ must hold one file per native::agent_types() triple"
     );
 }
 
 #[test]
-fn each_definition_names_its_own_model_and_effort_and_cannot_spawn() {
-    for (model, effort) in worker_agent_types() {
-        let name = worker_agent_type(&model, effort.as_deref());
+fn each_definition_names_its_own_kind_model_and_effort_and_cannot_spawn() {
+    for (kind, model, effort) in agent_types() {
+        let name = agent_type(kind, &model, effort.as_deref());
         let path = agents_dir().join(format!("{name}.md"));
         let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         let fields = frontmatter(&text);
@@ -79,11 +97,18 @@ fn each_definition_names_its_own_model_and_effort_and_cannot_spawn() {
         let tools: Vec<&str> = tools.split(", ").collect();
         assert_eq!(
             tools,
-            ["Read", "Grep", "Glob", "Edit", "Write", "Bash"],
-            "{name}: a worker's tools, with no Agent among them"
+            tools_of(kind),
+            "{name}: a {}'s tools, with no Agent among them",
+            kind_word(kind)
         );
+        assert_eq!(
+            field(&fields, "maxTurns"),
+            max_turns_of(kind),
+            "{name}: maxTurns"
+        );
+        let described = format!("relais {}.", kind_word(kind));
         assert!(
-            field(&fields, "description").is_some_and(|d| !d.is_empty()),
+            field(&fields, "description").is_some_and(|d| d.starts_with(&described)),
             "{name}: description"
         );
     }

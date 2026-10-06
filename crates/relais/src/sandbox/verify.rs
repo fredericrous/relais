@@ -266,6 +266,7 @@ fn probe_spec(
         sandbox,
         tools: crate::backend::ToolSet::ModeDefault,
         presentation: crate::backend::Presentation::Headless,
+        agent: crate::protocol::AgentKind::Worker,
     }
 }
 
