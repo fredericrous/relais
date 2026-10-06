@@ -2104,6 +2104,14 @@ fn resolve_session_id(
 /// answers. Starting spawns `relais coordinator daemon` detached from
 /// this CLI process so its exit cannot take the coordinator down.
 pub fn ensure_running(socket_path: &Path) -> Result<Client, CoordinatorError> {
+    // A path the OS cannot bind fails inside the detached daemon, whose
+    // output goes nowhere, and would surface here only as a start timeout.
+    if let Some(detail) = socket_path_too_long(socket_path) {
+        return Err(CoordinatorError::Protocol {
+            operation: "starting the coordinator",
+            detail,
+        });
+    }
     let client = Client::new(socket_path.to_path_buf());
     match client.ping() {
         Ok(_) => return Ok(client),
@@ -2142,6 +2150,47 @@ pub fn ensure_running(socket_path: &Path) -> Result<Client, CoordinatorError> {
     Err(CoordinatorError::Protocol {
         operation: "starting the coordinator",
         detail: "it did not answer within the start timeout".into(),
+    })
+}
+
+/// The longest Unix socket path the OS binds, in bytes: `sun_path` less its
+/// terminating NUL (104 on macOS and the BSDs, 108 on Linux). `None` where
+/// the coordinator listens on something else (Windows: loopback TCP).
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+const MAX_SOCKET_PATH_BYTES: Option<usize> = Some(103);
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))
+))]
+const MAX_SOCKET_PATH_BYTES: Option<usize> = Some(107);
+#[cfg(not(unix))]
+const MAX_SOCKET_PATH_BYTES: Option<usize> = None;
+
+/// Why `path` cannot be the coordinator's socket, if it is too long to bind.
+fn socket_path_too_long(path: &Path) -> Option<String> {
+    socket_path_over(path, MAX_SOCKET_PATH_BYTES?)
+}
+
+fn socket_path_over(path: &Path, max: usize) -> Option<String> {
+    let len = path.as_os_str().len();
+    (len > max).then(|| {
+        format!(
+            "the coordinator's socket path {} is {len} bytes, over the {max} this OS can bind; \
+             point RELAIS_STATE_DIR at a shorter directory",
+            path.display()
+        )
     })
 }
 
@@ -3195,5 +3244,17 @@ mod tests {
         let resolved = resolve_session_id(both, Some(7), 9);
         assert_eq!(resolved.id, "override-session");
         assert_eq!(resolved.source, SessionSource::Override);
+    }
+
+    #[test]
+    fn a_socket_path_over_the_os_limit_is_refused_with_the_remedy() {
+        let short = Path::new("/tmp/rl/relais.sock");
+        assert_eq!(socket_path_over(short, 103), None);
+        let long = PathBuf::from(format!("/tmp/{}/relais.sock", "d".repeat(120)));
+        let detail = socket_path_over(&long, 103).expect("too long");
+        assert!(detail.contains("over the 103 this OS can bind"), "{detail}");
+        assert!(detail.contains("RELAIS_STATE_DIR"), "{detail}");
+        assert_eq!(socket_path_over(Path::new(&"a".repeat(103)), 103), None);
+        assert!(socket_path_over(Path::new(&"a".repeat(104)), 103).is_some());
     }
 }
