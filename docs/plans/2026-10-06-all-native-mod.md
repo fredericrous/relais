@@ -266,3 +266,37 @@ Each package: `make check` (which now includes `claude plugin test claude-plugin
 - In the same session, the model spawns an unrelated agent with `isolation: "worktree"` → it runs in Claude Code's own `.claude/worktrees/agent-<id>` on a `worktree-agent-<id>` branch, and the relais hook journal shows no `WorktreeCreate` entry.
 
 <!-- panel: repos=relais adds=lang:typescript,ui reviewers=backend,lang:typescript,ui-design,ux-research,react,game-ux body-sha=ba59de77b8c9 -->
+
+## Decision log
+
+**2026-10-06, S0** (Claude Code 2.1.291; a probe plugin `relais-s0` with one shipped agent, driven in interactive sessions through a pty at 120 and 160 columns). The gate passes.
+
+| Item | Measured |
+|---|---|
+| mods load with no env var | yes: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS` is not needed (the first probe's failure was an invalid `node:fs` import) |
+| plugin agent naming | `<plugin>:<agent>` (`relais-s0:s0-worker`, `source=plugin`); `$.agent.spawn` of it works; it renders in the agents panel (`◯ relais-s0:s0-worker  relais d1`) |
+| `agent.offer` | returning `{isOffered:false}` keeps the type out of the model's list. **It also blocks resuming that agent** ("Agent type … is not offered in this session"), so the hook lets the type through while the mod's own `SendMessage` is in flight |
+| `turn.complete` count | one per subagent run, even with 6 tool calls; `$.agent.list()` shows `completed` ~150 ms later |
+| agent eviction | a completed agent leaves `$.agent.list()` ~30 s after it ends, and is still resumable 2 min later. **The end signal is `completed`/`failed`/`killed` or absent, after a turn** |
+| continuation | `$.tool.call SendMessage` resumes it in the same cwd (with the offer let through), with its own `turn.complete` |
+| `TaskStop` | stops a plugin agent (`task_type: local_agent`); status `killed`; one empty `turn.complete` follows |
+| model's SendMessage | refused by the mod's `tool.call` hook (origin `engine`); the mod's own passes (origin `{plugin: relais-s0}`) |
+| notifications | none for a plugin agent's first run; after a continued run: `prompt.submit` with origin `task-notification` and text starting `<task-notification>\n<task-id>{agentId}</task-id>`. The drop works |
+| verdict into the main loop | `$.prompt.submit({text})` from a timer or stream callback; refused from inside a `command.run` hook. The model reads "The relais-s0 plugin sent a message: …" |
+| `$.process.spawn` | a 64 KB line plus 5,000 lines arrived as one 114 KB chunk in 73 ms; the line splitter stays (chunking is not guaranteed) |
+| stdin | 200 KB to `wc -c` via `$.process.run` in 23 ms |
+| spawn → started | 189–307 ms over 5 spawns (the 120 s wait has room to spare) |
+| pane placement | unasked at session start: not placed at 120 columns (`reason: "unasked below 144 columns (120 now): …"`), placed at 160. From a command it is placed at 120 |
+| pane focus | `focus:false` is always refused ("focus is true or left out", host check). Opened with focus left out or true, text typed right after reached the prompt intact (0 characters lost) |
+| pane redraw | 250 events at 50/s → 154–162 renders, lag at most 23 ms (the bar was p95 at most 250 ms) |
+| `claude plugin validate` | **does not type-check**: a `register.ts` with two type errors passes. The gate is structural; the tests guard behaviour |
+| `claude plugin test` | runs with an empty `HOME`, no sign-in, in under 2 s. CI install of the pinned Claude Code is confirmed on the first push |
+| transcripts | written in a normal interactive session (main and `subagents/agent-<id>.jsonl`). A pty session that inherits the parent's `CLAUDE_*` variables (`CLAUDE_CODE_CHILD_SESSION`) writes none; the test driver strips them |
+| persistent install | deferred to M5 (local marketplace + `claude plugin install`, or `CLAUDE_CODE_PLUGIN_DIRS`), measured there with an isolated `HOME` |
+
+**Decisions taken from S0:**
+- `agent.offer` hides `relais:*` except while the mod resumes its own agent (a module flag set around its `SendMessage`).
+- A dispatch ends when its agent is `completed`, `failed`, `killed` or no longer listed, after at least one turn, or after the status moved since a continue.
+- The pane opens with focus left out, never `focus:false`. Placement follows `isPlaced`.
+- `$.prompt.submit` carries the verdict, called from the stream handler, never from inside a command hook.
+- No type check in the gate; the plugin's tests carry it.
