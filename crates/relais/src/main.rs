@@ -2167,24 +2167,47 @@ fn hook_command(dir: &Path) -> Result<CliOutcome, CliError> {
 }
 
 /// `relais hook`, run with no flags: read one payload on stdin, decide
-/// what to say about it, and say it (SPEC §23). Always accepts — a
-/// non-zero exit from a hook is reported to the session as a failure of
-/// the tool call it was watching, so a relais that cannot answer must be
-/// indistinguishable from a relais that had nothing to say. Every path
-/// that could fail (an unreadable settings file, an unreachable
-/// coordinator, a payload that is not JSON, a panic anywhere inside) is
-/// swallowed rather than surfaced; `relais doctor` is where any of that
-/// is reported as a finding.
+/// what to say about it, and say it (SPEC §23). Exits 0 except when the
+/// answer itself asks otherwise: a `WorktreeCreate` relais could not make
+/// a tree for exits 1 with the reason, because Claude Code refuses that
+/// agent either way and the reason is the only thing worth adding. For
+/// everything else a non-zero exit is reported to the session as a
+/// failure of the tool call it was watching, so a relais that cannot
+/// answer must be indistinguishable from a relais that had nothing to
+/// say. Every path that could fail (an unreadable settings file, an
+/// unreachable coordinator, a payload that is not JSON, a panic anywhere
+/// inside) is swallowed rather than surfaced; `relais doctor` is where
+/// any of that is reported as a finding.
 fn hook_respond_command() -> CliOutcome {
     // The whole body, not just `respond::handle`: reading stdin,
     // loading settings and journalling all run here too, and none of
     // them may take the process down with them any more than the
     // decision itself may.
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook_respond));
+    // An answer may ask for a non-zero exit (a worktree that could not be
+    // made); a panic still exits 0, as every hook failure always has.
+    let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook_respond)).unwrap_or(0);
+    if code != 0 {
+        std::process::exit(code);
+    }
     CliOutcome::Accepted
 }
 
-fn hook_respond() {
+/// Print an answer: stdout as rendered (one trailing newline), stderr
+/// when it has something to say. Returns the exit status it asks for.
+fn write_answer(answer: &relais::hook::decide::HookAnswer) -> i32 {
+    if let Some(mut text) = answer.stdout_payload() {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        print!("{text}");
+    }
+    if let Some(reason) = answer.stderr_payload() {
+        eprintln!("{reason}");
+    }
+    answer.exit_code()
+}
+
+fn hook_respond() -> i32 {
     use std::io::Read;
     let mut payload = Vec::new();
     // A truncated read leaves `payload` with whatever arrived so far;
@@ -2196,27 +2219,15 @@ fn hook_respond() {
 
     let Ok(socket) = relais::coordinator::socket_path() else {
         // No home directory: nothing to connect to and nowhere to
-        // journal. `decide_or_silent` still owes an answer for "the
-        // coordinator could not be reached" under this machine's own
-        // stance, so build one directly rather than skip the decision
-        // entirely.
-        let event = relais::hook::event::parse(&payload);
-        let answer = relais::hook::decide::decide_or_silent(
-            &event,
-            &settings,
-            None,
-            std::time::Duration::ZERO,
-        );
-        if let Some(text) = answer.stdout_payload() {
-            println!("{text}");
-        }
-        return;
+        // journal. The hook still owes an answer for "the coordinator
+        // could not be reached" under this machine's own stance, and a
+        // `WorktreeCreate` still owes a path or a reason.
+        let answer = relais::hook::respond::answer_without_home(&payload, &settings);
+        return write_answer(&answer);
     };
     let gate = relais::coordinator::RemoteGate::new(socket);
     let handled = relais::hook::respond::handle(&payload, &settings, &gate);
-    if let Some(text) = handled.answer.stdout_payload() {
-        println!("{text}");
-    }
+    let code = write_answer(&handled.answer);
     if let Ok(path) = paths::hook_journal_path() {
         let entry = relais::hook::respond::journal_entry(&payload, &handled);
         // Best effort, like every other step here: a journal write
@@ -2224,6 +2235,7 @@ fn hook_respond() {
         // answered above.
         let _ = relais::hook::respond::append_journal(&path, &entry);
     }
+    code
 }
 
 /// The machine's hook-admission settings, or the stated defaults when

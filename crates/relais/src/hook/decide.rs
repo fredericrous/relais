@@ -3,9 +3,14 @@
 //! A hook cannot refuse to answer, and it may never say yes on a person's
 //! behalf: a hook that green-lit a tool call would override that person's
 //! own permission settings, which is not this binary's business. So every
-//! case here resolves to
-//! exactly one of two things — stay silent, or refuse the tool call and say
-//! what was exceeded and what the person can do about it — and the pure
+//! case about a tool call resolves to one of three things — stay silent,
+//! refuse the tool call and say what was exceeded and what the person can
+//! do about it, or rewrite a marked call's input to exactly what relais
+//! asked for, with no permission decision attached (measured on Claude
+//! Code 2.1.291: the rewrite takes effect without one, so it grants
+//! nothing). Two answers belong to the `WorktreeCreate` event instead of
+//! a tool call: the path of the tree an isolated agent works in, or the
+//! reason one could not be made. The pure
 //! function that gets there reads no clock, touches no filesystem and makes
 //! no network call: every case can be read and tested without running a
 //! session.
@@ -13,13 +18,14 @@
 //! `decide` takes the event, the machine's own admission settings and
 //! whatever the coordinator answered, already resolved — it does not itself
 //! contact the coordinator, write a journal, touch the ledger or install
-//! anything. It decides, and [`HookAnswer::stdout_payload`] renders the
-//! decision into the one shape a hook may speak in.
+//! anything. It decides, and [`HookAnswer::stdout_payload`],
+//! [`HookAnswer::stderr_payload`] and [`HookAnswer::exit_code`] render the
+//! decision into what the hook prints and how it exits.
 //!
 //! `super::respond::handle` is the caller that wires this up: `relais
 //! hook`, run with no flags, asks the coordinator about a spawn, calls
-//! [`decide_or_silent`], prints [`HookAnswer::stdout_payload`] when there
-//! is one, and journals the firing. This module stays pure regardless —
+//! [`decide_or_silent`], prints the rendered answer, exits with its
+//! status, and journals the firing. This module stays pure regardless —
 //! the wiring is what changed, not the decision.
 //!
 //! `PostToolUseFailure` is deliberately not among the events this decides
@@ -32,7 +38,10 @@
 //! this — until then it is matched explicitly below, alongside every other
 //! phase, and resolves to silence like the rest.
 
+use std::path::PathBuf;
 use std::time::Duration;
+
+use serde_json::{json, Value};
 
 use super::event::{HookEvent, ToolCallPhase};
 use crate::admission::{Decision, Refusal as AdmissionRefusal};
@@ -124,11 +133,11 @@ impl Refusal {
     }
 }
 
-/// The one shape a hook may speak in. There is deliberately no variant that
+/// The shapes a hook may speak in. There is deliberately no variant that
 /// says yes on a person's behalf — see the module doc. There is also no
-/// variant that only advises: the hook denies or stays silent, never
-/// anything in between (SPEC §23 records this narrowing explicitly, so a
-/// reader finds a decision here rather than an oversight).
+/// variant that only advises: on a tool call the hook denies, rewrites a
+/// marked call's input, or stays silent (SPEC §23 records this explicitly,
+/// so a reader finds a decision here rather than an oversight).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookAnswer {
     /// Nothing to say: exit 0, nothing on stdout.
@@ -138,13 +147,49 @@ pub enum HookAnswer {
     /// `refusal.sentence()` always names what was exceeded and what the
     /// person can do about it.
     Refuse { refusal: Refusal },
+    /// Replace the tool call's input with exactly this, and decide
+    /// nothing else: no permission decision is printed, so the person's
+    /// own settings still rule the call.
+    Rewrite { input: Value },
+    /// The tree an isolated agent will work in, answering
+    /// `WorktreeCreate`.
+    WorktreePath { path: PathBuf },
+    /// No tree could be made: the reason goes to stderr and the hook
+    /// exits 1, which is how Claude Code learns the agent cannot start.
+    WorktreeFailed { reason: String },
 }
 
 impl HookAnswer {
-    /// The stdout payload for this answer: `None` for [`HookAnswer::Silent`]
-    /// — literally nothing is printed — and `Some` JSON for
-    /// [`HookAnswer::Refuse`]. Pure: it renders a string, it does not print
-    /// one; the caller that owns stdout does the actual write.
+    /// The process exit status this answer asks for: 1 for
+    /// [`HookAnswer::WorktreeFailed`], 0 for everything else.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            HookAnswer::WorktreeFailed { .. } => 1,
+            HookAnswer::Silent
+            | HookAnswer::Refuse { .. }
+            | HookAnswer::Rewrite { .. }
+            | HookAnswer::WorktreePath { .. } => 0,
+        }
+    }
+
+    /// What this answer writes to stderr: only a failed tree says
+    /// anything there.
+    pub fn stderr_payload(&self) -> Option<String> {
+        match self {
+            HookAnswer::WorktreeFailed { reason } => Some(reason.clone()),
+            HookAnswer::Silent
+            | HookAnswer::Refuse { .. }
+            | HookAnswer::Rewrite { .. }
+            | HookAnswer::WorktreePath { .. } => None,
+        }
+    }
+
+    /// The stdout payload for this answer: `None` when nothing is printed
+    /// ([`HookAnswer::Silent`], [`HookAnswer::WorktreeFailed`]), JSON for
+    /// [`HookAnswer::Refuse`] and [`HookAnswer::Rewrite`], and the bare
+    /// path plus one newline for [`HookAnswer::WorktreePath`] (the
+    /// caller prints it as is). Pure: it renders a string, it does not
+    /// print one; the caller that owns stdout does the actual write.
     ///
     /// The `hookSpecificOutput.permissionDecision` form, not the older
     /// top-level `{"decision":"block"}` one. Both were run against real
@@ -160,7 +205,17 @@ impl HookAnswer {
     /// anywhere reports a failure.
     pub fn stdout_payload(&self) -> Option<String> {
         match self {
-            HookAnswer::Silent => None,
+            HookAnswer::Silent | HookAnswer::WorktreeFailed { .. } => None,
+            HookAnswer::Rewrite { input } => Some(
+                json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "updatedInput": input,
+                    }
+                })
+                .to_string(),
+            ),
+            HookAnswer::WorktreePath { path } => Some(format!("{}\n", path.display())),
             HookAnswer::Refuse { refusal } => {
                 let reason = refusal.sentence();
                 Some(
@@ -201,6 +256,10 @@ pub fn decide(
         | HookEvent::SessionEnd(_)
         | HookEvent::SubagentStart(_)
         | HookEvent::SubagentStop(_)
+        // A continuation is not a spawn: nothing to admit, in any phase.
+        | HookEvent::SendMessageCall(_)
+        // Answered by `respond`, which makes the tree on disk.
+        | HookEvent::WorktreeCreate(_)
         | HookEvent::NotOurs => HookAnswer::Silent,
         HookEvent::AgentToolCall(call) => match call.phase {
             // Only `Pre` still holds the tool call open long enough to
@@ -213,6 +272,20 @@ pub fn decide(
             ToolCallPhase::PostFailure => HookAnswer::Silent,
         },
     }
+}
+
+/// The Agent call's input as relais asked for it: `subagent_type`,
+/// `model` and `prompt` replaced, `isolation` set to `"worktree"` and
+/// `run_in_background` set to true, every other field kept as sent. A
+/// parent that paraphrased or changed those fields cannot change what runs.
+pub fn rewrite_spawn(tool_input: &Value, subagent_type: &str, model: &str, prompt: &str) -> Value {
+    let mut fields = tool_input.as_object().cloned().unwrap_or_default();
+    fields.insert("subagent_type".into(), json!(subagent_type));
+    fields.insert("model".into(), json!(model));
+    fields.insert("prompt".into(), json!(prompt));
+    fields.insert("isolation".into(), json!("worktree"));
+    fields.insert("run_in_background".into(), json!(true));
+    Value::Object(fields)
 }
 
 /// Decide about one spawn (a `PreToolUse` on the Agent tool), given what
@@ -401,7 +474,8 @@ pub fn decide_or_silent(
 mod tests {
     use super::*;
     use crate::hook::event::{
-        AgentToolCall, SessionEnd, SessionStart, SubagentStart, SubagentStop,
+        AgentToolCall, SendMessageCall, SessionEnd, SessionStart, SubagentStart, SubagentStop,
+        WorktreeCreate,
     };
     use crate::ids::{AgentId, AgentType, PromptId, SessionId, ToolUseId};
     use crate::money::MicroUsd;
@@ -469,6 +543,19 @@ mod tests {
             phase,
             caller_agent_id: None,
             prompt_id: Some(PromptId::new("p1")),
+            tool_input: None,
+        })
+    }
+
+    fn send_message(phase: ToolCallPhase) -> HookEvent {
+        HookEvent::SendMessageCall(SendMessageCall {
+            session_id: SessionId::new("s1"),
+            tool_use_id: ToolUseId::new("t2"),
+            phase,
+            caller_agent_id: None,
+            to: Some("a1".into()),
+            message: Some("go on".into()),
+            tool_input: None,
         })
     }
 
@@ -509,7 +596,29 @@ mod tests {
                     agent_id: AgentId::new("a1"),
                     agent_type: AgentType::new("general-purpose"),
                     prompt_id: None,
+                    agent_transcript_path: None,
+                    last_assistant_message: None,
+                    cwd: None,
                 }),
+            ),
+            (
+                "WorktreeCreate",
+                HookEvent::WorktreeCreate(WorktreeCreate {
+                    session_id: SessionId::new("s1"),
+                    name: "agent-a1".into(),
+                    cwd: "/repo".into(),
+                }),
+            ),
+            ("SendMessage Pre", send_message(ToolCallPhase::Pre)),
+            (
+                "SendMessage Post",
+                send_message(ToolCallPhase::Post {
+                    launched_agent: None,
+                }),
+            ),
+            (
+                "SendMessage PostFailure",
+                send_message(ToolCallPhase::PostFailure),
             ),
             ("NotOurs", HookEvent::NotOurs),
             (
@@ -769,6 +878,82 @@ mod tests {
         assert!(payload.contains("\"permissionDecision\":\"deny\""));
         assert!(payload.contains("depth 4 exceeds"));
         assert!(!payload.to_ascii_lowercase().contains("allow"));
+    }
+
+    #[test]
+    fn a_rewrite_prints_updated_input_and_no_permission_decision() {
+        let input = json!({ "prompt": "p", "model": "haiku" });
+        let payload = HookAnswer::Rewrite {
+            input: input.clone(),
+        }
+        .stdout_payload()
+        .expect("a rewrite renders");
+        let value: Value = serde_json::from_str(&payload).expect("json");
+        assert_eq!(value["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(value["hookSpecificOutput"]["updatedInput"], input);
+        assert!(!payload.contains("permissionDecision"), "{payload}");
+    }
+
+    #[test]
+    fn rewrite_spawn_replaces_what_relais_asked_for_and_keeps_the_rest() {
+        let sent = json!({
+            "description": "e12 worker",
+            "subagent_type": "general-purpose",
+            "model": "opus",
+            "prompt": "do something else",
+            "isolation": "none",
+            "run_in_background": false,
+        });
+        let rewritten = rewrite_spawn(&sent, "relais-worker", "haiku", "the real prompt");
+        assert_eq!(
+            rewritten,
+            json!({
+                "description": "e12 worker",
+                "subagent_type": "relais-worker",
+                "model": "haiku",
+                "prompt": "the real prompt",
+                "isolation": "worktree",
+                "run_in_background": true,
+            })
+        );
+    }
+
+    #[test]
+    fn a_worktree_path_prints_bare_and_exits_zero() {
+        let answer = HookAnswer::WorktreePath {
+            path: "/repo/.claude/worktrees/agent-1".into(),
+        };
+        assert_eq!(
+            answer.stdout_payload().as_deref(),
+            Some("/repo/.claude/worktrees/agent-1\n")
+        );
+        assert_eq!(answer.stderr_payload(), None);
+        assert_eq!(answer.exit_code(), 0);
+    }
+
+    #[test]
+    fn a_failed_worktree_prints_the_reason_on_stderr_and_exits_one() {
+        let answer = HookAnswer::WorktreeFailed {
+            reason: "path exists".into(),
+        };
+        assert_eq!(answer.stdout_payload(), None);
+        assert_eq!(answer.stderr_payload().as_deref(), Some("path exists"));
+        assert_eq!(answer.exit_code(), 1);
+    }
+
+    #[test]
+    fn silent_and_refuse_exit_zero_with_nothing_on_stderr() {
+        let refuse = HookAnswer::Refuse {
+            refusal: Refusal {
+                rule: RefusalRule::QueueTimeout,
+                reason: "r".into(),
+                remedy: "m".into(),
+            },
+        };
+        for answer in [HookAnswer::Silent, refuse] {
+            assert_eq!(answer.exit_code(), 0);
+            assert_eq!(answer.stderr_payload(), None);
+        }
     }
 
     /// `decide_or_silent` is the boundary a caller actually uses: for every

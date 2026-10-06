@@ -8,6 +8,21 @@ missing here.
 
 ## Unreleased
 
+### Added
+
+- The hook can read and answer native-worker payloads (groundwork for
+  native workers; nothing installs the new event yet). It parses an Agent
+  call's `tool_input`, `SendMessage` calls, `WorktreeCreate`, and the
+  transcript path, last message and `cwd` of a `SubagentStop`. It may rewrite
+  a marked spawn's input to what relais asked for (`updatedInput` with no
+  permission decision, so the hook still never says yes for the person), and
+  `relais::native` defines the `[relais-dispatch: <id>]` run marker.
+- Once relais answers `WorktreeCreate`, it does so for every isolated spawn
+  on the machine: an unmarked one gets Claude Code's default tree
+  (`.claude/worktrees/<name>` on `worktree-<name>` from HEAD), removed again
+  on the agent's stop when nothing changed in it and kept otherwise. A tree
+  that cannot be made fails the spawn with the reason, exit status 1.
+
 ### Changed
 
 - A sandboxed worker may bind a local TCP port (#105): the worker settings

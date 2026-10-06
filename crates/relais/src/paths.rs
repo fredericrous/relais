@@ -129,6 +129,12 @@ pub fn hook_journal_path() -> Result<PathBuf, HomeUnset> {
     Ok(state_dir()?.join("hook_journal.jsonl"))
 }
 
+/// One record per default worktree the hook created for an isolated
+/// spawn (`hook::worktree`), at `<dir>/<session>/<name>.json`.
+pub fn hook_worktrees_dir() -> Result<PathBuf, HomeUnset> {
+    Ok(state_dir()?.join("hook-worktrees"))
+}
+
 /// Claude Code's own config directory relocator (SPEC §11): a session's
 /// transcripts live under it, at `<dir>/projects/<slug>/<session>.jsonl`.
 /// Named for Claude Code's own variable, not relais's — this is the

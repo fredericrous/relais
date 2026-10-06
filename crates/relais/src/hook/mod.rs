@@ -29,6 +29,7 @@ pub mod decide;
 pub mod event;
 pub mod pairing;
 pub mod respond;
+pub mod worktree;
 
 use std::fs;
 use std::io::Read;
