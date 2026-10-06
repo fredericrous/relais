@@ -4,8 +4,16 @@ import { event, line, settle, startedRun, startQueued } from './support.ts'
 const RUN = 'run-65d322006dd13-c35c'
 
 const phase = (seq: number, state: string) => event(RUN, seq, { kind: 'phase', state, reason: 'ok', detail: {} })
-const done = (outcome = 'accepted') =>
-  line({ relais: 'done', run: RUN, outcome, receipt: '/runs/r1/receipt.json', summary: 'one file changed, +3 -1' })
+// The shape relais writes: the summary is an object, `trial` only for a replay.
+const done = (outcome = 'accepted', extra: Record<string, unknown> = {}) =>
+  line({
+    relais: 'done',
+    run: RUN,
+    outcome,
+    receipt: '/runs/r1/receipt.json',
+    summary: { files_changed: 1, insertions: 3, deletions: 1 },
+    ...extra,
+  })
 
 const lastStatus = (engine: any) => engine.calls.statuses[engine.calls.statuses.length - 1]
 
@@ -41,13 +49,25 @@ test('done toasts the outcome, tells the model, and the status line keeps the ou
   const text = engine.calls.prompts[0].text
   expect(text).toContain('accepted')
   expect(text).toContain('/runs/r1/receipt.json')
-  expect(text).toContain('one file changed, +3 -1')
+  expect(text).toContain(`relais run ${RUN} finished: accepted.`)
+  expect(text).toContain('Changed: 1 file, +3 -1')
+  expect(text).not.toContain('Replay trial')
   expect(lastStatus(engine)).toContain('accepted')
   // It stays: nothing wipes it while time passes. Ten seconds outlasts
   // the 3 s toast merge and a 2 s poll; a full minute of 100 ms flushes
   // costs seconds of real time and proves nothing more.
   await tick(engine, 10000)
   expect(lastStatus(engine)).toContain('accepted')
+})
+
+test('a replay\'s done names the replay and its trial', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.stream.push('stdout', phase(0, 'running') + done('accepted', { trial: 'trial-65d3-r' }))
+  await settle(engine)
+  await tick(engine)
+  const text = engine.calls.prompts[0].text
+  expect(text).toContain(`relais replay ${RUN} finished: accepted.`)
+  expect(text).toContain('Replay trial: trial-65d3-r')
 })
 
 test('the kept outcome goes when the pane is opened', async ($: any, on: any) => {

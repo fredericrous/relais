@@ -419,6 +419,10 @@ enum DatasetCommand {
         /// no trial recorded, no usage recorded
         #[arg(long = "dry-run")]
         dry_run: bool,
+        /// Speak the protocol of `relais run --protocol` on stdout; how
+        /// the relais plugin starts a replay that spends
+        #[arg(long)]
+        protocol: bool,
     },
 }
 
@@ -849,14 +853,22 @@ fn main() {
 /// The protocol channel of `relais run --protocol` (SPEC §29): installed
 /// before the run starts, or refused on a platform that cannot.
 fn open_protocol(command: &Command) -> Result<Option<relais::protocol::Channel>, CliError> {
-    if let Command::Run { protocol: true, .. } = command {
-        return relais::protocol::install()
-            .map(Some)
-            .map_err(|e| CliError::Usage {
-                detail: format!("run --protocol: {e}"),
-            });
+    let run = matches!(command, Command::Run { protocol: true, .. });
+    let replay = matches!(
+        command,
+        Command::Dataset {
+            cmd: DatasetCommand::Replay { protocol: true, .. },
+        }
+    );
+    if !run && !replay {
+        return Ok(None);
     }
-    Ok(None)
+    let name = if replay { "dataset replay" } else { "run" };
+    relais::protocol::install()
+        .map(Some)
+        .map_err(|e| CliError::Usage {
+            detail: format!("{name} --protocol: {e}"),
+        })
 }
 
 /// Route one parsed invocation to its handler. Every handler returns the
@@ -934,7 +946,15 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
                 task,
                 recipe,
                 dry_run,
-            } => replay_command(&task, &recipe, dry_run),
+                protocol,
+            } => {
+                let host = std::env::var("RELAIS_HOST").ok();
+                let origin = relais::native::RunOrigin {
+                    protocol,
+                    host: host.as_deref(),
+                };
+                replay_command(&task, &recipe, dry_run, &origin)
+            }
         },
         Command::Recipe { cmd } => match cmd {
             RecipeCommand::List => recipe_list_command(),
@@ -2897,23 +2917,8 @@ fn run_command(
     // The worker attempts go to the relais plugin of the parent session;
     // everything else stays on the Claude backend.
     let prices = load_price_table()?;
-    {
-        let mut aliases: Vec<String> = repo.models.values().map(|m| m.id.clone()).collect();
-        aliases.sort();
-        aliases.dedup();
-        let observations = operational(ledger.model_observations(), "model observations")?;
-        let machine_toml = paths::machine_settings_path().map_err(CliError::Home)?;
-        let decided =
-            relais::native_pricing::preflight(&aliases, &prices, &observations, &machine_toml);
-        for warning in &decided.warnings {
-            eprintln!("{warning}");
-        }
-        if !decided.refusals.is_empty() {
-            for refusal in &decided.refusals {
-                eprintln!("relais run: {refusal}");
-            }
-            return Ok(CliOutcome::Blocked);
-        }
+    if let Some(blocked) = pricing_preflight("relais run", &repo, &prices, &ledger)? {
+        return Ok(blocked);
     }
     let native_backend = relais::adapter::native::NativeBackend::new(
         backend.as_ref(),
@@ -3127,7 +3132,65 @@ fn run_command(
 /// anything — it produces exactly one arm's result for one task, and it
 /// spends real money, subject to the ordinary ceilings ordinary work goes
 /// through (the same `execute` path `relais run` takes).
-fn replay_command(task: &str, recipe: &Path, dry_run: bool) -> Result<CliOutcome, CliError> {
+/// Refuses, before anything is dispatched, a policy naming a model the
+/// price table cannot price and no observation resolves (N5); the warnings
+/// go to stderr either way.
+fn pricing_preflight(
+    who: &str,
+    policy: &relais::policy::RepoPolicy,
+    prices: &relais::orchestration::PriceTable,
+    ledger: &relais::ledger::Ledger,
+) -> Result<Option<CliOutcome>, CliError> {
+    let mut aliases: Vec<String> = policy.models.values().map(|m| m.id.clone()).collect();
+    aliases.sort();
+    aliases.dedup();
+    let observations = operational(ledger.model_observations(), "model observations")?;
+    let machine_toml = paths::machine_settings_path().map_err(CliError::Home)?;
+    let decided = relais::native_pricing::preflight(&aliases, prices, &observations, &machine_toml);
+    for warning in &decided.warnings {
+        eprintln!("{warning}");
+    }
+    if decided.refusals.is_empty() {
+        return Ok(None);
+    }
+    for refusal in &decided.refusals {
+        eprintln!("{who}: {refusal}");
+    }
+    Ok(Some(CliOutcome::Blocked))
+}
+
+/// The `done` line of a replay, sent once its trial is recorded (or could
+/// not be): the plugin's verdict names the trial, and never precedes it.
+fn announce_replay_done(artifacts_dir: &Path, run: &str, outcome: &str, trial: Option<&str>) {
+    let artifacts = artifacts_dir.join(run);
+    let written = artifacts.join("receipt.json");
+    let receipt = written
+        .is_file()
+        .then(|| written.to_string_lossy().into_owned());
+    // Dropped on failure: the plugin that was reading is gone, and the
+    // replay's result is in the ledger.
+    let _ = relais::protocol::Wire::process().send(&relais::protocol::Request::Done {
+        run,
+        outcome,
+        receipt: receipt.as_deref(),
+        summary: relais::protocol::Summary::of_candidate(&artifacts),
+        trial,
+    });
+}
+
+fn replay_command(
+    task: &str,
+    recipe: &Path,
+    dry_run: bool,
+    origin: &relais::native::RunOrigin<'_>,
+) -> Result<CliOutcome, CliError> {
+    // A dry run spends nothing and is allowed anywhere; a spending replay
+    // starts only the way a run does.
+    if !dry_run {
+        if let Some(detail) = relais::native::origin_refusal(origin) {
+            return Err(CliError::Usage { detail });
+        }
+    }
     let (root, incumbent) = load_repo_policy()?;
     let candidate_text = std::fs::read_to_string(recipe).map_err(|cause| CliError::Read {
         what: "the candidate recipe",
@@ -3270,7 +3333,42 @@ fn replay_command(task: &str, recipe: &Path, dry_run: bool) -> Result<CliOutcome
 
     let machine = load_machine()?;
     let artifacts_dir = paths::runs_dir().map_err(CliError::Home)?;
+    let backend = match relais::adapter::claude::ClaudeBackend::discover() {
+        Ok(backend) => std::sync::Arc::from(backend),
+        Err(e) => {
+            eprintln!("relais dataset replay: {e}");
+            return Ok(CliOutcome::Blocked);
+        }
+    };
+    let socket = relais::coordinator::socket_path().map_err(CliError::Home)?;
+    if let Err(e) = relais::coordinator::ensure_running(&socket) {
+        eprintln!("relais dataset replay: blocked (admission_unavailable): {e}");
+        return Ok(CliOutcome::Blocked);
+    }
+    let gate = relais::coordinator::RemoteGate::new(socket);
+    let session = relais::coordinator::resolve_session();
+    // Before the checkout and before anything is dispatched: the plugin of
+    // this session is alive, on a Claude Code it supports.
+    let capabilities = backend.probe();
+    let installed = capabilities
+        .as_ref()
+        .and_then(|capabilities| capabilities.version.as_deref());
+    match run_refusal(&gate, &session.id, installed) {
+        Ok(None) => {}
+        Ok(Some(detail)) => return Err(CliError::Usage { detail }),
+        Err(e) => {
+            eprintln!("relais dataset replay: blocked (admission_unavailable): {e}");
+            return Ok(CliOutcome::Blocked);
+        }
+    }
     let ids = id_source();
+    let run_id = match ids.run_id() {
+        Ok(run_id) => run_id,
+        Err(e) => {
+            eprintln!("relais dataset replay: {e}");
+            return Ok(CliOutcome::OperationalFailure);
+        }
+    };
     let replay_id = match ids.mint_replay_trial() {
         Ok(id) => id,
         Err(e) => {
@@ -3295,26 +3393,32 @@ fn replay_command(task: &str, recipe: &Path, dry_run: bool) -> Result<CliOutcome
         ..source_contract.clone()
     };
 
-    let backend = match relais::adapter::claude::ClaudeBackend::discover() {
-        Ok(backend) => std::sync::Arc::from(backend),
-        Err(e) => {
-            eprintln!("relais dataset replay: {e}");
-            return Ok(CliOutcome::Blocked);
-        }
-    };
     let git = relais::workspace::SystemGit;
     let aval_resolver = relais::context::AvalCli::new(checkout_dir.clone());
     let hooks = relais::verify::AmontCli::new();
     let attest = relais::verify::AmontCli::new();
     let worker_env = relais::backend::LaunchEnv::from_process_env();
-    let socket = relais::coordinator::socket_path().map_err(CliError::Home)?;
-    if let Err(e) = relais::coordinator::ensure_running(&socket) {
-        eprintln!("relais dataset replay: blocked (admission_unavailable): {e}");
-        return Ok(CliOutcome::Blocked);
+    let prices = load_price_table()?;
+    if let Some(blocked) = pricing_preflight(
+        "relais dataset replay",
+        candidate.policy(),
+        &prices,
+        &ledger,
+    )? {
+        return Ok(blocked);
     }
-    let gate = relais::coordinator::RemoteGate::new(socket);
-
-    let session = relais::coordinator::resolve_session();
+    let native_backend = relais::adapter::native::NativeBackend::new(
+        backend.as_ref(),
+        &gate,
+        relais::adapter::native::Link {
+            run_id: run_id.as_str().to_string(),
+            session_id: session.id.clone(),
+            wire: relais::protocol::Wire::process(),
+            projects_dir: paths::claude_projects_dir().ok(),
+        },
+        relais::adapter::native::Waits::DEFAULT,
+        Some(prices),
+    );
     // Same placement as `relais run`: before `execute`, so it is visible
     // on every path rather than deferred to the end of a run that spends
     // real money and can take minutes.
@@ -3333,7 +3437,7 @@ fn replay_command(task: &str, recipe: &Path, dry_run: bool) -> Result<CliOutcome
         machine: &machine,
         ledger: &ledger,
         ids: &ids,
-        backend: backend.as_ref(),
+        backend: &native_backend,
         git: &git,
         hooks: &hooks,
         attest: &attest,
@@ -3349,8 +3453,8 @@ fn replay_command(task: &str, recipe: &Path, dry_run: bool) -> Result<CliOutcome
         heartbeat_every: std::time::Duration::from_secs(30),
         task_override: Some(&task_id),
         purpose: Some(RunPurpose::Replay),
-        run_id: None,
-        presentation: relais::backend::Presentation::Headless,
+        run_id: Some(run_id.clone()),
+        presentation: relais::backend::Presentation::Native,
         wire: relais::protocol::Wire::process(),
     });
     // Bring the replay's own refs into the live repository BEFORE the
@@ -3380,22 +3484,17 @@ fn replay_command(task: &str, recipe: &Path, dry_run: bool) -> Result<CliOutcome
         Ok(outcome) => outcome,
         Err(e) => {
             eprintln!("relais dataset replay: {e}");
+            announce_replay_done(&artifacts_dir, run_id.as_str(), "interrupted", None);
             return Ok(CliOutcome::OperationalFailure);
         }
     };
 
     // The purpose was written with the run row (see `RunConfig::purpose`),
     // so there is nothing to stamp here.
-
-    let (trial_outcome, accepted_without_escalation) =
-        live_trial::trial_outcome_of(&outcome.terminal);
-    let (trial_cost, duration_ms) = operational(
-        live_trial::settled_figures(&ledger, &outcome.run_id),
-        "dataset replay",
-    )?;
-
-    operational(
-        ledger.insert_replay_trial(&relais::ledger::NewReplayTrial {
+    let recorded = record_replay_trial(
+        &ledger,
+        &outcome,
+        &relais::ledger::NewReplayTrial {
             trial_id: &replay_id,
             task_id: &task_id,
             source_run_id: &source_run,
@@ -3406,19 +3505,28 @@ fn replay_command(task: &str, recipe: &Path, dry_run: bool) -> Result<CliOutcome
             verification_profile_hash: &replay_profile_hash,
             workspace_isolation: "fresh_checkout_no_accepted_answer",
             arm_run_id: &outcome.run_id,
-        }),
-        "dataset replay",
-    )?;
-    operational(
-        ledger.settle_trial(
-            &replay_id,
-            trial_outcome,
-            accepted_without_escalation,
-            trial_cost,
-            duration_ms,
-        ),
-        "dataset replay",
-    )?;
+        },
+    );
+    let trial_outcome = match recorded {
+        Ok(trial_outcome) => {
+            announce_replay_done(
+                &artifacts_dir,
+                outcome.run_id(),
+                outcome.state().as_str(),
+                Some(replay_id.as_str()),
+            );
+            trial_outcome
+        }
+        Err(e) => {
+            announce_replay_done(
+                &artifacts_dir,
+                outcome.run_id(),
+                outcome.state().as_str(),
+                None,
+            );
+            return Err(e);
+        }
+    };
 
     println!("replay run: {}", outcome.run_id());
     println!("replay record: {replay_id}");
@@ -3427,6 +3535,32 @@ fn replay_command(task: &str, recipe: &Path, dry_run: bool) -> Result<CliOutcome
         "this replay is one arm's result; it does not compare, score, rank or promote anything"
     );
     Ok(CliOutcome::Accepted)
+}
+
+/// Writes the replay's trial and settles it from the arm run's outcome.
+fn record_replay_trial(
+    ledger: &relais::ledger::Ledger,
+    outcome: &relais::runner::RunOutcome,
+    trial: &relais::ledger::NewReplayTrial<'_>,
+) -> Result<relais::ledger::TrialOutcome, CliError> {
+    let (trial_outcome, accepted_without_escalation) =
+        live_trial::trial_outcome_of(&outcome.terminal);
+    let (trial_cost, duration_ms) = operational(
+        live_trial::settled_figures(ledger, &outcome.run_id),
+        "dataset replay",
+    )?;
+    operational(ledger.insert_replay_trial(trial), "dataset replay")?;
+    operational(
+        ledger.settle_trial(
+            trial.trial_id,
+            trial_outcome,
+            accepted_without_escalation,
+            trial_cost,
+            duration_ms,
+        ),
+        "dataset replay",
+    )?;
+    Ok(trial_outcome)
 }
 
 /// `kind` as `list`/`show` print it — never `Debug`'s capitalised

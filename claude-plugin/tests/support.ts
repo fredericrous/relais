@@ -38,7 +38,8 @@ export function scriptedEngine(on: any, options: { session?: string; isPlaced?: 
   let nextAgent = 1
 
   // Each child's output, fed by the test one chunk at a time. A child is
-  // known by its task (`relais run --task <task> --protocol`).
+  // known by its task (`relais run --task <task> --protocol`, or `relais
+  // dataset replay --task <task> --recipe <recipe> --protocol`).
   const queues = new Map<string, { items: any[]; wake: (() => void) | undefined }>()
   const queueOf = (task: string) => {
     const queue = queues.get(task) ?? { items: [], wake: undefined }
@@ -70,7 +71,7 @@ export function scriptedEngine(on: any, options: { session?: string; isPlaced?: 
   })
   on('process.spawn', async function* (_$: any, e: any) {
     calls.spawn.push(e)
-    const queue = queueOf(e.argv[3])
+    const queue = queueOf(e.argv[e.argv.indexOf('--task') + 1])
     for (;;) {
       while (queue.items.length === 0) await new Promise<void>(resolve => (queue.wake = resolve))
       const next = queue.items.shift()

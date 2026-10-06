@@ -7,11 +7,12 @@ import { dispatchOfDescription, onTurn } from './agents.ts'
 import { HELLO_EVERY_MS, sendHello } from './callbacks.ts'
 import type { Fx } from './fx.ts'
 import { DENY_MESSAGE, isRelaisNotification, isRelaisType, relaisAddresses } from './guards.ts'
-import { childOf, onChunk, pump, reloadTimeline, startRun, statusOf } from './runs.ts'
+import { childOf, onChunk, pump, reloadTimeline, startReplay, startRun, statusOf } from './runs.ts'
 import { close, createStore, detach, every } from './store.ts'
 import { FLUSH_MS, openPane, renderPane, timelineLines } from './ui.ts'
 
 const RUN_TOOL = 'mcp__relais__run'
+const REPLAY_TOOL = 'mcp__relais__replay'
 const STATUS_TOOL = 'mcp__relais__status'
 
 // Every effect the sibling modules use, spelled on `$` here: `claude plugin
@@ -73,6 +74,20 @@ export function register(on: any) {
       },
     })
     await $.tool.register({
+      name: 'replay',
+      description:
+        "Replay a task's accepted relais run under a candidate recipe, in a scratch checkout, with native agents: one arm's result, recorded as a trial. Spends real money. Returns at once; the outcome arrives as a message.",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          task: { type: 'string', description: 'The id of the task whose accepted run to replay.' },
+          recipe: { type: 'string', description: 'Path to the candidate relais.toml.' },
+          cwd: { type: 'string', description: 'The repository to work in (absolute path).' },
+        },
+        required: ['task', 'recipe', 'cwd'],
+      },
+    })
+    await $.tool.register({
       name: 'status',
       description:
         "The phases, decisions, cost and latest output of relais runs: one run by id, or all of this session's.",
@@ -104,6 +119,15 @@ export function register(on: any) {
     const fx = effects($)
     ensurePump(fx)
     return { result: await startRun(fx, store, { task: e.task, cwd: e.cwd }) }
+  })
+
+  on('tool.call', { tool: REPLAY_TOOL }, async ($: any, e: any) => {
+    if (typeof e.task !== 'string' || typeof e.recipe !== 'string' || typeof e.cwd !== 'string') {
+      return { deny: 'relais replay needs a task, a recipe and a cwd (all text).' }
+    }
+    const fx = effects($)
+    ensurePump(fx)
+    return { result: await startReplay(fx, store, { task: e.task, recipe: e.recipe, cwd: e.cwd }) }
   })
 
   on('tool.call', { tool: STATUS_TOOL }, async ($: any, e: any) => ({

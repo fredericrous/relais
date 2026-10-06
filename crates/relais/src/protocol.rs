@@ -209,6 +209,9 @@ pub enum Request<'a> {
         outcome: &'a str,
         receipt: Option<&'a str>,
         summary: Option<Summary>,
+        /// The replay trial a `relais dataset replay` recorded for this run.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        trial: Option<&'a str>,
     },
 }
 
@@ -766,6 +769,7 @@ mod tests {
                 insertions: 2,
                 deletions: 3,
             }),
+            trial: None,
         })
         .expect("sent");
         let written: Vec<Vec<u8>> = rx.try_iter().collect();

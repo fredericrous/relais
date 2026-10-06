@@ -3924,3 +3924,234 @@ fn an_unseeded_envelope_runs_the_incumbent_and_records_no_trial() {
     assert_eq!(tw.trials_created(), 0);
     tw.world.stop_coordinator();
 }
+
+// M3b: a replay that spends runs inside a Claude Code session, through the
+// relais plugin, every dispatch a native agent.
+
+/// A world holding one accepted run, and what a replay of it takes: the
+/// task's id and a candidate recipe (the repository's own policy).
+fn world_with_accepted_run(name: &str) -> (World, String, PathBuf) {
+    let world = World::new(name);
+    // A replay checkout inherits the repository's identity from `origin`.
+    git(
+        &world.repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/acme/widgets.git",
+        ],
+    );
+    world.write_policy(1);
+    // A recipe covering the task, so a replay has an arm to run.
+    let policy_path = world.repo.join("relais.toml");
+    let policy = format!(
+        "{}\n[[recipes]]\nname = \"src-change\"\nscope_within = [\"src/**\"]\ntier = \"implementation\"\nrevision = 0\n",
+        std::fs::read_to_string(&policy_path).expect("policy")
+    );
+    std::fs::write(&policy_path, &policy).expect("policy with a recipe");
+    git(&world.repo, &["add", "relais.toml"]);
+    git(&world.repo, &["commit", "-q", "-m", "recipe"]);
+    let hash = RepoPolicy::from_toml_str(&policy)
+        .expect("valid policy")
+        .authority_hash();
+    world.write_machine(&hash, "");
+    let task = world.write_task_for("task.json", "an easy one", "optional");
+    let accepted = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(
+        accepted.status.code(),
+        Some(0),
+        "{}",
+        text(&accepted.stderr)
+    );
+    let run_id = World::run_id_of(&text(&accepted.stdout));
+    let ledger =
+        relais::ledger::Ledger::open(&world.state.join("ledger.sqlite")).expect("open ledger");
+    let task_id = ledger
+        .task_of_run(&relais::ids::RunId::from_stored(run_id))
+        .expect("query task")
+        .expect("the run is on record under a task");
+    let recipe = world.root.join("candidate.toml");
+    std::fs::copy(world.repo.join("relais.toml"), &recipe).expect("candidate recipe");
+    (world, task_id.as_str().to_string(), recipe)
+}
+
+const REPLAY_REFUSAL: &str = "relais run starts from Claude Code with the relais plugin";
+
+#[test]
+fn a_spending_replay_outside_the_plugin_is_refused_before_anything_runs() {
+    let (world, task_id, recipe) = world_with_accepted_run("replay-refused");
+    let recipe = recipe.to_string_lossy().to_string();
+    let launches = world.worker_launches();
+    let replay = ["dataset", "replay", "--task", &task_id, "--recipe", &recipe];
+    // No `--protocol`, with or without the host; `--protocol` without it.
+    for (extra, host) in [
+        (None, None),
+        (None, Some("claude-code-mod")),
+        (Some("--protocol"), None),
+    ] {
+        let mut cmd = world.command(&[]);
+        cmd.args(replay);
+        cmd.args(extra);
+        if let Some(host) = host {
+            cmd.env("RELAIS_HOST", host);
+        }
+        let out = cmd.output().expect("relais runs");
+        assert_ne!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        assert!(
+            text(&out.stderr).contains(REPLAY_REFUSAL),
+            "{}",
+            text(&out.stderr)
+        );
+    }
+    assert!(!world.state.join("worktrees").join("replay").exists());
+    assert_eq!(world.worker_launches(), launches);
+}
+
+#[test]
+fn a_spending_replay_without_a_fresh_hello_is_refused_before_anything_runs() {
+    let (world, task_id, recipe) = world_with_accepted_run("replay-no-hello");
+    let launches = world.worker_launches();
+    let out = world
+        // The plugin of the session that ran the accepted run said hello;
+        // this one is another session, whose plugin never did.
+        .command(&[
+            ("RELAIS_HOST", "claude-code-mod"),
+            ("RELAIS_SESSION_ID", "tab-other"),
+        ])
+        .args(["dataset", "replay", "--task", &task_id, "--recipe"])
+        .arg(&recipe)
+        .arg("--protocol")
+        .output()
+        .expect("relais runs");
+    let stderr = text(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("has not said hello"), "{stderr}");
+    assert!(!world.state.join("worktrees").join("replay").exists());
+    assert_eq!(world.worker_launches(), launches);
+}
+
+#[test]
+fn a_dry_run_replay_needs_no_plugin() {
+    let (world, task_id, recipe) = world_with_accepted_run("replay-dry");
+    let out = world
+        .command(&[])
+        .args(["dataset", "replay", "--task", &task_id, "--recipe"])
+        .arg(&recipe)
+        .arg("--dry-run")
+        .output()
+        .expect("relais runs");
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("dry run: nothing was dispatched"));
+}
+
+#[test]
+fn a_replay_naming_an_unpriced_model_is_refused_before_any_spawn() {
+    let (world, task_id, recipe) = world_with_accepted_run("replay-unpriced");
+    // The same machine with no price table: nothing the candidate names
+    // can be priced, so `relais run` would refuse it too.
+    let machine = world.config.join("machine.toml");
+    let text_of = std::fs::read_to_string(&machine).expect("machine.toml");
+    assert!(text_of.contains(PRICING));
+    std::fs::write(&machine, text_of.replace(PRICING, "")).expect("machine.toml");
+    let out = world.plugin().run(
+        &[
+            "dataset",
+            "replay",
+            "--task",
+            &task_id,
+            "--recipe",
+            recipe.to_str().unwrap(),
+            "--protocol",
+        ],
+        &[],
+    );
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert_ne!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("relais dataset replay: native_unpriced"),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("\"spawn\""), "{stdout}");
+}
+
+#[test]
+fn a_protocol_replay_sends_its_worker_as_a_spawn_line_and_ends_with_done() {
+    let (world, task_id, recipe) = world_with_accepted_run("replay-protocol");
+    let out = world.plugin().run(
+        &[
+            "dataset",
+            "replay",
+            "--task",
+            &task_id,
+            "--recipe",
+            recipe.to_str().unwrap(),
+            "--protocol",
+        ],
+        &[],
+    );
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    // Every line is a protocol object and the last is `done`; the events
+    // are what it returns, the requests are read here.
+    protocol_lines(&stdout);
+    let lines: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a protocol line"))
+        .collect();
+    let worker = lines
+        .iter()
+        .find(|line| line["relais"] == "spawn" && line["agent_kind"] == "worker")
+        .unwrap_or_else(|| panic!("no worker spawn line: {stdout}"));
+    // The attempt's worktree, cut from the scratch checkout: the replay's
+    // own run, not the run it replays.
+    let run_id = worker["run"].as_str().expect("a run id");
+    assert_eq!(
+        worker["cwd"].as_str(),
+        world
+            .state
+            .join("worktrees")
+            .join(run_id)
+            .join("task")
+            .to_str()
+    );
+    // The worktree was cut from the scratch checkout, not the live
+    // repository that holds the accepted answer: that is the repository the
+    // replay's run is recorded against.
+    let conn = rusqlite::Connection::open(world.state.join("ledger.sqlite")).expect("the ledger");
+    let repo_path: String = conn
+        .query_row(
+            "SELECT repo_path FROM runs WHERE id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .expect("the replay's run row");
+    let live = world.repo.canonicalize().expect("the live repository");
+    assert_ne!(
+        std::path::Path::new(&repo_path)
+            .canonicalize()
+            .unwrap_or_else(|_| repo_path.clone().into()),
+        live,
+        "the replay ran in the live repository"
+    );
+    // `done` comes once, last, after the trial is recorded, and names it.
+    assert_eq!(
+        lines.iter().filter(|line| line["relais"] == "done").count(),
+        1,
+        "{stdout}"
+    );
+    let done = lines.last().expect("a line");
+    assert_eq!(done["relais"], "done");
+    let trial = done["trial"]
+        .as_str()
+        .expect("done names the replay's trial");
+    let (arm_run, outcome): (String, Option<String>) = conn
+        .query_row(
+            "SELECT arm_run_id, outcome FROM trials WHERE trial_id = ?1",
+            [trial],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the trial `done` names is on record");
+    assert_eq!(arm_run, run_id);
+    assert!(outcome.is_some(), "the trial is settled before `done`");
+}

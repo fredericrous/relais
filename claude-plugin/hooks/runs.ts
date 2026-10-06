@@ -39,6 +39,22 @@ export async function pump(fx: Fx, store: Store) {
 }
 
 export async function startRun(fx: Fx, store: Store, input: { task: string; cwd: string }) {
+  await startChild(fx, store, ['relais', 'run', '--task', input.task, '--protocol'], input.cwd)
+  return `Started relais run for: ${input.task} (in ${input.cwd}). It runs in the relais pane and /relais-status; its outcome arrives here as a message when it ends.`
+}
+
+export async function startReplay(
+  fx: Fx,
+  store: Store,
+  input: { task: string; recipe: string; cwd: string },
+) {
+  const argv = ['relais', 'dataset', 'replay', '--task', input.task, '--recipe', input.recipe, '--protocol']
+  await startChild(fx, store, argv, input.cwd)
+  return `Started relais replay of ${input.task} under ${input.recipe} (in ${input.cwd}). It runs in the relais pane and /relais-status; its outcome arrives here as a message when it ends.`
+}
+
+// The one way a relais child starts: `run` and `replay` differ in argv only.
+async function startChild(fx: Fx, store: Store, argvOf: string[], cwd: string) {
   const session = await fx.session.id()
   store.sessions.add(session)
   store.heldOutcome = undefined
@@ -46,18 +62,17 @@ export async function startRun(fx: Fx, store: Store, input: { task: string; cwd:
   const now = await fx.clock.now()
   const key = `starting-${store.children.length + 1}`
   const request = {
-    argv: ['relais', 'run', '--task', input.task, '--protocol'],
-    cwd: input.cwd,
+    argv: argvOf,
+    cwd,
     env: { RELAIS_HOST: 'claude-code-mod', RELAIS_SESSION_ID: session },
   }
   const argv = JSON.stringify(request.argv)
-  const child: Child = { session, cwd: input.cwd, argv, exited: false, key }
+  const child: Child = { session, cwd, argv, exited: false, key }
   store.children.push(child)
   store.starting.push(child)
   store.models = { ...store.models, [key]: emptyRun(key, now) }
   detach(drain(fx, store, child, fx.process.spawn(request)))
   await announceRun(fx, store)
-  return `Started relais run for: ${input.task} (in ${input.cwd}). It runs in the relais pane and /relais-status; its outcome arrives here as a message when it ends.`
 }
 
 // The child a `process.spawn` request starts, if it is one of relais's runs.
@@ -167,11 +182,12 @@ async function onDone(fx: Fx, store: Store, child: Child, line: any, now: number
   store.heldOutcome = `${shortId(run)} ${outcome}`
   markDirty(store)
   toastOutcome(fx, run, outcome, receipt)
-  const summary = typeof line.summary === 'string' ? line.summary.slice(0, MAX_SUMMARY) : ''
+  const trial = typeof line.trial === 'string' ? line.trial : null
   const text = [
-    `relais run ${run} finished: ${outcome}.`,
+    `relais ${trial ? 'replay' : 'run'} ${run} finished: ${outcome}.`,
     receipt ? `Receipt: ${receipt}` : '',
-    summary,
+    summaryText(line.summary),
+    trial ? `Replay trial: ${trial}` : '',
   ]
     .filter(Boolean)
     .join('\n')
@@ -179,6 +195,17 @@ async function onDone(fx: Fx, store: Store, child: Child, line: any, now: number
   // be submitted from under a tool or command hook: the session's timer
   // (`pump`) sends it.
   store.verdicts.push(text)
+}
+
+// What relais's `done` says the candidate changed: an object
+// `{files_changed, insertions, deletions}`, or nothing.
+export function summaryText(summary: unknown): string {
+  if (typeof summary !== 'object' || summary === null) return ''
+  const { files_changed: files, insertions, deletions } = summary as Record<string, unknown>
+  if (typeof files !== 'number') return ''
+  const plus = typeof insertions === 'number' ? insertions : 0
+  const minus = typeof deletions === 'number' ? deletions : 0
+  return `Changed: ${files} file${files === 1 ? '' : 's'}, +${plus} -${minus}`.slice(0, MAX_SUMMARY)
 }
 
 // A child that exited with its run still live was cut off.

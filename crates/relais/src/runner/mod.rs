@@ -1311,12 +1311,19 @@ impl<'a> RunEngine<'a> {
             state: outcome.state().as_str().to_string(),
             receipt: receipt.clone(),
         });
-        if self.parent.is_none() {
+        // A replay's `done` waits for its trial to be recorded: its caller
+        // sends it (`relais dataset replay`).
+        let announces = match self.config.purpose {
+            Some(crate::lifecycle::RunPurpose::Replay) => false,
+            Some(crate::lifecycle::RunPurpose::TrialArm) | None => self.parent.is_none(),
+        };
+        if announces {
             let done = Request::Done {
                 run: self.run_id.as_str(),
                 outcome: outcome.state().as_str(),
                 receipt: receipt.as_deref(),
                 summary: Summary::of_candidate(&self.artifacts),
+                trial: None,
             };
             // Dropped on failure: the plugin that was reading is gone, the
             // run's outcome is in the ledger and in `events.jsonl`.

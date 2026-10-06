@@ -10,13 +10,18 @@ missing here.
 
 ### Changed
 
+- A spending `relais dataset replay` runs inside a Claude Code session too:
+  `--protocol`, started by the plugin's `replay` tool, every dispatch a native
+  agent; without the plugin it is refused like `relais run` (`--dry-run` is not),
+  and like a run it is refused up front for a model it cannot price. Its `done`
+  line comes after the replay trial is recorded and names it (`trial`).
 - A `relais run`'s reviewer and planner are native agents too, spawned through
   the plugin like its workers: `spawn` lines with `agent_kind` `reviewer` or
   `planner` and the `relais:relais-reviewer-…` / `relais:relais-planner-…`
   agent types, which the plugin now ships (reviewer: Read, Grep, Glob; planner:
   Read, Grep, Glob, Bash, 8 turns), one per model and effort like the workers.
   A reviewer or planner always spawns fresh; only a worker is continued for a
-  repair. `relais dataset replay` stays headless for now.
+  repair.
 - `relais run` talks to the relais plugin of the parent Claude Code session
   through protocol lines and `relais native` callbacks, and is always native
   for workers. A worker attempt goes out as a `spawn` line (`agent_kind`,

@@ -23,10 +23,12 @@ does **not** type-check `register.ts`; the tests carry the behaviour.
 ## What it does
 
 - **Tools and command.** At `session.start` it registers `mcp__relais__run`
-  (`{task, cwd}`) and `mcp__relais__status` (`{run?}`) and the command
-  `/relais-status`. `run` starts `relais run --task <task> --protocol` in
-  `cwd` with `RELAIS_HOST=claude-code-mod` and `RELAIS_SESSION_ID=<session>`
-  and returns at once. It says `relais native hello --session <id>` at
+  (`{task, cwd}`), `mcp__relais__replay` (`{task, recipe, cwd}`) and
+  `mcp__relais__status` (`{run?}`) and the command `/relais-status`. `run`
+  starts `relais run --task <task> --protocol` in `cwd` with
+  `RELAIS_HOST=claude-code-mod` and `RELAIS_SESSION_ID=<session>` and returns
+  at once; `replay` starts `relais dataset replay --task <task> --recipe
+  <recipe> --protocol` the same way. It says `relais native hello --session <id>` at
   `session.start` and every 30 s.
 - **The protocol.** relais's stdout is JSON lines `{"relais": …}`; a pure line
   splitter reassembles them from the child's chunks and ignores anything else.

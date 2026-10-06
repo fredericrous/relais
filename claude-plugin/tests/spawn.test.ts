@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { nativeCalls, settle, spawnLine, startedRun, startQueued } from './support.ts'
+import { nativeCalls, scriptedEngine, settle, spawnLine, startedRun, startQueued } from './support.ts'
 
 test('the run tool starts relais with the protocol flag, the host and the session', async ($: any, on: any) => {
   const engine = await startedRun($, on)
@@ -60,4 +60,43 @@ test('a stop line stops the agent through TaskStop', async ($: any, on: any) => 
   const stops = engine.calls.tool.filter((t: any) => t.tool === 'TaskStop')
   expect(stops.length).toBe(1)
   expect(stops[0].task_id).toBe('agent-1')
+})
+
+const REPLAY = { tool: 'mcp__relais__replay', task: 'fix it', recipe: '/tmp/candidate.toml', cwd: '/repo' }
+
+async function startedReplay($: any, on: any) {
+  const engine = scriptedEngine(on)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await settle(engine)
+  await $.tool.call(REPLAY)
+  await startQueued(engine)
+  return engine
+}
+
+test('the replay tool starts relais dataset replay with the protocol flag, the host and the session', async ($: any, on: any) => {
+  const engine = await startedReplay($, on)
+  const [child] = engine.calls.spawn
+  expect(child.argv).toEqual(['relais', 'dataset', 'replay', '--task', 'fix it', '--recipe', '/tmp/candidate.toml', '--protocol'])
+  expect(child.cwd).toBe('/repo')
+  expect(child.env).toEqual({ RELAIS_HOST: 'claude-code-mod', RELAIS_SESSION_ID: 'session-1' })
+})
+
+test("a replay's spawn line spawns an agent in the hook-chosen cwd like a run's", async ($: any, on: any) => {
+  const engine = await startedReplay($, on)
+  engine.stream.push('stdout', spawnLine('d1', { cwd: '/scratch/replay-1' }))
+  await settle(engine)
+  expect(engine.calls.spawned.length).toBe(1)
+  expect(engine.calls.spawned[0].cwd).toBe('/scratch/replay-1')
+  expect(engine.calls.spawned[0].description).toBe('relais d1')
+})
+
+test('a replay without a recipe is denied and starts nothing', async ($: any, on: any) => {
+  const engine = scriptedEngine(on)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await settle(engine)
+  const { recipe: _recipe, ...withoutRecipe } = REPLAY
+  const reply = await $.tool.call(withoutRecipe)
+  expect(reply.deny).toContain('needs a task, a recipe and a cwd')
+  await startQueued(engine)
+  expect(engine.calls.spawn.length).toBe(0)
 })
