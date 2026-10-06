@@ -161,4 +161,26 @@ Each package: `make check`, falsification of its key test with a forced rebuild,
 - **Headless `relais run` unchanged:** `relais run` on the same small change task, no `--native` → `accepted` with a `managed_run` dispatch, as before this change.
 - **Latency measured:** the time from a `RELAIS-SPAWN` line to its bind, p50 and maximum over 10 runs, compared with the 120 s spawn wait.
 
+## Decision log
+
+**2026-10-06, S0 results** (Claude Code 2.1.291, a `claude -p --model haiku` parent, a logging hook in a scratch repo). The gate passes: option A.
+
+| # | Question | Result |
+|---|---|---|
+| E0 | `relais doctor --probe-hooks` | PreToolUse, PostToolUse, SubagentStart, SubagentStop, SessionStart and SessionEnd fire. SubagentStop carries `agent_transcript_path`, `last_assistant_message`, `stop_hook_active`, `effort`. PostToolUseFailure did not fire (as before). |
+| E1 | `updatedInput` on `PreToolUse(Agent)` | A rewritten `subagent_type` and `model` run (transcript model haiku, `.meta.json` agentType the rewritten one). **No `permissionDecision` is needed.** The hook's tool name is `Agent`. |
+| E2 | A subagent's `Bash` rewritten with a `cd X &&` prefix | Runs; the command's file lands in X. (B's mechanism works, but B is not needed.) |
+| E3 | `WorktreeCreate` supplying a path | **Works.** The subagent works in the hook's path. The payload's `name` is `agent-<agentId>`, the same id SubagentStart reports, and it fires about 90 ms after `PreToolUse(Agent)`. Claude Code did not remove the tree afterwards. |
+| E4 | `SendMessage` continuing a finished subagent | `{to: <agentId>, message, summary}` continues it. SubagentStart and SubagentStop fire again with the same `agent_id`, and records append to the same `agent-<id>.jsonl` (8 records for 4 distinct `message.id`: per-id dedup is required). |
+| E5 | Frontmatter `effort:` and `maxTurns:` | Both honoured (partial result after 3 turns; transcript `effort` low). |
+| E6 | Permission modes | In `default` and `dontAsk`, the rewritten call runs with no decision. `ask` in `-p` is refused. |
+| E7 | Monitor following a background Bash | `tail -f` on the output file streams lines; the parent called `Agent` on seeing a `SPAWN-NOW` line (+22 s from start). |
+
+Not measured, and why it does not matter: a marked spawn with the coordinator stopped is relais's own code (N1 tests it); records written before `PostToolUse` are covered by booking by `message.id`; hook latency on unmarked `Bash` only mattered under B.
+
+**Decisions taken from S0:**
+- **Option A.** Worker definitions carry `isolation: worktree`; the hook answers `WorktreeCreate` with the pending dispatch's prepared tree. The pairing is the dispatch the same session's `PreToolUse(Agent)` just rewrote, and the `agent-<id>` name binds it, before `PostToolUse`. B's Bash rewrite and Edit/Write confinement are dropped, and so is the widened matcher.
+- **No `allow`.** The rewrite answers `updatedInput` alone, with no `permissionDecision`. SPEC §23's rule "the hook never says yes on a person's behalf" therefore stays as it is; the per-mode allow/ask table above is not built. SPEC gains one sentence: the hook may rewrite a marked call's input to what relais itself asked for, which grants nothing.
+- The hook matcher gains `SendMessage` and the `WorktreeCreate` event; `SendMessage` input is `to` and `message`.
+
 <!-- panel: repos=relais adds= reviewers=backend body-sha=ebe649d81b94 -->
