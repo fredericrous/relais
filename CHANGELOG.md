@@ -6,6 +6,18 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## Unreleased
+
+### Changed
+
+- A sandboxed worker may bind a local TCP port (#105): the worker settings
+  set `network.allowLocalBinding`, so tests that start a local server (Go
+  `httptest`, envtest, Node test servers) pass inside the sandbox, where they
+  failed with EPERM. This covers `0.0.0.0`, so such a server is reachable from
+  the LAN while it runs; outbound stays limited to the allowlist. The probe
+  gains a `local-bind` step (probe version 7: run
+  `relais doctor --verify-sandbox` once).
+
 ## v0.9.0
 
 Workers can run inside the OS sandbox instead of a list of allowed command
