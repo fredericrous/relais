@@ -44,9 +44,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use super::event::{HookEvent, ToolCallPhase};
-use crate::admission::{
-    ClaimOutcome, Decision, Refusal as AdmissionRefusal, StopNativeOutcome, WorktreeOutcome,
-};
+use crate::admission::{ClaimOutcome, Decision, Refusal as AdmissionRefusal, StopNativeOutcome};
 use crate::policy::{CoordinatorUnreachableBehavior, HookAdmissionSettings};
 
 /// Which rule produced a refusal. Spans both this module's own rules — a
@@ -497,15 +495,6 @@ pub fn decide_unmarked_message(
         Some(Recipient::RelaisWorker) => refuse_native(NativeRefusal::BehindRelais),
         Some(Recipient::Other) => HookAnswer::Silent,
         None => decide_unreachable(settings),
-    }
-}
-
-/// `WorktreeCreate`, given whether relais has a claimed spawn waiting for
-/// its tree: the tree is relais's, or `None` and the default tree is made.
-pub fn decide_native_tree(outcome: Option<WorktreeOutcome>) -> Option<HookAnswer> {
-    match outcome {
-        Some(WorktreeOutcome::Path { path }) => Some(HookAnswer::WorktreePath { path }),
-        Some(WorktreeOutcome::NotNative) | None => None,
     }
 }
 

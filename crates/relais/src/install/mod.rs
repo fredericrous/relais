@@ -394,8 +394,11 @@ must not edit files.
      `message`, exactly.
    Never send anything else to relais's agents, and never spawn one
    request twice: the hook refuses both. Do not work on the task
-   yourself while the run is going. When the background run ends, read
-   its outcome as in step 5.
+   yourself while the run is going. A worker finishing is not the run
+   finishing: relais still verifies, and may review, repair or escalate.
+   Keep following the output until relais prints its outcome line, and
+   do not end your turn before it: a run whose session ends goes with it.
+   Then read the outcome as in step 5.
    For a terminal or an unattended run, without Claude Code's agent
    rendering, run `relais run --task .relais/task.json` instead.
 
@@ -2277,6 +2280,8 @@ mod tests {
             "Never send anything else to relais's agents",
             "never spawn one\n   request twice",
             "relais run --task .relais/task.json",
+            "A worker finishing is not the run\n   finishing",
+            "do not end your turn before it",
         ] {
             assert!(skill.contains(instruction), "{instruction}\n{skill}");
         }

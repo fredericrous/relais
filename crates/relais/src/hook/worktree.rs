@@ -93,15 +93,12 @@ pub fn create_default(
             branch,
             base_sha,
         },
-        Err(reason) => {
-            undo(&root, &path, &branch);
-            return Err(reason);
-        }
+        Err(reason) => return Err(with_undo(reason, undo(&root, &path, &branch))),
     };
     let record_path = records.join(session_id).join(format!("{name}.json"));
     if let Err(e) = write_record(&record_path, &record) {
-        undo(&root, &path, &record.branch);
-        return Err(format!("could not record {}: {e}", path.display()));
+        let reason = format!("could not record {}: {e}", path.display());
+        return Err(with_undo(reason, undo(&root, &path, &record.branch)));
     }
     Ok(path)
 }
@@ -178,13 +175,31 @@ fn settle(record: &Record) -> Cleanup {
     }
 }
 
-/// Take a half-made tree back out. Best effort: the caller is already
-/// reporting the failure that led here.
-fn undo(root: &Path, path: &Path, branch: &str) {
+/// Take a half-made tree back out, returning what could not be undone: a
+/// tree or branch left behind with no record is one no cleanup will find,
+/// so the person is told about it with the failure that led here.
+fn undo(root: &Path, path: &Path, branch: &str) -> Vec<String> {
     let path_arg = path.to_string_lossy().into_owned();
-    // Best effort: the caller already returns the error that led here.
-    let _ = git_output(root, &["worktree", "remove", "--force", &path_arg]);
-    let _ = git_output(root, &["branch", "-D", branch]);
+    [
+        git_output(root, &["worktree", "remove", "--force", &path_arg])
+            .err()
+            .map(|e| format!("the tree {path_arg} is left behind ({e})")),
+        git_output(root, &["branch", "-D", branch])
+            .err()
+            .map(|e| format!("the branch {branch} is left behind ({e})")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// The failure that led to an undo, and whatever the undo left behind.
+fn with_undo(reason: String, left: Vec<String>) -> String {
+    if left.is_empty() {
+        reason
+    } else {
+        format!("{reason}; undoing it failed: {}", left.join("; "))
+    }
 }
 
 /// A name Claude Code chose, checked before it becomes part of a path and
@@ -220,6 +235,67 @@ fn git_output(dir: &Path, args: &[&str]) -> Result<String, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
+}
+
+/// The note a rewritten relais spawn leaves for its `WorktreeCreate`:
+/// how many of this session's spawns still await relais's tree. It lets a
+/// `WorktreeCreate` that cannot reach the coordinator tell a relais spawn
+/// (refused: a default tree is one relais would never judge) from anyone
+/// else's (the default tree, as always).
+fn pending_note(records: &Path, session_id: &str) -> PathBuf {
+    records.join(session_id).join("native-pending")
+}
+
+fn pending_count(note: &Path) -> u64 {
+    // A missing or unreadable note is no pending relais spawn: the
+    // `WorktreeCreate` then takes the default tree, as it does for anyone.
+    std::fs::read_to_string(note)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn write_pending(note: &Path, count: u64) -> std::io::Result<()> {
+    if count == 0 {
+        return match std::fs::remove_file(note) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            Ok(()) | Err(_) => Ok(()),
+        };
+    }
+    if let Some(parent) = note.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(note, count.to_string())
+}
+
+/// A marked spawn was rewritten: one more of this session's spawns awaits
+/// relais's tree.
+pub fn note_native_spawn(records: &Path, session_id: &str) -> std::io::Result<()> {
+    if !is_safe_component(session_id) {
+        return Err(std::io::Error::other(format!(
+            "refusing the session id {session_id:?}"
+        )));
+    }
+    let note = pending_note(records, session_id);
+    write_pending(&note, pending_count(&note).saturating_add(1))
+}
+
+/// A `WorktreeCreate` of this session was answered (or refused) for a
+/// relais spawn: take one pending spawn off the note. `true` when there was
+/// one to take.
+pub fn take_native_spawn(records: &Path, session_id: &str) -> bool {
+    if !is_safe_component(session_id) {
+        return false;
+    }
+    let note = pending_note(records, session_id);
+    let count = pending_count(&note);
+    if count == 0 {
+        return false;
+    }
+    // Best effort: a note left one too high refuses at most one later
+    // unreachable `WorktreeCreate` of this session, which says why.
+    let _ = write_pending(&note, count - 1);
+    true
 }
 
 /// Write a record owner-only, like the hook journal: it names a person's
@@ -449,5 +525,19 @@ mod tests {
             Cleanup::NoRecord
         );
         assert!(path.exists());
+    }
+
+    /// What an undo leaves behind travels with the failure that led to it.
+    #[test]
+    fn an_undo_that_leaves_something_behind_says_so() {
+        assert_eq!(with_undo("boom".into(), Vec::new()), "boom");
+        let said = with_undo(
+            "boom".into(),
+            vec!["the branch worktree-x is left behind (locked)".into()],
+        );
+        assert_eq!(
+            said,
+            "boom; undoing it failed: the branch worktree-x is left behind (locked)"
+        );
     }
 }

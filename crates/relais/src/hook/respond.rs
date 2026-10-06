@@ -101,7 +101,7 @@ pub fn answer_without_home(payload: &[u8], settings: &HookAdmissionSettings) -> 
         let event = event::parse(payload);
         // No coordinator to ask: a marked call is refused, whatever the
         // machine's stance says.
-        let answer = match native::handle(&event, settings, None) {
+        let answer = match native::handle(&event, settings, None, None) {
             Native::Answered { answer, .. } => return answer,
             Native::Passed { .. } | Native::Unconcerned => {
                 decide_or_silent(&event, settings, None, Duration::ZERO)
@@ -119,7 +119,7 @@ fn handle_inner(
     records: Option<&Path>,
 ) -> Handled {
     let event = event::parse(payload);
-    let native = match native::handle(&event, settings, Some(gate)) {
+    let native = match native::handle(&event, settings, Some(gate), records) {
         // A native firing is answered here and goes no further: a marked
         // call is never admitted under the session's own run, so it is
         // charged once, and its dispatch is never withdrawn from here.

@@ -13,12 +13,15 @@
 //! admitted under the native run when the runner sent its dispatch, so it
 //! is charged once.
 
+use std::path::Path;
+
 use serde_json::Value;
 
 use super::decide::{self, HookAnswer, Recipient};
 use super::event::{AgentToolCall, SendMessageCall, ToolCallPhase, WorktreeCreate};
 use super::event::{HookEvent, SubagentStop};
-use crate::admission::{BindNativeOutcome, ClaimOutcome, Gate, GateError};
+use super::worktree as trees;
+use crate::admission::{BindNativeOutcome, ClaimOutcome, Gate, GateError, WorktreeOutcome};
 use crate::native::{find_marker, Marker};
 use crate::policy::HookAdmissionSettings;
 
@@ -46,10 +49,18 @@ pub enum NativePath {
     NativeTree,
     /// A `WorktreeCreate` no native dispatch claimed: the default tree.
     NotNativeTree,
+    /// A `WorktreeCreate` that could not reach the coordinator: refused
+    /// when this session has a rewritten relais spawn awaiting its tree,
+    /// the default tree otherwise.
+    TreeUnreachable,
     /// A `SubagentStop` of a native dispatch's agent.
     NativeStop,
     /// A `SubagentStop` no native dispatch claimed: today's handling.
     NotNativeStop,
+    /// A `SubagentStop` that could not reach the coordinator: today's
+    /// handling, and the stop of a native dispatch, if it was one, is lost
+    /// (its runner ends at its wall time).
+    StopUnreachable,
     /// An unmarked message to the agent behind a native dispatch: refused.
     MessageBehindRelais,
     /// An unmarked message to any other agent.
@@ -68,8 +79,10 @@ impl NativePath {
             Self::BindSkipped => "bind_skipped",
             Self::NativeTree => "native_tree",
             Self::NotNativeTree => "not_native_tree",
+            Self::TreeUnreachable => "tree_unreachable",
             Self::NativeStop => "native_stop",
             Self::NotNativeStop => "not_native_stop",
+            Self::StopUnreachable => "stop_unreachable",
             Self::MessageBehindRelais => "message_behind_relais",
             Self::MessageUnconcerned => "message_unconcerned",
         }
@@ -97,11 +110,12 @@ pub fn handle(
     event: &HookEvent,
     settings: &HookAdmissionSettings,
     gate: Option<&dyn Gate>,
+    records: Option<&Path>,
 ) -> Native {
     match event {
-        HookEvent::AgentToolCall(call) => agent_call(call, gate),
+        HookEvent::AgentToolCall(call) => agent_call(call, gate, records),
         HookEvent::SendMessageCall(call) => message_call(call, settings, gate),
-        HookEvent::WorktreeCreate(create) => worktree(create, gate),
+        HookEvent::WorktreeCreate(create) => worktree(create, gate, records),
         HookEvent::SubagentStop(stop) => subagent_stop(stop, gate),
         HookEvent::SessionStart(_)
         | HookEvent::SessionEnd(_)
@@ -120,6 +134,18 @@ fn ask<T>(
     // The error says why the call failed; what the hook does about it does
     // not depend on the reason, and a hook has nowhere to report it.
     gate.and_then(|gate| call(gate).ok())
+}
+
+/// One coordinator call, keeping why it could not be made: a tree or a
+/// stop has to tell "not a native dispatch's" from "could not ask".
+fn reach<T>(
+    gate: Option<&dyn Gate>,
+    call: impl FnOnce(&dyn Gate) -> Result<T, GateError>,
+) -> Result<T, String> {
+    match gate {
+        Some(gate) => call(gate).map_err(|e| e.to_string()),
+        None => Err("this machine has no coordinator to ask".to_string()),
+    }
 }
 
 fn text_of<'a>(input: Option<&'a Value>, key: &str) -> &'a str {
@@ -147,7 +173,7 @@ fn claim_path(claim: &Option<ClaimOutcome>) -> NativePath {
     }
 }
 
-fn agent_call(call: &AgentToolCall, gate: Option<&dyn Gate>) -> Native {
+fn agent_call(call: &AgentToolCall, gate: Option<&dyn Gate>, records: Option<&Path>) -> Native {
     let marker = find_marker(text_of(call.tool_input.as_ref(), "prompt"));
     let dispatch_id = match marker {
         Marker::None => return Native::Unconcerned,
@@ -170,6 +196,13 @@ fn agent_call(call: &AgentToolCall, gate: Option<&dyn Gate>) -> Native {
             let claim = ask(gate, |gate| {
                 gate.claim_native(call.session_id.as_str(), &dispatch_id, None)
             });
+            if let (Some(ClaimOutcome::Spawn { .. }), Some(records)) = (&claim, records) {
+                // Best effort: without the note, a `WorktreeCreate` that
+                // then cannot reach the coordinator gives this spawn the
+                // default tree; the dispatch's bind refuses that tree's
+                // name, so the run still ends rather than judging it.
+                let _ = trees::note_native_spawn(records, call.session_id.as_str());
+            }
             Native::Answered {
                 path: claim_path(&claim),
                 answer: decide::decide_marked_spawn(call.tool_input.as_ref(), claim),
@@ -257,23 +290,42 @@ fn message_call(
     }
 }
 
-fn worktree(create: &WorktreeCreate, gate: Option<&dyn Gate>) -> Native {
-    let outcome = ask(gate, |gate| {
-        gate.native_worktree(create.session_id.as_str(), &create.name)
-    });
-    match decide::decide_native_tree(outcome) {
-        Some(answer) => Native::Answered {
-            answer,
-            path: NativePath::NativeTree,
-        },
-        None => Native::Passed {
+fn worktree(create: &WorktreeCreate, gate: Option<&dyn Gate>, records: Option<&Path>) -> Native {
+    let session = create.session_id.as_str();
+    let outcome = reach(gate, |gate| gate.native_worktree(session, &create.name));
+    let took_pending = || records.is_some_and(|records| trees::take_native_spawn(records, session));
+    match outcome {
+        Ok(WorktreeOutcome::Path { path }) => {
+            took_pending();
+            Native::Answered {
+                answer: HookAnswer::WorktreePath { path },
+                path: NativePath::NativeTree,
+            }
+        }
+        Ok(WorktreeOutcome::NotNative) => Native::Passed {
             path: NativePath::NotNativeTree,
+        },
+        // A relais spawn of this session awaits its tree and the coordinator
+        // cannot say which: refused, never a default tree relais would not
+        // judge. Anyone else's spawn gets the default tree, as always.
+        Err(cause) if took_pending() => Native::Answered {
+            answer: HookAnswer::WorktreeFailed {
+                reason: format!(
+                    "a relais spawn of this session needs relais's prepared worktree, and the \
+                     coordinator could not be reached to name it ({cause}); refused rather than \
+                     given a default tree relais would never judge"
+                ),
+            },
+            path: NativePath::TreeUnreachable,
+        },
+        Err(_) => Native::Passed {
+            path: NativePath::TreeUnreachable,
         },
     }
 }
 
 fn subagent_stop(stop: &SubagentStop, gate: Option<&dyn Gate>) -> Native {
-    let outcome = ask(gate, |gate| {
+    let outcome = reach(gate, |gate| {
         gate.stop_native(
             stop.session_id.as_str(),
             stop.agent_id.as_str(),
@@ -281,13 +333,18 @@ fn subagent_stop(stop: &SubagentStop, gate: Option<&dyn Gate>) -> Native {
             stop.last_assistant_message.as_deref(),
         )
     });
-    match decide::decide_native_stop(outcome) {
-        Some(answer) => Native::Answered {
-            answer,
-            path: NativePath::NativeStop,
+    match outcome {
+        Ok(outcome) => match decide::decide_native_stop(Some(outcome)) {
+            Some(answer) => Native::Answered {
+                answer,
+                path: NativePath::NativeStop,
+            },
+            None => Native::Passed {
+                path: NativePath::NotNativeStop,
+            },
         },
-        None => Native::Passed {
-            path: NativePath::NotNativeStop,
+        Err(_) => Native::Passed {
+            path: NativePath::StopUnreachable,
         },
     }
 }
@@ -572,6 +629,18 @@ mod tests {
     impl Gate for Down {
         fn register_run(&self, _: &RunRegistration) -> GateResult<()> {
             Err(down("register_run"))
+        }
+        fn native_worktree(&self, _: &str, _: &str) -> GateResult<WorktreeOutcome> {
+            Err(down("native_worktree"))
+        }
+        fn stop_native(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&Path>,
+            _: Option<&str>,
+        ) -> GateResult<crate::admission::StopNativeOutcome> {
+            Err(down("stop_native"))
         }
         fn admit(&self, _: &DispatchRequest) -> GateResult<Decision> {
             Err(down("admit"))
@@ -957,5 +1026,66 @@ mod tests {
         };
         assert!(path.ends_with(".claude/worktrees/agent-agent-07"));
         assert_eq!(handled.native, Some(NativePath::NotNativeTree));
+    }
+
+    fn records_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "relais-native-records-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        dir
+    }
+
+    /// A rewritten relais spawn leaves a note; its `WorktreeCreate` that
+    /// cannot reach the coordinator is then refused with the reason, never
+    /// given a default tree relais would not judge. The note is consumed:
+    /// the next unreachable `WorktreeCreate` of the session is anyone's,
+    /// and goes to the default tree as always.
+    #[test]
+    fn a_relais_spawns_tree_with_the_coordinator_down_is_refused_not_defaulted() {
+        let records = records_dir("tree-down");
+        let gate = LocalGate::new(ConcurrencyLimits::default());
+        request(&gate, "d1", &spawn_ask("d1"));
+        let claimed = handle_in(&pre_spawn("d1"), &carry_on(), &gate, Some(&records));
+        assert!(matches!(claimed.answer, HookAnswer::Rewrite { .. }));
+
+        let refused = handle_in(
+            &worktree_create("agent-a1", Path::new("/nonexistent-repo")),
+            &carry_on(),
+            &Down,
+            Some(&records),
+        );
+        assert_eq!(refused.native, Some(NativePath::TreeUnreachable));
+        let HookAnswer::WorktreeFailed { reason } = &refused.answer else {
+            panic!("expected a refusal, got {:?}", refused.answer);
+        };
+        assert!(reason.contains("relais spawn"), "{reason}");
+        assert!(reason.contains("no daemon"), "the cause is kept: {reason}");
+
+        let anyones = handle_in(
+            &worktree_create("agent-a2", Path::new("/nonexistent-repo")),
+            &carry_on(),
+            &Down,
+            Some(&records),
+        );
+        assert_eq!(anyones.native, Some(NativePath::TreeUnreachable));
+        if let HookAnswer::WorktreeFailed { reason } = &anyones.answer {
+            assert!(
+                !reason.contains("relais spawn"),
+                "the default tree was attempted: {reason}"
+            );
+        }
+        std::fs::remove_dir_all(&records).ok();
+    }
+
+    /// The journal tells "could not ask" from "not a native dispatch's".
+    #[test]
+    fn an_unreachable_stop_is_journalled_as_unreachable() {
+        let handled = handle_in(&stop("a1", "done"), &carry_on(), &Down, None);
+        assert_eq!(handled.native, Some(NativePath::StopUnreachable));
+        let gate = LocalGate::new(ConcurrencyLimits::default());
+        let ordinary = handle_in(&stop("a1", "done"), &carry_on(), &gate, None);
+        assert_eq!(ordinary.native, Some(NativePath::NotNativeStop));
     }
 }
