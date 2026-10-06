@@ -128,6 +128,7 @@ impl Backend for MockBackend {
             worker_claims_blockage: outcome.result_text.as_deref().is_some_and(claims_blockage),
             permission_denials: outcome.permission_denials,
             failure_detail: None,
+            booked_message_ids: Vec::new(),
         })
     }
 }

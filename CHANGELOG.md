@@ -68,6 +68,14 @@ missing here.
   still on the old matcher (`hook-wiring`). Run
   `relais install --claude --hooks --write` after upgrading.
 
+- A native worker's messages are counted once, whichever of `relais run
+  --native` and `relais usage import` reads its transcript first. The run
+  records the message ids it booked (ledger step v18, new table
+  `native_usage_messages`; an older binary does not understand it) and
+  removes any `orchestration_usage` row an earlier import made of them;
+  `usage import` skips those ids and its summary line says how many records
+  it skipped as already booked to a relais run.
+
 ### Changed
 
 - A sandboxed worker may bind a local TCP port (#105): the worker settings

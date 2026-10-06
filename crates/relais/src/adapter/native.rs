@@ -241,6 +241,7 @@ fn ended_result(spec: &LaunchSpec, ended: Ended, detail: String) -> LaunchResult
         worker_claims_blockage: false,
         permission_denials: Vec::new(),
         failure_detail: Some(detail),
+        booked_message_ids: Vec::new(),
     }
 }
 
@@ -477,6 +478,7 @@ impl<'a> NativeBackend<'a> {
             usage: booked.usage,
             permission_denials: Vec::new(),
             failure_detail: None,
+            booked_message_ids: fresh.into_iter().map(|record| record.message_id).collect(),
         }
     }
 
@@ -792,6 +794,41 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// The attempt names exactly the message ids it booked, and a
+    /// continuation's attempt does not name the ones an earlier attempt took.
+    #[test]
+    fn a_stopped_attempt_names_the_message_ids_it_booked_once() {
+        let headless = crate::adapter::mock::MockBackend::new(|_| panic!("no headless launch"));
+        let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
+        let backend = NativeBackend::writing_to(
+            &headless,
+            &gate,
+            "s1".into(),
+            Duration::from_secs(1),
+            None,
+            Box::new(std::io::sink()),
+        );
+        let dir = crate::test_support::short_temp_dir("native-booked");
+        let line = |id: &str| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"2026-10-06T10:00:00Z","message":{{"id":"{id}","model":"sonnet-x","usage":{{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation":{{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}}}}}}"#
+            )
+        };
+        let transcript = dir.join("agent-a1.jsonl");
+        std::fs::write(&transcript, format!("{}\n{}\n", line("m1"), line("m2"))).expect("written");
+        let stop = || {
+            backend.stopped_result(
+                &spec("sonnet", None),
+                "a1".into(),
+                Some(&transcript),
+                None,
+                Vec::new(),
+            )
+        };
+        assert_eq!(stop().booked_message_ids, ["m1", "m2"]);
+        assert!(stop().booked_message_ids.is_empty());
     }
 
     #[test]

@@ -235,4 +235,15 @@ Checks green, then `needs_review` with two findings, fixed by hand:
 
 Deliberate: no `maxTurns`. The attempt's wall time and the budget checked between attempts bound it, and a turn cap would stop a worker mid-edit. `make check` green (1,303 lib tests). Falsified: the matcher migration and the missing-definition refusal. Decision left open, to answer `salvaged` with the merge sha.
 
+**2026-10-06, N4** (run-65d2c0ea3d2d0-146d5, sonnet@medium, one attempt, $1.42). It added:
+- `LaunchResult.booked_message_ids`;
+- a `native_usage_messages` table (v18), written with the attempt's usage event in one transaction, which also deletes any `orchestration_usage` copy an earlier import made;
+- `usage import` skipping booked ids and reporting the count.
+
+Checks green, then `needs_review` with two findings, fixed by hand:
+- the import checked and inserted in two statements, so a native run committing in between left a message in both tables → the guard is now inside the insert (`WHERE NOT EXISTS`), one atomic statement;
+- no test went through a headless run → a runner test asserts no native rows and usage still booked.
+
+`make check` green (1,309 lib tests). Falsified: the insert guard. Decision left open, to answer `salvaged` with the merge sha.
+
 <!-- panel: repos=relais adds= reviewers=backend body-sha=ebe649d81b94 -->

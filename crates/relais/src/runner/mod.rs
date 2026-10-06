@@ -2240,7 +2240,11 @@ impl<'a> RunEngine<'a> {
             requested_effort,
             harness: self.harness.clone(),
         };
-        ledger.record_usage(&event)?;
+        if result.booked_message_ids.is_empty() {
+            ledger.record_usage(&event)?;
+        } else {
+            ledger.record_native_usage(&event, &result.booked_message_ids)?;
+        }
         progress.spend.fold(event.cost, usage.cost.completeness());
 
         // What the sandbox denied, however the attempt went: AFTER the cost
@@ -7166,6 +7170,33 @@ mod tests {
         );
         let review = fixture.artifacts.join(outcome.run_id()).join("review.txt");
         assert!(review.is_file(), "review evidence is retained");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A headless run books its usage as before: no transcript message is
+    /// claimed for the run, so `usage import` still counts the session's.
+    #[test]
+    fn a_headless_run_books_no_native_messages() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let backend = conditional_worker("relais task");
+        let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &backend);
+        assert!(matches!(outcome.terminal, Terminal::Accepted { .. }));
+        let conn = rusqlite::Connection::open(fixture.dir.join("ledger.sqlite")).expect("ledger");
+        let booked: i64 = conn
+            .query_row("SELECT COUNT(*) FROM native_usage_messages", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(booked, 0);
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events WHERE run_id = ?1",
+                [outcome.run_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert!(events > 0, "the attempt's usage is still booked");
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 

@@ -639,6 +639,11 @@ pub struct LaunchResult {
     /// the error it reported — for the interrupted transition's evidence.
     #[serde(default)]
     pub failure_detail: Option<String>,
+    /// The transcript message ids this attempt's usage was booked from:
+    /// only a native worker's, empty for every other launch. The runner
+    /// records them so `usage import` does not count them again (SPEC §11).
+    #[serde(default)]
+    pub booked_message_ids: Vec<String>,
 }
 
 impl LaunchResult {
@@ -900,6 +905,7 @@ mod tests {
             worker_claims_blockage: false,
             permission_denials: Vec::new(),
             failure_detail: None,
+            booked_message_ids: Vec::new(),
         };
         assert!(result.terminal_result_missing());
         let completed = LaunchResult {
@@ -931,6 +937,31 @@ mod tests {
             ..result
         };
         assert!(unreadable.terminal_result_missing());
+    }
+
+    #[test]
+    fn a_stored_result_without_booked_message_ids_still_parses() {
+        let mut stored = serde_json::to_value(LaunchResult {
+            dispatch_id: "disp-1".into(),
+            ended: Ended::Exited(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            result_text: None,
+            session_id: None,
+            effective_model: None,
+            usage: UsageReport::unknown(),
+            worker_claims_blockage: false,
+            permission_denials: Vec::new(),
+            failure_detail: None,
+            booked_message_ids: vec!["m1".into()],
+        })
+        .expect("serializes");
+        stored
+            .as_object_mut()
+            .expect("an object")
+            .remove("booked_message_ids");
+        let parsed: LaunchResult = serde_json::from_value(stored).expect("an old result parses");
+        assert!(parsed.booked_message_ids.is_empty());
     }
 
     /// `inclusive` described a cost, so it meant nothing without one,

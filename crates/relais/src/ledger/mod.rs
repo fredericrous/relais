@@ -24,7 +24,7 @@ use crate::outcome::{Outcome, OutcomeDetail, OutcomeKind};
 use crate::policy::Tier;
 use crate::route::RoutedBy;
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 17;
+pub const LEDGER_SCHEMA_VERSION: u64 = 18;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -1324,7 +1324,58 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ALTER TABLE trials ADD COLUMN arm_run_id TEXT;
     "#,
     ),
+    (
+        // The transcript messages a native worker's attempt was booked
+        // for (SPEC §11). A native worker is a subagent of the
+        // orchestrating session, so `usage import` meets the same
+        // messages; this table is how each is counted once, whichever
+        // reads the transcript first.
+        "v18",
+        r#"
+    CREATE TABLE native_usage_messages (
+        message_id TEXT PRIMARY KEY,
+        dispatch_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        recorded_at TEXT NOT NULL
+    );
+    "#,
+    ),
 ];
+
+/// The one `usage_events` insert: a duplicate event id is ignored.
+fn insert_usage_event(conn: &Connection, event: &UsageEvent) -> Result<bool> {
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO usage_events
+            (event_id, run_id, attempt_id, parent_event_id, model,
+             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+             cost_micros, cost_kind, completeness, inclusive, at,
+             phase, duration_ms, requested_model, requested_effort, harness)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                 ?15, ?16, ?17, ?18, ?19)",
+        params![
+            event.event_id,
+            event.run_id.as_str(),
+            event.attempt_id,
+            event.parent_event_id,
+            event.model,
+            event.input_tokens,
+            event.output_tokens,
+            event.cache_read_tokens,
+            event.cache_write_tokens,
+            event.cost.map(MicroUsd::to_micros),
+            serde_json::to_string(&event.cost_kind).expect("cost kind serializes"),
+            serde_json::to_string(&event.completeness).expect("completeness serializes"),
+            event.inclusive,
+            event.at,
+            event.phase.map(UsagePhase::as_str),
+            event.duration_ms,
+            event.requested_model,
+            event.requested_effort,
+            event.harness,
+        ],
+    )?;
+    Ok(inserted == 1)
+}
 
 pub struct Ledger {
     conn: Connection,
@@ -3220,37 +3271,39 @@ impl Ledger {
     }
 
     pub fn record_usage(&self, event: &UsageEvent) -> Result<bool> {
-        let inserted = self.conn.execute(
-            "INSERT OR IGNORE INTO usage_events
-                (event_id, run_id, attempt_id, parent_event_id, model,
-                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                 cost_micros, cost_kind, completeness, inclusive, at,
-                 phase, duration_ms, requested_model, requested_effort, harness)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                     ?15, ?16, ?17, ?18, ?19)",
-            params![
-                event.event_id,
-                event.run_id.as_str(),
-                event.attempt_id,
-                event.parent_event_id,
-                event.model,
-                event.input_tokens,
-                event.output_tokens,
-                event.cache_read_tokens,
-                event.cache_write_tokens,
-                event.cost.map(MicroUsd::to_micros),
-                serde_json::to_string(&event.cost_kind).expect("cost kind serializes"),
-                serde_json::to_string(&event.completeness).expect("completeness serializes"),
-                event.inclusive,
-                event.at,
-                event.phase.map(UsagePhase::as_str),
-                event.duration_ms,
-                event.requested_model,
-                event.requested_effort,
-                event.harness,
-            ],
-        )?;
-        Ok(inserted == 1)
+        insert_usage_event(&self.conn, event)
+    }
+
+    /// A native attempt's usage event and the transcript messages it was
+    /// booked for, in one transaction. Those messages belong to the run:
+    /// an `orchestration_usage` row an earlier import made of any of them
+    /// is deleted, so every message is counted once (SPEC §11).
+    pub fn record_native_usage(&self, event: &UsageEvent, message_ids: &[String]) -> Result<bool> {
+        let tx = self.write_tx()?;
+        let inserted = insert_usage_event(&tx, event)?;
+        for message_id in message_ids {
+            tx.execute(
+                "INSERT OR IGNORE INTO native_usage_messages
+                    (message_id, dispatch_id, run_id, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![message_id, event.event_id, event.run_id.as_str(), event.at],
+            )?;
+            tx.execute(
+                "DELETE FROM orchestration_usage WHERE message_id = ?1",
+                params![message_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    /// Was this transcript message booked to a native run's attempt?
+    pub fn is_native_booked(&self, message_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM native_usage_messages WHERE message_id = ?1)",
+            params![message_id],
+            |row| row.get(0),
+        )?)
     }
 
     /// Dispatch intent is persisted BEFORE the process exists (SPEC §12).
@@ -4213,6 +4266,12 @@ impl Ledger {
     /// streaming carries a partial `output_tokens`; a later import of the
     /// finished message raises it (and its cost), and nothing else ever
     /// changes an existing row — re-importing the same content is a no-op.
+    /// A message a relais run already booked (`native_usage_messages`) is
+    /// never inserted, and the check is part of the insert itself: an
+    /// import that read the message as unbooked, racing a native run that
+    /// books it and deletes any imported copy in one transaction, cannot
+    /// slip the row in after that delete. One statement is atomic, so the
+    /// message is counted once in either order.
     pub fn record_orchestration_usage(&self, row: &OrchestrationUsageRow) -> Result<bool> {
         let inserted = self.conn.execute(
             "INSERT INTO orchestration_usage
@@ -4220,7 +4279,9 @@ impl Ledger {
                  input_tokens, output_tokens, cache_read_tokens,
                  cache_write_5m_tokens, cache_write_1h_tokens,
                  cost_micros, pricing_version, completeness, at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
+             WHERE NOT EXISTS
+                 (SELECT 1 FROM native_usage_messages WHERE message_id = ?1)
              ON CONFLICT(message_id) DO UPDATE SET
                  output_tokens = excluded.output_tokens,
                  cost_micros = excluded.cost_micros,
@@ -5156,6 +5217,89 @@ mod tests {
             completeness: CostCompleteness::Actual,
             at: at.into(),
         }
+    }
+
+    /// Import first: it booked the worker's message as the session's own.
+    /// The native booking moves exactly that row to the run and keeps the
+    /// session's, so summed over both tables each message is counted once.
+    #[test]
+    fn a_native_booking_takes_over_the_row_an_import_made_first() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-n"), "/r", Some("sess-1"), &task("run-n"), "rk")
+            .expect("run");
+        let at = "2026-10-06T00:00:00Z";
+        for id in ["msg-session", "msg-worker"] {
+            ledger
+                .record_orchestration_usage(&usage_row(id, "sess-1", at))
+                .expect("imported");
+        }
+        let booked = event("d1", "run-n", 1_000);
+        ledger
+            .record_native_usage(&booked, &["msg-worker".to_string()])
+            .expect("native booking");
+        let (session_cost, _) = ledger
+            .orchestration_spend_since("2026-01-01T00:00:00Z")
+            .expect("spend");
+        assert_eq!(
+            session_cost,
+            MicroUsd::from_micros(1_000),
+            "only the session's"
+        );
+        assert_eq!(
+            ledger.run_cost(&run("run-n")).expect("run cost"),
+            MicroUsd::from_micros(1_000)
+        );
+        assert!(ledger.is_native_booked("msg-worker").expect("lookup"));
+        assert!(!ledger.is_native_booked("msg-session").expect("lookup"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The race: an import reads the worker's message as unbooked, the
+    /// run books it (deleting no row, since none exists yet), and only
+    /// then does the import insert. The insert's own guard refuses it.
+    #[test]
+    fn an_import_racing_a_native_booking_still_counts_the_message_once() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-n"), "/r", Some("sess-1"), &task("run-n"), "rk")
+            .expect("run");
+        let at = "2026-10-06T00:00:00Z";
+        assert!(!ledger.is_native_booked("msg-worker").expect("lookup"));
+        ledger
+            .record_native_usage(&event("d1", "run-n", 1_000), &["msg-worker".to_string()])
+            .expect("native booking");
+        assert!(!ledger
+            .record_orchestration_usage(&usage_row("msg-worker", "sess-1", at))
+            .expect("the late insert runs"));
+        let rows: i64 = ledger
+            .conn
+            .query_row("SELECT COUNT(*) FROM orchestration_usage", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(rows, 0, "the run's message is not the session's too");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A headless attempt books no transcript message to a run.
+    #[test]
+    fn a_plain_usage_event_books_no_native_message() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-h"), "/r", None, &task("run-h"), "rk")
+            .expect("run");
+        ledger
+            .record_usage(&event("d1", "run-h", 10))
+            .expect("usage");
+        let booked: i64 = ledger
+            .conn
+            .query_row("SELECT COUNT(*) FROM native_usage_messages", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(booked, 0);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A message imported mid-stream carries a partial `output_tokens`.

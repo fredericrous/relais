@@ -4246,6 +4246,9 @@ fn is_bare_shell_pid(session_id: &str) -> bool {
 /// One session's message count, token totals and cost, imported.
 struct ImportSummary {
     messages: usize,
+    /// Records left out because a relais run booked them (a native
+    /// worker's messages, SPEC §11); not part of any other figure.
+    skipped_native: usize,
     input_tokens: u64,
     output_tokens: u64,
     cache_read_tokens: u64,
@@ -4331,6 +4334,7 @@ fn import_session(
     }
     let mut summary = ImportSummary {
         messages: 0,
+        skipped_native: 0,
         input_tokens: 0,
         output_tokens: 0,
         cache_read_tokens: 0,
@@ -4352,6 +4356,10 @@ fn import_session(
             }
         };
         for record in orchestration::parse_transcript(&text) {
+            if operational(ledger.is_native_booked(&record.message_id), "usage import")? {
+                summary.skipped_native += 1;
+                continue;
+            }
             let priced = orchestration::price(&record, price_table);
             summary.messages += 1;
             summary.input_tokens += record.input_tokens;
@@ -4390,6 +4398,14 @@ fn import_session(
     Ok(SessionImportOutcome::Imported(summary))
 }
 
+/// The summary line's tail when records were left to the run that booked them.
+fn skipped_note(skipped: usize) -> String {
+    match skipped {
+        0 => String::new(),
+        n => format!("; {n} record(s) skipped, already booked to a relais run"),
+    }
+}
+
 fn usage_import_command(
     session: Option<&str>,
     projects_dir: Option<&Path>,
@@ -4411,11 +4427,12 @@ fn usage_import_command(
         match import_session(&ledger, &projects_dir, &price_table, &session_id)? {
             SessionImportOutcome::Imported(summary) => {
                 println!(
-                    "{session_id}: {} message(s), {} input + {} output tokens: {}",
+                    "{session_id}: {} message(s), {} input + {} output tokens: {}{}",
                     summary.messages,
                     summary.input_tokens,
                     summary.output_tokens,
                     report::cost_line(summary.cost, summary.completeness),
+                    skipped_note(summary.skipped_native),
                 );
             }
             SessionImportOutcome::Unattributable => {
@@ -5174,6 +5191,94 @@ mod tests {
             .orchestration_spend_since(since)
             .expect("spend in the window");
         assert_eq!(cost, MicroUsd::from_micros(5_000_000));
+    }
+
+    /// Run first: the native attempt booked the worker's messages from
+    /// its subagent transcript, so importing the session inserts the
+    /// session's own messages only and reports what it left to the run.
+    #[test]
+    fn import_leaves_a_native_workers_messages_to_the_run_that_booked_them() {
+        use relais::ids::{RunId, TaskId};
+        use relais::ledger::UsageEvent;
+        use relais::money::CostKind;
+        let (ledger, dir) = temp_ledger("import-native");
+        let run = RunId::from_stored("run-n");
+        ledger
+            .insert_run(
+                &run,
+                "/repo",
+                Some("sess-n"),
+                &TaskId::from_stored("task-n"),
+                "rk",
+            )
+            .expect("run");
+        let line = |id: &str| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"2026-10-06T10:00:00Z","message":{{"id":"{id}","model":"claude-opus-5","usage":{{"input_tokens":1000000,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation":{{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}}}}}}"#
+            )
+        };
+        let slug = dir.join("projects").join("-slug");
+        let subagents = slug.join("sess-n").join("subagents");
+        std::fs::create_dir_all(&subagents).expect("subagents dir");
+        std::fs::write(slug.join("sess-n.jsonl"), line("msg-session")).expect("main");
+        std::fs::write(subagents.join("agent-a1.jsonl"), line("msg-worker")).expect("agent");
+        let table = PriceTable {
+            version: "test".into(),
+            models: vec![relais::orchestration::ModelPrice {
+                ids: vec!["claude-opus-5".into()],
+                input: 5_000_000,
+                output: 25_000_000,
+                cache_read: 500_000,
+                cache_write_5m: 6_250_000,
+                cache_write_1h: 10_000_000,
+                fast_input: None,
+                fast_output: None,
+            }],
+        };
+        let booked = UsageEvent {
+            event_id: "d1".into(),
+            run_id: run.clone(),
+            attempt_id: None,
+            parent_event_id: None,
+            model: Some("claude-opus-5".into()),
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(0),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost: Some(MicroUsd::from_micros(5_000_000)),
+            cost_kind: CostKind::EstimatedApiEquivalent,
+            completeness: CostCompleteness::Estimated,
+            inclusive: false,
+            at: ledger.now(),
+            phase: None,
+            duration_ms: None,
+            requested_model: None,
+            requested_effort: None,
+            harness: None,
+        };
+        ledger
+            .record_native_usage(&booked, &["msg-worker".to_string()])
+            .expect("native booking");
+        let SessionImportOutcome::Imported(summary) =
+            import_session(&ledger, &dir.join("projects"), &table, "sess-n").expect("imports")
+        else {
+            panic!("the session has a transcript");
+        };
+        assert_eq!(summary.messages, 1);
+        assert_eq!(summary.skipped_native, 1);
+        assert!(skipped_note(summary.skipped_native).contains("1 record(s) skipped"));
+        let (session_cost, _) = ledger
+            .orchestration_spend_since("2026-01-01T00:00:00Z")
+            .expect("spend");
+        assert_eq!(
+            session_cost,
+            MicroUsd::from_micros(5_000_000),
+            "the session's own only"
+        );
+        assert_eq!(
+            ledger.run_cost(&run).expect("run cost"),
+            MicroUsd::from_micros(5_000_000)
+        );
     }
 
     /// Walks every `DecideAnswer` and asserts the terminal state it
