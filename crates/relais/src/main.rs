@@ -39,6 +39,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use relais::acceptance::Evidence;
+use relais::admission::{BoundOutcome, Gate, GateError, StoppedOutcome, StoppedReport};
 use relais::backend::Backend;
 use relais::contract::TaskContract;
 use relais::ids::{IdSource, RunId, TaskId};
@@ -142,24 +143,18 @@ enum Command {
         /// record.
         #[arg(long = "revise")]
         revise: Option<String>,
-        /// Launch each worker attempt as a native subagent the parent
-        /// Claude Code session spawns, so Claude Code renders it (SPEC §23).
-        /// Needs a parent Claude Code session
-        #[arg(long)]
-        native: bool,
-        /// How long to wait for the parent session to spawn a requested
-        /// native worker before the attempt ends `native_spawn_missing`
-        #[arg(
-            long = "native-spawn-wait",
-            value_name = "SECONDS",
-            requires = "native"
-        )]
-        native_spawn_wait: Option<u64>,
         /// Keep stdout for protocol lines (one JSON object per line, each
         /// with a `relais` key) and send everything else to stderr
-        /// (SPEC §29). Not supported on Windows yet
+        /// (SPEC §29). Not supported on Windows yet. A run starts only from
+        /// Claude Code with the relais plugin, which passes this
         #[arg(long)]
         protocol: bool,
+    },
+    /// What the relais plugin calls: short processes that tell the
+    /// coordinator what its agents did (SPEC §23)
+    Native {
+        #[command(subcommand)]
+        cmd: NativeCommand,
     },
     /// Show recent runs, or one run's current state
     Status { run_id: Option<String> },
@@ -424,6 +419,36 @@ enum DatasetCommand {
         /// no trial recorded, no usage recorded
         #[arg(long = "dry-run")]
         dry_run: bool,
+    },
+}
+
+/// Exit 0 acknowledges; non-zero asks the plugin to retry.
+#[derive(Subcommand)]
+enum NativeCommand {
+    /// The session's plugin is alive
+    Hello {
+        #[arg(long)]
+        session: String,
+    },
+    /// The plugin spawned the dispatch's agent
+    Bound {
+        #[arg(long)]
+        dispatch: String,
+        #[arg(long)]
+        agent: String,
+    },
+    /// The dispatch's agent ended; `{"agent", "status", "usage", "answer"}`
+    /// on stdin
+    Stopped {
+        #[arg(long)]
+        dispatch: String,
+    },
+    /// Print a run's timeline as one JSON object: phases, decisions, cost,
+    /// outcome and the last 40 lines of check output
+    Status {
+        /// The run; the latest when omitted
+        #[arg(long)]
+        run: Option<String>,
     },
 }
 
@@ -871,18 +896,16 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
         Command::Run {
             task,
             revise,
-            native,
-            native_spawn_wait,
-            protocol: _,
-        } => run_command(
-            &task,
-            revise.as_deref(),
-            native.then(|| {
-                std::time::Duration::from_secs(
-                    native_spawn_wait.unwrap_or(DEFAULT_NATIVE_SPAWN_WAIT),
-                )
-            }),
-        ),
+            protocol,
+        } => {
+            let host = std::env::var("RELAIS_HOST").ok();
+            let origin = relais::native::RunOrigin {
+                protocol,
+                host: host.as_deref(),
+            };
+            run_command(&task, revise.as_deref(), &origin)
+        }
+        Command::Native { cmd } => native_command(cmd),
         Command::Status { run_id } => status_command(run_id.as_deref()),
         Command::Explain { run_id } => explain_command(&run_id),
         Command::Resume {
@@ -2639,35 +2662,165 @@ fn plan_trial_lines(
     Ok(decision.lines())
 }
 
-/// Seconds `relais run --native` waits for the parent session to spawn a
-/// requested worker.
-const DEFAULT_NATIVE_SPAWN_WAIT: u64 = 120;
+/// `relais native …`: what the relais plugin tells the coordinator, and
+/// the run timeline it reads back (SPEC §23, §29). Exit 0 acknowledges.
+fn native_command(cmd: NativeCommand) -> Result<CliOutcome, CliError> {
+    match cmd {
+        NativeCommand::Status { run } => native_status_command(run.as_deref()),
+        NativeCommand::Hello { session } => {
+            let socket = relais::coordinator::socket_path().map_err(CliError::Home)?;
+            // The first call of a session may find no daemon: start one, as
+            // `relais run` would.
+            if let Err(e) = relais::coordinator::ensure_running(&socket) {
+                eprintln!("relais native hello: {e}");
+                return Ok(CliOutcome::OperationalFailure);
+            }
+            acknowledged(
+                "hello",
+                relais::coordinator::RemoteGate::new(socket).native_hello(&session),
+            )
+        }
+        NativeCommand::Bound { dispatch, agent } => {
+            let gate = native_gate()?;
+            match gate.native_bound(&dispatch, &agent) {
+                Ok(BoundOutcome::Bound) => Ok(CliOutcome::Accepted),
+                Ok(BoundOutcome::Refused { reason }) => {
+                    eprintln!("relais native bound: refused: {reason}");
+                    Ok(CliOutcome::Blocked)
+                }
+                Ok(BoundOutcome::NotNative) => {
+                    eprintln!("relais native bound: no native dispatch {dispatch} on record");
+                    Ok(CliOutcome::UnknownRun)
+                }
+                Err(e) => {
+                    eprintln!("relais native bound: {e}");
+                    Ok(CliOutcome::OperationalFailure)
+                }
+            }
+        }
+        NativeCommand::Stopped { dispatch } => {
+            let report = match read_stopped_report(&read_stdin()?) {
+                Ok(report) => report,
+                Err(e) => {
+                    return Err(CliError::Usage {
+                        detail: format!(
+                            "native stopped: the payload on stdin is not a report: {e}"
+                        ),
+                    })
+                }
+            };
+            let gate = native_gate()?;
+            match gate.native_stopped(&dispatch, &report) {
+                Ok(StoppedOutcome::Recorded | StoppedOutcome::AlreadyStopped) => {
+                    Ok(CliOutcome::Accepted)
+                }
+                Ok(StoppedOutcome::WrongAgent) => {
+                    eprintln!(
+                        "relais native stopped: dispatch {dispatch} is bound to another agent \
+                         than {}",
+                        report.agent_id
+                    );
+                    Ok(CliOutcome::Blocked)
+                }
+                Ok(StoppedOutcome::NotNative) => {
+                    eprintln!("relais native stopped: no native dispatch {dispatch} on record");
+                    Ok(CliOutcome::UnknownRun)
+                }
+                Err(e) => {
+                    eprintln!("relais native stopped: {e}");
+                    Ok(CliOutcome::OperationalFailure)
+                }
+            }
+        }
+    }
+}
 
-/// Why a `--native` run cannot start under this session, if it cannot: a
-/// native worker is spawned by a parent Claude Code session, which a
-/// session id guessed from the parent process is not.
-fn native_session_refusal(
-    native: Option<std::time::Duration>,
-    session: &relais::coordinator::ResolvedSessionId,
-) -> Option<String> {
-    (native.is_some() && session.source.is_fallback()).then(|| {
-        "native workers need to run inside Claude Code: no CLAUDE_CODE_SESSION_ID in the \
-         environment names a parent session to spawn them"
-            .to_string()
+/// The coordinator the plugin's callbacks talk to. A callback never starts
+/// one: with none running there is no dispatch to tell it about.
+fn native_gate() -> Result<relais::coordinator::RemoteGate, CliError> {
+    let socket = relais::coordinator::socket_path().map_err(CliError::Home)?;
+    Ok(relais::coordinator::RemoteGate::new(socket))
+}
+
+fn acknowledged(what: &str, answer: Result<(), GateError>) -> Result<CliOutcome, CliError> {
+    match answer {
+        Ok(()) => Ok(CliOutcome::Accepted),
+        Err(e) => {
+            eprintln!("relais native {what}: {e}");
+            Ok(CliOutcome::OperationalFailure)
+        }
+    }
+}
+
+fn read_stdin() -> Result<String, CliError> {
+    std::io::read_to_string(std::io::stdin()).map_err(|cause| CliError::Operational {
+        operation: "reading stdin",
+        cause: Box::new(cause),
     })
 }
 
-/// `native` is the spawn wait of a `--native` run, `None` for a headless one.
+fn read_stopped_report(payload: &str) -> Result<StoppedReport, serde_json::Error> {
+    serde_json::from_str(payload)
+}
+
+/// `relais native status`: one JSON object, the run's timeline from its
+/// `events.jsonl`, and never the whole file.
+fn native_status_command(run: Option<&str>) -> Result<CliOutcome, CliError> {
+    let artifacts = paths::runs_dir().map_err(CliError::Home)?;
+    let Some(run) = run
+        .map(str::to_string)
+        .or_else(|| relais::protocol::latest_run(&artifacts))
+    else {
+        eprintln!("relais native status: no run has written events yet");
+        return Ok(CliOutcome::UnknownRun);
+    };
+    let path = artifacts.join(&run).join("events.jsonl");
+    match std::fs::read_to_string(&path) {
+        Ok(events) => {
+            println!("{}", relais::protocol::timeline(&run, &events));
+            Ok(CliOutcome::Accepted)
+        }
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "relais native status: run {run} has no events at {}",
+                path.display()
+            );
+            Ok(CliOutcome::UnknownRun)
+        }
+        Err(cause) => Err(CliError::Read {
+            what: "the run's events",
+            path,
+            cause,
+        }),
+    }
+}
+
+/// Why this `relais run` must not start, if it must not: it comes from the
+/// relais plugin, whose session said hello recently, on a Claude Code the
+/// plugin supports. `installed` is what `claude --version` printed.
+fn run_refusal(
+    gate: &dyn Gate,
+    session: &str,
+    installed: Option<&str>,
+) -> Result<Option<String>, GateError> {
+    if let Some(detail) = relais::native::unsupported_claude_code(installed) {
+        return Ok(Some(detail));
+    }
+    Ok(relais::native::hello_refusal(
+        gate.native_hello_age(session)?,
+    ))
+}
+
+/// A `relais run` starts only from Claude Code with the relais plugin.
 fn run_command(
     task: &Path,
     revise: Option<&str>,
-    native: Option<std::time::Duration>,
+    origin: &relais::native::RunOrigin<'_>,
 ) -> Result<CliOutcome, CliError> {
-    let session = relais::coordinator::resolve_session();
-    if let Some(detail) = native_session_refusal(native, &session) {
-        eprintln!("relais run: {detail}");
-        return Ok(CliOutcome::Blocked);
+    if let Some(detail) = relais::native::origin_refusal(origin) {
+        return Err(CliError::Usage { detail });
     }
+    let session = relais::coordinator::resolve_session();
     let (root, repo) = load_repo_policy()?;
     let machine = load_machine()?;
     let contract = load_contract(task)?;
@@ -2706,9 +2859,23 @@ fn run_command(
         return Ok(CliOutcome::Blocked);
     }
     let gate = relais::coordinator::RemoteGate::new(socket);
+    // Before anything is dispatched: the plugin of this session is alive,
+    // and the Claude Code it runs on is one the plugin supports.
+    let capabilities = backend.probe();
+    let installed = capabilities
+        .as_ref()
+        .and_then(|capabilities| capabilities.version.as_deref());
+    match run_refusal(&gate, &session.id, installed) {
+        Ok(None) => {}
+        Ok(Some(detail)) => return Err(CliError::Usage { detail }),
+        Err(e) => {
+            eprintln!("relais run: blocked (admission_unavailable): {e}");
+            return Ok(CliOutcome::Blocked);
+        }
+    }
     // Learned routing reads the registry's active artifact, pinned for
     // this run (SPEC §17); disabled routing leaves everything else intact.
-    let harness = backend.probe().map(|capabilities| {
+    let harness = capabilities.as_ref().map(|capabilities| {
         format!(
             "{} {}",
             backend.name(),
@@ -2720,20 +2887,24 @@ fn run_command(
         .as_ref()
         .map(|registry| RegistryPredictor::new(registry, &repo, harness.as_deref()));
     let ids = id_source();
-    // The worker attempts of a `--native` run go to the parent session;
-    // everything else stays on the Claude backend.
-    let prices = match native {
-        Some(_) => Some(load_price_table()?),
-        None => None,
+    let run_id = match ids.run_id() {
+        Ok(run_id) => run_id,
+        Err(e) => {
+            eprintln!("relais run: {e}");
+            return Ok(CliOutcome::OperationalFailure);
+        }
     };
-    if let Some(table) = &prices {
+    // The worker attempts go to the relais plugin of the parent session;
+    // everything else stays on the Claude backend.
+    let prices = load_price_table()?;
+    {
         let mut aliases: Vec<String> = repo.models.values().map(|m| m.id.clone()).collect();
         aliases.sort();
         aliases.dedup();
         let observations = operational(ledger.model_observations(), "model observations")?;
         let machine_toml = paths::machine_settings_path().map_err(CliError::Home)?;
         let decided =
-            relais::native_pricing::preflight(&aliases, table, &observations, &machine_toml);
+            relais::native_pricing::preflight(&aliases, &prices, &observations, &machine_toml);
         for warning in &decided.warnings {
             eprintln!("{warning}");
         }
@@ -2744,23 +2915,22 @@ fn run_command(
             return Ok(CliOutcome::Blocked);
         }
     }
-    let native_backend = native.map(|spawn_wait| {
-        relais::adapter::native::NativeBackend::new(
-            backend.as_ref(),
-            &gate,
-            session.id.clone(),
-            spawn_wait,
-            prices,
-        )
-    });
-    let run_backend: &dyn relais::backend::Backend = match &native_backend {
-        Some(native_backend) => native_backend,
-        None => backend.as_ref(),
-    };
-    let worker_presentation = match native {
-        Some(_) => relais::backend::Presentation::Native,
-        None => relais::backend::Presentation::Headless,
-    };
+    let native_backend = relais::adapter::native::NativeBackend::new(
+        backend.as_ref(),
+        &gate,
+        relais::adapter::native::Link {
+            run_id: run_id.as_str().to_string(),
+            session_id: session.id.clone(),
+            wire: relais::protocol::Wire::process(),
+            // Without a home there is no transcript to read: the run books
+            // its usage and says `rollback_ids_missing`.
+            projects_dir: paths::claude_projects_dir().ok(),
+        },
+        relais::adapter::native::Waits::DEFAULT,
+        Some(prices),
+    );
+    let run_backend: &dyn relais::backend::Backend = &native_backend;
+    let worker_presentation = relais::backend::Presentation::Native;
     // Printed here, before `execute`, so it is visible on every path —
     // including the `Err` arm below that returns early — and only once:
     // a run can take minutes, and deferring this to the end read as
@@ -2802,13 +2972,6 @@ fn run_command(
         .draws()
         .then(|| workspace::resolve_base(&root, &contract.base_ref).ok())
         .flatten();
-    let run_id = match ids.run_id() {
-        Ok(run_id) => run_id,
-        Err(e) => {
-            eprintln!("relais run: {e}");
-            return Ok(CliOutcome::OperationalFailure);
-        }
-    };
     let trial_id = match &trial_base {
         Some(base_sha) => {
             let contract_hash = contract.hash();
@@ -2872,6 +3035,7 @@ fn run_command(
         purpose: trial_id.as_ref().map(|_| RunPurpose::TrialArm),
         run_id: Some(run_id.clone()),
         worker_presentation,
+        wire: relais::protocol::Wire::process(),
     }) {
         Ok(outcome) => outcome,
         Err(e) => {
@@ -3187,6 +3351,7 @@ fn replay_command(task: &str, recipe: &Path, dry_run: bool) -> Result<CliOutcome
         purpose: Some(RunPurpose::Replay),
         run_id: None,
         worker_presentation: relais::backend::Presentation::Headless,
+        wire: relais::protocol::Wire::process(),
     });
     // Bring the replay's own refs into the live repository BEFORE the
     // checkout goes. The runner names its candidate and snapshot refs in
@@ -5134,47 +5299,54 @@ mod tests {
         (ledger, dir)
     }
 
-    fn session(
-        source: relais::coordinator::SessionSource,
-    ) -> relais::coordinator::ResolvedSessionId {
-        relais::coordinator::ResolvedSessionId {
-            id: "s1".into(),
-            source,
-        }
-    }
-
-    /// A native worker is spawned by a parent Claude Code session: a
-    /// session id guessed from the parent process is refused, and a
-    /// headless run never asks.
     #[test]
-    fn a_native_run_needs_a_parent_claude_code_session() {
-        use relais::coordinator::SessionSource;
-        let wait = Some(std::time::Duration::from_secs(120));
-        let refusal = native_session_refusal(wait, &session(SessionSource::ParentPidFallback))
-            .expect("a fallback session is refused");
-        assert!(refusal.contains("inside Claude Code"), "{refusal}");
-        assert_eq!(
-            native_session_refusal(wait, &session(SessionSource::ClaudeCode)),
-            None
-        );
-        assert_eq!(
-            native_session_refusal(None, &session(SessionSource::ParentPidFallback)),
-            None
-        );
+    fn a_run_is_refused_without_a_recent_hello_or_on_a_claude_code_outside_the_range() {
+        let gate = relais::admission::LocalGate::new(Default::default());
+        let supported = Some("2.1.291 (Claude Code)");
+        let silent = run_refusal(&gate, "s1", supported)
+            .expect("answers")
+            .expect("no hello is refused");
+        assert!(silent.contains("hello"), "{silent}");
+        gate.native_hello("s1").expect("hello");
+        assert_eq!(run_refusal(&gate, "s1", supported).expect("answers"), None);
+        assert!(run_refusal(&gate, "other", supported)
+            .expect("answers")
+            .is_some());
+        let old = run_refusal(&gate, "s1", Some("2.1.0 (Claude Code)"))
+            .expect("answers")
+            .expect("refused");
+        assert!(old.contains(relais::native::SUPPORTED_CLAUDE_CODE), "{old}");
+        assert!(old.contains("2.1.0"), "{old}");
     }
 
     #[test]
-    fn the_native_spawn_wait_is_only_accepted_with_native() {
-        let parse = |args: &[&str]| {
+    fn the_native_flags_are_gone_and_the_native_callbacks_parse() {
+        let parse_run = |args: &[&str]| {
             Cli::try_parse_from(["relais", "run", "--task", "t.json"].iter().chain(args))
         };
-        assert!(parse(&["--native", "--native-spawn-wait", "30"]).is_ok());
-        assert!(parse(&["--native"]).is_ok());
-        assert!(parse(&[]).is_ok());
-        assert!(
-            parse(&["--native-spawn-wait", "30"]).is_err(),
-            "the wait means nothing without --native"
-        );
+        assert!(parse_run(&["--protocol"]).is_ok());
+        assert!(parse_run(&[]).is_ok());
+        assert!(parse_run(&["--native"]).is_err());
+        assert!(parse_run(&["--native-spawn-wait", "30"]).is_err());
+        let parse = |args: &[&str]| Cli::try_parse_from(["relais", "native"].iter().chain(args));
+        assert!(parse(&["hello", "--session", "s1"]).is_ok());
+        assert!(parse(&["bound", "--dispatch", "d1", "--agent", "a1"]).is_ok());
+        assert!(parse(&["bound", "--dispatch", "d1"]).is_err());
+        assert!(parse(&["stopped", "--dispatch", "d1"]).is_ok());
+        assert!(parse(&["status"]).is_ok());
+        assert!(parse(&["status", "--run", "run-1"]).is_ok());
+    }
+
+    #[test]
+    fn a_stopped_report_is_read_from_the_plugins_payload() {
+        let report = read_stopped_report(
+            r#"{"agent":"a1","status":"killed","usage":{"input_tokens":3,"model":"m"},"answer":"x"}"#,
+        )
+        .expect("parses");
+        assert_eq!(report.agent_id, "a1");
+        assert_eq!(report.status, relais::admission::AgentStatus::Killed);
+        assert_eq!(report.usage.and_then(|usage| usage.input_tokens), Some(3));
+        assert!(read_stopped_report(r#"{"agent":"a1","status":"exploded"}"#).is_err());
     }
 
     /// `relais explain` says a report it cannot parse in one line within 80

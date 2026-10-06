@@ -226,10 +226,12 @@ or the reason it was kept, and a scorecard re-measured afterwards.
 (`relais-research`, `relais-implementation`, `relais-review`) and 19 native
 worker definitions, `agents/relais-worker-<model>-<effort>.md`, for the models
 `haiku` (effort `default` only), `sonnet`, `opus` and `fable` (efforts
-`default`, `low`, `medium`, `high`, `xhigh`, `max`). Inside Claude Code,
-`/relais` runs `relais run --native`, so the worker shows as Claude Code's own
-agent; a terminal or unattended run uses `relais run --task …` as before.
-`--hooks` also wires the eight hook events a native run needs.
+`default`, `low`, `medium`, `high`, `xhigh`, `max`). `relais run` starts only
+from Claude Code with the relais plugin, which runs it with `--protocol` and
+`RELAIS_HOST=claude-code-mod`, so the worker shows as Claude Code's own agent;
+from a plain terminal it is refused (exit 2), as it is on a Claude Code outside
+the plugin's range (`>= 2.1.291, < 2.2.0`). `--native` is gone.
+`--hooks` also wires the eight hook events #171's native path needs.
 
 The `relais install --claude --hooks` integration — what it wires, its
 handler timeouts, how to remove it, what `relais doctor` reports on it,

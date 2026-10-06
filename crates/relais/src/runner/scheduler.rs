@@ -732,6 +732,7 @@ fn run_package(
         purpose: None,
         run_id: None,
         worker_presentation: engine.config.worker_presentation,
+        wire: engine.config.wire.clone(),
     };
     engine.transition(
         State::Running,

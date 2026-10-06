@@ -21,6 +21,13 @@ use relais::test_support::short_temp_dir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_relais");
 
+/// What the fake agents cost: a native worker is priced from the usage the
+/// plugin reports, so the world prices its models so that the fake's 100
+/// input and 10 output tokens are the $0.01 its headless result reported.
+const PRICING: &str = "[pricing]\nversion = \"suite\"\n\n[[pricing.models]]\n\
+ids = [\"haiku\", \"sonnet\", \"fable\"]\ninput = 90000000\noutput = 100000000\n\
+cache_read = 0\ncache_write_5m = 0\ncache_write_1h = 0\n";
+
 /// One isolated world: repo, state dir, config dir, fake claude. Short
 /// paths under /tmp because the coordinator socket lives in the state
 /// dir and Unix socket paths are limited to ~100 bytes.
@@ -209,7 +216,7 @@ amont_agent = "off"
         std::fs::write(
             self.config.join("machine.toml"),
             format!(
-                "schema_version = 1\n{extra}\n[trust.\"{key}\"]\n                 granted_at = \"2026-09-18\"\nreviewed_by = \"the release suite\"\n"
+                "schema_version = 1\n{extra}\n{PRICING}\n[trust.\"{key}\"]\n                 granted_at = \"2026-09-18\"\nreviewed_by = \"the release suite\"\n"
             ),
         )
         .expect("machine");
@@ -284,9 +291,20 @@ amont_agent = "off"
     /// scenario's `relais` subprocess at a fake `amont` on its own PATH
     /// without touching any other test's environment.
     fn relais_with_env(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+        // `relais run` starts only from the relais plugin: the world plays it.
+        if args.first() == Some(&"run") {
+            return self.plugin().run(args, extra_env);
+        }
+        self.command(extra_env)
+            .args(args)
+            .output()
+            .expect("relais runs")
+    }
+
+    /// A `relais` command in this world's environment.
+    fn command(&self, extra_env: &[(&str, &str)]) -> Command {
         let mut cmd = Command::new(BIN);
-        cmd.args(args)
-            .current_dir(&self.repo)
+        cmd.current_dir(&self.repo)
             .env("RELAIS_STATE_DIR", &self.state)
             .env("RELAIS_CONFIG_DIR", &self.config)
             .env("RELAIS_CLAUDE_BIN", &self.claude)
@@ -294,7 +312,16 @@ amont_agent = "off"
         for (key, value) in extra_env {
             cmd.env(key, value);
         }
-        cmd.output().expect("relais runs")
+        cmd
+    }
+
+    fn plugin(&self) -> ScriptedPlugin {
+        ScriptedPlugin {
+            repo: self.repo.clone(),
+            state: self.state.clone(),
+            config: self.config.clone(),
+            claude: self.claude.clone(),
+        }
     }
 
     fn stop_coordinator(&self) {
@@ -380,6 +407,233 @@ impl Drop for World {
     }
 }
 
+/// The relais plugin, scripted: what Claude Code does with the protocol
+/// lines of a `relais run` (SPEC §23, §29). It says hello, answers each
+/// `spawn` and `continue` by running the fake harness in the request's
+/// directory as the agent, and tells the coordinator through `relais native
+/// bound` and `stopped` what the agent did and spent.
+#[derive(Clone)]
+struct ScriptedPlugin {
+    repo: PathBuf,
+    state: PathBuf,
+    config: PathBuf,
+    claude: PathBuf,
+}
+
+impl ScriptedPlugin {
+    fn command(&self) -> Command {
+        let mut cmd = Command::new(BIN);
+        cmd.current_dir(&self.repo)
+            .env("RELAIS_STATE_DIR", &self.state)
+            .env("RELAIS_CONFIG_DIR", &self.config)
+            .env("RELAIS_CLAUDE_BIN", &self.claude)
+            .env("RELAIS_SESSION_ID", "tab-test");
+        cmd
+    }
+
+    /// One `relais native` call, retried as the plugin retries.
+    fn native(&self, args: &[&str], stdin: &str) {
+        use std::io::Write;
+        for _ in 0..20 {
+            let mut child = self
+                .command()
+                .arg("native")
+                .args(args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("relais native");
+            let mut input = child.stdin.take().expect("stdin");
+            // The call may exit before reading a payload it does not use.
+            input.write_all(stdin.as_bytes()).ok();
+            drop(input);
+            if child.wait().expect("native").success() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// The agent: the fake harness, run in `cwd` with the prompt on stdin.
+    fn agent(
+        &self,
+        groups: &std::sync::Mutex<Vec<u32>>,
+        cwd: &Path,
+        model: &str,
+        prompt: &str,
+    ) -> serde_json::Value {
+        use std::io::Write;
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new(&self.claude)
+            .args(["-p", "--model", model, "--output-format", "json"])
+            .current_dir(cwd)
+            .process_group(0)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the fake harness");
+        groups.lock().expect("groups").push(child.id());
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(prompt.as_bytes())
+            .expect("prompt");
+        let pgid = child.id();
+        let out = child.wait_with_output().expect("agent output");
+        // An agent that has answered is over, background work included:
+        // its group goes now, not when the whole run ends, so a load that
+        // slows the run cannot let a late write land.
+        let _ = Command::new("kill")
+            .args(["-9", &format!("-{pgid}")])
+            .stderr(std::process::Stdio::null())
+            .status();
+        text(&out.stdout)
+            .lines()
+            .rev()
+            .find_map(|line| serde_json::from_str(line).ok())
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Bind the agent, then report how its run ended.
+    fn report(&self, dispatch: &str, agent: &str, model: &str, result: &serde_json::Value) {
+        self.native(&["bound", "--dispatch", dispatch, "--agent", agent], "");
+        let usage = &result["usage"];
+        let status = if result.is_null() {
+            "killed"
+        } else {
+            "completed"
+        };
+        let payload = serde_json::json!({
+            "agent": agent,
+            "status": status,
+            "usage": {
+                "input_tokens": usage["input_tokens"],
+                "output_tokens": usage["output_tokens"],
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "model": model,
+            },
+            "answer": result["result"],
+        });
+        self.native(&["stopped", "--dispatch", dispatch], &payload.to_string());
+    }
+
+    /// Run `relais run` as the plugin would. A caller that asked for
+    /// `--protocol` gets the protocol lines as stdout; any other gets the
+    /// human lines the run's own stdout used to hold.
+    fn run(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+        use std::io::{BufRead, Read};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        self.native(&["hello", "--session", "tab-test"], "");
+        let ends = Arc::new(AtomicBool::new(false));
+        let hello = {
+            let (plugin, ends) = (self.clone(), Arc::clone(&ends));
+            std::thread::spawn(move || {
+                // The plugin says hello every 30 s; a run lapses at 60.
+                let mut waited = 0;
+                while !ends.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    waited += 1;
+                    if waited == 100 {
+                        waited = 0;
+                        plugin.native(&["hello", "--session", "tab-test"], "");
+                    }
+                }
+            })
+        };
+        let wants_protocol = args.contains(&"--protocol");
+        let mut cmd = self.command();
+        cmd.args(args).env("RELAIS_HOST", "claude-code-mod");
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
+        if !wants_protocol {
+            cmd.arg("--protocol");
+        }
+        let mut child = cmd
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("relais run");
+        let mut stderr_pipe = child.stderr.take().expect("stderr");
+        let stderr_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr_pipe.read_to_end(&mut bytes).ok();
+            bytes
+        });
+        let groups = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let mut agents = std::collections::BTreeMap::<String, (PathBuf, String)>::new();
+        let mut workers = Vec::new();
+        let mut protocol = String::new();
+        for line in std::io::BufReader::new(child.stdout.take().expect("stdout")).lines() {
+            let line = line.expect("a line");
+            protocol.push_str(&line);
+            protocol.push('\n');
+            let Ok(request) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let field = |key: &str| request[key].as_str().unwrap_or_default().to_string();
+            let (dispatch, agent, cwd, model, prompt) = match field("relais").as_str() {
+                "spawn" => {
+                    let agent = format!("ag{}", agents.len() + 1);
+                    let (cwd, model) = (PathBuf::from(field("cwd")), field("model"));
+                    agents.insert(agent.clone(), (cwd.clone(), model.clone()));
+                    (field("dispatch"), agent, cwd, model, field("prompt"))
+                }
+                "continue" => {
+                    let agent = field("agent");
+                    let (cwd, model) = agents.get(&agent).cloned().expect("a known agent");
+                    (field("dispatch"), agent, cwd, model, field("message"))
+                }
+                _ => continue,
+            };
+            let (plugin, groups) = (self.clone(), Arc::clone(&groups));
+            workers.push(std::thread::spawn(move || {
+                let result = plugin.agent(&groups, &cwd, &model, &prompt);
+                plugin.report(&dispatch, &agent, &model, &result);
+            }));
+        }
+        let status = child.wait().expect("relais run ends");
+        ends.store(true, Ordering::SeqCst);
+        // An agent the run gave up on (a wall clock, a cancel) is killed.
+        for group in groups.lock().expect("groups").iter() {
+            Command::new("kill")
+                .args(["-9", &format!("-{group}")])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .ok();
+        }
+        for worker in workers {
+            worker.join().expect("agent thread");
+        }
+        hello.join().expect("hello thread");
+        let stderr = stderr_reader.join().expect("stderr reader");
+        let stdout = if wants_protocol {
+            protocol.into_bytes()
+        } else {
+            text(&stderr)
+                .lines()
+                .filter(|line| {
+                    ["accepted:", "receipt:", "patch:", "cost:", "run:"]
+                        .iter()
+                        .any(|prefix| line.starts_with(prefix))
+                })
+                .map(|line| format!("{line}\n"))
+                .collect::<String>()
+                .into_bytes()
+        };
+        Output {
+            status,
+            stdout,
+            stderr,
+        }
+    }
+}
+
 fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)
@@ -415,7 +669,7 @@ fn text(bytes: &[u8]) -> String {
 /// scenario proves that no second worker was started.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 case "$1" in
-  --version) echo "fake-claude 9.9.9"; exit 0 ;;
+  --version) echo "2.1.291 (fake-claude)"; exit 0 ;;
   --help) echo "usage: claude -p --model <model> --effort <level> --output-format <format> --max-budget-usd <amount> --disallowed-tools <tools...> --settings <file-or-json>"; exit 0 ;;
 esac
 here=$(dirname "$0")
@@ -522,7 +776,8 @@ minimum_tier = "escalation"
     assert_eq!(receipt["run_id"], run_id);
     assert_eq!(receipt["attempts"], 1);
     assert_eq!(receipt["models_used"], serde_json::json!(["fable"]));
-    assert_eq!(receipt["cost_completeness"], "actual");
+    // A native worker is priced from the usage the plugin reports.
+    assert_eq!(receipt["cost_completeness"], "estimated");
     assert!(run_dir.join("candidate-1.patch").exists());
     assert!(run_dir.join("review.txt").exists());
     // The candidate the receipt names is a real commit in the repo.
@@ -543,7 +798,10 @@ minimum_tier = "escalation"
         explained.contains("checks_and_review_passed"),
         "{explained}"
     );
-    assert!(explained.contains("cost: $0.012 (actual)"), "{explained}");
+    assert!(
+        explained.contains("cost: $0.012 (estimated)"),
+        "{explained}"
+    );
     let report = world.relais(&["report", "--since", "2026-01-01", "--json"]);
     let report: serde_json::Value = serde_json::from_str(&text(&report.stdout)).expect("json");
     assert_eq!(report["accepted"], 1, "{report}");
@@ -1075,7 +1333,7 @@ fn repair_then_escalation_all_attributed_to_one_run() {
 /// Every stdout line of a `--protocol` run, each of which must be a JSON
 /// object carrying a `relais` key (SPEC §29).
 fn protocol_lines(stdout: &str) -> Vec<serde_json::Value> {
-    stdout
+    let lines: Vec<serde_json::Value> = stdout
         .lines()
         .map(|line| {
             let value: serde_json::Value = serde_json::from_str(line)
@@ -1083,6 +1341,17 @@ fn protocol_lines(stdout: &str) -> Vec<serde_json::Value> {
             assert!(value.get("relais").is_some(), "no `relais` key: {line}");
             value
         })
+        .collect();
+    assert_eq!(
+        lines.last().map(|line| line["relais"].clone()),
+        Some(serde_json::json!("done")),
+        "the last line of a run is its `done`: {stdout}"
+    );
+    // The events are what the callers below compare; the requests and the
+    // `done` are the plugin's.
+    lines
+        .into_iter()
+        .filter(|line| line["relais"] == "event")
         .collect()
 }
 
@@ -1190,9 +1459,14 @@ fn a_protocol_run_keeps_stdout_for_events_and_events_jsonl_holds_the_same() {
     assert!(plain_stdout.starts_with("accepted: "), "{plain_stdout}");
     let plain_events = events_jsonl(&plain_world.run_dir(&World::run_id_of(&plain_stdout)));
     assert_seq_counts_from_zero(&plain_events);
+    // The mirrored stderr lines exist only under --protocol; every other
+    // event is the same, in the same order, with or without it.
+    let without_stderr = |kinds: Vec<String>| -> Vec<String> {
+        kinds.into_iter().filter(|kind| kind != "stderr").collect()
+    };
     assert_eq!(
-        event_kinds(&plain_events),
-        kinds,
+        without_stderr(event_kinds(&plain_events)),
+        without_stderr(kinds),
         "the same events with or without --protocol"
     );
 }
@@ -1265,7 +1539,7 @@ fn budget_exhaustion_preserves_evidence_and_stops_dispatch() {
     assert_eq!(report["accepted"], 0);
     assert_eq!(report["runs"].as_array().map(Vec::len), Some(1));
     assert_eq!(report["runs"][0]["status"], "budget_exhausted");
-    assert_eq!(report["runs"][0]["cost_completeness"], "actual");
+    assert_eq!(report["runs"][0]["cost_completeness"], "estimated");
 }
 
 // SPEC §14: missing required integrations, unavailable models and
@@ -1278,7 +1552,11 @@ fn blocked_outcomes_are_explicit_and_launch_nothing() {
     let task = world.write_task("task.json", "off");
 
     // No trust grant: blocked before any dispatch.
-    std::fs::write(world.config.join("machine.toml"), "schema_version = 1\n").expect("machine");
+    std::fs::write(
+        world.config.join("machine.toml"),
+        format!("schema_version = 1\n{PRICING}\n"),
+    )
+    .expect("machine");
     let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
     assert_eq!(run.status.code(), Some(3), "{}", text(&run.stderr));
     assert!(
@@ -1299,14 +1577,11 @@ fn blocked_outcomes_are_explicit_and_launch_nothing() {
 
     // Harness binary missing: blocked, never a fallback.
     world.write_machine(&hash, "");
-    let missing = Command::new(BIN)
-        .args(["run", "--task", task.to_str().unwrap()])
-        .current_dir(&world.repo)
-        .env("RELAIS_STATE_DIR", &world.state)
-        .env("RELAIS_CONFIG_DIR", &world.config)
-        .env("RELAIS_CLAUDE_BIN", world.root.join("no-such-claude"))
-        .output()
-        .expect("relais");
+    let no_claude = world.root.join("no-such-claude");
+    let missing = world.relais_with_env(
+        &["run", "--task", task.to_str().unwrap()],
+        &[("RELAIS_CLAUDE_BIN", no_claude.to_str().unwrap())],
+    );
     assert_eq!(missing.status.code(), Some(3), "{}", text(&missing.stderr));
 
     // Dirty tree: explicit, never copied.
@@ -2923,19 +3198,19 @@ fn coordinator_cancel_and_stop_leave_state_consistent() {
     assert_eq!(again.status.code(), Some(0), "{}", text(&again.stderr));
 }
 
-// SPEC §8, §11: the machine's permission allowlist reaches the worker as an
-// explicit settings document, the dollar ceiling as the CLI's own flag, and
-// no permission-mode or bypass flag ever appears on the argv.
+// SPEC §8, §11: a launch relais still makes itself — the reviewer, since the
+// worker is a native agent now — carries the dollar ceiling as the CLI's own
+// flag and a tool deny list, and no permission-mode or bypass flag ever
+// appears on the argv.
 #[test]
-fn launch_argv_carries_machine_permissions_and_the_budget_flag() {
+fn launch_argv_carries_the_budget_flag_and_no_bypass() {
     let world = World::new("argv");
     let hash = world.write_policy(1);
-    world.write_machine(
-        &hash,
-        "[spending]\nper_run_micros = 2500000\n\n[permissions]\nallowed_tools = [\"Edit\", \"Bash(cargo test:*)\"]\n",
-    );
-    let task = world.write_task("task.json", "off");
+    world.write_machine(&hash, "[spending]\nper_run_micros = 2500000\n");
+    let task = world.write_task_for("task.json", "an easy one", "required");
     let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(0), "{}", text(&run.stderr));
+    // The last harness launch of the run is the review's.
     let argv = std::fs::read_to_string(world.root.join("argv-last.log")).expect("argv log");
     let args: Vec<&str> = argv.lines().collect();
     assert_eq!(args[0], "-p", "{argv}");
@@ -2943,25 +3218,14 @@ fn launch_argv_carries_machine_permissions_and_the_budget_flag() {
         .iter()
         .position(|arg| *arg == "--max-budget-usd")
         .unwrap_or_else(|| panic!("budget flag missing: {argv}"));
-    assert_eq!(args[budget_at + 1], "2.5");
+    let budget: f64 = args[budget_at + 1].parse().expect("a dollar figure");
+    assert!(budget > 0.0 && budget <= 2.5, "{argv}");
     assert!(!args.contains(&"--budget"), "{argv}");
-    let settings_at = args
-        .iter()
-        .position(|arg| *arg == "--settings")
-        .unwrap_or_else(|| panic!("settings flag missing: {argv}"));
-    let settings: serde_json::Value = serde_json::from_str(args[settings_at + 1]).expect("json");
-    assert_eq!(
-        settings["permissions"]["allow"],
-        serde_json::json!(["Edit", "Bash(cargo test:*)"])
-    );
     assert!(args.contains(&"--disallowed-tools"), "{argv}");
     assert!(
         !argv.contains("permission-mode") && !argv.contains("dangerously"),
         "{argv}"
     );
-    // sonnet churns and never fixes; one attempt, then failed — the point
-    // here is the argv, not the outcome.
-    assert_ne!(run.status.code(), Some(0));
 }
 
 // SPEC §14: interrupted execution resumes without duplicate live workers
@@ -3335,7 +3599,7 @@ impl TrialWorld {
             )
         };
         let mut text = format!(
-            "schema_version = 1\n{trials}\n{}",
+            "schema_version = 1\n{trials}\n{PRICING}\n{}",
             grant(&self.incumbent_hash)
         );
         if grant_candidate == GrantCandidate::Yes {
@@ -3486,10 +3750,15 @@ fn trials_are_off_by_default_and_change_nothing_when_off() {
 
     let run = tw.world.relais(&["run", "--task", &task.to_string_lossy()]);
     assert!(run.status.success(), "run: {}", text(&run.stderr));
+    // The artifact paths a run prints carry this world's name.
+    let said: String = text(&run.stderr)
+        .lines()
+        .filter(|line| !line.starts_with("receipt:") && !line.starts_with("patch:"))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        !text(&run.stderr).contains("trial"),
-        "a disabled envelope says nothing on run: {}",
-        text(&run.stderr)
+        !said.contains("trial"),
+        "a disabled envelope says nothing on run: {said}"
     );
     assert_eq!(tw.trials_created(), 0, "no trials row is written when off");
     tw.world.stop_coordinator();

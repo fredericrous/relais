@@ -8,6 +8,37 @@ missing here.
 
 ## Unreleased
 
+### Changed
+
+- `relais run` talks to the relais plugin of the parent Claude Code session
+  through protocol lines and `relais native` callbacks, and is always native
+  for workers. A worker attempt goes out as a `spawn` line (`agent_kind`,
+  `relais:` agent type, the attempt's worktree as `cwd`, no marker in the
+  prompt), a repair on the same model as a `continue` line, a cancelled
+  attempt as a `stop` line, and every run ends with one `done` line (outcome,
+  receipt, and the candidate's files changed, insertions and deletions). The
+  `RELAIS-SPAWN` and `RELAIS-CONTINUE` text lines are gone. See SPEC §23, §29.
+- A native attempt's usage is the usage the plugin reports in `stopped`, priced
+  with the machine's `[pricing]` table as before. The agent's transcript is read
+  for message ids only, recorded in `native_usage_messages`; when it is missing
+  the usage is booked anyway and the run emits a `rollback_ids_missing` decision.
+- `relais run` is refused before anything runs (exit 2) without `--protocol`,
+  without `RELAIS_HOST=claude-code-mod`, or when the session's plugin said no
+  hello in the last 60 s, and on a Claude Code outside `>= 2.1.291, < 2.2.0`
+  (the message names the range and the installed version). A hello that lapses
+  during an attempt ends it `interrupted (mod_gone)`. The coordinator's wire
+  protocol is now version 5: restart a daemon left running (`relais coordinator
+  stop`).
+- `--native` and `--native-spawn-wait` are removed; the 120 s spawn wait stays
+  internal.
+
+### Added
+
+- `relais native hello|bound|stopped|status`: the short processes the plugin
+  calls. `bound` and `stopped` are idempotent; `stopped` before `bound` is kept;
+  `status` prints a run's phases, decisions, cost, outcome and at most the last
+  40 lines of check output, from its `events.jsonl`.
+
 ### Fixed
 
 - A native attempt whose cost could not be priced is booked as

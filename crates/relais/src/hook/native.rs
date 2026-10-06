@@ -329,7 +329,6 @@ fn subagent_stop(stop: &SubagentStop, gate: Option<&dyn Gate>) -> Native {
         gate.stop_native(
             stop.session_id.as_str(),
             stop.agent_id.as_str(),
-            stop.agent_transcript_path.as_deref(),
             stop.last_assistant_message.as_deref(),
         )
     });
@@ -637,7 +636,6 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: Option<&Path>,
             _: Option<&str>,
         ) -> GateResult<crate::admission::StopNativeOutcome> {
             Err(down("stop_native"))
@@ -724,8 +722,9 @@ mod tests {
             state_of(&gate, "d1"),
             NativeState::Stopped {
                 agent_id: "agent-01".into(),
-                transcript_path: Some("/REDACTED/transcript.jsonl".into()),
-                last_assistant_message: Some("all done".into()),
+                status: crate::admission::AgentStatus::Completed,
+                usage: None,
+                answer: Some("all done".into()),
             }
         );
         let run = &gate.status().runs[RUN];
@@ -932,18 +931,15 @@ mod tests {
             state_of(&gate, "d2"),
             NativeState::Stopped {
                 agent_id: "agent-01".into(),
-                transcript_path: Some("/REDACTED/transcript.jsonl".into()),
-                last_assistant_message: Some("second attempt".into()),
+                status: crate::admission::AgentStatus::Completed,
+                usage: None,
+                answer: Some("second attempt".into()),
             }
         );
-        let NativeState::Stopped {
-            last_assistant_message,
-            ..
-        } = state_of(&gate, "d1")
-        else {
+        let NativeState::Stopped { answer, .. } = state_of(&gate, "d1") else {
             panic!("the first attempt stays stopped");
         };
-        assert_eq!(last_assistant_message.as_deref(), Some("first attempt"));
+        assert_eq!(answer.as_deref(), Some("first attempt"));
     }
 
     #[test]

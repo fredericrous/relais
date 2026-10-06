@@ -315,3 +315,20 @@ Checks green, then `needs_review` with four findings, fixed by hand:
 - stderr events took `seq` numbers the channel skips → they carry `stderr_seq` instead, and `seq` is gapless on stdout and in the file.
 
 `make check` green (1,337 lib tests). Falsified: the receipt naming and `check_ended` on a failed spawn.
+
+**2026-10-06, M2b** (run-65d3185e46a1b-3bf6, sonnet@medium, **interrupted at the 45-minute wall clock**, no usage reported). The worker had finished the change and was fixing the last release scenarios (30 of 41 passing). Rather than rerun 45 minutes, its worktree diff was salvaged by hand. It added:
+- the protocol requests `spawn`/`continue`/`stop`/`done`, replacing the `RELAIS-SPAWN` text lines;
+- `relais native hello|bound|stopped|status`, with `Stopped` carrying status, usage and answer;
+- the results built from them;
+- the transcript read for rollback ids, with `rollback_ids_missing` when the transcript is absent;
+- `relais run` refused without `--protocol`, `RELAIS_HOST` and a hello within 60 s, or outside `SUPPORTED_CLAUDE_CODE`;
+- `mod_gone` mid-run;
+- `--native*` flags removed;
+- a scripted plugin driving the release scenarios.
+
+Finished by hand:
+- **the learner** counted only `actual` costs as complete, so with every cost now `estimated` nothing would train again → an `estimated` cost counts as complete (a lower bound or an unknown still does not), with a test;
+- **the protocol scenario** compared stderr events that exist only under `--protocol` → compared without them;
+- **the late-write scenario** was racy under load because the scripted plugin killed agent process groups only at run end → an agent's group is killed as soon as it answers, as the agent is then over.
+
+No relais review ran on this package (the run ended before it); the branch's implementation review covers it. `make check` green (1,359 lib tests, 41 scenarios). Falsified: the stale-hello refusal (fails) and `mod_gone` (the test hangs to the wall clock instead of passing).

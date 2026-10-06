@@ -22,12 +22,12 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::admission::{
-    AdmissionState, AgentSettleOutcome, Attribution, BindNativeOutcome, BindOutcome, ClaimOutcome,
-    Decision, DispatchRequest, DispatchSource, Enforcement, Gate, GateError, HeartbeatStatus,
-    LifecycleOutcome, NativeAnswer, NativeAsk, NativeProgress, PendingSignal, Provenance,
-    RegisterOutcome, ReleaseWriteOutcome, ResourceClass, ResumeOutcome, RunRegistration, Signal,
-    StatusSnapshot, StopNativeOutcome, WaitOutcome, WithdrawOutcome, WorktreeOutcome,
-    WriteLeaseOutcome,
+    AdmissionState, AgentSettleOutcome, Attribution, BindNativeOutcome, BindOutcome, BoundOutcome,
+    ClaimOutcome, Decision, DispatchRequest, DispatchSource, Enforcement, Gate, GateError,
+    HeartbeatStatus, LifecycleOutcome, NativeAnswer, NativeAsk, NativeProgress, PendingSignal,
+    Provenance, RegisterOutcome, ReleaseWriteOutcome, ResourceClass, ResumeOutcome,
+    RunRegistration, Signal, StatusSnapshot, StopNativeOutcome, StoppedOutcome, StoppedReport,
+    WaitOutcome, WithdrawOutcome, WorktreeOutcome, WriteLeaseOutcome,
 };
 use crate::ipc::{Listener, Stream};
 use crate::ledger::Ledger;
@@ -97,7 +97,11 @@ const DESCRIPTOR_RETRIES: u32 = 20;
 /// `native_worktree`, `bind_native`, `stop_native`, `is_native_agent`,
 /// `native_status`) and their one `native` reply: a v3 daemon has none of
 /// them, and a marked call it cannot answer must be refused, not guessed.
-pub const PROTOCOL_VERSION: u32 = 4;
+///
+/// v5 added the relais plugin's calls (`native_hello`, `native_hello_age`,
+/// `native_bound`, `native_stopped`) and dropped `transcript_path` from
+/// `stop_native`: a v4 daemon would refuse them.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Why a coordinator call, election or startup failed. Every variant
 /// names the operation and the entity it was about, so a caller can tell
@@ -290,8 +294,25 @@ pub enum Request {
     StopNative {
         session_id: String,
         agent_id: String,
-        transcript_path: Option<PathBuf>,
         last_assistant_message: Option<String>,
+    },
+    /// The session's relais plugin is alive (`relais native hello`).
+    NativeHello {
+        session_id: String,
+    },
+    /// How long ago the session's plugin last said hello.
+    NativeHelloAge {
+        session_id: String,
+    },
+    /// The plugin bound a dispatch to its agent (`relais native bound`).
+    NativeBound {
+        dispatch_id: String,
+        agent_id: String,
+    },
+    /// The plugin reports a dispatch's agent ended (`relais native stopped`).
+    NativeStopped {
+        dispatch_id: String,
+        report: StoppedReport,
     },
     IsNativeAgent {
         session_id: String,
@@ -1290,16 +1311,37 @@ pub fn handle(
         Request::StopNative {
             session_id,
             agent_id,
-            transcript_path,
             last_assistant_message,
         } => Response::Native {
             answer: NativeAnswer::Stopped {
-                outcome: state.stop_native(
-                    &session_id,
-                    &agent_id,
-                    transcript_path,
-                    last_assistant_message,
-                ),
+                outcome: state.stop_native(&session_id, &agent_id, last_assistant_message),
+            },
+        },
+        Request::NativeHello { session_id } => {
+            state.native_hello(&session_id, now);
+            Response::Ack
+        }
+        Request::NativeHelloAge { session_id } => Response::Native {
+            answer: NativeAnswer::HelloAge {
+                age_ms: state
+                    .native_hello_age(&session_id, now)
+                    .map(|age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX)),
+            },
+        },
+        Request::NativeBound {
+            dispatch_id,
+            agent_id,
+        } => Response::Native {
+            answer: NativeAnswer::BoundAgent {
+                outcome: state.bind_native_agent(&dispatch_id, &agent_id, now),
+            },
+        },
+        Request::NativeStopped {
+            dispatch_id,
+            report,
+        } => Response::Native {
+            answer: NativeAnswer::StoppedAgent {
+                outcome: state.stopped_native(&dispatch_id, &report),
             },
         },
         Request::IsNativeAgent {
@@ -1856,7 +1898,6 @@ impl Gate for RemoteGate {
         &self,
         session_id: &str,
         agent_id: &str,
-        transcript_path: Option<&Path>,
         last_assistant_message: Option<&str>,
     ) -> Result<StopNativeOutcome, GateError> {
         self.native_call(
@@ -1864,10 +1905,70 @@ impl Gate for RemoteGate {
             Request::StopNative {
                 session_id: session_id.into(),
                 agent_id: agent_id.into(),
-                transcript_path: transcript_path.map(Path::to_path_buf),
                 last_assistant_message: last_assistant_message.map(str::to_string),
             },
             NativeAnswer::stopped,
+        )
+    }
+
+    fn native_hello(&self, session_id: &str) -> Result<(), GateError> {
+        match self.call(
+            "native_hello",
+            Request::NativeHello {
+                session_id: session_id.into(),
+            },
+        )? {
+            Response::Ack => Ok(()),
+            Response::Refused { refusal } => {
+                Err(Self::refused("native_hello", "native dispatch", &refusal))
+            }
+            unexpected @ (Response::Unknown { .. }
+            | Response::Error { .. }
+            | Response::ShuttingDown
+            | Response::Pong { .. }
+            | Response::Decision { .. }
+            | Response::AgentSettled { .. }
+            | Response::Heartbeat { .. }
+            | Response::Native { .. }
+            | Response::WriteLease { .. }
+            | Response::Cancelled { .. }
+            | Response::Status { .. }) => Err(Self::unexpected("native_hello", &unexpected)),
+        }
+    }
+
+    fn native_hello_age(&self, session_id: &str) -> Result<Option<Duration>, GateError> {
+        self.native_call(
+            "native_hello_age",
+            Request::NativeHelloAge {
+                session_id: session_id.into(),
+            },
+            NativeAnswer::hello_age,
+        )
+    }
+
+    fn native_bound(&self, dispatch_id: &str, agent_id: &str) -> Result<BoundOutcome, GateError> {
+        self.native_call(
+            "native_bound",
+            Request::NativeBound {
+                dispatch_id: dispatch_id.into(),
+                agent_id: agent_id.into(),
+            },
+            NativeAnswer::bound_agent,
+        )
+    }
+
+    fn native_stopped(
+        &self,
+        dispatch_id: &str,
+        report: &StoppedReport,
+    ) -> Result<StoppedOutcome, GateError> {
+        self.native_call(
+            "native_stopped",
+            Request::NativeStopped {
+                dispatch_id: dispatch_id.into(),
+                report: report.clone(),
+            },
+            NativeAnswer::stopped_agent,
         )
     }
 
@@ -2507,10 +2608,16 @@ mod tests {
                 .expect("admit"),
             Decision::Granted
         );
+        assert_eq!(gate.native_hello_age("sess-n").expect("age"), None);
+        gate.native_hello("sess-n").expect("hello");
+        assert!(gate
+            .native_hello_age("sess-n")
+            .expect("age")
+            .is_some_and(|age| age < Duration::from_secs(5)));
         let ask = NativeAsk::Spawn {
             subagent_type: "relais-worker".into(),
             model: "sonnet".into(),
-            prompt: format!("go\n{}", crate::native::marker_line("d-n")),
+            prompt: "go".into(),
             worktree: PathBuf::from("/trees/n"),
         };
         assert_eq!(
@@ -2537,7 +2644,7 @@ mod tests {
         );
         assert!(gate.is_native_agent("sess-n", "a1").expect("agent"));
         assert_eq!(
-            gate.stop_native("sess-n", "a1", Some(Path::new("/t/a1.jsonl")), Some("done"))
+            gate.stop_native("sess-n", "a1", Some("done"))
                 .expect("stop"),
             StopNativeOutcome::Stopped {
                 dispatch_id: "d-n".into()

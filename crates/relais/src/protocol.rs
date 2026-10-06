@@ -164,6 +164,149 @@ struct Line<'a> {
     event: &'a Event,
 }
 
+/// What the run asks of the relais plugin, and its end: one JSON line each,
+/// written through the same [`Wire`] as the events.
+#[derive(Debug, Serialize)]
+#[serde(tag = "relais", rename_all = "snake_case")]
+pub enum Request<'a> {
+    /// Run this agent, in `cwd`.
+    Spawn {
+        run: &'a str,
+        dispatch: &'a str,
+        agent_kind: AgentKind,
+        subagent_type: &'a str,
+        model: &'a str,
+        description: String,
+        prompt: &'a str,
+        cwd: String,
+    },
+    /// Another turn for an agent that already ran.
+    Continue {
+        run: &'a str,
+        dispatch: &'a str,
+        agent: &'a str,
+        message: &'a str,
+    },
+    /// The attempt was cancelled while its agent runs.
+    Stop {
+        run: &'a str,
+        dispatch: &'a str,
+        agent: &'a str,
+    },
+    /// The run ended.
+    Done {
+        run: &'a str,
+        outcome: &'a str,
+        receipt: Option<&'a str>,
+        summary: Option<Summary>,
+    },
+}
+
+/// What the run's candidate changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Summary {
+    pub files_changed: u64,
+    pub insertions: u64,
+    pub deletions: u64,
+}
+
+impl Summary {
+    /// What a unified diff changes: its files, and its added and removed lines.
+    pub fn of_patch(patch: &str) -> Self {
+        let mut summary = Self {
+            files_changed: 0,
+            insertions: 0,
+            deletions: 0,
+        };
+        for line in patch.lines() {
+            if line.starts_with("diff --git ") {
+                summary.files_changed += 1;
+            } else if line.starts_with('+') && !line.starts_with("+++") {
+                summary.insertions += 1;
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                summary.deletions += 1;
+            }
+        }
+        summary
+    }
+
+    /// The summary of the run's last candidate, when it kept one: the
+    /// highest-numbered `candidate-<n>.patch` in its artifacts directory.
+    pub fn of_candidate(artifacts: &Path) -> Option<Self> {
+        let latest = std::fs::read_dir(artifacts)
+            .ok()?
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let number = name
+                    .strip_prefix("candidate-")?
+                    .strip_suffix(".patch")?
+                    .parse::<u32>()
+                    .ok()?;
+                Some((number, entry.path()))
+            })
+            .max_by_key(|(number, _)| *number)?;
+        let patch = std::fs::read_to_string(latest.1).ok()?;
+        Some(Self::of_patch(&patch))
+    }
+}
+
+/// Where protocol lines go: the process's real stdout once [`install`] has
+/// kept it, or a sink a test reads. One writer per wire, so lines never
+/// interleave.
+#[derive(Clone)]
+pub struct Wire(Option<Arc<Mutex<Box<dyn Write + Send>>>>);
+
+impl std::fmt::Debug for Wire {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Wire(sink)"
+        } else {
+            "Wire(process)"
+        })
+    }
+}
+
+impl Wire {
+    /// The process's own protocol stdout. Lines written before [`install`]
+    /// has kept it go nowhere.
+    pub fn process() -> Self {
+        Self(None)
+    }
+
+    /// A wire that writes to `out`, flushing every line.
+    pub fn to(out: impl Write + Send + 'static) -> Self {
+        Self(Some(Arc::new(Mutex::new(Box::new(out)))))
+    }
+
+    /// Write one request line.
+    pub fn send(&self, request: &Request<'_>) -> io::Result<()> {
+        let line = serde_json::to_string(request).map_err(io::Error::other)?;
+        self.write_line(&line)
+    }
+
+    fn write_line(&self, line: &str) -> io::Result<()> {
+        let mut bytes = Vec::with_capacity(line.len() + 1);
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
+        match &self.0 {
+            Some(sink) => {
+                let mut out = locked(sink);
+                out.write_all(&bytes)?;
+                out.flush()
+            }
+            None => match PROTOCOL_STDOUT.get() {
+                // One write, under the lock, so lines never interleave.
+                Some(stdout) => locked(stdout).write_all(&bytes),
+                None => Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "the protocol channel is not installed (run with --protocol)",
+                )),
+            },
+        }
+    }
+}
+
 /// The real stdout, kept for protocol lines. Set once, by [`install`].
 static PROTOCOL_STDOUT: OnceLock<Mutex<File>> = OnceLock::new();
 
@@ -184,6 +327,7 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct EventLog {
     run: String,
     path: PathBuf,
+    wire: Wire,
     state: Mutex<LogState>,
 }
 
@@ -222,7 +366,9 @@ impl EventLog {
             let _ = writeln!(file, "{line}");
         }
         if event.is_protocol_line() {
-            write_protocol_line(&line);
+            // A reader that has gone away loses the line; the run does not
+            // end for it, and `events.jsonl` still has it.
+            let _ = self.wire.write_line(&line);
         }
     }
 
@@ -239,19 +385,6 @@ impl EventLog {
     }
 }
 
-fn write_protocol_line(line: &str) {
-    let Some(stdout) = PROTOCOL_STDOUT.get() else {
-        return;
-    };
-    let mut bytes = Vec::with_capacity(line.len() + 1);
-    bytes.extend_from_slice(line.as_bytes());
-    bytes.push(b'\n');
-    // One write, under the lock, so lines never interleave. A reader that
-    // has gone away loses the line; the run does not end for it, and
-    // `events.jsonl` still has it.
-    let _ = locked(stdout).write_all(&bytes);
-}
-
 /// Where a run's events go. Cheap to clone and pass around; a silent one
 /// (no run, no file) does nothing.
 #[derive(Debug, Clone)]
@@ -263,11 +396,18 @@ impl Events {
         Self(None)
     }
 
-    /// The events of `run`, appended under its artifacts directory.
+    /// The events of `run`, appended under its artifacts directory and
+    /// sent to the process's protocol stdout.
     pub fn for_run(run: &str, artifacts: &Path) -> Self {
+        Self::for_run_on(run, artifacts, Wire::process())
+    }
+
+    /// The events of `run`, sent to `wire`.
+    pub fn for_run_on(run: &str, artifacts: &Path, wire: Wire) -> Self {
         Self(Some(Arc::new(EventLog {
             run: run.to_string(),
             path: artifacts.join("events.jsonl"),
+            wire,
             state: Mutex::new(LogState {
                 next_seq: 0,
                 next_stderr_seq: 0,
@@ -293,6 +433,86 @@ impl Events {
     pub fn mirror_stderr(&self) {
         *locked(&STDERR_RUN) = self.0.clone();
     }
+}
+
+/// The most `output` lines a status carries.
+pub const STATUS_OUTPUT_LINES: usize = 40;
+
+/// A run's timeline as `relais native status` prints it: its phases,
+/// decisions, cost and outcome, and the last [`STATUS_OUTPUT_LINES`] lines
+/// of check output, read from the run's `events.jsonl`. Never the whole file.
+pub fn timeline(run: &str, events_jsonl: &str) -> serde_json::Value {
+    let mut phases = Vec::new();
+    let mut decisions = Vec::new();
+    let mut cost = Vec::new();
+    let mut outcome = serde_json::Value::Null;
+    let mut output: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    for line in events_jsonl.lines() {
+        // A line that is not an event (a torn last line of a killed run)
+        // says nothing about the timeline.
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let event = &entry["event"];
+        match event["kind"].as_str() {
+            Some("phase") => phases.push(serde_json::json!({
+                "at": entry["at"],
+                "state": event["state"],
+                "reason": event["reason"],
+            })),
+            Some("decision") => decisions.push(serde_json::json!({
+                "at": entry["at"],
+                "what": event["what"],
+                "reason": event["reason"],
+            })),
+            Some("cost") => cost.push(serde_json::json!({
+                "booked": event["booked"],
+                "completeness": event["completeness"],
+            })),
+            Some("outcome") => {
+                outcome = serde_json::json!({
+                    "state": event["state"],
+                    "receipt": event["receipt"],
+                });
+            }
+            Some("output") => {
+                for text in event["text"].as_str().unwrap_or_default().lines() {
+                    if output.len() == STATUS_OUTPUT_LINES {
+                        output.pop_front();
+                    }
+                    output.push_back(text.to_string());
+                }
+            }
+            Some(_) | None => {}
+        }
+    }
+    serde_json::json!({
+        "run": run,
+        "phases": phases,
+        "decisions": decisions,
+        "cost": cost,
+        "outcome": outcome,
+        "output": output,
+    })
+}
+
+/// The run whose events were written last, under the artifacts directory.
+pub fn latest_run(artifacts: &Path) -> Option<String> {
+    std::fs::read_dir(artifacts)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let written = entry
+                .path()
+                .join("events.jsonl")
+                .metadata()
+                .ok()?
+                .modified()
+                .ok()?;
+            Some((written, entry.file_name().to_string_lossy().into_owned()))
+        })
+        .max()
+        .map(|(_, run)| run)
 }
 
 /// A line the pipe carried, as the text of a `stderr` event.
@@ -433,6 +653,121 @@ mod tests {
         assert_eq!(written[0]["event"]["kind"], "decision");
         assert_eq!(written[1]["event"]["completeness"], "actual");
         assert_eq!(written[2]["event"]["text"], "hi");
+    }
+
+    #[test]
+    fn a_timeline_keeps_phases_decisions_cost_outcome_and_the_last_40_output_lines() {
+        let dir = crate::test_support::short_temp_dir("pr-timeline");
+        let events = Events::for_run("run-1", &dir.join("run-1"));
+        events.emit(Event::Phase {
+            state: "running".into(),
+            reason: "worker_dispatched".into(),
+            detail: serde_json::Value::Null,
+        });
+        events.emit(Event::Decision {
+            what: "repair".into(),
+            reason: "checks_failed".into(),
+        });
+        let first: String = (0..30).map(|n| format!("a{n}\n")).collect();
+        let second: String = (0..30).map(|n| format!("b{n}\n")).collect();
+        for text in [first, second] {
+            events.emit(Event::Output {
+                label: "check".into(),
+                text,
+                elided_bytes: 0,
+            });
+        }
+        events.emit(Event::Cost {
+            booked: Some(5),
+            completeness: CostCompleteness::Actual,
+        });
+        events.emit(Event::Outcome {
+            state: "accepted".into(),
+            receipt: Some("/r/receipt.json".into()),
+        });
+        let text = std::fs::read_to_string(dir.join("run-1/events.jsonl")).expect("events");
+        let timeline = timeline("run-1", &text);
+        assert_eq!(timeline["run"], "run-1");
+        assert_eq!(timeline["phases"][0]["state"], "running");
+        assert_eq!(timeline["decisions"][0]["what"], "repair");
+        assert_eq!(timeline["cost"][0]["booked"], 5);
+        assert_eq!(timeline["outcome"]["state"], "accepted");
+        assert_eq!(timeline["outcome"]["receipt"], "/r/receipt.json");
+        let output = timeline["output"].as_array().expect("output lines");
+        assert_eq!(output.len(), STATUS_OUTPUT_LINES);
+        assert_eq!(output[0], "a20", "the oldest lines are the ones dropped");
+        assert_eq!(output[STATUS_OUTPUT_LINES - 1], "b29");
+    }
+
+    #[test]
+    fn the_latest_run_is_the_one_whose_events_were_written_last() {
+        let dir = crate::test_support::short_temp_dir("pr-latest");
+        assert_eq!(latest_run(&dir), None);
+        for run in ["run-a", "run-b"] {
+            Events::for_run(run, &dir.join(run)).emit(Event::Decision {
+                what: "stop".into(),
+                reason: "done".into(),
+            });
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(latest_run(&dir).as_deref(), Some("run-b"));
+    }
+
+    #[test]
+    fn a_patch_summary_counts_files_insertions_and_deletions() {
+        let patch = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-old\n+new\n+more\n \
+                     keep\ndiff --git a/y b/y\ndeleted file mode 100644\n--- a/y\n+++ /dev/null\n-gone\n";
+        assert_eq!(
+            Summary::of_patch(patch),
+            Summary {
+                files_changed: 2,
+                insertions: 2,
+                deletions: 2
+            }
+        );
+    }
+
+    #[test]
+    fn requests_and_events_share_one_wire_and_are_one_json_line_each() {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        struct Chunks(std::sync::mpsc::Sender<Vec<u8>>);
+        impl Write for Chunks {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.send(buf.to_vec()).map_err(io::Error::other)?;
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let wire = Wire::to(Chunks(tx));
+        wire.send(&Request::Stop {
+            run: "r",
+            dispatch: "d",
+            agent: "a",
+        })
+        .expect("sent");
+        wire.send(&Request::Done {
+            run: "r",
+            outcome: "accepted",
+            receipt: None,
+            summary: Some(Summary {
+                files_changed: 1,
+                insertions: 2,
+                deletions: 3,
+            }),
+        })
+        .expect("sent");
+        let written: Vec<Vec<u8>> = rx.try_iter().collect();
+        assert_eq!(written.len(), 2, "one write per line");
+        let stop: serde_json::Value = serde_json::from_slice(&written[0]).expect("json");
+        assert_eq!(stop["relais"], "stop");
+        assert_eq!(stop["agent"], "a");
+        let done: serde_json::Value = serde_json::from_slice(&written[1]).expect("json");
+        assert_eq!(done["relais"], "done");
+        assert_eq!(done["summary"]["deletions"], 3);
+        assert!(done["receipt"].is_null());
+        assert!(written.iter().all(|line| line.ends_with(b"\n")));
     }
 
     #[test]

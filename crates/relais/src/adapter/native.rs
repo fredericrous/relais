@@ -1,33 +1,36 @@
 //! The native presentation of a worker attempt (SPEC §23).
 //!
-//! `relais run --native` does not start the worker: it asks the parent
-//! Claude Code session to spawn it as a subagent, so Claude Code renders it
-//! as its own. This backend publishes that request on stdout, registers it
-//! with the coordinator, whose hook makes the session run exactly what was
-//! registered, and waits for the subagent to stop. It then reads what the
-//! subagent spent from its transcript, so the engine judges the attempt as
-//! it judges a headless one. Every launch that is not a native worker's
-//! goes to the headless backend untouched.
+//! `relais run` does not start the worker: it asks the relais plugin of the
+//! parent Claude Code session to spawn it as a subagent, so Claude Code
+//! renders it as its own. This backend writes that request as a protocol
+//! line (SPEC §29), registers it with the coordinator, and waits for the
+//! plugin's `relais native bound` and `relais native stopped` calls, which
+//! carry the agent and what it spent. The engine then judges the attempt as
+//! it judges any other. Every launch that is not a native worker's goes to
+//! the headless backend untouched.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::admission::{
-    Gate, NativeAsk, NativeProgress, NativeState, RegisterOutcome, ADMISSION_POLL,
+    AgentStatus, AgentUsage, Gate, GateError, NativeAsk, NativeProgress, NativeState,
+    RegisterOutcome, StoppedReport, ADMISSION_POLL,
 };
 use crate::backend::{
     claims_blockage, Backend, BackendError, Capabilities, Cost, LaunchResult, LaunchSpec,
     Presentation, UsageReport,
 };
 use crate::money::MicroUsd;
-use crate::native::{has_worker_definition, marker_line, worker_agent_type};
-use crate::orchestration::{parse_transcript, price, unpriced_reason, PriceTable, UsageRecord};
+use crate::native::{has_worker_definition, plugin_agent_type, worker_agent_type, HELLO_FRESH};
+use crate::orchestration::{
+    parse_transcript, price, unpriced_reason, CacheWrites, PriceTable, Speed, UsageRecord,
+};
 use crate::policy::EffortId;
 use crate::procs::Ended;
+use crate::protocol::{AgentKind, Request, Wire};
 
 /// The label a worker that was never spawned ends with.
 const SPAWN_MISSING: &str = "native_spawn_missing";
@@ -35,9 +38,40 @@ const SPAWN_MISSING: &str = "native_spawn_missing";
 /// The label an attempt whose model has no shipped worker definition ends with.
 const WORKER_MISSING: &str = "native_worker_missing";
 
+/// The label an attempt ends with when the session's plugin stopped saying hello.
+const MOD_GONE: &str = "mod_gone";
+
 /// Consecutive unanswered status polls that end the wait: a coordinator
 /// that has stopped answering cannot tell this attempt anything.
 const STATUS_FAILURES_ALLOWED: u32 = 3;
+
+/// How long the backend waits on the plugin.
+#[derive(Debug, Clone, Copy)]
+pub struct Waits {
+    /// A request nobody bound within this ends `native_spawn_missing`.
+    pub spawn: Duration,
+    /// A session whose plugin said no hello for this long ends the attempt
+    /// `mod_gone`.
+    pub hello_lapse: Duration,
+}
+
+impl Waits {
+    pub const DEFAULT: Self = Self {
+        spawn: Duration::from_secs(120),
+        hello_lapse: HELLO_FRESH,
+    };
+}
+
+/// Where the backend's run talks to the plugin, and where it can see what
+/// the plugin's agents wrote.
+pub struct Link {
+    pub run_id: String,
+    pub session_id: String,
+    pub wire: Wire,
+    /// Claude Code's `projects` directory, where an agent's transcript is
+    /// read for its message ids; `None` when it cannot be known.
+    pub projects_dir: Option<PathBuf>,
+}
 
 /// The subagent a task's last native attempt ran as.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,8 +86,6 @@ struct KnownAgent {
 struct Memory {
     /// The agent of each task's last native attempt, by the task's tree.
     agents: BTreeMap<PathBuf, KnownAgent>,
-    /// Transcript message ids already booked to an earlier attempt.
-    booked: BTreeSet<String>,
 }
 
 /// How an attempt reaches the session.
@@ -109,7 +141,7 @@ fn missing_definition(route: &Route, spec: &LaunchSpec) -> Option<String> {
             }
             Some(format!(
                 "{WORKER_MISSING}: relais ships no native worker for model {} at effort {}; \
-                 use a model alias (haiku, sonnet, opus, fable) or run without --native",
+                 use a model alias (haiku, sonnet, opus, fable)",
                 spec.model,
                 effort.unwrap_or("default")
             ))
@@ -119,81 +151,74 @@ fn missing_definition(route: &Route, spec: &LaunchSpec) -> Option<String> {
 
 /// The request registered with the coordinator for this attempt.
 fn ask_for(route: &Route, spec: &LaunchSpec) -> NativeAsk {
-    let text = format!("{}\n{}", spec.prompt, marker_line(&spec.dispatch_id));
     match route {
         Route::Spawn => NativeAsk::Spawn {
-            subagent_type: worker_agent_type(
+            subagent_type: plugin_agent_type(&worker_agent_type(
                 &spec.model,
                 spec.effort.as_ref().map(EffortId::as_str),
-            ),
+            )),
             model: spec.model.clone(),
-            prompt: text,
+            prompt: spec.prompt.clone(),
             worktree: spec.work_dir.clone(),
         },
         Route::Continue { agent_id, .. } => NativeAsk::Continue {
             agent_id: agent_id.clone(),
-            message: text,
+            message: spec.prompt.clone(),
         },
     }
 }
 
-/// The one stdout line that is the parent session's whole interface: its
-/// JSON is exactly the tool input to send.
-fn request_line(spec: &LaunchSpec, ask: &NativeAsk) -> String {
+/// The protocol line that asks the plugin for what was registered.
+fn request_for<'a>(run: &'a str, spec: &'a LaunchSpec, ask: &'a NativeAsk) -> Request<'a> {
     match ask {
         NativeAsk::Spawn {
             subagent_type,
             model,
             prompt,
-            ..
-        } => format!(
-            "RELAIS-SPAWN {}",
-            serde_json::json!({
-                "dispatch_id": spec.dispatch_id,
-                "subagent_type": subagent_type,
-                "model": model,
-                "description": format!("relais {}", spec.dispatch_id),
-                "prompt": prompt,
-                "isolation": "worktree",
-                "run_in_background": true,
-            })
-        ),
-        NativeAsk::Continue { agent_id, message } => format!(
-            "RELAIS-CONTINUE {}",
-            serde_json::json!({
-                "dispatch_id": spec.dispatch_id,
-                "to": agent_id,
-                "message": message,
-            })
-        ),
+            worktree,
+        } => Request::Spawn {
+            run,
+            dispatch: &spec.dispatch_id,
+            agent_kind: AgentKind::Worker,
+            subagent_type,
+            model,
+            description: format!("relais {}", spec.dispatch_id),
+            prompt,
+            cwd: worktree.to_string_lossy().into_owned(),
+        },
+        NativeAsk::Continue { agent_id, message } => Request::Continue {
+            run,
+            dispatch: &spec.dispatch_id,
+            agent: agent_id,
+            message,
+        },
     }
 }
 
 /// How the wait for a subagent ended.
 #[derive(Debug)]
 enum Awaited {
-    Stopped {
-        agent_id: String,
-        transcript_path: Option<PathBuf>,
-        last_assistant_message: Option<String>,
-    },
+    Stopped(StoppedReport),
     /// Anything but a stop: the attempt has no result.
-    Ended { ended: Ended, detail: String },
+    Ended {
+        ended: Ended,
+        detail: String,
+    },
 }
 
-/// What the new records of a transcript add up to.
+/// What a dispatch's reported usage adds up to.
 #[derive(Debug, PartialEq)]
 struct Booked {
     usage: UsageReport,
     effective_model: Option<String>,
     /// Why records could not be priced, one line per model and reason,
-    /// in transcript order: what the runner's backstop names.
+    /// in order: what the runner's backstop names.
     unpriced: Vec<String>,
 }
 
-/// Usage of the records not booked yet: tokens summed, cost estimated from
-/// the machine's price table, the model of the last one. No new record, no
-/// table or a model without a price leaves the figure unknown, never zero.
+/// Usage of the records given: tokens summed, cost estimated from the
+/// machine's price table, the model of the last one. No record, no table or
+/// a model without a price leaves the figure unknown, never zero.
 fn usage_of(records: &[UsageRecord], prices: Option<&PriceTable>) -> Booked {
     if records.is_empty() {
         return Booked {
@@ -247,6 +272,38 @@ fn usage_of(records: &[UsageRecord], prices: Option<&PriceTable>) -> Booked {
     }
 }
 
+/// What the plugin reported for a dispatch, priced as a transcript's
+/// records are. A report without usage, or without the model that ran,
+/// leaves the figure unknown, never zero.
+fn usage_of_report(usage: Option<&AgentUsage>, prices: Option<&PriceTable>) -> Booked {
+    let Some(usage) = usage else {
+        return usage_of(&[], prices);
+    };
+    let Some(model) = usage.model.clone() else {
+        return Booked {
+            usage: UsageReport::unknown(),
+            effective_model: None,
+            unpriced: vec!["the agent reported no model".to_string()],
+        };
+    };
+    // The plugin sums one cache-write figure over the turns, without the
+    // tier it was written at: priced at the 5-minute rate, the default.
+    let record = UsageRecord {
+        message_id: String::new(),
+        model,
+        speed: Speed::Standard,
+        input_tokens: usage.input_tokens.unwrap_or(0),
+        output_tokens: usage.output_tokens.unwrap_or(0),
+        cache_read_input_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+        cache_writes: CacheWrites {
+            ephemeral_5m_input_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+            ephemeral_1h_input_tokens: 0,
+        },
+        timestamp: String::new(),
+    };
+    usage_of(std::slice::from_ref(&record), prices)
+}
+
 /// A launch that did not reach a result.
 fn ended_result(spec: &LaunchSpec, ended: Ended, detail: String) -> LaunchResult {
     LaunchResult {
@@ -271,63 +328,35 @@ fn ended_result(spec: &LaunchSpec, ended: Ended, detail: String) -> LaunchResult
 pub struct NativeBackend<'a> {
     headless: &'a dyn Backend,
     gate: &'a (dyn Gate + Sync),
-    session_id: String,
-    spawn_wait: Duration,
+    link: Link,
+    waits: Waits,
     prices: Option<PriceTable>,
     memory: Mutex<Memory>,
-    /// Where the request lines go: stdout, which the parent session reads.
-    out: Mutex<Box<dyn Write + Send + 'a>>,
 }
 
 impl<'a> NativeBackend<'a> {
     pub fn new(
         headless: &'a dyn Backend,
         gate: &'a (dyn Gate + Sync),
-        session_id: String,
-        spawn_wait: Duration,
+        link: Link,
+        waits: Waits,
         prices: Option<PriceTable>,
-    ) -> Self {
-        Self::writing_to(
-            headless,
-            gate,
-            session_id,
-            spawn_wait,
-            prices,
-            Box::new(std::io::stdout()),
-        )
-    }
-
-    /// The same backend writing its request lines to `out` instead of
-    /// stdout: the port a test reads the parent session's side of.
-    pub fn writing_to(
-        headless: &'a dyn Backend,
-        gate: &'a (dyn Gate + Sync),
-        session_id: String,
-        spawn_wait: Duration,
-        prices: Option<PriceTable>,
-        out: Box<dyn Write + Send + 'a>,
     ) -> Self {
         Self {
             headless,
             gate,
-            session_id,
-            spawn_wait,
+            link,
+            waits,
             prices,
             memory: Mutex::new(Memory::default()),
-            out: Mutex::new(out),
         }
     }
 
-    /// Write one request line and flush it, so the session sees it now.
-    fn publish(&self, line: &str) -> Result<(), BackendError> {
-        // A poisoned lock only means another writer panicked mid-line;
-        // the next line is written whole.
-        let mut out = self
-            .out
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        writeln!(out, "{line}")
-            .and_then(|()| out.flush())
+    /// Write one request line, so the plugin sees it now.
+    fn publish(&self, request: &Request<'_>) -> Result<(), BackendError> {
+        self.link
+            .wire
+            .send(request)
             .map_err(|e| BackendError::Launch(format!("the native request was not written: {e}")))
     }
 
@@ -343,12 +372,19 @@ impl<'a> NativeBackend<'a> {
     fn await_stop(&self, spec: &LaunchSpec, route: &Route) -> Awaited {
         let started = Instant::now();
         let mut failures = 0u32;
+        // The agent the last poll found the dispatch bound to: once the run
+        // is cancelled the coordinator settles the dispatch, and its record
+        // no longer names the agent.
+        let mut running: Option<String> = None;
         loop {
             if spec
                 .cancel
                 .as_ref()
                 .is_some_and(|flag| flag.load(Ordering::SeqCst))
             {
+                if let Some(agent) = &running {
+                    self.stop_agent(spec, agent);
+                }
                 return Awaited::Ended {
                     ended: Ended::Cancelled,
                     detail: "the dispatch was cancelled while the native worker ran".into(),
@@ -360,7 +396,7 @@ impl<'a> NativeBackend<'a> {
                     detail: "the native worker did not stop within the attempt's wall time".into(),
                 };
             }
-            match self.gate.native_status(&spec.dispatch_id) {
+            match self.poll(spec) {
                 Err(e) => {
                     failures += 1;
                     if failures >= STATUS_FAILURES_ALLOWED {
@@ -373,15 +409,54 @@ impl<'a> NativeBackend<'a> {
                         };
                     }
                 }
-                Ok(progress) => {
+                Ok((progress, hello_age)) => {
                     failures = 0;
+                    if let NativeProgress::Known {
+                        state: NativeState::Bound { agent_id },
+                    } = &progress
+                    {
+                        running = Some(agent_id.clone());
+                    }
                     if let Some(awaited) = self.settled(spec, route, &progress, started) {
                         return awaited;
+                    }
+                    let alive = hello_age.is_some_and(|age| age < self.waits.hello_lapse);
+                    if !alive {
+                        return Awaited::Ended {
+                            ended: Ended::Exited(1),
+                            detail: format!(
+                                "{MOD_GONE}: the relais plugin of session {} said no hello for \
+                                 {}s while dispatch {} ran",
+                                self.link.session_id,
+                                self.waits.hello_lapse.as_secs(),
+                                spec.dispatch_id
+                            ),
+                        };
                     }
                 }
             }
             std::thread::sleep(ADMISSION_POLL);
         }
+    }
+
+    /// What the coordinator knows now: the dispatch's record, and how long
+    /// ago the session's plugin last said hello.
+    fn poll(&self, spec: &LaunchSpec) -> Result<(NativeProgress, Option<Duration>), GateError> {
+        let progress = self.gate.native_status(&spec.dispatch_id)?;
+        let hello_age = self.gate.native_hello_age(&self.link.session_id)?;
+        Ok((progress, hello_age))
+    }
+
+    /// Ask the plugin to stop the agent of a cancelled attempt.
+    fn stop_agent(&self, spec: &LaunchSpec, agent: &str) {
+        let stop = Request::Stop {
+            run: &self.link.run_id,
+            dispatch: &spec.dispatch_id,
+            agent,
+        };
+        // Dropped on failure: the attempt ends cancelled either way, and a
+        // plugin that cannot be told has nothing left to stop.
+        let _ = self.publish(&stop);
     }
 
     /// What one status says about the wait, `None` while it goes on.
@@ -396,18 +471,20 @@ impl<'a> NativeBackend<'a> {
             NativeProgress::Known { state } => match state {
                 NativeState::Stopped {
                     agent_id,
-                    transcript_path,
-                    last_assistant_message,
-                } => Some(Awaited::Stopped {
+                    status,
+                    usage,
+                    answer,
+                } => Some(Awaited::Stopped(StoppedReport {
                     agent_id: agent_id.clone(),
-                    transcript_path: transcript_path.clone(),
-                    last_assistant_message: last_assistant_message.clone(),
-                }),
+                    status: *status,
+                    usage: usage.clone(),
+                    answer: answer.clone(),
+                })),
                 NativeState::Failed { reason } => Some(Awaited::Ended {
                     ended: Ended::Exited(1),
                     detail: reason.clone(),
                 }),
-                NativeState::Requested { .. } if started.elapsed() >= self.spawn_wait => {
+                NativeState::Requested { .. } if started.elapsed() >= self.waits.spawn => {
                     let nobody = match route {
                         Route::Spawn => "no session spawned it",
                         Route::Continue { .. } => "no session sent the continuation",
@@ -416,7 +493,7 @@ impl<'a> NativeBackend<'a> {
                         ended: Ended::Exited(1),
                         detail: format!(
                             "{SPAWN_MISSING}: {nobody} within {}s of the request for dispatch {}",
-                            self.spawn_wait.as_secs(),
+                            self.waits.spawn.as_secs(),
                             spec.dispatch_id
                         ),
                     })
@@ -436,40 +513,68 @@ impl<'a> NativeBackend<'a> {
         }
     }
 
-    /// The result of a subagent that stopped: its last message, and the
-    /// usage of the transcript records no earlier attempt has booked.
+    /// The message ids of an agent's transcript, found at
+    /// `<projects>/*/<session>/subagents/agent-<agent>.jsonl`. They are
+    /// read for nothing else: an older relais's usage import skips what is
+    /// recorded here, so the agent's usage is not booked twice after a
+    /// revert. Empty when the file is missing or holds no message.
+    fn rollback_ids(&self, agent_id: &str) -> Vec<String> {
+        let Some(projects) = &self.link.projects_dir else {
+            return Vec::new();
+        };
+        // An unreadable directory is the same fact as a missing file: no
+        // ids, which the run says as `rollback_ids_missing`.
+        let Ok(slugs) = std::fs::read_dir(projects) else {
+            return Vec::new();
+        };
+        let file = format!("agent-{agent_id}.jsonl");
+        slugs
+            .flatten()
+            .find_map(|slug| {
+                let path = slug
+                    .path()
+                    .join(&self.link.session_id)
+                    .join("subagents")
+                    .join(&file);
+                std::fs::read_to_string(path).ok()
+            })
+            .map(|content| {
+                parse_transcript(&content)
+                    .into_iter()
+                    .map(|record| record.message_id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The result of a subagent that stopped: its answer and what it
+    /// reported spending.
     fn stopped_result(
         &self,
         spec: &LaunchSpec,
-        agent_id: String,
-        transcript_path: Option<&Path>,
-        last_assistant_message: Option<String>,
+        report: StoppedReport,
         mut notes: Vec<String>,
     ) -> LaunchResult {
-        let records = match transcript_path.map(std::fs::read_to_string) {
-            Some(Ok(content)) => parse_transcript(&content),
-            Some(Err(e)) => {
-                notes.push(format!("the agent's transcript could not be read ({e})"));
-                Vec::new()
-            }
-            None => {
-                notes.push("the agent's stop named no transcript".into());
-                Vec::new()
-            }
-        };
-        let fresh: Vec<UsageRecord> = {
-            let mut memory = self.memory();
-            let fresh: Vec<UsageRecord> = records
-                .into_iter()
-                .filter(|record| !memory.booked.contains(&record.message_id))
-                .collect();
-            memory
-                .booked
-                .extend(fresh.iter().map(|record| record.message_id.clone()));
+        let StoppedReport {
+            agent_id,
+            status,
+            usage,
+            answer,
+        } = report;
+        let booked = usage_of_report(usage.as_ref(), self.prices.as_ref());
+        let failure = match status {
+            AgentStatus::Completed => None,
+            AgentStatus::Failed => Some("failed"),
+            AgentStatus::Killed => Some("killed"),
+        }
+        .map(|how| format!("the native agent {agent_id} {how}"));
+        if failure.is_none() {
             // A continuation runs at the effort its agent was spawned with,
             // whatever this attempt asked for, so the agent already on
             // record keeps its effort; only a fresh spawn records the
-            // effort it was asked to run at.
+            // effort it was asked to run at. An agent that failed is not
+            // continued: the next attempt spawns afresh.
+            let mut memory = self.memory();
             let effort = match memory.agents.get(&spec.work_dir) {
                 Some(known) if known.agent_id == agent_id => known.effort.clone(),
                 Some(_) | None => spec.effort.clone(),
@@ -482,24 +587,24 @@ impl<'a> NativeBackend<'a> {
                     effort,
                 },
             );
-            fresh
-        };
-        let booked = usage_of(&fresh, self.prices.as_ref());
+        }
+        let result_text = answer.filter(|_| failure.is_none());
+        if failure.is_some() {
+            notes.clear();
+        }
         LaunchResult {
             dispatch_id: spec.dispatch_id.clone(),
-            ended: Ended::Exited(0),
+            ended: Ended::Exited(i32::from(failure.is_some())),
             stdout: String::new(),
             stderr: notes.join("\n"),
-            worker_claims_blockage: last_assistant_message
-                .as_deref()
-                .is_some_and(claims_blockage),
-            result_text: last_assistant_message,
-            session_id: Some(agent_id),
+            worker_claims_blockage: result_text.as_deref().is_some_and(claims_blockage),
+            result_text,
             effective_model: booked.effective_model,
             usage: booked.usage,
             permission_denials: Vec::new(),
-            failure_detail: None,
-            booked_message_ids: fresh.into_iter().map(|record| record.message_id).collect(),
+            failure_detail: failure,
+            booked_message_ids: self.rollback_ids(&agent_id),
+            session_id: Some(agent_id),
             unpriced: booked.unpriced,
         }
     }
@@ -513,7 +618,7 @@ impl<'a> NativeBackend<'a> {
         let ask = ask_for(&route, spec);
         match self
             .gate
-            .register_native(&self.session_id, &spec.dispatch_id, &ask)
+            .register_native(&self.link.session_id, &spec.dispatch_id, &ask)
         {
             Ok(RegisterOutcome::Registered) => {}
             Ok(refusal) => {
@@ -531,13 +636,9 @@ impl<'a> NativeBackend<'a> {
                 ))
             }
         }
-        self.publish(&request_line(spec, &ask))?;
+        self.publish(&request_for(&self.link.run_id, spec, &ask))?;
         match self.await_stop(spec, &route) {
-            Awaited::Stopped {
-                agent_id,
-                transcript_path,
-                last_assistant_message,
-            } => {
+            Awaited::Stopped(report) => {
                 let notes = match route {
                     Route::Continue {
                         effort_note: Some(note),
@@ -545,13 +646,7 @@ impl<'a> NativeBackend<'a> {
                     } => vec![note],
                     Route::Continue { .. } | Route::Spawn => Vec::new(),
                 };
-                Ok(self.stopped_result(
-                    spec,
-                    agent_id,
-                    transcript_path.as_deref(),
-                    last_assistant_message,
-                    notes,
-                ))
+                Ok(self.stopped_result(spec, report, notes))
             }
             Awaited::Ended { ended, detail } => Ok(ended_result(spec, ended, detail)),
         }
@@ -579,8 +674,10 @@ impl Backend for NativeBackend<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
-    use crate::orchestration::{CacheWrites, ModelPrice, Speed};
+    use crate::orchestration::ModelPrice;
 
     fn effort(name: &str) -> EffortId {
         EffortId::parse(name).expect("a valid effort identifier")
@@ -647,6 +744,34 @@ mod tests {
         }
     }
 
+    fn backend_in<'a>(
+        headless: &'a dyn Backend,
+        gate: &'a (dyn Gate + Sync),
+        projects_dir: Option<PathBuf>,
+    ) -> NativeBackend<'a> {
+        NativeBackend::new(
+            headless,
+            gate,
+            Link {
+                run_id: "run-1".into(),
+                session_id: "s1".into(),
+                wire: Wire::to(std::io::sink()),
+                projects_dir,
+            },
+            Waits::DEFAULT,
+            None,
+        )
+    }
+
+    fn reported(agent: &str, status: AgentStatus, usage: Option<AgentUsage>) -> StoppedReport {
+        StoppedReport {
+            agent_id: agent.into(),
+            status,
+            usage,
+            answer: Some("DONE".into()),
+        }
+    }
+
     #[test]
     fn the_same_model_continues_and_anything_else_spawns() {
         let known = agent("sonnet", Some("medium"));
@@ -672,7 +797,6 @@ mod tests {
         assert!(refusal.contains("claude-sonnet-5-5"), "{refusal}");
         assert!(refusal.contains("high"), "{refusal}");
         assert!(refusal.contains("haiku, sonnet, opus, fable"), "{refusal}");
-        assert!(refusal.contains("without --native"), "{refusal}");
         assert!(missing_definition(&Route::Spawn, &spec("haiku", Some("high"))).is_some());
         assert!(missing_definition(&Route::Spawn, &spec("haiku", None)).is_none());
         assert!(missing_definition(&Route::Spawn, &spec("opus", Some("max"))).is_none());
@@ -685,13 +809,10 @@ mod tests {
             .map(|(path, _)| path.to_string_lossy().replace('\\', "/"))
             .collect();
         for (model, effort) in crate::native::worker_agent_types() {
-            let ask = ask_for(&Route::Spawn, &spec(&model, effort.as_deref()));
-            let NativeAsk::Spawn { subagent_type, .. } = ask else {
-                panic!("a spawn route asks for a spawn");
-            };
+            let agent_type = worker_agent_type(&model, effort.as_deref());
             assert!(
-                files.contains(&format!("agents/{subagent_type}.md")),
-                "{subagent_type}"
+                files.contains(&format!("agents/{agent_type}.md")),
+                "{agent_type}"
             );
         }
     }
@@ -709,41 +830,38 @@ mod tests {
     }
 
     #[test]
-    fn a_spawn_line_is_the_tool_input_with_the_marker_in_the_prompt() {
+    fn a_spawn_line_names_the_plugin_agent_the_worktree_and_carries_no_marker() {
         let spec = spec("sonnet", Some("medium"));
         let ask = ask_for(&Route::Spawn, &spec);
-        let line = request_line(&spec, &ask);
-        let json = line.strip_prefix("RELAIS-SPAWN ").expect("a spawn line");
-        let input: serde_json::Value = serde_json::from_str(json).expect("json");
-        assert_eq!(input["dispatch_id"], "d1");
-        assert_eq!(input["subagent_type"], "relais-worker-sonnet-medium");
+        let line = serde_json::to_string(&request_for("run-1", &spec, &ask)).expect("json");
+        let input: serde_json::Value = serde_json::from_str(&line).expect("json");
+        assert_eq!(input["relais"], "spawn");
+        assert_eq!(input["run"], "run-1");
+        assert_eq!(input["dispatch"], "d1");
+        assert_eq!(input["agent_kind"], "worker");
+        assert_eq!(input["subagent_type"], "relais:relais-worker-sonnet-medium");
         assert_eq!(input["model"], "sonnet");
         assert_eq!(input["description"], "relais d1");
-        assert_eq!(input["isolation"], "worktree");
-        assert_eq!(input["run_in_background"], true);
-        let prompt = input["prompt"].as_str().expect("prompt");
-        assert!(prompt.starts_with("do the work\n"), "{prompt}");
-        assert!(prompt.ends_with(&marker_line("d1")), "{prompt}");
+        assert_eq!(input["cwd"], "/trees/task");
+        assert_eq!(input["prompt"], "do the work");
+        assert!(!line.contains("relais-dispatch"), "{line}");
         assert!(!line.contains('\n'));
     }
 
     #[test]
-    fn a_continue_line_names_the_agent_and_carries_the_marker() {
+    fn a_continue_line_names_the_agent_and_the_dispatch() {
         let spec = spec("sonnet", None);
         let route = Route::Continue {
             agent_id: "a1".into(),
             effort_note: None,
         };
-        let line = request_line(&spec, &ask_for(&route, &spec));
-        let json = line
-            .strip_prefix("RELAIS-CONTINUE ")
-            .expect("a continue line");
-        let input: serde_json::Value = serde_json::from_str(json).expect("json");
-        assert_eq!(input["to"], "a1");
-        assert!(input["message"]
-            .as_str()
-            .expect("message")
-            .ends_with(&marker_line("d1")));
+        let line = serde_json::to_string(&request_for("run-1", &spec, &ask_for(&route, &spec)))
+            .expect("json");
+        let input: serde_json::Value = serde_json::from_str(&line).expect("json");
+        assert_eq!(input["relais"], "continue");
+        assert_eq!(input["dispatch"], "d1");
+        assert_eq!(input["agent"], "a1");
+        assert_eq!(input["message"], "do the work");
     }
 
     #[test]
@@ -766,6 +884,33 @@ mod tests {
         assert_eq!(booked.effective_model.as_deref(), Some("sonnet-x"));
     }
 
+    #[test]
+    fn reported_usage_is_priced_and_names_the_model_that_ran() {
+        let usage = AgentUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cache_read_input_tokens: Some(0),
+            cache_creation_input_tokens: Some(2),
+            model: Some("sonnet-x".into()),
+        };
+        let booked = usage_of_report(Some(&usage), Some(&table()));
+        assert_eq!(booked.usage.input_tokens, Some(10));
+        assert_eq!(booked.usage.cache_write_tokens, Some(2));
+        assert_eq!(
+            booked.usage.cost,
+            Cost::Estimated {
+                micros: MicroUsd::from_micros(10 + 10)
+            }
+        );
+        assert_eq!(booked.effective_model.as_deref(), Some("sonnet-x"));
+        let unreported = usage_of_report(None, Some(&table()));
+        assert_eq!(unreported.usage, UsageReport::unknown());
+        let modelless = usage_of_report(Some(&AgentUsage::default()), Some(&table()));
+        assert_eq!(modelless.usage.cost, Cost::Unknown);
+        assert_eq!(modelless.effective_model, None);
+        assert_eq!(modelless.unpriced.len(), 1);
+    }
+
     /// Repairs raise effort on the same model by default, and a
     /// continuation keeps the effort its agent was spawned with: after two
     /// raised repairs, the note still names the effort the agent runs at.
@@ -773,20 +918,11 @@ mod tests {
     fn the_agent_keeps_its_spawn_effort_across_continuations() {
         let headless = crate::adapter::mock::MockBackend::new(|_| panic!("no headless launch"));
         let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
-        let backend = NativeBackend::writing_to(
-            &headless,
-            &gate,
-            "s1".into(),
-            Duration::from_secs(1),
-            None,
-            Box::new(std::io::sink()),
-        );
+        let backend = backend_in(&headless, &gate, None);
         let stop = |asked: &str| {
             backend.stopped_result(
                 &spec("sonnet", Some(asked)),
-                "a1".into(),
-                None,
-                None,
+                reported("a1", AgentStatus::Completed, None),
                 Vec::new(),
             )
         };
@@ -808,49 +944,61 @@ mod tests {
             route_for_ask("xhigh"),
             Route::Continue { effort_note: Some(ref note), .. } if note.contains("(medium)")
         ));
-        stop("xhigh");
-        assert!(matches!(
-            route_for_ask("high"),
-            Route::Continue {
-                effort_note: Some(_),
-                ..
-            }
-        ));
     }
 
-    /// The attempt names exactly the message ids it booked, and a
-    /// continuation's attempt does not name the ones an earlier attempt took.
     #[test]
-    fn a_stopped_attempt_names_the_message_ids_it_booked_once() {
+    fn a_failed_or_killed_agent_has_no_result_and_is_not_continued() {
         let headless = crate::adapter::mock::MockBackend::new(|_| panic!("no headless launch"));
         let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
-        let backend = NativeBackend::writing_to(
-            &headless,
-            &gate,
-            "s1".into(),
-            Duration::from_secs(1),
-            None,
-            Box::new(std::io::sink()),
-        );
-        let dir = crate::test_support::short_temp_dir("native-booked");
+        let backend = backend_in(&headless, &gate, None);
+        for (status, word) in [
+            (AgentStatus::Failed, "failed"),
+            (AgentStatus::Killed, "killed"),
+        ] {
+            let result = backend.stopped_result(
+                &spec("sonnet", None),
+                reported("a1", status, None),
+                Vec::new(),
+            );
+            assert_eq!(result.ended, Ended::Exited(1));
+            assert_eq!(result.result_text, None);
+            assert!(
+                result
+                    .failure_detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains(word)),
+                "{result:?}"
+            );
+        }
+        assert!(backend.memory().agents.is_empty());
+    }
+
+    /// The ids are those of the agent's transcript, found by session and
+    /// agent under any project slug; a missing file has none.
+    #[test]
+    fn an_agents_transcript_gives_its_message_ids() {
+        let headless = crate::adapter::mock::MockBackend::new(|_| panic!("no headless launch"));
+        let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
+        let dir = crate::test_support::short_temp_dir("native-ids");
+        let subagents = dir.join("-slug").join("s1").join("subagents");
+        std::fs::create_dir_all(&subagents).expect("dirs");
         let line = |id: &str| {
             format!(
                 r#"{{"type":"assistant","timestamp":"2026-10-06T10:00:00Z","message":{{"id":"{id}","model":"sonnet-x","usage":{{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation":{{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}}}}}}"#
             )
         };
-        let transcript = dir.join("agent-a1.jsonl");
-        std::fs::write(&transcript, format!("{}\n{}\n", line("m1"), line("m2"))).expect("written");
-        let stop = || {
-            backend.stopped_result(
-                &spec("sonnet", None),
-                "a1".into(),
-                Some(&transcript),
-                None,
-                Vec::new(),
-            )
-        };
-        assert_eq!(stop().booked_message_ids, ["m1", "m2"]);
-        assert!(stop().booked_message_ids.is_empty());
+        std::fs::write(
+            subagents.join("agent-a1.jsonl"),
+            format!("{}\n{}\n", line("m1"), line("m2")),
+        )
+        .expect("written");
+        let backend = backend_in(&headless, &gate, Some(dir.to_path_buf()));
+        assert_eq!(backend.rollback_ids("a1"), ["m1", "m2"]);
+        assert!(backend.rollback_ids("a2").is_empty());
+        let nowhere = backend_in(&headless, &gate, Some(dir.join("absent")));
+        assert!(nowhere.rollback_ids("a1").is_empty());
+        let unknown = backend_in(&headless, &gate, None);
+        assert!(unknown.rollback_ids("a1").is_empty());
     }
 
     /// The reasons are said record by record, never inferred from the
