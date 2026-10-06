@@ -194,4 +194,15 @@ Not measured, and why it does not matter: a marked spawn with the coordinator st
 
 **Decision (the person, 2026-10-06): A, with a fallback that reproduces the default.** relais's `WorktreeCreate` answers a marked spawn with relais's prepared tree. For every other spawn, it does what Claude Code does by default (E9): `git worktree add -b worktree-<name> <repo root of cwd>/.claude/worktrees/<name> HEAD`, and prints the path. `WorktreeRemove` never fires, so relais removes such a tree on that agent's `SubagentStop` (`name` is `agent-<agent_id>`) when it has no changes and no new commits, branch included, and keeps it otherwise. A failure to create is reported to Claude Code (non-zero exit with the reason), never a silent empty answer. Accepted risk: if Claude Code changes its default (a `worktree.baseRef` setting, `.worktreeinclude`), relais's copy differs until updated.
 
+**2026-10-06, N1 split in two runs.** N1a (hook parsing and answers, the default tree) and N1b (the coordinator's native registry, wired into the hook). Ledger rows move to N2: the runner writes dispatch rows, not the hook. The hook's install (the `SendMessage` matcher, the `WorktreeCreate` event and its handler timeout, migrating the old `Agent|Task` entry) moves to N3.
+
+**2026-10-06, N1a** (run-65d28bb65be1e-ecf3, sonnet@medium, one attempt): checks green, then `needs_review` with five findings, all real and fixed by hand in 131f3fc:
+- the no-home path answered `WorktreeCreate` silently;
+- the `hook_respond_command` doc still said "always accepts";
+- SPEC §23 still said "two dispositions";
+- an unreadable tree record passed for no record;
+- a SendMessage `Post` could bind an `agentId`.
+
+`make check` green; two key tests falsified (no-home `WorktreeCreate`, keep a tree with a new commit). Decision left open, to answer `salvaged` with the merge sha. For #105: 0 verified denials, coverage complete, 3 recovered refusals (a long heredoc, a `$TMPDIR` heredoc, a heredoc append), none fatal; no local-server test in it.
+
 <!-- panel: repos=relais adds= reviewers=backend body-sha=ebe649d81b94 -->
