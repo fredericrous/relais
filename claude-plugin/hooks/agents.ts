@@ -135,9 +135,9 @@ export async function handleStop(fx: Fx, store: Store, line: any) {
   if (why !== undefined) await note(fx, store, text(line.run), `TaskStop of agent ${agent} failed: ${why}`)
 }
 
-// A failure the plugin met, as a `stderr` entry of the run (or of every
-// live run when it belongs to none): shown labelled in the pane and in the
-// status reply, never dropped.
+// A failure the plugin met, as a `stderr` entry of the run it names, else
+// of every live run, else of the latest run: shown labelled in the pane and
+// in the status reply. Only with no run at all is there nowhere to say it.
 export async function note(fx: Fx, store: Store, run: string | undefined, message: string) {
   const now = await fx.clock.now()
   const keys = Object.keys(store.models)

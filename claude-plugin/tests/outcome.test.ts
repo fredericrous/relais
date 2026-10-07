@@ -72,16 +72,18 @@ test('a replay\'s done names the replay and its trial', async ($: any, on: any) 
 
 test('a verdict whose submit fails stays queued and is sent on the next tick', async ($: any, on: any) => {
   const engine = await startedRun($, on)
-  engine.script.submitFailures = 1
+  engine.script.submitFailures = 2
   engine.stream.push('stdout', phase(0, 'running') + done())
   await settle(engine)
+  await tick(engine)
   await tick(engine)
   await tick(engine)
   expect(engine.calls.prompts.length).toBe(1)
   expect(engine.calls.prompts[0].text).toContain('finished: accepted')
   // The failed attempt was said, once, in the run's timeline.
   const reply = await $.tool.call({ tool: 'mcp__relais__status', run: RUN })
-  expect(reply.result).toContain('relais plugin: the outcome message could not be sent yet')
+  // Two failed ticks, one line: said once per streak.
+  expect(reply.result.split('the outcome message could not be sent yet').length - 1).toBe(1)
 })
 
 test('a status relais cannot give says why instead of "no run"', async ($: any, on: any) => {
