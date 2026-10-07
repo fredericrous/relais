@@ -23,7 +23,7 @@ export type Reason =
   | 'abstained'
   | 'cache_gate'
 export type Outcome = 'completed_verified' | 'completed_accepted' | 'corrected' | 'unknown'
-export type ReassessEvent = 'failed_verification' | 'repair_failed' | 'scope_growth' | 'spawn' | 'correction' | 'flag'
+export type ReassessEvent = 'failed_verification' | 'repair_failed' | 'scope_growth' | 'spawn' | 'correction' | 'flag' | 'revert'
 
 const KINDS: readonly Kind[] = ['question', 'edit', 'debug', 'design', 'review']
 const SCOPES: readonly Scope[] = ['local', 'module', 'cross-cutting', 'unknown']
@@ -55,7 +55,6 @@ export type RouterState = {
   mode: Mode
   mode_reason?: string
   envelope: unknown
-  r3: { id: string; passed: boolean } | null
   holdout: boolean
   tiers: Record<Tier, { model: string; effort: Effort | null }>
   capability_table: { version: number; rules: { when: Record<string, unknown>; tier: Tier }[] }
@@ -287,7 +286,6 @@ export function parseRouterState(text: unknown): RouterState | undefined {
     mode: oneOf(['on', 'shadow', 'off'] as const, raw.mode, 'shadow'),
     mode_reason: typeof raw.mode_reason === 'string' ? raw.mode_reason : undefined,
     envelope: raw.envelope ?? null,
-    r3: raw.r3 && typeof raw.r3.id === 'string' ? { id: raw.r3.id, passed: raw.r3.passed === true } : null,
     holdout: raw.holdout === true,
     tiers,
     capability_table: rules.length > 0 ? { version: Number(raw.capability_table.version) || 1, rules } : DEFAULT_TABLE,
@@ -308,33 +306,10 @@ export function parseRouterState(text: unknown): RouterState | undefined {
 
 // --- the mode ---------------------------------------------------------------
 
-export type Consents = { envelope: unknown; r3: unknown }
-
-// The narrower of relais's mode and the plugin's own two store records: an
-// envelope or an R3 pass that reached machine.toml or the ledger any other
-// way than through the person's answer here switches nothing on.
-export function modeEffective(state: RouterState | undefined, consents: Consents): Mode {
-  if (!state) return 'shadow'
-  if (state.mode === 'off') return 'off'
-  if (state.mode !== 'on') return 'shadow'
-  const envelope = consents.envelope as any
-  const r3 = consents.r3 as any
-  const hasEnvelope = !!envelope && typeof envelope === 'object' && typeof envelope.answer === 'string'
-  const hasR3 = !!r3 && typeof r3 === 'object' && !!state.r3 && state.r3.passed && r3.id === state.r3.id
-  return hasEnvelope && hasR3 ? 'on' : 'shadow'
-}
-
-// Why the mode stays shadow although relais says on, for the one toast.
-export function shadowWhy(state: RouterState | undefined, consents: Consents): string | undefined {
-  if (!state || state.mode === 'off') return undefined
-  const envelope = consents.envelope as any
-  if (state.envelope && !(envelope && typeof envelope.answer === 'string')) {
-    return 'session routing stays in shadow: the envelope in machine.toml was not granted through /relais-routing here'
-  }
-  if (state.mode === 'on' && modeEffective(state, consents) !== 'on') {
-    return 'session routing stays in shadow: the R3 pass was not recorded through /relais-r3 here'
-  }
-  return undefined
+// router-state's mode (R1b: on whenever the envelope is recorded, narrowed
+// by RELAIS_SESSION_ROUTING); shadow when there is no state to route by.
+export function modeEffective(state: RouterState | undefined): Mode {
+  return state ? state.mode : 'shadow'
 }
 
 // --- tiers and models -------------------------------------------------------
@@ -517,6 +492,8 @@ export type ReassessRecord = {
   tier_to: Tier
   effort_to: Effort | null
   escalating: boolean
+  // A revert's files, hashed (fileHash).
+  files?: string[]
 }
 
 // The decision for a main-session turn's first request, and the task it
@@ -703,6 +680,115 @@ export function evidenceOf(tool: string, e: any, result: any, checks: string[][]
   return { kind: 'check', command, passed: true }
 }
 
+// --- reverts and file hashes (plan §5: missed failures, measured) -----------------
+
+// SHA-256, hex: the files a task edited are recorded hashed, never named.
+const K = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01,
+  0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+  0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+  0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08,
+  0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+  0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+])
+
+export function sha256Hex(text: string): string {
+  const data = encoder.encode(text)
+  const length = ((data.length + 9 + 63) >> 6) << 6
+  const bytes = new Uint8Array(length)
+  bytes.set(data)
+  bytes[data.length] = 0x80
+  const view = new DataView(bytes.buffer)
+  view.setUint32(length - 8, Math.floor((data.length * 8) / 2 ** 32))
+  view.setUint32(length - 4, (data.length * 8) >>> 0)
+  const h = new Uint32Array([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19])
+  const w = new Uint32Array(64)
+  const rotr = (x: number, n: number) => (x >>> n) | (x << (32 - n))
+  for (let offset = 0; offset < length; offset += 64) {
+    for (let i = 0; i < 16; i++) w[i] = view.getUint32(offset + i * 4)
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3)
+      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10)
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0
+    }
+    let [a, b, c, d, e, f, g, hh] = h
+    for (let i = 0; i < 64; i++) {
+      const t1 = (hh + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i]) >>> 0
+      const t2 = ((rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0
+      hh = g
+      g = f
+      f = e
+      e = (d + t1) >>> 0
+      d = c
+      c = b
+      b = a
+      a = (t1 + t2) >>> 0
+    }
+    h[0] += a
+    h[1] += b
+    h[2] += c
+    h[3] += d
+    h[4] += e
+    h[5] += f
+    h[6] += g
+    h[7] += hh
+  }
+  return Array.from(h, x => x.toString(16).padStart(8, '0')).join('')
+}
+
+// A path as the repository names it: relative to the session's cwd, no
+// leading `./`.
+export function repoRelative(file: string, cwd: string | undefined): string {
+  const root = cwd ? cwd.replace(/\/+$/, '') + '/' : ''
+  const rel = root && file.startsWith(root) ? file.slice(root.length) : file
+  return rel.replace(/^(\.\/)+/, '')
+}
+
+// The contract's file hash: the first 16 hex digits of the sha256 of the
+// repo-relative path.
+export const fileHash = (file: string, cwd: string | undefined) => sha256Hex(repoRelative(file, cwd)).slice(0, 16)
+
+// The paths a Bash command reverts, or undefined when it reverts nothing:
+// `git revert …` (its files unknown here: []), `git checkout [<ref>] --
+// <paths>`, and `git restore <paths>` unless it only unstages.
+export function revertedPaths(command: string): string[] | undefined {
+  let found: string[] | undefined
+  for (const segment of command.split(/&&|\|\||;|\||\n/)) {
+    const argv = words(segment.trim())
+    while (argv.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[0])) argv.shift()
+    if (argv[0] !== 'git') continue
+    const sub = argv[1]
+    const rest = argv.slice(2)
+    let paths: string[] | undefined
+    if (sub === 'revert') paths = []
+    else if (sub === 'checkout') {
+      const dash = rest.indexOf('--')
+      if (dash >= 0) paths = rest.slice(dash + 1)
+    } else if (sub === 'restore') {
+      const dash = rest.indexOf('--')
+      const flags = dash >= 0 ? rest.slice(0, dash) : rest.filter(a => a.startsWith('-'))
+      const onlyStaged =
+        flags.some(f => f === '--staged' || f === '-S') && !flags.some(f => f === '--worktree' || f === '-W')
+      if (!onlyStaged) paths = dash >= 0 ? rest.slice(dash + 1) : rest.filter(a => !a.startsWith('-'))
+    }
+    if (paths !== undefined) found = [...(found ?? []), ...paths]
+  }
+  return found
+}
+
+// A revert's reassessment: no escalation, the tier kept, the files hashed.
+export function revertRecord(state: RouterState, task: TaskState, paths: string[], cwd: string | undefined): ReassessRecord {
+  return {
+    event: 'revert',
+    tier_from: task.tier,
+    tier_to: task.tier,
+    effort_to: effortOf(state, task),
+    escalating: false,
+    files: [...new Set(paths.map(path => fileHash(path, cwd)))].sort(),
+  }
+}
+
 // The scope the edited files show: a second top-level directory makes it
 // cross-cutting; more than 8 files makes a local task a module one.
 export function grownScope(scope: Scope, files: string[], cwd: string | undefined): Scope {
@@ -880,7 +966,8 @@ export function reassessRecord(task: TaskState, r: ReassessRecord, now: number) 
   return { kind: 'reassess', task_id: task.id, agent_id: task.agentId, ...r, at: iso(now) }
 }
 
-export function taskRecord(task: TaskState, endedAt: number | null) {
+export function taskRecord(task: TaskState, endedAt: number | null, cwd: string | undefined) {
+  const outcome = outcomeOf(task)
   return {
     kind: 'task',
     task_id: task.id,
@@ -888,8 +975,12 @@ export function taskRecord(task: TaskState, endedAt: number | null) {
     started_at: iso(task.startedAt),
     ended_at: endedAt === null ? null : iso(endedAt),
     class: task.class,
-    outcome: outcomeOf(task),
+    outcome,
+    // The outcome as the task ended: relais keeps the first one it gets, so
+    // a later correction is measured against it (plan §5, missed failures).
+    completed_at_end: endedAt === null ? null : outcome,
     inferred: task.inferred,
+    files: [...new Set(task.files.map(file => fileHash(file, cwd)))].sort(),
     escalations: task.escalations,
     exhausted: task.exhausted,
     turns: task.turns,
@@ -902,14 +993,11 @@ export function taskRecord(task: TaskState, endedAt: number | null) {
 export type RouterMemory = {
   // `relais native router-state`, or undefined (shadow, nothing decided).
   state: RouterState | undefined
-  // The plugin's own two store records, read with the state.
-  consents: { envelope: unknown; r3: unknown }
   // The session the state and the queued records belong to.
   session: string | undefined
   cwd: string | undefined
   isStale: boolean
   refreshing: Promise<void> | undefined
-  hasToastedShadow: boolean
   task: TaskState | undefined
   // Router-created subagents' tasks, by agentId.
   subtasks: Record<string, TaskState>
@@ -929,12 +1017,10 @@ export type RouterMemory = {
 
 export const createRouterMemory = (): RouterMemory => ({
   state: undefined,
-  consents: { envelope: undefined, r3: undefined },
   session: undefined,
   cwd: undefined,
   isStale: false,
   refreshing: undefined,
-  hasToastedShadow: false,
   task: undefined,
   subtasks: {},
   unkeyed: {},

@@ -69,7 +69,6 @@ PURE_FILES = {
     "router/mode.rs",
     "router/outcome.rs",
     "router/pins.rs",
-    "router/r3.rs",
     "router/report.rs",
     "router/state.rs",
     "router/stats.rs",

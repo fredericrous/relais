@@ -173,6 +173,26 @@ fn timestamp(field: &str, value: &str) -> Result<(), String> {
         .map_err(|e| format!("{field} `{value}` is not RFC 3339: {e}"))
 }
 
+/// File hashes as the contract has them: the first 16 hex digits of the
+/// sha256 of a repo-relative path, lowercase. Returned sorted, once each.
+fn file_hashes(files: Vec<String>) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::with_capacity(files.len());
+    for hash in files {
+        let valid = hash.len() == 16
+            && hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !valid {
+            return Err(format!("files `{hash}` is not 16 lowercase hex digits"));
+        }
+        if !out.contains(&hash) {
+            out.push(hash);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 fn named(field: &str, value: &str) -> Result<(), String> {
     if value.trim().is_empty() {
         Err(format!("{field} is empty"))
@@ -229,6 +249,8 @@ struct Reassess {
     tier_to: Tier,
     effort_to: Option<String>,
     escalating: bool,
+    #[serde(default)]
+    files: Vec<String>,
     at: String,
 }
 
@@ -242,7 +264,11 @@ struct Task {
     class: Option<Class>,
     outcome: TaskOutcome,
     #[serde(default)]
+    completed_at_end: Option<TaskOutcome>,
+    #[serde(default)]
     inferred: Vec<String>,
+    #[serde(default)]
+    files: Vec<String>,
     escalations: u32,
     exhausted: bool,
     turns: u32,
@@ -330,8 +356,10 @@ fn reassess(r: Reassess) -> Result<RouterRecord, String> {
                 "spawn",
                 "correction",
                 "flag",
+                "revert",
             ],
         )?,
+        files: file_hashes(r.files)?,
         task_id: r.task_id,
         agent_id: r.agent_id,
         tier_from: r.tier_from.as_str().into(),
@@ -364,6 +392,8 @@ fn task(t: Task) -> Result<RouterRecord, String> {
         class: t.class.as_ref().map(Class::row).transpose()?,
         outcome: t.outcome.as_str().into(),
         outcome_rank: t.outcome.rank(),
+        completed_at_end: t.completed_at_end.map(|o| o.as_str().to_string()),
+        files: file_hashes(t.files)?,
         task_id: t.task_id,
         agent_id: t.agent_id,
         started_at: t.started_at,
@@ -506,6 +536,27 @@ mod tests {
         });
         let batch = parse_batch(&payload.to_string()).unwrap();
         assert!(matches!(&batch.records[0], RouterRecord::Usage(u) if u.task_id == "unassigned"));
+    }
+
+    #[test]
+    fn file_hashes_and_the_end_outcome_parse_and_a_bad_hash_is_refused() {
+        let mut value: serde_json::Value = serde_json::from_str(&sample_batch("s1")).unwrap();
+        value["records"][3]["files"] = serde_json::json!(["bbbbbbbbbbbbbbbb", "0123456789abcdef"]);
+        value["records"][3]["completed_at_end"] = serde_json::json!("completed_verified");
+        value["records"][2]["event"] = serde_json::json!("revert");
+        value["records"][2]["escalating"] = serde_json::json!(false);
+        value["records"][2]["files"] = serde_json::json!(["0123456789abcdef"]);
+        let batch = parse_batch(&value.to_string()).unwrap();
+        assert!(matches!(&batch.records[3], RouterRecord::Task(t)
+            if t.files == vec!["0123456789abcdef", "bbbbbbbbbbbbbbbb"]
+                && t.completed_at_end.as_deref() == Some("completed_verified")));
+        assert!(matches!(&batch.records[2], RouterRecord::Reassess(r)
+            if r.event == "revert" && r.files == vec!["0123456789abcdef"]));
+        value["records"][3]["files"] = serde_json::json!(["src/lib.rs"]);
+        assert_eq!(
+            parse_batch(&value.to_string()).unwrap_err().record,
+            Some((3, "task".into()))
+        );
     }
 
     #[test]

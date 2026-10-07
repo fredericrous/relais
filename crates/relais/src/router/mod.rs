@@ -3,20 +3,19 @@
 //! `docs/router-protocol.md`). The relais plugin routes the session's own
 //! model; relais serves it what it needs to decide (`router-state`),
 //! records what it decided and how tasks ended (`router-observe`), holds
-//! the person's envelope (`router-envelope`) and the R3 gate (`router r3`),
-//! and reports the spend (`relais report`).
+//! the person's envelope (`router-envelope`), and reports the spend
+//! (`relais report`).
 //!
 //! This file is the adapter: it reads machine.toml, the repository's
 //! policy, the agent definitions, the environment and the ledger, and
 //! hands values to the pure modules beside it (`table`, `mode`, `outcome`,
-//! `holdout`, `stats`, `wire`, `pins`, `state`, `r3`, `report`). R1 has no
+//! `holdout`, `stats`, `wire`, `pins`, `state`, `report`). R1 has no
 //! learner: `adjustments` is always empty.
 
 pub mod holdout;
 pub mod mode;
 pub mod outcome;
 pub mod pins;
-pub mod r3;
 pub mod report;
 pub mod state;
 pub mod stats;
@@ -25,16 +24,17 @@ pub mod wire;
 
 use std::path::{Path, PathBuf};
 
-use crate::ledger::{Ledger, LedgerError, RouterProvenance};
-use crate::policy::{MachineSettings, RepoPolicy, RoutingEnvelope};
+use crate::ledger::{Ledger, LedgerError};
+use crate::policy::{MachineSettings, RepoPolicy, RoutingEnvelope, RoutingOff};
 use crate::trust::GrantError;
 
 /// Where a write came from. The CLI cannot tell a person's shell from the
-/// model's Bash call, so anything not the plugin's own question is
-/// unattributed.
+/// model's Bash call, so anything not the plugin's own question or
+/// `relais install` is unattributed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     PluginAsk,
+    Install,
     Cli,
 }
 
@@ -42,6 +42,7 @@ impl Source {
     pub fn as_str(self) -> &'static str {
         match self {
             Source::PluginAsk => "plugin-ask",
+            Source::Install => "install",
             Source::Cli => "cli (unattributed)",
         }
     }
@@ -164,39 +165,23 @@ pub fn definition_pins(dirs: &[PathBuf]) -> Vec<(String, String)> {
     pins
 }
 
-/// The latest R3 row and the completed tasks' token totals, read only when
-/// the ledger already exists: `router-state` never creates one. Opening an
-/// existing ledger brings it to this binary's schema, as every command does. A ledger
-/// that cannot be read is said and served as empty, which keeps the mode
-/// at shadow.
-fn ledger_facts(path: &Path) -> (Option<state::R3Row>, Vec<(String, u8, u64)>) {
+/// The completed tasks' token totals, read only when the ledger already
+/// exists: `router-state` never creates one. Opening an existing ledger
+/// brings it to this binary's schema, as every command does. A ledger that
+/// cannot be read is said and served as empty: the fixed priors stand in.
+fn completed_task_tokens(path: &Path) -> Vec<(String, u8, u64)> {
     if !path.exists() {
-        return (None, Vec::new());
+        return Vec::new();
     }
-    let read = Ledger::open(path).and_then(|ledger| {
-        let r3 = ledger.latest_router_r3()?.and_then(|row| match row {
-            RouterProvenance::R3 {
-                id,
-                passed,
-                source,
-                at,
-            } => Some(state::R3Row {
-                id,
-                passed,
-                at,
-                source,
-            }),
-            RouterProvenance::Envelope { .. } => None,
-        });
-        Ok((r3, ledger.router_task_token_totals(&state::COMPLETED)?))
-    });
+    let read =
+        Ledger::open(path).and_then(|ledger| ledger.router_task_token_totals(&state::COMPLETED));
     match read {
-        Ok(facts) => facts,
+        Ok(totals) => totals,
         Err(e) => {
             eprintln!(
-                "relais native router-state: warning: the ledger could not be read ({e}); no r3 pass and no observed priors"
+                "relais native router-state: warning: the ledger could not be read ({e}); no observed priors"
             );
-            (None, Vec::new())
+            Vec::new()
         }
     }
 }
@@ -207,7 +192,7 @@ pub fn router_state(session: &str, cwd: &Path) -> Result<state::RouterState, Sta
     let machine = read_machine(&machine_path).map_err(StateError::Machine)?;
     let (root, repo) = repo_context(cwd);
     let ledger_path = crate::paths::ledger_path().map_err(StateError::Home)?;
-    let (r3, completed_task_tokens) = ledger_facts(&ledger_path);
+    let completed_task_tokens = completed_task_tokens(&ledger_path);
     let mut dirs: Vec<PathBuf> = user_agents_dir().into_iter().collect();
     dirs.push(root.join(".claude").join("agents"));
     let env_mode = std::env::var(mode::MODE_ENV).ok();
@@ -215,7 +200,6 @@ pub fn router_state(session: &str, cwd: &Path) -> Result<state::RouterState, Sta
         session,
         machine: &machine,
         repo: repo.as_ref(),
-        r3,
         env_mode: env_mode.as_deref(),
         completed_task_tokens,
         definition_pins: definition_pins(&dirs),
@@ -253,9 +237,14 @@ pub fn observe(ledger_path: &Path, payload: &str) -> Result<usize, ObserveError>
     Ok(batch.records.len())
 }
 
-/// `text` with `[session_routing] envelope = { … }` set, everything else
-/// as it was.
-pub fn set_envelope(text: &str, envelope: &RoutingEnvelope) -> Result<String, GrantError> {
+/// `text` with `[session_routing]`'s `remove` key gone and `key = { … }`
+/// set from `fields`, everything else as it was.
+fn replace_routing_key(
+    text: &str,
+    remove: &str,
+    key: &str,
+    fields: Vec<(&str, toml_edit::Value)>,
+) -> Result<String, GrantError> {
     let mut doc: toml_edit::DocumentMut = text
         .parse()
         .map_err(|e: toml_edit::TomlError| GrantError::Unwritable(e.to_string()))?;
@@ -264,16 +253,47 @@ pub fn set_envelope(text: &str, envelope: &RoutingEnvelope) -> Result<String, Gr
         .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
         .as_table_mut()
         .ok_or_else(|| GrantError::Unwritable("`session_routing` is not a table".into()))?;
+    table.remove(remove);
     let mut inline = toml_edit::InlineTable::new();
-    inline.insert("granted_at", envelope.granted_at.clone().into());
-    inline.insert("by", envelope.by.clone().into());
-    inline.insert("epsilon_max", envelope.epsilon_max.into());
-    inline.insert("source", envelope.source.clone().into());
+    for (name, value) in fields {
+        inline.insert(name, value);
+    }
     table.insert(
-        "envelope",
+        key,
         toml_edit::Item::Value(toml_edit::Value::InlineTable(inline)),
     );
     Ok(doc.to_string())
+}
+
+/// `text` with `[session_routing] envelope = { … }` set and any `off`
+/// tombstone removed, everything else as it was.
+pub fn set_envelope(text: &str, envelope: &RoutingEnvelope) -> Result<String, GrantError> {
+    replace_routing_key(
+        text,
+        "off",
+        "envelope",
+        vec![
+            ("granted_at", envelope.granted_at.clone().into()),
+            ("by", envelope.by.clone().into()),
+            ("epsilon_max", envelope.epsilon_max.into()),
+            ("source", envelope.source.clone().into()),
+        ],
+    )
+}
+
+/// `text` without `[session_routing] envelope` and with the `off`
+/// tombstone set, everything else as it was.
+pub fn set_off(text: &str, off: &RoutingOff) -> Result<String, GrantError> {
+    replace_routing_key(
+        text,
+        "envelope",
+        "off",
+        vec![
+            ("at", off.at.clone().into()),
+            ("by", off.by.clone().into()),
+            ("source", off.source.clone().into()),
+        ],
+    )
 }
 
 /// Write the envelope to machine.toml (locked, atomic, comments and mode
@@ -283,6 +303,35 @@ pub fn write_envelope(machine_path: &Path, envelope: &RoutingEnvelope) -> Result
         set_envelope(text, envelope).map(Some)
     })?;
     Ok(())
+}
+
+/// Record `envelope` only when machine.toml has neither an envelope nor an
+/// `off` tombstone, under the same lock as the check: an envelope the
+/// person recorded is never replaced, and routing they turned off stays
+/// off. Whether it was written.
+pub fn write_envelope_if_absent(
+    machine_path: &Path,
+    envelope: &RoutingEnvelope,
+) -> Result<bool, GrantError> {
+    crate::trust::edit_machine(machine_path, |text, current| {
+        let routing = &current.session_routing;
+        if routing.envelope.is_some() || routing.off.is_some() {
+            return Ok(None);
+        }
+        set_envelope(text, envelope).map(Some)
+    })
+}
+
+/// Turn routing off in machine.toml (the same locked writer): the
+/// envelope removed, the tombstone recorded. Whether an envelope was
+/// removed.
+pub fn write_off(machine_path: &Path, off: &RoutingOff) -> Result<bool, GrantError> {
+    let mut had_envelope = false;
+    crate::trust::edit_machine(machine_path, |text, current| {
+        had_envelope = current.session_routing.envelope.is_some();
+        set_off(text, off).map(Some)
+    })?;
+    Ok(had_envelope)
 }
 
 /// `relais report`'s section, or `None` when no routed task started in
@@ -296,7 +345,8 @@ pub fn report_section(
     if window.tasks.is_empty() {
         return Ok(None);
     }
-    Ok(Some(report::session_routing(&window, pricing)))
+    let pricing = pricing.clone().with_built_in_defaults();
+    Ok(Some(report::session_routing(&window, &pricing)))
 }
 
 #[cfg(test)]
@@ -327,6 +377,28 @@ mod tests {
         let twice = set_envelope(&after, &again).unwrap();
         let machine = MachineSettings::from_toml_str(&twice).unwrap();
         assert_eq!(machine.session_routing.envelope, Some(again));
+    }
+
+    #[test]
+    fn off_replaces_the_envelope_and_an_envelope_replaces_off() {
+        let before =
+            "# mine\nschema_version = 1\n\n[session_routing]\n# tuned\nholdout_rate = 0.2\n";
+        let off = RoutingOff {
+            at: "2026-10-07T01:00:00Z".into(),
+            by: "me".into(),
+            source: Source::PluginAsk.as_str().into(),
+        };
+        let with = set_envelope(before, &envelope()).unwrap();
+        let turned_off = set_off(&with, &off).unwrap();
+        assert!(turned_off.starts_with(before), "{turned_off}");
+        let machine = MachineSettings::from_toml_str(&turned_off).unwrap();
+        assert_eq!(machine.session_routing.envelope, None);
+        assert_eq!(machine.session_routing.off, Some(off));
+        assert_eq!(machine.session_routing.holdout_rate, 0.2);
+        let again = set_envelope(&turned_off, &envelope()).unwrap();
+        let machine = MachineSettings::from_toml_str(&again).unwrap();
+        assert_eq!(machine.session_routing.envelope, Some(envelope()));
+        assert_eq!(machine.session_routing.off, None);
     }
 
     #[test]

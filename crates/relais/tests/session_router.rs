@@ -1,6 +1,6 @@
 //! The session router's relais commands (SPEC §30), through the real
 //! binary: `native router-state`, `native router-observe`, `native
-//! router-envelope`, `router r3` and the `relais report` section. Each
+//! router-envelope` and the `relais report` section. Each
 //! scenario runs in a world of its own (state, config and home), with no
 //! git, no shell and no harness, so it runs on every platform CI builds.
 
@@ -152,7 +152,9 @@ fn router_state_answers_in_shadow_and_never_creates_the_ledger() {
     assert_eq!(state["tiers"]["research"]["model"], "claude-haiku-5-5");
     assert_eq!(state["capability_table"]["version"], 1);
     assert_eq!(state["seed"].as_str().unwrap().len(), 16);
-    assert!(state["rates"]["claude-haiku-5-5"].is_null());
+    // haiku is priced from relais's built-in list; sonnet is not.
+    assert_eq!(state["rates"]["claude-haiku-5-5"]["input"], 500_000);
+    assert!(state["rates"]["claude-sonnet-5-5"].is_null());
     assert!(
         !world.ledger_path().exists(),
         "router-state created the ledger"
@@ -233,12 +235,12 @@ fn an_unreadable_agents_directory_is_said_not_skipped_silently() {
 }
 
 #[test]
-fn the_mode_is_on_only_with_an_envelope_and_a_passing_r3_and_the_env_narrows_it() {
+fn the_envelope_alone_turns_routing_on_and_the_env_only_narrows_it() {
     let world = World::new("mode");
-    let mode = |world: &World| {
-        world.state_json(&world.relais(&["native", "router-state", "--session", "s"]))["mode"]
-            .clone()
+    let state = |world: &World| {
+        world.state_json(&world.relais(&["native", "router-state", "--session", "s"]))
     };
+    assert_eq!(state(&world)["mode"], "shadow");
     let granted = world.relais(&[
         "native",
         "router-envelope",
@@ -248,15 +250,17 @@ fn the_mode_is_on_only_with_an_envelope_and_a_passing_r3_and_the_env_narrows_it(
         "0.1",
     ]);
     assert_eq!(code(&granted), 0, "{}", stderr(&granted));
-    assert_eq!(mode(&world), "shadow");
-    let recorded = world.relais(&["router", "r3", "--record", "--id", "r3-abc", "--passed"]);
-    assert_eq!(code(&recorded), 0, "{}", stderr(&recorded));
-    let state = world.state_json(&world.relais(&["native", "router-state", "--session", "s"]));
-    assert_eq!(state["mode"], "on");
-    assert_eq!(state["r3"]["id"], "r3-abc");
-    assert_eq!(state["r3"]["source"], "cli (unattributed)");
-    assert_eq!(state["epsilon"], 0.1);
-    for (value, expected) in [("shadow", "shadow"), ("off", "off"), ("on", "on")] {
+    let on = state(&world);
+    assert_eq!(on["mode"], "on");
+    assert_eq!(on["mode_reason"], "envelope recorded");
+    assert_eq!(on["epsilon"], 0.1);
+    assert!(on.get("r3").is_none(), "{on}");
+    for (value, expected) in [
+        ("shadow", "shadow"),
+        ("off", "off"),
+        ("on", "on"),
+        ("nope", "shadow"),
+    ] {
         let output = world.relais_env(
             &["native", "router-state", "--session", "s"],
             "RELAIS_SESSION_ROUTING",
@@ -264,36 +268,122 @@ fn the_mode_is_on_only_with_an_envelope_and_a_passing_r3_and_the_env_narrows_it(
         );
         assert_eq!(world.state_json(&output)["mode"], expected, "env {value}");
     }
-    // A later failure withdraws the pass.
-    world.relais(&["router", "r3", "--record", "--id", "r3-def", "--failed"]);
-    let state = world.state_json(&world.relais(&["native", "router-state", "--session", "s"]));
-    assert_eq!(state["mode"], "shadow");
-    assert_eq!(state["mode_reason"], "no r3 pass");
 }
 
 #[test]
-fn r3_record_needs_a_verdict_and_eval_prints_one() {
-    let world = World::new("r3");
-    let refused = world.relais(&["router", "r3", "--record", "--id", "x"]);
-    assert_eq!(code(&refused), 2, "{}", stderr(&refused));
-    assert_eq!(code(&world.relais(&["router", "r3"])), 2);
-    let labels = world.root.join("labels.jsonl");
-    std::fs::write(
-        &labels,
-        r#"{"item":"a","human":{"tier":"research","relation":"new_task","outcome_correct":true},"router":{"tier":"research","relation":"new_task","outcome":"completed_verified"}}
-"#,
-    )
-    .unwrap();
-    let path = labels.to_string_lossy().into_owned();
-    let output = world.relais(&["router", "r3", "--eval", &path, "--json"]);
+fn router_envelope_off_removes_the_envelope_keeps_the_file_and_records_why() {
+    let world = World::new("off");
+    let before =
+        "# my machine\nschema_version = 1\n\n[session_routing]\n# tuned\nholdout_rate = 0.2\n";
+    std::fs::write(world.machine(), before).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(world.machine(), std::fs::Permissions::from_mode(0o640)).unwrap();
+    }
+    let granted = world.relais(&[
+        "native",
+        "router-envelope",
+        "--by",
+        "me",
+        "--epsilon-max",
+        "0.1",
+        "--source",
+        "plugin-ask",
+    ]);
+    assert_eq!(code(&granted), 0, "{}", stderr(&granted));
+    let off = world.relais(&[
+        "native",
+        "router-envelope",
+        "--off",
+        "--by",
+        "me",
+        "--source",
+        "plugin-ask",
+    ]);
+    assert_eq!(code(&off), 0, "{}", stderr(&off));
+    let printed: serde_json::Value = serde_json::from_slice(&off.stdout).unwrap();
+    assert_eq!(printed["removed"], true);
+    let after = std::fs::read_to_string(world.machine()).unwrap();
+    assert!(after.starts_with(before), "{after}");
+    assert!(!after.contains("envelope"), "{after}");
+    assert!(after.contains("off = {"), "{after}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(world.machine())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640);
+    }
+    let state = world.state_json(&world.relais(&["native", "router-state", "--session", "s"]));
+    assert_eq!(state["mode"], "shadow");
+    let rows = world.ledger().router_provenance().unwrap();
+    assert!(
+        matches!(&rows[..], [RouterProvenance::Envelope { .. }, RouterProvenance::EnvelopeRemoved { source, .. }] if source == "plugin-ask"),
+        "{rows:?}"
+    );
+    // `--off` takes no rate, and a grant needs one.
+    assert_eq!(
+        code(&world.relais(&[
+            "native",
+            "router-envelope",
+            "--off",
+            "--by",
+            "me",
+            "--epsilon-max",
+            "0.1"
+        ])),
+        2
+    );
+    assert_eq!(
+        code(&world.relais(&["native", "router-envelope", "--by", "me"])),
+        2
+    );
+    // Recording an envelope again lifts the tombstone.
+    let again = world.relais(&[
+        "native",
+        "router-envelope",
+        "--by",
+        "me",
+        "--epsilon-max",
+        "0.1",
+    ]);
+    assert_eq!(code(&again), 0, "{}", stderr(&again));
+    let after = std::fs::read_to_string(world.machine()).unwrap();
+    assert!(
+        after.contains("envelope = {") && !after.contains("off = {"),
+        "{after}"
+    );
+}
+
+#[test]
+fn a_task_record_keeps_its_file_hashes_and_its_end_outcome() {
+    let world = World::new("files");
+    let mut first: serde_json::Value =
+        serde_json::from_str(&batch("s", "t1", "completed_verified", "claude-haiku-5-5")).unwrap();
+    first["records"][4]["files"] = serde_json::json!(["0123456789abcdef"]);
+    first["records"][4]["completed_at_end"] = serde_json::json!("completed_verified");
+    first["records"][3]["event"] = serde_json::json!("revert");
+    first["records"][3]["escalating"] = serde_json::json!(false);
+    first["records"][3]["files"] = serde_json::json!(["0123456789abcdef"]);
+    let output = world.relais_stdin(&["native", "router-observe"], &first.to_string());
     assert_eq!(code(&output), 0, "{}", stderr(&output));
-    let evaluation: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(evaluation["passed"], false);
-    assert!(evaluation["id"].as_str().unwrap().starts_with("r3-"));
-    let text = stdout(&world.relais(&["router", "r3", "--eval", &path]));
-    assert!(text.contains("verdict: failed (id r3-"), "{text}");
-    std::fs::write(&labels, "{not json}\n").unwrap();
-    assert_eq!(code(&world.relais(&["router", "r3", "--eval", &path])), 2);
+    let mut later: serde_json::Value =
+        serde_json::from_str(&batch("s", "t1", "corrected", "claude-haiku-5-5")).unwrap();
+    later["records"][4]["completed_at_end"] = serde_json::json!("corrected");
+    let output = world.relais_stdin(&["native", "router-observe"], &later.to_string());
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let task = world
+        .ledger()
+        .router_task("s", "t1", None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.outcome, "corrected");
+    assert_eq!(task.completed_at_end.as_deref(), Some("completed_verified"));
+    assert_eq!(task.files, vec!["0123456789abcdef"]);
 }
 
 #[test]

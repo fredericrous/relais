@@ -69,6 +69,8 @@ pub struct RouterReassessRow {
     pub tier_to: String,
     pub effort_to: Option<String>,
     pub escalating: bool,
+    /// Hashed repo-relative paths (a `revert`'s files), sorted.
+    pub files: Vec<String>,
     pub at: String,
 }
 
@@ -84,7 +86,12 @@ pub struct RouterTaskRow {
     pub class: Option<RouterClass>,
     pub outcome: String,
     pub outcome_rank: u8,
+    /// The outcome when the task ended: set once, never moved by a later
+    /// record, so a later correction can be compared with it.
+    pub completed_at_end: Option<String>,
     pub inferred: Vec<String>,
+    /// Hashed repo-relative paths of the files the task edited, sorted.
+    pub files: Vec<String>,
     pub escalations: u32,
     pub exhausted: bool,
     pub turns: u32,
@@ -100,8 +107,8 @@ pub enum RouterRecord {
     Task(RouterTaskRow),
 }
 
-/// One `router_provenance` row: an envelope written, or an R3 result
-/// recorded, with who wrote it from where.
+/// One `router_provenance` row: an envelope written or removed, with who
+/// did it from where.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RouterProvenance {
     Envelope {
@@ -110,9 +117,7 @@ pub enum RouterProvenance {
         source: String,
         at: String,
     },
-    R3 {
-        id: String,
-        passed: bool,
+    EnvelopeRemoved {
         source: String,
         at: String,
     },
@@ -172,18 +177,25 @@ fn later(a: Option<String>, b: Option<String>) -> Option<String> {
     }
 }
 
-/// `incoming` folded onto `stored`: the outcome moves only up the rank,
-/// counters only up, `exhausted` and the inferred signals only gain.
-/// Order-independent, so a resend arriving late changes nothing.
-fn merge_task(stored: RouterTaskRow, incoming: &RouterTaskRow) -> RouterTaskRow {
-    let promote = incoming.outcome_rank > stored.outcome_rank;
-    let mut inferred = stored.inferred;
-    for signal in &incoming.inferred {
-        if !inferred.contains(signal) {
-            inferred.push(signal.clone());
+/// `extra` added to `list` once each, sorted.
+fn union(mut list: Vec<String>, extra: &[String]) -> Vec<String> {
+    for item in extra {
+        if !list.contains(item) {
+            list.push(item.clone());
         }
     }
-    inferred.sort();
+    list.sort();
+    list
+}
+
+/// `incoming` folded onto `stored`: the outcome moves only up the rank,
+/// counters only up, `exhausted`, the inferred signals and the files only
+/// gain, and the outcome at the end is kept from the first record that
+/// had one. Order-independent for everything but that first end outcome.
+fn merge_task(stored: RouterTaskRow, incoming: &RouterTaskRow) -> RouterTaskRow {
+    let promote = incoming.outcome_rank > stored.outcome_rank;
+    let inferred = union(stored.inferred, &incoming.inferred);
+    let files = union(stored.files, &incoming.files);
     RouterTaskRow {
         task_id: stored.task_id,
         agent_id: stored.agent_id,
@@ -200,7 +212,11 @@ fn merge_task(stored: RouterTaskRow, incoming: &RouterTaskRow) -> RouterTaskRow 
             stored.outcome
         },
         outcome_rank: stored.outcome_rank.max(incoming.outcome_rank),
+        completed_at_end: stored
+            .completed_at_end
+            .or(incoming.completed_at_end.clone()),
         inferred,
+        files,
         escalations: stored.escalations.max(incoming.escalations),
         exhausted: stored.exhausted || incoming.exhausted,
         turns: stored.turns.max(incoming.turns),
@@ -230,7 +246,7 @@ fn read_class(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<Option<
 const TASK_COLUMNS: &str =
     "task_id, agent_id, started_at, ended_at, class_kind, difficulty, scope, \
      uncertainty, verifiable, confidence, outcome, outcome_rank, inferred_json, escalations, \
-     exhausted, turns, explicit_quote";
+     exhausted, turns, explicit_quote, completed_at_end, files_json";
 
 fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouterTaskRow> {
     read_task_at(row, 0)
@@ -327,11 +343,13 @@ impl Ledger {
                     )?;
                 }
                 RouterRecord::Reassess(r) => {
+                    let files =
+                        serde_json::to_string(&r.files).expect("a list of strings serializes");
                     tx.execute(
                         "INSERT INTO router_reassess
                             (session, task_id, agent_id, event, tier_from, tier_to, effort_to,
-                             escalating, at, recorded_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                             escalating, files_json, at, recorded_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                          ON CONFLICT (session, task_id, agent_id, event, at) DO NOTHING",
                         params![
                             session,
@@ -342,6 +360,7 @@ impl Ledger {
                             r.tier_to,
                             r.effort_to,
                             r.escalating,
+                            files,
                             r.at,
                             now,
                         ],
@@ -366,14 +385,17 @@ impl Ledger {
                         class_columns(&merged.class);
                     let inferred = serde_json::to_string(&merged.inferred)
                         .expect("a list of strings serializes");
+                    let files =
+                        serde_json::to_string(&merged.files).expect("a list of strings serializes");
                     tx.execute(
                         "INSERT INTO router_tasks
                             (session, task_id, agent_id, started_at, ended_at, class_kind,
                              difficulty, scope, uncertainty, verifiable, confidence, outcome,
                              outcome_rank, inferred_json, escalations, exhausted, turns,
-                             explicit_quote, recorded_at, updated_at)
+                             explicit_quote, completed_at_end, files_json, recorded_at,
+                             updated_at)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                                 ?15, ?16, ?17, ?18, ?19, ?19)
+                                 ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21)
                          ON CONFLICT (session, task_id, agent_id) DO UPDATE SET
                             started_at = excluded.started_at, ended_at = excluded.ended_at,
                             class_kind = excluded.class_kind, difficulty = excluded.difficulty,
@@ -383,6 +405,8 @@ impl Ledger {
                             inferred_json = excluded.inferred_json,
                             escalations = excluded.escalations, exhausted = excluded.exhausted,
                             turns = excluded.turns, explicit_quote = excluded.explicit_quote,
+                            completed_at_end = excluded.completed_at_end,
+                            files_json = excluded.files_json,
                             updated_at = excluded.updated_at",
                         params![
                             session,
@@ -403,6 +427,8 @@ impl Ledger {
                             merged.exhausted,
                             merged.turns,
                             merged.explicit_quote,
+                            merged.completed_at_end,
+                            files,
                             now,
                         ],
                     )?;
@@ -482,7 +508,7 @@ impl Ledger {
         Ok(out)
     }
 
-    /// Record an envelope write or an R3 result.
+    /// Record an envelope write or removal.
     pub fn record_router_provenance(&self, row: &RouterProvenance) -> Result<()> {
         match row {
             RouterProvenance::Envelope {
@@ -495,62 +521,34 @@ impl Ledger {
                  VALUES ('envelope', ?1, ?2, ?3, ?4)",
                 params![by, epsilon_max, source, at],
             )?,
-            RouterProvenance::R3 {
-                id,
-                passed,
-                source,
-                at,
-            } => self.conn.execute(
-                "INSERT INTO router_provenance (kind, r3_id, passed, source, at)
-                 VALUES ('r3', ?1, ?2, ?3, ?4)",
-                params![id, passed, source, at],
+            RouterProvenance::EnvelopeRemoved { source, at } => self.conn.execute(
+                "INSERT INTO router_provenance (kind, source, at)
+                 VALUES ('envelope_off', ?1, ?2)",
+                params![source, at],
             )?,
         };
         Ok(())
     }
 
-    /// The latest R3 row, which alone decides whether R3 has passed: a
-    /// failure recorded after a pass withdraws it.
-    pub fn latest_router_r3(&self) -> Result<Option<RouterProvenance>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT r3_id, passed, source, at FROM router_provenance
-                  WHERE kind = 'r3' ORDER BY id DESC LIMIT 1",
-                [],
-                |row| {
-                    Ok(RouterProvenance::R3 {
-                        id: row.get(0)?,
-                        passed: row.get(1)?,
-                        source: row.get(2)?,
-                        at: row.get(3)?,
-                    })
-                },
-            )
-            .optional()?)
-    }
-
     /// Every provenance row, oldest first.
     pub fn router_provenance(&self) -> Result<Vec<RouterProvenance>> {
         let mut stmt = self.conn.prepare(
-            "SELECT kind, r3_id, passed, granted_by, epsilon_max, source, at
+            "SELECT kind, granted_by, epsilon_max, source, at
                FROM router_provenance ORDER BY id",
         )?;
         let rows = stmt.query_map([], |row| {
             let kind: String = row.get(0)?;
-            Ok(if kind == "r3" {
-                RouterProvenance::R3 {
-                    id: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    passed: row.get::<_, Option<bool>>(2)?.unwrap_or(false),
-                    source: row.get(5)?,
-                    at: row.get(6)?,
+            Ok(if kind == "envelope_off" {
+                RouterProvenance::EnvelopeRemoved {
+                    source: row.get(3)?,
+                    at: row.get(4)?,
                 }
             } else {
                 RouterProvenance::Envelope {
-                    by: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    epsilon_max: row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
-                    source: row.get(5)?,
-                    at: row.get(6)?,
+                    by: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    epsilon_max: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                    source: row.get(3)?,
+                    at: row.get(4)?,
                 }
             })
         })?;
@@ -626,7 +624,18 @@ impl Ledger {
 
 /// [`read_task`] for a row whose task columns start at `offset`.
 fn read_task_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<RouterTaskRow> {
-    let inferred: String = row.get(offset + 12)?;
+    // A row this binary wrote always parses; one that does not is a
+    // corrupt row, reported as such rather than read as "no signals".
+    let json_list = |index: usize| -> rusqlite::Result<Vec<String>> {
+        let text: String = row.get(offset + index)?;
+        serde_json::from_str(&text).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                offset + index,
+                rusqlite::types::Type::Text,
+                Box::new(e),
+            )
+        })
+    };
     Ok(RouterTaskRow {
         task_id: row.get(offset)?,
         agent_id: unkey(row.get(offset + 1)?),
@@ -635,15 +644,9 @@ fn read_task_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<Rout
         class: read_class(row, offset + 4)?,
         outcome: row.get(offset + 10)?,
         outcome_rank: row.get::<_, i64>(offset + 11)?.clamp(0, 255) as u8,
-        // A row this binary wrote always parses; one that does not is a
-        // corrupt row, reported as such rather than read as "no signals".
-        inferred: serde_json::from_str(&inferred).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                offset + 12,
-                rusqlite::types::Type::Text,
-                Box::new(e),
-            )
-        })?,
+        completed_at_end: row.get(offset + 17)?,
+        inferred: json_list(12)?,
+        files: json_list(18)?,
         escalations: row.get::<_, i64>(offset + 13)?.max(0) as u32,
         exhausted: row.get(offset + 14)?,
         turns: row.get::<_, i64>(offset + 15)?.max(0) as u32,
@@ -675,7 +678,9 @@ mod tests {
             class: None,
             outcome: outcome.into(),
             outcome_rank: rank,
+            completed_at_end: None,
             inferred: vec![],
+            files: vec![],
             escalations: 0,
             exhausted: false,
             turns: 1,
@@ -756,22 +761,50 @@ mod tests {
     }
 
     #[test]
-    fn the_latest_r3_row_decides() {
+    fn a_later_correction_moves_the_outcome_but_not_the_end_outcome_and_files_gain() {
         let (ledger, _dir) = ledger();
-        assert_eq!(ledger.latest_router_r3().unwrap(), None);
-        for passed in [true, false] {
+        let ended = RouterTaskRow {
+            completed_at_end: Some("completed_verified".into()),
+            files: vec!["aaaaaaaaaaaaaaaa".into()],
+            ..task("completed_verified", 1)
+        };
+        let corrected = RouterTaskRow {
+            completed_at_end: Some("corrected".into()),
+            files: vec!["bbbbbbbbbbbbbbbb".into()],
+            ..task("corrected", 2)
+        };
+        for row in [ended, corrected] {
             ledger
-                .record_router_provenance(&RouterProvenance::R3 {
-                    id: "r3-a".into(),
-                    passed,
-                    source: "cli (unattributed)".into(),
-                    at: "2026-10-07T00:00:00Z".into(),
-                })
+                .record_router_batch("s", &[RouterRecord::Task(row)])
                 .unwrap();
         }
-        assert!(matches!(
-            ledger.latest_router_r3().unwrap(),
-            Some(RouterProvenance::R3 { passed: false, .. })
-        ));
+        let stored = ledger.router_task("s", "t1", None).unwrap().unwrap();
+        assert_eq!(stored.outcome, "corrected");
+        assert_eq!(
+            stored.completed_at_end.as_deref(),
+            Some("completed_verified")
+        );
+        assert_eq!(stored.files, vec!["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"]);
+    }
+
+    #[test]
+    fn provenance_rows_read_back_in_order() {
+        let (ledger, _dir) = ledger();
+        let written = vec![
+            RouterProvenance::Envelope {
+                by: "relais install".into(),
+                epsilon_max: 0.1,
+                source: "install".into(),
+                at: "2026-10-07T00:00:00Z".into(),
+            },
+            RouterProvenance::EnvelopeRemoved {
+                source: "plugin-ask".into(),
+                at: "2026-10-07T01:00:00Z".into(),
+            },
+        ];
+        for row in &written {
+            ledger.record_router_provenance(row).unwrap();
+        }
+        assert_eq!(ledger.router_provenance().unwrap(), written);
     }
 }

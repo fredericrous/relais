@@ -40,39 +40,19 @@ export function machineSettingsPath(env: { home?: string; configDir?: string }):
   return undefined
 }
 
-export const ROUTER_CONSENT_MESSAGE =
-  "Session routing is granted only by the person: they type /relais-routing (the envelope) or /relais-r3 (an R3 pass), and the plugin asks them. The model does not run router-envelope or r3 --record, and does not write the plugin's store."
+export const ROUTER_ENVELOPE_MESSAGE =
+  'Session routing is the person\'s to turn on or off: `relais install --claude` or /relais-routing records the envelope, and /relais-routing off removes it. The model does not run router-envelope or relais install --claude.'
 
-// Where Claude Code keeps this plugin's `$.store`: "a JSON file of the
-// plugin's own under the user's Claude Code configuration directory"
-// (the mods types; no API names the file). On this build it is
-// `<config>/plugins/store/<plugin>_<source>-<hash>.json`, so the whole
-// directory is guarded: `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
-export function pluginStoreDir(env: { home?: string; claudeConfigDir?: string }): string | undefined {
-  if (env.claudeConfigDir) return `${env.claudeConfigDir.replace(/\/+$/, '')}/plugins/store/`
-  if (env.home) return `${env.home.replace(/\/+$/, '')}/.claude/plugins/store/`
-  return undefined
-}
-
-// Why the model's Bash, Write or Edit call may not touch the router's
-// consent records, or undefined. A reminder, not a boundary: in a
+// Why the model's Bash call may not record or remove the routing envelope,
+// or undefined: `relais native router-envelope`, and `relais install …
+// --claude` (which records the envelope). A reminder, not a boundary: in a
 // bypass-permissions session a deliberate write is the stated limit.
-export function routerConsentGuard(
-  tool: string,
-  input: Record<string, unknown>,
-  env: { home?: string; claudeConfigDir?: string },
-): string | undefined {
-  const dir = pluginStoreDir(env)
-  const named = (text: string) =>
-    (dir !== undefined && (text.includes(dir) || text.includes(dir.slice(0, -1)))) || text.includes('.claude/plugins/store')
-  if (tool === 'Bash') {
-    const command = String(input.command ?? '')
-    if (/\brouter-envelope\b/.test(command)) return ROUTER_CONSENT_MESSAGE
-    if (/\br3\b[^|;&\n]*--record\b/.test(command)) return ROUTER_CONSENT_MESSAGE
-    return named(command) ? ROUTER_CONSENT_MESSAGE : undefined
-  }
-  const file = String(input.file_path ?? input.notebook_path ?? '')
-  return file !== '' && named(file) ? ROUTER_CONSENT_MESSAGE : undefined
+export function routerEnvelopeGuard(tool: string, input: Record<string, unknown>): string | undefined {
+  if (tool !== 'Bash') return undefined
+  const command = String(input.command ?? '')
+  if (/\brouter-envelope\b/.test(command)) return ROUTER_ENVELOPE_MESSAGE
+  if (/\brelais\s+install\b[^|;&\n]*--claude\b/.test(command)) return ROUTER_ENVELOPE_MESSAGE
+  return undefined
 }
 
 // Why the model's Write, Edit or Bash call may not touch the grants, or

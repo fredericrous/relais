@@ -19,9 +19,8 @@ exit, or stdout that does not parse, the plugin runs in `shadow`.
 {
   "schema": 1,
   "mode": "on | shadow | off",
-  "mode_reason": "envelope and r3 recorded | no envelope | no r3 pass | env RELAIS_SESSION_ROUTING=shadow | ...",
-  "envelope": { "granted_at": "RFC3339", "by": "string", "epsilon_max": 0.1, "source": "plugin-ask | cli (unattributed)" },
-  "r3": { "id": "string", "passed": true, "at": "RFC3339", "source": "plugin-ask | cli (unattributed)" },
+  "mode_reason": "envelope recorded | no envelope | env RELAIS_SESSION_ROUTING=shadow | ...",
+  "envelope": { "granted_at": "RFC3339", "by": "string", "epsilon_max": 0.1, "source": "install | plugin-ask | cli (unattributed)" },
   "holdout": false,
   "seed": "16 hex chars",
   "epsilon": 0.1,
@@ -53,11 +52,11 @@ exit, or stdout that does not parse, the plugin runs in `shadow`.
 }
 ```
 
-- **`mode`** is relais's side only: `on` when an envelope is in machine.toml, the latest R3 row has `passed: true`, and the env does not narrow it; otherwise `shadow`; `off` when the env says so. The plugin computes `mode_effective` = the narrower of `mode` and its own two `$.store` records (`envelope_consent`, `r3_consent`). The `r3_consent` record must name the same `r3.id`.
+- **`mode`** is `on` whenever an envelope is in machine.toml, `shadow` without one; `RELAIS_SESSION_ROUTING=off|shadow` can only narrow it (any other value narrows to `shadow`). The plugin's `mode_effective` is this `mode`, and `shadow` when router-state did not answer.
 - **`holdout`** is drawn by Rust from `SplitMix64(hash(session id))` against `holdout_rate` (machine `[session_routing]`, default 0.1). In a held-out session the plugin decides and records but never applies.
 - **`seed`** is per session: the plugin's exploration draws are `SplitMix64(seed, draw_index)`. They are R2's; R1 sends `explored: false`.
 - **`tiers`** come from the repository's `relais.toml` `[models.*]` when present, else machine defaults. Aliases are resolved to full ids by `[session_routing.model_ids]`, defaulting to haiku → `claude-haiku-5-5`, sonnet → `claude-sonnet-5-5`, opus → `claude-opus-5-5`, fable → `claude-fable-5-1`. `turn.step` refuses aliases (S0).
-- **`rates`** are micro-USD per million tokens, from `PriceTable`; `cache_write` is the 1-hour rate (S0). A model with no price is `null`, and the plugin then never switches down to it.
+- **`rates`** are micro-USD per million tokens, from machine.toml `[pricing]`, else relais's built-in list (`claude-haiku-5-5` only; a machine entry wins per model); `cache_write` is the 1-hour rate (S0). A model with no price is `null`, and the plugin then never switches down to it.
 - **`pins`**: subagent types whose definition (user `~/.claude/agents/*.md`, project `.claude/agents/*.md`) names a `model:` in its front matter, plus machine `[session_routing] pinned_agents`. The plugin never overrides a pinned type.
 - **`checks`**: argv prefixes that count as verification. The repository's `relais.toml` profile commands, plus the built-in list `cargo test`, `cargo nextest`, `npm test`, `pnpm test`, `yarn test`, `bun test`, `pytest`, `uv run pytest`, `go test`, `make check`, `make test`.
 - **`adjustments`**: R2's learned rules; empty in R1.
@@ -81,14 +80,19 @@ Record kinds (field `kind`):
   "input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "at": "RFC3339" }
 
 { "kind": "reassess", "task_id": "s", "agent_id": "s|null",
-  "event": "failed_verification|repair_failed|scope_growth|spawn|correction|flag",
-  "tier_from": "…", "tier_to": "…", "effort_to": "s|null", "escalating": true, "at": "RFC3339" }
+  "event": "failed_verification|repair_failed|scope_growth|spawn|correction|flag|revert",
+  "tier_from": "…", "tier_to": "…", "effort_to": "s|null", "escalating": true,
+  "files": ["16 hex"], "at": "RFC3339" }
 
 { "kind": "task", "task_id": "s", "agent_id": "s|null", "started_at": "RFC3339", "ended_at": "RFC3339|null",
   "class": { … }, "outcome": "completed_verified|completed_accepted|corrected|unknown",
-  "inferred": ["aborted", "no_complaint", "respawned"], "escalations": 0, "exhausted": false, "turns": 1,
-  "explicit_quote": "s|null" }
+  "completed_at_end": "completed_verified|completed_accepted|corrected|unknown|null",
+  "inferred": ["aborted", "no_complaint", "respawned"], "files": ["16 hex"],
+  "escalations": 0, "exhausted": false, "turns": 1, "explicit_quote": "s|null" }
 ```
+
+- **`files`** are the first 16 hex digits of the SHA-256 of a repo-relative path (relative to the session's cwd, no leading `./`), lowercase. On a `task`: every file the task edited (Edit, Write, MultiEdit, NotebookEdit successes). On a `reassess` with `event: "revert"`: the files a successful Bash `git revert …` (`[]`: its files are not known here), `git checkout [<ref>] -- <paths>` or `git restore <paths>` (not `--staged` alone) put back; a revert is never escalating. Optional, default `[]`. R2 matches reverts and later corrections to the tasks whose files they touch (plan §5, missed failures).
+- **`completed_at_end`** is the outcome when the task ended (`null` while it is open). relais keeps the first one it receives; a later record never moves it, so a correction that arrives after the end is measured against it. Optional, default `null`.
 
 Idempotency keys:
 - decision: `(session, task_id, turn_id, agent_id)`;
@@ -96,43 +100,10 @@ Idempotency keys:
 - reassess: `(session, task_id, agent_id, event, at)`;
 - task: `(session, task_id, agent_id)`.
 
-A `task` record may be sent again with a later outcome. Its rank is `corrected` > `completed_verified` = `completed_accepted` > `unknown`. A higher-ranked outcome overwrites a lower one; a lower one never overwrites. `unknown` never overwrites anything.
+A `task` record may be sent again with a later outcome. Its rank is `corrected` > `completed_verified` = `completed_accepted` > `unknown`. A higher-ranked outcome overwrites a lower one; a lower one never overwrites. `unknown` never overwrites anything. `files` and `inferred` only gain; `completed_at_end` is never overwritten once set.
 
-## `relais native router-envelope --by <name> --epsilon-max <f> [--source plugin-ask]`
+## `relais native router-envelope --by <name> (--epsilon-max <f> | --off) [--source plugin-ask]`
 
-Writes `[session_routing] envelope = { granted_at, by, epsilon_max, source }` to machine.toml (locked, atomic, comments kept, as `trust grant` does) and a ledger provenance row. Prints `{"schema":1,"envelope":{…}}`. Exits 0, 2 bad args, 1 failure. Run by the plugin's `/relais-routing` handler after `$.ui.ask`. Typed in a shell it records `source: cli (unattributed)`.
+Writes `[session_routing] envelope = { granted_at, by, epsilon_max, source }` to machine.toml (locked, atomic, comments and file mode kept, as `trust grant` does), removes any `off` tombstone, and writes a ledger provenance row. Prints `{"schema":1,"envelope":{…}}`. With `--off` it removes the envelope and records `[session_routing] off = { at, by, source }` instead, so routing stays off: `relais install --claude` records an envelope only when neither an envelope nor `off` is there. It prints `{"schema":1,"envelope":null,"off":{…},"removed":bool}`. Exits 0, 2 bad args, 1 failure. Run by the plugin's `/relais-routing` (after `$.ui.ask`) and `/relais-routing off`. Typed in a shell it records `source: cli (unattributed)`.
 
-## `relais router r3 --record --id <id> (--passed | --failed) [--source plugin-ask]`
-
-Writes a ledger provenance row only. `relais router r3 --eval <labels.jsonl> [--json]` computes the R3 measures from a hand-labelled file: tier accuracy, continuation detection, `previous`/outcome agreement and the missed-failure rate, with Wilson bounds and the plan's gates. It prints the verdict and an `id`. The plugin's `/relais-r3` runs `--eval` and shows the verdict through `$.ui.ask`; on yes it runs `--record` with `--source plugin-ask` and writes its own `r3_consent` store record naming that `id`.
-
-## R3 labels (`relais router r3 --eval <labels.jsonl>`)
-
-One JSON object per line (blank lines are skipped); unknown fields are
-refused, and an `item` may appear once. Exit 2 names the first bad line.
-
-```json
-{ "item": "string, unique",
-  "human":  { "tier": "research|implementation|escalation|null",
-              "relation": "new_task|continuation|correction|null",
-              "outcome_correct": true },
-  "router": { "tier": "research|implementation|escalation|null",
-              "relation": "new_task|continuation|correction|null",
-              "outcome": "completed_verified|completed_accepted|corrected|unknown|null" } }
-```
-
-A `null` (or absent) field leaves the item out of the measures that need
-it. The measures, each with its 95% bounds:
-
-- **tier accuracy**: `router.tier == human.tier`, over items with both. Gate: Wilson lower bound ≥ 0.75.
-- **continuation detection**: `router.relation == "continuation"`, over items whose `human.relation` is `continuation`. Reported, no gate.
-- **outcome agreement**: over items with `human.outcome_correct` and a router outcome other than `unknown`, the router agrees when it said `completed_*` and the person said correct, or `corrected` and the person said wrong. Gate: Wilson lower bound ≥ 0.75 (100 of 120 passes, 99 does not).
-- **missed failures**: over items with `human.outcome_correct: false`, the share the router called `completed_*`. Gate: the exact (Clopper–Pearson, two-sided 95%) upper bound ≤ 0.1, which with 0 misses needs ≥ 36 such items.
-
-The verdict passes when all three gates pass. Its `id` is `r3-` and the
-first 16 hex characters of SHA-256 of the file's bytes; `--record --id`
-and the plugin's `r3_consent` record name it. `--json` prints
-`{schema, id, items, tier_accuracy, continuation_detection,
-outcome_agreement, missed_failure, passed}`, each measure as
-`{successes, n, rate, lower, upper, gate, passed}`. A failed verdict still
-exits 0: the verdict is the output.
+`relais install --claude --write` records the envelope itself (`by: "relais install"`, `epsilon_max: 0.1`, `source: install`) when it installs the plugin and machine.toml has neither an envelope nor `off`; a preview writes nothing.

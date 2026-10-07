@@ -422,3 +422,64 @@ fn doctor_warns_with_the_fix_when_the_plugin_is_absent_disabled_or_stale() {
         }
     }
 }
+
+/// Installing the plugin is the authorization to route the session (plan
+/// R1b): `--write` records the envelope once; a preview records nothing.
+#[test]
+fn an_install_records_the_routing_envelope_once_and_a_preview_does_not() {
+    let world = World::new("envelope");
+    let machine = world.root.join("cfg").join("machine.toml");
+    let preview = world.relais(&["install", "--claude"]);
+    assert_eq!(preview.status.code(), Some(0), "{}", text(&preview.stderr));
+    assert!(!machine.exists(), "a preview wrote machine.toml");
+
+    let out = world.relais(&["install", "--claude", "--write"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("session routing is on; turn it off with /relais-routing off"),
+        "{}",
+        text(&out.stdout)
+    );
+    let recorded = std::fs::read_to_string(&machine).expect("machine.toml");
+    assert!(recorded.contains("[session_routing]"), "{recorded}");
+    assert!(recorded.contains("source = \"install\""), "{recorded}");
+    assert!(recorded.contains("by = \"relais install\""), "{recorded}");
+    assert!(recorded.contains("epsilon_max = 0.1"), "{recorded}");
+    let state = world.relais(&["native", "router-state", "--session", "s"]);
+    let state: serde_json::Value = serde_json::from_slice(&state.stdout).expect("json");
+    assert_eq!(state["mode"], "on");
+
+    // A second install leaves the envelope as it is, and says nothing.
+    let again = world.relais(&["install", "--claude", "--write"]);
+    assert_eq!(again.status.code(), Some(0), "{}", text(&again.stderr));
+    assert!(!text(&again.stdout).contains("session routing is on"));
+    assert_eq!(std::fs::read_to_string(&machine).unwrap(), recorded);
+}
+
+#[test]
+fn an_install_never_replaces_an_envelope_the_person_recorded() {
+    let world = World::new("envelope-kept");
+    let machine = world.root.join("cfg").join("machine.toml");
+    let mine = "# mine\nschema_version = 1\n\n[session_routing]\nenvelope = { granted_at = \"2026-10-01T00:00:00Z\", by = \"me\", epsilon_max = 0.05, source = \"plugin-ask\" }\n";
+    std::fs::write(&machine, mine).unwrap();
+    let out = world.relais(&["install", "--claude", "--write"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&machine).unwrap(), mine);
+}
+
+/// Off sticks: once the person turned routing off, a later install does
+/// not turn it back on.
+#[test]
+fn an_install_after_routing_was_turned_off_leaves_it_off() {
+    let world = World::new("envelope-off");
+    let machine = world.root.join("cfg").join("machine.toml");
+    let off = world.relais(&["native", "router-envelope", "--off", "--by", "me"]);
+    assert_eq!(off.status.code(), Some(0), "{}", text(&off.stderr));
+    let out = world.relais(&["install", "--claude", "--write"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let after = std::fs::read_to_string(&machine).unwrap();
+    assert!(!after.contains("envelope"), "{after}");
+    let state = world.relais(&["native", "router-state", "--session", "s"]);
+    let state: serde_json::Value = serde_json::from_slice(&state.stdout).expect("json");
+    assert_eq!(state["mode"], "shadow");
+}

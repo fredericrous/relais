@@ -33,9 +33,8 @@
 //! | 19 | `NothingDetected` | `init --detect` found no verification command and none was typed; nothing was written |
 //!
 //! The session-router commands (`native router-state`, `router-observe`,
-//! `router-envelope`, `router r3`) use 0, 1 and 2 only: 2 is a bad payload
-//! or invocation (nothing written), 1 a failure to retry. A failed R3
-//! verdict is output, not an error, and exits 0.
+//! `router-envelope`) use 0, 1 and 2 only: 2 is a bad payload or
+//! invocation (nothing written), 1 a failure to retry.
 //!
 //! README.md carries the same table for people who do not read source.
 
@@ -337,11 +336,6 @@ enum Command {
         #[command(subcommand)]
         cmd: EvidenceCommand,
     },
-    /// The session router's evaluation gate (SPEC §30)
-    Router {
-        #[command(subcommand)]
-        cmd: RouterCommand,
-    },
     /// Read one Claude Code hook payload on stdin and answer it (SPEC
     /// §23): silence, or a refusal a person can act on. With `--probe
     /// --record <dir>`, record the payload verbatim instead and decide
@@ -531,17 +525,26 @@ enum NativeCommand {
     /// payload is invalid, and then nothing is written
     #[command(name = "router-observe")]
     RouterObserve,
-    /// Record the person's routing envelope in machine.toml (SPEC §30).
-    /// Run by the plugin after its own question; typed in a shell it is
-    /// recorded as unattributed
+    /// Record the person's routing envelope in machine.toml (SPEC §30),
+    /// or with `--off` remove it and record that routing is off. Run by
+    /// the plugin after its own question; typed in a shell it is recorded
+    /// as unattributed
     #[command(name = "router-envelope")]
     RouterEnvelope {
-        /// Who granted it
+        /// Who granted it (or turned routing off)
         #[arg(long)]
         by: String,
         /// The highest exploration rate allowed, 0 to 1
-        #[arg(long = "epsilon-max")]
-        epsilon_max: f64,
+        #[arg(
+            long = "epsilon-max",
+            required_unless_present = "off",
+            conflicts_with = "off"
+        )]
+        epsilon_max: Option<f64>,
+        /// Turn routing off: remove the envelope, and keep `relais install`
+        /// from recording it again
+        #[arg(long)]
+        off: bool,
         /// `plugin-ask` when the plugin asked the person
         #[arg(long, value_enum)]
         source: Option<RouterSource>,
@@ -549,7 +552,7 @@ enum NativeCommand {
 }
 
 /// Who wrote a session-routing record: only the plugin's own question
-/// is attributed.
+/// is attributed (`relais install` attributes its own write).
 #[derive(Clone, Copy, ValueEnum)]
 enum RouterSource {
     #[value(name = "plugin-ask")]
@@ -561,38 +564,6 @@ fn router_source(source: Option<RouterSource>) -> relais::router::Source {
         Some(RouterSource::PluginAsk) => relais::router::Source::PluginAsk,
         None => relais::router::Source::Cli,
     }
-}
-
-#[derive(Subcommand)]
-enum RouterCommand {
-    /// The R3 evaluation of the session router (SPEC §30): `--eval`
-    /// measures a hand-labelled file against the gates and prints the
-    /// verdict and its id; `--record` writes that verdict to the ledger.
-    /// Recording alone never switches routing on: the plugin's own
-    /// `/relais-r3` record is needed too
-    R3 {
-        /// Measure this labels file (JSON lines; docs/router-protocol.md)
-        #[arg(long, value_name = "LABELS", conflicts_with_all = ["record", "id", "passed", "failed", "source"])]
-        eval: Option<PathBuf>,
-        /// Machine-readable output for `--eval`
-        #[arg(long, requires = "eval")]
-        json: bool,
-        /// Record an R3 result
-        #[arg(long, requires = "id")]
-        record: bool,
-        /// The id `--eval` printed
-        #[arg(long, requires = "record")]
-        id: Option<String>,
-        /// The evaluation passed
-        #[arg(long, requires = "record", conflicts_with = "failed")]
-        passed: bool,
-        /// The evaluation failed
-        #[arg(long, requires = "record")]
-        failed: bool,
-        /// `plugin-ask` when the plugin asked the person
-        #[arg(long, value_enum, requires = "record")]
-        source: Option<RouterSource>,
-    },
 }
 
 #[derive(Subcommand)]
@@ -1145,7 +1116,6 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             run_command(&task, revise.as_deref(), &origin)
         }
         Command::Native { cmd } => native_command(cmd),
-        Command::Router { cmd } => router_command(cmd),
         Command::Trust { cmd } => trust_command(cmd),
         Command::Status { run_id } => status_command(run_id.as_deref()),
         Command::Explain { run_id } => explain_command(&run_id),
@@ -1391,12 +1361,56 @@ fn install_command(write: bool, user: bool, targets: Targets) -> Result<CliOutco
     let report = operational(relais::install::install(&request, &home), "install")?;
     let plugin = relais::install::plugin::install(request.mode, &marketplace_dir()?);
     let outcome = render_install("install", &request, &report, &plugin);
+    if request.mode == Mode::Apply && plugin.failure.is_none() {
+        install_routing_envelope();
+    }
     match targets {
         Targets::OwnedFiles => Ok(outcome),
         Targets::OwnedFilesAndHooks => Ok(worse_outcome(
             outcome,
             install_hooks_target(&request, &home)?,
         )),
+    }
+}
+
+/// Installing the plugin is the person's authorization to route the
+/// session (plan, decision 1, R1b): record the envelope when machine.toml
+/// has neither one nor an `off` tombstone, and say how to turn it off. A
+/// failure here is said and does not fail the install: routing then stays
+/// in shadow.
+fn install_routing_envelope() {
+    let Ok(machine_path) = paths::machine_settings_path() else {
+        eprintln!("relais install: session routing not recorded: no config directory");
+        return;
+    };
+    let envelope = relais::policy::RoutingEnvelope {
+        granted_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        by: "relais install".to_string(),
+        epsilon_max: 0.1,
+        source: relais::router::Source::Install.as_str().to_string(),
+    };
+    match relais::router::write_envelope_if_absent(&machine_path, &envelope) {
+        Ok(true) => {
+            let recorded = open_ledger().and_then(|ledger| {
+                operational(
+                    ledger.record_router_provenance(&relais::ledger::RouterProvenance::Envelope {
+                        by: envelope.by.clone(),
+                        epsilon_max: envelope.epsilon_max,
+                        source: envelope.source.clone(),
+                        at: envelope.granted_at.clone(),
+                    }),
+                    "recording the envelope in the ledger",
+                )
+            });
+            if let Err(e) = recorded {
+                eprintln!("relais install: warning: the ledger did not record the envelope ({e})");
+            }
+            println!(
+                "session routing is on; turn it off with /relais-routing off or RELAIS_SESSION_ROUTING=off"
+            );
+        }
+        Ok(false) => {}
+        Err(e) => eprintln!("relais install: session routing not recorded: {e}"),
     }
 }
 
@@ -3269,9 +3283,16 @@ fn native_command(cmd: NativeCommand) -> Result<CliOutcome, CliError> {
         NativeCommand::RouterObserve => Ok(router_observe_command()),
         NativeCommand::RouterEnvelope {
             by,
+            off: true,
+            source,
+            ..
+        } => router_off_command(&by, router_source(source)),
+        NativeCommand::RouterEnvelope {
+            by,
             epsilon_max,
             source,
-        } => router_envelope_command(&by, epsilon_max, router_source(source)),
+            ..
+        } => router_envelope_command(&by, epsilon_max.unwrap_or(f64::NAN), router_source(source)),
         NativeCommand::Hello { session } => {
             let socket = relais::coordinator::socket_path().map_err(CliError::Home)?;
             // The first call of a session may find no daemon: start one, as
@@ -3447,83 +3468,44 @@ fn router_envelope_command(
     Ok(CliOutcome::Accepted)
 }
 
-fn router_command(cmd: RouterCommand) -> Result<CliOutcome, CliError> {
-    match cmd {
-        RouterCommand::R3 {
-            eval: Some(labels),
-            json,
-            ..
-        } => r3_eval_command(&labels, json),
-        RouterCommand::R3 {
-            record: true,
-            id: Some(id),
-            passed,
-            failed,
-            source,
-            ..
-        } => {
-            if passed == failed {
-                return Err(CliError::Usage {
-                    detail: "router r3 --record: give exactly one of --passed or --failed".into(),
-                });
-            }
-            if id.trim().is_empty() {
-                return Err(CliError::Usage {
-                    detail: "router r3 --record: --id is empty".into(),
-                });
-            }
-            let source = router_source(source);
-            let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-            let ledger = open_ledger()?;
-            operational(
-                ledger.record_router_provenance(&relais::ledger::RouterProvenance::R3 {
-                    id: id.clone(),
-                    passed,
-                    source: source.as_str().to_string(),
-                    at,
-                }),
-                "recording the R3 result in the ledger",
-            )?;
-            println!(
-                "router r3: {} recorded for {id} ({})",
-                if passed { "pass" } else { "failure" },
-                source.as_str()
-            );
-            Ok(CliOutcome::Accepted)
+/// `relais native router-envelope --off`: the envelope removed and the
+/// `off` tombstone recorded in machine.toml, then the provenance row.
+fn router_off_command(by: &str, source: relais::router::Source) -> Result<CliOutcome, CliError> {
+    if by.trim().is_empty() {
+        eprintln!("relais native router-envelope: --by is empty; name who turned routing off");
+        return Ok(CliOutcome::InvalidInput);
+    }
+    let machine_path = paths::machine_settings_path().map_err(CliError::Home)?;
+    let off = relais::policy::RoutingOff {
+        at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        by: by.to_string(),
+        source: source.as_str().to_string(),
+    };
+    let had_envelope = match relais::router::write_off(&machine_path, &off) {
+        Ok(had) => had,
+        Err(e) => {
+            eprintln!("relais native router-envelope: {e}");
+            return Ok(CliOutcome::OperationalFailure);
         }
-        RouterCommand::R3 { .. } => Err(CliError::Usage {
-            detail:
-                "router r3: give --eval <labels.jsonl>, or --record --id <id> --passed|--failed"
-                    .into(),
-        }),
+    };
+    let recorded = open_ledger().and_then(|ledger| {
+        operational(
+            ledger.record_router_provenance(&relais::ledger::RouterProvenance::EnvelopeRemoved {
+                source: off.source.clone(),
+                at: off.at.clone(),
+            }),
+            "recording the removal in the ledger",
+        )
+    });
+    if let Err(e) = recorded {
+        eprintln!(
+            "relais native router-envelope: warning: routing is off in machine.toml, but the \
+             ledger did not record it ({e})"
+        );
     }
-}
-
-/// `relais router r3 --eval`: the verdict is the output, so a failed gate
-/// still exits 0; only an unreadable or invalid labels file is an error.
-fn r3_eval_command(labels: &Path, json: bool) -> Result<CliOutcome, CliError> {
-    use relais::router::r3;
-    let bytes = std::fs::read(labels).map_err(|cause| CliError::Read {
-        what: "the R3 labels",
-        path: labels.to_path_buf(),
-        cause,
-    })?;
-    let text = String::from_utf8(bytes.clone()).map_err(|cause| CliError::Invalid {
-        what: "the R3 labels",
-        path: labels.to_path_buf(),
-        cause: Box::new(cause),
-    })?;
-    let parsed = r3::parse_labels(&text).map_err(|cause| CliError::Invalid {
-        what: "the R3 labels",
-        path: labels.to_path_buf(),
-        cause: Box::new(cause),
-    })?;
-    let evaluation = r3::evaluate(r3::labels_id(&bytes), &parsed);
-    if json {
-        print_document(&evaluation)?;
-    } else {
-        print!("{}", evaluation.render());
-    }
+    print_document(
+        &serde_json::json!({ "schema": 1, "envelope": null, "off": off, "removed": had_envelope }),
+    )?;
     Ok(CliOutcome::Accepted)
 }
 

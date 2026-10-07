@@ -10,9 +10,8 @@ const ok = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isSt
 export const ROUTER_STATE = {
   schema: 1,
   mode: 'on',
-  mode_reason: 'envelope and r3 recorded',
+  mode_reason: 'envelope recorded',
   envelope: { granted_at: '2026-10-06T10:00:00Z', by: 'the person', epsilon_max: 0.1, source: 'plugin-ask' },
-  r3: { id: 'r3-1', passed: true, at: '2026-10-06T11:00:00Z', source: 'plugin-ask' },
   holdout: false,
   seed: '0123456789abcdef',
   epsilon: 0.1,
@@ -40,11 +39,6 @@ export const ROUTER_STATE = {
   excluded_models: [],
   checks: [['cargo', 'test'], ['npm', 'test']],
   adjustments: [],
-}
-
-export const CONSENTS = {
-  envelope_consent: { answer: 'Allow session routing', at: '2026-10-06T10:00:00Z', session: 'session-0' },
-  r3_consent: { id: 'r3-1', at: '2026-10-06T11:00:00Z', session: 'session-0' },
 }
 
 // The classifier's JSON for one request.
@@ -75,17 +69,19 @@ export type Routed = Engine & {
   observeExits: number[]
 }
 
-// A session started with router-state and the store records given.
+// A session started with the router-state given; `state` is the live
+// document, so a test may change it (an envelope recorded or removed).
 export async function routedSession(
   $: any,
   on: any,
-  options: { state?: Record<string, unknown>; store?: Record<string, unknown> } = {},
-): Promise<Routed> {
-  const engine = scriptedEngine(on, { store: options.store ?? CONSENTS }) as Routed
+  options: { state?: Record<string, unknown> } = {},
+): Promise<Routed & { state: Record<string, unknown> }> {
+  const engine = scriptedEngine(on) as Routed & { state: Record<string, unknown> }
   engine.labels = new Map()
   engine.fallback = label()
   engine.observeExits = []
-  const state = { ...ROUTER_STATE, ...(options.state ?? {}) }
+  const state: Record<string, unknown> = { ...ROUTER_STATE, ...(options.state ?? {}) }
+  engine.state = state
   engine.script.runResult = (argv: string[]) => {
     if (argv[1] === 'native' && argv[2] === 'router-state') return { ...ok, stdout: JSON.stringify(state) }
     if (argv[1] === 'native' && argv[2] === 'router-observe') {

@@ -9,7 +9,7 @@ import type { Fx } from './fx.ts'
 import { DENY_MESSAGE, isRelaisNotification, isRelaisType, relaisAddresses } from './guards.ts'
 import { childOf, contractPath, onChunk, pump, reloadTimeline, startReplay, startRun, statusOf } from './runs.ts'
 import { onboardTool, onPersonPrompt, trustTool, withRoutingSection } from './consent.ts'
-import { machineSettingsGuard, routerConsentGuard } from './guards.ts'
+import { machineSettingsGuard, routerEnvelopeGuard } from './guards.ts'
 import {
   afterStep,
   beforeStep,
@@ -18,7 +18,6 @@ import {
   onSessionEnd,
   onToolResult,
   onTurnComplete,
-  r3Command,
   refreshState,
   routeSpawn,
   routingCommand,
@@ -167,11 +166,7 @@ export function register(on: any) {
     })
     await $.command.register({
       name: 'relais-routing',
-      description: 'Allow relais to route the session model by the task (asks you; shows what it allows).',
-    })
-    await $.command.register({
-      name: 'relais-r3',
-      description: 'Evaluate a hand-labelled R3 file and, if it passes and you agree, record the pass.',
+      description: "Route the session model by the task (asks you; shows what it allows). '/relais-routing off' turns it off.",
     })
     await $.command.register({
       name: 'relais-flag',
@@ -224,17 +219,14 @@ export function register(on: any) {
 
   // machine.toml holds the grants: the model does not write it, and is
   // told so when a Bash command names it (a reminder, not a wall: SPEC §5).
-  // The same for the router's consent: the envelope and the R3 pass are
-  // the person's, through /relais-routing and /relais-r3, and the plugin's
-  // store holding their records is not the model's to write.
+  // The same for the router's envelope: it is the person's, recorded by
+  // `relais install --claude` or /relais-routing, never by the model.
   on('tool.check', { tool: ['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Bash'] }, async ($: any, e: any, next: any) => {
     const decided = await next(e)
     const home = await $.env.get('HOME')
     const configDir = await $.env.get('RELAIS_CONFIG_DIR')
-    const claudeConfigDir = await $.env.get('CLAUDE_CONFIG_DIR')
     const input = e.input ?? {}
-    const refusal =
-      machineSettingsGuard(e.tool, input, { home, configDir }) ?? routerConsentGuard(e.tool, input, { home, claudeConfigDir })
+    const refusal = machineSettingsGuard(e.tool, input, { home, configDir }) ?? routerEnvelopeGuard(e.tool, input)
     return refusal ? { decision: 'deny', reason: refusal } : decided
   })
 
@@ -388,13 +380,9 @@ export function register(on: any) {
   // the person's prompt reaches the model but is read as a hook's aside.
   on('prompt.compose', async (_$: any, e: any, next: any) => withRoutingSection(await next(e)))
 
-  on('command.run', { command: 'relais-routing' }, async ($: any) => ({
-    text: await routingCommand(effects($), store),
-  })).catch(() => ({ text: 'relais could not ask about session routing (internal error). Nothing was written.' }))
-
-  on('command.run', { command: 'relais-r3' }, async ($: any) => ({
-    text: await r3Command(effects($), store),
-  })).catch(() => ({ text: 'relais could not run the R3 evaluation (internal error). Nothing was recorded.' }))
+  on('command.run', { command: 'relais-routing' }, async ($: any, e: any) => ({
+    text: await routingCommand(effects($), store, typeof e?.args === 'string' ? e.args : ''),
+  })).catch(() => ({ text: 'relais could not change session routing (internal error). Nothing was written.' }))
 
   on('command.run', { command: 'relais-flag' }, async ($: any) => ({
     text: await flag(effects($), store),

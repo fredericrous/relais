@@ -1432,6 +1432,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
         tier_to TEXT NOT NULL,
         effort_to TEXT,
         escalating INTEGER NOT NULL,
+        files_json TEXT NOT NULL,
         at TEXT NOT NULL,
         recorded_at TEXT NOT NULL,
         PRIMARY KEY (session, task_id, agent_id, event, at)
@@ -1450,7 +1451,9 @@ const MIGRATIONS: &[(&str, &str)] = &[
         confidence REAL,
         outcome TEXT NOT NULL,
         outcome_rank INTEGER NOT NULL,
+        completed_at_end TEXT,
         inferred_json TEXT NOT NULL,
+        files_json TEXT NOT NULL,
         escalations INTEGER NOT NULL,
         exhausted INTEGER NOT NULL,
         turns INTEGER NOT NULL,
@@ -1463,8 +1466,6 @@ const MIGRATIONS: &[(&str, &str)] = &[
     CREATE TABLE router_provenance (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         kind TEXT NOT NULL,
-        r3_id TEXT,
-        passed INTEGER,
         granted_by TEXT,
         epsilon_max REAL,
         source TEXT NOT NULL,

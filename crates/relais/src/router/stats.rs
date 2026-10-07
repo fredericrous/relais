@@ -22,7 +22,7 @@ pub fn wilson(successes: u64, n: u64, z: f64) -> (f64, f64) {
     ((centre - half).max(0.0), (centre + half).min(1.0))
 }
 
-/// `ln C(n, k)`, by summing logs: exact enough for the sizes R3 has.
+/// `ln C(n, k)`, by summing logs: exact enough for the sizes the gates see.
 fn ln_choose(n: u64, k: u64) -> f64 {
     let k = k.min(n - k);
     (0..k)

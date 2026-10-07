@@ -322,33 +322,23 @@ test('a held-out session decides and records, and applies nothing', async ($: an
   expect(decisions[0].holdout).toBe(true)
 })
 
-test('mode_effective: an envelope without the plugin’s consent record stays shadow, with one toast', async ($: any, on: any) => {
-  const engine = await routedSession($, on, { store: { r3_consent: { id: 'r3-1' } } })
-  const { steps } = await personTurn($, engine, 'rename foo to bar, tests exist')
-  expect(steps[0].model).toBe(SONNET)
-  await personTurn($, engine, 'rename baz too, tests exist')
-  await settle(engine)
-  const toasts = engine.calls.toasts.filter(t => t.includes('/relais-routing'))
-  expect(toasts.length).toBe(1)
-  await endSession($, engine)
-  expect(observed(engine, 'decision').every((d: any) => d.mode_effective === 'shadow')).toBe(true)
-})
-
-test('mode_effective: an R3 provenance row without the matching /relais-r3 record stays shadow', async ($: any, on: any) => {
-  const engine = await routedSession($, on, {
-    store: { envelope_consent: { answer: 'Allow session routing', at: 'x', session: 's' }, r3_consent: { id: 'r3-0' } },
-  })
-  const { steps } = await personTurn($, engine, 'rename foo to bar, tests exist')
-  expect(steps[0].model).toBe(SONNET)
-})
-
-test('mode_effective: both records and router-state on switch routing on, shown on the status line', async ($: any, on: any) => {
+test('mode_effective follows router-state: on routes with no plugin store record and no toast', async ($: any, on: any) => {
   const engine = await routedSession($, on)
   const { steps } = await personTurn($, engine, 'rename foo to bar, tests exist')
   expect(steps[0].model).toBe(HAIKU)
   await engine.clock.advance(100)
   await settle(engine)
   expect(engine.calls.statuses[engine.calls.statuses.length - 1]).toBe('relais · research (haiku-5-5)')
+  expect(engine.calls.toasts.filter(t => t.includes('routing')).length).toBe(0)
+  await endSession($, engine)
+  expect(observed(engine, 'decision').every((d: any) => d.mode_effective === 'on')).toBe(true)
+})
+
+test('mode_effective: router-state in shadow (no envelope) routes nothing and says nothing', async ($: any, on: any) => {
+  const engine = await routedSession($, on, { state: { mode: 'shadow', mode_reason: 'no envelope', envelope: null } })
+  const { steps } = await personTurn($, engine, 'rename foo to bar, tests exist')
+  expect(steps[0].model).toBe(SONNET)
+  expect(engine.calls.toasts.length).toBe(0)
 })
 
 test('observations: one router-observe per prompt; flushed at session.end', async ($: any, on: any) => {
@@ -405,8 +395,22 @@ test('/relais-flag marks the task corrected and moves its next request up', asyn
   expect(observed(engine, 'reassess')[0].event).toBe('flag')
 })
 
-test('/relais-routing writes the envelope through relais and the plugin’s record only on the yes', async ($: any, on: any) => {
-  const engine = await routedSession($, on, { store: { r3_consent: { id: 'r3-1' } } })
+// router-state as relais would serve it after each router-envelope call.
+function followEnvelope(engine: any) {
+  const base = engine.script.runResult
+  engine.script.runResult = (argv: string[], init: any) => {
+    if (argv[1] === 'native' && argv[2] === 'router-envelope') {
+      const off = argv.includes('--off')
+      engine.state.mode = off ? 'shadow' : 'on'
+      engine.state.envelope = off ? null : { by: 'x', epsilon_max: 0.1, source: 'plugin-ask', granted_at: 'x' }
+    }
+    return base(argv, init)
+  }
+}
+
+test('/relais-routing records the envelope on the yes, and routing follows', async ($: any, on: any) => {
+  const engine = await routedSession($, on, { state: { mode: 'shadow', mode_reason: 'no envelope', envelope: null } })
+  followEnvelope(engine)
   engine.script.ask = () => 'Not now'
   const presentation = { layout: 'main', columns: 120 }
   const declined = await $.command.run({ command: 'relais-routing', args: '', origin: { kind: 'composer' }, presentation })
@@ -415,7 +419,7 @@ test('/relais-routing writes the envelope through relais and the plugin’s reco
   expect((await personTurn($, engine, 'rename foo to bar, tests exist')).steps[0].model).toBe(SONNET)
   engine.script.ask = () => 'Allow session routing'
   const granted = await $.command.run({ command: 'relais-routing', args: '', origin: { kind: 'composer' }, presentation })
-  expect(granted.text).toContain('granted')
+  expect(granted.text).toContain('Mode now: on')
   const [call] = nativeCalls(engine.calls, 'router-envelope')
   expect(call.argv).toEqual([
     'relais', 'native', 'router-envelope',
@@ -424,43 +428,57 @@ test('/relais-routing writes the envelope through relais and the plugin’s reco
     '--source', 'plugin-ask',
   ])
   expect(engine.calls.asked[0].question).toContain('ε ≤ 0.1')
-  // The plugin's record, with the R3 one already there, switches routing on.
+  expect(engine.calls.asked[0].question).toContain('/relais-routing off')
   const { steps } = await personTurn($, engine, 'rename foo to bar, tests exist')
   expect(steps[0].model).toBe(HAIKU)
 })
 
-test('/relais-r3 records a pass only when it passed and the person agreed', async ($: any, on: any) => {
-  const engine = await routedSession($, on, {
-    store: { envelope_consent: { answer: 'Allow session routing', at: 'x', session: 's' } },
-  })
-  const base = engine.script.runResult
-  engine.script.runResult = (argv: string[], init: any) =>
-    argv[1] === 'router' && argv.includes('--eval')
-      ? { exitCode: 0, stdout: JSON.stringify({ id: 'r3-1', passed: true, tier_accuracy_lower: 0.8 }), stderr: '' }
-      : base(argv, init)
-  const answers = ['/repo/labels.jsonl', 'Record this pass']
-  engine.script.ask = () => answers.shift()
+test('/relais-routing off removes the envelope without asking, and routing stops', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  followEnvelope(engine)
+  expect((await personTurn($, engine, 'rename foo to bar, tests exist')).steps[0].model).toBe(HAIKU)
   const presentation = { layout: 'main', columns: 120 }
-  const reply = await $.command.run({ command: 'relais-r3', args: '', origin: { kind: 'composer' }, presentation })
-  expect(reply.text).toContain('r3-1 recorded')
-  const runs = engine.calls.run.map(c => c.argv.join(' '))
-  expect(runs).toContain('relais router r3 --eval /repo/labels.jsonl --json')
-  expect(runs).toContain('relais router r3 --record --id r3-1 --passed --source plugin-ask')
-  expect(engine.calls.asked[1].question).toContain('tier_accuracy_lower: 0.8')
-  // The plugin's record names the pass router-state reports: routing is on.
-  const { steps } = await personTurn($, engine, 'rename foo to bar, tests exist')
-  expect(steps[0].model).toBe(HAIKU)
+  const reply = await $.command.run({ command: 'relais-routing', args: ' off ', origin: { kind: 'composer' }, presentation })
+  expect(reply.text).toContain('Mode now: shadow')
+  expect(engine.calls.asked.length).toBe(0)
+  const [call] = nativeCalls(engine.calls, 'router-envelope')
+  expect(call.argv).toEqual([
+    'relais', 'native', 'router-envelope', '--off',
+    '--by', 'the person in Claude Code session session-1',
+    '--source', 'plugin-ask',
+  ])
+  expect((await personTurn($, engine, 'rename baz to qux, tests exist')).steps[0].model).toBe(SONNET)
 })
 
-test('the model’s Bash calls of router-envelope and r3 --record, and writes to the plugin store, are refused', async ($: any, on: any) => {
+test('the model’s Bash calls of router-envelope and relais install --claude are refused; the store is not guarded', async ($: any, on: any) => {
   await routedSession($, on)
   const check = (tool: string, input: Record<string, unknown>) => $.tool.check({ tool, input, ...input })
   const refused = async (tool: string, input: Record<string, unknown>) => (await check(tool, input)).decision
   expect(await refused('Bash', { command: 'relais native router-envelope --by me --epsilon-max 0.1' })).toBe('deny')
-  expect(await refused('Bash', { command: 'relais router r3 --record --id x --passed' })).toBe('deny')
-  expect(await refused('Bash', { command: 'echo {} > ~/.claude/plugins/store/relais_x.json' })).toBe('deny')
-  expect(await refused('Write', { file_path: '/Users/p/.claude/plugins/store/relais_x.json', content: '{}' })).toBe('deny')
-  expect(await refused('Bash', { command: 'relais router r3 --eval labels.jsonl --json' })).not.toBe('deny')
+  expect(await refused('Bash', { command: 'relais native router-envelope --off --by me' })).toBe('deny')
+  expect(await refused('Bash', { command: 'relais install --claude' })).toBe('deny')
+  expect(await refused('Bash', { command: 'relais  install --write --claude --hooks' })).toBe('deny')
+  expect(await refused('Bash', { command: 'cd /x && relais install --claude --write' })).toBe('deny')
+  expect(await refused('Write', { file_path: '/Users/p/.config/relais/machine.toml', content: '' })).toBe('deny')
+  expect(await refused('Bash', { command: 'relais native router-state --session s' })).not.toBe('deny')
+  expect(await refused('Bash', { command: 'relais uninstall --claude' })).not.toBe('deny')
+  expect(await refused('Write', { file_path: '/Users/p/.claude/plugins/store/relais_x.json', content: '{}' })).not.toBe('deny')
+})
+
+test('a revert is recorded with the hashed files, and the task carries its files hashed', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'rename foo to bar, tests exist')
+  await toolCall($, engine, edit('/repo/src/lib.rs'), { result: 'ok', text: 'ok' })
+  await toolCall($, engine, bash('git restore src/lib.rs'), { result: { stdout: '', stderr: '' }, text: '' })
+  await toolCall($, engine, bash('git checkout main'), { result: { stdout: '', stderr: '' }, text: '' })
+  await endSession($, engine)
+  const reverts = observed(engine, 'reassess').filter((r: any) => r.event === 'revert')
+  expect(reverts.length).toBe(1)
+  expect(reverts[0].files).toEqual(['b1a35a68f14e6962'])
+  expect(reverts[0].escalating).toBe(false)
+  const [task] = observed(engine, 'task')
+  expect(task.files).toEqual(['b1a35a68f14e6962'])
+  expect(task.completed_at_end).toBe(task.outcome)
 })
 
 test('a classifier answer that fails to parse, or no router-state, routes nothing', async ($: any, on: any) => {

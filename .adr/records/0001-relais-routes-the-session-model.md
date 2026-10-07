@@ -39,13 +39,16 @@ records it (SPEC §30):
   evidence (a failed check after an edit, repeated failed repairs, a
   correction). It never guarantees a model, a dollar limit or acceptance
   for the session's work; SPEC §3's "advisory" label still holds.
-- **An envelope, granted once.** Routing is `on` only when the person
-  granted the envelope through the plugin's own question (`$.ui.ask`,
-  written by `relais native router-envelope`) **and** an R3 evaluation
-  passed and was recorded through the plugin's `/relais-r3`. Until both,
-  it runs in `shadow`: it decides and records, and switches nothing. This
-  is SPEC §17's "explicitly authorized envelope with independent
-  evaluation gates"; §25's promotion rules are unchanged.
+- **An envelope, granted once.** Routing is `on` whenever the envelope is
+  recorded in machine.toml: by `relais install --claude --write` when it
+  installs the plugin (installing is the authorization), or by the
+  plugin's `/relais-routing` after its own question (`$.ui.ask`). Without
+  it, routing runs in `shadow`: it decides and records, and switches
+  nothing. `/relais-routing off` removes it and keeps it off. There is no
+  hand-labelled evaluation: learned adjustments pass automatic gates, with
+  missed failures measured from later corrections and reverts. This is
+  SPEC §17's "explicitly authorized envelope with independent evaluation
+  gates"; §25's promotion rules are unchanged.
 - **Fail-open.** Any error, timeout or unparsable answer leaves the
   request as it was (`next(e)`), or keeps the task's current tier — it
   never downgrades on missing information (SPEC §23).
@@ -63,15 +66,12 @@ records it (SPEC §30):
 ## The stated limit
 
 With bypass permissions the model can do anything the person's shell can.
-The plugin honours the envelope and the R3 pass only when its own store
-holds the consent records written after the person's answers; an envelope
-or R3 row that appears without them leaves the mode at `shadow`, and the
-plugin's `tool.check` guards refuse the model's writes to machine.toml,
-`router-envelope`, `r3 --record` and the store file. That stops an
-accidental or "helpful" self-grant. It does not stop a **deliberate** edit
-of the plugin store's backing file from the shell: that is the accepted
-limit, the same one SPEC §5 states for the trust grant. The CLI records
-every envelope and R3 write with its source (`plugin-ask`, or
+The plugin's `tool.check` guards refuse the model's writes to
+machine.toml and its Bash calls of `router-envelope` and `relais install
+--claude`. That stops an accidental or "helpful" self-grant. It does not
+stop a **deliberate** edit of machine.toml from the shell: that is the
+accepted limit, the same one SPEC §5 states for the trust grant. relais
+records every envelope write with its source (`install`, `plugin-ask`, or
 `cli (unattributed)`), so a write the person did not make is visible.
 
 ## Consequences

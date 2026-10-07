@@ -56,7 +56,7 @@ impl TaskOutcome {
         matches!(self, Self::CompletedVerified | Self::CompletedAccepted)
     }
 
-    /// An outcome learning and R3 agreement may count (plan §5): every
+    /// An outcome learning may count (plan §5): every
     /// one but `unknown`.
     pub fn is_strong(self) -> bool {
         self != Self::Unknown

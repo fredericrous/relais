@@ -7,6 +7,7 @@ import {
   decideMain,
   decideSpawn,
   evidenceOf,
+  fileHash,
   matchesCheck,
   modeEffective,
   newTask,
@@ -14,8 +15,10 @@ import {
   outcomeOf,
   parseClassification,
   parseRouterState,
-  shadowWhy,
+  revertedPaths,
+  sha256Hex,
   tableTier,
+  taskRecord,
   type Class,
 } from '../hooks/router.ts'
 import { ROUTER_STATE } from './routing-support.ts'
@@ -191,16 +194,37 @@ test('checks are matched on argv prefixes after env assignments; background and 
   expect(evidenceOf('Edit', { file_path: '/repo/a' }, { isError: true, text: 'no match' }, checks)).toBe(undefined)
 })
 
-test('mode_effective is the narrower of relais and the plugin store records', () => {
-  const envelope = { answer: 'Allow session routing', at: 'now', session: 's' }
-  expect(modeEffective(state, { envelope: undefined, r3: { id: 'r3-1' } })).toBe('shadow')
-  expect(shadowWhy(state, { envelope: undefined, r3: { id: 'r3-1' } })).toContain('/relais-routing')
-  expect(modeEffective(state, { envelope, r3: { id: 'r3-0' } })).toBe('shadow')
-  expect(shadowWhy(state, { envelope, r3: { id: 'r3-0' } })).toContain('/relais-r3')
-  expect(modeEffective(state, { envelope, r3: { id: 'r3-1' } })).toBe('on')
-  expect(modeEffective({ ...state, mode: 'shadow' }, { envelope, r3: { id: 'r3-1' } })).toBe('shadow')
-  expect(modeEffective({ ...state, mode: 'off' }, { envelope, r3: { id: 'r3-1' } })).toBe('off')
-  expect(modeEffective(undefined, { envelope, r3: { id: 'r3-1' } })).toBe('shadow')
+test('mode_effective is router-state’s mode, and shadow without a state', () => {
+  expect(modeEffective(state)).toBe('on')
+  expect(modeEffective({ ...state, mode: 'shadow' })).toBe('shadow')
+  expect(modeEffective({ ...state, mode: 'off' })).toBe('off')
+  expect(modeEffective(undefined)).toBe('shadow')
+})
+
+test('file hashes are the first 16 hex of the sha256 of the repo-relative path', () => {
+  expect(sha256Hex('')).toBe('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')
+  expect(sha256Hex('abc')).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad')
+  expect(sha256Hex('a'.repeat(1000)).length).toBe(64)
+  expect(fileHash('/repo/src/lib.rs', '/repo')).toBe('b1a35a68f14e6962')
+  expect(fileHash('./src/lib.rs', '/repo')).toBe('b1a35a68f14e6962')
+  const task = { ...newTask('t', null, 'x', asClass(), 'research', 0), files: ['/repo/src/lib.rs', 'src/lib.rs'] }
+  const record = taskRecord(task, 1000, '/repo')
+  expect(record.files).toEqual(['b1a35a68f14e6962'])
+  expect(record.completed_at_end).toBe('unknown')
+  expect(taskRecord(task, null, '/repo').completed_at_end).toBe(null)
+})
+
+test('reverts: git revert, checkout -- paths and restore are found; a branch switch or unstaging is not', () => {
+  expect(revertedPaths('git restore src/lib.rs')).toEqual(['src/lib.rs'])
+  expect(revertedPaths('git restore --source=HEAD~1 -- a b')).toEqual(['a', 'b'])
+  expect(revertedPaths('git restore --staged src/lib.rs')).toBe(undefined)
+  expect(revertedPaths('git restore -S -W src/lib.rs')).toEqual(['src/lib.rs'])
+  expect(revertedPaths('git checkout -- a.rs')).toEqual(['a.rs'])
+  expect(revertedPaths('git checkout HEAD~2 -- a.rs b.rs')).toEqual(['a.rs', 'b.rs'])
+  expect(revertedPaths('git checkout main')).toBe(undefined)
+  expect(revertedPaths('git revert --no-edit abc123')).toEqual([])
+  expect(revertedPaths('cargo test && git restore x.rs')).toEqual(['x.rs'])
+  expect(revertedPaths('echo git restore x')).toBe(undefined)
 })
 
 test('outcomes: corrected outranks verified; an accept is completed_accepted; inferred signals are no outcome', () => {

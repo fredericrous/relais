@@ -746,6 +746,11 @@ pub struct SessionRoutingSettings {
     /// that passes every gate. Absent: `shadow`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub envelope: Option<RoutingEnvelope>,
+    /// The person turned routing off (`/relais-routing off`): a tombstone
+    /// that keeps `relais install` from recording the envelope again.
+    /// Recording an envelope removes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub off: Option<RoutingOff>,
     /// The share of sessions held out (decided and recorded, never
     /// applied), drawn per session id.
     pub holdout_rate: f64,
@@ -767,6 +772,7 @@ impl Default for SessionRoutingSettings {
     fn default() -> Self {
         Self {
             envelope: None,
+            off: None,
             holdout_rate: 0.1,
             epsilon: 0.1,
             model_ids: BTreeMap::new(),
@@ -852,8 +858,18 @@ pub struct RoutingEnvelope {
     pub granted_at: String,
     pub by: String,
     pub epsilon_max: f64,
-    /// `plugin-ask`, or `cli (unattributed)`: the CLI cannot tell a
-    /// person's shell from the model's Bash call.
+    /// `install`, `plugin-ask`, or `cli (unattributed)`: the CLI cannot
+    /// tell a person's shell from the model's Bash call.
+    pub source: String,
+}
+
+/// `[session_routing] off = { at, by, source }`: routing was turned off,
+/// and stays off until an envelope is recorded again.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingOff {
+    pub at: String,
+    pub by: String,
     pub source: String,
 }
 

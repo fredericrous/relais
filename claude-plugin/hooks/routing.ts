@@ -1,6 +1,6 @@
 // The session router's effects: router-state, the classifier, pinning a
 // turn's decision, recovery from tool results, subagent routing, the
-// observations and the person's three commands. The decisions themselves
+// observations and the person's two commands. The decisions themselves
 // are router.ts's (pure). Everything here fails open: a hook that calls in
 // catches, and a failure leaves the request as it was.
 
@@ -28,8 +28,9 @@ import {
   parseRouterState,
   reassessRecord,
   rerun,
+  revertedPaths,
+  revertRecord,
   routeStatus,
-  shadowWhy,
   spawnPrompt,
   taskRecord,
   TIERS,
@@ -38,6 +39,7 @@ import {
   type Decision,
   type Mode,
   type RouterMemory,
+  type RouterState,
   type TaskState,
 } from './router.ts'
 import { after, detach, type Store } from './store.ts'
@@ -45,7 +47,6 @@ import { markDirty } from './ui.ts'
 
 const STATE_TIMEOUT_MS = 10_000
 const OBSERVE_TIMEOUT_MS = 20_000
-const R3_TIMEOUT_MS = 120_000
 // The first request of a turn waits this long for the classifier at most,
 // and leaves 500 ms of the hook's own budget.
 const PIN_WAIT_MS = 2000
@@ -54,16 +55,13 @@ const OBSERVE_BACKOFF_MS = [1000, 2000, 4000, 8000, 15000]
 export const OBSERVE_RETRIES = 5
 const ENVELOPE_EPSILON = '0.1'
 export const ENVELOPE_YES = 'Allow session routing'
-export const R3_YES = 'Record this pass'
-export const ENVELOPE_KEY = 'envelope_consent'
-export const R3_KEY = 'r3_consent'
 
 const TIMEOUT = Symbol('timeout')
 
 // What the prompt's classifier call resolves to.
 export type Classified = { cls: Classification | undefined; text: string; sessionModel: string | undefined; usage: any; model: string; at: number }
 
-const modeOf = (r: RouterMemory): Mode => modeEffective(r.state, r.consents)
+const modeOf = (r: RouterMemory): Mode => modeEffective(r.state)
 const isApplying = (r: RouterMemory) => modeOf(r) === 'on' && r.state?.holdout !== true
 
 // Waits for `promise` at most `ms` on the session's clock.
@@ -110,21 +108,6 @@ export async function loadRouterState(fx: Fx, store: Store) {
     r.state = undefined
   }
   r.isStale = false
-  await readConsents(fx, store)
-  const why = shadowWhy(r.state, r.consents)
-  if (why && !r.hasToastedShadow) {
-    r.hasToastedShadow = true
-    fx.ui.toast(`relais · ${why}`)
-  }
-}
-
-async function readConsents(fx: Fx, store: Store) {
-  const r = store.router
-  try {
-    r.consents = { envelope: await fx.kv.get(ENVELOPE_KEY), r3: await fx.kv.get(R3_KEY) }
-  } catch {
-    r.consents = { envelope: undefined, r3: undefined }
-  }
 }
 
 // At session.start: the state is read in the background, and the first
@@ -444,6 +427,7 @@ export function onToolResult(fx: Fx, store: Store, e: any, result: any, now: num
   const agentId: string | undefined = e.agentId
   const task = agentId ? r.subtasks[agentId] : r.task
   if (!task) return
+  noteRevert(store, state, task, e, result, now)
   const evidence = evidenceOf(String(e.tool), e, result, state.checks)
   if (!evidence) return
   const out = onEvidence(state, task, evidence, r.cwd)
@@ -453,6 +437,17 @@ export function onToolResult(fx: Fx, store: Store, e: any, result: any, now: num
     queue(store, reassessRecord(out.task, out.reassess, now))
     if (!agentId) refreshRoute(store)
   }
+}
+
+// A Bash command that succeeded in reverting files (`git revert`, `git
+// checkout -- …`, `git restore …`): recorded against the task in progress,
+// with the files hashed, so R2 can match it to the task that edited them.
+function noteRevert(store: Store, state: RouterState, task: TaskState, e: any, result: any, now: number) {
+  if (String(e.tool) !== 'Bash' || e.run_in_background === true) return
+  if (!result || result.deny !== undefined || result.isError) return
+  const paths = revertedPaths(typeof e.command === 'string' ? e.command : '')
+  if (paths === undefined) return
+  queue(store, reassessRecord(task, revertRecord(state, task, paths, store.router.cwd), now))
 }
 
 // The pinned decision follows the task from the next request on.
@@ -494,7 +489,7 @@ export function onTurnComplete(store: Store, e: any, now: number) {
 }
 
 function endTask(store: Store, task: TaskState, now: number) {
-  queue(store, taskRecord(task, now))
+  queue(store, taskRecord(task, now, store.router.cwd))
 }
 
 // A relais run ended: its acceptance verifies the task, which ends at the
@@ -594,83 +589,28 @@ export function envelopeQuestion(state: RouterMemory['state']): string {
     `- route the session's own model and its subagents' by the task, and move up on failure evidence (${tiers});`,
     `- explore one tier lower at ε ≤ ${ENVELOPE_EPSILON} at a task start (R2);`,
     '- switch on a learned adjustment only when it passes every gate (R2).',
-    'Routing switches on only once an R3 pass is recorded too (/relais-r3). RELAIS_SESSION_ROUTING=off turns it off; relais router rollback undoes an activation.',
+    'Turn it off with /relais-routing off, or RELAIS_SESSION_ROUTING=off for one shell.',
   ].join('\n')
 }
 
-// `/relais-routing`: the person grants the envelope here, or nowhere.
-export async function routingCommand(fx: Fx, store: Store): Promise<string> {
+// `/relais-routing`: routing on (the envelope, after the person's yes), or
+// with `off` routing off (the envelope removed, and kept off).
+export async function routingCommand(fx: Fx, store: Store, args = ''): Promise<string> {
   const r = store.router
   const session = await fx.session.id()
+  const by = `the person in Claude Code session ${session}`
+  const run = (argv: string[]) => fx.process.run(argv, { ...(r.cwd ? { cwd: r.cwd } : {}), timeoutMs: STATE_TIMEOUT_MS })
+  const failed = (result: any) => clip(String(result?.stderr ?? '').trim(), 600)
+  if (args.trim() === 'off') {
+    const result = await run(['relais', 'native', 'router-envelope', '--off', '--by', by, '--source', 'plugin-ask'])
+    if (result?.exitCode !== 0) return `relais could not turn session routing off (exit ${result?.exitCode}): ${failed(result)}.`
+    await refresh(fx, store)
+    return `Session routing is off, and stays off until you run /relais-routing again. Mode now: ${modeOf(r)}.`
+  }
   const answer = await ask(fx, envelopeQuestion(r.state), [NOT_NOW, ENVELOPE_YES])
   if (answer !== ENVELOPE_YES) return 'Session routing was not granted. Nothing was written.'
-  const argv = [
-    'relais', 'native', 'router-envelope',
-    '--by', `the person in Claude Code session ${session}`,
-    '--epsilon-max', ENVELOPE_EPSILON,
-    '--source', 'plugin-ask',
-  ]
-  const result = await fx.process.run(argv, { ...(r.cwd ? { cwd: r.cwd } : {}), timeoutMs: STATE_TIMEOUT_MS })
-  if (result?.exitCode !== 0) {
-    return `relais could not record the envelope (exit ${result?.exitCode}): ${clip(String(result?.stderr ?? '').trim(), 600)}. Nothing was granted.`
-  }
-  try {
-    await fx.kv.set(ENVELOPE_KEY, { answer, at: new Date(await fx.clock.now()).toISOString(), session })
-    await refresh(fx, store)
-  } catch (reason) {
-    return `relais recorded the envelope in machine.toml, but the plugin could not keep its own record of your answer (${String((reason as any)?.message ?? reason).slice(0, 200)}), so routing stays in shadow. Run /relais-routing again.`
-  }
-  return `Session routing granted. Mode now: ${modeOf(r)}${modeOf(r) === 'on' ? '' : ' (routing switches on once an R3 pass is recorded with /relais-r3)'}.`
+  const result = await run(['relais', 'native', 'router-envelope', '--by', by, '--epsilon-max', ENVELOPE_EPSILON, '--source', 'plugin-ask'])
+  if (result?.exitCode !== 0) return `relais could not record the envelope (exit ${result?.exitCode}): ${failed(result)}. Nothing was granted.`
+  await refresh(fx, store)
+  return `Session routing granted. Mode now: ${modeOf(r)}. Turn it off with /relais-routing off.`
 }
-
-const R3_PATH_QUESTION =
-  'relais R3 · Which file holds the hand-labelled R3 items (JSONL)? Type its path below, or choose Not now.'
-
-// `/relais-r3`: relais evaluates the labels; a pass is recorded only on the
-// person's yes, and only then does the plugin keep its record.
-export async function r3Command(fx: Fx, store: Store): Promise<string> {
-  const r = store.router
-  const typed = await ask(fx, R3_PATH_QUESTION, [NOT_NOW])
-  if (typed === undefined || typed === NOT_NOW || typed.trim() === '') return 'No R3 evaluation was run.'
-  const path = typed.trim()
-  const evaluated = await fx.process.run(['relais', 'router', 'r3', '--eval', path, '--json'], {
-    ...(r.cwd ? { cwd: r.cwd } : {}),
-    timeoutMs: R3_TIMEOUT_MS,
-  })
-  let verdict: any
-  try {
-    verdict = JSON.parse(String(evaluated?.stdout ?? ''))
-  } catch {
-    verdict = undefined
-  }
-  if (evaluated?.exitCode !== 0 || !verdict || typeof verdict.id !== 'string') {
-    return `relais could not evaluate ${escapeDisplay(path)} (exit ${evaluated?.exitCode}): ${clip(String(evaluated?.stderr ?? '').trim(), 600)}`
-  }
-  const shown = verdictLines(verdict)
-  if (verdict.passed !== true) return [`R3 did not pass (id ${verdict.id}). Nothing was recorded.`, ...shown].join('\n')
-  const answer = await ask(fx, [`relais R3 · passed (id ${escapeDisplay(verdict.id)}).`, ...shown, 'Record this pass?'].join('\n'), [NOT_NOW, R3_YES])
-  if (answer !== R3_YES) return `R3 passed (id ${verdict.id}) but was not recorded.`
-  const recorded = await fx.process.run(
-    ['relais', 'router', 'r3', '--record', '--id', verdict.id, '--passed', '--source', 'plugin-ask'],
-    { ...(r.cwd ? { cwd: r.cwd } : {}), timeoutMs: STATE_TIMEOUT_MS },
-  )
-  if (recorded?.exitCode !== 0) {
-    return `relais could not record the R3 pass (exit ${recorded?.exitCode}): ${clip(String(recorded?.stderr ?? '').trim(), 600)}`
-  }
-  try {
-    const session = await fx.session.id()
-    await fx.kv.set(R3_KEY, { id: verdict.id, at: new Date(await fx.clock.now()).toISOString(), session })
-    await refresh(fx, store)
-  } catch (reason) {
-    return `relais recorded the R3 pass ${verdict.id}, but the plugin could not keep its own record of your answer (${String((reason as any)?.message ?? reason).slice(0, 200)}), so routing stays in shadow. Run /relais-r3 again.`
-  }
-  return `R3 pass ${verdict.id} recorded. Mode now: ${modeOf(r)}.`
-}
-
-function verdictLines(verdict: any): string[] {
-  return Object.entries(verdict)
-    .filter(([k]) => k !== 'id' && k !== 'passed' && k !== 'schema')
-    .slice(0, 12)
-    .map(([k, v]) => `${escapeDisplay(k)}: ${escapeDisplay(clip(typeof v === 'string' ? v : JSON.stringify(v), 160))}`)
-}
-

@@ -1,6 +1,6 @@
 //! `relais native router-state`'s document (docs/router-protocol.md),
 //! assembled from values the caller read: machine settings, the
-//! repository policy, the latest R3 row, the environment, the ledger's
+//! repository policy, the environment, the ledger's
 //! token totals and the agent definitions. Pure.
 
 use std::collections::BTreeMap;
@@ -38,15 +38,6 @@ pub const BUILT_IN_CHECKS: &[&[&str]] = &[
     &["make", "test"],
 ];
 
-/// The latest R3 row, as served.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct R3Row {
-    pub id: String,
-    pub passed: bool,
-    pub at: String,
-    pub source: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TierModel {
     pub model: String,
@@ -78,7 +69,6 @@ pub struct RouterState {
     pub mode: Mode,
     pub mode_reason: String,
     pub envelope: Option<RoutingEnvelope>,
-    pub r3: Option<R3Row>,
     pub holdout: bool,
     pub seed: String,
     pub epsilon: f64,
@@ -99,7 +89,6 @@ pub struct Inputs<'a> {
     /// The repository's policy, when the cwd is in a repository with a
     /// valid `relais.toml`.
     pub repo: Option<&'a RepoPolicy>,
-    pub r3: Option<R3Row>,
     /// `RELAIS_SESSION_ROUTING`, as read.
     pub env_mode: Option<&'a str>,
     /// `(kind, difficulty, total tokens)` of completed tasks.
@@ -205,18 +194,15 @@ pub const COMPLETED: [&str; 2] = [
 /// The document, from its inputs.
 pub fn build(inputs: Inputs<'_>) -> RouterState {
     let routing = &inputs.machine.session_routing;
-    let (mode, mode_reason) = resolve_mode(
-        routing.envelope.is_some(),
-        inputs.r3.as_ref().map(|r3| r3.passed),
-        inputs.env_mode,
-    );
+    let (mode, mode_reason) = resolve_mode(routing.envelope.is_some(), inputs.env_mode);
     let draw = holdout::draw(inputs.session, routing.holdout_rate);
     let tiers = tiers(&inputs);
     let pricing = inputs
         .machine
         .pricing
         .clone()
-        .unwrap_or_else(PriceTable::empty);
+        .unwrap_or_else(PriceTable::empty)
+        .with_built_in_defaults();
     let mut models: Vec<String> = tiers.values().map(|tier| tier.model.clone()).collect();
     models.extend(routing.resolved_model_ids().into_values());
     let mut pins: BTreeMap<String, String> = BTreeMap::new();
@@ -231,7 +217,6 @@ pub fn build(inputs: Inputs<'_>) -> RouterState {
         mode,
         mode_reason,
         envelope: routing.envelope.clone(),
-        r3: inputs.r3.clone(),
         holdout: draw.holdout,
         seed: draw.seed,
         epsilon: routing.effective_epsilon(),
@@ -262,7 +247,6 @@ mod tests {
             session: "s0",
             machine,
             repo,
-            r3: None,
             env_mode: None,
             completed_task_tokens: vec![],
             definition_pins: vec![],
@@ -336,6 +320,22 @@ mod tests {
     }
 
     #[test]
+    fn haiku_is_priced_from_the_built_in_list_unless_machine_toml_prices_it() {
+        let machine_without = machine("");
+        let state = build(inputs(&machine_without, None));
+        assert_eq!(
+            state.rates["claude-haiku-5-5"],
+            Some(Rates {
+                input: 500_000,
+                output: 2_500_000,
+                cache_read: 50_000,
+                cache_write: 1_000_000,
+            })
+        );
+        assert_eq!(state.rates["claude-sonnet-5-5"], None);
+    }
+
+    #[test]
     fn priors_use_a_median_only_from_ten_completed_tasks() {
         let mut totals: Vec<(String, u8, u64)> = (0..10)
             .map(|i| ("edit".to_string(), 2, 1000 * (i + 1)))
@@ -381,7 +381,6 @@ mod tests {
                 "mode_reason",
                 "pins",
                 "priors",
-                "r3",
                 "rates",
                 "schema",
                 "seed",
