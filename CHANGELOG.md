@@ -30,6 +30,10 @@ missing here.
   set beside them, which ran every hook twice. A hand-formatted file it refuses
   to rewrite now says that the hooks are already there and names the one
   replacement to make, and no longer offers a block to paste.
+- A run cancelled while its native agent runs ends `cancelled`, as it should.
+  When the cancellation settled the dispatch between two of the backend's
+  checks, the run read the vanished record as a lost dispatch and ended
+  `interrupted` (seen on macOS CI).
 
 ## v0.10.0
 
