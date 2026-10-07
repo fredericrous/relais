@@ -105,3 +105,34 @@ Writes `[session_routing] envelope = { granted_at, by, epsilon_max, source }` to
 ## `relais router r3 --record --id <id> (--passed | --failed) [--source plugin-ask]`
 
 Writes a ledger provenance row only. `relais router r3 --eval <labels.jsonl> [--json]` computes the R3 measures from a hand-labelled file: tier accuracy, continuation detection, `previous`/outcome agreement and the missed-failure rate, with Wilson bounds and the plan's gates. It prints the verdict and an `id`. The plugin's `/relais-r3` runs `--eval` and shows the verdict through `$.ui.ask`; on yes it runs `--record` with `--source plugin-ask` and writes its own `r3_consent` store record naming that `id`.
+
+## R3 labels (`relais router r3 --eval <labels.jsonl>`)
+
+One JSON object per line (blank lines are skipped); unknown fields are
+refused, and an `item` may appear once. Exit 2 names the first bad line.
+
+```json
+{ "item": "string, unique",
+  "human":  { "tier": "research|implementation|escalation|null",
+              "relation": "new_task|continuation|correction|null",
+              "outcome_correct": true },
+  "router": { "tier": "research|implementation|escalation|null",
+              "relation": "new_task|continuation|correction|null",
+              "outcome": "completed_verified|completed_accepted|corrected|unknown|null" } }
+```
+
+A `null` (or absent) field leaves the item out of the measures that need
+it. The measures, each with its 95% bounds:
+
+- **tier accuracy**: `router.tier == human.tier`, over items with both. Gate: Wilson lower bound ≥ 0.75.
+- **continuation detection**: `router.relation == "continuation"`, over items whose `human.relation` is `continuation`. Reported, no gate.
+- **outcome agreement**: over items with `human.outcome_correct` and a router outcome other than `unknown`, the router agrees when it said `completed_*` and the person said correct, or `corrected` and the person said wrong. Gate: Wilson lower bound ≥ 0.75 (100 of 120 passes, 99 does not).
+- **missed failures**: over items with `human.outcome_correct: false`, the share the router called `completed_*`. Gate: the exact (Clopper–Pearson, two-sided 95%) upper bound ≤ 0.1, which with 0 misses needs ≥ 36 such items.
+
+The verdict passes when all three gates pass. Its `id` is `r3-` and the
+first 16 hex characters of SHA-256 of the file's bytes; `--record --id`
+and the plugin's `r3_consent` record name it. `--json` prints
+`{schema, id, items, tier_accuracy, continuation_detection,
+outcome_agreement, missed_failure, passed}`, each measure as
+`{successes, n, rate, lower, upper, gate, passed}`. A failed verdict still
+exits 0: the verdict is the output.
