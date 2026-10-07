@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { allowLabel, escapeDisplay, NOT_NOW, onboardTool, onPersonPrompt, question2, trustTool, USE_CHECKS, type Shown } from '../hooks/consent.ts'
+import { allowLabel, escapeDisplay, withRoutingSection, NOT_NOW, onboardTool, onPersonPrompt, question2, trustTool, USE_CHECKS, type Shown } from '../hooks/consent.ts'
 import { machineSettingsGuard, MACHINE_SETTINGS_MESSAGE } from '../hooks/guards.ts'
 import { createStore } from '../hooks/store.ts'
 
@@ -139,7 +139,7 @@ test('trust: Not now is not asked again in this session; a dismissal is', async 
   w.state.policy = true
   w.answers.push(NOT_NOW)
   expect(await trustTool(w.fx, w.store, '/repo', 's')).toContain('declined (not_now)')
-  expect(w.toasts).toContain('relais · not set up in repo · /relais to be asked again')
+  expect(w.toasts).toContain('relais · not set up in repo · ask Claude to set up relais to be asked again')
   expect(await trustTool(w.fx, w.store, '/repo', 's')).toContain('declined (not_now)')
   expect(w.asks.length).toBe(1)
 
@@ -281,15 +281,15 @@ test('the guard keeps the model off machine.toml', async () => {
   expect(machineSettingsGuard('Write', { file_path: '/repo/relais.toml' }, env)).toBe(undefined)
 })
 
-test('a Not now holds until the person types /relais themselves, then they are asked again', async () => {
+test('a Not now holds until the person asks for relais again, then they are asked again', async () => {
   const w = world()
   w.state.policy = true
   w.answers.push(NOT_NOW)
   await trustTool(w.fx, w.store, '/repo', 's')
-  onPersonPrompt(w.store, 'relais run abc finished: blocked')
+  onPersonPrompt(w.store, 'add a doc comment to add')
   expect(await trustTool(w.fx, w.store, '/repo', 's')).toContain('declined (not_now)')
   expect(w.asks.length).toBe(1)
-  onPersonPrompt(w.store, '/relais add a doc comment')
+  onPersonPrompt(w.store, 'ok, set up Relais here')
   w.answers.push(YES2)
   expect(await trustTool(w.fx, w.store, '/repo', 's')).toContain('ready')
   expect(w.asks.length).toBe(2)
@@ -317,4 +317,15 @@ test('onboard: a relais.toml that cannot be removed after a decline is said', as
 test('bidi overrides and line separators are spelled out', async () => {
   expect(escapeDisplay('rm\u202etxt.sh')).toBe('rm\\u{202e}txt.sh')
   expect(escapeDisplay('a\u2028b')).toBe('a\\u{2028}b')
+})
+
+test('the system prompt gains the routing rule as one section, once', async () => {
+  const base = { sections: [{ id: 'base', text: 'You are Claude Code.', scope: 'global' }] }
+  const composed = withRoutingSection(base)
+  expect(composed.sections.map((s: any) => s.id)).toEqual(['base', 'relais-routing'])
+  expect(composed.sections[1].text).toContain('route each bounded implementation or inspection task')
+  expect(composed.sections[1].text).toContain('mcp__relais__run')
+  expect(composed.sections[1].scope).toBe('global')
+  expect(withRoutingSection(composed)).toBe(composed)
+  expect(withRoutingSection(undefined)).toBe(undefined)
 })

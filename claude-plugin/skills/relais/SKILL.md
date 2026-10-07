@@ -1,32 +1,36 @@
 ---
 name: relais
-description: Route a bounded coding task through the relais supervised runner — explicit model, verification, escalation and accounting. Starts the run with the relais plugin's tools.
+description: Use proactively, without being asked, for any bounded implementation or inspection task — one objective, a write scope, acceptance a command can verify. relais picks the model for it, runs and verifies it in an isolated worktree, escalates and accounts. Works in any repository; one that is not set up yet is set up on the first run, with the person answering.
 ---
 
-# /relais
+# relais
 
-Express the requested work as a task contract, then hand it to relais
-through the plugin's tools. The parent does not supervise intermediate
-turns.
+Route a bounded task through relais instead of doing it yourself: relais
+chooses the model and effort for it, runs it in its own worktree,
+verifies it with the repository's checks and reports the outcome. The
+person does not have to ask for it, and the parent does not supervise
+intermediate turns.
 
-## Inputs
+## The contract comes from you, not from the person
 
-Before a contract can be written, the caller must supply:
+Write the contract from what you already have: the approved plan and the
+step being worked on, or the request in front of you. Do not ask the
+person for its fields.
 
-- the repository or task worktree the change belongs to (its root is
-  where `relais.toml` is found);
-- one precise objective sentence;
-- the write scope: which paths the change may touch;
-- acceptance criteria a command can verify — never "looks right" or a
-  worker's own completion message.
+- **Repository:** the one the task changes (its task worktree when one
+  exists).
+- **Objective:** one precise sentence, from the plan step or the request.
+- **Write scope:** the paths the plan names, or the files the change
+  plainly touches. Keep it as narrow as the work allows.
+- **Acceptance:** what a command can verify. The plan's verification
+  items that a command can check, and the repository's checks passing.
+  Never "looks right" or a worker's own completion message.
+- **Verification profile:** `"default"`, unless the repository's
+  `relais.toml` names another the work calls for.
 
-Missing any of these is a reason to ask, not to guess one on the
-caller's behalf.
-
-The verification profile is `"default"` unless the repository's
-`relais.toml` names another one the person asked for. A repository with
-no `relais.toml` is not a reason to stop: step 3 sets it up with the
-person.
+Ask the person only when there is no task to route at all. A repository
+with no `relais.toml` is not a reason to ask or to stop: step 3 sets it
+up, and the person answers there.
 
 ## Steps
 
@@ -78,8 +82,9 @@ person.
    - Both ask the person themselves, in Claude Code's own dialog. Do not
      ask the same question first, and do not answer it for them.
    - `ready`: call `mcp__relais__run` again.
-   - `declined (not_now)`: stop and report that relais was not set up;
-     do not call run again unless the person asks for relais again.
+   - `declined (not_now)`: do the task yourself, without relais, and say
+     so in one line. Do not route work through relais in that repository
+     again this session unless the person mentions relais.
    - `declined (dismissed)`: ask the person what they want.
    - `not set up (…)`: report the reason it gives (a refused commit, a
      detached HEAD) and what it says to do.

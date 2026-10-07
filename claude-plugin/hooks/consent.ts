@@ -158,10 +158,33 @@ const err = (r: any) => String(r?.stderr ?? '').trim().slice(0, 2000)
 
 export type Declined = 'not_now' | 'dismissed'
 
-// The person typed `/relais` themselves: a Not now earlier in the session
-// no longer holds, so they are asked again (the decline toast says so).
+// The person asked for relais again ("set up relais here", "use relais"),
+// or invoked its skill: a Not now earlier in the session no longer holds,
+// so the next run asks again. Only the person's own prompts reach this
+// (register.ts), never the outcome messages this plugin submits.
 export function onPersonPrompt(store: Store, text: unknown) {
-  if (typeof text === 'string' && /^\s*\/relais\b/.test(text)) store.declined.clear()
+  if (typeof text === 'string' && /\brelais\b/i.test(text)) store.declined.clear()
+}
+
+// The routing rule the plugin adds to the system prompt (register.ts,
+// `prompt.compose`). Measured in a fresh repository with a plain request:
+// with the skill's description alone, or this text attached to the
+// person's prompt, the model did the task itself; as a system-prompt
+// section, with the run tool's description saying the same, it routed.
+// Fixed text, so the prompt cache holds.
+export const ROUTING_CONTEXT =
+  'relais plugin: route each bounded implementation or inspection task (one objective, a write scope, acceptance a command can verify) through relais instead of doing it yourself: load the relais skill (`relais:relais`) and call mcp__relais__run with a contract you write from the plan or the request; relais picks the model, runs and verifies it. A repository that is not set up is set up on that first run, with the person answering. Keep design, multi-repo, ops and exploratory work in the session, do the task yourself where the person declined relais for that repository, and say in one line which path a task took.'
+
+export const ROUTING_SECTION = 'relais-routing'
+
+// The composed system prompt with the routing rule as one more section,
+// in the scope of the last one; unchanged when it holds no sections or
+// already has this one.
+export function withRoutingSection(composed: any): any {
+  const sections = composed?.sections
+  if (!Array.isArray(sections) || sections.some((s: any) => s?.id === ROUTING_SECTION)) return composed
+  const scope = sections[sections.length - 1]?.scope
+  return { ...composed, sections: [...sections, { id: ROUTING_SECTION, text: `# relais\n\n${ROUTING_CONTEXT}`, scope }] }
 }
 
 // `relais … --json` output, or undefined when it is not JSON.
@@ -175,7 +198,7 @@ function parsed<T>(r: any): T | undefined {
 
 function declined(reason: Declined, repo: string): string {
   if (reason === 'not_now') {
-    return `declined (not_now): the person chose Not now. relais was not set up in ${repo}; nothing ran. Tell them, and do not ask again unless they ask for relais themselves.`
+    return `declined (not_now): the person chose Not now. relais was not set up in ${repo}; nothing ran. Do the task without relais, tell them so in one line, and do not route work through relais in ${repo} again this session unless they ask for it.`
   }
   return (
     `declined (dismissed): the person closed the question or chose to chat about it, or nobody can be asked in this session. Nothing ran in ${repo}. ` +
@@ -242,7 +265,7 @@ async function grant(fx: Fx, repo: Repo, key: string, session: string): Promise<
 
 function refuse(fx: Fx, store: Store, repo: Repo, reason: Declined): string {
   if (reason === 'not_now') store.declined.add(repo.root)
-  fx.ui.toast(`relais · not set up in ${repo.name} · /relais to be asked again`)
+  fx.ui.toast(`relais · not set up in ${repo.name} · ask Claude to set up relais to be asked again`)
   return declined(reason, repo.name)
 }
 
@@ -283,7 +306,7 @@ async function onboard(fx: Fx, store: Store, repo: Repo, session: string): Promi
     if (typed === NOT_NOW) return refuse(fx, store, repo, 'not_now')
     if (typed === undefined) return refuse(fx, store, repo, 'dismissed')
     if (typeof typed !== 'string') {
-      fx.ui.toast(`relais · not set up in ${repo.name} · /relais to be asked again`)
+      fx.ui.toast(`relais · not set up in ${repo.name} · ask Claude to set up relais to be asked again`)
       return `declined (command_refused): the command the person typed was refused twice (${typed.refused}). Nothing was written in ${repo.name}. Tell them relais runs one plain command, without shell operators.`
     }
     command = typed

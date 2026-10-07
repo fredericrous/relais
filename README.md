@@ -116,9 +116,11 @@ milliseconds.
 
 ## Using it on a repository
 
-From Claude Code with the plugin, there is nothing to set up first:
-`/relais <task>` in any repository. The first time, the plugin asks two
-questions in Claude Code's own dialog:
+From Claude Code with the plugin, there is nothing to set up and nothing
+to type: the model routes a bounded task through relais on its own (the
+plugin's `relais` skill; `/relais:relais` invokes it by hand), and relais
+picks the model for it. The first time this happens in a repository, the
+plugin asks two questions in Claude Code's own dialog:
 
 1. **Use these checks?** It shows the commands `relais init --detect` found
    in the repository: a Makefile `check`/`test` target, `cargo test`,
@@ -131,7 +133,8 @@ questions in Claude Code's own dialog:
 
 Change `relais.toml` later and only the second question comes back, with
 new or changed commands marked `+` or `~`. Answer *Not now* and nothing is
-written. The plugin asks; the model can neither word the question nor
+written, and the model does the task without relais until you mention
+relais again. The plugin asks; the model can neither word the question nor
 answer it, and the plugin refuses the model's own edits to `machine.toml`.
 
 By hand, the same steps are:
@@ -173,7 +176,7 @@ reviewed_by = "you"                   # required
 repo = "git@github.com:me/the-repo.git"   # what plan filled in, for readers
 ```
 
-Runs start from Claude Code (`/relais`, or the `mcp__relais__run` tool):
+Runs start from Claude Code (the `mcp__relais__run` tool the skill calls):
 `relais run` is refused anywhere else. A worker refused a tool ends the run
 `blocked (permission_denied)` naming the tool; nothing is escalated. A
 `[permissions] allowed_tools` left in `machine.toml` is no longer read, and

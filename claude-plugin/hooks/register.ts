@@ -8,7 +8,7 @@ import { HELLO_EVERY_MS, sendHello } from './callbacks.ts'
 import type { Fx } from './fx.ts'
 import { DENY_MESSAGE, isRelaisNotification, isRelaisType, relaisAddresses } from './guards.ts'
 import { childOf, contractPath, onChunk, pump, reloadTimeline, startReplay, startRun, statusOf } from './runs.ts'
-import { onboardTool, onPersonPrompt, trustTool } from './consent.ts'
+import { onboardTool, onPersonPrompt, trustTool, withRoutingSection } from './consent.ts'
 import { machineSettingsGuard } from './guards.ts'
 import { close, createStore, detach, every } from './store.ts'
 import { FLUSH_MS, openPane, renderPane, timelineLines } from './ui.ts'
@@ -69,7 +69,7 @@ export function register(on: any) {
     await $.tool.register({
       name: 'run',
       description:
-        'Start a relais run for a task in a repository: relais works on it in an isolated worktree with native agents, verifies the result and reports the outcome. Returns at once; the outcome arrives as a message.',
+        'Use this instead of editing files yourself for any bounded implementation or inspection task (one objective, a write scope, acceptance a command can verify): relais picks the model, works in an isolated worktree with native agents, verifies the result with the repository\'s checks and reports the outcome. Works in any repository; one not set up yet is set up with the person on the first run. Returns at once; the outcome arrives as a message.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -252,6 +252,8 @@ export function register(on: any) {
   // one that only mentions an id included, is kept.
   on('prompt.submit', async ($: any, e: any, next: any) => {
     if (e.origin?.kind !== 'task-notification') {
+      // Not the outcome messages this plugin submits itself.
+      if (next.origin?.plugin === $.plugin.name) return next(e)
       onPersonPrompt(store, e.text)
       return next(e)
     }
@@ -259,6 +261,10 @@ export function register(on: any) {
     for (const id of relaisAddresses(await $.agent.list(), $.plugin.name)) ids.add(id)
     return isRelaisNotification(e.text, ids) ? { drop: 'relais agent notification' } : next(e)
   })
+
+  // The routing rule as a section of the system prompt: a note attached to
+  // the person's prompt reaches the model but is read as a hook's aside.
+  on('prompt.compose', async (_$: any, e: any, next: any) => withRoutingSection(await next(e)))
 
   on('ui.render', { component: 'Pane', requestId: 'relais' }, ($: any, e: any) =>
     renderPane(effects($), e),
