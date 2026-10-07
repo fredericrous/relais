@@ -69,6 +69,7 @@ test('the classifier reply is parsed through fences and prose; a missing relatio
     verifiable: true,
     explicit: { value: 'accept', quote: 'ship it' },
     user_model: 'opus',
+    user_model_for: null,
     confidence: 1,
   })
   expect(parseClassification('{"kind":"edit"}')).toBe(undefined)
@@ -214,9 +215,14 @@ test('outcomes: corrected outranks verified; an accept is completed_accepted; in
 test('a spawn: pins are kept, the person’s model honoured, low confidence abstains, the table routes', () => {
   expect(decideSpawn({ state, type: 'pinned-agent', cls: cls() }).decision!.reason).toBe('pin')
   expect(decideSpawn({ state, type: 'pinned-agent', cls: cls() }).isRouted).toBe(false)
-  const named = decideSpawn({ state, type: 'Explore', cls: cls({ user_model: 'opus' }) })
+  const named = decideSpawn({ state, type: 'Explore', cls: cls(), personModel: 'opus' })
   expect(named.decision!.model).toBe('claude-opus-5-5')
+  expect(named.decision!.reason).toBe('user_model')
   expect(named.isRouted).toBe(false)
+  // A model named inside the spawn prompt is the parent's preference: routed by the table.
+  const parentAsked = decideSpawn({ state, type: 'Explore', cls: cls({ user_model: 'opus', difficulty: 1, kind: 'question' }) })
+  expect(parentAsked.decision!.reason).toBe('table')
+  expect(parentAsked.decision!.model).toBe('claude-haiku-5-5')
   expect(decideSpawn({ state, type: 'Explore', cls: cls({ confidence: 0.2 }) }).decision!.override).toBe(false)
   const routed = decideSpawn({ state, type: 'Explore', cls: cls({ difficulty: 1, kind: 'question' }) })
   expect(routed.isRouted).toBe(true)

@@ -353,7 +353,7 @@ export async function routeSpawn(fx: Fx, store: Store, e: any, next: any, remain
       cls = got.ok ? parseClassification(got.text) : undefined
     }
   }
-  const spawn = decideSpawn({ state, type, cls })
+  const spawn = decideSpawn({ state, type, cls, personModel: r.task?.subagentModel ?? null })
   const applied = !!spawn.decision?.override && isApplying(r)
   const result = await next(applied && spawn.decision ? { ...e, model: spawn.decision.model } : e)
   const now = await fx.clock.now()

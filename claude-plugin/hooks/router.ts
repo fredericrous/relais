@@ -44,6 +44,9 @@ export type Classification = Class & {
   relation: Relation
   explicit: { value: 'accept' | 'correct' | 'none'; quote: string | null }
   user_model: string | null
+  // Who the named model is for: this session's own work, or a subagent the
+  // person asks to be started ("use an Explore agent on opus").
+  user_model_for: 'session' | 'subagent' | null
 }
 
 // `relais native router-state`, as far as the plugin reads it. Unknown
@@ -77,6 +80,9 @@ export type TaskState = {
   // or the person's model is kept).
   override: boolean
   userModel: string | null
+  // A model the person named for the subagents this task starts: kept for
+  // them, never applied to the session.
+  subagentModel: string | null
   turns: number
   escalations: number
   exhausted: boolean
@@ -166,7 +172,7 @@ export function hash(text: string): string {
 // Fixed, so the prompt cache holds it from one call to the next.
 export const CLASSIFIER_SYSTEM = [
   'You label one request a person typed to a coding agent. Reply with ONE JSON object and nothing else:',
-  '{"relation":"new_task|continuation|correction","kind":"question|edit|debug|design|review","difficulty":1,"scope":"local|module|cross-cutting|unknown","uncertainty":"low|medium|high","verifiable":true,"explicit":{"value":"accept|correct|none","quote":null},"user_model":null,"confidence":0.8}',
+  '{"relation":"new_task|continuation|correction","kind":"question|edit|debug|design|review","difficulty":1,"scope":"local|module|cross-cutting|unknown","uncertainty":"low|medium|high","verifiable":true,"explicit":{"value":"accept|correct|none","quote":null},"user_model":null,"user_model_for":null,"confidence":0.8}',
   'Fields:',
   '- relation, read against ACTIVE TASK: new_task when there is none or the request starts unrelated work; continuation when it goes on with the task ("yes, do it", "continue", "same issue in the other service"); correction when it says the work done was wrong or must be redone.',
   '- kind: question (an answer, no edits), edit, debug, design, review.',
@@ -175,7 +181,8 @@ export const CLASSIFIER_SYSTEM = [
   '- uncertainty: high when the cause or the approach is unclear (a subtle bug), low when the work is plain.',
   '- verifiable: true when a test, build or check exists or is named that can prove the work.',
   '- explicit: accept when the person approves the work done ("looks good", "ship it"), correct when they say it is wrong; quote their words, else value none and quote null.',
-  '- user_model: a model the person named for this work (haiku, sonnet, opus, fable or a full id), else null.',
+  '- user_model: a model the person named (haiku, sonnet, opus, fable or a full id), else null.',
+  '- user_model_for: "subagent" when the named model is for an agent or subagent the person asks to be started ("use an Explore agent with opus"), "session" when it is for this work itself, null when no model is named.',
   '- confidence 0-1: how sure you are of relation and difficulty.',
 ].join('\n')
 
@@ -241,6 +248,7 @@ export function parseClassification(text: unknown): Classification | undefined {
     verifiable: raw.verifiable === true,
     explicit: { value: oneOf(['accept', 'correct', 'none'] as const, explicitValue, 'none'), quote: quote ? clip(quote, 300) : null },
     user_model: typeof raw.user_model === 'string' && raw.user_model.trim() !== '' ? raw.user_model.trim() : null,
+    user_model_for: raw.user_model_for === 'subagent' ? 'subagent' : raw.user_model_for === 'session' ? 'session' : null,
     confidence: Number.isFinite(confidence) ? Math.min(1, Math.max(0, confidence)) : 0,
   }
 }
@@ -458,6 +466,7 @@ export function newTask(id: string, agentId: string | null, opening: string, c: 
     effort: null,
     override: true,
     userModel: null,
+    subagentModel: null,
     turns: 0,
     escalations: 0,
     exhausted: false,
@@ -563,7 +572,9 @@ function startTask(input: MainInput, cls: Classification): MainOutput {
   const task = newTask(input.newTaskId, null, input.text, c, table, input.now)
   task.turns = 1
   const userModel = resolveModel(state, cls.user_model)
-  if (userModel) {
+  // A model named for a subagent is kept for the spawns, never the session.
+  if (userModel && cls.user_model_for === 'subagent') task.subagentModel = userModel
+  if (userModel && cls.user_model_for !== 'subagent') {
     task.userModel = userModel
     task.tier = tierOfModel(state, userModel) ?? table
     task.lastReason = 'user_model'
@@ -754,7 +765,15 @@ export type SpawnDecision = {
   class: Class | undefined
 }
 
-export function decideSpawn(input: { state: RouterState; type: string; cls: Classification | undefined }): SpawnDecision {
+// `personModel` is a model the PERSON named for subagents (the active main
+// task's `subagentModel`). A model named inside the spawn's own prompt was
+// written by the parent agent: a preference relais overrides, never a pin.
+export function decideSpawn(input: {
+  state: RouterState
+  type: string
+  cls: Classification | undefined
+  personModel?: string | null
+}): SpawnDecision {
   const { state, type, cls } = input
   const pinned = state.pins[type]
   if (pinned) {
@@ -764,9 +783,9 @@ export function decideSpawn(input: { state: RouterState; type: string; cls: Clas
       class: cls && classOf(cls),
     }
   }
-  if (!cls) return { decision: undefined, isRouted: false, class: undefined }
-  const c = classOf(cls)
-  const userModel = resolveModel(state, cls.user_model)
+  const userModel = input.personModel ? resolveModel(state, input.personModel) : undefined
+  if (!cls && !userModel) return { decision: undefined, isRouted: false, class: undefined }
+  const c = cls ? classOf(cls) : undefined
   if (userModel) {
     return {
       decision: { tier: tierOfModel(state, userModel) ?? 'implementation', model: userModel, effort: null, reason: 'user_model', override: true, wouldPassGate: true },
@@ -774,6 +793,7 @@ export function decideSpawn(input: { state: RouterState; type: string; cls: Clas
       class: c,
     }
   }
+  if (!cls || !c) return { decision: undefined, isRouted: false, class: undefined }
   const tier = tableTier(state.capability_table, c)
   const model = state.tiers[tier].model
   if (cls.confidence < LOW_CONFIDENCE || state.excluded_models.includes(model)) {

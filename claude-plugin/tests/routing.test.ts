@@ -258,6 +258,15 @@ test('a model named in the prompt is honoured, and an agent definition’s pin i
   expect(engine.calls.completes.length).toBe(1)
 })
 
+test('a model the person names for a subagent goes to that subagent, never to the session', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  engine.labels.set('Explore agent with opus', label({ difficulty: 1, kind: 'question', user_model: 'opus', user_model_for: 'subagent' }))
+  const { steps } = await personTurn($, engine, 'use an Explore agent with opus to list the files')
+  expect(steps[0].model).toBe(HAIKU)
+  await $.agent.spawn({ prompt: 'list the files', description: 'list files', subagentType: 'Explore' })
+  expect(engine.calls.spawned[engine.calls.spawned.length - 1].model).toBe(OPUS)
+})
+
 test('an isOwn or notification prompt is never classified', async ($: any, on: any) => {
   const engine = await routedSession($, on)
   await $.prompt.submit({ text: '<task-notification><task-id>x</task-id></task-notification>', wait: false, origin: { kind: 'task-notification' } })
