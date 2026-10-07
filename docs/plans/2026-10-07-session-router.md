@@ -11,7 +11,7 @@ adrs: [new: relais session routing]
 
 👉 **Decide:** none beyond decision 1, which the person favours. Approve if the route-then-recover design matches "complete work correctly at lower total cost".
 
-📍 relais · revised at the person's request (capability routing, automatic recovery, cost per completed task), built for `--dangerously-skip-permissions` · next: S0. Panel: backend, lang:rust, unix, react.
+📍 relais · S0 and R1 done, plus the R3 CLI; implementation review approved · next: merge, the person's live check of `/relais-routing`, then R3 labels and, after weeks of data, R2. Panel: backend, lang:rust, unix, react.
 
 **Changed by the person's review:**
 - Routing goes by difficulty, scope, uncertainty and verification.
@@ -348,7 +348,8 @@ The gate **passes**. The probe plugin and its logs are kept outside the reposito
   - shadow sessions are a third arm of the report;
   - the plugin store path is guarded as a directory (`~/.claude/plugins/store/`), because no API exposes the file;
   - the cache gate uses a fixed token mix and no `rebuild_back` yet (no next-task prediction in R1);
-  - `explored` is always false: exploration belongs to R2.
+  - `explored` is always false: exploration belongs to R2;
+  - classifier usage is booked in `router_usage` (source `classifier`), not as an `orchestration_usage` row as §5 said. S0 found that hooks expose no message id, so the router keeps its own accounting table for every step and classifier call, and never adds it to `usage import`'s totals.
 - **Found by the headless check and fixed (`0ff6977`):** "use an Explore agent with opus" moved the *main session* to opus. The classifier now reports who a named model is for (`user_model_for`):
   - a model named for a subagent is kept for the spawn and never applied to the session;
   - a model named inside the spawn's own prompt comes from the parent agent, so it is a preference the table overrides.
@@ -376,5 +377,18 @@ All checks ran in a scratch config and state, with headless `claude -p --dangero
 | `$.ui.ask` dialogs (`/relais-routing`, `/relais-r3`) in an interactive bypass session | shown and answered | **not run**: needs the person (the live check) |
 | R2 learning, R3 evaluation on real labels | later phases | not in this PR: R2 needs weeks of R1 data, and R3 needs the person's labelled transcripts |
 
+## Implementation review
+
+- **Round 1: approve-with-changes** (93k tokens, 120 s). Fixed in `4a6244d`:
+  - spawn bookkeeping never throws after `next`, and the error handler never calls `next` twice;
+  - an unreadable agents directory is warned about;
+  - the command messages are honest after a store failure;
+  - a corrupt inferred column is an error;
+  - a stdin read failure exits 1;
+  - relais workers' usage is no longer booked against the person's task.
+- **Delta: approve-with-changes** (41k tokens, 35 s). Kept:
+  - deliberate: when only the refresh fails after the store write, the message is pessimistic; the next session's refresh corrects it;
+  - deliberate: the unreadable-directory test assumes it does not run as root (CI runners are not root);
+  - the classifier-usage location is recorded as an agreed deviation (R1 decision log).
 
 <!-- panel: repos=relais reviewers=backend,language:rust,unix,react body-sha=3b57295144e6 -->
