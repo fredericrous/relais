@@ -640,6 +640,11 @@ pub enum PolicyError {
     /// A `[[recipes]]` table with two recipes sharing `(name, revision)`
     /// or two recipes sharing a [`RecipeSpec::recipe_id`].
     InvalidRecipe(RecipeError),
+    /// A `[session_routing]` value out of range.
+    InvalidSessionRouting {
+        field: &'static str,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for PolicyError {
@@ -661,6 +666,9 @@ impl std::fmt::Display for PolicyError {
                 write!(f, "trust grant [trust.\"{key}\"]: {detail}")
             }
             Self::InvalidRecipe(err) => write!(f, "{err}"),
+            Self::InvalidSessionRouting { field, detail } => {
+                write!(f, "[session_routing] {field}: {detail}")
+            }
         }
     }
 }
@@ -718,6 +726,135 @@ pub struct MachineSettings {
     /// keeps parsing, with any keys. `doctor` reports it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<toml::Table>,
+    /// `[session_routing]`: the plugin's advisory router of the session's
+    /// own model (SPEC §30). Machine-owned like `[trials]`: a repository
+    /// can neither grant the envelope nor widen it. Every key is optional,
+    /// so a machine.toml written before this table existed parses
+    /// unchanged; with no `envelope` the router only observes (`shadow`).
+    #[serde(default)]
+    pub session_routing: SessionRoutingSettings,
+}
+
+/// `[session_routing]` in machine.toml (SPEC §30). Only `envelope` is
+/// authority, and only `relais native router-envelope` writes it; the rest
+/// are tuning with safe defaults.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SessionRoutingSettings {
+    /// What the person granted once: routing on, downward exploration up
+    /// to `epsilon_max`, automatic activation of a learned adjustment
+    /// that passes every gate. Absent: `shadow`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub envelope: Option<RoutingEnvelope>,
+    /// The share of sessions held out (decided and recorded, never
+    /// applied), drawn per session id.
+    pub holdout_rate: f64,
+    /// The exploration rate; served clamped to `envelope.epsilon_max`,
+    /// and 0 with no envelope.
+    pub epsilon: f64,
+    /// Alias → full model id, over the built-in defaults
+    /// ([`default_model_ids`]): `turn.step` refuses an alias.
+    pub model_ids: BTreeMap<String, String>,
+    /// Subagent types the router never re-routes.
+    pub pinned_agents: Vec<String>,
+    /// Full ids that do not spawn on this harness.
+    pub excluded_models: Vec<String>,
+    /// The success floor a learned adjustment must clear (R2).
+    pub quality_floor: f64,
+}
+
+impl Default for SessionRoutingSettings {
+    fn default() -> Self {
+        Self {
+            envelope: None,
+            holdout_rate: 0.1,
+            epsilon: 0.1,
+            model_ids: BTreeMap::new(),
+            pinned_agents: Vec::new(),
+            excluded_models: Vec::new(),
+            quality_floor: 0.85,
+        }
+    }
+}
+
+impl SessionRoutingSettings {
+    /// The alias table the router serves: the built-in defaults with this
+    /// machine's `model_ids` over them.
+    pub fn resolved_model_ids(&self) -> BTreeMap<String, String> {
+        let mut ids = default_model_ids();
+        ids.extend(self.model_ids.clone());
+        ids
+    }
+
+    /// `model` as a full id: an alias this table names is replaced, any
+    /// other spelling is taken to be an id already.
+    pub fn full_model_id(&self, model: &str) -> String {
+        self.resolved_model_ids()
+            .get(model)
+            .cloned()
+            .unwrap_or_else(|| model.to_string())
+    }
+
+    /// The exploration rate in force: never above the envelope's
+    /// `epsilon_max`, and 0 without an envelope (exploration is the
+    /// envelope's alone).
+    pub fn effective_epsilon(&self) -> f64 {
+        match &self.envelope {
+            Some(envelope) => self.epsilon.min(envelope.epsilon_max),
+            None => 0.0,
+        }
+    }
+
+    fn validate(&self) -> Result<(), PolicyError> {
+        let unit = |field: &'static str, value: f64| {
+            if value.is_finite() && (0.0..=1.0).contains(&value) {
+                Ok(())
+            } else {
+                Err(PolicyError::InvalidSessionRouting {
+                    field,
+                    detail: format!("{value} is not between 0 and 1"),
+                })
+            }
+        };
+        unit("holdout_rate", self.holdout_rate)?;
+        unit("epsilon", self.epsilon)?;
+        unit("quality_floor", self.quality_floor)?;
+        if let Some(envelope) = &self.envelope {
+            unit("envelope.epsilon_max", envelope.epsilon_max)?;
+            if envelope.by.trim().is_empty() {
+                return Err(PolicyError::InvalidSessionRouting {
+                    field: "envelope.by",
+                    detail: "names nobody".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The built-in alias table (S0: `turn.step` needs a full id).
+pub fn default_model_ids() -> BTreeMap<String, String> {
+    [
+        ("haiku", "claude-haiku-5-5"),
+        ("sonnet", "claude-sonnet-5-5"),
+        ("opus", "claude-opus-5-5"),
+        ("fable", "claude-fable-5-1"),
+    ]
+    .into_iter()
+    .map(|(alias, id)| (alias.to_string(), id.to_string()))
+    .collect()
+}
+
+/// `[session_routing] envelope = { granted_at, by, epsilon_max, source }`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingEnvelope {
+    pub granted_at: String,
+    pub by: String,
+    pub epsilon_max: f64,
+    /// `plugin-ask`, or `cli (unattributed)`: the CLI cannot tell a
+    /// person's shell from the model's Bash call.
+    pub source: String,
 }
 
 /// `[efforts]` in machine.toml: the order and per-model support the
@@ -1215,6 +1352,7 @@ impl MachineSettings {
         for (key, grant) in &self.trust {
             grant.validate(key)?;
         }
+        self.session_routing.validate()?;
         Ok(())
     }
 }
@@ -1801,6 +1939,57 @@ keys = ["output.contract"]
             machine.admission.queue_behaviour(),
             QueueBehaviour::WaitUpTo(Duration::from_secs(2))
         );
+    }
+
+    /// A machine.toml from before `[session_routing]` (the shape every
+    /// installed relais wrote) parses, and means shadow: no envelope.
+    #[test]
+    fn an_older_machine_toml_without_session_routing_parses_with_defaults() {
+        let older = "schema_version = 1\n\n[spending]\nper_run_micros = 3000000\n\n\
+                     [trust.\"k\"]\ngranted_at = \"2026-09-20\"\nreviewed_by = \"me\"\n";
+        let machine = MachineSettings::from_toml_str(older).expect("parses");
+        let routing = &machine.session_routing;
+        assert_eq!(routing.envelope, None);
+        assert_eq!(routing.holdout_rate, 0.1);
+        assert_eq!(routing.epsilon, 0.1);
+        assert_eq!(routing.quality_floor, 0.85);
+        assert_eq!(routing.effective_epsilon(), 0.0);
+        assert_eq!(routing.full_model_id("haiku"), "claude-haiku-5-5");
+        assert_eq!(routing.full_model_id("sonnet"), "claude-sonnet-5-5");
+        assert_eq!(routing.full_model_id("opus"), "claude-opus-5-5");
+        assert_eq!(routing.full_model_id("fable"), "claude-fable-5-1");
+        assert_eq!(routing.full_model_id("claude-x-1"), "claude-x-1");
+    }
+
+    #[test]
+    fn session_routing_reads_every_key_and_clamps_epsilon_to_the_envelope() {
+        let text = "schema_version = 1\n\n[session_routing]\nholdout_rate = 0.25\nepsilon = 0.2\n\
+                    pinned_agents = [\"my-reviewer\"]\nexcluded_models = [\"claude-opus-5-5[1m]\"]\n\
+                    quality_floor = 0.9\n\
+                    envelope = { granted_at = \"2026-10-07T00:00:00Z\", by = \"me\", epsilon_max = 0.05, source = \"plugin-ask\" }\n\n\
+                    [session_routing.model_ids]\nhaiku = \"claude-haiku-9\"\n";
+        let machine = MachineSettings::from_toml_str(text).expect("parses");
+        let routing = &machine.session_routing;
+        assert_eq!(routing.holdout_rate, 0.25);
+        assert_eq!(routing.effective_epsilon(), 0.05);
+        assert_eq!(routing.pinned_agents, vec!["my-reviewer".to_string()]);
+        assert_eq!(routing.full_model_id("haiku"), "claude-haiku-9");
+        // An override replaces one alias, never the rest of the table.
+        assert_eq!(routing.full_model_id("opus"), "claude-opus-5-5");
+        assert_eq!(routing.envelope.as_ref().unwrap().source, "plugin-ask");
+    }
+
+    #[test]
+    fn session_routing_refuses_unknown_keys_and_rates_out_of_range() {
+        for bad in [
+            "[session_routing]\nholdout = 0.1\n",
+            "[session_routing]\nholdout_rate = 1.5\n",
+            "[session_routing]\nepsilon = -0.1\n",
+            "[session_routing]\nenvelope = { granted_at = \"x\", by = \" \", epsilon_max = 0.1, source = \"cli\" }\n",
+        ] {
+            let text = format!("schema_version = 1\n{bad}");
+            assert!(MachineSettings::from_toml_str(&text).is_err(), "{bad}");
+        }
     }
 
     /// The single place that decides what `queue_wait_secs` means: zero

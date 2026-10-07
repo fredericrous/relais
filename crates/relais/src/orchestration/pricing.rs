@@ -60,6 +60,13 @@ impl PriceTable {
         self.rate_for(model).is_some()
     }
 
+    /// The entry that names `model` exactly, if any: its per-million
+    /// rates, for a caller that serves rates rather than pricing a record
+    /// (the session router, SPEC §30).
+    pub fn rate(&self, model: &str) -> Option<&ModelPrice> {
+        self.rate_for(model)
+    }
+
     fn rate_for(&self, model: &str) -> Option<&ModelPrice> {
         self.models.iter().find(|price| price.matches(model))
     }

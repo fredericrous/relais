@@ -1032,6 +1032,7 @@ mod tests {
             pricing: None,
             efforts: Default::default(),
             sandbox: Default::default(),
+            session_routing: Default::default(),
         };
         machine.trust.insert(
             crate::policy::grant_key(&repo.authority_hash(), &identity()),
@@ -1386,6 +1387,7 @@ mod tests {
             pricing: None,
             efforts: Default::default(),
             sandbox: Default::default(),
+            session_routing: Default::default(),
         };
         let d = expect_blocked(decide(
             &change_contract(&["crates/amont/**"]),
@@ -1875,6 +1877,7 @@ mod tests {
             pricing: None,
             efforts: Default::default(),
             sandbox: Default::default(),
+            session_routing: Default::default(),
         };
         let d = expect_blocked(decide(
             &change_contract(&["crates/amont/**"]),

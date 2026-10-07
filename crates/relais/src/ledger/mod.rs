@@ -24,7 +24,13 @@ use crate::outcome::{Outcome, OutcomeDetail, OutcomeKind};
 use crate::policy::Tier;
 use crate::route::RoutedBy;
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 19;
+mod router;
+pub use router::{
+    RouterClass, RouterDecisionRow, RouterProvenance, RouterReassessRow, RouterRecord,
+    RouterTaskRow, RouterUsageRow, RouterWindow,
+};
+
+pub const LEDGER_SCHEMA_VERSION: u64 = 20;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -1360,6 +1366,117 @@ const MIGRATIONS: &[(&str, &str)] = &[
         granted_at TEXT NOT NULL
     );
     CREATE INDEX idx_trust_grants_repo ON trust_grants(repo_key, id);
+    "#,
+    ),
+    (
+        // The session router's own records (SPEC §30), written by
+        // `relais native router-observe`. Keys are the wire contract's
+        // (docs/router-protocol.md); an absent turn or agent id is stored
+        // as '' so a key holding one is still UNIQUE (SQLite treats NULLs
+        // as distinct). No cost column anywhere: a cost is computed from
+        // the token columns and `[pricing]` when read, never stored. The
+        // usage rows are the router's own accounting and are never added
+        // to `orchestration_usage` totals (plan decision log, S0).
+        "v20",
+        r#"
+    CREATE TABLE router_decisions (
+        session TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        relation TEXT NOT NULL,
+        class_kind TEXT,
+        difficulty INTEGER,
+        scope TEXT,
+        uncertainty TEXT,
+        verifiable INTEGER,
+        confidence REAL,
+        tier TEXT NOT NULL,
+        model TEXT NOT NULL,
+        effort TEXT,
+        reason TEXT NOT NULL,
+        mode_effective TEXT NOT NULL,
+        holdout INTEGER NOT NULL,
+        applied INTEGER NOT NULL,
+        explored INTEGER NOT NULL,
+        propensity REAL,
+        draw REAL,
+        would_pass_gate INTEGER NOT NULL,
+        at TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        PRIMARY KEY (session, task_id, turn_id, agent_id)
+    );
+    CREATE TABLE router_usage (
+        session TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        step INTEGER NOT NULL,
+        agent_id TEXT NOT NULL,
+        source TEXT NOT NULL,
+        model TEXT NOT NULL,
+        input_tokens INTEGER NOT NULL,
+        output_tokens INTEGER NOT NULL,
+        cache_read_input_tokens INTEGER NOT NULL,
+        cache_creation_input_tokens INTEGER NOT NULL,
+        at TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        PRIMARY KEY (session, turn_id, step, agent_id, source)
+    );
+    CREATE INDEX idx_router_usage_task ON router_usage(session, task_id, agent_id);
+    CREATE TABLE router_reassess (
+        session TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        event TEXT NOT NULL,
+        tier_from TEXT NOT NULL,
+        tier_to TEXT NOT NULL,
+        effort_to TEXT,
+        escalating INTEGER NOT NULL,
+        at TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        PRIMARY KEY (session, task_id, agent_id, event, at)
+    );
+    CREATE TABLE router_tasks (
+        session TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        class_kind TEXT,
+        difficulty INTEGER,
+        scope TEXT,
+        uncertainty TEXT,
+        verifiable INTEGER,
+        confidence REAL,
+        outcome TEXT NOT NULL,
+        outcome_rank INTEGER NOT NULL,
+        inferred_json TEXT NOT NULL,
+        escalations INTEGER NOT NULL,
+        exhausted INTEGER NOT NULL,
+        turns INTEGER NOT NULL,
+        explicit_quote TEXT,
+        recorded_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (session, task_id, agent_id)
+    );
+    CREATE INDEX idx_router_tasks_started ON router_tasks(started_at);
+    CREATE TABLE router_provenance (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL,
+        r3_id TEXT,
+        passed INTEGER,
+        granted_by TEXT,
+        epsilon_max REAL,
+        source TEXT NOT NULL,
+        at TEXT NOT NULL
+    );
+    CREATE INDEX idx_router_provenance_kind ON router_provenance(kind, id);
+    CREATE VIEW router_task_tokens AS
+        SELECT session, task_id, agent_id,
+               SUM(input_tokens + output_tokens + cache_read_input_tokens
+                   + cache_creation_input_tokens) AS total_tokens
+          FROM router_usage
+         GROUP BY session, task_id, agent_id;
     "#,
     ),
 ];
