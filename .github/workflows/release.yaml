@@ -373,9 +373,9 @@ jobs:
           cat dist/SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      # An unarmed channel must be VISIBLE. A release that quietly shipped to
-      # one of four places, because three variables were never set, is the
-      # silent-success shape this whole project is arranged against.
+      # Every channel is listed, armed or not: a release that quietly shipped
+      # to fewer places than it says is the silent-success shape this whole
+      # project is arranged against.
       - name: Which channels are armed
         run: |
           set -euo pipefail
@@ -386,7 +386,7 @@ jobs:
             echo "|---|---|---|"
             echo "| GitHub release | yes | nothing |"
             echo "| crates.io, npm | not built | \`relais\` is a working name; package availability is unchecked (SPEC.md) |"
-            echo "| homebrew tap | ${{ vars.PUBLISH_TAP == 'true' && 'yes' || 'NO' }} | \`PUBLISH_TAP\` + \`TAP_DEPLOY_KEY\` + a seeded \`Formula/relais.rb\` |"
+            echo "| homebrew tap | yes | \`TAP_DEPLOY_KEY\` + the seeded \`Formula/relais.rb\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # The release's last manual step, retired. The tap formula was bumped by
@@ -408,15 +408,13 @@ jobs:
     # push step's nothing-to-commit path makes that resume a no-op when the
     # tap already carries the version.
     #
-    # NOTE: seed `Formula/relais.rb` in the tap before arming this. bump-tap.py
-    # REWRITES a formula; it does not create one, and it asserts four url/sha
-    # pairs are present rather than hoping a sed matched.
-    # Gated on a repository VARIABLE, not just the tag, because this repository
-    # does not yet carry the credential this job needs. A release that failed
-    # three jobs on a missing secret would read as a broken release rather than
-    # as an unarmed channel. Set the variable when the secret is in place:
-    #     gh variable set PUBLISH_TAP -R fredericrous/relais --body true
-    if: github.ref_type == 'tag' && vars.PUBLISH_TAP == 'true'
+    #
+    # bump-tap.py REWRITES `Formula/relais.rb` (seeded in the tap); it does
+    # not create one, and it asserts four url/sha pairs are present rather
+    # than hoping a sed matched. Every tag publishes, as amont's release
+    # does: the variable gate this job waited behind kept the tap at 0.1.1
+    # through v0.9.0 although the deploy key was in place.
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -494,7 +492,7 @@ jobs:
   verify-brew:
     name: brew can install what was published
     needs: [guard, publish-tap]
-    if: github.ref_type == 'tag' && vars.PUBLISH_TAP == 'true'
+    if: github.ref_type == 'tag'
     # macOS because that is where nearly every brew user of this tool is, and
     # because the bottle-less formula builds from the darwin release asset —
     # the same bytes an actual user downloads.

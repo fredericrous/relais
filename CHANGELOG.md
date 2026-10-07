@@ -6,6 +6,15 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## Unreleased
+
+### Changed
+
+- Every release tag publishes to the Homebrew tap and then checks that `brew
+  install fredericrous/tap/relais` works, as amont's release does. The tap had
+  stayed at 0.1.1 because its job waited behind a repository variable that was
+  never set; `brew upgrade relais` now follows the releases.
+
 ## v0.10.0
 
 relais becomes a Claude Code plugin. Every agent a run dispatches (worker,
