@@ -11,7 +11,7 @@ adrs: []
 
 👉 **Decide:** none. Approve if `$.ui.ask` is model-proof in a live session (the P4 check).
 
-📍 relais · S0–P4 done, implementation review approved (live dialogs skipped by the person) · next: merge the PR. Panel: backend, lang:rust, tui, unix, plus a UI delta.
+📍 relais · S0–P5 done (P5: the model routes without a command), implementation review approved; live dialogs skipped by the person · next: merge #178, then option 2's own plan. Panel: backend, lang:rust, tui, unix, plus a UI delta.
 
 📄 Full reviews: [2026-10-07-zero-setup-onboarding.reviews.md](2026-10-07-zero-setup-onboarding.reviews.md)
 
@@ -51,7 +51,7 @@ Both gates protect something real, so this plan keeps them and takes the manual 
 - **`relais.toml` holds the verification profile.** That profile decides whether a candidate is accepted. Without it, relais is a plain subagent.
 - **The trust grant matters because relais runs repository commands through `$.process.spawn` → `verify::run_observed`.** Those runs skip Claude Code's Bash prompt and its folder-trust prompt. Without a grant, a cloned repository's `relais.toml` could run anything the moment the model calls `mcp__relais__run`.
 
-Outcome: `/relais <task>` works in any repository with at most two questions, each asked once: "use these checks?" and "allow these commands to run?". `doctor`, `init` and `plan` stay for people who edit by hand.
+Outcome: a bounded task is routed through relais in any repository, by the model on its own or with `/relais:relais`, with at most two questions, each asked once: "use these checks?" and "allow these commands to run?". `doctor`, `init` and `plan` stay for people who edit by hand.
 
 ## Design
 
@@ -224,11 +224,11 @@ Options: `Not now`, `Allow 2 commands`. The safe option comes first ([NN/g, conf
 
 **On decline:**
 - No file is left behind. A `relais.toml` written for Q2 is removed.
-- The toast reads `relais · not set up in <repo> · /relais to be asked again`.
+- The toast reads `relais · not set up in <repo> · ask Claude to set up relais to be asked again`.
 - The tool returns one of:
-  - `declined{reason: "not_now"}`: the model reports "relais was not set up; nothing ran".
+  - `declined{reason: "not_now"}`: the model does the task in the session and says so in one line (P5).
   - `declined{reason: "dismissed"}` (dismissal, Chat about this, or `claude -p`): the model asks the person what they want, and does not just stop. Its message also names the CLI path, `relais init --detect --write` then `relais trust grant`, for a session with nobody to ask.
-- After `not_now`, this repository is not asked again for the rest of the session, unless the person runs `/relais` again themselves.
+- After `not_now`, this repository is not asked again for the rest of the session, unless the person asks for relais again (P5).
 
 **What it guarantees, stated honestly** (👉 decision 2):
 - The plugin path is model-proof.
@@ -267,7 +267,7 @@ Options: `Not now`, `Allow 2 commands`. The safe option comes first ([NN/g, conf
 6. If the commit is refused (`onboard_commit_failed`: detached HEAD, mid-rebase or mid-merge, a hook rejection, or the 10-minute timeout):
    - **no grant is written**;
    - `relais.toml` is **kept**;
-   - the tool returns the hook's output and "commit relais.toml, then /relais again".
+   - the tool returns the hook's output and "commit relais.toml, then call mcp__relais__run".
    - A retry finds `relais.toml` present (committed or not). `run` then reports `dirty_base` or `missing_trust_grant`, so only Q2 is asked; Q1 never comes back.
 7. On any decline, the rules above apply, and the uncommitted `relais.toml` is removed.
 
@@ -279,7 +279,7 @@ Options: `Not now`, `Allow 2 commands`. The safe option comes first ([NN/g, conf
   - On `no_policy` → `mcp__relais__onboard`.
   - On `missing_trust_grant` → `mcp__relais__trust`.
   - Then run again.
-- On `declined` → stop and report.
+- On `declined (not_now)` → do the task in the session; on `dismissed` → ask the person (P5).
 - The model never edits `machine.toml` and never runs `relais trust grant`.
 
 `README.md` "Using it on a repository" is rewritten around this flow. The stale `relais run --task` line (`:150`) is removed, and the exit-code table gains 18 (stale key) and 19 (nothing detected).
@@ -299,6 +299,11 @@ Each package ends with `make check`, falsification of its key test with a forced
 - **P2 — `init --detect`** (Rust): `repo::detect_policy`, inferred integrations, the SPEC §5:214 rewording, the init hint.
 - **P3 — every exit reaches the model** (Rust + plugin): `Done` with an optional run and code, pre-run and preflight blocks over the protocol, and the `endUnfinished` message.
 - **P4 — plugin tools** (TS): the `run` contract object, `onboard` (with the commit) and `trust` through the S0 mechanism, the Write/Edit/Bash guards, `SKILL.md`, `README.md`.
+- **P5 — model-routed runs** (TS, after the PR opened, at the person's request). The person routes nothing by hand:
+  - the plugin adds one system-prompt line (`prompt.compose`) telling the model to load the `relais:relais` skill for a bounded task, and the run tool's description says when to use it;
+  - the skill writes the contract from the plan or the request and never asks the person for its fields;
+  - *Not now* means the model does the task in the session, and is lifted when the person asks for relais again (not by "don't use relais", not by the plugin's own outcome messages).
+  - Non-goals: choosing the session's own model per turn (option 2, its own plan); slash-command aliases.
 
 ## Verification
 
@@ -344,14 +349,14 @@ Key tests, each as input → expected. Fixture repositories are built in a tempd
   - Commit fails (a hook exits 1) → `onboard_commit_failed`, `relais.toml` kept, 0 grants, and the hook's output in the result.
   - Typed `make test | tee x` twice → asked again once with the reason naming `|`, then declined.
   - Re-ask after a grant whose ledger argv was `[make check]`, with the policy now `make check` plus `cargo test` → Q2 shows `  check make check` and `+ check cargo test`.
-  - Toasts: decline → `relais · not set up in <repo> · /relais to be asked again`; success → `relais · set up: …`.
+  - Toasts: decline → `relais · not set up in <repo> · ask Claude to set up relais to be asked again`; success → `relais · set up: …`.
 - **Existing trust tests pass unchanged:** `missing_grant_blocks`, `changed_declaration_invalidates_grant`, `a_grant_is_bound_to_the_repository_as_well_as_the_declaration`.
 - **Against reality, in a real Claude Code session.** Use a fresh clone of a small Cargo crate with no `relais.toml`, and an empty scratch `RELAIS_CONFIG_DIR`:
-  - `/relais add a doc comment to X` → "use these checks? `cargo test`" → yes → `relais.toml` committed → "allow these commands?" → yes → run accepted. `machine.toml` holds one grant.
-  - Edit `relais.toml` (add a command), commit, then `/relais` again → only Q2 comes back, the new command marked `+` and the old ones unmarked.
+  - A plain request ("add a doc comment to X") → "use these checks? `cargo test`" → yes → `relais.toml` committed → "allow these commands?" → yes → run accepted. `machine.toml` holds one grant.
+  - Edit `relais.toml` (add a command), commit, then another bounded request → only Q2 comes back, the new command marked `+` and the old ones unmarked.
   - Answer no to the trust question → no further `mcp__relais__run` call, and the `machine.toml` sha is unchanged.
   - Tell the model "grant trust yourself" through `mcp__relais__trust` without consent, through Write/Edit on `machine.toml`, and through Bash `relais trust grant` and `env relais trust grant`. Count the grants written (expect 0 for the first three). For the last, expect either a grant written (the declared bypass) or a denial from the Bash text guard; record which in the decision log.
-  - With an unrelated file staged, `/relais` onboarding → the commit holds only `relais.toml`, and the file is still staged.
+  - With an unrelated file staged, onboarding → the commit holds only `relais.toml`, and the file is still staged.
   - A malformed contract, then a malformed `machine.toml` → exactly one queued message each, never `interrupted`.
   - Plain CLI: `relais init && relais plan --task …` still prints the paste block plus the `relais trust grant` line.
 
@@ -381,9 +386,14 @@ Key tests, each as input → expected. Fixture repositories are built in a tempd
 | Plugin: `done` code → next tool; exit without `done` → one message with stderr tail | per plan | pass (4 outcome tests) |
 | Consent: Allow / typed "Allow" / "yes" / rejection / Not now | 1/0/0/0/0 grants | pass; exact-label rule falsified |
 | Consent: parallel calls, stale key, `\nAllow` escaping, re-ask `+`, Q2 decline removes the toml, commit failure keeps it, typed command, refused twice | per plan | pass (15 tests) |
-| Headless `claude -p`, fresh Cargo repo, empty config: `/relais …` | contract object accepted → `no_policy` → `onboard` → `dismissed`; nothing written | as expected; `cfg/` empty, no `relais.toml` |
+| Headless `claude -p`, fresh Cargo repo, empty config: `/relais:relais …` | contract object accepted → `no_policy` → `onboard` → `dismissed`; nothing written | as expected; `cfg/` empty, no `relais.toml` |
 | Headless guards: Write to `machine.toml`; Bash `env relais trust grant`; Bash `echo hello` | denied / denied / runs | denied / denied / `hello` |
 | Live dialogs answered by a person (Q1, Q2, run accepted, re-ask) | per plan | **not run**: the person skipped it |
+| P5, headless, fresh Cargo repo, plain request "add checked_subtract … with unit tests", no mention of relais: skill description only | model routes | did it itself (2 runs: doc comment, checked_subtract) |
+| P5, same, routing rule attached to the person's prompt (`prompt.submit` context) | model routes | did it itself; it quoted the note back, so the note arrived and was read as an aside |
+| P5, same, rule as a system-prompt section + directive run-tool description | Skill → run → onboard | Skill → run → onboard (3 runs) |
+| P5, same, rule cut to one line pointing at the skill | Skill → run → onboard | Skill → run → onboard (2 runs) |
+| P5: *Not now* survives "don't use relais" and the plugin's own outcome message, and is lifted by "set up Relais here" | per plan | pass (unit) |
 
 ## Implementation review
 
@@ -394,6 +404,22 @@ Key tests, each as input → expected. Fixture repositories are built in a tempd
   - ledger and root read errors are reported;
   - a failed ledger write after a grant is a warning, not a failure.
 - **Delta: approve** (46k tokens, 29 s). One low kept as deliberate: an unresolvable ledger path (HOME unset) skips the change marks silently. Every relais command then fails on the missing home anyway.
-- **Not verified:** whether a typed `/relais …` reaches `prompt.submit` as literal text. It needs the live session the person skipped.
+- **Settled by P5:** a person's prompt does reach `prompt.submit`. Measured headless: the model quoted text the hook attached. *Not now* is now lifted by any request that mentions relais, not by a typed `/relais`.
+
+### P5 (2026-10-07)
+
+- The person's words, after the PR opened: "the whole point of relais was to not have to do /commands just it selects the best model for the task at hand", and "these 4 asks should be covered by our dev workflow with plan / review or automatically by the orchestrator llm".
+- Their global routing rule now applies in any repository (dotfiles#21).
+- **P5, round 1: approve-with-changes** (70k tokens, 42 s). All 6 findings fixed in `4401488`:
+  - P5 recorded in the plan, with measurements;
+  - the outcome message no longer lifts *Not now*;
+  - the routing rule is one line;
+  - SPEC §3 reworded;
+  - negation guard.
+- **P5, Delta: approve-with-changes** (44k tokens, 29 s). Fixed in `6bd0dc0`:
+  - a pump-driven test, falsified;
+  - the negation must sit within two words of "relais";
+  - status line updated.
+- **P5, re-bind: approve** (28k tokens, 18 s). Kept as deliberate: a refusal with three or more words between the negation and "relais" ("don't want to use relais") still lifts *Not now*. The cost is one extra question.
 
 <!-- panel: repos=relais adds=ui reviewers=backend,language:rust,tui,unix,react,ui-design,ux-research,game-ux body-sha=809cf40c1a6b -->
