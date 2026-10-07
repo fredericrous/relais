@@ -386,6 +386,8 @@ The worker had falsified two behaviours, the end signal's turn requirement and t
 
 Claude Code updated itself to 2.1.292 during the e2e; inside the tested range.
 
+**2026-10-07, CI on PR #173.** Windows failed two tests: the checkout turned `claude-plugin/` into CRLF (now pinned to LF in `.gitattributes`, since the plugin is embedded byte for byte) and a test expected `/` where the plan prints the platform's separator. The Ubuntu leg then wedged its runner three times: `release_scenarios` printed "running 48 tests" and nothing more, a cancel and the job timeout were ignored and no log was kept, while `main` re-run on the same runners passed in 2 minutes and the whole suite passed locally and in Linux containers (non-root, 4 and 12 CPUs, through a pipe). A temporary watcher (disk, memory, processes, read live) was pushed with one behavioural change: the scenario driver kills a finished agent's process group through `relais::procs::kill_group` instead of `/usr/bin/kill -9 -<pgid>`, and `kill_group` refuses pgid 1. That run passed (Ubuntu 2m13s, 83 GB free); the watcher was then removed. Not proven causal: Ubuntu 24.04's procps kill parsed `-9 -<pgid>` correctly in a container. If the wedge comes back, start from the driver's process groups.
+
 ## Outcome
 
 Verification against reality, 2026-10-07, Claude Code 2.1.292 (pty-driven interactive sessions, plugin from `--plugin-dir`, scratch repo; install measured separately with an isolated `HOME`). Input → expected → actual:
@@ -410,7 +412,7 @@ Verification against reality, 2026-10-07, Claude Code 2.1.292 (pty-driven intera
 
 ## Implementation review
 
-**approve** (tree 08405cf2…), after round 1 approve-with-changes, a Delta and three binding passes on the small fixes that followed (the last for Windows CI: plugin files pinned to LF, a platform path in a test).
+**approve** (tree fcb31859…), after round 1 approve-with-changes, a Delta and binding passes on each small fix that followed (Windows CI: plugin files pinned to LF and a platform path; the Ubuntu wedge: the driver's `kill_group`, a temporary watcher added and removed).
 Fixed: timed-out attempts stop their agent and a stopped agent is never continued; plugin failures (TaskStop, agent list, status, outcome submission) are said in the timeline; a verdict is never lost; a repair's evicted listing is not `failed`; the missing verification rows measured or named.
 Deliberate: a 60 s hello lapse reads as an ended session to `resume`; a failed list read at a `continue` is judged like a fresh spawn (bounded by the wall timeout).
 Tokens and time: round 1 97k / 97 s, Delta 45k / 30 s, bind passes 29k / 20 s, 29k / 17 s and 28k / 17 s.
