@@ -297,7 +297,8 @@ pub fn kill_tree(child: &mut Child) -> io::Result<()> {
 /// documented limit as `alive` (C6).
 pub fn kill_group(pgid: u32) -> GroupKill {
     // 0 is the caller's own group and 1 is init's: `kill(-1, …)` means
-    // every process this user owns. Neither is ever a group relais made.
+    // every process this user owns. Neither is ever a group relais made,
+    // so nothing is signalled and the answer is `NothingLeft`.
     if pgid <= 1 {
         return GroupKill::NothingLeft;
     }
@@ -1484,6 +1485,14 @@ mod tests {
     // A7: the delivery was discarded, so the coordinator recorded a
     // cancellation it had never sent. What the OS refused, and whether
     // trying again could ever work, is the whole answer.
+    /// 0 (this process's own group) and 1 (`kill(-1)`: every process this
+    /// user owns) are never a group relais made; nothing is signalled.
+    #[test]
+    fn the_own_group_and_every_process_are_never_killed_as_a_group() {
+        assert_eq!(kill_group(0), GroupKill::NothingLeft);
+        assert_eq!(kill_group(1), GroupKill::NothingLeft);
+    }
+
     #[test]
     fn a_signal_the_os_refuses_says_which_refusal_it_was() {
         // Nothing is bound to the lease: PID 0 is "this process group"

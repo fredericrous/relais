@@ -486,10 +486,8 @@ impl ScriptedPlugin {
         // An agent that has answered is over, background work included:
         // its group goes now, not when the whole run ends, so a load that
         // slows the run cannot let a late write land.
-        // Through the library, never `/usr/bin/kill -9 -<pgid>`: procps-ng's
-        // kill (Ubuntu) does not read a bare negative operand as a group,
-        // and a misread group can be every process this user owns, the CI
-        // runner included.
+        // Through the library, as relais itself does: one kill path, no
+        // dependence on how a platform's kill(1) parses a negative operand.
         let _ = relais::procs::kill_group(pgid);
         text(&out.stdout)
             .lines()

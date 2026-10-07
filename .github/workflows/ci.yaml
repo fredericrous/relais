@@ -95,10 +95,12 @@ jobs:
           git config --global user.name "relais ci"
       - if: ${{ !contains(fromJSON(steps.attest.outputs.gates || '[]'), 'pre-push-cargo-test') }}
         run: |
-          # TEMPORARY (PR #173): the Ubuntu leg wedges its runner; this shows
-          # disk, memory and the busiest processes live while the tests run.
+          # The Ubuntu leg wedged its runner on PR #173; this shows disk,
+          # memory and the busiest processes live while the tests run.
+          # holds-until: the wedge's cause is found; removed before PR #173 merges.
           if [ "$RUNNER_OS" = Linux ]; then
-            ( while sleep 30; do echo "=== watch $(date +%T)"; df -h / /tmp | tail -2; free -m | sed -n 2p; ps -eo pid,pgid,etime,pcpu,rss,args --sort=-pcpu | head -12; done ) &
+            ( set +e +o pipefail; while sleep 30; do echo "=== watch $(date +%T)"; df -h / /tmp | tail -2; free -m | sed -n 2p; ps -eo pid,pgid,etime,pcpu,rss,comm --sort=-pcpu | head -12; done ) &
+            trap 'kill $! 2>/dev/null' EXIT
           fi
           cargo test
 
