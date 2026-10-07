@@ -2254,7 +2254,11 @@ mod tests {
         assert!(std::fs::read_to_string(&skill)
             .expect("kept")
             .contains("MY body"));
-        assert!(plan.render().contains("keep    skills/relais/SKILL.md"));
+        // The plan prints a path the platform's way (`skills\relais\…` on Windows).
+        let kept = Path::new("skills").join("relais").join("SKILL.md");
+        assert!(plan
+            .render()
+            .contains(&format!("keep    {}", kept.display())));
         std::fs::remove_dir_all(&dir).ok();
     }
 
