@@ -21,19 +21,19 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::acceptance::Evidence;
 use crate::admission::{
-    BindOutcome, Decision, DispatchRequest, DispatchSource, Gate, GateError, Refusal,
-    ReleaseWriteOutcome, ResourceClass, RunRegistration, WriteLeaseOutcome,
+    Decision, DispatchRequest, DispatchSource, Gate, GateError, Refusal, ReleaseWriteOutcome,
+    ResourceClass, RunRegistration, WriteLeaseOutcome,
 };
-use crate::backend::{Backend, LaunchResult, LaunchSpec, ToolSet};
+use crate::backend::{Backend, LaunchResult, LaunchSpec};
 use crate::context::{self, ContextError, ContextManifest};
 use crate::contract::{Review, TaskContract};
-use crate::ids::{derive_task_id, DispatchId, PackageId, Pid, RunId};
+use crate::ids::{derive_task_id, DispatchId, PackageId, RunId};
 use crate::ledger::{EvidenceKind, EvidenceOrigin, Ledger, LedgerError, Transition, UsageEvent};
 use crate::lifecycle::UsagePhase;
 use crate::money::{CostCompleteness, CostKind, MicroUsd};
@@ -161,8 +161,6 @@ pub struct RunConfig<'a> {
     /// Whether an amont gate covers a candidate (`amont attest
     /// covered`), as a port.
     pub attest: &'a dyn verify::HookAttest,
-    /// The environment every worker this run dispatches will run with.
-    pub worker_env: crate::backend::LaunchEnv,
     pub artifacts_dir: PathBuf,
     /// aval resolution, injectable so runs are testable without the real
     /// corpus; production wiring passes a `context::AvalCli`.
@@ -983,18 +981,9 @@ impl<'a> RunEngine<'a> {
         }
 
         let cancel = Arc::new(AtomicBool::new(false));
-        let pid_slot = Arc::new(AtomicU32::new(0));
         spec.cancel = Some(Arc::clone(&cancel));
-        spec.pid_slot = Some(Arc::clone(&pid_slot));
         let stop = AtomicBool::new(false);
         let heartbeat_every = self.config.heartbeat_every;
-        let ledger_path = self.config.ledger.path().to_path_buf();
-        let session_id = self.config.session_id.clone();
-        // A bind the coordinator does not recognise means this worker
-        // holds no seat and no reservation — after a re-election, for
-        // instance. The heartbeat thread cannot end the run, so it says
-        // so here and the launch path reports it (A2).
-        let seat_lost: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
         // Cancellation reaches a worker only on the heartbeat (SPEC §23).
         // A coordinator that stops answering therefore makes `relais
         // cancel` a no-op, silently, for as long as the worker runs —
@@ -1003,70 +992,12 @@ impl<'a> RunEngine<'a> {
         let launched = std::thread::scope(|scope| {
             let dispatch_id = spec.dispatch_id.clone();
             let cancel = Arc::clone(&cancel);
-            let pid_slot = Arc::clone(&pid_slot);
             let stop = &stop;
-            let seat_lost = &seat_lost;
             let heartbeat_lost = &heartbeat_lost;
             scope.spawn(move || {
                 let mut last: Option<Instant> = None;
-                let mut bound_pid = false;
                 let mut heartbeat_errors: u32 = 0;
                 while !stop.load(Ordering::SeqCst) {
-                    let pid = pid_slot.load(Ordering::SeqCst);
-                    if !bound_pid && pid != 0 {
-                        // Bind the process to the lease and the ledger
-                        // on its own connection: the runner's is busy
-                        // blocking on the launch.
-                        bound_pid = true;
-                        match gate.bind(&dispatch_id, None, Some(pid)) {
-                            Ok(BindOutcome::Bound) => {}
-                            // A worker binds its own pid to its own
-                            // fresh dispatch, so this cannot happen
-                            // here — but a seat that silently failed to
-                            // bind is the unmanaged launch SPEC §23
-                            // forbids, so it is recorded like the other
-                            // ways a bind can fail rather than ignored.
-                            Ok(BindOutcome::AlreadyBoundToProcess) => record_lost_seat(
-                                seat_lost,
-                                format!(
-                                    "dispatch {dispatch_id} was already bound when pid {pid} \
-                                     tried to bind, so this worker holds no seat of its own"
-                                ),
-                            ),
-                            // The coordinator has no such dispatch: this
-                            // worker holds no seat, no reservation and
-                            // no PID on record, which is the unmanaged
-                            // launch SPEC §23 forbids (A2).
-                            Ok(BindOutcome::UnknownDispatch) => record_lost_seat(
-                                seat_lost,
-                                format!(
-                                    "the coordinator does not know dispatch {dispatch_id}, so \
-                                     pid {pid} holds no seat and no reservation"
-                                ),
-                            ),
-                            // The process was gone before the bind
-                            // reached the coordinator: a worker that
-                            // finished faster than its own heartbeat.
-                            // The lease is still ours and the release
-                            // below ends it.
-                            Ok(BindOutcome::PidNotAlive) => {}
-                            // Unreachable, not disagreeing: the lease
-                            // stands and the reconcile loop owns it.
-                            Err(e) if e.unavailable() => {}
-                            Err(e) => record_lost_seat(seat_lost, e.to_string()),
-                        }
-                        // Best effort, on this thread's own connection:
-                        // the pid is diagnostic detail on a row the
-                        // runner already wrote, and `resume` reconciles
-                        // a dispatch with no pid from the process table.
-                        if let Ok(ledger) = Ledger::open(&ledger_path) {
-                            let _ = ledger.attach_dispatch_process(
-                                &DispatchId::from_stored(dispatch_id.clone()),
-                                Some(Pid::new(pid)),
-                                Some(&session_id),
-                            );
-                        }
-                    }
                     if last.is_none_or(|last| last.elapsed() >= heartbeat_every) {
                         last = Some(Instant::now());
                         match gate.heartbeat(&dispatch_id) {
@@ -1135,15 +1066,6 @@ impl<'a> RunEngine<'a> {
         let _ = gate.release(&spec.dispatch_id);
         let spent = result.usage.cost.micros().map(MicroUsd::to_micros);
         let _ = gate.settle(&spec.dispatch_id, spent);
-        // The worker ran without a seat: its usage is now on the record
-        // and the run stops rather than pretending it was managed.
-        if let Some(detail) = seat_lost.into_inner().unwrap_or_else(|e| e.into_inner()) {
-            return Ok(Err(self.block(
-                Reason::AdmissionRefused,
-                BlockCode::AdmissionRefused,
-                format!("{detail}; the attempt is not a managed dispatch (SPEC §23)"),
-            )?));
-        }
         // The worker ran unheard: whatever it produced is on disk and in
         // the ledger, but nothing could have stopped it, so the run ends
         // interrupted rather than judging a candidate it could not
@@ -1663,7 +1585,6 @@ impl<'a> RunEngine<'a> {
                 )?))
             }
         };
-        let launched_env = crate::backend::worker_launch_env(&self.config.worker_env);
         let assembled = context::assemble(context::ContextInputs {
             contract: self.config.contract,
             repo: self.config.repo_policy,
@@ -1682,10 +1603,6 @@ impl<'a> RunEngine<'a> {
             turn_ceiling: capabilities
                 .map(crate::backend::Capabilities::turn_ceiling)
                 .unwrap_or_default(),
-            // The env the worker is LAUNCHED with, not the base it is
-            // built from: the launch adds the scrub, and the manifest names
-            // exactly what the worker process was given (V4).
-            worker_env: &launched_env,
             resolver: self.config.aval_resolver,
         });
         match assembled {
@@ -2116,13 +2033,9 @@ impl<'a> RunEngine<'a> {
             max_turns: None,
             budget_micros: remaining_budget,
             disallowed_tools: authority.disallowed_tools.clone(),
-            allowed_tools: authority.allowed_tools.clone(),
             work_dir: ctx.worktree_path.to_path_buf(),
-            env: crate::backend::worker_launch_env(&self.config.worker_env),
             wall_timeout: remaining_wall,
             cancel: None,
-            pid_slot: None,
-            tools: ToolSet::ModeDefault,
             agent: AgentKind::Worker,
         };
 
@@ -3848,9 +3761,9 @@ impl<'a> RunEngine<'a> {
             ));
         }
         prompt.push_str(&format!("\ncandidate commit: {}\n", request.candidate_sha));
-        // The patch travels IN the prompt. A reviewer is launched with an
-        // empty allowlist — it reports, it does not act — so a path it
-        // cannot open is a review that cannot happen: the first time this
+        // The patch travels IN the prompt. A reviewer's agent definition
+        // gives it Read, Grep and Glob only — it reports, it does not act —
+        // and a path it cannot open is a review that cannot happen: the first time this
         // prompt told a reviewer to read a file, it spent its whole wall
         // clock being refused and answered nothing at all.
         match read_patch(&request.patch_path, REVIEW_PATCH_BUDGET_BYTES) {
@@ -3913,10 +3826,7 @@ impl<'a> RunEngine<'a> {
             max_turns: None,
             budget_micros: remaining_budget,
             disallowed_tools: request.authority.disallowed_tools.clone(),
-            // The reviewer reports; it gets no allowlist.
-            allowed_tools: Vec::new(),
             work_dir: review_dir,
-            env: self.config.worker_env.clone(),
             // The review is part of acceptance, so it gets a floor of its
             // own rather than whatever the worker left of the run's wall
             // clock: a reviewer handed the one-second remainder is killed
@@ -3927,8 +3837,6 @@ impl<'a> RunEngine<'a> {
                 .saturating_duration_since(Instant::now())
                 .max(REVIEW_MIN_WALL),
             cancel: None,
-            pid_slot: None,
-            tools: purpose.tools(),
             agent: AgentKind::Reviewer,
         };
         let recorded = self.config.ledger.record_dispatch_intent(
@@ -4068,13 +3976,6 @@ struct ReviewSeat<'p> {
 }
 
 impl ReviewPurpose {
-    fn tools(self) -> ToolSet {
-        match self {
-            Self::Patch => ToolSet::ModeDefault,
-            Self::Report => ToolSet::ReadOnly,
-        }
-    }
-
     fn usage_phase(self) -> UsagePhase {
         match self {
             Self::Patch => UsagePhase::Review,
@@ -4988,7 +4889,6 @@ mod tests {
                 git: &crate::workspace::SystemGit,
                 hooks: &crate::verify::FixedInventory(None),
                 attest: &crate::verify::FixedAttest::default(),
-                worker_env: crate::backend::LaunchEnv::default(),
                 artifacts_dir: self.artifacts.clone(),
                 aval_resolver: &resolver,
                 predictor: None,
@@ -5010,25 +4910,6 @@ mod tests {
             machine: &MachineSettings,
             backend: &dyn Backend,
         ) -> RunOutcome {
-            self.execute_with_env(
-                contract,
-                repo,
-                machine,
-                backend,
-                crate::backend::LaunchEnv::default(),
-            )
-        }
-
-        /// `execute_with_machine` with the worker environment the run is
-        /// configured with.
-        fn execute_with_env(
-            &self,
-            contract: &TaskContract,
-            repo: &RepoPolicy,
-            machine: &MachineSettings,
-            backend: &dyn Backend,
-            worker_env: crate::backend::LaunchEnv,
-        ) -> RunOutcome {
             let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
                 adr: "ADR-0001".into(),
                 choice: None,
@@ -5045,7 +4926,6 @@ mod tests {
                 git: &crate::workspace::SystemGit,
                 hooks: &crate::verify::FixedInventory(None),
                 attest: &crate::verify::FixedAttest::default(),
-                worker_env,
                 artifacts_dir: self.artifacts.clone(),
                 aval_resolver: &resolver,
                 predictor: None,
@@ -5106,7 +4986,6 @@ mod tests {
                 git: &crate::workspace::SystemGit,
                 hooks: &crate::verify::FixedInventory(None),
                 attest: &crate::verify::FixedAttest::default(),
-                worker_env: crate::backend::LaunchEnv::default(),
                 artifacts_dir: self.artifacts.clone(),
                 aval_resolver: &resolver,
                 predictor: None,
@@ -6349,7 +6228,6 @@ mod tests {
             git: &crate::workspace::SystemGit,
             hooks: &crate::verify::FixedInventory(None),
             attest: &crate::verify::FixedAttest::default(),
-            worker_env: crate::backend::LaunchEnv::default(),
             artifacts_dir: fixture.artifacts.clone(),
             aval_resolver: &resolver,
             predictor: None,
@@ -7051,7 +6929,7 @@ mod tests {
     }
 
     /// A scripted inspection: the worker reports `report`, and the report
-    /// review, the one launch that asks for read-only tools, answers
+    /// review, the one launch seated as a reviewer, answers
     /// `review`. Every launch is kept, in order.
     fn inspecting_backend(
         report: &'static str,
@@ -7064,9 +6942,10 @@ mod tests {
         let seen = std::sync::Arc::clone(&launches);
         let backend = MockBackend::new(move |spec| {
             seen.lock().expect("launches").push(spec.clone());
-            let answer = match spec.tools {
-                ToolSet::ReadOnly => review,
-                ToolSet::ModeDefault => report,
+            let answer = if spec.agent == AgentKind::Reviewer {
+                review
+            } else {
+                report
             };
             MockOutcome {
                 result_text: Some(answer.into()),
@@ -7288,10 +7167,9 @@ mod tests {
         );
         let launches = launches.lock().expect("launches");
         let (worker, review) = (&launches[0], &launches[1]);
-        assert_eq!(worker.tools, ToolSet::ModeDefault);
-        assert_eq!(review.tools, ToolSet::ReadOnly);
+        assert_eq!(worker.agent, AgentKind::Worker);
+        assert_eq!(review.agent, AgentKind::Reviewer);
         assert_eq!(review.model, worker.model);
-        assert!(review.allowed_tools.is_empty());
         assert!(review.prompt.contains("[1] the entry point is described"));
         assert!(review.prompt.contains("[2] nothing else is claimed"));
         let report = fenced(&review.prompt, "worker report").expect("the report is fenced");
@@ -7357,14 +7235,16 @@ mod tests {
     fn a_report_review_that_cannot_be_dispatched_is_needs_review() {
         let fixture = Fixture::new();
         let repo = fixture.repo_policy(vec![passing_check()], 3);
-        let backend = MockBackend::new(|spec| match spec.tools {
-            ToolSet::ReadOnly => MockOutcome::default(),
-            ToolSet::ModeDefault => MockOutcome {
+        let backend = MockBackend::new(|spec| {
+            if spec.agent == AgentKind::Reviewer {
+                return MockOutcome::default();
+            }
+            MockOutcome {
                 result_text: Some("DONE: the report".into()),
                 exit_code: Some(0),
                 usage: Some(usage(50)),
                 ..Default::default()
-            },
+            }
         });
         let outcome = fixture.execute(&inspect_contract(), &repo, &backend);
         let RunOutcome {
@@ -10215,7 +10095,7 @@ mod tests {
             dispatch_id: &str,
             agent_id: Option<&str>,
             pid: Option<u32>,
-        ) -> Result<BindOutcome, GateError> {
+        ) -> Result<crate::admission::BindOutcome, GateError> {
             self.inner.bind(dispatch_id, agent_id, pid)
         }
         fn heartbeat(
@@ -10798,8 +10678,7 @@ mod tests {
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
-    /// A reviewer has no tools: it is launched with an empty allowlist
-    /// because it reports rather than acts. So the diff it judges has to
+    /// A reviewer reports rather than acts. So the diff it judges has to
     /// be IN the prompt. The first time it was a path instead, the
     /// reviewer spent its whole wall clock being refused and answered
     /// nothing (run-65c118139b020-1000173c4).
@@ -10812,11 +10691,6 @@ mod tests {
         let backend = MockBackend::new(move |spec| {
             seen.lock().unwrap().push(spec.prompt.clone());
             if spec.prompt.contains("semantic reviewer") {
-                assert!(
-                    spec.allowed_tools.is_empty(),
-                    "a reviewer is launched with no allowlist: {:?}",
-                    spec.allowed_tools
-                );
                 assert!(
                     spec.wall_timeout >= REVIEW_MIN_WALL,
                     "the review has its own floor, not the worker's remainder: {:?}",

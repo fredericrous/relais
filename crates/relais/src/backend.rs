@@ -16,7 +16,7 @@
 //! the process plumbing for talking to them.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -151,9 +151,9 @@ pub struct Capabilities {
     /// worker: when the harness cannot take it, the launch fails closed.
     #[serde(default)]
     pub supports_disallowed_tools: bool,
-    /// An explicit settings document (`--settings`), which is how a
-    /// machine-owned permission allowlist reaches the worker without any
-    /// permission-mode flag (SPEC §8).
+    /// Whether the harness accepts an explicit settings document
+    /// (`--settings`). Probed and reported; no dispatch passes one, since
+    /// every dispatch is a native agent of the session.
     #[serde(default)]
     pub supports_settings: bool,
     pub permission_enforcement: PermissionEnforcement,
@@ -216,186 +216,6 @@ pub enum PermissionEnforcement {
     Unknown,
 }
 
-/// The variables a worker process keeps, by exact name. Everything else
-/// is cleared, which is what removes `GIT_DIR`, `GIT_WORK_TREE`,
-/// `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` and
-/// `GIT_ALTERNATE_OBJECT_DIRECTORIES`: inherited from a rebase or a hook
-/// shell they override the working directory, and the worker's `git
-/// commit` lands in the user's repository instead of the owned worktree
-/// (audit V4, the same variables `workspace::git_command` strips).
-///
-/// The list is what `claude -p` needs to start and to reach a provider,
-/// read off Claude Code's own environment-variable and authentication
-/// documentation (code.claude.com/docs/en/env-vars, /authentication,
-/// /network-config) and checked against 2.1.278 with a cleared
-/// environment. A variable that only tunes behaviour is deliberately
-/// absent — the machine's policy decides those, not the operator's shell.
-///
-/// `USER` earns its place the hard way: on macOS, a session signed in
-/// with `/login` keeps its credential in the Keychain, and without
-/// `USER` the CLI reports "Not logged in · Please run /login" however
-/// much of `HOME` and `PATH` it is given.
-pub const WORKER_ENV_ALLOWLIST: &[&str] = &[
-    // The machine, without which nothing runs.
-    "PATH",
-    "HOME",
-    "USER",
-    "LOGNAME",
-    "SHELL",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "TERM",
-    "TMPDIR",
-    "XDG_CONFIG_HOME",
-    "XDG_CACHE_HOME",
-    "XDG_DATA_HOME",
-    // Windows spellings of the same thing. `SYSTEMROOT` is required for
-    // Node's own crypto and socket startup.
-    "SYSTEMROOT",
-    "SYSTEMDRIVE",
-    "WINDIR",
-    "COMSPEC",
-    "PATHEXT",
-    "APPDATA",
-    "LOCALAPPDATA",
-    "PROGRAMDATA",
-    "PROGRAMFILES",
-    "USERPROFILE",
-    "TEMP",
-    "TMP",
-    // Reaching the provider through a corporate network. Node does not
-    // honour `SSL_CERT_FILE`; `NODE_EXTRA_CA_CERTS` is the documented
-    // way to add a CA, and no variable that DISABLES verification is
-    // passed through.
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "NO_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "no_proxy",
-    "NODE_EXTRA_CA_CERTS",
-    // Google Cloud's own spellings, which carry no common prefix.
-    "GCLOUD_PROJECT",
-    "CLOUDSDK_CONFIG",
-];
-
-/// Credential families passed through by prefix: Anthropic's own
-/// (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
-/// `ANTHROPIC_CUSTOM_HEADERS`, the federation variables), Claude Code's
-/// own configuration (`CLAUDE_CODE_USE_BEDROCK`,
-/// `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`), and the clouds
-/// Claude Code can be pointed at (`AWS_*`, `GOOGLE_*`, `CLOUD_ML_REGION`,
-/// `VERTEX_REGION_CLAUDE_*`). A prefix, because which member of a family
-/// is set depends on how the operator signs in, and a worker that cannot
-/// authenticate produces a blocked run nobody can act on.
-pub const WORKER_ENV_PREFIXES: &[&str] = &[
-    "ANTHROPIC_",
-    "CLAUDE_CODE_",
-    "CLAUDE_CONFIG_",
-    "AWS_",
-    "GOOGLE_",
-    "CLOUD_ML_",
-    "VERTEX_",
-];
-
-/// Names that match a passed-through prefix but are still removed: the
-/// worker must not inherit relais's own authority or a budget override
-/// the machine did not set.
-pub const WORKER_ENV_DENIED: &[&str] = &[
-    "CLAUDE_CODE_EXTRA_BUDGET",
-    "RELAIS_CONFIG_DIR",
-    "RELAIS_STATE_DIR",
-    "RELAIS_CLAUDE_BIN",
-];
-
-/// The environment one dispatch runs with — the whole of it. A launch
-/// clears the ambient environment and sets exactly these, so what the
-/// worker inherits is a decision recorded in the context manifest rather
-/// than whatever shell the operator happened to start relais from.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct LaunchEnv {
-    passed: Vec<(String, String)>,
-}
-
-impl LaunchEnv {
-    /// Select the allowed variables out of an environment. Pure: the
-    /// ambient environment is a parameter, so what a worker would
-    /// inherit is testable without touching this process's own.
-    pub fn from_ambient(ambient: &[(String, String)]) -> Self {
-        let mut passed: Vec<(String, String)> = ambient
-            .iter()
-            .filter(|(name, _)| Self::is_allowed(name))
-            .cloned()
-            .collect();
-        passed.sort();
-        passed.dedup_by(|a, b| a.0 == b.0);
-        Self { passed }
-    }
-
-    /// The same selection over this process's real environment: the one
-    /// boundary call, made by the adapter at launch time.
-    pub fn from_process_env() -> Self {
-        Self::from_ambient(&std::env::vars().collect::<Vec<_>>())
-    }
-
-    /// Is this variable one a worker keeps?
-    pub fn is_allowed(name: &str) -> bool {
-        if WORKER_ENV_DENIED.contains(&name) {
-            return false;
-        }
-        WORKER_ENV_ALLOWLIST.contains(&name)
-            || WORKER_ENV_PREFIXES
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
-    }
-
-    /// Name and value, for the launch itself.
-    pub fn vars(&self) -> &[(String, String)] {
-        &self.passed
-    }
-
-    /// This environment with `name` set to `value`, replacing any earlier
-    /// value.
-    pub fn with_var(&self, name: &str, value: &str) -> Self {
-        let mut passed = self.without_var(name).passed;
-        passed.push((name.to_string(), value.to_string()));
-        passed.sort();
-        Self { passed }
-    }
-
-    /// This environment without `name`, whatever the ambient environment
-    /// carried.
-    pub fn without_var(&self, name: &str) -> Self {
-        Self {
-            passed: self
-                .passed
-                .iter()
-                .filter(|(passed, _)| passed != name)
-                .cloned()
-                .collect(),
-        }
-    }
-
-    /// The NAMES only — what the context manifest records. A value here
-    /// is a credential; the manifest says which variables reached the
-    /// worker, never what was in them.
-    pub fn names(&self) -> Vec<String> {
-        self.passed.iter().map(|(name, _)| name.clone()).collect()
-    }
-}
-
-/// The tool set a launch asks the harness for (`--tools`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolSet {
-    /// The launch's own default: nothing at all asked for (allowlist
-    /// mode).
-    ModeDefault,
-    /// `Read,Grep,Glob`: a launch that can look and never
-    /// write or run anything (SPEC §10, the report review).
-    ReadOnly,
-}
-
 /// One model dispatch. The prompt travels via stdin; arguments are an
 /// argv array; the working directory is the owned task worktree.
 #[derive(Debug, Clone)]
@@ -407,40 +227,15 @@ pub struct LaunchSpec {
     pub max_turns: Option<u32>,
     pub budget_micros: Option<i64>,
     pub disallowed_tools: Vec<String>,
-    /// Machine-owned permission rules the worker may use without asking
-    /// (a print-mode harness cannot ask). Explicit and reviewed, never a
-    /// bypass: a tool outside this list is still denied (SPEC §8).
-    pub allowed_tools: Vec<String>,
     pub work_dir: PathBuf,
-    /// Everything the worker process's environment will contain. The
-    /// adapter clears the ambient environment and sets these; an empty
-    /// one is a worker with no environment at all, never an inherited one.
-    pub env: LaunchEnv,
     pub wall_timeout: Duration,
     /// Set by the runner when the coordinator cancels this dispatch; the
     /// adapter kills the process group and reports `cancelled`
     /// (SPEC §20: the adapter contract includes cancellation).
     pub cancel: Option<Arc<AtomicBool>>,
-    /// Receives the child PID as soon as it exists, so the runner can
-    /// bind it to the lease and the ledger while the worker runs
-    /// (SPEC §12: persist the PID after the dispatch intent).
-    pub pid_slot: Option<Arc<AtomicU32>>,
-    /// The tools the harness is asked to expose.
-    pub tools: ToolSet,
     /// What kind of agent this dispatch is: the native agent definition it
     /// runs as, and the kind its run events name.
     pub agent: crate::protocol::AgentKind,
-}
-
-/// The environment variable that makes Claude Code strip provider
-/// credentials from the subprocesses it starts. A worker's launch sets it.
-pub const SUBPROCESS_ENV_SCRUB: &str = "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB";
-
-/// The environment one WORKER dispatch runs with: `base` plus the scrub.
-/// The context manifest records the worker env by NAME from this too, so
-/// the recorded names and the launched ones are one fact.
-pub fn worker_launch_env(base: &LaunchEnv) -> LaunchEnv {
-    base.with_var(SUBPROCESS_ENV_SCRUB, "1")
 }
 
 /// What the harness said one dispatch cost. `inclusive` describes a
@@ -679,29 +474,6 @@ mod tests {
         EffortId::parse(name).expect("a valid effort identifier")
     }
 
-    fn ambient() -> LaunchEnv {
-        LaunchEnv::from_ambient(&[
-            ("PATH".to_string(), "/usr/bin".to_string()),
-            ("TMPDIR".to_string(), "/var/tmp".to_string()),
-            (SUBPROCESS_ENV_SCRUB.to_string(), "0".to_string()),
-        ])
-    }
-
-    fn value_of(env: &LaunchEnv, name: &str) -> Option<String> {
-        env.vars()
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, v)| v.clone())
-    }
-
-    #[test]
-    fn workers_run_with_the_credential_scrub() {
-        let env = worker_launch_env(&ambient());
-        assert_eq!(value_of(&env, SUBPROCESS_ENV_SCRUB).as_deref(), Some("1"));
-        assert_eq!(value_of(&env, "TMPDIR").as_deref(), Some("/var/tmp"));
-        assert_eq!(value_of(&env, "PATH").as_deref(), Some("/usr/bin"));
-    }
-
     #[test]
     fn an_effort_is_refused_by_name_unless_the_cli_fact_cannot_say() {
         let known = Fact::Known(vec![effort("low"), effort("high")]);
@@ -909,65 +681,6 @@ mod tests {
                 requested: "sonnet".into(),
                 effective: "claude-fable-5-1".into(),
             }
-        );
-    }
-
-    /// V4: the worker's environment is chosen, not inherited. The git
-    /// variables that redirect a commit into the user's repository are
-    /// gone because nothing but the allowlist survives.
-    #[test]
-    fn a_worker_keeps_the_allowlist_and_nothing_else() {
-        let ambient: Vec<(String, String)> = [
-            ("PATH", "/usr/bin"),
-            ("HOME", "/home/dev"),
-            ("ANTHROPIC_API_KEY", "sk-secret"),
-            ("CLAUDE_CODE_USE_BEDROCK", "1"),
-            ("AWS_PROFILE", "work"),
-            ("HTTPS_PROXY", "http://proxy:3128"),
-            ("GIT_DIR", "/elsewhere/.git"),
-            ("GIT_INDEX_FILE", "/elsewhere/.git/index"),
-            ("GIT_WORK_TREE", "/elsewhere"),
-            ("CLAUDE_CODE_EXTRA_BUDGET", "999"),
-            ("RELAIS_STATE_DIR", "/run/relais"),
-            ("MY_SECRET_TOKEN", "hunter2"),
-        ]
-        .iter()
-        .map(|(name, value)| (name.to_string(), value.to_string()))
-        .collect();
-
-        let env = LaunchEnv::from_ambient(&ambient);
-        let names = env.names();
-        for kept in [
-            "PATH",
-            "HOME",
-            "ANTHROPIC_API_KEY",
-            "CLAUDE_CODE_USE_BEDROCK",
-            "AWS_PROFILE",
-            "HTTPS_PROXY",
-        ] {
-            assert!(names.contains(&kept.to_string()), "{kept} in {names:?}");
-        }
-        for removed in [
-            "GIT_DIR",
-            "GIT_INDEX_FILE",
-            "GIT_WORK_TREE",
-            "CLAUDE_CODE_EXTRA_BUDGET",
-            "RELAIS_STATE_DIR",
-            "MY_SECRET_TOKEN",
-        ] {
-            assert!(
-                !names.contains(&removed.to_string()),
-                "{removed} must not reach the worker: {names:?}"
-            );
-        }
-        assert_eq!(
-            env.vars().len(),
-            names.len(),
-            "every passed variable carries its value"
-        );
-        assert!(
-            LaunchEnv::from_ambient(&[]).names().is_empty(),
-            "an empty environment passes nothing, rather than falling back to the ambient one"
         );
     }
 }

@@ -2763,10 +2763,6 @@ fn run_command(
     let aval_resolver = relais::context::AvalCli::new(root.clone());
     let hooks = relais::verify::AmontCli::new();
     let attest = relais::verify::AmontCli::new();
-    // What every worker this run dispatches will have in its
-    // environment: an allowlist of this process's own, never the whole
-    // of it (SPEC §8).
-    let worker_env = relais::backend::LaunchEnv::from_process_env();
     // Managed dispatch is the only path `relais run` takes: a missing
     // coordinator blocks the run rather than launching unmanaged
     // (SPEC §23).
@@ -2917,7 +2913,6 @@ fn run_command(
         git: &git,
         hooks: &hooks,
         attest: &attest,
-        worker_env,
         artifacts_dir: artifacts_dir.clone(),
         aval_resolver: &aval_resolver,
         predictor: predictor
@@ -3289,7 +3284,6 @@ fn replay_command(
     let aval_resolver = relais::context::AvalCli::new(checkout_dir.clone());
     let hooks = relais::verify::AmontCli::new();
     let attest = relais::verify::AmontCli::new();
-    let worker_env = relais::backend::LaunchEnv::from_process_env();
     let prices = load_price_table()?;
     if let Some(blocked) = pricing_preflight(
         "relais dataset replay",
@@ -3333,7 +3327,6 @@ fn replay_command(
         git: &git,
         hooks: &hooks,
         attest: &attest,
-        worker_env,
         artifacts_dir: artifacts_dir.clone(),
         aval_resolver: &aval_resolver,
         predictor: None,

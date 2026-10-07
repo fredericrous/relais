@@ -709,7 +709,6 @@ fn run_package(
         git: engine.config.git,
         hooks: engine.config.hooks,
         attest: engine.config.attest,
-        worker_env: engine.config.worker_env.clone(),
         // The package's artifacts hang off the root run's; its
         // worktrees hang off THEIR parent, so a package worker's tree
         // sits under `packages/worktrees/<child-run>/` and no package's
@@ -1170,17 +1169,12 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
             tools.extend(["Edit".to_string(), "Write".to_string()]);
             tools
         },
-        // The planner reads; it gets no allowlist.
-        allowed_tools: Vec::new(),
         work_dir: engine.config.repo_dir.to_path_buf(),
-        env: engine.config.worker_env.clone(),
         wall_timeout: root
             .deadline
             .saturating_duration_since(Instant::now())
             .max(Duration::from_secs(1)),
         cancel: None,
-        pid_slot: None,
-        tools: crate::backend::ToolSet::ModeDefault,
         agent: AgentKind::Planner,
     };
     let budget = Budget {
@@ -1364,7 +1358,6 @@ mod tests {
             verification_profile: crate::policy::VerificationProfile::default(),
             review_floor: Review::Off,
             disallowed_tools: Vec::new(),
-            allowed_tools: Vec::new(),
             authority_hash: "hash".into(),
             grant_key: "key".into(),
             trust_granted: true,

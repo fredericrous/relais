@@ -25,6 +25,15 @@ missing here.
   --record <dir>`, which captures one payload, stays. A run's usage is always
   the price table's estimate. Ledgers written by a headless relais still read.
 
+- Everything that only configured a relais-launched process. `[permissions]
+  allowed_tools` in `machine.toml` is no longer read (it still parses, your trust
+  grants stay valid, and `relais doctor` says so): a native agent uses the tools
+  its agent definition names and the session's permissions. The worker
+  environment allowlist and its credential scrub are gone too: the agent inherits
+  the session's environment, so a new context manifest records no `worker_env`
+  and `env_protection` `session`. Manifests written before still read.
+  `disallowed_tools` stays.
+
 ### Changed
 
 - A spending `relais dataset replay` runs inside a Claude Code session too:

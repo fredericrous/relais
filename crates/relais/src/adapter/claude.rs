@@ -150,7 +150,7 @@ impl ClaudeBackend {
         let mut command = Command::new(&self.binary);
         command.args(args);
         let named = args.join(" ");
-        let end = run_with_timeout(command, PROBE_TIMEOUT, None, cancel, None).map_err(|e| {
+        let end = run_with_timeout(command, PROBE_TIMEOUT, None, cancel).map_err(|e| {
             ProbeFailure::NotRun {
                 args: named.clone(),
                 detail: e.to_string(),

@@ -697,13 +697,9 @@ mod tests {
             max_turns: None,
             budget_micros: None,
             disallowed_tools: Vec::new(),
-            allowed_tools: Vec::new(),
             work_dir: PathBuf::from("/trees/task"),
-            env: crate::backend::LaunchEnv::default(),
             wall_timeout: Duration::from_secs(60),
             cancel: None,
-            pid_slot: None,
-            tools: crate::backend::ToolSet::ModeDefault,
             agent: AgentKind::Worker,
         }
     }

@@ -11,7 +11,7 @@ use std::io;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -511,7 +511,6 @@ pub fn run_with_timeout(
     wall_timeout: Duration,
     stdin_bytes: Option<Vec<u8>>,
     cancel: Option<&AtomicBool>,
-    pid_slot: Option<&AtomicU32>,
 ) -> Result<ProcessEnd, RunError> {
     command.stdin(
         stdin_bytes
@@ -522,9 +521,6 @@ pub fn run_with_timeout(
     command.stderr(Stdio::piped());
     own_process_group(&mut command);
     let mut child = command.spawn().map_err(RunError::Spawn)?;
-    if let Some(slot) = pid_slot {
-        slot.store(child.id(), Ordering::SeqCst);
-    }
 
     let prompt = stdin_bytes.map(|bytes| {
         let mut stdin = child.stdin.take().expect("stdin is piped when bytes exist");
@@ -1176,16 +1172,7 @@ mod tests {
     fn run_with_timeout_kills_slow_children() {
         let command = slow_child();
         let started = Instant::now();
-        let pid_slot = AtomicU32::new(0);
-        let end = run_with_timeout(
-            command,
-            Duration::from_millis(300),
-            None,
-            None,
-            Some(&pid_slot),
-        )
-        .expect("runs");
-        assert_ne!(pid_slot.load(Ordering::SeqCst), 0, "the PID was published");
+        let end = run_with_timeout(command, Duration::from_millis(300), None, None).expect("runs");
         assert_eq!(
             end.ended,
             Ended::TimedOut,
@@ -1209,8 +1196,8 @@ mod tests {
             flag.store(true, Ordering::SeqCst);
         });
         let started = Instant::now();
-        let end = run_with_timeout(command, Duration::from_secs(30), None, Some(&cancel), None)
-            .expect("runs");
+        let end =
+            run_with_timeout(command, Duration::from_secs(30), None, Some(&cancel)).expect("runs");
         assert_eq!(
             end.ended,
             Ended::Cancelled,
@@ -1233,8 +1220,7 @@ mod tests {
         let mut command = Command::new("sh");
         command.args(["-c", "echo started; sleep 30 & exit 0"]);
         let started = Instant::now();
-        let end =
-            run_with_timeout(command, Duration::from_secs(120), None, None, None).expect("runs");
+        let end = run_with_timeout(command, Duration::from_secs(120), None, None).expect("runs");
         assert_eq!(end.ended, Ended::Exited(0), "the child itself succeeded");
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -1262,8 +1248,7 @@ mod tests {
         let mut command = Command::new("cmd");
         command.args(["/C", "echo started & start /b ping -n 60 127.0.0.1 > NUL"]);
         let started = Instant::now();
-        let end =
-            run_with_timeout(command, Duration::from_secs(120), None, None, None).expect("runs");
+        let end = run_with_timeout(command, Duration::from_secs(120), None, None).expect("runs");
         assert_eq!(end.ended, Ended::Exited(0), "the child itself succeeded");
         assert!(
             started.elapsed() < PIPE_DRAIN_GRACE * 4,
@@ -1284,8 +1269,7 @@ mod tests {
     fn a_child_that_spawned_nothing_leaves_an_empty_group() {
         let mut command = Command::new("sh");
         command.args(["-c", "exit 0"]);
-        let end =
-            run_with_timeout(command, Duration::from_secs(10), None, None, None).expect("runs");
+        let end = run_with_timeout(command, Duration::from_secs(10), None, None).expect("runs");
         assert_eq!(end.ended, Ended::Exited(0));
         assert_eq!(end.group, GroupKill::NothingLeft);
         assert!(end.group.describe().contains("nothing left"));
@@ -1301,7 +1285,7 @@ mod tests {
         // than any pipe buffer, so the write cannot complete.
         command.args(["-c", "exit 0"]);
         let prompt = vec![b'x'; 4 * 1024 * 1024];
-        let error = run_with_timeout(command, Duration::from_secs(30), Some(prompt), None, None)
+        let error = run_with_timeout(command, Duration::from_secs(30), Some(prompt), None)
             .expect_err("a prompt that was not delivered is a failed launch");
         assert!(
             matches!(error, RunError::PromptWrite(_)),
@@ -1326,7 +1310,6 @@ mod tests {
             Duration::from_secs(30),
             Some(vec![b'y'; 4 * 1024 * 1024]),
             Some(&cancel),
-            None,
         )
         .expect("a cancelled run is reported, not failed");
         assert_eq!(end.ended, Ended::Cancelled);
@@ -1340,7 +1323,6 @@ mod tests {
             command,
             Duration::from_secs(10),
             Some(b"prompt-bytes".to_vec()),
-            None,
             None,
         )
         .expect("runs");

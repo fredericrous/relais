@@ -867,22 +867,19 @@ impl TrustGrant {
 /// the deny floor: [`effective_disallowed_tools`] unions the two, so
 /// `disallowed_tools = []` still denies commit, merge, push, rebase,
 /// reset and tag.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Permissions {
     /// Extra denials, on top of [`default_disallowed_tools`]. Never
     /// read on its own — read [`effective_disallowed_tools`].
     #[serde(default = "default_disallowed_tools")]
     pub disallowed_tools: Vec<String>,
-    /// Claude Code permission rules the worker is granted, passed via
-    /// `--settings` (`{"permissions":{"allow":[…]}}`) — "Edit", "Write",
-    /// "Bash(cargo test:*)" and the like. Machine-owned and machine-owned
-    /// only: repo policy never appears here, so a repository cannot widen
-    /// what its own workers may do (SPEC §8). Empty by default: with no
-    /// grant a `change` worker is denied `Edit`/`Write` by the harness and
-    /// the attempt ends blocked rather than silently doing nothing.
-    #[serde(default)]
-    pub allowed_tools: Vec<String>,
+    /// `allowed_tools` as written, kept and never read: a native agent
+    /// uses the tools its agent definition names and the session's
+    /// permissions, so a machine.toml that still has the key keeps parsing,
+    /// with any value. `doctor` reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<toml::Value>,
 }
 
 /// The deny floor (SPEC §8: "a worker cannot commit, merge, push or
@@ -905,8 +902,9 @@ pub struct Permissions {
 /// enumerates that. What actually holds is downstream: relais snapshots
 /// the candidate itself, judges the diff against the declared scope,
 /// and never integrates anything — a worker that did manage to commit
-/// has changed nothing about what gets accepted. Strong confinement
-/// needs the separately configured OS/container backend §8 describes.
+/// has changed nothing about what gets accepted. Stronger confinement is
+/// the Claude Code session's own sandbox, which every dispatch runs under
+/// (§8).
 ///
 /// `Agent` and `Task` (its legacy name) are denied for a different reason:
 /// model choice belongs to the route. MEASURED 2026-09-28
@@ -955,7 +953,7 @@ impl Default for Permissions {
     fn default() -> Self {
         Self {
             disallowed_tools: default_disallowed_tools(),
-            allowed_tools: Vec::new(),
+            allowed_tools: None,
         }
     }
 }
@@ -1363,10 +1361,6 @@ pub struct EffectiveAuthority {
     pub verification_profile: VerificationProfile,
     pub review_floor: Review,
     pub disallowed_tools: Vec<String>,
-    /// Machine-owned permission grant handed to the worker via
-    /// `--settings`. Repo policy contributes nothing: authority here only
-    /// narrows, and a repository cannot broaden its own workers' reach.
-    pub allowed_tools: Vec<String>,
     /// The hash of the repository's executable declaration.
     pub authority_hash: String,
     /// The machine.toml key a grant for THIS declaration in THIS
@@ -1521,7 +1515,6 @@ pub fn effective_authority(
         verification_profile: profile,
         review_floor,
         disallowed_tools: effective_disallowed_tools(&machine.permissions),
-        allowed_tools: machine.permissions.allowed_tools.clone(),
         authority_hash,
         grant_key,
         trust_granted,
@@ -2134,7 +2127,7 @@ keys = ["output.contract"]
     fn a_machine_deny_list_adds_to_the_floor_without_duplicating_it() {
         let extra = Permissions {
             disallowed_tools: vec!["Bash(git push:*)".into(), "WebFetch".into()],
-            allowed_tools: Vec::new(),
+            allowed_tools: None,
         };
         let effective = effective_disallowed_tools(&extra);
         assert_eq!(
@@ -2382,25 +2375,34 @@ keys = ["output.contract"]
         }
     }
 
+    /// `[permissions] allowed_tools` is no longer read (a native agent uses
+    /// the tools its agent definition names), but a machine.toml that still
+    /// has it keeps parsing, keeps its trust grant valid, and moves nothing.
     #[test]
-    fn allowed_tools_are_machine_owned_and_empty_by_default() {
+    fn a_retired_allowed_tools_key_still_parses_and_keeps_its_grant() {
         let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
-        let machine =
+        let without =
             MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo))).expect("parses");
-        assert!(machine.permissions.allowed_tools.is_empty());
-        let a = authority(&repo, &machine);
-        assert!(a.allowed_tools.is_empty(), "no grant, no tools");
+        assert!(without.permissions.allowed_tools.is_none());
 
-        let granted = MachineSettings::from_toml_str(&machine_toml(&format!(
+        let with = MachineSettings::from_toml_str(&machine_toml(&format!(
             "{}\n[permissions]\nallowed_tools = [\"Edit\", \"Write\", \"Bash(cargo test:*)\"]\n",
             grant_for(&repo)
         )))
         .expect("parses");
-        let a = authority(&repo, &granted);
-        assert_eq!(a.allowed_tools, ["Edit", "Write", "Bash(cargo test:*)"]);
+        assert!(with.permissions.allowed_tools.is_some(), "the key is kept");
+
+        let before = authority(&repo, &without);
+        let after = authority(&repo, &with);
+        assert!(after.trust_granted, "the grant issued before still admits");
+        assert_eq!(after.authority_hash, before.authority_hash);
+        assert_eq!(after.grant_key, before.grant_key);
+        assert_eq!(after.disallowed_tools, before.disallowed_tools);
         assert!(
-            a.disallowed_tools.contains(&"Bash(git push:*)".to_string()),
-            "naming allowed tools never shortens the deny floor"
+            after
+                .disallowed_tools
+                .contains(&"Bash(git push:*)".to_string()),
+            "the deny floor stays"
         );
     }
 

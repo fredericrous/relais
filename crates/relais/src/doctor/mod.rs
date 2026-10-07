@@ -283,6 +283,26 @@ pub(crate) fn sandbox_finding(settings: &MachineSettings) -> Option<Finding> {
     })
 }
 
+/// What the `permissions` finding says when machine.toml still has
+/// `[permissions] allowed_tools`: a native agent uses the tools its agent
+/// definition names, so the key is parsed and ignored.
+const ALLOWED_TOOLS_NOT_READ: &str = "[permissions] allowed_tools in machine.toml is no longer \
+     read: native agents use the tools their agent definition names and the session's permissions";
+
+/// The `permissions` finding for a machine.toml that has `allowed_tools`,
+/// and none for one that does not.
+pub(crate) fn permissions_finding(settings: &MachineSettings) -> Option<Finding> {
+    settings
+        .permissions
+        .allowed_tools
+        .as_ref()
+        .map(|_| Finding {
+            component: "permissions",
+            level: Level::Warn,
+            detail: ALLOWED_TOOLS_NOT_READ.to_string(),
+        })
+}
+
 /// Words wrapped to `width` columns; continuation lines start with
 /// `indent`. A word longer than a line is broken across lines.
 fn wrap(text: &str, width: usize, indent: &str) -> Vec<String> {
@@ -1031,6 +1051,7 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
                     effort_settings = settings.efforts.clone();
                     max_effort = settings.routing.max_effort.clone();
                     findings.extend(sandbox_finding(&settings));
+                    findings.extend(permissions_finding(&settings));
                     pricing = match &settings.pricing {
                         Some(table) => PricingConfig::Table(table.clone()),
                         None => PricingConfig::Unconfigured,
@@ -1208,7 +1229,6 @@ fn stage_and_run(command: &str, config_dir: &Path, state_dir: &Path) -> HookHeal
         process,
         Duration::from_secs(10),
         Some(hook_probe_payload()),
-        None,
         None,
     ) {
         Ok(end) => hook_health_from_probe(&end),
@@ -3094,6 +3114,25 @@ mod tests {
         assert!(report.render().contains(sentence), "{}", report.render());
         let json = serde_json::to_value(&report).expect("serializes");
         assert_eq!(json["findings"][0]["component"], "sandbox");
+        assert_eq!(json["findings"][0]["detail"], sentence);
+    }
+
+    #[test]
+    fn an_allowed_tools_key_is_reported_as_no_longer_read() {
+        assert!(permissions_finding(&machine_with("")).is_none());
+        let machine = machine_with("[permissions]\nallowed_tools = [\"Edit\"]\n");
+        let finding = permissions_finding(&machine).expect("a finding");
+        let sentence = "[permissions] allowed_tools in machine.toml is no longer read: native \
+                        agents use the tools their agent definition names and the session's \
+                        permissions";
+        assert_eq!(finding.level, Level::Warn);
+        assert_eq!(finding.detail, sentence);
+        let report = DoctorReport {
+            findings: vec![finding],
+        };
+        assert!(report.render().contains(sentence), "{}", report.render());
+        let json = serde_json::to_value(&report).expect("serializes");
+        assert_eq!(json["findings"][0]["component"], "permissions");
         assert_eq!(json["findings"][0]["detail"], sentence);
     }
 }

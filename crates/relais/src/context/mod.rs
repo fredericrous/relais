@@ -191,8 +191,7 @@ pub fn aval_resolve(
     if let Some(scope) = scope {
         command.arg("--scope").arg(scope);
     }
-    match crate::procs::run_with_timeout(command, crate::tooling::PROBE_TIMEOUT, None, cancel, None)
-    {
+    match crate::procs::run_with_timeout(command, crate::tooling::PROBE_TIMEOUT, None, cancel) {
         Ok(end) => match end.ended {
             crate::procs::Ended::Exited(code) => parse_aval_output(code, &end.stdout),
             other => AvalVerdict::ToolFailure {
@@ -446,9 +445,9 @@ pub struct ContextManifest {
     /// pointed at more than this manifest records.
     #[serde(default)]
     pub truncated_hints: Vec<String>,
-    /// The environment variables the worker process was given, by NAME.
-    /// Never their values — several of them are credentials — but which
-    /// ones reached the worker is part of what the run was (audit V4).
+    /// The environment variables a relais-launched worker was given, by
+    /// NAME. A new manifest records none: the agent inherits the session's
+    /// environment. Kept so an older manifest, which lists names, parses.
     #[serde(default)]
     pub worker_env: Vec<String>,
     pub architecture: ArchitectureEvidence,
@@ -477,10 +476,10 @@ pub struct ContextManifest {
     /// What confines each way the worker can act on the machine.
     #[serde(default)]
     pub confinement: Confinement,
-    /// How the worker's environment credentials are kept from its
-    /// subprocesses: `scrub` (`credentials-deny` in a manifest written
-    /// under the OS sandbox).
-    /// Empty in a manifest written before this was recorded.
+    /// How the worker's environment is kept from its subprocesses: `session`
+    /// in a new manifest (the agent inherits the session's environment),
+    /// `scrub` or `credentials-deny` in an older one, empty in one written
+    /// before this was recorded.
     #[serde(default)]
     pub env_protection: String,
 }
@@ -491,10 +490,12 @@ pub struct SandboxRecord {
     pub verified: Option<String>,
 }
 
-/// The mechanism that bounds each channel: `os` (the OS sandbox),
+/// The mechanism that bounds each channel: `session` (the Claude Code
+/// session's own sandbox and permissions, which a native agent runs
+/// under). Older manifests hold `os` (relais's former OS sandbox),
 /// `worktree` (the file tools' own path rule), `allowlist` (permission
-/// rules) or `none`. Empty fields are a manifest from before this was
-/// recorded.
+/// rules relais once passed) or `none`; empty fields are a manifest from
+/// before this was recorded.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Confinement {
     pub bash: String,
@@ -504,16 +505,16 @@ pub struct Confinement {
 }
 
 impl Confinement {
-    /// The permission rules bound every channel: the only confinement
-    /// relais itself applies.
-    fn allowlist() -> Self {
+    /// The session bounds every channel: relais applies no confinement of
+    /// its own to a native agent.
+    fn session() -> Self {
         let all = |mechanism: &str| Self {
             bash: mechanism.into(),
             file_tools: mechanism.into(),
             web: mechanism.into(),
             mcp: mechanism.into(),
         };
-        all("allowlist")
+        all("session")
     }
 }
 
@@ -528,9 +529,6 @@ pub struct ContextInputs<'a> {
     /// Whether the harness this run will dispatch on can take a turn
     /// ceiling (`crate::backend::TurnCeiling`).
     pub turn_ceiling: crate::backend::TurnCeiling,
-    /// The environment the worker will run with: its variable names go
-    /// into the manifest.
-    pub worker_env: &'a crate::backend::LaunchEnv,
     /// The decision corpus, as a port, so tests supply verdicts without
     /// invoking the real binary.
     pub resolver: &'a dyn DecisionResolver,
@@ -550,7 +548,6 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         fingerprints,
         tool_versions,
         turn_ceiling,
-        worker_env,
         resolver,
     } = inputs;
 
@@ -654,7 +651,8 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         tool_versions,
         fingerprints: fingerprints.files(),
         truncated_hints: fingerprints.truncated_hints(),
-        worker_env: worker_env.names(),
+        // The agent inherits the session's environment; relais names none.
+        worker_env: Vec::new(),
         architecture: ArchitectureEvidence { resolved },
         verification_profile: contract.verification_profile.clone(),
         constraints: constraints.clone(),
@@ -662,8 +660,8 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         package_bytes,
         turn_ceiling: turn_ceiling.as_str().to_string(),
         sandbox: SandboxRecord::default(),
-        confinement: Confinement::allowlist(),
-        env_protection: "scrub".to_string(),
+        confinement: Confinement::session(),
+        env_protection: "session".to_string(),
     };
 
     if manifest.package_bytes > manifest.budget_bytes {
@@ -715,20 +713,10 @@ mod tests {
         RepoPolicy::from_toml_str(crate::policy::INIT_TEMPLATE).expect("policy parses")
     }
 
-    /// The environment a worker in these tests would run with.
-    fn worker_env() -> crate::backend::LaunchEnv {
-        crate::backend::LaunchEnv::from_ambient(&[
-            ("PATH".to_string(), "/usr/bin".to_string()),
-            ("ANTHROPIC_API_KEY".to_string(), "sk-not-real".to_string()),
-            ("GIT_DIR".to_string(), "/elsewhere/.git".to_string()),
-        ])
-    }
-
     fn inputs<'a>(
         contract: &'a TaskContract,
         repo: &'a RepoPolicy,
         resolver: &'a dyn DecisionResolver,
-        env: &'a crate::backend::LaunchEnv,
     ) -> ContextInputs<'a> {
         ContextInputs {
             contract,
@@ -753,7 +741,6 @@ mod tests {
                 claude_code: None,
             },
             turn_ceiling: crate::backend::TurnCeiling::Unavailable,
-            worker_env: env,
             resolver,
         }
     }
@@ -828,7 +815,7 @@ mod tests {
     fn active_decisions_assemble_into_constraints() {
         let c = contract(&["storage.object-store"]);
         let r = repo();
-        let manifest = assemble(inputs(&c, &r, &active, &worker_env())).expect("assembles");
+        let manifest = assemble(inputs(&c, &r, &active)).expect("assembles");
         assert_eq!(manifest.architecture.resolved.len(), 1);
         assert_eq!(manifest.constraints.len(), 1);
         assert_eq!(manifest.base_sha, "deadbeef");
@@ -842,7 +829,7 @@ mod tests {
         let c = contract(&["api.gateway"]);
         let r = repo();
         let contradiction = |_: &str, _: Option<&str>| AvalVerdict::Contradiction { heads: 2 };
-        let err = assemble(inputs(&c, &r, &contradiction, &worker_env())).unwrap_err();
+        let err = assemble(inputs(&c, &r, &contradiction)).unwrap_err();
         assert_eq!(
             err,
             ContextError::ContradictionBlocked {
@@ -858,10 +845,10 @@ mod tests {
         let r = repo();
         // No keys: an unrelated undecided key cannot block anything.
         let undecided = |_: &str, _: Option<&str>| AvalVerdict::Undecided;
-        assemble(inputs(&c, &r, &undecided, &worker_env())).expect("no keys means no dependency");
+        assemble(inputs(&c, &r, &undecided)).expect("no keys means no dependency");
 
         let dependent = contract(&["api.gateway"]);
-        let err = assemble(inputs(&dependent, &r, &undecided, &worker_env())).unwrap_err();
+        let err = assemble(inputs(&dependent, &r, &undecided)).unwrap_err();
         assert!(matches!(err, ContextError::NeedsDecision { .. }), "{err:?}");
     }
 
@@ -873,7 +860,7 @@ mod tests {
             exit: 3,
             detail: "unreadable".into(),
         };
-        let err = assemble(inputs(&c, &r, &broken, &worker_env())).unwrap_err();
+        let err = assemble(inputs(&c, &r, &broken)).unwrap_err();
         assert!(matches!(err, ContextError::ToolFailure { .. }), "{err:?}");
     }
 
@@ -888,7 +875,7 @@ mod tests {
             }],
         };
         let c = contract(&[]);
-        let manifest = assemble(inputs(&c, &r, &active, &worker_env())).expect("assembles");
+        let manifest = assemble(inputs(&c, &r, &active)).expect("assembles");
         assert_eq!(
             manifest.architecture.resolved[0].0, "output.contract",
             "mapping keys are resolved when the declared scope could touch their paths"
@@ -912,7 +899,7 @@ mod tests {
             choice: None,
             reason: None,
         };
-        let err = assemble(inputs(&c, &r, &big, &worker_env())).unwrap_err();
+        let err = assemble(inputs(&c, &r, &big)).unwrap_err();
         assert!(
             matches!(err, ContextError::SizingProblem { required_bytes, budget_bytes }
                 if required_bytes > budget_bytes),
@@ -928,7 +915,7 @@ mod tests {
         // Smaller than the objective alone: the old check counted only
         // constraints, of which this task has none, and passed.
         r.context.budget_bytes = 64;
-        let err = assemble(inputs(&c, &r, &active, &worker_env())).unwrap_err();
+        let err = assemble(inputs(&c, &r, &active)).unwrap_err();
         assert_eq!(
             err,
             ContextError::SizingProblem {
@@ -946,7 +933,7 @@ mod tests {
         // The same task fits under a budget the repository raised, and
         // the manifest carries both numbers as evidence.
         r.context.budget_bytes = 4096;
-        let manifest = assemble(inputs(&c, &r, &active, &worker_env())).expect("assembles");
+        let manifest = assemble(inputs(&c, &r, &active)).expect("assembles");
         assert_eq!(manifest.budget_bytes, 4096);
         assert!(manifest.package_bytes >= c.objective.len());
         assert_eq!(
@@ -958,8 +945,7 @@ mod tests {
     fn manifest() -> ContextManifest {
         let c = contract(&[]);
         let r = repo();
-        let env = worker_env();
-        assemble(inputs(&c, &r, &active, &env)).expect("assembles")
+        assemble(inputs(&c, &r, &active)).expect("assembles")
     }
 
     #[test]
@@ -978,9 +964,9 @@ mod tests {
             &manifest.confinement.web,
             &manifest.confinement.mcp,
         ] {
-            assert_eq!(channel, "allowlist");
+            assert_eq!(channel, "session");
         }
-        assert_eq!(manifest.env_protection, "scrub");
+        assert_eq!(manifest.env_protection, "session");
     }
 
     /// A manifest a sandboxed run stored still parses, its record as written.
@@ -1015,23 +1001,25 @@ mod tests {
         assert_eq!(parsed.env_protection, "");
     }
 
-    /// V4: which variables reached the worker is part of what the run
-    /// was — and the manifest carries the names, never the values.
+    /// The agent inherits the session's environment, so a new manifest names
+    /// no variable and records `session`.
     #[test]
-    fn the_manifest_names_the_environment_the_worker_was_given() {
-        let c = contract(&[]);
-        let r = repo();
-        let manifest = assemble(inputs(&c, &r, &active, &worker_env())).expect("assembles");
-        assert_eq!(
-            manifest.worker_env,
-            vec!["ANTHROPIC_API_KEY".to_string(), "PATH".to_string()],
-            "the allowlisted names, and the ambient GIT_DIR is not among them"
-        );
-        let rendered = serde_json::to_string(&manifest).expect("serializes");
-        assert!(
-            !rendered.contains("sk-not-real"),
-            "a manifest records names, never credentials"
-        );
+    fn a_new_manifest_names_no_worker_environment() {
+        let manifest = manifest();
+        assert!(manifest.worker_env.is_empty());
+        assert_eq!(manifest.env_protection, "session");
+    }
+
+    /// A manifest a relais-launched worker stored, with the names it was
+    /// given and `scrub`, still parses as written.
+    #[test]
+    fn a_manifest_stored_with_worker_env_names_and_scrub_still_parses() {
+        let mut stored = serde_json::to_value(manifest()).expect("json");
+        stored["worker_env"] = serde_json::json!(["ANTHROPIC_API_KEY", "PATH"]);
+        stored["env_protection"] = serde_json::json!("scrub");
+        let parsed: ContextManifest = serde_json::from_value(stored).expect("still parses");
+        assert_eq!(parsed.worker_env, ["ANTHROPIC_API_KEY", "PATH"]);
+        assert_eq!(parsed.env_protection, "scrub");
     }
 
     /// V15: a read hint that resolves to nothing used to contribute no

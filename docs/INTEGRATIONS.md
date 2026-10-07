@@ -144,7 +144,7 @@ machine that added `disallowed_tools = ["Agent", "Task"]` to `machine.toml`
 by hand (as v0.6.0's Upgrading notes advised) may keep or drop it: the
 floor carries it, and the union with `machine.toml` is idempotent.
 
-The deny floor and the allowlist match command strings. relais keeps no OS
+The deny floor matches command strings. relais keeps no OS
 sandbox of its own; a dispatch runs as a native agent under the Claude Code
 session's own sandbox (SPEC §8).
 

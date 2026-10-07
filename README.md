@@ -127,9 +127,10 @@ never written by a run. A trust grant is keyed by the PAIR of the
 repository's authority hash and the repository itself (its canonical root
 and, when git reports one, its `origin` URL), so editing `relais.toml`
 voids the grant and the same declaration in another repository needs its
-own review. `relais plan` prints the exact block to paste. The tools a
-worker may use are an explicit machine-owned allowlist — nothing is granted implicitly, and no
-permission-mode flag is ever passed. `disallowed_tools` here only ADDS to
+own review. `relais plan` prints the exact block to paste. A worker is a
+native agent: it runs with the tools its agent definition names and the
+session's permissions, and no permission-mode flag is ever passed.
+`disallowed_tools` here only ADDS to
 the shipped deny floor (commit, merge, push, rebase, reset, tag and the
 wrappers around them, plus `Agent`/`Task`: a worker never spawns subagents,
 since model choice belongs to the route); it cannot shorten it:
@@ -140,9 +141,6 @@ schema_version = 1
 [spending]
 per_run_micros = 3000000            # $3 per run, best effort (SPEC §11)
 
-[permissions]
-allowed_tools = ["Edit", "Write", "Bash(cargo test:*)", "Bash(make test:*)"]
-
 [trust."<grant key from relais plan>"]
 granted_at = "2026-09-20T00:00:00Z"   # RFC3339, or a plain 2026-09-20
 reviewed_by = "you"                   # required
@@ -150,7 +148,9 @@ repo = "git@github.com:me/the-repo.git"   # what plan filled in, for readers
 ```
 
 Then `relais run --task task.json`. A worker refused a tool ends the run
-`blocked (permission_denied)` naming the tool; nothing is escalated.
+`blocked (permission_denied)` naming the tool; nothing is escalated. A
+`[permissions] allowed_tools` left in `machine.toml` is no longer read, and
+`relais doctor` says so.
 
 relais keeps no OS sandbox of its own: every dispatch is a native agent of
 your Claude Code session and runs under that session's sandbox and

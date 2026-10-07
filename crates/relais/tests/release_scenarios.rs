@@ -4185,3 +4185,51 @@ fn doctor_reports_a_sandbox_section_as_no_longer_read() {
         "{report}"
     );
 }
+
+// A machine.toml from before the native mod still loads: `[permissions]
+// allowed_tools` parses, its trust grant still holds, and the real `relais
+// doctor` reports the key as no longer read, in text and in `--json`.
+#[test]
+fn doctor_reports_allowed_tools_as_no_longer_read() {
+    let world = World::new("doctor-allowed-tools");
+    let hash = world.write_policy(3);
+    world.write_machine(
+        &hash,
+        "[permissions]\nallowed_tools = [\"Edit\", \"Write\", \"Bash(cargo test:*)\"]\n",
+    );
+    let sentence = "[permissions] allowed_tools in machine.toml is no longer read";
+    let human = world.relais(&["doctor"]);
+    let human_out = format!("{}{}", text(&human.stdout), text(&human.stderr));
+    assert!(human_out.contains(sentence), "{human_out}");
+    let json = world.relais(&["doctor", "--json"]);
+    let report: serde_json::Value =
+        serde_json::from_str(&text(&json.stdout)).expect("doctor --json prints JSON");
+    let findings = report["findings"].as_array().expect("findings");
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding["component"] == "permissions"
+                && finding["detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.starts_with(sentence))),
+        "{report}"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding["component"] == "trust" && finding["level"] == "ok"),
+        "the grant written before the key was retired still holds: {report}"
+    );
+    // And it admits a run: the key changes neither the grant nor the
+    // authority it was issued for.
+    let task = world.write_task("task.json", "off");
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    let stderr = text(&run.stderr);
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "{}\n{stderr}",
+        text(&run.stdout)
+    );
+    assert!(!stderr.contains("trust"), "{stderr}");
+}

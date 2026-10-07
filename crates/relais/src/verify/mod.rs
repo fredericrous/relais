@@ -1562,9 +1562,11 @@ pub fn amont_list(
         }
         Stage::Local => {}
     }
-    let end = crate::procs::run_with_timeout(command, INVENTORY_TIMEOUT, None, cancel, None)
-        .map_err(|e| InventoryError::NotRun {
-            detail: e.to_string(),
+    let end =
+        crate::procs::run_with_timeout(command, INVENTORY_TIMEOUT, None, cancel).map_err(|e| {
+            InventoryError::NotRun {
+                detail: e.to_string(),
+            }
         })?;
     if end.ended != Ended::Exited(0) {
         return Err(InventoryError::Refused {
@@ -1775,11 +1777,12 @@ pub fn amont_attest_covered(
     // exits 0. The name is matched against the list below instead.
     let mut command = Command::new("amont");
     command.arg("attest").arg("covered").current_dir(dir);
-    let end = crate::procs::run_with_timeout(command, ATTEST_TIMEOUT, None, cancel, None).map_err(
-        |e| AttestError::NotRun {
-            detail: e.to_string(),
-        },
-    )?;
+    let end =
+        crate::procs::run_with_timeout(command, ATTEST_TIMEOUT, None, cancel).map_err(|e| {
+            AttestError::NotRun {
+                detail: e.to_string(),
+            }
+        })?;
     if end.ended != Ended::Exited(0) {
         return Err(AttestError::Refused {
             ended: end.ended.describe(),
