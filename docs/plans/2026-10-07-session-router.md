@@ -339,5 +339,42 @@ The gate **passes**. The probe plugin and its logs are kept outside the reposito
 - **The rebuild rate** is the 1-hour cache-write price.
 - **Volume, made concrete:** about 77 prompts a day, perhaps about 25 tasks. With a 10% hold-out, 150 completed tasks per arm takes on the order of two months; learned activations in the busiest stratum, likewise months. As the plan states, initial routing and recovery carry the value until then. The hold-out rate is a setting, so the person may raise it to shorten the spend comparison.
 
+### R1 (2026-10-07)
+
+- **How it was built:** the Rust and plugin halves were built in parallel against `docs/router-protocol.md`, then merged.
+- **Agreed deviations:**
+  - the missed-failure gate uses the exact Clopper–Pearson bound, the only one that gives the plan's "≥ 36";
+  - a machine-level `pinned_agents` entry is served as `inherit`;
+  - shadow sessions are a third arm of the report;
+  - the plugin store path is guarded as a directory (`~/.claude/plugins/store/`), because no API exposes the file;
+  - the cache gate uses a fixed token mix and no `rebuild_back` yet (no next-task prediction in R1);
+  - `explored` is always false: exploration belongs to R2.
+- **Found by the headless check and fixed (`0ff6977`):** "use an Explore agent with opus" moved the *main session* to opus. The classifier now reports who a named model is for (`user_model_for`):
+  - a model named for a subagent is kept for the spawn and never applied to the session;
+  - a model named inside the spawn's own prompt comes from the parent agent, so it is a preference the table overrides.
+- **Found by the headless check, left to the person:** the person's machine.toml prices `claude-haiku-4-5(-20251001)` but not `claude-haiku-5-5`, the `model_ids` default for haiku. With the defaults the research tier is unpriced, so routing never switches down. That is safe, but saves nothing. Either set `[session_routing] model_ids = { haiku = "claude-haiku-4-5-20251001" }` or add a `claude-haiku-5-5` price.
+
+## Verification record (2026-10-07, before push)
+
+All checks ran in a scratch config and state, with headless `claude -p --dangerously-skip-permissions` sessions in a fresh Cargo crate. The envelope and the R3 record came from the CLI with `--source plugin-ask`. The plugin's two consent records were seeded in its store file outside the session, as the plan allows for headless runs, and were deleted afterwards.
+
+| Check | Expected | Actual |
+|---|---|---|
+| `make lint` | clean | clean (38 modules, no cycles) |
+| `cargo test` | green | all suites green (1,184 unit tests, plus the integration suites, including `session_router` 9/9) |
+| `claude plugin validate` and `claude plugin test` | pass | validation passed; 132/132 |
+| Falsified key tests | red when broken | Rust: table, mode, outcome rank, payload, R3 bound, holdout, ledger-exists, unpriced. Plugin: escalation, red run, mode_effective, store guard, subagent model |
+| "Rename foo to bar, tests exist" (routed session) | research tier | all 13 requests on `claude-haiku-4-5-20251001`. Class: edit, difficulty 1, local, low uncertainty, verifiable, confidence 0.95 |
+| The same prompt in a held-out session | nothing applied | sonnet throughout; the decision was recorded with `holdout=1` |
+| The same prompt, with no price for the research model | no switch down | stayed on sonnet, `reason=cache_gate`, `would_pass_gate=0` |
+| "Make foo subtract, run cargo test, fix what fails" | escalates after the failing test, no "try again" | haiku → the `cargo test` failed → the next request on sonnet → fixed → passed. Reassess `failed_verification` research→implementation; task `completed_verified`, 1 escalation |
+| Hard investigation (intermittent wrong sums under load) | escalation | opus throughout; class: question, difficulty 5, cross-cutting, high uncertainty (2 of 2 sessions) |
+| "Use an Explore agent with opus to list src/" (after the fix) | session on the table's tier, subagent on the person's opus | main on haiku (research); subagent on `claude-opus-5-5`, `reason=user_model` |
+| An Explore subagent whose parent chose a model (unit) | the table overrides the parent | `routing.test.ts` / `router.test.ts` pass |
+| relais's own run worker keeps its rung model | untouched | covered by plugin tests (pending dispatch, plugin origin); not run headless |
+| Observations land, and the report has the section | per plan | `router_decisions`, `router_usage`, `router_reassess` and `router_tasks` are filled. `relais report` "session routing": routed 8 sessions, cost per completed task $0.59 (95% interval $0.23–$1.44); held-out and shadow arms show cost *unknown* while unpriced; unknown rate 53%; classifier 17 calls; 43,625 cache tokens rewritten after switches |
+| `$.ui.ask` dialogs (`/relais-routing`, `/relais-r3`) in an interactive bypass session | shown and answered | **not run**: needs the person (the live check) |
+| R2 learning, R3 evaluation on real labels | later phases | not in this PR: R2 needs weeks of R1 data, and R3 needs the person's labelled transcripts |
+
 
 <!-- panel: repos=relais reviewers=backend,language:rust,unix,react body-sha=3b57295144e6 -->
