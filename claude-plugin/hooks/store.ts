@@ -46,6 +46,8 @@ export type Store = {
   statusFailure: string | undefined
   // Whether the last look at `$.agent.list()` failed (said once a streak).
   isListFailing: boolean
+  // Whether the last verdict submission failed (said once a streak).
+  isSubmitFailing: boolean
   // When the pane's state was last written, in the clock's ms.
   flushedAt: number
   poll: { cancel: () => void } | undefined
@@ -78,6 +80,7 @@ export const createStore = (): Store => ({
   isDirty: false,
   statusFailure: undefined,
   isListFailing: false,
+  isSubmitFailing: false,
   flushedAt: 0,
   poll: undefined,
   heldOutcome: undefined,

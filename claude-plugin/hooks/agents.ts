@@ -138,9 +138,13 @@ export async function handleStop(fx: Fx, store: Store, line: any) {
 // A failure the plugin met, as a `stderr` entry of the run (or of every
 // live run when it belongs to none): shown labelled in the pane and in the
 // status reply, never dropped.
-async function note(fx: Fx, store: Store, run: string | undefined, message: string) {
+export async function note(fx: Fx, store: Store, run: string | undefined, message: string) {
   const now = await fx.clock.now()
-  const runs = run && store.models[run] ? [run] : Object.keys(store.models).filter(key => isLive(store.models[key]))
+  const keys = Object.keys(store.models)
+  const live = keys.filter(key => isLive(store.models[key]))
+  // A named run; else every live one; else the latest (a verdict waits
+  // only once its run has ended).
+  const runs = run && store.models[run] ? [run] : live.length > 0 ? live : keys.slice(-1)
   for (const key of runs) {
     store.models = { ...store.models, [key]: applyEvent(store.models[key], { kind: 'stderr', text: `relais plugin: ${message}` }, now) }
   }

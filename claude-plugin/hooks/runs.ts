@@ -4,7 +4,7 @@
 // (register.ts), which calls `onChunk`.
 
 import type { Fx } from './fx.ts'
-import { handleContinue, handleSpawn, handleStop } from './agents.ts'
+import { handleContinue, handleSpawn, handleStop, note } from './agents.ts'
 import { parseProtocolLine, splitLines } from './lines.ts'
 import {
   applyEvent,
@@ -37,9 +37,15 @@ export async function pump(fx: Fx, store: Store) {
   while (store.verdicts.length > 0) {
     try {
       await fx.prompt.submit({ text: store.verdicts[0] })
-    } catch {
+    } catch (reason) {
+      // Kept for the next tick; said once per streak of failures.
+      if (!store.isSubmitFailing) {
+        await note(fx, store, undefined, `the outcome message could not be sent yet: ${String((reason as any)?.message ?? reason)}`)
+      }
+      store.isSubmitFailing = true
       break
     }
+    store.isSubmitFailing = false
     store.verdicts.shift()
   }
   await flush(fx, store)

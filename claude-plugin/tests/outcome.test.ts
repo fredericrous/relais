@@ -79,6 +79,9 @@ test('a verdict whose submit fails stays queued and is sent on the next tick', a
   await tick(engine)
   expect(engine.calls.prompts.length).toBe(1)
   expect(engine.calls.prompts[0].text).toContain('finished: accepted')
+  // The failed attempt was said, once, in the run's timeline.
+  const reply = await $.tool.call({ tool: 'mcp__relais__status', run: RUN })
+  expect(reply.result).toContain('relais plugin: the outcome message could not be sent yet')
 })
 
 test('a status relais cannot give says why instead of "no run"', async ($: any, on: any) => {
