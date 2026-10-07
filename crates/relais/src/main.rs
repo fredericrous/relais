@@ -2120,23 +2120,19 @@ fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                     return Ok(CliOutcome::OperationalFailure);
                 }
             };
+            // The grant is in machine.toml now; the ledger row is its audit
+            // trail and the base of the next question's change marks. A
+            // ledger that cannot take it is said, not turned into a failed
+            // grant: the grant stands either way.
             if granted == relais::trust::Granted::Written {
-                let steps = operational(
-                    serde_json::to_string(&shown.declaration.steps),
-                    "rendering the granted steps",
-                )?;
-                let ledger = open_ledger()?;
-                operational(
-                    ledger.record_trust_grant(&relais::ledger::TrustGrantRecord {
-                        grant_key: &key,
-                        repo_key: &repo_key,
-                        repo: identity.label(),
-                        reviewed_by: &reviewed_by,
-                        source: source.as_str(),
-                        steps_json: &steps,
-                    }),
-                    "recording the grant in the ledger",
-                )?;
+                if let Err(e) =
+                    record_grant(&shown, &key, &repo_key, &identity, &reviewed_by, source)
+                {
+                    eprintln!(
+                        "relais trust grant: warning: the grant is in machine.toml, but the ledger \
+                         did not record it ({e}); the next question will not mark what changed"
+                    );
+                }
             }
             let written = granted == relais::trust::Granted::Written;
             if json {
@@ -2166,9 +2162,57 @@ fn previous_grant_steps(repo_key: &str) -> Option<Vec<relais::trust::Step>> {
     if !path.exists() {
         return None;
     }
-    let ledger = Ledger::open(&path).ok()?;
-    let json = ledger.latest_trust_grant_steps(repo_key).ok()??;
-    serde_json::from_str(&json).ok()
+    let read = Ledger::open(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|ledger| {
+            ledger
+                .latest_trust_grant_steps(repo_key)
+                .map_err(|e| e.to_string())
+        })
+        .and_then(|json| match json {
+            Some(json) => serde_json::from_str(&json)
+                .map(Some)
+                .map_err(|e| e.to_string()),
+            None => Ok(None),
+        });
+    match read {
+        Ok(steps) => steps,
+        Err(e) => {
+            eprintln!(
+                "relais trust show: warning: the last grant could not be read from the ledger ({e}); \
+                 changes are not marked"
+            );
+            None
+        }
+    }
+}
+
+/// The ledger row of a grant just written: who, from where, and the steps
+/// it authorized.
+fn record_grant(
+    shown: &relais::trust::Shown,
+    key: &str,
+    repo_key: &str,
+    identity: &RepoIdentity,
+    reviewed_by: &str,
+    source: GrantSource,
+) -> Result<(), CliError> {
+    let steps = operational(
+        serde_json::to_string(&shown.declaration.steps),
+        "rendering the granted steps",
+    )?;
+    let ledger = open_ledger()?;
+    operational(
+        ledger.record_trust_grant(&relais::ledger::TrustGrantRecord {
+            grant_key: key,
+            repo_key,
+            repo: identity.label(),
+            reviewed_by,
+            source: source.as_str(),
+            steps_json: &steps,
+        }),
+        "recording the grant in the ledger",
+    )
 }
 
 /// `relais trust show` for a person: the key on a line of its own, then
@@ -2767,6 +2811,15 @@ fn init_detect_command(
     command: Option<&str>,
 ) -> Result<CliOutcome, CliError> {
     let root = project_dir()?;
+    // Detection reads the root's listing; one that cannot be read is not
+    // "nothing detected", which would send a person to type a command.
+    if let Err(e) = std::fs::read_dir(&root) {
+        eprintln!(
+            "relais init --detect: {} could not be read: {e}",
+            root.display()
+        );
+        return Ok(CliOutcome::OperationalFailure);
+    }
     let mut proposal = relais::repo::detect_policy(&root);
     if let Some(text) = command {
         match relais::repo::parse_command_text(text) {

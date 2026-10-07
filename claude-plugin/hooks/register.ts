@@ -8,7 +8,7 @@ import { HELLO_EVERY_MS, sendHello } from './callbacks.ts'
 import type { Fx } from './fx.ts'
 import { DENY_MESSAGE, isRelaisNotification, isRelaisType, relaisAddresses } from './guards.ts'
 import { childOf, contractPath, onChunk, pump, reloadTimeline, startReplay, startRun, statusOf } from './runs.ts'
-import { onboardTool, trustTool } from './consent.ts'
+import { onboardTool, onPersonPrompt, trustTool } from './consent.ts'
 import { machineSettingsGuard } from './guards.ts'
 import { close, createStore, detach, every } from './store.ts'
 import { FLUSH_MS, openPane, renderPane, timelineLines } from './ui.ts'
@@ -251,7 +251,10 @@ export function register(on: any) {
   // relais's agents' completion notices are for relais; any other prompt,
   // one that only mentions an id included, is kept.
   on('prompt.submit', async ($: any, e: any, next: any) => {
-    if (e.origin?.kind !== 'task-notification') return next(e)
+    if (e.origin?.kind !== 'task-notification') {
+      onPersonPrompt(store, e.text)
+      return next(e)
+    }
     const ids = new Set(store.agentDispatch.keys())
     for (const id of relaisAddresses(await $.agent.list(), $.plugin.name)) ids.add(id)
     return isRelaisNotification(e.text, ids) ? { drop: 'relais agent notification' } : next(e)

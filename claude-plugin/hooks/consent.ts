@@ -33,6 +33,10 @@ export function escapeDisplay(text: string): string {
     else if (ch === '\t') out += '\\t'
     else if (ch === '\\') out += '\\\\'
     else if (code < 0x20 || (code >= 0x7f && code < 0xa0)) out += `\\x${code.toString(16).padStart(2, '0')}`
+    // Bidirectional overrides and isolates reorder what is drawn, and the
+    // line and paragraph separators break it: either can disguise a command.
+    else if (code === 0x200e || code === 0x200f || (code >= 0x2028 && code <= 0x202e) || (code >= 0x2066 && code <= 0x2069))
+      out += `\\u{${code.toString(16).padStart(4, '0')}}`
     else out += ch
   }
   return out
@@ -154,6 +158,21 @@ const err = (r: any) => String(r?.stderr ?? '').trim().slice(0, 2000)
 
 export type Declined = 'not_now' | 'dismissed'
 
+// The person typed `/relais` themselves: a Not now earlier in the session
+// no longer holds, so they are asked again (the decline toast says so).
+export function onPersonPrompt(store: Store, text: unknown) {
+  if (typeof text === 'string' && /^\s*\/relais\b/.test(text)) store.declined.clear()
+}
+
+// `relais … --json` output, or undefined when it is not JSON.
+function parsed<T>(r: any): T | undefined {
+  try {
+    return JSON.parse(out(r)) as T
+  } catch {
+    return undefined
+  }
+}
+
 function declined(reason: Declined, repo: string): string {
   if (reason === 'not_now') {
     return `declined (not_now): the person chose Not now. relais was not set up in ${repo}; nothing ran. Tell them, and do not ask again unless they ask for relais themselves.`
@@ -196,7 +215,8 @@ export async function trustTool(fx: Fx, store: Store, cwd: string, session: stri
 async function askTrust(fx: Fx, store: Store, repo: Repo, session: string): Promise<string> {
   const show = await run(fx, ['relais', 'trust', 'show', '--json'], repo.root)
   if (show.exitCode !== 0) return `not set up: relais trust show failed: ${err(show)}`
-  const shown: Shown = JSON.parse(out(show))
+  const shown = parsed<Shown>(show)
+  if (!shown) return `not set up: relais trust show printed no JSON: ${out(show).slice(0, 400)}`
   if (shown.granted) return `ready: ${repo.name} is already allowed. Call mcp__relais__run.`
   const q = question2(shown, repo.name)
   const answer = await ask(fx, q.text, [NOT_NOW, q.yes])
@@ -250,7 +270,9 @@ async function onboard(fx: Fx, store: Store, repo: Repo, session: string): Promi
 
   const detect = await run(fx, ['relais', 'init', '--detect', '--json'], repo.root)
   if (detect.exitCode !== 0 && detect.exitCode !== 19) return `not set up: relais init --detect failed: ${err(detect)}`
-  const proposal: Proposal | null = JSON.parse(out(detect)).proposal
+  const detected = parsed<{ proposal: Proposal | null }>(detect)
+  if (!detected) return `not set up: relais init --detect printed no JSON: ${out(detect).slice(0, 400)}`
+  const proposal = detected.proposal
 
   let command: string | undefined
   if (proposal && proposal.commands.length > 0) {
@@ -273,20 +295,21 @@ async function onboard(fx: Fx, store: Store, repo: Repo, session: string): Promi
     repo.root,
   )
   if (write.exitCode !== 0) return `not set up: relais init --detect --write failed: ${err(write)}`
-  const removeWritten = () => run(fx, ['rm', '-f', '--', `${repo.root}/${POLICY}`], repo.root)
+  // Nothing is left behind unless the person said yes to both: what this
+  // call wrote is removed, and a removal that fails is said.
+  const removeWritten = async (result: string) => {
+    const removed = await run(fx, ['rm', '-f', '--', `${repo.root}/${POLICY}`], repo.root)
+    return removed.exitCode === 0
+      ? result
+      : `${result}\nrelais.toml could not be removed (${err(removed)}); it is at ${repo.root}/${POLICY}, uncommitted.`
+  }
 
   const show = await run(fx, ['relais', 'trust', 'show', '--json'], repo.root)
-  if (show.exitCode !== 0) {
-    await removeWritten()
-    return `not set up: relais trust show failed: ${err(show)}`
-  }
-  const shown: Shown = JSON.parse(out(show))
+  const shown = show.exitCode === 0 ? parsed<Shown>(show) : undefined
+  if (!shown) return removeWritten(`not set up: relais trust show failed: ${err(show) || out(show).slice(0, 400)}`)
   const q = question2(shown, repo.name)
   const answer = await ask(fx, q.text, [NOT_NOW, q.yes])
-  if (answer !== q.yes) {
-    await removeWritten()
-    return refuse(fx, store, repo, answer === NOT_NOW ? 'not_now' : 'dismissed')
-  }
+  if (answer !== q.yes) return removeWritten(refuse(fx, store, repo, answer === NOT_NOW ? 'not_now' : 'dismissed'))
 
   fx.ui.toast('relais · committing relais.toml (hooks may take minutes)…')
   const committed = await commitPolicy(fx, repo)

@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { allowLabel, NOT_NOW, onboardTool, question2, trustTool, USE_CHECKS, type Shown } from '../hooks/consent.ts'
+import { allowLabel, escapeDisplay, NOT_NOW, onboardTool, onPersonPrompt, question2, trustTool, USE_CHECKS, type Shown } from '../hooks/consent.ts'
 import { machineSettingsGuard, MACHINE_SETTINGS_MESSAGE } from '../hooks/guards.ts'
 import { createStore } from '../hooks/store.ts'
 
@@ -14,6 +14,8 @@ function world(options: { detected?: string[][] | null; changes?: Shown['changes
     commitFails: false,
     stale: false,
     showFails: false,
+    showGarbage: false,
+    rmFails: false,
     detected: options.detected === undefined ? [['make', 'check']] : options.detected,
     typedCommand: undefined as string[] | undefined,
   }
@@ -62,6 +64,7 @@ function world(options: { detected?: string[][] | null; changes?: Shown['changes
     }
     if (cmd === 'test') return state.policy && rest[1] === '/repo/relais.toml' ? ok() : fail(1, '')
     if (cmd === 'rm') {
+      if (state.rmFails) return fail(1, 'rm: Permission denied')
       state.policy = false
       return ok()
     }
@@ -84,6 +87,7 @@ function world(options: { detected?: string[][] | null; changes?: Shown['changes
       }
       if (line === 'trust show --json') {
         if (state.showFails) throw new Error('relais is not installed')
+        if (state.showGarbage) return ok('warning: something went to stdout')
         return ok(JSON.stringify(shown()))
       }
       if (line.startsWith('trust grant')) {
@@ -275,4 +279,42 @@ test('the guard keeps the model off machine.toml', async () => {
   expect(machineSettingsGuard('Bash', { command: `cat >> ${path}` }, env)).toBe(MACHINE_SETTINGS_MESSAGE)
   expect(machineSettingsGuard('Bash', { command: 'relais trust show' }, env)).toBe(undefined)
   expect(machineSettingsGuard('Write', { file_path: '/repo/relais.toml' }, env)).toBe(undefined)
+})
+
+test('a Not now holds until the person types /relais themselves, then they are asked again', async () => {
+  const w = world()
+  w.state.policy = true
+  w.answers.push(NOT_NOW)
+  await trustTool(w.fx, w.store, '/repo', 's')
+  onPersonPrompt(w.store, 'relais run abc finished: blocked')
+  expect(await trustTool(w.fx, w.store, '/repo', 's')).toContain('declined (not_now)')
+  expect(w.asks.length).toBe(1)
+  onPersonPrompt(w.store, '/relais add a doc comment')
+  w.answers.push(YES2)
+  expect(await trustTool(w.fx, w.store, '/repo', 's')).toContain('ready')
+  expect(w.asks.length).toBe(2)
+})
+
+test('onboard: output from trust show that is not JSON removes the relais.toml it wrote', async () => {
+  const w = world()
+  w.state.showGarbage = true
+  w.answers.push(USE_CHECKS)
+  const result = await onboardTool(w.fx, w.store, '/repo', 's')
+  expect(result).toContain('not set up: relais trust show')
+  expect(w.state.policy).toBe(false)
+  expect(w.state.grants.length).toBe(0)
+})
+
+test('onboard: a relais.toml that cannot be removed after a decline is said', async () => {
+  const w = world()
+  w.state.rmFails = true
+  w.answers.push(USE_CHECKS, NOT_NOW)
+  const result = await onboardTool(w.fx, w.store, '/repo', 's')
+  expect(result).toContain('declined (not_now)')
+  expect(result).toContain('relais.toml could not be removed (rm: Permission denied)')
+})
+
+test('bidi overrides and line separators are spelled out', async () => {
+  expect(escapeDisplay('rm\u202etxt.sh')).toBe('rm\\u{202e}txt.sh')
+  expect(escapeDisplay('a\u2028b')).toBe('a\\u{2028}b')
 })

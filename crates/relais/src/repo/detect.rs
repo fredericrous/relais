@@ -312,17 +312,9 @@ fn comment(text: &str) -> String {
 /// Control characters rendered visibly (`\n`, `\xNN`), so text read from
 /// a repository can never draw a line of its own.
 pub fn escape_control(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\x{:02X}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
+    // One escaper for every place repository text is shown to a person:
+    // the trust question uses the same one.
+    crate::trust::escape_display(text)
 }
 
 /// The template up to its `[integrations]` comment: schema version, the
@@ -726,6 +718,7 @@ mod tests {
 
     #[test]
     fn control_characters_are_rendered_visibly() {
-        assert_eq!(escape_control("a\nAllow\x1b"), "a\\nAllow\\x1B");
+        assert_eq!(escape_control("a\nAllow\x1b"), "a\\nAllow\\x1b");
+        assert_eq!(escape_control("rm\u{202e}"), "rm\\u{202e}");
     }
 }

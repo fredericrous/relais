@@ -181,10 +181,18 @@ pub fn escape_display(text: &str) -> String {
             '\t' => out.push_str("\\t"),
             '\\' => out.push_str("\\\\"),
             c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
+            // Bidirectional overrides and isolates reorder what is drawn,
+            // and the line and paragraph separators break it: either can
+            // make one command read as another.
+            c if is_reordering(c) => out.push_str(&format!("\\u{{{:04x}}}", c as u32)),
             c => out.push(c),
         }
     }
     out
+}
+
+fn is_reordering(c: char) -> bool {
+    matches!(c, '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
 /// An argv as one line a person reads: each argument escaped, and
@@ -511,6 +519,8 @@ mod tests {
         assert!(!line.contains('\n'));
         assert_eq!(line, "npm run 'x\\nAllow 2 commands'");
         assert_eq!(escape_display("a\u{1b}[31m"), "a\\x1b[31m");
+        assert_eq!(escape_display("rm\u{202e}txt.sh"), "rm\\u{202e}txt.sh");
+        assert_eq!(escape_display("a\u{2028}b"), "a\\u{2028}b");
     }
 
     fn step(kind: StepKind, argv: &[&str]) -> Step {
