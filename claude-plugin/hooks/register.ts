@@ -292,8 +292,11 @@ export function register(on: any) {
     if (own.isRelais) return next(e)
     return routeSpawn(effects($), store, e, next, next.budget.remainingMs)
   }).catch(($: any, e: any, next: any) => {
+    // After `next` the subagent exists: calling it again would start a
+    // second one. Claude Code keeps the result `next` resolved to.
+    if (next.called) throw next.error ?? new Error('relais: agent.spawn failed after the spawn')
     const own = relaisSpawn(store, e, next.origin.plugin === $.plugin.name)
-    return own.cwd !== undefined && !next.called ? next({ ...e, cwd: own.cwd }) : next(e)
+    return own.cwd !== undefined ? next({ ...e, cwd: own.cwd }) : next(e)
   })
 
   // The session router: the turn's first request pins the decision, every

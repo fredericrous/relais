@@ -635,7 +635,15 @@ fn read_task_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<Rout
         class: read_class(row, offset + 4)?,
         outcome: row.get(offset + 10)?,
         outcome_rank: row.get::<_, i64>(offset + 11)?.clamp(0, 255) as u8,
-        inferred: serde_json::from_str(&inferred).unwrap_or_default(),
+        // A row this binary wrote always parses; one that does not is a
+        // corrupt row, reported as such rather than read as "no signals".
+        inferred: serde_json::from_str(&inferred).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                offset + 12,
+                rusqlite::types::Type::Text,
+                Box::new(e),
+            )
+        })?,
         escalations: row.get::<_, i64>(offset + 13)?.max(0) as u32,
         exhausted: row.get(offset + 14)?,
         turns: row.get::<_, i64>(offset + 15)?.max(0) as u32,

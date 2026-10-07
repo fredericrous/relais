@@ -123,8 +123,19 @@ fn user_agents_dir() -> Option<PathBuf> {
 pub fn definition_pins(dirs: &[PathBuf]) -> Vec<(String, String)> {
     let mut pins = Vec::new();
     for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            // No agents directory is the ordinary case: nothing pinned there.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // Anything else would drop the person's pins without a word, and
+            // the router would then override models they chose.
+            Err(e) => {
+                eprintln!(
+                    "relais native router-state: warning: {} could not be read ({e}); its agent pins are not applied",
+                    dir.display()
+                );
+                continue;
+            }
         };
         let mut files: Vec<PathBuf> = entries
             .filter_map(Result::ok)
@@ -154,7 +165,8 @@ pub fn definition_pins(dirs: &[PathBuf]) -> Vec<(String, String)> {
 }
 
 /// The latest R3 row and the completed tasks' token totals, read only when
-/// the ledger already exists: `router-state` never creates one. A ledger
+/// the ledger already exists: `router-state` never creates one. Opening an
+/// existing ledger brings it to this binary's schema, as every command does. A ledger
 /// that cannot be read is said and served as empty, which keeps the mode
 /// at shadow.
 fn ledger_facts(path: &Path) -> (Option<state::R3Row>, Vec<(String, u8, u64)>) {

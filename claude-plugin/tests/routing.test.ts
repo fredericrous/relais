@@ -190,6 +190,21 @@ test('a relais worker is never routed: its spawn keeps the rung model and is not
   expect(engine.calls.steps[0].model).toBe(SONNET)
 })
 
+test('a relais worker’s requests are not booked against the person’s task', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'rename foo to bar, tests exist')
+  await $.tool.call({ tool: 'mcp__relais__run', task: 'fix-it.json', cwd: '/repo' })
+  await startQueued(engine)
+  engine.stream.push('stdout', spawnLine('d1'))
+  await settle(engine)
+  await step($, { turnId: 'w1', index: 0, agentId: 'agent-1', model: 'claude-sonnet-5-5' })
+  await personTurn($, engine, 'and baz, tests exist')
+  await settle(engine)
+  const usage = observed(engine).filter((r: any) => r.kind === 'usage' && r.source === 'step')
+  expect(usage.length).toBeGreaterThan(0)
+  expect(usage.some((r: any) => r.agent_id === 'agent-1')).toBe(false)
+})
+
 test('a subagent is routed only when the router created it; the parent’s model is overridden', async ($: any, on: any) => {
   const engine = await routedSession($, on)
   await personTurn($, engine, 'rename foo to bar, tests exist')

@@ -311,6 +311,9 @@ export function afterStep(store: Store, e: any, result: any, now: number) {
   const r = store.router
   const usage = result?.usage
   if (!usage || !r.state) return
+  // relais's own run agents are accounted by relais's run, never here; any
+  // other subagent the router did not route counts against the main task.
+  if (e.agentId && !r.subtasks[e.agentId] && store.agentDispatch.has(e.agentId)) return
   const task = e.agentId ? r.subtasks[e.agentId] ?? r.task : r.task
   if (!e.agentId) {
     r.lastModel = typeof usage.model === 'string' ? usage.model : r.lastModel
@@ -356,6 +359,31 @@ export async function routeSpawn(fx: Fx, store: Store, e: any, next: any, remain
   const spawn = decideSpawn({ state, type, cls, personModel: r.task?.subagentModel ?? null })
   const applied = !!spawn.decision?.override && isApplying(r)
   const result = await next(applied && spawn.decision ? { ...e, model: spawn.decision.model } : e)
+  // The subagent is started: nothing below may throw, or the hook's error
+  // handler would see a failure after `next` and the spawn could repeat.
+  try {
+    await afterSpawn(fx, store, { state, spawn, applied, classified, description, prompt, result })
+  } catch (reason) {
+    await note(fx, store, undefined, `relais router: the spawn's bookkeeping failed: ${String((reason as any)?.message ?? reason).slice(0, 200)}`).catch(() => {})
+  }
+  return result
+}
+
+async function afterSpawn(
+  fx: Fx,
+  store: Store,
+  input: {
+    state: RouterState
+    spawn: ReturnType<typeof decideSpawn>
+    applied: boolean
+    classified: Awaited<ReturnType<typeof complete>> | undefined
+    description: string
+    prompt: string
+    result: any
+  },
+) {
+  const r = store.router
+  const { state, spawn, applied, classified, description, prompt, result } = input
   const now = await fx.clock.now()
   const agentId: string | undefined = typeof result?.agentId === 'string' ? result.agentId : undefined
   let owner: TaskState | undefined = r.task
@@ -391,7 +419,6 @@ export async function routeSpawn(fx: Fx, store: Store, e: any, next: any, remain
     queue(store, reassessRecord(out.task, out.record, now))
     refreshRoute(store)
   }
-  return result
 }
 
 // Spawns without an id, keyed on description and the first 1 KB of the
@@ -587,8 +614,12 @@ export async function routingCommand(fx: Fx, store: Store): Promise<string> {
   if (result?.exitCode !== 0) {
     return `relais could not record the envelope (exit ${result?.exitCode}): ${clip(String(result?.stderr ?? '').trim(), 600)}. Nothing was granted.`
   }
-  await fx.kv.set(ENVELOPE_KEY, { answer, at: new Date(await fx.clock.now()).toISOString(), session })
-  await refresh(fx, store)
+  try {
+    await fx.kv.set(ENVELOPE_KEY, { answer, at: new Date(await fx.clock.now()).toISOString(), session })
+    await refresh(fx, store)
+  } catch (reason) {
+    return `relais recorded the envelope in machine.toml, but the plugin could not keep its own record of your answer (${String((reason as any)?.message ?? reason).slice(0, 200)}), so routing stays in shadow. Run /relais-routing again.`
+  }
   return `Session routing granted. Mode now: ${modeOf(r)}${modeOf(r) === 'on' ? '' : ' (routing switches on once an R3 pass is recorded with /relais-r3)'}.`
 }
 
@@ -626,9 +657,13 @@ export async function r3Command(fx: Fx, store: Store): Promise<string> {
   if (recorded?.exitCode !== 0) {
     return `relais could not record the R3 pass (exit ${recorded?.exitCode}): ${clip(String(recorded?.stderr ?? '').trim(), 600)}`
   }
-  const session = await fx.session.id()
-  await fx.kv.set(R3_KEY, { id: verdict.id, at: new Date(await fx.clock.now()).toISOString(), session })
-  await refresh(fx, store)
+  try {
+    const session = await fx.session.id()
+    await fx.kv.set(R3_KEY, { id: verdict.id, at: new Date(await fx.clock.now()).toISOString(), session })
+    await refresh(fx, store)
+  } catch (reason) {
+    return `relais recorded the R3 pass ${verdict.id}, but the plugin could not keep its own record of your answer (${String((reason as any)?.message ?? reason).slice(0, 200)}), so routing stays in shadow. Run /relais-r3 again.`
+  }
   return `R3 pass ${verdict.id} recorded. Mode now: ${modeOf(r)}.`
 }
 

@@ -209,6 +209,29 @@ fn router_state_reads_repository_tiers_checks_and_agent_pins() {
     );
 }
 
+/// An agents directory that exists but cannot be read is said: skipping it
+/// silently would drop the person's pins, and the router would override
+/// models they chose.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_agents_directory_is_said_not_skipped_silently() {
+    use std::os::unix::fs::PermissionsExt;
+    let world = World::new("pins-unreadable");
+    let user_agents = world.root.join(".claude").join("agents");
+    std::fs::create_dir_all(&user_agents).unwrap();
+    std::fs::write(user_agents.join("deep.md"), "---\nmodel: opus\n---\n").unwrap();
+    std::fs::set_permissions(&user_agents, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let output = world.relais(&["native", "router-state", "--session", "s"]);
+    std::fs::set_permissions(&user_agents, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("could not be read")
+            && stderr(&output).contains("pins are not applied"),
+        "{}",
+        stderr(&output)
+    );
+}
+
 #[test]
 fn the_mode_is_on_only_with_an_envelope_and_a_passing_r3_and_the_env_narrows_it() {
     let world = World::new("mode");

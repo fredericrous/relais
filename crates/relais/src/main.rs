@@ -3373,8 +3373,9 @@ fn router_observe_command() -> CliOutcome {
     use std::io::Read;
     let mut payload = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut payload) {
+        // Not a bad payload: nothing was read, so the plugin retries.
         eprintln!("relais native router-observe: stdin could not be read: {e}");
-        return CliOutcome::InvalidInput;
+        return CliOutcome::OperationalFailure;
     }
     let ledger_path = match paths::ledger_path() {
         Ok(path) => path,
