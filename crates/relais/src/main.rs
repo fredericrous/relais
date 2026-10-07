@@ -32,6 +32,10 @@
 //! | 18 | `StaleGrantKey` | `trust grant` refused: the key given is not this policy's; `relais trust show` prints the current one |
 //! | 19 | `NothingDetected` | `init --detect` found no verification command and none was typed; nothing was written |
 //!
+//! The session-router commands (`native router-state`, `router-observe`,
+//! `router-envelope`) use 0, 1 and 2 only: 2 is a bad payload or
+//! invocation (nothing written), 1 a failure to retry.
+//!
 //! README.md carries the same table for people who do not read source.
 
 use std::path::{Path, PathBuf};
@@ -507,6 +511,59 @@ enum NativeCommand {
     /// repository's `.relais/tasks/`; prints the path `relais run --task`
     /// takes. What the plugin's run tool calls with the model's contract.
     Contract,
+    /// What the session router needs to decide (SPEC §30): mode, tiers,
+    /// capability table, rates, priors, pins, checks, hold-out and seed,
+    /// as one JSON object. Reads only; never creates the ledger
+    #[command(name = "router-state")]
+    RouterState {
+        /// The Claude Code session id
+        #[arg(long)]
+        session: String,
+    },
+    /// The session router's records on stdin (decisions, usage,
+    /// reassessments, tasks), written in one transaction; 2 when the
+    /// payload is invalid, and then nothing is written
+    #[command(name = "router-observe")]
+    RouterObserve,
+    /// Record the person's routing envelope in machine.toml (SPEC §30),
+    /// or with `--off` remove it and record that routing is off. Run by
+    /// the plugin after its own question; typed in a shell it is recorded
+    /// as unattributed
+    #[command(name = "router-envelope")]
+    RouterEnvelope {
+        /// Who granted it (or turned routing off)
+        #[arg(long)]
+        by: String,
+        /// The highest exploration rate allowed, 0 to 1
+        #[arg(
+            long = "epsilon-max",
+            required_unless_present = "off",
+            conflicts_with = "off"
+        )]
+        epsilon_max: Option<f64>,
+        /// Turn routing off: remove the envelope, and keep `relais install`
+        /// from recording it again
+        #[arg(long)]
+        off: bool,
+        /// `plugin-ask` when the plugin asked the person
+        #[arg(long, value_enum)]
+        source: Option<RouterSource>,
+    },
+}
+
+/// Who wrote a session-routing record: only the plugin's own question
+/// is attributed (`relais install` attributes its own write).
+#[derive(Clone, Copy, ValueEnum)]
+enum RouterSource {
+    #[value(name = "plugin-ask")]
+    PluginAsk,
+}
+
+fn router_source(source: Option<RouterSource>) -> relais::router::Source {
+    match source {
+        Some(RouterSource::PluginAsk) => relais::router::Source::PluginAsk,
+        None => relais::router::Source::Cli,
+    }
 }
 
 #[derive(Subcommand)]
@@ -1304,12 +1361,56 @@ fn install_command(write: bool, user: bool, targets: Targets) -> Result<CliOutco
     let report = operational(relais::install::install(&request, &home), "install")?;
     let plugin = relais::install::plugin::install(request.mode, &marketplace_dir()?);
     let outcome = render_install("install", &request, &report, &plugin);
+    if request.mode == Mode::Apply && plugin.failure.is_none() {
+        install_routing_envelope();
+    }
     match targets {
         Targets::OwnedFiles => Ok(outcome),
         Targets::OwnedFilesAndHooks => Ok(worse_outcome(
             outcome,
             install_hooks_target(&request, &home)?,
         )),
+    }
+}
+
+/// Installing the plugin is the person's authorization to route the
+/// session (plan, decision 1, R1b): record the envelope when machine.toml
+/// has neither one nor an `off` tombstone, and say how to turn it off. A
+/// failure here is said and does not fail the install: routing then stays
+/// in shadow.
+fn install_routing_envelope() {
+    let Ok(machine_path) = paths::machine_settings_path() else {
+        eprintln!("relais install: session routing not recorded: no config directory");
+        return;
+    };
+    let envelope = relais::policy::RoutingEnvelope {
+        granted_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        by: "relais install".to_string(),
+        epsilon_max: 0.1,
+        source: relais::router::Source::Install.as_str().to_string(),
+    };
+    match relais::router::write_envelope_if_absent(&machine_path, &envelope) {
+        Ok(true) => {
+            let recorded = open_ledger().and_then(|ledger| {
+                operational(
+                    ledger.record_router_provenance(&relais::ledger::RouterProvenance::Envelope {
+                        by: envelope.by.clone(),
+                        epsilon_max: envelope.epsilon_max,
+                        source: envelope.source.clone(),
+                        at: envelope.granted_at.clone(),
+                    }),
+                    "recording the envelope in the ledger",
+                )
+            });
+            if let Err(e) = recorded {
+                eprintln!("relais install: warning: the ledger did not record the envelope ({e})");
+            }
+            println!(
+                "session routing is on; turn it off with /relais-routing off or RELAIS_SESSION_ROUTING=off"
+            );
+        }
+        Ok(false) => {}
+        Err(e) => eprintln!("relais install: session routing not recorded: {e}"),
     }
 }
 
@@ -3178,6 +3279,20 @@ fn native_command(cmd: NativeCommand) -> Result<CliOutcome, CliError> {
     match cmd {
         NativeCommand::Status { run } => native_status_command(run.as_deref()),
         NativeCommand::Contract => native_contract_command(),
+        NativeCommand::RouterState { session } => Ok(router_state_command(&session)),
+        NativeCommand::RouterObserve => Ok(router_observe_command()),
+        NativeCommand::RouterEnvelope {
+            by,
+            off: true,
+            source,
+            ..
+        } => router_off_command(&by, router_source(source)),
+        NativeCommand::RouterEnvelope {
+            by,
+            epsilon_max,
+            source,
+            ..
+        } => router_envelope_command(&by, epsilon_max.unwrap_or(f64::NAN), router_source(source)),
         NativeCommand::Hello { session } => {
             let socket = relais::coordinator::socket_path().map_err(CliError::Home)?;
             // The first call of a session may find no daemon: start one, as
@@ -3248,6 +3363,152 @@ fn native_command(cmd: NativeCommand) -> Result<CliOutcome, CliError> {
 
 /// The coordinator the plugin's callbacks talk to. A callback never starts
 /// one: with none running there is no dispatch to tell it about.
+/// `relais native router-state` (SPEC §30). Its own exits, per the wire
+/// contract: 0 with the document on stdout, 1 when it cannot answer (the
+/// plugin then runs in shadow); clap's 2 covers bad arguments.
+fn router_state_command(session: &str) -> CliOutcome {
+    if session.trim().is_empty() {
+        eprintln!("relais native router-state: --session is empty");
+        return CliOutcome::InvalidInput;
+    }
+    let answered = cwd()
+        .map_err(|e| e.to_string())
+        .and_then(|cwd| relais::router::router_state(session, &cwd).map_err(|e| e.to_string()))
+        .and_then(|state| serde_json::to_string(&state).map_err(|e| e.to_string()));
+    match answered {
+        Ok(text) => {
+            println!("{text}");
+            CliOutcome::Accepted
+        }
+        Err(e) => {
+            eprintln!("relais native router-state: {e}");
+            CliOutcome::OperationalFailure
+        }
+    }
+}
+
+/// `relais native router-observe`: 0 recorded (duplicates included), 2
+/// the payload is invalid and nothing was written, 1 the ledger failed
+/// (the plugin retries).
+fn router_observe_command() -> CliOutcome {
+    use std::io::Read;
+    let mut payload = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut payload) {
+        // Not a bad payload: nothing was read, so the plugin retries.
+        eprintln!("relais native router-observe: stdin could not be read: {e}");
+        return CliOutcome::OperationalFailure;
+    }
+    let ledger_path = match paths::ledger_path() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("relais native router-observe: {e}");
+            return CliOutcome::OperationalFailure;
+        }
+    };
+    match relais::router::observe(&ledger_path, &payload) {
+        Ok(_) => CliOutcome::Accepted,
+        Err(e @ relais::router::ObserveError::Payload(_)) => {
+            eprintln!("relais native router-observe: {e}");
+            CliOutcome::InvalidInput
+        }
+        Err(e) => {
+            eprintln!("relais native router-observe: {e}");
+            CliOutcome::OperationalFailure
+        }
+    }
+}
+
+/// `relais native router-envelope`: machine.toml first (the envelope is
+/// authority), then the ledger's provenance row, which is its audit
+/// trail; a ledger that cannot take the row is said, not a failed grant.
+fn router_envelope_command(
+    by: &str,
+    epsilon_max: f64,
+    source: relais::router::Source,
+) -> Result<CliOutcome, CliError> {
+    if by.trim().is_empty() {
+        eprintln!("relais native router-envelope: --by is empty; name who granted it");
+        return Ok(CliOutcome::InvalidInput);
+    }
+    if !(epsilon_max.is_finite() && (0.0..=1.0).contains(&epsilon_max)) {
+        eprintln!(
+            "relais native router-envelope: --epsilon-max {epsilon_max} is not between 0 and 1"
+        );
+        return Ok(CliOutcome::InvalidInput);
+    }
+    let machine_path = paths::machine_settings_path().map_err(CliError::Home)?;
+    let envelope = relais::policy::RoutingEnvelope {
+        granted_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        by: by.to_string(),
+        epsilon_max,
+        source: source.as_str().to_string(),
+    };
+    if let Err(e) = relais::router::write_envelope(&machine_path, &envelope) {
+        eprintln!("relais native router-envelope: {e}");
+        return Ok(CliOutcome::OperationalFailure);
+    }
+    let recorded = open_ledger().and_then(|ledger| {
+        operational(
+            ledger.record_router_provenance(&relais::ledger::RouterProvenance::Envelope {
+                by: envelope.by.clone(),
+                epsilon_max,
+                source: envelope.source.clone(),
+                at: envelope.granted_at.clone(),
+            }),
+            "recording the envelope in the ledger",
+        )
+    });
+    if let Err(e) = recorded {
+        eprintln!(
+            "relais native router-envelope: warning: the envelope is in machine.toml, but the \
+             ledger did not record it ({e})"
+        );
+    }
+    print_document(&serde_json::json!({ "schema": 1, "envelope": envelope }))?;
+    Ok(CliOutcome::Accepted)
+}
+
+/// `relais native router-envelope --off`: the envelope removed and the
+/// `off` tombstone recorded in machine.toml, then the provenance row.
+fn router_off_command(by: &str, source: relais::router::Source) -> Result<CliOutcome, CliError> {
+    if by.trim().is_empty() {
+        eprintln!("relais native router-envelope: --by is empty; name who turned routing off");
+        return Ok(CliOutcome::InvalidInput);
+    }
+    let machine_path = paths::machine_settings_path().map_err(CliError::Home)?;
+    let off = relais::policy::RoutingOff {
+        at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        by: by.to_string(),
+        source: source.as_str().to_string(),
+    };
+    let had_envelope = match relais::router::write_off(&machine_path, &off) {
+        Ok(had) => had,
+        Err(e) => {
+            eprintln!("relais native router-envelope: {e}");
+            return Ok(CliOutcome::OperationalFailure);
+        }
+    };
+    let recorded = open_ledger().and_then(|ledger| {
+        operational(
+            ledger.record_router_provenance(&relais::ledger::RouterProvenance::EnvelopeRemoved {
+                source: off.source.clone(),
+                at: off.at.clone(),
+            }),
+            "recording the removal in the ledger",
+        )
+    });
+    if let Err(e) = recorded {
+        eprintln!(
+            "relais native router-envelope: warning: routing is off in machine.toml, but the \
+             ledger did not record it ({e})"
+        );
+    }
+    print_document(
+        &serde_json::json!({ "schema": 1, "envelope": null, "off": off, "removed": had_envelope }),
+    )?;
+    Ok(CliOutcome::Accepted)
+}
+
 fn native_gate() -> Result<relais::coordinator::RemoteGate, CliError> {
     let socket = relais::coordinator::socket_path().map_err(CliError::Home)?;
     Ok(relais::coordinator::RemoteGate::new(socket))
@@ -5023,6 +5284,10 @@ fn report_command(
         not_imported = import_for_report(&ledger, &projects_dir, &price_table, &since)?;
     }
     let mut report = operational(report::runs_report(&ledger, &since, by), "report")?;
+    report.session_routing = operational(
+        relais::router::report_section(&ledger, &since, &load_price_table()?),
+        "the session-routing section",
+    )?;
     report.orchestration.unattributable = not_imported.unattributable;
     report.orchestration.transcript_missing = not_imported.transcript_missing;
     // Best-effort: a report is still a report with no coordinator

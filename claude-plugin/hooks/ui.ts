@@ -40,7 +40,13 @@ export async function flush(fx: Fx, store: Store) {
   store.isDirty = false
   store.flushedAt = now
   await fx.pane.write(asJson({ runs: runsOf(store), now }))
-  fx.ui.status(statusLine(store.models, now, store.heldOutcome))
+  fx.ui.status(statusText(store, now))
+}
+
+// The run's status and the router's, side by side; either may be absent.
+export function statusText(store: Store, now: number): string | undefined {
+  const parts = [statusLine(store.models, now, store.heldOutcome), store.router.status].filter(Boolean)
+  return parts.length > 0 ? parts.join(' · ') : undefined
 }
 
 // Opens the pane. Unasked it is placed only on a wide terminal, and asked

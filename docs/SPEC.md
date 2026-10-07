@@ -26,7 +26,7 @@ The core unit is a task with an immutable contract and a sequence of recorded at
 
 Relais MUST NOT equate aval check with application compliance, an amont pass with semantic correctness, or a worker's completion message with acceptance. It MUST NOT change amont trust, skip settings or amont-agent stances to complete a task.
 
-Relais supports one repository per run, with bounded independent work packages when decomposition is justified. It includes an owned training pipeline, a native Rust learned router, reusable context, controlled routing trials and backend adapters. It excludes unrestricted agent teams, automatic publishing, deployment, cross-repository writes, a transparent model proxy and general-purpose chat memory.
+Relais supports one repository per run, with bounded independent work packages when decomposition is justified. It includes an owned training pipeline, a native Rust learned router, reusable context, controlled routing trials and backend adapters. It excludes unrestricted agent teams, automatic publishing, deployment, cross-repository writes, a transparent model proxy and general-purpose chat memory. The one exception to "no transparent model proxy" is the relais plugin's advisory session router (§30): inside an envelope the person grants once, it chooses the model of the person's own session requests, and it fails open.
 
 ## 3. User experience and integration modes
 
@@ -38,7 +38,7 @@ Relais supports one repository per run, with bounded independent work packages w
 
 A handler somebody else already has on one of these events is joined rather than displaced when it sits on an entry whose matcher is the one relais installs; an entry on a different matcher gets its own, because a matcher states which tool calls a handler wants to see, and widening somebody else's is not relais's to do. Nothing at that granularity is ever deleted on uninstall except the leaf command relais itself added, because relais cannot tell an entry it left empty apart from one that was already empty when it arrived.
 
-Native agent definitions provide convenient defaults for research, implementation and review. Native delegation remains the parent model's choice. Relais MUST label this mode advisory: it cannot guarantee a model, a dollar limit, an attempt limit, or acceptance for arbitrary work in the parent session.
+Native agent definitions provide convenient defaults for research, implementation and review. Native delegation remains the parent model's choice, except that the session router (§30), once its envelope is granted, may choose the model of a subagent the parent spawns — never of relais's own workers, and never of an agent the person pinned. Relais MUST label this mode advisory: it cannot guarantee a model, a dollar limit, an attempt limit, or acceptance for arbitrary work in the parent session.
 
 ### Supervised execution
 
@@ -71,7 +71,7 @@ relais report --since 2026-09-01
 
 `plan` performs local preflight and explains the route without launching a model. `run` validates the contract and starts an execution. `resume` reconciles interrupted state; it never blindly repeats the last command.
 
-Free-form prompting is a skill convenience. The runner accepts structured tasks; it does not invoke a classifier for every trivial request.
+Free-form prompting is a skill convenience. The runner accepts structured tasks; it does not invoke a classifier for every trivial request. The session router (§30) is the one exception, outside the runner: it makes one small classifier call per prompt the person types, and reports that call's cost.
 
 ## 4. Task contract
 
@@ -925,6 +925,28 @@ Nothing a run does is out of sight. Every step is an **event**, appended as one 
 The plugin answers through `relais native` (§23): `hello`, `bound`, `stopped` and `status`. Under `--protocol` every stdout line of a whole run, accepted or not, is one of these objects or an `event`, and the last is `done`; a package run's child runs write events but no `done`.
 
 **Streaming check output.** A command's stdout and stderr go to its log file, which stays the record. While it runs, a follower reads the growing file with a descriptor of its own: it never touches the command's pipes, so it cannot slow or block the check. New bytes are merged every 100 ms into `output` events of at most 4 KB of text each. A check puts at most 64 KB of output into events in all; the rest is skipped, counted, and reported in one final `output` event with empty `text` and `elided_bytes` set. When the follower falls behind it skips ahead and counts what it skipped. It stops, after one last read, when the command ends. The log file holds all of the output, and a check is no slower with the follower than without it.
+
+## 30. Session routing
+
+The relais plugin routes the model of the person's own Claude Code session (plan `docs/plans/2026-10-07-session-router.md`; the wire contract between the plugin and relais is `docs/router-protocol.md`; decision record `.adr/records/0001-relais-routes-the-session-model.md`). It is advisory (§3) and fails open (§23): any error, timeout or unreadable answer leaves a request as it was, or keeps the task's current tier, and never moves it down. relais's own supervised workers are never routed (§6).
+
+**The task.** The plugin keeps a small summary of the work in progress. A classifier call (haiku, low effort, one per prompt the person types; task notifications and relais's own prompts are never classified) reads the prompt against that summary and returns the relation (`new_task`, `continuation`, `correction`), the kind, the difficulty (1–5), the scope, the uncertainty, whether the work is verifiable, any explicit acceptance or correction, a model the person named, and a confidence. A continuation inherits the task's classification; only its difficulty may rise.
+
+**Initial routing.** A capability table, versioned and served by `relais native router-state`, maps the classification to a tier: escalation for difficulty ≥ 4 or high uncertainty beyond `local`; research for difficulty ≤ 2 with low uncertainty when the task is verifiable or a question; implementation otherwise. A model cheaper than the session's own is chosen only through the research rule (or, later, a learned adjustment), never on confidence alone; below 0.6 confidence a new task keeps the session's tier.
+
+**Recovery.** A failed check after an edit in the task (a test, lint or build command: the repository's profile commands and a built-in list), two failed repairs in a row, or a correction raises the task's tier by one, from the next request, at most twice; then the effort rises. Nothing moves a task down. A growing scope or a new subagent re-runs the table, which can only raise the tier. The person never has to say "try again".
+
+**Cache-aware switching.** A switch down at a task start happens only when the predicted saving (the median tokens of completed tasks of the same kind and difficulty, else a fixed prior of 20k, 60k, 150k, 400k or 800k tokens, times the price difference) exceeds the cost of rewriting the context into the new model's cache at the 1-hour write rate. An unknown price blocks a switch down; a switch up always passes.
+
+**Subagents.** The router decides a subagent's model through the same classifier and table, overriding the parent's `model` parameter within the envelope. A model the person named in the prompt, a model pinned by an agent definition the person maintains (`~/.claude/agents/*.md`, `.claude/agents/*.md`, read by relais) or `[session_routing] pinned_agents` is never overridden. A subagent's failed check escalates that subagent only.
+
+**Outcomes and evidence.** A task ends `completed_verified` (its last check passed, or a relais run in it was accepted), `completed_accepted` (the person said so), `corrected` (the person corrected or flagged it), or `unknown`. Inferred signals (an abort, no complaint, a respawn) are diagnostics, never outcomes. A task record sent again replaces the stored outcome only with a higher-ranked one: `corrected` > `completed_*` > `unknown`. `relais native router-observe` writes each prompt's batch of decisions, per-request usage (tokens and model, never a cost), reassessments and tasks in one transaction, idempotently, into the ledger's router tables (step v20); a bad payload exits 2 and writes nothing. These usage rows are the router's own accounting and are never added to `orchestration_usage` totals.
+
+**Authority.** `[session_routing]` in machine.toml holds the envelope (`granted_at`, `by`, `epsilon_max`, `source`), the hold-out rate (0.1), the exploration rate (0.1, never above `epsilon_max`, 0 without an envelope), the alias table (`model_ids`: `turn.step` needs full ids), `pinned_agents`, `excluded_models` and the learning floor. The mode is `on` whenever the envelope is recorded; `RELAIS_SESSION_ROUTING=off|shadow` can only narrow it; without an envelope it is `shadow` (decide and record, switch nothing). The plugin follows that mode. The envelope is recorded once, without a further question: by `relais install --claude --write` when it installs the plugin (installing is the authorization; source `install`), or by `/relais-routing` after the plugin asks through `$.ui.ask` (source `plugin-ask`). `/relais-routing off` removes it and records an `off` tombstone, which keeps a later install from recording it again. `relais native router-envelope` writes both with the same locked, atomic, comment- and mode-keeping writer as `trust grant`, and records every write with its source (`install`, `plugin-ask`, or `cli (unattributed)`). There is no hand-labelled evaluation: the classifier's quality is judged from automatic outcomes, and missed failures are measured from later corrections and reverts.
+
+**The bypass limit.** Every session runs with permission prompts bypassed, so the model can do anything the person's shell can. The plugin's `tool.check` guards refuse its writes to machine.toml and its Bash calls of `router-envelope` and `relais install --claude`. That stops an accidental or "helpful" self-grant. A deliberate edit of machine.toml from the shell is not stopped: that is the accepted limit, the same one §5 states for the trust grant.
+
+**Measurement.** 10% of sessions are held out, drawn by `SplitMix64` seeded from the session id: they decide and record and apply nothing. `relais report` prints a "session routing" section: the total cost per completed task in routed against held-out (and shadow) sessions, priced from `[pricing]` at read time with the cache rebuild at the 1-hour write rate, a 95% cluster-bootstrap interval over sessions, counts, the unknown-outcome rate, the classifier's own cost and the cache tokens rewritten after a switch — all labelled an API-equivalent estimate, and an unpriced model shown as unknown, never zero (§11). Learned adjustments (seeded exploration, the activation gates, `router evaluate` and `rollback`) come later and activate only inside the envelope.
 
 ---
 

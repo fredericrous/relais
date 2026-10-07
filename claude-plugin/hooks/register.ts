@@ -9,8 +9,21 @@ import type { Fx } from './fx.ts'
 import { DENY_MESSAGE, isRelaisNotification, isRelaisType, relaisAddresses } from './guards.ts'
 import { childOf, contractPath, onChunk, pump, reloadTimeline, startReplay, startRun, statusOf } from './runs.ts'
 import { onboardTool, onPersonPrompt, trustTool, withRoutingSection } from './consent.ts'
-import { machineSettingsGuard } from './guards.ts'
-import { close, createStore, detach, every } from './store.ts'
+import { machineSettingsGuard, routerEnvelopeGuard } from './guards.ts'
+import {
+  afterStep,
+  beforeStep,
+  flag,
+  onPrompt,
+  onSessionEnd,
+  onToolResult,
+  onTurnComplete,
+  refreshState,
+  routeSpawn,
+  routingCommand,
+} from './routing.ts'
+import { EDIT_TOOLS } from './router.ts'
+import { close, createStore, detach, every, type Store } from './store.ts'
 import { FLUSH_MS, openPane, renderPane, timelineLines } from './ui.ts'
 
 const RUN_TOOL = 'mcp__relais__run'
@@ -19,11 +32,15 @@ const STATUS_TOOL = 'mcp__relais__status'
 const ONBOARD_TOOL = 'mcp__relais__onboard'
 const TRUST_TOOL = 'mcp__relais__trust'
 const CONSENT_FAILED = 'declined: relais could not ask the person (internal error). Nothing was written or allowed.'
+// The prompts a person makes: typed, through the bridge, or a headless
+// run's own. Every other origin (notifications, schedules, peers, plugins)
+// is never classified.
+const PERSON_ORIGINS = new Set(['composer', 'bridge', 'sdk'])
 
 // Every effect the sibling modules use, spelled on `$` here: `claude plugin
 // validate` follows `$` within a file, not across an import.
 const effects = ($: any): Fx => ({
-  session: { id: () => $.session.id() },
+  session: { id: () => $.session.id(), model: () => $.session.model() },
   process: {
     run: (argv: string[], init: unknown) => $.process.run(argv, init),
     spawn: (request: unknown) => $.process.spawn(request),
@@ -50,7 +67,20 @@ const effects = ($: any): Fx => ({
     read: () => $.state.get({ plugin: 'relais', key: 'pane' }),
     write: (value: unknown) => $.state.set({ plugin: 'relais', key: 'pane' }, value),
   },
+  model: { complete: (request: unknown) => $.model.complete(request) },
+  kv: {
+    get: (key: string) => $.store.get(key),
+    set: (key: string, value: unknown) => $.store.set(key, value),
+  },
 })
+
+// Whether a spawn is relais's own: a pending dispatch, or this plugin's own
+// call; the directory it runs in when it is both.
+function relaisSpawn(store: Store, e: any, isOurs: boolean) {
+  const dispatch = dispatchOfDescription(e.description)
+  const pending = dispatch ? store.pending.get(dispatch) : undefined
+  return { isRelais: isOurs || pending !== undefined, cwd: isOurs && pending ? pending.cwd : undefined }
+}
 
 export function register(on: any) {
   const store = createStore()
@@ -66,6 +96,10 @@ export function register(on: any) {
   on('session.start', async ($: any, e: any, next: any) => {
     const fx = effects($)
     store.sessions.add(await fx.session.id())
+    // The router's state is read in the background; the first prompt waits
+    // for it (routing.ts). Until then, and on any failure, nothing is routed.
+    if (typeof e.cwd === 'string') store.router.cwd = e.cwd
+    detach(refreshState(fx, store))
     await $.tool.register({
       name: 'run',
       description:
@@ -130,14 +164,32 @@ export function register(on: any) {
       name: 'relais-status',
       description: "Open the relais pane: this session's runs, live.",
     })
+    await $.command.register({
+      name: 'relais-routing',
+      description: "Route the session model by the task (asks you; shows what it allows). '/relais-routing off' turns it off.",
+    })
+    await $.command.register({
+      name: 'relais-flag',
+      description: 'Mark the current task as wrong: relais moves it to a stronger model from the next request.',
+    })
     ensurePump(fx)
     detach(sendHello(fx, store))
     every(fx, store, HELLO_EVERY_MS, () => detach(sendHello(fx, store)))
     return next(e)
   })
 
-  on('session.end', ($: any, e: any, next: any) => {
+  on('session.end', async ($: any, e: any, next: any) => {
+    // The router's open tasks and observations go first, at every reason.
+    try {
+      const fx = effects($)
+      await onSessionEnd(fx, store, String(e.reason), await fx.clock.now())
+    } catch {
+      // Fail open: the session ends whatever the router could send.
+    }
     // /clear and /resume go on in this module under a new session id.
+    if (e.reason !== 'clear' && e.reason !== 'resume') close(store)
+    return next(e)
+  }).catch(($: any, e: any, next: any) => {
     if (e.reason !== 'clear' && e.reason !== 'resume') close(store)
     return next(e)
   })
@@ -167,11 +219,14 @@ export function register(on: any) {
 
   // machine.toml holds the grants: the model does not write it, and is
   // told so when a Bash command names it (a reminder, not a wall: SPEC §5).
-  on('tool.check', { tool: ['Write', 'Edit', 'MultiEdit', 'Bash'] }, async ($: any, e: any, next: any) => {
+  // The same for the router's envelope: it is the person's, recorded by
+  // `relais install --claude` or /relais-routing, never by the model.
+  on('tool.check', { tool: ['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Bash'] }, async ($: any, e: any, next: any) => {
     const decided = await next(e)
     const home = await $.env.get('HOME')
     const configDir = await $.env.get('RELAIS_CONFIG_DIR')
-    const refusal = machineSettingsGuard(e.tool, e.input ?? {}, { home, configDir })
+    const input = e.input ?? {}
+    const refusal = machineSettingsGuard(e.tool, input, { home, configDir }) ?? routerEnvelopeGuard(e.tool, input)
     return refusal ? { decision: 'deny', reason: refusal } : decided
   })
 
@@ -219,15 +274,66 @@ export function register(on: any) {
   // Runs in the directory relais chose for the dispatch: the attempt's
   // worktree, the review directory, the repo. Only this plugin's own spawn
   // of a pending dispatch is touched.
+  //
+  // Every other spawn is the session router's (routing.ts): classified and,
+  // within the envelope, given a model. relais's own (a pending dispatch,
+  // or this plugin's own call) are never routed.
   on('agent.spawn', async ($: any, e: any, next: any) => {
-    const dispatch = dispatchOfDescription(e.description)
-    const pending = dispatch ? store.pending.get(dispatch) : undefined
-    const isOurs = next.origin.plugin === $.plugin.name
-    return isOurs && pending ? next({ ...e, cwd: pending.cwd }) : next(e)
+    const own = relaisSpawn(store, e, next.origin.plugin === $.plugin.name)
+    if (own.cwd !== undefined) return next({ ...e, cwd: own.cwd })
+    if (own.isRelais) return next(e)
+    return routeSpawn(effects($), store, e, next, next.budget.remainingMs)
+  }).catch(($: any, e: any, next: any) => {
+    // After `next` the subagent exists: calling it again would start a
+    // second one. Claude Code keeps the result `next` resolved to.
+    if (next.called) throw next.error ?? new Error('relais: agent.spawn failed after the spawn')
+    const own = relaisSpawn(store, e, next.origin.plugin === $.plugin.name)
+    return own.cwd !== undefined ? next({ ...e, cwd: own.cwd }) : next(e)
   })
 
-  on('turn.complete', ($: any, e: any, next: any) => {
-    onTurn(effects($), store, e)
+  // The session router: the turn's first request pins the decision, every
+  // request is rewritten only when the router decided for its loop and the
+  // mode is on; each response's usage is recorded. Fails open to `next(e)`.
+  on('turn.step', async function* ($: any, e: any, next: any) {
+    const fx = effects($)
+    let routed = e
+    try {
+      routed = await beforeStep(fx, store, e, next.budget.remainingMs)
+    } catch {
+      routed = e
+    }
+    const result = yield* next(routed)
+    try {
+      afterStep(store, e, result, await fx.clock.now())
+    } catch {
+      // Usage is a record, never a reason to fail the step.
+    }
+    return result
+  }).catch(async function* (_$: any, e: any, next: any) {
+    return yield* next(e)
+  })
+
+  // Evidence for recovery: edits, and the checks' results. The tool's own
+  // answer passes unchanged.
+  on('tool.call', { tool: ['Bash', ...EDIT_TOOLS] }, async ($: any, e: any, next: any) => {
+    const result = await next(e)
+    try {
+      const fx = effects($)
+      onToolResult(fx, store, e, result, await fx.clock.now())
+    } catch {
+      // Fail open.
+    }
+    return result
+  }).catch(($: any, e: any, next: any) => next(e))
+
+  on('turn.complete', async ($: any, e: any, next: any) => {
+    const fx = effects($)
+    onTurn(fx, store, e)
+    try {
+      onTurnComplete(store, e, await fx.clock.now())
+    } catch {
+      // Fail open.
+    }
     return next(e)
   })
 
@@ -252,7 +358,17 @@ export function register(on: any) {
   // one that only mentions an id included, is kept.
   on('prompt.submit', async ($: any, e: any, next: any) => {
     if (e.origin?.kind !== 'task-notification') {
+      // Whether this plugin submitted it is read before onPersonPrompt
+      // consumes the mark.
+      const isOwn = typeof e.text === 'string' && store.ownPrompts.has(e.text)
       onPersonPrompt(store, e.text)
+      if (!isOwn && PERSON_ORIGINS.has(e.origin?.kind) && typeof e.text === 'string') {
+        try {
+          await onPrompt(effects($), store, e.text)
+        } catch {
+          // Fail open: the prompt goes on unrouted.
+        }
+      }
       return next(e)
     }
     const ids = new Set(store.agentDispatch.keys())
@@ -263,6 +379,14 @@ export function register(on: any) {
   // The routing rule as a section of the system prompt: a note attached to
   // the person's prompt reaches the model but is read as a hook's aside.
   on('prompt.compose', async (_$: any, e: any, next: any) => withRoutingSection(await next(e)))
+
+  on('command.run', { command: 'relais-routing' }, async ($: any, e: any) => ({
+    text: await routingCommand(effects($), store, typeof e?.args === 'string' ? e.args : ''),
+  })).catch(() => ({ text: 'relais could not change session routing (internal error). Nothing was written.' }))
+
+  on('command.run', { command: 'relais-flag' }, async ($: any) => ({
+    text: await flag(effects($), store),
+  })).catch(() => ({ text: 'relais could not flag the task (internal error).' }))
 
   on('ui.render', { component: 'Pane', requestId: 'relais' }, ($: any, e: any) =>
     renderPane(effects($), e),

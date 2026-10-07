@@ -1,8 +1,10 @@
 //! Pricing an orchestration usage record from a machine-owned price
-//! table (SPEC §11). Prices are never constants in this module: they
-//! come from `[pricing]` in `~/.config/relais/machine.toml`, read and
-//! parsed by the caller, so an Anthropic price change is a config edit,
-//! not a code change.
+//! table (SPEC §11). Prices come from `[pricing]` in
+//! `~/.config/relais/machine.toml`, read and parsed by the caller, so an
+//! Anthropic price change is a config edit, not a code change. The one
+//! exception is [`built_in_prices`], which the session router (SPEC §30)
+//! falls back to for a model machine.toml does not price; a machine entry
+//! always wins.
 
 use serde::{Deserialize, Serialize};
 
@@ -60,9 +62,97 @@ impl PriceTable {
         self.rate_for(model).is_some()
     }
 
+    /// The entry that names `model` exactly, if any: its per-million
+    /// rates, for a caller that serves rates rather than pricing a record
+    /// (the session router, SPEC §30).
+    pub fn rate(&self, model: &str) -> Option<&ModelPrice> {
+        self.rate_for(model)
+    }
+
     fn rate_for(&self, model: &str) -> Option<&ModelPrice> {
         self.models.iter().find(|price| price.matches(model))
     }
+
+    /// This table with every [`built_in_prices`] entry it does not already
+    /// price appended: the machine's own entry wins per model. A table
+    /// with no version takes the built-in list's.
+    pub fn with_built_in_defaults(mut self) -> Self {
+        let mut appended = false;
+        for price in built_in_prices() {
+            if !price.ids.iter().any(|id| self.prices(id)) {
+                self.models.push(price);
+                appended = true;
+            }
+        }
+        // A cost priced partly from the built-in list says so in its label.
+        if self.version.is_empty() {
+            self.version = BUILT_IN_PRICES_VERSION.to_string();
+        } else if appended {
+            self.version = format!("{} + {BUILT_IN_PRICES_VERSION}", self.version);
+        }
+        self
+    }
+}
+
+/// The version recorded for a cost priced only from [`built_in_prices`].
+pub const BUILT_IN_PRICES_VERSION: &str = "relais built-in 2026-10-07";
+
+/// The built-in rates, micro-USD per million tokens, used where machine.toml
+/// prices no entry for a model (a machine.toml entry wins per model).
+/// Source: platform.claude.com/docs/en/about-claude/pricing, read
+/// 2026-10-07. Where the page gives two values, the lower-saving one is
+/// kept, so a switch's saving is never overstated:
+/// - claude-haiku-5-5: the over-100k-prompt tier ($0.50 / $2.50);
+/// - claude-sonnet-5-5: cache reads at 0.05x ($0.10), as the page's caching
+///   section states, not the $0.20 in its model table.
+pub fn built_in_prices() -> Vec<ModelPrice> {
+    let price = |ids: &[&str], rates: [i64; 5], fast: Option<(i64, i64)>| ModelPrice {
+        ids: ids.iter().map(|id| id.to_string()).collect(),
+        input: rates[0],
+        output: rates[1],
+        cache_read: rates[2],
+        cache_write_5m: rates[3],
+        cache_write_1h: rates[4],
+        fast_input: fast.map(|f| f.0),
+        fast_output: fast.map(|f| f.1),
+    };
+    vec![
+        price(
+            &["claude-haiku-5-5"],
+            [500_000, 2_500_000, 50_000, 625_000, 1_000_000],
+            None,
+        ),
+        price(
+            &["claude-haiku-4-5", "claude-haiku-4-5-20251001"],
+            [1_000_000, 5_000_000, 100_000, 1_250_000, 2_000_000],
+            None,
+        ),
+        price(
+            &["claude-sonnet-5-5"],
+            [2_000_000, 10_000_000, 100_000, 2_500_000, 4_000_000],
+            None,
+        ),
+        price(
+            &["claude-sonnet-5"],
+            [2_000_000, 10_000_000, 200_000, 2_500_000, 4_000_000],
+            None,
+        ),
+        price(
+            &["claude-opus-5-5"],
+            [4_000_000, 20_000_000, 200_000, 5_000_000, 8_000_000],
+            Some((8_000_000, 40_000_000)),
+        ),
+        price(
+            &["claude-opus-5"],
+            [5_000_000, 25_000_000, 500_000, 6_250_000, 10_000_000],
+            Some((10_000_000, 50_000_000)),
+        ),
+        price(
+            &["claude-fable-5-1"],
+            [10_000_000, 50_000_000, 250_000, 12_500_000, 20_000_000],
+            None,
+        ),
+    ]
 }
 
 /// The result of pricing one usage record.
@@ -154,6 +244,33 @@ pub fn price(record: &UsageRecord, table: &PriceTable) -> Priced {
 mod tests {
     use super::*;
     use crate::orchestration::transcript::CacheWrites;
+
+    #[test]
+    fn built_in_prices_fill_gaps_and_a_machine_entry_wins() {
+        let defaulted = PriceTable::empty().with_built_in_defaults();
+        assert_eq!(defaulted.version, BUILT_IN_PRICES_VERSION);
+        assert_eq!(defaulted.rate("claude-haiku-5-5").unwrap().input, 500_000);
+        let mine = PriceTable {
+            version: "mine".into(),
+            models: vec![ModelPrice {
+                ids: vec!["claude-haiku-5-5".into()],
+                input: 1,
+                output: 2,
+                cache_read: 3,
+                cache_write_5m: 4,
+                cache_write_1h: 5,
+                fast_input: None,
+                fast_output: None,
+            }],
+        }
+        .with_built_in_defaults();
+        // Built-ins filled the other models, and the label says so.
+        assert_eq!(mine.version, format!("mine + {BUILT_IN_PRICES_VERSION}"));
+        // The machine's entry wins for its model; the other built-ins fill in.
+        assert_eq!(mine.rate("claude-haiku-5-5").unwrap().input, 1);
+        assert_eq!(mine.models.len(), built_in_prices().len());
+        assert_eq!(mine.rate("claude-sonnet-5-5").unwrap().input, 2_000_000);
+    }
 
     fn record(input: u64, output: u64, cache_read: u64, cache: CacheWrites) -> UsageRecord {
         UsageRecord {

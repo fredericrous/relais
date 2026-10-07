@@ -4870,6 +4870,7 @@ mod tests {
                 pricing: None,
                 efforts: Default::default(),
                 sandbox: Default::default(),
+                session_routing: Default::default(),
             }
         }
 

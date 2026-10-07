@@ -282,7 +282,9 @@ impl std::fmt::Display for GrantError {
                 LOCK_WAIT.as_secs()
             ),
             GrantError::Invalid(cause) => write!(f, "machine.toml is not valid: {cause}"),
-            GrantError::Unwritable(detail) => write!(f, "the grant could not be added: {detail}"),
+            GrantError::Unwritable(detail) => {
+                write!(f, "machine.toml could not be edited: {detail}")
+            }
         }
     }
 }
@@ -305,15 +307,37 @@ const LOCK_POLL: Duration = Duration::from_millis(25);
 const MACHINE_FILE_MODE: u32 = 0o600;
 
 /// Add `[trust."<key>"]` to the machine settings at `path`, creating the
-/// file (and its directory) when there is none.
+/// file (and its directory) when there is none, through [`edit_machine`].
+pub fn grant(path: &Path, key: &str, record: &TrustGrant) -> Result<Granted, GrantError> {
+    let written = edit_machine(path, |text, current| {
+        if current.trust.contains_key(key) {
+            return Ok(None);
+        }
+        add_grant(text, key, record).map(Some)
+    })?;
+    Ok(if written {
+        Granted::Written
+    } else {
+        Granted::AlreadyPresent
+    })
+}
+
+/// The one way relais rewrites machine.toml: `trust grant` and
+/// `native router-envelope` both go through it.
 ///
 /// Read, edit, validate and rename happen under an exclusive lock on a
-/// sibling `machine.toml.lock`, so two grants at once both land. The
-/// edit goes through `toml_edit`, so a person's comments and ordering
-/// survive. The new file is validated as [`MachineSettings`] before it
-/// replaces the old one, written atomically, and keeps the old file's
-/// mode (0600 for a new one).
-pub fn grant(path: &Path, key: &str, record: &TrustGrant) -> Result<Granted, GrantError> {
+/// sibling `machine.toml.lock`, so two writers at once both land. `edit`
+/// gets the file's text (a bare `schema_version` line when there is no
+/// file) and its parsed settings, and returns the new text, or `None` to
+/// leave the file alone; it edits through `toml_edit`, so a person's
+/// comments and ordering survive. The new text is validated as
+/// [`MachineSettings`] before it replaces the old one, written
+/// atomically, and keeps the old file's mode (0600 for a new one).
+/// `true` when the file was written.
+pub fn edit_machine(
+    path: &Path,
+    edit: impl FnOnce(&str, &MachineSettings) -> Result<Option<String>, GrantError>,
+) -> Result<bool, GrantError> {
     let io = |what: &'static str, path: &Path| {
         let path = path.to_path_buf();
         move |cause| GrantError::Io { what, path, cause }
@@ -348,15 +372,14 @@ pub fn grant(path: &Path, key: &str, record: &TrustGrant) -> Result<Granted, Gra
         Err(cause) => return Err(io("cannot read", path)(cause)),
     };
     let current = MachineSettings::from_toml_str(&text).map_err(GrantError::Invalid)?;
-    if current.trust.contains_key(key) {
-        return Ok(Granted::AlreadyPresent);
-    }
-    let edited = add_grant(&text, key, record)?;
+    let Some(edited) = edit(&text, &current)? else {
+        return Ok(false);
+    };
     MachineSettings::from_toml_str(&edited)
         .map_err(|cause| GrantError::Unwritable(cause.to_string()))?;
     crate::fsutil::write_atomic_with_mode(path, &edited, Some(mode))
         .map_err(io("cannot write", path))?;
-    Ok(Granted::Written)
+    Ok(true)
 }
 
 /// The mode an existing file has, so a rewrite keeps it. Off Unix there

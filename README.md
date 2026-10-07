@@ -77,6 +77,10 @@ split wherever a caller has to act differently.
 | 18 | `trust grant` refused: the key is not this policy's; `relais trust show` prints the current one |
 | 19 | `init --detect` found no verification command and none was typed; nothing was written |
 
+The session-router commands (`native router-state`, `router-observe`,
+`router-envelope`) use 0, 1 and 2 only: 2 is a bad payload or
+invocation (nothing written), 1 a failure to retry.
+
 ## Layout
 
 One crate, `crates/relais`, one binary. Modules follow SPEC §13:
@@ -98,6 +102,7 @@ One crate, `crates/relais`, one binary. Modules follow SPEC §13:
 | `ledger` | the SQLite ledger with additive migrations (§12) |
 | `report`, `doctor`, `install` | reporting, diagnostics, the Claude integration |
 | `learn` | features, dataset, learner, predict, evaluate, registry (§16, §17) |
+| `router` | the session router's relais side: state, observations, envelope, report (§30) |
 
 `crates/relais/tests/release_scenarios.rs` runs the §14 release scenarios
 through the real binary against a fake `claude`; the §23 concurrency
@@ -215,6 +220,40 @@ declares no setup:
 ```
  ! setup        package-lock.json present, and profile `default` declares no setup step: …
 ```
+
+### Session routing
+
+The plugin can also route the model of your own session (SPEC §30): a
+cheap model for an easy, checkable task, a stronger one for a hard or
+uncertain one, and one tier up when a check fails after an edit or you
+correct the work. `relais install --claude --write` turns it on when it
+installs the plugin (it records the envelope in machine.toml); on a
+machine where it did not, `/relais-routing` does. `/relais-routing off`
+turns it off and keeps it off, and `RELAIS_SESSION_ROUTING=off|shadow`
+narrows it for one shell. Without the envelope it runs in `shadow`
+(decides and records, switches nothing).
+
+```sh
+relais native router-state --session <id>    # what the plugin decides from (JSON)
+relais report                                # includes "session routing": cost per completed task, routed vs held out
+```
+
+The plugin calls `native router-observe` and `native router-envelope`
+itself; their wire contract is `docs/router-protocol.md`. Tuning lives in
+machine.toml, every key optional:
+
+```toml
+[session_routing]
+holdout_rate = 0.1                 # share of sessions held out for the comparison
+pinned_agents = ["my-reviewer"]    # subagent types never re-routed
+excluded_models = []               # full ids that do not spawn here
+[session_routing.model_ids]        # alias → full id, over the defaults
+haiku = "claude-haiku-5-5"
+```
+
+**Upgrade relais before adding `[session_routing]`** (or before
+installing the plugin or granting the envelope, which write it): an older relais refuses machine.toml keys
+it does not know, and would then refuse every command that reads the file.
 
 `docs/AUDIT-2026-09-20.md` is the audit this behaviour came out of, with
 the findings still open. `docs/REVIEW-2026-09-21.md` is the crate-wide

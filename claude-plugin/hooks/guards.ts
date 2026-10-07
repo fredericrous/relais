@@ -40,6 +40,21 @@ export function machineSettingsPath(env: { home?: string; configDir?: string }):
   return undefined
 }
 
+export const ROUTER_ENVELOPE_MESSAGE =
+  'Session routing is the person\'s to turn on or off: `relais install --claude` or /relais-routing records the envelope, and /relais-routing off removes it. The model does not run router-envelope or relais install --claude.'
+
+// Why the model's Bash call may not record or remove the routing envelope,
+// or undefined: `relais native router-envelope`, and `relais install …
+// --claude` (which records the envelope). A reminder, not a boundary: in a
+// bypass-permissions session a deliberate write is the stated limit.
+export function routerEnvelopeGuard(tool: string, input: Record<string, unknown>): string | undefined {
+  if (tool !== 'Bash') return undefined
+  const command = String(input.command ?? '')
+  if (/\brouter-envelope\b/.test(command)) return ROUTER_ENVELOPE_MESSAGE
+  if (/\brelais\s+install\b[^|;&\n]*--claude\b/.test(command)) return ROUTER_ENVELOPE_MESSAGE
+  return undefined
+}
+
 // Why the model's Write, Edit or Bash call may not touch the grants, or
 // undefined. Write and Edit are matched on the exact path. Bash is a shell
 // string, so its match is a reminder for the model, not a boundary: SPEC §5

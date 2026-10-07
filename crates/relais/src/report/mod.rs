@@ -602,6 +602,12 @@ pub struct Report {
     /// Present only for `--by recipe`: says the cohort figures are
     /// observational, not a comparison ([`RECIPE_OBSERVATIONAL_NOTE`]).
     pub observational: Option<String>,
+    /// The session router's spend (SPEC §30): cost per completed task in
+    /// routed sessions against held-out ones. `runs_report` leaves it
+    /// `None`; `relais report` fills it from the router's tables and
+    /// `[pricing]`, and it stays `None` when no routed task started in
+    /// the window.
+    pub session_routing: Option<crate::router::report::SessionRoutingReport>,
 }
 
 /// Orchestration spend imported from Claude Code session transcripts
@@ -974,6 +980,7 @@ pub fn runs_report(
         enforcement: EnforcementReport::observed(),
         orchestration,
         cost_per_accepted_task_with_orchestration,
+        session_routing: None,
         trial_spend,
         observational,
     })
@@ -1254,6 +1261,9 @@ impl Report {
                 self.orchestration.unattributable,
                 self.orchestration.transcript_missing,
             ));
+        }
+        if let Some(routing) = &self.session_routing {
+            out.push_str(&routing.render());
         }
     }
 }
@@ -1661,6 +1671,7 @@ mod tests {
                 transcript_missing: 0,
             },
             cost_per_accepted_task_with_orchestration: Some(MicroUsd::from_micros(10)),
+            session_routing: None,
         };
         let rendered = report.render();
         assert!(
@@ -1873,6 +1884,7 @@ mod tests {
                 "repair_outcomes",
                 "runs",
                 "schema_version",
+                "session_routing",
                 "since",
                 "standing",
                 "standing_tasks",

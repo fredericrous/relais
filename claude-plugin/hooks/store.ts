@@ -4,6 +4,7 @@
 import type { Fx } from './fx.ts'
 import type { Dispatch } from './dispatches.ts'
 import type { RunModel } from './timeline.ts'
+import { createRouterMemory, type RouterMemory } from './router.ts'
 
 // One `relais run` child, as the module started it.
 export type Child = {
@@ -68,6 +69,9 @@ export type Store = {
   // Outcome messages this plugin submitted, so `prompt.submit` does not
   // take them for the person's own words.
   ownPrompts: Set<string>
+  // The session router's memory: router-state, the task, the pinned route,
+  // the observations waiting (routing.ts).
+  router: RouterMemory
 }
 
 // A background promise nobody awaits: once the module unloads its effects
@@ -101,6 +105,7 @@ export const createStore = (): Store => ({
   consent: new Map(),
   declined: new Set(),
   ownPrompts: new Set(),
+  router: createRouterMemory(),
 })
 
 // Timers go through here so that unloading can clear every one.
