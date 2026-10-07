@@ -283,6 +283,24 @@ pub(crate) fn sandbox_finding(settings: &MachineSettings) -> Option<Finding> {
     })
 }
 
+/// The `hook-worktrees` finding: records the former `WorktreeCreate` hook
+/// (before the relais plugin) kept of the default worktrees it made, which
+/// nothing reads or cleans any more. None when the directory is absent.
+pub(crate) fn hook_worktrees_finding(state_dir: &Path) -> Option<Finding> {
+    let dir = state_dir.join("hook-worktrees");
+    dir.is_dir().then(|| Finding {
+        component: "hook-worktrees",
+        level: Level::Warn,
+        detail: format!(
+            "{} holds records of default worktrees relais's former WorktreeCreate hook \
+             made; nothing reads them now. Remove the directory, and any leftover \
+             `worktree-agent-*` worktree and branch (`git worktree list`, `git worktree \
+             remove`, `git branch -D`) in the repositories they name",
+            dir.display()
+        ),
+    })
+}
+
 /// What the `permissions` finding says when machine.toml still has
 /// `[permissions] allowed_tools`: a native agent uses the tools its agent
 /// definition names, so the key is parsed and ignored.
@@ -895,6 +913,9 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
     // depend on it.
     let home = paths::home_dir().ok();
     let mut findings = directory_findings();
+    if let Ok(state) = paths::state_dir() {
+        findings.extend(hook_worktrees_finding(&state));
+    }
 
     check_command("git", &["--version"], &mut findings, "git");
 
@@ -1416,10 +1437,12 @@ fn hook_timeout_finding(
 }
 
 /// Whether every settings file that records a relais hook wires the
-/// current set: the tool matcher `Agent|Task|SendMessage` and a
-/// `WorktreeCreate` handler. A file an older relais wrote still has the
-/// old matcher, which native workers need replaced; nothing is said when
-/// no file records a hook, because `hook-live` already says so.
+/// current set: the tool matcher `Agent|Task` and no `WorktreeCreate`
+/// handler. A file the relais that ran native workers through the hook
+/// wrote still has the `SendMessage` matcher and a `WorktreeCreate`
+/// handler with no code behind it, which breaks Claude Code's own
+/// isolated agents; nothing is said when no file records a hook, because
+/// `hook-live` already says so.
 fn hook_wiring_finding(roots: crate::install::settings::MergedRoots<'_>) -> Option<Finding> {
     let scan = recorded_hooks(roots);
     let stale: Vec<RecordedHook> = scan
@@ -1432,8 +1455,9 @@ fn hook_wiring_finding(roots: crate::install::settings::MergedRoots<'_>) -> Opti
             component: "hook-wiring",
             level: Level::Warn,
             detail: format!(
-                "{} still wires the old tool matcher (or no WorktreeCreate handler), which \
-                 native workers need updated; run `relais install --claude --hooks --write`",
+                "{} still has relais's SendMessage matcher or its WorktreeCreate entry, which \
+                 the plugin replaced and which stops Claude Code's own isolated agents from \
+                 getting their worktrees; run `relais install --claude --hooks --write`",
                 describe_hook_locations(&stale)
             ),
         });
@@ -2568,30 +2592,34 @@ mod tests {
     }
 
     #[test]
-    fn hook_wiring_finding_flags_the_old_matcher_and_accepts_the_new_set() {
+    fn hook_wiring_finding_flags_the_native_hook_wiring_and_accepts_the_current_set() {
         let dir = crate::test_support::temp_dir("doctor-hook-wiring");
         let claude_dir = dir.join(".claude");
         std::fs::create_dir_all(&claude_dir).expect("mkdir");
         let settings = claude_dir.join("settings.json");
-        let old = serde_json::json!({
-            "hooks": {
-                "PreToolUse": [
-                    {"matcher": "Agent|Task", "hooks": [
-                        {"type": "command", "command": "/opt/relais/bin/relais hook"}
-                    ]}
-                ]
-            }
-        });
-        std::fs::write(&settings, old.to_string()).expect("write");
-        let finding = hook_wiring_finding(merged_roots(&dir, None)).expect("a finding");
-        assert_eq!(finding.level, Level::Warn, "{}", finding.detail);
-        assert!(
-            finding
-                .detail
-                .contains("relais install --claude --hooks --write"),
-            "{}",
-            finding.detail
-        );
+        let command = "/opt/relais/bin/relais hook";
+        let relais = serde_json::json!([{"type": "command", "command": command}]);
+        let stale = [
+            // The SendMessage matcher of the hook-side native path.
+            serde_json::json!({"hooks": {
+                "PreToolUse": [{"matcher": "Agent|Task|SendMessage", "hooks": relais}]
+            }}),
+            // The current matcher with relais's WorktreeCreate entry left.
+            serde_json::json!({"hooks": {
+                "PreToolUse": [{"matcher": "Agent|Task", "hooks": relais}],
+                "WorktreeCreate": [{"hooks": relais}]
+            }}),
+        ];
+        for old in stale {
+            std::fs::write(&settings, old.to_string()).expect("write");
+            let finding = hook_wiring_finding(merged_roots(&dir, None)).expect("a finding");
+            assert_eq!(finding.level, Level::Warn, "{}", finding.detail);
+            assert!(
+                finding.detail.contains("relais install --claude"),
+                "{}",
+                finding.detail
+            );
+        }
 
         let mut current = serde_json::json!({});
         crate::install::settings::apply_hooks(
@@ -3096,6 +3124,23 @@ mod tests {
     #[test]
     fn a_machine_toml_without_sandbox_has_no_sandbox_finding() {
         assert!(sandbox_finding(&machine_with("")).is_none());
+    }
+
+    #[test]
+    fn leftover_hook_worktree_records_are_named_and_none_when_absent() {
+        let dir = std::env::temp_dir().join(format!("relais-hookwt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        assert!(hook_worktrees_finding(&dir).is_none());
+        std::fs::create_dir_all(dir.join("hook-worktrees").join("session-1")).expect("records");
+        let finding = hook_worktrees_finding(&dir).expect("a finding");
+        assert_eq!(finding.component, "hook-worktrees");
+        assert_eq!(finding.level, Level::Warn);
+        assert!(
+            finding.detail.contains("worktree-agent-*"),
+            "{}",
+            finding.detail
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A `[sandbox]` section, keys and all, is reported as one line saying

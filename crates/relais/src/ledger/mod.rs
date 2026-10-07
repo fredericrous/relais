@@ -3306,6 +3306,18 @@ impl Ledger {
         )?)
     }
 
+    /// Is this agent the one a relais dispatch recorded
+    /// (`dispatches.agent_id`)? Its whole transcript is the run's, so
+    /// `usage import` leaves it alone even when no message id of it was
+    /// booked.
+    pub fn is_relais_agent(&self, agent_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM dispatches WHERE agent_id = ?1)",
+            params![agent_id],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Dispatch intent is persisted BEFORE the process exists (SPEC §12).
     /// A retry with the same dispatch ID is a no-op, not a duplicate.
     ///

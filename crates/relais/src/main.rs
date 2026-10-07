@@ -1229,6 +1229,7 @@ fn render_hooks_preview(plan: relais::install::HooksPlan) -> CliOutcome {
                         relais::install::HookEventAction::Current => "keep",
                         relais::install::HookEventAction::CorrectTimeout => "retime",
                         relais::install::HookEventAction::MigrateMatcher => "migrate",
+                        relais::install::HookEventAction::RemoveRetired => "remove",
                         relais::install::HookEventAction::JoinExisting => "join",
                         relais::install::HookEventAction::NewEntry => "add",
                     },
@@ -2216,47 +2217,24 @@ fn hook_command(dir: &Path) -> Result<CliOutcome, CliError> {
 }
 
 /// `relais hook`, run with no flags: read one payload on stdin, decide
-/// what to say about it, and say it (SPEC §23). Exits 0 except when the
-/// answer itself asks otherwise: a `WorktreeCreate` relais could not make
-/// a tree for exits 1 with the reason, because Claude Code refuses that
-/// agent either way and the reason is the only thing worth adding. For
-/// everything else a non-zero exit is reported to the session as a
-/// failure of the tool call it was watching, so a relais that cannot
-/// answer must be indistinguishable from a relais that had nothing to
-/// say. Every path that could fail (an unreadable settings file, an
-/// unreachable coordinator, a payload that is not JSON, a panic anywhere
-/// inside) is swallowed rather than surfaced; `relais doctor` is where
-/// any of that is reported as a finding.
+/// what to say about it, and say it (SPEC §23). Always accepts — a
+/// non-zero exit from a hook is reported to the session as a failure of
+/// the tool call it was watching, so a relais that cannot answer must be
+/// indistinguishable from a relais that had nothing to say. Every path
+/// that could fail (an unreadable settings file, an unreachable
+/// coordinator, a payload that is not JSON, a panic anywhere inside) is
+/// swallowed rather than surfaced; `relais doctor` is where any of that
+/// is reported as a finding.
 fn hook_respond_command() -> CliOutcome {
     // The whole body, not just `respond::handle`: reading stdin,
     // loading settings and journalling all run here too, and none of
     // them may take the process down with them any more than the
     // decision itself may.
-    // An answer may ask for a non-zero exit (a worktree that could not be
-    // made); a panic still exits 0, as every hook failure always has.
-    let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook_respond)).unwrap_or(0);
-    if code != 0 {
-        std::process::exit(code);
-    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook_respond));
     CliOutcome::Accepted
 }
 
-/// Print an answer: stdout as rendered (one trailing newline), stderr
-/// when it has something to say. Returns the exit status it asks for.
-fn write_answer(answer: &relais::hook::decide::HookAnswer) -> i32 {
-    if let Some(mut text) = answer.stdout_payload() {
-        if !text.ends_with('\n') {
-            text.push('\n');
-        }
-        print!("{text}");
-    }
-    if let Some(reason) = answer.stderr_payload() {
-        eprintln!("{reason}");
-    }
-    answer.exit_code()
-}
-
-fn hook_respond() -> i32 {
+fn hook_respond() {
     use std::io::Read;
     let mut payload = Vec::new();
     // A truncated read leaves `payload` with whatever arrived so far;
@@ -2268,15 +2246,27 @@ fn hook_respond() -> i32 {
 
     let Ok(socket) = relais::coordinator::socket_path() else {
         // No home directory: nothing to connect to and nowhere to
-        // journal. The hook still owes an answer for "the coordinator
-        // could not be reached" under this machine's own stance, and a
-        // `WorktreeCreate` still owes a path or a reason.
-        let answer = relais::hook::respond::answer_without_home(&payload, &settings);
-        return write_answer(&answer);
+        // journal. `decide_or_silent` still owes an answer for "the
+        // coordinator could not be reached" under this machine's own
+        // stance, so build one directly rather than skip the decision
+        // entirely.
+        let event = relais::hook::event::parse(&payload);
+        let answer = relais::hook::decide::decide_or_silent(
+            &event,
+            &settings,
+            None,
+            std::time::Duration::ZERO,
+        );
+        if let Some(text) = answer.stdout_payload() {
+            println!("{text}");
+        }
+        return;
     };
     let gate = relais::coordinator::RemoteGate::new(socket);
     let handled = relais::hook::respond::handle(&payload, &settings, &gate);
-    let code = write_answer(&handled.answer);
+    if let Some(text) = handled.answer.stdout_payload() {
+        println!("{text}");
+    }
     if let Ok(path) = paths::hook_journal_path() {
         let entry = relais::hook::respond::journal_entry(&payload, &handled);
         // Best effort, like every other step here: a journal write
@@ -2284,7 +2274,6 @@ fn hook_respond() -> i32 {
         // answered above.
         let _ = relais::hook::respond::append_journal(&path, &entry);
     }
-    code
 }
 
 /// The machine's hook-admission settings, or the stated defaults when
@@ -4531,7 +4520,9 @@ enum SessionImportOutcome {
 }
 
 /// Import one session's orchestration usage: its main transcript and
-/// every subagent file beside it (SPEC §11). Idempotent — every insert
+/// every subagent file beside it, except what a relais run booked: the
+/// message ids in `native_usage_messages` and the whole file of an agent
+/// a dispatch recorded (SPEC §11). Idempotent — every insert
 /// goes through `record_orchestration_usage`'s `message_id` uniqueness,
 /// so importing the same session twice inserts nothing the second time.
 fn import_session(
@@ -4578,8 +4569,17 @@ fn import_session(
                 })
             }
         };
+        // A relais dispatch's agent is the run's, whatever message ids its
+        // transcript carries: a dispatch whose ids could not be recorded
+        // (`rollback_ids_missing`) is still never booked twice.
+        let relais_agent = match paths::subagent_agent_id(&path) {
+            Some(agent_id) => operational(ledger.is_relais_agent(agent_id), "usage import")?,
+            None => false,
+        };
         for record in orchestration::parse_transcript(&text) {
-            if operational(ledger.is_native_booked(&record.message_id), "usage import")? {
+            if relais_agent
+                || operational(ledger.is_native_booked(&record.message_id), "usage import")?
+            {
                 summary.skipped_native += 1;
                 continue;
             }
@@ -5315,6 +5315,98 @@ mod tests {
             .expect("refused");
         assert!(old.contains(relais::native::SUPPORTED_CLAUDE_CODE), "{old}");
         assert!(old.contains("2.1.0"), "{old}");
+    }
+
+    /// A session transcript: one assistant message with this id.
+    fn assistant_line(message_id: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"2026-10-06T10:00:00Z","message":{{"id":"{message_id}","model":"claude-opus-5","usage":{{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0}}}}}}"#
+        )
+    }
+
+    /// The projects directory of one session: its main transcript, and
+    /// the transcripts of a relais agent (`a-relais`) and of the person's
+    /// own subagent (`a-own`).
+    fn session_with_two_subagents(dir: &Path) -> PathBuf {
+        let projects = dir.join("projects");
+        let slug = projects.join("-slug");
+        let subagents = slug.join("sess-r").join("subagents");
+        std::fs::create_dir_all(&subagents).expect("subagents dir");
+        std::fs::write(slug.join("sess-r.jsonl"), assistant_line("msg-main")).expect("main");
+        std::fs::write(
+            subagents.join("agent-a-relais.jsonl"),
+            assistant_line("msg-relais"),
+        )
+        .expect("relais agent");
+        std::fs::write(
+            subagents.join("agent-a-own.jsonl"),
+            assistant_line("msg-own"),
+        )
+        .expect("own agent");
+        projects
+    }
+
+    /// `usage import` books the session's own messages and the person's
+    /// subagents, and nothing from the transcript of an agent the ledger
+    /// records as a relais dispatch — even though none of that agent's
+    /// message ids is in `native_usage_messages` (`rollback_ids_missing`).
+    #[test]
+    fn usage_import_skips_the_agent_file_of_a_relais_dispatch() {
+        let (ledger, dir) = temp_ledger("import-agent-file");
+        let projects = session_with_two_subagents(&dir);
+        let run = relais::ids::RunId::from_stored("run-r");
+        ledger
+            .insert_run(
+                &run,
+                "/repo",
+                Some("sess-r"),
+                &relais::ids::TaskId::from_stored("task-r"),
+                "rk",
+            )
+            .expect("run");
+        let imported = |ledger: &Ledger| match import_session(
+            ledger,
+            &projects,
+            &PriceTable::empty(),
+            "sess-r",
+        )
+        .expect("imports")
+        {
+            SessionImportOutcome::Imported(summary) => summary,
+            SessionImportOutcome::Unattributable | SessionImportOutcome::TranscriptMissing => {
+                panic!("the session has a transcript")
+            }
+        };
+
+        // No dispatch on record: all three files are the session's.
+        let (fresh, fresh_dir) = temp_ledger("import-agent-file-fresh");
+        assert_eq!(imported(&fresh).messages, 3);
+        drop(fresh_dir);
+
+        let dispatch = relais::ids::DispatchId::from_stored("d-r");
+        ledger
+            .record_dispatch_intent(
+                &dispatch,
+                &run,
+                None,
+                &serde_json::json!({}),
+                0,
+                relais::route::RoutedBy::ConservativeBaseline,
+            )
+            .expect("dispatch");
+        ledger
+            .record_native_dispatch(&dispatch, Some("a-relais"))
+            .expect("agent bound");
+        assert!(!ledger.is_native_booked("msg-relais").expect("lookup"));
+
+        let summary = imported(&ledger);
+        assert_eq!(
+            summary.messages, 2,
+            "the main transcript and the person's agent"
+        );
+        assert_eq!(summary.skipped_native, 1, "the relais agent's file");
+        // Idempotent: a second import inserts nothing either.
+        assert_eq!(imported(&ledger).messages, 2);
     }
 
     #[test]

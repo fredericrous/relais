@@ -772,7 +772,6 @@ mod tests {
     use crate::admission::{
         Decision, DispatchRequest, DispatchSource, ResourceClass, RunRegistration,
     };
-    use crate::native::marker_line;
     use crate::policy::ConcurrencyLimits;
     use std::time::Duration;
 
@@ -820,7 +819,7 @@ mod tests {
         NativeAsk::Spawn {
             subagent_type: "relais-worker".into(),
             model: "sonnet".into(),
-            prompt: format!("do it\n{}", marker_line(dispatch)),
+            prompt: format!("do it for {dispatch}"),
             worktree: PathBuf::from("/trees/task"),
         }
     }
@@ -828,7 +827,7 @@ mod tests {
     fn continue_ask(dispatch: &str, agent: &str) -> NativeAsk {
         NativeAsk::Continue {
             agent_id: agent.into(),
-            message: format!("fix it\n{}", marker_line(dispatch)),
+            message: format!("fix it for {dispatch}"),
         }
     }
 
@@ -998,7 +997,7 @@ mod tests {
         let second_tree = NativeAsk::Spawn {
             subagent_type: "w".into(),
             model: "m".into(),
-            prompt: marker_line("d2"),
+            prompt: "do it for d2".into(),
             worktree: PathBuf::from("/trees/two"),
         };
         state.register_native("s1", "d1", &spawn_ask("d1"));

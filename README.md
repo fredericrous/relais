@@ -219,7 +219,12 @@ from Claude Code with the relais plugin, which runs it with `--protocol` and
 `RELAIS_HOST=claude-code-mod`, so the worker shows as Claude Code's own agent;
 from a plain terminal it is refused (exit 2), as it is on a Claude Code outside
 the plugin's range (`>= 2.1.291, < 2.2.0`). `--native` is gone.
-`--hooks` also wires the eight hook events #171's native path needs.
+`--hooks` wires only the admission caps on your own `Agent`/`Task` spawns
+(`Agent|Task`, no `WorktreeCreate`, no `SendMessage`): Claude Code makes its own
+worktrees, and the plugin starts, continues and stops relais's agents. Installing
+over a settings file from the hook-side native path (#171) removes relais's
+`SendMessage` matcher and `WorktreeCreate` entry and keeps every entry that is not
+relais's.
 
 The `relais install --claude --hooks` integration — what it wires, its
 handler timeouts, how to remove it, what `relais doctor` reports on it,

@@ -20,10 +20,8 @@
 
 pub mod decide;
 pub mod event;
-pub mod native;
 pub mod pairing;
 pub mod respond;
-pub mod worktree;
 
 use std::fs;
 use std::io::Read;
@@ -37,10 +35,10 @@ use serde_json::Value;
 /// an oversized payload is refused.
 pub const MAX_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
-/// The eight hook targets relais reads: the three tool-scoped events, plus
-/// the five lifecycle events (`WorktreeCreate` among them). Named once so
-/// the settings installer and its checks cannot disagree about the list.
-pub const TARGETS: [&str; 8] = [
+/// The seven hook targets relais reads: the three tool-scoped events, plus
+/// the four lifecycle events. Named once so the settings installer and its
+/// checks cannot disagree about the list.
+pub const TARGETS: [&str; 7] = [
     "PreToolUse",
     "PostToolUse",
     "PostToolUseFailure",
@@ -48,7 +46,6 @@ pub const TARGETS: [&str; 8] = [
     "SubagentStop",
     "SessionStart",
     "SessionEnd",
-    "WorktreeCreate",
 ];
 
 /// One recorded hook invocation.

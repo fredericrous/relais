@@ -296,7 +296,7 @@ fn install_is_preview_first_and_uninstall_keeps_foreign_and_modified_files() {
 }
 
 // The objective this suite exists for: `relais install --claude` alone
-// never touches settings.json, `--hooks` wires all eight targets in and
+// never touches settings.json, `--hooks` wires all seven targets in and
 // a re-run says nothing is left to do, and `relais doctor` exercises the
 // recorded command — spawning it for real against a scratch environment
 // — rather than merely reading the file back.
@@ -333,7 +333,6 @@ fn install_hooks_wires_settings_json_and_a_rerun_is_current() {
         "SubagentStop",
         "SessionStart",
         "SessionEnd",
-        "WorktreeCreate",
     ] {
         assert!(
             settings["hooks"][event]
@@ -342,8 +341,12 @@ fn install_hooks_wires_settings_json_and_a_rerun_is_current() {
             "{event} must carry a relais handler: {settings}"
         );
     }
+    assert!(
+        settings["hooks"].get("WorktreeCreate").is_none(),
+        "relais answers no WorktreeCreate: {settings}"
+    );
     assert_eq!(
-        settings["hooks"]["PreToolUse"][0]["matcher"], "Agent|Task|SendMessage",
+        settings["hooks"]["PreToolUse"][0]["matcher"], "Agent|Task",
         "{settings}"
     );
     assert!(settings["hooks"]["SessionStart"][0]
@@ -375,6 +378,86 @@ fn install_hooks_wires_settings_json_and_a_rerun_is_current() {
             .is_some_and(Vec::is_empty),
         "{after}"
     );
+}
+
+// A settings file the hook-side native path (#171) wrote — the SendMessage
+// matcher and relais's WorktreeCreate entry, beside a foreign WorktreeCreate
+// hook — is flagged by `relais doctor`, migrated by the next install with the
+// foreign entry kept, and no longer flagged; uninstall removes either form.
+#[test]
+fn install_hooks_migrates_the_native_hook_wiring_in_a_temp_home() {
+    let world = World::new("install-migrate");
+    std::fs::create_dir_all(world.repo.join(".claude")).expect("mkdir");
+    let settings_path = world.repo.join(".claude/settings.json");
+    let command = format!("{BIN} hook");
+    let relais = serde_json::json!([{"type": "command", "command": command, "timeout": 10}]);
+    let foreign = serde_json::json!({"hooks": [
+        {"type": "command", "command": "/usr/bin/their-worktree-tool"}
+    ]});
+    let old = serde_json::json!({"hooks": {
+        "PreToolUse": [{"matcher": "Agent|Task|SendMessage", "hooks": relais}],
+        "PostToolUse": [{"matcher": "Agent|Task|SendMessage", "hooks": relais}],
+        "PostToolUseFailure": [{"matcher": "Agent|Task|SendMessage", "hooks": relais}],
+        "SubagentStart": [{"hooks": relais}],
+        "SubagentStop": [{"hooks": relais}],
+        "SessionStart": [{"hooks": relais}],
+        "SessionEnd": [{"hooks": relais}],
+        "WorktreeCreate": [{"hooks": [{"type": "command", "command": command, "timeout": 60}]}, foreign]
+    }});
+    let write_old = || {
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&old).expect("render") + "\n",
+        )
+        .expect("write settings");
+    };
+    let wiring_finding = |world: &World| -> Option<serde_json::Value> {
+        let report = world.relais(&["doctor", "--json"]);
+        let report: serde_json::Value =
+            serde_json::from_str(text(&report.stdout).trim()).expect("doctor --json");
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .find(|f| f["component"] == "hook-wiring")
+            .cloned()
+    };
+
+    write_old();
+    let flagged = wiring_finding(&world).expect("doctor flags the old wiring");
+    assert!(
+        flagged["detail"]
+            .as_str()
+            .unwrap()
+            .contains("relais install --claude"),
+        "{flagged}"
+    );
+
+    let write = world.relais(&["install", "--claude", "--hooks", "--write"]);
+    assert_eq!(write.status.code(), Some(0), "{}", text(&write.stderr));
+    let migrated: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("settings"))
+            .expect("valid json");
+    assert_eq!(migrated["hooks"]["PreToolUse"][0]["matcher"], "Agent|Task");
+    assert_eq!(
+        migrated["hooks"]["WorktreeCreate"],
+        serde_json::json!([foreign]),
+        "relais's entry goes, the foreign one stays"
+    );
+    assert!(wiring_finding(&world).is_none(), "{migrated}");
+
+    // Uninstall removes either form.
+    write_old();
+    let uninstall = world.relais(&["uninstall", "--claude", "--hooks", "--write"]);
+    assert_eq!(
+        uninstall.status.code(),
+        Some(0),
+        "{}",
+        text(&uninstall.stderr)
+    );
+    let after = std::fs::read_to_string(&settings_path).expect("settings");
+    assert!(!after.contains(&command), "{after}");
+    assert!(after.contains("/usr/bin/their-worktree-tool"), "{after}");
 }
 
 // `relais doctor` exercises the hook it finds recorded in settings.json

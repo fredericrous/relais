@@ -90,12 +90,28 @@ why the derived timeout exists: raising `queue_wait_secs` without also
 raising the handler timeout would make that failure mode more likely,
 not less.
 
+### Upgrading from the hook-side native path
+
+An earlier relais (#171) ran native workers through this hook: it wired the
+matcher `Agent|Task|SendMessage` and a `WorktreeCreate` handler. The relais
+plugin does that work now (it starts, continues and stops relais's agents, with
+a working directory of its own), so the hook is back to admission caps on your
+own `Agent` and `Task` spawns, and Claude Code makes its own isolated-agent
+worktrees again. A `WorktreeCreate` handler with no code behind it would break
+those, so re-run `relais install --claude --hooks --write` over an old file: it
+moves relais's command to the `Agent|Task` entry and removes it from
+`WorktreeCreate` (an entry or event array that held nothing else goes; a hook of
+someone else's on either stays, and so does every other entry). `relais doctor`
+reports (`hook-wiring`) a file that still has the old matcher or the
+`WorktreeCreate` entry, and names that command as the fix.
+
 ## Removing it
 
 `relais uninstall --claude --hooks` reverses exactly what `--hooks`
-added: the leaf command on each of the seven targets, and nothing an
-entry's matcher was already carrying for someone else. Preview first,
-same as install; `--write` applies it.
+added: the leaf command on each of the seven targets, the old
+`Agent|Task|SendMessage` matcher and the `WorktreeCreate` entry if a file
+still has them, and nothing an entry's matcher was already carrying for
+someone else. Preview first, same as install; `--write` applies it.
 
 ## What `relais doctor` says about it
 

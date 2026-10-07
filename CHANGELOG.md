@@ -34,7 +34,41 @@ missing here.
   and `env_protection` `session`. Manifests written before still read.
   `disallowed_tools` stays.
 
+- The hook-side native path (#171). The relais plugin spawns, continues and
+  stops relais's agents, so the dispatch marker (`[relais-dispatch: <id>]`),
+  `hook/native.rs`, `hook/worktree.rs`, the hook's `Rewrite`, `WorktreePath` and
+  `WorktreeFailed` answers and its handling of `WorktreeCreate` and
+  `SendMessage` events are gone, and the `/relais` skill and the worker
+  definitions no longer tell the model to copy a `RELAIS-SPAWN` line. `relais
+  hook` given a `WorktreeCreate` or a `SendMessage` call exits 0 with no output,
+  and Claude Code makes its own worktrees again. The classic hook is back to
+  what it did before #171: admission caps on your own `Agent` and `Task`
+  spawns. The coordinator's native registry, the `relais native` callbacks and
+  the ledger columns stay.
+
 ### Changed
+
+- `relais install --claude --hooks` writes the matcher `Agent|Task` again (not
+  `Agent|Task|SendMessage`) on the three tool events and no `WorktreeCreate`
+  handler. Installing over a file from the hook-side native path removes
+  relais's `SendMessage` matcher and `WorktreeCreate` entry and keeps every
+  entry that is not relais's; `relais uninstall --claude --hooks` removes either
+  form; `relais doctor` (`hook-wiring`) reports a file that still has them and
+  names `relais install --claude --hooks --write` as the fix. A `WorktreeCreate`
+  handler with no code behind it would break Claude Code's own isolated agents,
+  so run it once after upgrading. The retired wiring is found whatever path
+  the relais that wrote it lived at; a settings file install refuses to rewrite
+  (hand-formatted) gets the same steps to do by hand. `relais doctor`
+  (`hook-worktrees`) names the records the old hook kept under
+  `<state>/hook-worktrees/`, which nothing reads now, and the leftover
+  `worktree-agent-*` worktrees to remove.
+- `relais usage import` skips the whole `subagents/agent-<id>.jsonl` transcript
+  of an agent the ledger records as a relais dispatch (`dispatches.agent_id`),
+  besides the message ids in `native_usage_messages`, so a dispatch whose
+  transcript ids could not be recorded (`rollback_ids_missing`) is never booked
+  twice.
+- The hook journal no longer records the `worktree` and `native` fields, and its
+  `outcome` is never `answered_after_waiting`.
 
 - A spending `relais dataset replay` runs inside a Claude Code session too:
   `--protocol`, started by the plugin's `replay` tool, every dispatch a native

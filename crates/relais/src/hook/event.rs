@@ -8,8 +8,6 @@
 //! were modelled rather than recorded verbatim); this module is written
 //! against what they showed, not against invented shapes.
 
-use std::path::PathBuf;
-
 use serde::Deserialize;
 
 use crate::ids::{AgentId, AgentType, PromptId, SessionId, ToolUseId};
@@ -27,9 +25,6 @@ const AGENT_TOOL_NAME: &str = "Agent";
 /// contract written against either name behaves the same way.
 const LEGACY_AGENT_TOOL_NAME: &str = "Task";
 
-/// The tool a parent session continues a finished subagent with.
-const SEND_MESSAGE_TOOL_NAME: &str = "SendMessage";
-
 /// A hook payload, typed. Every payload lands in exactly one variant —
 /// never an error, never a panic — because a hook cannot refuse to
 /// answer: the tool call or lifecycle transition it describes is
@@ -44,12 +39,6 @@ pub enum HookEvent {
     /// tool is the Agent tool (or its legacy name, `Task`) — the only
     /// tool relais acts on.
     AgentToolCall(AgentToolCall),
-    /// A `PreToolUse`/`PostToolUse`/`PostToolUseFailure` event whose tool
-    /// is `SendMessage`, the call that continues a finished subagent.
-    SendMessageCall(SendMessageCall),
-    /// Claude Code asking a hook for the working tree of an isolated
-    /// spawn (`isolation: "worktree"`).
-    WorktreeCreate(WorktreeCreate),
     /// Not something relais acts on. One case covers two different
     /// reasons, deliberately: a tool event for a tool other than the
     /// Agent tool (`0001-PreToolUse.json`, a `Read`, lands here), and a
@@ -94,12 +83,6 @@ pub struct SubagentStop {
     pub agent_id: AgentId,
     pub agent_type: AgentType,
     pub prompt_id: Option<PromptId>,
-    /// The subagent's own transcript, `None` when the payload names none.
-    pub agent_transcript_path: Option<PathBuf>,
-    /// What the subagent said last, `None` when absent.
-    pub last_assistant_message: Option<String>,
-    /// The subagent's working directory (its worktree, when isolated).
-    pub cwd: Option<PathBuf>,
 }
 
 /// Which of the three tool-scoped events a payload was, with what only
@@ -138,33 +121,6 @@ pub struct AgentToolCall {
     /// carries one. See `caller_agent_id_is_absent_on_the_spawn_and_present_on_a_subagents_call`.
     pub caller_agent_id: Option<AgentId>,
     pub prompt_id: Option<PromptId>,
-    /// The call's `tool_input` object as sent, on every phase.
-    pub tool_input: Option<serde_json::Value>,
-}
-
-/// A tool-scoped event whose tool is `SendMessage`. Its `Post` phase
-/// never names a launched agent: a continuation launches nothing new.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SendMessageCall {
-    pub session_id: SessionId,
-    pub tool_use_id: ToolUseId,
-    pub phase: ToolCallPhase,
-    pub caller_agent_id: Option<AgentId>,
-    /// `tool_input.to`: the agent being continued.
-    pub to: Option<String>,
-    /// `tool_input.message`.
-    pub message: Option<String>,
-    pub tool_input: Option<serde_json::Value>,
-}
-
-/// Claude Code asking for the tree an isolated agent will work in. Names
-/// no tool call: `name` is `agent-` followed by the agent id that
-/// `SubagentStart` reports a moment later.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorktreeCreate {
-    pub session_id: SessionId,
-    pub name: String,
-    pub cwd: PathBuf,
 }
 
 /// The fields this module reads to classify a payload — deliberately
@@ -190,13 +146,6 @@ struct Envelope {
     /// typed any tighter would turn some other tool's response into an
     /// envelope that fails to parse.
     tool_response: Option<serde_json::Value>,
-    /// Held loosely for the same reason: only the Agent and SendMessage
-    /// tools' inputs are read, and each tool's shape is its own.
-    tool_input: Option<serde_json::Value>,
-    cwd: Option<PathBuf>,
-    name: Option<String>,
-    agent_transcript_path: Option<PathBuf>,
-    last_assistant_message: Option<String>,
 }
 
 /// Parse one hook payload into a typed event. Never fails outward — see
@@ -240,31 +189,15 @@ fn classify(envelope: Envelope) -> HookEvent {
             })
         }
         "SubagentStop" => {
-            let agent_transcript_path = envelope.agent_transcript_path.clone();
-            let last_assistant_message = envelope.last_assistant_message.clone();
-            let cwd = envelope.cwd.clone();
             classify_subagent(envelope, |session_id, agent_id, agent_type, prompt_id| {
                 HookEvent::SubagentStop(SubagentStop {
                     session_id,
                     agent_id,
                     agent_type,
                     prompt_id,
-                    agent_transcript_path,
-                    last_assistant_message,
-                    cwd,
                 })
             })
         }
-        "WorktreeCreate" => match (envelope.session_id, envelope.name, envelope.cwd) {
-            (Some(session_id), Some(name), Some(cwd)) => {
-                HookEvent::WorktreeCreate(WorktreeCreate {
-                    session_id,
-                    name,
-                    cwd,
-                })
-            }
-            _ => HookEvent::NotOurs,
-        },
         "PreToolUse" => classify_tool_call(ToolCallPhase::Pre, envelope),
         "PostToolUse" => {
             let launched_agent = launched_agent(&envelope);
@@ -305,50 +238,18 @@ fn classify_tool_call(phase: ToolCallPhase, envelope: Envelope) -> HookEvent {
         envelope.tool_name.as_deref(),
         Some(AGENT_TOOL_NAME) | Some(LEGACY_AGENT_TOOL_NAME)
     );
-    let is_send_message = envelope.tool_name.as_deref() == Some(SEND_MESSAGE_TOOL_NAME);
-    if !is_agent_tool && !is_send_message {
+    if !is_agent_tool {
         return HookEvent::NotOurs;
     }
     let (Some(session_id), Some(tool_use_id)) = (envelope.session_id, envelope.tool_use_id) else {
         return HookEvent::NotOurs;
     };
-    if is_agent_tool {
-        return HookEvent::AgentToolCall(AgentToolCall {
-            session_id,
-            tool_use_id,
-            phase,
-            caller_agent_id: envelope.agent_id,
-            prompt_id: envelope.prompt_id,
-            tool_input: envelope.tool_input,
-        });
-    }
-    let text_of = |key: &str| {
-        envelope
-            .tool_input
-            .as_ref()
-            .and_then(|input| input.get(key))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-    };
-    let (to, message) = (text_of("to"), text_of("message"));
-    // A message launches no agent: it resumes one (`resumedAgentId`,
-    // hooks-native/0008). Cleared here rather than trusted to the
-    // response's current shape, so an `agentId` there binds nothing.
-    let phase = match phase {
-        ToolCallPhase::Post { .. } => ToolCallPhase::Post {
-            launched_agent: None,
-        },
-        ToolCallPhase::Pre => ToolCallPhase::Pre,
-        ToolCallPhase::PostFailure => ToolCallPhase::PostFailure,
-    };
-    HookEvent::SendMessageCall(SendMessageCall {
+    HookEvent::AgentToolCall(AgentToolCall {
         session_id,
         tool_use_id,
         phase,
         caller_agent_id: envelope.agent_id,
-        to,
-        message,
-        tool_input: envelope.tool_input,
+        prompt_id: envelope.prompt_id,
     })
 }
 
@@ -415,9 +316,6 @@ mod tests {
                 agent_id: AgentId::new("a1"),
                 agent_type: AgentType::new("general-purpose"),
                 prompt_id: None,
-                agent_transcript_path: None,
-                last_assistant_message: None,
-                cwd: None,
             })
         );
     }
@@ -446,7 +344,6 @@ mod tests {
                     phase,
                     caller_agent_id: None,
                     prompt_id: None,
-                    tool_input: None,
                 }),
                 "phase {name}"
             );
@@ -651,112 +548,22 @@ mod tests {
         assert_eq!(call.session_id, stop.session_id);
     }
 
-    fn native_fixture(name: &str) -> Vec<u8> {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/hooks-native")
-            .join(name);
-        fs::read(&path).unwrap_or_else(|e| panic!("read fixture {name}: {e}"))
-    }
-
+    /// The plugin owns worktrees and continuations now: a `WorktreeCreate`
+    /// and a `SendMessage` call in either phase are payloads relais does
+    /// not act on, recorded ones included.
     #[test]
-    fn native_0001_and_0004_carry_the_spawn_input_on_every_phase() {
-        for (name, is_post) in [
-            ("0001-PreToolUse.json", false),
-            ("0004-PostToolUse.json", true),
+    fn a_worktree_create_and_a_send_message_call_are_not_ours() {
+        for name in [
+            "0002-WorktreeCreate.json",
+            "0006-PreToolUse.json",
+            "0008-PostToolUse.json",
         ] {
-            let HookEvent::AgentToolCall(call) = parse(&native_fixture(name)) else {
-                panic!("{name} is an Agent call");
-            };
-            assert_eq!(matches!(call.phase, ToolCallPhase::Post { .. }), is_post);
-            let input = call.tool_input.expect("tool_input");
-            assert_eq!(input["isolation"], "worktree", "{name}");
-            assert!(input["prompt"].is_string(), "{name}");
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/hooks-native")
+                .join(name);
+            let bytes = fs::read(&path).unwrap_or_else(|e| panic!("read fixture {name}: {e}"));
+            assert_eq!(parse(&bytes), HookEvent::NotOurs, "{name}");
         }
-    }
-
-    #[test]
-    fn native_0002_is_a_worktree_create() {
-        assert_eq!(
-            parse(&native_fixture("0002-WorktreeCreate.json")),
-            HookEvent::WorktreeCreate(WorktreeCreate {
-                session_id: SessionId::new("session-0000"),
-                name: "agent-agent-01".into(),
-                cwd: PathBuf::from("/REPO"),
-            })
-        );
-    }
-
-    #[test]
-    fn a_worktree_create_missing_a_field_is_not_ours() {
-        for missing in ["session_id", "name", "cwd"] {
-            let mut value: serde_json::Value =
-                serde_json::from_slice(&native_fixture("0002-WorktreeCreate.json")).unwrap();
-            value.as_object_mut().unwrap().remove(missing);
-            assert_eq!(
-                parse(value.to_string().as_bytes()),
-                HookEvent::NotOurs,
-                "{missing}"
-            );
-        }
-    }
-
-    #[test]
-    fn native_0005_a_subagent_stop_carries_its_transcript_message_and_cwd() {
-        let HookEvent::SubagentStop(stop) = parse(&native_fixture("0005-SubagentStop.json")) else {
-            panic!("0005 is a SubagentStop");
-        };
-        assert_eq!(
-            stop.agent_transcript_path,
-            Some(PathBuf::from("/REDACTED/transcript.jsonl"))
-        );
-        assert!(stop.last_assistant_message.is_some());
-        assert_eq!(stop.cwd, Some(PathBuf::from("/RELAIS-TREE")));
-    }
-
-    #[test]
-    fn native_0006_is_a_send_message_call_naming_its_target() {
-        let HookEvent::SendMessageCall(call) = parse(&native_fixture("0006-PreToolUse.json"))
-        else {
-            panic!("0006 is a SendMessage call");
-        };
-        assert_eq!(call.phase, ToolCallPhase::Pre);
-        assert_eq!(call.to.as_deref(), Some("agent-01"));
-        assert_eq!(
-            call.message.as_deref(),
-            Some("Run echo SECOND with Bash and reply with its output.")
-        );
-        assert!(call.tool_input.is_some());
-    }
-
-    #[test]
-    fn a_send_message_post_launches_nothing() {
-        let HookEvent::SendMessageCall(call) = parse(&native_fixture("0008-PostToolUse.json"))
-        else {
-            panic!("0008 is a SendMessage call");
-        };
-        assert_eq!(
-            call.phase,
-            ToolCallPhase::Post {
-                launched_agent: None
-            }
-        );
-    }
-
-    /// Not an accident of 0008's response shape: an `agentId` in a
-    /// SendMessage response still launches nothing.
-    #[test]
-    fn a_send_message_post_naming_an_agent_id_still_launches_nothing() {
-        let HookEvent::SendMessageCall(call) = parse(
-            br#"{"hook_event_name":"PostToolUse","session_id":"s1","tool_name":"SendMessage","tool_use_id":"t1","tool_input":{"to":"a1","message":"m"},"tool_response":{"agentId":"a1"}}"#,
-        ) else {
-            panic!("a SendMessage call");
-        };
-        assert_eq!(
-            call.phase,
-            ToolCallPhase::Post {
-                launched_agent: None
-            }
-        );
     }
 
     // The fixture walk lives in `tests/hook_event_fixtures.rs`, not

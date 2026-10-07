@@ -3,29 +3,22 @@
 //! A hook cannot refuse to answer, and it may never say yes on a person's
 //! behalf: a hook that green-lit a tool call would override that person's
 //! own permission settings, which is not this binary's business. So every
-//! case about a tool call resolves to one of three things — stay silent,
+//! case about a tool call resolves to one of two things — stay silent, or
 //! refuse the tool call and say what was exceeded and what the person can
-//! do about it, or rewrite a marked call's input to exactly what relais
-//! asked for, with no permission decision attached (measured on Claude
-//! Code 2.1.291: the rewrite takes effect without one, so it grants
-//! nothing). Two answers belong to the `WorktreeCreate` event instead of
-//! a tool call: the path of the tree an isolated agent works in, or the
-//! reason one could not be made. The pure
-//! function that gets there reads no clock, touches no filesystem and makes
-//! no network call: every case can be read and tested without running a
-//! session.
+//! do about it. The pure function that gets there reads no clock, touches
+//! no filesystem and makes no network call: every case can be read and
+//! tested without running a session.
 //!
 //! `decide` takes the event, the machine's own admission settings and
 //! whatever the coordinator answered, already resolved — it does not itself
 //! contact the coordinator, write a journal, touch the ledger or install
-//! anything. It decides, and [`HookAnswer::stdout_payload`],
-//! [`HookAnswer::stderr_payload`] and [`HookAnswer::exit_code`] render the
-//! decision into what the hook prints and how it exits.
+//! anything. It decides, and [`HookAnswer::stdout_payload`] renders the
+//! decision into what the hook prints.
 //!
 //! `super::respond::handle` is the caller that wires this up: `relais
 //! hook`, run with no flags, asks the coordinator about a spawn, calls
-//! [`decide_or_silent`], prints the rendered answer, exits with its
-//! status, and journals the firing. This module stays pure regardless —
+//! [`decide_or_silent`], prints the rendered answer, and journals the
+//! firing. This module stays pure regardless —
 //! the wiring is what changed, not the decision.
 //!
 //! `PostToolUseFailure` is deliberately not among the events this decides
@@ -38,13 +31,10 @@
 //! this — until then it is matched explicitly below, alongside every other
 //! phase, and resolves to silence like the rest.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
-use serde_json::{json, Value};
-
 use super::event::{HookEvent, ToolCallPhase};
-use crate::admission::{ClaimOutcome, Decision, Refusal as AdmissionRefusal, StopNativeOutcome};
+use crate::admission::{Decision, Refusal as AdmissionRefusal};
 use crate::policy::{CoordinatorUnreachableBehavior, HookAdmissionSettings};
 
 /// Which rule produced a refusal. Spans both this module's own rules — a
@@ -62,105 +52,6 @@ pub enum RefusalRule {
     CoordinatorUnreachable,
     /// The coordinator was reached and refused outright, for this code.
     Admission(AdmissionRefusal),
-    /// A call tied to a relais dispatch (a marked call, or a message to
-    /// relais's worker) that relais will not let through.
-    Native(NativeRefusal),
-}
-
-/// Why relais refused a call that belongs to a native dispatch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NativeRefusal {
-    /// The marker is malformed, or names two dispatches.
-    AmbiguousMarker,
-    /// The coordinator could not be reached: a marked call is refused
-    /// whatever `on_coordinator_unreachable` says, because nothing else
-    /// can vouch for it.
-    CoordinatorUnreachable,
-    UnknownDispatch,
-    WrongSession,
-    AlreadyClaimed,
-    Finished,
-    Cancelled,
-    LeaseLapsed,
-    WrongRecipient,
-    NotLeasable,
-    /// An unmarked message to the agent behind a native dispatch.
-    BehindRelais,
-}
-
-impl NativeRefusal {
-    fn label(self) -> &'static str {
-        match self {
-            Self::AmbiguousMarker => "ambiguous_marker",
-            Self::CoordinatorUnreachable => "coordinator_unreachable",
-            Self::UnknownDispatch => "unknown_dispatch",
-            Self::WrongSession => "wrong_session",
-            Self::AlreadyClaimed => "already_claimed",
-            Self::Finished => "finished",
-            Self::Cancelled => "cancelled",
-            Self::LeaseLapsed => "lease_lapsed",
-            Self::WrongRecipient => "wrong_recipient",
-            Self::NotLeasable => "not_leasable",
-            Self::BehindRelais => "behind_relais",
-        }
-    }
-
-    /// What was wrong with the call, and what the person can do about it.
-    fn reason_and_remedy(self) -> (&'static str, &'static str) {
-        match self {
-            Self::AmbiguousMarker => (
-                "this call carries a malformed relais dispatch marker, or two different ones",
-                "send the prompt or message exactly as relais printed it, with its one \
-                 `[relais-dispatch: <id>]` line",
-            ),
-            Self::CoordinatorUnreachable => (
-                "relais could not reach its coordinator, and this call belongs to a relais \
-                 dispatch that only the coordinator can vouch for",
-                "retry once the coordinator is reachable (`relais doctor` reports its status); \
-                 `on_coordinator_unreachable` does not apply to a call relais asked for",
-            ),
-            Self::UnknownDispatch => (
-                "no relais dispatch of this session asked for this call",
-                "spawn or continue only with the exact request relais printed \
-                 (`RELAIS-SPAWN` or `RELAIS-CONTINUE`)",
-            ),
-            Self::WrongSession => (
-                "the dispatch this call names belongs to another session",
-                "make the call in the session that started the relais run",
-            ),
-            Self::AlreadyClaimed => (
-                "an earlier call already claimed this dispatch, and relais asked for one",
-                "do not repeat the call; wait for the run's next request",
-            ),
-            Self::Finished => (
-                "the dispatch this call names already ran and settled",
-                "wait for the run's next `RELAIS-SPAWN` or `RELAIS-CONTINUE`",
-            ),
-            Self::Cancelled => (
-                "the relais run this call belongs to was cancelled",
-                "do not make this call; start the run again if the work is still wanted",
-            ),
-            Self::LeaseLapsed => (
-                "relais is no longer heartbeating this dispatch, so nothing may run under it",
-                "check that the `relais run` that printed the request is still running \
-                 (`relais coordinator status`), and start it again if it is not",
-            ),
-            Self::WrongRecipient => (
-                "relais did not ask for this call: its recipient or its kind differs from \
-                 the request",
-                "send exactly what relais printed, to the agent it names",
-            ),
-            Self::NotLeasable => (
-                "the dispatch this call names is bound to a process, which an agent cannot \
-                 take over",
-                "start the run again",
-            ),
-            Self::BehindRelais => (
-                "that agent is relais's worker, and relais speaks to it itself",
-                "let the run finish, or cancel it, before talking to that agent",
-            ),
-        }
-    }
 }
 
 impl RefusalRule {
@@ -172,7 +63,6 @@ impl RefusalRule {
             RefusalRule::QueueTimeout => "queue_timeout".to_string(),
             RefusalRule::CoordinatorUnreachable => "coordinator_unreachable".to_string(),
             RefusalRule::Admission(code) => format!("admission_{}", code.as_str()),
-            RefusalRule::Native(kind) => format!("native_{}", kind.label()),
         }
     }
 }
@@ -229,21 +119,15 @@ impl Refusal {
                     self.reason, self.remedy
                 )
             }
-            RefusalRule::Native(_) => {
-                format!(
-                    "relais refused this call: {}. {}.",
-                    self.reason, self.remedy
-                )
-            }
         }
     }
 }
 
 /// The shapes a hook may speak in. There is deliberately no variant that
 /// says yes on a person's behalf — see the module doc. There is also no
-/// variant that only advises: on a tool call the hook denies, rewrites a
-/// marked call's input, or stays silent (SPEC §23 records this explicitly,
-/// so a reader finds a decision here rather than an oversight).
+/// variant that only advises: on a tool call the hook denies or stays
+/// silent (SPEC §23 records this explicitly, so a reader finds a decision
+/// here rather than an oversight).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookAnswer {
     /// Nothing to say: exit 0, nothing on stdout.
@@ -253,49 +137,13 @@ pub enum HookAnswer {
     /// `refusal.sentence()` always names what was exceeded and what the
     /// person can do about it.
     Refuse { refusal: Refusal },
-    /// Replace the tool call's input with exactly this, and decide
-    /// nothing else: no permission decision is printed, so the person's
-    /// own settings still rule the call.
-    Rewrite { input: Value },
-    /// The tree an isolated agent will work in, answering
-    /// `WorktreeCreate`.
-    WorktreePath { path: PathBuf },
-    /// No tree could be made: the reason goes to stderr and the hook
-    /// exits 1, which is how Claude Code learns the agent cannot start.
-    WorktreeFailed { reason: String },
 }
 
 impl HookAnswer {
-    /// The process exit status this answer asks for: 1 for
-    /// [`HookAnswer::WorktreeFailed`], 0 for everything else.
-    pub fn exit_code(&self) -> i32 {
-        match self {
-            HookAnswer::WorktreeFailed { .. } => 1,
-            HookAnswer::Silent
-            | HookAnswer::Refuse { .. }
-            | HookAnswer::Rewrite { .. }
-            | HookAnswer::WorktreePath { .. } => 0,
-        }
-    }
-
-    /// What this answer writes to stderr: only a failed tree says
-    /// anything there.
-    pub fn stderr_payload(&self) -> Option<String> {
-        match self {
-            HookAnswer::WorktreeFailed { reason } => Some(reason.clone()),
-            HookAnswer::Silent
-            | HookAnswer::Refuse { .. }
-            | HookAnswer::Rewrite { .. }
-            | HookAnswer::WorktreePath { .. } => None,
-        }
-    }
-
     /// The stdout payload for this answer: `None` when nothing is printed
-    /// ([`HookAnswer::Silent`], [`HookAnswer::WorktreeFailed`]), JSON for
-    /// [`HookAnswer::Refuse`] and [`HookAnswer::Rewrite`], and the bare
-    /// path plus one newline for [`HookAnswer::WorktreePath`] (the
-    /// caller prints it as is). Pure: it renders a string, it does not
-    /// print one; the caller that owns stdout does the actual write.
+    /// ([`HookAnswer::Silent`]) and JSON for [`HookAnswer::Refuse`]. Pure:
+    /// it renders a string, it does not print one; the caller that owns
+    /// stdout does the actual write.
     ///
     /// The `hookSpecificOutput.permissionDecision` form, not the older
     /// top-level `{"decision":"block"}` one. Both were run against real
@@ -311,17 +159,7 @@ impl HookAnswer {
     /// anywhere reports a failure.
     pub fn stdout_payload(&self) -> Option<String> {
         match self {
-            HookAnswer::Silent | HookAnswer::WorktreeFailed { .. } => None,
-            HookAnswer::Rewrite { input } => Some(
-                json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "updatedInput": input,
-                    }
-                })
-                .to_string(),
-            ),
-            HookAnswer::WorktreePath { path } => Some(format!("{}\n", path.display())),
+            HookAnswer::Silent => None,
             HookAnswer::Refuse { refusal } => {
                 let reason = refusal.sentence();
                 Some(
@@ -362,10 +200,6 @@ pub fn decide(
         | HookEvent::SessionEnd(_)
         | HookEvent::SubagentStart(_)
         | HookEvent::SubagentStop(_)
-        // A continuation is not a spawn: nothing to admit, in any phase.
-        | HookEvent::SendMessageCall(_)
-        // Answered by `respond`, which makes the tree on disk.
-        | HookEvent::WorktreeCreate(_)
         | HookEvent::NotOurs => HookAnswer::Silent,
         HookEvent::AgentToolCall(call) => match call.phase {
             // Only `Pre` still holds the tool call open long enough to
@@ -377,134 +211,6 @@ pub fn decide(
             // recorded here rather than merely implied.
             ToolCallPhase::PostFailure => HookAnswer::Silent,
         },
-    }
-}
-
-/// The Agent call's input as relais asked for it: `subagent_type`,
-/// `model` and `prompt` replaced, `isolation` set to `"worktree"` and
-/// `run_in_background` set to true, every other field kept as sent. A
-/// parent that paraphrased or changed those fields cannot change what runs.
-pub fn rewrite_spawn(tool_input: &Value, subagent_type: &str, model: &str, prompt: &str) -> Value {
-    let mut fields = tool_input.as_object().cloned().unwrap_or_default();
-    fields.insert("subagent_type".into(), json!(subagent_type));
-    fields.insert("model".into(), json!(model));
-    fields.insert("prompt".into(), json!(prompt));
-    fields.insert("isolation".into(), json!("worktree"));
-    fields.insert("run_in_background".into(), json!(true));
-    Value::Object(fields)
-}
-
-/// The `SendMessage` call's input as relais asked for it: `to` and
-/// `message` replaced, every other field kept as sent.
-pub fn rewrite_continue(tool_input: &Value, agent_id: &str, message: &str) -> Value {
-    let mut fields = tool_input.as_object().cloned().unwrap_or_default();
-    fields.insert("to".into(), json!(agent_id));
-    fields.insert("message".into(), json!(message));
-    Value::Object(fields)
-}
-
-fn refuse_native(kind: NativeRefusal) -> HookAnswer {
-    let (reason, remedy) = kind.reason_and_remedy();
-    HookAnswer::Refuse {
-        refusal: Refusal {
-            rule: RefusalRule::Native(kind),
-            reason: reason.to_string(),
-            remedy: remedy.to_string(),
-        },
-    }
-}
-
-/// Why a claim that did not run this call was refused. A claim for the
-/// other kind of call (a continuation answered to a spawn, or the other
-/// way round) is a wrong recipient: relais asked for something else.
-fn claim_refusal(claim: &ClaimOutcome) -> NativeRefusal {
-    match claim {
-        ClaimOutcome::Spawn { .. } | ClaimOutcome::Continue { .. } => NativeRefusal::WrongRecipient,
-        ClaimOutcome::UnknownDispatch => NativeRefusal::UnknownDispatch,
-        ClaimOutcome::WrongSession => NativeRefusal::WrongSession,
-        ClaimOutcome::AlreadyClaimed => NativeRefusal::AlreadyClaimed,
-        ClaimOutcome::Finished => NativeRefusal::Finished,
-        ClaimOutcome::Cancelled => NativeRefusal::Cancelled,
-        ClaimOutcome::LeaseLapsed => NativeRefusal::LeaseLapsed,
-        ClaimOutcome::WrongRecipient => NativeRefusal::WrongRecipient,
-        ClaimOutcome::NotLeasable => NativeRefusal::NotLeasable,
-    }
-}
-
-/// A call whose marker is malformed or names two dispatches.
-pub fn decide_ambiguous_marker() -> HookAnswer {
-    refuse_native(NativeRefusal::AmbiguousMarker)
-}
-
-/// A marked spawn (`PreToolUse` on the Agent tool), given what the
-/// coordinator answered when asked to claim its dispatch: `None` when it
-/// could not be reached, which refuses whatever `on_coordinator_unreachable`
-/// says, because only the coordinator can vouch for a marked call. A claim
-/// answers with the spawn relais asked for, and the call runs as that.
-pub fn decide_marked_spawn(tool_input: Option<&Value>, claim: Option<ClaimOutcome>) -> HookAnswer {
-    match claim {
-        Some(ClaimOutcome::Spawn {
-            subagent_type,
-            model,
-            prompt,
-        }) => HookAnswer::Rewrite {
-            input: rewrite_spawn(
-                tool_input.unwrap_or(&Value::Null),
-                &subagent_type,
-                &model,
-                &prompt,
-            ),
-        },
-        Some(refused) => refuse_native(claim_refusal(&refused)),
-        None => refuse_native(NativeRefusal::CoordinatorUnreachable),
-    }
-}
-
-/// A marked `SendMessage`, as [`decide_marked_spawn`] decides a spawn.
-pub fn decide_marked_message(
-    tool_input: Option<&Value>,
-    claim: Option<ClaimOutcome>,
-) -> HookAnswer {
-    match claim {
-        Some(ClaimOutcome::Continue { agent_id, message }) => HookAnswer::Rewrite {
-            input: rewrite_continue(tool_input.unwrap_or(&Value::Null), &agent_id, &message),
-        },
-        Some(refused) => refuse_native(claim_refusal(&refused)),
-        None => refuse_native(NativeRefusal::CoordinatorUnreachable),
-    }
-}
-
-/// Who an unmarked `SendMessage` is addressed to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Recipient {
-    /// An agent bound, now or before, to a native dispatch on record.
-    RelaisWorker,
-    /// Any other agent.
-    Other,
-}
-
-/// A `SendMessage` with no marker, given who its recipient is (`None`: the
-/// coordinator could not be reached). Talking to relais's worker behind its back is refused; any
-/// other agent is none of relais's business, and an outage is the
-/// machine's own stance.
-pub fn decide_unmarked_message(
-    settings: &HookAdmissionSettings,
-    recipient: Option<Recipient>,
-) -> HookAnswer {
-    match recipient {
-        Some(Recipient::RelaisWorker) => refuse_native(NativeRefusal::BehindRelais),
-        Some(Recipient::Other) => HookAnswer::Silent,
-        None => decide_unreachable(settings),
-    }
-}
-
-/// `SubagentStop`, given whether the agent was a native dispatch's: its
-/// stop is recorded and nothing else is done (the dispatch settles with
-/// the runner, and its tree is relais's). `None` and today's handling.
-pub fn decide_native_stop(outcome: Option<StopNativeOutcome>) -> Option<HookAnswer> {
-    match outcome {
-        Some(StopNativeOutcome::Stopped { .. }) => Some(HookAnswer::Silent),
-        Some(StopNativeOutcome::NotNative) | None => None,
     }
 }
 
@@ -664,22 +370,9 @@ impl RefusalRule {
     pub fn availability(self) -> Availability {
         match self {
             // The coordinator never answered, so nothing was decided.
-            RefusalRule::CoordinatorUnreachable
-            | RefusalRule::Native(NativeRefusal::CoordinatorUnreachable) => Availability::Unknown,
+            RefusalRule::CoordinatorUnreachable => Availability::Unknown,
             // It answered, and relais chose to stop waiting for it.
             RefusalRule::QueueTimeout => Availability::Decided,
-            RefusalRule::Native(
-                NativeRefusal::AmbiguousMarker
-                | NativeRefusal::UnknownDispatch
-                | NativeRefusal::WrongSession
-                | NativeRefusal::AlreadyClaimed
-                | NativeRefusal::Finished
-                | NativeRefusal::Cancelled
-                | NativeRefusal::LeaseLapsed
-                | NativeRefusal::WrongRecipient
-                | NativeRefusal::NotLeasable
-                | NativeRefusal::BehindRelais,
-            ) => Availability::Decided,
             RefusalRule::Admission(code) => match code {
                 AdmissionRefusal::UnknownRun
                 | AdmissionRefusal::RunCancelled
@@ -713,8 +406,7 @@ pub fn decide_or_silent(
 mod tests {
     use super::*;
     use crate::hook::event::{
-        AgentToolCall, SendMessageCall, SessionEnd, SessionStart, SubagentStart, SubagentStop,
-        WorktreeCreate,
+        AgentToolCall, SessionEnd, SessionStart, SubagentStart, SubagentStop,
     };
     use crate::ids::{AgentId, AgentType, PromptId, SessionId, ToolUseId};
     use crate::money::MicroUsd;
@@ -782,19 +474,6 @@ mod tests {
             phase,
             caller_agent_id: None,
             prompt_id: Some(PromptId::new("p1")),
-            tool_input: None,
-        })
-    }
-
-    fn send_message(phase: ToolCallPhase) -> HookEvent {
-        HookEvent::SendMessageCall(SendMessageCall {
-            session_id: SessionId::new("s1"),
-            tool_use_id: ToolUseId::new("t2"),
-            phase,
-            caller_agent_id: None,
-            to: Some("a1".into()),
-            message: Some("go on".into()),
-            tool_input: None,
         })
     }
 
@@ -835,29 +514,7 @@ mod tests {
                     agent_id: AgentId::new("a1"),
                     agent_type: AgentType::new("general-purpose"),
                     prompt_id: None,
-                    agent_transcript_path: None,
-                    last_assistant_message: None,
-                    cwd: None,
                 }),
-            ),
-            (
-                "WorktreeCreate",
-                HookEvent::WorktreeCreate(WorktreeCreate {
-                    session_id: SessionId::new("s1"),
-                    name: "agent-a1".into(),
-                    cwd: "/repo".into(),
-                }),
-            ),
-            ("SendMessage Pre", send_message(ToolCallPhase::Pre)),
-            (
-                "SendMessage Post",
-                send_message(ToolCallPhase::Post {
-                    launched_agent: None,
-                }),
-            ),
-            (
-                "SendMessage PostFailure",
-                send_message(ToolCallPhase::PostFailure),
             ),
             ("NotOurs", HookEvent::NotOurs),
             (
@@ -1117,82 +774,6 @@ mod tests {
         assert!(payload.contains("\"permissionDecision\":\"deny\""));
         assert!(payload.contains("depth 4 exceeds"));
         assert!(!payload.to_ascii_lowercase().contains("allow"));
-    }
-
-    #[test]
-    fn a_rewrite_prints_updated_input_and_no_permission_decision() {
-        let input = json!({ "prompt": "p", "model": "haiku" });
-        let payload = HookAnswer::Rewrite {
-            input: input.clone(),
-        }
-        .stdout_payload()
-        .expect("a rewrite renders");
-        let value: Value = serde_json::from_str(&payload).expect("json");
-        assert_eq!(value["hookSpecificOutput"]["hookEventName"], "PreToolUse");
-        assert_eq!(value["hookSpecificOutput"]["updatedInput"], input);
-        assert!(!payload.contains("permissionDecision"), "{payload}");
-    }
-
-    #[test]
-    fn rewrite_spawn_replaces_what_relais_asked_for_and_keeps_the_rest() {
-        let sent = json!({
-            "description": "e12 worker",
-            "subagent_type": "general-purpose",
-            "model": "opus",
-            "prompt": "do something else",
-            "isolation": "none",
-            "run_in_background": false,
-        });
-        let rewritten = rewrite_spawn(&sent, "relais-worker", "haiku", "the real prompt");
-        assert_eq!(
-            rewritten,
-            json!({
-                "description": "e12 worker",
-                "subagent_type": "relais-worker",
-                "model": "haiku",
-                "prompt": "the real prompt",
-                "isolation": "worktree",
-                "run_in_background": true,
-            })
-        );
-    }
-
-    #[test]
-    fn a_worktree_path_prints_bare_and_exits_zero() {
-        let answer = HookAnswer::WorktreePath {
-            path: "/repo/.claude/worktrees/agent-1".into(),
-        };
-        assert_eq!(
-            answer.stdout_payload().as_deref(),
-            Some("/repo/.claude/worktrees/agent-1\n")
-        );
-        assert_eq!(answer.stderr_payload(), None);
-        assert_eq!(answer.exit_code(), 0);
-    }
-
-    #[test]
-    fn a_failed_worktree_prints_the_reason_on_stderr_and_exits_one() {
-        let answer = HookAnswer::WorktreeFailed {
-            reason: "path exists".into(),
-        };
-        assert_eq!(answer.stdout_payload(), None);
-        assert_eq!(answer.stderr_payload().as_deref(), Some("path exists"));
-        assert_eq!(answer.exit_code(), 1);
-    }
-
-    #[test]
-    fn silent_and_refuse_exit_zero_with_nothing_on_stderr() {
-        let refuse = HookAnswer::Refuse {
-            refusal: Refusal {
-                rule: RefusalRule::QueueTimeout,
-                reason: "r".into(),
-                remedy: "m".into(),
-            },
-        };
-        for answer in [HookAnswer::Silent, refuse] {
-            assert_eq!(answer.exit_code(), 0);
-            assert_eq!(answer.stderr_payload(), None);
-        }
     }
 
     /// `decide_or_silent` is the boundary a caller actually uses: for every

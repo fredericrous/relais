@@ -224,10 +224,9 @@ pub fn owned_files() -> Vec<(PathBuf, String)> {
     files
 }
 
-/// A native worker definition: the subagent a `RELAIS-SPAWN` line asks the
-/// session to start. No `Agent` among its tools, so a worker cannot spawn.
-/// `isolation: worktree` as the plan's decision log says (the spawn's own
-/// input sets it too). No `maxTurns`, deliberately: the attempt's wall
+/// A native worker definition: the subagent the relais plugin starts for a
+/// run's dispatch. No `Agent` among its tools, so a worker cannot spawn.
+/// No `maxTurns`, deliberately: the attempt's wall
 /// time and the budget checked between attempts bound it, and a turn cap
 /// would stop a worker in the middle of an edit.
 fn agent_native_worker(agent_type: &str, model: &str, effort: Option<&str>) -> String {
@@ -235,11 +234,10 @@ fn agent_native_worker(agent_type: &str, model: &str, effort: Option<&str>) -> S
     let body = format!(
         r#"---
 name: {agent_type}
-description: relais native worker. Spawned only from a RELAIS-SPAWN line printed by `relais run --native`; never pick it yourself.
+description: relais native worker. Started only by the relais plugin for a run's dispatch; never pick it yourself.
 tools: Read, Grep, Glob, Edit, Write, Bash
 model: {model}
-{effort_line}isolation: worktree
----
+{effort_line}---
 
 You are a relais worker. The task, the rules and the acceptance criteria
 arrive in your prompt; follow them exactly.
@@ -376,31 +374,22 @@ must not edit files.
 
 3. Preflight without spending: `relais plan --task .relais/task.json`
 
-4. Execute natively, so the worker shows as Claude Code's own agent.
-   relais reads `CLAUDE_CODE_SESSION_ID` from the environment on its
-   own, so the coordinator's per-session limits and attribution are per
-   TAB rather than per shell (SPEC §23) without naming anything
-   explicitly. Run
-   `relais run --native --task .relais/task.json`
-   with the Bash tool's `run_in_background: true`, and follow its
-   output: the Monitor tool on a `tail -f` of the output file, or read
-   the output file. relais asks for each worker on one line:
-   - on a line `RELAIS-SPAWN <json>`, call the Agent tool once with
-     exactly that JSON's fields (`subagent_type`, `model`,
-     `description`, `prompt`, `isolation`, `run_in_background`), the
-     prompt unchanged;
-   - on a line `RELAIS-CONTINUE <json>`, call SendMessage (load it with
-     ToolSearch first if it is deferred) with that JSON's `to` and
-     `message`, exactly.
-   Never send anything else to relais's agents, and never spawn one
-   request twice: the hook refuses both. Do not work on the task
-   yourself while the run is going. A worker finishing is not the run
-   finishing: relais still verifies, and may review, repair or escalate.
-   Keep following the output until relais prints its outcome line, and
-   do not end your turn before it: a run whose session ends goes with it.
-   Then read the outcome as in step 5.
-   For a terminal or an unattended run, without Claude Code's agent
-   rendering, run `relais run --task .relais/task.json` instead.
+4. Execute through the relais plugin, so the worker shows as Claude
+   Code's own agent. Call the relais tool `mcp__relais__run` with
+   `task` set to `.relais/task.json` and `cwd` set to `<root>`; it
+   starts the run and returns at once. relais reads the session from
+   the plugin, so the coordinator's per-session limits and attribution
+   are per TAB rather than per shell (SPEC §23). The plugin starts each
+   worker, continues it for a repair and stops it when the run is
+   cancelled. Never spawn, message or stop relais's agents yourself:
+   the plugin refuses it. Do not work on the task yourself while the
+   run is going. A worker finishing is not the run finishing: relais
+   still verifies, and may review, repair or escalate. The run's
+   outcome reaches you as a message when it ends; when the person asks
+   how it is going, or a toast says it ended, call
+   `mcp__relais__status`. Do not end your turn before the outcome
+   arrives: a run whose session ends goes with it. Then read the
+   outcome as in step 5.
 
 5. Read the outcome: accepted (receipt + patch), needs_decision,
 needs_review, blocked, failed, budget_exhausted or interrupted. The
@@ -996,7 +985,7 @@ impl InstallRoot {
     /// read it, a directory in its place, an I/O failure mid-read — is
     /// returned, because "I could not see what is there" is not "there
     /// is nothing there", and the caller's answer to the second is to
-    /// write a fresh eight-handler document. Collapsing the two would
+    /// write a fresh seven-handler document. Collapsing the two would
     /// mean a settings.json relais could not read got replaced by one it
     /// composed, which is the opposite of this module's promise.
     fn read_settings(&self) -> std::io::Result<Option<String>> {
@@ -1651,8 +1640,8 @@ mod tests {
             "the skill must not stand a raw shell PID in for a session:\n{body}"
         );
         assert!(
-            body.contains("relais run --task .relais/task.json"),
-            "the skill must still show the plain invocation:\n{body}"
+            body.contains("`mcp__relais__run`"),
+            "the skill must still show how a run starts:\n{body}"
         );
     }
 
@@ -1941,13 +1930,13 @@ mod tests {
     }
 
     #[test]
-    fn hooks_apply_wires_all_eight_targets_into_a_fresh_settings_file() {
+    fn hooks_apply_wires_all_seven_targets_into_a_fresh_settings_file() {
         let (root, dir) = temp_root();
         let binary = relais_binary_for_test();
         let plan = root
             .plan_hooks(&binary, Duration::from_secs(2), no_other_roots())
             .expect("plan hooks");
-        assert_eq!(plan.applicable_count(), 8);
+        assert_eq!(plan.applicable_count(), 7);
 
         let applied = root
             .apply_hooks(&binary, Duration::from_secs(2), no_other_roots())
@@ -1955,7 +1944,7 @@ mod tests {
         let HooksApplied::Applied(events) = applied else {
             panic!("expected events to be wired: {applied:?}");
         };
-        assert_eq!(events.len(), 8, "{events:?}");
+        assert_eq!(events.len(), 7, "{events:?}");
 
         // A re-run is a no-op.
         let replan = root
@@ -2128,6 +2117,106 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The settings file the hook-side native path (#171) wrote — the
+    /// `SendMessage` matcher and relais's `WorktreeCreate` entry — beside
+    /// two foreign entries.
+    fn write_native_hook_settings(root: &InstallRoot, binary: &Path) -> PathBuf {
+        let command = settings::hook_command(binary);
+        let relais = serde_json::json!([{"type": "command", "command": command, "timeout": 10}]);
+        let value = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Agent|Task|SendMessage", "hooks": relais},
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/bin/lint"}]}
+                ],
+                "PostToolUse": [{"matcher": "Agent|Task|SendMessage", "hooks": relais}],
+                "PostToolUseFailure": [{"matcher": "Agent|Task|SendMessage", "hooks": relais}],
+                "SubagentStart": [{"hooks": relais}],
+                "SubagentStop": [{"hooks": relais}],
+                "SessionStart": [{"hooks": relais}],
+                "SessionEnd": [{"hooks": relais}],
+                "WorktreeCreate": [
+                    {"hooks": [{"type": "command", "command": command, "timeout": 60}]},
+                    {"hooks": [{"type": "command", "command": "/usr/bin/their-worktree-tool"}]}
+                ]
+            }
+        });
+        std::fs::create_dir_all(&root.claude_dir).expect("mkdir");
+        let path = root.claude_dir.join("settings.json");
+        std::fs::write(&path, settings::render_canonical(&value) + "\n").expect("write");
+        path
+    }
+
+    #[test]
+    fn hooks_install_migrates_the_native_hook_wiring_and_keeps_foreign_entries() {
+        let (root, dir) = temp_root();
+        let binary = relais_binary_for_test();
+        let path = write_native_hook_settings(&root, &binary);
+
+        let applied = root
+            .apply_hooks(&binary, Duration::from_secs(2), no_other_roots())
+            .expect("apply hooks");
+        let HooksApplied::Applied(events) = applied else {
+            panic!("the old wiring must be migrated: {applied:?}");
+        };
+        assert!(events.contains(&"WorktreeCreate"), "{events:?}");
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        let command = settings::hook_command(&binary);
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+            let entries = after["hooks"][event].as_array().expect("entries");
+            assert!(
+                entries.iter().any(|e| e["matcher"] == "Agent|Task"
+                    && e["hooks"][0]["command"] == command.as_str()),
+                "{event}: {entries:?}"
+            );
+            assert!(
+                entries
+                    .iter()
+                    .all(|e| e["matcher"] != "Agent|Task|SendMessage"),
+                "{event}: {entries:?}"
+            );
+        }
+        assert!(after["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .any(|e| e["matcher"] == "Bash"));
+        assert_eq!(
+            after["hooks"]["WorktreeCreate"],
+            serde_json::json!([
+                {"hooks": [{"type": "command", "command": "/usr/bin/their-worktree-tool"}]}
+            ])
+        );
+
+        // A second install has nothing left to do.
+        assert_eq!(
+            root.apply_hooks(&binary, Duration::from_secs(2), no_other_roots())
+                .expect("apply hooks again"),
+            HooksApplied::AlreadyCurrent
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hooks_uninstall_removes_the_native_hook_wiring_too() {
+        let (root, dir) = temp_root();
+        let binary = relais_binary_for_test();
+        let path = write_native_hook_settings(&root, &binary);
+
+        let removed = root.apply_hooks_removal(&binary).expect("apply removal");
+        let HooksRemoved::Removed(events) = removed else {
+            panic!("expected removal: {removed:?}");
+        };
+        assert!(events.contains(&"WorktreeCreate"), "{events:?}");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(!text.contains(&settings::hook_command(&binary)), "{text}");
+        assert!(text.contains("/usr/bin/their-worktree-tool"), "{text}");
+        assert!(text.contains("/usr/bin/lint"), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn hooks_uninstall_removes_only_what_install_added() {
         let (root, dir) = temp_root();
@@ -2149,12 +2238,12 @@ mod tests {
             .expect("write foreign hook");
 
         let plan = root.plan_hooks_removal(&binary).expect("plan removal");
-        assert_eq!(plan.applicable_count(), 8);
+        assert_eq!(plan.applicable_count(), 7);
         let removed = root.apply_hooks_removal(&binary).expect("apply removal");
         let HooksRemoved::Removed(events) = removed else {
             panic!("expected removal: {removed:?}");
         };
-        assert_eq!(events.len(), 8, "{events:?}");
+        assert_eq!(events.len(), 7, "{events:?}");
 
         let after: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
@@ -2208,7 +2297,7 @@ mod tests {
         let shipped = crate::native::worker_agent_types();
         assert_eq!(shipped.len(), 19);
         for (model, effort) in shipped {
-            // The name a RELAIS-SPAWN line carries is the file's name.
+            // The name a dispatch's agent type carries is the file's name.
             let agent_type = crate::native::worker_agent_type(&model, effort.as_deref());
             let path = root.claude_dir.join(format!("agents/{agent_type}.md"));
             let file = std::fs::read_to_string(&path)
@@ -2227,11 +2316,9 @@ mod tests {
                 "{agent_type} must not spawn: {tools}"
             );
             assert_eq!(tools, "Read, Grep, Glob, Edit, Write, Bash");
-            assert_eq!(
-                value_of(&front, "isolation"),
-                Some("worktree"),
-                "{agent_type}"
-            );
+            // The plugin's spawn sets the directory; Claude Code's own
+            // worktree isolation would put the worker somewhere else.
+            assert_eq!(value_of(&front, "isolation"), None, "{agent_type}");
             assert!(
                 value_of(&front, "description")
                     .expect("description")
@@ -2263,27 +2350,32 @@ mod tests {
     }
 
     #[test]
-    fn the_relais_skill_runs_native_workers_exactly_as_asked() {
+    fn the_relais_skill_runs_workers_through_the_plugin_and_names_no_hook_marker() {
         let skill = skill_relais();
         for instruction in [
-            "relais run --native --task .relais/task.json",
-            "`run_in_background: true`",
-            "Monitor tool on a `tail -f`",
-            "`RELAIS-SPAWN <json>`",
-            "call the Agent tool once with",
-            "`subagent_type`, `model`,",
-            "`run_in_background`), the\n     prompt unchanged",
-            "`RELAIS-CONTINUE <json>`",
-            "SendMessage",
-            "ToolSearch",
-            "`to` and\n     `message`, exactly",
-            "Never send anything else to relais's agents",
-            "never spawn one\n   request twice",
-            "relais run --task .relais/task.json",
-            "A worker finishing is not the run\n   finishing",
-            "do not end your turn before it",
+            "`mcp__relais__run`",
+            "`task` set to `.relais/task.json`",
+            "`cwd` set to `<root>`",
+            "Never spawn, message or stop relais's agents yourself",
+            "`mcp__relais__status`",
+            "A worker finishing is not the run",
+            "Do not end your turn before the outcome",
         ] {
             assert!(skill.contains(instruction), "{instruction}\n{skill}");
+        }
+        for gone in [
+            "RELAIS-SPAWN",
+            "RELAIS-CONTINUE",
+            "--native",
+            "SendMessage",
+            "WorktreeCreate",
+        ] {
+            assert!(!skill.contains(gone), "{gone}\n{skill}");
+        }
+        for (path, content) in owned_files() {
+            for gone in ["RELAIS-SPAWN", "RELAIS-CONTINUE", "WorktreeCreate"] {
+                assert!(!content.contains(gone), "{gone} in {}", path.display());
+            }
         }
     }
 }

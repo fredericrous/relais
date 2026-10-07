@@ -484,20 +484,31 @@ fn a_world_is_countable_by_doctors_scan() {
     );
 }
 
-/// A tree that cannot be made fails the spawn the way Claude Code reads
-/// it: nothing on stdout, the reason on stderr, exit status 1.
+/// Worktrees and continuations belong to the plugin: a `WorktreeCreate`
+/// and a `SendMessage` `PreToolUse` exit 0 with no decision, so Claude
+/// Code makes its own tree and runs its own continuation.
 #[test]
-fn a_worktree_create_that_fails_exits_one_with_the_reason_on_stderr() {
-    let world = World::new("worktree-fail");
-    let payload = serde_json::json!({
-        "hook_event_name": "WorktreeCreate",
-        "session_id": "session-w",
-        "name": "../escape",
-        "cwd": world.state,
-    })
-    .to_string();
-    let (code, stdout, stderr) = world.hook(payload.as_bytes());
-    assert_eq!(code, 1, "stderr: {stderr}");
-    assert_eq!(stdout, "");
-    assert!(stderr.contains("refusing"), "{stderr}");
+fn a_worktree_create_and_a_send_message_exit_zero_with_no_output() {
+    let world = World::new("worktree-silent");
+    let payloads = [
+        serde_json::json!({
+            "hook_event_name": "WorktreeCreate",
+            "session_id": "session-w",
+            "name": "agent-a1",
+            "cwd": world.state,
+        }),
+        serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "session-w",
+            "tool_name": "SendMessage",
+            "tool_use_id": "toolu-m",
+            "tool_input": { "to": "a1", "message": "go on" },
+        }),
+    ];
+    for payload in payloads {
+        let (code, stdout, stderr) = world.hook(payload.to_string().as_bytes());
+        assert_eq!(code, 0, "{payload}: {stderr}");
+        assert_eq!(stdout, "", "{payload}");
+        assert_eq!(stderr, "", "{payload}");
+    }
 }

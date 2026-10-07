@@ -7,10 +7,6 @@
 //! decision, and release whatever a refused spawn's own request may
 //! have reserved before the caller prints anything. This is the one
 //! caller `decide.rs`'s module doc used to say did not exist yet.
-//!
-//! A firing that belongs to a native dispatch relais asked for is answered
-//! first, by [`native`](super::native), and never reaches the rest: a
-//! marked call is not admitted under the session's own run.
 
 use std::io::Write;
 use std::path::Path;
@@ -18,14 +14,11 @@ use std::time::{Duration, Instant};
 
 use super::decide::{decide_or_silent, CoordinatorAnswer, HookAnswer};
 use super::event::{self, HookEvent, ToolCallPhase};
-use super::native::{self, Native, NativePath};
-use super::worktree;
 use crate::admission::{
     Decision, DispatchRequest, DispatchSource, Gate, Provenance, Refusal, ResourceClass,
     RunRegistration,
 };
 use crate::ids;
-use crate::paths;
 use crate::policy::{HookAdmissionSettings, QueueBehaviour};
 use crate::runner::ADMISSION_POLL;
 
@@ -41,14 +34,6 @@ pub struct Handled {
     /// answer, via [`wait_for_a_seat`]. Zero for every firing that was
     /// never queued at all.
     pub waited: Duration,
-    /// What a `WorktreeCreate` or a `SubagentStop` did to the default
-    /// trees on disk (created path, failure reason, cleanup outcome), for
-    /// the journal. `None` for every other firing, and for a stop that
-    /// had no tree of ours.
-    pub worktree: Option<String>,
-    /// Which native path this firing took (`hook::native`), for the
-    /// journal. `None` when nothing about it was native.
-    pub native: Option<NativePath>,
 }
 
 /// Handle one hook payload: parse it, ask the coordinator about a
@@ -65,81 +50,22 @@ pub struct Handled {
 /// a real socket and a real clock, neither of which `decide` itself
 /// touches.
 pub fn handle(payload: &[u8], settings: &HookAdmissionSettings, gate: &dyn Gate) -> Handled {
-    let records = paths::hook_worktrees_dir().ok();
-    handle_in(payload, settings, gate, records.as_deref())
-}
-
-/// [`handle`] with the directory the default trees' records live in
-/// named by the caller; `None` when the machine has no state directory.
-pub fn handle_in(
-    payload: &[u8],
-    settings: &HookAdmissionSettings,
-    gate: &dyn Gate,
-    records: Option<&Path>,
-) -> Handled {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        handle_inner(payload, settings, gate, records)
+        handle_inner(payload, settings, gate)
     }))
     .unwrap_or(Handled {
         event: HookEvent::NotOurs,
         coordinator: None,
         answer: HookAnswer::Silent,
         waited: Duration::ZERO,
-        worktree: None,
-        native: None,
     })
 }
 
-/// The answer when the machine has no home directory: no coordinator to
-/// reach and no state directory to record a tree in. The decision is the
-/// one `decide` gives an unreachable coordinator, and the tree events
-/// still get their answers — a `WorktreeCreate` fails with its reason
-/// rather than going silent, which Claude Code would turn into a refused
-/// agent with no reason given.
-pub fn answer_without_home(payload: &[u8], settings: &HookAdmissionSettings) -> HookAnswer {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let event = event::parse(payload);
-        // No coordinator to ask: a marked call is refused, whatever the
-        // machine's stance says.
-        let answer = match native::handle(&event, settings, None, None) {
-            Native::Answered { answer, .. } => return answer,
-            Native::Passed { .. } | Native::Unconcerned => {
-                decide_or_silent(&event, settings, None, Duration::ZERO)
-            }
-        };
-        tend_default_trees(&event, answer, None).0
-    }))
-    .unwrap_or(HookAnswer::Silent)
-}
-
-fn handle_inner(
-    payload: &[u8],
-    settings: &HookAdmissionSettings,
-    gate: &dyn Gate,
-    records: Option<&Path>,
-) -> Handled {
+fn handle_inner(payload: &[u8], settings: &HookAdmissionSettings, gate: &dyn Gate) -> Handled {
     let event = event::parse(payload);
-    let native = match native::handle(&event, settings, Some(gate), records) {
-        // A native firing is answered here and goes no further: a marked
-        // call is never admitted under the session's own run, so it is
-        // charged once, and its dispatch is never withdrawn from here.
-        Native::Answered { answer, path } => {
-            return Handled {
-                event,
-                coordinator: None,
-                answer,
-                waited: Duration::ZERO,
-                worktree: None,
-                native: Some(path),
-            };
-        }
-        Native::Passed { path } => Some(path),
-        Native::Unconcerned => None,
-    };
     let (coordinator, waited) = ask_coordinator(&event, settings, gate);
     let answer = decide_or_silent(&event, settings, coordinator.clone(), waited);
     follow_agent_lifecycle(&event, gate);
-    let (answer, worktree) = tend_default_trees(&event, answer, records);
     if matches!(answer, HookAnswer::Refuse { .. }) {
         if let HookEvent::AgentToolCall(call) = &event {
             let dispatch_id = ids::derive_dispatch_id(&call.session_id, &call.tool_use_id);
@@ -158,65 +84,6 @@ fn handle_inner(
         coordinator,
         answer,
         waited,
-        worktree,
-        native,
-    }
-}
-
-/// The two events that touch the default trees on disk. A
-/// `WorktreeCreate` is answered here (`decide` stays pure and answers
-/// it `Silent`): the tree is made, or the reason it could not be is
-/// handed back to Claude Code. A `SubagentStop` removes the tree made
-/// for that agent when nothing changed in it, after the seat was
-/// settled. Every other event passes through with its answer.
-fn tend_default_trees(
-    event: &HookEvent,
-    answer: HookAnswer,
-    records: Option<&Path>,
-) -> (HookAnswer, Option<String>) {
-    match event {
-        HookEvent::WorktreeCreate(create) => {
-            let created = match records {
-                Some(records) => worktree::create_default(
-                    &create.cwd,
-                    &create.name,
-                    create.session_id.as_str(),
-                    records,
-                ),
-                None => Err("relais has no state directory to record the tree in".to_string()),
-            };
-            match created {
-                Ok(path) => {
-                    let note = format!("created {}", path.display());
-                    (HookAnswer::WorktreePath { path }, Some(note))
-                }
-                Err(reason) => {
-                    let note = format!("failed: {reason}");
-                    (HookAnswer::WorktreeFailed { reason }, Some(note))
-                }
-            }
-        }
-        HookEvent::SubagentStop(stop) => {
-            let Some(records) = records else {
-                return (answer, None);
-            };
-            let outcome = worktree::cleanup_after_stop(
-                stop.session_id.as_str(),
-                stop.agent_id.as_str(),
-                records,
-            );
-            let note = match outcome {
-                worktree::Cleanup::NoRecord => None,
-                other => Some(other.label()),
-            };
-            (answer, note)
-        }
-        HookEvent::SessionStart(_)
-        | HookEvent::SessionEnd(_)
-        | HookEvent::SubagentStart(_)
-        | HookEvent::AgentToolCall(_)
-        | HookEvent::SendMessageCall(_)
-        | HookEvent::NotOurs => (answer, None),
     }
 }
 
@@ -297,8 +164,6 @@ fn follow_agent_lifecycle(event: &HookEvent, gate: &dyn Gate) {
         HookEvent::SessionStart(_)
         | HookEvent::SessionEnd(_)
         | HookEvent::SubagentStart(_)
-        | HookEvent::SendMessageCall(_)
-        | HookEvent::WorktreeCreate(_)
         | HookEvent::NotOurs => {}
     }
 }
@@ -464,11 +329,6 @@ fn wait_outcome(handled: &Handled) -> &'static str {
     match &handled.answer {
         HookAnswer::Silent => "admitted_after_waiting",
         HookAnswer::Refuse { .. } => "refused_after_waiting",
-        // No firing that answers with a rewrite or a tree waits for a
-        // seat; named so a future one is a decision, not a fall-through.
-        HookAnswer::Rewrite { .. }
-        | HookAnswer::WorktreePath { .. }
-        | HookAnswer::WorktreeFailed { .. } => "answered_after_waiting",
     }
 }
 
@@ -496,11 +356,6 @@ pub fn journal_entry(payload: &[u8], handled: &Handled) -> serde_json::Value {
     });
     let (decision, reason, rule, availability) = match &handled.answer {
         HookAnswer::Silent => ("silent", None, None, None),
-        HookAnswer::Rewrite { .. } => ("rewrite", None, None, None),
-        HookAnswer::WorktreePath { .. } => ("worktree_path", None, None, None),
-        HookAnswer::WorktreeFailed { reason } => {
-            ("worktree_failed", Some(reason.clone()), None, None)
-        }
         HookAnswer::Refuse { refusal } => (
             "refuse",
             Some(refusal.sentence()),
@@ -530,8 +385,6 @@ pub fn journal_entry(payload: &[u8], handled: &Handled) -> serde_json::Value {
         "availability": availability,
         "waited_ms": handled.waited.as_millis() as u64,
         "outcome": wait_outcome(handled),
-        "worktree": handled.worktree,
-        "native": handled.native.map(NativePath::label),
     })
 }
 
@@ -1693,8 +1546,6 @@ mod tests {
                 refusal: refusal.clone(),
             },
             waited: Duration::ZERO,
-            worktree: None,
-            native: None,
         };
         let entry = journal_entry(&payload, &handled);
         assert_eq!(entry["decision"], "refuse");
@@ -1725,8 +1576,6 @@ mod tests {
             coordinator: None,
             answer: HookAnswer::Silent,
             waited: Duration::ZERO,
-            worktree: None,
-            native: None,
         };
         let entry = journal_entry(b"not json {{{", &handled);
         assert_eq!(entry["payload"], "not json {{{");
@@ -1747,8 +1596,6 @@ mod tests {
             coordinator: Some(crate::admission::Decision::Granted),
             answer: HookAnswer::Silent,
             waited: Duration::from_millis(900),
-            worktree: None,
-            native: None,
         };
         let entry = journal_entry(&payload, &admitted);
         assert_eq!(entry["waited_ms"], 900);
@@ -1765,8 +1612,6 @@ mod tests {
                 },
             },
             waited: Duration::from_secs(2),
-            worktree: None,
-            native: None,
         };
         let entry = journal_entry(&payload, &refused);
         assert_eq!(entry["waited_ms"], 2_000);
@@ -1991,140 +1836,31 @@ mod tests {
         assert_eq!(second.waited, std::time::Duration::ZERO);
     }
 
-    fn git_ok(dir: &Path, args: &[&str]) {
-        let status = crate::workspace::git_command(dir)
-            .args([
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@example.com",
-                "-c",
-                "commit.gpgsign=false",
-                "-c",
-                "core.hooksPath=/dev/null",
-            ])
-            .args(args)
-            .status()
-            .expect("git runs");
-        assert!(status.success(), "git {args:?}");
-    }
-
-    fn worktree_create_payload(session: &str, name: &str, cwd: &Path) -> Vec<u8> {
-        serde_json::json!({
-            "hook_event_name": "WorktreeCreate",
-            "session_id": session,
-            "name": name,
-            "cwd": cwd,
-        })
-        .to_string()
-        .into_bytes()
-    }
-
-    /// The wiring, end to end through `handle_in`: a `WorktreeCreate`
-    /// answers with the new tree's path, and the same agent's
-    /// `SubagentStop` removes it again, each journalled.
+    /// The plugin owns worktrees and continuations: a `WorktreeCreate` and
+    /// a `SendMessage` call, in every phase, get no decision and never
+    /// reach the coordinator.
     #[test]
-    fn a_worktree_create_is_answered_and_its_stop_cleans_up() {
-        let scratch = crate::test_support::temp_dir("respond-worktree");
-        let repo = scratch.join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        git_ok(&repo, &["init", "-q", "-b", "main"]);
-        git_ok(
-            &repo,
-            &["commit", "-q", "--allow-empty", "-m", "chore: init"],
-        );
-        let records = scratch.join("records");
-        let gate = LocalGate::new(ConcurrencyLimits::default());
-
-        let created = handle_in(
-            &worktree_create_payload("s1", "agent-a1", &repo),
-            &settings(),
-            &gate,
-            Some(&records),
-        );
-        let HookAnswer::WorktreePath { path } = &created.answer else {
-            panic!("expected a path, got {:?}", created.answer);
-        };
-        assert!(path.ends_with(".claude/worktrees/agent-a1"));
-        assert!(path.exists());
-        let entry = journal_entry(b"{}", &created);
-        assert_eq!(entry["decision"], "worktree_path");
-        assert!(entry["worktree"].as_str().unwrap().starts_with("created "));
-
-        let stopped = handle_in(
-            &stop_payload("s1", "a1"),
-            &settings(),
-            &gate,
-            Some(&records),
-        );
-        assert_eq!(stopped.answer, HookAnswer::Silent);
-        assert_eq!(stopped.worktree.as_deref(), Some("removed"));
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn a_failed_worktree_create_answers_with_the_reason() {
-        let scratch = crate::test_support::temp_dir("respond-worktree-fail");
-        let gate = LocalGate::new(ConcurrencyLimits::default());
-        let handled = handle_in(
-            &worktree_create_payload("s1", "../escape", &scratch),
-            &settings(),
-            &gate,
-            Some(&scratch.join("records")),
-        );
-        let HookAnswer::WorktreeFailed { reason } = &handled.answer else {
-            panic!("expected a failure, got {:?}", handled.answer);
-        };
-        assert!(reason.contains("refusing"), "{reason}");
-        assert_eq!(handled.answer.exit_code(), 1);
-        let entry = journal_entry(b"{}", &handled);
-        assert_eq!(entry["decision"], "worktree_failed");
-        assert_eq!(entry["reason"], reason.as_str());
-    }
-
-    #[test]
-    fn a_worktree_create_with_no_state_directory_fails_rather_than_staying_silent() {
-        let gate = LocalGate::new(ConcurrencyLimits::default());
-        let handled = handle_in(
-            &worktree_create_payload("s1", "agent-a1", Path::new("/repo")),
-            &settings(),
-            &gate,
-            None,
-        );
-        assert!(matches!(handled.answer, HookAnswer::WorktreeFailed { .. }));
-    }
-
-    /// The path `main.rs` takes when the machine has no home directory:
-    /// no gate at all, and still never a silent `WorktreeCreate`.
-    #[test]
-    fn a_worktree_create_without_a_home_fails_rather_than_staying_silent() {
-        let answer = answer_without_home(
-            &worktree_create_payload("s1", "agent-a1", Path::new("/repo")),
-            &settings(),
-        );
-        assert!(matches!(answer, HookAnswer::WorktreeFailed { .. }));
-        assert_eq!(answer.exit_code(), 1);
-    }
-
-    #[test]
-    fn a_send_message_call_is_silent_in_every_phase() {
+    fn a_worktree_create_and_a_send_message_call_get_no_decision() {
         let gate = PanicsIfAsked;
+        let mut payloads = vec![serde_json::json!({
+            "hook_event_name": "WorktreeCreate",
+            "session_id": "s1",
+            "name": "agent-a1",
+            "cwd": "/repo",
+        })];
         for name in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
-            let payload = serde_json::json!({
+            payloads.push(serde_json::json!({
                 "hook_event_name": name,
                 "session_id": "s1",
                 "tool_name": "SendMessage",
                 "tool_use_id": "t1",
                 "tool_input": { "to": "a1", "message": "go on" },
-            })
-            .to_string()
-            .into_bytes();
-            let handled = handle_in(&payload, &settings(), &gate, None);
-            assert!(
-                matches!(handled.event, HookEvent::SendMessageCall(_)),
-                "{name}"
-            );
-            assert_eq!(handled.answer, HookAnswer::Silent, "{name}");
+            }));
+        }
+        for payload in payloads {
+            let handled = handle(payload.to_string().as_bytes(), &settings(), &gate);
+            assert_eq!(handled.event, HookEvent::NotOurs, "{payload}");
+            assert_eq!(handled.answer, HookAnswer::Silent, "{payload}");
         }
     }
 }

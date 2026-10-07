@@ -84,8 +84,6 @@ pub fn pair(events: &[HookEvent]) -> Vec<Pairing> {
             HookEvent::SessionStart(_)
             | HookEvent::SessionEnd(_)
             | HookEvent::SubagentStop(_)
-            | HookEvent::SendMessageCall(_)
-            | HookEvent::WorktreeCreate(_)
             | HookEvent::NotOurs => {}
         }
     }
@@ -172,7 +170,6 @@ mod tests {
                 phase,
                 caller_agent_id: None,
                 prompt_id: None,
-                tool_input: None,
             })
         };
         let events = vec![
@@ -222,7 +219,6 @@ mod tests {
                 phase: ToolCallPhase::Pre,
                 caller_agent_id: None,
                 prompt_id: None,
-                tool_input: None,
             }),
             HookEvent::AgentToolCall(AgentToolCall {
                 session_id: session_id.clone(),
@@ -230,7 +226,6 @@ mod tests {
                 phase: ToolCallPhase::Pre,
                 caller_agent_id: None,
                 prompt_id: None,
-                tool_input: None,
             }),
             HookEvent::SubagentStart(SubagentStart {
                 session_id,
