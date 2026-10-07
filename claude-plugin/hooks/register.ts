@@ -252,8 +252,6 @@ export function register(on: any) {
   // one that only mentions an id included, is kept.
   on('prompt.submit', async ($: any, e: any, next: any) => {
     if (e.origin?.kind !== 'task-notification') {
-      // Not the outcome messages this plugin submits itself.
-      if (next.origin?.plugin === $.plugin.name) return next(e)
       onPersonPrompt(store, e.text)
       return next(e)
     }

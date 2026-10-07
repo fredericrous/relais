@@ -160,20 +160,24 @@ export type Declined = 'not_now' | 'dismissed'
 
 // The person asked for relais again ("set up relais here", "use relais"),
 // or invoked its skill: a Not now earlier in the session no longer holds,
-// so the next run asks again. Only the person's own prompts reach this
-// (register.ts), never the outcome messages this plugin submits.
+// so the next run asks again. Not when they turn it away ("don't use
+// relais"), and never for a message this plugin submitted itself.
 export function onPersonPrompt(store: Store, text: unknown) {
-  if (typeof text === 'string' && /\brelais\b/i.test(text)) store.declined.clear()
+  if (typeof text !== 'string') return
+  if (store.ownPrompts.delete(text)) return
+  if (!/\brelais\b/i.test(text)) return
+  if (/\b(don'?t|do not|without|no|stop|never|skip)\b[^.!?\n]*\brelais\b/i.test(text)) return
+  store.declined.clear()
 }
 
 // The routing rule the plugin adds to the system prompt (register.ts,
-// `prompt.compose`). Measured in a fresh repository with a plain request:
-// with the skill's description alone, or this text attached to the
-// person's prompt, the model did the task itself; as a system-prompt
-// section, with the run tool's description saying the same, it routed.
-// Fixed text, so the prompt cache holds.
+// `prompt.compose`): one line, the skill holds the rest. Measured in a
+// fresh repository with a plain request: with the skill's description
+// alone, or a rule attached to the person's prompt, the model did the task
+// itself; as a system-prompt line, with the run tool's description saying
+// when to use it, it routed (5 of 5 runs). Fixed text, so the cache holds.
 export const ROUTING_CONTEXT =
-  'relais plugin: route each bounded implementation or inspection task (one objective, a write scope, acceptance a command can verify) through relais instead of doing it yourself: load the relais skill (`relais:relais`) and call mcp__relais__run with a contract you write from the plan or the request; relais picks the model, runs and verifies it. A repository that is not set up is set up on that first run, with the person answering. Keep design, multi-repo, ops and exploratory work in the session, do the task yourself where the person declined relais for that repository, and say in one line which path a task took.'
+  'Route each bounded implementation or inspection task through relais instead of doing it yourself: load the `relais:relais` skill.'
 
 export const ROUTING_SECTION = 'relais-routing'
 

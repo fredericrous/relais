@@ -47,6 +47,7 @@ export async function pump(fx: Fx, store: Store) {
   // tried again on the next tick, never lost.
   while (store.verdicts.length > 0) {
     try {
+      store.ownPrompts.add(store.verdicts[0])
       await fx.prompt.submit({ text: store.verdicts[0] })
     } catch (reason) {
       // Kept for the next tick; said once per streak of failures.

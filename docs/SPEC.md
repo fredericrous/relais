@@ -42,7 +42,7 @@ Native agent definitions provide convenient defaults for research, implementatio
 
 ### Supervised execution
 
-The `/relais` skill asks the parent to express the requested work as a task contract and invoke the Relais runner. The runner launches separate programmatic Claude Code sessions with explicit model, effort, tools and limits. It returns a compact report plus artifact paths.
+The relais skill (`relais:relais`; the plugin's system-prompt line tells the parent to use it) has the parent express a bounded task as a task contract and invoke the Relais runner. The runner launches separate programmatic Claude Code sessions with explicit model, effort, tools and limits. It returns a compact report plus artifact paths.
 
 The parent model routes a bounded task through relais on its own, writing the contract from the approved plan or the request rather than asking the person for its fields; `/relais:relais` invokes the skill by hand. A repository needs no setup before its first run. When a run reports `no_policy` or `missing_trust_grant`, the skill calls the plugin's `onboard` or `trust` tool. That tool asks the person in Claude Code's own dialog: whether to use the checks `relais init --detect` found (writing and committing `relais.toml`), and whether relais may run the listed commands (the grant, §5). It asks at most those two questions. Answering *Not now* writes nothing.
 
@@ -50,9 +50,9 @@ Once a task is accepted for execution, the parent does not supervise intermediat
 
 Conversational examples:
 
-- `/relais Fix the JSON escaping defect in amont list output.`
-- `/relais Investigate why this check is inactive; do not edit files.`
-- `Use Relais for this implementation; preserve the approved design.`
+- `Fix the JSON escaping defect in amont list output.` (routed without being asked)
+- `Investigate why this check is inactive; do not edit files.`
+- `/relais:relais Use Relais for this implementation; preserve the approved design.`
 
 CLI examples:
 

@@ -65,6 +65,9 @@ export type Store = {
   consent: Map<string, Promise<string>>
   // Repository roots the person answered Not now for in this session.
   declined: Set<string>
+  // Outcome messages this plugin submitted, so `prompt.submit` does not
+  // take them for the person's own words.
+  ownPrompts: Set<string>
 }
 
 // A background promise nobody awaits: once the module unloads its effects
@@ -97,6 +100,7 @@ export const createStore = (): Store => ({
   decisionToast: undefined,
   consent: new Map(),
   declined: new Set(),
+  ownPrompts: new Set(),
 })
 
 // Timers go through here so that unloading can clear every one.
