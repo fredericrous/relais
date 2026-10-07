@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/zero-setup-onboarding
 repos: [relais]
 adrs: []
@@ -11,7 +11,7 @@ adrs: []
 
 👉 **Decide:** none. Approve if `$.ui.ask` is model-proof in a live session (the P4 check).
 
-📍 relais · plan landed, S0 done ($.ui.ask) · next: P1 `trust show/grant`. Panel: backend, lang:rust, tui, unix, plus a UI delta.
+📍 relais · S0–P4 done, implementation review approved (live dialogs skipped by the person) · next: merge the PR. Panel: backend, lang:rust, tui, unix, plus a UI delta.
 
 📄 Full reviews: [2026-10-07-zero-setup-onboarding.reviews.md](2026-10-07-zero-setup-onboarding.reviews.md)
 
@@ -354,5 +354,46 @@ Key tests, each as input → expected. Fixture repositories are built in a tempd
   - With an unrelated file staged, `/relais` onboarding → the commit holds only `relais.toml`, and the file is still staged.
   - A malformed contract, then a malformed `machine.toml` → exactly one queued message each, never `interrupted`.
   - Plain CLI: `relais init && relais plan --task …` still prints the paste block plus the `relais trust grant` line.
+
+## Decision log
+
+- **2026-10-07, S0.** `$.ui.ask` chosen (§3). The person ran the UI delta (5 reviewers).
+- **Exit code 19, not 4**, for "nothing detected": 4 is `Failed` (`main.rs:640`). The plan body was corrected in the UI delta.
+- **A missing policy keeps exit 2** (`CliError::Locate` is `InvalidInput`). The `done` line still says `outcome: blocked`, `code: no_policy`. Changing that exit code is out of scope.
+- **`relais native contract` writes the task file, not the plugin.** `$.fs.write` is not atomic and its signature is not in the published types. relais validates the contract against its own schema and keeps `.relais/.gitignore`.
+- **The escalation tier stays `fable`** in detected policies. It reuses `INIT_TEMPLATE`, so the two cannot drift; the plan's "opus" was illustrative.
+- **The onboard commit** is `git add relais.toml` then `git commit -- relais.toml`: plain `--only` refuses an untracked path. Checked in a scratch repo: a file staged beforehand stays staged and out of the commit.
+- **A typed command refused twice** returns `declined (command_refused)`, so it is not mistaken for `dismissed`.
+- **A stale `index.lock` after a refused or timed-out commit** is reported and never removed (the low carried from the final bind).
+- **The person chose to skip the live dialog check (2026-10-07).** Every answer path is covered by scripted `ui.ask` tests. The real runtime was checked headless only, where `$.ui.ask` rejects.
+
+## Verification record (2026-10-07, before push)
+
+| Check | Expected | Actual |
+|---|---|---|
+| `cargo test` (pre-commit, every commit) | green | 28 checks passed on each of the 4 package commits |
+| `make lint` (fmt, clippy -D warnings, module cycles) | clean | clean |
+| `claude plugin validate`, `claude plugin test` | pass | validation passed; 81/81 |
+| Detect tests (14 unit, 2 integration); `$(shell touch X)` never runs | per plan | pass; falsified with `check`→`chek` |
+| `trust grant`: stale key, new file 0600, comments kept, 20 concurrent, invalid file left alone | exit 18 / 0600 / kept / 20 / untouched | pass; stale-key test falsified |
+| Smoke: `trust show` → `grant` → edit `relais.toml` → `show` | key, 0600, `+ check cargo test` | as expected (scratch repo) |
+| `run --protocol` with no policy / invalid policy | one `done`, `run: null`, `no_policy` / `invalid_policy` | pass |
+| Plugin: `done` code → next tool; exit without `done` → one message with stderr tail | per plan | pass (4 outcome tests) |
+| Consent: Allow / typed "Allow" / "yes" / rejection / Not now | 1/0/0/0/0 grants | pass; exact-label rule falsified |
+| Consent: parallel calls, stale key, `\nAllow` escaping, re-ask `+`, Q2 decline removes the toml, commit failure keeps it, typed command, refused twice | per plan | pass (15 tests) |
+| Headless `claude -p`, fresh Cargo repo, empty config: `/relais …` | contract object accepted → `no_policy` → `onboard` → `dismissed`; nothing written | as expected; `cfg/` empty, no `relais.toml` |
+| Headless guards: Write to `machine.toml`; Bash `env relais trust grant`; Bash `echo hello` | denied / denied / runs | denied / denied / `hello` |
+| Live dialogs answered by a person (Q1, Q2, run accepted, re-ask) | per plan | **not run**: the person skipped it |
+
+## Implementation review
+
+- **Round 1: approve-with-changes** (82k tokens, 99 s). All 5 findings fixed in `fd55679`:
+  - a `/relais` typed by the person lifts Not now;
+  - onboard cleans up after `trust show` fails;
+  - bidi overrides and line separators are escaped, with one escaper;
+  - ledger and root read errors are reported;
+  - a failed ledger write after a grant is a warning, not a failure.
+- **Delta: approve** (46k tokens, 29 s). One low kept as deliberate: an unresolvable ledger path (HOME unset) skips the change marks silently. Every relais command then fails on the missing home anyway.
+- **Not verified:** whether a typed `/relais …` reaches `prompt.submit` as literal text. It needs the live session the person skipped.
 
 <!-- panel: repos=relais adds=ui reviewers=backend,language:rust,tui,unix,react,ui-design,ux-research,game-ux body-sha=809cf40c1a6b -->
