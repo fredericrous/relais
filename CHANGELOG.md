@@ -15,6 +15,16 @@ missing here.
   stayed at 0.1.1 because its job waited behind a repository variable that was
   never set; `brew upgrade relais` now follows the releases.
 
+### Fixed
+
+- `relais doctor` fails a Claude Code outside the range the relais plugin is
+  tested on (`>= 2.1.291, < 2.2.0`), or one whose version cannot be read, in
+  the words `relais run` refuses it with; it used to report any version as fine.
+- The relais pane's outcome row names what the candidate changed (`2 files, +5
+  -1`) beside the receipt: the run's `outcome` event, and the timeline
+  `relais native status` rebuilds from, now carry the change summary the `done`
+  line already had.
+
 ## v0.10.0
 
 relais becomes a Claude Code plugin. Every agent a run dispatches (worker,

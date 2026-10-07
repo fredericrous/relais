@@ -180,6 +180,21 @@ test('more agents than fit are summarised, and an unknown cost says so', async (
   expect(texts.some(t => t.startsWith('cost') && t.includes('unknown'))).toBe(true)
 })
 
+test('the outcome row names what the candidate changed', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  const { texts } = await drawn($, engine, [
+    phase(0, 'running'),
+    event(RUN, 1, {
+      kind: 'outcome',
+      state: 'accepted',
+      receipt: '/runs/r/receipt.json',
+      summary: { files_changed: 2, insertions: 5, deletions: 1 },
+    }),
+  ])
+  const row = texts.find(t => t.startsWith('outcome '))
+  expect(row).toBe('outcome accepted · 2 files, +5 -1 · receipt /runs/r/receipt.json')
+})
+
 test('a known cost is shown with how well it is known', async ($: any, on: any) => {
   const engine = await startedRun($, on)
   const { texts } = await drawn($, engine, [

@@ -230,8 +230,16 @@ fn default_integration_bin(name: &str) -> String {
 
 /// The Claude Code line, including what the harness can and cannot
 /// enforce. Split out so the capability text is testable against a fake
-/// `--help`.
+/// `--help`. A version outside the range the relais plugin is tested on is
+/// a failure: `relais run` refuses it with the same words.
 pub(crate) fn claude_code_finding(caps: &Capabilities) -> Finding {
+    if let Some(refusal) = crate::native::unsupported_claude_code(caps.version.as_deref()) {
+        return Finding {
+            component: "claude-code",
+            level: Level::Fail,
+            detail: format!("{refusal}; relais run refuses it"),
+        };
+    }
     let mut detail = format!("version {}", caps.version.as_deref().unwrap_or("?"));
     if !caps.supports_model {
         detail.push_str("; WARNING: --model not advertised in --help");
@@ -2004,7 +2012,7 @@ mod tests {
     fn the_turn_ceiling_line_reports_what_the_harness_can_take() {
         // The installed Claude Code: SPEC §11 promises a turn ceiling it
         // has no flag for, so doctor says which ceilings are real.
-        let finding = claude_code_finding(&capabilities_from_help("2.1.278".into(), HELP_2_1));
+        let finding = claude_code_finding(&capabilities_from_help("2.1.292".into(), HELP_2_1));
         assert_eq!(finding.level, Level::Ok);
         assert!(
             finding.detail.contains(
@@ -2015,7 +2023,7 @@ mod tests {
             finding.detail
         );
         let older = claude_code_finding(&capabilities_from_help(
-            "1.0".into(),
+            "2.1.291".into(),
             "--model --output-format --max-turns",
         ));
         assert!(
@@ -2025,6 +2033,30 @@ mod tests {
             "{}",
             older.detail
         );
+    }
+
+    /// A Claude Code outside the plugin's tested range fails doctor, in the
+    /// words `relais run` refuses it with; so does one whose version cannot
+    /// be read.
+    #[test]
+    fn a_claude_code_outside_the_supported_range_fails_doctor() {
+        for outside in ["2.1.278", "2.2.0", "3.0.1"] {
+            let finding = claude_code_finding(&capabilities_from_help(outside.into(), HELP_2_1));
+            assert_eq!(finding.level, Level::Fail, "{outside}");
+            assert!(
+                finding
+                    .detail
+                    .contains(crate::native::SUPPORTED_CLAUDE_CODE),
+                "{}",
+                finding.detail
+            );
+            assert!(finding.detail.contains(outside), "{}", finding.detail);
+        }
+        let mut unread = capabilities_from_help("2.1.292".into(), HELP_2_1);
+        unread.version = None;
+        assert_eq!(claude_code_finding(&unread).level, Level::Fail);
+        let inside = claude_code_finding(&capabilities_from_help("2.1.291".into(), HELP_2_1));
+        assert_eq!(inside.level, Level::Ok);
     }
 
     #[test]

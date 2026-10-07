@@ -135,6 +135,10 @@ pub enum Event {
     Outcome {
         state: String,
         receipt: Option<String>,
+        /// What the run's last candidate changed, when it kept one: the
+        /// pane's outcome row, and a timeline rebuilt from the events.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<Summary>,
     },
     /// A line the process wrote to stdout or stderr under `--protocol`.
     Stderr {
@@ -536,6 +540,7 @@ pub fn timeline(run: &str, events_jsonl: &str) -> serde_json::Value {
                 outcome = serde_json::json!({
                     "state": event["state"],
                     "receipt": event["receipt"],
+                    "summary": event["summary"],
                 });
             }
             Some("output") => {
@@ -748,6 +753,11 @@ mod tests {
         events.emit(Event::Outcome {
             state: "accepted".into(),
             receipt: Some("/r/receipt.json".into()),
+            summary: Some(Summary {
+                files_changed: 1,
+                insertions: 3,
+                deletions: 1,
+            }),
         });
         let text = std::fs::read_to_string(dir.join("run-1/events.jsonl")).expect("events");
         let timeline = timeline("run-1", &text);
@@ -756,6 +766,8 @@ mod tests {
         assert_eq!(timeline["decisions"][0]["what"], "repair");
         assert_eq!(timeline["cost"][0]["booked"], 5);
         assert_eq!(timeline["outcome"]["state"], "accepted");
+        assert_eq!(timeline["outcome"]["summary"]["files_changed"], 1);
+        assert_eq!(timeline["outcome"]["summary"]["insertions"], 3);
         assert_eq!(timeline["outcome"]["receipt"], "/r/receipt.json");
         let output = timeline["output"].as_array().expect("output lines");
         assert_eq!(output.len(), STATUS_OUTPUT_LINES);

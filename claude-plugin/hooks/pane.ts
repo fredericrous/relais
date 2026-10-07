@@ -11,6 +11,7 @@ import {
   formatCost,
   isLive,
   mmss,
+  outcomeText,
   shortId,
 } from './timeline.ts'
 
@@ -87,9 +88,9 @@ function frame(m: RunModel, room: Room): { head: Row[]; steps: Row[]; tail: Row[
   }
   tail.push({ text: `cost    ${formatCost(m.cost)}` })
   if (m.outcome) {
-    const receipt = m.outcome.receipt ? ` · receipt ${m.outcome.receipt}` : ''
+
     tail.push({
-      text: `outcome ${m.outcome.state}${receipt}`,
+      text: `outcome ${outcomeText(m.outcome)}`,
       bold: true,
       color: m.outcome.state.startsWith('accepted') ? undefined : 'error',
     })
