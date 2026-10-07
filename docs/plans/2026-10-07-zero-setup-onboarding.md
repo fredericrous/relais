@@ -421,5 +421,6 @@ Key tests, each as input → expected. Fixture repositories are built in a tempd
   - the negation must sit within two words of "relais";
   - status line updated.
 - **P5, re-bind: approve** (28k tokens, 18 s). Kept as deliberate: a refusal with three or more words between the negation and "relais" ("don't want to use relais") still lifts *Not now*. The cost is one extra question.
+- **CI fix, re-bind: approve** (25k tokens, 12 s). On windows-latest, `native_contract_saves_a_contract_and_refuses_prose` compared an 8.3 short path with a canonical one. The test now canonicalizes both sides (`37a971a`); no product code changed.
 
 <!-- panel: repos=relais adds=ui reviewers=backend,language:rust,tui,unix,react,ui-design,ux-research,game-ux body-sha=809cf40c1a6b -->
