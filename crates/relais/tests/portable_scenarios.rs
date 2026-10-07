@@ -1802,11 +1802,11 @@ fn native_contract_saves_a_contract_and_refuses_prose() {
     let saved = pipe(&contract);
     assert_eq!(saved.status.code(), Some(0), "{}", text(&saved.stderr));
     let path = PathBuf::from(text(&saved.stdout).trim());
-    let tasks = std::fs::canonicalize(&world.repo)
-        .expect("repo")
-        .join(".relais")
-        .join("tasks");
-    assert!(path.starts_with(&tasks), "{}", path.display());
+    // Both sides canonical: macOS reaches the temp dir through a symlink,
+    // and Windows prints a short (8.3) name where canonicalize gives `\\?\`.
+    let tasks = std::fs::canonicalize(world.repo.join(".relais").join("tasks")).expect("tasks");
+    let saved_at = std::fs::canonicalize(&path).expect("the printed path exists");
+    assert!(saved_at.starts_with(&tasks), "{}", path.display());
     assert_eq!(std::fs::read_to_string(&path).expect("saved"), contract);
     assert_eq!(
         git(&world.repo, &["status", "--porcelain"]).trim(),
