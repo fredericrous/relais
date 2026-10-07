@@ -306,4 +306,38 @@ Delivery order, at the person's request: prove the switch works, then initial ro
   - the prompt-to-first-request p95 is within 2 s of routing off;
   - every person flag shows up as a `corrected` task.
 
+## Decision log
+
+### S0: spike results (2026-10-07, Claude Code 2.1.292, headless `--dangerously-skip-permissions`)
+
+The gate **passes**. The probe plugin and its logs are kept outside the repository (scratchpad `s0probe`, `s0a`–`s0e`). Each check: input → expected → actual.
+
+| Check | Expected | Actual |
+|---|---|---|
+| `turn.step` switch, main session, mid-turn (index 1 → full id `claude-haiku-4-5-20251001`) | answered by haiku | `usage.model` = `claude-haiku-4-5-20251001` on step 1, sonnet on step 0 |
+| `turn.step` switch with the alias `haiku` | works | **fails**: "issue with the selected model (haiku)". `turn.step` needs a full id, so `router-state` serves full ids |
+| Cache after a mid-turn switch | rewrite | step 1: `cache_read` 0, `cache_creation` 23,830 (the whole context). The gate is needed |
+| Cache-write TTL split (person's transcripts, 14 days) | measure | 1 h: 434,284,952 tokens, 5 min: 4,038 → **price rebuilds at the 1 h write rate** |
+| `agent.spawn` returning `{model:'haiku'}`, parent asked `opus` for Explore | haiku | the subagent ran on `claude-haiku-5-5` (spawn resolves aliases). The parent's `model` param can be overridden |
+| Source of the spawn's `model` | known? | `e.model` is the Agent tool's param as given; undefined lets the agent definition, then the parent, decide. Definition pins are invisible → `router-state` serves them (Rust reads `.claude/agents`) |
+| `agentId` at spawn | before the first subagent step | `result.agentId` returned after 25 ms, before the subagent's step 0. No keying gap |
+| `tool.call` `agentId` for a subagent's Bash | present | present, the same id as its `turn.step` |
+| Subagent completion | detectable | `turn.complete` with its `agentId` |
+| Bash failure | exit visible | no exit-code field; `isError: true`, `text` "Exit code 1". `false` is an error, `ls` is not |
+| `$.model.complete` passes through `turn.step` | no | no step logged during 30 classifier calls |
+| Classifier latency, haiku, default effort (n=20) | measure | p50 1.66 s, p95 1.95 s; **261 output tokens with `maxTokens` 20** (thinking) |
+| Classifier latency, haiku, `effort:'low'` (n=10) | measure | **p50 834 ms, p95 1.11 s, 6 output tokens**. The classifier uses `effort:'low'` and a cached `system` block |
+| Message ids in hooks | present? | **absent**: `TurnStepResult.usage` and `ModelCompleteResult.usage` carry tokens and model only |
+| `tool.check` deny under bypass (Write and Bash `>>` on the guarded path) | refused | both refused (`decided: allow`, the plugin denied); the file was never created |
+| `$.fs.read` | available? | it exists, but resolves relative to the session cwd. Not needed (pins come from Rust) |
+| Prompts per day (person's transcripts, 14 days) | measure | median 77, min 4, max 183 |
+| `$.ui.ask` in an interactive bypass session | dialog shown | **not run here**, because headless cannot show it. Moved to the R1 live check |
+| Models that fail to spawn | list | known from the person's notes: `[1m]` variants for background agents. `router-state` excludes them |
+
+**Consequences for R1 (no body change; these follow from the S0 clauses the plan already contains):**
+- **Cost without message ids:** the router records each step's own `usage` (tokens and model) and each classifier call's `usage`, keyed `(session, turnId, step index, agentId)`. Routed-session cost comes from these rows alone; they are never added to `usage import`'s totals, so nothing is counted twice. Priced once by Rust from `PriceTable`.
+- **The rebuild rate** is the 1-hour cache-write price.
+- **Volume, made concrete:** about 77 prompts a day, perhaps about 25 tasks. With a 10% hold-out, 150 completed tasks per arm takes on the order of two months; learned activations in the busiest stratum, likewise months. As the plan states, initial routing and recovery carry the value until then. The hold-out rate is a setting, so the person may raise it to shorten the spend comparison.
+
+
 <!-- panel: repos=relais reviewers=backend,language:rust,unix,react body-sha=3b57295144e6 -->
