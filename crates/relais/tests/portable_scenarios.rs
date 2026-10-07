@@ -847,6 +847,82 @@ fn plan_without_a_trust_grant_is_blocked_and_prints_the_grant() {
     );
 }
 
+#[test]
+fn a_fresh_machine_is_told_the_grant_is_missing_and_trust_grant_unblocks_plan() {
+    let world = World::new("trust-grant");
+    world.write_policy();
+    // No machine.toml at all: the state of a machine that never ran
+    // relais. Absent is empty settings, so `plan` reaches the trust check
+    // and says what is missing instead of failing to read the file.
+    let machine = world.config.join("machine.toml");
+    assert!(!machine.exists());
+    let task = world.write_task("task.json");
+    let plan = world.relais(&["plan", "--task", task.to_str().unwrap()]);
+    let stdout = text(&plan.stdout);
+    assert_eq!(
+        plan.status.code(),
+        Some(3),
+        "{stdout}\n{}",
+        text(&plan.stderr)
+    );
+    assert!(stdout.contains("trust grant: MISSING"), "{stdout}");
+    assert!(stdout.contains("relais trust grant --key "), "{stdout}");
+
+    let show = world.relais(&["trust", "show", "--json"]);
+    assert_eq!(show.status.code(), Some(0), "{}", text(&show.stderr));
+    let shown: serde_json::Value = serde_json::from_slice(&show.stdout).expect("show json");
+    let key = shown["grant_key"].as_str().expect("grant_key").to_string();
+    assert_eq!(shown["granted"], serde_json::json!(false));
+
+    // A key that is not this policy's is refused by name, and writes
+    // nothing.
+    let stale = world.relais(&[
+        "trust",
+        "grant",
+        "--key",
+        "0000",
+        "--reviewed-by",
+        "the suite",
+    ]);
+    assert_eq!(stale.status.code(), Some(18), "{}", text(&stale.stderr));
+    assert!(text(&stale.stderr).contains("stale_grant_key"));
+    assert!(
+        text(&stale.stderr).contains(&key),
+        "the current key is named"
+    );
+    assert!(!machine.exists(), "a refused grant writes nothing");
+
+    let grant = world.relais(&[
+        "trust",
+        "grant",
+        "--key",
+        &key,
+        "--reviewed-by",
+        "the suite",
+    ]);
+    assert_eq!(grant.status.code(), Some(0), "{}", text(&grant.stderr));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&machine)
+            .expect("machine.toml")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "machine.toml is private");
+    }
+    let again = world.relais(&["plan", "--task", task.to_str().unwrap()]);
+    let again_stdout = text(&again.stdout);
+    assert!(
+        again_stdout.contains(&format!("trust grant: {key} (in machine.toml)")),
+        "{again_stdout}\n{}",
+        text(&again.stderr)
+    );
+    assert!(
+        !again_stdout.contains("missing_trust_grant"),
+        "{again_stdout}"
+    );
+}
+
 // `plan`'s stdout is a stable contract other tooling parses (the
 // preceding test asserts `missing_trust_grant` appears exactly once
 // there). Session attribution is not part of that contract and belongs

@@ -73,6 +73,8 @@ split wherever a caller has to act differently.
 | 14 | nothing to train on yet |
 | 15 | not enough records for one tier |
 | 16 | the learner did not converge |
+| 17 | `recipe promote` refused: the comparison does not clear every gate |
+| 18 | `trust grant` refused: the key is not this policy's; `relais trust show` prints the current one |
 
 ## Layout
 

@@ -13,6 +13,21 @@ use std::path::Path;
 /// The temporary file is removed on every failure path, so a full disk
 /// or a permission error leaves nothing behind but the original.
 pub(crate) fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    write_atomic_with_mode(path, contents, None)
+}
+
+/// [`write_atomic`], with the staged file given `mode` (Unix permission
+/// bits) BEFORE the rename, and the directory fsynced after it. A file
+/// that holds grants must not pass through a moment where it is world
+/// readable, and a rename that is not on disk can come back as the old
+/// file after a crash. `None` leaves the mode to the umask, as
+/// `write_atomic` always has. Windows has no mode bits; there it is
+/// `write_atomic` plus nothing.
+pub(crate) fn write_atomic_with_mode(
+    path: &Path,
+    contents: &str,
+    mode: Option<u32>,
+) -> std::io::Result<()> {
     // A sibling, hidden, and unique per process and per call: two relais
     // processes installing at once must not share a staging file.
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -28,6 +43,13 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     ));
     let staged = (|| -> std::io::Result<()> {
         let mut file = std::fs::File::create(&temp)?;
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
         file.write_all(contents.as_bytes())?;
         file.flush()?;
         // Durability, not just visibility: without this the rename can be
@@ -48,6 +70,13 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
         // that cannot be removed is named by this call alone.
         let _ = std::fs::remove_file(&temp);
         return Err(e);
+    }
+    // The rename lives in the directory: fsync it so the new name is
+    // durable, not only the new bytes. Unix only — Windows cannot open
+    // a directory as a file, and NTFS journals the rename itself.
+    #[cfg(unix)]
+    if mode.is_some() {
+        std::fs::File::open(parent)?.sync_all()?;
     }
     Ok(())
 }

@@ -45,6 +45,7 @@ pub mod runner;
 #[doc(hidden)]
 pub mod test_support;
 pub mod tooling;
+pub mod trust;
 pub mod verify;
 pub mod workspace;
 
