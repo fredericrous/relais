@@ -33,6 +33,8 @@ export function scriptedEngine(on: any, options: { session?: string; isPlaced?: 
     toolResult: (_e: any): any => ({ result: 'ok', text: 'ok' }),
     duringTool: async (_$: any, _e: any): Promise<void> => {},
     isPlaced: options.isPlaced ?? true,
+    // How many `prompt.submit` calls fail before one goes through.
+    submitFailures: 0,
   }
   const store: Record<string, { value: unknown; version: number }> = {}
   let nextAgent = 1
@@ -121,6 +123,10 @@ export function scriptedEngine(on: any, options: { session?: string; isPlaced?: 
     return { value: { isSet: true, version } }
   })
   on('prompt.submit', (_$: any, e: any) => {
+    if (script.submitFailures > 0) {
+      script.submitFailures -= 1
+      throw new Error('not now')
+    }
     calls.prompts.push(e)
     return { text: e.text }
   })

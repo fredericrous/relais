@@ -70,6 +70,28 @@ test('a replay\'s done names the replay and its trial', async ($: any, on: any) 
   expect(text).toContain('Replay trial: trial-65d3-r')
 })
 
+test('a verdict whose submit fails stays queued and is sent on the next tick', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.script.submitFailures = 1
+  engine.stream.push('stdout', phase(0, 'running') + done())
+  await settle(engine)
+  await tick(engine)
+  await tick(engine)
+  expect(engine.calls.prompts.length).toBe(1)
+  expect(engine.calls.prompts[0].text).toContain('finished: accepted')
+})
+
+test('a status relais cannot give says why instead of "no run"', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.script.runResult = (argv: string[]) =>
+    argv[2] === 'status'
+      ? { exitCode: 3, stdout: '', stderr: 'no such run', isStdoutTruncated: false, isStderrTruncated: false }
+      : { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+  const reply = await $.tool.call({ tool: 'mcp__relais__status', run: 'run-missing' })
+  expect(reply.result).toContain('could not be read')
+  expect(reply.result).toContain('no such run')
+})
+
 test('the kept outcome goes when the pane is opened', async ($: any, on: any) => {
   const engine = await startedRun($, on)
   engine.stream.push('stdout', phase(0, 'running') + done())

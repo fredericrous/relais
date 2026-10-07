@@ -5,6 +5,7 @@ import type { Fx } from './fx.ts'
 import { type Dispatch, observe, openDispatch, stoppedPayload, withTurn } from './dispatches.ts'
 import { sendBound, sendStopped } from './callbacks.ts'
 import { detach, every, type Child, type Store } from './store.ts'
+import { applyEvent, isLive } from './timeline.ts'
 
 const POLL_MS = 2000
 
@@ -120,14 +121,30 @@ export async function handleContinue(fx: Fx, store: Store, child: Child, line: a
   startPoll(fx, store)
 }
 
-export async function handleStop(fx: Fx, line: any) {
+export async function handleStop(fx: Fx, store: Store, line: any) {
   const agent = text(line.agent) ?? text(line.agent_id)
   if (!agent) return
+  let why: string | undefined
   try {
-    await fx.tool.call({ tool: 'TaskStop', task_id: agent })
-  } catch {
-    // Already gone: the end signal reports it.
+    why = refusal(await fx.tool.call({ tool: 'TaskStop', task_id: agent }))
+  } catch (reason) {
+    why = failureText(reason)
   }
+  // Said in the run's timeline: an agent relais asked to stop may still be
+  // running, and the person is the one who can stop it.
+  if (why !== undefined) await note(fx, store, text(line.run), `TaskStop of agent ${agent} failed: ${why}`)
+}
+
+// A failure the plugin met, as a `stderr` entry of the run (or of every
+// live run when it belongs to none): shown labelled in the pane and in the
+// status reply, never dropped.
+async function note(fx: Fx, store: Store, run: string | undefined, message: string) {
+  const now = await fx.clock.now()
+  const runs = run && store.models[run] ? [run] : Object.keys(store.models).filter(key => isLive(store.models[key]))
+  for (const key of runs) {
+    store.models = { ...store.models, [key]: applyEvent(store.models[key], { kind: 'stderr', text: `relais plugin: ${message}` }, now) }
+  }
+  store.isDirty = true
 }
 
 // The pane's agent rows carry the agent id once it is known.
@@ -168,9 +185,13 @@ export async function check(fx: Fx, store: Store) {
   let listed: any[]
   try {
     listed = await fx.agent.list()
-  } catch {
+  } catch (reason) {
+    // Retried on the next poll; said once per streak of failures.
+    if (!store.isListFailing) await note(fx, store, undefined, `the agent list could not be read: ${failureText(reason)}`)
+    store.isListFailing = true
     return
   }
+  store.isListFailing = false
   showStatus(store, listed)
   for (const d of open) {
     // Re-read: a turn may have landed while the list was awaited.

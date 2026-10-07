@@ -102,8 +102,12 @@ export function observe(
   if (d.isStopped) return { dispatch: next, ended: undefined }
   if (!listed) {
     // Evicted after it ended: a turn was its answer; with none, it vanished.
+    // A repair's agent was listed (stale) at the continue already, so its
+    // vanishing counts only once its status has moved since: before that,
+    // the stale listing may simply have been evicted ahead of the resumed one.
     if (d.turns > 0) return { dispatch: next, ended: d.last && ENDED.includes(d.last) ? d.last : 'completed' }
-    return { dispatch: next, ended: seen ? 'failed' : undefined }
+    const vanished = seen && (d.startStatus === undefined || moved)
+    return { dispatch: next, ended: vanished ? 'failed' : undefined }
   }
   if (!ENDED.includes(listed.status)) return { dispatch: next, ended: undefined }
   if (d.turns > 0) return { dispatch: next, ended: listed.status }

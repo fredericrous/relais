@@ -1263,6 +1263,15 @@ fn an_agent_that_never_stops_ends_at_the_wall_timeout() {
             .is_some_and(|detail| detail["timed_out"] == true)),
         "the wait was recorded as a timeout: {transitions:?}"
     );
+    // The agent is told to stop: left running, it would go on editing the
+    // attempt's worktree and spending what nothing books.
+    assert!(
+        run.seen()
+            .iter()
+            .any(|seen| matches!(seen, Seen::Stop { .. })),
+        "a stop line on timeout: {:?}",
+        run.seen()
+    );
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
 

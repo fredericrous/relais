@@ -32,8 +32,15 @@ const MAX_SUMMARY = 4000
 // One tick of the session's timer: sends the verdicts waiting, then writes
 // the pane's state if anything changed.
 export async function pump(fx: Fx, store: Store) {
-  for (let text = store.verdicts.shift(); text !== undefined; text = store.verdicts.shift()) {
-    await fx.prompt.submit({ text })
+  // A verdict leaves the queue only once submitted: one that fails is
+  // tried again on the next tick, never lost.
+  while (store.verdicts.length > 0) {
+    try {
+      await fx.prompt.submit({ text: store.verdicts[0] })
+    } catch {
+      break
+    }
+    store.verdicts.shift()
   }
   await flush(fx, store)
 }
@@ -142,7 +149,7 @@ async function onLine(fx: Fx, store: Store, child: Child, line: any, now: number
       await handleContinue(fx, store, child, line)
       return
     case 'stop':
-      await handleStop(fx, line)
+      await handleStop(fx, store, line)
       return
     case 'event':
       onEvent(store, child, line, now)
@@ -224,7 +231,11 @@ export async function reloadTimeline(fx: Fx, store: Store, run?: string) {
   const argv = ['relais', 'native', 'status', ...(run ? ['--run', run] : [])]
   try {
     const result = await fx.process.run(argv, { timeoutMs: STATUS_TIMEOUT_MS })
-    if (result.exitCode !== 0) return undefined
+    if (result.exitCode !== 0) {
+      store.statusFailure = `relais native status exited ${result.exitCode}: ${String(result.stderr ?? '').trim().slice(0, 400)}`
+      return undefined
+    }
+    store.statusFailure = undefined
     const text: string = result.stdout
     const now = await fx.clock.now()
     const rebuilt: Record<string, RunModel> = rebuildRuns(JSON.parse(text), now)
@@ -232,7 +243,8 @@ export async function reloadTimeline(fx: Fx, store: Store, run?: string) {
     store.models = { ...rebuilt, ...store.models }
     markDirty(store)
     return text
-  } catch {
+  } catch (reason) {
+    store.statusFailure = `relais native status failed: ${String((reason as any)?.message ?? reason).slice(0, 400)}`
     return undefined
   }
 }
@@ -243,6 +255,10 @@ export async function statusOf(fx: Fx, store: Store, run?: string): Promise<stri
   const known = () => Object.values(store.models).filter(m => !run || m.run === run)
   if (known().length === 0) await reloadTimeline(fx, store, run)
   const models = known()
-  if (models.length === 0) return 'No relais run is known in this session.'
+  if (models.length === 0) {
+    return store.statusFailure
+      ? `No relais run is known in this session, and relais's own timeline could not be read: ${store.statusFailure}`
+      : 'No relais run is known in this session.'
+  }
   return JSON.stringify(models.map(m => statusReply(m, now)))
 }

@@ -398,6 +398,11 @@ impl<'a> NativeBackend<'a> {
                 };
             }
             if started.elapsed() >= spec.wall_timeout {
+                // The attempt is over; an agent left running would go on
+                // editing its worktree and spending what nothing books.
+                if let Some(agent) = &running {
+                    self.stop_agent(spec, agent);
+                }
                 return Awaited::Ended {
                     ended: Ended::TimedOut,
                     detail: "the native worker did not stop within the attempt's wall time".into(),
@@ -407,6 +412,9 @@ impl<'a> NativeBackend<'a> {
                 Err(e) => {
                     failures += 1;
                     if failures >= STATUS_FAILURES_ALLOWED {
+                        if let Some(agent) = &running {
+                            self.stop_agent(spec, agent);
+                        }
                         return Awaited::Ended {
                             ended: Ended::Exited(1),
                             detail: format!(
@@ -454,16 +462,27 @@ impl<'a> NativeBackend<'a> {
         Ok((progress, hello_age))
     }
 
-    /// Ask the plugin to stop the agent of a cancelled attempt.
+    /// Ask the plugin to stop the agent of an attempt that is over
+    /// (cancelled, timed out, or no longer followed).
     fn stop_agent(&self, spec: &LaunchSpec, agent: &str) {
+        // A stopped agent is never continued: its late, empty last turn
+        // would land on the repair and read as that repair's end.
+        self.memory()
+            .agents
+            .retain(|_, known| known.agent_id != agent);
         let stop = Request::Stop {
             run: &self.link.run_id,
             dispatch: &spec.dispatch_id,
             agent,
         };
-        // Dropped on failure: the attempt ends cancelled either way, and a
-        // plugin that cannot be told has nothing left to stop.
-        let _ = self.publish(&stop);
+        // The attempt ends either way; a stop nobody received is said, on
+        // stderr (the run's events), so the person can stop the agent.
+        if let Err(e) = self.publish(&stop) {
+            eprintln!(
+                "relais: could not ask the plugin to stop agent {agent} of dispatch {}: {e}",
+                spec.dispatch_id
+            );
+        }
     }
 
     /// What one status says about the wait, `None` while it goes on.
@@ -1004,6 +1023,30 @@ mod tests {
             );
         }
         assert!(backend.memory().agents.is_empty());
+    }
+
+    /// An agent relais asked to stop (a timed-out or cancelled attempt) is
+    /// forgotten, so the next attempt spawns afresh instead of continuing
+    /// it: its late, empty last turn would read as the repair's end.
+    #[test]
+    fn a_stopped_agent_is_not_continued() {
+        let harness = crate::adapter::mock::MockBackend::new(|_| panic!("no launch"));
+        let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
+        let backend = backend_in(&harness, &gate, None);
+        let worker = spec("sonnet", None);
+        backend.stopped_result(
+            &worker,
+            reported("a1", AgentStatus::Completed, None),
+            Vec::new(),
+        );
+        let known = backend.memory().agents.get(&worker.work_dir).cloned();
+        assert!(matches!(
+            route_for(known.as_ref(), &worker),
+            Route::Continue { .. }
+        ));
+        backend.stop_agent(&worker, "a1");
+        let known = backend.memory().agents.get(&worker.work_dir).cloned();
+        assert_eq!(route_for(known.as_ref(), &worker), Route::Spawn);
     }
 
     /// The ids are those of the agent's transcript, found by session and

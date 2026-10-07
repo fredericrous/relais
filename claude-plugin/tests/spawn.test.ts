@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { nativeCalls, scriptedEngine, settle, spawnLine, startedRun, startQueued } from './support.ts'
+import { event, nativeCalls, scriptedEngine, settle, spawnLine, startedRun, startQueued } from './support.ts'
 
 test('the run tool starts relais with the protocol flag, the host and the session', async ($: any, on: any) => {
   const engine = await startedRun($, on)
@@ -60,6 +60,22 @@ test('a stop line stops the agent through TaskStop', async ($: any, on: any) => 
   const stops = engine.calls.tool.filter((t: any) => t.tool === 'TaskStop')
   expect(stops.length).toBe(1)
   expect(stops[0].task_id).toBe('agent-1')
+})
+
+test('a TaskStop that fails is said in the run\'s timeline, not dropped', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.stream.push('stdout', event('run-1', 0, { kind: 'phase', state: 'running', reason: 'ok', detail: {} }) + spawnLine('d1'))
+  await settle(engine)
+  engine.script.toolResult = (e: any) => {
+    if (e.tool === 'TaskStop') throw new Error('no such task')
+    return { result: 'ok', text: 'ok' }
+  }
+  engine.stream.push('stdout', JSON.stringify({ relais: 'stop', run: 'run-1', dispatch: 'd1', agent: 'agent-1' }) + '\n')
+  await settle(engine)
+  const reply = await $.tool.call({ tool: 'mcp__relais__status', run: 'run-1' })
+  // The reason is whatever answered the call (here the guard hook, which
+  // fails closed around the engine's error); that it failed is what counts.
+  expect(reply.result).toContain('relais plugin: TaskStop of agent agent-1 failed')
 })
 
 const REPLAY = { tool: 'mcp__relais__replay', task: 'fix it', recipe: '/tmp/candidate.toml', cwd: '/repo' }

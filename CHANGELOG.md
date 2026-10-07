@@ -131,6 +131,17 @@ missing here.
 
 ### Fixed
 
+- An attempt that times out (or loses the coordinator) tells the plugin to
+  stop its agent, as a cancelled one did; an agent relais stopped is never
+  continued for a repair (its late, empty last turn would have read as the
+  repair's end). A stop that could not be sent is said on stderr.
+- The plugin says what it could not do instead of dropping it: a failed
+  `TaskStop` or agent-list read is a `relais plugin:` line in the run's
+  timeline and its status reply (which now carries the run's latest `stderr`
+  lines), an unreadable `relais native status` is named in the status reply,
+  and a verdict whose submission fails is sent again on the next tick. A
+  repair's agent that drops off the list before its status moved is no
+  longer reported `failed`.
 - `relais resume` reconciles a native run whose Claude Code session ended: a
   native agent has no PID, so it is judged by its session, gone once the
   session's relais plugin stops saying hello (and still live, refused, while

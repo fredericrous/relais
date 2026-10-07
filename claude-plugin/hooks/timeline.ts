@@ -4,6 +4,7 @@
 
 export const MAX_EVENTS = 200
 export const MAX_OUTPUT_LINES = 40
+export const MAX_STDERR_LINES = 10
 // A line is cut to this before it is stored, whatever width the pane gets.
 export const MAX_LINE = 240
 
@@ -422,6 +423,8 @@ export function statusReply(m: RunModel, now: number) {
     cost: formatCost(m.cost),
     outcome: m.outcome ?? null,
     output: latestOutput(m, MAX_OUTPUT_LINES),
+    // relais's own human lines and the plugin's failures, the latest few.
+    stderr: m.events.filter(e => e.kind === 'stderr').slice(-MAX_STDERR_LINES).map(e => e.text),
   }
 }
 

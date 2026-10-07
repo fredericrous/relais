@@ -42,6 +42,10 @@ export type Store = {
   // Session ids the module says hello for.
   sessions: Set<string>
   isDirty: boolean
+  // Why the last `relais native status` could not be read, if it could not.
+  statusFailure: string | undefined
+  // Whether the last look at `$.agent.list()` failed (said once a streak).
+  isListFailing: boolean
   // When the pane's state was last written, in the clock's ms.
   flushedAt: number
   poll: { cancel: () => void } | undefined
@@ -72,6 +76,8 @@ export const createStore = (): Store => ({
   resuming: 0,
   sessions: new Set(),
   isDirty: false,
+  statusFailure: undefined,
+  isListFailing: false,
   flushedAt: 0,
   poll: undefined,
   heldOutcome: undefined,
