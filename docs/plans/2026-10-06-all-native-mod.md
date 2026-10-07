@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/all-native-mod
 repos: [relais]
 adrs: []
@@ -375,7 +375,16 @@ The worker had falsified two behaviours, the end signal's turn requirement and t
 
 **Observed, against the plan:** a plugin reload (`/reload-plugins`) mid-run does not end the run. Reloaded during verification and during a worker's turn, the child and its stream lived on, the dispatch ended normally and the run was accepted, booked once. What ends a run is the session ending; `relais resume` then reconciles it (above).
 
-**Not done here:** `make mod-probe` (S0's probes as a script for range bumps) and the five-person hallway test of the pane's unbacked numbers (the person's to run); spawn → bound was measured over 5 spawns in S0 (189–307 ms), not 20; a forced panic shown as `stderr` was not driven (it needs a panic trigger in production code; the drain is reasoned, M2a). Claude Code updated itself to 2.1.292 during the e2e; inside the tested range.
+**Not done here:**
+- `make mod-probe` (S0's probes as a script for range bumps), and the five-person hallway test of the pane's unbacked numbers (the person's to run).
+- spawn → bound was measured over 5 spawns in S0 (189–307 ms), not 20.
+- A forced panic shown as `stderr` was not driven: it needs a panic trigger in production code; the drain is reasoned (M2a).
+- "the run's distinct `dispatches.agent_id` = the relais agents in `$.agent.list()`": the ledger side was checked (one worker and one reviewer agent; one agent for the repair's two dispatches), but `$.agent.list()` itself was not captured in the e2e, only Claude Code's footer count, which also counts the model's own agents.
+- "pane events = `events.jsonl` events with three checks streaming" was not measured; the pane was compared with `events.jsonl` by replaying the file through the pane's own layout (the attestation captures), one check per run.
+
+**Deliberate, after the implementation review:** `relais resume` takes a native dispatch for gone once its session's hello is older than 60 s. A session alive but unable to say hello for that long (its coordinator calls failing) would read as ended; that is the same signal `mod_gone` already ends a running attempt on, and a coordinator that never heard the session (restarted) is no evidence either way. A failed agent-list read at the very moment of a `continue` leaves the repair without its start status, so it is judged like a fresh spawn; at worst it ends `failed` and the next attempt spawns afresh, and relais's wall timeout (which now stops the agent) bounds it. A plugin failure noted with no live run lands in the latest run's timeline (the run a waiting verdict belongs to); only with no run at all does it land nowhere, and then nothing is waiting on it.
+
+Claude Code updated itself to 2.1.292 during the e2e; inside the tested range.
 
 ## Outcome
 
@@ -395,4 +404,13 @@ Verification against reality, 2026-10-07, Claude Code 2.1.292 (pty-driven intera
 - The live checkout's status before and after → identical.
 - `relais install --claude --user --write` (isolated `HOME`) → marketplace add + install; again → update; doctor ok; uninstall removes both → as expected.
 - `make check` time added by `make plugin` → 19.7 s (55 tests).
+- Every verification command in the ledger has its event lines → `check_log` evidence vs `check_started` events: repair run 3 = 3, review run 2 = 2, inspect run 1 command (its one log recorded twice, as baseline and as verification) = 1.
+- Rollback ids against reality → `native_usage_messages` per dispatch vs the agent transcript's assistant message ids: 3 = 3 (worker), 4 = 4 (reviewer), and the repaired agent's 3 + 2 = 5 across its two dispatches.
 
+
+## Implementation review
+
+**approve** (tree 033de7e5…), after round 1 approve-with-changes, a Delta and two binding passes on the small fixes that followed.
+Fixed: timed-out attempts stop their agent and a stopped agent is never continued; plugin failures (TaskStop, agent list, status, outcome submission) are said in the timeline; a verdict is never lost; a repair's evicted listing is not `failed`; the missing verification rows measured or named.
+Deliberate: a 60 s hello lapse reads as an ended session to `resume`; a failed list read at a `continue` is judged like a fresh spawn (bounded by the wall timeout).
+Tokens and time: round 1 97k / 97 s, Delta 45k / 30 s, bind passes 29k / 20 s and 29k / 17 s.
