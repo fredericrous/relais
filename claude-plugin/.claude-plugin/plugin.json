@@ -1,6 +1,6 @@
 {
   "name": "relais",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "relais as a Claude Code plugin: starts relais runs, shows every agent they dispatch as a native agent, and keeps the run's timeline live in a pane. Tested on Claude Code >= 2.1.291 < 2.2.0.",
   "author": { "name": "fredericrous" },
   "types": "./types/index.d.ts"
