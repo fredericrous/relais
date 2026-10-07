@@ -74,8 +74,8 @@ pub enum Reason {
     DuplicateDispatch,
     /// The harness refused the worker a tool it needed (SPEC §8).
     PermissionDenied,
-    /// The harness refused the form of a command, not a permission: the
-    /// worker is told the rewrite and repaired at the same tier (SPEC §8).
+    /// Nothing produces this any more (it came from the OS sandbox's denial
+    /// classification); the ledger may still hold it.
     ShapeRefused,
     /// The candidate carries the base tree: verification is the
     /// baseline's, not re-run.

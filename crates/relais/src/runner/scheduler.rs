@@ -710,13 +710,11 @@ fn run_package(
         hooks: engine.config.hooks,
         attest: engine.config.attest,
         worker_env: engine.config.worker_env.clone(),
-        sandbox_host: engine.config.sandbox_host,
         // The package's artifacts hang off the root run's; its
         // worktrees hang off THEIR parent, so a package worker's tree
         // sits under `packages/worktrees/<child-run>/` and no package's
         // record — its own or a sibling's — is its cwd's parent (B6).
         artifacts_dir: engine.artifacts.join("packages").join(&package.id),
-        tmp_link_root: engine.config.tmp_link_root.clone(),
         aval_resolver: engine.config.aval_resolver,
         predictor: engine.config.predictor,
         gate: engine.config.gate,
@@ -1183,7 +1181,6 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
             .max(Duration::from_secs(1)),
         cancel: None,
         pid_slot: None,
-        sandbox: None,
         tools: crate::backend::ToolSet::ModeDefault,
         presentation: engine.config.presentation,
         agent: AgentKind::Planner,

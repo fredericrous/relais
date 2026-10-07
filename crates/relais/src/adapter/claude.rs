@@ -24,8 +24,7 @@ use std::time::Duration;
 
 use crate::backend::{
     claims_blockage, Backend, BackendError, Capabilities, Cost, LaunchResult, LaunchSpec,
-    PermissionDenial, PermissionEnforcement, ProbeLauncher, SandboxCapability, SandboxLaunch,
-    ToolSet, UsageReport,
+    PermissionDenial, PermissionEnforcement, ProbeLauncher, ToolSet, UsageReport,
 };
 use crate::money::MicroUsd;
 use crate::procs::{run_with_timeout, Ended, ProcessEnd};
@@ -308,7 +307,6 @@ pub fn capabilities_from_help(version: String, help: &str) -> Capabilities {
         // adapter reports observed enforcement until the
         // compatibility matrix verifies it per version.
         permission_enforcement: PermissionEnforcement::Observed,
-        sandbox: SandboxCapability::WorktreeOnly,
     }
 }
 
@@ -324,9 +322,6 @@ pub fn build_argv(spec: &LaunchSpec, caps: &Capabilities) -> Result<Vec<String>,
     }
     if !spec.allowed_tools.is_empty() && !caps.supports_settings {
         return Err(BackendError::Unsupported("a permission allowlist"));
-    }
-    if spec.sandbox.is_some() && !caps.supports_settings {
-        return Err(BackendError::Unsupported("sandbox settings"));
     }
 
     let mut argv: Vec<String> = vec!["-p".into(), "--model".into(), spec.model.clone()];
@@ -370,26 +365,20 @@ pub fn build_argv(spec: &LaunchSpec, caps: &Capabilities) -> Result<Vec<String>,
         argv.push("--disallowed-tools".into());
         argv.push(tool.clone());
     }
-    match &spec.sandbox {
-        Some(launch) => argv.extend(sandbox_args(launch, sandbox_tools(spec.tools))),
-        None => {
-            match spec.tools {
-                ToolSet::ReadOnly => {
-                    argv.push("--tools".into());
-                    argv.push(READ_ONLY_TOOLS.into());
-                }
-                // Allowlist mode has no tool flag of its own: the
-                // permission rules below decide.
-                ToolSet::ModeDefault => {}
-            }
-            if !spec.allowed_tools.is_empty() {
-                argv.push("--settings".into());
-                argv.push(
-                    serde_json::json!({ "permissions": { "allow": spec.allowed_tools } })
-                        .to_string(),
-                );
-            }
+    match spec.tools {
+        ToolSet::ReadOnly => {
+            argv.push("--tools".into());
+            argv.push(READ_ONLY_TOOLS.into());
         }
+        // The headless launch has no tool flag of its own: the
+        // permission rules below decide.
+        ToolSet::ModeDefault => {}
+    }
+    if !spec.allowed_tools.is_empty() {
+        argv.push("--settings".into());
+        argv.push(
+            serde_json::json!({ "permissions": { "allow": spec.allowed_tools } }).to_string(),
+        );
     }
     Ok(argv)
 }
@@ -410,38 +399,8 @@ pub fn probe_argv(spec: &LaunchSpec, caps: &Capabilities) -> Result<Vec<String>,
     Ok(argv)
 }
 
-/// The tools a sandboxed worker has. `MultiEdit` is not a tool on the
-/// measured harness (S0), so it is not listed.
-const SANDBOX_TOOLS: &str = "Bash,Read,Edit,Write,Grep,Glob";
-
-/// What a launch that can only look asks for, in either mode.
+/// What a launch that can only look asks for.
 const READ_ONLY_TOOLS: &str = "Read,Grep,Glob";
-
-/// The `--tools` value a launch in sandbox mode passes: what it asked for,
-/// or the sandbox worker's own set.
-fn sandbox_tools(asked: ToolSet) -> &'static str {
-    match asked {
-        ToolSet::ModeDefault => SANDBOX_TOOLS,
-        ToolSet::ReadOnly => READ_ONLY_TOOLS,
-    }
-}
-
-/// What a sandboxed launch adds: no user, project or local settings,
-/// hooks or plugins (`--restricted`), no MCP servers but the ones named
-/// here (none), the tools above, the scratch directory, and ONE
-/// `--settings` document that replaces the allowlist-only one.
-fn sandbox_args(launch: &SandboxLaunch, tools: &str) -> Vec<String> {
-    vec![
-        "--restricted".into(),
-        "--tools".into(),
-        tools.into(),
-        "--strict-mcp-config".into(),
-        "--add-dir".into(),
-        launch.scratch_dir.to_string_lossy().into_owned(),
-        "--settings".into(),
-        launch.settings.to_string(),
-    ]
-}
 
 /// Micro-USD as the plain decimal `--max-budget-usd` takes; never a
 /// float on the way there.
@@ -688,21 +647,9 @@ mod tests {
             wall_timeout: Duration::from_secs(10),
             cancel: None,
             pid_slot: None,
-            sandbox: None,
             tools: crate::backend::ToolSet::ModeDefault,
             presentation: crate::backend::Presentation::Headless,
             agent: crate::protocol::AgentKind::Worker,
-        }
-    }
-
-    fn sandboxed_spec() -> LaunchSpec {
-        LaunchSpec {
-            sandbox: Some(SandboxLaunch {
-                settings: serde_json::json!({"sandbox": {"enabled": true}}),
-                scratch_dir: PathBuf::from("/state/runs/r/attempts/1/scratch"),
-                tmp_link: PathBuf::from("/tmp/rl-0a1b2c3d"),
-            }),
-            ..spec(Some(500_000))
         }
     }
 
@@ -716,26 +663,19 @@ mod tests {
     }
 
     #[test]
-    fn a_read_only_launch_asks_for_exactly_three_tools_in_both_modes() {
+    fn a_read_only_launch_asks_for_exactly_three_tools() {
         let caps = capabilities_from_help("2.1.278".into(), HELP_2_1);
         let read_only = |spec: LaunchSpec| LaunchSpec {
             tools: ToolSet::ReadOnly,
             allowed_tools: Vec::new(),
             ..spec
         };
-        for spec in [read_only(spec(Some(500_000))), read_only(sandboxed_spec())] {
-            let argv = build_argv(&spec, &caps).expect("argv");
-            assert_eq!(count(&argv, "--tools"), 1, "{argv:?}");
-            assert_eq!(value_after(&argv, "--tools"), "Read,Grep,Glob");
-        }
+        let argv = build_argv(&read_only(spec(Some(500_000))), &caps).expect("argv");
+        assert_eq!(count(&argv, "--tools"), 1, "{argv:?}");
+        assert_eq!(value_after(&argv, "--tools"), "Read,Grep,Glob");
         // The launches that never asked keep what they always had.
         let worker = build_argv(&spec(Some(500_000)), &caps).expect("argv");
         assert_eq!(count(&worker, "--tools"), 0, "{worker:?}");
-        let sandboxed = build_argv(&sandboxed_spec(), &caps).expect("argv");
-        assert_eq!(
-            value_after(&sandboxed, "--tools"),
-            "Bash,Read,Edit,Write,Grep,Glob"
-        );
     }
 
     #[test]
@@ -763,41 +703,10 @@ mod tests {
     }
 
     #[test]
-    fn the_sandbox_argv_carries_each_flag_once_and_the_exact_settings() {
-        let caps = capabilities_from_help("2.1.285".into(), HELP_2_1);
-        let argv = build_argv(&sandboxed_spec(), &caps).expect("argv");
-        for flag in [
-            "--restricted",
-            "--tools",
-            "--strict-mcp-config",
-            "--add-dir",
-            "--settings",
-        ] {
-            assert_eq!(count(&argv, flag), 1, "{flag} in {argv:?}");
-        }
-        assert_eq!(
-            value_after(&argv, "--tools"),
-            "Bash,Read,Edit,Write,Grep,Glob"
-        );
-        assert_eq!(
-            value_after(&argv, "--add-dir"),
-            "/state/runs/r/attempts/1/scratch"
-        );
-        assert_eq!(
-            value_after(&argv, "--settings"),
-            r#"{"sandbox":{"enabled":true}}"#,
-            "the allowlist-only settings are replaced, not joined"
-        );
-        assert!(
-            !argv.iter().any(|arg| arg.contains("Bash(cargo test")),
-            "no permissions.allow Bash rule rides along"
-        );
-    }
-
-    #[test]
     fn the_probe_argv_differs_from_the_workers_only_in_the_output_format() {
         let caps = capabilities_from_help("2.1.285".into(), HELP_2_1);
-        for spec in [sandboxed_spec(), spec(Some(500_000))] {
+        {
+            let spec = spec(Some(500_000));
             let worker = build_argv(&spec, &caps).expect("argv");
             let probe = probe_argv(&spec, &caps).expect("argv");
             let streamed: Vec<String> = probe
@@ -818,20 +727,9 @@ mod tests {
         let mut no_format = caps.clone();
         no_format.supports_output_format_json = false;
         assert!(matches!(
-            probe_argv(&sandboxed_spec(), &no_format),
+            probe_argv(&spec(Some(500_000)), &no_format),
             Err(BackendError::Unsupported(_))
         ));
-    }
-
-    #[test]
-    fn the_deny_floor_is_the_same_in_both_modes() {
-        let caps = capabilities_from_help("2.1.285".into(), HELP_2_1);
-        let plain = build_argv(&spec(Some(500_000)), &caps).expect("argv");
-        let sandboxed = build_argv(&sandboxed_spec(), &caps).expect("argv");
-        for argv in [&plain, &sandboxed] {
-            assert_eq!(count(argv, "--disallowed-tools"), 1);
-            assert_eq!(value_after(argv, "--disallowed-tools"), "Bash(git push:*)");
-        }
     }
 
     #[test]

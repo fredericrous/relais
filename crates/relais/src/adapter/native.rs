@@ -706,7 +706,6 @@ mod tests {
             wall_timeout: Duration::from_secs(60),
             cancel: None,
             pid_slot: None,
-            sandbox: None,
             tools: crate::backend::ToolSet::ModeDefault,
             presentation: Presentation::Native,
             agent: AgentKind::Worker,

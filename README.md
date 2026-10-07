@@ -153,21 +153,10 @@ repo = "git@github.com:me/the-repo.git"   # what plan filled in, for readers
 Then `relais run --task task.json`. A worker refused a tool ends the run
 `blocked (permission_denied)` naming the tool; nothing is escalated.
 
-An allowlist matches command strings, and a command string is not a
-boundary. For an OS boundary, turn on `[sandbox]` (off by default): the
-worker's Bash then runs in the macOS or Linux sandbox, so pipes, redirects
-and `&&` work, writes are confined to the worktree, the worker's scratch
-directory (`$TMPDIR`) and the `writable` paths you list, and the network to
-the `network` domains you list. A credential floor (SSH, cloud, git, docker,
-cargo and Claude credentials, relais's own config and ledger) is never
-readable whatever you list. A run whose sandbox cannot be relied on ends
-`blocked (sandbox_unavailable)` or `blocked (sandbox_weakened)` before any
-worker starts, and one whose sandbox no probe has verified ends
-`blocked (sandbox_unverified)`: run `relais doctor --verify-sandbox` (two
-short real sessions, a few cents) once per harness version, platform and
-sandbox configuration, and it records the pass the run then looks up.
-`relais doctor` shows where the sandbox stands. SPEC §8 has the launch, the
-checks, the verification and the scope of the guarantee.
+relais keeps no OS sandbox of its own: every dispatch is a native agent of
+your Claude Code session and runs under that session's sandbox and
+permissions. A `[sandbox]` section left in `machine.toml` is no longer
+read, and `relais doctor` says so. SPEC §8 has the details.
 
 A verification worktree is a checkout of one revision and nothing else.
 In a repository whose dependencies live in the tree (npm, pnpm, yarn,

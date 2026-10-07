@@ -3,8 +3,8 @@
 //! A backend launches one dispatch and reports what came back: the
 //! terminal result text, the model that actually ran, what it cost, the
 //! tools the harness refused, and how the process ended. The contract
-//! covers launch, cancellation, effective profile, permission capability,
-//! sandbox capability and usage completeness. No adapter may advertise
+//! covers launch, cancellation, effective profile, permission capability
+//! and usage completeness. No adapter may advertise
 //! guarantees its backend cannot enforce, and nothing here assumes a
 //! capability: they are probed on the machine.
 //!
@@ -157,7 +157,6 @@ pub struct Capabilities {
     #[serde(default)]
     pub supports_settings: bool,
     pub permission_enforcement: PermissionEnforcement,
-    pub sandbox: SandboxCapability,
 }
 
 impl Capabilities {
@@ -213,17 +212,6 @@ pub enum PermissionEnforcement {
     Enforced,
     /// Permissions can be observed but not guaranteed.
     Observed,
-    #[default]
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum SandboxCapability {
-    /// OS/container isolation configured for this backend.
-    Strong,
-    /// Worktree-only: an acceptance boundary, not isolation (SPEC §8).
-    WorktreeOnly,
     #[default]
     Unknown,
 }
@@ -400,10 +388,10 @@ impl LaunchEnv {
 /// The tool set a launch asks the harness for (`--tools`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolSet {
-    /// What the launch mode has always asked for: the sandbox worker's
-    /// tools, and nothing at all in allowlist mode.
+    /// The launch's own default: nothing at all asked for (allowlist
+    /// mode).
     ModeDefault,
-    /// `Read,Grep,Glob` in either mode: a launch that can look and never
+    /// `Read,Grep,Glob`: a launch that can look and never
     /// write or run anything (SPEC §10, the report review).
     ReadOnly,
 }
@@ -449,10 +437,6 @@ pub struct LaunchSpec {
     /// bind it to the lease and the ledger while the worker runs
     /// (SPEC §12: persist the PID after the dispatch intent).
     pub pid_slot: Option<Arc<AtomicU32>>,
-    /// The OS-sandbox launch, for a worker on a machine with `[sandbox]`
-    /// on (SPEC §8). `None` is the allowlist launch, and every dispatch
-    /// that is not a worker's.
-    pub sandbox: Option<SandboxLaunch>,
     /// The tools the harness is asked to expose.
     pub tools: ToolSet,
     /// Who runs the launch: relais's own child process, or a native
@@ -463,54 +447,15 @@ pub struct LaunchSpec {
     pub agent: crate::protocol::AgentKind,
 }
 
-/// What a sandboxed launch adds: the whole `--settings` JSON (sandbox,
-/// credential floor and permissions in one document), the scratch
-/// directory the worker writes its own output to, and the short path the
-/// worker's `CLAUDE_CODE_TMPDIR` names: a symlink to the scratch on unix (a
-/// Unix socket path is capped near 104 bytes, and the scratch path spends
-/// most of it), the scratch itself elsewhere. Claude Code appends
-/// `/claude-<uid>` to it, so sandboxed Bash's `TMPDIR` lands in the scratch.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SandboxLaunch {
-    pub settings: serde_json::Value,
-    pub scratch_dir: PathBuf,
-    pub tmp_link: PathBuf,
-}
-
-/// The variable Claude Code honours as the base of its own temp dir
-/// (`<it>/claude-<uid>`, which sandboxed Bash gets as `TMPDIR`). It never
-/// passes the launch's own `TMPDIR` on, and falls back to `/tmp/claude-<uid>`
-/// without a word when the path is too long.
-pub const CLAUDE_TMPDIR: &str = "CLAUDE_CODE_TMPDIR";
-
 /// The environment variable that makes Claude Code strip provider
-/// credentials from the subprocesses it starts. Allowlist mode sets it.
-/// Sandbox mode must not: measured on 2.1.285, it disables the sandbox's
-/// auto-allow, and the `credentials.envVars` deny protects the environment
-/// there instead.
+/// credentials from the subprocesses it starts. A headless worker sets it.
 pub const SUBPROCESS_ENV_SCRUB: &str = "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB";
 
-/// The environment one WORKER dispatch runs with: `base` plus what the
-/// mode adds. Sandbox mode points `CLAUDE_CODE_TMPDIR` at the short link to
-/// the scratch (and leaves `TMPDIR` as `base` has it) and carries no scrub
-/// (even one the ambient environment brought); allowlist
-/// mode sets the scrub.
-pub fn worker_launch_env(base: &LaunchEnv, sandbox: Option<&SandboxLaunch>) -> LaunchEnv {
-    worker_env_with(base, sandbox.map(|launch| launch.tmp_link.as_path()))
-}
-
-/// [`worker_launch_env`] from the `CLAUDE_CODE_TMPDIR` path alone:
-/// `Some` is sandbox mode. The context manifest records the worker env by NAME
-/// before any attempt has its own scratch directory, and building it
-/// here, not from `base`, keeps the recorded names and the launched ones
-/// one fact.
-pub fn worker_env_with(base: &LaunchEnv, claude_tmpdir: Option<&std::path::Path>) -> LaunchEnv {
-    match claude_tmpdir {
-        Some(dir) => base
-            .without_var(SUBPROCESS_ENV_SCRUB)
-            .with_var(CLAUDE_TMPDIR, &dir.to_string_lossy()),
-        None => base.with_var(SUBPROCESS_ENV_SCRUB, "1"),
-    }
+/// The environment one WORKER dispatch runs with: `base` plus the scrub.
+/// The context manifest records the worker env by NAME from this too, so
+/// the recorded names and the launched ones are one fact.
+pub fn worker_launch_env(base: &LaunchEnv) -> LaunchEnv {
+    base.with_var(SUBPROCESS_ENV_SCRUB, "1")
 }
 
 /// What the harness said one dispatch cost. `inclusive` describes a
@@ -763,9 +708,8 @@ pub trait Backend {
     fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError>;
 }
 
-/// One probe session (SPEC §8, `relais doctor --verify-sandbox`): `spec`
-/// launched exactly as a worker is, except that the harness streams its
-/// transcript. Returns that stream (one JSON record per line).
+/// One probe session: `spec` launched exactly as a worker is, except that
+/// the harness streams its transcript (`relais doctor --probe-hooks`). Returns that stream (one JSON record per line).
 pub trait ProbeLauncher {
     fn stream(&self, spec: &LaunchSpec) -> Result<String, BackendError>;
 }
@@ -794,65 +738,11 @@ mod tests {
             .map(|(_, v)| v.clone())
     }
 
-    /// The manifest names the env the worker is LAUNCHED with, per mode:
-    /// the names `worker_env_with` gives before any attempt exists are the
-    /// names `worker_launch_env` gives at dispatch.
     #[test]
-    fn the_recorded_worker_env_names_are_the_launched_ones() {
-        let base = ambient();
-        assert_eq!(
-            worker_env_with(&base, None).names(),
-            worker_launch_env(&base, None).names()
-        );
-        let launch = SandboxLaunch {
-            settings: serde_json::json!({}),
-            scratch_dir: PathBuf::from("/state/runs/r/attempts/1/scratch"),
-            tmp_link: PathBuf::from("/tmp/rl-0a1b2c3d"),
-        };
-        let recorded = worker_env_with(&base, Some(std::path::Path::new("/state/runs/r/attempts")));
-        assert_eq!(
-            recorded.names(),
-            worker_launch_env(&base, Some(&launch)).names()
-        );
-        assert!(!recorded
-            .names()
-            .iter()
-            .any(|name| name == SUBPROCESS_ENV_SCRUB));
-        assert!(worker_env_with(&base, None)
-            .names()
-            .iter()
-            .any(|name| name == SUBPROCESS_ENV_SCRUB));
-    }
-
-    #[test]
-    fn allowlist_workers_run_with_the_credential_scrub() {
-        let env = worker_launch_env(&ambient(), None);
+    fn workers_run_with_the_credential_scrub() {
+        let env = worker_launch_env(&ambient());
         assert_eq!(value_of(&env, SUBPROCESS_ENV_SCRUB).as_deref(), Some("1"));
         assert_eq!(value_of(&env, "TMPDIR").as_deref(), Some("/var/tmp"));
-    }
-
-    #[test]
-    fn sandboxed_workers_get_the_short_link_as_claude_tmpdir_and_no_scrub() {
-        let launch = SandboxLaunch {
-            settings: serde_json::json!({}),
-            scratch_dir: PathBuf::from("/state/runs/r/attempts/1/scratch"),
-            tmp_link: PathBuf::from("/tmp/rl-0a1b2c3d"),
-        };
-        let env = worker_launch_env(&ambient(), Some(&launch));
-        assert_eq!(
-            value_of(&env, CLAUDE_TMPDIR).as_deref(),
-            Some("/tmp/rl-0a1b2c3d")
-        );
-        assert_eq!(
-            value_of(&env, "TMPDIR").as_deref(),
-            Some("/var/tmp"),
-            "the launch's own TMPDIR is left as the base env has it"
-        );
-        assert_eq!(
-            value_of(&env, SUBPROCESS_ENV_SCRUB),
-            None,
-            "the scrub disables the sandbox's auto-allow, even when the ambient env has it"
-        );
         assert_eq!(value_of(&env, "PATH").as_deref(), Some("/usr/bin"));
     }
 

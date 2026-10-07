@@ -90,27 +90,16 @@ enum Command {
         /// the network; never part of `make check`.
         #[arg(
             long = "probe-hooks",
-            conflicts_with_all = ["effort_template", "verify_sandbox"]
+            conflicts_with_all = ["effort_template"]
         )]
         probe_hooks: bool,
-        /// Verify the worker OS sandbox with two real `claude -p` probe
-        /// sessions (a sandboxed worker's launch, and the allowlist
-        /// launch), and record the pass under the configuration it was
-        /// measured on; a sandboxed worker runs only on a recorded one.
-        /// Costs money (a few cents) and touches the network; never part
-        /// of `make check`.
-        #[arg(
-            long = "verify-sandbox",
-            conflicts_with_all = ["probe_hooks", "effort_template"]
-        )]
-        verify_sandbox: bool,
         /// Print the machine.toml block that states the effort facts
         /// `doctor` reports unknown: the CLI-accepted list pre-filled from
         /// `--help`, the model-support and order lines left for you to
         /// confirm.
         #[arg(
             long = "effort-template",
-            conflicts_with_all = ["json", "verify_sandbox"]
+            conflicts_with_all = ["json"]
         )]
         effort_template: bool,
     },
@@ -878,13 +867,11 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
         Command::Doctor {
             json,
             probe_hooks,
-            verify_sandbox,
             effort_template,
-        } => match (probe_hooks, verify_sandbox, effort_template) {
-            (true, _, _) => doctor_probe_hooks_command(),
-            (false, true, _) => doctor_verify_sandbox_command(),
-            (false, false, true) => doctor_effort_template_command(),
-            (false, false, false) => doctor_command(json),
+        } => match (probe_hooks, effort_template) {
+            (true, _) => doctor_probe_hooks_command(),
+            (false, true) => doctor_effort_template_command(),
+            (false, false) => doctor_command(json),
         },
         Command::Hook { probe, record } => match (probe, record) {
             (true, Some(dir)) => hook_command(&dir),
@@ -2228,45 +2215,6 @@ fn doctor_effort_template_command() -> Result<CliOutcome, CliError> {
     Ok(CliOutcome::Accepted)
 }
 
-/// `relais doctor --verify-sandbox`: two real probe sessions, and the
-/// record of a pass. With `[sandbox]` off nothing is launched and the
-/// answer is the exit-0 statement of that; a sandbox that cannot be relied
-/// on blocks (exit 3); a probe that fails or cannot run exits 1.
-fn doctor_verify_sandbox_command() -> Result<CliOutcome, CliError> {
-    let settings = match load_machine() {
-        Ok(machine) => machine.sandbox,
-        // No machine.toml: the sandbox is off, as for a run.
-        Err(CliError::Read { cause, .. }) if cause.kind() == std::io::ErrorKind::NotFound => {
-            relais::policy::SandboxSettings::default()
-        }
-        Err(other) => return Err(other),
-    };
-    match doctor::verify_sandbox_here(&settings, &project_dir()?) {
-        Ok(doctor::SandboxVerification::Off) => {
-            println!("the OS sandbox is off ([sandbox] enabled = false); nothing was launched");
-            Ok(CliOutcome::Accepted)
-        }
-        Ok(doctor::SandboxVerification::Blocked(blocker)) => {
-            println!(
-                "blocked ({}): {}; nothing was launched",
-                blocker.code, blocker.detail
-            );
-            Ok(CliOutcome::Blocked)
-        }
-        Ok(doctor::SandboxVerification::Ran(outcome)) => {
-            print!("{}", outcome.render());
-            match outcome.passed() {
-                true => Ok(CliOutcome::Accepted),
-                false => Ok(CliOutcome::OperationalFailure),
-            }
-        }
-        Err(why) => {
-            eprintln!("relais doctor --verify-sandbox: {why}");
-            Ok(CliOutcome::OperationalFailure)
-        }
-    }
-}
-
 /// `relais hook --probe --record <dir>`: the record-only handler
 /// `relais doctor --probe-hooks` wires into its throwaway settings file.
 /// Reads one payload from stdin, writes it verbatim, decides nothing,
@@ -3022,10 +2970,7 @@ fn run_command(
         hooks: &hooks,
         attest: &attest,
         worker_env,
-        sandbox_host: &relais::sandbox::RealSandboxHost,
         artifacts_dir: artifacts_dir.clone(),
-        // Where a sandboxed worker's short temp-dir link goes (unused off unix).
-        tmp_link_root: std::path::PathBuf::from("/tmp"),
         aval_resolver: &aval_resolver,
         predictor: predictor
             .as_ref()
@@ -3442,10 +3387,7 @@ fn replay_command(
         hooks: &hooks,
         attest: &attest,
         worker_env,
-        sandbox_host: &relais::sandbox::RealSandboxHost,
         artifacts_dir: artifacts_dir.clone(),
-        // Where a sandboxed worker's short temp-dir link goes (unused off unix).
-        tmp_link_root: std::path::PathBuf::from("/tmp"),
         aval_resolver: &aval_resolver,
         predictor: None,
         gate: Some(&gate),
@@ -4204,26 +4146,9 @@ fn explain_command(run_id: &str) -> Result<CliOutcome, CliError> {
                 print!(" for {criterion_id}");
             }
             println!();
-            if row.kind == EvidenceKind::SandboxDenials {
-                println!("{}", sandbox_denials_text(&row.path));
-            }
         }
     }
     Ok(CliOutcome::Accepted)
-}
-
-/// The denial report a sandboxed attempt recorded, rendered; a file that
-/// cannot be read or parsed is said so rather than skipped.
-fn sandbox_denials_text(path: &str) -> String {
-    let report = std::fs::read_to_string(path)
-        .map_err(|e| e.to_string())
-        .and_then(|body| {
-            serde_json::from_str::<relais::sandbox::DenialReport>(&body).map_err(|e| e.to_string())
-        });
-    match report {
-        Ok(report) => report.render(),
-        Err(why) => relais::sandbox::DenialReport::render_unreadable(&why),
-    }
 }
 
 /// Whether `resume` also retires the worktree once the run is terminal
@@ -5471,6 +5396,17 @@ mod tests {
         assert!(parse(&["status", "--run", "run-1"]).is_ok());
     }
 
+    /// relais keeps no OS sandbox, so there is nothing for the flag to
+    /// verify: it no longer parses.
+    #[test]
+    fn doctor_verify_sandbox_is_a_usage_error() {
+        let parse = |args: &[&str]| Cli::try_parse_from(["relais", "doctor"].iter().chain(args));
+        assert!(parse(&[]).is_ok());
+        assert!(parse(&["--json"]).is_ok());
+        assert!(parse(&["--verify-sandbox"]).is_err());
+        assert!(parse(&["--json", "--verify-sandbox"]).is_err());
+    }
+
     #[test]
     fn a_stopped_report_is_read_from_the_plugins_payload() {
         let report = read_stopped_report(
@@ -5481,24 +5417,6 @@ mod tests {
         assert_eq!(report.status, relais::admission::AgentStatus::Killed);
         assert_eq!(report.usage.and_then(|usage| usage.input_tokens), Some(3));
         assert!(read_stopped_report(r#"{"agent":"a1","status":"exploded"}"#).is_err());
-    }
-
-    /// `relais explain` says a report it cannot parse in one line within 80
-    /// columns, however long the parse error is.
-    #[test]
-    fn an_unreadable_denial_report_is_one_line_within_80_columns() {
-        let dir = relais::test_support::short_temp_dir("main-denials-text");
-        let path = dir.join("sandbox-denials-1.json");
-        let coverage = "x".repeat(300);
-        std::fs::write(
-            &path,
-            format!(r#"{{"verified":[],"suspected":[],"coverage":"{coverage}"}}"#),
-        )
-        .expect("report written");
-        let text = sandbox_denials_text(&path.to_string_lossy());
-        assert!(text.starts_with("sandbox denials: unreadable ("), "{text}");
-        assert_eq!(text.lines().count(), 1, "{text}");
-        assert!(text.chars().count() <= 80, "{text}");
     }
 
     /// A session that started its run BEFORE the report window and kept

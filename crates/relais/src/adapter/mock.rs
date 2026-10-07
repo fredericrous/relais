@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::backend::{
     check_effort, claims_blockage, Backend, BackendError, Capabilities, LaunchResult, LaunchSpec,
-    PermissionDenial, PermissionEnforcement, SandboxCapability, UsageReport,
+    PermissionDenial, PermissionEnforcement, UsageReport,
 };
 use crate::catalog::{EffortSet, Fact};
 use crate::policy::EffortId;
@@ -89,7 +89,6 @@ impl Backend for MockBackend {
             supports_disallowed_tools: true,
             supports_settings: true,
             permission_enforcement: PermissionEnforcement::Observed,
-            sandbox: SandboxCapability::WorktreeOnly,
         })
     }
 

@@ -8,6 +8,15 @@ missing here.
 
 ## Unreleased
 
+### Removed
+
+- relais's own OS sandbox. Every dispatch is a native agent of your Claude Code
+  session and runs under that session's sandbox and permissions, so the
+  `[sandbox]` section of `machine.toml` is no longer read (it still parses, and
+  `relais doctor` says so), and `relais doctor --verify-sandbox` is gone, as is
+  the sandbox denial report. Issue #105 (a sandboxed worker binding a local
+  port) is dropped with it. Runs recorded under the sandbox still read.
+
 ### Changed
 
 - A spending `relais dataset replay` runs inside a Claude Code session too:

@@ -4155,3 +4155,33 @@ fn a_protocol_replay_sends_its_worker_as_a_spawn_line_and_ends_with_done() {
     assert_eq!(arm_run, run_id);
     assert!(outcome.is_some(), "the trial is settled before `done`");
 }
+
+// A machine.toml from before the native mod still loads: its `[sandbox]`
+// section, keys and all, parses and is reported as no longer read, by the
+// real `relais doctor` in text and in `--json`.
+#[test]
+fn doctor_reports_a_sandbox_section_as_no_longer_read() {
+    let world = World::new("doctor-sandbox");
+    let hash = world.write_policy(3);
+    world.write_machine(
+        &hash,
+        "[sandbox]\nenabled = true\nwritable = [\"~/scratch\"]\n",
+    );
+    let sentence = "[sandbox] in machine.toml is no longer read";
+    let human = world.relais(&["doctor"]);
+    let human_out = format!("{}{}", text(&human.stdout), text(&human.stderr));
+    assert!(human_out.contains(sentence), "{human_out}");
+    let json = world.relais(&["doctor", "--json"]);
+    let report: serde_json::Value =
+        serde_json::from_str(&text(&json.stdout)).expect("doctor --json prints JSON");
+    let findings = report["findings"].as_array().expect("findings");
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding["component"] == "sandbox"
+                && finding["detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.starts_with(sentence))),
+        "{report}"
+    );
+}
