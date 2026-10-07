@@ -343,7 +343,7 @@ Finished by hand:
 No relais review ran on this package (the run ended before it); the branch's implementation review covers it. `make check` green (1,359 lib tests, 41 scenarios). Falsified: the stale-hello refusal (fails) and `mod_gone` (the test hangs to the wall clock instead of passing).
 
 **2026-10-06, M1** (run-65d322006dd13-c35c, sonnet@medium, run in parallel with M2b; **also interrupted at the 45-minute wall clock**, during its final `make check`). Salvaged by hand. `claude-plugin/` contains:
-- the plugin manifest (tested range `>= 2.1.291 < 2.2.0`) and the 21 worker agents;
+- the plugin manifest (tested range `>= 2.1.291 < 2.2.0`) and the 19 worker agents (haiku at default; sonnet, opus and fable at default and six efforts);
 - `register.ts` with small modules (`lines`, `dispatches`, `callbacks`, `guards`, `runs`, `timeline`, `pane`, `ui`, `store`, `agents`, `fx`), effects behind a deps object;
 - 49 tests across 7 files, including `tests/views/relais-pane.test.ts`.
 
@@ -354,3 +354,45 @@ The worker had falsified two behaviours, the end signal's turn requirement and t
 - **M2a's 10 MB timing test** (flagged by the M1 worker as flaky under load) measured its two sides one after the other → they are now interleaved, so both are measured under the same load, still at 5% or 200 ms.
 
 `make check` green (with `make plugin`: 49 pass). No relais review ran (the run ended before it); the branch's implementation review covers it.
+
+**2026-10-07, the first plugin e2e** (82dbd44). The pane showed only `attempt 1 · worker`: relais emitted phases from ledger transitions alone, so preflight, the baseline, the task worktree, review and receipt never reached the plugin, and the baseline check landed before any step. relais now emits a `step` event at each stage (a second one of the same name fills in its detail: the route, the baseline verdict, the receipt path). The status line's ⚠ is Claude Code's own glyph for a plugin's pinned notice; the mods API cannot style it, so only relais's duplicate `relais ·` prefix went.
+
+**2026-10-07, M3a** (run-65d336c4144d0-5a93, `needs_review`, salvaged; 4d1e2b5). `LaunchSpec` carries the `AgentKind`; a run's reviewer and planner are spawn lines with their own agent types, 19 definitions per kind in the plugin (57 in all). Review findings fixed by hand: their ledger rows stayed `managed_run` with no agent, their cost was booked `ApiSpend`, the reviewer's cwd and exact type were untested; the worker path now shares `record_native_row`/`usage_cost_kind`/`book_usage` with them. Deliberate: an unpriced reviewer or planner books its cost unknown and does not stop the run (N5's up-front refusal covers the configured models).
+
+**2026-10-07, M3b** (run-65d33ffd2530b-a707, `needs_review`, salvaged; 05969ac). `relais dataset replay --protocol` and the plugin's `replay` tool. Fixed by hand: `done` went out before the replay trial was recorded (now after, naming the `trial`); the replay skipped run's pricing preflight (shared now); the cwd test could not tell the scratch checkout from the live repository (it checks the run's recorded repository). Found on the way: the plugin dropped relais's `summary` object, expecting a string.
+
+**2026-10-07, M4a** (run-65d347c8cd379-c134, `needs_review` with no defects; bfd225f). The OS sandbox is gone (`sandbox/`, about 9,900 lines with docs and tests); `[sandbox]` still parses and doctor says it is no longer read; sandbox-era rows, receipts and manifests still read. #105 closes as dropped. Fixed: stale docs, the doctor wiring and the stored manifest untested.
+
+**2026-10-07, M4b1** (run-65d3513780c77-5b26, `needs_decision` only because it removed the Makefile's `probe-hooks` target, which `check` never ran; reviewed by hand; 79f2e23). relais launches no `claude -p`: `Presentation`, `ClaudeBackend::launch`, `ProbeLauncher`, headless rules, `doctor --probe-hooks` gone; `ClaudeBackend` stays as the harness prober behind a `Harness` trait; a test scans the sources for a `-p` launch.
+
+**2026-10-07, M4b2** (run-65d359d9050bb-13bc0, `needs_review`, salvaged; e31034a). `LaunchSpec` loses `env`, `allowed_tools`, `pid_slot`, `tools`; `[permissions] allowed_tools` parses and is not read; old grants still admit a run. Fixed: the manifest still said `allowlist` (now `session`), stale comments, no run through an old grant.
+
+**2026-10-07, M4c** (run-65d361c12ed9f-5152, `needs_review`, salvaged; 30af0ad). The hook-side native path (#171) is gone; install writes `Agent|Task` and no `WorktreeCreate` again and migrates the #171 wiring. Fixed: the retired wiring is found by shape (a relais at another path left a `WorktreeCreate` handler that would break Claude Code's own isolated agents), a refused hand-formatted file now says what to remove by hand, installed workers lost `isolation: worktree`, doctor names the old hook's worktree records. The hook-wiring migration the plan put in M5 landed here, with the code it migrates away from.
+
+**2026-10-07, M5a** (run-65d371918b8b3-11a59, interrupted at the wall clock with the work complete and its tests green; salvaged; c45ef2d). The binary embeds the plugin; `relais install --claude` installs or updates it through a directory marketplace, `uninstall` removes it, doctor's `plugin` finding replaces `--probe-hooks`, the `/relais` skill moved into the plugin. The real install, reinstall, doctor and uninstall were run against an isolated `HOME`.
+
+**2026-10-07, the e2e of the whole branch** (9bb10e4) found and fixed: `relais resume` refused a native run whose session had ended, for as long as the dead run's coordinator seat lasted (a native dispatch has no PID; it is now judged by its session's hello); `relais native status` had no event lines, so the plugin could not rebuild its pane after `/clear` or `/resume` (it now carries them, bounded); a failed verification followed by a repair drew as `✓`, the repair as a 0-second step, and one agent as two rows.
+
+**Observed, against the plan:** a plugin reload (`/reload-plugins`) mid-run does not end the run. Reloaded during verification and during a worker's turn, the child and its stream lived on, the dispatch ended normally and the run was accepted, booked once. What ends a run is the session ending; `relais resume` then reconciles it (above).
+
+**Not done here:** `make mod-probe` (S0's probes as a script for range bumps) and the five-person hallway test of the pane's unbacked numbers (the person's to run); spawn → bound was measured over 5 spawns in S0 (189–307 ms), not 20; a forced panic shown as `stderr` was not driven (it needs a panic trigger in production code; the drain is reasoned, M2a). Claude Code updated itself to 2.1.292 during the e2e; inside the tested range.
+
+## Outcome
+
+Verification against reality, 2026-10-07, Claude Code 2.1.292 (pty-driven interactive sessions, plugin from `--plugin-dir`, scratch repo; install measured separately with an isolated `HOME`). Input → expected → actual:
+
+- One-file run, review required → worker and reviewer native, accepted, rows `native_run` with agent ids, usage from `turn.complete` → as expected: worker sonnet and reviewer opus agents, two distinct `agent_id`s, usage 6/507 and 8/734 tokens, `EstimatedApiEquivalent`; the outcome message reached the model, no agent-completion notice did.
+- No blind spots → the pane shows preflight → baseline → worktree · setup → attempt → verification with output → review → decision → receipt and cost → as expected; captures under `~/.claude/amont-agent/attestations/9bb10e4/`.
+- First candidate red → the repair continues the same agent, booked from its own turn → as expected: `initial` and `repair` dispatches on agent `ae24dae77aa91c5a0`, 23,063 µ$ then 10,133 µ$, accepted at attempt 2/3.
+- Inspect task → report review native, `settled_via = report_review` → as expected.
+- The model spawns `relais:relais-reviewer-haiku-default` → refused → `Agent type … not found`.
+- The model spawns an unrelated agent with `isolation: "worktree"` → Claude Code's own worktree → `.claude/worktrees/agent-a9e31fa2c04b0155d`, branch `worktree-agent-a9e31fa2c04b0155d`.
+- Plugin reloaded mid-run → (plan: interrupted) → the run carried on and was accepted, booked once (see the Decision log).
+- Session ended mid-run → `relais resume` reconciles → after the fix, `running → interrupted`, the dispatch `reconciled_dead`: "a native agent of session …, which has ended".
+- `/clear`/`/resume` rebuild → the full pane from `relais native status` → after the fix, the repair run rebuilt from relais's real output with every step.
+- `relais run` from a plain terminal → refused with the message → exit 2, "relais run starts from Claude Code with the relais plugin…"; with a host but no hello: "…has not said hello within 60s…".
+- No `claude -p` launch site → only `git commit-tree -p` matches; the `no_headless_launch` test guards it.
+- The live checkout's status before and after → identical.
+- `relais install --claude --user --write` (isolated `HOME`) → marketplace add + install; again → update; doctor ok; uninstall removes both → as expected.
+- `make check` time added by `make plugin` → 19.7 s (55 tests).
+
