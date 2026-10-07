@@ -72,7 +72,8 @@ pub enum Reason {
     IntegrationFailed,
     AdmissionRefused,
     DuplicateDispatch,
-    /// The harness refused the worker a tool it needed (SPEC §8).
+    /// The harness refused the worker a tool it needed (SPEC §8). Nothing
+    /// produces it any more; a ledger written by a headless relais holds it.
     PermissionDenied,
     /// Nothing produces this any more (it came from the OS sandbox's denial
     /// classification); the ledger may still hold it.

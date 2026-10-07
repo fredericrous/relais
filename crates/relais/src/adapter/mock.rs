@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use crate::backend::{
-    check_effort, claims_blockage, Backend, BackendError, Capabilities, LaunchResult, LaunchSpec,
-    PermissionDenial, PermissionEnforcement, UsageReport,
+    check_effort, claims_blockage, Backend, BackendError, Capabilities, Harness, LaunchResult,
+    LaunchSpec, PermissionEnforcement, UsageReport,
 };
 use crate::catalog::{EffortSet, Fact};
 use crate::policy::EffortId;
@@ -24,8 +24,6 @@ pub struct MockOutcome {
     pub effective_model: Option<String>,
     pub usage: Option<UsageReport>,
     pub session_id: Option<String>,
-    /// Tools the scripted harness "refused" the worker.
-    pub permission_denials: Vec<PermissionDenial>,
 }
 
 pub struct MockBackend {
@@ -72,7 +70,7 @@ impl MockBackend {
     }
 }
 
-impl Backend for MockBackend {
+impl Harness for MockBackend {
     fn name(&self) -> &'static str {
         "mock"
     }
@@ -91,9 +89,11 @@ impl Backend for MockBackend {
             permission_enforcement: PermissionEnforcement::Observed,
         })
     }
+}
 
+impl Backend for MockBackend {
     fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError> {
-        // The same rule the Claude adapter applies: a requested effort is
+        // The same rule the native adapter applies: a requested effort is
         // passed on or refused, never dropped.
         if let Some(effort) = &spec.effort {
             check_effort(&self.accepted_efforts, effort, &spec.model, Some("test"))?;
@@ -125,7 +125,6 @@ impl Backend for MockBackend {
             effective_model: outcome.effective_model.or(Some(spec.model.clone())),
             usage: outcome.usage.unwrap_or(UsageReport::unknown()),
             worker_claims_blockage: outcome.result_text.as_deref().is_some_and(claims_blockage),
-            permission_denials: outcome.permission_denials,
             failure_detail: None,
             booked_message_ids: Vec::new(),
             unpriced: Vec::new(),

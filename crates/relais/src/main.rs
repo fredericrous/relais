@@ -40,7 +40,7 @@ use serde::Serialize;
 
 use relais::acceptance::Evidence;
 use relais::admission::{BoundOutcome, Gate, GateError, StoppedOutcome, StoppedReport};
-use relais::backend::Backend;
+use relais::backend::Harness;
 use relais::contract::TaskContract;
 use relais::ids::{IdSource, RunId, TaskId};
 use relais::install::{InstallReport, InstallRequest, Mode, Scope};
@@ -83,16 +83,6 @@ enum Command {
         /// Machine-readable output
         #[arg(long)]
         json: bool,
-        /// Probe what Claude Code's hooks actually send: wire the hook
-        /// targets relais will use into a throwaway settings file, run
-        /// one real `claude -p` session through it, and write a
-        /// compatibility record of what fired. Costs money and touches
-        /// the network; never part of `make check`.
-        #[arg(
-            long = "probe-hooks",
-            conflicts_with_all = ["effort_template"]
-        )]
-        probe_hooks: bool,
         /// Print the machine.toml block that states the effort facts
         /// `doctor` reports unknown: the CLI-accepted list pre-filled from
         /// `--help`, the model-support and order lines left for you to
@@ -319,9 +309,8 @@ enum Command {
     /// Read one Claude Code hook payload on stdin and answer it (SPEC
     /// §23): silence, or a refusal a person can act on. With `--probe
     /// --record <dir>`, record the payload verbatim instead and decide
-    /// nothing — the internal mode `relais doctor --probe-hooks` wires
-    /// into its throwaway settings file, not something a person runs
-    /// directly.
+    /// nothing — the mode that captures payloads as fixtures, not something
+    /// a person runs directly.
     Hook {
         /// Record-only mode: requires `--record`.
         #[arg(long)]
@@ -866,13 +855,14 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
     match command {
         Command::Doctor {
             json,
-            probe_hooks,
             effort_template,
-        } => match (probe_hooks, effort_template) {
-            (true, _) => doctor_probe_hooks_command(),
-            (false, true) => doctor_effort_template_command(),
-            (false, false) => doctor_command(json),
-        },
+        } => {
+            if effort_template {
+                doctor_effort_template_command()
+            } else {
+                doctor_command(json)
+            }
+        }
         Command::Hook { probe, record } => match (probe, record) {
             (true, Some(dir)) => hook_command(&dir),
             (false, None) => Ok(hook_respond_command()),
@@ -2216,10 +2206,9 @@ fn doctor_effort_template_command() -> Result<CliOutcome, CliError> {
 }
 
 /// `relais hook --probe --record <dir>`: the record-only handler
-/// `relais doctor --probe-hooks` wires into its throwaway settings file.
-/// Reads one payload from stdin, writes it verbatim, decides nothing,
-/// and always accepts — the handler cannot fail the session it is
-/// watching.
+/// for capturing hook payloads as fixtures. Reads one payload from
+/// stdin, writes it verbatim, decides nothing, and always accepts — the
+/// handler cannot fail the session it is watching.
 fn hook_command(dir: &Path) -> Result<CliOutcome, CliError> {
     let order = relais::hook::arrival_nanos();
     relais::hook::record(dir, order, std::io::stdin().lock());
@@ -2310,46 +2299,6 @@ fn hook_admission_settings() -> relais::policy::HookAdmissionSettings {
         .and_then(|text| MachineSettings::from_toml_str(&text).ok())
         .map(|machine| machine.admission)
         .unwrap_or_default()
-}
-
-/// `relais doctor --probe-hooks`: wire the seven hook targets into a
-/// throwaway settings file, run one real session through it, and print
-/// what was observed. Never part of `relais doctor`'s normal report —
-/// this needs a real Claude Code, costs money and touches the network.
-fn doctor_probe_hooks_command() -> Result<CliOutcome, CliError> {
-    let claude_binary = relais::tooling::which("claude").ok_or_else(|| CliError::Operational {
-        operation: "doctor --probe-hooks",
-        cause: Box::new(relais::hook::ProbeHooksError::NoClaudeBinary),
-    })?;
-    let relais_binary = operational(std::env::current_exe(), "doctor --probe-hooks")?;
-    let report = operational(
-        relais::hook::probe(&claude_binary, &relais_binary),
-        "doctor --probe-hooks",
-    )?;
-    println!(
-        "hook probe: Claude Code {}",
-        report.record.claude_code_version
-    );
-    println!("  settings:   {}", report.settings_path.display());
-    println!("  recordings: {}", report.recording_dir.display());
-    for target in &report.record.targets {
-        let fields = if target.fields.is_empty() {
-            "(no fields)".to_string()
-        } else {
-            target.fields.join(", ")
-        };
-        println!(
-            "  {:<20} {:<12} {}",
-            target.target,
-            if target.fired {
-                "fired"
-            } else {
-                "did not fire"
-            },
-            fields
-        );
-    }
-    Ok(CliOutcome::Accepted)
 }
 
 fn init_command() -> Result<CliOutcome, CliError> {
@@ -2883,7 +2832,6 @@ fn run_command(
         Some(prices),
     );
     let run_backend: &dyn relais::backend::Backend = &native_backend;
-    let presentation = relais::backend::Presentation::Native;
     // Printed here, before `execute`, so it is visible on every path —
     // including the `Err` arm below that returns early — and only once:
     // a run can take minutes, and deferring this to the end read as
@@ -2984,7 +2932,6 @@ fn run_command(
         // `trials.source_run_id` never disagree about it (SPEC §28).
         purpose: trial_id.as_ref().map(|_| RunPurpose::TrialArm),
         run_id: Some(run_id.clone()),
-        presentation,
         wire: relais::protocol::Wire::process(),
     }) {
         Ok(outcome) => outcome,
@@ -3396,7 +3343,6 @@ fn replay_command(
         task_override: Some(&task_id),
         purpose: Some(RunPurpose::Replay),
         run_id: Some(run_id.clone()),
-        presentation: relais::backend::Presentation::Native,
         wire: relais::protocol::Wire::process(),
     });
     // Bring the replay's own refs into the live repository BEFORE the

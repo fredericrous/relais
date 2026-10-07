@@ -1263,9 +1263,8 @@ pub enum BlockCode {
     EnvMissing,
     ArchitectureContradiction,
     DecompositionKind,
-    /// The harness refused the worker a tool it needed: missing
-    /// permissions are a blocked result, never a worker that chose to do
-    /// nothing (SPEC §8).
+    /// The harness refused the worker a tool it needed (SPEC §8). Nothing
+    /// produces it any more; a ledger written by a headless relais holds it.
     PermissionDenied,
     /// The harness reported no effective model, so nothing establishes
     /// that the routed model ran. Unverified is not approved (SPEC §6).

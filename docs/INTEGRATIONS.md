@@ -13,9 +13,7 @@ this page only explains how to use them.
 
 ## What `--hooks` writes
 
-Seven targets, the same seven every time — this list and the one
-`relais doctor --probe-hooks` records from are kept identical by a test,
-so they cannot drift apart silently:
+Seven targets, the same seven every time:
 
 | event | matcher |
 |---|---|
@@ -101,14 +99,8 @@ same as install; `--write` applies it.
 
 ## What `relais doctor` says about it
 
-Three separate findings, because they answer three separate questions:
+Two separate findings, because they answer two separate questions:
 
-- **`hook-compat`** — is there a compatibility record, and is it stale?
-  `relais doctor --probe-hooks` is what produces that record (see below);
-  a fresh machine has none, and `doctor` says so rather than assuming
-  compatibility. A record that exists but names a Claude Code version
-  different from the one on `PATH` now is reported stale, not silently
-  trusted.
 - **`hook-timeout`** — does the timeout actually recorded in
   `settings.json` still cover the configured `queue_wait_secs`? The hook
   cannot read its own handler timeout to check this itself, so `doctor`
@@ -139,47 +131,14 @@ Three separate findings, because they answer three separate questions:
 your `~/.claude/settings.json` — all three, not just the first that names
 a relais command on `PreToolUse`, so `hook-live` and `hook-timeout` see a
 hook wired only in the local file exactly as they would one in the
-committed file. `hook-compat` reads no settings file at all — it compares
-the compatibility record against the Claude Code on `PATH`.
-
-### The compatibility matrix
-
-`relais doctor --probe-hooks` is a separate, explicit command, never part
-of the ordinary `doctor` run: it needs a real Claude Code session (a
-throwaway settings file under the state directory, never your own
-`settings.json`), costs money, and touches the network. It runs one
-`claude -p` session whose prompt forces a subagent to itself launch a
-second subagent — so a spawn made FROM INSIDE a subagent is recorded, not
-only the top-level one the main session makes — records every payload
-that arrives on the seven targets, and writes a compatibility record
-naming the Claude Code version observed and, per target, whether it
-fired and what fields its payload carried — reported as what was seen,
-never as what was expected. There is no shipped compatibility table, and
-none is implied to exist on a fresh machine: the matrix is written by
-this command, not carried as a static claim in this document. A target
-that never fires for a given Claude Code version is recorded as not
-firing; that is a fact about that version, not a probe failure.
-
-The record also carries a `capabilities` section: what the harness's
-BEHAVIOR showed itself capable of, derived from the same recorded
-payloads rather than from which fields merely appeared — which tool name
-it sent for an agent spawn, whether a nested spawn's own payload named
-the subagent that made it (so parentage at depth two can be joined), and
-whether the failing tool call the probe makes actually fired
-`PostToolUseFailure`. A capability the recordings cannot settle is
-reported as unknown, never defaulted to `false`; `relais doctor` reports
-it alongside the freshness finding, and a record written before this
-field existed is reported as having no capabilities at all, not as every
-capability being false.
+committed file.
 
 Nothing here narrows which models a hook-admitted agent may use. That
-would need both a compatibility record confirming the harness reports
-enough to act on and a setting to act on it with, and neither exists
-today.
+would need a setting to act on it with, and none exists today.
 
 ## Worker deny floor and `disallowed_tools`
 
-The shipped deny floor now includes `Agent` and `Task`, so a print-mode
+The shipped deny floor now includes `Agent` and `Task`, so a
 worker cannot hand its task to a subagent that picks its own model. A
 machine that added `disallowed_tools = ["Agent", "Task"]` to `machine.toml`
 by hand (as v0.6.0's Upgrading notes advised) may keep or drop it: the

@@ -570,25 +570,14 @@ fn doctor_names_what_is_missing_and_exits_on_a_blocker() {
 }
 
 #[test]
-fn doctor_reports_no_hook_compat_record_until_one_is_written() {
-    let world = World::new("doctor-hook-compat");
-    let first = world.relais(&["doctor", "--json"]);
-    let report: serde_json::Value =
-        serde_json::from_str(text(&first.stdout).trim()).expect("doctor --json is a document");
-    let finding = report["findings"]
-        .as_array()
-        .expect("findings")
-        .iter()
-        .find(|f| f["component"] == "hook-compat")
-        .unwrap_or_else(|| panic!("no `hook-compat` finding in {report}"))
-        .clone();
-    assert_eq!(finding["level"], "warn", "{report}");
+fn doctor_probe_hooks_is_a_usage_error() {
+    let world = World::new("doctor-probe-hooks");
+    let output = world.relais(&["doctor", "--probe-hooks"]);
+    assert_eq!(output.status.code(), Some(2), "{}", text(&output.stderr));
     assert!(
-        finding["detail"]
-            .as_str()
-            .unwrap()
-            .contains("no hook compatibility record"),
-        "{finding}"
+        text(&output.stderr).contains("--probe-hooks"),
+        "{}",
+        text(&output.stderr)
     );
 }
 
@@ -1533,4 +1522,86 @@ fn run_protocol_is_refused_on_windows_before_anything_runs() {
         text(&run.stderr)
     );
     assert!(text(&run.stdout).is_empty(), "{}", text(&run.stdout));
+}
+
+/// A ledger a headless relais wrote — a `managed_run` dispatch, `ApiSpend`
+/// usage and a `permission_denied` block — still reads: `status`,
+/// `explain` and `report` work on it.
+#[test]
+fn a_ledger_holding_headless_era_rows_still_reads() {
+    use relais::ids::{DispatchId, RunId, TaskId};
+    use relais::ledger::{Ledger, Transition, UsageEvent};
+    use relais::lifecycle::State;
+    use relais::money::{CostCompleteness, CostKind, MicroUsd};
+    use relais::route::RoutedBy;
+
+    let world = World::new("headless-ledger");
+    let ledger = Ledger::open(&world.state.join("ledger.sqlite")).expect("ledger opens");
+    let run = RunId::from_stored("run-headless");
+    ledger
+        .insert_run(
+            &run,
+            &world.repo.to_string_lossy(),
+            Some("tab-old"),
+            &TaskId::from_stored("task-headless"),
+            "repo-key",
+        )
+        .expect("run");
+    ledger
+        .record_dispatch_intent(
+            &DispatchId::from_stored("disp-headless"),
+            &run,
+            None,
+            &serde_json::json!({}),
+            0,
+            RoutedBy::ConservativeBaseline,
+        )
+        .expect("a managed_run dispatch");
+    ledger
+        .record_usage(&UsageEvent {
+            event_id: "usage-headless".into(),
+            run_id: run.clone(),
+            attempt_id: None,
+            parent_event_id: None,
+            model: Some("sonnet".into()),
+            input_tokens: Some(100),
+            output_tokens: Some(10),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost: Some(MicroUsd::from_micros(1_234)),
+            cost_kind: CostKind::ApiSpend,
+            completeness: CostCompleteness::Actual,
+            inclusive: false,
+            at: "2026-09-01T00:00:00+00:00".into(),
+            phase: None,
+            duration_ms: None,
+            requested_model: None,
+            requested_effort: None,
+            harness: None,
+        })
+        .expect("api spend usage");
+    ledger
+        .record_transition(&Transition {
+            run_id: run.clone(),
+            attempt_id: None,
+            from_state: Some(State::Prepared),
+            to_state: State::Blocked,
+            reason: "permission_denied".into(),
+            detail: Some(serde_json::json!({ "tools": ["Edit"] })),
+            at: "2026-09-01T00:00:01+00:00".into(),
+        })
+        .expect("a permission_denied block");
+    drop(ledger);
+
+    let status = world.relais(&["status"]);
+    assert_eq!(status.status.code(), Some(0), "{}", text(&status.stderr));
+    let explain = world.relais(&["explain", "run-headless"]);
+    assert_eq!(explain.status.code(), Some(0), "{}", text(&explain.stderr));
+    assert!(
+        text(&explain.stdout).contains("permission_denied"),
+        "{}",
+        text(&explain.stdout)
+    );
+    let report = world.relais(&["report"]);
+    assert_eq!(report.status.code(), Some(0), "{}", text(&report.stderr));
 }

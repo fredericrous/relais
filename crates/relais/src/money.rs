@@ -101,6 +101,8 @@ impl std::fmt::Display for MicroUsd {
 /// consumption).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CostKind {
+    /// What a headless harness reported. Nothing produces it any more, but
+    /// the ledger holds it on old rows.
     ApiSpend,
     UsageCreditSpend,
     EstimatedApiEquivalent,

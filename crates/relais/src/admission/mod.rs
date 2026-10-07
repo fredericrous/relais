@@ -216,12 +216,14 @@ pub struct DispatchRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchSource {
+    /// A headless dispatch relais launched itself. Nothing produces it any
+    /// more, but old ledger rows and the default of an absent source hold it.
     #[default]
     ManagedRun,
     HookAdmitted,
     Observed,
-    /// A worker attempt of a `relais run --native`: a managed dispatch
-    /// whose worker is a subagent the parent session spawns (SPEC §23).
+    /// A dispatch of a `relais run`: a managed dispatch whose agent is a
+    /// subagent the parent session spawns (SPEC §23).
     NativeRun,
 }
 

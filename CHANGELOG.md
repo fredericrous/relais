@@ -16,6 +16,14 @@ missing here.
   `relais doctor` says so), and `relais doctor --verify-sandbox` is gone, as is
   the sandbox denial report. Issue #105 (a sandboxed worker binding a local
   port) is dropped with it. Runs recorded under the sandbox still read.
+- Headless launching. relais never starts `claude -p` any more: every dispatch of
+  `relais run` and of a spending `relais dataset replay` is a native agent
+  spawned through the plugin, and `claude --version` and `claude --help` are the
+  only `claude` processes relais runs. `relais doctor --probe-hooks` is gone
+  (the flag is a usage error), and with it the `hook-compat` finding of
+  `relais doctor` and the `make probe-hooks` target; `relais hook --probe
+  --record <dir>`, which captures one payload, stays. A run's usage is always
+  the price table's estimate. Ledgers written by a headless relais still read.
 
 ### Changed
 

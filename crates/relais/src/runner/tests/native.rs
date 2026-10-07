@@ -356,8 +356,6 @@ struct Cast {
 struct Native {
     outcome: RunOutcome,
     script: Scripted,
-    /// The prompts the headless backend underneath was launched with.
-    headless: Vec<String>,
 }
 
 impl Native {
@@ -428,22 +426,11 @@ fn run_native_contract(
     let machine = fixture.machine_for(&repo);
     let gate = Arc::new(LocalGate::new(ConcurrencyLimits::default()));
     gate.native_hello(SESSION).expect("hello");
-    let headless_log = Arc::new(std::sync::Mutex::new(Vec::<(String, Presentation)>::new()));
-    let log = Arc::clone(&headless_log);
-    let headless = MockBackend::new(move |spec| {
-        log.lock()
-            .unwrap()
-            .push((spec.prompt.clone(), spec.presentation));
-        MockOutcome {
-            result_text: Some("review ok\nFINDINGS: none".into()),
-            exit_code: Some(0),
-            ..Default::default()
-        }
-    });
+    let harness = MockBackend::new(|_| MockOutcome::default());
     let (wire, rx) = LineSink::wire();
     let projects = fixture.dir.join("projects");
     let backend = NativeBackend::new(
-        &headless,
+        &harness,
         gate.as_ref(),
         Link {
             run_id: "run-under-test".into(),
@@ -463,29 +450,13 @@ fn run_native_contract(
         &machine,
         &backend,
         gate.as_ref(),
-        Presented {
-            presentation: Presentation::Native,
-            wire: wire.clone(),
-        },
+        Presented { wire: wire.clone() },
     );
     // Every holder of the wire gone ends the plugin's loop.
     drop(backend);
     drop(wire);
     let script = session.join().expect("the scripted plugin");
-    let headless = headless_log
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|(prompt, presentation)| {
-            assert_eq!(*presentation, Presentation::Headless, "{prompt}");
-            prompt.clone()
-        })
-        .collect();
-    Native {
-        outcome,
-        script,
-        headless,
-    }
+    Native { outcome, script }
 }
 
 fn ledger_of(fixture: &Fixture) -> rusqlite::Connection {
@@ -623,11 +594,6 @@ fn a_change_task_is_accepted_after_a_worker_spawn_and_a_reviewer_spawn() {
     // The reviewer reads the review directory: the task worktree the
     // worker left its candidate in.
     assert_eq!(reviewer_cwd, worker_cwd);
-    assert!(
-        run.headless.is_empty(),
-        "no dispatch went headless: {:?}",
-        run.headless
-    );
     // The worker's dispatch row is native and names its agent.
     assert_eq!(
         dispatch_rows(&fixture, &run.outcome.run_id),
@@ -730,7 +696,6 @@ fn a_decomposed_task_spawns_its_planner_in_the_repository_before_its_worker() {
     assert_eq!(*planner_type, "relais:relais-planner-haiku-default");
     assert_eq!(*worker_type, "relais:relais-worker-sonnet-default");
     assert_eq!(*planner_cwd, &fixture.repo);
-    assert!(run.headless.is_empty(), "{:?}", run.headless);
     // Every dispatch row of the run, the planner's included, is native
     // and names its agent; the planning usage is the price table's estimate.
     let conn = ledger_of(&fixture);
@@ -810,7 +775,6 @@ fn a_repair_continues_the_same_agent_and_an_escalation_spawns_on_the_next_model(
             ("native_run".to_string(), Some("ag2".to_string())),
         ]
     );
-    assert!(run.headless.is_empty(), "no review was asked for");
     assert_protocol_stream(&run);
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
@@ -1064,7 +1028,7 @@ fn an_attempt_accepted_with_an_unpriced_record_stays_accepted() {
 }
 
 #[test]
-fn a_headless_attempt_with_an_unknown_cost_is_never_an_unpriced_native_model() {
+fn an_attempt_with_no_booked_record_has_no_unpriced_model() {
     let result = LaunchResult {
         dispatch_id: "d".into(),
         ended: Ended::Exited(0),
@@ -1075,14 +1039,12 @@ fn a_headless_attempt_with_an_unknown_cost_is_never_an_unpriced_native_model() {
         effective_model: Some("claude-sonnet-5".into()),
         usage: crate::backend::UsageReport::unknown(),
         worker_claims_blockage: false,
-        permission_denials: Vec::new(),
         failure_detail: None,
         booked_message_ids: Vec::new(),
         unpriced: Vec::new(),
     };
-    assert_eq!(unpriced_native_model(Presentation::Headless, &result), None);
     assert_eq!(
-        unpriced_native_model(Presentation::Native, &result),
+        unpriced_native_model(&result),
         None,
         "no booked record, nothing to price"
     );
@@ -1091,9 +1053,8 @@ fn a_headless_attempt_with_an_unknown_cost_is_never_an_unpriced_native_model() {
         unpriced: vec!["claude-sonnet-5 has no [pricing.models] entry".into()],
         ..result
     };
-    assert_eq!(unpriced_native_model(Presentation::Headless, &booked), None);
     assert_eq!(
-        unpriced_native_model(Presentation::Native, &booked),
+        unpriced_native_model(&booked),
         Some(vec![
             "claude-sonnet-5 has no [pricing.models] entry".to_string()
         ])
@@ -1119,10 +1080,10 @@ fn no_bind_within_the_wait_ends_the_attempt_interrupted_and_the_run_stops() {
     let machine = fixture.machine_for(&repo);
     let gate = LocalGate::new(ConcurrencyLimits::default());
     gate.native_hello(SESSION).expect("hello");
-    let headless = MockBackend::new(|_| MockOutcome::default());
+    let harness = MockBackend::new(|_| MockOutcome::default());
     let (wire, rx) = LineSink::wire();
     let backend = NativeBackend::new(
-        &headless,
+        &harness,
         &gate,
         Link {
             run_id: "run-under-test".into(),
@@ -1143,7 +1104,6 @@ fn no_bind_within_the_wait_ends_the_attempt_interrupted_and_the_run_stops() {
         &backend,
         &gate,
         Presented {
-            presentation: Presentation::Native,
             wire: Wire::process(),
         },
     );
@@ -1169,10 +1129,10 @@ fn a_model_without_a_shipped_definition_ends_interrupted_before_any_spawn_line()
     let machine = fixture.machine_for(&repo);
     let gate = LocalGate::new(ConcurrencyLimits::default());
     gate.native_hello(SESSION).expect("hello");
-    let headless = MockBackend::new(|_| MockOutcome::default());
+    let harness = MockBackend::new(|_| MockOutcome::default());
     let (wire, rx) = LineSink::wire();
     let backend = NativeBackend::new(
-        &headless,
+        &harness,
         &gate,
         Link {
             run_id: "run-under-test".into(),
@@ -1190,7 +1150,6 @@ fn a_model_without_a_shipped_definition_ends_interrupted_before_any_spawn_line()
         &backend,
         &gate,
         Presented {
-            presentation: Presentation::Native,
             wire: Wire::process(),
         },
     );
@@ -1220,9 +1179,9 @@ fn a_native_launch_that_fails_keeps_its_row_native() {
     let machine = fixture.machine_for(&repo);
     let gate = LocalGate::new(ConcurrencyLimits::default());
     gate.native_hello(SESSION).expect("hello");
-    let headless = MockBackend::new(|_| MockOutcome::default());
+    let harness = MockBackend::new(|_| MockOutcome::default());
     let backend = NativeBackend::new(
-        &headless,
+        &harness,
         &gate,
         Link {
             run_id: "run-under-test".into(),
@@ -1240,7 +1199,6 @@ fn a_native_launch_that_fails_keeps_its_row_native() {
         &backend,
         &gate,
         Presented {
-            presentation: Presentation::Native,
             wire: Wire::process(),
         },
     );
@@ -1357,21 +1315,26 @@ fn a_run_cancelled_while_its_agent_runs_asks_the_plugin_to_stop_it() {
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
 
+/// The mock backend is only a scripted agent: a run on it books what a
+/// native run books, a dispatch row `native_run` and an estimated cost.
 #[test]
-fn a_headless_run_builds_headless_launch_specs() {
+fn a_run_on_the_mock_backend_books_native_rows_and_estimated_usage() {
     let fixture = Fixture::new();
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
     let machine = fixture.machine_for(&repo);
     let gate = LocalGate::new(ConcurrencyLimits::default());
-    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let log = Arc::clone(&seen);
     let backend = MockBackend::new(move |spec| {
-        log.lock().unwrap().push(spec.presentation);
         // The reviewer's tree has no such file to remove.
         std::fs::remove_file(spec.work_dir.join("src/main.rs")).ok();
         MockOutcome {
             result_text: Some("DONE\nFINDINGS: none".into()),
             exit_code: Some(0),
+            usage: Some(crate::backend::UsageReport {
+                cost: crate::backend::Cost::Estimated {
+                    micros: MicroUsd::from_micros(7),
+                },
+                ..Default::default()
+            }),
             ..Default::default()
         }
     });
@@ -1383,12 +1346,17 @@ fn a_headless_run_builds_headless_launch_specs() {
         &gate,
     );
     assert!(matches!(outcome.terminal, Terminal::Accepted(_)));
-    let seen = seen.lock().unwrap();
-    assert!(seen.len() >= 2, "a worker and a reviewer: {seen:?}");
-    assert!(seen
-        .iter()
-        .all(|presentation| *presentation == Presentation::Headless));
     let rows = dispatch_rows(&fixture, &outcome.run_id);
-    assert_eq!(rows, vec![("managed_run".to_string(), None)]);
+    assert_eq!(rows, vec![("native_run".to_string(), None)]);
+    let conn = ledger_of(&fixture);
+    let kinds: Vec<String> = conn
+        .prepare("SELECT DISTINCT cost_kind FROM usage_events WHERE run_id = ?1")
+        .expect("prepare")
+        .query_map([outcome.run_id.as_str()], |row| row.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(kinds.len(), 1, "{kinds:?}");
+    assert!(kinds[0].contains("EstimatedApiEquivalent"), "{kinds:?}");
     std::fs::remove_dir_all(&fixture.dir).ok();
 }

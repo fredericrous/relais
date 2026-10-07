@@ -878,7 +878,6 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
 
     check_command("git", &["--version"], &mut findings, "git");
 
-    let mut installed_claude_version: Option<String> = None;
     // A probe that errored says so: "not found", "did not answer" and
     // "answered and refused" are different things to fix.
     let cli_probe = match probe_harness() {
@@ -891,12 +890,10 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
             CliEffortProbe::failed(reason)
         }
         Ok(caps) => {
-            installed_claude_version = caps.version.clone();
             findings.push(claude_code_finding(&caps));
             CliEffortProbe::read(caps.accepted_efforts)
         }
     };
-    findings.push(hook_compat_finding(installed_claude_version.as_deref()));
 
     let policy_path = repo_dir.join("relais.toml");
     let policy = match std::fs::read_to_string(&policy_path) {
@@ -1080,93 +1077,6 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
 /// list unknown rather than guessed, and says why it could not be probed.
 pub fn effort_template_for(policy: &RepoPolicy) -> String {
     effort_template(&policy_models(policy), &probe_cli_efforts())
-}
-
-/// The hook compatibility record `relais doctor --probe-hooks` writes,
-/// checked against the Claude Code actually on PATH. A record is
-/// evidence about one version; trusting it for a different one silently
-/// would mean a fixture built on 2.1.x reads as evidence for 2.3.x that
-/// installed it (SPEC criteria). Never a blocker: nothing here stops a
-/// run, and the record itself is optional.
-fn hook_compat_finding(installed_version: Option<&str>) -> Finding {
-    let path = match crate::hook::compat_record_path() {
-        Ok(path) => path,
-        Err(e) => {
-            return Finding {
-                component: "hook-compat",
-                level: Level::Warn,
-                detail: e.to_string(),
-            }
-        }
-    };
-    match crate::hook::read_compat_record(&path) {
-        None => Finding {
-            component: "hook-compat",
-            level: Level::Warn,
-            detail: format!(
-                "no hook compatibility record yet — run `relais doctor --probe-hooks` \
-                 (costs money, touches the network) to write {}",
-                path.display()
-            ),
-        },
-        Some(record) => {
-            let capabilities = capabilities_summary(&record.capabilities);
-            match installed_version {
-                Some(installed) if installed == record.claude_code_version => Finding {
-                    component: "hook-compat",
-                    level: Level::Ok,
-                    detail: format!(
-                        "fresh: recorded for Claude Code {} at {} — {capabilities}",
-                        record.claude_code_version, record.observed_at
-                    ),
-                },
-                Some(installed) => Finding {
-                    component: "hook-compat",
-                    level: Level::Warn,
-                    detail: format!(
-                        "stale: recorded for Claude Code {}, installed is {installed} — \
-                         re-run `relais doctor --probe-hooks` — {capabilities}",
-                        record.claude_code_version
-                    ),
-                },
-                None => Finding {
-                    component: "hook-compat",
-                    level: Level::Warn,
-                    detail: format!(
-                        "recorded for Claude Code {}, but the installed version could not be \
-                         read — re-run `relais doctor --probe-hooks` once it can — {capabilities}",
-                        record.claude_code_version
-                    ),
-                },
-            }
-        }
-    }
-}
-
-/// Render a record's [`crate::hook::HookCapabilities`] for a `doctor`
-/// finding. `None` (a record written before capabilities existed) is
-/// reported as absent — never rendered as every capability being
-/// `false`, which would read as a measurement that was never taken.
-fn capabilities_summary(capabilities: &Option<crate::hook::HookCapabilities>) -> String {
-    let Some(capabilities) = capabilities else {
-        return "capabilities: absent (record predates capability probing)".to_string();
-    };
-    format!(
-        "capabilities: agent_tool_name={}, parent_agent_id={}, post_tool_use_failure_fires={}",
-        render_capability(&capabilities.agent_tool_name, |name| name.clone()),
-        render_capability(&capabilities.parent_agent_id, |v| v.to_string()),
-        render_capability(&capabilities.post_tool_use_failure_fires, |v| v.to_string()),
-    )
-}
-
-fn render_capability<T>(
-    capability: &crate::hook::Capability<T>,
-    show: impl FnOnce(&T) -> String,
-) -> String {
-    match capability {
-        crate::hook::Capability::Known(value) => show(value),
-        crate::hook::Capability::Unknown => "unknown".to_string(),
-    }
 }
 
 /// What exercising a recorded hook command found. `relais doctor`
@@ -1513,9 +1423,8 @@ fn hook_wiring_finding(roots: crate::install::settings::MergedRoots<'_>) -> Opti
 
 /// `relais doctor` exercising the live hook (SPEC criteria), checked
 /// against every settings file Claude Code merges — see
-/// [`crate::install::settings::settings_candidates`]. Never part of `--probe-hooks`: that command
-/// needs a real Claude Code session and costs money; this spawns nothing
-/// but the hook binary itself.
+/// [`crate::install::settings::settings_candidates`]. It spawns nothing but
+/// the hook binary itself.
 fn hook_live_finding(roots: crate::install::settings::MergedRoots<'_>) -> Finding {
     let scan = recorded_hooks(roots);
     match scan.hooks.as_slice() {
@@ -1992,43 +1901,6 @@ mod tests {
     /// An older record carries no capabilities at all. Reporting that as
     /// a row of `false` would state, as measurement, that the harness
     /// lacks every capability — from a file that never looked.
-    #[test]
-    fn absent_capabilities_are_reported_absent_never_as_false() {
-        let rendered = capabilities_summary(&None);
-        assert!(rendered.contains("absent"), "{rendered}");
-        assert!(
-            !rendered.contains("false"),
-            "an absent record must not read as a negative measurement: {rendered}"
-        );
-    }
-
-    /// `Unknown` and `Known(false)` are different claims — "the probe did
-    /// not settle this" against "the harness does not do this" — and must
-    /// not render alike.
-    #[test]
-    fn unknown_capabilities_render_unknown_not_false() {
-        use crate::hook::{Capability, HookCapabilities};
-        let rendered = capabilities_summary(&Some(HookCapabilities {
-            agent_tool_name: Capability::Unknown,
-            parent_agent_id: Capability::Unknown,
-            post_tool_use_failure_fires: Capability::Unknown,
-        }));
-        assert_eq!(rendered.matches("unknown").count(), 3, "{rendered}");
-        assert!(!rendered.contains("false"), "{rendered}");
-
-        let negative = capabilities_summary(&Some(HookCapabilities {
-            agent_tool_name: Capability::Known("Agent".to_string()),
-            parent_agent_id: Capability::Unknown,
-            post_tool_use_failure_fires: Capability::Known(false),
-        }));
-        assert!(negative.contains("agent_tool_name=Agent"), "{negative}");
-        assert!(negative.contains("parent_agent_id=unknown"), "{negative}");
-        assert!(
-            negative.contains("post_tool_use_failure_fires=false"),
-            "a measured negative DOES render false: {negative}"
-        );
-    }
-
     const HELP_2_1: &str = "usage: claude -p --model <model> --effort <level> \
          --output-format <format> --max-budget-usd <amount> \
          --disallowed-tools <tools...> --settings <file-or-json>";

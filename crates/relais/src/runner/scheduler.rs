@@ -729,7 +729,6 @@ fn run_package(
         // fact, free to disagree.
         purpose: None,
         run_id: None,
-        presentation: engine.config.presentation,
         wire: engine.config.wire.clone(),
     };
     engine.transition(
@@ -1182,7 +1181,6 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         cancel: None,
         pid_slot: None,
         tools: crate::backend::ToolSet::ModeDefault,
-        presentation: engine.config.presentation,
         agent: AgentKind::Planner,
     };
     let budget = Budget {
@@ -1233,7 +1231,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         cache_read_tokens: result.usage.cache_read_tokens,
         cache_write_tokens: result.usage.cache_write_tokens,
         cost: result.usage.cost.micros(),
-        cost_kind: engine.usage_cost_kind(&result.usage.cost),
+        cost_kind: engine.usage_cost_kind(),
         completeness: result.usage.cost.completeness(),
         inclusive: result.usage.cost.inclusive(),
         at: engine.config.ledger.now(),

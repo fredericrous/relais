@@ -204,9 +204,6 @@ pub enum Observation {
     /// The worker process ended without a terminal result: killed,
     /// non-zero exit, or output the adapter could not read.
     TerminalResultMissing { timed_out: bool, detail: String },
-    /// The harness refused the worker these tools. A worker that could
-    /// not act is blocked, not failed, and never escalated (SPEC §8).
-    PermissionDenied(Vec<String>),
     /// The dispatch was cancelled through the coordinator.
     Cancelled(String),
     /// The provider ran a model other than the one requested.
@@ -465,24 +462,6 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
             },
         ),
 
-        Observation::PermissionDenied(tools) => {
-            let detail = format!(
-                "the harness refused the worker these tools: {}; grant them in the machine \
-                 permissions allowlist or narrow the task — a stronger model is not bought \
-                 for a missing permission",
-                tools.join(", ")
-            );
-            Decision::stop(
-                State::Blocked,
-                Reason::PermissionDenied,
-                serde_json::json!({ "tools": tools }),
-                Terminal::Blocked {
-                    code: BlockCode::PermissionDenied,
-                    detail,
-                },
-            )
-        }
-
         Observation::Cancelled(detail) => Decision::stop(
             State::Cancelled,
             Reason::CancelledByUser,
@@ -655,21 +634,6 @@ mod tests {
         assert_eq!(d.state, State::Failed);
         assert_eq!(d.reason, Reason::CriteriaUnmet);
         assert!(matches!(d.next, Next::Stop(Terminal::Failed { .. })));
-    }
-
-    #[test]
-    fn refused_tools_are_blocked_never_escalated() {
-        let b = budget(0, Some(Tier::Escalation));
-        let d = decide(&b, Observation::PermissionDenied(vec!["Edit".into()]));
-        assert_eq!(d.state, State::Blocked);
-        assert_eq!(d.reason, Reason::PermissionDenied);
-        assert!(matches!(
-            d.next,
-            Next::Stop(Terminal::Blocked {
-                code: BlockCode::PermissionDenied,
-                ..
-            })
-        ));
     }
 
     #[test]

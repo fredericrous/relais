@@ -127,9 +127,8 @@ never written by a run. A trust grant is keyed by the PAIR of the
 repository's authority hash and the repository itself (its canonical root
 and, when git reports one, its `origin` URL), so editing `relais.toml`
 voids the grant and the same declaration in another repository needs its
-own review. `relais plan` prints the exact block to paste. A print-mode
-worker cannot ask for permission, so the tools it may use are an explicit
-machine-owned allowlist — nothing is granted implicitly, and no
+own review. `relais plan` prints the exact block to paste. The tools a
+worker may use are an explicit machine-owned allowlist — nothing is granted implicitly, and no
 permission-mode flag is ever passed. `disallowed_tools` here only ADDS to
 the shipped deny floor (commit, merge, push, rebase, reset, tag and the
 wrappers around them, plus `Agent`/`Task`: a worker never spawns subagents,

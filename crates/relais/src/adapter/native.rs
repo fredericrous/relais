@@ -1,4 +1,4 @@
-//! The native presentation of a dispatch (SPEC §23).
+//! The native launch of a dispatch (SPEC §23).
 //!
 //! `relais run` does not start the worker, the reviewer or the planner: it
 //! asks the relais plugin of the parent Claude Code session to spawn it as a
@@ -7,8 +7,8 @@
 //! line (SPEC §29), registers it with the coordinator, and waits for the
 //! plugin's `relais native bound` and `relais native stopped` calls, which
 //! carry the agent and what it spent. The engine then judges the attempt as
-//! it judges any other. Every launch that is not native goes to
-//! the headless backend untouched.
+//! it judges any other. Every dispatch is native: relais starts no
+//! `claude` process of its own but the probes of the harness.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -21,8 +21,8 @@ use crate::admission::{
     RegisterOutcome, StoppedReport, ADMISSION_POLL,
 };
 use crate::backend::{
-    claims_blockage, Backend, BackendError, Capabilities, Cost, LaunchResult, LaunchSpec,
-    Presentation, UsageReport,
+    claims_blockage, Backend, BackendError, Capabilities, Cost, Harness, LaunchResult, LaunchSpec,
+    UsageReport,
 };
 use crate::money::MicroUsd;
 use crate::native::{agent_type, has_definition, kind_word, plugin_agent_type, HELLO_FRESH};
@@ -324,17 +324,16 @@ fn ended_result(spec: &LaunchSpec, ended: Ended, detail: String) -> LaunchResult
         effective_model: None,
         usage: UsageReport::unknown(),
         worker_claims_blockage: false,
-        permission_denials: Vec::new(),
         failure_detail: Some(detail),
         booked_message_ids: Vec::new(),
         unpriced: Vec::new(),
     }
 }
 
-/// Launches a worker attempt as a native subagent of the parent session,
-/// and everything else on the headless backend it wraps.
+/// Launches every dispatch as a native subagent of the parent session. The
+/// harness it was given is only probed, for its identity and capabilities.
 pub struct NativeBackend<'a> {
-    headless: &'a dyn Backend,
+    harness: &'a dyn Harness,
     gate: &'a (dyn Gate + Sync),
     link: Link,
     waits: Waits,
@@ -344,14 +343,14 @@ pub struct NativeBackend<'a> {
 
 impl<'a> NativeBackend<'a> {
     pub fn new(
-        headless: &'a dyn Backend,
+        harness: &'a dyn Harness,
         gate: &'a (dyn Gate + Sync),
         link: Link,
         waits: Waits,
         prices: Option<PriceTable>,
     ) -> Self {
         Self {
-            headless,
+            harness,
             gate,
             link,
             waits,
@@ -609,7 +608,6 @@ impl<'a> NativeBackend<'a> {
             result_text,
             effective_model: booked.effective_model,
             usage: booked.usage,
-            permission_denials: Vec::new(),
             failure_detail: failure,
             booked_message_ids: self.rollback_ids(&agent_id),
             session_id: Some(agent_id),
@@ -661,22 +659,21 @@ impl<'a> NativeBackend<'a> {
     }
 }
 
-impl Backend for NativeBackend<'_> {
-    /// The harness the worker runs on is the wrapped one: a native worker
-    /// is still Claude Code, so a run's recorded identity does not change.
+impl Harness for NativeBackend<'_> {
+    /// The harness a native agent runs on is the probed one: it is still
+    /// Claude Code, so a run's recorded identity does not change.
     fn name(&self) -> &'static str {
-        self.headless.name()
+        self.harness.name()
     }
 
     fn probe(&self) -> Option<Capabilities> {
-        self.headless.probe()
+        self.harness.probe()
     }
+}
 
+impl Backend for NativeBackend<'_> {
     fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError> {
-        match spec.presentation {
-            Presentation::Headless => self.headless.launch(spec),
-            Presentation::Native => self.launch_native(spec),
-        }
+        self.launch_native(spec)
     }
 }
 
@@ -707,7 +704,6 @@ mod tests {
             cancel: None,
             pid_slot: None,
             tools: crate::backend::ToolSet::ModeDefault,
-            presentation: Presentation::Native,
             agent: AgentKind::Worker,
         }
     }
@@ -753,12 +749,12 @@ mod tests {
     }
 
     fn backend_in<'a>(
-        headless: &'a dyn Backend,
+        harness: &'a dyn Harness,
         gate: &'a (dyn Gate + Sync),
         projects_dir: Option<PathBuf>,
     ) -> NativeBackend<'a> {
         NativeBackend::new(
-            headless,
+            harness,
             gate,
             Link {
                 run_id: "run-1".into(),
@@ -960,9 +956,9 @@ mod tests {
     /// raised repairs, the note still names the effort the agent runs at.
     #[test]
     fn the_agent_keeps_its_spawn_effort_across_continuations() {
-        let headless = crate::adapter::mock::MockBackend::new(|_| panic!("no headless launch"));
+        let harness = crate::adapter::mock::MockBackend::new(|_| panic!("no launch"));
         let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
-        let backend = backend_in(&headless, &gate, None);
+        let backend = backend_in(&harness, &gate, None);
         let stop = |asked: &str| {
             backend.stopped_result(
                 &spec("sonnet", Some(asked)),
@@ -992,9 +988,9 @@ mod tests {
 
     #[test]
     fn a_failed_or_killed_agent_has_no_result_and_is_not_continued() {
-        let headless = crate::adapter::mock::MockBackend::new(|_| panic!("no headless launch"));
+        let harness = crate::adapter::mock::MockBackend::new(|_| panic!("no launch"));
         let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
-        let backend = backend_in(&headless, &gate, None);
+        let backend = backend_in(&harness, &gate, None);
         for (status, word) in [
             (AgentStatus::Failed, "failed"),
             (AgentStatus::Killed, "killed"),
@@ -1021,7 +1017,7 @@ mod tests {
     /// agent under any project slug; a missing file has none.
     #[test]
     fn an_agents_transcript_gives_its_message_ids() {
-        let headless = crate::adapter::mock::MockBackend::new(|_| panic!("no headless launch"));
+        let harness = crate::adapter::mock::MockBackend::new(|_| panic!("no launch"));
         let gate = crate::admission::LocalGate::new(crate::policy::ConcurrencyLimits::default());
         let dir = crate::test_support::short_temp_dir("native-ids");
         let subagents = dir.join("-slug").join("s1").join("subagents");
@@ -1036,12 +1032,12 @@ mod tests {
             format!("{}\n{}\n", line("m1"), line("m2")),
         )
         .expect("written");
-        let backend = backend_in(&headless, &gate, Some(dir.to_path_buf()));
+        let backend = backend_in(&harness, &gate, Some(dir.to_path_buf()));
         assert_eq!(backend.rollback_ids("a1"), ["m1", "m2"]);
         assert!(backend.rollback_ids("a2").is_empty());
-        let nowhere = backend_in(&headless, &gate, Some(dir.join("absent")));
+        let nowhere = backend_in(&harness, &gate, Some(dir.join("absent")));
         assert!(nowhere.rollback_ids("a1").is_empty());
-        let unknown = backend_in(&headless, &gate, None);
+        let unknown = backend_in(&harness, &gate, None);
         assert!(unknown.rollback_ids("a1").is_empty());
     }
 

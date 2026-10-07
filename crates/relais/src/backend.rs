@@ -1,19 +1,19 @@
 //! The execution-backend contract (SPEC §20) and its wire types.
 //!
 //! A backend launches one dispatch and reports what came back: the
-//! terminal result text, the model that actually ran, what it cost, the
-//! tools the harness refused, and how the process ended. The contract
-//! covers launch, cancellation, effective profile, permission capability
-//! and usage completeness. No adapter may advertise
+//! terminal result text, the model that actually ran, what it cost, and
+//! how it ended. The contract covers launch, cancellation, effective
+//! profile, permission capability and usage completeness. No adapter may advertise
 //! guarantees its backend cannot enforce, and nothing here assumes a
 //! capability: they are probed on the machine.
 //!
 //! The trait and its types live here rather than inside `adapter`
 //! because they are this crate's interface to a model harness, not the
 //! Claude adapter's property: the runner depends on `Backend`, the
-//! adapter implements it, and a second implementation costs nobody a
-//! change of import. `adapter` keeps the concrete backends and the
-//! process plumbing for talking to them.
+//! native adapter implements it, and a second implementation costs
+//! nobody a change of import. [`Harness`] is the half that only probes
+//! the installed Claude Code. `adapter` keeps the concrete backends and
+//! the process plumbing for talking to them.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32};
@@ -396,18 +396,6 @@ pub enum ToolSet {
     ReadOnly,
 }
 
-/// How a launch is presented to the person running relais (SPEC §23).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Presentation {
-    /// A child process relais starts and supervises: every launch but a
-    /// native worker's.
-    #[default]
-    Headless,
-    /// A subagent the parent Claude Code session spawns on relais's
-    /// behalf, so Claude Code renders it.
-    Native,
-}
-
 /// One model dispatch. The prompt travels via stdin; arguments are an
 /// argv array; the working directory is the owned task worktree.
 #[derive(Debug, Clone)]
@@ -439,16 +427,13 @@ pub struct LaunchSpec {
     pub pid_slot: Option<Arc<AtomicU32>>,
     /// The tools the harness is asked to expose.
     pub tools: ToolSet,
-    /// Who runs the launch: relais's own child process, or a native
-    /// subagent of the parent session.
-    pub presentation: Presentation,
     /// What kind of agent this dispatch is: the native agent definition it
     /// runs as, and the kind its run events name.
     pub agent: crate::protocol::AgentKind,
 }
 
 /// The environment variable that makes Claude Code strip provider
-/// credentials from the subprocesses it starts. A headless worker sets it.
+/// credentials from the subprocesses it starts. A worker's launch sets it.
 pub const SUBPROCESS_ENV_SCRUB: &str = "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB";
 
 /// The environment one WORKER dispatch runs with: `base` plus the scrub.
@@ -537,29 +522,6 @@ impl UsageReport {
     }
 }
 
-/// One tool call the harness refused the worker.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PermissionDenial {
-    /// The tool, and for Bash the command: `Edit`, `Bash(git diff)`.
-    pub entry: String,
-    /// The refused call's id in the transcript, when the harness named it.
-    pub tool_use_id: Option<String>,
-}
-
-impl PermissionDenial {
-    pub fn new(entry: impl Into<String>, tool_use_id: Option<&str>) -> Self {
-        Self {
-            entry: entry.into(),
-            tool_use_id: tool_use_id.map(str::to_string),
-        }
-    }
-
-    /// The tool's name, without a Bash command.
-    pub fn tool_name(&self) -> &str {
-        self.entry.split('(').next().unwrap_or(&self.entry)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LaunchResult {
     pub dispatch_id: String,
@@ -578,23 +540,18 @@ pub struct LaunchResult {
     pub effective_model: Option<String>,
     pub usage: UsageReport,
     pub worker_claims_blockage: bool,
-    /// Tools the harness refused the worker, as it reported them. A
-    /// worker that could not act is not a worker that chose not to:
-    /// missing permissions produce a blocked result (SPEC §8).
-    #[serde(default)]
-    pub permission_denials: Vec<PermissionDenial>,
     /// Why the harness ended without a usable result — its stderr, or
     /// the error it reported — for the interrupted transition's evidence.
     #[serde(default)]
     pub failure_detail: Option<String>,
     /// The transcript message ids this attempt's usage was booked from:
-    /// only a native worker's, empty for every other launch. The runner
-    /// records them so `usage import` does not count them again (SPEC §11).
+    /// The runner records them so `usage import` does not count them
+    /// again (SPEC §11).
     #[serde(default)]
     pub booked_message_ids: Vec<String>,
     /// Why some of those messages could not be priced, one line per model
-    /// and reason (`orchestration::unpriced_reason`): only a native
-    /// worker's, empty when every booked message priced.
+    /// and reason (`orchestration::unpriced_reason`): empty when every
+    /// booked message priced.
     #[serde(default)]
     pub unpriced: Vec<String>,
 }
@@ -698,20 +655,19 @@ pub fn claims_blockage(result_text: &str) -> bool {
     })
 }
 
-/// The adapter contract (SPEC §20).
-pub trait Backend {
+/// What a backend reports about the harness it runs on (SPEC §20): which
+/// one it is and what it accepts, probed on the machine.
+pub trait Harness {
     fn name(&self) -> &'static str;
-    /// Probe the installed backend; capabilities are observed, not
-    /// declared. `None` = backend not installed (blocked, not fallback).
+    /// Probe the installed harness; capabilities are observed, not
+    /// declared. `None` = harness not installed (blocked, not fallback).
     fn probe(&self) -> Option<Capabilities>;
-    /// Launch one dispatch and wait for its terminal result.
-    fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError>;
 }
 
-/// One probe session: `spec` launched exactly as a worker is, except that
-/// the harness streams its transcript (`relais doctor --probe-hooks`). Returns that stream (one JSON record per line).
-pub trait ProbeLauncher {
-    fn stream(&self, spec: &LaunchSpec) -> Result<String, BackendError>;
+/// The adapter contract (SPEC §20): a harness that can launch one dispatch.
+pub trait Backend: Harness {
+    /// Launch one dispatch and wait for its terminal result.
+    fn launch(&self, spec: &LaunchSpec) -> Result<LaunchResult, BackendError>;
 }
 
 #[cfg(test)]
@@ -801,7 +757,6 @@ mod tests {
             effective_model: None,
             usage: UsageReport::unknown(),
             worker_claims_blockage: false,
-            permission_denials: Vec::new(),
             failure_detail: None,
             booked_message_ids: Vec::new(),
             unpriced: Vec::new(),
@@ -850,7 +805,6 @@ mod tests {
             effective_model: None,
             usage: UsageReport::unknown(),
             worker_claims_blockage: false,
-            permission_denials: Vec::new(),
             failure_detail: None,
             booked_message_ids: vec!["m1".into()],
             unpriced: Vec::new(),

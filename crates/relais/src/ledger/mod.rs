@@ -5282,7 +5282,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A headless attempt books no transcript message to a run.
+    /// An attempt without message ids books no transcript message to a run.
     #[test]
     fn a_plain_usage_event_books_no_native_message() {
         let (ledger, dir) = temp_ledger();

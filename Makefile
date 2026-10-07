@@ -5,7 +5,7 @@
 # shim, which reads the pin.
 CARGO := $(shell command -v rustup >/dev/null 2>&1 && test -x "$(HOME)/.cargo/bin/cargo" && echo "$(HOME)/.cargo/bin/cargo" || echo cargo)
 
-.PHONY: all check lint test build fmt toolchain msrv audit plugin probe-hooks
+.PHONY: all check lint test build fmt toolchain msrv audit plugin
 
 all: check
 
@@ -104,12 +104,3 @@ build:
 
 fmt:
 	$(CARGO) fmt --all
-
-## `relais doctor --probe-hooks`, built first so a stale binary is never
-## what runs. Its own target, never folded into `check`: it needs a real
-## Claude Code on PATH, costs money (a live model session) and touches
-## the network, none of which `check` may depend on to stay green on a
-## machine with neither.
-probe-hooks:
-	$(CARGO) build
-	$(CARGO) run -- doctor --probe-hooks
