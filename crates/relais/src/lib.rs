@@ -36,6 +36,7 @@ pub mod report;
 pub mod resume;
 pub mod rng;
 pub mod route;
+pub mod router;
 pub mod runner;
 /// Scratch-directory test helpers. `pub`, not `#[cfg(test)]`: the
 /// integration suites under `tests/` build this crate as an ordinary

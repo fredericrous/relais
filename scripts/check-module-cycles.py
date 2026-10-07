@@ -65,6 +65,16 @@ PURE_FILES = {
     "hook/pairing.rs",
     "learn/drift.rs",
     "route/trial.rs",
+    "router/holdout.rs",
+    "router/mode.rs",
+    "router/outcome.rs",
+    "router/pins.rs",
+    "router/r3.rs",
+    "router/report.rs",
+    "router/state.rs",
+    "router/stats.rs",
+    "router/table.rs",
+    "router/wire.rs",
 }
 
 PURE_MODULES = {
