@@ -18,12 +18,15 @@ Before a contract can be written, the caller must supply:
 - one precise objective sentence;
 - the write scope: which paths the change may touch;
 - acceptance criteria a command can verify — never "looks right" or a
-  worker's own completion message;
-- the verification profile to run, named in that repository's
-  `relais.toml`.
+  worker's own completion message.
 
 Missing any of these is a reason to ask, not to guess one on the
 caller's behalf.
+
+The verification profile is `"default"` unless the repository's
+`relais.toml` names another one the person asked for. A repository with
+no `relais.toml` is not a reason to stop: step 3 sets it up with the
+person.
 
 ## Steps
 
@@ -32,7 +35,8 @@ caller's behalf.
    pass, so a subdirectory is fine, but a directory outside the
    repository is refused, never guessed.
 
-2. Write a contract at `<root>/.relais/task.json`:
+2. Start the run with the `mcp__relais__run` tool: `cwd` set to the
+   repository, and `task` set to the contract itself, as an object:
 
 ```json
 {
@@ -43,21 +47,17 @@ caller's behalf.
   "write_scope": ["<paths the change may touch>"],
   "read_hints": ["<entry points>"],
   "acceptance": ["<criterion a command can verify>", "..."],
-  "verification_profile": "<profile from relais.toml>",
+  "verification_profile": "default",
   "review": "optional"
 }
 ```
 
-Use `"kind": "inspect"` with evidence criteria for investigations that
-must not edit files.
-
-3. Preflight without spending: `relais plan --task .relais/task.json`
-   (a plain command; it runs nothing and spends nothing).
-
-4. Start the run with the `mcp__relais__run` tool: `task` set to
-   `.relais/task.json` and `cwd` set to `<root>`. It starts the run and
-   returns at once. To replay a recorded run, call `mcp__relais__replay`
-   with `{task, recipe, cwd}` instead.
+   Use `"kind": "inspect"` with evidence criteria for investigations
+   that must not edit files. relais validates the contract and saves it
+   under `.relais/tasks/`; a refusal names the field to fix. Write no
+   task file and run no `relais plan` yourself. The tool starts the run
+   and returns at once. To replay a recorded run, call
+   `mcp__relais__replay` with `{task, recipe, cwd}` instead.
    - **Never run `relais run` in Bash.** It is refused outside the
      plugin, and a run started there would not be seen, attributed or
      stopped by it.
@@ -68,7 +68,26 @@ must not edit files.
      finishing is not the run finishing: relais still verifies, and may
      review, repair or escalate.
 
-5. Follow it and read the outcome.
+3. If the outcome says the repository is not set up, set it up with the
+   person, then go back to step 2 with the same contract:
+   - `blocked (no_policy)`: call `mcp__relais__onboard` with the `cwd`.
+     It proposes the checks found in the repository, asks the person to
+     use them and to allow relais to run them, and commits `relais.toml`.
+   - `blocked (missing_trust_grant)`: call `mcp__relais__trust` with the
+     `cwd`. It shows the person the exact commands and asks.
+   - Both ask the person themselves, in Claude Code's own dialog. Do not
+     ask the same question first, and do not answer it for them.
+   - `ready`: call `mcp__relais__run` again.
+   - `declined (not_now)`: stop and report that relais was not set up;
+     do not call run again unless the person asks for relais again.
+   - `declined (dismissed)`: ask the person what they want.
+   - `not set up (…)`: report the reason it gives (a refused commit, a
+     detached HEAD) and what it says to do.
+   - **Never edit `machine.toml`, and never run `relais trust grant`
+     yourself.** A grant is the person's decision; the plugin refuses
+     both.
+
+4. Follow it and read the outcome.
    - Progress: call `mcp__relais__status` (phases, decisions, cost and
      the last lines of output), or tell the person to open
      `/relais-status`.
@@ -76,7 +95,8 @@ must not edit files.
      turn before it arrives: a run whose session ends goes with it.
    - Read the outcome: accepted (receipt + patch), needs_decision,
      needs_review, blocked, failed, budget_exhausted or interrupted. The
-     artifacts path is on every terminal state.
+     artifacts path is on every terminal state. A run refused before it
+     started says `Nothing ran` and names why.
 
 ## Rules
 
@@ -89,8 +109,11 @@ must not edit files.
 
 ## Done when
 
-- the contract was written to `<root>/.relais/task.json` and `relais
-  plan` accepted it without complaint;
+- the contract was passed to `mcp__relais__run` as an object and relais
+  accepted it;
+- a repository that was not set up was set up through
+  `mcp__relais__onboard` / `mcp__relais__trust`, with the person
+  answering, or the person declined and that was reported;
 - the run was started with `mcp__relais__run` (never `relais run` in
   Bash) and reached a terminal state (accepted, needs_decision,
   needs_review, blocked, failed, budget_exhausted or interrupted), and

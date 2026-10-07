@@ -114,7 +114,7 @@ test('the kept outcome goes when the next run starts', async ($: any, on: any) =
   await settle(engine)
   await tick(engine)
   expect(lastStatus(engine)).toContain('accepted')
-  await $.tool.call({ tool: 'mcp__relais__run', task: 'next', cwd: '/repo' })
+  await $.tool.call({ tool: 'mcp__relais__run', task: 'next.json', cwd: '/repo' })
   await startQueued(engine)
   await tick(engine)
   expect(lastStatus(engine)).not.toContain('accepted')

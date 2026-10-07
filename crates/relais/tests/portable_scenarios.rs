@@ -1770,6 +1770,59 @@ fn rollback_of_a_single_revision_recipe_is_refused() {
     );
 }
 
+/// The plugin's run tool hands the model's contract to `relais native
+/// contract` on stdin: a contract is saved under `.relais/tasks/` (kept out
+/// of `git status`), and prose is refused by its schema error.
+#[test]
+fn native_contract_saves_a_contract_and_refuses_prose() {
+    use std::io::Write;
+    let world = World::new("native-contract");
+    world.write_policy();
+    let pipe = |stdin: &str| {
+        let mut child = Command::new(BIN)
+            .args(["native", "contract"])
+            .current_dir(&world.repo)
+            .env("RELAIS_STATE_DIR", &world.state)
+            .env("RELAIS_CONFIG_DIR", &world.config)
+            .env("HOME", &world.root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("relais runs");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(stdin.as_bytes())
+            .expect("written");
+        child.wait_with_output().expect("relais ends")
+    };
+    let contract = std::fs::read_to_string(world.write_task("task.json")).expect("task");
+    let saved = pipe(&contract);
+    assert_eq!(saved.status.code(), Some(0), "{}", text(&saved.stderr));
+    let path = PathBuf::from(text(&saved.stdout).trim());
+    let tasks = std::fs::canonicalize(&world.repo)
+        .expect("repo")
+        .join(".relais")
+        .join("tasks");
+    assert!(path.starts_with(&tasks), "{}", path.display());
+    assert_eq!(std::fs::read_to_string(&path).expect("saved"), contract);
+    assert_eq!(
+        git(&world.repo, &["status", "--porcelain"]).trim(),
+        "",
+        "nothing shows in git status"
+    );
+
+    let prose = pipe("fix the JSON escaping in amont list");
+    assert_eq!(prose.status.code(), Some(2));
+    assert!(
+        text(&prose.stderr).contains("not a task contract"),
+        "{}",
+        text(&prose.stderr)
+    );
+}
+
 /// The `done` lines a `relais run --protocol` wrote on stdout.
 #[cfg(unix)]
 fn done_lines(stdout: &[u8]) -> Vec<serde_json::Value> {

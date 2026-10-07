@@ -503,6 +503,10 @@ enum NativeCommand {
         #[arg(long)]
         run: Option<String>,
     },
+    /// A task contract on stdin, validated and saved under the
+    /// repository's `.relais/tasks/`; prints the path `relais run --task`
+    /// takes. What the plugin's run tool calls with the model's contract.
+    Contract,
 }
 
 #[derive(Subcommand)]
@@ -2481,6 +2485,58 @@ fn tuning_bounds(incumbent: &RepoPolicy) -> route::TuningBounds {
     route::default_tuning_bounds(incumbent, allowed_models.as_deref(), &catalogs)
 }
 
+/// `relais native contract`: the model writes a task as JSON, the plugin
+/// pipes it here. Refused, by its schema error, unless it is a contract —
+/// so a sentence of prose never becomes a run. Saved as
+/// `<root>/.relais/tasks/<hash>.json`, under the `.relais/` the dirty-tree
+/// check already leaves alone, with a `.gitignore` that keeps it out of
+/// `git status`.
+fn native_contract_command() -> Result<CliOutcome, CliError> {
+    use std::io::Read;
+    let mut text = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut text) {
+        eprintln!("relais native contract: stdin could not be read: {e}");
+        return Ok(CliOutcome::InvalidInput);
+    }
+    let contract = match TaskContract::from_json_str(&text) {
+        Ok(contract) => contract,
+        Err(e) => {
+            eprintln!(
+                "relais native contract: not a task contract: {e}. Required: schema_version, kind, \
+                 objective, base_ref, write_scope, acceptance, verification_profile"
+            );
+            return Ok(CliOutcome::InvalidInput);
+        }
+    };
+    let root = project_dir()?;
+    let dir = root.join(".relais");
+    let tasks = dir.join("tasks");
+    let written = (|| -> std::io::Result<PathBuf> {
+        std::fs::create_dir_all(&tasks)?;
+        let ignore = dir.join(".gitignore");
+        if !ignore.exists() {
+            std::fs::write(&ignore, "*\n")?;
+        }
+        let hash = contract.hash();
+        let path = tasks.join(format!("{}.json", &hash[..hash.len().min(16)]));
+        std::fs::write(&path, &text)?;
+        Ok(path)
+    })();
+    match written {
+        Ok(path) => {
+            println!("{}", path.display());
+            Ok(CliOutcome::Accepted)
+        }
+        Err(e) => {
+            eprintln!(
+                "relais native contract: {} could not be written: {e}",
+                tasks.display()
+            );
+            Ok(CliOutcome::OperationalFailure)
+        }
+    }
+}
+
 fn load_contract(task: &Path) -> Result<TaskContract, CliError> {
     let text = std::fs::read_to_string(task).map_err(|cause| CliError::Read {
         what: "the task contract",
@@ -3068,6 +3124,7 @@ fn plan_trial_lines(
 fn native_command(cmd: NativeCommand) -> Result<CliOutcome, CliError> {
     match cmd {
         NativeCommand::Status { run } => native_status_command(run.as_deref()),
+        NativeCommand::Contract => native_contract_command(),
         NativeCommand::Hello { session } => {
             let socket = relais::coordinator::socket_path().map_err(CliError::Home)?;
             // The first call of a session may find no daemon: start one, as

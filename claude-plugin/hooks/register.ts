@@ -7,13 +7,18 @@ import { dispatchOfDescription, onTurn } from './agents.ts'
 import { HELLO_EVERY_MS, sendHello } from './callbacks.ts'
 import type { Fx } from './fx.ts'
 import { DENY_MESSAGE, isRelaisNotification, isRelaisType, relaisAddresses } from './guards.ts'
-import { childOf, onChunk, pump, reloadTimeline, startReplay, startRun, statusOf } from './runs.ts'
+import { childOf, contractPath, onChunk, pump, reloadTimeline, startReplay, startRun, statusOf } from './runs.ts'
+import { onboardTool, trustTool } from './consent.ts'
+import { machineSettingsGuard } from './guards.ts'
 import { close, createStore, detach, every } from './store.ts'
 import { FLUSH_MS, openPane, renderPane, timelineLines } from './ui.ts'
 
 const RUN_TOOL = 'mcp__relais__run'
 const REPLAY_TOOL = 'mcp__relais__replay'
 const STATUS_TOOL = 'mcp__relais__status'
+const ONBOARD_TOOL = 'mcp__relais__onboard'
+const TRUST_TOOL = 'mcp__relais__trust'
+const CONSENT_FAILED = 'declined: relais could not ask the person (internal error). Nothing was written or allowed.'
 
 // Every effect the sibling modules use, spelled on `$` here: `claude plugin
 // validate` follows `$` within a file, not across an import.
@@ -38,6 +43,7 @@ const effects = ($: any): Fx => ({
     toast: (text: string) => $.ui.toast(text),
     status: (text: string | undefined) => $.ui.status(text),
     resolve: (e: unknown) => $.ui.resolve(e),
+    ask: (question: string, options: string[]) => $.ui.ask(question, options),
   },
   prompt: { submit: (args: unknown) => $.prompt.submit(args) },
   pane: {
@@ -67,10 +73,34 @@ export function register(on: any) {
       inputSchema: {
         type: 'object',
         properties: {
-          task: { type: 'string', description: 'The task, as one clear instruction.' },
+          task: {
+            type: 'object',
+            description:
+              'The task contract: {schema_version: 1, kind: "change" | "inspect", objective, base_ref: "HEAD", write_scope: [globs], read_hints: [paths], acceptance: [criteria a command can verify], verification_profile: "default", review: "optional"}. A path to a contract .json file is also accepted.',
+          },
           cwd: { type: 'string', description: 'The repository to work in (absolute path).' },
         },
         required: ['task', 'cwd'],
+      },
+    })
+    await $.tool.register({
+      name: 'onboard',
+      description:
+        'Set relais up in a repository that has no relais.toml (a run reported no_policy): relais proposes the checks from the repository, and the person is asked to use them and to allow relais to run them. Returns ready, declined or not set up.',
+      inputSchema: {
+        type: 'object',
+        properties: { cwd: { type: 'string', description: 'The repository (absolute path).' } },
+        required: ['cwd'],
+      },
+    })
+    await $.tool.register({
+      name: 'trust',
+      description:
+        "Ask the person to allow the commands of a repository's relais.toml (a run reported missing_trust_grant). The person sees the exact commands. Returns ready or declined.",
+      inputSchema: {
+        type: 'object',
+        properties: { cwd: { type: 'string', description: 'The repository (absolute path).' } },
+        required: ['cwd'],
       },
     })
     await $.tool.register({
@@ -113,12 +143,36 @@ export function register(on: any) {
   })
 
   on('tool.call', { tool: RUN_TOOL }, async ($: any, e: any) => {
-    if (typeof e.task !== 'string' || typeof e.cwd !== 'string') {
-      return { deny: 'relais run needs a task and a cwd (both text).' }
-    }
+    if (typeof e.cwd !== 'string') return { deny: 'relais run needs a cwd: the repository, as an absolute path.' }
     const fx = effects($)
+    const task = await contractPath(fx, e.task, e.cwd)
+    if (task.deny) return { deny: task.deny }
     ensurePump(fx)
-    return { result: await startRun(fx, store, { task: e.task, cwd: e.cwd }) }
+    return { result: await startRun(fx, store, { task: task.path, cwd: e.cwd }) }
+  })
+
+  // Both ask the person from inside the tool call; anything that throws is
+  // a refusal, never a pass.
+  on('tool.call', { tool: ONBOARD_TOOL }, async ($: any, e: any) => {
+    if (typeof e.cwd !== 'string') return { deny: 'relais onboard needs a cwd (absolute path).' }
+    const fx = effects($)
+    return { result: await onboardTool(fx, store, e.cwd, await fx.session.id()) }
+  }).catch(() => ({ result: CONSENT_FAILED }))
+
+  on('tool.call', { tool: TRUST_TOOL }, async ($: any, e: any) => {
+    if (typeof e.cwd !== 'string') return { deny: 'relais trust needs a cwd (absolute path).' }
+    const fx = effects($)
+    return { result: await trustTool(fx, store, e.cwd, await fx.session.id()) }
+  }).catch(() => ({ result: CONSENT_FAILED }))
+
+  // machine.toml holds the grants: the model does not write it, and is
+  // told so when a Bash command names it (a reminder, not a wall: SPEC §5).
+  on('tool.check', { tool: ['Write', 'Edit', 'MultiEdit', 'Bash'] }, async ($: any, e: any, next: any) => {
+    const decided = await next(e)
+    const home = await $.env.get('HOME')
+    const configDir = await $.env.get('RELAIS_CONFIG_DIR')
+    const refusal = machineSettingsGuard(e.tool, e.input ?? {}, { home, configDir })
+    return refusal ? { decision: 'deny', reason: refusal } : decided
   })
 
   on('tool.call', { tool: REPLAY_TOOL }, async ($: any, e: any) => {

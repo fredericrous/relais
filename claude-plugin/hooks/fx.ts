@@ -11,7 +11,7 @@ export type Fx = {
   agent: { spawn: Call; list: Call }
   tool: { call: Call }
   clock: { now: Call; every: Call; after: Call }
-  ui: { open: Call; toast: Call; status: Call; resolve: Call }
+  ui: { open: Call; toast: Call; status: Call; resolve: Call; ask: Call }
   prompt: { submit: Call }
   // The pane's one `$.state` value: written by the stream handler's flush,
   // read by the `ui.render` hook.

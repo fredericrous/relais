@@ -62,6 +62,28 @@ export async function pump(fx: Fx, store: Store) {
   await flush(fx, store)
 }
 
+// The run tool's `task`: a contract object, which relais validates and saves
+// under the repository's `.relais/tasks/`, or the path of a contract file.
+// Prose is refused with what a contract needs.
+export async function contractPath(fx: Fx, task: unknown, cwd: string): Promise<{ path: string; deny?: undefined } | { deny: string }> {
+  if (typeof task === 'string') {
+    if (task.endsWith('.json')) return { path: task }
+    return {
+      deny: 'relais run takes a task contract, not prose: pass task as an object {schema_version: 1, kind, objective, base_ref, write_scope, acceptance, verification_profile} (see the relais skill).',
+    }
+  }
+  if (!task || typeof task !== 'object') return { deny: 'relais run needs a task contract object.' }
+  const saved = await fx.process.run(['relais', 'native', 'contract'], {
+    cwd,
+    stdin: JSON.stringify(task),
+    timeoutMs: STATUS_TIMEOUT_MS,
+  })
+  if (saved.exitCode !== 0) {
+    return { deny: `relais refused the contract: ${String(saved.stderr ?? '').trim().slice(0, 1000)}` }
+  }
+  return { path: String(saved.stdout ?? '').trim() }
+}
+
 export async function startRun(fx: Fx, store: Store, input: { task: string; cwd: string }) {
   await startChild(fx, store, ['relais', 'run', '--task', input.task, '--protocol'], input.cwd)
   return `Started relais run for: ${input.task} (in ${input.cwd}). It runs in the relais pane and /relais-status; its outcome arrives here as a message when it ends.`

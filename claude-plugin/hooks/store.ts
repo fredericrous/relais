@@ -60,6 +60,11 @@ export type Store = {
   heldOutcome: string | undefined
   // Decisions waiting to be merged into one toast.
   decisionToast: { texts: string[]; timer: { cancel: () => void } } | undefined
+  // The setup question open for a repository root (consent.ts): a second
+  // call waits for it rather than asking again.
+  consent: Map<string, Promise<string>>
+  // Repository roots the person answered Not now for in this session.
+  declined: Set<string>
 }
 
 // A background promise nobody awaits: once the module unloads its effects
@@ -90,6 +95,8 @@ export const createStore = (): Store => ({
   poll: undefined,
   heldOutcome: undefined,
   decisionToast: undefined,
+  consent: new Map(),
+  declined: new Set(),
 })
 
 // Timers go through here so that unloading can clear every one.
