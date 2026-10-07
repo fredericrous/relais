@@ -14,6 +14,11 @@ export type Calls = {
   statuses: (string | undefined)[]
   prompts: any[]
   opened: any[]
+  // What reached the engine's `turn.step` (after the plugin's hooks), and
+  // each `$.model.complete` request.
+  steps: any[]
+  completes: any[]
+  asked: { question: string; options: string[] }[]
 }
 
 export type Agents = { id: string; status: string; type?: string; name?: string; description?: string }[]
@@ -22,9 +27,28 @@ const ok = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isSt
 
 export const RELAIS_AGENT_TYPE = 'relais:relais-worker-sonnet-medium'
 
-export function scriptedEngine(on: any, options: { session?: string; isPlaced?: boolean } = {}) {
+export const zeroUsage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+
+export function scriptedEngine(
+  on: any,
+  options: { session?: string; isPlaced?: boolean; store?: Record<string, unknown> } = {},
+) {
   const clock = mock.clock(on, { now: Date.parse('2026-10-06T12:00:00Z') })
-  const calls: Calls = { run: [], spawn: [], spawned: [], tool: [], toasts: [], statuses: [], prompts: [], opened: [] }
+  mock.store(on, options.store ?? {})
+  mock.env(on, { HOME: '/Users/p' })
+  const calls: Calls = {
+    run: [],
+    spawn: [],
+    spawned: [],
+    tool: [],
+    toasts: [],
+    statuses: [],
+    prompts: [],
+    opened: [],
+    steps: [],
+    completes: [],
+    asked: [],
+  }
   const agents: Agents = []
   // What a test changes to script the world: `relais native …` results, a
   // tool's answer, and a hook run inside a tool call.
@@ -35,6 +59,17 @@ export function scriptedEngine(on: any, options: { session?: string; isPlaced?: 
     isPlaced: options.isPlaced ?? true,
     // How many `prompt.submit` calls fail before one goes through.
     submitFailures: 0,
+    // `$.model.complete`'s answer (the classifier): unanswered by default.
+    complete: (_e: any): any => ({ isAnswered: false, reason: 'empty-reply', usage: zeroUsage }),
+    sessionModel: 'claude-sonnet-5-5',
+    // A response's usage; the model that answered is the request's.
+    stepUsage: (e: any): any => ({ ...zeroUsage, input_tokens: 10, output_tokens: 5, model: e.model }),
+    // Whether `agent.spawn` names the started agent (a workflow's remote one does not).
+    spawnHasAgentId: true,
+    // `$.ui.ask`'s answer; a throw is a dismissal.
+    ask: (_question: string, _options: string[]): any => {
+      throw new Error('dismissed')
+    },
   }
   const store: Record<string, { value: unknown; version: number }> = {}
   let nextAgent = 1
@@ -86,17 +121,38 @@ export function scriptedEngine(on: any, options: { session?: string; isPlaced?: 
   // shows in `$.agent.list()` as running.
   on('agent.spawn', (_$: any, e: any) => {
     calls.spawned.push(e)
+    const id = `agent-${nextAgent++}`
     agents.push({
-      id: `agent-${nextAgent++}`,
+      id,
       status: 'running',
       type: e.subagent_type ?? e.subagentType,
       description: e.description,
     })
-    return { model: e.model ?? 'sonnet' }
+    return { model: e.model ?? 'sonnet', ...(script.spawnHasAgentId ? { agentId: id } : {}) }
   })
+  on('turn.step', async function* (_$: any, e: any) {
+    calls.steps.push(e)
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: script.stepUsage(e) }
+  })
+  // The engine's own verdict on a tool call: allowed (bypass mode).
+  on('tool.check', () => ({ decision: 'allow' }))
+  on('model.complete', async (_$: any, e: any) => {
+    calls.completes.push(e)
+    return { value: await script.complete(e) }
+  })
+  on('session.model', () => ({ value: script.sessionModel }))
+
   on('agent.offer', () => ({ isOffered: true }))
   on('turn.complete', (_$: any, e: any) => ({ text: e.answer }))
   on('tool.call', async ($: any, e: any) => {
+    // `$.ui.ask` is a call of the AskUserQuestion tool beneath the hooks.
+    if (e.tool === 'AskUserQuestion') {
+      const q = e.questions?.[0] ?? {}
+      const options = (q.options ?? []).map((o: any) => o.label)
+      calls.asked.push({ question: q.question, options })
+      const answer = await script.ask(q.question, options)
+      return { result: { questions: e.questions, answers: { [q.question]: answer } }, text: String(answer) }
+    }
     calls.tool.push(e)
     await script.duringTool($, e)
     return script.toolResult(e)
