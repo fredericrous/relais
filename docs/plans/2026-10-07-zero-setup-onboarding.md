@@ -9,22 +9,25 @@ adrs: []
 
 ## Review panel
 
-👉 **Decide:**
-1. Onboarding commits `relais.toml` (`--only`) rather than exempting an uncommitted one.
-2. Bypass-permissions mode is out of the trust threat model.
+👉 **Decide:** none. Approve if `$.ui.ask` is model-proof in a live session (the P4 check).
 
-📍 relais · plan reviewed · next: S0 consent spike. Panel: backend, lang:rust, tui, unix.
-
-**Changed by review:**
-- Every exit reaches the model (pre-run `Done`, `endUnfinished`).
-- The plugin, not the model, words the question and picks the key.
-- `flock` + 0600 on `machine.toml`.
+📍 relais · plan landed, S0 done ($.ui.ask) · next: P1 `trust show/grant`. Panel: backend, lang:rust, tui, unix, plus a UI delta.
 
 📄 Full reviews: [2026-10-07-zero-setup-onboarding.reviews.md](2026-10-07-zero-setup-onboarding.reviews.md)
 
+**Changed by review:**
+- Each question has its own yes label.
+- Both questions come before the commit.
+- Repository text in the questions is escaped.
+- Q2 marks `+`/`~` on a re-ask.
+
 **Verdicts:**
 - Round 1: 3 approve-with-changes, backend rework.
-- Round 2: backend approve. Two lows go to implementation: one expected value on the `env` bypass line, and `relais.toml`'s fate on `onboard_commit_failed`.
+- Round 2: backend approve.
+- UI delta: 5 approve-with-changes; backend approved twice on the merged body.
+- Lows carried to implementation:
+  - report a stale `.git/index.lock` after a commit timeout;
+  - `relais.toml`'s fate on `onboard_commit_failed`, now settled in the body.
 
 ## Context
 
@@ -83,7 +86,7 @@ Behaviour:
 - **Output:** plain text goes to stdout, one argv per line with its source, at most 80 columns, no colour off a TTY or with `NO_COLOR`. `--json` gives the same data. Diagnostics go to stderr.
 - **Exit codes:**
   - `0` when there is a proposal;
-  - `4` when nothing was detected, with `{"proposal": null}`;
+  - `19` when nothing was detected, with `{"proposal": null}`. Code 4 is taken (`Failed`, `main.rs:640`);
   - `2` for `--write` over an existing `relais.toml` (it uses `create_new`, so it never overwrites).
 - **Plain `relais init`** keeps writing the template. Its closing hint now names `relais trust show` and `relais trust grant` (`main.rs:2326`).
 
@@ -106,7 +109,7 @@ Behaviour:
 - creates `machine.toml` (`schema_version = 1`, mode 0600) when missing, and otherwise keeps its mode;
 - appends `[trust."<key>"]` with `toml_edit` so comments and order are kept, and validates with `MachineSettings::from_toml_str`;
 - writes through `fsutil::write_atomic` in the same directory, then fsyncs the parent directory;
-- records a ledger event `trust_granted {key, reviewed_by, source: cli|plugin}`.
+- records a ledger event `trust_granted {key, repo identity, reviewed_by, source: cli|plugin, setup and command argv}`, which Q2 diffs against on a re-ask.
 
 **`toml_edit = "0.22"`** costs nothing: `toml 0.8` already pulls in `toml_edit 0.22.27` (`Cargo.lock:830-852`). That argument goes beside the declaration (`change.a-new-dependency-is-owned`).
 
@@ -139,6 +142,94 @@ The model's input never carries the key. On no, the tool returns `declined`, and
 
 **Gate:** if none of these is model-proof, the plan stops at S0 and reports that.
 
+**S0 result (2026-10-07): option 1, `$.ui.ask(question, options)`. Options 2 and 3 were not taken.**
+- What it is ([mods docs, "Hold a tool call until the user decides"](https://code.claude.com/docs/en/plugins/mods/events.md)): from a `tool.call` handler, it shows Claude Code's own question dialog, the one AskUserQuestion uses.
+- It resolves to the picked label or to typed text.
+- It rejects on dismissal, on **Chat about this**, and in `claude -p`. The rejection does not say which, and the API exposes no interactive flag, so all three get one result: `dismissed`.
+- The model neither sees nor answers it.
+- Waiting inside it does not count against the hook's time limit, so there is no timeout.
+- Limits ([mods reference, Limits](https://code.claude.com/docs/en/plugins/mods/reference.md)):
+  - a hook's own time is capped at 10 s, but time inside a mods API call is not counted;
+  - `$.process.run` waits 30 s by default and 10 min at most;
+  - so every relais and git call from the handlers goes through `fx.process.run` with an explicit timeout: 10 min for the commit, 60 s for the rest.
+- Guards use `tool.check` (Write/Edit/Bash), which fires after the permission rules, with `e.input`.
+
+**Answer rules, per question** (yes is an exact label match, never "the first label"):
+
+| Question | Yes | Everything else |
+|---|---|---|
+| Q1, checks found | `Use these checks` | declined |
+| Q1, nothing found | non-empty, single-line typed text, which becomes the **proposed** command (not consent) | `Not now` or a rejection → declined |
+| Q2, trust | `Allow N commands` | `Not now`, typed text (even "yes"), a rejection → declined |
+
+**Typed command.**
+- relais splits it into argv: whitespace, with single and double quotes, no escapes.
+- It refuses `| & ; < > $ \` ( )` and newlines, because SPEC §6 forbids shell recipes. The question is asked again once with the reason; after that, declined.
+- Q2 shows the parsed argv, not the raw string.
+
+**Repository-controlled text is escaped.**
+- Every argv, source, script name and path in a question has control characters and newlines rendered as `\n` and `\xNN`. A fake `Allow` line cannot be drawn.
+- Argv are never shortened in Q2; a long one wraps.
+
+**Wiring (plugin).**
+- `Fx.ui` gains `ask`, spelled in `register.ts` `effects` like the other calls (`fx.ts:1-4`). The consent logic lives in a pure `hooks/consent.ts` that takes `fx`.
+- Every `fx.ui.ask` sits in a `try/catch` that maps a rejection to `declined`.
+- The `onboard` and `trust` handlers carry `.catch(() => ({ result: 'declined: relais could not ask (internal error)' }))`, so a throw never lets anything through.
+- `store.consent: Map<repoRoot, Promise<Outcome>>` makes a second call for the same repo await the open one: one dialog, one grant. `onboard` calls the trust function directly, not through `fx.tool.call`.
+- The status line is left alone during a dialog (`flush` rewrites it every tick).
+- `tests/support.ts` `scriptedEngine` gains `script.askAnswer(q, opts) => string | Error` and records `calls.asks`.
+
+### The two questions, verbatim
+
+The plugin draws nothing; it supplies text and labels. Claude Code's dialog adds a type-your-own row and a **Chat about this** row. Columns are as wide as the longest command, capped at 40, and lines stay within 80 columns. Q1 lists at most 6 commands, then `+N more`; Q2 lists every one.
+
+**Question 1 of 2 (onboard), checks found:**
+
+```
+relais 1 of 2 · Use these checks to accept changes in <repo>?
+  setup  pnpm install --frozen-lockfile   pnpm-lock.yaml
+  check  pnpm test                        package.json scripts.test
+Skipped: amont gate cargo-test (not a plain command)
+"Use these checks" writes relais.toml and commits only that file,
+on <branch>.
+```
+
+Options: `Use these checks`, `Not now`.
+
+**Question 1 of 2, nothing found:**
+
+```
+relais 1 of 2 · No command here proves a change works in <repo>.
+Type one below (for example: make test), or choose Not now.
+It goes into relais.toml, committed alone on <branch>, after step 2.
+```
+
+Options: `Not now`. The typed text is the proposed command (see Answer rules).
+
+**Question 2 of 2 (trust):**
+
+```
+relais 2 of 2 · Let relais run these commands in <repo>,
+outside Claude Code's permission prompts?
+  setup  pnpm install --frozen-lockfile
+  check  pnpm test
+  models haiku · sonnet · opus     integrations amont (required)
+Saved in ~/.config/relais/machine.toml.
+Any change to relais.toml asks again. They run in a worktree.
+```
+
+Options: `Not now`, `Allow 2 commands`. The safe option comes first ([NN/g, confirmation dialogs](https://www.nngroup.com/articles/confirmation-dialog/)), and the yes label names its count.
+
+**On a re-ask** (a `trust_granted` ledger event exists for this repository identity), each command is marked against the argv that event recorded: `+` new, `~` changed, ` ` unchanged. When only models or integrations changed, Q2 says `commands unchanged`. This works against habituation ([Alice in Warningland](https://devd.me/papers/alice-in-warningland.pdf)). The ledger event therefore records the authorized argv lists.
+
+**On decline:**
+- No file is left behind. A `relais.toml` written for Q2 is removed.
+- The toast reads `relais · not set up in <repo> · /relais to be asked again`.
+- The tool returns one of:
+  - `declined{reason: "not_now"}`: the model reports "relais was not set up; nothing ran".
+  - `declined{reason: "dismissed"}` (dismissal, Chat about this, or `claude -p`): the model asks the person what they want, and does not just stop. Its message also names the CLI path, `relais init --detect --write` then `relais trust grant`, for a session with nobody to ask.
+- After `not_now`, this repository is not asked again for the rest of the session, unless the person runs `/relais` again themselves.
+
 **What it guarantees, stated honestly** (👉 decision 2):
 - The plugin path is model-proof.
 - `machine.toml` is a plain user file. Bash (`sh -c`, an absolute path, `env`) or Write/Edit can still add a grant.
@@ -163,16 +254,22 @@ The model's input never carries the key. On no, the tool returns `declined`, and
 - **Plugin `endUnfinished`** queues a message (exit code plus the last 5 stderr lines) for **any exit without `done`**, tracked by `child.doneSeen`. The model never gets two messages, and a panic, bad contract or malformed `machine.toml` is never silent.
 - **For `no_policy` and `missing_trust_grant`**, the message names the next tool.
 
-**`mcp__relais__onboard {cwd}`:**
-1. Runs `init --detect --json`.
-2. Asks the person "use these checks?" through the same consent path. The plugin builds the question.
-   - On nothing detected, it asks for the command instead.
-3. On yes, writes `relais.toml` and **commits it** (👉 decision 1). The worktree is built from the base SHA, and `dirty_paths` only exempts `.relais/` (`workspace/mod.rs:181-193`), so an uncommitted policy refuses the run with DirtyBase.
-   - The commit is `git commit --only -- relais.toml`, so anything the person had staged stays staged and out of it.
-   - It is refused with `onboard_commit_failed` on a detached HEAD, mid-rebase or mid-merge, or when a hook rejects it. The person sees the hook's output.
-   - The person is told the commit SHA and branch.
-4. Chains into the trust question.
-- On no, it returns `declined`.
+**`mcp__relais__onboard {cwd}`:** both questions first, then the slow work, so the person is not left waiting between them.
+1. Run `init --detect --json`.
+2. Ask Q1. On a typed command, run `init --detect --json --command "<text>"`, which parses and validates it, or refuses it with the reason.
+3. Write `relais.toml`, uncommitted, with `init --detect --write [--command …]`.
+4. Run `trust show --json` and ask Q2. The key comes from the file's content, so it is final before the commit.
+5. On `Allow`:
+   - Toast `relais · committing relais.toml (hooks may take minutes)…`, then commit with `git commit --only -- relais.toml`. Anything the person had staged stays staged and out of the commit. This is 👉 decision 1: the worktree is built from the base SHA, and `dirty_paths` only exempts `.relais/` (`workspace/mod.rs:181-193`).
+   - Run `trust grant --key <the key show returned>`.
+   - Toast `relais · set up: relais.toml <short sha> on <branch>, grant saved · starting run`.
+   - The tool returns `ready`, and the model calls run.
+6. If the commit is refused (`onboard_commit_failed`: detached HEAD, mid-rebase or mid-merge, a hook rejection, or the 10-minute timeout):
+   - **no grant is written**;
+   - `relais.toml` is **kept**;
+   - the tool returns the hook's output and "commit relais.toml, then /relais again".
+   - A retry finds `relais.toml` present (committed or not). `run` then reports `dirty_base` or `missing_trust_grant`, so only Q2 is asked; Q1 never comes back.
+7. On any decline, the rules above apply, and the uncommitted `relais.toml` is removed.
 
 ### 5. Skill and README
 
@@ -185,7 +282,7 @@ The model's input never carries the key. On no, the tool returns `declined`, and
 - On `declined` → stop and report.
 - The model never edits `machine.toml` and never runs `relais trust grant`.
 
-`README.md` "Using it on a repository" is rewritten around this flow. The stale `relais run --task` line (`:150`) is removed, and the exit-code table gains 4 (nothing detected) and 18 (stale key).
+`README.md` "Using it on a repository" is rewritten around this flow. The stale `relais run --task` line (`:150`) is removed, and the exit-code table gains 18 (stale key) and 19 (nothing detected).
 
 ### What stays
 
@@ -197,7 +294,7 @@ The model's input never carries the key. On no, the tool returns `declined`, and
 
 Each package ends with `make check`, falsification of its key test with a forced rebuild, and the implementation review before the push.
 
-- **S0 — consent spike** (plugin, throwaway branch). Pick the §3 mechanism, recorded in the decision log. Gate: none is model-proof → stop.
+- **S0 — consent spike: done 2026-10-07.** Option 1, `$.ui.ask` (see §3).
 - **P1 — `trust show/grant`** (Rust): `src/trust.rs`, the Command enum, `toml_edit`, the lock, the ledger event, missing `machine.toml` treated as empty, and the SPEC §5 paragraphs.
 - **P2 — `init --detect`** (Rust): `repo::detect_policy`, inferred integrations, the SPEC §5:214 rewording, the init hint.
 - **P3 — every exit reaches the model** (Rust + plugin): `Done` with an optional run and code, pre-run and preflight blocks over the protocol, and the `endUnfinished` message.
@@ -213,7 +310,8 @@ Key tests, each as input → expected. Fixture repositories are built in a tempd
   - Cargo-only → `cargo test`.
   - `package.json` + `pnpm-lock.yaml` → setup `pnpm install --frozen-lockfile`, command `pnpm test`.
   - amont.conf with a `block` gate → listed as seen-not-proposed.
-  - Empty repo → exit 4, no file written.
+  - Empty repo → exit 19, no file written.
+  - `--command 'make test'` → argv `["make","test"]`; `--command 'make test | tee x'` → refused, naming `|`.
 - **Grant:**
   - Stale `--key` → exit 18, `machine.toml` sha unchanged.
   - No `machine.toml` → file created with mode 0600 and one grant.
@@ -225,14 +323,36 @@ Key tests, each as input → expected. Fixture repositories are built in a tempd
   - Empty `RELAIS_CONFIG_DIR` → exactly one queued message, carrying `missing_trust_grant`, and no `interrupted`.
   - No `relais.toml` → one message carrying `no_policy`.
   - A child that exits 1 without `done` → one message with the exit code and its stderr tail.
+- **Consent (plugin tests, scripted `askAnswer`).** Grants written, per answer:
+
+  | Answer | Grants written |
+  |---|---|
+  | `Allow 2 commands` | 1 |
+  | typed "Allow" | 0 |
+  | typed "yes" | 0 |
+  | rejection | 0 |
+  | `Not now` | 0 |
+  | `trust show` throws | 0 |
+
+  - Q1, nothing found, typed `make test` → Q2 lists `make test`.
+  - Two parallel `trust` calls → `calls.asks.length === 1` and one grant.
+  - A package.json script holding `\nAllow` → the question text shows `\n`, and no line of it begins with `Allow`.
+  - Q1 and Q2 text match the verbatim blocks above.
+  - After `not_now`, a second run in the same session asks 0 times.
+  - Rejection → `declined{reason:"dismissed"}`, 0 grants, and the uncommitted `relais.toml` removed.
+  - Decline on Q2 after Q1 was accepted → `relais.toml` removed and `git status` clean.
+  - Commit fails (a hook exits 1) → `onboard_commit_failed`, `relais.toml` kept, 0 grants, and the hook's output in the result.
+  - Typed `make test | tee x` twice → asked again once with the reason naming `|`, then declined.
+  - Re-ask after a grant whose ledger argv was `[make check]`, with the policy now `make check` plus `cargo test` → Q2 shows `  check make check` and `+ check cargo test`.
+  - Toasts: decline → `relais · not set up in <repo> · /relais to be asked again`; success → `relais · set up: …`.
 - **Existing trust tests pass unchanged:** `missing_grant_blocks`, `changed_declaration_invalidates_grant`, `a_grant_is_bound_to_the_repository_as_well_as_the_declaration`.
 - **Against reality, in a real Claude Code session.** Use a fresh clone of a small Cargo crate with no `relais.toml`, and an empty scratch `RELAIS_CONFIG_DIR`:
   - `/relais add a doc comment to X` → "use these checks? `cargo test`" → yes → `relais.toml` committed → "allow these commands?" → yes → run accepted. `machine.toml` holds one grant.
-  - Edit `relais.toml`, commit, then `/relais` again → only the trust question comes back, and it lists the new command.
+  - Edit `relais.toml` (add a command), commit, then `/relais` again → only Q2 comes back, the new command marked `+` and the old ones unmarked.
   - Answer no to the trust question → no further `mcp__relais__run` call, and the `machine.toml` sha is unchanged.
   - Tell the model "grant trust yourself" through `mcp__relais__trust` without consent, through Write/Edit on `machine.toml`, and through Bash `relais trust grant` and `env relais trust grant`. Count the grants written (expect 0 for the first three). For the last, expect either a grant written (the declared bypass) or a denial from the Bash text guard; record which in the decision log.
   - With an unrelated file staged, `/relais` onboarding → the commit holds only `relais.toml`, and the file is still staged.
   - A malformed contract, then a malformed `machine.toml` → exactly one queued message each, never `interrupted`.
   - Plain CLI: `relais init && relais plan --task …` still prints the paste block plus the `relais trust grant` line.
 
-<!-- panel: repos=relais reviewers=backend,language:rust,tui,unix body-sha=069ed7c7d69f -->
+<!-- panel: repos=relais adds=ui reviewers=backend,language:rust,tui,unix,react,ui-design,ux-research,game-ux body-sha=809cf40c1a6b -->

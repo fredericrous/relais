@@ -47,3 +47,53 @@
 - **plan-review-backend, final bind: approve** (24k tokens, 15 s). Two lows carried to implementation:
   - the `env` bypass line should state one expected value (1 grant plus a decision-log entry);
   - on `onboard_commit_failed`, keep `relais.toml` and tell the person to commit it, or remove it — choose one.
+
+### UI delta (2026-10-07, after S0 picked `$.ui.ask`; the person chose to run it)
+
+- **backend: approve-with-changes** (32k tokens, 30 s). Findings, all applied:
+  - [blocking] The first-label yes rule made `Not now` a yes.
+  - [high] Typed text was both a decline and the answer.
+  - [medium] "Timeout" contradiction.
+  - [medium] Rejection paths.
+  - [medium] Escape repository-controlled text.
+  - [medium] UI verification rows.
+  - [low] Mark S0 done.
+- **game-ux: approve-with-changes** (28k tokens, 27 s). Findings, all applied:
+  - Same yes-rule finding.
+  - [high] ~9-minute gap between the questions → both questions first.
+  - [medium] Confirmation after Allow.
+  - [medium] Label/text mismatch.
+  - [medium] Chat about this.
+  - [low] How to resume.
+  - [low] "1 of 2".
+- **ui-design: approve-with-changes** (29k tokens, 39 s). Findings, all applied:
+  - Same yes-rule finding.
+  - [high] Q2 must list models and integrations.
+  - [medium] Q1 phrased as a question, with "Skipped".
+  - [medium] Q2 puts the risk first.
+  - [medium] Discuss vs decline.
+  - [medium] No re-ask in the session.
+  - [low] Toast style.
+  - [low] 80 columns.
+- **ux-research: approve-with-changes** (37k tokens, 48 s). Findings, all applied:
+  - Same yes-rule finding, plus a shell-style split that refuses metacharacters.
+  - [medium] Re-ask habituation → `+`/`~` marks (Alice in Warningland).
+  - [medium] Safe option first (NN/g).
+  - [low] `Allow N commands`.
+  - Kept as is:
+    - [low] two questions are not backed by research → measure command recall;
+    - [low] jargon → "Skipped … (not a plain command)".
+- **react: approve-with-changes** (43k tokens, 39 s). Findings, all applied:
+  - [high] `Fx.ui.ask` wiring.
+  - [high] Fail closed (`try/catch` + `.catch`).
+  - [medium] Per-repository `store.consent`.
+  - [medium] Answer rules.
+  - [low] Timeout.
+  - [low] Status overwritten.
+  - [medium] Scripted `askAnswer`.
+- **backend, re-bind: approve-with-changes** (33k tokens, 31 s). Applied:
+  - `no_ui` cannot be detected → folded into `dismissed`.
+  - The commit inside the handler, against the mods limits → `fx.process.run`, 10 min.
+  - Re-ask expected value.
+  - Missing rows.
+- **backend, final bind: approve** (25k tokens, 18 s). Two lows: a stale `index.lock` after a timeout (carried to implementation), and the verdicts line (fixed).
