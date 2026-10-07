@@ -212,15 +212,26 @@ pub enum Request<'a> {
         dispatch: &'a str,
         agent: &'a str,
     },
-    /// The run ended.
+    /// The run ended — or, with `run: None`, it never started: the
+    /// policy, the machine settings, the contract or admission refused it
+    /// before a run id existed. Every `relais run --protocol` that exits
+    /// sends exactly one of these, so the plugin always has an outcome to
+    /// hand the model.
     Done {
-        run: &'a str,
+        run: Option<&'a str>,
         outcome: &'a str,
         receipt: Option<&'a str>,
         summary: Option<Summary>,
         /// The replay trial a `relais dataset replay` recorded for this run.
         #[serde(skip_serializing_if = "Option::is_none")]
         trial: Option<&'a str>,
+        /// Why it ended where it did, by name: a block code
+        /// (`missing_trust_grant`, `no_policy`, …) or a decision reason.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code: Option<&'a str>,
+        /// The same sentence the CLI prints on stderr.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<&'a str>,
     },
 }
 
@@ -273,6 +284,15 @@ impl Summary {
     }
 }
 
+/// Whether this process has sent its `done` line on its own protocol
+/// stdout — what `main` reads to send one for a run that ended before
+/// the runner could.
+static DONE_SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn done_sent() -> bool {
+    DONE_SENT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Where protocol lines go: the process's real stdout once [`install`] has
 /// kept it, or a sink a test reads. One writer per wire, so lines never
 /// interleave.
@@ -304,7 +324,11 @@ impl Wire {
     /// Write one request line.
     pub fn send(&self, request: &Request<'_>) -> io::Result<()> {
         let line = serde_json::to_string(request).map_err(io::Error::other)?;
-        self.write_line(&line)
+        self.write_line(&line)?;
+        if self.0.is_none() && matches!(request, Request::Done { .. }) {
+            DONE_SENT.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     fn write_line(&self, line: &str) -> io::Result<()> {
@@ -838,7 +862,7 @@ mod tests {
         })
         .expect("sent");
         wire.send(&Request::Done {
-            run: "r",
+            run: Some("r"),
             outcome: "accepted",
             receipt: None,
             summary: Some(Summary {
@@ -847,6 +871,8 @@ mod tests {
                 deletions: 3,
             }),
             trial: None,
+            code: None,
+            detail: None,
         })
         .expect("sent");
         let written: Vec<Vec<u8>> = rx.try_iter().collect();
@@ -858,6 +884,10 @@ mod tests {
         assert_eq!(done["relais"], "done");
         assert_eq!(done["summary"]["deletions"], 3);
         assert!(done["receipt"].is_null());
+        assert!(
+            done.get("code").is_none(),
+            "absent, not null, when there is none"
+        );
         assert!(written.iter().all(|line| line.ends_with(b"\n")));
     }
 

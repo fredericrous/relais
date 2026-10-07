@@ -29,6 +29,16 @@ import {
 
 const STATUS_TIMEOUT_MS = 10_000
 const MAX_SUMMARY = 4000
+const STDERR_TAIL = 5
+
+// What the model does next when a run is refused for a reason it can fix
+// with the person: the tool that asks them.
+const NEXT_STEP: Record<string, string> = {
+  no_policy:
+    'This repository has no relais.toml yet. Call mcp__relais__onboard with this cwd: it asks the person which checks to use and whether relais may run them, then call mcp__relais__run again.',
+  missing_trust_grant:
+    "The person has not allowed this repository's commands yet. Call mcp__relais__trust with this cwd: it shows them the exact commands and asks; then call mcp__relais__run again.",
+}
 
 // One tick of the session's timer: sends the verdicts waiting, then writes
 // the pane's state if anything changed.
@@ -134,6 +144,7 @@ function onStderr(store: Store, child: Child, carry: Carry, text: string, now: n
 }
 
 function addStderr(store: Store, child: Child, text: string, now: number) {
+  child.stderrTail = [...(child.stderrTail ?? []), text].slice(-STDERR_TAIL)
   const model = store.models[child.key] ?? emptyRun(child.key, now)
   store.models = { ...store.models, [child.key]: applyEvent(model, { kind: 'stderr', text }, now) }
 }
@@ -186,8 +197,11 @@ function onEvent(store: Store, child: Child, line: any, now: number) {
 }
 
 async function onDone(fx: Fx, store: Store, child: Child, line: any, now: number) {
+  child.doneSeen = true
   const run = typeof line.run === 'string' ? line.run : child.key
   const outcome = String(line.outcome ?? 'ended')
+  const code = typeof line.code === 'string' ? line.code : null
+  const detail = typeof line.detail === 'string' ? line.detail : null
   const receipt = typeof line.receipt === 'string' ? line.receipt : null
   const model = store.models[run]
   if (model && isLive(model)) {
@@ -197,11 +211,18 @@ async function onDone(fx: Fx, store: Store, child: Child, line: any, now: number
   markDirty(store)
   toastOutcome(fx, run, outcome, receipt)
   const trial = typeof line.trial === 'string' ? line.trial : null
+  const why = code ? ` (${code})${detail ? `: ${detail}` : ''}` : detail ? `: ${detail}` : ''
+  // `run: null`: refused before a run existed, so there is no id to name.
+  const headline =
+    typeof line.run === 'string'
+      ? `relais ${trial ? 'replay' : 'run'} ${run} finished: ${outcome}${why}.`
+      : `relais ${trial ? 'replay' : 'run'} ${outcome}${why}. Nothing ran.`
   const text = [
-    `relais ${trial ? 'replay' : 'run'} ${run} finished: ${outcome}.`,
+    headline,
     receipt ? `Receipt: ${receipt}` : '',
     summaryText(line.summary),
     trial ? `Replay trial: ${trial}` : '',
+    code ? NEXT_STEP[code] ?? '' : '',
   ]
     .filter(Boolean)
     .join('\n')
@@ -218,8 +239,22 @@ export function summaryText(summary: unknown): string {
   return changed ? `Changed: ${changed}`.slice(0, MAX_SUMMARY) : ''
 }
 
-// A child that exited with its run still live was cut off.
+// A child that exited with its run still live was cut off. One that exited
+// without a `done` line at all (a panic, a refusal before the protocol was
+// up) still tells the model: the skill waits for an outcome, and silence
+// would leave it waiting.
 function endUnfinished(store: Store, child: Child, code: number | null, now: number) {
+  if (!child.doneSeen) {
+    const tail = (child.stderrTail ?? []).join('\n')
+    store.verdicts.push(
+      [
+        `relais exited${code === null ? '' : ` with code ${code}`} without an outcome. Nothing was accepted.`,
+        tail ? `Its last output:\n${tail}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    )
+  }
   const model = store.models[child.key]
   if (!model || !isLive(model)) return
   const state = code === 0 ? 'ended' : 'interrupted'

@@ -65,6 +65,22 @@ pub enum Terminal {
 }
 
 impl Terminal {
+    /// The name and sentence of why the run ended where it did, for the
+    /// `done` line: a block code or a decision reason with its detail,
+    /// the detail alone for the other ends, nothing for an acceptance.
+    pub fn named_reason(&self) -> (Option<String>, Option<&str>) {
+        match self {
+            Self::Accepted(_) => (None, None),
+            Self::NeedsDecision { reason, detail } => (Some(reason.to_string()), Some(detail)),
+            Self::Blocked { code, detail } => (Some(code.to_string()), Some(detail)),
+            Self::NeedsReview { detail }
+            | Self::Failed { detail }
+            | Self::BudgetExhausted { detail }
+            | Self::Interrupted { detail }
+            | Self::Cancelled { detail } => (None, Some(detail)),
+        }
+    }
+
     pub fn state(&self) -> State {
         match self {
             Self::Accepted(_) => State::Accepted,

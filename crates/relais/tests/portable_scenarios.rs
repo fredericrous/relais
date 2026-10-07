@@ -1699,6 +1699,68 @@ fn rollback_of_a_single_revision_recipe_is_refused() {
     );
 }
 
+/// The `done` lines a `relais run --protocol` wrote on stdout.
+#[cfg(unix)]
+fn done_lines(stdout: &[u8]) -> Vec<serde_json::Value> {
+    text(stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|line| line["relais"] == "done")
+        .collect()
+}
+
+/// A run refused before it exists still sends exactly one `done` line,
+/// with `run: null` and the refusal by name, so the plugin can tell the
+/// model what to do instead of a bare exit code (SPEC §29).
+#[cfg(unix)]
+#[test]
+fn a_run_refused_before_it_starts_still_sends_one_done_line_naming_why() {
+    let world = World::new("proto-unstarted");
+    let task = world.write_task("task.json");
+    let plugin_run = |world: &World| {
+        Command::new(BIN)
+            .args(["run", "--task", task.to_str().unwrap(), "--protocol"])
+            .current_dir(&world.repo)
+            .env("RELAIS_STATE_DIR", &world.state)
+            .env("RELAIS_CONFIG_DIR", &world.config)
+            .env("RELAIS_CLAUDE_BIN", &world.claude)
+            .env("RELAIS_SESSION_ID", "tab-test")
+            .env("RELAIS_HOST", "claude-code-mod")
+            .env("HOME", &world.root)
+            .output()
+            .expect("relais runs")
+    };
+    // No relais.toml in this repository yet.
+    let _ = std::fs::remove_file(world.repo.join("relais.toml"));
+    let run = plugin_run(&world);
+    let done = done_lines(&run.stdout);
+    assert_eq!(
+        done.len(),
+        1,
+        "{}\n{}",
+        text(&run.stdout),
+        text(&run.stderr)
+    );
+    assert!(done[0]["run"].is_null(), "{}", done[0]);
+    assert_eq!(done[0]["outcome"], "blocked");
+    assert_eq!(done[0]["code"], "no_policy", "{}", done[0]);
+    assert!(
+        done[0]["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("relais.toml"),
+        "{}",
+        done[0]
+    );
+
+    // A policy that does not parse is named too.
+    std::fs::write(world.repo.join("relais.toml"), "schema_version = 99\n").expect("policy");
+    let invalid = plugin_run(&world);
+    let done = done_lines(&invalid.stdout);
+    assert_eq!(done.len(), 1, "{}", text(&invalid.stderr));
+    assert_eq!(done[0]["code"], "invalid_policy", "{}", done[0]);
+}
+
 // SPEC §29: `--protocol` needs the descriptors of a Unix process; where it
 // cannot be honoured it is refused before anything runs, not ignored.
 #[cfg(windows)]

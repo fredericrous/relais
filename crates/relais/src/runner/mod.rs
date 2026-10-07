@@ -1190,12 +1190,15 @@ impl<'a> RunEngine<'a> {
             Some(crate::lifecycle::RunPurpose::TrialArm) | None => self.parent.is_none(),
         };
         if announces {
+            let (code, detail) = outcome.terminal.named_reason();
             let done = Request::Done {
-                run: self.run_id.as_str(),
+                run: Some(self.run_id.as_str()),
                 outcome: outcome.state().as_str(),
                 receipt: receipt.as_deref(),
                 summary,
                 trial: None,
+                code: code.as_deref(),
+                detail,
             };
             // Dropped on failure: the plugin that was reading is gone, the
             // run's outcome is in the ledger and in `events.jsonl`.

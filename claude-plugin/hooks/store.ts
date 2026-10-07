@@ -16,6 +16,11 @@ export type Child = {
   // The key of this child's run in `Store.models`: a placeholder until its
   // first event names the run.
   key: string
+  // Set by its `done` line. A child that exits without one still owes the
+  // model a message: the exit code and the end of its stderr.
+  doneSeen?: boolean
+  // The last stderr lines, for that message.
+  stderrTail?: string[]
 }
 
 export type Store = {

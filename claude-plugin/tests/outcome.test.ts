@@ -193,3 +193,57 @@ test('a child that exits with its run unfinished ends that run as interrupted', 
   const [run] = JSON.parse(reply.result)
   expect(run.outcome.state).toBe('interrupted')
 })
+
+test('a run refused before it started names why and the tool that fixes it', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.stream.push(
+    'stdout',
+    line({ relais: 'done', run: null, outcome: 'blocked', receipt: null, summary: null, code: 'no_policy', detail: 'no relais.toml in the repository at /repo' }),
+  )
+  engine.stream.end(2)
+  await settle(engine)
+  await tick(engine)
+  expect(engine.calls.prompts.length).toBe(1)
+  const text = engine.calls.prompts[0].text
+  expect(text).toContain('relais run blocked (no_policy): no relais.toml in the repository at /repo. Nothing ran.')
+  expect(text).toContain('mcp__relais__onboard')
+  expect(text).not.toContain('starting-')
+})
+
+test('a missing trust grant points the model at the trust tool', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.stream.push(
+    'stdout',
+    phase(0, 'running') + done('blocked', { receipt: null, summary: null, code: 'missing_trust_grant', detail: 'no trust grant for this execution declaration' }),
+  )
+  engine.stream.end(3)
+  await settle(engine)
+  await tick(engine)
+  expect(engine.calls.prompts.length).toBe(1)
+  const text = engine.calls.prompts[0].text
+  expect(text).toContain(`relais run ${RUN} finished: blocked (missing_trust_grant): no trust grant`)
+  expect(text).toContain('mcp__relais__trust')
+})
+
+test('a child that exits without a done line still tells the model, once, with its last output', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.stream.push('stderr', 'one\ntwo\nthree\nfour\nfive\nsix\nthread main panicked at src/main.rs:1\n')
+  engine.stream.end(101)
+  await settle(engine)
+  await tick(engine)
+  expect(engine.calls.prompts.length).toBe(1)
+  const text = engine.calls.prompts[0].text
+  expect(text).toContain('relais exited with code 101 without an outcome')
+  expect(text).toContain('thread main panicked')
+  expect(text).not.toContain('one\n')
+})
+
+test('a done line followed by the exit sends exactly one message', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.stream.push('stdout', phase(0, 'running') + phase(1, 'accepted') + done())
+  engine.stream.end(0)
+  await settle(engine)
+  await tick(engine)
+  await tick(engine)
+  expect(engine.calls.prompts.length).toBe(1)
+})

@@ -811,6 +811,26 @@ impl std::error::Error for CliError {
 }
 
 impl CliError {
+    /// The name a `done` line gives this failure when it ends a
+    /// `relais run --protocol` before any run exists (SPEC §29).
+    fn wire_code(&self) -> &'static str {
+        match self {
+            CliError::Locate(relais::repo::LocateError::RepoWithoutPolicy(_)) => "no_policy",
+            CliError::Locate(relais::repo::LocateError::NotInRepository(_)) => "not_in_repository",
+            CliError::Read { what, .. } | CliError::Invalid { what, .. } => match *what {
+                "the repository policy" => "invalid_policy",
+                "the machine settings" => "invalid_machine_settings",
+                _ => "invalid_input",
+            },
+            CliError::Home(_) | CliError::Cwd(_) => "environment",
+            CliError::Usage { .. } => "refused",
+            CliError::NoDataset { .. }
+            | CliError::Amend(_)
+            | CliError::AppendPolicy { .. }
+            | CliError::Operational { .. } => "operational_failure",
+        }
+    }
+
     /// The exit code this failure ends the process with. Exhaustive: a
     /// new variant has to say which half of the table it belongs to.
     fn outcome(&self) -> CliOutcome {
@@ -865,9 +885,17 @@ fn main() {
     let dispatched =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(cli.command)));
     let outcome = match dispatched {
-        Ok(Ok(outcome)) => outcome,
+        Ok(Ok(outcome)) => {
+            if channel.is_some() {
+                announce_unstarted(outcome, None);
+            }
+            outcome
+        }
         Ok(Err(e)) => {
             eprintln!("relais: {e}");
+            if channel.is_some() {
+                announce_unstarted(e.outcome(), Some(&e));
+            }
             e.outcome()
         }
         Err(panic) => {
@@ -881,6 +909,50 @@ fn main() {
         channel.close();
     }
     std::process::exit(exit_code(&outcome));
+}
+
+thread_local! {
+    /// The refusal a `relais run --protocol` printed before any run
+    /// existed, for the `done` line `main` sends in its place.
+    static REFUSAL: std::cell::RefCell<Option<(&'static str, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Print a refusal that ends `relais run` before a run exists, and keep
+/// it for the `done` line (see [`announce_unstarted`]).
+fn refuse_run(code: &'static str, detail: String, outcome: CliOutcome) -> CliOutcome {
+    eprintln!("relais run: blocked ({code}): {detail}");
+    REFUSAL.with(|refusal| *refusal.borrow_mut() = Some((code, detail)));
+    outcome
+}
+
+/// Every `relais run --protocol` (and `dataset replay --protocol`) that
+/// exits sends one `done` line: the runner sends it for a run that
+/// started; this sends it, with `run: null`, for one refused before it
+/// could — no policy, unreadable settings, a bad contract, admission.
+/// Without it the plugin had only an exit code to tell the model.
+fn announce_unstarted(outcome: CliOutcome, error: Option<&CliError>) {
+    if relais::protocol::done_sent() || outcome == CliOutcome::Accepted {
+        return;
+    }
+    let kept = REFUSAL.with(|refusal| refusal.borrow_mut().take());
+    let (code, detail) = match (error, kept) {
+        (Some(e), _) => (e.wire_code(), e.to_string()),
+        (None, Some((code, detail))) => (code, detail),
+        (None, None) => (
+            "refused",
+            format!("relais exited with code {}", exit_code(&outcome)),
+        ),
+    };
+    let _ = relais::protocol::Wire::process().send(&relais::protocol::Request::Done {
+        run: None,
+        outcome: "blocked",
+        receipt: None,
+        summary: None,
+        trial: None,
+        code: Some(code),
+        detail: Some(&detail),
+    });
 }
 
 /// The protocol channel of `relais run --protocol` (SPEC §29): installed
@@ -3008,17 +3080,17 @@ fn run_command(
     let ledger = open_ledger()?;
     let task_override = match resolve_task_override(&ledger, &contract, revise) {
         Ok(task_override) => task_override,
-        Err(detail) => {
-            eprintln!("relais run: {detail}");
-            return Ok(CliOutcome::Blocked);
-        }
+        Err(detail) => return Ok(refuse_run("task_refused", detail, CliOutcome::Blocked)),
     };
     let artifacts_dir = paths::runs_dir().map_err(CliError::Home)?;
     let backend = match relais::adapter::claude::ClaudeBackend::discover() {
         Ok(backend) => std::sync::Arc::from(backend),
         Err(e) => {
-            eprintln!("relais run: {e}");
-            return Ok(CliOutcome::Blocked);
+            return Ok(refuse_run(
+                "backend_unavailable",
+                e.to_string(),
+                CliOutcome::Blocked,
+            ))
         }
     };
     // The three tools a run talks to, each behind the port this crate
@@ -3032,8 +3104,11 @@ fn run_command(
     // (SPEC §23).
     let socket = relais::coordinator::socket_path().map_err(CliError::Home)?;
     if let Err(e) = relais::coordinator::ensure_running(&socket) {
-        eprintln!("relais run: blocked (admission_unavailable): {e}");
-        return Ok(CliOutcome::Blocked);
+        return Ok(refuse_run(
+            "admission_unavailable",
+            e.to_string(),
+            CliOutcome::Blocked,
+        ));
     }
     let gate = relais::coordinator::RemoteGate::new(socket);
     // Before anything is dispatched: the plugin of this session is alive,
@@ -3046,8 +3121,11 @@ fn run_command(
         Ok(None) => {}
         Ok(Some(detail)) => return Err(CliError::Usage { detail }),
         Err(e) => {
-            eprintln!("relais run: blocked (admission_unavailable): {e}");
-            return Ok(CliOutcome::Blocked);
+            return Ok(refuse_run(
+                "admission_unavailable",
+                e.to_string(),
+                CliOutcome::Blocked,
+            ))
         }
     }
     // Learned routing reads the registry's active artifact, pinned for
@@ -3321,11 +3399,13 @@ fn announce_replay_done(artifacts_dir: &Path, run: &str, outcome: &str, trial: O
     // Dropped on failure: the plugin that was reading is gone, and the
     // replay's result is in the ledger.
     let _ = relais::protocol::Wire::process().send(&relais::protocol::Request::Done {
-        run,
+        run: Some(run),
         outcome,
         receipt: receipt.as_deref(),
         summary: relais::protocol::Summary::of_candidate(&artifacts),
         trial,
+        code: None,
+        detail: None,
     });
 }
 
