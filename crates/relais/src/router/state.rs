@@ -300,7 +300,8 @@ mod tests {
     #[test]
     fn rates_are_per_million_with_the_one_hour_write_and_null_when_unpriced() {
         let machine = machine(
-            "[pricing]\nversion = \"v\"\n[[pricing.models]]\nids = [\"claude-haiku-5-5\"]\n\
+            "[session_routing]\nmodel_ids = { opus = \"claude-mystery-9\" }\n\
+             [pricing]\nversion = \"v\"\n[[pricing.models]]\nids = [\"claude-haiku-5-5\"]\n\
              input = 1000000\noutput = 5000000\ncache_read = 100000\ncache_write_5m = 1250000\n\
              cache_write_1h = 2000000\n",
         );
@@ -314,9 +315,10 @@ mod tests {
                 cache_write: 2_000_000,
             })
         );
-        assert_eq!(state.rates["claude-opus-5-5"], None);
+        // A model neither machine.toml nor the built-in list prices.
+        assert_eq!(state.rates["claude-mystery-9"], None);
         let json = serde_json::to_value(&state).unwrap();
-        assert!(json["rates"]["claude-opus-5-5"].is_null());
+        assert!(json["rates"]["claude-mystery-9"].is_null());
     }
 
     #[test]
@@ -332,7 +334,11 @@ mod tests {
                 cache_write: 1_000_000,
             })
         );
-        assert_eq!(state.rates["claude-sonnet-5-5"], None);
+        // The other current models come from the built-in list too.
+        assert_eq!(
+            state.rates["claude-sonnet-5-5"].as_ref().map(|r| r.input),
+            Some(2_000_000)
+        );
     }
 
     #[test]

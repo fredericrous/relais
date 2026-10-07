@@ -92,22 +92,62 @@ impl PriceTable {
 /// The version recorded for a cost priced only from [`built_in_prices`].
 pub const BUILT_IN_PRICES_VERSION: &str = "relais built-in 2026-10-07";
 
-/// The built-in rates, micro-USD per million tokens.
-///
-/// claude-haiku-5-5: platform.claude.com/docs/en/about-claude/pricing,
-/// read 2026-10-07, the over-100k-prompt tier ($0.50 / $2.50 input /
-/// output), so a saving is never overstated.
+/// The built-in rates, micro-USD per million tokens, used where machine.toml
+/// prices no entry for a model (a machine.toml entry wins per model).
+/// Source: platform.claude.com/docs/en/about-claude/pricing, read
+/// 2026-10-07. Where the page gives two values, the lower-saving one is
+/// kept, so a switch's saving is never overstated:
+/// - claude-haiku-5-5: the over-100k-prompt tier ($0.50 / $2.50);
+/// - claude-sonnet-5-5: cache reads at 0.05x ($0.10), as the page's caching
+///   section states, not the $0.20 in its model table.
 pub fn built_in_prices() -> Vec<ModelPrice> {
-    vec![ModelPrice {
-        ids: vec!["claude-haiku-5-5".to_string()],
-        input: 500_000,
-        output: 2_500_000,
-        cache_read: 50_000,
-        cache_write_5m: 625_000,
-        cache_write_1h: 1_000_000,
-        fast_input: None,
-        fast_output: None,
-    }]
+    let price = |ids: &[&str], rates: [i64; 5], fast: Option<(i64, i64)>| ModelPrice {
+        ids: ids.iter().map(|id| id.to_string()).collect(),
+        input: rates[0],
+        output: rates[1],
+        cache_read: rates[2],
+        cache_write_5m: rates[3],
+        cache_write_1h: rates[4],
+        fast_input: fast.map(|f| f.0),
+        fast_output: fast.map(|f| f.1),
+    };
+    vec![
+        price(
+            &["claude-haiku-5-5"],
+            [500_000, 2_500_000, 50_000, 625_000, 1_000_000],
+            None,
+        ),
+        price(
+            &["claude-haiku-4-5", "claude-haiku-4-5-20251001"],
+            [1_000_000, 5_000_000, 100_000, 1_250_000, 2_000_000],
+            None,
+        ),
+        price(
+            &["claude-sonnet-5-5"],
+            [2_000_000, 10_000_000, 100_000, 2_500_000, 4_000_000],
+            None,
+        ),
+        price(
+            &["claude-sonnet-5"],
+            [2_000_000, 10_000_000, 200_000, 2_500_000, 4_000_000],
+            None,
+        ),
+        price(
+            &["claude-opus-5-5"],
+            [4_000_000, 20_000_000, 200_000, 5_000_000, 8_000_000],
+            Some((8_000_000, 40_000_000)),
+        ),
+        price(
+            &["claude-opus-5"],
+            [5_000_000, 25_000_000, 500_000, 6_250_000, 10_000_000],
+            Some((10_000_000, 50_000_000)),
+        ),
+        price(
+            &["claude-fable-5-1"],
+            [10_000_000, 50_000_000, 250_000, 12_500_000, 20_000_000],
+            None,
+        ),
+    ]
 }
 
 /// The result of pricing one usage record.
@@ -220,8 +260,10 @@ mod tests {
         }
         .with_built_in_defaults();
         assert_eq!(mine.version, "mine");
-        assert_eq!(mine.models.len(), 1);
+        // The machine's entry wins for its model; the other built-ins fill in.
         assert_eq!(mine.rate("claude-haiku-5-5").unwrap().input, 1);
+        assert_eq!(mine.models.len(), built_in_prices().len());
+        assert_eq!(mine.rate("claude-sonnet-5-5").unwrap().input, 2_000_000);
     }
 
     fn record(input: u64, output: u64, cache_read: u64, cache: CacheWrites) -> UsageRecord {

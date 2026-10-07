@@ -152,9 +152,9 @@ fn router_state_answers_in_shadow_and_never_creates_the_ledger() {
     assert_eq!(state["tiers"]["research"]["model"], "claude-haiku-5-5");
     assert_eq!(state["capability_table"]["version"], 1);
     assert_eq!(state["seed"].as_str().unwrap().len(), 16);
-    // haiku is priced from relais's built-in list; sonnet is not.
+    // The current models are priced from relais's built-in list.
     assert_eq!(state["rates"]["claude-haiku-5-5"]["input"], 500_000);
-    assert!(state["rates"]["claude-sonnet-5-5"].is_null());
+    assert_eq!(state["rates"]["claude-sonnet-5-5"]["input"], 2_000_000);
     assert!(
         !world.ledger_path().exists(),
         "router-state created the ledger"
@@ -567,7 +567,7 @@ fn the_report_prices_routing_spend_and_says_unknown_for_an_unpriced_model() {
     .unwrap();
     for (session, model, outcome) in [
         ("priced", "claude-haiku-5-5", "completed_verified"),
-        ("unpriced", "claude-opus-5-5", "completed_verified"),
+        ("unpriced", "claude-mystery-9", "completed_verified"),
     ] {
         let mut value: serde_json::Value =
             serde_json::from_str(&batch(session, "t1", outcome, model)).unwrap();
@@ -590,7 +590,7 @@ fn the_report_prices_routing_spend_and_says_unknown_for_an_unpriced_model() {
         "{text}"
     );
     assert!(
-        text.contains("held out: 1 session(s), 1 task(s), 1 completed; cost per completed task unknown (no [pricing.models] entry for claude-opus-5-5)"),
+        text.contains("held out: 1 session(s), 1 task(s), 1 completed; cost per completed task unknown (no [pricing.models] entry for claude-mystery-9)"),
         "{text}"
     );
     let json = world.relais(&["report", "--since", "2026-10-01", "--no-import", "--json"]);
