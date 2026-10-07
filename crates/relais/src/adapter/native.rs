@@ -384,18 +384,8 @@ impl<'a> NativeBackend<'a> {
         // no longer names the agent.
         let mut running: Option<String> = None;
         loop {
-            if spec
-                .cancel
-                .as_ref()
-                .is_some_and(|flag| flag.load(Ordering::SeqCst))
-            {
-                if let Some(agent) = &running {
-                    self.stop_agent(spec, agent);
-                }
-                return Awaited::Ended {
-                    ended: Ended::Cancelled,
-                    detail: "the dispatch was cancelled while the native worker ran".into(),
-                };
+            if let Some(cancelled) = self.cancelled(spec, running.as_deref()) {
+                return cancelled;
             }
             if started.elapsed() >= spec.wall_timeout {
                 // The attempt is over; an agent left running would go on
@@ -426,6 +416,15 @@ impl<'a> NativeBackend<'a> {
                 }
                 Ok((progress, hello_age)) => {
                     failures = 0;
+                    // A cancellation settles the dispatch, and can land
+                    // between the check above and this poll: a record gone
+                    // while the run is cancelled is that cancellation, not
+                    // a lost dispatch.
+                    if matches!(progress, NativeProgress::Finished | NativeProgress::Unknown) {
+                        if let Some(cancelled) = self.cancelled(spec, running.as_deref()) {
+                            return cancelled;
+                        }
+                    }
                     if let NativeProgress::Known {
                         state: NativeState::Bound { agent_id },
                     } = &progress
@@ -452,6 +451,25 @@ impl<'a> NativeBackend<'a> {
             }
             std::thread::sleep(ADMISSION_POLL);
         }
+    }
+
+    /// The attempt's end when its run has been cancelled: the agent, if one
+    /// was bound, is asked to stop. `None` while the run goes on.
+    fn cancelled(&self, spec: &LaunchSpec, running: Option<&str>) -> Option<Awaited> {
+        let is_cancelled = spec
+            .cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst));
+        if !is_cancelled {
+            return None;
+        }
+        if let Some(agent) = running {
+            self.stop_agent(spec, agent);
+        }
+        Some(Awaited::Ended {
+            ended: Ended::Cancelled,
+            detail: "the dispatch was cancelled while the native worker ran".into(),
+        })
     }
 
     /// What the coordinator knows now: the dispatch's record, and how long

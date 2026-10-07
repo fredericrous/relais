@@ -9,6 +9,7 @@ import { parseProtocolLine, splitLines } from './lines.ts'
 import {
   applyEvent,
   applyLine,
+  changedText,
   emptyRun,
   isLive,
   rebuildRuns,
@@ -190,7 +191,7 @@ async function onDone(fx: Fx, store: Store, child: Child, line: any, now: number
   const receipt = typeof line.receipt === 'string' ? line.receipt : null
   const model = store.models[run]
   if (model && isLive(model)) {
-    store.models = { ...store.models, [run]: applyEvent(model, { kind: 'outcome', state: outcome, receipt }, now) }
+    store.models = { ...store.models, [run]: applyEvent(model, { kind: 'outcome', state: outcome, receipt, summary: line.summary }, now) }
   }
   store.heldOutcome = `${shortId(run)} ${outcome}`
   markDirty(store)
@@ -213,12 +214,8 @@ async function onDone(fx: Fx, store: Store, child: Child, line: any, now: number
 // What relais's `done` says the candidate changed: an object
 // `{files_changed, insertions, deletions}`, or nothing.
 export function summaryText(summary: unknown): string {
-  if (typeof summary !== 'object' || summary === null) return ''
-  const { files_changed: files, insertions, deletions } = summary as Record<string, unknown>
-  if (typeof files !== 'number') return ''
-  const plus = typeof insertions === 'number' ? insertions : 0
-  const minus = typeof deletions === 'number' ? deletions : 0
-  return `Changed: ${files} file${files === 1 ? '' : 's'}, +${plus} -${minus}`.slice(0, MAX_SUMMARY)
+  const changed = changedText(summary)
+  return changed ? `Changed: ${changed}`.slice(0, MAX_SUMMARY) : ''
 }
 
 // A child that exited with its run still live was cut off.

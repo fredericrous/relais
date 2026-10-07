@@ -15,6 +15,26 @@ missing here.
   stayed at 0.1.1 because its job waited behind a repository variable that was
   never set; `brew upgrade relais` now follows the releases.
 
+### Fixed
+
+- `relais doctor` fails a Claude Code outside the range the relais plugin is
+  tested on (`>= 2.1.291, < 2.2.0`), or one whose version cannot be read, in
+  the words `relais run` refuses it with; it used to report any version as fine.
+- The relais pane's outcome row names what the candidate changed (`2 files, +5
+  -1`) beside the receipt: the run's `outcome` event, and the timeline
+  `relais native status` rebuilds from, now carry the change summary the `done`
+  line already had.
+- `relais install --claude --hooks` on a settings file whose relais hooks run a
+  relais binary at another path (an older install, a moved or Homebrew binary)
+  points them at this binary in place (`repoint`) instead of adding a second
+  set beside them, which ran every hook twice. A hand-formatted file it refuses
+  to rewrite now says that the hooks are already there and names the one
+  replacement to make, and no longer offers a block to paste.
+- A run cancelled while its native agent runs ends `cancelled`, as it should.
+  When the cancellation settled the dispatch between two of the backend's
+  checks, the run read the vanished record as a lost dispatch and ended
+  `interrupted` (seen on macOS CI).
+
 ## v0.10.0
 
 relais becomes a Claude Code plugin. Every agent a run dispatches (worker,

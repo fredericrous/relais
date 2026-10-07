@@ -1177,9 +1177,11 @@ impl<'a> RunEngine<'a> {
         let receipt = written
             .is_file()
             .then(|| written.to_string_lossy().into_owned());
+        let summary = Summary::of_candidate(&self.artifacts);
         self.events.emit(Event::Outcome {
             state: outcome.state().as_str().to_string(),
             receipt: receipt.clone(),
+            summary,
         });
         // A replay's `done` waits for its trial to be recorded: its caller
         // sends it (`relais dataset replay`).
@@ -1192,7 +1194,7 @@ impl<'a> RunEngine<'a> {
                 run: self.run_id.as_str(),
                 outcome: outcome.state().as_str(),
                 receipt: receipt.as_deref(),
-                summary: Summary::of_candidate(&self.artifacts),
+                summary,
                 trial: None,
             };
             // Dropped on failure: the plugin that was reading is gone, the

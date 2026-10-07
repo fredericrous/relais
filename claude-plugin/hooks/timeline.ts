@@ -55,7 +55,7 @@ export type RunModel = {
   agents: AgentRow[]
   decisions: Entry[]
   cost: Cost | undefined
-  outcome: { state: string; receipt: string | null } | undefined
+  outcome: { state: string; receipt: string | null; changed: string } | undefined
   events: Entry[]
   ledger: string | undefined
   // What the next worker attempt is, after a `repairing`/`escalating`
@@ -296,8 +296,14 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
     }
     case 'outcome': {
       m = closeStep(m, at, isFailing(event.state) ? 'fail' : 'done')
-      m = { ...m, phase: event.state, endedAt: at, outcome: { state: event.state, receipt: event.receipt ?? null } }
-      return withEntry(m, at, 'outcome', `${event.state}${event.receipt ? ` · ${event.receipt}` : ''}`)
+      const changed = changedText(event.summary)
+      m = {
+        ...m,
+        phase: event.state,
+        endedAt: at,
+        outcome: { state: event.state, receipt: event.receipt ?? null, changed },
+      }
+      return withEntry(m, at, 'outcome', `${event.state}${changed ? ` · ${changed}` : ''}${event.receipt ? ` · ${event.receipt}` : ''}`)
     }
     case 'stderr':
       return withEntry(m, at, 'stderr', event.text ?? '')
@@ -374,6 +380,24 @@ export function latestOutput(m: RunModel, limit: number): string[] {
   return []
 }
 
+// What a run's candidate changed, from relais's summary object
+// `{files_changed, insertions, deletions}`: `1 file, +3 -1`, or nothing.
+export function changedText(summary: unknown): string {
+  if (typeof summary !== 'object' || summary === null) return ''
+  const { files_changed: files, insertions, deletions } = summary as Record<string, unknown>
+  if (typeof files !== 'number') return ''
+  const plus = typeof insertions === 'number' ? insertions : 0
+  const minus = typeof deletions === 'number' ? deletions : 0
+  return `${files} file${files === 1 ? '' : 's'}, +${plus} -${minus}`
+}
+
+// An outcome as one line: the state, what changed, the receipt.
+export function outcomeText(outcome: { state: string; receipt: string | null; changed: string }): string {
+  const changed = outcome.changed ? ` · ${outcome.changed}` : ''
+  const receipt = outcome.receipt ? ` · receipt ${outcome.receipt}` : ''
+  return `${outcome.state}${changed}${receipt}`
+}
+
 // The status line: the live runs, or the outcome kept after `done`.
 export function statusLine(
   models: Record<string, RunModel>,
@@ -400,7 +424,7 @@ export function timelineText(m: RunModel, now: number): string[] {
   }
   for (const d of m.decisions) lines.push(`decision · ${d.text}`)
   lines.push(`cost ${formatCost(m.cost)}`)
-  if (m.outcome) lines.push(`outcome ${m.outcome.state}${m.outcome.receipt ? ` · receipt ${m.outcome.receipt}` : ''}`)
+  if (m.outcome) lines.push(`outcome ${outcomeText(m.outcome)}`)
   return lines
 }
 
