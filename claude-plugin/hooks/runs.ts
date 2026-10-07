@@ -18,6 +18,7 @@ import {
   type RunModel,
 } from './timeline.ts'
 import { sendHello } from './callbacks.ts'
+import { onRunDone } from './routing.ts'
 import { detach, type Child, type Store } from './store.ts'
 import {
   announceRun,
@@ -231,6 +232,7 @@ async function onDone(fx: Fx, store: Store, child: Child, line: any, now: number
     store.models = { ...store.models, [run]: applyEvent(model, { kind: 'outcome', state: outcome, receipt, summary: line.summary }, now) }
   }
   store.heldOutcome = `${shortId(run)} ${outcome}`
+  onRunDone(store, outcome)
   markDirty(store)
   toastOutcome(fx, run, outcome, receipt)
   const trial = typeof line.trial === 'string' ? line.trial : null

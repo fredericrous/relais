@@ -6,7 +6,7 @@
 type Call = (...args: any[]) => any
 
 export type Fx = {
-  session: { id: Call }
+  session: { id: Call; model: Call }
   process: { run: Call; spawn: Call }
   agent: { spawn: Call; list: Call }
   tool: { call: Call }
@@ -16,4 +16,8 @@ export type Fx = {
   // The pane's one `$.state` value: written by the stream handler's flush,
   // read by the `ui.render` hook.
   pane: { read: Call; write: Call }
+  // The session router's side calls (routing.ts): the classifier, the
+  // plugin's own store (the consent records).
+  model: { complete: Call }
+  kv: { get: Call; set: Call }
 }
