@@ -392,7 +392,16 @@ pub fn build(
             "cost completeness",
             ledger.run_cost_completeness(&run_id),
         )?;
-        let cost_complete = completeness == crate::money::CostCompleteness::Actual;
+        // Complete means every part of the run is costed: a figure the
+        // harness reported, or (every dispatch native) every token priced
+        // from the machine table. A lower bound or an unknown is not.
+        let cost_complete = match completeness {
+            crate::money::CostCompleteness::Actual | crate::money::CostCompleteness::Estimated => {
+                true
+            }
+            crate::money::CostCompleteness::IncompleteLowerBound
+            | crate::money::CostCompleteness::Unknown => false,
+        };
         let task = TaskFeatures::extract(&contract, repo_policy);
         // The identity that actually ran. Without a dispatch intent there
         // is no model to attribute the outcome to, and a default identity
@@ -857,7 +866,17 @@ argv = ["true"]
         }
 
         fn usage(&self, event: &str, run: &str, model: &str) {
-            use crate::money::{CostCompleteness, CostKind, MicroUsd};
+            self.usage_as(event, run, model, crate::money::CostCompleteness::Actual);
+        }
+
+        fn usage_as(
+            &self,
+            event: &str,
+            run: &str,
+            model: &str,
+            completeness: crate::money::CostCompleteness,
+        ) {
+            use crate::money::{CostKind, MicroUsd};
             self.ledger
                 .record_usage(&crate::ledger::UsageEvent {
                     event_id: event.into(),
@@ -871,7 +890,7 @@ argv = ["true"]
                     cache_write_tokens: None,
                     cost: Some(MicroUsd::from_micros(10)),
                     cost_kind: CostKind::ApiSpend,
-                    completeness: CostCompleteness::Actual,
+                    completeness,
                     inclusive: false,
                     at: crate::ledger::now_rfc3339(),
                     phase: None,
@@ -959,6 +978,34 @@ argv = ["true"]
             "the superseded attempt is still named, not silently dropped: {:?}",
             dataset.exclusions
         );
+    }
+
+    /// Every dispatch native: a run's cost is every token priced from the
+    /// machine table, `Estimated`. That is a complete cost and trains the
+    /// cost model; a lower bound or an unknown still does not.
+    #[test]
+    fn an_estimated_cost_is_complete_and_a_lower_bound_is_not() {
+        use crate::money::CostCompleteness;
+        for (completeness, complete) in [
+            (CostCompleteness::Actual, true),
+            (CostCompleteness::Estimated, true),
+            (CostCompleteness::IncompleteLowerBound, false),
+            (CostCompleteness::Unknown, false),
+        ] {
+            let times: Vec<String> = (0..30)
+                .map(|minute| format!("2026-01-01T00:{minute:02}:00+00:00"))
+                .collect();
+            let fixture = LedgerFixture::open_with_clock("dataset-estimated", times);
+            fixture.dispatched_for_task("run-e", "task-e", "implementation", "initial");
+            fixture.usage_as("run-e-d1", "run-e", "sonnet", completeness);
+            fixture.settle("run-e", State::Accepted);
+            let dataset = fixture.build();
+            assert_eq!(dataset.records.len(), 1, "{completeness:?}");
+            assert_eq!(
+                dataset.records[0].cost_complete, complete,
+                "{completeness:?}"
+            );
+        }
     }
 
     /// A dispatch with no recorded `routed_by` still trains the

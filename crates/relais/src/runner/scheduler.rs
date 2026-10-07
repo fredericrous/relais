@@ -27,9 +27,10 @@ use crate::contract::{Decomposition, DecompositionMode, Kind, TaskContract, Work
 use crate::contract::{Review, WorkPackage};
 use crate::ledger::UsageEvent;
 use crate::lifecycle::UsagePhase;
-use crate::money::{CostKind, MicroUsd};
+use crate::money::MicroUsd;
 use crate::policy::{BlockCode, EffectiveAuthority, MachineSettings, Tier};
 use crate::procs::Ended;
+use crate::protocol::AgentKind;
 use crate::route::{Recipe, Route, RungIndex};
 use crate::verify::{self, Receipt, VerificationReport};
 use crate::workspace::{self, WorkspaceError};
@@ -708,14 +709,11 @@ fn run_package(
         git: engine.config.git,
         hooks: engine.config.hooks,
         attest: engine.config.attest,
-        worker_env: engine.config.worker_env.clone(),
-        sandbox_host: engine.config.sandbox_host,
         // The package's artifacts hang off the root run's; its
         // worktrees hang off THEIR parent, so a package worker's tree
         // sits under `packages/worktrees/<child-run>/` and no package's
         // record — its own or a sibling's — is its cwd's parent (B6).
         artifacts_dir: engine.artifacts.join("packages").join(&package.id),
-        tmp_link_root: engine.config.tmp_link_root.clone(),
         aval_resolver: engine.config.aval_resolver,
         predictor: engine.config.predictor,
         gate: engine.config.gate,
@@ -730,7 +728,7 @@ fn run_package(
         // fact, free to disagree.
         purpose: None,
         run_id: None,
-        worker_presentation: engine.config.worker_presentation,
+        wire: engine.config.wire.clone(),
     };
     engine.transition(
         State::Running,
@@ -1158,6 +1156,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         remaining_budget.unwrap_or(0),
         root.decision.routed_by,
     )?;
+    engine.record_native_row(&dispatch_id, None)?;
     let spec = LaunchSpec {
         dispatch_id: dispatch_id.as_str().to_string(),
         prompt,
@@ -1170,19 +1169,13 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
             tools.extend(["Edit".to_string(), "Write".to_string()]);
             tools
         },
-        // The planner reads; it gets no allowlist.
-        allowed_tools: Vec::new(),
         work_dir: engine.config.repo_dir.to_path_buf(),
-        env: engine.config.worker_env.clone(),
         wall_timeout: root
             .deadline
             .saturating_duration_since(Instant::now())
             .max(Duration::from_secs(1)),
         cancel: None,
-        pid_slot: None,
-        sandbox: None,
-        tools: crate::backend::ToolSet::ModeDefault,
-        presentation: crate::backend::Presentation::Headless,
+        agent: AgentKind::Planner,
     };
     let budget = Budget {
         attempts_used: 0,
@@ -1197,6 +1190,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
     let dispatch_start = Instant::now();
     let result = match engine.managed_launch(ManagedDispatch {
         spec,
+        attempt: None,
         depth: 0,
         parent: None,
         reserve_micros: remaining_budget.unwrap_or(0),
@@ -1218,8 +1212,9 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         .config
         .ledger
         .finish_dispatch(&dispatch_id, "completed")?;
+    engine.record_native_row(&dispatch_id, result.session_id.as_deref())?;
     // Planning overhead is the run's cost (SPEC §19).
-    engine.config.ledger.record_usage(&UsageEvent {
+    let planning_usage = UsageEvent {
         event_id: dispatch_id.as_str().to_string(),
         run_id: engine.run_id.clone(),
         attempt_id: None,
@@ -1230,7 +1225,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         cache_read_tokens: result.usage.cache_read_tokens,
         cache_write_tokens: result.usage.cache_write_tokens,
         cost: result.usage.cost.micros(),
-        cost_kind: CostKind::ApiSpend,
+        cost_kind: engine.usage_cost_kind(),
         completeness: result.usage.cost.completeness(),
         inclusive: result.usage.cost.inclusive(),
         at: engine.config.ledger.now(),
@@ -1239,7 +1234,8 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
         requested_model: Some(profile.id.clone()),
         requested_effort: effort_str(profile.effort.as_ref()),
         harness: engine.harness.clone(),
-    })?;
+    };
+    engine.book_usage(&planning_usage, &result)?;
     if result.ended == Ended::Cancelled {
         return Ok(Proposal::Failed(engine.stop(
             &budget,
@@ -1362,7 +1358,6 @@ mod tests {
             verification_profile: crate::policy::VerificationProfile::default(),
             review_floor: Review::Off,
             disallowed_tools: Vec::new(),
-            allowed_tools: Vec::new(),
             authority_hash: "hash".into(),
             grant_key: "key".into(),
             trust_granted: true,

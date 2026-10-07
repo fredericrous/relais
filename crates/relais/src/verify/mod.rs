@@ -28,10 +28,12 @@ use crate::policy::{
     named_command, CommandSpec, DependencyMode, Integrations, VerificationProfile,
 };
 use crate::procs::Ended;
+use crate::protocol::{Event, Events};
 use crate::tooling::{ProgramVersion, VersionUnknown};
 use crate::workspace::{Git, WorkspaceError};
 
 mod end;
+mod follow;
 mod junit;
 
 pub use end::CheckEnd;
@@ -824,6 +826,20 @@ pub fn run_command(
     label: &str,
     log_stem: &str,
 ) -> Result<CheckOutcome, VerifyError> {
+    run_observed(dir, spec, logs_dir, label, log_stem, &Events::silent())
+}
+
+/// [`run_command`], reporting the check to `events` as it runs: its start,
+/// its output as the log grows (bounded, see `follow`), and its end. With
+/// silent events no follower runs at all.
+pub fn run_observed(
+    dir: &Path,
+    spec: &CommandSpec,
+    logs_dir: &Path,
+    label: &str,
+    log_stem: &str,
+    events: &Events,
+) -> Result<CheckOutcome, VerifyError> {
     let timeout = command_timeout(spec)?;
     std::fs::create_dir_all(logs_dir)?;
     // A report the candidate itself committed is not this command's
@@ -852,13 +868,33 @@ pub fn run_command(
         .stdout(log_file.try_clone()?)
         .stderr(log_file);
     crate::procs::own_process_group(&mut command);
+    events.emit(Event::CheckStarted {
+        label: label.to_string(),
+        argv: spec.argv.clone(),
+    });
+    let started = std::time::Instant::now();
+    // Every way out after `check_started` says the check ended: an
+    // error is reported with no exit status, never left open.
+    let ended_with = |exit: Option<i32>| {
+        events.emit(Event::CheckEnded {
+            label: label.to_string(),
+            exit,
+            duration_ms: started.elapsed().as_millis() as u64,
+        });
+    };
     let ended = match command.spawn() {
         Ok(mut child) => {
             // The whole process group goes when the check ends, however
             // it ends: a `cargo test` grandchild left running in a
             // worktree that is about to be removed corrupts the next
             // thing that reads it (audit V1).
-            crate::procs::wait_for_exit(&mut child, timeout, None)?.ended
+            match wait_following(&mut child, timeout, &log_path, label, events) {
+                Ok(ended) => ended,
+                Err(e) => {
+                    ended_with(None);
+                    return Err(e);
+                }
+            }
         }
         // A program that is not there is the same fact whether relais
         // spawned it directly or a shell looked for it: the shell says
@@ -871,11 +907,26 @@ pub fn run_command(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             use std::io::Write as _;
             let mut log = std::fs::OpenOptions::new().append(true).open(&log_path)?;
-            writeln!(log, "relais: {}: command not found", spec.argv[0])?;
+            let message = format!("relais: {}: command not found", spec.argv[0]);
+            writeln!(log, "{message}")?;
+            // No follower runs for a command that never started, so the
+            // line the log got is sent as its output here.
+            events.emit(Event::Output {
+                label: label.to_string(),
+                text: format!("{message}\n"),
+                elided_bytes: 0,
+            });
             Ended::Exited(COMMAND_NOT_FOUND)
         }
-        Err(e) => return Err(VerifyError::Io(e)),
+        Err(e) => {
+            ended_with(None);
+            return Err(VerifyError::Io(e));
+        }
     };
+    ended_with(match ended {
+        Ended::Exited(code) => Some(code),
+        Ended::TimedOut | Ended::Cancelled | Ended::Signalled => None,
+    });
     let log_bytes = std::fs::read(&log_path)?;
     let junit = match spec.junit {
         Some(_) => Some(read_junit(
@@ -891,6 +942,29 @@ pub fn run_command(
         log_path: log_path.to_string_lossy().into_owned(),
         log_sha256: sha256_hex(&log_bytes),
         junit,
+    })
+}
+
+/// Wait for the check to end, with a follower streaming its log into
+/// `events` meanwhile, and let the follower read once more before this
+/// returns. Silent events start no follower.
+fn wait_following(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    log_path: &Path,
+    label: &str,
+    events: &Events,
+) -> Result<Ended, VerifyError> {
+    if events.is_silent() {
+        return Ok(crate::procs::wait_for_exit(child, timeout, None)?.ended);
+    }
+    let (ended_tx, ended_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(move || follow::follow(log_path, label, events, &ended_rx));
+        let waited = crate::procs::wait_for_exit(child, timeout, None);
+        // Dropping the sender wakes the follower for its final read.
+        drop(ended_tx);
+        Ok(waited?.ended)
     })
 }
 
@@ -994,12 +1068,15 @@ pub fn run_profile(
     profile: &VerificationProfile,
     logs_dir: &Path,
     prefix: &str,
+    events: &Events,
 ) -> Result<Vec<CheckOutcome>, VerifyError> {
     let mut outcomes = Vec::new();
     for (index, command) in profile.commands.iter().enumerate() {
         let label = check_label(command);
         let log_stem = format!("{prefix}-cmd{index}");
-        outcomes.push(run_command(dir, command, logs_dir, &label, &log_stem)?);
+        outcomes.push(run_observed(
+            dir, command, logs_dir, &label, &log_stem, events,
+        )?);
     }
     Ok(outcomes)
 }
@@ -1024,12 +1101,13 @@ pub fn run_setup(
     profile: &VerificationProfile,
     logs_dir: &Path,
     prefix: &str,
+    events: &Events,
 ) -> Result<Vec<CheckOutcome>, VerifyError> {
     let mut outcomes = Vec::new();
     for (index, command) in profile.setup.iter().enumerate() {
         let label = setup_label(command);
         let log_stem = format!("{prefix}-setup{index}");
-        let outcome = run_command(dir, command, logs_dir, &label, &log_stem)?;
+        let outcome = run_observed(dir, command, logs_dir, &label, &log_stem, events)?;
         let failed = outcome.failed();
         outcomes.push(outcome);
         if failed {
@@ -1484,9 +1562,11 @@ pub fn amont_list(
         }
         Stage::Local => {}
     }
-    let end = crate::procs::run_with_timeout(command, INVENTORY_TIMEOUT, None, cancel, None)
-        .map_err(|e| InventoryError::NotRun {
-            detail: e.to_string(),
+    let end =
+        crate::procs::run_with_timeout(command, INVENTORY_TIMEOUT, None, cancel).map_err(|e| {
+            InventoryError::NotRun {
+                detail: e.to_string(),
+            }
         })?;
     if end.ended != Ended::Exited(0) {
         return Err(InventoryError::Refused {
@@ -1697,11 +1777,12 @@ pub fn amont_attest_covered(
     // exits 0. The name is matched against the list below instead.
     let mut command = Command::new("amont");
     command.arg("attest").arg("covered").current_dir(dir);
-    let end = crate::procs::run_with_timeout(command, ATTEST_TIMEOUT, None, cancel, None).map_err(
-        |e| AttestError::NotRun {
-            detail: e.to_string(),
-        },
-    )?;
+    let end =
+        crate::procs::run_with_timeout(command, ATTEST_TIMEOUT, None, cancel).map_err(|e| {
+            AttestError::NotRun {
+                detail: e.to_string(),
+            }
+        })?;
     if end.ended != Ended::Exited(0) {
         return Err(AttestError::Refused {
             ended: end.ended.describe(),
@@ -2330,8 +2411,9 @@ mod tests {
             inputs: Vec::new(),
             cache_baseline: false,
         };
-        let base = run_profile(&dir, &profile, &logs, "base").expect("base");
-        let candidate = run_profile(&dir, &profile, &logs, "attempt1").expect("candidate");
+        let base = run_profile(&dir, &profile, &logs, "base", &Events::silent()).expect("base");
+        let candidate =
+            run_profile(&dir, &profile, &logs, "attempt1", &Events::silent()).expect("candidate");
         assert_eq!(base[0].label, check_label(&profile.commands[0]));
         assert!(base[0].label.starts_with("sh@"), "{}", base[0].label);
         assert_eq!(
@@ -2351,7 +2433,8 @@ mod tests {
             ],
             ..profile.clone()
         };
-        let again = run_profile(&dir, &reordered, &logs, "attempt2").expect("reordered");
+        let again =
+            run_profile(&dir, &reordered, &logs, "attempt2", &Events::silent()).expect("reordered");
         assert_eq!(again[1].label, base[0].label);
         assert_ne!(again[0].label, base[0].label);
         std::fs::remove_dir_all(&dir).ok();
@@ -2640,7 +2723,7 @@ mod tests {
             inputs: Vec::new(),
             cache_baseline: false,
         };
-        let setup = run_setup(&dir, &profile, &logs, "base").expect("setup");
+        let setup = run_setup(&dir, &profile, &logs, "base", &Events::silent()).expect("setup");
         assert_eq!(setup.len(), 1);
         assert!(!setup[0].failed());
         assert!(
@@ -2659,7 +2742,7 @@ mod tests {
             "a setup label never equals the check label of the same argv"
         );
         assert!(setup_failure(&setup).is_none());
-        let checks = run_profile(&dir, &profile, &logs, "base").expect("checks");
+        let checks = run_profile(&dir, &profile, &logs, "base", &Events::silent()).expect("checks");
         assert!(
             !checks[0].failed(),
             "the command sees what the setup installed"
@@ -2684,7 +2767,7 @@ mod tests {
             inputs: Vec::new(),
             cache_baseline: false,
         };
-        let setup = run_setup(&dir, &profile, &logs, "task").expect("setup ran");
+        let setup = run_setup(&dir, &profile, &logs, "task", &Events::silent()).expect("setup ran");
         assert_eq!(setup.len(), 1, "the second command was not attempted");
         let failed = setup_failure(&setup).expect("the failure is reported");
         assert_eq!(failed.ended, Ended::Exited(1));
@@ -2872,6 +2955,160 @@ mod tests {
     /// Unique fixture directories under parallel test threads.
     fn temp_dir(tag: &str) -> crate::test_support::TempDir {
         crate::test_support::temp_dir(&format!("verify-{tag}"))
+    }
+
+    /// The lines of an `events.jsonl`, in order.
+    fn written_events(dir: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(dir.join("events.jsonl"))
+            .expect("events.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a json line"))
+            .collect()
+    }
+
+    #[test]
+    fn a_running_check_is_reported_from_its_start_to_its_end() {
+        let dir = temp_dir("observed");
+        let events = Events::for_run("run-o", &dir.join("art"));
+        let slow = command(&["sh", "-c", "echo one; sleep 0.4; echo two"], 10);
+        run_observed(&dir, &slow, &dir.join("logs"), "slow", "s-cmd0", &events).expect("runs");
+        let written = written_events(&dir.join("art"));
+        let kinds: Vec<&str> = written
+            .iter()
+            .map(|w| w["event"]["kind"].as_str().expect("a kind"))
+            .collect();
+        assert_eq!(kinds.first(), Some(&"check_started"));
+        assert_eq!(kinds.last(), Some(&"check_ended"));
+        let text: String = written
+            .iter()
+            .filter(|w| w["event"]["kind"] == "output")
+            .map(|w| w["event"]["text"].as_str().expect("text").to_string())
+            .collect();
+        assert_eq!(text, "one\ntwo\n");
+        assert!(
+            kinds.iter().filter(|kind| **kind == "output").count() >= 2,
+            "output arrives while the check runs, not once at the end: {kinds:?}"
+        );
+        let ended = &written.last().expect("an event")["event"];
+        assert_eq!(ended["exit"], 0);
+        assert_eq!(ended["label"], "slow");
+        let seqs: Vec<u64> = written.iter().map(|w| w["seq"].as_u64().unwrap()).collect();
+        assert_eq!(seqs, (0..seqs.len() as u64).collect::<Vec<_>>());
+    }
+
+    /// A program that exists and cannot be executed fails to spawn: the
+    /// check still ends in the events, with no exit status, never left open.
+    #[cfg(unix)]
+    #[test]
+    fn a_check_that_cannot_start_still_ends_in_the_events() {
+        let dir = temp_dir("noexec");
+        let script = dir.join("not-executable.sh");
+        std::fs::write(&script, "#!/bin/sh\necho never\n").expect("script");
+        let events = Events::for_run("run-x", &dir.join("art"));
+        let spec = command(&[script.to_str().expect("utf-8")], 10);
+        let result = run_observed(&dir, &spec, &dir.join("logs"), "noexec", "x-cmd0", &events);
+        assert!(
+            result.is_err(),
+            "a permission error is an error: {result:?}"
+        );
+        let written = written_events(&dir.join("art"));
+        let kinds: Vec<&str> = written
+            .iter()
+            .map(|w| w["event"]["kind"].as_str().expect("a kind"))
+            .collect();
+        assert_eq!(kinds, ["check_started", "check_ended"]);
+        assert!(written[1]["event"]["exit"].is_null());
+    }
+
+    /// A program that is not there: its "command not found" line reaches
+    /// the events as output, then the check ends with exit 127.
+    #[test]
+    fn a_missing_program_reports_its_line_and_ends() {
+        let dir = temp_dir("missing");
+        let events = Events::for_run("run-m", &dir.join("art"));
+        let spec = command(&["relais-no-such-program-anywhere"], 10);
+        run_observed(&dir, &spec, &dir.join("logs"), "missing", "m-cmd0", &events).expect("runs");
+        let written = written_events(&dir.join("art"));
+        let kinds: Vec<&str> = written
+            .iter()
+            .map(|w| w["event"]["kind"].as_str().expect("a kind"))
+            .collect();
+        assert_eq!(kinds, ["check_started", "output", "check_ended"]);
+        assert!(written[1]["event"]["text"]
+            .as_str()
+            .expect("text")
+            .contains("command not found"));
+        assert_eq!(written[2]["event"]["exit"], 127);
+    }
+
+    /// A check printing 10 MB: events carry at most 64 KB of its text, in
+    /// pieces of at most 4 KB, and count the rest; the log keeps it all;
+    /// and following the check costs it no time worth measuring.
+    #[test]
+    fn a_check_printing_ten_megabytes_streams_a_bounded_prefix_and_counts_the_rest() {
+        const PRINTED: u64 = 10 * 1024 * 1024;
+        let dir = temp_dir("flood");
+        let flood = command(&["sh", "-c", "head -c 10485760 /dev/zero | tr '\\0' x"], 60);
+        // The best of three on each side, the two sides interleaved: a
+        // loaded machine slows a run, and alternating them puts both under
+        // the same load, so what is compared is what the follower adds.
+        let mut silent_took = std::time::Duration::MAX;
+        let mut silent = None;
+        let mut followed_took = std::time::Duration::MAX;
+        let mut followed = None;
+        for round in 0..3 {
+            let start = std::time::Instant::now();
+            silent =
+                Some(run_command(&dir, &flood, &dir.join("logs"), "flood", "plain").expect("runs"));
+            silent_took = silent_took.min(start.elapsed());
+            let events = Events::for_run("run-f", &dir.join(format!("art{round}")));
+            let start = std::time::Instant::now();
+            followed = Some(
+                run_observed(&dir, &flood, &dir.join("logs"), "flood", "seen", &events)
+                    .expect("runs"),
+            );
+            followed_took = followed_took.min(start.elapsed());
+        }
+        let silent = silent.expect("ran");
+        let followed = followed.expect("ran");
+
+        assert_eq!(
+            std::fs::metadata(&followed.log_path).unwrap().len(),
+            PRINTED
+        );
+        assert_eq!(followed.log_sha256, silent.log_sha256);
+        let written = written_events(&dir.join("art2"));
+        let outputs: Vec<&serde_json::Value> = written
+            .iter()
+            .map(|w| &w["event"])
+            .filter(|event| event["kind"] == "output")
+            .collect();
+        let texts: Vec<usize> = outputs
+            .iter()
+            .map(|event| event["text"].as_str().expect("text").len())
+            .collect();
+        assert!(texts.iter().all(|len| *len <= 4 * 1024), "{texts:?}");
+        let text_bytes: usize = texts.iter().sum();
+        assert!(text_bytes <= 64 * 1024, "{text_bytes}");
+        let elided: u64 = outputs
+            .iter()
+            .map(|event| event["elided_bytes"].as_u64().expect("a count"))
+            .sum();
+        assert_eq!(
+            elided + text_bytes as u64,
+            PRINTED,
+            "every byte is either shown or counted"
+        );
+        assert!(elided > 0);
+
+        let allowed = std::cmp::max(
+            silent_took.mul_f64(0.05),
+            std::time::Duration::from_millis(200),
+        );
+        assert!(
+            followed_took <= silent_took + allowed,
+            "followed {followed_took:?} against {silent_took:?} without the follower"
+        );
     }
 
     const AMONT_SAMPLE: &str = r#"{

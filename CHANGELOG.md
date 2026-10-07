@@ -8,8 +8,152 @@ missing here.
 
 ## Unreleased
 
+### Removed
+
+- relais's own OS sandbox. Every dispatch is a native agent of your Claude Code
+  session and runs under that session's sandbox and permissions, so the
+  `[sandbox]` section of `machine.toml` is no longer read (it still parses, and
+  `relais doctor` says so), and `relais doctor --verify-sandbox` is gone, as is
+  the sandbox denial report. Issue #105 (a sandboxed worker binding a local
+  port) is dropped with it. Runs recorded under the sandbox still read.
+- Headless launching. relais never starts `claude -p` any more: every dispatch of
+  `relais run` and of a spending `relais dataset replay` is a native agent
+  spawned through the plugin, and `claude --version` and `claude --help` are the
+  only `claude` processes relais runs. `relais doctor --probe-hooks` is gone
+  (the flag is a usage error), and with it the `hook-compat` finding of
+  `relais doctor` and the `make probe-hooks` target; `relais hook --probe
+  --record <dir>`, which captures one payload, stays. A run's usage is always
+  the price table's estimate. Ledgers written by a headless relais still read.
+
+- Everything that only configured a relais-launched process. `[permissions]
+  allowed_tools` in `machine.toml` is no longer read (it still parses, your trust
+  grants stay valid, and `relais doctor` says so): a native agent uses the tools
+  its agent definition names and the session's permissions. The worker
+  environment allowlist and its credential scrub are gone too: the agent inherits
+  the session's environment, so a new context manifest records no `worker_env`
+  and `env_protection` `session`. Manifests written before still read.
+  `disallowed_tools` stays.
+
+- The hook-side native path (#171). The relais plugin spawns, continues and
+  stops relais's agents, so the dispatch marker (`[relais-dispatch: <id>]`),
+  `hook/native.rs`, `hook/worktree.rs`, the hook's `Rewrite`, `WorktreePath` and
+  `WorktreeFailed` answers and its handling of `WorktreeCreate` and
+  `SendMessage` events are gone, and the `/relais` skill and the worker
+  definitions no longer tell the model to copy a `RELAIS-SPAWN` line. `relais
+  hook` given a `WorktreeCreate` or a `SendMessage` call exits 0 with no output,
+  and Claude Code makes its own worktrees again. The classic hook is back to
+  what it did before #171: admission caps on your own `Agent` and `Task`
+  spawns. The coordinator's native registry, the `relais native` callbacks and
+  the ledger columns stay.
+
+### Changed
+
+- `relais install --claude` installs the relais Claude Code plugin,
+  `relais@relais-local`, which carries the mod, the agent definitions and the
+  `/relais` skill (now written for the plugin: start a run with
+  `mcp__relais__run`, a replay with `mcp__relais__replay`, follow it with
+  `mcp__relais__status` or `/relais-status`, never `relais run` in Bash). The
+  plugin is embedded in the binary: install writes a directory marketplace under
+  relais's state directory and runs `claude plugin marketplace add` and `claude
+  plugin install`, or `marketplace update` and `plugin update` once it is
+  installed; the plugin's version is relais's, so every release refreshes Claude
+  Code's copy. A `claude` call that fails is reported with its stderr and install
+  exits non-zero. `relais uninstall --claude` runs `claude plugin uninstall` and
+  `claude plugin marketplace remove` and removes the directory. Install no
+  longer writes `~/.claude/skills/relais/SKILL.md` or the per-model worker
+  agents in `.claude/agents/`, and removes the ones an earlier relais wrote when
+  you have not edited them (an edited one is kept and reported). `relais doctor`
+  has a `plugin` finding: ok when the plugin is enabled at this relais's
+  version, a warning naming `relais install --claude --write` when it is absent,
+  disabled or at another version.
+- `relais install --claude --hooks` writes the matcher `Agent|Task` again (not
+  `Agent|Task|SendMessage`) on the three tool events and no `WorktreeCreate`
+  handler. Installing over a file from the hook-side native path removes
+  relais's `SendMessage` matcher and `WorktreeCreate` entry and keeps every
+  entry that is not relais's; `relais uninstall --claude --hooks` removes either
+  form; `relais doctor` (`hook-wiring`) reports a file that still has them and
+  names `relais install --claude --hooks --write` as the fix. A `WorktreeCreate`
+  handler with no code behind it would break Claude Code's own isolated agents,
+  so run it once after upgrading. The retired wiring is found whatever path
+  the relais that wrote it lived at; a settings file install refuses to rewrite
+  (hand-formatted) gets the same steps to do by hand. `relais doctor`
+  (`hook-worktrees`) names the records the old hook kept under
+  `<state>/hook-worktrees/`, which nothing reads now, and the leftover
+  `worktree-agent-*` worktrees to remove.
+- `relais usage import` skips the whole `subagents/agent-<id>.jsonl` transcript
+  of an agent the ledger records as a relais dispatch (`dispatches.agent_id`),
+  besides the message ids in `native_usage_messages`, so a dispatch whose
+  transcript ids could not be recorded (`rollback_ids_missing`) is never booked
+  twice.
+- The hook journal no longer records the `worktree` and `native` fields, and its
+  `outcome` is never `answered_after_waiting`.
+
+- A spending `relais dataset replay` runs inside a Claude Code session too:
+  `--protocol`, started by the plugin's `replay` tool, every dispatch a native
+  agent; without the plugin it is refused like `relais run` (`--dry-run` is not),
+  and like a run it is refused up front for a model it cannot price. Its `done`
+  line comes after the replay trial is recorded and names it (`trial`).
+- A `relais run`'s reviewer and planner are native agents too, spawned through
+  the plugin like its workers: `spawn` lines with `agent_kind` `reviewer` or
+  `planner` and the `relais:relais-reviewer-…` / `relais:relais-planner-…`
+  agent types, which the plugin now ships (reviewer: Read, Grep, Glob; planner:
+  Read, Grep, Glob, Bash, 8 turns), one per model and effort like the workers.
+  A reviewer or planner always spawns fresh; only a worker is continued for a
+  repair.
+- `relais run` talks to the relais plugin of the parent Claude Code session
+  through protocol lines and `relais native` callbacks, and is always native
+  for workers. A worker attempt goes out as a `spawn` line (`agent_kind`,
+  `relais:` agent type, the attempt's worktree as `cwd`, no marker in the
+  prompt), a repair on the same model as a `continue` line, a cancelled
+  attempt as a `stop` line, and every run ends with one `done` line (outcome,
+  receipt, and the candidate's files changed, insertions and deletions). The
+  `RELAIS-SPAWN` and `RELAIS-CONTINUE` text lines are gone. See SPEC §23, §29.
+- A native attempt's usage is the usage the plugin reports in `stopped`, priced
+  with the machine's `[pricing]` table as before. The agent's transcript is read
+  for message ids only, recorded in `native_usage_messages`; when it is missing
+  the usage is booked anyway and the run emits a `rollback_ids_missing` decision.
+- `relais run` is refused before anything runs (exit 2) without `--protocol`,
+  without `RELAIS_HOST=claude-code-mod`, or when the session's plugin said no
+  hello in the last 60 s, and on a Claude Code outside `>= 2.1.291, < 2.2.0`
+  (the message names the range and the installed version). A hello that lapses
+  during an attempt ends it `interrupted (mod_gone)`. The coordinator's wire
+  protocol is now version 5: restart a daemon left running (`relais coordinator
+  stop`).
+- `--native` and `--native-spawn-wait` are removed; the 120 s spawn wait stays
+  internal.
+
+### Added
+
+- `relais native hello|bound|stopped|status`: the short processes the plugin
+  calls. `bound` and `stopped` are idempotent; `stopped` before `bound` is kept;
+  `status` prints a run's phases, decisions, cost, outcome and at most the last
+  40 lines of check output, from its `events.jsonl`.
+
 ### Fixed
 
+- An attempt that times out (or loses the coordinator) tells the plugin to
+  stop its agent, as a cancelled one did; an agent relais stopped is never
+  continued for a repair (its late, empty last turn would have read as the
+  repair's end). A stop that could not be sent is said on stderr.
+- The plugin says what it could not do instead of dropping it: a failed
+  `TaskStop` or agent-list read is a `relais plugin:` line in the run's
+  timeline and its status reply (which now carries the run's latest `stderr`
+  lines), an unreadable `relais native status` is named in the status reply,
+  and a verdict whose submission fails is sent again on the next tick. A
+  repair's agent that drops off the list before its status moved is no
+  longer reported `failed`.
+- `relais resume` reconciles a native run whose Claude Code session ended: a
+  native agent has no PID, so it is judged by its session, gone once the
+  session's relais plugin stops saying hello (and still live, refused, while
+  it says it). It used to refuse for as long as the dead run's coordinator
+  seat lasted.
+- `relais native status` carries the run's `events` (every one but output, and
+  only the newest output lines), so the plugin rebuilds the whole pane after
+  `/clear` or `/resume`; it had nothing to rebuild from. `dispatch_ended` names
+  its agent, so a repair's second dispatch reads as the same agent.
+- The pane marks a verification whose check failed as `FAIL` even when a
+  repair follows, titles the repair attempt `attempt N · repair`, and keeps
+  one agent row per agent.
 - A native attempt whose cost could not be priced is booked as
   `estimated_api_equivalent` with an unknown figure, not as `api_spend`.
 - A `RELAIS_STATE_DIR` whose coordinator socket path is longer than the OS
@@ -18,6 +162,17 @@ missing here.
 
 ### Added
 
+- `relais run --protocol` keeps stdout for protocol lines only: one JSON
+  object per line, each with a `relais` key, and every other byte the
+  process writes (`println!`, `eprintln!`, a panic's message) goes to stderr.
+  It is the channel a Claude Code plugin will read; Windows refuses it for
+  now (exit 2). See SPEC §29.
+- Every run now records its events — phases, dispatches, cost, each check's
+  start, bounded streamed output and end, decisions and the outcome — as
+  numbered lines in `<artifacts>/<run>/events.jsonl`, with or without
+  `--protocol`. A check's output goes into events at most 64 KB per check
+  (4 KB per event); the rest is counted, and the full log stays in the
+  artifacts directory.
 - `relais run --native` refuses up front, `native_unpriced`, when a model it
   can dispatch has no `[pricing.models]` entry (the effective model the ledger
   last saw for the alias, or no price table at all), naming the alias, the id
@@ -90,6 +245,18 @@ missing here.
   removes any `orchestration_usage` row an earlier import made of them;
   `usage import` skips those ids and its summary line says how many records
   it skipped as already booked to a relais run.
+- The relais Claude Code plugin (`claude-plugin/`, a Claude Code mod, tested
+  on Claude Code >= 2.1.291 and < 2.2.0). It registers a `run` and a `status`
+  tool and `/relais-status`, starts `relais run --protocol`, and does what
+  relais asks over that channel: spawns, continues and stops native agents
+  (each in the directory relais chose), adds each turn's usage and reports the
+  dispatch once when its agent's run ends (`relais native bound|stopped`,
+  retried until acknowledged), and tells the model the run's outcome. It
+  hides relais's agent types, messages and completion notices from the
+  model, and shows the run live in a pane and the status line. 19 worker
+  definitions ship with it, one per `native::worker_agent_types()` pair.
+  Nothing installs it yet: `make plugin` (validate and test, now part of
+  `make check` and of CI) is its gate, and it needs `claude` on the PATH.
 
 ### Changed
 

@@ -127,10 +127,10 @@ never written by a run. A trust grant is keyed by the PAIR of the
 repository's authority hash and the repository itself (its canonical root
 and, when git reports one, its `origin` URL), so editing `relais.toml`
 voids the grant and the same declaration in another repository needs its
-own review. `relais plan` prints the exact block to paste. A print-mode
-worker cannot ask for permission, so the tools it may use are an explicit
-machine-owned allowlist — nothing is granted implicitly, and no
-permission-mode flag is ever passed. `disallowed_tools` here only ADDS to
+own review. `relais plan` prints the exact block to paste. A worker is a
+native agent: it runs with the tools its agent definition names and the
+session's permissions, and no permission-mode flag is ever passed.
+`disallowed_tools` here only ADDS to
 the shipped deny floor (commit, merge, push, rebase, reset, tag and the
 wrappers around them, plus `Agent`/`Task`: a worker never spawns subagents,
 since model choice belongs to the route); it cannot shorten it:
@@ -141,9 +141,6 @@ schema_version = 1
 [spending]
 per_run_micros = 3000000            # $3 per run, best effort (SPEC §11)
 
-[permissions]
-allowed_tools = ["Edit", "Write", "Bash(cargo test:*)", "Bash(make test:*)"]
-
 [trust."<grant key from relais plan>"]
 granted_at = "2026-09-20T00:00:00Z"   # RFC3339, or a plain 2026-09-20
 reviewed_by = "you"                   # required
@@ -151,23 +148,14 @@ repo = "git@github.com:me/the-repo.git"   # what plan filled in, for readers
 ```
 
 Then `relais run --task task.json`. A worker refused a tool ends the run
-`blocked (permission_denied)` naming the tool; nothing is escalated.
+`blocked (permission_denied)` naming the tool; nothing is escalated. A
+`[permissions] allowed_tools` left in `machine.toml` is no longer read, and
+`relais doctor` says so.
 
-An allowlist matches command strings, and a command string is not a
-boundary. For an OS boundary, turn on `[sandbox]` (off by default): the
-worker's Bash then runs in the macOS or Linux sandbox, so pipes, redirects
-and `&&` work, writes are confined to the worktree, the worker's scratch
-directory (`$TMPDIR`) and the `writable` paths you list, and the network to
-the `network` domains you list. A credential floor (SSH, cloud, git, docker,
-cargo and Claude credentials, relais's own config and ledger) is never
-readable whatever you list. A run whose sandbox cannot be relied on ends
-`blocked (sandbox_unavailable)` or `blocked (sandbox_weakened)` before any
-worker starts, and one whose sandbox no probe has verified ends
-`blocked (sandbox_unverified)`: run `relais doctor --verify-sandbox` (two
-short real sessions, a few cents) once per harness version, platform and
-sandbox configuration, and it records the pass the run then looks up.
-`relais doctor` shows where the sandbox stands. SPEC §8 has the launch, the
-checks, the verification and the scope of the guarantee.
+relais keeps no OS sandbox of its own: every dispatch is a native agent of
+your Claude Code session and runs under that session's sandbox and
+permissions. A `[sandbox]` section left in `machine.toml` is no longer
+read, and `relais doctor` says so. SPEC §8 has the details.
 
 A verification worktree is a checkout of one revision and nothing else.
 In a repository whose dependencies live in the tree (npm, pnpm, yarn,
@@ -221,15 +209,34 @@ or the reason it was kept, and a scorecard re-measured afterwards.
   verify (no `SHA256SUMS`, no sha256 tool). `RELAIS_SKIP_CHECKSUM=1` is
   the explicit way to accept an unverified binary.
 
-`relais install --claude` writes the `/relais`, `/relais-verified-push` and
-`/relais-architecture-conflict` skills, the three advisory agents
-(`relais-research`, `relais-implementation`, `relais-review`) and 19 native
-worker definitions, `agents/relais-worker-<model>-<effort>.md`, for the models
-`haiku` (effort `default` only), `sonnet`, `opus` and `fable` (efforts
-`default`, `low`, `medium`, `high`, `xhigh`, `max`). Inside Claude Code,
-`/relais` runs `relais run --native`, so the worker shows as Claude Code's own
-agent; a terminal or unattended run uses `relais run --task …` as before.
-`--hooks` also wires the eight hook events a native run needs.
+`relais install --claude` writes the `/relais-verified-push` and
+`/relais-architecture-conflict` skills and the three advisory agents
+(`relais-research`, `relais-implementation`, `relais-review`), and installs the
+relais plugin, `relais@relais-local`, which carries the mod, the agent
+definitions (`relais-worker-<model>-<effort>` and the reviewer and planner ones)
+and the `/relais` skill. The plugin is embedded in the `relais` binary, so a
+relais installed from a release needs nothing else: install writes a directory
+marketplace under relais's state directory (`claude-marketplace/`) and runs
+`claude plugin marketplace add` then `claude plugin install` (once it is
+installed, `marketplace update` then `plugin update`). The plugin carries
+relais's version, so each release refreshes Claude Code's copy; `relais doctor`
+(`plugin`) warns, naming `relais install --claude --write`, when it is absent,
+disabled or at another version. `relais uninstall --claude` runs `claude plugin
+uninstall` and `claude plugin marketplace remove` and removes the directory. A
+`claude` call that fails is reported with its stderr and the command exits
+non-zero. The per-model worker agent files and the `/relais` skill an earlier
+relais wrote under `.claude/` are removed by the next install when you have not
+edited them, and kept and reported when you have. `relais run` starts only
+from Claude Code with the relais plugin, which runs it with `--protocol` and
+`RELAIS_HOST=claude-code-mod`, so the worker shows as Claude Code's own agent;
+from a plain terminal it is refused (exit 2), as it is on a Claude Code outside
+the plugin's range (`>= 2.1.291, < 2.2.0`). `--native` is gone.
+`--hooks` wires only the admission caps on your own `Agent`/`Task` spawns
+(`Agent|Task`, no `WorktreeCreate`, no `SendMessage`): Claude Code makes its own
+worktrees, and the plugin starts, continues and stops relais's agents. Installing
+over a settings file from the hook-side native path (#171) removes relais's
+`SendMessage` matcher and `WorktreeCreate` entry and keeps every entry that is not
+relais's.
 
 The `relais install --claude --hooks` integration — what it wires, its
 handler timeouts, how to remove it, what `relais doctor` reports on it,

@@ -33,6 +33,9 @@ struct World {
     repo: PathBuf,
     state: PathBuf,
     config: PathBuf,
+    /// The Claude Code this world's relais finds: one that does not exist,
+    /// unless the scenario installs the plugin (`with_plugin_claude`).
+    claude: PathBuf,
 }
 
 impl World {
@@ -63,11 +66,29 @@ impl World {
         git(&repo, &["commit", "-q", "-m", "base"]);
         Self {
             _scratch: scratch,
+            claude: root.join("no-such-claude"),
             root,
             repo,
             state,
             config,
         }
+    }
+
+    /// A `claude` that says no plugin is installed and accepts every other
+    /// call, for the scenarios whose subject is the files and the hook
+    /// wiring `install --claude` writes beside the plugin. A `sh` script,
+    /// so those scenarios run on Unix; the plugin's own steps are driven
+    /// in `plugin_install.rs`.
+    #[cfg(unix)]
+    fn with_plugin_claude(mut self) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let claude = self.root.join("claude");
+        let script =
+            "#!/bin/sh\nif [ \"$1 $2 $3\" = \"plugin list --json\" ]; then echo '[]'; fi\nexit 0\n";
+        std::fs::write(&claude, script).expect("fake claude");
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        self.claude = claude;
+        self
     }
 
     /// The binary, in this world. `RELAIS_CLAUDE_BIN` names a path that
@@ -87,7 +108,7 @@ impl World {
             .current_dir(cwd)
             .env("RELAIS_STATE_DIR", &self.state)
             .env("RELAIS_CONFIG_DIR", &self.config)
-            .env("RELAIS_CLAUDE_BIN", self.root.join("no-such-claude"))
+            .env("RELAIS_CLAUDE_BIN", &self.claude)
             .env("RELAIS_SESSION_ID", "tab-test")
             // This world's home, so nothing here reads — or acts on —
             // the home directory of whoever is running `make check`.
@@ -260,17 +281,23 @@ fn init_writes_a_valid_policy_once() {
 // SPEC §14: installation and uninstall preserve unrelated configuration
 // and modified owned files.
 #[test]
+#[cfg(unix)]
 fn install_is_preview_first_and_uninstall_keeps_foreign_and_modified_files() {
-    let world = World::new("install");
+    let world = World::new("install").with_plugin_claude();
     let preview = world.relais(&["install", "--claude"]);
     assert_eq!(preview.status.code(), Some(0));
     assert!(text(&preview.stdout).contains("preview only"));
-    assert!(!world.repo.join(".claude/skills/relais/SKILL.md").exists());
+    assert!(!world
+        .repo
+        .join(".claude/skills/relais-verified-push/SKILL.md")
+        .exists());
     std::fs::create_dir_all(world.repo.join(".claude/agents")).expect("mkdir");
     std::fs::write(world.repo.join(".claude/agents/custom.md"), "# mine\n").expect("foreign");
     let write = world.relais(&["install", "--claude", "--write"]);
     assert_eq!(write.status.code(), Some(0), "{}", text(&write.stderr));
-    let skill = world.repo.join(".claude/skills/relais/SKILL.md");
+    let skill = world
+        .repo
+        .join(".claude/skills/relais-verified-push/SKILL.md");
     assert!(skill.exists());
     assert!(world
         .repo
@@ -296,13 +323,14 @@ fn install_is_preview_first_and_uninstall_keeps_foreign_and_modified_files() {
 }
 
 // The objective this suite exists for: `relais install --claude` alone
-// never touches settings.json, `--hooks` wires all eight targets in and
+// never touches settings.json, `--hooks` wires all seven targets in and
 // a re-run says nothing is left to do, and `relais doctor` exercises the
 // recorded command — spawning it for real against a scratch environment
 // — rather than merely reading the file back.
 #[test]
+#[cfg(unix)]
 fn install_claude_alone_never_touches_settings_json() {
-    let world = World::new("install-no-hooks");
+    let world = World::new("install-no-hooks").with_plugin_claude();
     std::fs::create_dir_all(world.repo.join(".claude")).expect("mkdir");
     let settings = world.repo.join(".claude/settings.json");
     let original = "{\n  \"hooks\": {}\n}\n";
@@ -317,8 +345,9 @@ fn install_claude_alone_never_touches_settings_json() {
 }
 
 #[test]
+#[cfg(unix)]
 fn install_hooks_wires_settings_json_and_a_rerun_is_current() {
-    let world = World::new("install-hooks");
+    let world = World::new("install-hooks").with_plugin_claude();
     let write = world.relais(&["install", "--claude", "--hooks", "--write"]);
     assert_eq!(write.status.code(), Some(0), "{}", text(&write.stderr));
     let settings_path = world.repo.join(".claude/settings.json");
@@ -333,7 +362,6 @@ fn install_hooks_wires_settings_json_and_a_rerun_is_current() {
         "SubagentStop",
         "SessionStart",
         "SessionEnd",
-        "WorktreeCreate",
     ] {
         assert!(
             settings["hooks"][event]
@@ -342,8 +370,12 @@ fn install_hooks_wires_settings_json_and_a_rerun_is_current() {
             "{event} must carry a relais handler: {settings}"
         );
     }
+    assert!(
+        settings["hooks"].get("WorktreeCreate").is_none(),
+        "relais answers no WorktreeCreate: {settings}"
+    );
     assert_eq!(
-        settings["hooks"]["PreToolUse"][0]["matcher"], "Agent|Task|SendMessage",
+        settings["hooks"]["PreToolUse"][0]["matcher"], "Agent|Task",
         "{settings}"
     );
     assert!(settings["hooks"]["SessionStart"][0]
@@ -377,6 +409,87 @@ fn install_hooks_wires_settings_json_and_a_rerun_is_current() {
     );
 }
 
+// A settings file the hook-side native path (#171) wrote — the SendMessage
+// matcher and relais's WorktreeCreate entry, beside a foreign WorktreeCreate
+// hook — is flagged by `relais doctor`, migrated by the next install with the
+// foreign entry kept, and no longer flagged; uninstall removes either form.
+#[test]
+#[cfg(unix)]
+fn install_hooks_migrates_the_native_hook_wiring_in_a_temp_home() {
+    let world = World::new("install-migrate").with_plugin_claude();
+    std::fs::create_dir_all(world.repo.join(".claude")).expect("mkdir");
+    let settings_path = world.repo.join(".claude/settings.json");
+    let command = format!("{BIN} hook");
+    let relais = serde_json::json!([{"type": "command", "command": command, "timeout": 10}]);
+    let foreign = serde_json::json!({"hooks": [
+        {"type": "command", "command": "/usr/bin/their-worktree-tool"}
+    ]});
+    let old = serde_json::json!({"hooks": {
+        "PreToolUse": [{"matcher": "Agent|Task|SendMessage", "hooks": relais}],
+        "PostToolUse": [{"matcher": "Agent|Task|SendMessage", "hooks": relais}],
+        "PostToolUseFailure": [{"matcher": "Agent|Task|SendMessage", "hooks": relais}],
+        "SubagentStart": [{"hooks": relais}],
+        "SubagentStop": [{"hooks": relais}],
+        "SessionStart": [{"hooks": relais}],
+        "SessionEnd": [{"hooks": relais}],
+        "WorktreeCreate": [{"hooks": [{"type": "command", "command": command, "timeout": 60}]}, foreign]
+    }});
+    let write_old = || {
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&old).expect("render") + "\n",
+        )
+        .expect("write settings");
+    };
+    let wiring_finding = |world: &World| -> Option<serde_json::Value> {
+        let report = world.relais(&["doctor", "--json"]);
+        let report: serde_json::Value =
+            serde_json::from_str(text(&report.stdout).trim()).expect("doctor --json");
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .find(|f| f["component"] == "hook-wiring")
+            .cloned()
+    };
+
+    write_old();
+    let flagged = wiring_finding(&world).expect("doctor flags the old wiring");
+    assert!(
+        flagged["detail"]
+            .as_str()
+            .unwrap()
+            .contains("relais install --claude"),
+        "{flagged}"
+    );
+
+    let write = world.relais(&["install", "--claude", "--hooks", "--write"]);
+    assert_eq!(write.status.code(), Some(0), "{}", text(&write.stderr));
+    let migrated: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("settings"))
+            .expect("valid json");
+    assert_eq!(migrated["hooks"]["PreToolUse"][0]["matcher"], "Agent|Task");
+    assert_eq!(
+        migrated["hooks"]["WorktreeCreate"],
+        serde_json::json!([foreign]),
+        "relais's entry goes, the foreign one stays"
+    );
+    assert!(wiring_finding(&world).is_none(), "{migrated}");
+
+    // Uninstall removes either form.
+    write_old();
+    let uninstall = world.relais(&["uninstall", "--claude", "--hooks", "--write"]);
+    assert_eq!(
+        uninstall.status.code(),
+        Some(0),
+        "{}",
+        text(&uninstall.stderr)
+    );
+    let after = std::fs::read_to_string(&settings_path).expect("settings");
+    assert!(!after.contains(&command), "{after}");
+    assert!(after.contains("/usr/bin/their-worktree-tool"), "{after}");
+}
+
 // `relais doctor` exercises the hook it finds recorded in settings.json
 // by spawning it for real: a fixture spawn payload on stdin, its
 // directories redirected to a scratch environment that refuses when the
@@ -384,8 +497,9 @@ fn install_hooks_wires_settings_json_and_a_rerun_is_current() {
 // state directory). The recorded command IS this test binary, so this
 // proves the wiring end to end, not just the planning.
 #[test]
+#[cfg(unix)]
 fn doctor_exercises_the_recorded_hook_and_reports_a_refusal() {
-    let world = World::new("doctor-hook-live");
+    let world = World::new("doctor-hook-live").with_plugin_claude();
     let before = world.relais(&["doctor", "--json"]);
     let report: serde_json::Value =
         serde_json::from_str(text(&before.stdout).trim()).expect("doctor --json is a document");
@@ -448,8 +562,9 @@ fn doctor_exercises_the_recorded_hook_and_reports_a_refusal() {
 // file the harness merges, it refuses to write the one it owns rather
 // than adding a second handler behind a person's back.
 #[test]
+#[cfg(unix)]
 fn install_hooks_refuses_when_the_local_settings_file_already_carries_one() {
-    let world = World::new("install-hooks-dup");
+    let world = World::new("install-hooks-dup").with_plugin_claude();
     std::fs::create_dir_all(world.repo.join(".claude")).expect("mkdir");
     std::fs::write(
         world.repo.join(".claude/settings.local.json"),
@@ -570,25 +685,14 @@ fn doctor_names_what_is_missing_and_exits_on_a_blocker() {
 }
 
 #[test]
-fn doctor_reports_no_hook_compat_record_until_one_is_written() {
-    let world = World::new("doctor-hook-compat");
-    let first = world.relais(&["doctor", "--json"]);
-    let report: serde_json::Value =
-        serde_json::from_str(text(&first.stdout).trim()).expect("doctor --json is a document");
-    let finding = report["findings"]
-        .as_array()
-        .expect("findings")
-        .iter()
-        .find(|f| f["component"] == "hook-compat")
-        .unwrap_or_else(|| panic!("no `hook-compat` finding in {report}"))
-        .clone();
-    assert_eq!(finding["level"], "warn", "{report}");
+fn doctor_probe_hooks_is_a_usage_error() {
+    let world = World::new("doctor-probe-hooks");
+    let output = world.relais(&["doctor", "--probe-hooks"]);
+    assert_eq!(output.status.code(), Some(2), "{}", text(&output.stderr));
     assert!(
-        finding["detail"]
-            .as_str()
-            .unwrap()
-            .contains("no hook compatibility record"),
-        "{finding}"
+        text(&output.stderr).contains("--probe-hooks"),
+        "{}",
+        text(&output.stderr)
     );
 }
 
@@ -1517,4 +1621,102 @@ fn rollback_of_a_single_revision_recipe_is_refused() {
         "{}",
         text(&unknown.stderr)
     );
+}
+
+// SPEC §29: `--protocol` needs the descriptors of a Unix process; where it
+// cannot be honoured it is refused before anything runs, not ignored.
+#[cfg(windows)]
+#[test]
+fn run_protocol_is_refused_on_windows_before_anything_runs() {
+    let world = World::new("proto-win");
+    let run = world.relais(&["run", "--task", "no-such-task.json", "--protocol"]);
+    assert_eq!(run.status.code(), Some(2), "{}", text(&run.stderr));
+    assert!(
+        text(&run.stderr).contains("not supported on Windows yet"),
+        "{}",
+        text(&run.stderr)
+    );
+    assert!(text(&run.stdout).is_empty(), "{}", text(&run.stdout));
+}
+
+/// A ledger a headless relais wrote — a `managed_run` dispatch, `ApiSpend`
+/// usage and a `permission_denied` block — still reads: `status`,
+/// `explain` and `report` work on it.
+#[test]
+fn a_ledger_holding_headless_era_rows_still_reads() {
+    use relais::ids::{DispatchId, RunId, TaskId};
+    use relais::ledger::{Ledger, Transition, UsageEvent};
+    use relais::lifecycle::State;
+    use relais::money::{CostCompleteness, CostKind, MicroUsd};
+    use relais::route::RoutedBy;
+
+    let world = World::new("headless-ledger");
+    let ledger = Ledger::open(&world.state.join("ledger.sqlite")).expect("ledger opens");
+    let run = RunId::from_stored("run-headless");
+    ledger
+        .insert_run(
+            &run,
+            &world.repo.to_string_lossy(),
+            Some("tab-old"),
+            &TaskId::from_stored("task-headless"),
+            "repo-key",
+        )
+        .expect("run");
+    ledger
+        .record_dispatch_intent(
+            &DispatchId::from_stored("disp-headless"),
+            &run,
+            None,
+            &serde_json::json!({}),
+            0,
+            RoutedBy::ConservativeBaseline,
+        )
+        .expect("a managed_run dispatch");
+    ledger
+        .record_usage(&UsageEvent {
+            event_id: "usage-headless".into(),
+            run_id: run.clone(),
+            attempt_id: None,
+            parent_event_id: None,
+            model: Some("sonnet".into()),
+            input_tokens: Some(100),
+            output_tokens: Some(10),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost: Some(MicroUsd::from_micros(1_234)),
+            cost_kind: CostKind::ApiSpend,
+            completeness: CostCompleteness::Actual,
+            inclusive: false,
+            at: "2026-09-01T00:00:00+00:00".into(),
+            phase: None,
+            duration_ms: None,
+            requested_model: None,
+            requested_effort: None,
+            harness: None,
+        })
+        .expect("api spend usage");
+    ledger
+        .record_transition(&Transition {
+            run_id: run.clone(),
+            attempt_id: None,
+            from_state: Some(State::Prepared),
+            to_state: State::Blocked,
+            reason: "permission_denied".into(),
+            detail: Some(serde_json::json!({ "tools": ["Edit"] })),
+            at: "2026-09-01T00:00:01+00:00".into(),
+        })
+        .expect("a permission_denied block");
+    drop(ledger);
+
+    let status = world.relais(&["status"]);
+    assert_eq!(status.status.code(), Some(0), "{}", text(&status.stderr));
+    let explain = world.relais(&["explain", "run-headless"]);
+    assert_eq!(explain.status.code(), Some(0), "{}", text(&explain.stderr));
+    assert!(
+        text(&explain.stdout).contains("permission_denied"),
+        "{}",
+        text(&explain.stdout)
+    );
+    let report = world.relais(&["report"]);
+    assert_eq!(report.status.code(), Some(0), "{}", text(&report.stderr));
 }

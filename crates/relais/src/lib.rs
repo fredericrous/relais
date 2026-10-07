@@ -30,13 +30,13 @@ pub mod outcome;
 pub mod paths;
 pub mod policy;
 pub mod procs;
+pub mod protocol;
 pub mod repo;
 pub mod report;
 pub mod resume;
 pub mod rng;
 pub mod route;
 pub mod runner;
-pub mod sandbox;
 /// Scratch-directory test helpers. `pub`, not `#[cfg(test)]`: the
 /// integration suites under `tests/` build this crate as an ordinary
 /// dependency and cannot see `pub(crate)`, so this is the one

@@ -16,7 +16,6 @@
 //! that supplies both.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -25,8 +24,9 @@ use crate::policy::ConcurrencyLimits;
 
 mod native;
 pub use native::{
-    BindNativeOutcome, ClaimOutcome, NativeAnswer, NativeAsk, NativeProgress, NativeState,
-    RegisterOutcome, StopNativeOutcome, WorktreeOutcome,
+    AgentStatus, AgentUsage, BindNativeOutcome, BoundOutcome, ClaimOutcome, NativeAnswer,
+    NativeAsk, NativeProgress, NativeState, RegisterOutcome, StopNativeOutcome, StoppedOutcome,
+    StoppedReport, WorktreeOutcome,
 };
 
 /// Poll period while waiting on the coordinator: queued for admission, or
@@ -216,12 +216,14 @@ pub struct DispatchRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchSource {
+    /// A headless dispatch relais launched itself. Nothing produces it any
+    /// more, but old ledger rows and the default of an absent source hold it.
     #[default]
     ManagedRun,
     HookAdmitted,
     Observed,
-    /// A worker attempt of a `relais run --native`: a managed dispatch
-    /// whose worker is a subagent the parent session spawns (SPEC §23).
+    /// A dispatch of a `relais run`: a managed dispatch whose agent is a
+    /// subagent the parent session spawns (SPEC §23).
     NativeRun,
 }
 
@@ -2677,10 +2679,33 @@ pub trait Gate {
         &self,
         _session_id: &str,
         _agent_id: &str,
-        _transcript_path: Option<&Path>,
         _last_assistant_message: Option<&str>,
     ) -> Result<StopNativeOutcome, GateError> {
         Ok(StopNativeOutcome::NotNative)
+    }
+    /// The session's relais plugin said hello (see
+    /// `AdmissionState::native_hello`).
+    fn native_hello(&self, _session_id: &str) -> Result<(), GateError> {
+        Ok(())
+    }
+    /// How long ago the session's plugin last said hello; `None` if it
+    /// never did (see `AdmissionState::native_hello_age`).
+    fn native_hello_age(&self, _session_id: &str) -> Result<Option<Duration>, GateError> {
+        Ok(None)
+    }
+    /// The plugin bound a dispatch to its agent (see
+    /// `AdmissionState::bind_native_agent`).
+    fn native_bound(&self, _dispatch_id: &str, _agent_id: &str) -> Result<BoundOutcome, GateError> {
+        Ok(BoundOutcome::NotNative)
+    }
+    /// The plugin reports a dispatch's agent ended (see
+    /// `AdmissionState::stopped_native`).
+    fn native_stopped(
+        &self,
+        _dispatch_id: &str,
+        _report: &StoppedReport,
+    ) -> Result<StoppedOutcome, GateError> {
+        Ok(StoppedOutcome::NotNative)
     }
     /// Is the agent bound, or was it, to a native dispatch on record?
     fn is_native_agent(&self, _session_id: &str, _agent_id: &str) -> Result<bool, GateError> {
@@ -2985,15 +3010,38 @@ impl Gate for LocalGate {
         &self,
         session_id: &str,
         agent_id: &str,
-        transcript_path: Option<&Path>,
         last_assistant_message: Option<&str>,
     ) -> Result<StopNativeOutcome, GateError> {
         Ok(self.admission().stop_native(
             session_id,
             agent_id,
-            transcript_path.map(Path::to_path_buf),
             last_assistant_message.map(str::to_string),
         ))
+    }
+
+    fn native_hello(&self, session_id: &str) -> Result<(), GateError> {
+        self.admission().native_hello(session_id, Instant::now());
+        Ok(())
+    }
+
+    fn native_hello_age(&self, session_id: &str) -> Result<Option<Duration>, GateError> {
+        Ok(self
+            .admission()
+            .native_hello_age(session_id, Instant::now()))
+    }
+
+    fn native_bound(&self, dispatch_id: &str, agent_id: &str) -> Result<BoundOutcome, GateError> {
+        Ok(self
+            .admission()
+            .bind_native_agent(dispatch_id, agent_id, Instant::now()))
+    }
+
+    fn native_stopped(
+        &self,
+        dispatch_id: &str,
+        report: &StoppedReport,
+    ) -> Result<StoppedOutcome, GateError> {
+        Ok(self.admission().stopped_native(dispatch_id, report))
     }
 
     fn is_native_agent(&self, session_id: &str, agent_id: &str) -> Result<bool, GateError> {

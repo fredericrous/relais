@@ -1,1 +1,5 @@
 target/
+# Written by Claude Code each time it loads the plugin (the mods API's
+# declarations, for this build); never edited, never committed.
+claude-plugin/.claude-plugin/types/
+claude-plugin/tsconfig.json

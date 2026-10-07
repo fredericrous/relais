@@ -1,0 +1,3 @@
+# The Claude Code plugin is embedded in the binary byte for byte (build.rs)
+# and read by Claude Code on every platform: it keeps LF on every checkout.
+claude-plugin/** text eol=lf

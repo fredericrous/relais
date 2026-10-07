@@ -206,8 +206,8 @@ pub enum EvidenceKind {
     HumanSignOff,
     /// The JUnit report a command wrote, kept as its check log is.
     JunitReport,
-    /// What a sandboxed worker attempt was denied and how complete that
-    /// account is (SPEC §8).
+    /// Nothing produces this any more (the OS sandbox's denial report); the
+    /// ledger may still hold it.
     SandboxDenials,
     /// What relais did differently for a native worker than it asked
     /// (SPEC §23): a continuation keeps its agent's own effort.
@@ -3306,6 +3306,18 @@ impl Ledger {
         )?)
     }
 
+    /// Is this agent the one a relais dispatch recorded
+    /// (`dispatches.agent_id`)? Its whole transcript is the run's, so
+    /// `usage import` leaves it alone even when no message id of it was
+    /// booked.
+    pub fn is_relais_agent(&self, agent_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM dispatches WHERE agent_id = ?1)",
+            params![agent_id],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Dispatch intent is persisted BEFORE the process exists (SPEC §12).
     /// A retry with the same dispatch ID is a no-op, not a duplicate.
     ///
@@ -5282,7 +5294,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A headless attempt books no transcript message to a run.
+    /// An attempt without message ids books no transcript message to a run.
     #[test]
     fn a_plain_usage_event_books_no_native_message() {
         let (ledger, dir) = temp_ledger();
@@ -7702,6 +7714,82 @@ mod tests {
                 .expect("models since"),
             vec!["claude-haiku-4-5".to_string()]
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A run the OS sandbox once handled leaves rows nothing writes any
+    /// more: a `shape_refused` transition naming a retired block code, and
+    /// a `sandbox_denials` evidence row. They still read back through the
+    /// ledger API `status` and `explain` use, by their stored spellings
+    /// (the manifest such a run stored is `context`'s test).
+    #[test]
+    fn a_run_with_sandbox_era_rows_still_reads_back() {
+        use crate::policy::BlockCode;
+        let (ledger, dir) = temp_ledger();
+        let id = run("run-sandbox-era");
+        ledger
+            .insert_run(&id, "/repo", None, &task("run-sandbox-era"), "rk")
+            .expect("run");
+        ledger
+            .record_transition(&Transition {
+                run_id: id.clone(),
+                attempt_id: None,
+                from_state: Some(State::Running),
+                to_state: State::Repairing,
+                reason: Reason::ShapeRefused.as_str().into(),
+                detail: None,
+                at: now_rfc3339(),
+            })
+            .expect("transition");
+        for code in [
+            BlockCode::SandboxUnavailable,
+            BlockCode::SandboxWeakened,
+            BlockCode::SandboxUnverified,
+        ] {
+            ledger
+                .record_transition(&Transition {
+                    run_id: id.clone(),
+                    attempt_id: None,
+                    from_state: Some(State::Repairing),
+                    to_state: State::Blocked,
+                    reason: Reason::PermissionDenied.as_str().into(),
+                    detail: Some(serde_json::json!({ "code": code.as_str() })),
+                    at: now_rfc3339(),
+                })
+                .expect("transition");
+            let stored = serde_json::to_string(&code).expect("a code serializes");
+            let back: BlockCode = serde_json::from_str(&stored).expect("a code parses");
+            assert_eq!(back, code, "{stored}");
+        }
+        ledger
+            .record_evidence(
+                &id,
+                None,
+                EvidenceKind::SandboxDenials,
+                Path::new("/runs/r/attempts/sandbox-denials-1.json"),
+                None,
+            )
+            .expect("evidence");
+        assert_eq!(
+            ledger.run_status(&id).expect("status"),
+            Some(State::Blocked)
+        );
+        let transitions = ledger.transitions(&id).expect("transitions");
+        assert!(transitions
+            .iter()
+            .any(|t| t.reason == "shape_refused" && t.to_state == State::Repairing));
+        assert!(transitions.iter().any(|t| t
+            .detail
+            .as_ref()
+            .is_some_and(|d| d["code"] == "sandbox_unverified")));
+        assert_eq!(
+            Reason::parse("shape_refused").expect("a stored reason"),
+            Reason::ShapeRefused
+        );
+        let evidence = ledger.evidence(&id).expect("evidence");
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].kind, EvidenceKind::SandboxDenials);
+        assert_eq!(evidence[0].kind.to_string(), "sandbox_denials");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

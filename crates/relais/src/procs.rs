@@ -11,7 +11,7 @@ use std::io;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -170,6 +170,34 @@ pub fn peer_uid(stream: &std::os::unix::net::UnixStream) -> io::Result<u32> {
     imp::peer_uid(stream.as_raw_fd())
 }
 
+/// This process's stdout and stderr, moved aside and replaced by one pipe:
+/// the protocol channel's way of keeping the real stdout for itself
+/// (`protocol::install`).
+#[cfg(unix)]
+pub struct DivertedStdio {
+    /// What fd 1 was before the diversion.
+    pub stdout: std::fs::File,
+    /// What fd 2 was before the diversion.
+    pub stderr: std::fs::File,
+    /// The pipe's read end: every byte written to fd 1 or fd 2 since.
+    pub reader: std::fs::File,
+}
+
+/// Keep the current stdout and stderr (as duplicated descriptors), then
+/// make fd 1 and fd 2 the write end of a new pipe. All of the descriptors
+/// handed back are close-on-exec, so a child process holds none of them.
+#[cfg(unix)]
+pub fn divert_stdio() -> io::Result<DivertedStdio> {
+    imp::divert_stdio()
+}
+
+/// Put the kept stdout and stderr back onto fd 1 and fd 2, which closes
+/// the pipe's last write end in this process.
+#[cfg(unix)]
+pub fn restore_stdio(stdout: &std::fs::File, stderr: &std::fs::File) -> io::Result<()> {
+    imp::restore_stdio(stdout, stderr)
+}
+
 /// The process umask, narrowed to `mask` for as long as the returned
 /// value lives.
 ///
@@ -268,7 +296,10 @@ pub fn kill_tree(child: &mut Child) -> io::Result<()> {
 /// reap and this call; that window is microseconds wide and is the same
 /// documented limit as `alive` (C6).
 pub fn kill_group(pgid: u32) -> GroupKill {
-    if pgid == 0 {
+    // 0 is the caller's own group and 1 is init's: `kill(-1, …)` means
+    // every process this user owns. Neither is ever a group relais made,
+    // so nothing is signalled and the answer is `NothingLeft`.
+    if pgid <= 1 {
         return GroupKill::NothingLeft;
     }
     imp::kill_group(pgid)
@@ -483,7 +514,6 @@ pub fn run_with_timeout(
     wall_timeout: Duration,
     stdin_bytes: Option<Vec<u8>>,
     cancel: Option<&AtomicBool>,
-    pid_slot: Option<&AtomicU32>,
 ) -> Result<ProcessEnd, RunError> {
     command.stdin(
         stdin_bytes
@@ -494,9 +524,6 @@ pub fn run_with_timeout(
     command.stderr(Stdio::piped());
     own_process_group(&mut command);
     let mut child = command.spawn().map_err(RunError::Spawn)?;
-    if let Some(slot) = pid_slot {
-        slot.store(child.id(), Ordering::SeqCst);
-    }
 
     let prompt = stdin_bytes.map(|bytes| {
         let mut stdin = child.stdin.take().expect("stdin is piped when bytes exist");
@@ -808,6 +835,77 @@ mod imp {
         }
     }
 
+    /// A descriptor equal to `fd` that is not inherited across exec.
+    fn dup_cloexec(fd: libc::c_int) -> io::Result<std::os::fd::OwnedFd> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: `fcntl` with F_DUPFD_CLOEXEC reads no memory; the new
+        // descriptor, when there is one, is owned by nothing else.
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `duplicate` is a fresh descriptor this call owns.
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicate) })
+    }
+
+    fn make_cloexec(fd: &std::os::fd::OwnedFd) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `fcntl` with F_SETFD on a descriptor `fd` keeps open.
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn duplicate_onto(from: &std::os::fd::OwnedFd, onto: libc::c_int) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `dup2` replaces descriptor `onto` with a copy of `from`,
+        // which `from`'s owner keeps open for the call.
+        if unsafe { libc::dup2(from.as_raw_fd(), onto) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub fn divert_stdio() -> io::Result<super::DivertedStdio> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let stdout = dup_cloexec(libc::STDOUT_FILENO)?;
+        let stderr = dup_cloexec(libc::STDERR_FILENO)?;
+        let mut ends: [libc::c_int; 2] = [0; 2];
+        // SAFETY: `pipe` writes two descriptors into the array it is given.
+        if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: both descriptors were just created and nothing else
+        // owns them.
+        let (reader, writer) =
+            unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+        make_cloexec(&reader)?;
+        make_cloexec(&writer)?;
+        duplicate_onto(&writer, libc::STDOUT_FILENO)?;
+        duplicate_onto(&writer, libc::STDERR_FILENO)?;
+        Ok(super::DivertedStdio {
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            reader: reader.into(),
+        })
+    }
+
+    pub fn restore_stdio(stdout: &std::fs::File, stderr: &std::fs::File) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `dup2` onto the standard descriptors from descriptors
+        // the caller keeps open.
+        let restored = unsafe {
+            libc::dup2(stdout.as_raw_fd(), libc::STDOUT_FILENO) >= 0
+                && libc::dup2(stderr.as_raw_fd(), libc::STDERR_FILENO) >= 0
+        };
+        if restored {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
     pub fn try_lock_exclusive(file: &std::fs::File) -> io::Result<bool> {
         use std::os::unix::io::AsRawFd;
         // SAFETY: an advisory lock on a descriptor this process owns; the
@@ -1077,16 +1175,7 @@ mod tests {
     fn run_with_timeout_kills_slow_children() {
         let command = slow_child();
         let started = Instant::now();
-        let pid_slot = AtomicU32::new(0);
-        let end = run_with_timeout(
-            command,
-            Duration::from_millis(300),
-            None,
-            None,
-            Some(&pid_slot),
-        )
-        .expect("runs");
-        assert_ne!(pid_slot.load(Ordering::SeqCst), 0, "the PID was published");
+        let end = run_with_timeout(command, Duration::from_millis(300), None, None).expect("runs");
         assert_eq!(
             end.ended,
             Ended::TimedOut,
@@ -1110,8 +1199,8 @@ mod tests {
             flag.store(true, Ordering::SeqCst);
         });
         let started = Instant::now();
-        let end = run_with_timeout(command, Duration::from_secs(30), None, Some(&cancel), None)
-            .expect("runs");
+        let end =
+            run_with_timeout(command, Duration::from_secs(30), None, Some(&cancel)).expect("runs");
         assert_eq!(
             end.ended,
             Ended::Cancelled,
@@ -1134,8 +1223,7 @@ mod tests {
         let mut command = Command::new("sh");
         command.args(["-c", "echo started; sleep 30 & exit 0"]);
         let started = Instant::now();
-        let end =
-            run_with_timeout(command, Duration::from_secs(120), None, None, None).expect("runs");
+        let end = run_with_timeout(command, Duration::from_secs(120), None, None).expect("runs");
         assert_eq!(end.ended, Ended::Exited(0), "the child itself succeeded");
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -1163,8 +1251,7 @@ mod tests {
         let mut command = Command::new("cmd");
         command.args(["/C", "echo started & start /b ping -n 60 127.0.0.1 > NUL"]);
         let started = Instant::now();
-        let end =
-            run_with_timeout(command, Duration::from_secs(120), None, None, None).expect("runs");
+        let end = run_with_timeout(command, Duration::from_secs(120), None, None).expect("runs");
         assert_eq!(end.ended, Ended::Exited(0), "the child itself succeeded");
         assert!(
             started.elapsed() < PIPE_DRAIN_GRACE * 4,
@@ -1185,8 +1272,7 @@ mod tests {
     fn a_child_that_spawned_nothing_leaves_an_empty_group() {
         let mut command = Command::new("sh");
         command.args(["-c", "exit 0"]);
-        let end =
-            run_with_timeout(command, Duration::from_secs(10), None, None, None).expect("runs");
+        let end = run_with_timeout(command, Duration::from_secs(10), None, None).expect("runs");
         assert_eq!(end.ended, Ended::Exited(0));
         assert_eq!(end.group, GroupKill::NothingLeft);
         assert!(end.group.describe().contains("nothing left"));
@@ -1202,7 +1288,7 @@ mod tests {
         // than any pipe buffer, so the write cannot complete.
         command.args(["-c", "exit 0"]);
         let prompt = vec![b'x'; 4 * 1024 * 1024];
-        let error = run_with_timeout(command, Duration::from_secs(30), Some(prompt), None, None)
+        let error = run_with_timeout(command, Duration::from_secs(30), Some(prompt), None)
             .expect_err("a prompt that was not delivered is a failed launch");
         assert!(
             matches!(error, RunError::PromptWrite(_)),
@@ -1227,7 +1313,6 @@ mod tests {
             Duration::from_secs(30),
             Some(vec![b'y'; 4 * 1024 * 1024]),
             Some(&cancel),
-            None,
         )
         .expect("a cancelled run is reported, not failed");
         assert_eq!(end.ended, Ended::Cancelled);
@@ -1241,7 +1326,6 @@ mod tests {
             command,
             Duration::from_secs(10),
             Some(b"prompt-bytes".to_vec()),
-            None,
             None,
         )
         .expect("runs");
@@ -1396,6 +1480,14 @@ mod tests {
             "the hard kill ends it"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 0 (this process's own group) and 1 (`kill(-1)`: every process this
+    /// user owns) are never a group relais made; nothing is signalled.
+    #[test]
+    fn the_own_group_and_every_process_are_never_killed_as_a_group() {
+        assert_eq!(kill_group(0), GroupKill::NothingLeft);
+        assert_eq!(kill_group(1), GroupKill::NothingLeft);
     }
 
     // A7: the delivery was discarded, so the coordinator recorded a

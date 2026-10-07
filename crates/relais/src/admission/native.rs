@@ -13,12 +13,11 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use super::{AdmissionState, BindOutcome, Provenance};
-use crate::native::{find_marker, Marker};
 
 /// What relais asked the parent session to run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,15 +34,43 @@ pub enum NativeAsk {
     Continue { agent_id: String, message: String },
 }
 
-impl NativeAsk {
-    /// The text the run marker must be in: the prompt of a spawn, the
-    /// message of a continuation.
-    fn marked_text(&self) -> &str {
-        match self {
-            Self::Spawn { prompt, .. } => prompt,
-            Self::Continue { message, .. } => message,
-        }
-    }
+/// How an agent's run ended, as the plugin reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatus {
+    Completed,
+    Failed,
+    Killed,
+}
+
+/// What an agent spent over one dispatch, summed by the plugin over the
+/// dispatch's turns. A figure the plugin did not report is `None`, never
+/// zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentUsage {
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u64>,
+    /// The model that ran, as the harness names it.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// What `relais native stopped` carries: how an agent's run ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoppedReport {
+    #[serde(rename = "agent")]
+    pub agent_id: String,
+    pub status: AgentStatus,
+    #[serde(default)]
+    pub usage: Option<AgentUsage>,
+    #[serde(default)]
+    pub answer: Option<String>,
 }
 
 /// Where a native dispatch is, from the request to the agent's end.
@@ -62,8 +89,9 @@ pub enum NativeState {
     /// with the real spend.
     Stopped {
         agent_id: String,
-        transcript_path: Option<PathBuf>,
-        last_assistant_message: Option<String>,
+        status: AgentStatus,
+        usage: Option<AgentUsage>,
+        answer: Option<String>,
     },
     /// The dispatch cannot run as asked; `reason` is a stable label.
     Failed { reason: String },
@@ -90,6 +118,8 @@ struct NativeRecord {
 pub(super) struct NativeRegistry {
     records: BTreeMap<String, NativeRecord>,
     claims: u64,
+    /// When each session's plugin last said hello.
+    hellos: BTreeMap<String, Instant>,
 }
 
 impl NativeRegistry {
@@ -103,8 +133,6 @@ impl NativeRegistry {
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum RegisterOutcome {
     Registered,
-    /// The prompt or message does not carry exactly this dispatch's marker.
-    MarkerMissing,
     UnknownDispatch,
     WrongSession,
     Finished,
@@ -175,6 +203,29 @@ pub enum StopNativeOutcome {
     NotNative,
 }
 
+/// What `relais native bound` is answered. `Bound` acknowledges, whether
+/// this call bound the agent or an earlier one did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum BoundOutcome {
+    Bound,
+    Refused { reason: String },
+    NotNative,
+}
+
+/// What `relais native stopped` is answered. `Recorded` and
+/// `AlreadyStopped` both acknowledge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum StoppedOutcome {
+    Recorded,
+    /// The dispatch already holds a stop: it is not changed.
+    AlreadyStopped,
+    /// The dispatch is bound to another agent.
+    WrongAgent,
+    NotNative,
+}
+
 /// What `native_status` knows about a dispatch: what N2 polls.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "progress", rename_all = "snake_case")]
@@ -192,13 +243,37 @@ pub enum NativeProgress {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "answer", rename_all = "snake_case")]
 pub enum NativeAnswer {
-    Registered { outcome: RegisterOutcome },
-    Claimed { outcome: ClaimOutcome },
-    Worktree { outcome: WorktreeOutcome },
-    Bound { outcome: BindNativeOutcome },
-    Stopped { outcome: StopNativeOutcome },
-    Agent { native: bool },
-    Progress { progress: NativeProgress },
+    Registered {
+        outcome: RegisterOutcome,
+    },
+    Claimed {
+        outcome: ClaimOutcome,
+    },
+    Worktree {
+        outcome: WorktreeOutcome,
+    },
+    Bound {
+        outcome: BindNativeOutcome,
+    },
+    Stopped {
+        outcome: StopNativeOutcome,
+    },
+    Agent {
+        native: bool,
+    },
+    Progress {
+        progress: NativeProgress,
+    },
+    BoundAgent {
+        outcome: BoundOutcome,
+    },
+    StoppedAgent {
+        outcome: StoppedOutcome,
+    },
+    /// Milliseconds since the session's last hello; `None`: never.
+    HelloAge {
+        age_ms: Option<u64>,
+    },
 }
 
 /// One reader per answer, so a caller names the answer it expects and
@@ -259,6 +334,30 @@ impl NativeAnswer {
             None
         }
     }
+
+    pub fn bound_agent(self) -> Option<BoundOutcome> {
+        if let Self::BoundAgent { outcome } = self {
+            Some(outcome)
+        } else {
+            None
+        }
+    }
+
+    pub fn stopped_agent(self) -> Option<StoppedOutcome> {
+        if let Self::StoppedAgent { outcome } = self {
+            Some(outcome)
+        } else {
+            None
+        }
+    }
+
+    pub fn hello_age(self) -> Option<Option<Duration>> {
+        if let Self::HelloAge { age_ms } = self {
+            Some(age_ms.map(Duration::from_millis))
+        } else {
+            None
+        }
+    }
 }
 
 impl AdmissionState {
@@ -270,9 +369,6 @@ impl AdmissionState {
         dispatch_id: &str,
         ask: &NativeAsk,
     ) -> RegisterOutcome {
-        if find_marker(ask.marked_text()) != Marker::One(dispatch_id.to_string()) {
-            return RegisterOutcome::MarkerMissing;
-        }
         let Some(dispatch) = self.dispatches.get(dispatch_id) else {
             return if self.finished.contains(dispatch_id) {
                 RegisterOutcome::Finished
@@ -480,7 +576,6 @@ impl AdmissionState {
         &mut self,
         session_id: &str,
         agent_id: &str,
-        transcript_path: Option<PathBuf>,
         last_assistant_message: Option<String>,
     ) -> StopNativeOutcome {
         // Bound to that agent, or not yet bound but given the tree named
@@ -507,13 +602,114 @@ impl AdmissionState {
         let Some(dispatch_id) = found else {
             return StopNativeOutcome::NotNative;
         };
+        // The hook knows nothing of what the agent spent: the plugin's
+        // `stopped` report carries that, and this path is not the new flow.
         let stopped = NativeState::Stopped {
             agent_id: agent_id.to_string(),
-            transcript_path,
-            last_assistant_message,
+            status: AgentStatus::Completed,
+            usage: None,
+            answer: last_assistant_message,
         };
         self.set_native(&dispatch_id, stopped, None);
         StopNativeOutcome::Stopped { dispatch_id }
+    }
+
+    /// The session's plugin said hello.
+    pub fn native_hello(&mut self, session_id: &str, now: Instant) {
+        self.native.hellos.insert(session_id.to_string(), now);
+    }
+
+    /// How long ago the session's plugin last said hello; `None` if it
+    /// never did.
+    pub fn native_hello_age(&self, session_id: &str, now: Instant) -> Option<Duration> {
+        self.native
+            .hellos
+            .get(session_id)
+            .map(|hello| now.saturating_duration_since(*hello))
+    }
+
+    /// The plugin bound the dispatch to the agent it runs. Idempotent: the
+    /// same agent again is acknowledged; another is refused. A record that
+    /// already holds the agent's stop keeps it.
+    pub fn bind_native_agent(
+        &mut self,
+        dispatch_id: &str,
+        agent_id: &str,
+        now: Instant,
+    ) -> BoundOutcome {
+        let Some(record) = self.native.records.get(dispatch_id) else {
+            return BoundOutcome::NotNative;
+        };
+        let held_by = |held: &str| BoundOutcome::Refused {
+            reason: format!("dispatch {dispatch_id} belongs to agent {held}"),
+        };
+        let stopped = match &record.state {
+            NativeState::Bound { agent_id: held } if held == agent_id => {
+                return BoundOutcome::Bound
+            }
+            NativeState::Bound { agent_id: held } => return held_by(held),
+            NativeState::Stopped { agent_id: held, .. } if held != agent_id => {
+                return held_by(held)
+            }
+            NativeState::Stopped { .. } => true,
+            NativeState::Requested {
+                ask: NativeAsk::Continue {
+                    agent_id: asked, ..
+                },
+            } if asked != agent_id => return held_by(asked),
+            NativeState::Requested { .. }
+            | NativeState::Claimed
+            | NativeState::TreeGiven { .. } => false,
+            NativeState::Failed { .. } => return BoundOutcome::NotNative,
+        };
+        match self.lease_binding(dispatch_id, agent_id, now) {
+            BindOutcome::Bound => {
+                if !stopped {
+                    let bound = NativeState::Bound {
+                        agent_id: agent_id.to_string(),
+                    };
+                    self.set_native(dispatch_id, bound, None);
+                }
+                BoundOutcome::Bound
+            }
+            BindOutcome::UnknownDispatch
+            | BindOutcome::PidNotAlive
+            | BindOutcome::AlreadyBoundToProcess => {
+                self.fail_native(dispatch_id, BIND_REFUSED);
+                BoundOutcome::Refused {
+                    reason: BIND_REFUSED.to_string(),
+                }
+            }
+        }
+    }
+
+    /// The plugin reports how the dispatch's agent ended. Idempotent per
+    /// dispatch: a second report changes nothing. A stop before the bind is
+    /// kept; the bind that follows finds it. It is not settled or released
+    /// here.
+    pub fn stopped_native(&mut self, dispatch_id: &str, report: &StoppedReport) -> StoppedOutcome {
+        let Some(record) = self.native.records.get(dispatch_id) else {
+            return StoppedOutcome::NotNative;
+        };
+        match &record.state {
+            NativeState::Stopped { .. } => return StoppedOutcome::AlreadyStopped,
+            NativeState::Bound { agent_id } if *agent_id != report.agent_id => {
+                return StoppedOutcome::WrongAgent
+            }
+            NativeState::Failed { .. } => return StoppedOutcome::NotNative,
+            NativeState::Bound { .. }
+            | NativeState::Requested { .. }
+            | NativeState::Claimed
+            | NativeState::TreeGiven { .. } => {}
+        }
+        let stopped = NativeState::Stopped {
+            agent_id: report.agent_id.clone(),
+            status: report.status,
+            usage: report.usage.clone(),
+            answer: report.answer.clone(),
+        };
+        self.set_native(dispatch_id, stopped, None);
+        StoppedOutcome::Recorded
     }
 
     /// Is the agent bound, or was it, to a native dispatch still on
@@ -576,7 +772,6 @@ mod tests {
     use crate::admission::{
         Decision, DispatchRequest, DispatchSource, ResourceClass, RunRegistration,
     };
-    use crate::native::marker_line;
     use crate::policy::ConcurrencyLimits;
     use std::time::Duration;
 
@@ -624,7 +819,7 @@ mod tests {
         NativeAsk::Spawn {
             subagent_type: "relais-worker".into(),
             model: "sonnet".into(),
-            prompt: format!("do it\n{}", marker_line(dispatch)),
+            prompt: format!("do it for {dispatch}"),
             worktree: PathBuf::from("/trees/task"),
         }
     }
@@ -632,12 +827,12 @@ mod tests {
     fn continue_ask(dispatch: &str, agent: &str) -> NativeAsk {
         NativeAsk::Continue {
             agent_id: agent.into(),
-            message: format!("fix it\n{}", marker_line(dispatch)),
+            message: format!("fix it for {dispatch}"),
         }
     }
 
     #[test]
-    fn registration_needs_an_admitted_unfinished_dispatch_of_the_session_with_its_marker() {
+    fn registration_needs_an_admitted_unfinished_dispatch_of_the_session() {
         let now = Instant::now();
         let mut state = state();
         admitted(&mut state, "d1", "s1", now);
@@ -649,10 +844,6 @@ mod tests {
         assert_eq!(
             state.register_native("s2", "d1", &ask),
             RegisterOutcome::WrongSession
-        );
-        assert_eq!(
-            state.register_native("s1", "d1", &spawn_ask("d2")),
-            RegisterOutcome::MarkerMissing
         );
         assert_eq!(
             state.register_native("s1", "d1", &ask),
@@ -715,7 +906,7 @@ mod tests {
         state.claim_native("s1", "d1", None, now);
         state.native_worktree("s1", "agent-a1");
         assert_eq!(
-            state.stop_native("s1", "a1", None, Some("done".into())),
+            state.stop_native("s1", "a1", Some("done".into())),
             StopNativeOutcome::Stopped {
                 dispatch_id: "d1".into()
             }
@@ -767,7 +958,7 @@ mod tests {
         assert!(state.is_native_agent("s1", "a1"));
         assert!(!state.is_native_agent("s2", "a1"));
         assert_eq!(
-            state.stop_native("s1", "a1", Some("/t.jsonl".into()), Some("done".into())),
+            state.stop_native("s1", "a1", Some("done".into())),
             StopNativeOutcome::Stopped {
                 dispatch_id: "d1".into()
             }
@@ -781,8 +972,9 @@ mod tests {
             NativeProgress::Known {
                 state: NativeState::Stopped {
                     agent_id: "a1".into(),
-                    transcript_path: Some("/t.jsonl".into()),
-                    last_assistant_message: Some("done".into()),
+                    status: AgentStatus::Completed,
+                    usage: None,
+                    answer: Some("done".into()),
                 }
             }
         );
@@ -805,7 +997,7 @@ mod tests {
         let second_tree = NativeAsk::Spawn {
             subagent_type: "w".into(),
             model: "m".into(),
-            prompt: marker_line("d2"),
+            prompt: "do it for d2".into(),
             worktree: PathBuf::from("/trees/two"),
         };
         state.register_native("s1", "d1", &spawn_ask("d1"));
@@ -907,20 +1099,177 @@ mod tests {
         state.claim_native("s1", "d1", None, now);
         state.native_worktree("s1", "agent-a1");
         state.bind_native("s1", "d1", "a1", now);
-        state.stop_native("s1", "a1", None, Some("first".into()));
+        state.stop_native("s1", "a1", Some("first".into()));
         admitted(&mut state, "d2", "s1", now);
         state.register_native("s1", "d2", &continue_ask("d2", "a1"));
         state.claim_native("s1", "d2", Some("a1"), now);
         assert_eq!(
-            state.stop_native("s1", "a1", None, Some("second".into())),
+            state.stop_native("s1", "a1", Some("second".into())),
             StopNativeOutcome::Stopped {
                 dispatch_id: "d2".into()
             }
         );
         assert_eq!(
-            state.stop_native("s1", "a1", None, None),
+            state.stop_native("s1", "a1", None),
             StopNativeOutcome::NotNative,
             "both attempts are stopped now"
         );
+    }
+
+    fn report(agent: &str, answer: &str) -> StoppedReport {
+        StoppedReport {
+            agent_id: agent.into(),
+            status: AgentStatus::Completed,
+            usage: Some(AgentUsage {
+                input_tokens: Some(10),
+                model: Some("m".into()),
+                ..AgentUsage::default()
+            }),
+            answer: Some(answer.into()),
+        }
+    }
+
+    #[test]
+    fn bound_moves_a_requested_record_acknowledges_the_same_agent_and_refuses_another() {
+        let now = Instant::now();
+        let mut state = state();
+        admitted(&mut state, "d1", "s1", now);
+        assert_eq!(
+            state.bind_native_agent("d1", "a1", now),
+            BoundOutcome::NotNative,
+            "nothing is registered yet"
+        );
+        state.register_native("s1", "d1", &spawn_ask("d1"));
+        assert_eq!(
+            state.bind_native_agent("d1", "a1", now),
+            BoundOutcome::Bound
+        );
+        assert_eq!(
+            state.bind_native_agent("d1", "a1", now),
+            BoundOutcome::Bound,
+            "the same agent again is acknowledged"
+        );
+        assert!(matches!(
+            state.bind_native_agent("d1", "a2", now),
+            BoundOutcome::Refused { .. }
+        ));
+        assert_eq!(
+            state.native_status("d1"),
+            NativeProgress::Known {
+                state: NativeState::Bound {
+                    agent_id: "a1".into()
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn a_claimed_record_binds_without_a_tree() {
+        let now = Instant::now();
+        let mut state = state();
+        admitted(&mut state, "d1", "s1", now);
+        state.register_native("s1", "d1", &spawn_ask("d1"));
+        state.claim_native("s1", "d1", None, now);
+        assert_eq!(
+            state.bind_native_agent("d1", "a1", now),
+            BoundOutcome::Bound
+        );
+    }
+
+    #[test]
+    fn a_continuation_binds_only_its_own_agent() {
+        let now = Instant::now();
+        let mut state = state();
+        admitted(&mut state, "d2", "s1", now);
+        state.register_native("s1", "d2", &continue_ask("d2", "a1"));
+        assert!(matches!(
+            state.bind_native_agent("d2", "a9", now),
+            BoundOutcome::Refused { .. }
+        ));
+        assert_eq!(
+            state.bind_native_agent("d2", "a1", now),
+            BoundOutcome::Bound
+        );
+    }
+
+    #[test]
+    fn a_second_stopped_acknowledges_and_changes_nothing() {
+        let now = Instant::now();
+        let mut state = state();
+        admitted(&mut state, "d1", "s1", now);
+        state.register_native("s1", "d1", &spawn_ask("d1"));
+        state.bind_native_agent("d1", "a1", now);
+        assert_eq!(
+            state.stopped_native("d1", &report("a1", "first")),
+            StoppedOutcome::Recorded
+        );
+        assert_eq!(
+            state.stopped_native("d1", &report("a1", "second")),
+            StoppedOutcome::AlreadyStopped
+        );
+        let NativeProgress::Known {
+            state: NativeState::Stopped { answer, usage, .. },
+        } = state.native_status("d1")
+        else {
+            panic!("stopped");
+        };
+        assert_eq!(answer.as_deref(), Some("first"));
+        assert_eq!(usage.and_then(|usage| usage.input_tokens), Some(10));
+    }
+
+    #[test]
+    fn a_stop_before_the_bind_is_kept_and_the_bind_finds_it() {
+        let now = Instant::now();
+        let mut state = state();
+        admitted(&mut state, "d1", "s1", now);
+        state.register_native("s1", "d1", &spawn_ask("d1"));
+        assert_eq!(
+            state.stopped_native("d1", &report("a1", "done")),
+            StoppedOutcome::Recorded
+        );
+        assert!(matches!(
+            state.bind_native_agent("d1", "a2", now),
+            BoundOutcome::Refused { .. }
+        ));
+        assert_eq!(
+            state.bind_native_agent("d1", "a1", now),
+            BoundOutcome::Bound
+        );
+        assert!(matches!(
+            state.native_status("d1"),
+            NativeProgress::Known {
+                state: NativeState::Stopped { ref agent_id, .. }
+            } if agent_id == "a1"
+        ));
+    }
+
+    #[test]
+    fn a_stop_from_another_agent_than_the_bound_one_is_refused() {
+        let now = Instant::now();
+        let mut state = state();
+        admitted(&mut state, "d1", "s1", now);
+        state.register_native("s1", "d1", &spawn_ask("d1"));
+        state.bind_native_agent("d1", "a1", now);
+        assert_eq!(
+            state.stopped_native("d1", &report("a2", "done")),
+            StoppedOutcome::WrongAgent
+        );
+        assert_eq!(
+            state.stopped_native("nope", &report("a1", "done")),
+            StoppedOutcome::NotNative
+        );
+    }
+
+    #[test]
+    fn a_hello_is_remembered_per_session() {
+        let t0 = Instant::now();
+        let mut state = state();
+        assert_eq!(state.native_hello_age("s1", t0), None);
+        state.native_hello("s1", t0);
+        assert_eq!(
+            state.native_hello_age("s1", t0 + Duration::from_secs(5)),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(state.native_hello_age("s2", t0), None);
     }
 }

@@ -38,6 +38,20 @@ pub enum DispatchVerdict {
     /// No PID was recorded and nothing else knows: the outcome is
     /// unknown. Unknown is never retried and never assumed dead.
     Unknown { dispatch: DispatchId },
+    /// A native agent of a Claude Code session whose relais plugin is
+    /// still saying hello: the session, and so maybe the agent, lives.
+    /// Refused like `StillAlive`.
+    SessionLive {
+        dispatch: DispatchId,
+        session: String,
+    },
+    /// A native agent of a session whose plugin stopped saying hello
+    /// (`native::HELLO_FRESH`): a subagent does not outlive its session,
+    /// so the agent is gone, as provably as a PID that is gone.
+    SessionGone {
+        dispatch: DispatchId,
+        session: String,
+    },
 }
 
 impl DispatchVerdict {
@@ -46,7 +60,9 @@ impl DispatchVerdict {
             DispatchVerdict::StillAlive { dispatch, .. }
             | DispatchVerdict::ProvablyDead { dispatch, .. }
             | DispatchVerdict::CoordinatorHoldsASeat { dispatch }
-            | DispatchVerdict::Unknown { dispatch } => dispatch,
+            | DispatchVerdict::Unknown { dispatch }
+            | DispatchVerdict::SessionLive { dispatch, .. }
+            | DispatchVerdict::SessionGone { dispatch, .. } => dispatch,
         }
     }
 
@@ -62,6 +78,12 @@ impl DispatchVerdict {
             }
             DispatchVerdict::Unknown { dispatch } => {
                 format!("{dispatch} (no pid recorded; nothing knows its outcome)")
+            }
+            DispatchVerdict::SessionLive { dispatch, session } => {
+                format!("{dispatch} (a native agent of session {session}, whose relais plugin is still live)")
+            }
+            DispatchVerdict::SessionGone { dispatch, session } => {
+                format!("{dispatch} (a native agent of session {session}, which has ended)")
             }
         }
     }
@@ -85,6 +107,7 @@ impl Reconciliation {
                     verdict,
                     DispatchVerdict::StillAlive { .. }
                         | DispatchVerdict::CoordinatorHoldsASeat { .. }
+                        | DispatchVerdict::SessionLive { .. }
                 )
             })
             .collect()
@@ -102,10 +125,11 @@ impl Reconciliation {
     /// live dispatch at all is trivially proven.
     pub fn all_provably_dead(&self) -> bool {
         self.verdicts.iter().all(|verdict| match verdict {
-            DispatchVerdict::ProvablyDead { .. } => true,
+            DispatchVerdict::ProvablyDead { .. } | DispatchVerdict::SessionGone { .. } => true,
             DispatchVerdict::StillAlive { .. }
             | DispatchVerdict::CoordinatorHoldsASeat { .. }
-            | DispatchVerdict::Unknown { .. } => false,
+            | DispatchVerdict::Unknown { .. }
+            | DispatchVerdict::SessionLive { .. } => false,
         })
     }
 
@@ -115,10 +139,12 @@ impl Reconciliation {
         self.verdicts
             .iter()
             .filter_map(|verdict| match verdict {
-                DispatchVerdict::ProvablyDead { dispatch, .. } => Some(dispatch),
+                DispatchVerdict::ProvablyDead { dispatch, .. }
+                | DispatchVerdict::SessionGone { dispatch, .. } => Some(dispatch),
                 DispatchVerdict::StillAlive { .. }
                 | DispatchVerdict::CoordinatorHoldsASeat { .. }
-                | DispatchVerdict::Unknown { .. } => None,
+                | DispatchVerdict::Unknown { .. }
+                | DispatchVerdict::SessionLive { .. } => None,
             })
             .collect()
     }
@@ -132,7 +158,12 @@ impl Reconciliation {
         let dead: Vec<String> = self
             .verdicts
             .iter()
-            .filter(|verdict| matches!(verdict, DispatchVerdict::ProvablyDead { .. }))
+            .filter(|verdict| {
+                matches!(
+                    verdict,
+                    DispatchVerdict::ProvablyDead { .. } | DispatchVerdict::SessionGone { .. }
+                )
+            })
             .map(DispatchVerdict::describe)
             .collect();
         let unknown: Vec<String> = self
@@ -171,17 +202,45 @@ pub fn reconcile(
     coordinator_view: Option<&RunStatus>,
     alive: &dyn Fn(Pid) -> bool,
 ) -> Reconciliation {
+    reconcile_with_sessions(dispatches, coordinator_view, alive, &|_| None)
+}
+
+/// [`reconcile`], with what is known of the Claude Code sessions native
+/// agents belong to: `session_live(session)` is `Some(true)` while that
+/// session's relais plugin says hello, `Some(false)` once it has stopped,
+/// and `None` when nothing answered (no evidence, so the dispatch stays
+/// judged as before). A native agent has no PID relais owns; its session
+/// is what it lives and dies with, and that outranks a coordinator seat
+/// the run that died left behind.
+pub fn reconcile_with_sessions(
+    dispatches: &[LiveDispatch],
+    coordinator_view: Option<&RunStatus>,
+    alive: &dyn Fn(Pid) -> bool,
+    session_live: &dyn Fn(&str) -> Option<bool>,
+) -> Reconciliation {
     let coordinator_busy = coordinator_view
         .is_some_and(|run: &RunStatus| run.active > 0 || run.waiting > 0 || run.queued > 0);
     let verdicts = dispatches
         .iter()
         .map(|live| {
             let dispatch = live.dispatch.clone();
-            match live.pid {
-                Some(pid) if alive(pid) => DispatchVerdict::StillAlive { dispatch, pid },
-                Some(pid) => DispatchVerdict::ProvablyDead { dispatch, pid },
-                None if coordinator_busy => DispatchVerdict::CoordinatorHoldsASeat { dispatch },
-                None => DispatchVerdict::Unknown { dispatch },
+            let native_session = (live.source.as_deref() == Some("native_run"))
+                .then_some(live.session_id.as_deref())
+                .flatten();
+            let session = native_session.and_then(|session| {
+                session_live(session).map(|is_live| (session.to_string(), is_live))
+            });
+            match (live.pid, session) {
+                (Some(pid), _) if alive(pid) => DispatchVerdict::StillAlive { dispatch, pid },
+                (Some(pid), _) => DispatchVerdict::ProvablyDead { dispatch, pid },
+                (None, Some((session, true))) => DispatchVerdict::SessionLive { dispatch, session },
+                (None, Some((session, false))) => {
+                    DispatchVerdict::SessionGone { dispatch, session }
+                }
+                (None, None) if coordinator_busy => {
+                    DispatchVerdict::CoordinatorHoldsASeat { dispatch }
+                }
+                (None, None) => DispatchVerdict::Unknown { dispatch },
             }
         })
         .collect();
@@ -347,5 +406,71 @@ mod tests {
         let detail = outcome.detail();
         assert!(detail.contains("dead (pid 12 is gone)"), "{detail}");
         assert!(detail.contains("[nopid]"), "{detail}");
+    }
+
+    fn native(dispatch: &str, session: &str) -> LiveDispatch {
+        LiveDispatch {
+            source: Some("native_run".into()),
+            session_id: Some(session.into()),
+            ..live(dispatch, None)
+        }
+    }
+
+    /// A native agent whose session ended (its plugin stopped saying
+    /// hello) is gone: the run reconciles, even with the seat the dead
+    /// run left in the coordinator, and its tree may be retired.
+    #[test]
+    fn a_native_agent_of_an_ended_session_is_gone_whatever_the_seat() {
+        let view = busy_run(1, 0, 0);
+        let outcome = reconcile_with_sessions(
+            &[native("d1", "tab-gone")],
+            Some(&view),
+            NOTHING_IS_ALIVE,
+            &|session| Some(session != "tab-gone"),
+        );
+        assert!(outcome.may_reconcile(), "{}", outcome.refusal());
+        assert!(outcome.all_provably_dead());
+        assert_eq!(outcome.provably_dead(), [&DispatchId::from_stored("d1")]);
+        assert!(
+            outcome
+                .detail()
+                .contains("session tab-gone, which has ended"),
+            "{}",
+            outcome.detail()
+        );
+    }
+
+    /// A native agent whose session still says hello may be running:
+    /// resume refuses, as for a live PID.
+    #[test]
+    fn a_native_agent_of_a_live_session_refuses_the_resume() {
+        let outcome =
+            reconcile_with_sessions(&[native("d1", "tab")], None, NOTHING_IS_ALIVE, &|_| {
+                Some(true)
+            });
+        assert!(!outcome.may_reconcile());
+        assert!(
+            outcome.refusal().contains("still live"),
+            "{}",
+            outcome.refusal()
+        );
+    }
+
+    /// With nothing known of the session, a native dispatch is judged as
+    /// before: a held seat refuses, no seat leaves it unknown.
+    #[test]
+    fn a_native_agent_with_no_session_evidence_is_judged_as_before() {
+        let view = busy_run(1, 0, 0);
+        let held = reconcile_with_sessions(
+            &[native("d1", "tab")],
+            Some(&view),
+            NOTHING_IS_ALIVE,
+            &|_| None,
+        );
+        assert!(!held.may_reconcile());
+        let free =
+            reconcile_with_sessions(&[native("d1", "tab")], None, NOTHING_IS_ALIVE, &|_| None);
+        assert!(free.may_reconcile());
+        assert!(!free.all_provably_dead(), "unknown is never assumed dead");
     }
 }

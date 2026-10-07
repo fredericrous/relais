@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use crate::fsutil::write_atomic;
 use crate::ids::sha256_hex;
 
+pub mod plugin;
 pub mod settings;
 pub use settings::{HookEventAction, HookEventPlan, HooksPlan};
 
@@ -179,19 +180,11 @@ fn read_block(text: &str) -> BlockRead {
     })
 }
 
-/// Files relais owns, in install order: the advisory agents, one native
-/// worker per shipped (model, effort), then the skills.
+/// Files relais owns, in install order: the advisory agents, then the two
+/// skills that stay user-level. The `/relais` skill and the native
+/// worker agents live in the plugin ([`plugin`]).
 pub fn owned_files() -> Vec<(PathBuf, String)> {
-    let workers = crate::native::worker_agent_types()
-        .into_iter()
-        .map(|(model, effort)| {
-            let agent_type = crate::native::worker_agent_type(&model, effort.as_deref());
-            (
-                Path::new("agents").join(format!("{agent_type}.md")),
-                agent_native_worker(&agent_type, &model, effort.as_deref()),
-            )
-        });
-    let mut files = vec![
+    vec![
         (
             Path::new("agents").join("relais-research.md"),
             agent_research(),
@@ -201,13 +194,6 @@ pub fn owned_files() -> Vec<(PathBuf, String)> {
             agent_implementation(),
         ),
         (Path::new("agents").join("relais-review.md"), agent_review()),
-    ];
-    files.extend(workers);
-    files.extend([
-        (
-            Path::new("skills").join("relais").join("SKILL.md"),
-            skill_relais(),
-        ),
         (
             Path::new("skills")
                 .join("relais-verified-push")
@@ -220,35 +206,22 @@ pub fn owned_files() -> Vec<(PathBuf, String)> {
                 .join("SKILL.md"),
             skill_relais_architecture_conflict(),
         ),
-    ]);
-    files
+    ]
 }
 
-/// A native worker definition: the subagent a `RELAIS-SPAWN` line asks the
-/// session to start. No `Agent` among its tools, so a worker cannot spawn.
-/// `isolation: worktree` as the plan's decision log says (the spawn's own
-/// input sets it too). No `maxTurns`, deliberately: the attempt's wall
-/// time and the budget checked between attempts bound it, and a turn cap
-/// would stop a worker in the middle of an edit.
-fn agent_native_worker(agent_type: &str, model: &str, effort: Option<&str>) -> String {
-    let effort_line = effort.map_or(String::new(), |effort| format!("effort: {effort}\n"));
-    let body = format!(
-        r#"---
-name: {agent_type}
-description: relais native worker. Spawned only from a RELAIS-SPAWN line printed by `relais run --native`; never pick it yourself.
-tools: Read, Grep, Glob, Edit, Write, Bash
-model: {model}
-{effort_line}isolation: worktree
----
-
-You are a relais worker. The task, the rules and the acceptance criteria
-arrive in your prompt; follow them exactly.
-
-Verification, not your own summary, decides acceptance. You do not
-commit, push or publish anything.
-"#
-    );
-    body.trim_end().to_string()
+/// Files an earlier relais wrote that the plugin replaced: the per-(model,
+/// effort) native worker agents and the `/relais` skill. No template is
+/// kept for them — what is removed is judged by the marker each carries.
+pub fn retired_files() -> Vec<PathBuf> {
+    let workers = crate::native::worker_agent_types()
+        .into_iter()
+        .map(|(model, effort)| {
+            let agent_type = crate::native::worker_agent_type(&model, effort.as_deref());
+            Path::new("agents").join(format!("{agent_type}.md"))
+        });
+    workers
+        .chain([Path::new("skills").join("relais").join("SKILL.md")])
+        .collect()
 }
 
 fn agent_research() -> String {
@@ -315,115 +288,6 @@ evidence, and a suggested verification. If there are no findings, say
 "FINDINGS: none". You cannot edit files and you cannot waive checks.
 Lack of findings is evidence, not proof. These are advisory defaults:
 the relais runner owns acceptance.
-"#;
-    body.trim_end().to_string()
-}
-
-fn skill_relais() -> String {
-    let body = r#"---
-name: relais
-description: Route a bounded coding task through the relais supervised runner — explicit model, verification, escalation and accounting.
----
-
-# /relais
-
-Express the requested work as a task contract, then hand it to the
-runner. The parent does not supervise intermediate turns.
-
-## Inputs
-
-Before a contract can be written, the caller must supply:
-
-- the repository or task worktree the change belongs to (its root is
-  where `relais.toml` is found);
-- one precise objective sentence;
-- the write scope: which paths the change may touch;
-- acceptance criteria a command can verify — never "looks right" or a
-  worker's own completion message;
-- the verification profile to run, named in that repository's
-  `relais.toml`.
-
-Missing any of these is a reason to ask, not to guess one on the
-caller's behalf.
-
-## Steps
-
-1. Work from the repository the task changes — its task worktree when
-   one exists. Every command below runs with that directory as cwd
-   (`cd <root> && …`); the session's own cwd may be anywhere else.
-   `relais` finds `relais.toml` upward from cwd to the repository root,
-   so a subdirectory is fine, but a directory outside the repository is
-   refused, never guessed.
-
-2. Write a contract at `<root>/.relais/task.json`:
-
-```json
-{
-  "schema_version": 1,
-  "kind": "change",
-  "objective": "<one precise sentence>",
-  "base_ref": "HEAD",
-  "write_scope": ["<paths the change may touch>"],
-  "read_hints": ["<entry points>"],
-  "acceptance": ["<criterion a command can verify>", "..."],
-  "verification_profile": "<profile from relais.toml>",
-  "review": "optional"
-}
-```
-
-Use `"kind": "inspect"` with evidence criteria for investigations that
-must not edit files.
-
-3. Preflight without spending: `relais plan --task .relais/task.json`
-
-4. Execute natively, so the worker shows as Claude Code's own agent.
-   relais reads `CLAUDE_CODE_SESSION_ID` from the environment on its
-   own, so the coordinator's per-session limits and attribution are per
-   TAB rather than per shell (SPEC §23) without naming anything
-   explicitly. Run
-   `relais run --native --task .relais/task.json`
-   with the Bash tool's `run_in_background: true`, and follow its
-   output: the Monitor tool on a `tail -f` of the output file, or read
-   the output file. relais asks for each worker on one line:
-   - on a line `RELAIS-SPAWN <json>`, call the Agent tool once with
-     exactly that JSON's fields (`subagent_type`, `model`,
-     `description`, `prompt`, `isolation`, `run_in_background`), the
-     prompt unchanged;
-   - on a line `RELAIS-CONTINUE <json>`, call SendMessage (load it with
-     ToolSearch first if it is deferred) with that JSON's `to` and
-     `message`, exactly.
-   Never send anything else to relais's agents, and never spawn one
-   request twice: the hook refuses both. Do not work on the task
-   yourself while the run is going. A worker finishing is not the run
-   finishing: relais still verifies, and may review, repair or escalate.
-   Keep following the output until relais prints its outcome line, and
-   do not end your turn before it: a run whose session ends goes with it.
-   Then read the outcome as in step 5.
-   For a terminal or an unattended run, without Claude Code's agent
-   rendering, run `relais run --task .relais/task.json` instead.
-
-5. Read the outcome: accepted (receipt + patch), needs_decision,
-needs_review, blocked, failed, budget_exhausted or interrupted. The
-artifacts path is printed on every terminal state.
-
-## Rules
-
-- The contract is frozen once the run starts; changing objective, scope,
-  acceptance or budget is a new run.
-- Acceptance criteria must be executable by the verification profile; a
-  worker's completion message is never acceptance.
-- If the run needs a decision, make it explicitly — do not let a model
-  invent it.
-
-## Done when
-
-- the contract was written to `<root>/.relais/task.json` and `relais
-  plan` accepted it without complaint;
-- the run reached a terminal state (accepted, needs_decision,
-  needs_review, blocked, failed, budget_exhausted or interrupted) and
-  that state, not a worker's own summary, was read;
-- a `needs_decision` outcome was resolved explicitly, not guessed;
-- for `accepted`, the printed artifacts path was checked, not assumed.
 "#;
     body.trim_end().to_string()
 }
@@ -782,10 +646,35 @@ impl InstallRoot {
                 }
             }
         }
+        actions.extend(self.retired_actions());
         InstallPlan { actions }
     }
 
-    /// Apply a plan: --write. Only Create and Update run; SkipForeign,
+    /// What to do about the files the plugin replaced: remove the ones
+    /// relais wrote and nobody edited, report the edited and the
+    /// unreadable ones, say nothing of a file that is not relais's.
+    fn retired_actions(&self) -> Vec<Action> {
+        retired_files()
+            .into_iter()
+            .filter_map(|relative| {
+                let path = self.owned_path(&relative);
+                match presence(&path) {
+                    Presence::Missing | Presence::Dangling => return None,
+                    Presence::Present => {}
+                }
+                match Self::block_of(&path) {
+                    BlockRead::Absent => None,
+                    BlockRead::Malformed => Some(Action::Malformed { relative }),
+                    BlockRead::Found(block) if block.is_unchanged() => {
+                        Some(Action::Remove { relative })
+                    }
+                    BlockRead::Found(_) => Some(Action::Conflict { relative }),
+                }
+            })
+            .collect()
+    }
+
+    /// Apply a plan: --write. Create, Update and Remove run; SkipForeign,
     /// Conflict and Malformed stay untouched and are reported. An
     /// applicable action the file's current state refuses is returned in
     /// `not_applied`, never swallowed.
@@ -797,10 +686,17 @@ impl InstallRoot {
         for action in &plan.actions {
             let relative = match action {
                 Action::Create { relative } | Action::Update { relative } => relative,
-                Action::SkipForeign { .. }
-                | Action::Conflict { .. }
-                | Action::Malformed { .. }
-                | Action::Remove { .. } => continue,
+                Action::Remove { relative } => {
+                    if self.remove_owned(relative)? {
+                        done.applied.push(action.clone());
+                    } else {
+                        done.not_applied.push(action.clone());
+                    }
+                    continue;
+                }
+                Action::SkipForeign { .. } | Action::Conflict { .. } | Action::Malformed { .. } => {
+                    continue
+                }
             };
             let Some(content) = owned_files()
                 .into_iter()
@@ -886,6 +782,7 @@ impl InstallRoot {
                 BlockRead::Found(_) => actions.push(Action::Conflict { relative }),
             }
         }
+        actions.extend(self.retired_actions());
         InstallPlan { actions }
     }
 
@@ -901,59 +798,64 @@ impl InstallRoot {
             let Action::Remove { relative } = action else {
                 continue;
             };
-            let path = self.owned_path(relative);
-            // If the user added content outside the markers, remove
-            // only the owned block and keep their bytes; otherwise
-            // the whole file was ours and goes away.
-            match std::fs::read_to_string(&path) {
-                Ok(text) => match read_block(&text) {
-                    // Re-checked here, not trusted from the plan: the
-                    // file may have been edited since the preview.
-                    BlockRead::Found(block) if block.is_unchanged() => {
-                        let mut remaining = String::with_capacity(text.len());
-                        remaining.push_str(&text[..block.start]);
-                        remaining.push_str(&text[block.end..]);
-                        // The frontmatter opener above a YAML marker is ours
-                        // as much as the block: a file holding nothing else
-                        // goes away whole rather than leaving a `---` stub.
-                        if !is_only_opener(&remaining) {
-                            write_atomic(&path, &remaining)?;
-                            done.applied.push(action.clone());
-                            continue;
-                        }
-                    }
-                    BlockRead::Found(_) | BlockRead::Malformed | BlockRead::Absent => {
-                        done.not_applied.push(action.clone());
-                        continue;
-                    }
-                },
-                // Gone since the preview, or unreadable: nothing to
-                // remove, and nothing to claim was removed.
-                Err(_) => {
-                    done.not_applied.push(action.clone());
-                    continue;
-                }
+            if self.remove_owned(relative)? {
+                done.applied.push(action.clone());
+            } else {
+                done.not_applied.push(action.clone());
             }
-            std::fs::remove_file(&path)?;
-            // Clean directories we created, but never a directory we
-            // did not own end-to-end.
-            for ancestor in path.ancestors().skip(1) {
-                if ancestor == self.claude_dir {
-                    break;
-                }
-                match std::fs::read_dir(ancestor).map(|mut entries| entries.next().is_none()) {
-                    // An empty directory relais made on the way in. A
-                    // failed removal is not worth reporting: the file the
-                    // user asked to remove is gone either way.
-                    Ok(true) => {
-                        let _ = std::fs::remove_dir(ancestor);
-                    }
-                    Ok(false) | Err(_) => break,
-                }
-            }
-            done.applied.push(action.clone());
         }
         Ok(done)
+    }
+
+    /// Remove the owned block of the file at `relative`, judged against
+    /// the file as it is now. False when there was nothing of ours to
+    /// remove: the file is gone, unreadable, edited or not marked.
+    fn remove_owned(&self, relative: &Path) -> std::io::Result<bool> {
+        let path = self.owned_path(relative);
+        // If the user added content outside the markers, remove only the
+        // owned block and keep their bytes; otherwise the whole file was
+        // ours and goes away.
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            // Gone since the preview, or unreadable: nothing to remove,
+            // and nothing to claim was removed.
+            return Ok(false);
+        };
+        let BlockRead::Found(block) = read_block(&text) else {
+            return Ok(false);
+        };
+        // Re-checked here, not trusted from the plan: the file may have
+        // been edited since the preview.
+        if !block.is_unchanged() {
+            return Ok(false);
+        }
+        let mut remaining = String::with_capacity(text.len());
+        remaining.push_str(&text[..block.start]);
+        remaining.push_str(&text[block.end..]);
+        // The frontmatter opener above a YAML marker is ours as much as
+        // the block: a file holding nothing else goes away whole rather
+        // than leaving a `---` stub.
+        if !is_only_opener(&remaining) {
+            write_atomic(&path, &remaining)?;
+            return Ok(true);
+        }
+        std::fs::remove_file(&path)?;
+        // Clean directories we created, but never a directory we did not
+        // own end-to-end.
+        for ancestor in path.ancestors().skip(1) {
+            if ancestor == self.claude_dir {
+                break;
+            }
+            match std::fs::read_dir(ancestor).map(|mut entries| entries.next().is_none()) {
+                // An empty directory relais made on the way in. A failed
+                // removal is not worth reporting: the file the user asked
+                // to remove is gone either way.
+                Ok(true) => {
+                    let _ = std::fs::remove_dir(ancestor);
+                }
+                Ok(false) | Err(_) => break,
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -996,7 +898,7 @@ impl InstallRoot {
     /// read it, a directory in its place, an I/O failure mid-read — is
     /// returned, because "I could not see what is there" is not "there
     /// is nothing there", and the caller's answer to the second is to
-    /// write a fresh eight-handler document. Collapsing the two would
+    /// write a fresh seven-handler document. Collapsing the two would
     /// mean a settings.json relais could not read got replaced by one it
     /// composed, which is the opposite of this module's promise.
     fn read_settings(&self) -> std::io::Result<Option<String>> {
@@ -1234,7 +1136,7 @@ mod tests {
         let applied = root.apply(&plan).expect("apply");
         assert_eq!(applied.applied.len(), owned_files().len());
         assert!(applied.not_applied.is_empty(), "{applied:?}");
-        let skill = root.claude_dir.join("skills/relais/SKILL.md");
+        let skill = root.claude_dir.join("skills/relais-verified-push/SKILL.md");
         assert!(skill.is_file());
         // Unrelated content survives untouched.
         let settings = root.claude_dir.join("settings.json");
@@ -1296,7 +1198,7 @@ mod tests {
         root.apply(&root.plan()).expect("apply");
         // Foreign file stays; owned file gets a user edit.
         std::fs::write(root.claude_dir.join("agents/custom.md"), "# custom\n").expect("foreign");
-        let owned = root.claude_dir.join("skills/relais/SKILL.md");
+        let owned = root.claude_dir.join("skills/relais-verified-push/SKILL.md");
         let original = std::fs::read_to_string(&owned).expect("read");
         std::fs::write(&owned, format!("{original}\n<!-- user note -->\n")).expect("edit");
 
@@ -1632,16 +1534,15 @@ mod tests {
         }
     }
 
-    /// `relais run`/`relais plan` resolve their own session from
-    /// `RELAIS_SESSION_ID`/`CLAUDE_CODE_SESSION_ID`; the skill must not
+    /// The plugin starts a run with its own session; the skill must not
     /// tell a caller to shell out `RELAIS_SESSION_ID="${CLAUDE_SESSION_ID:-$$}"`
     /// by hand, which named the wrong variable and stood in a raw shell
     /// PID for every session sharing that shell. FALSIFY: put that prefix
     /// back in front of `relais run --task .relais/task.json` and watch
     /// this fail; restore afterward.
     #[test]
-    fn relais_skill_names_no_manual_session_id_prefix() {
-        let body = skill_relais();
+    fn the_plugin_skill_names_no_manual_session_id_prefix() {
+        let body = plugin::embedded_text("skills/relais/SKILL.md").expect("the plugin ships it");
         assert!(
             !body.contains("CLAUDE_SESSION_ID"),
             "the skill must not name the wrong session variable:\n{body}"
@@ -1651,8 +1552,8 @@ mod tests {
             "the skill must not stand a raw shell PID in for a session:\n{body}"
         );
         assert!(
-            body.contains("relais run --task .relais/task.json"),
-            "the skill must still show the plain invocation:\n{body}"
+            body.contains("`mcp__relais__run`"),
+            "the skill must still show how a run starts:\n{body}"
         );
     }
 
@@ -1661,9 +1562,9 @@ mod tests {
         let (root, dir) = temp_root();
         // What relais 0.1.4 wrote: an HTML marker as line 1, the whole
         // template (opener included) inside the block.
-        let skill = root.claude_dir.join("skills/relais/SKILL.md");
+        let skill = root.claude_dir.join("skills/relais-verified-push/SKILL.md");
         std::fs::create_dir_all(skill.parent().unwrap()).expect("mkdir");
-        let content = skill_relais();
+        let content = skill_relais_verified_push();
         let old_layout = format!(
             "{BEGIN_MARKER} {} -->\n{}\n{END_MARKER}\n",
             sha256_hex(content.trim_end_matches('\n').as_bytes()),
@@ -1680,10 +1581,7 @@ mod tests {
         );
         root.apply(&plan).expect("apply");
         let migrated = std::fs::read_to_string(&skill).expect("read");
-        assert!(
-            migrated.starts_with("---\nname: relais\n")
-                || migrated.starts_with("---\n# relais:begin ")
-        );
+        assert!(migrated.starts_with("---\n# relais:begin "));
         assert!(
             migrated.starts_with("---\n"),
             "Claude Code needs the opener first:\n{migrated}"
@@ -1876,7 +1774,9 @@ mod tests {
         let written = install(&request, &home).expect("apply");
         assert_eq!(written.applied.len(), owned_files().len(), "{written:?}");
         assert!(written.not_applied.is_empty(), "{written:?}");
-        assert!(home.join(".claude/skills/relais/SKILL.md").is_file());
+        assert!(home
+            .join(".claude/skills/relais-verified-push/SKILL.md")
+            .is_file());
         assert!(home.join(".claude/agents/relais-research.md").is_file());
 
         let removed = uninstall(
@@ -1941,13 +1841,13 @@ mod tests {
     }
 
     #[test]
-    fn hooks_apply_wires_all_eight_targets_into_a_fresh_settings_file() {
+    fn hooks_apply_wires_all_seven_targets_into_a_fresh_settings_file() {
         let (root, dir) = temp_root();
         let binary = relais_binary_for_test();
         let plan = root
             .plan_hooks(&binary, Duration::from_secs(2), no_other_roots())
             .expect("plan hooks");
-        assert_eq!(plan.applicable_count(), 8);
+        assert_eq!(plan.applicable_count(), 7);
 
         let applied = root
             .apply_hooks(&binary, Duration::from_secs(2), no_other_roots())
@@ -1955,7 +1855,7 @@ mod tests {
         let HooksApplied::Applied(events) = applied else {
             panic!("expected events to be wired: {applied:?}");
         };
-        assert_eq!(events.len(), 8, "{events:?}");
+        assert_eq!(events.len(), 7, "{events:?}");
 
         // A re-run is a no-op.
         let replan = root
@@ -2128,6 +2028,106 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The settings file the hook-side native path (#171) wrote — the
+    /// `SendMessage` matcher and relais's `WorktreeCreate` entry — beside
+    /// two foreign entries.
+    fn write_native_hook_settings(root: &InstallRoot, binary: &Path) -> PathBuf {
+        let command = settings::hook_command(binary);
+        let relais = serde_json::json!([{"type": "command", "command": command, "timeout": 10}]);
+        let value = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Agent|Task|SendMessage", "hooks": relais},
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/bin/lint"}]}
+                ],
+                "PostToolUse": [{"matcher": "Agent|Task|SendMessage", "hooks": relais}],
+                "PostToolUseFailure": [{"matcher": "Agent|Task|SendMessage", "hooks": relais}],
+                "SubagentStart": [{"hooks": relais}],
+                "SubagentStop": [{"hooks": relais}],
+                "SessionStart": [{"hooks": relais}],
+                "SessionEnd": [{"hooks": relais}],
+                "WorktreeCreate": [
+                    {"hooks": [{"type": "command", "command": command, "timeout": 60}]},
+                    {"hooks": [{"type": "command", "command": "/usr/bin/their-worktree-tool"}]}
+                ]
+            }
+        });
+        std::fs::create_dir_all(&root.claude_dir).expect("mkdir");
+        let path = root.claude_dir.join("settings.json");
+        std::fs::write(&path, settings::render_canonical(&value) + "\n").expect("write");
+        path
+    }
+
+    #[test]
+    fn hooks_install_migrates_the_native_hook_wiring_and_keeps_foreign_entries() {
+        let (root, dir) = temp_root();
+        let binary = relais_binary_for_test();
+        let path = write_native_hook_settings(&root, &binary);
+
+        let applied = root
+            .apply_hooks(&binary, Duration::from_secs(2), no_other_roots())
+            .expect("apply hooks");
+        let HooksApplied::Applied(events) = applied else {
+            panic!("the old wiring must be migrated: {applied:?}");
+        };
+        assert!(events.contains(&"WorktreeCreate"), "{events:?}");
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        let command = settings::hook_command(&binary);
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+            let entries = after["hooks"][event].as_array().expect("entries");
+            assert!(
+                entries.iter().any(|e| e["matcher"] == "Agent|Task"
+                    && e["hooks"][0]["command"] == command.as_str()),
+                "{event}: {entries:?}"
+            );
+            assert!(
+                entries
+                    .iter()
+                    .all(|e| e["matcher"] != "Agent|Task|SendMessage"),
+                "{event}: {entries:?}"
+            );
+        }
+        assert!(after["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .any(|e| e["matcher"] == "Bash"));
+        assert_eq!(
+            after["hooks"]["WorktreeCreate"],
+            serde_json::json!([
+                {"hooks": [{"type": "command", "command": "/usr/bin/their-worktree-tool"}]}
+            ])
+        );
+
+        // A second install has nothing left to do.
+        assert_eq!(
+            root.apply_hooks(&binary, Duration::from_secs(2), no_other_roots())
+                .expect("apply hooks again"),
+            HooksApplied::AlreadyCurrent
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hooks_uninstall_removes_the_native_hook_wiring_too() {
+        let (root, dir) = temp_root();
+        let binary = relais_binary_for_test();
+        let path = write_native_hook_settings(&root, &binary);
+
+        let removed = root.apply_hooks_removal(&binary).expect("apply removal");
+        let HooksRemoved::Removed(events) = removed else {
+            panic!("expected removal: {removed:?}");
+        };
+        assert!(events.contains(&"WorktreeCreate"), "{events:?}");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(!text.contains(&settings::hook_command(&binary)), "{text}");
+        assert!(text.contains("/usr/bin/their-worktree-tool"), "{text}");
+        assert!(text.contains("/usr/bin/lint"), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn hooks_uninstall_removes_only_what_install_added() {
         let (root, dir) = temp_root();
@@ -2149,12 +2149,12 @@ mod tests {
             .expect("write foreign hook");
 
         let plan = root.plan_hooks_removal(&binary).expect("plan removal");
-        assert_eq!(plan.applicable_count(), 8);
+        assert_eq!(plan.applicable_count(), 7);
         let removed = root.apply_hooks_removal(&binary).expect("apply removal");
         let HooksRemoved::Removed(events) = removed else {
             panic!("expected removal: {removed:?}");
         };
-        assert_eq!(events.len(), 8, "{events:?}");
+        assert_eq!(events.len(), 7, "{events:?}");
 
         let after: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
@@ -2182,108 +2182,150 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The `key: value` lines of a file's frontmatter, comments dropped.
-    fn frontmatter(file: &str) -> Vec<(String, String)> {
-        file.strip_prefix("---\n")
-            .and_then(|rest| rest.split("\n---").next())
-            .expect("frontmatter")
-            .lines()
-            .filter(|line| !line.starts_with('#'))
-            .filter_map(|line| line.split_once(": "))
-            .map(|(key, value)| (key.to_string(), value.trim().to_string()))
-            .collect()
-    }
-
-    fn value_of<'a>(front: &'a [(String, String)], key: &str) -> Option<&'a str> {
-        front
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, value)| value.as_str())
+    /// What an earlier relais installed for the native path: one worker
+    /// definition per shipped (model, effort), and the `/relais` skill.
+    fn install_retired_files(root: &InstallRoot) {
+        for relative in retired_files() {
+            let name = relative
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("stem");
+            install_older_template(
+                &root.owned_path(&relative),
+                &format!("---\nname: {name}\n---\n\nan earlier body\n"),
+            );
+        }
     }
 
     #[test]
-    fn install_writes_one_worker_definition_per_shipped_model_and_effort() {
+    fn install_writes_neither_the_relais_skill_nor_the_worker_definitions() {
         let (root, dir) = temp_root();
         root.apply(&root.plan()).expect("apply");
-        let shipped = crate::native::worker_agent_types();
-        assert_eq!(shipped.len(), 19);
-        for (model, effort) in shipped {
-            // The name a RELAIS-SPAWN line carries is the file's name.
-            let agent_type = crate::native::worker_agent_type(&model, effort.as_deref());
-            let path = root.claude_dir.join(format!("agents/{agent_type}.md"));
-            let file = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("{agent_type} is not installed: {e}"));
-            let front = frontmatter(&file);
-            assert_eq!(value_of(&front, "name"), Some(agent_type.as_str()));
-            assert_eq!(value_of(&front, "model"), Some(model.as_str()));
-            assert_eq!(
-                value_of(&front, "effort"),
-                effort.as_deref(),
-                "{agent_type}"
-            );
-            let tools = value_of(&front, "tools").expect("tools");
+        assert!(!root.claude_dir.join("skills/relais/SKILL.md").exists());
+        for relative in retired_files() {
+            assert!(!root.owned_path(&relative).exists(), "{relative:?}");
+        }
+        assert_eq!(retired_files().len(), 19 + 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn install_removes_the_files_the_plugin_replaced_when_unedited() {
+        let (root, dir) = temp_root();
+        install_retired_files(&root);
+        let plan = root.plan();
+        for relative in retired_files() {
             assert!(
-                !tools.contains("Agent"),
-                "{agent_type} must not spawn: {tools}"
+                plan.actions.contains(&Action::Remove {
+                    relative: relative.clone()
+                }),
+                "{relative:?}: {plan:?}"
             );
-            assert_eq!(tools, "Read, Grep, Glob, Edit, Write, Bash");
-            assert_eq!(
-                value_of(&front, "isolation"),
-                Some("worktree"),
-                "{agent_type}"
-            );
+        }
+        assert_eq!(
+            plan.actions.len(),
+            owned_files().len() + retired_files().len(),
+            "{plan:?}"
+        );
+        let done = root.apply(&plan).expect("apply");
+        assert!(done.not_applied.is_empty(), "{done:?}");
+        for relative in retired_files() {
+            assert!(!root.owned_path(&relative).exists(), "{relative:?}");
+        }
+        assert!(
+            !root.claude_dir.join("skills/relais").exists(),
+            "the directory relais made goes with its file"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_edited_retired_file_is_kept_and_reported() {
+        let (root, dir) = temp_root();
+        install_retired_files(&root);
+        let skill = root.claude_dir.join("skills/relais/SKILL.md");
+        let text = std::fs::read_to_string(&skill).expect("read");
+        std::fs::write(&skill, text.replace("an earlier body", "MY body")).expect("edit");
+        let plan = root.plan();
+        assert!(plan.actions.contains(&Action::Conflict {
+            relative: PathBuf::from("skills/relais/SKILL.md")
+        }));
+        root.apply(&plan).expect("apply");
+        assert!(std::fs::read_to_string(&skill)
+            .expect("kept")
+            .contains("MY body"));
+        // The plan prints a path the platform's way (`skills\relais\…` on Windows).
+        let kept = Path::new("skills").join("relais").join("SKILL.md");
+        assert!(plan
+            .render()
+            .contains(&format!("keep    {}", kept.display())));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_skill_of_the_same_name_that_is_not_relais_s_is_left_alone_and_unmentioned() {
+        let (root, dir) = temp_root();
+        let skill = root.claude_dir.join("skills/relais/SKILL.md");
+        std::fs::create_dir_all(skill.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&skill, "---\nname: relais\n---\nmine\n").expect("write");
+        for plan in [root.plan(), root.uninstall_plan()] {
             assert!(
-                value_of(&front, "description")
-                    .expect("description")
-                    .starts_with("relais native worker."),
-                "{agent_type}"
+                plan.actions
+                    .iter()
+                    .all(|action| action.relative() != Path::new("skills/relais/SKILL.md")),
+                "{plan:?}"
             );
-            assert!(file.contains("commit, push or publish"), "{agent_type}");
         }
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn uninstall_removes_the_worker_definitions() {
+    fn uninstall_removes_the_files_the_plugin_replaced_too() {
         let (root, dir) = temp_root();
-        root.apply(&root.plan()).expect("apply");
-        root.apply_uninstall(&root.uninstall_plan())
+        install_retired_files(&root);
+        let done = root
+            .apply_uninstall(&root.uninstall_plan())
             .expect("uninstall");
-        for (model, effort) in crate::native::worker_agent_types() {
-            let agent_type = crate::native::worker_agent_type(&model, effort.as_deref());
-            assert!(
-                !root
-                    .claude_dir
-                    .join(format!("agents/{agent_type}.md"))
-                    .exists(),
-                "{agent_type}"
-            );
+        assert_eq!(done.applied.len(), retired_files().len(), "{done:?}");
+        for relative in retired_files() {
+            assert!(!root.owned_path(&relative).exists(), "{relative:?}");
         }
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn the_relais_skill_runs_native_workers_exactly_as_asked() {
-        let skill = skill_relais();
+    fn the_plugin_skill_starts_runs_through_the_tools_and_names_no_hook_marker() {
+        let skill = plugin::embedded_text("skills/relais/SKILL.md").expect("the plugin ships it");
+        assert!(skill.starts_with("---\nname: relais\n"), "{skill}");
+        // Prose wraps; the instructions are matched across the wrapping.
+        let skill = skill.split_whitespace().collect::<Vec<_>>().join(" ");
         for instruction in [
-            "relais run --native --task .relais/task.json",
-            "`run_in_background: true`",
-            "Monitor tool on a `tail -f`",
-            "`RELAIS-SPAWN <json>`",
-            "call the Agent tool once with",
-            "`subagent_type`, `model`,",
-            "`run_in_background`), the\n     prompt unchanged",
-            "`RELAIS-CONTINUE <json>`",
-            "SendMessage",
-            "ToolSearch",
-            "`to` and\n     `message`, exactly",
-            "Never send anything else to relais's agents",
-            "never spawn one\n   request twice",
-            "relais run --task .relais/task.json",
-            "A worker finishing is not the run\n   finishing",
-            "do not end your turn before it",
+            "`mcp__relais__run`",
+            "`task` set to `.relais/task.json`",
+            "`cwd` set to `<root>`",
+            "`mcp__relais__replay`",
+            "`mcp__relais__status`",
+            "`/relais-status`",
+            "Never run `relais run` in Bash",
+            "Never spawn, message or stop relais's agents yourself",
+            "A worker finishing is not the run",
+            "Do not end your turn before it arrives",
         ] {
             assert!(skill.contains(instruction), "{instruction}\n{skill}");
+        }
+        for gone in [
+            "RELAIS-SPAWN",
+            "RELAIS-CONTINUE",
+            "--native",
+            "SendMessage",
+            "WorktreeCreate",
+        ] {
+            assert!(!skill.contains(gone), "{gone}\n{skill}");
+        }
+        for (path, content) in owned_files() {
+            for gone in ["RELAIS-SPAWN", "RELAIS-CONTINUE", "WorktreeCreate"] {
+                assert!(!content.contains(gone), "{gone} in {}", path.display());
+            }
         }
     }
 }

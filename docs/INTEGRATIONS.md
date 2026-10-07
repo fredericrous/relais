@@ -1,8 +1,22 @@
 # The Claude Code hook integration
 
-`relais install --claude` writes agent definitions and three skills —
-`/relais`, `/relais-verified-push` and `/relais-architecture-conflict` —
-and never touches `settings.json`. `relais install --claude --hooks` is a
+`relais install --claude` writes three advisory agent definitions and two
+skills — `/relais-verified-push` and `/relais-architecture-conflict` — and
+installs the relais Claude Code plugin (`relais@relais-local`), which carries
+the mod, the agent definitions relais dispatches and the `/relais` skill. The
+plugin is embedded in the binary: install writes it as a directory marketplace
+under relais's state directory (`claude-marketplace/`), then runs `claude plugin
+marketplace add <dir>` and `claude plugin install relais@relais-local`, or
+`marketplace update relais-local` and `plugin update relais@relais-local` when
+`claude plugin list --json` already shows it. Claude Code copies the plugin into
+its cache by version, and the plugin's `version` is relais's, so a new relais
+refreshes it. `relais uninstall --claude` runs `claude plugin uninstall` and
+`claude plugin marketplace remove` (each accepted when already gone) and removes
+the directory. `relais doctor` reports a `plugin` finding: ok when it is
+enabled at this relais's version, a warning naming `relais install --claude
+--write` otherwise. Install never touches `settings.json`
+(Claude Code's own `claude plugin` commands write the plugin's entries to its
+user settings). `relais install --claude --hooks` is a
 separate, explicit ask on top of that: it wires a live hook into
 `.claude/settings.json` so relais can see — and, on one event, refuse —
 native Claude Code subagent spawns. This document explains what that
@@ -13,9 +27,7 @@ this page only explains how to use them.
 
 ## What `--hooks` writes
 
-Seven targets, the same seven every time — this list and the one
-`relais doctor --probe-hooks` records from are kept identical by a test,
-so they cannot drift apart silently:
+Seven targets, the same seven every time:
 
 | event | matcher |
 |---|---|
@@ -92,23 +104,33 @@ why the derived timeout exists: raising `queue_wait_secs` without also
 raising the handler timeout would make that failure mode more likely,
 not less.
 
+### Upgrading from the hook-side native path
+
+An earlier relais (#171) ran native workers through this hook: it wired the
+matcher `Agent|Task|SendMessage` and a `WorktreeCreate` handler. The relais
+plugin does that work now (it starts, continues and stops relais's agents, with
+a working directory of its own), so the hook is back to admission caps on your
+own `Agent` and `Task` spawns, and Claude Code makes its own isolated-agent
+worktrees again. A `WorktreeCreate` handler with no code behind it would break
+those, so re-run `relais install --claude --hooks --write` over an old file: it
+moves relais's command to the `Agent|Task` entry and removes it from
+`WorktreeCreate` (an entry or event array that held nothing else goes; a hook of
+someone else's on either stays, and so does every other entry). `relais doctor`
+reports (`hook-wiring`) a file that still has the old matcher or the
+`WorktreeCreate` entry, and names that command as the fix.
+
 ## Removing it
 
 `relais uninstall --claude --hooks` reverses exactly what `--hooks`
-added: the leaf command on each of the seven targets, and nothing an
-entry's matcher was already carrying for someone else. Preview first,
-same as install; `--write` applies it.
+added: the leaf command on each of the seven targets, the old
+`Agent|Task|SendMessage` matcher and the `WorktreeCreate` entry if a file
+still has them, and nothing an entry's matcher was already carrying for
+someone else. Preview first, same as install; `--write` applies it.
 
 ## What `relais doctor` says about it
 
-Three separate findings, because they answer three separate questions:
+Two separate findings, because they answer two separate questions:
 
-- **`hook-compat`** — is there a compatibility record, and is it stale?
-  `relais doctor --probe-hooks` is what produces that record (see below);
-  a fresh machine has none, and `doctor` says so rather than assuming
-  compatibility. A record that exists but names a Claude Code version
-  different from the one on `PATH` now is reported stale, not silently
-  trusted.
 - **`hook-timeout`** — does the timeout actually recorded in
   `settings.json` still cover the configured `queue_wait_secs`? The hook
   cannot read its own handler timeout to check this itself, so `doctor`
@@ -139,58 +161,22 @@ Three separate findings, because they answer three separate questions:
 your `~/.claude/settings.json` — all three, not just the first that names
 a relais command on `PreToolUse`, so `hook-live` and `hook-timeout` see a
 hook wired only in the local file exactly as they would one in the
-committed file. `hook-compat` reads no settings file at all — it compares
-the compatibility record against the Claude Code on `PATH`.
-
-### The compatibility matrix
-
-`relais doctor --probe-hooks` is a separate, explicit command, never part
-of the ordinary `doctor` run: it needs a real Claude Code session (a
-throwaway settings file under the state directory, never your own
-`settings.json`), costs money, and touches the network. It runs one
-`claude -p` session whose prompt forces a subagent to itself launch a
-second subagent — so a spawn made FROM INSIDE a subagent is recorded, not
-only the top-level one the main session makes — records every payload
-that arrives on the seven targets, and writes a compatibility record
-naming the Claude Code version observed and, per target, whether it
-fired and what fields its payload carried — reported as what was seen,
-never as what was expected. There is no shipped compatibility table, and
-none is implied to exist on a fresh machine: the matrix is written by
-this command, not carried as a static claim in this document. A target
-that never fires for a given Claude Code version is recorded as not
-firing; that is a fact about that version, not a probe failure.
-
-The record also carries a `capabilities` section: what the harness's
-BEHAVIOR showed itself capable of, derived from the same recorded
-payloads rather than from which fields merely appeared — which tool name
-it sent for an agent spawn, whether a nested spawn's own payload named
-the subagent that made it (so parentage at depth two can be joined), and
-whether the failing tool call the probe makes actually fired
-`PostToolUseFailure`. A capability the recordings cannot settle is
-reported as unknown, never defaulted to `false`; `relais doctor` reports
-it alongside the freshness finding, and a record written before this
-field existed is reported as having no capabilities at all, not as every
-capability being false.
+committed file.
 
 Nothing here narrows which models a hook-admitted agent may use. That
-would need both a compatibility record confirming the harness reports
-enough to act on and a setting to act on it with, and neither exists
-today.
+would need a setting to act on it with, and none exists today.
 
 ## Worker deny floor and `disallowed_tools`
 
-The shipped deny floor now includes `Agent` and `Task`, so a print-mode
+The shipped deny floor now includes `Agent` and `Task`, so a
 worker cannot hand its task to a subagent that picks its own model. A
 machine that added `disallowed_tools = ["Agent", "Task"]` to `machine.toml`
 by hand (as v0.6.0's Upgrading notes advised) may keep or drop it: the
 floor carries it, and the union with `machine.toml` is idempotent.
 
-The deny floor and the allowlist match command strings. A machine that
-wants an OS boundary instead sets `[sandbox] enabled = true` in
-`machine.toml`: the worker then runs restricted (no user, project or local
-settings, hooks or plugins), with no MCP servers, Bash inside the OS
-sandbox, and the same `--disallowed-tools` floor. SPEC §8 ("Worker OS
-sandbox") is the reference for what that does and does not guarantee.
+The deny floor matches command strings. relais keeps no OS
+sandbox of its own; a dispatch runs as a native agent under the Claude Code
+session's own sandbox (SPEC §8).
 
 ## Known limits of the hook path
 

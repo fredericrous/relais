@@ -97,6 +97,13 @@ pub fn ledger_path() -> Result<PathBuf, HomeUnset> {
     Ok(state_dir()?.join("ledger.sqlite"))
 }
 
+/// The directory marketplace `relais install --claude` writes the
+/// Claude Code plugin into (`.claude-plugin/marketplace.json` and
+/// `plugins/relais/`), and registers with `claude plugin marketplace add`.
+pub fn claude_marketplace_dir() -> Result<PathBuf, HomeUnset> {
+    Ok(state_dir()?.join("claude-marketplace"))
+}
+
 /// The learned-artifact registry (SPEC §17).
 pub fn registry_dir() -> Result<PathBuf, HomeUnset> {
     Ok(state_dir()?.join("registry"))
@@ -127,12 +134,6 @@ pub fn runs_dir() -> Result<PathBuf, HomeUnset> {
 /// files above.
 pub fn hook_journal_path() -> Result<PathBuf, HomeUnset> {
     Ok(state_dir()?.join("hook_journal.jsonl"))
-}
-
-/// One record per default worktree the hook created for an isolated
-/// spawn (`hook::worktree`), at `<dir>/<session>/<name>.json`.
-pub fn hook_worktrees_dir() -> Result<PathBuf, HomeUnset> {
-    Ok(state_dir()?.join("hook-worktrees"))
 }
 
 /// Claude Code's own config directory relocator (SPEC §11): a session's
@@ -204,6 +205,18 @@ pub fn subagent_transcripts(main_transcript: &Path) -> Vec<PathBuf> {
         .collect();
     files.sort();
     files
+}
+
+/// The agent id a subagent transcript belongs to: the `<id>` of
+/// `agent-<id>.jsonl`. `None` for any other file name, a session's main
+/// transcript included.
+pub fn subagent_agent_id(transcript: &Path) -> Option<&str> {
+    transcript
+        .file_name()?
+        .to_str()?
+        .strip_prefix("agent-")?
+        .strip_suffix(".jsonl")
+        .filter(|id| !id.is_empty())
 }
 
 #[cfg(test)]
@@ -282,6 +295,18 @@ mod tests {
         std::fs::write(subagents_dir.join("notes.txt"), "").expect("decoy");
         assert_eq!(subagent_transcripts(&main), vec![agent_one, agent_two]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_subagent_transcript_names_its_agent() {
+        let agent = |path: &'static str| subagent_agent_id(Path::new(path));
+        assert_eq!(
+            agent("/p/-slug/s1/subagents/agent-a1b2.jsonl"),
+            Some("a1b2")
+        );
+        assert_eq!(agent("/p/-slug/s1.jsonl"), None);
+        assert_eq!(agent("/p/-slug/s1/subagents/agent-.jsonl"), None);
+        assert_eq!(agent("/p/-slug/s1/subagents/notes.txt"), None);
     }
 
     #[test]
