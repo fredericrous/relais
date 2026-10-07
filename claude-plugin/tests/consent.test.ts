@@ -2,6 +2,7 @@ import { expect, test } from 'claude-code/testing'
 import { allowLabel, escapeDisplay, withRoutingSection, NOT_NOW, onboardTool, onPersonPrompt, question2, trustTool, USE_CHECKS, type Shown } from '../hooks/consent.ts'
 import { machineSettingsGuard, MACHINE_SETTINGS_MESSAGE } from '../hooks/guards.ts'
 import { createStore } from '../hooks/store.ts'
+import { pump } from '../hooks/runs.ts'
 
 // A repository and a relais, scripted: what `git` and `relais` answer, and
 // what was asked, toasted and granted.
@@ -332,4 +333,27 @@ test('the system prompt gains the routing rule as one section, once', async () =
   expect(composed.sections[1].scope).toBe('global')
   expect(withRoutingSection(composed)).toBe(composed)
   expect(withRoutingSection(undefined)).toBe(undefined)
+})
+
+test('the outcome message the pump submits does not lift a Not now when it comes back through prompt.submit', async () => {
+  const store = createStore()
+  store.declined.add('/repo')
+  store.verdicts.push('relais run run-1 finished: accepted.\nReceipt: /runs/r1/receipt.json')
+  // Claude Code feeds a submitted prompt through every prompt.submit hook,
+  // this plugin's included.
+  const fx: any = { prompt: { submit: async ({ text }: { text: string }) => onPersonPrompt(store, text) } }
+  await pump(fx, store)
+  expect(store.verdicts.length).toBe(0)
+  expect(store.declined.has('/repo')).toBe(true)
+  expect(store.ownPrompts.size).toBe(0)
+})
+
+test('a request that only mentions a negation elsewhere still lifts a Not now', async () => {
+  const store = createStore()
+  store.declined.add('/repo')
+  onPersonPrompt(store, 'skip the plan and use relais')
+  expect(store.declined.size).toBe(0)
+  store.declined.add('/repo')
+  onPersonPrompt(store, 'no relais for this one')
+  expect(store.declined.size).toBe(1)
 })

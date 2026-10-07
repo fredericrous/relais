@@ -166,7 +166,9 @@ export function onPersonPrompt(store: Store, text: unknown) {
   if (typeof text !== 'string') return
   if (store.ownPrompts.delete(text)) return
   if (!/\brelais\b/i.test(text)) return
-  if (/\b(don'?t|do not|without|no|stop|never|skip)\b[^.!?\n]*\brelais\b/i.test(text)) return
+  // A refusal names relais within two words of its negation ("don't use
+  // relais", "no relais"); "skip the plan and use relais" is a request.
+  if (/\b(don'?t|do not|without|no|stop|never|skip)\s+(\S+\s+){0,2}relais\b/i.test(text)) return
   store.declined.clear()
 }
 
