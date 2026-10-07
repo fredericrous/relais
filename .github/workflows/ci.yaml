@@ -94,7 +94,13 @@ jobs:
           git config --global user.email "ci@relais.invalid"
           git config --global user.name "relais ci"
       - if: ${{ !contains(fromJSON(steps.attest.outputs.gates || '[]'), 'pre-push-cargo-test') }}
-        run: cargo test
+        run: |
+          # TEMPORARY (PR #173): the Ubuntu leg wedges its runner; this shows
+          # disk, memory and the busiest processes live while the tests run.
+          if [ "$RUNNER_OS" = Linux ]; then
+            ( while sleep 30; do echo "=== watch $(date +%T)"; df -h / /tmp | tail -2; free -m | sed -n 2p; ps -eo pid,pgid,etime,pcpu,rss,args --sort=-pcpu | head -12; done ) &
+          fi
+          cargo test
 
   # `make msrv`: the floor `rust-version` claims, actually compiled
   # against. Without this, `rust-version` is a string nothing tests.

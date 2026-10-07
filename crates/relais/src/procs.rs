@@ -296,7 +296,9 @@ pub fn kill_tree(child: &mut Child) -> io::Result<()> {
 /// reap and this call; that window is microseconds wide and is the same
 /// documented limit as `alive` (C6).
 pub fn kill_group(pgid: u32) -> GroupKill {
-    if pgid == 0 {
+    // 0 is the caller's own group and 1 is init's: `kill(-1, …)` means
+    // every process this user owns. Neither is ever a group relais made.
+    if pgid <= 1 {
         return GroupKill::NothingLeft;
     }
     imp::kill_group(pgid)

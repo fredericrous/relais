@@ -486,10 +486,11 @@ impl ScriptedPlugin {
         // An agent that has answered is over, background work included:
         // its group goes now, not when the whole run ends, so a load that
         // slows the run cannot let a late write land.
-        let _ = Command::new("kill")
-            .args(["-9", &format!("-{pgid}")])
-            .stderr(std::process::Stdio::null())
-            .status();
+        // Through the library, never `/usr/bin/kill -9 -<pgid>`: procps-ng's
+        // kill (Ubuntu) does not read a bare negative operand as a group,
+        // and a misread group can be every process this user owns, the CI
+        // runner included.
+        let _ = relais::procs::kill_group(pgid);
         text(&out.stdout)
             .lines()
             .rev()
@@ -601,11 +602,7 @@ impl ScriptedPlugin {
         ends.store(true, Ordering::SeqCst);
         // An agent the run gave up on (a wall clock, a cancel) is killed.
         for group in groups.lock().expect("groups").iter() {
-            Command::new("kill")
-                .args(["-9", &format!("-{group}")])
-                .stderr(std::process::Stdio::null())
-                .status()
-                .ok();
+            let _ = relais::procs::kill_group(*group);
         }
         for worker in workers {
             worker.join().expect("agent thread");
