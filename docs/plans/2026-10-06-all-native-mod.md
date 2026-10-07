@@ -410,7 +410,7 @@ Verification against reality, 2026-10-07, Claude Code 2.1.292 (pty-driven intera
 
 ## Implementation review
 
-**approve** (tree 033de7e5…), after round 1 approve-with-changes, a Delta and two binding passes on the small fixes that followed.
+**approve** (tree 08405cf2…), after round 1 approve-with-changes, a Delta and three binding passes on the small fixes that followed (the last for Windows CI: plugin files pinned to LF, a platform path in a test).
 Fixed: timed-out attempts stop their agent and a stopped agent is never continued; plugin failures (TaskStop, agent list, status, outcome submission) are said in the timeline; a verdict is never lost; a repair's evicted listing is not `failed`; the missing verification rows measured or named.
 Deliberate: a 60 s hello lapse reads as an ended session to `resume`; a failed list read at a `continue` is judged like a fresh spawn (bounded by the wall timeout).
-Tokens and time: round 1 97k / 97 s, Delta 45k / 30 s, bind passes 29k / 20 s and 29k / 17 s.
+Tokens and time: round 1 97k / 97 s, Delta 45k / 30 s, bind passes 29k / 20 s, 29k / 17 s and 28k / 17 s.
