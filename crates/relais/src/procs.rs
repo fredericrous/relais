@@ -1482,9 +1482,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // A7: the delivery was discarded, so the coordinator recorded a
-    // cancellation it had never sent. What the OS refused, and whether
-    // trying again could ever work, is the whole answer.
     /// 0 (this process's own group) and 1 (`kill(-1)`: every process this
     /// user owns) are never a group relais made; nothing is signalled.
     #[test]
@@ -1493,6 +1490,9 @@ mod tests {
         assert_eq!(kill_group(1), GroupKill::NothingLeft);
     }
 
+    // A7: the delivery was discarded, so the coordinator recorded a
+    // cancellation it had never sent. What the OS refused, and whether
+    // trying again could ever work, is the whole answer.
     #[test]
     fn a_signal_the_os_refuses_says_which_refusal_it_was() {
         // Nothing is bound to the lease: PID 0 is "this process group"
