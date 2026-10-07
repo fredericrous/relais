@@ -116,11 +116,28 @@ test('escalations are toasted, and decisions within 3 s merge into one toast', a
 test('after /clear the timeline is reloaded from relais native status', async ($: any, on: any) => {
   on('classic.SessionStart', () => ({}))
   const engine = await startedRun($, on)
+  // The shape `relais native status` prints: the summary, and the event
+  // lines themselves (as `events.jsonl` holds them) to rebuild from.
+  const ev = (seq: number, event: Record<string, unknown>) => ({
+    relais: 'event',
+    run: 'run-old',
+    seq,
+    at: `2026-10-06T11:00:0${seq}Z`,
+    event,
+  })
   const timeline = {
     run: 'run-old',
+    phases: [{ at: '2026-10-06T11:00:01Z', state: 'running', reason: 'worker_dispatched' }],
+    decisions: [{ at: '2026-10-06T11:00:05Z', what: 'repair', reason: 'checks_failed' }],
+    cost: [],
+    outcome: null,
+    output: [],
     events: [
-      { seq: 0, at: '2026-10-06T11:00:00Z', event: { kind: 'phase', state: 'running', reason: 'ok', detail: {} } },
-      { seq: 1, at: '2026-10-06T11:00:05Z', event: { kind: 'decision', what: 'repair', reason: 'checks_failed' } },
+      ev(0, { kind: 'step', name: 'preflight', detail: 'route implementation · sonnet@medium', max_attempts: 3 }),
+      ev(1, { kind: 'phase', state: 'running', reason: 'worker_dispatched', detail: {} }),
+      ev(2, { kind: 'dispatch_started', dispatch: 'd1', agent_kind: 'worker', attempt: 1, model: 'sonnet', effort: 'medium' }),
+      ev(3, { kind: 'dispatch_ended', dispatch: 'd1', agent: 'agent-x', outcome: 'exit 0', usage: null, cost: null }),
+      ev(5, { kind: 'decision', what: 'repair', reason: 'checks_failed' }),
     ],
   }
   engine.script.runResult = (argv: string[]) =>
@@ -133,6 +150,8 @@ test('after /clear the timeline is reloaded from relais native status', async ($
   const [run] = JSON.parse(reply.result)
   expect(run.run).toBe('run-old')
   expect(run.decisions).toEqual(['repair · checks_failed'])
+  expect(run.phases.map((p: any) => p.title)).toEqual(['preflight', 'attempt 1 · worker'])
+  expect(run.maxAttempts).toBe(3)
   expect(engine.calls.run.some((c: any) => c.argv.join(' ') === 'relais native status')).toBe(true)
 })
 

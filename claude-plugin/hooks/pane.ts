@@ -72,14 +72,18 @@ function frame(m: RunModel, room: Room): { head: Row[]; steps: Row[]; tail: Row[
   if (decision) tail.push({ text: `decision ${decision.text}`, bold: true })
   tail.push(...stderr.map(e => ({ text: `stderr │ ${e.text}`, color: 'error' })))
   tail.push(rule(room.columns))
-  const shown = m.agents.slice(0, MAX_AGENT_ROWS)
+  // One row per agent: a repair continues the same agent under a new
+  // dispatch, and it is still one agent (its latest status shown).
+  const agents = agentRows(m)
+  const shown = agents.slice(0, MAX_AGENT_ROWS)
   if (shown.length === 0) tail.push({ text: 'agents  none', dim: true })
   shown.forEach((a, i) => {
-    const who = `${a.kind} ${shortId(a.agentId ?? a.dispatch)}`
-    tail.push({ text: `${i === 0 ? 'agents  ' : '        '}● ${pad(who, 16)}${a.status}` })
+    const who = `${a.kind} ${shortId(a.id)}`
+    const turns = a.dispatches > 1 ? ` · ${a.dispatches} dispatches` : ''
+    tail.push({ text: `${i === 0 ? 'agents  ' : '        '}● ${pad(who, 16)}${a.status}${turns}` })
   })
-  if (m.agents.length > shown.length) {
-    tail.push({ text: `        +${m.agents.length - shown.length} more agents`, dim: true })
+  if (agents.length > shown.length) {
+    tail.push({ text: `        +${agents.length - shown.length} more agents`, dim: true })
   }
   tail.push({ text: `cost    ${formatCost(m.cost)}` })
   if (m.outcome) {
@@ -92,6 +96,23 @@ function frame(m: RunModel, room: Room): { head: Row[]; steps: Row[]; tail: Row[
   }
   if (m.ledger) tail.push({ text: `ledger  ${m.ledger}`, dim: true })
   return { head, steps, tail }
+}
+
+type AgentLine = { id: string; kind: string; status: string; dispatches: number }
+
+function agentRows(m: RunModel): AgentLine[] {
+  const rows: AgentLine[] = []
+  for (const a of m.agents) {
+    const id = a.agentId ?? a.dispatch
+    const known = a.agentId ? rows.find(r => r.id === id) : undefined
+    if (known) {
+      known.status = a.status
+      known.dispatches += 1
+    } else {
+      rows.push({ id, kind: a.kind, status: a.status, dispatches: 1 })
+    }
+  }
+  return rows
 }
 
 // The output a run shows, `cap` lines at most: the last ones, so the
@@ -120,8 +141,9 @@ export function layoutPane(runs: RunModel[], room: Room): Row[] {
       out.push(stepRow(step))
       if (step.state === 'active') out.push(...outputRows(f.m, cap))
     })
-    // A finished run keeps its last check's output only while rows are spare.
-    if (!isLive(f.m)) out.push(...outputRowsOfFailed(f.m, cap))
+    // A run that ended failing keeps its failed check's output while rows
+    // are spare; an accepted one does not (its failure was repaired).
+    if (!isLive(f.m) && !f.m.outcome?.state.startsWith('accepted')) out.push(...outputRowsOfFailed(f.m, cap))
     out.push(...f.steps, ...f.tail)
   }
   return out

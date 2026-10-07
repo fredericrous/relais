@@ -239,7 +239,7 @@ enum Command {
     /// Install the Claude Code integration; preview-first, --write applies
     /// (SPEC §3). User-level installation is explicit, not the default.
     Install {
-        /// Install the Claude Code skill and agent definitions
+        /// Install the relais Claude Code plugin (the run tools, the pane, the `/relais` skill and the agents it dispatches) and the advisory agents and skills
         #[arg(long = "claude")]
         claude: bool,
         /// Also wire the live hook into settings.json (SPEC §23);
@@ -256,7 +256,7 @@ enum Command {
     },
     /// Remove only owned, unchanged artifacts (SPEC §3).
     Uninstall {
-        /// Remove the Claude Code skill and agent definitions
+        /// Remove the relais Claude Code plugin and the advisory agents and skills
         #[arg(long = "claude")]
         claude: bool,
         /// Also remove relais's own commands from settings.json;
@@ -4199,10 +4199,25 @@ fn reconcile_run(ledger: &Ledger, run: &RunId) -> Result<resume::Reconciliation,
         .map(relais::coordinator::Client::new)
         .and_then(|client| client.status().ok())
         .and_then(|snapshot| snapshot.runs.get(run.as_str()).cloned());
-    Ok(resume::reconcile(
+    // A native agent lives and dies with its Claude Code session, which
+    // is live while its relais plugin says hello.
+    let gate = relais::coordinator::socket_path()
+        .ok()
+        .map(relais::coordinator::RemoteGate::new);
+    let session_live = |session: &str| {
+        let gate = gate.as_ref()?;
+        match gate.native_hello_age(session) {
+            Ok(Some(age)) => Some(age < relais::native::HELLO_FRESH),
+            // Never heard since the coordinator started (it may have been
+            // restarted): no evidence either way.
+            Ok(None) | Err(_) => None,
+        }
+    };
+    Ok(resume::reconcile_with_sessions(
         &live,
         coordinator_view.as_ref(),
         &|pid| relais::coordinator::process_alive(pid.get()),
+        &session_live,
     ))
 }
 

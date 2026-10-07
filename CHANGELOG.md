@@ -131,6 +131,18 @@ missing here.
 
 ### Fixed
 
+- `relais resume` reconciles a native run whose Claude Code session ended: a
+  native agent has no PID, so it is judged by its session, gone once the
+  session's relais plugin stops saying hello (and still live, refused, while
+  it says it). It used to refuse for as long as the dead run's coordinator
+  seat lasted.
+- `relais native status` carries the run's `events` (every one but output, and
+  only the newest output lines), so the plugin rebuilds the whole pane after
+  `/clear` or `/resume`; it had nothing to rebuild from. `dispatch_ended` names
+  its agent, so a repair's second dispatch reads as the same agent.
+- The pane marks a verification whose check failed as `FAIL` even when a
+  repair follows, titles the repair attempt `attempt N · repair`, and keeps
+  one agent row per agent.
 - A native attempt whose cost could not be priced is booked as
   `estimated_api_equivalent` with an unknown figure, not as `api_spend`.
 - A `RELAIS_STATE_DIR` whose coordinator socket path is longer than the OS

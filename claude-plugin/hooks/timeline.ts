@@ -57,6 +57,9 @@ export type RunModel = {
   outcome: { state: string; receipt: string | null } | undefined
   events: Entry[]
   ledger: string | undefined
+  // What the next worker attempt is, after a `repairing`/`escalating`
+  // transition: its step is titled by it.
+  retry: 'repair' | 'escalation' | undefined
 }
 
 export const emptyRun = (run: string, startedAt: number): RunModel => ({
@@ -73,6 +76,7 @@ export const emptyRun = (run: string, startedAt: number): RunModel => ({
   outcome: undefined,
   events: [],
   ledger: undefined,
+  retry: undefined,
 })
 
 const FAILED_STATES = ['failed', 'blocked', 'cancelled', 'interrupted', 'budget_exhausted']
@@ -135,7 +139,10 @@ const replaceLast = (steps: Step[], step: Step): Step[] => [...steps.slice(0, -1
 function closeStep(m: RunModel, at: number, state: 'done' | 'fail'): RunModel {
   const step = lastStep(m)
   if (!step || step.state !== 'active') return m
-  return { ...m, steps: replaceLast(m.steps, { ...step, state, endedAt: at }) }
+  // A verification whose check failed is a failed step, whatever comes
+  // next (a repair, an escalation); a red baseline is expected and is not.
+  const checkFailed = step.phase === 'verifying' && step.checks.some(c => c.exit !== 0 && c.exit !== undefined)
+  return { ...m, steps: replaceLast(m.steps, { ...step, state: checkFailed ? 'fail' : state, endedAt: at }) }
 }
 
 function openStep(m: RunModel, title: string, phase: string, at: number): RunModel {
@@ -185,7 +192,11 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
       m = closeStep(m, at, isFailing(event.state) ? 'fail' : 'done')
       m = { ...m, phase: event.state, maxAttempts: maxAttemptsOf(event.detail) ?? m.maxAttempts }
       const isTerminal = m.outcome !== undefined
-      if (!isTerminal && !FINAL_STATES.includes(event.state)) {
+      // A repair or an escalation is the next attempt's kind, not a step:
+      // the decision row says why, the next attempt's title says what.
+      if (event.state === 'repairing' || event.state === 'escalating') {
+        m = { ...m, retry: event.state === 'repairing' ? 'repair' : 'escalation' }
+      } else if (!isTerminal && !FINAL_STATES.includes(event.state)) {
         m = openStep(m, titleOfState(event.state, attempt + 1), event.state, at)
         m = mapLast(m, s => ({ ...s, detail: event.reason ?? '' }))
       }
@@ -219,7 +230,9 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
       const route = `${event.model}${event.effort ? `@${event.effort}` : ''}`
       m = { ...m, attempt, agents: [...m.agents, row], maxAttempts: maxAttemptsOf(event) ?? m.maxAttempts }
       if (event.agent_kind === 'worker') {
-        m = mapLast(m, s => ({ ...s, title: `attempt ${attempt} · worker`, detail: route }))
+        const kind = m.retry ?? 'worker'
+        m = mapLast(m, s => ({ ...s, title: `attempt ${attempt} · ${kind}`, detail: route }))
+        m = { ...m, retry: undefined }
       } else {
         m = mapLast(m, s => ({ ...s, detail: `${event.agent_kind} · ${route}` }))
       }
@@ -227,7 +240,13 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
     }
     case 'dispatch_ended': {
       const status = agentStatusOf(event.outcome)
-      m = { ...m, agents: m.agents.map(a => (a.dispatch === event.dispatch ? { ...a, status } : a)) }
+      const agentId = typeof event.agent === 'string' ? event.agent : undefined
+      m = {
+        ...m,
+        agents: m.agents.map(a =>
+          a.dispatch === event.dispatch ? { ...a, status, agentId: a.agentId ?? agentId } : a,
+        ),
+      }
       return withEntry(m, at, 'dispatch', `ended · ${event.outcome}`)
     }
     case 'cost': {

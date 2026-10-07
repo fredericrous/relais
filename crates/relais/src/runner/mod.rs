@@ -599,6 +599,7 @@ fn dispatch_ended(dispatch: String, launched: &Launched) -> Event {
     match launched {
         Ok(result) => Event::DispatchEnded {
             dispatch,
+            agent: result.session_id.clone(),
             outcome: result.ended.describe(),
             usage: Some(TokenUsage {
                 input_tokens: result.usage.input_tokens,
@@ -613,6 +614,7 @@ fn dispatch_ended(dispatch: String, launched: &Launched) -> Event {
         },
         Err(outcome) => Event::DispatchEnded {
             dispatch,
+            agent: None,
             outcome: outcome.state().as_str().to_string(),
             usage: None,
             cost: None,

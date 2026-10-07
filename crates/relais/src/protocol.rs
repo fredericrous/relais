@@ -97,6 +97,11 @@ pub enum Event {
     },
     DispatchEnded {
         dispatch: String,
+        /// The agent that ran it, when one was bound: a repair continues
+        /// the same agent under a new dispatch, so a reader rebuilding the
+        /// timeline can tell one agent from two.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
         outcome: String,
         usage: Option<TokenUsage>,
         cost: Option<CostFigure>,
@@ -448,13 +453,55 @@ impl Events {
     }
 }
 
+/// Every event but `output`, and of `output` only the newest events whose
+/// lines fit in [`STATUS_OUTPUT_LINES`], in their original order; then at
+/// most [`STATUS_EVENTS`] of them, the newest.
+fn bounded_events(events: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let mut lines_left = STATUS_OUTPUT_LINES;
+    let mut keep = vec![true; events.len()];
+    for (i, entry) in events.iter().enumerate().rev() {
+        if entry["event"]["kind"] != "output" {
+            continue;
+        }
+        let lines = entry["event"]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .lines()
+            .count();
+        if lines_left == 0 || lines > lines_left {
+            lines_left = 0;
+            keep[i] = false;
+        } else {
+            lines_left -= lines;
+        }
+    }
+    let kept: Vec<serde_json::Value> = events
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(entry, keep)| keep.then_some(entry))
+        .collect();
+    let skip = kept.len().saturating_sub(STATUS_EVENTS);
+    kept.into_iter().skip(skip).collect()
+}
+
 /// The most `output` lines a status carries.
 pub const STATUS_OUTPUT_LINES: usize = 40;
+
+/// The most `events` a status carries: far more than a run's steps,
+/// dispatches and decisions, so only a pathological run is cut (its
+/// oldest events go).
+pub const STATUS_EVENTS: usize = 1000;
 
 /// A run's timeline as `relais native status` prints it: its phases,
 /// decisions, cost and outcome, and the last [`STATUS_OUTPUT_LINES`] lines
 /// of check output, read from the run's `events.jsonl`. Never the whole file.
+///
+/// `events` is what the plugin rebuilds its pane from after `/clear` or
+/// `/resume`: the event lines themselves, every one but `output`, plus
+/// only the newest `output` lines up to [`STATUS_OUTPUT_LINES`] — so the
+/// reply stays bounded however much a check printed.
 pub fn timeline(run: &str, events_jsonl: &str) -> serde_json::Value {
+    let mut events: Vec<serde_json::Value> = Vec::new();
     let mut phases = Vec::new();
     let mut decisions = Vec::new();
     let mut cost = Vec::new();
@@ -467,6 +514,9 @@ pub fn timeline(run: &str, events_jsonl: &str) -> serde_json::Value {
             continue;
         };
         let event = &entry["event"];
+        if event["kind"].is_string() {
+            events.push(entry.clone());
+        }
         match event["kind"].as_str() {
             Some("phase") => phases.push(serde_json::json!({
                 "at": entry["at"],
@@ -506,6 +556,7 @@ pub fn timeline(run: &str, events_jsonl: &str) -> serde_json::Value {
         "cost": cost,
         "outcome": outcome,
         "output": output,
+        "events": bounded_events(events),
     })
 }
 
@@ -710,6 +761,20 @@ mod tests {
         assert_eq!(output.len(), STATUS_OUTPUT_LINES);
         assert_eq!(output[0], "a20", "the oldest lines are the ones dropped");
         assert_eq!(output[STATUS_OUTPUT_LINES - 1], "b29");
+        // The event lines the plugin rebuilds its pane from: every one but
+        // `output`, in order, and only the newest output that fits.
+        let kinds: Vec<&str> = timeline["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .map(|entry| entry["event"]["kind"].as_str().expect("a kind"))
+            .collect();
+        assert_eq!(kinds, ["phase", "decision", "output", "cost", "outcome"]);
+        assert!(timeline["events"][2]["event"]["text"]
+            .as_str()
+            .expect("text")
+            .starts_with("b0"));
+        assert_eq!(timeline["events"][0]["run"], "run-1");
     }
 
     #[test]

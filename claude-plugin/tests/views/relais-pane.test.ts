@@ -3,7 +3,7 @@
 // the drawing by element.
 
 import { expect, test } from 'claude-code/testing'
-import { event, settle, spawnLine, startedRun, startQueued } from '../support.ts'
+import { continueLine, event, settle, spawnLine, startedRun, startQueued } from '../support.ts'
 
 const RUN = 'run-65d322006dd13-c35c'
 
@@ -211,6 +211,32 @@ test('an agent’s status in the footer follows the agent list', async ($: any, 
   await settle(engine)
   const { texts } = await drawn($, engine, [])
   expect(texts.some(t => t.includes('● worker') && t.includes('completed'))).toBe(true)
+})
+
+test('a repair: the failed verification is FAIL, the next attempt is the repair, one agent row', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.stream.push('stdout', phase(0, 'running') + started(1, 'd1') + spawnLine('d1'))
+  await settle(engine)
+  const repair = [
+    phase(2, 'verifying'),
+    checkStarted(3, 'unit'),
+    output(4, 'unit', 'FAIL: test_greet\n'),
+    event(RUN, 5, { kind: 'check_ended', label: 'unit', exit: 1, duration_ms: 400 }),
+    event(RUN, 6, { kind: 'decision', what: 'repair', reason: 'behavioral_failure' }),
+    phase(7, 'repairing', 'behavioral_failure'),
+    phase(8, 'running'),
+    started(9, 'd2', 2),
+  ].join('')
+  engine.stream.push('stdout', repair + continueLine('d2', 'agent-1'))
+  await settle(engine)
+  const { texts } = await drawn($, engine, [])
+  const failed = indexOf(texts, 'verification')
+  expect(texts[failed].startsWith('FAIL')).toBe(true)
+  expect(indexOf(texts, 'attempt 2 · repair')).toBeGreaterThan(failed)
+  expect(texts.some(t => /^\W*repair\s/.test(t.replace(/^[✓▸] /, '')))).toBe(false)
+  const agentRows = texts.filter(t => t.includes('● worker'))
+  expect(agentRows.length).toBe(1)
+  expect(agentRows[0]).toContain('2 dispatches')
 })
 
 test('where the pane is not placed, a toast points to /relais-status, which prints the timeline', async ($: any, on: any) => {
