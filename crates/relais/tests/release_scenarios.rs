@@ -671,6 +671,7 @@ const FAKE_CLAUDE: &str = r#"#!/bin/sh
 case "$1" in
   --version) echo "2.1.291 (fake-claude)"; exit 0 ;;
   --help) echo "usage: claude -p --model <model> --effort <level> --output-format <format> --max-budget-usd <amount> --disallowed-tools <tools...> --settings <file-or-json>"; exit 0 ;;
+  plugin) echo "[]"; exit 0 ;;
 esac
 here=$(dirname "$0")
 printf '%s\n' "$@" > "$here/argv-last.log"

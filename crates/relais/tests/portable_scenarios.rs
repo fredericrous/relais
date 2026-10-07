@@ -33,6 +33,9 @@ struct World {
     repo: PathBuf,
     state: PathBuf,
     config: PathBuf,
+    /// The Claude Code this world's relais finds: one that does not exist,
+    /// unless the scenario installs the plugin (`with_plugin_claude`).
+    claude: PathBuf,
 }
 
 impl World {
@@ -63,11 +66,29 @@ impl World {
         git(&repo, &["commit", "-q", "-m", "base"]);
         Self {
             _scratch: scratch,
+            claude: root.join("no-such-claude"),
             root,
             repo,
             state,
             config,
         }
+    }
+
+    /// A `claude` that says no plugin is installed and accepts every other
+    /// call, for the scenarios whose subject is the files and the hook
+    /// wiring `install --claude` writes beside the plugin. A `sh` script,
+    /// so those scenarios run on Unix; the plugin's own steps are driven
+    /// in `plugin_install.rs`.
+    #[cfg(unix)]
+    fn with_plugin_claude(mut self) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let claude = self.root.join("claude");
+        let script =
+            "#!/bin/sh\nif [ \"$1 $2 $3\" = \"plugin list --json\" ]; then echo '[]'; fi\nexit 0\n";
+        std::fs::write(&claude, script).expect("fake claude");
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        self.claude = claude;
+        self
     }
 
     /// The binary, in this world. `RELAIS_CLAUDE_BIN` names a path that
@@ -87,7 +108,7 @@ impl World {
             .current_dir(cwd)
             .env("RELAIS_STATE_DIR", &self.state)
             .env("RELAIS_CONFIG_DIR", &self.config)
-            .env("RELAIS_CLAUDE_BIN", self.root.join("no-such-claude"))
+            .env("RELAIS_CLAUDE_BIN", &self.claude)
             .env("RELAIS_SESSION_ID", "tab-test")
             // This world's home, so nothing here reads — or acts on —
             // the home directory of whoever is running `make check`.
@@ -260,17 +281,23 @@ fn init_writes_a_valid_policy_once() {
 // SPEC §14: installation and uninstall preserve unrelated configuration
 // and modified owned files.
 #[test]
+#[cfg(unix)]
 fn install_is_preview_first_and_uninstall_keeps_foreign_and_modified_files() {
-    let world = World::new("install");
+    let world = World::new("install").with_plugin_claude();
     let preview = world.relais(&["install", "--claude"]);
     assert_eq!(preview.status.code(), Some(0));
     assert!(text(&preview.stdout).contains("preview only"));
-    assert!(!world.repo.join(".claude/skills/relais/SKILL.md").exists());
+    assert!(!world
+        .repo
+        .join(".claude/skills/relais-verified-push/SKILL.md")
+        .exists());
     std::fs::create_dir_all(world.repo.join(".claude/agents")).expect("mkdir");
     std::fs::write(world.repo.join(".claude/agents/custom.md"), "# mine\n").expect("foreign");
     let write = world.relais(&["install", "--claude", "--write"]);
     assert_eq!(write.status.code(), Some(0), "{}", text(&write.stderr));
-    let skill = world.repo.join(".claude/skills/relais/SKILL.md");
+    let skill = world
+        .repo
+        .join(".claude/skills/relais-verified-push/SKILL.md");
     assert!(skill.exists());
     assert!(world
         .repo
@@ -301,8 +328,9 @@ fn install_is_preview_first_and_uninstall_keeps_foreign_and_modified_files() {
 // recorded command — spawning it for real against a scratch environment
 // — rather than merely reading the file back.
 #[test]
+#[cfg(unix)]
 fn install_claude_alone_never_touches_settings_json() {
-    let world = World::new("install-no-hooks");
+    let world = World::new("install-no-hooks").with_plugin_claude();
     std::fs::create_dir_all(world.repo.join(".claude")).expect("mkdir");
     let settings = world.repo.join(".claude/settings.json");
     let original = "{\n  \"hooks\": {}\n}\n";
@@ -317,8 +345,9 @@ fn install_claude_alone_never_touches_settings_json() {
 }
 
 #[test]
+#[cfg(unix)]
 fn install_hooks_wires_settings_json_and_a_rerun_is_current() {
-    let world = World::new("install-hooks");
+    let world = World::new("install-hooks").with_plugin_claude();
     let write = world.relais(&["install", "--claude", "--hooks", "--write"]);
     assert_eq!(write.status.code(), Some(0), "{}", text(&write.stderr));
     let settings_path = world.repo.join(".claude/settings.json");
@@ -385,8 +414,9 @@ fn install_hooks_wires_settings_json_and_a_rerun_is_current() {
 // hook — is flagged by `relais doctor`, migrated by the next install with the
 // foreign entry kept, and no longer flagged; uninstall removes either form.
 #[test]
+#[cfg(unix)]
 fn install_hooks_migrates_the_native_hook_wiring_in_a_temp_home() {
-    let world = World::new("install-migrate");
+    let world = World::new("install-migrate").with_plugin_claude();
     std::fs::create_dir_all(world.repo.join(".claude")).expect("mkdir");
     let settings_path = world.repo.join(".claude/settings.json");
     let command = format!("{BIN} hook");
@@ -467,8 +497,9 @@ fn install_hooks_migrates_the_native_hook_wiring_in_a_temp_home() {
 // state directory). The recorded command IS this test binary, so this
 // proves the wiring end to end, not just the planning.
 #[test]
+#[cfg(unix)]
 fn doctor_exercises_the_recorded_hook_and_reports_a_refusal() {
-    let world = World::new("doctor-hook-live");
+    let world = World::new("doctor-hook-live").with_plugin_claude();
     let before = world.relais(&["doctor", "--json"]);
     let report: serde_json::Value =
         serde_json::from_str(text(&before.stdout).trim()).expect("doctor --json is a document");
@@ -531,8 +562,9 @@ fn doctor_exercises_the_recorded_hook_and_reports_a_refusal() {
 // file the harness merges, it refuses to write the one it owns rather
 // than adding a second handler behind a person's back.
 #[test]
+#[cfg(unix)]
 fn install_hooks_refuses_when_the_local_settings_file_already_carries_one() {
-    let world = World::new("install-hooks-dup");
+    let world = World::new("install-hooks-dup").with_plugin_claude();
     std::fs::create_dir_all(world.repo.join(".claude")).expect("mkdir");
     std::fs::write(
         world.repo.join(".claude/settings.local.json"),

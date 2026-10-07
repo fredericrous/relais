@@ -48,6 +48,24 @@ missing here.
 
 ### Changed
 
+- `relais install --claude` installs the relais Claude Code plugin,
+  `relais@relais-local`, which carries the mod, the agent definitions and the
+  `/relais` skill (now written for the plugin: start a run with
+  `mcp__relais__run`, a replay with `mcp__relais__replay`, follow it with
+  `mcp__relais__status` or `/relais-status`, never `relais run` in Bash). The
+  plugin is embedded in the binary: install writes a directory marketplace under
+  relais's state directory and runs `claude plugin marketplace add` and `claude
+  plugin install`, or `marketplace update` and `plugin update` once it is
+  installed; the plugin's version is relais's, so every release refreshes Claude
+  Code's copy. A `claude` call that fails is reported with its stderr and install
+  exits non-zero. `relais uninstall --claude` runs `claude plugin uninstall` and
+  `claude plugin marketplace remove` and removes the directory. Install no
+  longer writes `~/.claude/skills/relais/SKILL.md` or the per-model worker
+  agents in `.claude/agents/`, and removes the ones an earlier relais wrote when
+  you have not edited them (an edited one is kept and reported). `relais doctor`
+  has a `plugin` finding: ok when the plugin is enabled at this relais's
+  version, a warning naming `relais install --claude --write` when it is absent,
+  disabled or at another version.
 - `relais install --claude --hooks` writes the matcher `Agent|Task` again (not
   `Agent|Task|SendMessage`) on the three tool events and no `WorktreeCreate`
   handler. Installing over a file from the hook-side native path removes

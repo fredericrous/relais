@@ -209,12 +209,24 @@ or the reason it was kept, and a scorecard re-measured afterwards.
   verify (no `SHA256SUMS`, no sha256 tool). `RELAIS_SKIP_CHECKSUM=1` is
   the explicit way to accept an unverified binary.
 
-`relais install --claude` writes the `/relais`, `/relais-verified-push` and
-`/relais-architecture-conflict` skills, the three advisory agents
-(`relais-research`, `relais-implementation`, `relais-review`) and 19 native
-worker definitions, `agents/relais-worker-<model>-<effort>.md`, for the models
-`haiku` (effort `default` only), `sonnet`, `opus` and `fable` (efforts
-`default`, `low`, `medium`, `high`, `xhigh`, `max`). `relais run` starts only
+`relais install --claude` writes the `/relais-verified-push` and
+`/relais-architecture-conflict` skills and the three advisory agents
+(`relais-research`, `relais-implementation`, `relais-review`), and installs the
+relais plugin, `relais@relais-local`, which carries the mod, the agent
+definitions (`relais-worker-<model>-<effort>` and the reviewer and planner ones)
+and the `/relais` skill. The plugin is embedded in the `relais` binary, so a
+relais installed from a release needs nothing else: install writes a directory
+marketplace under relais's state directory (`claude-marketplace/`) and runs
+`claude plugin marketplace add` then `claude plugin install` (once it is
+installed, `marketplace update` then `plugin update`). The plugin carries
+relais's version, so each release refreshes Claude Code's copy; `relais doctor`
+(`plugin`) warns, naming `relais install --claude --write`, when it is absent,
+disabled or at another version. `relais uninstall --claude` runs `claude plugin
+uninstall` and `claude plugin marketplace remove` and removes the directory. A
+`claude` call that fails is reported with its stderr and the command exits
+non-zero. The per-model worker agent files and the `/relais` skill an earlier
+relais wrote under `.claude/` are removed by the next install when you have not
+edited them, and kept and reported when you have. `relais run` starts only
 from Claude Code with the relais plugin, which runs it with `--protocol` and
 `RELAIS_HOST=claude-code-mod`, so the worker shows as Claude Code's own agent;
 from a plain terminal it is refused (exit 2), as it is on a Claude Code outside

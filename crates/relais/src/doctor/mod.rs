@@ -1107,6 +1107,9 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
     findings.push(worktrees_finding_on_disk());
     findings.push(strays_finding_on_disk());
     findings.push(coordinator_finding());
+    findings.push(plugin_finding(
+        crate::install::plugin::Claude::discover().and_then(|claude| claude.installed()),
+    ));
     findings.push(hook_live_finding(merged_roots(repo_dir, home.as_deref())));
     findings.extend(hook_wiring_finding(merged_roots(repo_dir, home.as_deref())));
 
@@ -1529,6 +1532,45 @@ fn hook_live_finding(roots: crate::install::settings::MergedRoots<'_>) -> Findin
                 describe_hook_locations(many)
             ),
         },
+    }
+}
+
+/// Whether the relais plugin is installed in Claude Code, enabled, and at
+/// this relais's version. The plugin is the only way a run starts, so an
+/// absent, disabled or stale one is the first thing to fix. `listed` is
+/// what `claude plugin list --json` said.
+pub fn plugin_finding(
+    listed: Result<crate::install::plugin::Installed, crate::install::plugin::PluginError>,
+) -> Finding {
+    use crate::install::plugin::{version, Installed, PLUGIN_ID};
+    let fix = "run `relais install --claude --write`";
+    let warn = |detail: String| (Level::Warn, detail);
+    let (level, detail) = match listed {
+        Err(e) => warn(format!("cannot tell whether {PLUGIN_ID} is installed: {e}")),
+        Ok(Installed::No) => warn(format!(
+            "{PLUGIN_ID} is not installed in Claude Code — {fix}"
+        )),
+        Ok(Installed::Yes { enabled: false, .. }) => {
+            warn(format!("{PLUGIN_ID} is installed but disabled — {fix}"))
+        }
+        Ok(Installed::Yes {
+            version: installed,
+            enabled: true,
+        }) => match installed == version() {
+            true => (
+                Level::Ok,
+                format!("{PLUGIN_ID} {installed} is installed and enabled"),
+            ),
+            false => warn(format!(
+                "{PLUGIN_ID} is at {installed}, this relais is {} — {fix}",
+                version()
+            )),
+        },
+    };
+    Finding {
+        component: "plugin",
+        level,
+        detail,
     }
 }
 
@@ -3179,5 +3221,46 @@ mod tests {
         let json = serde_json::to_value(&report).expect("serializes");
         assert_eq!(json["findings"][0]["component"], "permissions");
         assert_eq!(json["findings"][0]["detail"], sentence);
+    }
+
+    fn plugin_listed(version: &str, enabled: bool) -> crate::install::plugin::Installed {
+        crate::install::plugin::Installed::Yes {
+            version: version.to_string(),
+            enabled,
+        }
+    }
+
+    #[test]
+    fn the_plugin_is_ok_when_enabled_at_this_relais_version() {
+        let finding = plugin_finding(Ok(plugin_listed(crate::install::plugin::version(), true)));
+        assert_eq!(finding.component, "plugin");
+        assert_eq!(finding.level, Level::Ok);
+        assert!(
+            finding.detail.contains("relais@relais-local"),
+            "{finding:?}"
+        );
+    }
+
+    #[test]
+    fn the_plugin_warns_with_the_fix_when_absent_disabled_or_stale() {
+        use crate::install::plugin::{Installed, PluginError};
+        let current = crate::install::plugin::version();
+        for (listed, says) in [
+            (Ok(Installed::No), "not installed"),
+            (Ok(plugin_listed(current, false)), "disabled"),
+            (Ok(plugin_listed("0.0.1", true)), "is at 0.0.1"),
+            (
+                Err(PluginError::Unreadable("nope".into())),
+                "cannot tell whether",
+            ),
+        ] {
+            let finding = plugin_finding(listed);
+            assert_eq!(finding.level, Level::Warn, "{says}: {finding:?}");
+            assert!(finding.detail.contains(says), "{says}: {finding:?}");
+            assert!(
+                finding.detail.contains("relais install --claude") || says == "cannot tell whether",
+                "{says}: {finding:?}"
+            );
+        }
     }
 }

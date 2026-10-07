@@ -803,15 +803,12 @@ mod tests {
     }
 
     #[test]
-    fn every_name_a_shipped_pair_can_print_has_an_install_file() {
-        let files: Vec<String> = crate::install::owned_files()
-            .into_iter()
-            .map(|(path, _)| path.to_string_lossy().replace('\\', "/"))
-            .collect();
+    fn every_name_a_shipped_pair_can_print_has_a_plugin_file() {
+        let files = crate::install::plugin::embedded_paths();
         for (model, effort) in crate::native::worker_agent_types() {
             let agent_type = crate::native::worker_agent_type(&model, effort.as_deref());
             assert!(
-                files.contains(&format!("agents/{agent_type}.md")),
+                files.contains(&format!("agents/{agent_type}.md").as_str()),
                 "{agent_type}"
             );
         }

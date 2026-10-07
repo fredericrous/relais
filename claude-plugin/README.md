@@ -83,7 +83,24 @@ does **not** type-check `register.ts`; the tests carry the behaviour.
 - `agents/relais-worker-<model>-<effort>.md` — one worker definition per
   `native::worker_agent_types()` pair (`crates/relais/tests/plugin_agents.rs`
   keeps the two in step).
+- `skills/relais/SKILL.md` — the `/relais` skill: start a run with
+  `mcp__relais__run`, a replay with `mcp__relais__replay`, follow it with
+  `mcp__relais__status` or `/relais-status`.
 - `tests/*.test.ts`, `tests/views/relais-pane.test.ts` — the plugin's tests.
+
+## Installing
+
+`relais install --claude --write` installs it; nothing else is needed, because
+the `relais` binary embeds every file here except `tests/`,
+`.claude-plugin/types/` and `tsconfig.json` (a test keeps the embedded set equal
+to the files on disk). It writes a directory marketplace, `relais-local`, under
+relais's state directory, with the plugin at `plugins/relais/`, and runs
+`claude plugin marketplace add` and `claude plugin install relais@relais-local`
+(`marketplace update` and `plugin update` when it is installed already).
+`.claude-plugin/plugin.json`'s `version` is the relais crate's version (a test
+keeps them equal): Claude Code caches an installed plugin by version, so a new
+relais refreshes its copy only because the version moved.
+`relais uninstall --claude --write` undoes both registrations.
 
 Two facts about Claude Code shape the code. A plugin's own `agent.spawn` hook
 runs only for a spawn made from inside a hook frame, so the child's output is

@@ -1057,15 +1057,28 @@ fn install_home(scope: &Scope) -> Result<PathBuf, CliError> {
 /// Print a plan and what applying it did. Returns the outcome: an apply
 /// that could not carry out part of its plan exits non-zero and names the
 /// files, rather than reporting "applied 0 change(s)" and 0 (C9).
-fn render_install(verb: &str, request: &InstallRequest, report: &InstallReport) -> CliOutcome {
+fn render_install(
+    verb: &str,
+    request: &InstallRequest,
+    report: &InstallReport,
+    plugin: &relais::install::plugin::PluginReport,
+) -> CliOutcome {
     println!(
-        "relais {verb} --claude ({})\n{}",
+        "relais {verb} --claude ({})\n{}{}",
         request.scope_label(),
-        report.plan.render()
+        report.plan.render(),
+        plugin.render()
     );
-    match report.mode {
+    let plugin_outcome = match &plugin.failure {
+        None => CliOutcome::Accepted,
+        Some(failure) => {
+            eprintln!("relais {verb}: the plugin step failed — {failure}");
+            CliOutcome::NotFullyApplied
+        }
+    };
+    let files_outcome = match report.mode {
         Mode::Preview => {
-            if report.plan.applicable_count() == 0 {
+            if report.plan.applicable_count() == 0 && plugin.steps.is_empty() {
                 println!("nothing to do");
             } else {
                 println!("preview only: re-run with --write to apply");
@@ -1074,9 +1087,6 @@ fn render_install(verb: &str, request: &InstallRequest, report: &InstallReport) 
         }
         Mode::Apply => {
             println!("applied {} change(s)", report.applied.len());
-            if report.not_applied.is_empty() {
-                return CliOutcome::Accepted;
-            }
             for action in &report.not_applied {
                 eprintln!(
                     "relais {verb}: could not apply {} — it changed between the preview and \
@@ -1084,9 +1094,18 @@ fn render_install(verb: &str, request: &InstallRequest, report: &InstallReport) 
                     action.relative().display()
                 );
             }
-            CliOutcome::NotFullyApplied
+            match report.not_applied.is_empty() {
+                true => CliOutcome::Accepted,
+                false => CliOutcome::NotFullyApplied,
+            }
         }
-    }
+    };
+    worse_outcome(files_outcome, plugin_outcome)
+}
+
+/// The directory marketplace the plugin is installed from.
+fn marketplace_dir() -> Result<PathBuf, CliError> {
+    paths::claude_marketplace_dir().map_err(CliError::Home)
 }
 
 /// What an `install`/`uninstall --claude` invocation is aimed at. Not a
@@ -1095,9 +1114,10 @@ fn render_install(verb: &str, request: &InstallRequest, report: &InstallReport) 
 /// one, and the two cases read as what they are at every call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Targets {
-    /// The owned files under `.claude/` only.
+    /// The owned files under `.claude/` and the plugin.
     OwnedFiles,
-    /// The owned files, and then the hook wiring in `settings.json`.
+    /// The owned files and the plugin, and then the hook wiring in
+    /// `settings.json`.
     OwnedFilesAndHooks,
 }
 
@@ -1117,7 +1137,8 @@ fn install_command(write: bool, user: bool, targets: Targets) -> Result<CliOutco
     let request = install_request(write, user)?;
     let home = install_home(&request.scope)?;
     let report = operational(relais::install::install(&request, &home), "install")?;
-    let outcome = render_install("install", &request, &report);
+    let plugin = relais::install::plugin::install(request.mode, &marketplace_dir()?);
+    let outcome = render_install("install", &request, &report, &plugin);
     match targets {
         Targets::OwnedFiles => Ok(outcome),
         Targets::OwnedFilesAndHooks => Ok(worse_outcome(
@@ -1176,7 +1197,8 @@ fn uninstall_command(write: bool, user: bool, targets: Targets) -> Result<CliOut
     let request = install_request(write, user)?;
     let home = install_home(&request.scope)?;
     let report = operational(relais::install::uninstall(&request, &home), "uninstall")?;
-    let outcome = render_install("uninstall", &request, &report);
+    let plugin = relais::install::plugin::uninstall(request.mode, &marketplace_dir()?);
+    let outcome = render_install("uninstall", &request, &report, &plugin);
     match targets {
         Targets::OwnedFiles => Ok(outcome),
         Targets::OwnedFilesAndHooks => Ok(worse_outcome(

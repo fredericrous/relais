@@ -292,7 +292,7 @@ Each package: `make check` (which now includes `claude plugin test claude-plugin
 | `claude plugin validate` | **does not type-check**: a `register.ts` with two type errors passes. The gate is structural; the tests guard behaviour |
 | `claude plugin test` | runs with an empty `HOME`, no sign-in, in under 2 s. CI install of the pinned Claude Code is confirmed on the first push |
 | transcripts | written in a normal interactive session (main and `subagents/agent-<id>.jsonl`). A pty session that inherits the parent's `CLAUDE_*` variables (`CLAUDE_CODE_CHILD_SESSION`) writes none; the test driver strips them |
-| persistent install | deferred to M5 (local marketplace + `claude plugin install`, or `CLAUDE_CODE_PLUGIN_DIRS`), measured there with an isolated `HOME` |
+| persistent install | **measured in M5a** (Claude Code 2.1.291, isolated `HOME`; see the entry below): a directory marketplace + `claude plugin install` |
 
 **Decisions taken from S0:**
 - `agent.offer` hides `relais:*` except while the mod resumes its own agent (a module flag set around its `SendMessage`).
@@ -300,6 +300,15 @@ Each package: `make check` (which now includes `claude plugin test claude-plugin
 - The pane opens with focus left out, never `focus:false`. Placement follows `isPlaced`.
 - `$.prompt.submit` carries the verdict, called from the stream handler, never from inside a command hook.
 - No type check in the gate; the plugin's tests carry it.
+
+**2026-10-07, S0 'persistent install'** (M5a; Claude Code 2.1.291, isolated `HOME`). Binding facts:
+- a directory marketplace works: a directory holding `.claude-plugin/marketplace.json` = `{"name":"relais-local","owner":{"name":"relais"},"plugins":[{"name":"relais","source":"./plugins/relais","description":…}]}` and the plugin at `plugins/relais/`;
+- `claude plugin marketplace add <dir>` records it in user settings (`extraKnownMarketplaces.relais-local`, source `directory`);
+- `claude plugin install relais@relais-local` enables it (`enabledPlugins`) and copies it to `~/.claude/plugins/cache/relais-local/relais/<version>/`, so a changed plugin needs a new `version` and `claude plugin marketplace update relais-local` + `claude plugin update relais@relais-local` to be picked up;
+- `claude plugin list --json` gives `[{id, version, scope, enabled, installPath, readFromFolder, …}]`;
+- `claude plugin uninstall relais@relais-local` and `claude plugin marketplace remove relais-local` undo both.
+
+**Taken in M5a:** the binary embeds `claude-plugin/` (`build.rs`; not `tests/`, `.claude-plugin/types/`, `tsconfig.json`); `plugin.json`'s `version` is the crate's, so each release refreshes the cache; `relais install --claude` writes the marketplace under `<state>/claude-marketplace/` and runs `marketplace add` + `install`, or `marketplace update` + `update` when `plugin list --json` shows `relais@relais-local`; failures name the command and its stderr and exit 13; uninstall accepts an `uninstall`/`marketplace remove` whose stderr says `not found` (measured 2.1.291: `Plugin "relais@relais-local" not found in installed plugins` and `Marketplace 'relais-local' not found`, both on stderr, exit 1). The `/relais` skill and the worker agents are the plugin's, and install removes the user-level copies an earlier relais wrote (unedited: removed; edited: kept and reported). `doctor --probe-hooks` is replaced by the `plugin` finding.
 
 **2026-10-06, the pane's direction** (the person, from three text-cell directions: timeline, split, dashboard): **A, timeline**. The artboard is `2026-10-06-all-native-mod.pane.txt`, which M1's pane view tests follow.
 

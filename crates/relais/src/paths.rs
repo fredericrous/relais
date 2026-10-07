@@ -97,6 +97,13 @@ pub fn ledger_path() -> Result<PathBuf, HomeUnset> {
     Ok(state_dir()?.join("ledger.sqlite"))
 }
 
+/// The directory marketplace `relais install --claude` writes the
+/// Claude Code plugin into (`.claude-plugin/marketplace.json` and
+/// `plugins/relais/`), and registers with `claude plugin marketplace add`.
+pub fn claude_marketplace_dir() -> Result<PathBuf, HomeUnset> {
+    Ok(state_dir()?.join("claude-marketplace"))
+}
+
 /// The learned-artifact registry (SPEC §17).
 pub fn registry_dir() -> Result<PathBuf, HomeUnset> {
     Ok(state_dir()?.join("registry"))
