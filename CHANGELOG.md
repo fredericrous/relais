@@ -6,7 +6,9 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
-## Unreleased
+## v0.10.1
+
+Fixes after 0.10.0, and `brew upgrade relais` now follows the releases.
 
 ### Changed
 
