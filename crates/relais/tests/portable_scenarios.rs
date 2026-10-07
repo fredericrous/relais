@@ -276,6 +276,77 @@ fn init_writes_a_valid_policy_once() {
     let second = world.relais(&["init"]);
     assert_eq!(second.status.code(), Some(2));
     assert!(text(&second.stderr).contains("never overwrites"));
+    assert!(
+        text(&first.stdout).contains("relais trust show; relais trust grant --key"),
+        "{}",
+        text(&first.stdout)
+    );
+}
+
+/// `init --detect --write` writes the proposal it printed, once, and the
+/// written policy parses; a second write is refused like plain init.
+#[test]
+fn init_detect_writes_the_proposal_once() {
+    let world = World::new("detect");
+    std::fs::write(world.repo.join("Makefile"), "check:\n\ttrue\n").expect("Makefile");
+    let first = world.relais(&["init", "--detect", "--write"]);
+    assert_eq!(first.status.code(), Some(0), "{}", text(&first.stderr));
+    let stdout = text(&first.stdout);
+    assert!(
+        stdout.contains("  check  make check   Makefile: target check"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.lines().all(|line| line.chars().count() <= 80),
+        "{stdout}"
+    );
+    let policy = std::fs::read_to_string(world.repo.join("relais.toml")).expect("policy");
+    let parsed = RepoPolicy::from_toml_str(&policy).expect("the proposal is a valid policy");
+    assert_eq!(
+        parsed.verification.profiles["default"].commands[0].argv,
+        ["make", "check"]
+    );
+    let second = world.relais(&["init", "--detect", "--write"]);
+    assert_eq!(second.status.code(), Some(2));
+    assert!(text(&second.stderr).contains("never overwrites"));
+
+    let json = world.relais(&["init", "--detect", "--json"]);
+    assert_eq!(json.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("--json prints one document");
+    assert_eq!(
+        document["proposal"]["commands"][0]["argv"],
+        serde_json::json!(["make", "check"])
+    );
+}
+
+/// Nothing to propose: exit 19, `{"proposal": null}`, and no file — the
+/// caller asks a person for the command instead.
+#[test]
+fn init_detect_on_an_empty_repository_exits_19_and_writes_nothing() {
+    let world = World::new("detect-none");
+    let none = world.relais(&["init", "--detect", "--write", "--json"]);
+    assert_eq!(none.status.code(), Some(19), "{}", text(&none.stderr));
+    let document: serde_json::Value = serde_json::from_slice(&none.stdout).expect("json");
+    assert_eq!(document, serde_json::json!({ "proposal": null }));
+    assert!(!world.repo.join("relais.toml").exists());
+
+    let refused = world.relais(&["init", "--detect", "--command", "make test | tee x"]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(
+        text(&refused.stderr).contains('|'),
+        "{}",
+        text(&refused.stderr)
+    );
+
+    let typed = world.relais(&["init", "--detect", "--write", "--command", "make test"]);
+    assert_eq!(typed.status.code(), Some(0), "{}", text(&typed.stderr));
+    let policy = std::fs::read_to_string(world.repo.join("relais.toml")).expect("policy");
+    let parsed = RepoPolicy::from_toml_str(&policy).expect("valid");
+    assert_eq!(
+        parsed.verification.profiles["default"].commands[0].argv,
+        ["make", "test"]
+    );
 }
 
 // SPEC §14: installation and uninstall preserve unrelated configuration

@@ -30,6 +30,7 @@
 //! | 16 | `SolverDiverged` | the learner did not converge |
 //! | 17 | `PromotionRefused` | `recipe promote` refused: the comparison does not clear every gate; nothing was written |
 //! | 18 | `StaleGrantKey` | `trust grant` refused: the key given is not this policy's; `relais trust show` prints the current one |
+//! | 19 | `NothingDetected` | `init --detect` found no verification command and none was typed; nothing was written |
 //!
 //! README.md carries the same table for people who do not read source.
 
@@ -95,7 +96,25 @@ enum Command {
         effort_template: bool,
     },
     /// Create a relais.toml policy for this repository
-    Init,
+    Init {
+        /// Propose a policy from the repository's own files (Makefile
+        /// targets, manifests, lockfiles) instead of writing the
+        /// template. Only reads text; runs nothing.
+        #[arg(long = "detect")]
+        detect: bool,
+        /// Print the proposal as JSON: `{"proposal": {...}}`, or
+        /// `{"proposal": null}` when nothing was detected.
+        #[arg(long = "json", requires = "detect")]
+        json: bool,
+        /// Write the proposal to relais.toml. Never overwrites.
+        #[arg(long = "write", requires = "detect")]
+        write: bool,
+        /// Use this command instead of the detected ones: split on
+        /// whitespace and quotes, and refused if it holds a shell
+        /// operator.
+        #[arg(long = "command", value_name = "TEXT", requires = "detect")]
+        command: Option<String>,
+    },
     /// Show what a trust grant for this repository's policy would let
     /// relais run, or record one in machine.toml (SPEC §5)
     Trust {
@@ -679,6 +698,8 @@ enum CliOutcome {
     PromotionRefused,
     /// `trust grant`: the key given is not the current policy's.
     StaleGrantKey,
+    /// `init --detect` found no verification command and none was typed.
+    NothingDetected,
 }
 
 /// The one exit-code table. Pure, total, and exhaustive over
@@ -706,6 +727,7 @@ const fn exit_code(outcome: &CliOutcome) -> i32 {
         CliOutcome::SolverDiverged => 16,
         CliOutcome::PromotionRefused => 17,
         CliOutcome::StaleGrantKey => 18,
+        CliOutcome::NothingDetected => 19,
     }
 }
 
@@ -1000,7 +1022,18 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
                 detail: "hook --record: needs --probe".into(),
             }),
         },
-        Command::Init => init_command(),
+        Command::Init {
+            detect,
+            json,
+            write,
+            command,
+        } => {
+            if detect {
+                init_detect_command(json, write, command.as_deref())
+            } else {
+                init_command()
+            }
+        }
         Command::Plan { task, revise, json } => {
             let format = if json {
                 PlanFormat::Json
@@ -2643,10 +2676,7 @@ fn init_command() -> Result<CliOutcome, CliError> {
     let path = project_dir()?.join("relais.toml");
     match relais::repo::write_init_template(&path) {
         Ok(true) => {
-            println!(
-                "wrote {} (edit the model IDs and verification profile, then add a trust grant in machine.toml)",
-                path.display()
-            );
+            println!("{}", init_written_hint(&path));
             Ok(CliOutcome::Accepted)
         }
         Ok(false) => {
@@ -2661,6 +2691,124 @@ fn init_command() -> Result<CliOutcome, CliError> {
             Ok(CliOutcome::OperationalFailure)
         }
     }
+}
+
+/// What a person does after init wrote a policy: review it, then grant.
+fn init_written_hint(path: &Path) -> String {
+    format!(
+        "wrote {} (review it, then: relais trust show; relais trust grant --key <key> --reviewed-by <name>)",
+        path.display()
+    )
+}
+
+/// `relais init --detect`: propose a policy from the repository's files,
+/// print it, and with `--write` write it — never over an existing one.
+/// Nothing detected and nothing typed is its own exit code (19), with no
+/// file written, so a caller can ask a person for the command.
+fn init_detect_command(
+    json: bool,
+    write: bool,
+    command: Option<&str>,
+) -> Result<CliOutcome, CliError> {
+    let root = project_dir()?;
+    let mut proposal = relais::repo::detect_policy(&root);
+    if let Some(text) = command {
+        match relais::repo::parse_command_text(text) {
+            Ok(argv) => proposal = proposal.with_command(argv, "--command"),
+            Err(e) => {
+                eprintln!("relais init --command: {e}");
+                return Ok(CliOutcome::InvalidInput);
+            }
+        }
+    }
+    if proposal.is_empty() {
+        if json {
+            println!("{}", serde_json::json!({ "proposal": null }));
+        } else {
+            for line in skipped_lines(&proposal) {
+                println!("{line}");
+            }
+        }
+        eprintln!(
+            "relais init --detect: no verification command found in {} \
+             (no Makefile check/test target, Cargo.toml, go.mod, package.json \
+             test script or pytest); name one with --command",
+            root.display()
+        );
+        return Ok(CliOutcome::NothingDetected);
+    }
+    let path = root.join("relais.toml");
+    if write {
+        match relais::repo::write_new_policy(&path, &proposal.toml) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "relais init: {} already exists; init never overwrites",
+                    path.display()
+                );
+                return Ok(CliOutcome::InvalidInput);
+            }
+            Err(e) => {
+                eprintln!("relais init: {e}");
+                return Ok(CliOutcome::OperationalFailure);
+            }
+        }
+    }
+    if json {
+        println!("{}", serde_json::json!({ "proposal": proposal }));
+    } else {
+        for line in proposal_lines(&proposal) {
+            println!("{line}");
+        }
+    }
+    if write {
+        // A diagnostic: stdout carries the proposal alone, so it stays
+        // one JSON document, or lines of at most 80 columns.
+        eprintln!("{}", init_written_hint(&path));
+    }
+    Ok(CliOutcome::Accepted)
+}
+
+/// The proposal as plain lines: one per setup step and command, with its
+/// source, then what was seen and not proposed. At most 80 columns where
+/// the argv allows it: a source that does not fit goes on its own line.
+/// Repository text is escaped, so a crafted name cannot draw a line.
+fn proposal_lines(proposal: &relais::repo::Proposal) -> Vec<String> {
+    const WIDTH: usize = 80;
+    let mut lines = Vec::new();
+    let rows = proposal
+        .setup
+        .iter()
+        .map(|step| ("setup", step))
+        .chain(proposal.commands.iter().map(|check| ("check", check)));
+    for (kind, item) in rows {
+        let argv = relais::repo::escape_control(&item.argv.join(" "));
+        let source = relais::repo::escape_control(&item.source);
+        let head = format!("  {kind}  {argv}");
+        let one_line = format!("{head}   {source}");
+        if one_line.chars().count() <= WIDTH {
+            lines.push(one_line);
+        } else {
+            lines.push(head);
+            lines.push(format!("         {source}"));
+        }
+    }
+    lines.extend(skipped_lines(proposal));
+    lines
+}
+
+fn skipped_lines(proposal: &relais::repo::Proposal) -> Vec<String> {
+    proposal
+        .skipped
+        .iter()
+        .map(|skip| {
+            format!(
+                "Skipped: {} ({})",
+                relais::repo::escape_control(&skip.what),
+                relais::repo::escape_control(&skip.reason)
+            )
+        })
+        .collect()
 }
 
 /// How `plan` prints its decision.
@@ -6100,12 +6248,14 @@ mod tests {
         CliOutcome::NoTierCoverage,
         CliOutcome::SolverDiverged,
         CliOutcome::PromotionRefused,
+        CliOutcome::StaleGrantKey,
+        CliOutcome::NothingDetected,
     ];
 
     #[test]
     fn the_exit_code_table_is_total_and_injective() {
         let mut seen: Vec<i32> = ALL.iter().map(exit_code).collect();
-        assert_eq!(seen.len(), 18, "every documented outcome is listed");
+        assert_eq!(seen.len(), 20, "every documented outcome is listed");
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(
