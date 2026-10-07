@@ -6,7 +6,21 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
-## Unreleased
+## v0.10.0
+
+relais becomes a Claude Code plugin. Every agent a run dispatches (worker,
+repair, escalation, patch review, report review, planner) is a native agent
+of your Claude Code session, spawned by the relais plugin, and relais never
+launches `claude -p` again. A relais pane, the status line and the outcome
+message show every step of a run live. Runs start from Claude Code (`/relais`,
+or the `mcp__relais__run` and `mcp__relais__replay` tools); `relais run` from a
+plain terminal is refused. relais's own OS sandbox, its headless launch and
+the hook-side native path of the previous unreleased version are gone.
+
+**After upgrading, run `relais install --claude --hooks --user --write` once.**
+It installs the plugin (`relais@relais-local`) and removes a `WorktreeCreate`
+hook an earlier install may have left, which has no code behind it any more
+and would stop Claude Code's own isolated agents. `relais doctor` checks both.
 
 ### Removed
 
