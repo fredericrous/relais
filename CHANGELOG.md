@@ -24,6 +24,12 @@ missing here.
   -1`) beside the receipt: the run's `outcome` event, and the timeline
   `relais native status` rebuilds from, now carry the change summary the `done`
   line already had.
+- `relais install --claude --hooks` on a settings file whose relais hooks run a
+  relais binary at another path (an older install, a moved or Homebrew binary)
+  points them at this binary in place (`repoint`) instead of adding a second
+  set beside them, which ran every hook twice. A hand-formatted file it refuses
+  to rewrite now says that the hooks are already there and names the one
+  replacement to make, and no longer offers a block to paste.
 
 ## v0.10.0
 

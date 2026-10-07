@@ -169,6 +169,10 @@ pub enum HookEventAction {
     /// `timeout` is absent or no longer covers `queue_wait_secs`: it is
     /// corrected in place, nothing else about the entry changes.
     CorrectTimeout,
+    /// relais's hook is already on this event's entry, but runs a relais
+    /// binary at another path (an older install, a moved binary): it is
+    /// pointed at this binary in place rather than a second one joining it.
+    UpdatePath,
     /// An entry already matches relais's matcher; its command joins that
     /// entry's `hooks` array.
     JoinExisting,
@@ -263,7 +267,7 @@ fn paste_block(relais_binary: &Path, queue_wait: Duration) -> String {
 /// isolated agents, so it is never left unmentioned. Empty when the file
 /// shows none (judged on the parsed document, or on the text when it does
 /// not parse).
-fn retired_wiring_note(text: &str, value: Option<&Value>) -> String {
+fn retired_wiring_note(text: &str, value: Option<&Value>, command: &str) -> String {
     let (retired, legacy) = match value {
         Some(value) => (
             entries(value, RETIRED_EVENT)
@@ -284,6 +288,18 @@ fn retired_wiring_note(text: &str, value: Option<&Value>) -> String {
         ),
     };
     let mut steps = Vec::new();
+    // relais's hooks already wired at another binary's path: pasting a
+    // block would run every hook twice; the path is what changes.
+    for recorded in value
+        .map(|value| hooks_elsewhere(value, command))
+        .unwrap_or_default()
+    {
+        steps.push(format!(
+            "relais's hooks are already in this file, running `{recorded}`: replace that \
+             command with `{command}` wherever it appears; nothing needs pasting (a second \
+             set would run every hook twice)"
+        ));
+    }
     if retired {
         steps.push(format!(
             "remove relais's `{RETIRED_EVENT}` entry (relais no longer answers it, and a \
@@ -301,6 +317,21 @@ fn retired_wiring_note(text: &str, value: Option<&Value>) -> String {
     } else {
         format!(". By hand, also: {}", steps.join("; "))
     }
+}
+
+/// The commands of relais hooks on the events relais installs that run a
+/// relais binary other than `command`'s.
+fn hooks_elsewhere(value: &Value, command: &str) -> std::collections::BTreeSet<String> {
+    target_names()
+        .into_iter()
+        .flat_map(|event| entries(value, event).iter())
+        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter(|hook| is_relais_hook(hook))
+        .filter_map(|hook| hook.get("command").and_then(Value::as_str))
+        .filter(|recorded| *recorded != command)
+        .map(str::to_string)
+        .collect()
 }
 
 /// Plan the hook wiring against a settings document that may not exist
@@ -321,7 +352,7 @@ pub fn plan_hooks(
                 return HooksPlan::Unrenderable {
                     reason: format!(
                         "settings.json is not valid JSON: {e}{}",
-                        retired_wiring_note(text, None)
+                        retired_wiring_note(text, None, &hook_command(relais_binary))
                     ),
                     paste_block: paste_block(relais_binary, queue_wait),
                 }
@@ -336,9 +367,14 @@ pub fn plan_hooks(
                      spacing or formatting differs from relais's canonical JSON writer); \
                      editing it here would bury the change in reformatting nobody asked \
                      for{}",
-                    retired_wiring_note(text, Some(&value))
+                    retired_wiring_note(text, Some(&value), &hook_command(relais_binary))
                 ),
-                paste_block: paste_block(relais_binary, queue_wait),
+                // Hooks already wired elsewhere are repointed, not added to.
+                paste_block: if hooks_elsewhere(&value, &hook_command(relais_binary)).is_empty() {
+                    paste_block(relais_binary, queue_wait)
+                } else {
+                    String::new()
+                },
             };
         }
     }
@@ -464,6 +500,12 @@ fn event_action(
             HookEventAction::CorrectTimeout
         };
     }
+    if entries
+        .iter()
+        .any(|entry| entry_matcher(entry) == matcher && entry_has_relais_hook(entry))
+    {
+        return HookEventAction::UpdatePath;
+    }
     if entries.iter().any(|entry| entry_matcher(entry) == matcher) {
         HookEventAction::JoinExisting
     } else {
@@ -513,6 +555,25 @@ pub fn apply_hooks(
                 if !migrated {
                     changed.push(event);
                 }
+            }
+            continue;
+        }
+        // relais's hook at another binary's path: pointed at this one.
+        let elsewhere = array
+            .iter_mut()
+            .filter(|entry| entry_matcher(entry) == matcher)
+            .find_map(|entry| {
+                entry
+                    .get_mut("hooks")?
+                    .as_array_mut()?
+                    .iter_mut()
+                    .find(|hook| is_relais_hook(hook))
+            });
+        if let Some(hook) = elsewhere {
+            hook["command"] = Value::String(command.clone());
+            hook["timeout"] = serde_json::json!(required);
+            if !migrated {
+                changed.push(event);
             }
             continue;
         }
@@ -1529,6 +1590,80 @@ mod tests {
         assert!(!is_relais_hook_command("/usr/bin/git-hook hook"));
         assert!(!is_relais_hook_command("/usr/bin/relais hook --probe"));
         assert!(is_relais_hook_command("/Users/me/.cargo/bin/relais hook"));
+    }
+
+    /// relais's hooks wired by a relais at another path (an older install, a
+    /// moved binary) are pointed at this binary in place: one hook per event,
+    /// never a second one joining the first.
+    #[test]
+    fn hooks_running_another_relais_binary_are_repointed_not_duplicated() {
+        let old = Path::new("/Users/me/.cargo/bin/relais");
+        let mut value = serde_json::json!({});
+        apply_hooks(&mut value, old, Duration::from_secs(2));
+        let text = render_canonical(&value);
+        let HooksPlan::Ready { events } = plan_hooks(Some(&text), binary(), Duration::from_secs(2))
+        else {
+            panic!("relais's own rendering always round-trips");
+        };
+        assert!(
+            events
+                .iter()
+                .all(|e| e.action == HookEventAction::UpdatePath),
+            "{events:?}"
+        );
+        apply_hooks(&mut value, binary(), Duration::from_secs(2));
+        let rendered = render_canonical(&value);
+        assert!(!rendered.contains(".cargo/bin/relais"), "{rendered}");
+        for event in target_names() {
+            let commands: Vec<&str> = entries(&value, event)
+                .iter()
+                .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+                .flatten()
+                .filter_map(|hook| hook.get("command").and_then(Value::as_str))
+                .collect();
+            assert_eq!(commands, [hook_command(binary()).as_str()], "{event}");
+        }
+        let HooksPlan::Ready { events } =
+            plan_hooks(Some(&rendered), binary(), Duration::from_secs(2))
+        else {
+            panic!("relais's own rendering always round-trips");
+        };
+        assert!(events.iter().all(|e| e.action == HookEventAction::Current));
+    }
+
+    /// A hand-formatted file whose relais hooks run another binary is refused
+    /// with the one replacement to make by hand, not only a block to paste.
+    #[test]
+    fn a_refused_file_with_hooks_at_another_path_names_the_replacement() {
+        let mut value = serde_json::json!({});
+        apply_hooks(
+            &mut value,
+            Path::new("/Users/me/.cargo/bin/relais"),
+            Duration::from_secs(2),
+        );
+        let text = serde_json::to_string_pretty(&value)
+            .unwrap()
+            .replace("  ", "    ");
+        let HooksPlan::Unrenderable {
+            reason,
+            paste_block,
+        } = plan_hooks(Some(&text), binary(), Duration::from_secs(2))
+        else {
+            panic!("a re-indented file is refused");
+        };
+        assert!(
+            reason.contains("`/Users/me/.cargo/bin/relais hook`"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains(&format!("`{}`", hook_command(binary()))),
+            "{reason}"
+        );
+        assert!(reason.contains("nothing needs pasting"), "{reason}");
+        assert!(
+            paste_block.is_empty(),
+            "no second set to paste: {paste_block}"
+        );
     }
 
     /// A file install refuses to rewrite still tells the person what of

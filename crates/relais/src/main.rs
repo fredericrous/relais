@@ -1250,6 +1250,7 @@ fn render_hooks_preview(plan: relais::install::HooksPlan) -> CliOutcome {
                     match event.action {
                         relais::install::HookEventAction::Current => "keep",
                         relais::install::HookEventAction::CorrectTimeout => "retime",
+                        relais::install::HookEventAction::UpdatePath => "repoint",
                         relais::install::HookEventAction::MigrateMatcher => "migrate",
                         relais::install::HookEventAction::RemoveRetired => "remove",
                         relais::install::HookEventAction::JoinExisting => "join",
@@ -1352,7 +1353,10 @@ fn render_hooks_removed(removed: relais::install::HooksRemoved) -> CliOutcome {
 /// not "nothing ran at all".
 fn print_unrenderable(verb: &str, reason: &str, paste_block: &str) -> CliOutcome {
     eprintln!("relais {verb} --hooks: refused — {reason}");
-    println!("paste this into settings.json's \"hooks\" key by hand:\n{paste_block}");
+    // Nothing to paste when the reason already says what to change by hand.
+    if !paste_block.is_empty() {
+        println!("paste this into settings.json's \"hooks\" key by hand:\n{paste_block}");
+    }
     CliOutcome::NotFullyApplied
 }
 
