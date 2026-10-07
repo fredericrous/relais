@@ -206,8 +206,8 @@ test('a known cost is shown with how well it is known', async ($: any, on: any) 
 
 test('concurrent runs each get a section', async ($: any, on: any) => {
   const engine = await startedRun($, on)
-  const second = engine.feed('second task')
-  await $.tool.call({ tool: 'mcp__relais__run', task: 'second task', cwd: '/repo' })
+  const second = engine.feed('second-task.json')
+  await $.tool.call({ tool: 'mcp__relais__run', task: 'second-task.json', cwd: '/repo' })
   await startQueued(engine)
   second.push('stdout', event('run-two', 0, { kind: 'phase', state: 'running', reason: 'ok', detail: {} }))
   const { texts } = await drawn($, engine, [phase(0, 'verifying')])

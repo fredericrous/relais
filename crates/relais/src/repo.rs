@@ -9,6 +9,13 @@ use std::path::Path;
 
 use crate::policy::{RepoIdentity, INIT_TEMPLATE};
 
+mod detect;
+
+pub use detect::{
+    detect_policy, escape_control, parse_command_text, CommandTextError, Proposal, ProposedCommand,
+    ProposedIntegrations, Skipped, DETECTED_PROFILE,
+};
+
 /// Why no policy was found upward from a directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocateError {
@@ -113,6 +120,14 @@ fn git_answer(root: &Path, args: &[&str]) -> Option<String> {
 /// Write the template unless a policy already exists. Returns `false`
 /// when the file was present; init never overwrites.
 pub fn write_init_template(path: &std::path::Path) -> std::io::Result<bool> {
+    write_new_policy(path, INIT_TEMPLATE)
+}
+
+/// Write `text` as a new policy at `path`, unless one already exists:
+/// `false` when the file was present, which is never overwritten. The
+/// create is exclusive (`create_new`), so two concurrent inits cannot
+/// both win.
+pub fn write_new_policy(path: &std::path::Path, text: &str) -> std::io::Result<bool> {
     use std::io::Write;
     let mut file = match std::fs::OpenOptions::new()
         .write(true)
@@ -123,7 +138,7 @@ pub fn write_init_template(path: &std::path::Path) -> std::io::Result<bool> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
         Err(e) => return Err(e),
     };
-    file.write_all(INIT_TEMPLATE.as_bytes())?;
+    file.write_all(text.as_bytes())?;
     Ok(true)
 }
 

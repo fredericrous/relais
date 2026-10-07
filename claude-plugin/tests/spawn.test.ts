@@ -4,15 +4,15 @@ import { event, nativeCalls, scriptedEngine, settle, spawnLine, startedRun, star
 test('the run tool starts relais with the protocol flag, the host and the session', async ($: any, on: any) => {
   const engine = await startedRun($, on)
   const [child] = engine.calls.spawn
-  expect(child.argv).toEqual(['relais', 'run', '--task', 'fix it', '--protocol'])
+  expect(child.argv).toEqual(['relais', 'run', '--task', 'fix-it.json', '--protocol'])
   expect(child.cwd).toBe('/repo')
   expect(child.env).toEqual({ RELAIS_HOST: 'claude-code-mod', RELAIS_SESSION_ID: 'session-1' })
 })
 
 test('the run tool returns at once with what it started', async ($: any, on: any) => {
   const engine = await startedRun($, on)
-  const reply = await $.tool.call({ tool: 'mcp__relais__run', task: 'other', cwd: '/repo' })
-  expect(reply.result).toContain('Started relais run for: other')
+  const reply = await $.tool.call({ tool: 'mcp__relais__run', task: 'other.json', cwd: '/repo' })
+  expect(reply.result).toContain('Started relais run for: other.json')
   await startQueued(engine)
   expect(engine.calls.spawn.length).toBe(2)
 })
@@ -99,7 +99,7 @@ test('the replay tool starts relais dataset replay with the protocol flag, the h
 
 test("a replay's spawn line spawns an agent in the hook-chosen cwd like a run's", async ($: any, on: any) => {
   const engine = await startedReplay($, on)
-  engine.stream.push('stdout', spawnLine('d1', { cwd: '/scratch/replay-1' }))
+  engine.feed('fix it').push('stdout', spawnLine('d1', { cwd: '/scratch/replay-1' }))
   await settle(engine)
   expect(engine.calls.spawned.length).toBe(1)
   expect(engine.calls.spawned[0].cwd).toBe('/scratch/replay-1')

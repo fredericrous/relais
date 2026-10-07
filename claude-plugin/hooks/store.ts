@@ -16,6 +16,11 @@ export type Child = {
   // The key of this child's run in `Store.models`: a placeholder until its
   // first event names the run.
   key: string
+  // Set by its `done` line. A child that exits without one still owes the
+  // model a message: the exit code and the end of its stderr.
+  doneSeen?: boolean
+  // The last stderr lines, for that message.
+  stderrTail?: string[]
 }
 
 export type Store = {
@@ -55,6 +60,14 @@ export type Store = {
   heldOutcome: string | undefined
   // Decisions waiting to be merged into one toast.
   decisionToast: { texts: string[]; timer: { cancel: () => void } } | undefined
+  // The setup question open for a repository root (consent.ts): a second
+  // call waits for it rather than asking again.
+  consent: Map<string, Promise<string>>
+  // Repository roots the person answered Not now for in this session.
+  declined: Set<string>
+  // Outcome messages this plugin submitted, so `prompt.submit` does not
+  // take them for the person's own words.
+  ownPrompts: Set<string>
 }
 
 // A background promise nobody awaits: once the module unloads its effects
@@ -85,6 +98,9 @@ export const createStore = (): Store => ({
   poll: undefined,
   heldOutcome: undefined,
   decisionToast: undefined,
+  consent: new Map(),
+  declined: new Set(),
+  ownPrompts: new Set(),
 })
 
 // Timers go through here so that unloading can clear every one.

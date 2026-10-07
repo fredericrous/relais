@@ -60,7 +60,7 @@ export function scriptedEngine(on: any, options: { session?: string; isPlaced?: 
       queue.wake?.()
     },
   })
-  const stream = feed('fix it')
+  const stream = feed('fix-it.json')
 
   on('session.id', () => ({ value: options.session ?? 'session-1' }))
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
@@ -152,7 +152,7 @@ export async function startedRun($: any, on: any, options: { isPlaced?: boolean 
   const engine = scriptedEngine(on, options)
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
   await settle(engine)
-  await $.tool.call({ tool: 'mcp__relais__run', task: 'fix it', cwd: '/repo' })
+  await $.tool.call({ tool: 'mcp__relais__run', task: 'fix-it.json', cwd: '/repo' })
   await startQueued(engine)
   return engine
 }

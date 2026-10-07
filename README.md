@@ -73,6 +73,9 @@ split wherever a caller has to act differently.
 | 14 | nothing to train on yet |
 | 15 | not enough records for one tier |
 | 16 | the learner did not converge |
+| 17 | `recipe promote` refused: the comparison does not clear every gate; nothing was written |
+| 18 | `trust grant` refused: the key is not this policy's; `relais trust show` prints the current one |
+| 19 | `init --detect` found no verification command and none was typed; nothing was written |
 
 ## Layout
 
@@ -113,9 +116,33 @@ milliseconds.
 
 ## Using it on a repository
 
+From Claude Code with the plugin, there is nothing to set up and nothing
+to type: the model routes a bounded task through relais on its own (the
+plugin's `relais` skill; `/relais:relais` invokes it by hand), and relais
+picks the model for it. The first time this happens in a repository, the
+plugin asks two questions in Claude Code's own dialog:
+
+1. **Use these checks?** It shows the commands `relais init --detect` found
+   in the repository: a Makefile `check`/`test` target, `cargo test`,
+   `go test`, a `package.json` test script, pytest, with the lockfile's
+   install as setup. On yes, it writes `relais.toml` and commits that file
+   alone. When nothing is found, you type the command.
+2. **Let relais run these commands, outside Claude Code's permission
+   prompts?** It shows every command the grant covers. On yes, it records
+   the grant in `machine.toml`.
+
+Change `relais.toml` later and only the second question comes back, with
+new or changed commands marked `+` or `~`. Answer *Not now* and nothing is
+written, and the model does the task without relais until you mention
+relais again. The plugin asks; the model can neither word the question nor
+answer it, and the plugin refuses the model's own edits to `machine.toml`.
+
+By hand, the same steps are:
+
 ```sh
-cd the-repo && relais init          # writes relais.toml; edit models + profile, commit it
-relais plan --task task.json        # prints the grant block to paste; blocked until trusted
+cd the-repo && relais init --detect --write   # or plain `relais init` for the template; review, commit
+relais trust show                             # the grant key and every command it would allow
+relais trust grant --key <key> --reviewed-by <you>
 ```
 
 Every command finds `relais.toml` upward from the cwd to the repository
@@ -127,7 +154,9 @@ never written by a run. A trust grant is keyed by the PAIR of the
 repository's authority hash and the repository itself (its canonical root
 and, when git reports one, its `origin` URL), so editing `relais.toml`
 voids the grant and the same declaration in another repository needs its
-own review. `relais plan` prints the exact block to paste. A worker is a
+own review. `relais trust grant` writes it (atomically, under a lock,
+keeping your comments and the file's mode); `relais plan` still prints the
+block if you prefer to paste it. A worker is a
 native agent: it runs with the tools its agent definition names and the
 session's permissions, and no permission-mode flag is ever passed.
 `disallowed_tools` here only ADDS to
@@ -141,13 +170,14 @@ schema_version = 1
 [spending]
 per_run_micros = 3000000            # $3 per run, best effort (SPEC §11)
 
-[trust."<grant key from relais plan>"]
+[trust."<grant key from relais trust show>"]
 granted_at = "2026-09-20T00:00:00Z"   # RFC3339, or a plain 2026-09-20
 reviewed_by = "you"                   # required
 repo = "git@github.com:me/the-repo.git"   # what plan filled in, for readers
 ```
 
-Then `relais run --task task.json`. A worker refused a tool ends the run
+Runs start from Claude Code (the `mcp__relais__run` tool the skill calls):
+`relais run` is refused anywhere else. A worker refused a tool ends the run
 `blocked (permission_denied)` naming the tool; nothing is escalated. A
 `[permissions] allowed_tools` left in `machine.toml` is no longer read, and
 `relais doctor` says so.

@@ -42,21 +42,25 @@ Native agent definitions provide convenient defaults for research, implementatio
 
 ### Supervised execution
 
-The `/relais` skill asks the parent to express the requested work as a task contract and invoke the Relais runner. The runner launches separate programmatic Claude Code sessions with explicit model, effort, tools and limits. It returns a compact report plus artifact paths.
+The relais skill (`relais:relais`; the plugin's system-prompt line tells the parent to use it) has the parent express a bounded task as a task contract and invoke the Relais runner. The runner launches separate programmatic Claude Code sessions with explicit model, effort, tools and limits. It returns a compact report plus artifact paths.
+
+The parent model routes a bounded task through relais on its own, writing the contract from the approved plan or the request rather than asking the person for its fields; `/relais:relais` invokes the skill by hand. A repository needs no setup before its first run. When a run reports `no_policy` or `missing_trust_grant`, the skill calls the plugin's `onboard` or `trust` tool. That tool asks the person in Claude Code's own dialog: whether to use the checks `relais init --detect` found (writing and committing `relais.toml`), and whether relais may run the listed commands (the grant, §5). It asks at most those two questions. Answering *Not now* writes nothing.
 
 Once a task is accepted for execution, the parent does not supervise intermediate turns. The runner performs verification and bounded escalation. The parent receives the result and remaining decisions only.
 
 Conversational examples:
 
-- `/relais Fix the JSON escaping defect in amont list output.`
-- `/relais Investigate why this check is inactive; do not edit files.`
-- `Use Relais for this implementation; preserve the approved design.`
+- `Fix the JSON escaping defect in amont list output.` (routed without being asked)
+- `Investigate why this check is inactive; do not edit files.`
+- `/relais:relais Use Relais for this implementation; preserve the approved design.`
 
 CLI examples:
 
 ```
 relais doctor
-relais init
+relais init [--detect [--write] [--json] [--command TEXT]]
+relais trust show
+relais trust grant --key KEY --reviewed-by NAME
 relais plan --task task.json
 relais run --task task.json
 relais status RUN_ID
@@ -211,7 +215,9 @@ Every key is optional, so an existing machine.toml parses unchanged. The admissi
 
 Repository commands, hooks and model launch configuration are executable authority. Relais requires a content-bound machine trust grant for a reviewed execution profile and relevant configuration. It delegates amont-specific trust to amont; it does not infer trust from repository ownership. Changed execution declarations invalidate the grant. Worker changes cannot update the frozen grant or commands during a run.
 
-A verification profile may declare a setup step: the commands that install the tree's own dependencies inside a verification worktree before the profile's commands run. It is executable authority like the commands (an installer runs the repository's lifecycle scripts), hashed into the grant, and never inferred: relais may report that a lockfile is present and no setup is declared, and it never runs an installer that policy does not name.
+A grant is written by exactly one command, `relais trust grant --key <key> --reviewed-by <name>`, typed by a person in a shell or run by the relais plugin after the person answered the plugin's own question listing the exact commands (`$.ui.ask`, a dialog the model can neither word nor answer). `relais trust show` prints what a grant would authorize: the key, the repository identity, the resolved machine.toml (`$RELAIS_CONFIG_DIR`, else `~/.config/relais`), and every setup step and command with the models and integrations. `trust grant` recomputes the key from the policy on disk and refuses a different one (`stale_grant_key`, exit 18), takes an exclusive lock beside machine.toml, keeps the file's comments and mode (0600 when it creates it), and records the grant and the steps it authorized in the ledger. No run, recipe or worker ever issues a grant. A missing machine.toml is read as empty settings, so a fresh machine is told `missing_trust_grant` rather than failing to read a file. Outside the plugin's question, machine.toml is a plain file: the plugin denies the model's Write and Edit on it and flags a Bash command that names it or `relais trust grant`, but the protection there is Claude Code's permission prompt, and a session in bypass-permissions mode is outside this threat model.
+
+A verification profile may declare a setup step: the commands that install the tree's own dependencies inside a verification worktree before the profile's commands run. It is executable authority like the commands (an installer runs the repository's lifecycle scripts), hashed into the grant, and never run unless a person confirmed it: relais may report that a lockfile is present and no setup is declared, and it never runs an installer that policy does not name. `relais init --detect` may propose setup steps and commands read from the repository's files, but a proposal is only a suggestion: what the person accepts is written to `relais.toml` and hashed into the grant, so nothing detected runs without that review.
 
 Dependencies are required, optional or off. Missing required integration blocks execution. Optional gaps appear explicitly in the report; they are never reported as passed checks.
 

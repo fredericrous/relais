@@ -267,7 +267,9 @@ pub struct VerificationProfile {
     /// there until this runs. It runs first, in every directory the
     /// commands run in, and stops at its first failure. It is executable
     /// authority like the commands themselves — hashed into the trust
-    /// grant, never inferred from a lockfile (SPEC §5, §7). Its outcomes
+    /// grant, and never run unless a person confirmed it: `init --detect`
+    /// may propose one from a lockfile, but only what the person accepts
+    /// is written (SPEC §5, §7). Its outcomes
     /// are evidence, never checks: a setup that succeeds passes nothing.
     #[serde(default)]
     pub setup: Vec<CommandSpec>,
@@ -1572,8 +1574,9 @@ amont_agent = "required"
 # It runs first, in EVERY worktree the commands run in (the base, the
 # task worktree, each candidate — five `npm ci` in a three-attempt run),
 # and it is executable authority like the commands: hashed into the
-# trust grant, never inferred from a lockfile. `relais doctor` says when
-# a lockfile is present and no setup is declared.
+# trust grant, and never run unless you confirmed it. `relais doctor` says
+# when a lockfile is present and no setup is declared; `relais init
+# --detect` proposes one.
 # [[verification.profiles.default.setup]]
 # argv = ["npm", "ci"]
 # timeout_seconds = 600

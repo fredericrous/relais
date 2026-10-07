@@ -29,6 +29,8 @@
 //! | 15 | `NoTierCoverage` | not enough records for one tier |
 //! | 16 | `SolverDiverged` | the learner did not converge |
 //! | 17 | `PromotionRefused` | `recipe promote` refused: the comparison does not clear every gate; nothing was written |
+//! | 18 | `StaleGrantKey` | `trust grant` refused: the key given is not this policy's; `relais trust show` prints the current one |
+//! | 19 | `NothingDetected` | `init --detect` found no verification command and none was typed; nothing was written |
 //!
 //! README.md carries the same table for people who do not read source.
 
@@ -94,7 +96,31 @@ enum Command {
         effort_template: bool,
     },
     /// Create a relais.toml policy for this repository
-    Init,
+    Init {
+        /// Propose a policy from the repository's own files (Makefile
+        /// targets, manifests, lockfiles) instead of writing the
+        /// template. Only reads text; runs nothing.
+        #[arg(long = "detect")]
+        detect: bool,
+        /// Print the proposal as JSON: `{"proposal": {...}}`, or
+        /// `{"proposal": null}` when nothing was detected.
+        #[arg(long = "json", requires = "detect")]
+        json: bool,
+        /// Write the proposal to relais.toml. Never overwrites.
+        #[arg(long = "write", requires = "detect")]
+        write: bool,
+        /// Use this command instead of the detected ones: split on
+        /// whitespace and quotes, and refused if it holds a shell
+        /// operator.
+        #[arg(long = "command", value_name = "TEXT", requires = "detect")]
+        command: Option<String>,
+    },
+    /// Show what a trust grant for this repository's policy would let
+    /// relais run, or record one in machine.toml (SPEC §5)
+    Trust {
+        #[command(subcommand)]
+        cmd: TrustCommand,
+    },
     /// Preflight a task contract: validate, resolve base, explain the
     /// route without launching a model (SPEC §3)
     Plan {
@@ -404,6 +430,51 @@ enum DatasetCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum TrustCommand {
+    /// The grant key, the repository, where machine.toml is, and every
+    /// command a grant would authorize. Writes nothing.
+    Show {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Record a grant for this repository's policy in machine.toml.
+    /// Never reads stdin; refused when --key is not the current policy's.
+    Grant {
+        /// The key `relais trust show` printed
+        #[arg(long)]
+        key: String,
+        /// Who reviewed the commands
+        #[arg(long = "reviewed-by")]
+        reviewed_by: String,
+        /// What was reviewed
+        #[arg(long)]
+        note: Option<String>,
+        /// Who asked the person: `cli` (typed in a shell) or `plugin`
+        #[arg(long, value_enum, default_value_t = GrantSource::Cli)]
+        source: GrantSource,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum GrantSource {
+    Cli,
+    Plugin,
+}
+
+impl GrantSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            GrantSource::Cli => "cli",
+            GrantSource::Plugin => "plugin",
+        }
+    }
+}
+
 /// Exit 0 acknowledges; non-zero asks the plugin to retry.
 #[derive(Subcommand)]
 enum NativeCommand {
@@ -432,6 +503,10 @@ enum NativeCommand {
         #[arg(long)]
         run: Option<String>,
     },
+    /// A task contract on stdin, validated and saved under the
+    /// repository's `.relais/tasks/`; prints the path `relais run --task`
+    /// takes. What the plugin's run tool calls with the model's contract.
+    Contract,
 }
 
 #[derive(Subcommand)]
@@ -625,6 +700,10 @@ enum CliOutcome {
     SolverDiverged,
     /// `recipe promote`: the recomputed comparison failed a gate.
     PromotionRefused,
+    /// `trust grant`: the key given is not the current policy's.
+    StaleGrantKey,
+    /// `init --detect` found no verification command and none was typed.
+    NothingDetected,
 }
 
 /// The one exit-code table. Pure, total, and exhaustive over
@@ -651,6 +730,8 @@ const fn exit_code(outcome: &CliOutcome) -> i32 {
         CliOutcome::NoTierCoverage => 15,
         CliOutcome::SolverDiverged => 16,
         CliOutcome::PromotionRefused => 17,
+        CliOutcome::StaleGrantKey => 18,
+        CliOutcome::NothingDetected => 19,
     }
 }
 
@@ -756,6 +837,26 @@ impl std::error::Error for CliError {
 }
 
 impl CliError {
+    /// The name a `done` line gives this failure when it ends a
+    /// `relais run --protocol` before any run exists (SPEC §29).
+    fn wire_code(&self) -> &'static str {
+        match self {
+            CliError::Locate(relais::repo::LocateError::RepoWithoutPolicy(_)) => "no_policy",
+            CliError::Locate(relais::repo::LocateError::NotInRepository(_)) => "not_in_repository",
+            CliError::Read { what, .. } | CliError::Invalid { what, .. } => match *what {
+                "the repository policy" => "invalid_policy",
+                "the machine settings" => "invalid_machine_settings",
+                _ => "invalid_input",
+            },
+            CliError::Home(_) | CliError::Cwd(_) => "environment",
+            CliError::Usage { .. } => "refused",
+            CliError::NoDataset { .. }
+            | CliError::Amend(_)
+            | CliError::AppendPolicy { .. }
+            | CliError::Operational { .. } => "operational_failure",
+        }
+    }
+
     /// The exit code this failure ends the process with. Exhaustive: a
     /// new variant has to say which half of the table it belongs to.
     fn outcome(&self) -> CliOutcome {
@@ -810,9 +911,17 @@ fn main() {
     let dispatched =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(cli.command)));
     let outcome = match dispatched {
-        Ok(Ok(outcome)) => outcome,
+        Ok(Ok(outcome)) => {
+            if channel.is_some() {
+                announce_unstarted(outcome, None);
+            }
+            outcome
+        }
         Ok(Err(e)) => {
             eprintln!("relais: {e}");
+            if channel.is_some() {
+                announce_unstarted(e.outcome(), Some(&e));
+            }
             e.outcome()
         }
         Err(panic) => {
@@ -826,6 +935,50 @@ fn main() {
         channel.close();
     }
     std::process::exit(exit_code(&outcome));
+}
+
+thread_local! {
+    /// The refusal a `relais run --protocol` printed before any run
+    /// existed, for the `done` line `main` sends in its place.
+    static REFUSAL: std::cell::RefCell<Option<(&'static str, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Print a refusal that ends `relais run` before a run exists, and keep
+/// it for the `done` line (see [`announce_unstarted`]).
+fn refuse_run(code: &'static str, detail: String, outcome: CliOutcome) -> CliOutcome {
+    eprintln!("relais run: blocked ({code}): {detail}");
+    REFUSAL.with(|refusal| *refusal.borrow_mut() = Some((code, detail)));
+    outcome
+}
+
+/// Every `relais run --protocol` (and `dataset replay --protocol`) that
+/// exits sends one `done` line: the runner sends it for a run that
+/// started; this sends it, with `run: null`, for one refused before it
+/// could — no policy, unreadable settings, a bad contract, admission.
+/// Without it the plugin had only an exit code to tell the model.
+fn announce_unstarted(outcome: CliOutcome, error: Option<&CliError>) {
+    if relais::protocol::done_sent() || outcome == CliOutcome::Accepted {
+        return;
+    }
+    let kept = REFUSAL.with(|refusal| refusal.borrow_mut().take());
+    let (code, detail) = match (error, kept) {
+        (Some(e), _) => (e.wire_code(), e.to_string()),
+        (None, Some((code, detail))) => (code, detail),
+        (None, None) => (
+            "refused",
+            format!("relais exited with code {}", exit_code(&outcome)),
+        ),
+    };
+    let _ = relais::protocol::Wire::process().send(&relais::protocol::Request::Done {
+        run: None,
+        outcome: "blocked",
+        receipt: None,
+        summary: None,
+        trial: None,
+        code: Some(code),
+        detail: Some(&detail),
+    });
 }
 
 /// The protocol channel of `relais run --protocol` (SPEC §29): installed
@@ -873,7 +1026,18 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
                 detail: "hook --record: needs --probe".into(),
             }),
         },
-        Command::Init => init_command(),
+        Command::Init {
+            detect,
+            json,
+            write,
+            command,
+        } => {
+            if detect {
+                init_detect_command(json, write, command.as_deref())
+            } else {
+                init_command()
+            }
+        }
         Command::Plan { task, revise, json } => {
             let format = if json {
                 PlanFormat::Json
@@ -895,6 +1059,7 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             run_command(&task, revise.as_deref(), &origin)
         }
         Command::Native { cmd } => native_command(cmd),
+        Command::Trust { cmd } => trust_command(cmd),
         Command::Status { run_id } => status_command(run_id.as_deref()),
         Command::Explain { run_id } => explain_command(&run_id),
         Command::Resume {
@@ -1887,6 +2052,236 @@ fn print_document<T: serde::Serialize>(document: &T) -> Result<(), CliError> {
     Ok(())
 }
 
+fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
+    let (root, policy) = load_repo_policy()?;
+    let machine = load_machine()?;
+    let machine_path = paths::machine_settings_path().map_err(CliError::Home)?;
+    let identity = relais::repo::identity(&root);
+    let repo_key = relais::policy::repo_key(&identity);
+    match cmd {
+        TrustCommand::Show { json } => {
+            // Read-only: the ledger is consulted only if it already
+            // exists, so `show` never creates the state directory.
+            let previous = previous_grant_steps(&repo_key);
+            let shown = relais::trust::show(
+                &policy,
+                &identity,
+                &machine,
+                machine_path,
+                previous.as_deref(),
+            );
+            if json {
+                print_document(&shown)?;
+            } else {
+                print!("{}", trust_show_text(&shown));
+            }
+            Ok(CliOutcome::Accepted)
+        }
+        TrustCommand::Grant {
+            key,
+            reviewed_by,
+            note,
+            source,
+            json,
+        } => {
+            let shown =
+                relais::trust::show(&policy, &identity, &machine, machine_path.clone(), None);
+            if key != shown.grant_key {
+                if json {
+                    print_document(&serde_json::json!({
+                        "code": "stale_grant_key",
+                        "current_key": shown.grant_key,
+                    }))?;
+                }
+                eprintln!(
+                    "relais trust grant: refused (stale_grant_key): {key} is not this policy's key; \
+                     relais.toml changed since it was shown. The current key is {}; review it with \
+                     `relais trust show`",
+                    shown.grant_key
+                );
+                return Ok(CliOutcome::StaleGrantKey);
+            }
+            if reviewed_by.trim().is_empty() {
+                eprintln!(
+                    "relais trust grant: --reviewed-by is empty; name who reviewed the commands"
+                );
+                return Ok(CliOutcome::InvalidInput);
+            }
+            let record = relais::policy::TrustGrant {
+                granted_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                reviewed_by: reviewed_by.clone(),
+                note,
+                repo: Some(identity.label().to_string()),
+            };
+            let granted = match relais::trust::grant(&machine_path, &key, &record) {
+                Ok(granted) => granted,
+                Err(e) => {
+                    eprintln!("relais trust grant: {e}");
+                    return Ok(CliOutcome::OperationalFailure);
+                }
+            };
+            // The grant is in machine.toml now; the ledger row is its audit
+            // trail and the base of the next question's change marks. A
+            // ledger that cannot take it is said, not turned into a failed
+            // grant: the grant stands either way.
+            if granted == relais::trust::Granted::Written {
+                if let Err(e) =
+                    record_grant(&shown, &key, &repo_key, &identity, &reviewed_by, source)
+                {
+                    eprintln!(
+                        "relais trust grant: warning: the grant is in machine.toml, but the ledger \
+                         did not record it ({e}); the next question will not mark what changed"
+                    );
+                }
+            }
+            let written = granted == relais::trust::Granted::Written;
+            if json {
+                print_document(&serde_json::json!({
+                    "code": if written { "granted" } else { "already_granted" },
+                    "grant_key": key,
+                    "machine_settings": machine_path,
+                }))?;
+            } else if written {
+                println!("trust grant: {key} recorded in {}", machine_path.display());
+            } else {
+                println!(
+                    "trust grant: {key} was already in {}",
+                    machine_path.display()
+                );
+            }
+            Ok(CliOutcome::Accepted)
+        }
+    }
+}
+
+/// The steps the latest recorded grant for this repository authorized,
+/// when the ledger exists and holds one. Best effort: a ledger that
+/// cannot be read only costs the change marks.
+fn previous_grant_steps(repo_key: &str) -> Option<Vec<relais::trust::Step>> {
+    let path = paths::ledger_path().ok()?;
+    if !path.exists() {
+        return None;
+    }
+    let read = Ledger::open(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|ledger| {
+            ledger
+                .latest_trust_grant_steps(repo_key)
+                .map_err(|e| e.to_string())
+        })
+        .and_then(|json| match json {
+            Some(json) => serde_json::from_str(&json)
+                .map(Some)
+                .map_err(|e| e.to_string()),
+            None => Ok(None),
+        });
+    match read {
+        Ok(steps) => steps,
+        Err(e) => {
+            eprintln!(
+                "relais trust show: warning: the last grant could not be read from the ledger ({e}); \
+                 changes are not marked"
+            );
+            None
+        }
+    }
+}
+
+/// The ledger row of a grant just written: who, from where, and the steps
+/// it authorized.
+fn record_grant(
+    shown: &relais::trust::Shown,
+    key: &str,
+    repo_key: &str,
+    identity: &RepoIdentity,
+    reviewed_by: &str,
+    source: GrantSource,
+) -> Result<(), CliError> {
+    let steps = operational(
+        serde_json::to_string(&shown.declaration.steps),
+        "rendering the granted steps",
+    )?;
+    let ledger = open_ledger()?;
+    operational(
+        ledger.record_trust_grant(&relais::ledger::TrustGrantRecord {
+            grant_key: key,
+            repo_key,
+            repo: identity.label(),
+            reviewed_by,
+            source: source.as_str(),
+            steps_json: &steps,
+        }),
+        "recording the grant in the ledger",
+    )
+}
+
+/// `relais trust show` for a person: the key on a line of its own, then
+/// the commands with their change marks, the models and integrations.
+fn trust_show_text(shown: &relais::trust::Shown) -> String {
+    use relais::trust::{display_argv, escape_display, Change};
+    let mut out = String::new();
+    out.push_str(&format!("grant key: {}\n", shown.grant_key));
+    out.push_str(&format!(
+        "status: {}\n",
+        if shown.granted {
+            "granted"
+        } else {
+            "not granted"
+        }
+    ));
+    out.push_str(&format!(
+        "repository: {}\n",
+        escape_display(&shown.repository)
+    ));
+    out.push_str(&format!(
+        "machine.toml: {} ($RELAIS_CONFIG_DIR, else ~/.config/relais)\n",
+        shown.machine_settings.display()
+    ));
+    out.push_str("commands relais would run:\n");
+    let width = shown
+        .declaration
+        .steps
+        .iter()
+        .map(|step| step.kind.as_str().len())
+        .max()
+        .unwrap_or(5);
+    for (i, step) in shown.declaration.steps.iter().enumerate() {
+        let mark = match shown.changes.as_ref().map(|changes| changes[i]) {
+            Some(Change::New) => '+',
+            Some(Change::Changed) => '~',
+            _ => ' ',
+        };
+        out.push_str(&format!(
+            "{mark} {:width$}  {}  [{}]\n",
+            step.kind.as_str(),
+            display_argv(&step.argv),
+            escape_display(&step.profile),
+        ));
+    }
+    let models: Vec<String> = shown
+        .declaration
+        .models
+        .iter()
+        .map(|model| format!("{} {}", model.tier, escape_display(&model.id)))
+        .collect();
+    out.push_str(&format!("models: {}\n", models.join(" · ")));
+    let integrations: Vec<String> = shown
+        .declaration
+        .integrations
+        .iter()
+        .map(|line| format!("{} ({})", line.name, line.mode))
+        .collect();
+    out.push_str(&format!(
+        "integrations: {}\n",
+        if integrations.is_empty() {
+            "none".to_string()
+        } else {
+            integrations.join(" · ")
+        }
+    ));
+    out
+}
+
 fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome, CliError> {
     use relais::coordinator::{self, Request, Response};
     let socket = coordinator::socket_path().map_err(CliError::Home)?;
@@ -2065,21 +2460,28 @@ fn load_repo_policy() -> Result<(PathBuf, RepoPolicy), CliError> {
 
 fn load_machine() -> Result<MachineSettings, CliError> {
     let path = paths::machine_settings_path().map_err(CliError::Home)?;
-    let text = std::fs::read_to_string(&path).map_err(|cause| {
-        if cause.kind() == std::io::ErrorKind::NotFound {
-            eprintln!(
-                "relais: machine settings {} do not exist; runs stay blocked on the trust grant",
-                path.display()
-            );
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        // Absent is empty: no ceilings, no grants. A fresh machine then
+        // reaches the trust check and is told `missing_trust_grant`,
+        // which names the way out, instead of failing on a read before
+        // any run exists (SPEC §5).
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {
+            format!(
+                "schema_version = {}\n",
+                relais::policy::MACHINE_SCHEMA_VERSION
+            )
         }
         // Unreadable is not absent: ceilings and grants the file states
         // would silently not apply.
-        CliError::Read {
-            what: "the machine settings",
-            path: path.clone(),
-            cause,
+        Err(cause) => {
+            return Err(CliError::Read {
+                what: "the machine settings",
+                path,
+                cause,
+            })
         }
-    })?;
+    };
     MachineSettings::from_toml_str(&text).map_err(|cause| CliError::Invalid {
         what: "the machine settings",
         path,
@@ -2125,6 +2527,58 @@ fn tuning_bounds(incumbent: &RepoPolicy) -> route::TuningBounds {
         incumbent.models.values().map(|profile| profile.id.as_str()),
     );
     route::default_tuning_bounds(incumbent, allowed_models.as_deref(), &catalogs)
+}
+
+/// `relais native contract`: the model writes a task as JSON, the plugin
+/// pipes it here. Refused, by its schema error, unless it is a contract —
+/// so a sentence of prose never becomes a run. Saved as
+/// `<root>/.relais/tasks/<hash>.json`, under the `.relais/` the dirty-tree
+/// check already leaves alone, with a `.gitignore` that keeps it out of
+/// `git status`.
+fn native_contract_command() -> Result<CliOutcome, CliError> {
+    use std::io::Read;
+    let mut text = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut text) {
+        eprintln!("relais native contract: stdin could not be read: {e}");
+        return Ok(CliOutcome::InvalidInput);
+    }
+    let contract = match TaskContract::from_json_str(&text) {
+        Ok(contract) => contract,
+        Err(e) => {
+            eprintln!(
+                "relais native contract: not a task contract: {e}. Required: schema_version, kind, \
+                 objective, base_ref, write_scope, acceptance, verification_profile"
+            );
+            return Ok(CliOutcome::InvalidInput);
+        }
+    };
+    let root = project_dir()?;
+    let dir = root.join(".relais");
+    let tasks = dir.join("tasks");
+    let written = (|| -> std::io::Result<PathBuf> {
+        std::fs::create_dir_all(&tasks)?;
+        let ignore = dir.join(".gitignore");
+        if !ignore.exists() {
+            std::fs::write(&ignore, "*\n")?;
+        }
+        let hash = contract.hash();
+        let path = tasks.join(format!("{}.json", &hash[..hash.len().min(16)]));
+        std::fs::write(&path, &text)?;
+        Ok(path)
+    })();
+    match written {
+        Ok(path) => {
+            println!("{}", path.display());
+            Ok(CliOutcome::Accepted)
+        }
+        Err(e) => {
+            eprintln!(
+                "relais native contract: {} could not be written: {e}",
+                tasks.display()
+            );
+            Ok(CliOutcome::OperationalFailure)
+        }
+    }
 }
 
 fn load_contract(task: &Path) -> Result<TaskContract, CliError> {
@@ -2322,10 +2776,7 @@ fn init_command() -> Result<CliOutcome, CliError> {
     let path = project_dir()?.join("relais.toml");
     match relais::repo::write_init_template(&path) {
         Ok(true) => {
-            println!(
-                "wrote {} (edit the model IDs and verification profile, then add a trust grant in machine.toml)",
-                path.display()
-            );
+            println!("{}", init_written_hint(&path));
             Ok(CliOutcome::Accepted)
         }
         Ok(false) => {
@@ -2340,6 +2791,133 @@ fn init_command() -> Result<CliOutcome, CliError> {
             Ok(CliOutcome::OperationalFailure)
         }
     }
+}
+
+/// What a person does after init wrote a policy: review it, then grant.
+fn init_written_hint(path: &Path) -> String {
+    format!(
+        "wrote {} (review it, then: relais trust show; relais trust grant --key <key> --reviewed-by <name>)",
+        path.display()
+    )
+}
+
+/// `relais init --detect`: propose a policy from the repository's files,
+/// print it, and with `--write` write it — never over an existing one.
+/// Nothing detected and nothing typed is its own exit code (19), with no
+/// file written, so a caller can ask a person for the command.
+fn init_detect_command(
+    json: bool,
+    write: bool,
+    command: Option<&str>,
+) -> Result<CliOutcome, CliError> {
+    let root = project_dir()?;
+    // Detection reads the root's listing; one that cannot be read is not
+    // "nothing detected", which would send a person to type a command.
+    if let Err(e) = std::fs::read_dir(&root) {
+        eprintln!(
+            "relais init --detect: {} could not be read: {e}",
+            root.display()
+        );
+        return Ok(CliOutcome::OperationalFailure);
+    }
+    let mut proposal = relais::repo::detect_policy(&root);
+    if let Some(text) = command {
+        match relais::repo::parse_command_text(text) {
+            Ok(argv) => proposal = proposal.with_command(argv, "--command"),
+            Err(e) => {
+                eprintln!("relais init --command: {e}");
+                return Ok(CliOutcome::InvalidInput);
+            }
+        }
+    }
+    if proposal.is_empty() {
+        if json {
+            println!("{}", serde_json::json!({ "proposal": null }));
+        } else {
+            for line in skipped_lines(&proposal) {
+                println!("{line}");
+            }
+        }
+        eprintln!(
+            "relais init --detect: no verification command found in {} \
+             (no Makefile check/test target, Cargo.toml, go.mod, package.json \
+             test script or pytest); name one with --command",
+            root.display()
+        );
+        return Ok(CliOutcome::NothingDetected);
+    }
+    let path = root.join("relais.toml");
+    if write {
+        match relais::repo::write_new_policy(&path, &proposal.toml) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "relais init: {} already exists; init never overwrites",
+                    path.display()
+                );
+                return Ok(CliOutcome::InvalidInput);
+            }
+            Err(e) => {
+                eprintln!("relais init: {e}");
+                return Ok(CliOutcome::OperationalFailure);
+            }
+        }
+    }
+    if json {
+        println!("{}", serde_json::json!({ "proposal": proposal }));
+    } else {
+        for line in proposal_lines(&proposal) {
+            println!("{line}");
+        }
+    }
+    if write {
+        // A diagnostic: stdout carries the proposal alone, so it stays
+        // one JSON document, or lines of at most 80 columns.
+        eprintln!("{}", init_written_hint(&path));
+    }
+    Ok(CliOutcome::Accepted)
+}
+
+/// The proposal as plain lines: one per setup step and command, with its
+/// source, then what was seen and not proposed. At most 80 columns where
+/// the argv allows it: a source that does not fit goes on its own line.
+/// Repository text is escaped, so a crafted name cannot draw a line.
+fn proposal_lines(proposal: &relais::repo::Proposal) -> Vec<String> {
+    const WIDTH: usize = 80;
+    let mut lines = Vec::new();
+    let rows = proposal
+        .setup
+        .iter()
+        .map(|step| ("setup", step))
+        .chain(proposal.commands.iter().map(|check| ("check", check)));
+    for (kind, item) in rows {
+        let argv = relais::repo::escape_control(&item.argv.join(" "));
+        let source = relais::repo::escape_control(&item.source);
+        let head = format!("  {kind}  {argv}");
+        let one_line = format!("{head}   {source}");
+        if one_line.chars().count() <= WIDTH {
+            lines.push(one_line);
+        } else {
+            lines.push(head);
+            lines.push(format!("         {source}"));
+        }
+    }
+    lines.extend(skipped_lines(proposal));
+    lines
+}
+
+fn skipped_lines(proposal: &relais::repo::Proposal) -> Vec<String> {
+    proposal
+        .skipped
+        .iter()
+        .map(|skip| {
+            format!(
+                "Skipped: {} ({})",
+                relais::repo::escape_control(&skip.what),
+                relais::repo::escape_control(&skip.reason)
+            )
+        })
+        .collect()
 }
 
 /// How `plan` prints its decision.
@@ -2599,6 +3177,7 @@ fn plan_trial_lines(
 fn native_command(cmd: NativeCommand) -> Result<CliOutcome, CliError> {
     match cmd {
         NativeCommand::Status { run } => native_status_command(run.as_deref()),
+        NativeCommand::Contract => native_contract_command(),
         NativeCommand::Hello { session } => {
             let socket = relais::coordinator::socket_path().map_err(CliError::Home)?;
             // The first call of a session may find no daemon: start one, as
@@ -2759,17 +3338,17 @@ fn run_command(
     let ledger = open_ledger()?;
     let task_override = match resolve_task_override(&ledger, &contract, revise) {
         Ok(task_override) => task_override,
-        Err(detail) => {
-            eprintln!("relais run: {detail}");
-            return Ok(CliOutcome::Blocked);
-        }
+        Err(detail) => return Ok(refuse_run("task_refused", detail, CliOutcome::Blocked)),
     };
     let artifacts_dir = paths::runs_dir().map_err(CliError::Home)?;
     let backend = match relais::adapter::claude::ClaudeBackend::discover() {
         Ok(backend) => std::sync::Arc::from(backend),
         Err(e) => {
-            eprintln!("relais run: {e}");
-            return Ok(CliOutcome::Blocked);
+            return Ok(refuse_run(
+                "backend_unavailable",
+                e.to_string(),
+                CliOutcome::Blocked,
+            ))
         }
     };
     // The three tools a run talks to, each behind the port this crate
@@ -2783,8 +3362,11 @@ fn run_command(
     // (SPEC §23).
     let socket = relais::coordinator::socket_path().map_err(CliError::Home)?;
     if let Err(e) = relais::coordinator::ensure_running(&socket) {
-        eprintln!("relais run: blocked (admission_unavailable): {e}");
-        return Ok(CliOutcome::Blocked);
+        return Ok(refuse_run(
+            "admission_unavailable",
+            e.to_string(),
+            CliOutcome::Blocked,
+        ));
     }
     let gate = relais::coordinator::RemoteGate::new(socket);
     // Before anything is dispatched: the plugin of this session is alive,
@@ -2797,8 +3379,11 @@ fn run_command(
         Ok(None) => {}
         Ok(Some(detail)) => return Err(CliError::Usage { detail }),
         Err(e) => {
-            eprintln!("relais run: blocked (admission_unavailable): {e}");
-            return Ok(CliOutcome::Blocked);
+            return Ok(refuse_run(
+                "admission_unavailable",
+                e.to_string(),
+                CliOutcome::Blocked,
+            ))
         }
     }
     // Learned routing reads the registry's active artifact, pinned for
@@ -3072,11 +3657,13 @@ fn announce_replay_done(artifacts_dir: &Path, run: &str, outcome: &str, trial: O
     // Dropped on failure: the plugin that was reading is gone, and the
     // replay's result is in the ledger.
     let _ = relais::protocol::Wire::process().send(&relais::protocol::Request::Done {
-        run,
+        run: Some(run),
         outcome,
         receipt: receipt.as_deref(),
         summary: relais::protocol::Summary::of_candidate(&artifacts),
         trial,
+        code: None,
+        detail: None,
     });
 }
 
@@ -3794,7 +4381,8 @@ fn recipe_evaluate_command(candidate_path: &Path) -> Result<CliOutcome, CliError
 /// policy they would produce, so it is one text, not two.
 fn missing_grant_text(grant_key: &str, repo_identity: &RepoIdentity) -> Result<String, CliError> {
     Ok(format!(
-        "trust grant: MISSING for {grant_key}. Review the execution declaration, then paste this \n\
+        "trust grant: MISSING for {grant_key}. Review the commands with `relais trust show`, then \n\
+         run `relais trust grant --key {grant_key} --reviewed-by <your name>`, or paste this \n\
          into {}:\n\n\
          [trust.\"{grant_key}\"]\n\
          granted_at = \"{}\"\n\
@@ -5770,12 +6358,14 @@ mod tests {
         CliOutcome::NoTierCoverage,
         CliOutcome::SolverDiverged,
         CliOutcome::PromotionRefused,
+        CliOutcome::StaleGrantKey,
+        CliOutcome::NothingDetected,
     ];
 
     #[test]
     fn the_exit_code_table_is_total_and_injective() {
         let mut seen: Vec<i32> = ALL.iter().map(exit_code).collect();
-        assert_eq!(seen.len(), 18, "every documented outcome is listed");
+        assert_eq!(seen.len(), 20, "every documented outcome is listed");
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(

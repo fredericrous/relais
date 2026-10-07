@@ -2301,8 +2301,10 @@ mod tests {
         let skill = skill.split_whitespace().collect::<Vec<_>>().join(" ");
         for instruction in [
             "`mcp__relais__run`",
-            "`task` set to `.relais/task.json`",
-            "`cwd` set to `<root>`",
+            "`task` set to the contract itself, as an object",
+            "`mcp__relais__onboard`",
+            "`mcp__relais__trust`",
+            "Never edit `machine.toml`, and never run `relais trust grant` yourself",
             "`mcp__relais__replay`",
             "`mcp__relais__status`",
             "`/relais-status`",
@@ -2316,6 +2318,7 @@ mod tests {
         for gone in [
             "RELAIS-SPAWN",
             "RELAIS-CONTINUE",
+            ".relais/task.json",
             "--native",
             "SendMessage",
             "WorktreeCreate",

@@ -276,6 +276,77 @@ fn init_writes_a_valid_policy_once() {
     let second = world.relais(&["init"]);
     assert_eq!(second.status.code(), Some(2));
     assert!(text(&second.stderr).contains("never overwrites"));
+    assert!(
+        text(&first.stdout).contains("relais trust show; relais trust grant --key"),
+        "{}",
+        text(&first.stdout)
+    );
+}
+
+/// `init --detect --write` writes the proposal it printed, once, and the
+/// written policy parses; a second write is refused like plain init.
+#[test]
+fn init_detect_writes_the_proposal_once() {
+    let world = World::new("detect");
+    std::fs::write(world.repo.join("Makefile"), "check:\n\ttrue\n").expect("Makefile");
+    let first = world.relais(&["init", "--detect", "--write"]);
+    assert_eq!(first.status.code(), Some(0), "{}", text(&first.stderr));
+    let stdout = text(&first.stdout);
+    assert!(
+        stdout.contains("  check  make check   Makefile: target check"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.lines().all(|line| line.chars().count() <= 80),
+        "{stdout}"
+    );
+    let policy = std::fs::read_to_string(world.repo.join("relais.toml")).expect("policy");
+    let parsed = RepoPolicy::from_toml_str(&policy).expect("the proposal is a valid policy");
+    assert_eq!(
+        parsed.verification.profiles["default"].commands[0].argv,
+        ["make", "check"]
+    );
+    let second = world.relais(&["init", "--detect", "--write"]);
+    assert_eq!(second.status.code(), Some(2));
+    assert!(text(&second.stderr).contains("never overwrites"));
+
+    let json = world.relais(&["init", "--detect", "--json"]);
+    assert_eq!(json.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("--json prints one document");
+    assert_eq!(
+        document["proposal"]["commands"][0]["argv"],
+        serde_json::json!(["make", "check"])
+    );
+}
+
+/// Nothing to propose: exit 19, `{"proposal": null}`, and no file — the
+/// caller asks a person for the command instead.
+#[test]
+fn init_detect_on_an_empty_repository_exits_19_and_writes_nothing() {
+    let world = World::new("detect-none");
+    let none = world.relais(&["init", "--detect", "--write", "--json"]);
+    assert_eq!(none.status.code(), Some(19), "{}", text(&none.stderr));
+    let document: serde_json::Value = serde_json::from_slice(&none.stdout).expect("json");
+    assert_eq!(document, serde_json::json!({ "proposal": null }));
+    assert!(!world.repo.join("relais.toml").exists());
+
+    let refused = world.relais(&["init", "--detect", "--command", "make test | tee x"]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(
+        text(&refused.stderr).contains('|'),
+        "{}",
+        text(&refused.stderr)
+    );
+
+    let typed = world.relais(&["init", "--detect", "--write", "--command", "make test"]);
+    assert_eq!(typed.status.code(), Some(0), "{}", text(&typed.stderr));
+    let policy = std::fs::read_to_string(world.repo.join("relais.toml")).expect("policy");
+    let parsed = RepoPolicy::from_toml_str(&policy).expect("valid");
+    assert_eq!(
+        parsed.verification.profiles["default"].commands[0].argv,
+        ["make", "test"]
+    );
 }
 
 // SPEC §14: installation and uninstall preserve unrelated configuration
@@ -844,6 +915,82 @@ fn plan_without_a_trust_grant_is_blocked_and_prints_the_grant() {
                 .next()
                 .is_none(),
         "plan launches nothing"
+    );
+}
+
+#[test]
+fn a_fresh_machine_is_told_the_grant_is_missing_and_trust_grant_unblocks_plan() {
+    let world = World::new("trust-grant");
+    world.write_policy();
+    // No machine.toml at all: the state of a machine that never ran
+    // relais. Absent is empty settings, so `plan` reaches the trust check
+    // and says what is missing instead of failing to read the file.
+    let machine = world.config.join("machine.toml");
+    assert!(!machine.exists());
+    let task = world.write_task("task.json");
+    let plan = world.relais(&["plan", "--task", task.to_str().unwrap()]);
+    let stdout = text(&plan.stdout);
+    assert_eq!(
+        plan.status.code(),
+        Some(3),
+        "{stdout}\n{}",
+        text(&plan.stderr)
+    );
+    assert!(stdout.contains("trust grant: MISSING"), "{stdout}");
+    assert!(stdout.contains("relais trust grant --key "), "{stdout}");
+
+    let show = world.relais(&["trust", "show", "--json"]);
+    assert_eq!(show.status.code(), Some(0), "{}", text(&show.stderr));
+    let shown: serde_json::Value = serde_json::from_slice(&show.stdout).expect("show json");
+    let key = shown["grant_key"].as_str().expect("grant_key").to_string();
+    assert_eq!(shown["granted"], serde_json::json!(false));
+
+    // A key that is not this policy's is refused by name, and writes
+    // nothing.
+    let stale = world.relais(&[
+        "trust",
+        "grant",
+        "--key",
+        "0000",
+        "--reviewed-by",
+        "the suite",
+    ]);
+    assert_eq!(stale.status.code(), Some(18), "{}", text(&stale.stderr));
+    assert!(text(&stale.stderr).contains("stale_grant_key"));
+    assert!(
+        text(&stale.stderr).contains(&key),
+        "the current key is named"
+    );
+    assert!(!machine.exists(), "a refused grant writes nothing");
+
+    let grant = world.relais(&[
+        "trust",
+        "grant",
+        "--key",
+        &key,
+        "--reviewed-by",
+        "the suite",
+    ]);
+    assert_eq!(grant.status.code(), Some(0), "{}", text(&grant.stderr));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&machine)
+            .expect("machine.toml")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "machine.toml is private");
+    }
+    let again = world.relais(&["plan", "--task", task.to_str().unwrap()]);
+    let again_stdout = text(&again.stdout);
+    assert!(
+        again_stdout.contains(&format!("trust grant: {key} (in machine.toml)")),
+        "{again_stdout}\n{}",
+        text(&again.stderr)
+    );
+    assert!(
+        !again_stdout.contains("missing_trust_grant"),
+        "{again_stdout}"
     );
 }
 
@@ -1621,6 +1768,121 @@ fn rollback_of_a_single_revision_recipe_is_refused() {
         "{}",
         text(&unknown.stderr)
     );
+}
+
+/// The plugin's run tool hands the model's contract to `relais native
+/// contract` on stdin: a contract is saved under `.relais/tasks/` (kept out
+/// of `git status`), and prose is refused by its schema error.
+#[test]
+fn native_contract_saves_a_contract_and_refuses_prose() {
+    use std::io::Write;
+    let world = World::new("native-contract");
+    world.write_policy();
+    let pipe = |stdin: &str| {
+        let mut child = Command::new(BIN)
+            .args(["native", "contract"])
+            .current_dir(&world.repo)
+            .env("RELAIS_STATE_DIR", &world.state)
+            .env("RELAIS_CONFIG_DIR", &world.config)
+            .env("HOME", &world.root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("relais runs");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(stdin.as_bytes())
+            .expect("written");
+        child.wait_with_output().expect("relais ends")
+    };
+    let contract = std::fs::read_to_string(world.write_task("task.json")).expect("task");
+    let saved = pipe(&contract);
+    assert_eq!(saved.status.code(), Some(0), "{}", text(&saved.stderr));
+    let path = PathBuf::from(text(&saved.stdout).trim());
+    // Both sides canonical: macOS reaches the temp dir through a symlink,
+    // and Windows prints a short (8.3) name where canonicalize gives `\\?\`.
+    let tasks = std::fs::canonicalize(world.repo.join(".relais").join("tasks")).expect("tasks");
+    let saved_at = std::fs::canonicalize(&path).expect("the printed path exists");
+    assert!(saved_at.starts_with(&tasks), "{}", path.display());
+    assert_eq!(std::fs::read_to_string(&path).expect("saved"), contract);
+    assert_eq!(
+        git(&world.repo, &["status", "--porcelain"]).trim(),
+        "",
+        "nothing shows in git status"
+    );
+
+    let prose = pipe("fix the JSON escaping in amont list");
+    assert_eq!(prose.status.code(), Some(2));
+    assert!(
+        text(&prose.stderr).contains("not a task contract"),
+        "{}",
+        text(&prose.stderr)
+    );
+}
+
+/// The `done` lines a `relais run --protocol` wrote on stdout.
+#[cfg(unix)]
+fn done_lines(stdout: &[u8]) -> Vec<serde_json::Value> {
+    text(stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|line| line["relais"] == "done")
+        .collect()
+}
+
+/// A run refused before it exists still sends exactly one `done` line,
+/// with `run: null` and the refusal by name, so the plugin can tell the
+/// model what to do instead of a bare exit code (SPEC §29).
+#[cfg(unix)]
+#[test]
+fn a_run_refused_before_it_starts_still_sends_one_done_line_naming_why() {
+    let world = World::new("proto-unstarted");
+    let task = world.write_task("task.json");
+    let plugin_run = |world: &World| {
+        Command::new(BIN)
+            .args(["run", "--task", task.to_str().unwrap(), "--protocol"])
+            .current_dir(&world.repo)
+            .env("RELAIS_STATE_DIR", &world.state)
+            .env("RELAIS_CONFIG_DIR", &world.config)
+            .env("RELAIS_CLAUDE_BIN", &world.claude)
+            .env("RELAIS_SESSION_ID", "tab-test")
+            .env("RELAIS_HOST", "claude-code-mod")
+            .env("HOME", &world.root)
+            .output()
+            .expect("relais runs")
+    };
+    // No relais.toml in this repository yet.
+    let _ = std::fs::remove_file(world.repo.join("relais.toml"));
+    let run = plugin_run(&world);
+    let done = done_lines(&run.stdout);
+    assert_eq!(
+        done.len(),
+        1,
+        "{}\n{}",
+        text(&run.stdout),
+        text(&run.stderr)
+    );
+    assert!(done[0]["run"].is_null(), "{}", done[0]);
+    assert_eq!(done[0]["outcome"], "blocked");
+    assert_eq!(done[0]["code"], "no_policy", "{}", done[0]);
+    assert!(
+        done[0]["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("relais.toml"),
+        "{}",
+        done[0]
+    );
+
+    // A policy that does not parse is named too.
+    std::fs::write(world.repo.join("relais.toml"), "schema_version = 99\n").expect("policy");
+    let invalid = plugin_run(&world);
+    let done = done_lines(&invalid.stdout);
+    assert_eq!(done.len(), 1, "{}", text(&invalid.stderr));
+    assert_eq!(done[0]["code"], "invalid_policy", "{}", done[0]);
 }
 
 // SPEC §29: `--protocol` needs the descriptors of a Unix process; where it

@@ -83,9 +83,12 @@ does **not** type-check `register.ts`; the tests carry the behaviour.
 - `agents/relais-worker-<model>-<effort>.md` — one worker definition per
   `native::worker_agent_types()` pair (`crates/relais/tests/plugin_agents.rs`
   keeps the two in step).
-- `skills/relais/SKILL.md` — the `/relais` skill: start a run with
-  `mcp__relais__run`, a replay with `mcp__relais__replay`, follow it with
-  `mcp__relais__status` or `/relais-status`.
+- `skills/relais/SKILL.md` — the `relais` skill (`/relais:relais` by hand),
+  which the model uses on its own for bounded tasks: the contract from the
+  plan or the request, a run with `mcp__relais__run`, setup with
+  `mcp__relais__onboard` / `mcp__relais__trust`, a replay with
+  `mcp__relais__replay`, progress with `mcp__relais__status` or
+  `/relais-status`.
 - `tests/*.test.ts`, `tests/views/relais-pane.test.ts` — the plugin's tests.
 
 ## Installing

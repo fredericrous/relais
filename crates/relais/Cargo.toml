@@ -19,6 +19,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # relais.toml (repository policy) and machine-owned settings.
 toml = "0.8"
+# The one writer of machine.toml's `[trust]` tables (`relais trust grant`)
+# edits the file a person also edits by hand, so their comments and
+# ordering must survive; `toml` re-serializes and loses both. Already in
+# the tree: `toml 0.8` depends on this exact crate (Cargo.lock), so it adds
+# no transitive code, no build script and no new release cadence to own.
+toml_edit = "0.22"
 # CLI. Derive-based, one binary.
 clap = { version = "4", features = ["derive"] }
 # Contract / policy / candidate / log hashes. The ledger keys evidence by

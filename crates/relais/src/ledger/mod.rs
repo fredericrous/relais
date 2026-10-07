@@ -24,7 +24,7 @@ use crate::outcome::{Outcome, OutcomeDetail, OutcomeKind};
 use crate::policy::Tier;
 use crate::route::RoutedBy;
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 18;
+pub const LEDGER_SCHEMA_VERSION: u64 = 19;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -1340,7 +1340,43 @@ const MIGRATIONS: &[(&str, &str)] = &[
     );
     "#,
     ),
+    (
+        // Every trust grant `relais trust grant` wrote (SPEC §5): who
+        // granted which key for which repository, from where, and the
+        // exact steps it authorized. machine.toml holds the grant itself;
+        // this is the audit trail, and what the next question for the
+        // same repository is marked against, so a person re-asked after
+        // an edit sees what changed rather than the whole list again.
+        "v19",
+        r#"
+    CREATE TABLE trust_grants (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        grant_key TEXT NOT NULL,
+        repo_key TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        reviewed_by TEXT NOT NULL,
+        source TEXT NOT NULL,
+        steps_json TEXT NOT NULL,
+        granted_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_trust_grants_repo ON trust_grants(repo_key, id);
+    "#,
+    ),
 ];
+
+/// One row of `trust_grants`: what [`Ledger::record_trust_grant`] writes.
+#[derive(Debug, Clone, Copy)]
+pub struct TrustGrantRecord<'a> {
+    pub grant_key: &'a str,
+    /// [`crate::policy::repo_key`] of the repository identity.
+    pub repo_key: &'a str,
+    /// The identity as a person reads it.
+    pub repo: &'a str,
+    pub reviewed_by: &'a str,
+    /// `cli` or `plugin`: who asked the person.
+    pub source: &'a str,
+    pub steps_json: &'a str,
+}
 
 /// The one `usage_events` insert: a duplicate event id is ignored.
 fn insert_usage_event(conn: &Connection, event: &UsageEvent) -> Result<bool> {
@@ -3089,6 +3125,41 @@ impl Ledger {
             params![run_id.as_str(), criterion_id, actor, note, self.now()],
         )?;
         Ok(())
+    }
+
+    /// Record a trust grant `relais trust grant` just wrote to
+    /// machine.toml (SPEC §5). `steps_json` is the JSON list of the steps
+    /// the grant authorized, as `trust show --json` printed them.
+    pub fn record_trust_grant(&self, grant: &TrustGrantRecord<'_>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO trust_grants
+                (grant_key, repo_key, repo, reviewed_by, source, steps_json, granted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                grant.grant_key,
+                grant.repo_key,
+                grant.repo,
+                grant.reviewed_by,
+                grant.source,
+                grant.steps_json,
+                self.now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The steps the latest grant for this repository authorized, as
+    /// recorded — `None` when this repository was never granted from a
+    /// command (a hand-pasted grant leaves no row).
+    pub fn latest_trust_grant_steps(&self, repo_key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT steps_json FROM trust_grants WHERE repo_key = ?1 ORDER BY id DESC LIMIT 1",
+                [repo_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?)
     }
 
     /// Every criterion a person has signed off for one run, with who

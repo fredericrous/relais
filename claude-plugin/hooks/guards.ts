@@ -28,3 +28,34 @@ export function isRelaisNotification(text: string, agentIds: ReadonlySet<string>
 
 export const DENY_MESSAGE =
   'This agent belongs to a relais run; relais drives it. Ask relais (the relais tool), not the agent.'
+
+export const MACHINE_SETTINGS_MESSAGE =
+  "machine.toml holds relais's trust grants, and only the person grants them. Call mcp__relais__trust with the repository's cwd: it shows them the exact commands and asks."
+
+// Where relais keeps machine.toml: `$RELAIS_CONFIG_DIR`, else
+// `~/.config/relais` (crates/relais/src/paths.rs).
+export function machineSettingsPath(env: { home?: string; configDir?: string }): string | undefined {
+  if (env.configDir) return `${env.configDir.replace(/\/+$/, '')}/machine.toml`
+  if (env.home) return `${env.home.replace(/\/+$/, '')}/.config/relais/machine.toml`
+  return undefined
+}
+
+// Why the model's Write, Edit or Bash call may not touch the grants, or
+// undefined. Write and Edit are matched on the exact path. Bash is a shell
+// string, so its match is a reminder for the model, not a boundary: SPEC §5
+// puts bypass-permissions sessions outside this threat model.
+export function machineSettingsGuard(
+  tool: string,
+  input: Record<string, unknown>,
+  env: { home?: string; configDir?: string },
+): string | undefined {
+  const path = machineSettingsPath(env)
+  const named = (text: string) =>
+    (path !== undefined && text.includes(path)) || text.includes('.config/relais/machine.toml')
+  if (tool === 'Bash') {
+    const command = String(input.command ?? '')
+    return /\brelais\s+trust\s+grant\b/.test(command) || named(command) ? MACHINE_SETTINGS_MESSAGE : undefined
+  }
+  const file = String(input.file_path ?? '')
+  return file !== '' && (file === path || named(file)) ? MACHINE_SETTINGS_MESSAGE : undefined
+}
