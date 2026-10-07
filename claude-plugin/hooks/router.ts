@@ -752,6 +752,10 @@ export const fileHash = (file: string, cwd: string | undefined) => sha256Hex(rep
 // The paths a Bash command reverts, or undefined when it reverts nothing:
 // `git revert …` (its files unknown here: []), `git checkout [<ref>] --
 // <paths>`, and `git restore <paths>` unless it only unstages.
+// holds-until: R2 computes missed failures. Until then a `git revert` (no
+// paths) and a pathspec like `.` are recorded but can never overlap a
+// task's files. R2 resolves them: the reverted commit's files via `git
+// show --name-only`, and `.` as every file the task touched.
 export function revertedPaths(command: string): string[] | undefined {
   let found: string[] | undefined
   for (const segment of command.split(/&&|\|\||;|\||\n/)) {

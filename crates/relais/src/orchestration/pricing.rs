@@ -77,13 +77,18 @@ impl PriceTable {
     /// price appended: the machine's own entry wins per model. A table
     /// with no version takes the built-in list's.
     pub fn with_built_in_defaults(mut self) -> Self {
+        let mut appended = false;
         for price in built_in_prices() {
             if !price.ids.iter().any(|id| self.prices(id)) {
                 self.models.push(price);
+                appended = true;
             }
         }
+        // A cost priced partly from the built-in list says so in its label.
         if self.version.is_empty() {
             self.version = BUILT_IN_PRICES_VERSION.to_string();
+        } else if appended {
+            self.version = format!("{} + {BUILT_IN_PRICES_VERSION}", self.version);
         }
         self
     }
@@ -259,7 +264,8 @@ mod tests {
             }],
         }
         .with_built_in_defaults();
-        assert_eq!(mine.version, "mine");
+        // Built-ins filled the other models, and the label says so.
+        assert_eq!(mine.version, format!("mine + {BUILT_IN_PRICES_VERSION}"));
         // The machine's entry wins for its model; the other built-ins fill in.
         assert_eq!(mine.rate("claude-haiku-5-5").unwrap().input, 1);
         assert_eq!(mine.models.len(), built_in_prices().len());

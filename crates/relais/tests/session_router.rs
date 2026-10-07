@@ -319,7 +319,7 @@ fn router_envelope_off_removes_the_envelope_keeps_the_file_and_records_why() {
         assert_eq!(mode, 0o640);
     }
     let state = world.state_json(&world.relais(&["native", "router-state", "--session", "s"]));
-    assert_eq!(state["mode"], "shadow");
+    assert_eq!(state["mode"], "off");
     let rows = world.ledger().router_provenance().unwrap();
     assert!(
         matches!(&rows[..], [RouterProvenance::Envelope { .. }, RouterProvenance::EnvelopeRemoved { source, .. }] if source == "plugin-ask"),
@@ -582,7 +582,7 @@ fn the_report_prices_routing_spend_and_says_unknown_for_an_unpriced_model() {
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     let text = stdout(&output);
     assert!(
-        text.contains("session routing (API-equivalent estimate, [pricing] 2026-10)"),
+        text.contains("session routing (API-equivalent estimate, [pricing] 2026-10 + relais built-in 2026-10-07)"),
         "{text}"
     );
     assert!(

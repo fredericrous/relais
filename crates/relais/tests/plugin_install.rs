@@ -481,5 +481,6 @@ fn an_install_after_routing_was_turned_off_leaves_it_off() {
     assert!(!after.contains("envelope"), "{after}");
     let state = world.relais(&["native", "router-state", "--session", "s"]);
     let state: serde_json::Value = serde_json::from_slice(&state.stdout).expect("json");
-    assert_eq!(state["mode"], "shadow");
+    // Off means off: no classifier call, not shadow.
+    assert_eq!(state["mode"], "off");
 }

@@ -538,19 +538,25 @@ impl Ledger {
         )?;
         let rows = stmt.query_map([], |row| {
             let kind: String = row.get(0)?;
-            Ok(if kind == "envelope_off" {
-                RouterProvenance::EnvelopeRemoved {
+            match kind.as_str() {
+                "envelope_off" => Ok(RouterProvenance::EnvelopeRemoved {
                     source: row.get(3)?,
                     at: row.get(4)?,
-                }
-            } else {
-                RouterProvenance::Envelope {
+                }),
+                "envelope" => Ok(RouterProvenance::Envelope {
                     by: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
                     epsilon_max: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
                     source: row.get(3)?,
                     at: row.get(4)?,
-                }
-            })
+                }),
+                // A kind this binary never writes is a ledger it does not
+                // understand, not an envelope.
+                other => Err(rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    format!("unknown router provenance kind `{other}`").into(),
+                )),
+            }
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }

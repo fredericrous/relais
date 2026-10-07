@@ -605,7 +605,7 @@ export async function routingCommand(fx: Fx, store: Store, args = ''): Promise<s
     const result = await run(['relais', 'native', 'router-envelope', '--off', '--by', by, '--source', 'plugin-ask'])
     if (result?.exitCode !== 0) return `relais could not turn session routing off (exit ${result?.exitCode}): ${failed(result)}.`
     await refresh(fx, store)
-    return `Session routing is off, and stays off until you run /relais-routing again. Mode now: ${modeOf(r)}.`
+    return `Session routing is off: no classifier call and no model switch, until you run /relais-routing again. Mode now: ${modeOf(r)}.`
   }
   const answer = await ask(fx, envelopeQuestion(r.state), [NOT_NOW, ENVELOPE_YES])
   if (answer !== ENVELOPE_YES) return 'Session routing was not granted. Nothing was written.'

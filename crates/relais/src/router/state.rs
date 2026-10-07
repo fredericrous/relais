@@ -194,7 +194,11 @@ pub const COMPLETED: [&str; 2] = [
 /// The document, from its inputs.
 pub fn build(inputs: Inputs<'_>) -> RouterState {
     let routing = &inputs.machine.session_routing;
-    let (mode, mode_reason) = resolve_mode(routing.envelope.is_some(), inputs.env_mode);
+    let (mode, mode_reason) = resolve_mode(
+        routing.envelope.is_some(),
+        routing.off.is_some(),
+        inputs.env_mode,
+    );
     let draw = holdout::draw(inputs.session, routing.holdout_rate);
     let tiers = tiers(&inputs);
     let pricing = inputs

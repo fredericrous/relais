@@ -20,7 +20,12 @@ pub enum Mode {
 
 /// The mode and the reason for it, from whether an envelope is in
 /// machine.toml and the value of [`MODE_ENV`].
-pub fn resolve_mode(envelope: bool, env: Option<&str>) -> (Mode, String) {
+pub fn resolve_mode(envelope: bool, off: bool, env: Option<&str>) -> (Mode, String) {
+    // `/relais-routing off` means off: no classifier call, no cost, until
+    // routing is turned on again (which removes the tombstone).
+    if off && !envelope {
+        return (Mode::Off, "turned off (/relais-routing off)".to_string());
+    }
     let (base, reason) = if envelope {
         (Mode::On, "envelope recorded".to_string())
     } else {
@@ -46,29 +51,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_tombstone_means_off_not_shadow() {
+        assert_eq!(resolve_mode(false, true, None).0, Mode::Off);
+        // Recording the envelope again removes the tombstone; were both
+        // present, the envelope wins.
+        assert_eq!(resolve_mode(true, true, None).0, Mode::On);
+        assert_eq!(resolve_mode(false, true, Some("on")).0, Mode::Off);
+    }
+
+    #[test]
     fn the_envelope_alone_turns_routing_on() {
         assert_eq!(
-            resolve_mode(true, None),
+            resolve_mode(true, false, None),
             (Mode::On, "envelope recorded".into())
         );
         assert_eq!(
-            resolve_mode(false, None),
+            resolve_mode(false, false, None),
             (Mode::Shadow, "no envelope".into())
         );
     }
 
     #[test]
     fn the_environment_only_narrows() {
-        assert_eq!(resolve_mode(true, Some("off")).0, Mode::Off);
+        assert_eq!(resolve_mode(true, false, Some("off")).0, Mode::Off);
         assert_eq!(
-            resolve_mode(true, Some("shadow")),
+            resolve_mode(true, false, Some("shadow")),
             (Mode::Shadow, "env RELAIS_SESSION_ROUTING=shadow".into())
         );
-        assert_eq!(resolve_mode(false, Some("off")).0, Mode::Off);
+        assert_eq!(resolve_mode(false, false, Some("off")).0, Mode::Off);
         // `on` in the environment never turns routing on by itself.
-        assert_eq!(resolve_mode(false, Some("on")).0, Mode::Shadow);
-        assert_eq!(resolve_mode(true, Some("on")).0, Mode::On);
-        assert_eq!(resolve_mode(true, Some("ON!")).0, Mode::Shadow);
-        assert_eq!(resolve_mode(true, Some("")).0, Mode::On);
+        assert_eq!(resolve_mode(false, false, Some("on")).0, Mode::Shadow);
+        assert_eq!(resolve_mode(true, false, Some("on")).0, Mode::On);
+        assert_eq!(resolve_mode(true, false, Some("ON!")).0, Mode::Shadow);
+        assert_eq!(resolve_mode(true, false, Some("")).0, Mode::On);
     }
 }
