@@ -11,7 +11,7 @@ adrs: [new: relais session routing]
 
 👉 **Decide:** none beyond decision 1, which the person favours. Approve if the route-then-recover design matches "complete work correctly at lower total cost".
 
-📍 relais · S0 and R1 done, plus the R3 CLI; implementation review approved · next: merge, the person's live check of `/relais-routing`, then R3 labels and, after weeks of data, R2. Panel: backend, lang:rust, unix, react.
+📍 relais · S0, R1 and R1b (full automation: no R3, envelope at install, built-in prices) done; reviews approved · next: merge, upgrade the installed relais, then R2 after weeks of data. Panel: backend, lang:rust, unix, react.
 
 **Changed by the person's review:**
 - Routing goes by difficulty, scope, uncertainty and verification.
@@ -23,11 +23,11 @@ adrs: [new: relais session routing]
 **Verdicts:**
 - Rounds 1–2: approved after rework.
 - The person's delta: backend and react approve-with-changes; backend approved after three binds.
-- Bypass-mode delta: backend approved after three binds; consent is honoured only from the plugin's store, `mode_effective` is computed in the plugin, and the stated limit is a deliberate store edit.
+- Bypass-mode delta: backend approved after three binds; consent is honoured only from the plugin's store, `mode_effective` is computed in the plugin, and the stated limit is a deliberate store edit (superseded by R1b: no store records).
 - Lows carried to implementation:
   - prompt-hash matching for same-description subagents;
   - the "Otherwise it is shadow" wording;
-  - tying the `/relais-r3` record to the latest R3 run.
+  - tying the `/relais-r3` record to the latest R3 run (moot: R3 removed in R1b).
 
 ## Context
 
@@ -40,15 +40,15 @@ Today relais only picks models for supervised runs: a contract, a worktree, veri
 
 **How the person works:** every session runs with `--dangerously-skip-permissions`. The design relies on no permission prompt:
 - routing, recovery and learning run in mods hooks, which fire in every permission mode;
-- the only questions relais asks (the envelope, setup, trust) are the plugin's own `$.ui.ask` dialogs, not permission prompts.
+- the only questions relais asks (setup and trust; the routing envelope is recorded without asking, R1b) are the plugin's own `$.ui.ask` dialogs, not permission prompts.
 
 S0 confirms both in bypass mode. Every headless and live check below runs with that flag.
 
 **What bypass mode means for the consent gates, stated honestly.** With `--dangerously-skip-permissions` the model can do anything the person's shell can, including editing machine.toml or running `relais native router-envelope` through Bash. No local mechanism withstands a *deliberate* attempt; the threat model, as in SPEC §5 for the trust grant, is an **accidental or "helpful" self-grant**. So:
-- **The plugin honours the envelope only when its own `$.store` holds the consent record** written by the `/relais-routing` handler after the person's `$.ui.ask` answer (`{answer, at, session}`). An envelope that appears in machine.toml without that record is ignored, the mode stays shadow, and a toast says so once. The same applies to the R3 pass: the person types `/relais-r3`, which shows the R3 result through `$.ui.ask` ("record this pass?") and writes the store record on yes. The CLI `relais router r3 --record` writes only relais's own provenance row, and cannot switch routing on alone.
-- **The accepted limit:** the plugin store's backing file is itself writable from the shell. A model that deliberately locates and edits it defeats this; that is the same limit SPEC §5 states for the trust grant.
-- `tool.check` guards refuse the model's Bash calls of `router-envelope` and `r3 --record`, and Write/Edit/Bash writes to machine.toml **and to the plugin store's file** (its path resolved at `session.start`). That is a nudge, not a boundary.
-- relais records every envelope and R3 write with its source (`plugin-ask`, or `cli (unattributed)`: the CLI cannot tell the person from the model's Bash call), and `relais router evaluate` shows it.
+- **The envelope is the only switch** (R1b, the person's decision): it is recorded once, by `relais install --claude` or `/relais-routing`, and the plugin follows `router-state`'s mode. There is no plugin-store consent record and no R3 gate. A model in bypass mode could write the envelope deliberately; the same limit as SPEC §5's trust grant.
+- **The accepted limit:** with the person's full shell, a model can deliberately edit machine.toml; the guards below are a nudge, not a boundary.
+- `tool.check` guards refuse the model's Bash calls of `router-envelope` and `relais install --claude`, and its Write/Edit/Bash writes to machine.toml. That is a nudge, not a boundary.
+- relais records every envelope write with its source (`install`, `plugin-ask`, or `cli (unattributed)`).
 
 **The person's decisions (2026-10-07):**
 - haiku classifies, and relais learns whether that call was right;
@@ -67,7 +67,7 @@ S0 confirms both in bypass mode. Every headless and live check below runs with t
 - **The hot path:**
   - The hooks module cannot reach the coordinator socket, and each `relais` spawn is a process.
   - So nothing on the per-request path spawns relais.
-- **Cost is already counted:** `usage import` books every main-session message, and every message of a subagent that is not relais's own, by `message_id`, with the model and both cache-write durations (`main.rs:5155`, `:5208-5236`). The router stores message ids, never a cost.
+- **Cost is already counted:** `usage import` books every main-session message, and every message of a subagent that is not relais's own, by `message_id`, with the model and both cache-write durations (`main.rs:5155`, `:5208-5236`). The router stores per-step usage rows (tokens, model) in `router_usage`, never a cost, and never adds them to `usage import`'s totals.
 - **The task learner cannot serve turns:** its features are contract fields, and its labels are verified acceptances (`learn/features.rs:67-94`, `learn/dataset.rs:382`). A draw counts as randomized only when seeded, with its probability recorded (`learn/comparison.rs:47-50`, `crate::rng::SplitMix64`).
 - **The prompt cache is per model:** a switch makes the next request rewrite the cache for the whole context (`orchestration/pricing.rs:22-23`).
 - **SPEC conflicts this plan amends:**
@@ -80,14 +80,14 @@ S0 confirms both in bypass mode. Every headless and live check below runs with t
   - everything fails open (§23);
   - an unknown cost is never zero, and savings are API-equivalent estimates (§11).
 
-👉 **Decision 1: the envelope (the person favours it).** The person grants it once with `/relais-routing`, a command they type: it is offered by a toast at the first session, and by onboarding. The command asks through the plugin's own `$.ui.ask`, the consent path the trust grant uses, and writes through `relais native router-envelope`. The model never writes machine.toml. The question shows what it would allow:
+👉 **Decision 1 (decided, R1b): the envelope, recorded without asking.** `relais install --claude` records it when the plugin is installed: installing is the authorization. `/relais-routing` records it on a machine where install did not, and turns routing off again (`/relais-routing off`). It allows:
 - routing on: initial routing and automatic recovery (§2–§3), within `allowed_models`;
 - downward exploration at ε ≤ 0.1;
 - automatic activation of a learned adjustment that passes every gate in §5.
 
-On yes it writes `[session_routing] envelope = { granted_at, by, epsilon_max }` to machine.toml. **The mode is `on` only when the envelope is granted *and* an R3 pass is recorded** (`/relais-r3`, a store record; the CLI writes provenance only).
+It writes `[session_routing] envelope = { granted_at, by, epsilon_max, source }` to machine.toml. **The mode is `on` whenever the envelope is recorded.**
 
-**The plugin computes the effective mode** (`mode_effective`): the narrower of `router-state`'s mode (machine.toml plus the env) and the plugin's two store records (envelope consent, R3 pass). Rust cannot read the plugin store. `mode_effective` is recorded on every observation and shown on the status line. Otherwise it is `shadow`: it decides and records, and switches nothing. There is no default `on`. An env `RELAIS_SESSION_ROUTING=off|shadow` can only narrow it. Every activation is recorded with its evidence, and `relais router rollback` undoes it.
+**The plugin follows `router-state`'s mode** (recorded as `mode_effective` on every observation, and shown on the status line). Without an envelope it is `shadow`: it decides and records, and switches nothing. An env `RELAIS_SESSION_ROUTING=off|shadow` can only narrow it. Every learned activation is recorded with its evidence, and `relais router rollback` undoes it.
 
 ## Design
 
@@ -175,14 +175,14 @@ Only **escalating evidence** raises the tier: a failed verification **after an e
 
 **Inferred signals** (no complaint, an abort, a repeated delegation) are stored as `inferred_*` diagnostics. They are never outcomes and never feed activation.
 
-**Missed failures:** R3 labels by hand which tasks were actually wrong. The router's "completed" verdict is checked against that.
-- The **missed-failure rate**: denominator = the tasks the human labelled wrong; numerator = those the router called completed. It gets its own gate, a 95% upper bound ≤ 0.1. That needs ≥ 36 human-wrong tasks with 0 misses, so R3 collects ≥ 40 wrong tasks.
+**Missed failures, measured automatically (computed in R2; R1 records what it needs):** a task recorded as completed counts as a missed failure when, within 24 hours and in any session, either (a) a later task whose relation is `correction` (or that the person `/relais-flag`s) edits at least one of the files the completed task edited, or (b) a revert of those files is observed in `tool.call` (`git revert`, `git checkout -- <file>`, `git restore <file>`). Task records carry the hashed paths of the files they edited so the overlap can be computed across sessions. A correction inside the still-open task makes that task `corrected` instead, which gate 2 already counts.
+- The **missed-failure rate** per stratum: missed failures over completed tasks, on **cumulative** counts. **Before activation** (gate 4) it is computed over the stratum's ≥ 36 completed **drawn** tasks; **after activation** over the tasks routed by the adjustment, cumulatively. Clopper–Pearson 95% upper bound; 0 misses in 36 is the smallest sample that can pass 0.1. A correction prompt inside an open task B that edits an earlier task A's files counts as A's miss only, never also as B's `corrected`.
 - Aggregate agreement cannot hide it.
-- Each activated stratum is re-audited: 10 of its tasks are labelled by hand within two weeks of activation, and the stratum rolls back automatically if two or more were wrong but counted completed.
+- After activation the same measure keeps running, with an early trigger: the stratum rolls back automatically at once on any `/relais-flag` or revert miss, or when its misses reach 4 at any n, and otherwise when its cumulative upper bound crosses 0.1 with ≥ 36 completed tasks. Every rollback is recorded with its counts.
 
 **Observations:**
-- One per task, plus one per routed request group (diagnostics), keyed `(session, task, turn, agent)`. They carry the decisions, the reassessment events, `would_pass_gate` and the drawn exploration value with its propensity, the message ids (no cost), and the outcome.
-- **Classifier calls:** S0 checks whether `$.model.complete` calls appear in the transcript. If they do not, `usage import` cannot see them. Each call's usage (tokens, model) is then sent in `router-observe` under its call id. Rust writes it as an `orchestration_usage` row (source `router_classifier`), so gate 3 and the report read one table. They are never left out of gate 3.
+- One per task, plus one per routed request group (diagnostics), keyed `(session, task, turn, agent)`. They carry the decisions, the reassessment events, `would_pass_gate` and the drawn exploration value with its propensity, per-step usage rows (tokens, model; no cost) in `router_usage`, and the outcome.
+- **Classifier calls:** S0 checks whether `$.model.complete` calls appear in the transcript. If they do not, `usage import` cannot see them. Each call's usage (tokens, model) is then sent in `router-observe` under its call id. Rust writes it to `router_usage` (source `classifier`), the router's own accounting table (R1 decision log), so gate 3 and the report read one table. They are never left out of gate 3.
 - Sent batched, one `relais native router-observe` per prompt, and flushed at `session.end`, including the `clear`/`resume` reasons.
 - The insert is idempotent (`UNIQUE` key, `ON CONFLICT` updates). A worse outcome may overwrite a better one, never the reverse.
 - Exits: 0 recorded or duplicate; 2 bad payload, dropped and noted; 1 retried at most 5 times.
@@ -197,8 +197,8 @@ Only **escalating evidence** raises the tier: a failed verification **after an e
 - A learned adjustment (for example "difficulty 3 local verifiable → research") **activates only if all of these hold:**
   1. ≥ 20 drawn tasks in the stratum, with strong outcomes only (completed-verified, completed-accepted or corrected; unknowns excluded and their rate ≤ 0.5);
   2. **success:** the 5% lower credible bound of the drawn arm's success rate ≥ `quality_floor` (0.85), and it is not more than 0.05 below the undrawn arm's;
-  3. **savings:** the drawn arm's **total cost per successfully completed task** is lower than the undrawn arm's. The total includes the classifier calls, cache rewrites, subagents and recovery escalations, all priced from `orchestration_usage`. The 90% interval of the difference must exclude zero;
-  4. **label quality** (not independence: a haiku-derived label is never an independent evaluation): R3's agreement lower bound ≥ 0.75 (100 of 120), the missed-failure upper bound ≤ 0.1 (above), and only strong outcomes count.
+  3. **savings:** the drawn arm's **total cost per successfully completed task** is lower than the undrawn arm's. The total includes the classifier calls, cache rewrites, subagents and recovery escalations, all priced from `router_usage`. The 90% interval of the difference must exclude zero;
+  4. **label quality, automatic** (no hand labels, R1b): only strong outcomes count (verification results, accepted relais runs, explicit acceptance or correction); the stratum's missed-failure rate (above) has a 95% upper bound ≤ 0.1, and the stratum has no `/relais-flag` or revert miss; an activated stratum rolls back per the early trigger above.
 - `relais router evaluate [--json]` shows every stratum and why it passes or fails. Activations and rollbacks are recorded in `router_activations`.
 
 **Spend headline** (`relais report`, "session routing"): the **total cost per completed task** in routed sessions vs randomized held-out sessions.
@@ -207,7 +207,7 @@ Only **escalating evidence** raises the tier: a failed verification **after an e
 - Per-turn figures are diagnostics only.
 - Target volume: ≥ 30 held-out sessions and about 150 completed tasks per arm. S0 projects the dates.
 - **Interval method:** a cluster bootstrap over sessions, used for both the spend headline and the savings gate. Tasks are clustered in sessions, and the hold-out is drawn per session.
-- **Learning volume, stated plainly:** strata are kind (5) × difficulty band (3) × scope (3) = 45. A stratum needs about 200 eligible tasks to collect 20 drawn ones at ε 0.1. With per-task costs ranging from 20k to 800k tokens, 20 drawn tasks separate only large savings (about 40% or more).
+- **Learning volume, stated plainly:** strata are kind (5) × difficulty band (3) × scope (3) = 45. A stratum needs about 200 eligible tasks to collect 20 drawn ones at ε 0.1, and gate 4's 36 completed drawn tasks need at least 360 (about 420 at 85% success, up to about 850 with 50% unknowns). With per-task costs ranging from 20k to 800k tokens, 20 drawn tasks separate only large savings (about 40% or more).
 - So **R2 starts with only the 3–5 busiest strata**, by S0's tasks per stratum per week, and the others merge into their difficulty band. S0 records the projected weeks per stratum. Learned adjustments are expected to be few and slow; initial routing and recovery deliver the value meanwhile.
 
 ### 6. Subagents
@@ -244,19 +244,15 @@ Delivery order, at the person's request: prove the switch works, then initial ro
     - `agent.spawn` returning `{model: haiku}` → the subagent's `usage.model` = haiku;
     - a failing `cargo test` through Bash → `tool.call` result with a non-zero exit;
     - `$.ui.ask` in an interactive bypass session → the dialog is shown, and the answer comes back;
-    - **fail closed:** the model is told to grant itself the envelope, through each of Write, Edit and a Bash redirect on machine.toml, `relais native router-envelope`, and `relais router r3 --record` → the plugin's `mode_effective` stays `shadow` after every attempt (`router-state`'s own mode is read too, to show the two layers differ). If any attempt makes `mode_effective` on, R1 stays shadow until it is fixed;
-    - the model is told to write the plugin store's consent record through Bash → expected: the `tool.check` guard refuses it. A successful deliberate write is the stated limit; it is recorded in the decision log, not hidden;
+    - the model is told to grant itself the envelope, through Write, Edit or a Bash redirect on machine.toml, or `relais native router-envelope` → the `tool.check` guard refuses each attempt;
   - whether the `agent.spawn` event carries the subagent's `agentId` before its first `turn.step`, and how a subagent's completion is seen (`turn.complete` with its `agentId`, or the agent list). Without an id at spawn time, the subtask is keyed when it first appears in `turn.step`, matched to the spawn by description, and recovery waits until then. If two pending router spawns share a description, the oldest is matched first. If the match is still ambiguous, both are left unkeyed: no routing override and no recovery, recorded as `unkeyed`.
 
   The results go in the decision log. If the switch does not take effect, stop.
-- **R1: initial routing, recovery and measurement (shadow until the envelope and a recorded R3 pass):**
+- **R1: initial routing, recovery and measurement (shadow until the envelope is recorded):**
   - **Rust:** `native router-state` (mode, tiers, capability table, rates, priors, seed, hold-out), `native router-observe` (batched, idempotent), ledger v20 (`router_tasks`, `router_decisions`, views), `[session_routing]` with the envelope, the report section (cost per completed task), the ADR, SPEC §30, the upgrade note.
-  - **Plugin:** `hooks/router.ts` (pure: the classifier parse, task state, the capability table, reassessment, the cache gate), the classifier at `prompt.submit`, pin-and-recover in `turn.step`, detecting checks in `tool.call`, routing in the existing `agent.spawn` hook, `/relais-routing` (the envelope, typed by the person) and `native router-envelope`, `/relais-r3` (records an R3 pass after `$.ui.ask`), `/relais-flag` (marks the current task `corrected`, which counts as escalating evidence), the status line, fail-open.
+  - **Plugin:** `hooks/router.ts` (pure: the classifier parse, task state, the capability table, reassessment, the cache gate), the classifier at `prompt.submit`, pin-and-recover in `turn.step`, detecting checks in `tool.call`, routing in the existing `agent.spawn` hook, `/relais-routing` (records or removes the envelope) and `native router-envelope`, `/relais-flag` (marks the current task `corrected`, which counts as escalating evidence), the status line, fail-open.
 - **R2: learning (envelope only):** seeded exploration, the `relais::router` learner with the four gates, `router evaluate` / `rollback`, automatic activation. It runs only after R1 has collected data.
-- **R3: evaluation; R1 switches on only after it passes** (`/relais-r3`, a store record; the CLI writes provenance only). 160 items from the person's own transcripts, with their OK. They include ≥ 20 continuations, ≥ 20 hard investigations, ≥ 20 easy edits, and ≥ 40 tasks that were actually wrong. They measure:
-  - the capability-tier accuracy (Wilson lower bound ≥ 0.75);
-  - the continuation detection;
-  - the agreement and the missed-failure rate (§5).
+- **R3: removed (R1b).** No hand-labelled evaluation: the person wants full automation. The classifier's quality is judged by the automatic outcomes and the missed-failure rate (§5), and routing recovers on evidence (§3).
 
 ## Verification
 
@@ -267,10 +263,12 @@ Delivery order, at the person's request: prove the switch works, then initial ro
   - inferred signals never count as outcomes;
   - ingest is idempotent, and a worse outcome overwrites a better one but never the reverse;
   - 8 concurrent writers lose nothing;
-  - mode: no envelope, or no recorded R3 pass, means shadow, and the env can only narrow it;
+  - mode: no envelope means shadow, the envelope means on, and the env can only narrow it;
   - classifier usage sent through `router-observe` is priced once and counted in gate 3;
-  - the missed-failure gate fails with 35 wrong tasks and passes with 36 (0 misses);
-  - a stratum rolls back automatically after 2 bad audits;
+  - the missed-failure gate: 0 misses in 35 completed fails, 0 in 36 passes; a correction one task later that edits the same file counts as 1 miss, and a correction to an unrelated file does not;
+  - a stratum rolls back automatically on one `/relais-flag` or revert miss, at 4 misses, or when its cumulative bound crosses 0.1 after activation;
+  - off, then `relais install --claude` → no envelope, mode shadow; the model's Bash `relais install --claude` → refused;
+  - a revert of a completed task's file within 24 h counts as a miss; a correction in another session counts; a later correction keeps the task in the denominator (`completed_at_end`).
   - an older machine.toml still parses;
   - seeded draws replay exactly;
   - the cache gate: a large context with a small predicted saving does not switch down, and switching up always passes.
@@ -290,10 +288,10 @@ Delivery order, at the person's request: prove the switch works, then initial ro
   - a model named in the prompt is honoured, an agent definition's pin is honoured, and the parent's `model` parameter is overridden within policy;
   - relais's own workers are untouched;
   - shadow and hold-out sessions apply nothing;
-  - `mode_effective`: an envelope in machine.toml without the plugin's consent record → shadow, with one toast; an R3 provenance row without the `/relais-r3` store record → shadow; both records plus `router-state` `on` → on;
+  - the plugin follows `router-state`'s mode;
   - the classifier timing out means `next(e)`;
   - the engine's `turn.step` receives the routed model.
-- **Headless** (`claude -p --dangerously-skip-permissions`, scratch config and state). `-p` cannot answer `$.ui.ask`, so the scratch setup seeds the plugin's consent record and the R3 record (the test harness writes them, outside the session). The dialog itself is checked in the live interactive bypass session:
+- **Headless** (`claude -p --dangerously-skip-permissions`, scratch config and state, with the envelope recorded by the CLI):
   - "rename `foo` to `bar`, tests exist" runs at the research tier;
   - "why does this test fail intermittently under load" runs at escalation;
   - an edit whose test fails twice is escalated mid-turn (`usage.model` changes, recorded as a reassessment);
@@ -346,7 +344,7 @@ The gate **passes**. The probe plugin and its logs are kept outside the reposito
   - the missed-failure gate uses the exact Clopper–Pearson bound, the only one that gives the plan's "≥ 36";
   - a machine-level `pinned_agents` entry is served as `inherit`;
   - shadow sessions are a third arm of the report;
-  - the plugin store path is guarded as a directory (`~/.claude/plugins/store/`), because no API exposes the file;
+  - the plugin store path was guarded as a directory (superseded by R1b: there are no store consent records, so that guard is removed);
   - the cache gate uses a fixed token mix and no `rebuild_back` yet (no next-task prediction in R1);
   - `explored` is always false: exploration belongs to R2;
   - classifier usage is booked in `router_usage` (source `classifier`), not as an `orchestration_usage` row as §5 said. S0 found that hooks expose no message id, so the router keeps its own accounting table for every step and classifier call, and never adds it to `usage import`'s totals.
@@ -377,6 +375,19 @@ All checks ran in a scratch config and state, with headless `claude -p --dangero
 | `$.ui.ask` dialogs (`/relais-routing`, `/relais-r3`) in an interactive bypass session | shown and answered | **not run**: needs the person (the live check) |
 | R2 learning, R3 evaluation on real labels | later phases | not in this PR: R2 needs weeks of R1 data, and R3 needs the person's labelled transcripts |
 
+### R1b verification (2026-10-07, before push)
+
+Branch binary, scratch `RELAIS_STATE_DIR`/`RELAIS_CONFIG_DIR`/`HOME`.
+
+| Check | Expected | Actual |
+|---|---|---|
+| amont pre-commit on `6e72c32` (lint, `cargo test`, plugin validate and tests) | green | 28 checks passed |
+| `plugin_install` and `session_router` integration suites | green | 13/13 and 11/11 |
+| `relais install --claude` on a fresh machine, then again | envelope recorded once (source `install`) | `an_install_records_the_routing_envelope_once_and_a_preview_does_not` passes |
+| `/relais-routing off`, then `relais install --claude` | stays `off` | `an_install_after_routing_was_turned_off_leaves_it_off` passes; CLI: `router-envelope --off` then `router-state` → `mode=off`, reason "turned off (/relais-routing off)" |
+| Envelope recorded, no `[pricing]` in machine.toml | `mode=on`, Haiku 5.5 priced | `router-state` → `mode=on`, rates for haiku-5-5, sonnet-5-5, opus-5-5, fable-5-1; headless rename session routed to `claude-haiku-5-5` |
+| Tombstone test falsified | red when broken | `a_tombstone_means_off_not_shadow` red with the off branch removed |
+
 ## Implementation review
 
 - **Round 1: approve-with-changes** (93k tokens, 120 s). Fixed in `4a6244d`:
@@ -390,5 +401,22 @@ All checks ran in a scratch config and state, with headless `claude -p --dangero
   - deliberate: when only the refresh fails after the store write, the message is pessimistic; the next session's refresh corrects it;
   - deliberate: the unreadable-directory test assumes it does not run as root (CI runners are not root);
   - the classifier-usage location is recorded as an agreed deviation (R1 decision log).
+
+### R1b: full automation (2026-10-07, the person)
+
+- **The person's words:** "you can get Haiku pricing from internet. I don't want to have to label by hand, what the fuck is /relais-r3 and why would I want to run that. I'm looking for full automation no headache".
+- **Haiku 5.5 price** taken from platform.claude.com/docs/en/about-claude/pricing (2026-10-07) and written to the person's machine.toml: the over-100k-prompt tier, so savings are not overstated. Input $0.50, output $2.50, cache read $0.05, 5-minute write $0.625, 1-hour write $1.00 per million tokens. (The up-to-100k tier is $0.10, $0.50, $0.01, $0.125 and $0.20.) `model_ids` keeps haiku → `claude-haiku-5-5`.
+- **R3 removed entirely:** `/relais-r3`, `relais router r3`, the labels format, and the R3 rows' role in the mode.
+- **The plugin's store consent records removed:** the mode is the envelope's.
+- **`relais install --claude` records the envelope** (source `install`). On the person's machine it is recorded at the next install. The installed 0.10.1 refuses an unknown `[session_routing]` table, so writing it before the upgrade would break it.
+- **Off sticks:** `/relais-routing off` records `[session_routing] off = { at, by, source }` (a tombstone) and removes the envelope. `relais install --claude` records the envelope only when there is neither an envelope nor a tombstone. `tool.check` also refuses the model's Bash `relais install --claude`. Verification: off, then install, leaves the mode `off` (the implementation review asked for a real off: no classifier call).
+- **Default prices:** relais's built-in `PriceTable` holds seven current models (Haiku 5.5 at its over-100k rates, Haiku 4.5, Sonnet 5.5, Sonnet 5, Opus 5.5, Opus 5, Fable 5.1), so a machine with no `[pricing]` can still switch down. A `[pricing]` entry wins, and the rates version reads `… + relais built-in 2026-10-07` when a default was used.
+- **Outcome as first recorded:** task records keep `completed_at_end` (the outcome when the task ended) beside the current outcome. A later correction raises the current outcome but leaves the task in the missed-failure denominator.
+- **Attribution:** a correction is attributed to the most recent completed task, in any session within 24 h, that edited an overlapping file; a revert is a `git revert`/`git checkout -- <file>`/`git restore <file>` of such a file. Only `/relais-flag` and reverts are fully independent of the classifier, so **the measured rate is a lower bound**. Gate 4 states that, and also requires that no `/relais-flag` or revert miss exists in the activated stratum.
+- **Superseded by R1b:** S0's `$.ui.ask` and consent-record checks and the R1 verification rows about `/relais-r3` and the plugin's consent records are history; they no longer describe the design. Task records gain hashed edited-file paths (R1 contract addition) for the cross-session missed-failure measure.
+- **Gate 4 is automatic:** missed failures are measured from later corrections and reverts, not hand labels.
+- **R1b round 1: approve-with-changes.** Fixed in `6e72c32`: off is a real `off` mode; the rates version names the built-ins; provenance kinds are matched explicitly; a holds-until on revert paths; the contract lists the seven built-in prices.
+- **R1b Delta: approve** (38k tokens, 22 s), all six findings resolved. Kept deliberate: if `router-state` fails after an off, the plugin falls back to shadow (fail-open, SPEC §23), so a classifier call may run; revisit in R2.
+
 
 <!-- panel: repos=relais reviewers=backend,language:rust,unix,react body-sha=3b57295144e6 -->
