@@ -728,6 +728,11 @@ impl AdmissionState {
         })
     }
 
+    /// Whether a dispatch is native: its end is the plugin's to report.
+    pub(super) fn is_native_dispatch(&self, dispatch_id: &str) -> bool {
+        self.native.records.contains_key(dispatch_id)
+    }
+
     /// What N2 polls.
     pub fn native_status(&self, dispatch_id: &str) -> NativeProgress {
         match self.native.records.get(dispatch_id) {
@@ -770,7 +775,8 @@ impl AdmissionState {
 mod tests {
     use super::*;
     use crate::admission::{
-        Decision, DispatchRequest, DispatchSource, ResourceClass, RunRegistration,
+        AgentSettleOutcome, Decision, DispatchRequest, DispatchSource, ResourceClass,
+        RunRegistration,
     };
     use crate::policy::ConcurrencyLimits;
     use std::time::Duration;
@@ -986,6 +992,44 @@ mod tests {
         state.release("d1", now);
         assert_eq!(state.native_status("d1"), NativeProgress::Finished);
         assert!(!state.is_native_agent("s1", "a1"));
+    }
+
+    /// FALSIFY: drop the native check in `settle_by_agent`. The live
+    /// hook's `SubagentStop` then settles the dispatch the moment the
+    /// worker ends, the record goes, and the runner's next poll reads
+    /// `Finished`: "the coordinator lost native dispatch" (2026-10-08,
+    /// two runs in a row, each worker done and its answer thrown away).
+    #[test]
+    fn a_subagent_stop_leaves_a_native_dispatch_to_the_plugin_and_the_runner() {
+        let now = Instant::now();
+        let mut state = state();
+        admitted(&mut state, "d1", "s1", now);
+        state.register_native("s1", "d1", &spawn_ask("d1"));
+        assert!(matches!(
+            state.claim_native("s1", "d1", None, now),
+            ClaimOutcome::Spawn { .. }
+        ));
+        state.native_worktree("s1", "agent-a1");
+        assert_eq!(
+            state.bind_native("s1", "d1", "a1", now),
+            BindNativeOutcome::Bound
+        );
+        assert_eq!(
+            state.settle_by_agent("s1", "a1", None, now),
+            AgentSettleOutcome::Native {
+                dispatch_id: "d1".into()
+            }
+        );
+        assert!(state.dispatches.contains_key("d1"), "still held");
+        assert!(state.stopped.is_empty(), "nothing remembered either");
+        // The plugin's stop then lands, and the runner reads it.
+        state.stop_native("s1", "a1", Some("done".into()));
+        assert!(matches!(
+            state.native_status("d1"),
+            NativeProgress::Known {
+                state: NativeState::Stopped { ref answer, .. }
+            } if answer.as_deref() == Some("done")
+        ));
     }
 
     #[test]
