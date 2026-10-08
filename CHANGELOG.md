@@ -6,6 +6,23 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## v0.11.1
+
+Native runs finish again when the live hook is wired, and the pane shows the
+worker working.
+
+- With `relais install --hooks`, a native worker's end reached the hook's
+  `SubagentStop`, which released the dispatch before the plugin reported it:
+  the run ended `interrupted` with "the coordinator lost native dispatch",
+  and a worker that had finished was thrown away. A native dispatch is now
+  left to the plugin and the runner.
+- The pane draws each tool call of the running worker (`Read src/x`,
+  `Bash cargo test`) under its attempt, and the status tool returns them.
+- relais's first stderr line (`session: <id> (<source>)`) is a dim footer
+  row in the pane, not a red error row.
+- **After upgrading, run `relais install --claude --user --write`**: a brew
+  upgrade does not update the plugin Claude Code loads.
+
 ## v0.11.0
 
 relais is picked up without a command. In any repository, the session's model
