@@ -173,6 +173,28 @@ function showStatus(store: Store, listed: any[]) {
   }
 }
 
+// What a tool call of a relais agent is, in one line: the tool and the
+// argument that names what it touches.
+const ACTIVITY_ARGS = ['command', 'file_path', 'notebook_path', 'pattern', 'path', 'url', 'query', 'description']
+
+export function activityText(e: any): string {
+  const arg = ACTIVITY_ARGS.map(key => e?.[key]).find(value => typeof value === 'string' && value.length > 0)
+  const tool = String(e?.tool ?? 'tool')
+  return arg ? `${tool} ${arg.replace(/\s+/g, ' ').trim()}` : tool
+}
+
+// A tool call of an agent a dispatch owns joins its run's current step, so
+// the pane shows the worker working rather than only that it was started.
+export function onAgentTool(store: Store, e: any, now: number) {
+  const agent = typeof e?.agentId === 'string' ? e.agentId : undefined
+  if (!agent || !store.agentDispatch.has(agent)) return
+  for (const [key, model] of Object.entries(store.models)) {
+    if (!isLive(model) || !model.agents.some(a => a.agentId === agent)) continue
+    store.models = { ...store.models, [key]: applyEvent(model, { kind: 'activity', text: activityText(e) }, now) }
+    store.isDirty = true
+  }
+}
+
 // `turn.complete` of an agent a dispatch owns: its usage joins the total.
 export function onTurn(fx: Fx, store: Store, e: any) {
   const dispatch = store.agentDispatch.get(e.agentId)

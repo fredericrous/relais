@@ -3,7 +3,7 @@
 // pane. relais keeps the run, verification and the decisions; this module
 // spawns, continues, stops and shows. See ../README.md.
 
-import { dispatchOfDescription, onTurn } from './agents.ts'
+import { dispatchOfDescription, onAgentTool, onTurn } from './agents.ts'
 import { HELLO_EVERY_MS, sendHello } from './callbacks.ts'
 import type { Fx } from './fx.ts'
 import { DENY_MESSAGE, isRelaisNotification, isRelaisType, relaisAddresses } from './guards.ts'
@@ -325,6 +325,23 @@ export function register(on: any) {
     }
     return result
   }).catch(($: any, e: any, next: any) => next(e))
+
+  // A relais agent's tool calls, as the pane's live lines for its step.
+  // Every other call passes untouched; the call itself is never changed.
+  on('tool.call', async ($: any, e: any, next: any) => {
+    if (typeof e.agentId === 'string' && store.agentDispatch.has(e.agentId)) {
+      try {
+        onAgentTool(store, e, await $.clock.now())
+      } catch {
+        // Fail open: a line not shown is never a reason to fail the call.
+      }
+    }
+    return next(e)
+  }).catch(($: any, e: any, next: any) => {
+    // After `next` the tool has run: calling it again would run it twice.
+    if (next.called) throw next.error ?? new Error('relais: tool.call failed after the call')
+    return next(e)
+  })
 
   on('turn.complete', async ($: any, e: any, next: any) => {
     const fx = effects($)

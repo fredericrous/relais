@@ -156,6 +156,34 @@ test('stderr carries its label and the error colour', async ($: any, on: any) =>
   expect(stderr.props.color).toBe('error')
 })
 
+test('the session line relais starts with is footer metadata, not a red stderr row', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.stream.push('stderr', 'session: a4a9604e (explicit override (RELAIS_SESSION_ID))\nreal trouble\n')
+  engine.stream.push('stderr', 'session: again\n')
+  const { rows } = await drawn($, engine, [phase(0, 'prepared')])
+  const red = rows.filter((r: any) => r.text.startsWith('stderr'))
+  // Only the first such line is the binding; a later one is relais's own text.
+  expect(red.map((r: any) => r.text)).toEqual(['stderr │ real trouble', 'stderr │ session: again'])
+  const session = rows.find((r: any) => r.text.startsWith('session '))
+  expect(session.text).toBe('session a4a9604e (explicit override (RELAIS_SESSION_ID))')
+  expect(session.props.dimColor).toBe(true)
+})
+
+test('a worker’s tool calls show under its attempt; another agent’s do not', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.stream.push('stdout', phase(0, 'running') + started(1, 'd1') + spawnLine('d1'))
+  await settle(engine)
+  await $.tool.call({ tool: 'Read', file_path: 'src/greet.py', agentId: 'agent-1' })
+  await $.tool.call({ tool: 'Bash', command: 'python3 -m unittest\n  -q', agentId: 'agent-1' })
+  await $.tool.call({ tool: 'Edit', file_path: 'elsewhere.py', agentId: 'agent-other' })
+  const { texts } = await drawn($, engine, [])
+  const attempt = indexOf(texts, 'attempt 1 · worker')
+  expect(texts.slice(attempt + 1, attempt + 3)).toEqual(['  │ Read src/greet.py', '  │ Bash python3 -m unittest -q'])
+  expect(texts.some(t => t.includes('elsewhere.py'))).toBe(false)
+  const reply = await $.tool.call({ tool: 'mcp__relais__status' })
+  expect(JSON.parse(reply.result)[0].output).toEqual(['Read src/greet.py', 'Bash python3 -m unittest -q'])
+})
+
 test('a failure carries the FAIL label and the error colour; a preflight failure shows no agents', async ($: any, on: any) => {
   const engine = await startedRun($, on)
   const { rows } = await drawn($, engine, [

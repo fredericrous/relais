@@ -167,9 +167,18 @@ function onStderr(store: Store, child: Child, carry: Carry, text: string, now: n
   for (const line of lines) addStderr(store, child, line, now)
 }
 
+// relais's first stderr line names the session it bound the run to
+// (`session: <id> (<source>)`): metadata, kept apart from its errors.
+const SESSION_LINE = /^session: (.+)$/
+
 function addStderr(store: Store, child: Child, text: string, now: number) {
-  child.stderrTail = [...(child.stderrTail ?? []), text].slice(-STDERR_TAIL)
   const model = store.models[child.key] ?? emptyRun(child.key, now)
+  const session = model.session === undefined ? SESSION_LINE.exec(text) : null
+  if (session) {
+    store.models = { ...store.models, [child.key]: applyEvent(model, { kind: 'session', id: session[1] }, now) }
+    return
+  }
+  child.stderrTail = [...(child.stderrTail ?? []), text].slice(-STDERR_TAIL)
   store.models = { ...store.models, [child.key]: applyEvent(model, { kind: 'stderr', text }, now) }
 }
 
@@ -213,7 +222,10 @@ function onEvent(store: Store, child: Child, line: any, now: number) {
     const placeholder = store.models[child.key]
     const { [child.key]: _gone, ...rest } = store.models
     store.models = placeholder
-      ? { ...rest, [line.run]: { ...emptyRun(line.run, placeholder.startedAt), events: placeholder.events } }
+      ? {
+          ...rest,
+          [line.run]: { ...emptyRun(line.run, placeholder.startedAt), events: placeholder.events, session: placeholder.session },
+        }
       : rest
     child.key = line.run
   }
