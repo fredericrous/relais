@@ -617,6 +617,13 @@ pub enum AgentSettleOutcome {
     /// `SubagentStop` precedes it — which is why the stop is remembered,
     /// and a later bind of the same agent finishes the dispatch at once.
     NothingBound,
+    /// The agent is a native dispatch's (the relais plugin spawned it).
+    /// Its end is the plugin's `stop_native`, which carries the answer and
+    /// the usage, and the runner settles it with the real spend: a
+    /// `SubagentStop` leaves it alone. Settling here would drop the record
+    /// before the runner reads the stop, which it reports as a lost
+    /// dispatch.
+    Native { dispatch_id: String },
 }
 
 /// What `acquire_write` did (SPEC §23: one writer per worktree).
@@ -1681,6 +1688,9 @@ impl AdmissionState {
             self.remember_stopped(session_id, agent_id);
             return AgentSettleOutcome::NothingBound;
         };
+        if self.is_native_dispatch(&dispatch_id) {
+            return AgentSettleOutcome::Native { dispatch_id };
+        }
         self.settle(&dispatch_id, spent_micros, now);
         self.release(&dispatch_id, now);
         AgentSettleOutcome::Settled { dispatch_id }

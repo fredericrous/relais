@@ -5,6 +5,8 @@
 export const MAX_EVENTS = 200
 export const MAX_OUTPUT_LINES = 40
 export const MAX_STDERR_LINES = 10
+// A step keeps the last lines of what its agent did (one per tool call).
+export const MAX_ACTIVITY_LINES = 40
 // A line is cut to this before it is stored, whatever width the pane gets.
 export const MAX_LINE = 240
 
@@ -28,6 +30,9 @@ export type Step = {
   startedAt: number
   endedAt: number | undefined
   checks: Check[]
+  // What the step's agent did, one line a tool call: shown while the step
+  // runs no check.
+  activity: string[]
 }
 
 export type AgentRow = {
@@ -58,6 +63,9 @@ export type RunModel = {
   outcome: { state: string; receipt: string | null; changed: string } | undefined
   events: Entry[]
   ledger: string | undefined
+  // The Claude Code session relais bound the run to: its first stderr line
+  // says so, which is metadata, not an error.
+  session: string | undefined
   // What the next worker attempt is, after a `repairing`/`escalating`
   // transition: its step is titled by it.
   retry: 'repair' | 'escalation' | undefined
@@ -77,6 +85,7 @@ export const emptyRun = (run: string, startedAt: number): RunModel => ({
   outcome: undefined,
   events: [],
   ledger: undefined,
+  session: undefined,
   retry: undefined,
 })
 
@@ -155,6 +164,7 @@ function openStep(m: RunModel, title: string, phase: string, at: number): RunMod
     startedAt: at,
     endedAt: undefined,
     checks: [],
+    activity: [],
   }
   return { ...m, steps: [...m.steps, step] }
 }
@@ -307,6 +317,13 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
     }
     case 'stderr':
       return withEntry(m, at, 'stderr', event.text ?? '')
+    case 'session':
+      return { ...m, session: event.id }
+    case 'activity':
+      // Only a running step's agent is shown working.
+      return lastStep(m)?.state === 'active'
+        ? mapLast(m, s => ({ ...s, activity: [...s.activity, cutLine(event.text ?? '')].slice(-MAX_ACTIVITY_LINES) }))
+        : m
     default:
       return m
   }
@@ -370,14 +387,19 @@ export function attemptText(m: RunModel): string {
   return m.maxAttempts ? `attempt ${m.attempt}/${m.maxAttempts}` : `attempt ${m.attempt}`
 }
 
-// The output a status reply and the transcript carry: the running check's
-// last lines, or the last check's.
+// The output a status reply and the transcript carry: the latest step's
+// running or last check, else what its agent did; else an earlier step's.
 export function latestOutput(m: RunModel, limit: number): string[] {
   for (let i = m.steps.length - 1; i >= 0; i--) {
-    const checks = m.steps[i].checks
-    if (checks.length > 0) return checks[checks.length - 1].output.slice(-limit)
+    const lines = stepOutput(m.steps[i])
+    if (lines.length > 0) return lines.slice(-limit)
   }
   return []
+}
+
+// A step's own lines: its last check's output, else its agent's activity.
+export function stepOutput(step: Step): string[] {
+  return step.checks.length > 0 ? step.checks[step.checks.length - 1].output : step.activity
 }
 
 // What a run's candidate changed, from relais's summary object

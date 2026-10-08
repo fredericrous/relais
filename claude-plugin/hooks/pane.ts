@@ -13,6 +13,7 @@ import {
   mmss,
   outcomeText,
   shortId,
+  stepOutput,
 } from './timeline.ts'
 
 export type Row = { text: string; color?: string; dim?: boolean; bold?: boolean }
@@ -96,6 +97,7 @@ function frame(m: RunModel, room: Room): { head: Row[]; steps: Row[]; tail: Row[
     })
   }
   if (m.ledger) tail.push({ text: `ledger  ${m.ledger}`, dim: true })
+  if (m.session) tail.push({ text: `session ${m.session}`, dim: true })
   return { head, steps, tail }
 }
 
@@ -117,12 +119,12 @@ function agentRows(m: RunModel): AgentLine[] {
 }
 
 // The output a run shows, `cap` lines at most: the last ones, so the
-// extra (earlier) lines are dropped, not wrapped.
+// extra (earlier) lines are dropped, not wrapped. A step running no check
+// shows what its agent does instead.
 function outputRows(m: RunModel, cap: number): Row[] {
   if (cap <= 0) return []
   const current = m.steps.find(s => s.state === 'active') ?? m.steps[m.steps.length - 1]
-  const checks = current?.checks ?? []
-  const lines = checks.length > 0 ? checks[checks.length - 1].output : []
+  const lines = current ? stepOutput(current) : []
   return lines.slice(-cap).map(text => ({ text: `  │ ${text}`, dim: true }))
 }
 
