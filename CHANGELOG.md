@@ -6,6 +6,52 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## v0.11.0
+
+relais is picked up without a command. In any repository, the session's model
+routes a bounded task through a supervised run on its own, setting the
+repository up the first time with two questions; and relais now picks the
+session's own model for each request, moving up a tier when a check fails.
+
+**After upgrading, run `relais install --claude` once.** It refreshes the
+plugin and records the session-routing envelope; `/relais-routing off` turns
+session routing off, and a later install keeps it off.
+
+### Added
+
+- Zero-setup onboarding. `/relais <task>`, or the model on its own, works in a
+  repository with no `relais.toml`: the plugin asks, in Claude Code's own
+  dialog, "use these checks?" (what `relais init --detect` found; on yes it
+  writes and commits `relais.toml`) and "let relais run these commands?" (on
+  yes it records the grant). The model can neither word, answer nor key them.
+- The plugin adds one line to the system prompt so the model routes bounded
+  implementation and inspection tasks through relais without being asked, and
+  writes the contract itself. *Not now* keeps a repository in the session until
+  the person asks for relais again.
+- `relais trust show` / `relais trust grant`, the only writer of `[trust]`
+  tables: it refuses a stale key (exit 18), writes atomically under a lock and
+  records the grant in the ledger. `relais init --detect` proposes a
+  verification profile by reading the repository's files, running nothing
+  (exit 19 when nothing is found).
+- Session routing. A haiku call classifies each request (difficulty, scope,
+  uncertainty, verifiability) and relais switches the session's model to the
+  cheapest capable tier; subagents are routed too, except a model the person
+  named and relais's own workers. A failed check after an edit, two failed
+  repairs or a correction (`/relais-flag`) moves the task up a tier from the
+  next request, at most twice. Built-in prices for current models let it switch
+  with no `[pricing]` set up.
+- `relais report` gains a "session routing" section: cost per completed task in
+  routed versus held-out sessions, with an interval.
+
+### Changed
+
+- A missing `machine.toml` reads as empty, so a fresh machine gets
+  `missing_trust_grant` instead of a read error.
+- Every run exit reaches the model: the `done` line carries `code` and
+  `detail`, a run refused before it starts still sends `done` (`run: null`),
+  and a child that exits without one is reported with its stderr.
+- The `run` tool takes the contract as an object. The ledger migrates to v20.
+
 ## v0.10.1
 
 Fixes after 0.10.0, and `brew upgrade relais` now follows the releases.
