@@ -3101,9 +3101,16 @@ mod tests {
         );
         assert!(elided > 0);
 
+        // What this guards against is a follower that costs the check real
+        // time (an event per write, a blocking reader): several times the
+        // silent run. Run-to-run noise is about ±11% even as the best of
+        // three (measured 2026-10-09: followed 2.28–2.88 s against silent
+        // 2.57–2.74 s, either side faster), so a 5% bound failed one run in
+        // five. Half the silent run is well outside the noise and well
+        // inside any real regression.
         let allowed = std::cmp::max(
-            silent_took.mul_f64(0.05),
-            std::time::Duration::from_millis(200),
+            silent_took.mul_f64(0.5),
+            std::time::Duration::from_millis(500),
         );
         assert!(
             followed_took <= silent_took + allowed,
