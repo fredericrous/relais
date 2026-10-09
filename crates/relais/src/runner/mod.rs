@@ -3029,19 +3029,55 @@ impl<'a> RunEngine<'a> {
     /// `git worktree list` entry per run, and the build output every
     /// worker leaves behind, are what used to accumulate (audit B15).
     ///
-    /// An interrupted run keeps its worktree: its state is uncertain
-    /// (SPEC §12) — a writer may still be in the tree — and `relais
-    /// resume --retire` retires it once its dispatches are provably
-    /// dead. A retirement that fails is on the record and changes
-    /// nothing about how the run ended: the directory is still there,
-    /// and so is everything in it.
+    /// An interrupted run's state is uncertain (SPEC §12): a writer may
+    /// still be in the tree. Its worktree is retired here only once
+    /// every dispatch the ledger still holds live is provably gone —
+    /// the judgement `relais resume --retire` makes, made at the end
+    /// instead of by a person later. A run whose own worker ended
+    /// (its dispatch closed before the run was judged) has no live
+    /// dispatch and is retired like any other end; one whose dispatch
+    /// may still write — a live process, a native agent of a session
+    /// whose plugin still says hello, an outcome nothing knows — keeps
+    /// its tree for `resume --retire`. Two interrupted runs of
+    /// 2026-10-08 kept 6.8 GB of installed dependencies for a day this
+    /// way, with nothing left writing them.
+    ///
+    /// A retirement that fails is on the record and changes nothing
+    /// about how the run ended: the directory is still there, and so
+    /// is everything in it.
     pub(crate) fn retire_worktree(
         &mut self,
         worktree: &TaskWorktree,
         outcome: &RunOutcome,
     ) -> Result<(), RunError> {
         match outcome.terminal.worktree_end() {
-            WorktreeEnd::Keep => return Ok(()),
+            WorktreeEnd::Keep => {
+                // A write lease on the tree is a writer, whatever the
+                // ledger says of dispatches (SPEC §23): a straggler that
+                // held it past the deadline is still in there.
+                let key = worktree.path.to_string_lossy().into_owned();
+                let lease_holder = self
+                    .config
+                    .gate
+                    .and_then(|gate| gate.write_lease_holder(&key).ok().flatten());
+                let judged = self.judge_live_dispatches()?;
+                let may_still_write = match lease_holder {
+                    Some(holder) => Some(format!("the write lease is held by {holder}")),
+                    None if !judged.all_provably_dead() => Some(judged.detail()),
+                    None => None,
+                };
+                if let Some(why) = may_still_write {
+                    self.events.emit(Event::Stderr {
+                        text: format!(
+                            "worktree {} kept: a dispatch may still write it ({why}); `relais \
+                             resume --retire {}` retires it once that is settled",
+                            worktree.path.display(),
+                            self.run_id
+                        ),
+                    });
+                    return Ok(());
+                }
+            }
             WorktreeEnd::Retire => {}
         }
         match workspace::retire(worktree, self.run_id.as_str(), &self.artifacts) {
@@ -3060,6 +3096,35 @@ impl<'a> RunEngine<'a> {
                 }),
             ),
         }
+    }
+
+    /// Judge every dispatch the ledger still records as live for this
+    /// run, with what the runner has: the process table, and the gate's
+    /// word on whether a native agent's session still says hello. No
+    /// coordinator view is consulted — it can only turn an unknown
+    /// outcome into a held seat, and both keep the tree — so a dispatch
+    /// with no PID and no session evidence stays unknown, never dead.
+    fn judge_live_dispatches(&self) -> Result<crate::resume::Reconciliation, RunError> {
+        let live: Vec<_> = self
+            .config
+            .ledger
+            .live_dispatches()?
+            .into_iter()
+            .filter(|dispatch| dispatch.run == self.run_id)
+            .collect();
+        let session_live = |session: &str| -> Option<bool> {
+            let gate = self.config.gate?;
+            match gate.native_hello_age(session) {
+                Ok(Some(age)) => Some(age < crate::native::HELLO_FRESH),
+                Ok(None) | Err(_) => None,
+            }
+        };
+        Ok(crate::resume::reconcile_with_sessions(
+            &live,
+            None,
+            &|pid| crate::coordinator::process_alive(pid.get()),
+            &session_live,
+        ))
     }
 
     /// Record every log a setup or a profile produced as evidence, under
@@ -4880,6 +4945,18 @@ mod tests {
             repo: &RepoPolicy,
             backend: &dyn Backend,
         ) -> RunOutcome {
+            self.execute_as(None, contract, repo, backend)
+        }
+
+        /// `execute`, under a run id the test minted first — so the
+        /// ledger can hold rows about the run before it starts.
+        fn execute_as(
+            &self,
+            run_id: Option<RunId>,
+            contract: &TaskContract,
+            repo: &RepoPolicy,
+            backend: &dyn Backend,
+        ) -> RunOutcome {
             let machine = self.machine_for(repo);
             let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
                 adr: "ADR-0001".into(),
@@ -4905,7 +4982,7 @@ mod tests {
                 heartbeat_every: Duration::from_millis(50),
                 task_override: None,
                 purpose: None,
-                run_id: None,
+                run_id,
                 wire: Wire::process(),
             })
             .expect("the fixture's id source mints identifiers")
@@ -6039,8 +6116,12 @@ mod tests {
         }
     }
 
+    /// SPEC §8, §12: the worker's process ended, so its dispatch is
+    /// closed before the run is judged; nothing is left that may write
+    /// the tree, and the runner retires it at the interrupted end the
+    /// way `resume --retire` would have later.
     #[test]
-    fn missing_terminal_result_is_interrupted_with_worktree_preserved() {
+    fn missing_terminal_result_is_interrupted_and_its_worktree_retired() {
         let fixture = Fixture::new();
         let repo = fixture.repo_policy(vec![main_gone_check()], 3);
         let backend = MockBackend::new(|_| MockOutcome {
@@ -6057,9 +6138,60 @@ mod tests {
             panic!("expected interrupted, got {outcome:?}");
         };
         assert!(
+            !fixture.worktree(&run_id).exists(),
+            "the worker is gone and its dispatch closed: nothing may still write the tree, so \
+             the runner retires it (SPEC §8, §12)"
+        );
+        let transitions = fixture.ledger.transitions(&run_id).expect("history");
+        let (state, _) = retirement(&transitions);
+        assert_eq!(state, State::Interrupted, "{transitions:?}");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// SPEC §8, §12: a dispatch of the run the ledger still holds live,
+    /// with no PID and no session evidence, has an unknown outcome — it
+    /// may be writing the tree — so the interrupted end keeps the
+    /// worktree for `resume --retire`.
+    #[test]
+    fn an_interrupted_run_keeps_its_worktree_while_a_dispatch_may_still_write_it() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let run_id = fixture.ids.run_id().expect("a run id");
+        let other = DispatchId::from_stored("disp-still-launched");
+        fixture
+            .ledger
+            .record_dispatch_intent(
+                &other,
+                &run_id,
+                None,
+                &serde_json::json!({ "kind": "initial" }),
+                0,
+                RoutedBy::ConservativeBaseline,
+            )
+            .expect("intent");
+        fixture
+            .ledger
+            .attach_dispatch_process(&other, None, Some("some-other-session"))
+            .expect("launched");
+        let backend = MockBackend::new(|_| MockOutcome {
+            result_text: None,
+            timed_out: true,
+            ..Default::default()
+        });
+        let outcome = fixture.execute_as(
+            Some(run_id.clone()),
+            &fixture.contract(Review::Optional),
+            &repo,
+            &backend,
+        );
+        assert!(
+            matches!(outcome.terminal, Terminal::Interrupted { .. }),
+            "expected interrupted, got {outcome:?}"
+        );
+        assert_eq!(outcome.run_id, run_id);
+        assert!(
             fixture.worktree(&run_id).is_dir(),
-            "an interrupted run keeps its worktree: its tree may still be being written, and \
-             `resume --retire` retires it once the dispatch is provably dead (SPEC §8, §12)"
+            "a dispatch of unknown outcome may still write the tree: kept for `resume --retire`"
         );
         let transitions = fixture.ledger.transitions(&run_id).expect("history");
         assert!(
@@ -10255,9 +10387,15 @@ mod tests {
         assert!(detail.contains("not supervised"), "{detail}");
         let transitions = fixture.ledger.transitions(&run_id).expect("transitions");
         assert_eq!(
-            transitions.last().map(|t| t.reason.as_str()),
-            Some(Reason::CoordinatorUnreachable.as_str())
+            ending(&transitions).reason,
+            Reason::CoordinatorUnreachable.as_str()
         );
+        // The worker's process had ended and its dispatch was closed:
+        // nothing may still write the tree, so it is retired like any
+        // other end, with what the unheard worker wrote exported.
+        let (state, _) = retirement(&transitions);
+        assert_eq!(state, State::Interrupted);
+        assert!(!fixture.worktree(&run_id).exists());
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 

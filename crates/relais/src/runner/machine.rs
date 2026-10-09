@@ -98,8 +98,9 @@ impl Terminal {
     pub fn worktree_end(&self) -> WorktreeEnd {
         match self {
             // Uncertain state: a writer may still be in the tree, and
-            // nothing was snapshotted. `relais resume --retire` retires
-            // it once the dispatches are provably dead.
+            // nothing was snapshotted. The runner retires it at the end
+            // once every live dispatch is provably dead, and `relais
+            // resume --retire` does so later otherwise.
             Self::Interrupted { .. } => WorktreeEnd::Keep,
             Self::Accepted(_)
             | Self::NeedsDecision { .. }
@@ -127,8 +128,9 @@ impl Terminal {
 }
 
 /// What becomes of a run's worktree at its end: retired — everything
-/// tracked named and exported, then the directory removed — or kept,
-/// for the one end whose tree may still be written.
+/// tracked named and exported, then the directory removed — or kept
+/// unless its live dispatches are provably dead, for the one end whose
+/// tree may still be written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorktreeEnd {
     Retire,
@@ -467,12 +469,12 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
             Terminal::Interrupted {
                 detail: if detail.is_empty() {
                     "the worker process ended without a terminal result; state is \
-                     interrupted and the worktree is preserved"
+                     interrupted and whatever it wrote is preserved"
                         .into()
                 } else {
                     format!(
                         "the worker process ended without a terminal result ({detail}); \
-                         state is interrupted and the worktree is preserved"
+                         state is interrupted and whatever it wrote is preserved"
                     )
                 },
             },
@@ -766,7 +768,7 @@ mod tests {
 
     /// SPEC §8, §12: every end retires the worktree — its tree is a
     /// named candidate — except the one whose tree may still be being
-    /// written.
+    /// written, which the runner retires only once nothing is.
     #[test]
     fn only_an_interrupted_end_keeps_its_worktree() {
         let detail = || "why".to_string();
