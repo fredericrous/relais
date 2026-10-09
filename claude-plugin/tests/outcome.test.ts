@@ -86,6 +86,30 @@ test('a verdict whose submit fails stays queued and is sent on the next tick', a
   expect(reply.result.split('the outcome message could not be sent yet').length - 1).toBe(1)
 })
 
+test('a verdict whose submit is still pending is not submitted again on the next tick', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  let release: () => void = () => {}
+  engine.script.submitHold = new Promise<void>(resolve => {
+    release = resolve
+  })
+  engine.stream.push('stdout', phase(0, 'running') + done())
+  await settle(engine)
+  await tick(engine)
+  await tick(engine)
+  await tick(engine)
+  // The engine holds the prompt until the session is idle; the pump waits
+  // on it rather than queueing the same verdict once more per tick.
+  expect(engine.calls.prompts.length).toBe(1)
+  release()
+  await settle(engine)
+  await tick(engine)
+  await tick(engine)
+  expect(engine.calls.prompts.length).toBe(1)
+  expect(engine.calls.prompts[0].text).toContain('finished: accepted')
+  const reply = await $.tool.call({ tool: 'mcp__relais__status', run: RUN })
+  expect(reply.result).not.toContain('could not be sent yet')
+})
+
 test('a status relais cannot give says why instead of "no run"', async ($: any, on: any) => {
   const engine = await startedRun($, on)
   engine.script.runResult = (argv: string[]) =>

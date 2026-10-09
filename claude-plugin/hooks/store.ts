@@ -54,6 +54,9 @@ export type Store = {
   isListFailing: boolean
   // Whether the last verdict submission failed (said once a streak).
   isSubmitFailing: boolean
+  // A verdict's `prompt.submit` is in flight: the pump holds until it
+  // settles instead of submitting the same verdict again on the next tick.
+  isSubmitting: boolean
   // When the pane's state was last written, in the clock's ms.
   flushedAt: number
   poll: { cancel: () => void } | undefined
@@ -98,6 +101,7 @@ export const createStore = (): Store => ({
   statusFailure: undefined,
   isListFailing: false,
   isSubmitFailing: false,
+  isSubmitting: false,
   flushedAt: 0,
   poll: undefined,
   heldOutcome: undefined,
