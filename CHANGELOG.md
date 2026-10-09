@@ -6,6 +6,18 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## v0.11.2
+
+One run outcome reaches the model once, however long the session's turn.
+
+- The plugin queued a finished run's outcome message again every 100 ms
+  while the session was busy: Claude Code holds a plugin's prompt until
+  the session is idle, and the pane timer re-entered the sender meanwhile.
+  One blocked run was queued 4,168 times and read by the model 3,578
+  times once the turn ended. A message in flight now holds the queue.
+- **After upgrading, run `relais install --claude --user --write`**: a brew
+  upgrade does not update the plugin Claude Code loads.
+
 ## v0.11.1
 
 Native runs finish again when the live hook is wired, and the pane shows the
