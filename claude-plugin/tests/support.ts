@@ -59,6 +59,10 @@ export function scriptedEngine(
     isPlaced: options.isPlaced ?? true,
     // How many `prompt.submit` calls fail before one goes through.
     submitFailures: 0,
+    // A promise every `prompt.submit` call waits on before it settles: the
+    // engine's, which resolves once the session is idle and the prompt's
+    // turn starts. Null settles at once.
+    submitHold: null as Promise<void> | null,
     // `$.model.complete`'s answer (the classifier): unanswered by default.
     complete: (_e: any): any => ({ isAnswered: false, reason: 'empty-reply', usage: zeroUsage }),
     sessionModel: 'claude-sonnet-5-5',
@@ -184,6 +188,7 @@ export function scriptedEngine(
       throw new Error('not now')
     }
     calls.prompts.push(e)
+    if (script.submitHold) return script.submitHold.then(() => ({ text: e.text }))
     return { text: e.text }
   })
 

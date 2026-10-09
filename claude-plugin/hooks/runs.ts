@@ -44,8 +44,25 @@ const NEXT_STEP: Record<string, string> = {
 // One tick of the session's timer: sends the verdicts waiting, then writes
 // the pane's state if anything changed.
 export async function pump(fx: Fx, store: Store) {
-  // A verdict leaves the queue only once submitted: one that fails is
-  // tried again on the next tick, never lost.
+  // The engine's `prompt.submit` settles once the prompt's turn starts,
+  // which is when the session is idle: behind a long turn it stays pending
+  // for minutes. The timer ticks on meanwhile, so a tick that finds a
+  // submit in flight only redraws; one that re-entered submitted the same
+  // verdict again every 100 ms (4,168 copies of one outcome, 2026-10-09).
+  if (!store.isSubmitting) {
+    store.isSubmitting = true
+    try {
+      await submitVerdicts(fx, store)
+    } finally {
+      store.isSubmitting = false
+    }
+  }
+  await flush(fx, store)
+}
+
+// A verdict leaves the queue only once submitted: one that fails is
+// tried again on the next tick, never lost.
+async function submitVerdicts(fx: Fx, store: Store) {
   while (store.verdicts.length > 0) {
     try {
       store.ownPrompts.add(store.verdicts[0])
@@ -56,12 +73,11 @@ export async function pump(fx: Fx, store: Store) {
         await note(fx, store, undefined, `the outcome message could not be sent yet: ${String((reason as any)?.message ?? reason)}`)
       }
       store.isSubmitFailing = true
-      break
+      return
     }
     store.isSubmitFailing = false
     store.verdicts.shift()
   }
-  await flush(fx, store)
 }
 
 // The run tool's `task`: a contract object, which relais validates and saves
