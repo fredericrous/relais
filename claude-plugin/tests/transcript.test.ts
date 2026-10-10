@@ -1,7 +1,7 @@
 // transcriptRows: the pure layout of an agent's messages at the pane's width.
 
 import { expect, test } from 'claude-code/testing'
-import { refreshTranscript, transcriptRows } from '../hooks/transcript.ts'
+import { refreshTranscript, transcriptRows, widthOf } from '../hooks/transcript.ts'
 import { createStore } from '../hooks/store.ts'
 
 const lines = (n: number, prefix = 'line') => Array.from({ length: n }, (_, i) => `${prefix} ${i + 1}`).join('\n')
@@ -31,8 +31,26 @@ test('rows come in message order, a bar on each, the speaker on the first row', 
 test('no row is over 72 cells, and a long message wraps behind a bar', () => {
   const rows = transcriptRows([agent('word '.repeat(60)), agent('x'.repeat(500))], 72, 400)
   expect(rows.length).toBeGreaterThan(2)
-  for (const row of rows) expect(Array.from(row.text).length).toBeLessThanOrEqual(72)
+  for (const row of rows) expect(widthOf(row.text)).toBeLessThanOrEqual(72)
   expect(rows[1].text.startsWith('       │ ')).toBe(true)
+})
+
+test('wide text is measured in cells: a CJK or emoji message wraps within 72 cells', () => {
+  const cjk = '日本語のテキストは一文字が二つのセルを使います。'.repeat(6)
+  const emoji = '🚀✅🔥'.repeat(40)
+  const rows = transcriptRows([agent(cjk), agent(emoji)], 72, 400)
+  expect(rows.length).toBeGreaterThan(4)
+  for (const row of rows) expect(widthOf(row.text)).toBeLessThanOrEqual(72)
+  // Nothing was cut: every character of the CJK message is in its rows.
+  const drawn = rows.map(r => r.text.replace(/^(agent  |       )│ /, '')).join('')
+  expect(drawn.includes(cjk)).toBe(true)
+})
+
+test('cells: a combining mark takes none, a CJK character two, a letter one', () => {
+  expect(widthOf('é')).toBe(1)
+  expect(widthOf('日本')).toBe(4)
+  expect(widthOf('abc')).toBe(3)
+  expect(widthOf('🚀')).toBe(2)
 })
 
 test('a 30-line message is 12 rows then the count of the rest', () => {
@@ -53,10 +71,45 @@ test('a 10-line result is 3 rows then the count of the rest', () => {
   ])
 })
 
-test('a long tool row ends in …', () => {
+test('a long tool row wraps onto a second row, which ends in … when more is left', () => {
   const rows = transcriptRows([agent('', [{ tool: 'Bash', input: { command: 'echo ' + 'a'.repeat(300) }, text: 'ok' }])], 72, 400)
-  expect(rows[0].text.endsWith('…')).toBe(true)
-  expect(Array.from(rows[0].text).length).toBeLessThanOrEqual(72)
+  expect(rows[0].text.startsWith('▸ Bash echo')).toBe(true)
+  expect(rows[0].text.endsWith('…')).toBe(false)
+  expect(rows[1].text.startsWith('  ')).toBe(true)
+  expect(rows[1].text.endsWith('…')).toBe(true)
+  for (const row of rows.slice(0, 2)) expect(widthOf(row.text)).toBeLessThanOrEqual(72)
+  expect(rows[2].text).toBe('  │ ok')
+})
+
+test('a tool row that fits two rows is wrapped at a space, not cut', () => {
+  // 'Bash ' and the command take 105 cells, more than one 70-cell row.
+  const command = 'echo ' + 'word '.repeat(19).trim()
+  const rows = transcriptRows([agent('', [{ tool: 'Bash', input: { command }, text: 'ok' }])], 72, 400)
+  expect(rows.slice(0, 2).some(r => r.text.includes('…'))).toBe(false)
+  expect(rows.slice(0, 2).map(r => r.text.slice(2)).join(' ')).toBe('Bash ' + command)
+  expect(rows[2].text).toBe('  │ ok')
+})
+
+test('a long result line wraps before the rows are counted', () => {
+  const rows = transcriptRows(
+    [agent('', [{ tool: 'Bash', input: { command: 'ls' }, text: 'x'.repeat(100) + '\nsecond\nthird' }])],
+    72,
+    400,
+  )
+  expect(rows.map(r => r.text)).toEqual([
+    '▸ Bash ls',
+    '  │ ' + 'x'.repeat(68),
+    '  │ ' + 'x'.repeat(32),
+    '  │ second',
+    '  │ … 1 more rows',
+  ])
+})
+
+test('a running tool call keeps … running at the end of a wrapped row', () => {
+  const rows = transcriptRows([agent('', [{ tool: 'Bash', input: { command: 'pnpm ' + 'c'.repeat(200) } }])], 72, 400)
+  expect(rows.length).toBe(2)
+  expect(rows[1].text.endsWith('… running')).toBe(true)
+  for (const row of rows) expect(widthOf(row.text)).toBeLessThanOrEqual(72)
 })
 
 test('an error result starts FAIL in the error colour', () => {

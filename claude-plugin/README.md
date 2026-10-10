@@ -74,9 +74,11 @@ does **not** type-check `register.ts`; the tests carry the behaviour.
   with `$.session.messages({ agentId })`: a `[ back ]` Button and a header
   (run, agent, status, model@effort, the run's elapsed time), then `person │`
   and `agent │` rows (each message cut at 12 rows), `▸ <tool> <what>` rows
-  with the result's first 3 rows, `… running` on a tool use in flight and
-  `FAIL` on an error. Rows are laid out at the pane's width before they are
-  stored, pass through `cutLine`, and the newest 400 are kept. The read runs
+  (wrapped onto at most 2) with the result's first 3 wrapped rows,
+  `… running` on a tool use in flight and `FAIL` on an error. Rows are laid
+  out at the pane's width in terminal cells (CJK and emoji take two) before
+  they are stored, so long text wraps before it is cut with `…`; they pass
+  through `cutLine`, and the newest 400 are kept. The read runs
   outside the 100 ms flush, once per tool call of the agent and once a second
   while it runs, once more when it finishes; it is bounded at 5 s (`transcript
   slow`), a `{ deny }` reads `transcript unavailable`, and either is noted
