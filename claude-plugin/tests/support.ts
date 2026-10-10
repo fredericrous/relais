@@ -19,6 +19,8 @@ export type Calls = {
   steps: any[]
   completes: any[]
   asked: { question: string; options: string[] }[]
+  // Each `$.session.messages` call that reached the engine.
+  messages: any[]
 }
 
 export type Agents = { id: string; status: string; type?: string; name?: string; description?: string }[]
@@ -48,6 +50,7 @@ export function scriptedEngine(
     steps: [],
     completes: [],
     asked: [],
+    messages: [],
   }
   const agents: Agents = []
   // What a test changes to script the world: `relais native …` results, a
@@ -74,6 +77,12 @@ export function scriptedEngine(
     ask: (_question: string, _options: string[]): any => {
       throw new Error('dismissed')
     },
+    // `$.session.messages({ agentId })`'s answer: the rows, or `{ deny }`.
+    messages: (_e: any): any => [],
+    // How long (mock clock, ms) the call takes to answer; 0 answers at once.
+    messagesDelay: 0,
+    // The call never settles.
+    messagesNever: false,
   }
   const store: Record<string, { value: unknown; version: number }> = {}
   let nextAgent = 1
@@ -145,6 +154,12 @@ export function scriptedEngine(
     return { value: await script.complete(e) }
   })
   on('session.model', () => ({ value: script.sessionModel }))
+  on('session.messages', async (_$: any, e: any) => {
+    calls.messages.push(e)
+    if (script.messagesNever) await new Promise<void>(() => {})
+    if (script.messagesDelay > 0) await clock.sleep(script.messagesDelay)
+    return { value: script.messages(e) }
+  })
 
   on('agent.offer', () => ({ isOffered: true }))
   on('turn.complete', (_$: any, e: any) => ({ text: e.answer }))

@@ -5,6 +5,26 @@ import type { Fx } from './fx.ts'
 import type { Dispatch } from './dispatches.ts'
 import type { RunModel } from './timeline.ts'
 import { createRouterMemory, type RouterMemory } from './router.ts'
+import type { TranscriptState } from './transcript.ts'
+
+// What the pane shows: the runs, or one agent's transcript.
+export type Shown =
+  | { kind: 'runs' }
+  | {
+      kind: 'agent'
+      agentId: string
+      run: string
+      transcript: TranscriptState
+      generation: number
+      // The pane's width at the press: the transcript is laid out at it.
+      columns: number
+      // The clock when the last read began.
+      refreshedAt: number
+      // Whether a result (rows, deny or slow) was stored for this view.
+      hasLanded: boolean
+      // The agent's status when the last read began: a change is read again.
+      status: string | undefined
+    }
 
 // One `relais run` child, as the module started it.
 export type Child = {
@@ -81,6 +101,17 @@ export type Store = {
   // The session router's memory: router-state, the task, the pinned route,
   // the observations waiting (routing.ts).
   router: RouterMemory
+  shown: Shown
+  // Counts the views opened: a read belongs to the one that began it.
+  generation: number
+  // The shown agent's transcript is read again on the next tick.
+  transcriptDirty: boolean
+  // A transcript read is under way (set around the whole attempt, 5 s bound).
+  isReadingTranscript: boolean
+  // The real `session.messages` promise is unsettled (it may outlive the bound).
+  pendingMessages: boolean
+  // `generation:reason` of the notes already made on the run.
+  notedReasons: Set<string>
 }
 
 // What an outcome message was built from, to rebuild it if the run's
@@ -134,6 +165,12 @@ export const createStore = (): Store => ({
   pendingOutcomes: new Map(),
   isCurrentMissingNoted: false,
   router: createRouterMemory(),
+  shown: { kind: 'runs' },
+  generation: 0,
+  transcriptDirty: false,
+  isReadingTranscript: false,
+  pendingMessages: false,
+  notedReasons: new Set(),
 })
 
 // Timers go through here so that unloading can clear every one.

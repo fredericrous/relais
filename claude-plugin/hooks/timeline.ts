@@ -42,6 +42,8 @@ export type AgentRow = {
   model: string
   effort: string | null
   agentId: string | undefined
+  // The subagent type of the spawn, once the spawn line named one.
+  type: string | undefined
   status: string
 }
 
@@ -236,6 +238,7 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
         model: event.model,
         effort: event.effort ?? null,
         agentId: undefined,
+        type: undefined,
         status: 'running',
       }
       const route = `${event.model}${event.effort ? `@${event.effort}` : ''}`

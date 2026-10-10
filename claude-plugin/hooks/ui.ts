@@ -32,14 +32,22 @@ export const markDirty = (store: Store) => {
   store.isDirty = true
 }
 
+const isAgentShown = (store: Store) => store.shown.kind === 'agent'
+
+// What the pane's state carries of the view: no generation, width or flags.
+const viewOf = (shown: Store['shown']) =>
+  shown.kind === 'agent'
+    ? { kind: 'agent', agentId: shown.agentId, run: shown.run, transcript: shown.transcript }
+    : { kind: 'runs' }
+
 export async function flush(fx: Fx, store: Store) {
-  if (store.closed || (!store.isDirty && !hasLiveRun(store))) return
+  if (store.closed || (!store.isDirty && !hasLiveRun(store) && !isAgentShown(store))) return
   const now = await fx.clock.now()
-  const isStale = hasLiveRun(store) && now - store.flushedAt >= CLOCK_REDRAW_MS
+  const isStale = (hasLiveRun(store) || isAgentShown(store)) && now - store.flushedAt >= CLOCK_REDRAW_MS
   if (!store.isDirty && !isStale) return
   store.isDirty = false
   store.flushedAt = now
-  await fx.pane.write(asJson({ runs: runsOf(store), now }))
+  await fx.pane.write(asJson({ runs: runsOf(store), now, shown: viewOf(store.shown) }))
   fx.ui.status(statusText(store, now))
 }
 
@@ -89,7 +97,39 @@ export function timelineLines(store: Store, now: number): string[] {
 }
 
 // `ui.render` for the pane: reads the state the flush wrote, writes nothing.
-export async function renderPane(fx: Fx, e: any) {
+export async function renderPane(fx: Fx, store: Store, e: any) {
   const { value } = await fx.pane.read()
-  return paneTree(fx, e, value)
+  return paneTree(fx, e, value, {
+    openAgent: (agentId, run, columns) => openAgent(fx, store, agentId, run, columns),
+    back: () => back(fx, store),
+  })
+}
+
+// A press on an agent row: the view changes at once, the read follows on the
+// next tick. A view opened while an older read is pending draws `slow` (not
+// stored as a result) until that call settles.
+export async function openAgent(fx: Fx, store: Store, agentId: string, run: string, columns: number) {
+  store.generation += 1
+  store.shown = {
+    kind: 'agent',
+    agentId,
+    run,
+    generation: store.generation,
+    columns,
+    refreshedAt: 0,
+    hasLanded: false,
+    status: undefined,
+    transcript: store.pendingMessages ? { kind: 'slow' } : { kind: 'loading' },
+  }
+  store.transcriptDirty = true
+  markDirty(store)
+  await flush(fx, store)
+}
+
+export async function back(fx: Fx, store: Store) {
+  store.generation += 1
+  store.shown = { kind: 'runs' }
+  store.transcriptDirty = false
+  markDirty(store)
+  await flush(fx, store)
 }
