@@ -69,8 +69,8 @@ export type Store = {
   consent: Map<string, Promise<string>>
   // Repository roots the person answered Not now for in this session.
   declined: Set<string>
-  // Outcome messages this plugin submitted, so `prompt.submit` does not
-  // take them for the person's own words.
+  // The outcome message this plugin is submitting, while its submit is in
+  // flight, so `prompt.submit` does not take it for the person's own words.
   ownPrompts: Set<string>
   // Outcome messages announcing a state that waits on a person, by their
   // exact text, until submitted: the pump checks each against what the

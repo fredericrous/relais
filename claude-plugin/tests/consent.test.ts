@@ -339,13 +339,51 @@ test('the outcome message the pump submits does not lift a Not now when it comes
   const store = createStore()
   store.declined.add('/repo')
   store.verdicts.push('relais run run-1 finished: accepted.\nReceipt: /runs/r1/receipt.json')
-  // Claude Code feeds a submitted prompt through every prompt.submit hook,
-  // this plugin's included.
+  // Should the engine ever feed this plugin's own submit to its own
+  // prompt.submit hook (the test kit's engine does not), the mark stops it.
   const fx: any = { prompt: { submit: async ({ text }: { text: string }) => onPersonPrompt(store, text) } }
   await pump(fx, store)
   expect(store.verdicts.length).toBe(0)
   expect(store.declined.has('/repo')).toBe(true)
   expect(store.ownPrompts.size).toBe(0)
+})
+
+test('an outcome no hook reads leaves no mark behind', async () => {
+  const store = createStore()
+  for (const run of ['run-1', 'run-2', 'run-3']) store.verdicts.push(`relais run ${run} finished: accepted.`)
+  // The engine skips the submitter's own prompt.submit hook: nothing
+  // consumes the marks, so the pump drops each once its submit settles.
+  const fx: any = { prompt: { submit: async () => ({}) } }
+  await pump(fx, store)
+  expect(store.verdicts.length).toBe(0)
+  expect(store.ownPrompts.size).toBe(0)
+})
+
+test('a failed submit leaves no mark behind, and its retry marks it again', async () => {
+  const store = createStore()
+  store.verdicts.push('relais run run-1 finished: accepted.')
+  const marked: number[] = []
+  let failures = 1
+  const fx: any = {
+    clock: { now: async () => 0 },
+    pane: { write: async () => {} },
+    ui: { status: async () => {} },
+    prompt: {
+      submit: async () => {
+        marked.push(store.ownPrompts.size)
+        if (failures-- > 0) throw new Error('not now')
+        return {}
+      },
+    },
+  }
+  await pump(fx, store)
+  expect(store.verdicts.length).toBe(1)
+  expect(store.ownPrompts.size).toBe(0)
+  await pump(fx, store)
+  expect(store.verdicts.length).toBe(0)
+  expect(store.ownPrompts.size).toBe(0)
+  // Marked while each submit was in flight, as a hook would read it.
+  expect(marked).toEqual([1, 1])
 })
 
 test('a request that only mentions a negation elsewhere still lifts a Not now', async () => {
