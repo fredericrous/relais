@@ -6,6 +6,22 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## Unreleased
+
+An agent's transcript opens inside the relais pane.
+
+- Each agent row of the pane is now a button, named under it as Claude
+  Code's tasks footer names the agent (`relais:relais-worker-sonnet-medium`).
+  Clicking it, or Enter on it, shows that agent's transcript in the pane:
+  what it was asked, what it said, each tool call with the first lines of
+  its result, live while it runs; `[ back ]` returns to the runs. A hint
+  under the agents says that `↓ to manage` opens the same agent in Claude
+  Code's own view, which a plugin cannot open itself.
+- The pane's agent rows still show at most three agents per run.
+- **After upgrading, run `relais install --claude --user --write`, then
+  restart your Claude Code sessions**: a running session keeps the plugin
+  it started with.
+
 ## v0.11.3
 
 An outcome that waits on you says what is true when it arrives.
