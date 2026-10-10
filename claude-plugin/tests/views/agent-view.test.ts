@@ -52,7 +52,8 @@ async function mount($: any, columns = 72) {
     viewport: { columns: 100, rows: 40, isFullscreen: true },
   })
   mounted.set($, ui)
-  const rows = await ui.findAll({ type: 'Text' })
+  // Text rows and the agent rows (Buttons whose label is their text), in order.
+  const rows = (await ui.findAll({})).filter((e: any) => e.type === 'Text' || e.type === 'Button')
   return { ui, rows, texts: rows.map((r: any) => r.text as string) }
 }
 

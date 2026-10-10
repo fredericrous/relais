@@ -274,8 +274,14 @@ export function paneTree(fx: Fx, e: any, state: PaneState | undefined, actions: 
       if (row.button && press?.kind === 'agent') {
         return h(
           Button,
-          { key: row.button.key, plain: true, onPress: () => actions.openAgent(press.agentId, press.run, columns) },
-          h(Text, { wrap: 'truncate-end' }, row.text),
+          // The text as `label`, not a Text child: Claude Code before 2.1.295
+          // refuses a Button with element children, and CI pins 2.1.291.
+          {
+            key: row.button.key,
+            label: row.text,
+            plain: true,
+            onPress: () => actions.openAgent(press.agentId, press.run, columns),
+          },
         )
       }
       return text(row, `row:${i}`)

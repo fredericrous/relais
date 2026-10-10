@@ -37,8 +37,11 @@ async function drawn($: any, engine: any, lines: string[], room: { bodyRows?: nu
     },
     viewport: { columns: 100, rows: 40, isFullscreen: true },
   })
-  const texts = (await ui.findAll({ type: 'Text' })).map((t: any) => t.text as string)
-  return { ui, texts, rows: await ui.findAll({ type: 'Text' }) }
+  // The rows as drawn, in order: Text rows and the agent rows, which are
+  // Buttons whose label is their text.
+  const rows = (await ui.findAll({})).filter((e: any) => e.type === 'Text' || e.type === 'Button')
+  const texts = rows.map((t: any) => t.text as string)
+  return { ui, texts, rows }
 }
 
 const indexOf = (texts: string[], needle: string) => texts.findIndex(t => t.includes(needle))
