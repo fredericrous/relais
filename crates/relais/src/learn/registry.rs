@@ -447,6 +447,51 @@ impl Registry {
         self.write_pointer(&self.active_path(), evaluated.artifact_id())
     }
 
+    /// The id the active pointer names, without loading the artifact.
+    pub fn active_id(&self) -> std::result::Result<Option<String>, ArtifactError> {
+        self.pointer(&self.active_path())
+    }
+
+    /// The id rollback would restore, without loading the artifact.
+    pub fn previous_id(&self) -> std::result::Result<Option<String>, ArtifactError> {
+        self.pointer(&self.previous_path())
+    }
+
+    /// When the active pointer last changed (a promotion or a rollback),
+    /// as RFC 3339; `None` when nothing is active or the filesystem does
+    /// not say.
+    pub fn active_changed_at(&self) -> Option<String> {
+        let modified = std::fs::metadata(self.active_path())
+            .ok()?
+            .modified()
+            .ok()?;
+        Some(
+            chrono::DateTime::<chrono::Utc>::from(modified)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+    }
+
+    /// Delete artifact `artifact_id`, unless the registry still points at
+    /// it. Whether a file was removed.
+    pub fn remove_unreferenced(
+        &self,
+        artifact_id: &str,
+    ) -> std::result::Result<bool, ArtifactError> {
+        for id in [self.active_id()?, self.previous_id()?]
+            .into_iter()
+            .flatten()
+        {
+            if id == artifact_id {
+                return Ok(false);
+            }
+        }
+        match std::fs::remove_file(self.artifacts_dir().join(format!("{artifact_id}.json"))) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(ArtifactError::Io(e)),
+        }
+    }
+
     pub fn rollback(&self) -> std::result::Result<Option<String>, ArtifactError> {
         let Some(id) = self.pointer(&self.previous_path())? else {
             return Ok(None);

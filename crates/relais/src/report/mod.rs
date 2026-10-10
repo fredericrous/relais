@@ -608,6 +608,10 @@ pub struct Report {
     /// `[pricing]`, and it stays `None` when no routed task started in
     /// the window.
     pub session_routing: Option<crate::router::report::SessionRoutingReport>,
+    /// What the learning loop did (SPEC §17). `runs_report` leaves it
+    /// `None`; `relais report` fills it from the ledger and the registry,
+    /// always: with nothing learned it is a sentence saying why.
+    pub learning: Option<crate::learn::summary::LearningReport>,
 }
 
 /// Orchestration spend imported from Claude Code session transcripts
@@ -981,6 +985,7 @@ pub fn runs_report(
         orchestration,
         cost_per_accepted_task_with_orchestration,
         session_routing: None,
+        learning: None,
         trial_spend,
         observational,
     })
@@ -1264,6 +1269,9 @@ impl Report {
         }
         if let Some(routing) = &self.session_routing {
             out.push_str(&routing.render());
+        }
+        if let Some(learning) = &self.learning {
+            out.push_str(&learning.render());
         }
     }
 }
@@ -1672,6 +1680,7 @@ mod tests {
             },
             cost_per_accepted_task_with_orchestration: Some(MicroUsd::from_micros(10)),
             session_routing: None,
+            learning: None,
         };
         let rendered = report.render();
         assert!(
@@ -1875,6 +1884,7 @@ mod tests {
                 "cost_per_accepted_task_with_orchestration",
                 "cost_per_standing_change",
                 "enforcement",
+                "learning",
                 "never_shipped_tasks",
                 "observational",
                 "open_decisions",

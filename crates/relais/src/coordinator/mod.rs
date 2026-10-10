@@ -27,7 +27,7 @@ use crate::admission::{
     HeartbeatStatus, LifecycleOutcome, NativeAnswer, NativeAsk, NativeProgress, PendingSignal,
     Provenance, RegisterOutcome, ReleaseWriteOutcome, ResourceClass, ResumeOutcome,
     RunRegistration, Signal, StatusSnapshot, StopNativeOutcome, StoppedOutcome, StoppedReport,
-    WaitOutcome, WithdrawOutcome, WorktreeOutcome, WriteLeaseOutcome,
+    TrainingDecision, WaitOutcome, WithdrawOutcome, WorktreeOutcome, WriteLeaseOutcome,
 };
 use crate::ipc::{Listener, Stream};
 use crate::ledger::Ledger;
@@ -101,7 +101,11 @@ const DESCRIPTOR_RETRIES: u32 = 20;
 /// v5 added the relais plugin's calls (`native_hello`, `native_hello_age`,
 /// `native_bound`, `native_stopped`) and dropped `transcript_path` from
 /// `stop_native`: a v4 daemon would refuse them.
-pub const PROTOCOL_VERSION: u32 = 5;
+///
+/// v6 added the Training lease (`acquire_training`, `end_training`) and
+/// its `training` reply: a v5 daemon would refuse both, and a learning
+/// cycle that cannot ask for the lease must not run without one.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Why a coordinator call, election or startup failed. Every variant
 /// names the operation and the entity it was about, so a caller can tell
@@ -344,6 +348,21 @@ pub enum Request {
     WriteLeaseHolder {
         worktree: String,
     },
+    /// The learning cycle's Training lease (SPEC §17): the run is
+    /// registered and the seat asked for in one call, WITHOUT queueing.
+    /// `pid` is the caller's own, bound to the seat; `started_at` is what a
+    /// refused second cycle will say about this holder.
+    AcquireTraining {
+        registration: RunRegistration,
+        request: DispatchRequest,
+        pid: u32,
+        started_at: String,
+    },
+    /// The cycle is over: seat and run released.
+    EndTraining {
+        dispatch_id: String,
+        run_id: String,
+    },
     CancelDispatch {
         dispatch_id: String,
     },
@@ -466,6 +485,10 @@ pub enum Response {
     },
     Decision {
         decision: Decision,
+    },
+    /// The answer to `acquire_training`.
+    Training {
+        decision: TrainingDecision,
     },
     /// What ending an agent did — including that nothing was bound to
     /// it, which is an ordinary answer and not `Unknown`.
@@ -1139,6 +1162,24 @@ pub fn handle(
         Request::RequestAdmission { request } => Response::Decision {
             decision: state.request(&request, now),
         },
+        Request::AcquireTraining {
+            registration,
+            request,
+            pid,
+            started_at,
+        } => {
+            state.register_run(&registration, now);
+            Response::Training {
+                decision: state.request_training(&request, pid, &started_at, now, &process_alive),
+            }
+        }
+        Request::EndTraining {
+            dispatch_id,
+            run_id,
+        } => {
+            state.end_training(&dispatch_id, &run_id, now);
+            Response::Ack
+        }
         Request::Bind {
             dispatch_id,
             agent_id,
@@ -1396,6 +1437,15 @@ pub fn handle(
     (response, Vec::new())
 }
 
+/// What [`Client::acquire_training`] came back with: the decision, and the
+/// names the lease is released by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrainingLease {
+    pub decision: TrainingDecision,
+    pub dispatch_id: String,
+    pub run_id: String,
+}
+
 /// The CLI-side client: connect, send one line, read one line, close.
 pub struct Client {
     socket: PathBuf,
@@ -1478,6 +1528,66 @@ impl Client {
         }
     }
 
+    /// Ask for the Training lease without queueing. The registration and
+    /// the seat travel in one call; the lease is the caller's until
+    /// [`Self::end_training`] or until its process is gone.
+    pub fn acquire_training(
+        &self,
+        session_id: &str,
+        pid: u32,
+        started_at: &str,
+    ) -> Result<TrainingLease, CoordinatorError> {
+        let run_id = format!("learn-cycle-{pid}");
+        let dispatch_id = format!("learn-cycle-{pid}-{started_at}");
+        let request = Request::AcquireTraining {
+            registration: RunRegistration {
+                run_id: run_id.clone(),
+                session_id: session_id.to_string(),
+                budget_micros: None,
+                max_agents: None,
+                max_depth: None,
+            },
+            request: DispatchRequest {
+                dispatch_id: dispatch_id.clone(),
+                run_id: run_id.clone(),
+                session_id: session_id.to_string(),
+                parent_dispatch: None,
+                depth: 0,
+                resource: ResourceClass::Training,
+                reserve_micros: 0,
+                source: DispatchSource::ManagedRun,
+                caller_agent_id: None,
+            },
+            pid,
+            started_at: started_at.to_string(),
+        };
+        match self.request(&request)? {
+            Response::Training { decision } => Ok(TrainingLease {
+                decision,
+                dispatch_id,
+                run_id,
+            }),
+            other => Err(CoordinatorError::Protocol {
+                operation: "acquire_training",
+                detail: format!("unexpected reply: {other:?}"),
+            }),
+        }
+    }
+
+    /// Give the Training lease back.
+    pub fn end_training(&self, lease: &TrainingLease) -> Result<(), CoordinatorError> {
+        match self.request(&Request::EndTraining {
+            dispatch_id: lease.dispatch_id.clone(),
+            run_id: lease.run_id.clone(),
+        })? {
+            Response::Ack => Ok(()),
+            other => Err(CoordinatorError::Protocol {
+                operation: "end_training",
+                detail: format!("unexpected reply: {other:?}"),
+            }),
+        }
+    }
+
     pub fn status(&self) -> Result<StatusSnapshot, CoordinatorError> {
         match self.request(&Request::Status)? {
             Response::Status { snapshot } => Ok(*snapshot),
@@ -1553,6 +1663,7 @@ impl RemoteGate {
             | Response::ShuttingDown
             | Response::Pong { .. }
             | Response::Decision { .. }
+            | Response::Training { .. }
             | Response::AgentSettled { .. }
             | Response::Heartbeat { .. }
             | Response::WriteLease { .. }
@@ -1787,6 +1898,7 @@ impl Gate for RemoteGate {
             | Response::ShuttingDown
             | Response::Pong { .. }
             | Response::Decision { .. }
+            | Response::Training { .. }
             | Response::Heartbeat { .. }
             | Response::Native { .. }
             | Response::WriteLease { .. }
@@ -1824,6 +1936,7 @@ impl Gate for RemoteGate {
             | Response::ShuttingDown
             | Response::Pong { .. }
             | Response::Decision { .. }
+            | Response::Training { .. }
             | Response::Heartbeat { .. }
             | Response::Native { .. }
             | Response::WriteLease { .. }
@@ -1927,6 +2040,7 @@ impl Gate for RemoteGate {
             | Response::ShuttingDown
             | Response::Pong { .. }
             | Response::Decision { .. }
+            | Response::Training { .. }
             | Response::AgentSettled { .. }
             | Response::Heartbeat { .. }
             | Response::Native { .. }

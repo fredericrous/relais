@@ -4936,6 +4936,7 @@ mod tests {
                 efforts: Default::default(),
                 sandbox: Default::default(),
                 session_routing: Default::default(),
+                learning: Default::default(),
             }
         }
 

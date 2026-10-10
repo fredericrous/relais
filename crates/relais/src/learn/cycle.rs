@@ -1,0 +1,901 @@
+//! The learning cycle (SPEC §17, relais ADR-0003): dataset build → train →
+//! evaluate → promote when allowed, composed in-process from the functions
+//! `relais dataset build`, `train`, `evaluate` and `promote` already use,
+//! with the rollback check in front and the retention rules behind.
+//!
+//! The decisions are pure functions of values handed in ([`due`],
+//! [`rollback_reason`], [`withheld`]); [`run_cycle`] and [`roll_back_active`]
+//! are the shell that reads the ledger and the registry and writes the
+//! `learning_cycles` row. The Training lease, the idle check and the exit
+//! codes belong to the caller: a cycle only starts once it holds the lease.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use chrono::{DateTime, Duration, Utc};
+use serde::Serialize;
+
+use crate::ids::RunId;
+use crate::ledger::{
+    LearningAction, LearningCycleFinish, LearningSource, LearningVerdict, Ledger, LedgerError,
+};
+use crate::outcome::OutcomeKind;
+use crate::policy::RepoPolicy;
+use crate::router::stats::clopper_pearson_upper;
+
+use super::dataset::{self, Dataset, DatasetError, Labelling};
+use super::evaluate::{self, EvalReport, EvalSettings, TrainError};
+use super::registry::{Artifact, ArtifactError, Registry};
+use super::salvage::{self, BackfillReport};
+
+/// A cycle that started less than this long ago makes the next one "not due".
+pub const DUE_AFTER_HOURS: i64 = 20;
+/// Runs a learned artifact must have routed before the acceptance bound
+/// may roll it back.
+pub const MIN_ROUTED_RUNS: u64 = 10;
+/// Terminal runs that must be recorded after a rollback before anything is
+/// promoted again.
+pub const MIN_RUNS_AFTER_ROLLBACK: usize = 10;
+/// Datasets kept on disk, newest first.
+pub const KEEP_DATASETS: usize = 5;
+/// Artifacts kept beside the ones the registry points at, newest first.
+pub const KEEP_ARTIFACTS: usize = 5;
+/// The one-sided 95% bound is the two-sided 90% interval's upper end.
+const ONE_SIDED_95: f64 = 0.10;
+
+// ---------------------------------------------------------------- log ----
+
+/// The log is rotated when it reaches this size; one old file is kept.
+pub const LOG_ROTATE_BYTES: u64 = 1024 * 1024;
+
+/// `--log <path>`: relais opens the file itself, in append mode, created
+/// 0600, so a detached spawn needs no shell redirection and the log cannot
+/// be world readable.
+pub struct CycleLog {
+    file: std::fs::File,
+}
+
+impl CycleLog {
+    /// Open `path` for appending, rotating it first when it has reached
+    /// [`LOG_ROTATE_BYTES`]: the old file becomes `<path>.1`, replacing the
+    /// one before it.
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        if std::fs::metadata(path).is_ok_and(|meta| meta.len() >= LOG_ROTATE_BYTES) {
+            let mut old = path.as_os_str().to_owned();
+            old.push(".1");
+            std::fs::rename(path, PathBuf::from(old))?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        Ok(Self {
+            file: options.open(path)?,
+        })
+    }
+
+    /// One line, written with a single `write_all`. A log that cannot be
+    /// written to loses the line; it never fails the cycle.
+    pub fn line(&mut self, text: &str) {
+        use std::io::Write;
+        let _ = self.file.write_all(format!("{text}\n").as_bytes());
+    }
+}
+
+// ---------------------------------------------------------------- due ----
+
+/// Whether `--if-due` has anything to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Due {
+    Yes,
+    No {
+        /// One sentence naming why.
+        reason: String,
+        /// When the cycle is next due, in words.
+        next_due: String,
+    },
+}
+
+impl Due {
+    /// The single line `--if-due` prints when there is nothing to do.
+    pub fn line(&self) -> Option<String> {
+        match self {
+            Self::Yes => None,
+            Self::No { reason, next_due } => Some(format!("not due: {reason}; {next_due}")),
+        }
+    }
+}
+
+/// Due when no cycle ever ran, or the last one is at least
+/// [`DUE_AFTER_HOURS`] old AND a run reached a terminal state since it.
+pub fn due(last_started_at: Option<&str>, terminal_runs_since: usize, now: DateTime<Utc>) -> Due {
+    let Some(last) = last_started_at else {
+        return Due::Yes;
+    };
+    let Ok(started) = DateTime::parse_from_rfc3339(last) else {
+        // A start time nobody can read is no evidence of a recent cycle.
+        return Due::Yes;
+    };
+    let next = started.with_timezone(&Utc) + Duration::hours(DUE_AFTER_HOURS);
+    if now < next {
+        return Due::No {
+            reason: format!(
+                "the last cycle started {} ago",
+                age_in_words(now - started.with_timezone(&Utc))
+            ),
+            next_due: format!(
+                "next due {} if a run has finished by then",
+                next.format("%Y-%m-%dT%H:%MZ")
+            ),
+        };
+    }
+    if terminal_runs_since == 0 {
+        return Due::No {
+            reason: "no run reached a terminal state since the last cycle".into(),
+            next_due: "due at the first run that does".into(),
+        };
+    }
+    Due::Yes
+}
+
+fn age_in_words(age: Duration) -> String {
+    let minutes = age.num_minutes().max(0);
+    if minutes < 90 {
+        format!("{minutes} min")
+    } else {
+        format!("{} h", age.num_hours())
+    }
+}
+
+// ----------------------------------------------------------- rollback ----
+
+/// How one run an artifact routed turned out, under the labelling policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutedOutcome {
+    /// Its change was reverted or a regression was confirmed.
+    Regressed,
+    /// Accepted without escalation: the label the acceptance model predicts.
+    Accepted,
+    /// Failed, or accepted only after escalation.
+    NotAccepted,
+    /// No evidence-backed label (in flight, blocked, never shipped, ...).
+    Unlabelled,
+}
+
+/// Why the active artifact is to be rolled back.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RollbackReason {
+    /// Any routed run was reverted or had a regression confirmed.
+    Regressed { runs: usize },
+    /// With at least [`MIN_ROUTED_RUNS`] labelled runs, even the upper end
+    /// of the one-sided 95% interval of their acceptance is under the
+    /// quality floor the artifact's evaluation used.
+    AcceptanceBelowFloor {
+        accepted: u64,
+        runs: u64,
+        upper: f64,
+        floor: f64,
+    },
+}
+
+impl std::fmt::Display for RollbackReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Regressed { runs } => write!(
+                f,
+                "{runs} run(s) it routed were reverted or had a regression confirmed"
+            ),
+            Self::AcceptanceBelowFloor {
+                accepted,
+                runs,
+                upper,
+                floor,
+            } => write!(
+                f,
+                "it routed {runs} run(s) and {accepted} were accepted; even the 95% upper bound \
+                 {upper:.2} is below the quality floor {floor:.2} its evaluation used"
+            ),
+        }
+    }
+}
+
+/// The rollback decision for an artifact, from how its routed runs ended.
+pub fn rollback_reason(outcomes: &[RoutedOutcome], floor: f64) -> Option<RollbackReason> {
+    let regressed = outcomes
+        .iter()
+        .filter(|outcome| **outcome == RoutedOutcome::Regressed)
+        .count();
+    if regressed > 0 {
+        return Some(RollbackReason::Regressed { runs: regressed });
+    }
+    let accepted = outcomes
+        .iter()
+        .filter(|outcome| **outcome == RoutedOutcome::Accepted)
+        .count() as u64;
+    let runs = accepted
+        + outcomes
+            .iter()
+            .filter(|outcome| **outcome == RoutedOutcome::NotAccepted)
+            .count() as u64;
+    if runs < MIN_ROUTED_RUNS {
+        return None;
+    }
+    let upper = clopper_pearson_upper(accepted, runs, ONE_SIDED_95);
+    (upper < floor).then_some(RollbackReason::AcceptanceBelowFloor {
+        accepted,
+        runs,
+        upper,
+        floor,
+    })
+}
+
+// ---------------------------------------------------------- anti-flap ----
+
+/// What a rolled-back artifact was trained on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RolledBackData {
+    pub label_policy_version: Option<u32>,
+    pub dataset_fingerprint: Option<String>,
+}
+
+/// Why a gate-passing artifact is not promoted this cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Withheld {
+    /// Its dataset and label policy match an artifact that was rolled back.
+    SameDataAsRolledBack,
+    /// Its dataset and label policy match the artifact already active: there
+    /// is nothing new to promote.
+    SameDataAsActive,
+    /// Fewer than [`MIN_RUNS_AFTER_ROLLBACK`] terminal runs since the last
+    /// rollback.
+    TooFewRunsSinceRollback { have: usize, need: usize },
+}
+
+impl std::fmt::Display for Withheld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SameDataAsRolledBack => write!(
+                f,
+                "withheld: it was trained on the same data and label policy as an artifact that \
+                 was rolled back"
+            ),
+            Self::SameDataAsActive => write!(
+                f,
+                "withheld: the active artifact was trained on the same data and label policy"
+            ),
+            Self::TooFewRunsSinceRollback { have, need } => write!(
+                f,
+                "withheld: {have} of the {need} terminal runs needed since the last rollback"
+            ),
+        }
+    }
+}
+
+/// The anti-flap rule. `runs_since_rollback` is `None` when nothing was
+/// ever rolled back.
+pub fn withheld(
+    fingerprint: &str,
+    label_policy_version: u32,
+    rolled_back: &[RolledBackData],
+    active: Option<(&str, u32)>,
+    runs_since_rollback: Option<usize>,
+) -> Option<Withheld> {
+    let same = |data: &RolledBackData| {
+        data.dataset_fingerprint.as_deref() == Some(fingerprint)
+            && data.label_policy_version == Some(label_policy_version)
+    };
+    if rolled_back.iter().any(same) {
+        return Some(Withheld::SameDataAsRolledBack);
+    }
+    if active.is_some_and(|(active_fingerprint, policy)| {
+        active_fingerprint == fingerprint && policy == label_policy_version
+    }) {
+        return Some(Withheld::SameDataAsActive);
+    }
+    match runs_since_rollback {
+        Some(have) if have < MIN_RUNS_AFTER_ROLLBACK => Some(Withheld::TooFewRunsSinceRollback {
+            have,
+            need: MIN_RUNS_AFTER_ROLLBACK,
+        }),
+        _ => None,
+    }
+}
+
+// -------------------------------------------------------------- shell ----
+
+/// Where a cycle is, for the progress line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    Build,
+    Train,
+    Evaluate,
+    Promote,
+}
+
+impl Stage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Train => "train",
+            Self::Evaluate => "evaluate",
+            Self::Promote => "promote",
+        }
+    }
+}
+
+/// Why a stage of the cycle stopped.
+#[derive(Debug)]
+pub enum CycleError {
+    Ledger(LedgerError),
+    Dataset(DatasetError),
+    Artifact(ArtifactError),
+    Io {
+        what: &'static str,
+        path: PathBuf,
+        cause: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for CycleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ledger(e) => write!(f, "{e}"),
+            Self::Dataset(e) => write!(f, "{e}"),
+            Self::Artifact(e) => write!(f, "{e}"),
+            Self::Io { what, path, cause } => write!(f, "{what} {}: {cause}", path.display()),
+        }
+    }
+}
+
+impl std::error::Error for CycleError {}
+
+impl From<LedgerError> for CycleError {
+    fn from(e: LedgerError) -> Self {
+        Self::Ledger(e)
+    }
+}
+impl From<DatasetError> for CycleError {
+    fn from(e: DatasetError) -> Self {
+        Self::Dataset(e)
+    }
+}
+impl From<ArtifactError> for CycleError {
+    fn from(e: ArtifactError) -> Self {
+        Self::Artifact(e)
+    }
+}
+
+/// The promotion gates' thresholds, machine settings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GateSettings {
+    pub quality_floor: f64,
+    pub min_supported_test_records: usize,
+    pub max_abstention_rate: f64,
+}
+
+/// Everything a cycle reads, handed in.
+pub struct CycleInputs<'a> {
+    pub ledger: &'a Ledger,
+    pub registry: &'a Registry,
+    pub repo: &'a RepoPolicy,
+    pub datasets_dir: &'a Path,
+    pub gates: GateSettings,
+    /// The `[learning]` envelope is recorded: promote on passing gates.
+    pub auto_promote: bool,
+    pub now: DateTime<Utc>,
+}
+
+/// What a cycle did, for the person and for `--json`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CycleReport {
+    pub cycle_id: i64,
+    pub action: LearningAction,
+    pub artifact_id: Option<String>,
+    pub dataset_fingerprint: Option<String>,
+    pub label_policy_version: Option<u32>,
+    pub examples_by_class: BTreeMap<String, u64>,
+    pub examples_by_source: BTreeMap<String, u64>,
+    pub cohorts: Vec<String>,
+    pub verdict: Option<LearningVerdict>,
+    /// Cycles left unfinished by a dead process and closed now.
+    pub interrupted_closed: usize,
+    pub note: Option<String>,
+    pub error: Option<String>,
+    /// The line telling the person how to promote, when the cycle stopped
+    /// at `awaiting_promotion`.
+    pub promote_hint: Option<String>,
+}
+
+/// The dataset, built the way `relais dataset build` builds it.
+pub fn build_dataset(
+    ledger: &Ledger,
+    repo: &RepoPolicy,
+) -> Result<(Dataset, BackfillReport), CycleError> {
+    let backfill = salvage::backfill(ledger)?;
+    let contract_of = |run_id: &str| -> Result<Option<dataset::ContractMaterial>, LedgerError> {
+        let run = RunId::from_stored(run_id);
+        let Some((contract, tier)) = ledger.run_contract_and_tier(&run)? else {
+            return Ok(None);
+        };
+        let objective = contract.objective.clone();
+        Ok(Some((contract, objective, tier.as_str().to_string())))
+    };
+    Ok((dataset::build(ledger, &contract_of, repo)?, backfill))
+}
+
+/// Write `dataset` to `dir/<timestamp>.json` through a temporary file and a
+/// rename: a process killed halfway leaves no partial dataset a later
+/// `train` could read.
+pub fn write_dataset(
+    dir: &Path,
+    dataset: &Dataset,
+    now: DateTime<Utc>,
+) -> Result<PathBuf, CycleError> {
+    let io = |what, path: &Path| {
+        let path = path.to_path_buf();
+        move |cause| CycleError::Io { what, path, cause }
+    };
+    std::fs::create_dir_all(dir).map_err(io("cannot create", dir))?;
+    let path = dir.join(format!("{}.json", now.format("%Y%m%dT%H%M%S")));
+    let text = serde_json::to_string_pretty(dataset).expect("a dataset is plain owned data");
+    crate::fsutil::write_atomic(&path, &text).map_err(io("cannot write", &path))?;
+    Ok(path)
+}
+
+/// Fit the artifact on `dataset` and evaluate it, as `relais train` does.
+pub fn train_artifact(
+    dataset: &Dataset,
+    artifact_id: &str,
+    gates: GateSettings,
+) -> Result<(Artifact, EvalReport), TrainError> {
+    let settings = EvalSettings {
+        artifact_id: artifact_id.to_string(),
+        solver: super::learner::SolverSettings::default(),
+        quality_floor: gates.quality_floor,
+        min_records_per_tier: evaluate::DEFAULT_MIN_RECORDS_PER_TIER,
+        min_supported_test_records: gates.min_supported_test_records,
+        max_abstention_rate: gates.max_abstention_rate,
+    };
+    let outcome = evaluate::train_and_evaluate(dataset, &settings)?;
+    let artifact = Artifact {
+        schema_version: super::registry::ARTIFACT_SCHEMA_VERSION,
+        artifact_id: artifact_id.to_string(),
+        feature_schema: super::features::FeatureSchema::standard(),
+        standardization: outcome.standardization,
+        acceptance: outcome.acceptance,
+        cost: outcome.cost,
+        tiers_supported: outcome.tiers_supported,
+        observed_identities: outcome.observed_identities,
+        cohorts: vec!["change".into(), "inspect".into()],
+        label_policy_version: dataset.label_policy_version,
+        dataset_fingerprint: dataset.fingerprint.clone(),
+        solver: settings.solver,
+        trained_at: crate::ledger::now_rfc3339(),
+        relais_version: crate::version().into(),
+        evaluation: Some(
+            serde_json::to_value(&outcome.report)
+                .expect("an EvalReport serializes: owned strings and finite f64"),
+        ),
+    };
+    Ok((artifact, outcome.report))
+}
+
+/// The id a cycle gives its candidate artifact.
+pub fn artifact_id_at(now: DateTime<Utc>) -> String {
+    format!("artifact-{}", now.format("%Y%m%dT%H%M%S"))
+}
+
+fn class_counts(dataset: &Dataset) -> BTreeMap<String, u64> {
+    let labels = dataset.acceptance_labels();
+    BTreeMap::from([
+        (
+            "accepted_without_escalation".to_string(),
+            labels.accepted_without_escalation as u64,
+        ),
+        ("other".to_string(), labels.other as u64),
+    ])
+}
+
+fn source_counts(dataset: &Dataset) -> BTreeMap<String, u64> {
+    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    for record in &dataset.records {
+        *counts
+            .entry(record.label_source.as_str().to_string())
+            .or_default() += 1;
+    }
+    counts
+}
+
+fn cohorts_covered(dataset: &Dataset) -> Vec<String> {
+    let mut cohorts: Vec<String> = dataset
+        .records
+        .iter()
+        .map(|record| record.task.cohort().to_string())
+        .collect();
+    cohorts.sort();
+    cohorts.dedup();
+    cohorts
+}
+
+/// How a run the active artifact routed ended, under the labelling policy.
+pub fn routed_outcome(ledger: &Ledger, run: &RunId) -> Result<RoutedOutcome, LedgerError> {
+    let Some(state) = ledger.run_status(run)? else {
+        return Ok(RoutedOutcome::Unlabelled);
+    };
+    let Some(task) = ledger.task_of_run(run)? else {
+        return Ok(RoutedOutcome::Unlabelled);
+    };
+    let outcome = ledger
+        .latest_outcome(&task)?
+        .map(|stored| stored.outcome.kind);
+    if matches!(
+        outcome,
+        Some(OutcomeKind::Reverted | OutcomeKind::ConfirmedRegression)
+    ) {
+        return Ok(RoutedOutcome::Regressed);
+    }
+    let decision = ledger.decision_of_run(run)?;
+    let salvage = salvage::salvage_evidence_of(decision.as_ref());
+    Ok(match dataset::labelling_of(state, outcome, salvage) {
+        Labelling::Accepted | Labelling::AcceptedViaSalvage => {
+            let approved = decision.and_then(|record| record.resolution)
+                == Some(crate::lifecycle::Reason::DecisionApproved);
+            if ledger.escalation_attempted(run)? || approved {
+                RoutedOutcome::NotAccepted
+            } else {
+                RoutedOutcome::Accepted
+            }
+        }
+        Labelling::Failed => RoutedOutcome::NotAccepted,
+        Labelling::Excluded(_) => RoutedOutcome::Unlabelled,
+    })
+}
+
+/// The quality floor an artifact's own evaluation used.
+fn evaluation_floor(artifact: &Artifact) -> Option<f64> {
+    let report: EvalReport = serde_json::from_value(artifact.evaluation.clone()?).ok()?;
+    Some(report.gates.quality_floor)
+}
+
+/// What rolling back did.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RolledBack {
+    /// The artifact that was active and no longer is.
+    pub from: String,
+    /// The artifact that is active now.
+    pub to: String,
+    pub reason: String,
+}
+
+/// Why nothing was rolled back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NothingToRollBack {
+    NoActiveArtifact,
+    /// Nothing was promoted over a predecessor, or the predecessor is
+    /// already what is active.
+    NoPreviousArtifact,
+}
+
+impl std::fmt::Display for NothingToRollBack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoActiveArtifact => write!(f, "no learned artifact is active"),
+            Self::NoPreviousArtifact => write!(
+                f,
+                "the active artifact has no previous artifact to return to"
+            ),
+        }
+    }
+}
+
+/// Roll the active task artifact back through `Registry::rollback` and
+/// record it as a `learning_cycles` row (`finished` is the row a cycle
+/// already holds, `None` inserts one). The row names the artifact rolled
+/// back FROM and the data it was trained on, which is what the anti-flap
+/// rule later compares against.
+pub fn roll_back_active(
+    ledger: &Ledger,
+    registry: &Registry,
+    source: LearningSource,
+    reason: &str,
+    open_cycle: Option<i64>,
+) -> Result<Result<RolledBack, NothingToRollBack>, CycleError> {
+    let Some(active) = registry.active()? else {
+        return Ok(Err(NothingToRollBack::NoActiveArtifact));
+    };
+    let Some(previous) = registry.previous_id()? else {
+        return Ok(Err(NothingToRollBack::NoPreviousArtifact));
+    };
+    if previous == active.artifact_id {
+        return Ok(Err(NothingToRollBack::NoPreviousArtifact));
+    }
+    let Some(restored) = registry.rollback()? else {
+        return Ok(Err(NothingToRollBack::NoPreviousArtifact));
+    };
+    let finish = LearningCycleFinish {
+        label_policy_version: Some(active.label_policy_version),
+        dataset_fingerprint: Some(active.dataset_fingerprint.clone()),
+        artifact_id: Some(active.artifact_id.clone()),
+        action: Some(LearningAction::RolledBack),
+        note: Some(format!("restored {restored}: {reason}")),
+        ..LearningCycleFinish::default()
+    };
+    match open_cycle {
+        Some(id) => {
+            ledger.finish_learning_cycle(id, &finish)?;
+        }
+        None => {
+            ledger.record_learning_rollback(source, &finish)?;
+        }
+    }
+    Ok(Ok(RolledBack {
+        from: active.artifact_id,
+        to: restored,
+        reason: reason.to_string(),
+    }))
+}
+
+/// Check the active artifact against the runs it routed; the reason to
+/// roll it back, if there is one.
+pub fn active_artifact_verdict(
+    ledger: &Ledger,
+    registry: &Registry,
+) -> Result<Option<RollbackReason>, CycleError> {
+    let Some(active) = registry.active()? else {
+        return Ok(None);
+    };
+    // With no predecessor there is nothing to return to; the evidence is
+    // not collected for a rollback that cannot happen.
+    match registry.previous_id()? {
+        Some(previous) if previous != active.artifact_id => {}
+        _ => return Ok(None),
+    }
+    let floor = evaluation_floor(&active).unwrap_or(super::evaluate::DEFAULT_QUALITY_FLOOR);
+    let mut outcomes = Vec::new();
+    for run in ledger.runs_routed_by_artifact(&active.artifact_id)? {
+        outcomes.push(routed_outcome(ledger, &run)?);
+    }
+    Ok(rollback_reason(&outcomes, floor))
+}
+
+/// Run one cycle. The caller holds the Training lease and has decided the
+/// cycle is wanted; this opens the row, closes the ones a dead process left,
+/// and never leaves its own row unfinished unless the process is killed.
+pub fn run_cycle(
+    inputs: &CycleInputs<'_>,
+    progress: &mut dyn FnMut(Stage),
+) -> Result<CycleReport, LedgerError> {
+    let ledger = inputs.ledger;
+    let cycle_id = ledger.begin_learning_cycle()?;
+    let interrupted_closed = ledger.close_unfinished_learning_cycles(cycle_id)?;
+    let mut report = CycleReport {
+        cycle_id,
+        action: LearningAction::None,
+        artifact_id: None,
+        dataset_fingerprint: None,
+        label_policy_version: None,
+        examples_by_class: BTreeMap::new(),
+        examples_by_source: BTreeMap::new(),
+        cohorts: Vec::new(),
+        verdict: None,
+        interrupted_closed,
+        note: None,
+        error: None,
+        promote_hint: None,
+    };
+    if let Err(e) = cycle_body(inputs, progress, &mut report) {
+        if let CycleError::Ledger(ledger_error) = e {
+            return Err(ledger_error);
+        }
+        report.action = LearningAction::Error;
+        report.error = Some(e.to_string());
+    }
+    ledger.finish_learning_cycle(
+        cycle_id,
+        &LearningCycleFinish {
+            label_policy_version: report.label_policy_version,
+            dataset_fingerprint: report.dataset_fingerprint.clone(),
+            examples_by_class: report.examples_by_class.clone(),
+            examples_by_source: report.examples_by_source.clone(),
+            cohorts: report.cohorts.clone(),
+            artifact_id: report.artifact_id.clone(),
+            evaluate: report.verdict.clone(),
+            action: Some(report.action),
+            error: report.error.clone(),
+            note: report.note.clone(),
+        },
+    )?;
+    // Retention is housekeeping after the row is closed: failing at it is
+    // worth saying, not worth losing the cycle's record over.
+    if let Err(e) = retain(inputs.datasets_dir, inputs.registry) {
+        report.note = Some(match report.note.take() {
+            Some(note) => format!("{note}; retention: {e}"),
+            None => format!("retention: {e}"),
+        });
+    }
+    Ok(report)
+}
+
+fn cycle_body(
+    inputs: &CycleInputs<'_>,
+    progress: &mut dyn FnMut(Stage),
+    report: &mut CycleReport,
+) -> Result<(), CycleError> {
+    let ledger = inputs.ledger;
+    let registry = inputs.registry;
+
+    // The active artifact is judged first: a regression is acted on before
+    // anything new is trained over it.
+    if let Some(reason) = active_artifact_verdict(ledger, registry)? {
+        match roll_back_active(
+            ledger,
+            registry,
+            LearningSource::Cycle,
+            &reason.to_string(),
+            Some(report.cycle_id),
+        )? {
+            Ok(rolled) => {
+                report.action = LearningAction::RolledBack;
+                report.artifact_id = Some(rolled.from.clone());
+                report.note = Some(format!(
+                    "rolled back {} to {}: {}",
+                    rolled.from, rolled.to, rolled.reason
+                ));
+                // The row is already finished by the rollback; the caller's
+                // finish is then a no-op on a closed row.
+                return Ok(());
+            }
+            Err(nothing) => {
+                report.note = Some(format!("rollback wanted ({reason}) but {nothing}"));
+            }
+        }
+    }
+
+    progress(Stage::Build);
+    let (dataset, backfill) = build_dataset(ledger, inputs.repo)?;
+    let dataset_path = write_dataset(inputs.datasets_dir, &dataset, inputs.now)?;
+    report.dataset_fingerprint = Some(dataset.fingerprint.clone());
+    report.label_policy_version = Some(dataset.label_policy_version);
+    report.examples_by_class = class_counts(&dataset);
+    report.examples_by_source = source_counts(&dataset);
+    report.cohorts = cohorts_covered(&dataset);
+    let salvage_note = format!(
+        "{} excluded; salvage containment: {} computed, {} unreachable (dataset {})",
+        dataset.exclusions.len(),
+        backfill.recorded,
+        backfill.unreachable,
+        dataset_path.display()
+    );
+
+    progress(Stage::Train);
+    let artifact_id = artifact_id_at(inputs.now);
+    let (artifact, eval_report) = match train_artifact(&dataset, &artifact_id, inputs.gates) {
+        Ok(trained) => trained,
+        // Nothing to learn from yet is a result, not a failure.
+        Err(e @ (TrainError::NoTrainingRecords { .. } | TrainError::NoTierCoverage { .. })) => {
+            progress(Stage::Evaluate);
+            report.verdict = Some(LearningVerdict {
+                passed: false,
+                failed_gates: vec![e.to_string()],
+            });
+            report.note = Some(salvage_note);
+            return Ok(());
+        }
+        Err(e) => {
+            report.error = Some(e.to_string());
+            report.action = LearningAction::Error;
+            report.note = Some(salvage_note);
+            return Ok(());
+        }
+    };
+    registry.store(&artifact)?;
+    report.artifact_id = Some(artifact_id.clone());
+
+    progress(Stage::Evaluate);
+    let failures = eval_report.gates.failures();
+    report.verdict = Some(LearningVerdict {
+        passed: failures.is_empty(),
+        failed_gates: failures.iter().map(ToString::to_string).collect(),
+    });
+    if !failures.is_empty() {
+        report.note = Some(salvage_note);
+        return Ok(());
+    }
+    progress(Stage::Promote);
+    promote_candidate(inputs, report, &artifact_id, &salvage_note)
+}
+
+/// The last step: a stored artifact whose evidence is checked by
+/// `Registry::evaluated` (every gate recomputed from its report) is promoted
+/// through `Registry::promote` only when the `[learning]` envelope is
+/// recorded and the anti-flap rule allows it. Otherwise it waits.
+pub fn promote_candidate(
+    inputs: &CycleInputs<'_>,
+    report: &mut CycleReport,
+    artifact_id: &str,
+    note: &str,
+) -> Result<(), CycleError> {
+    let ledger = inputs.ledger;
+    let registry = inputs.registry;
+    let evaluated = registry.evaluated(artifact_id)?;
+    let candidate = evaluated.artifact();
+    let rollbacks = ledger.learning_rollbacks()?;
+    let rolled_back: Vec<RolledBackData> = rollbacks
+        .iter()
+        .map(|row| RolledBackData {
+            label_policy_version: row.label_policy_version,
+            dataset_fingerprint: row.dataset_fingerprint.clone(),
+        })
+        .collect();
+    let runs_since_rollback = match rollbacks.first() {
+        Some(last) => Some(
+            ledger
+                .terminal_root_runs_since(last.ended_at.as_deref().unwrap_or(&last.started_at))?,
+        ),
+        None => None,
+    };
+    let active = registry.active()?;
+    let active_data = active
+        .as_ref()
+        .map(|a| (a.dataset_fingerprint.as_str(), a.label_policy_version));
+    if let Some(why) = withheld(
+        &candidate.dataset_fingerprint,
+        candidate.label_policy_version,
+        &rolled_back,
+        active_data,
+        runs_since_rollback,
+    ) {
+        report.note = Some(format!("{why}; {note}"));
+        return Ok(());
+    }
+    if inputs.auto_promote {
+        registry.promote(&evaluated)?;
+        report.action = LearningAction::Promoted;
+        report.note = Some(format!("promoted {artifact_id}; {note}"));
+    } else {
+        report.action = LearningAction::AwaitingPromotion;
+        report.promote_hint = Some(format!("relais promote {artifact_id}"));
+        report.note = Some(note.to_string());
+    }
+    Ok(())
+}
+
+/// Keep the [`KEEP_DATASETS`] newest datasets, and every artifact the
+/// registry points at plus the [`KEEP_ARTIFACTS`] newest.
+pub fn retain(datasets_dir: &Path, registry: &Registry) -> Result<(), CycleError> {
+    let io = |what, path: &Path| {
+        let path = path.to_path_buf();
+        move |cause| CycleError::Io { what, path, cause }
+    };
+    if let Ok(entries) = std::fs::read_dir(datasets_dir) {
+        let mut datasets: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension().is_some_and(|ext| ext == "json")
+                    && !path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+            })
+            .collect();
+        datasets.sort();
+        let excess = datasets.len().saturating_sub(KEEP_DATASETS);
+        for old in datasets.into_iter().take(excess) {
+            std::fs::remove_file(&old).map_err(io("cannot remove", &old))?;
+        }
+    }
+    let mut ids = registry.list();
+    ids.sort();
+    let excess = ids.len().saturating_sub(KEEP_ARTIFACTS);
+    for old in ids.into_iter().take(excess) {
+        // Refuses the ids the registry still points at.
+        registry.remove_unreferenced(&old)?;
+    }
+    Ok(())
+}

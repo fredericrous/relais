@@ -31,6 +31,13 @@
 //! | 17 | `PromotionRefused` | `recipe promote` refused: the comparison does not clear every gate; nothing was written |
 //! | 18 | `StaleGrantKey` | `trust grant` refused: the key given is not this policy's; `relais trust show` prints the current one |
 //! | 19 | `NothingDetected` | `init --detect` found no verification command and none was typed; nothing was written |
+//! | 20 | `TrainingLeaseHeld` | `learn cycle`: another cycle holds the Training lease; the message names its pid and start time |
+//!
+//! `learn cycle` also ends 0 where it did nothing wrong and nothing was
+//! asked of the person: `deferred` (agents of other sessions are active and
+//! `training_when_idle` is set), `not due` (`--if-due`), and
+//! `awaiting_promotion` (an artifact passed its gates and waits for `relais
+//! promote`).
 //!
 //! The session-router commands (`native router-state`, `router-observe`,
 //! `router-envelope`) use 0, 1 and 2 only: 2 is a bad payload or
@@ -234,6 +241,19 @@ enum Command {
     /// Atomically activate an evaluated artifact; the previous artifact
     /// stays available for rollback (SPEC §17)
     Promote { artifact_id: String },
+    /// The learning loop: a cycle that builds, trains, evaluates and (inside
+    /// the `[learning]` envelope) promotes; and its last result (SPEC §17)
+    Learn {
+        #[command(subcommand)]
+        cmd: LearnCommand,
+    },
+    /// Return to the previous task artifact; the person's own rollback,
+    /// recorded as a learning cycle row with source `person` (SPEC §17)
+    Rollback {
+        /// Print the result as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Record a final outcome for an accepted candidate (SPEC §20)
     Feedback {
         /// The run whose accepted candidate this is about; omit with
@@ -406,6 +426,35 @@ enum CoordinatorCommand {
 }
 
 #[derive(Subcommand)]
+enum LearnCommand {
+    /// Build the dataset, train, evaluate and promote when allowed. Takes
+    /// the Training lease without queueing: a second cycle exits 20.
+    /// Not idle (`training_when_idle`) exits 0 as `deferred`
+    Cycle {
+        /// Do nothing (exit 0, one line) when the last cycle started less
+        /// than 20 hours ago or no run reached a terminal state since it
+        #[arg(long = "if-due")]
+        if_due: bool,
+        /// Print the cycle as JSON
+        #[arg(long)]
+        json: bool,
+        /// Append output to this file (created 0600, rotated at 1 MiB with
+        /// one old file kept) instead of stdout and stderr
+        #[arg(long)]
+        log: Option<PathBuf>,
+        /// No progress lines on stderr
+        #[arg(short, long)]
+        quiet: bool,
+    },
+    /// The most recent learning cycle row, read without migrating the ledger
+    Last {
+        /// Print the row as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum DatasetCommand {
     /// Snapshot a versioned dataset from the ledger (SPEC §17)
     Build,
@@ -543,6 +592,23 @@ enum NativeCommand {
         epsilon_max: Option<f64>,
         /// Turn routing off: remove the envelope, and keep `relais install`
         /// from recording it again
+        #[arg(long)]
+        off: bool,
+        /// `plugin-ask` when the plugin asked the person
+        #[arg(long, value_enum)]
+        source: Option<RouterSource>,
+    },
+    /// Record the person's automatic-promotion grant in machine.toml
+    /// (`[learning] auto_promote`, SPEC §17), or with `--off` remove it and
+    /// record that promotion is off. Run by the plugin after its own
+    /// question; typed in a shell it is recorded as unattributed
+    #[command(name = "learning-envelope")]
+    LearningEnvelope {
+        /// Who granted it (or turned automatic promotion off)
+        #[arg(long)]
+        by: String,
+        /// Turn automatic promotion off and keep the installer from
+        /// recording it again
         #[arg(long)]
         off: bool,
         /// `plugin-ask` when the plugin asked the person
@@ -761,6 +827,8 @@ enum CliOutcome {
     StaleGrantKey,
     /// `init --detect` found no verification command and none was typed.
     NothingDetected,
+    /// `learn cycle`: another cycle holds the Training lease.
+    TrainingLeaseHeld,
 }
 
 /// The one exit-code table. Pure, total, and exhaustive over
@@ -789,6 +857,7 @@ const fn exit_code(outcome: &CliOutcome) -> i32 {
         CliOutcome::PromotionRefused => 17,
         CliOutcome::StaleGrantKey => 18,
         CliOutcome::NothingDetected => 19,
+        CliOutcome::TrainingLeaseHeld => 20,
     }
 }
 
@@ -1170,6 +1239,16 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
         Command::Train => train_command(),
         Command::Evaluate { artifact } => evaluate_command(&artifact),
         Command::Promote { artifact_id } => promote_command(&artifact_id),
+        Command::Learn { cmd } => match cmd {
+            LearnCommand::Cycle {
+                if_due,
+                json,
+                log,
+                quiet,
+            } => learn_cycle_command(if_due, json, log.as_deref(), quiet),
+            LearnCommand::Last { json } => learn_last_command(json),
+        },
+        Command::Rollback { json } => rollback_command(json),
         Command::Feedback {
             run_id,
             task,
@@ -1363,6 +1442,7 @@ fn install_command(write: bool, user: bool, targets: Targets) -> Result<CliOutco
     let outcome = render_install("install", &request, &report, &plugin);
     if request.mode == Mode::Apply && plugin.failure.is_none() {
         install_routing_envelope();
+        install_learning_envelope();
     }
     match targets {
         Targets::OwnedFiles => Ok(outcome),
@@ -1411,6 +1491,28 @@ fn install_routing_envelope() {
         }
         Ok(false) => {}
         Err(e) => eprintln!("relais install: session routing not recorded: {e}"),
+    }
+}
+
+/// Installing the plugin is also the person's authorization for automatic
+/// promotion of a task artifact that passed every gate (relais ADR-0003):
+/// record the grant when machine.toml has neither one nor an `off`
+/// tombstone, and say how to turn it off. A failure is said and does not
+/// fail the install: the cycle then stops at `awaiting_promotion`.
+fn install_learning_envelope() {
+    let Ok(machine_path) = paths::machine_settings_path() else {
+        eprintln!("relais install: automatic promotion not recorded: no config directory");
+        return;
+    };
+    let grant = relais::policy::AutoPromote {
+        granted_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        by: "relais install".to_string(),
+        source: relais::router::Source::Install.as_str().to_string(),
+    };
+    match relais::learn::envelope::write_auto_promote_if_absent(&machine_path, &grant) {
+        Ok(true) => println!("automatic promotion is on; turn it off with /relais-learning off"),
+        Ok(false) => {}
+        Err(e) => eprintln!("relais install: automatic promotion not recorded: {e}"),
     }
 }
 
@@ -1982,6 +2084,387 @@ fn promote_command(artifact_id: &str) -> Result<CliOutcome, CliError> {
             Ok(CliOutcome::OperationalFailure)
         }
     }
+}
+
+/// Where a learning cycle's lines go: stdout and stderr, or, with `--log`,
+/// one append-only file relais opens itself (0600, rotated at 1 MiB, one old
+/// file kept). `-q` silences progress lines only.
+struct CycleOut {
+    log: Option<relais::learn::cycle::CycleLog>,
+    quiet: bool,
+}
+
+impl CycleOut {
+    fn open(log: Option<&Path>, quiet: bool) -> Result<Self, CliError> {
+        let log = match log {
+            Some(path) => Some(relais::learn::cycle::CycleLog::open(path).map_err(|cause| {
+                CliError::Read {
+                    what: "the learning cycle log",
+                    path: path.to_path_buf(),
+                    cause,
+                }
+            })?),
+            None => None,
+        };
+        Ok(Self { log, quiet })
+    }
+
+    /// A result line: stdout.
+    fn say(&mut self, line: &str) {
+        match &mut self.log {
+            Some(log) => log.line(line),
+            None => println!("{line}"),
+        }
+    }
+
+    /// A diagnostic: stderr.
+    fn complain(&mut self, line: &str) {
+        match &mut self.log {
+            Some(log) => log.line(line),
+            None => eprintln!("{line}"),
+        }
+    }
+
+    /// One stage's progress line: stderr, unless `-q`.
+    fn progress(&mut self, line: &str) {
+        if !self.quiet {
+            self.complain(line);
+        }
+    }
+}
+
+/// The Training lease, released when this drops. The coordinator also frees
+/// it when this process is gone (pid liveness), so a crash leaves nothing.
+struct TrainingGuard {
+    client: relais::coordinator::Client,
+    lease: relais::coordinator::TrainingLease,
+}
+
+impl Drop for TrainingGuard {
+    fn drop(&mut self) {
+        if let Err(e) = self.client.end_training(&self.lease) {
+            eprintln!("relais learn cycle: the Training lease was not released ({e}); it expires with this process");
+        }
+    }
+}
+
+/// `relais learn cycle [--if-due] [--json] [--log <path>] [-q]` (SPEC §17).
+///
+/// Order matters: the Training lease comes first, before the due check and
+/// before the cycle's row exists, so concurrent session starts cannot both
+/// pass a 20-hour check.
+fn learn_cycle_command(
+    if_due: bool,
+    json: bool,
+    log: Option<&Path>,
+    quiet: bool,
+) -> Result<CliOutcome, CliError> {
+    use relais::admission::TrainingDecision;
+    let mut out = CycleOut::open(log, quiet)?;
+    let ledger = open_ledger()?;
+    let machine = load_machine()?;
+    let socket = relais::coordinator::socket_path().map_err(CliError::Home)?;
+    let client = match relais::coordinator::ensure_running(&socket) {
+        Ok(client) => client,
+        Err(e) => {
+            out.complain(&format!("relais learn cycle: {e}"));
+            return Ok(CliOutcome::OperationalFailure);
+        }
+    };
+    let session = relais::coordinator::resolve_session();
+    let started_at = relais::ledger::now_rfc3339();
+    let lease = match client.acquire_training(&session.id, std::process::id(), &started_at) {
+        Ok(lease) => lease,
+        Err(e) => {
+            out.complain(&format!("relais learn cycle: {e}"));
+            return Ok(CliOutcome::OperationalFailure);
+        }
+    };
+    let due = |ledger: &Ledger| -> Result<relais::learn::cycle::Due, CliError> {
+        let last = operational(ledger.last_cycle_started(), "learn cycle")?;
+        let terminal = match &last {
+            Some(row) => operational(
+                ledger.terminal_root_runs_since(&row.started_at),
+                "learn cycle",
+            )?,
+            None => 0,
+        };
+        Ok(relais::learn::cycle::due(
+            last.as_ref().map(|row| row.started_at.as_str()),
+            terminal,
+            chrono::Utc::now(),
+        ))
+    };
+    match lease.decision.clone() {
+        TrainingDecision::Granted => {}
+        TrainingDecision::Busy { holder } => {
+            let who = match holder {
+                Some(holder) => format!(
+                    "pid {}, started {}",
+                    holder
+                        .pid
+                        .map_or_else(|| "unknown".to_string(), |pid| pid.to_string()),
+                    if holder.started_at.is_empty() {
+                        "at an unrecorded time"
+                    } else {
+                        &holder.started_at
+                    }
+                ),
+                None => "its holder is not recorded".to_string(),
+            };
+            out.complain(&format!(
+                "relais learn cycle: another learning cycle holds the Training lease ({who}); \
+                 not queued"
+            ));
+            return Ok(CliOutcome::TrainingLeaseHeld);
+        }
+        TrainingDecision::NotIdle { agents } => {
+            // A cycle that is not due has nothing to defer.
+            if if_due {
+                if let Some(line) = due(&ledger)?.line() {
+                    out.say(&line);
+                    return Ok(CliOutcome::Accepted);
+                }
+            }
+            let line = format!("deferred: not idle ({agents} agents active)");
+            if let Some(log) = &mut out.log {
+                log.line(&format!(
+                    "{} deferred {agents}",
+                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                ));
+            }
+            println!("{line}");
+            return Ok(CliOutcome::Accepted);
+        }
+        TrainingDecision::Refused { code, detail } => {
+            out.complain(&format!(
+                "relais learn cycle: the coordinator refused the Training lease ({}): {detail}",
+                code.as_str()
+            ));
+            return Ok(CliOutcome::OperationalFailure);
+        }
+    }
+    let _guard = TrainingGuard { client, lease };
+    if if_due {
+        if let Some(line) = due(&ledger)?.line() {
+            out.say(&line);
+            return Ok(CliOutcome::Accepted);
+        }
+    }
+    let repo = match load_repo_policy() {
+        Ok((_, repo)) => repo,
+        // A cycle started from a directory with no relais.toml still has a
+        // ledger to learn from; task features then read the default policy.
+        Err(_) => RepoPolicy::from_toml_str(&format!(
+            "schema_version = {}\n",
+            relais::policy::POLICY_SCHEMA_VERSION
+        ))
+        .map_err(|cause| CliError::Operational {
+            operation: "learn cycle",
+            cause: Box::new(cause),
+        })?,
+    };
+    let registry = registry()?;
+    let datasets = datasets_dir()?;
+    let inputs = relais::learn::cycle::CycleInputs {
+        ledger: &ledger,
+        registry: &registry,
+        repo: &repo,
+        datasets_dir: &datasets,
+        gates: relais::learn::cycle::GateSettings {
+            quality_floor: machine
+                .routing
+                .quality_floor
+                .unwrap_or(relais::learn::evaluate::DEFAULT_QUALITY_FLOOR),
+            min_supported_test_records: machine.routing.min_supported_test_records,
+            max_abstention_rate: machine.routing.max_abstention_rate,
+        },
+        auto_promote: machine.learning.auto_promote.is_some(),
+        now: chrono::Utc::now(),
+    };
+    let mut stage_number = 0;
+    let report = {
+        let out = &mut out;
+        operational(
+            relais::learn::cycle::run_cycle(&inputs, &mut |stage| {
+                stage_number += 1;
+                out.progress(&format!(
+                    "relais learn cycle: [{stage_number}/4] {}",
+                    stage.as_str()
+                ));
+            }),
+            "learn cycle",
+        )?
+    };
+    if json {
+        let text = operational(serde_json::to_string_pretty(&report), "rendering JSON")?;
+        out.say(&text);
+    } else {
+        out.say(&format!(
+            "learning cycle {}: {}",
+            report.cycle_id,
+            report.action.as_str()
+        ));
+        if let Some(artifact) = &report.artifact_id {
+            out.say(&format!("  artifact: {artifact}"));
+        }
+        if let Some(fingerprint) = &report.dataset_fingerprint {
+            let classes = report
+                .examples_by_class
+                .iter()
+                .map(|(class, count)| format!("{class} {count}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.say(&format!(
+                "  dataset: {} ({classes})",
+                fingerprint.get(..12).unwrap_or(fingerprint)
+            ));
+        }
+        if let Some(verdict) = &report.verdict {
+            if verdict.passed {
+                out.say("  evaluate: every gate passed");
+            } else {
+                out.say("  evaluate: gates failed");
+                for gate in &verdict.failed_gates {
+                    out.say(&format!("    {gate}"));
+                }
+            }
+        }
+        if let Some(note) = &report.note {
+            out.say(&format!("  {note}"));
+        }
+        if let Some(error) = &report.error {
+            out.complain(&format!("relais learn cycle: {error}"));
+        }
+        if let Some(hint) = &report.promote_hint {
+            out.say(&format!("  {hint}"));
+        }
+    }
+    Ok(match report.action {
+        relais::ledger::LearningAction::Error => CliOutcome::OperationalFailure,
+        _ => CliOutcome::Accepted,
+    })
+}
+
+/// `relais learn last [--json]`: the most recent `learning_cycles` row, read
+/// without creating or migrating the ledger (as `native status` reads it).
+fn learn_last_command(json: bool) -> Result<CliOutcome, CliError> {
+    let path = paths::ledger_path().map_err(CliError::Home)?;
+    let last = if path.is_file() {
+        match Ledger::open_read_only(&path).and_then(|ledger| ledger.last_learning_cycle()) {
+            Ok(last) => last,
+            Err(e) => {
+                eprintln!("relais learn last: {e}");
+                return Ok(CliOutcome::OperationalFailure);
+            }
+        }
+    } else {
+        None
+    };
+    if json {
+        print_document(&serde_json::json!({ "schema": 1, "last": last }))?;
+    } else {
+        match last {
+            Some(row) => println!(
+                "{} {}{}",
+                row.started_at,
+                row.action.as_str(),
+                row.artifact_id
+                    .map(|id| format!(" {id}"))
+                    .unwrap_or_default()
+            ),
+            None => println!("no learning cycle has run yet"),
+        }
+    }
+    Ok(CliOutcome::Accepted)
+}
+
+/// `relais rollback [--json]`: the previous task artifact becomes active,
+/// recorded as a `learning_cycles` row from a person.
+fn rollback_command(json: bool) -> Result<CliOutcome, CliError> {
+    let reg = registry()?;
+    let ledger = open_ledger()?;
+    let result = operational(
+        relais::learn::cycle::roll_back_active(
+            &ledger,
+            &reg,
+            relais::ledger::LearningSource::Person,
+            "rolled back by a person",
+            None,
+        ),
+        "rollback",
+    )?;
+    match result {
+        Ok(rolled) => {
+            if json {
+                print_document(&serde_json::json!({ "schema": 1, "rolled_back": rolled }))?;
+            } else {
+                println!("rolled back {} to {}", rolled.from, rolled.to);
+            }
+            Ok(CliOutcome::Accepted)
+        }
+        Err(nothing) => {
+            if json {
+                print_document(
+                    &serde_json::json!({ "schema": 1, "rolled_back": null, "reason": nothing.to_string() }),
+                )?;
+            } else {
+                eprintln!("relais rollback: {nothing}");
+            }
+            Ok(CliOutcome::Blocked)
+        }
+    }
+}
+
+/// `relais native learning-envelope`: the automatic-promotion grant in
+/// machine.toml (the same locked, comment-keeping writer as the routing
+/// envelope).
+fn learning_envelope_command(
+    by: &str,
+    source: relais::router::Source,
+) -> Result<CliOutcome, CliError> {
+    if by.trim().is_empty() {
+        eprintln!("relais native learning-envelope: --by is empty; name who granted it");
+        return Ok(CliOutcome::InvalidInput);
+    }
+    let machine_path = paths::machine_settings_path().map_err(CliError::Home)?;
+    let grant = relais::policy::AutoPromote {
+        granted_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        by: by.to_string(),
+        source: source.as_str().to_string(),
+    };
+    if let Err(e) = relais::learn::envelope::write_auto_promote(&machine_path, &grant) {
+        eprintln!("relais native learning-envelope: {e}");
+        return Ok(CliOutcome::OperationalFailure);
+    }
+    print_document(&serde_json::json!({ "schema": 1, "auto_promote": grant }))?;
+    Ok(CliOutcome::Accepted)
+}
+
+/// `relais native learning-envelope --off`: the grant removed and the
+/// `off` tombstone recorded.
+fn learning_off_command(by: &str, source: relais::router::Source) -> Result<CliOutcome, CliError> {
+    if by.trim().is_empty() {
+        eprintln!("relais native learning-envelope: --by is empty; name who turned it off");
+        return Ok(CliOutcome::InvalidInput);
+    }
+    let machine_path = paths::machine_settings_path().map_err(CliError::Home)?;
+    let off = relais::policy::AutoPromoteOff {
+        at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        by: by.to_string(),
+        source: source.as_str().to_string(),
+    };
+    let had_grant = match relais::learn::envelope::write_off(&machine_path, &off) {
+        Ok(had) => had,
+        Err(e) => {
+            eprintln!("relais native learning-envelope: {e}");
+            return Ok(CliOutcome::OperationalFailure);
+        }
+    };
+    print_document(
+        &serde_json::json!({ "schema": 1, "auto_promote": null, "off": off, "removed": had_grant }),
+    )?;
+    Ok(CliOutcome::Accepted)
 }
 
 /// `coordinator status --json`, in every state. A typed document, never a
@@ -3312,6 +3795,14 @@ fn native_command(cmd: NativeCommand) -> Result<CliOutcome, CliError> {
             source,
             ..
         } => router_envelope_command(&by, epsilon_max.unwrap_or(f64::NAN), router_source(source)),
+        NativeCommand::LearningEnvelope {
+            by,
+            off: true,
+            source,
+        } => learning_off_command(&by, router_source(source)),
+        NativeCommand::LearningEnvelope { by, source, .. } => {
+            learning_envelope_command(&by, router_source(source))
+        }
         NativeCommand::Hello { session } => {
             let socket = relais::coordinator::socket_path().map_err(CliError::Home)?;
             // The first call of a session may find no daemon: start one, as
@@ -5365,6 +5856,14 @@ fn report_command(
         relais::router::report_section(&ledger, &since, &load_price_table()?),
         "the session-routing section",
     )?;
+    // Best-effort: a registry that will not open reads as no active artifact.
+    let registry_for_report = paths::registry_dir()
+        .ok()
+        .and_then(|dir| relais::learn::registry::Registry::open(&dir).ok());
+    report.learning = Some(operational(
+        relais::learn::summary::learning_report(&ledger, registry_for_report.as_ref()),
+        "the learning section",
+    )?);
     report.orchestration.unattributable = not_imported.unattributable;
     report.orchestration.transcript_missing = not_imported.transcript_missing;
     // Best-effort: a report is still a report with no coordinator

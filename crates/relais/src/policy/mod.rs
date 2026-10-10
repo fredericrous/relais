@@ -645,6 +645,11 @@ pub enum PolicyError {
         field: &'static str,
         detail: String,
     },
+    /// A `[learning]` value that names nobody.
+    InvalidLearning {
+        field: &'static str,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for PolicyError {
@@ -668,6 +673,9 @@ impl std::fmt::Display for PolicyError {
             Self::InvalidRecipe(err) => write!(f, "{err}"),
             Self::InvalidSessionRouting { field, detail } => {
                 write!(f, "[session_routing] {field}: {detail}")
+            }
+            Self::InvalidLearning { field, detail } => {
+                write!(f, "[learning] {field}: {detail}")
             }
         }
     }
@@ -733,6 +741,63 @@ pub struct MachineSettings {
     /// unchanged; with no `envelope` the router only observes (`shadow`).
     #[serde(default)]
     pub session_routing: SessionRoutingSettings,
+    /// `[learning]`: whether the learning cycle may promote a task
+    /// artifact that passed every gate (SPEC §17, relais ADR-0003).
+    /// Machine-owned: a repository can neither grant nor widen it. With no
+    /// `auto_promote` the cycle stops at `awaiting_promotion`.
+    #[serde(default)]
+    pub learning: LearningSettings,
+}
+
+/// `[learning]` in machine.toml. Only `auto_promote` is authority, and
+/// only the plugin installer and `relais native learning-envelope` write
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LearningSettings {
+    /// What the person granted once: a gate-passing task artifact is
+    /// promoted by the cycle itself, and rolled back by it on evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_promote: Option<AutoPromote>,
+    /// The person turned automatic promotion off: a tombstone that keeps
+    /// the installer from recording it again. Recording the grant
+    /// removes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub off: Option<AutoPromoteOff>,
+}
+
+impl LearningSettings {
+    fn validate(&self) -> Result<(), PolicyError> {
+        if let Some(grant) = &self.auto_promote {
+            if grant.by.trim().is_empty() {
+                return Err(PolicyError::InvalidLearning {
+                    field: "auto_promote.by",
+                    detail: "names nobody".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `[learning] auto_promote = { granted_at, by, source }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoPromote {
+    pub granted_at: String,
+    pub by: String,
+    /// `install`, `plugin-ask`, or `cli (unattributed)`.
+    pub source: String,
+}
+
+/// `[learning] off = { at, by, source }`: automatic promotion was turned
+/// off and stays off until a grant is recorded again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoPromoteOff {
+    pub at: String,
+    pub by: String,
+    pub source: String,
 }
 
 /// `[session_routing]` in machine.toml (SPEC §30). Only `envelope` is
@@ -1369,6 +1434,7 @@ impl MachineSettings {
             grant.validate(key)?;
         }
         self.session_routing.validate()?;
+        self.learning.validate()?;
         Ok(())
     }
 }
