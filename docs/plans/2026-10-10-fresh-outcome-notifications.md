@@ -101,9 +101,15 @@ Intended outcome: a message announcing a state that waits on a person (`needs_de
 | Live ledger, read-only, incident run `run-65d6671dde41e-6d1a` | `outcome` needs_decision, `current.state` accepted, resolution set | `needs_decision`; `accepted`, `decision_approved` at 2026-10-09T11:34:19 |
 | Latency, 20 calls on the live ledger (debug build, machine under `make check`) | under 300 ms | p50 47 ms, max 68 ms |
 | Same, on a copy of the live ledger with a writer committing every 20 ms | under 300 ms, `current` present | p50 49 ms, max 56 ms, `current` 20/20 |
-| Plugin `outcome.test.ts`: incident (code and no code), recheck, still open byte for byte, 3 fail-open cases, `current` missing once, 3 not-awaiting outcomes, retry | per plan | pass; 150/150 in the kit |
+| Plugin `outcome.test.ts`: incident (code and no code), recheck, still open byte for byte, 3 fail-open cases, `current` missing once, 3 not-awaiting outcomes, retry | per plan | pass; 153/153 in the kit after the review fixes |
 | Falsification: `freshen` short-circuited | the new tests fail | 9 fail |
 | v0.11.2 pending-submit test | pass | pass |
 | `make check` (fmt, clippy, module cycles, cargo test, MSRV 1.88, audit, plugin) | green | green: tests and lint in one run; msrv, audit, plugin and lint re-run on the final tree after the first run hit a full disk |
+
+## Implementation review
+
+- **Approve** after three passes (63k tokens, 60 s; 69k, 21 s; 72k, 14 s); status stays `active`: Phase 3 (release v0.11.3, live observation) is next.
+- Round 1, approve-with-changes, 3 findings fixed in `dc5b393`: one pane note per outcome across retries; a status reply of another shape fails open; the plan body marks the replaced hook design.
+- Delta, approve-with-changes, 1 low fixed in `82d0e0f`: the failed and answered notes are tracked apart. Final round: approve, no findings.
 
 <!-- panel: repos=relais adds= reviewers=backend,lang:rust,tui,unix body-sha=163b82211d32 -->
