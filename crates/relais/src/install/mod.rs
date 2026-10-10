@@ -228,7 +228,7 @@ fn agent_research() -> String {
     let body = r#"---
 name: relais-research
 description: Read-only investigation worker (relais advisory default). Facts and evidence, never edits.
-tools: Read, Grep, Glob
+tools: Read, Grep, Glob, LSP
 model: haiku
 ---
 
@@ -243,6 +243,11 @@ You have no write tools. You never guess a decision; if an architectural
 answer is required, say that a decision is needed instead of inventing
 one. These are advisory defaults: the relais runner, not this
 definition, owns the model, budget and acceptance for supervised work.
+
+Find and follow code with LSP where it answers (workspaceSymbol,
+goToDefinition, findReferences, incomingCalls), and Read only the
+range it points to; grep and whole-file Reads are for text LSP cannot
+see (comments, strings, config).
 "#;
     body.trim_end().to_string()
 }
@@ -251,7 +256,7 @@ fn agent_implementation() -> String {
     let body = r#"---
 name: relais-implementation
 description: Implementation worker (relais advisory default) for bounded changes under a task contract.
-tools: Read, Grep, Glob, Edit, Write, Bash
+tools: Read, Grep, Glob, LSP, Edit, Write, Bash
 model: sonnet
 ---
 
@@ -269,6 +274,11 @@ parent delegates a bounded change:
 
 These are advisory defaults: the relais runner, not this definition,
 owns the model, budget and acceptance for supervised work.
+
+Find and follow code with LSP where it answers (workspaceSymbol,
+goToDefinition, findReferences, incomingCalls), and Read only the
+range it points to; grep and whole-file Reads are for text LSP cannot
+see (comments, strings, config).
 "#;
     body.trim_end().to_string()
 }
@@ -277,7 +287,7 @@ fn agent_review() -> String {
     let body = r#"---
 name: relais-review
 description: Semantic reviewer (relais advisory default). Reports findings; cannot edit or waive anything.
-tools: Read, Grep, Glob
+tools: Read, Grep, Glob, LSP
 model: fable
 ---
 
@@ -288,6 +298,11 @@ evidence, and a suggested verification. If there are no findings, say
 "FINDINGS: none". You cannot edit files and you cannot waive checks.
 Lack of findings is evidence, not proof. These are advisory defaults:
 the relais runner owns acceptance.
+
+Find and follow code with LSP where it answers (workspaceSymbol,
+goToDefinition, findReferences, incomingCalls), and Read only the
+range it points to; grep and whole-file Reads are for text LSP cannot
+see (comments, strings, config).
 "#;
     body.trim_end().to_string()
 }
