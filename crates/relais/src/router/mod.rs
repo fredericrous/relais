@@ -12,6 +12,7 @@
 //! `holdout`, `stats`, `wire`, `pins`, `state`, `report`). R1 has no
 //! learner: `adjustments` is always empty.
 
+pub mod explore;
 pub mod gate;
 pub mod holdout;
 pub mod mode;
@@ -187,6 +188,41 @@ fn completed_task_tokens(path: &Path) -> Vec<(String, u8, u64)> {
     }
 }
 
+/// Whether the exploration stop rule holds: read only when the ledger
+/// already exists and an epsilon is in force. When it fires, the stop and
+/// the counts it saw are recorded. A ledger that cannot be read or written
+/// is said and the rule does not stop (it errs toward the envelope's rate,
+/// which the person set).
+fn exploration_stopped(path: &Path, epsilon_in_force: bool) -> bool {
+    if !epsilon_in_force || !path.exists() {
+        return false;
+    }
+    let run = || -> Result<bool, LedgerError> {
+        let ledger = Ledger::open(path)?;
+        let strata = explore::strata(&ledger.router_exploration_tasks()?);
+        let check = explore::stop_check(&strata);
+        if check.stop {
+            ledger.record_router_exploration_stop(&crate::ledger::RouterExplorationStop {
+                at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                drawn: check.drawn,
+                drawn_bad: check.drawn_bad,
+                undrawn: check.undrawn,
+                undrawn_bad: check.undrawn_bad,
+            })?;
+        }
+        Ok(check.stop)
+    };
+    match run() {
+        Ok(stopped) => stopped,
+        Err(e) => {
+            eprintln!(
+                "relais native router-state: warning: the ledger could not be read ({e}); exploration stop rule not applied"
+            );
+            false
+        }
+    }
+}
+
 /// `relais native router-state --session <id>`, run in `cwd`.
 pub fn router_state(session: &str, cwd: &Path) -> Result<state::RouterState, StateError> {
     let machine_path = crate::paths::machine_settings_path().map_err(StateError::Home)?;
@@ -204,6 +240,10 @@ pub fn router_state(session: &str, cwd: &Path) -> Result<state::RouterState, Sta
         env_mode: env_mode.as_deref(),
         completed_task_tokens,
         definition_pins: definition_pins(&dirs),
+        exploration_stopped: exploration_stopped(
+            &ledger_path,
+            machine.session_routing.effective_epsilon() > 0.0,
+        ),
     }))
 }
 
@@ -347,7 +387,16 @@ pub fn report_section(
         return Ok(None);
     }
     let pricing = pricing.clone().with_built_in_defaults();
-    Ok(Some(report::session_routing(&window, &pricing)))
+    let exploration = report::exploration(
+        &ledger.router_exploration_tasks()?,
+        ledger.router_exploration_stops()?.pop(),
+        chrono::Utc::now(),
+    );
+    Ok(Some(report::session_routing(
+        &window,
+        &pricing,
+        exploration,
+    )))
 }
 
 #[cfg(test)]

@@ -236,6 +236,7 @@ async function pin(fx: Fx, store: Store, e: any, remainingMs: number) {
     lastModel: r.lastModel,
     contextTokens: r.lastContext,
     newTaskId: `task-${now}-${++r.seq}`,
+    session: r.session,
     now,
   })
   if (out.ended) detach(endTask(fx, store, out.ended, now))

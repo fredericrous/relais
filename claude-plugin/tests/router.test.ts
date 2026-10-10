@@ -6,7 +6,9 @@ import {
   classifierPrompt,
   decideMain,
   decideSpawn,
+  decisionRecord,
   evidenceOf,
+  explorationDraw,
   fileHash,
   gateChecks,
   matchesCheck,
@@ -47,21 +49,20 @@ const asClass = (over: Partial<Class> = {}): Class => ({
   confidence: 0.9,
   ...over,
 })
-const main = (over: Record<string, unknown> = {}) =>
-  decideMain({
-    state,
-    task: undefined,
-    cls: cls(),
-    timedOut: false,
-    forceNew: false,
-    text: 'do it',
-    sessionModel: 'claude-sonnet-5-5',
-    lastModel: undefined,
-    contextTokens: 0,
-    newTaskId: 'task-1',
-    now: 0,
-    ...over,
-  } as any)
+const mainInput = () => ({
+  state,
+  task: undefined,
+  cls: cls(),
+  timedOut: false,
+  forceNew: false,
+  text: 'do it',
+  sessionModel: 'claude-sonnet-5-5',
+  lastModel: undefined,
+  contextTokens: 0,
+  newTaskId: 'task-1',
+  now: 0,
+})
+const main = (over: Record<string, unknown> = {}) => decideMain({ ...mainInput(), ...over } as any)
 
 test('the classifier reply is parsed through fences and prose; a missing relation is no reply', () => {
   const parsed = parseClassification('```json\n{"relation":"continuation","kind":"debug","difficulty":9,"scope":"x","uncertainty":"high","verifiable":true,"explicit":{"value":"accept","quote":"ship it"},"user_model":"opus","confidence":1.4}\n```')
@@ -311,4 +312,116 @@ test('router-state that does not parse, or names no tier models, is none', () =>
   expect(parseRouterState('nope')).toBe(undefined)
   expect(parseRouterState(JSON.stringify({ ...ROUTER_STATE, schema: 2 }))).toBe(undefined)
   expect(parseRouterState(JSON.stringify({ ...ROUTER_STATE, tiers: { research: { model: 'x' } } }))).toBe(undefined)
+})
+
+// --- exploration (learning-loop Phase 4) ---------------------------------------
+
+// The same vector crate::rng's tests check: both languages draw alike.
+test('the exploration draw matches the vector shared with Rust, non-ASCII ids included', () => {
+  expect(explorationDraw('0123456789abcdef', 'session-1', 'task-1')).toBe(0.24444899038069579)
+  expect(explorationDraw('fedcba9876543210', 'sessión-é', 'tâche-日本語-🚀')).toBe(0.8532650270632014)
+  expect(explorationDraw('', '', '')).toBe(0.96696972315229)
+  expect(explorationDraw('a', 'bc', 'd')).toBe(0.34418990774171765)
+  expect(explorationDraw('ab', 'c', 'd')).not.toBe(explorationDraw('a', 'bc', 'd'))
+})
+
+test('10,000 seeded draws are the sequence Rust draws, and fall below 0.1 ten percent of the time', () => {
+  let sum = 0n
+  let below = 0
+  for (let i = 0; i < 10_000; i++) {
+    const draw = explorationDraw('seed-10k', 'session-10k', `task-${i}`)
+    sum = (sum + BigInt(draw * 2 ** 53)) & ((1n << 64n) - 1n)
+    if (draw < 0.1) below += 1
+  }
+  expect(sum).toBe(8148712194814526056n)
+  expect(below).toBe(1032)
+})
+
+test('router-state serves the seed and epsilon; an epsilon out of range, or none, is 0', () => {
+  expect(state.seed).toBe('0123456789abcdef')
+  expect(state.epsilon).toBe(0.1)
+  const without = parseRouterState(JSON.stringify({ ...ROUTER_STATE, seed: undefined, epsilon: undefined }))!
+  expect([without.seed, without.epsilon]).toEqual(['', 0])
+  expect(parseRouterState(JSON.stringify({ ...ROUTER_STATE, epsilon: 7 }))!.epsilon).toBe(0)
+})
+
+const SESSION = 'session-x'
+// A task id the seed draws below (or at least) epsilon.
+const taskIdWhere = (below: boolean, seed = state.seed, epsilon = state.epsilon) => {
+  for (let i = 0; ; i++) {
+    const id = `task-${i}`
+    if (explorationDraw(seed, SESSION, id) < epsilon === below) return id
+  }
+}
+const explore = (over: Record<string, unknown> = {}) => main({ session: SESSION, newTaskId: taskIdWhere(true), ...over })
+
+test('below epsilon a new main task starts one tier lower; the draw, propensity and gate are recorded', () => {
+  const out = explore()
+  expect(out.task!.tier).toBe('research')
+  expect(out.task!.exploredDown).toBe(true)
+  expect(out.decision!.exploration).toMatchObject({ explored: true, propensity: 0.1 })
+  const record = decisionRecord({ task: out.task!, turnId: 't', agentId: null, relation: 'new_task', decision: out.decision!, mode: 'on', holdout: false, applied: true, now: 0 })
+  expect(record).toMatchObject({ explored: true, propensity: 0.1, would_pass_gate: true, applied: true })
+  expect(record.draw).toBe(explorationDraw(state.seed, SESSION, out.task!.id))
+  expect(record.draw).toBeLessThan(0.1)
+})
+
+test('at or above epsilon the table stands, with propensity 1 - epsilon', () => {
+  const out = main({ session: SESSION, newTaskId: taskIdWhere(false) })
+  expect(out.task!.tier).toBe('implementation')
+  expect(out.decision!.exploration).toMatchObject({ explored: false, propensity: 0.9 })
+  expect(out.task!.exploredDown).toBe(false)
+})
+
+test('escalation explores to implementation, and research cannot be lowered: not explored, propensity 1', () => {
+  const hard = explore({ cls: cls({ difficulty: 5 }) })
+  expect(hard.task!.tier).toBe('implementation')
+  expect(hard.decision!.exploration!.explored).toBe(true)
+  const easy = explore({ cls: cls({ difficulty: 1 }) })
+  expect(easy.task!.tier).toBe('research')
+  expect(easy.decision!.exploration).toMatchObject({ explored: false, propensity: 1 })
+  expect(easy.decision!.exploration!.draw).toBeLessThan(0.1)
+  expect(easy.task!.exploredDown).toBe(false)
+})
+
+test('a drawn switch down that fails the cache gate is explored and not applied', () => {
+  const out = explore({ contextTokens: 500_000_000 })
+  expect(out.decision!.reason).toBe('cache_gate')
+  expect(out.decision!.wouldPassGate).toBe(false)
+  expect(out.decision!.override).toBe(false)
+  expect(out.decision!.exploration!.explored).toBe(true)
+  const record = decisionRecord({ task: out.task!, turnId: 't', agentId: null, relation: 'new_task', decision: out.decision!, mode: 'on', holdout: false, applied: false, now: 0 })
+  expect(record).toMatchObject({ explored: true, applied: false, would_pass_gate: false })
+})
+
+test('held-out, shadow, epsilon 0, no session, continuations, corrections and subagents are never explored', () => {
+  const id = taskIdWhere(true)
+  const held = decideMain({ ...mainInput(), state: { ...state, holdout: true }, session: SESSION, newTaskId: id })
+  const shadow = decideMain({ ...mainInput(), state: { ...state, mode: 'shadow' }, session: SESSION, newTaskId: id })
+  const zero = decideMain({ ...mainInput(), state: { ...state, epsilon: 0 }, session: SESSION, newTaskId: id })
+  const nobody = main({ newTaskId: id })
+  for (const out of [held, shadow, zero, nobody]) {
+    expect(out.decision!.exploration).toBe(undefined)
+    expect(out.task!.tier).toBe('implementation')
+    const record = decisionRecord({ task: out.task!, turnId: 't', agentId: null, relation: 'new_task', decision: out.decision!, mode: 'on', holdout: false, applied: true, now: 0 })
+    expect([record.explored, record.propensity, record.draw]).toEqual([false, null, null])
+  }
+  const started = explore()
+  const next = main({ task: started.task, cls: cls({ relation: 'continuation' }), session: SESSION, newTaskId: id })
+  expect(next.decision!.exploration).toBe(undefined)
+  expect(next.task!.tier).toBe('research')
+  const corrected = main({ task: started.task, cls: cls({ relation: 'correction' }), session: SESSION, newTaskId: id })
+  expect(corrected.decision!.exploration).toBe(undefined)
+  const spawn = decideSpawn({ state, type: 'Explore', cls: cls() })
+  expect(spawn.decision!.exploration).toBe(undefined)
+})
+
+test('10,000 seeded task starts at epsilon 0.1 explore 10% +/- 1%', () => {
+  let explored = 0
+  for (let i = 0; i < 10_000; i++) {
+    const out = main({ session: 'session-10k', newTaskId: `task-${i}`, state: { ...state, seed: 'seed-10k' } })
+    if (out.decision!.exploration!.explored) explored += 1
+  }
+  expect(explored).toBeGreaterThanOrEqual(900)
+  expect(explored).toBeLessThanOrEqual(1100)
 })

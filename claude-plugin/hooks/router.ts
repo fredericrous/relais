@@ -56,6 +56,11 @@ export type RouterState = {
   mode_reason?: string
   envelope: unknown
   holdout: boolean
+  // The session's exploration seed and the rate in force (0 without an
+  // envelope, or once the stop rule fired). From a relais that predates
+  // them: '' and 0, so nothing is explored.
+  seed: string
+  epsilon: number
   tiers: Record<Tier, { model: string; effort: Effort | null }>
   capability_table: { version: number; rules: { when: Record<string, unknown>; tier: Tier }[] }
   rates: Record<string, { input: number; output: number; cache_read: number; cache_write: number } | null>
@@ -109,7 +114,15 @@ export type TaskState = {
   relaisAccepted: boolean
   inferred: string[]
   lastReason: Reason
+  // The task started one tier below the table's choice, by the exploration
+  // draw: its floor stays one below the table's for the whole task.
+  exploredDown: boolean
 }
+
+// What the exploration draw decided for a task start. Absent on a decision
+// the draw did not apply to (continuations, corrections, subagents, held-out
+// sessions, mode not `on`).
+export type Exploration = { explored: boolean; propensity: number; draw: number }
 
 export type Decision = {
   tier: Tier
@@ -120,6 +133,7 @@ export type Decision = {
   // mode is `on` and the session is not held out.
   override: boolean
   wouldPassGate: boolean
+  exploration?: Exploration
 }
 
 export const CLASSIFIER_MAX_TOKENS = 160
@@ -296,6 +310,8 @@ export function parseRouterState(text: unknown): RouterState | undefined {
     mode_reason: typeof raw.mode_reason === 'string' ? raw.mode_reason : undefined,
     envelope: raw.envelope ?? null,
     holdout: raw.holdout === true,
+    seed: typeof raw.seed === 'string' ? raw.seed : '',
+    epsilon: typeof raw.epsilon === 'number' && raw.epsilon > 0 && raw.epsilon <= 1 ? raw.epsilon : 0,
     tiers,
     capability_table: rules.length > 0 ? { version: Number(raw.capability_table.version) || 1, rules } : DEFAULT_TABLE,
     rates: raw.rates && typeof raw.rates === 'object' ? raw.rates : {},
@@ -352,6 +368,14 @@ export function modeEffective(state: RouterState | undefined): Mode {
 export const rank = (tier: Tier) => TIERS.indexOf(tier)
 export const higher = (a: Tier, b: Tier): Tier => (rank(a) >= rank(b) ? a : b)
 const stepUp = (tier: Tier): Tier => TIERS[Math.min(TIERS.length - 1, rank(tier) + 1)]
+const stepDown = (tier: Tier): Tier => TIERS[Math.max(0, rank(tier) - 1)]
+
+// The tier the table asks for a task now: one step lower for a task the
+// exploration draw lowered, never below research.
+const floorTier = (state: RouterState, task: TaskState): Tier => {
+  const table = tableTier(state.capability_table, task.class)
+  return task.exploredDown ? stepDown(table) : table
+}
 
 // The capability table's tier for a classification: the first rule whose
 // conditions all hold. A condition the plugin does not know never holds.
@@ -419,7 +443,13 @@ export const shortModel = (model: string) => model.replace(/^claude-/, '')
 
 const effortOf = (state: RouterState, task: TaskState): Effort | null => task.effort ?? state.tiers[task.tier].effort
 
-export function decisionOf(state: RouterState, task: TaskState, reason: Reason, wouldPassGate = true): Decision {
+export function decisionOf(
+  state: RouterState,
+  task: TaskState,
+  reason: Reason,
+  wouldPassGate = true,
+  exploration?: Exploration,
+): Decision {
   return {
     tier: task.tier,
     model: task.userModel ?? state.tiers[task.tier].model,
@@ -427,6 +457,7 @@ export function decisionOf(state: RouterState, task: TaskState, reason: Reason, 
     reason,
     override: task.override,
     wouldPassGate,
+    ...(exploration ? { exploration } : {}),
   }
 }
 
@@ -493,6 +524,7 @@ export function newTask(id: string, agentId: string | null, opening: string, c: 
     relaisAccepted: false,
     inferred: [],
     lastReason: 'table',
+    exploredDown: false,
   }
 }
 
@@ -511,6 +543,9 @@ export type MainInput = {
   lastModel: string | undefined
   contextTokens: number
   newTaskId: string
+  // The session's id, which the exploration draw is keyed by; without it
+  // nothing is explored.
+  session?: string
   now: number
 }
 
@@ -558,7 +593,7 @@ export function decideMain(input: MainInput): MainOutput {
   task.class = { ...task.class, difficulty: Math.max(task.class.difficulty, cls.difficulty) }
   const reassess: ReassessRecord[] = []
   let reason: Reason = 'explicit_kept'
-  const raised = higher(task.tier, tableTier(state.capability_table, task.class))
+  const raised = higher(task.tier, floorTier(state, task))
   if (raised !== task.tier) {
     task.tier = raised
     task.override = true
@@ -604,6 +639,13 @@ function startTask(input: MainInput, cls: Classification): MainOutput {
   // Below /model only through the table's research rule.
   let tier = table
   if (sessionTier && rank(table) < rank(sessionTier) && table !== 'research') tier = sessionTier
+  // Exploration: below epsilon the initial tier is one step lower, never
+  // below research. At research nothing can be lowered.
+  const exploration = exploreAt(input, tier)
+  if (exploration?.explored) {
+    tier = stepDown(tier)
+    task.exploredDown = true
+  }
   task.tier = tier
   let reason: Reason = 'table'
   let wouldPassGate = true
@@ -621,7 +663,18 @@ function startTask(input: MainInput, cls: Classification): MainOutput {
     }
   }
   task.lastReason = reason
-  return { task, ended, decision: decisionOf(state, task, reason, wouldPassGate), relation: 'new_task', reassess: [] }
+  return { task, ended, decision: decisionOf(state, task, reason, wouldPassGate, exploration), relation: 'new_task', reassess: [] }
+}
+
+// The draw for a main-session task start: only in mode `on`, outside the
+// hold-out, with an epsilon in force and a seed and session to key it by.
+function exploreAt(input: MainInput, tier: Tier): Exploration | undefined {
+  const { state, session } = input
+  if (state.mode !== 'on' || state.holdout || !(state.epsilon > 0) || !state.seed || !session) return undefined
+  const draw = explorationDraw(state.seed, session, input.newTaskId)
+  if (tier === 'research') return { explored: false, propensity: 1, draw }
+  const explored = draw < state.epsilon
+  return { explored, propensity: explored ? state.epsilon : 1 - state.epsilon, draw }
 }
 
 // A task the next one replaced: no complaint followed it.
@@ -658,7 +711,7 @@ export function escalate(state: RouterState, task: TaskState, event: ReassessEve
 export function rerun(state: RouterState, task: TaskState, event: 'scope_growth' | 'spawn'): { task: TaskState; record: ReassessRecord } {
   const t = clone(task)
   const from = t.tier
-  const raised = higher(t.tier, tableTier(state.capability_table, t.class))
+  const raised = higher(t.tier, floorTier(state, t))
   if (raised !== t.tier) {
     t.tier = raised
     t.override = true
@@ -741,7 +794,11 @@ const K = new Uint32Array([
 ])
 
 export function sha256Hex(text: string): string {
-  const data = encoder.encode(text)
+  return Array.from(sha256Words(encoder.encode(text)), x => x.toString(16).padStart(8, '0')).join('')
+}
+
+// The eight 32-bit words of the SHA-256 of `data`.
+function sha256Words(data: Uint8Array): Uint32Array {
   const length = ((data.length + 9 + 63) >> 6) << 6
   const bytes = new Uint8Array(length)
   bytes.set(data)
@@ -781,7 +838,40 @@ export function sha256Hex(text: string): string {
     h[6] += g
     h[7] += hh
   }
-  return Array.from(h, x => x.toString(16).padStart(8, '0')).join('')
+  return h
+}
+
+// --- exploration (docs/router-protocol.md, "Exploration") ----------------------------
+
+const MASK64 = (1n << 64n) - 1n
+
+// The first output of SplitMix64 seeded with `seed` (crate::rng::SplitMix64).
+export function splitMix64First(seed: bigint): bigint {
+  const state = (seed + 0x9e3779b97f4a7c15n) & MASK64
+  let z = state
+  z = ((z ^ (z >> 30n)) * 0xbf58476d1ce4e5b9n) & MASK64
+  z = ((z ^ (z >> 27n)) * 0x94d049bb133111ebn) & MASK64
+  return z ^ (z >> 31n)
+}
+
+// The exploration draw in [0, 1), the same function as Rust's
+// `crate::rng::exploration_draw`: u is the first 8 bytes, big-endian, of
+// SHA-256 over the UTF-8 bytes of seed, session and task, each preceded by
+// its byte length as a 4-byte big-endian integer; x is SplitMix64(u)'s
+// first output; the draw is (x >> 11) * 2^-53.
+export function explorationDraw(seed: string, session: string, task: string): number {
+  const parts = [seed, session, task].map(part => encoder.encode(part))
+  const data = new Uint8Array(parts.reduce((n, part) => n + 4 + part.length, 0))
+  const view = new DataView(data.buffer)
+  let at = 0
+  for (const part of parts) {
+    view.setUint32(at, part.length)
+    data.set(part, at + 4)
+    at += 4 + part.length
+  }
+  const words = sha256Words(data)
+  const u = (BigInt(words[0]) << 32n) | BigInt(words[1])
+  return Number(splitMix64First(u) >> 11n) * 2 ** -53
 }
 
 // A path as the repository names it: relative to the session's cwd, no
@@ -984,9 +1074,9 @@ export function decisionRecord(input: {
     mode_effective: input.mode,
     holdout: input.holdout,
     applied: input.applied,
-    explored: false,
-    propensity: null,
-    draw: null,
+    explored: input.decision.exploration?.explored ?? false,
+    propensity: input.decision.exploration?.propensity ?? null,
+    draw: input.decision.exploration?.draw ?? null,
     would_pass_gate: input.decision.wouldPassGate,
     table_version: input.tableVersion ?? null,
     at: iso(input.now),

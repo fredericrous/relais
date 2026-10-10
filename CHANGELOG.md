@@ -23,6 +23,18 @@ The session router gets real outcome evidence.
   dies before the task ends no longer leaves a correction with no task.
 - Each routing decision records the capability table's version. The ledger
   migrates to schema 23 (additive columns).
+- Seeded downward exploration: at a main-session task start, outside the
+  hold-out and in mode `on`, a draw below `epsilon` starts the task one tier
+  lower (never below research, never for continuations, corrections or
+  subagents). The draw is defined once for Rust and the plugin, and each
+  decision records `explored`, `propensity`, `draw` and `would_pass_gate`.
+- Automatic stop rule: once 20 explored tasks have strong outcomes, if their
+  corrected share exceeds the undrawn tasks' in the same strata by more than
+  15 points, `router-state` serves `epsilon = 0` and the ledger records the
+  stop with its counts (schema 24, additive).
+- `relais report` shows, per stratum (kind, difficulty band, scope), drawn and
+  undrawn tasks with strong outcomes, both corrected shares and the projected
+  date the busiest stratum reaches 20 drawn tasks; also in `--json`.
 
 A salvaged run can now teach the learner, when its verified patch landed.
 

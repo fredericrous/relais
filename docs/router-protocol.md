@@ -55,13 +55,27 @@ exit, or stdout that does not parse, the plugin runs in `shadow`.
 
 - **`mode`** is `on` whenever an envelope is in machine.toml; `off` when routing was turned off (`[session_routing] off`, the tombstone `/relais-routing off` records), so no classifier call is made; `shadow` with neither; `RELAIS_SESSION_ROUTING=off|shadow` can only narrow it (any other value narrows to `shadow`). The plugin's `mode_effective` is this `mode`, and `shadow` when router-state did not answer.
 - **`holdout`** is drawn by Rust from `SplitMix64(hash(session id))` against `holdout_rate` (machine `[session_routing]`, default 0.1). In a held-out session the plugin decides and records but never applies.
-- **`seed`** is per session: the plugin's exploration draws are `SplitMix64(seed, draw_index)`. They are R2's; R1 sends `explored: false`.
+- **`seed`** is per session (16 hex digits). With `epsilon` it keys the exploration draw (below). **`epsilon`** is the exploration rate in force: never above the envelope's `epsilon_max`, 0 without an envelope, and 0 once the stop rule has fired.
 - **`tiers`** come from the repository's `relais.toml` `[models.*]` when present, else machine defaults. Aliases are resolved to full ids by `[session_routing.model_ids]`, defaulting to haiku → `claude-haiku-5-5`, sonnet → `claude-sonnet-5-5`, opus → `claude-opus-5-5`, fable → `claude-fable-5-1`. `turn.step` refuses aliases (S0).
 - **`rates`** are micro-USD per million tokens, from machine.toml `[pricing]`, else relais's built-in list (Haiku 5.5 and 4.5, Sonnet 5.5 and 5, Opus 5.5 and 5, Fable 5.1; platform.claude.com pricing, 2026-10-07. Where the page gives two values, the one that overstates no saving is kept: Haiku 5.5's over-100k tier, and Sonnet 5.5's 0.05x cache read. A machine entry wins per model); `cache_write` is the 1-hour rate (S0). A model with no price is `null`, and the plugin then never switches down to it.
 - **`pins`**: subagent types whose definition (user `~/.claude/agents/*.md`, project `.claude/agents/*.md`) names a `model:` in its front matter, plus machine `[session_routing] pinned_agents`. The plugin never overrides a pinned type.
 - **`checks`**: argv prefixes that count as verification. The repository's `relais.toml` profile commands, plus the built-in list: `test` kind: `cargo test`, `cargo nextest`, `npm test`, `pnpm test`, `yarn test`, `bun test`, `pnpm run test`, `npm run test`, `pytest`, `uv run pytest`, `go test`, `make check`, `make test`; `lint` kind: `cargo clippy`, `pnpm run lint`, `npm run lint`, `go vet`, `golangci-lint run`, `ruff check`, `mypy`, `pyright`, `make lint`; `build` kind: `cargo check`, `cargo build`, `pnpm run build`, `pnpm run typecheck`, `npm run build`, `npm run typecheck`, `tsc`, `go build`, `make build`.
 - **`check_kinds`**: the kind of each entry of `checks`, same order and length: `test`, `lint` or `build`. A repository command that is not on the built-in list is `test`. A relais that does not serve it leaves the plugin to read the kind off the argv. The plugin adds the kind `gate` for an amont stamp (below).
 - **`adjustments`**: R2's learned rules; empty in R1.
+
+### Exploration
+
+At a main-session `new_task` start, when the mode is `on`, the session is not held out and `epsilon > 0`, the plugin draws once and records it. The draw is defined identically in Rust (`crate::rng::exploration_draw`) and TypeScript (`explorationDraw`):
+
+1. `u` is the first 8 bytes, big-endian, of SHA-256 over the UTF-8 bytes of `seed`, the session id and the task id, each preceded by its byte length as a 4-byte big-endian integer.
+2. `x` is the first output of SplitMix64 seeded with `u`.
+3. `draw = (x >> 11) * 2^-53`, a uniform in `[0, 1)`.
+
+A shared test vector, non-ASCII ids included, and a 10,000-draw fingerprint are checked in both languages.
+
+Below `epsilon` (`draw < epsilon`) the initial tier is one step lower than the table chose, never below research; the task keeps that floor (the table may raise the tier, never above one step under its own choice) and recovery still applies. Continuations, corrections, subagents and held-out sessions are never explored. When the table's tier is already research nothing can be lowered: `explored = false`, `propensity = 1`. The decision records `explored`, `propensity` (`epsilon` when lowered, `1 - epsilon` otherwise), `draw` and `would_pass_gate`. The cache gate still applies: a drawn switch down that fails it is recorded `explored = true`, `applied = false`. A decision the draw did not apply to records `explored = false`, `propensity = null`, `draw = null`.
+
+**Stop rule** (Rust, evaluated by `router-state`): once at least 20 drawn tasks (explored and applied) have strong outcomes (`completed_verified`, `completed_accepted`, `corrected`), if their corrected share exceeds that of undrawn tasks (the draw ran and passed them over) in the same strata (kind x difficulty band x scope; bands 1-2, 3, 4-5) by more than 15 percentage points, `router-state` serves `epsilon = 0` and a row in `router_exploration_stops` records the stop with its counts (ledger step v24). The rule is re-read at every `router-state`; a row is written when the counts differ from the latest one. `relais report` prints per stratum the drawn and undrawn tasks with strong outcomes, both corrected shares and the projected date the stratum reaches 20 drawn tasks (`no projection: 0 drawn` without a draw), the top 5 strata then `+N more`, and the same in `--json` under `session_routing.exploration`.
 
 ## `relais native router-observe`
 

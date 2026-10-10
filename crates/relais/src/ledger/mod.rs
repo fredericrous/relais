@@ -26,11 +26,12 @@ use crate::route::RoutedBy;
 
 mod router;
 pub use router::{
-    RouterCheck, RouterClass, RouterDecisionRow, RouterProvenance, RouterReassessRow, RouterRecord,
-    RouterTaskOutcomeRow, RouterTaskRow, RouterUsageRow, RouterWindow,
+    ExplorationTask, RouterCheck, RouterClass, RouterDecisionRow, RouterExplorationStop,
+    RouterProvenance, RouterReassessRow, RouterRecord, RouterTaskOutcomeRow, RouterTaskRow,
+    RouterUsageRow, RouterWindow,
 };
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 23;
+pub const LEDGER_SCHEMA_VERSION: u64 = 24;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -1543,6 +1544,24 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ALTER TABLE router_tasks ADD COLUMN checks_json TEXT;
     UPDATE router_tasks SET outcome_source = 'own';
     ALTER TABLE router_decisions ADD COLUMN table_version INTEGER;
+    "#,
+    ),
+    (
+        // The exploration stop rule's record (learning-loop Phase 4): one
+        // row each time `router-state` finds drawn tasks doing worse than
+        // undrawn ones in the same strata and serves epsilon 0, with the
+        // counts it saw. Additive: a binary that predates it never reads
+        // the table.
+        "v24",
+        r#"
+    CREATE TABLE router_exploration_stops (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        at TEXT NOT NULL,
+        drawn INTEGER NOT NULL,
+        drawn_bad INTEGER NOT NULL,
+        undrawn INTEGER NOT NULL,
+        undrawn_bad INTEGER NOT NULL
+    );
     "#,
     ),
 ];

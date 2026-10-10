@@ -164,6 +164,34 @@ pub struct RouterWindow {
     pub decisions: Vec<(String, bool, bool)>,
 }
 
+/// One main-session task, as the exploration evidence reads it: its class,
+/// how it ended and what the draw did at its start.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExplorationTask {
+    pub kind: String,
+    pub difficulty: u8,
+    pub scope: String,
+    pub outcome: String,
+    pub started_at: String,
+    /// The draw lowered the tier (`explored`) and the switch was applied.
+    pub drawn: bool,
+    /// The draw ran and passed the task over: eligible (a propensity was
+    /// recorded), not lowered, not held out.
+    pub undrawn: bool,
+}
+
+/// One time the exploration stop rule fired, with the counts it saw
+/// (drawn and undrawn tasks with strong outcomes in the strata the draws
+/// fall in; `*_bad` are the corrected ones).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RouterExplorationStop {
+    pub at: String,
+    pub drawn: usize,
+    pub drawn_bad: usize,
+    pub undrawn: usize,
+    pub undrawn_bad: usize,
+}
+
 /// An absent id, as a key column stores it.
 fn key(id: &Option<String>) -> &str {
     id.as_deref().unwrap_or("")
@@ -572,6 +600,86 @@ impl Ledger {
             }
         }
         Ok(out)
+    }
+
+    /// Every main-session task that has a class and a `new_task` decision,
+    /// with what the exploration draw did at its start: drawn (lowered and
+    /// applied) or undrawn (the draw ran, passed it over, not held out).
+    pub fn router_exploration_tasks(&self) -> Result<Vec<ExplorationTask>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.class_kind, t.difficulty, t.scope, t.outcome, t.started_at,
+                    d.explored, d.applied, d.propensity, d.holdout
+               FROM router_tasks t
+               JOIN router_decisions d
+                 ON d.session = t.session AND d.task_id = t.task_id
+                AND d.agent_id = '' AND d.relation = 'new_task'
+              WHERE t.agent_id = '' AND t.class_kind IS NOT NULL AND t.scope IS NOT NULL
+                AND t.difficulty IS NOT NULL
+              ORDER BY t.started_at, t.session, t.task_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let explored: bool = row.get(5)?;
+            let applied: bool = row.get(6)?;
+            let propensity: Option<f64> = row.get(7)?;
+            let holdout: bool = row.get(8)?;
+            Ok(ExplorationTask {
+                kind: row.get(0)?,
+                difficulty: row.get::<_, i64>(1)?.clamp(0, 255) as u8,
+                scope: row.get(2)?,
+                outcome: row.get(3)?,
+                started_at: row.get(4)?,
+                drawn: explored && applied && !holdout,
+                undrawn: !explored && propensity.is_some() && !holdout,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Record that the stop rule fired, unless the latest stop row already
+    /// holds these counts (the rule is re-read at every session start).
+    /// Whether a row was written.
+    pub fn record_router_exploration_stop(&self, stop: &RouterExplorationStop) -> Result<bool> {
+        if let Some(latest) = self.router_exploration_stops()?.pop() {
+            if (
+                latest.drawn,
+                latest.drawn_bad,
+                latest.undrawn,
+                latest.undrawn_bad,
+            ) == (stop.drawn, stop.drawn_bad, stop.undrawn, stop.undrawn_bad)
+            {
+                return Ok(false);
+            }
+        }
+        self.conn.execute(
+            "INSERT INTO router_exploration_stops (at, drawn, drawn_bad, undrawn, undrawn_bad)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                stop.at,
+                stop.drawn as i64,
+                stop.drawn_bad as i64,
+                stop.undrawn as i64,
+                stop.undrawn_bad as i64
+            ],
+        )?;
+        Ok(true)
+    }
+
+    /// Every stop row, oldest first.
+    pub fn router_exploration_stops(&self) -> Result<Vec<RouterExplorationStop>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT at, drawn, drawn_bad, undrawn, undrawn_bad
+               FROM router_exploration_stops ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RouterExplorationStop {
+                at: row.get(0)?,
+                drawn: row.get::<_, i64>(1)?.max(0) as usize,
+                drawn_bad: row.get::<_, i64>(2)?.max(0) as usize,
+                undrawn: row.get::<_, i64>(3)?.max(0) as usize,
+                undrawn_bad: row.get::<_, i64>(4)?.max(0) as usize,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Record an envelope write or removal.

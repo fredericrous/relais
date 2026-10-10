@@ -139,6 +139,9 @@ pub struct Inputs<'a> {
     /// Pins from the agent definitions, user scope first so the project's
     /// win on a shared name.
     pub definition_pins: Vec<(String, String)>,
+    /// The exploration stop rule fired (`explore::stop_check`): epsilon is
+    /// served as 0.
+    pub exploration_stopped: bool,
 }
 
 /// What a machine-pinned agent with no definition pin is served as: the
@@ -283,7 +286,11 @@ pub fn build(inputs: Inputs<'_>) -> RouterState {
         envelope: routing.envelope.clone(),
         holdout: draw.holdout,
         seed: draw.seed,
-        epsilon: routing.effective_epsilon(),
+        epsilon: if inputs.exploration_stopped {
+            0.0
+        } else {
+            routing.effective_epsilon()
+        },
         tiers,
         capability_table: default_table(),
         rates: rates(&pricing, models),
@@ -315,7 +322,20 @@ mod tests {
             env_mode: None,
             completed_task_tokens: vec![],
             definition_pins: vec![],
+            exploration_stopped: false,
         }
+    }
+
+    #[test]
+    fn a_stopped_exploration_serves_epsilon_zero() {
+        let machine = machine(
+            "[session_routing]\nepsilon = 0.1\n\
+             envelope = { granted_at = \"2026-10-07T00:00:00Z\", by = \"me\", epsilon_max = 0.1, source = \"cli\" }\n",
+        );
+        assert_eq!(build(inputs(&machine, None)).epsilon, 0.1);
+        let mut stopped = inputs(&machine, None);
+        stopped.exploration_stopped = true;
+        assert_eq!(build(stopped).epsilon, 0.0);
     }
 
     #[test]

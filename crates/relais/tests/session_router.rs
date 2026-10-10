@@ -600,3 +600,117 @@ fn the_report_prices_routing_spend_and_says_unknown_for_an_unpriced_model() {
     assert_eq!(value["session_routing"]["arms"][0]["arm"], "routed");
     assert!(value["session_routing"]["arms"][1]["cost"].is_null());
 }
+
+/// One session's batch of `n` main-session tasks, each with the
+/// exploration fields the draw recorded and an outcome.
+fn exploration_batch(session: &str, tasks: &[(String, bool, &str)]) -> String {
+    let mut records = Vec::new();
+    for (task, drawn, outcome) in tasks {
+        let class = serde_json::json!({
+            "kind": "edit", "difficulty": 3, "scope": "local",
+            "uncertainty": "low", "verifiable": true, "confidence": 0.9
+        });
+        records.push(serde_json::json!({
+            "kind": "decision", "task_id": task, "turn_id": format!("{task}-u1"), "agent_id": null,
+            "relation": "new_task", "class": class,
+            "tier": if *drawn { "research" } else { "implementation" },
+            "model": "claude-sonnet-5-5", "effort": null, "reason": "table",
+            "mode_effective": "on", "holdout": false, "applied": true,
+            "explored": drawn, "propensity": if *drawn { 0.1 } else { 0.9 }, "draw": 0.05,
+            "would_pass_gate": true, "at": "2026-10-07T10:00:00Z"
+        }));
+        records.push(serde_json::json!({
+            "kind": "task", "task_id": task, "agent_id": null,
+            "started_at": "2026-10-07T10:00:00Z", "ended_at": "2026-10-07T10:05:00Z",
+            "class": class, "outcome": outcome, "inferred": [],
+            "escalations": 0, "exhausted": false, "turns": 1, "explicit_quote": null
+        }));
+    }
+    serde_json::json!({ "schema": 1, "session": session, "records": records }).to_string()
+}
+
+/// 20 drawn tasks, `drawn_corrected` of them corrected, and 40 clean
+/// undrawn ones, in a world with an envelope.
+fn world_with_exploration(tag: &str, drawn_corrected: usize) -> World {
+    let world = World::new(tag);
+    std::fs::write(
+        world.machine(),
+        "schema_version = 1\n[session_routing]\nepsilon = 0.1\n\
+         envelope = { granted_at = \"2026-10-07T00:00:00Z\", by = \"me\", epsilon_max = 0.1, source = \"cli\" }\n",
+    )
+    .unwrap();
+    let mut tasks = Vec::new();
+    for i in 0..20 {
+        let outcome = if i < drawn_corrected {
+            "corrected"
+        } else {
+            "completed_verified"
+        };
+        tasks.push((format!("d{i}"), true, outcome));
+    }
+    for i in 0..40 {
+        tasks.push((format!("u{i}"), false, "completed_verified"));
+    }
+    let output = world.relais_stdin(
+        &["native", "router-observe"],
+        &exploration_batch("s-explore", &tasks),
+    );
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    world
+}
+
+#[test]
+fn drawn_tasks_doing_worse_than_undrawn_stop_exploration_and_the_stop_is_recorded() {
+    let world = world_with_exploration("stop", 4);
+    let state = world.state_json(&world.relais(&["native", "router-state", "--session", "s-9"]));
+    assert_eq!(state["epsilon"], 0.0);
+    let stops = world.ledger().router_exploration_stops().unwrap();
+    assert_eq!(stops.len(), 1);
+    assert_eq!(
+        (
+            stops[0].drawn,
+            stops[0].drawn_bad,
+            stops[0].undrawn,
+            stops[0].undrawn_bad
+        ),
+        (20, 4, 40, 0)
+    );
+    // Read again with nothing new: still stopped, no second row.
+    let again = world.state_json(&world.relais(&["native", "router-state", "--session", "s-10"]));
+    assert_eq!(again["epsilon"], 0.0);
+    assert_eq!(world.ledger().router_exploration_stops().unwrap().len(), 1);
+    // The report says so.
+    let text = stdout(&world.relais(&["report", "--since", "2026-10-01", "--no-import"]));
+    assert!(
+        text.contains("edit d3 local: drawn 20 (20%), undrawn 40 (0%)"),
+        "{text}"
+    );
+    assert!(text.contains("stopped "), "{text}");
+    let section = text
+        .split("  exploration (")
+        .nth(1)
+        .and_then(|rest| rest.split("\nlearning:").next())
+        .expect("an exploration section");
+    assert!(
+        section.lines().all(|line| line.chars().count() <= 80),
+        "{section}"
+    );
+}
+
+#[test]
+fn at_fifteen_points_exploration_goes_on_and_no_stop_is_recorded() {
+    let world = world_with_exploration("go", 3);
+    let state = world.state_json(&world.relais(&["native", "router-state", "--session", "s-9"]));
+    assert_eq!(state["epsilon"], 0.1);
+    assert!(world
+        .ledger()
+        .router_exploration_stops()
+        .unwrap()
+        .is_empty());
+    let json = world.relais(&["report", "--since", "2026-10-01", "--no-import", "--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let exploration = &value["session_routing"]["exploration"];
+    assert_eq!(exploration["strata"][0]["drawn"], 20);
+    assert_eq!(exploration["strata"][0]["projection"]["state"], "reached");
+    assert!(exploration["stop"].is_null());
+}

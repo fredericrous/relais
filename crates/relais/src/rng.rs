@@ -42,9 +42,86 @@ impl SplitMix64 {
     }
 }
 
+/// The exploration draw (learning-loop Phase 4), defined once for Rust
+/// and the plugin's TypeScript: `u` is the first 8 bytes, big-endian, of
+/// SHA-256 over the UTF-8 bytes of `seed`, `session` and `task`, each
+/// preceded by its byte length as a 4-byte big-endian integer; the first
+/// output `x` of [`SplitMix64`] seeded with `u`; the draw is
+/// `(x >> 11) * 2^-53`, a uniform in `[0, 1)`.
+pub fn exploration_draw(seed: &str, session: &str, task: &str) -> f64 {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in [seed, session, task] {
+        hasher.update((part.len() as u32).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&digest[..8]);
+    let x = SplitMix64::new(u64::from_be_bytes(head)).next_u64();
+    (x >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shared with `claude-plugin/tests/router.test.ts`: the same inputs
+    /// must give the same draws in both languages.
+    const VECTOR_INPUTS: [(&str, &str, &str); 4] = [
+        ("0123456789abcdef", "session-1", "task-1"),
+        ("fedcba9876543210", "sessión-é", "tâche-日本語-🚀"),
+        ("", "", ""),
+        ("a", "bc", "d"),
+    ];
+
+    /// Wrapping sum of the first 10,000 draws' 53-bit integers, and the
+    /// draws below 0.1, for seed `seed-10k` and session `session-10k`.
+    fn sequence_fingerprint() -> (u64, usize) {
+        let mut sum = 0u64;
+        let mut below = 0usize;
+        for i in 0..10_000 {
+            let draw = exploration_draw("seed-10k", "session-10k", &format!("task-{i}"));
+            sum = sum.wrapping_add((draw * (1u64 << 53) as f64) as u64);
+            if draw < 0.1 {
+                below += 1;
+            }
+        }
+        (sum, below)
+    }
+
+    #[test]
+    fn the_exploration_draw_matches_the_shared_vector() {
+        let expected = [
+            0.24444899038069579,
+            0.8532650270632014,
+            0.96696972315229,
+            0.34418990774171765,
+        ];
+        for ((seed, session, task), want) in VECTOR_INPUTS.iter().zip(expected) {
+            assert_eq!(
+                exploration_draw(seed, session, task),
+                want,
+                "{seed} {session} {task}"
+            );
+        }
+    }
+
+    #[test]
+    fn ten_thousand_draws_match_the_shared_fingerprint_and_explore_ten_percent() {
+        let (sum, below) = sequence_fingerprint();
+        assert_eq!(sum, 8_148_712_194_814_526_056);
+        assert_eq!(below, 1032, "10% +/- 1% of 10,000");
+        assert!((900..=1100).contains(&below));
+    }
+
+    #[test]
+    fn length_prefixes_keep_the_parts_apart() {
+        assert_ne!(
+            exploration_draw("a", "bc", "d"),
+            exploration_draw("ab", "c", "d")
+        );
+    }
 
     #[test]
     fn same_seed_same_sequence() {
