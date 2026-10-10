@@ -93,6 +93,9 @@ export type PendingOutcome = {
   kind: string
   // The lines after the headline that stay true: receipt, changes, trial.
   facts: string[]
+  // Whether its check was already said in the pane: a submit that keeps
+  // failing is checked again every tick, and said once.
+  isNoted: boolean
 }
 
 // A background promise nobody awaits: once the module unloads its effects

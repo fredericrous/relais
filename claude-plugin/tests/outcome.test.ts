@@ -414,6 +414,23 @@ failOpen('times out', () => {
   throw new Error('timed out after 1000 ms')
 })
 failOpen('answers with no JSON', () => ok('not json'))
+failOpen('answers in a shape it does not read', (argv: string[]) =>
+  statusWith(argv[4], { state: 7, decision: { ...answered.decision, resolution: { what: 'approved' } } }),
+)
+
+test('an outcome whose submit keeps failing is checked every retry and noted once', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.script.runResult = (argv: string[]) =>
+    argv[2] === 'status' ? { exitCode: 1, stdout: '', stderr: 'ledger busy', isStdoutTruncated: false, isStderrTruncated: false } : ok()
+  engine.script.submitFailures = 3
+  engine.stream.push('stdout', phase(0, 'running') + needsDecision())
+  await settle(engine)
+  for (let i = 0; i < 5; i++) await tick(engine, 100)
+  expect(engine.calls.prompts.length).toBe(1)
+  expect(statusCalls(engine).length).toBe(4)
+  const said = await paneNotes($)
+  expect(said.split('could not check the outcome is still current').length - 1).toBe(1)
+})
 
 test('a relais without `current` is said once per session, not once per outcome', async ($: any, on: any) => {
   const engine = await startedRun($, on)
