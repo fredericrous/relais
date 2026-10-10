@@ -53,6 +53,15 @@ test('cells: a combining mark takes none, a CJK character two, a letter one', ()
   expect(widthOf('🚀')).toBe(2)
 })
 
+test('an emoji selector widens a narrow pictograph to two cells', () => {
+  expect(widthOf('\u203C')).toBe(1)
+  expect(widthOf('\u203C\uFE0F')).toBe(2)
+  expect(widthOf('\u00A9\uFE0F')).toBe(2)
+  // A selector after a letter, or after a wide emoji, adds nothing.
+  expect(widthOf('a\uFE0F')).toBe(1)
+  expect(widthOf('\u{1F680}\uFE0F')).toBe(2)
+})
+
 test('a 30-line message is 12 rows then the count of the rest', () => {
   const rows = transcriptRows([user(lines(30))], 72, 400)
   expect(rows.length).toBe(13)

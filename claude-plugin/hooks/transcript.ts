@@ -61,7 +61,7 @@ export function cutBytes(text: string, columns: number): string {
 // character or an emoji, else 1.
 // holds-until: a script the ranges below miss draws as one cell too few;
 // then the full Unicode East Asian Width table replaces them.
-const ZERO_WIDTH = /^[\p{Mn}\p{Me}​-‏⁠︀-️]$/u
+const ZERO_WIDTH = /^[\p{Mn}\p{Me}\u200B-\u200F\u2060\uFE00-\uFE0F]$/u
 const EMOJI = /^\p{Extended_Pictographic}$/u
 const WIDE_RANGES: ReadonlyArray<readonly [number, number]> = [
   [0x1100, 0x115f],
@@ -82,18 +82,33 @@ export function cellsOf(ch: string): number {
   if (ZERO_WIDTH.test(ch)) return 0
   const code = ch.codePointAt(0) ?? 0
   if (WIDE_RANGES.some(([low, high]) => code >= low && code <= high)) return 2
-  // Pictographs below U+2600 (©, ®, ‼) are narrow unless a selector asks.
+  // Pictographs below U+2600 (©, ®, ‼) are narrow on their own; a following
+  // emoji selector widens them (see `cellsAt`).
   return code >= 0x2600 && EMOJI.test(ch) ? 2 : 1
 }
 
-export const widthOf = (text: string): number => Array.from(text).reduce((n, ch) => n + cellsOf(ch), 0)
+const EMOJI_SELECTOR = '\uFE0F'
+
+// The cells `chars[i]` takes where it stands: an emoji selector after a
+// narrow pictograph (`‼` or `©` followed by U+FE0F) makes it two cells, so
+// the selector adds one.
+function cellsAt(chars: readonly string[], i: number): number {
+  const ch = chars[i]
+  if (ch === EMOJI_SELECTOR && i > 0 && EMOJI.test(chars[i - 1]) && cellsOf(chars[i - 1]) === 1) return 1
+  return cellsOf(ch)
+}
+
+export const widthOf = (text: string): number => {
+  const chars = Array.from(text)
+  return chars.reduce((n, _, i) => n + cellsAt(chars, i), 0)
+}
 
 // The longest start of `chars` that fits in `width` cells: how many code points.
 function fitting(chars: readonly string[], width: number): number {
   let cells = 0
   let count = 0
-  for (const ch of chars) {
-    const n = cellsOf(ch)
+  for (let i = 0; i < chars.length; i += 1) {
+    const n = cellsAt(chars, i)
     if (cells + n > width) break
     cells += n
     count += 1
