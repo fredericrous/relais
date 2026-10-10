@@ -39,9 +39,9 @@ fn field<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> {
 /// The tools each kind of agent may use; none has Agent.
 fn tools_of(kind: AgentKind) -> &'static [&'static str] {
     match kind {
-        AgentKind::Worker => &["Read", "Grep", "Glob", "Edit", "Write", "Bash"],
-        AgentKind::Reviewer => &["Read", "Grep", "Glob"],
-        AgentKind::Planner => &["Read", "Grep", "Glob", "Bash"],
+        AgentKind::Worker => &["Read", "Grep", "Glob", "LSP", "Edit", "Write", "Bash"],
+        AgentKind::Reviewer => &["Read", "Grep", "Glob", "LSP"],
+        AgentKind::Planner => &["Read", "Grep", "Glob", "LSP", "Bash"],
     }
 }
 
@@ -100,6 +100,10 @@ fn each_definition_names_its_own_kind_model_and_effort_and_cannot_spawn() {
             tools_of(kind),
             "{name}: a {}'s tools, with no Agent among them",
             kind_word(kind)
+        );
+        assert!(
+            text.contains("Find and follow code with LSP"),
+            "{name}: says to navigate with LSP, or the tool goes unused"
         );
         assert_eq!(
             field(&fields, "maxTurns"),

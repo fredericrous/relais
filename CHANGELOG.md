@@ -25,6 +25,13 @@ An agent's transcript opens inside the relais pane.
   longer inherit the run's `RELAIS_HOST`, so relais can verify changes to
   its own repository.
 - The pane's agent rows still show at most three agents per run.
+- Workers, planners and reviewers can use the LSP tool, and their
+  definitions say to find code with it and Read only the range it points
+  to. Over 2026-10-01..10, workers made 0 LSP calls against 63 Reads of
+  code files (45 of them whole files) and 157 shell greps: `LSP` was not
+  among their tools. The advisory agents `relais install` writes
+  (`relais-research`, `relais-implementation`, `relais-review`) get the
+  same.
 - **After upgrading, run `relais install --claude --user --write`, then
   restart your Claude Code sessions**: a running session keeps the plugin
   it started with.
