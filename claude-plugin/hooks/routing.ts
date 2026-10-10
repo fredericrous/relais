@@ -11,6 +11,7 @@ import {
   CLASSIFIER_MAX_TOKENS,
   CLASSIFIER_SYSTEM,
   CLASSIFIER_TIMEOUT_MS,
+  classificationRecord,
   classifierPrompt,
   clip,
   decideMain,
@@ -149,11 +150,11 @@ export async function onPrompt(fx: Fx, store: Store, text: string) {
   detach(flushObservations(fx, store))
   if (!r.state && !r.isStale) return
   const seq = ++r.seq
-  const promise = classifyPrompt(fx, store, text).catch(() => undefined)
+  const promise = classifyPrompt(fx, store, text, seq).catch(() => undefined)
   r.pendingRoute = { seq, promise }
 }
 
-async function classifyPrompt(fx: Fx, store: Store, text: string): Promise<Classified | undefined> {
+async function classifyPrompt(fx: Fx, store: Store, text: string, seq: number): Promise<Classified | undefined> {
   const r = store.router
   const session = await fx.session.id()
   if (session !== r.session || r.isStale) {
@@ -163,9 +164,9 @@ async function classifyPrompt(fx: Fx, store: Store, text: string): Promise<Class
   if (!r.state || r.state.mode === 'off') return undefined
   const [sessionModel, reply] = await Promise.all([
     Promise.resolve(fx.session.model()).catch(() => undefined),
-    complete(fx, store, classifierPrompt(text, r.task)),
+    classify(fx, store, classifierPrompt(text, r.task), 'prompt', seq),
   ])
-  return { ...reply, text, cls: reply.ok ? parseClassification(reply.text) : undefined, sessionModel }
+  return { ...reply, text, sessionModel }
 }
 
 const classifierModel = (store: Store) => {
@@ -185,6 +186,33 @@ async function complete(fx: Fx, store: Store, prompt: string) {
     timeoutMs: CLASSIFIER_TIMEOUT_MS,
   })
   return { ok: reply?.isAnswered === true, text: reply?.text, usage: reply?.usage, model, at: await fx.clock.now() }
+}
+
+// One classifier call, parsed, and kept for training whatever came of it
+// (an unparsed reply is a record too). Kept here, not where the decision is
+// taken, so a reply that lands after the turn stopped waiting is kept as
+// well. Fails open: the record is a side effect and never costs the call.
+async function classify(fx: Fx, store: Store, prompt: string, purpose: 'prompt' | 'spawn', seq: number) {
+  const started = await fx.clock.now()
+  const reply = await complete(fx, store, prompt)
+  const cls = reply.ok ? parseClassification(reply.text) : undefined
+  try {
+    queue(
+      store,
+      classificationRecord({
+        callId: `classifier:${reply.at}:${seq}:${purpose}`,
+        purpose,
+        model: reply.model,
+        text: prompt,
+        cls,
+        latencyMs: reply.at - started,
+        now: reply.at,
+      }),
+    )
+  } catch {
+    // The call's answer is what routing needs; the record is not.
+  }
+  return { ...reply, cls }
 }
 
 function queueClassifierUsage(store: Store, taskId: string, c: { usage: any; model: string; at: number } | undefined) {
@@ -343,13 +371,13 @@ export async function routeSpawn(fx: Fx, store: Store, e: any, next: any, remain
   const type = String(e.subagentType ?? e.subagent_type ?? '')
   const description = String(e.description ?? '')
   const prompt = String(e.prompt ?? '')
-  let classified: Awaited<ReturnType<typeof complete>> | undefined
+  let classified: Awaited<ReturnType<typeof classify>> | undefined
   let cls: Classification | undefined
   if (!state.pins[type]) {
-    const got = await within(fx, complete(fx, store, spawnPrompt(type, description, prompt)).catch(() => undefined), waitFor(remainingMs))
+    const got = await within(fx, classify(fx, store, spawnPrompt(type, description, prompt), 'spawn', ++r.seq).catch(() => undefined), waitFor(remainingMs))
     if (got !== TIMEOUT && got) {
       classified = got
-      cls = got.ok ? parseClassification(got.text) : undefined
+      cls = got.cls
     }
   }
   const spawn = decideSpawn({ state, type, cls, personModel: r.task?.subagentModel ?? null })
@@ -372,7 +400,7 @@ async function afterSpawn(
     state: RouterState
     spawn: ReturnType<typeof decideSpawn>
     applied: boolean
-    classified: Awaited<ReturnType<typeof complete>> | undefined
+    classified: Awaited<ReturnType<typeof classify>> | undefined
     description: string
     prompt: string
     result: any

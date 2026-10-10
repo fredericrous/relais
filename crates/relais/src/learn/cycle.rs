@@ -388,6 +388,9 @@ pub struct CycleInputs<'a> {
     pub gates: GateSettings,
     /// The `[learning]` envelope is recorded: promote on passing gates.
     pub auto_promote: bool,
+    /// The classifier input day files (ADR-0002): the cycle deletes those
+    /// past their 90 days, as every write of one does.
+    pub classifier_dir: Option<PathBuf>,
     pub now: DateTime<Utc>,
 }
 
@@ -718,6 +721,14 @@ pub fn run_cycle(
             Some(note) => format!("{note}; retention: {e}"),
             None => format!("retention: {e}"),
         });
+    }
+    if let Some(dir) = &inputs.classifier_dir {
+        if let Err(e) = crate::router::capture::purge_expired(dir, inputs.now) {
+            report.note = Some(match report.note.take() {
+                Some(note) => format!("{note}; classifier inputs: {e}"),
+                None => format!("classifier inputs: {e}"),
+            });
+        }
     }
     Ok(report)
 }
@@ -1147,6 +1158,7 @@ argv = ["true"]
                     max_abstention_rate: 0.5,
                 },
                 auto_promote,
+                classifier_dir: None,
                 now: Utc::now(),
             }
         }
@@ -1282,6 +1294,29 @@ argv = ["true"]
         assert!(rows[0].ended_at.is_some());
         assert_eq!(rows[0].source, LearningSource::Cycle);
         assert_eq!(rows[0].action, LearningAction::None);
+    }
+
+    #[test]
+    fn a_cycle_deletes_classifier_day_files_past_their_ninety_days() {
+        let world = World::new("classifier-ttl");
+        let dir = world._dir.join("classifier");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let now = Utc::now();
+        let day = |ago: i64| {
+            format!(
+                "{}.jsonl",
+                (now.date_naive() - Duration::days(ago)).format("%Y-%m-%d")
+            )
+        };
+        for ago in [0, 90, 91, 200] {
+            std::fs::write(dir.join(day(ago)), "{}\n").expect("file");
+        }
+        let repo = repo_policy();
+        let mut inputs = world.inputs(&repo, false);
+        inputs.classifier_dir = Some(dir.clone());
+        run_cycle(&inputs, &mut silent()).expect("cycle");
+        assert!(dir.join(day(0)).exists() && dir.join(day(90)).exists());
+        assert!(!dir.join(day(91)).exists() && !dir.join(day(200)).exists());
     }
 
     #[test]

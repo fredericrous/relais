@@ -247,6 +247,12 @@ enum Command {
         #[command(subcommand)]
         cmd: LearnCommand,
     },
+    /// The session router's data for training a local classifier
+    /// (SPEC §30, relais ADR-0002)
+    Router {
+        #[command(subcommand)]
+        cmd: RouterCommand,
+    },
     /// Return to the previous task artifact; the person's own rollback,
     /// recorded as a learning cycle row with source `person` (SPEC §17)
     Rollback {
@@ -423,6 +429,26 @@ enum CoordinatorCommand {
     /// Ask the running coordinator to exit; runs in flight keep their
     /// ledger state and `relais resume` reconciles them
     Stop,
+}
+
+#[derive(Subcommand)]
+enum RouterCommand {
+    /// Write the kept classifier calls that parsed as JSON lines: a header
+    /// with the capability table and its version, then one line per call
+    /// `{call_id, at, prompt_version, input, answer, split}`, split by time
+    /// (newest 20% test, next 10% calibration, the rest train). The input
+    /// text is the person's own prompts; nothing leaves the machine except
+    /// by this command
+    #[command(name = "export-classifier")]
+    ExportClassifier {
+        /// The file to create (mode 0600, through a temporary file in its
+        /// directory, then renamed), or `-` for stdout
+        #[arg(long)]
+        out: PathBuf,
+        /// Only calls made on or after this date (YYYY-MM-DD, UTC)
+        #[arg(long)]
+        since: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1256,6 +1282,11 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
                 quiet,
             } => learn_cycle_command(if_due, json, log.as_deref(), quiet),
             LearnCommand::Last { json } => learn_last_command(json),
+        },
+        Command::Router { cmd } => match cmd {
+            RouterCommand::ExportClassifier { out, since } => {
+                export_classifier_command(&out, since.as_deref())
+            }
         },
         Command::Rollback { json } => rollback_command(json),
         Command::Feedback {
@@ -2291,6 +2322,7 @@ fn learn_cycle_command(
             max_abstention_rate: machine.routing.max_abstention_rate,
         },
         auto_promote: machine.learning.auto_promote.is_some(),
+        classifier_dir: paths::state_dir().ok().map(|dir| dir.join("classifier")),
         now: chrono::Utc::now(),
     };
     let mut stage_number = 0;
@@ -2387,6 +2419,61 @@ fn learn_last_command(json: bool) -> Result<CliOutcome, CliError> {
             None => println!("no learning cycle has run yet"),
         }
     }
+    Ok(CliOutcome::Accepted)
+}
+
+/// `relais router export-classifier --out <file|-> [--since <date>]`.
+fn export_classifier_command(out: &Path, since: Option<&str>) -> Result<CliOutcome, CliError> {
+    let since_at = match since {
+        None => None,
+        Some(text) => match chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d") {
+            Ok(day) => Some(format!("{day}T00:00:00Z")),
+            Err(_) => {
+                return Err(CliError::Usage {
+                    detail: format!("--since `{text}` is not a date (YYYY-MM-DD)"),
+                })
+            }
+        },
+    };
+    let ledger = open_ledger()?;
+    let (all, parsed) = operational(ledger.router_classification_counts(), "export-classifier")?;
+    let rows = operational(
+        ledger.router_classifications_parsed(since_at.as_deref()),
+        "export-classifier",
+    )?;
+    let dir = paths::state_dir()
+        .map_err(CliError::Home)?
+        .join("classifier");
+    let (lines, skipped) = operational(
+        relais::router::capture::read_lines(&dir),
+        "export-classifier",
+    )?;
+    if skipped > 0 {
+        eprintln!("relais router export-classifier: {skipped} unreadable day-file line(s) skipped");
+    }
+    let export = relais::router::export::build(
+        rows,
+        &lines,
+        &relais::router::table::default_table(),
+        all,
+        parsed,
+    );
+    let text = export.text();
+    if out == Path::new("-") {
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        if let Err(e) = stdout
+            .write_all(text.as_bytes())
+            .and_then(|()| stdout.flush())
+        {
+            eprintln!("relais router export-classifier: stdout: {e}");
+            return Ok(CliOutcome::OperationalFailure);
+        }
+    } else if let Err(e) = relais::fsutil::write_atomic_with_mode(out, &text, Some(0o600)) {
+        eprintln!("relais router export-classifier: {}: {e}", out.display());
+        return Ok(CliOutcome::OperationalFailure);
+    }
+    eprintln!("{}", export.counts.summary());
     Ok(CliOutcome::Accepted)
 }
 
@@ -3952,7 +4039,20 @@ fn router_observe_command() -> CliOutcome {
             return CliOutcome::OperationalFailure;
         }
     };
-    match relais::router::observe(&ledger_path, &payload) {
+    let policy = match (paths::machine_settings_path(), paths::state_dir()) {
+        (Ok(machine_path), Ok(state_dir)) => relais::router::capture_policy(
+            &machine_path,
+            &state_dir,
+            std::env::var(relais::router::mode::MODE_ENV)
+                .ok()
+                .as_deref(),
+            chrono::Utc::now(),
+        ),
+        // The ledger path resolved from the same home, so this does not
+        // happen; were it to, nothing is kept.
+        _ => relais::router::capture::CapturePolicy::Off,
+    };
+    match relais::router::observe(&ledger_path, &payload, &policy) {
         Ok(_) => CliOutcome::Accepted,
         Err(e @ relais::router::ObserveError::Payload(_)) => {
             eprintln!("relais native router-observe: {e}");

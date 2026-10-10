@@ -26,12 +26,12 @@ use crate::route::RoutedBy;
 
 mod router;
 pub use router::{
-    ExplorationTask, RouterCheck, RouterClass, RouterDecisionRow, RouterExplorationStop,
-    RouterProvenance, RouterReassessRow, RouterRecord, RouterTaskOutcomeRow, RouterTaskRow,
-    RouterUsageRow, RouterWindow,
+    ExplorationTask, RouterCheck, RouterClass, RouterClassificationRow, RouterDecisionRow,
+    RouterExplorationStop, RouterProvenance, RouterReassessRow, RouterRecord, RouterTaskOutcomeRow,
+    RouterTaskRow, RouterUsageRow, RouterWindow,
 };
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 24;
+pub const LEDGER_SCHEMA_VERSION: u64 = 25;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -1562,6 +1562,32 @@ const MIGRATIONS: &[(&str, &str)] = &[
         undrawn INTEGER NOT NULL,
         undrawn_bad INTEGER NOT NULL
     );
+    "#,
+    ),
+    (
+        // The session router's classifier calls kept for training
+        // (learning-loop Phase 5, relais ADR-0002): everything about a
+        // call EXCEPT its text, which lives in a local 0600 day file. The
+        // text is represented by its SHA-256 only, never stored. `answer_json`
+        // is the parsed answer without the person's quoted words. Additive:
+        // a binary that predates it never reads the table.
+        "v25",
+        r#"
+    CREATE TABLE router_classifications (
+        session TEXT NOT NULL,
+        call_id TEXT NOT NULL,
+        purpose TEXT NOT NULL,
+        model TEXT NOT NULL,
+        prompt_version TEXT NOT NULL,
+        input_sha256 TEXT NOT NULL,
+        answer_json TEXT,
+        parse_ok INTEGER NOT NULL,
+        latency_ms INTEGER,
+        at TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        PRIMARY KEY (session, call_id)
+    );
+    CREATE INDEX idx_router_classifications_at ON router_classifications(at);
     "#,
     ),
 ];

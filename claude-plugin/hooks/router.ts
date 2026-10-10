@@ -1110,6 +1110,59 @@ export function usageRecord(input: {
   }
 }
 
+// The classifier input the contract allows: at most this many bytes.
+export const CLASSIFICATION_INPUT_BYTES = 3072
+
+let classifierVersionMemo: string | undefined
+
+// The classifier's prompt version: the SHA-256 of its system prompt, so a
+// training set says which prompt labelled each call.
+export function classifierVersion(): string {
+  classifierVersionMemo ??= sha256Hex(CLASSIFIER_SYSTEM)
+  return classifierVersionMemo
+}
+
+// One classifier call, kept for training (docs/router-protocol.md): the
+// text sent, and the parsed answer with every field, or null when the
+// reply did not parse. relais keeps the text in a local file and only its
+// hash in the ledger.
+export function classificationRecord(input: {
+  callId: string
+  purpose: 'prompt' | 'spawn'
+  model: string
+  text: string
+  cls: Classification | undefined
+  latencyMs: number | null
+  now: number
+}) {
+  const c = input.cls
+  return {
+    kind: 'classification',
+    call_id: input.callId,
+    purpose: input.purpose,
+    model: input.model,
+    prompt_version: classifierVersion(),
+    input: clip(input.text, CLASSIFICATION_INPUT_BYTES),
+    answer: c
+      ? {
+          relation: c.relation,
+          kind: c.kind,
+          difficulty: c.difficulty,
+          scope: c.scope,
+          uncertainty: c.uncertainty,
+          verifiable: c.verifiable,
+          explicit: { value: c.explicit.value, quote: c.explicit.quote },
+          user_model: c.user_model,
+          user_model_for: c.user_model_for,
+          confidence: c.confidence,
+        }
+      : null,
+    parse_ok: c !== undefined,
+    latency_ms: input.latencyMs !== null && Number.isFinite(input.latencyMs) ? Math.max(0, Math.round(input.latencyMs)) : null,
+    at: iso(input.now),
+  }
+}
+
 export function reassessRecord(task: TaskState, r: ReassessRecord, now: number) {
   return { kind: 'reassess', task_id: task.id, agent_id: task.agentId, ...r, at: iso(now) }
 }

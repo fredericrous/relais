@@ -110,7 +110,18 @@ Record kinds (field `kind`):
 
 { "kind": "task_outcome", "task_id": "s", "agent_id": "s|null",
   "outcome": "completed_verified|completed_accepted|corrected|unknown", "at": "RFC3339" }
+
+{ "kind": "classification", "call_id": "s", "purpose": "prompt|spawn", "model": "full id",
+  "prompt_version": "64 lowercase hex: SHA-256 of the classifier's system prompt",
+  "input": "the exact user content sent to the classifier, at most 3072 bytes",
+  "answer": { "relation": "new_task|continuation|correction", "kind": "question|edit|debug|design|review",
+              "difficulty": 3, "scope": "local|module|cross-cutting|unknown", "uncertainty": "low|medium|high",
+              "verifiable": true, "explicit": { "value": "accept|correct|none", "quote": "s|null" },
+              "user_model": "s|null", "user_model_for": "session|subagent|null", "confidence": 0.8 },
+  "parse_ok": true, "latency_ms": 350, "at": "RFC3339" }
 ```
+
+- **`classification`** is one classifier call, kept to train a local model on (relais ADR-0002). The plugin sends one for every call, prompt or spawn, including a reply that did not parse (`answer: null`, `parse_ok: false`), and fails open if it cannot. `answer` is the plugin's parse of the reply, every field; `explicit`, `user_model` and `user_model_for` are optional and default to `none`, `null`, `null`; `latency_ms` is optional. `parse_ok` and `answer` must agree. relais writes `input` (and `answer.explicit.quote`) to a local day file, `<state dir>/classifier/<YYYY-MM-DD>.jsonl` (0700 directory, 0600 files, secret shapes redacted, files deleted after 90 days), and the rest to `router_classifications` with the SHA-256 of `input` instead of the text. With `[session_routing] keep_classifier_inputs = false`, `RELAIS_SESSION_ROUTING=off` or routing off, relais drops these records and writes neither. An older relais refuses the kind (exit 2).
 
 - **`files`** are the first 16 hex digits of the SHA-256 of a repo-relative path (relative to the session's cwd, no leading `./`), lowercase. On a `task`: every file the task edited (Edit, Write, MultiEdit, NotebookEdit successes). On a `reassess` with `event: "revert"`: the files a successful Bash `git revert …` (`[]`: its files are not known here), `git checkout [<ref>] -- <paths>` or `git restore <paths>` (not `--staged` alone) put back; a revert is never escalating. Optional, default `[]`. R2 matches reverts and later corrections to the tasks whose files they touch (plan §5, missed failures).
 - **`table_version`** is the capability table's `version` the decision was made under. Optional, default `null`.
@@ -123,7 +134,8 @@ Idempotency keys:
 - usage: `(session, turn_id, step, agent_id, source)`;
 - reassess: `(session, task_id, agent_id, event, at)`;
 - task: `(session, task_id, agent_id)`;
-- task_outcome: `(session, task_id, agent_id)` (it updates that task).
+- task_outcome: `(session, task_id, agent_id)` (it updates that task);
+- classification: `(session, call_id)`.
 
 A `task` record may be sent again with a later outcome. Its rank is `corrected` > `completed_verified` = `completed_accepted` > `unknown`. A higher-ranked outcome overwrites a lower one; a lower one never overwrites. `unknown` never overwrites anything. `files` and `inferred` only gain; `completed_at_end` is never overwritten once set.
 

@@ -46,6 +46,9 @@ pub struct Arm {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Classifier {
     pub calls: usize,
+    /// Parsed classifier calls kept for training, over the whole ledger
+    /// (not the window): what the first local-model run waits on.
+    pub captured: u64,
     pub cost: Option<MicroUsd>,
     pub unpriced_models: Vec<String>,
 }
@@ -328,6 +331,7 @@ pub fn session_routing(
         unknown_rate: (tasks > 0).then(|| unknown as f64 / tasks as f64),
         classifier: Classifier {
             calls: classifier_rows.len(),
+            captured: 0,
             cost: classifier_cost,
             unpriced_models: classifier_unpriced,
         },
@@ -389,6 +393,10 @@ impl SessionRoutingReport {
         out.push_str(&format!(
             "  classifier: {} call(s), {classifier}\n",
             self.classifier.calls
+        ));
+        out.push_str(&format!(
+            "  classifier calls kept for training: {} parsed\n",
+            self.classifier.captured
         ));
         out.push_str(&format!(
             "  cache rebuilt after a model switch: {} token(s) written\n",

@@ -831,6 +831,9 @@ pub struct SessionRoutingSettings {
     pub excluded_models: Vec<String>,
     /// The success floor a learned adjustment must clear (R2).
     pub quality_floor: f64,
+    /// Keep each classifier call's input text, locally, to train a model
+    /// on (ADR-0002): `false` captures nothing, no file and no ledger row.
+    pub keep_classifier_inputs: bool,
 }
 
 impl Default for SessionRoutingSettings {
@@ -844,6 +847,7 @@ impl Default for SessionRoutingSettings {
             pinned_agents: Vec::new(),
             excluded_models: Vec::new(),
             quality_floor: 0.85,
+            keep_classifier_inputs: true,
         }
     }
 }
@@ -2023,6 +2027,13 @@ keys = ["output.contract"]
         );
     }
 
+    #[test]
+    fn keeping_classifier_inputs_is_on_unless_the_person_turns_it_off() {
+        let off = "schema_version = 1\n\n[session_routing]\nkeep_classifier_inputs = false\n";
+        let machine = MachineSettings::from_toml_str(off).expect("parses");
+        assert!(!machine.session_routing.keep_classifier_inputs);
+    }
+
     /// A machine.toml from before `[session_routing]` (the shape every
     /// installed relais wrote) parses, and means shadow: no envelope.
     #[test]
@@ -2035,6 +2046,7 @@ keys = ["output.contract"]
         assert_eq!(routing.holdout_rate, 0.1);
         assert_eq!(routing.epsilon, 0.1);
         assert_eq!(routing.quality_floor, 0.85);
+        assert!(routing.keep_classifier_inputs);
         assert_eq!(routing.effective_epsilon(), 0.0);
         assert_eq!(routing.full_model_id("haiku"), "claude-haiku-5-5");
         assert_eq!(routing.full_model_id("sonnet"), "claude-sonnet-5-5");

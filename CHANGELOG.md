@@ -36,6 +36,13 @@ The session router gets real outcome evidence.
   undrawn tasks with strong outcomes, both corrected shares and the projected
   date the busiest stratum reaches 20 drawn tasks; also in `--json`.
 
+The session router keeps its classifier calls to train a local model on (relais ADR-0002).
+
+- The plugin sends a `classification` record for every classifier call, prompt or spawn: the exact input (at most 3 KB), the parsed answer with every field, the prompt version, whether it parsed and the latency. relais writes the input text to a local day file (`<state dir>/classifier/<YYYY-MM-DD>.jsonl`, directory 0700, files 0600), with provider API keys, bearer tokens, private key blocks and long base64 or hex runs redacted, and deletes files older than 90 days when it writes and in `relais learn cycle`. The ledger holds only the text's SHA-256 (schema 25, a new `router_classifications` table).
+- `[session_routing] keep_classifier_inputs = false` in machine.toml, `RELAIS_SESSION_ROUTING=off` and routing turned off capture nothing. Upgrade relais before the plugin: an older relais refuses the new record kind.
+- New `relais router export-classifier --out <file|-> [--since <date>]` writes the parsed calls as JSON lines behind a header with the capability table and its version, split by time into train, calibration and test. It is the one way the text leaves the machine.
+- `relais report` shows how many parsed classifier calls are kept.
+
 A salvaged run can now teach the learner, when its verified patch landed.
 
 - `relais decide --answer salvaged` records whether the run's verified

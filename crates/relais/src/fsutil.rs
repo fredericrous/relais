@@ -23,7 +23,7 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 /// file after a crash. `None` leaves the mode to the umask, as
 /// `write_atomic` always has. Windows has no mode bits; there it is
 /// `write_atomic` plus nothing.
-pub(crate) fn write_atomic_with_mode(
+pub fn write_atomic_with_mode(
     path: &Path,
     contents: &str,
     mode: Option<u32>,
@@ -79,4 +79,36 @@ pub(crate) fn write_atomic_with_mode(
         std::fs::File::open(parent)?.sync_all()?;
     }
     Ok(())
+}
+
+/// A directory only its owner can enter: created if absent and, when it
+/// already exists, forced to 0700 whatever the umask or an earlier
+/// version left it. Windows has no mode bits; there it is
+/// `create_dir_all`.
+pub(crate) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Append `line` plus a newline to `path` for the owner alone: opened
+/// `O_APPEND | O_CREAT` with mode 0600, and written with ONE `write_all`,
+/// so two writers append whole lines, never halves of them.
+pub(crate) fn append_private_line(path: &Path, line: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    let mut bytes = Vec::with_capacity(line.len() + 1);
+    bytes.extend_from_slice(line.as_bytes());
+    bytes.push(b'\n');
+    file.write_all(&bytes)
 }

@@ -127,9 +127,29 @@ pub struct RouterTaskOutcomeRow {
     pub at: String,
 }
 
+/// One classifier call, keyed `(session, call_id)`. It holds everything but
+/// the call's text: `input_sha256` stands for it (the text is in a local
+/// day file, `router::capture`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouterClassificationRow {
+    pub call_id: String,
+    /// `prompt` or `spawn`.
+    pub purpose: String,
+    pub model: String,
+    /// SHA-256 of the classifier's system prompt.
+    pub prompt_version: String,
+    pub input_sha256: String,
+    /// The parsed answer, every field, as JSON; `None` when it did not parse.
+    pub answer_json: Option<String>,
+    pub parse_ok: bool,
+    pub latency_ms: Option<u64>,
+    pub at: String,
+}
+
 /// One record of a `router-observe` batch.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RouterRecord {
+    Classification(RouterClassificationRow),
     Decision(RouterDecisionRow),
     Usage(RouterUsageRow),
     Reassess(RouterReassessRow),
@@ -508,6 +528,33 @@ impl Ledger {
                         ],
                     )?;
                 }
+                RouterRecord::Classification(c) => {
+                    tx.execute(
+                        "INSERT INTO router_classifications
+                            (session, call_id, purpose, model, prompt_version, input_sha256,
+                             answer_json, parse_ok, latency_ms, at, recorded_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                         ON CONFLICT (session, call_id) DO UPDATE SET
+                            purpose = excluded.purpose, model = excluded.model,
+                            prompt_version = excluded.prompt_version,
+                            input_sha256 = excluded.input_sha256,
+                            answer_json = excluded.answer_json, parse_ok = excluded.parse_ok,
+                            latency_ms = excluded.latency_ms, at = excluded.at",
+                        params![
+                            session,
+                            c.call_id,
+                            c.purpose,
+                            c.model,
+                            c.prompt_version,
+                            c.input_sha256,
+                            c.answer_json,
+                            c.parse_ok,
+                            c.latency_ms.map(saturating_i64),
+                            c.at,
+                            now,
+                        ],
+                    )?;
+                }
                 RouterRecord::TaskOutcome(o) => {
                     // Only over a stored `unknown`, and only with a real
                     // outcome; a task that has no row yet is left alone.
@@ -571,6 +618,49 @@ impl Ledger {
             *slot = n.max(0) as u64;
         }
         Ok(counts)
+    }
+
+    /// How many classifier calls are kept, and how many of them parsed:
+    /// the count the first Laya run waits on.
+    pub fn router_classification_counts(&self) -> Result<(u64, u64)> {
+        let (all, parsed): (i64, i64) = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(parse_ok), 0) FROM router_classifications",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((all.max(0) as u64, parsed.max(0) as u64))
+    }
+
+    /// Every kept classifier call that parsed, `at` or later, oldest
+    /// first. The text is not here (see [`RouterClassificationRow`]).
+    pub fn router_classifications_parsed(
+        &self,
+        since: Option<&str>,
+    ) -> Result<Vec<(String, RouterClassificationRow)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session, call_id, purpose, model, prompt_version, input_sha256,
+                    answer_json, parse_ok, latency_ms, at
+               FROM router_classifications
+              WHERE parse_ok = 1 AND answer_json IS NOT NULL AND at >= ?1
+              ORDER BY at, session, call_id",
+        )?;
+        let rows = stmt.query_map(params![since.unwrap_or("")], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                RouterClassificationRow {
+                    call_id: row.get(1)?,
+                    purpose: row.get(2)?,
+                    model: row.get(3)?,
+                    prompt_version: row.get(4)?,
+                    input_sha256: row.get(5)?,
+                    answer_json: row.get(6)?,
+                    parse_ok: row.get(7)?,
+                    latency_ms: row.get::<_, Option<i64>>(8)?.map(|n| n.max(0) as u64),
+                    at: row.get(9)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// `(kind, difficulty, total tokens)` of every task whose outcome is

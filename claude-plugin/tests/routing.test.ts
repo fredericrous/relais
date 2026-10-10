@@ -3,6 +3,7 @@
 
 import { expect, test } from 'claude-code/testing'
 import { nativeCalls, settle, spawnLine, startQueued } from './support.ts'
+import { CLASSIFIER_SYSTEM, sha256Hex } from '../hooks/router.ts'
 import {
   answered,
   bash,
@@ -352,6 +353,7 @@ test('observations: one router-observe per prompt; flushed at session.end', asyn
   expect(calls[0].payload.schema).toBe(1)
   expect(calls[0].payload.session).toBe('session-1')
   expect(calls[0].payload.records.map((r: any) => `${r.kind}:${r.source ?? ''}`)).toEqual([
+    'classification:',
     'usage:classifier',
     'decision:',
     'usage:step',
@@ -486,6 +488,59 @@ test('a classifier answer that fails to parse, or no router-state, routes nothin
   engine.fallback = () => ({ isAnswered: true, text: 'not json', usage: answered({}).usage })
   const { steps } = await personTurn($, engine, 'hello')
   expect(steps[0].model).toBe(SONNET)
+})
+
+// --- classifier calls kept for training (learning-loop Phase 5) -------------------------
+
+test('each classifier call is a classification record: the prompt sent, the parsed answer, the prompt version', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  engine.labels.set('rename foo', label({ explicit: { value: 'correct', quote: 'that was wrong' }, user_model: 'opus' }))
+  await personTurn($, engine, 'rename foo to bar, tests exist')
+  await endSession($, engine)
+  const records = observed(engine, 'classification')
+  expect(records.length).toBe(1)
+  const [c] = records
+  expect(c.purpose).toBe('prompt')
+  expect(c.model).toBe(HAIKU)
+  expect(c.prompt_version).toMatch(/^[0-9a-f]{64}$/)
+  expect(c.prompt_version).toBe(sha256Hex(CLASSIFIER_SYSTEM))
+  expect(c.input).toBe(String(engine.calls.completes[0].prompt))
+  expect(c.input).toContain('rename foo to bar')
+  expect(c.parse_ok).toBe(true)
+  expect(c.latency_ms).toBeGreaterThanOrEqual(0)
+  expect(c.answer).toEqual({
+    relation: 'new_task',
+    kind: 'edit',
+    difficulty: 2,
+    scope: 'local',
+    uncertainty: 'low',
+    verifiable: true,
+    explicit: { value: 'correct', quote: 'that was wrong' },
+    user_model: 'opus',
+    user_model_for: null,
+    confidence: 0.9,
+  })
+})
+
+test('a reply that does not parse is a classification record with no answer; the input is at most 3 KB', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  engine.fallback = () => ({ isAnswered: true, text: 'not json', usage: answered({}).usage })
+  await personTurn($, engine, 'é'.repeat(5000))
+  await endSession($, engine)
+  const [c] = observed(engine, 'classification')
+  expect(c.parse_ok).toBe(false)
+  expect(c.answer).toBeNull()
+  expect(new TextEncoder().encode(c.input).length).toBeLessThanOrEqual(3072)
+})
+
+test('a subagent spawn classified is a classification record of purpose spawn', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await $.agent.spawn({ prompt: 'look up where foo is defined', description: 'find foo', subagentType: 'Explore' })
+  await endSession($, engine)
+  const spawns = observed(engine, 'classification').filter((r: any) => r.purpose === 'spawn')
+  expect(spawns.length).toBe(1)
+  expect(spawns[0].input).toContain('look up where foo is defined')
+  expect(spawns[0].parse_ok).toBe(true)
 })
 
 // --- evidence for the router (learning-loop Phase 3) ----------------------------------
