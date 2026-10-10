@@ -10,7 +10,7 @@ adrs: []
 ## Review panel
 
 👉 **Decide:** none — approve if checking the ledger at delivery, failing open, is the right place to stop stale outcome messages.
-📍 relais · plan reviewed, nothing built · next: worktree, Phase 1 read-only ledger open. Panel: backend, rust, tui, unix.
+📍 relais · Phases 1 and 2 built and verified · next: merge, release v0.11.3, then the Phase 3 live observation. Panel: backend, rust, tui, unix.
 **Changed by review:** ledger opened read-only (no create/migrate, 250 ms busy); rewrite only on a recorded resolution, headline without `detail`; entry kept until delivered (retry-safe).
 📄 Full reviews: [2026-10-10-fresh-outcome-notifications.reviews.md](2026-10-10-fresh-outcome-notifications.reviews.md)
 
@@ -80,5 +80,29 @@ Intended outcome: a message announcing a state that waits on a person (`needs_de
 
 - The `status` tool's in-memory model still shows the ended state after a decision; a follow-up can read `current` there.
 - Provider substitution (`unapproved_substitution` with a blank model), learned routing, worktree retirement.
+
+## Decision log
+
+- **2026-10-10, Phase 2: the check runs in the pump, not in a `prompt.submit` hook.** Measured in the plugin test kit: a submit the plugin itself makes passes through every plugin's `prompt.submit` hook but its own (a probe in our hook never ran for the pump's submit). The hook planned here would never have run. `freshen` now runs in `submitVerdicts`, right before `fx.prompt.submit`, which is the end of the plugin-queue wait that held the incident's message for ten minutes. The outcome is unchanged; the host's own idle wait for the queue head was never ours to check, in either design. `register.ts` is not changed.
+- **The submitted text is the one marked in `ownPrompts`**, so a mark, if the host ever passes it to our hook, matches what was sent.
+- **`pendingOutcomes` entries carry `kind` and `facts`** (receipt, changes, trial lines) beside `run`, `outcome`, `code`, so the rewrite keeps the replay wording and those lines without re-parsing the message.
+- **Store sizes are not asserted in the plugin tests.** The kit gives the test no handle on the module's store. Test 1's "no leftover entry" is checked through behaviour instead: an identical outcome later is checked again, against a different answer.
+- **The 250 ms wait is timed in-process, not around the CLI.** `a_read_only_open_gives_up_after_its_own_short_wait` (ledger tests) holds an exclusive lock and asserts the open gives up as busy after at least 250 ms and under the writers' 5 s. The two CLI busy tests assert what is printed (`current` present under a writer; absent, with one stderr line naming the lock, under an exclusive lock) and no wall clock. A first version bounded the CLI call at 1.5 s; at load average 178 it took 4–6 s per process start in parallel, so that bound measured the machine.
+- **`current_of_run` returns a typed `CurrentUnknown`** (home unset, no ledger, ledger error), not a `String` (`errors.typed-values`).
+- **`LedgerError::SchemaMismatch`** is a new variant for a read-only open on any other schema; `SchemaAhead` keeps its meaning for writers.
+
+## Verification record (2026-10-10, before push)
+
+| Check | Expected | Actual |
+|---|---|---|
+| `tests/native_status.rs` (9): resolved, open, the three state spellings, unknown run, empty state dir, writer in progress, exclusive lock, closed WAL ledger unchanged, other schema | per plan | pass |
+| Ledger: read-only open under an exclusive lock; missing ledger | busy after ≥250 ms and <5 s; nothing created | pass |
+| Live ledger, read-only, incident run `run-65d6671dde41e-6d1a` | `outcome` needs_decision, `current.state` accepted, resolution set | `needs_decision`; `accepted`, `decision_approved` at 2026-10-09T11:34:19 |
+| Latency, 20 calls on the live ledger (debug build, machine under `make check`) | under 300 ms | p50 47 ms, max 68 ms |
+| Same, on a copy of the live ledger with a writer committing every 20 ms | under 300 ms, `current` present | p50 49 ms, max 56 ms, `current` 20/20 |
+| Plugin `outcome.test.ts`: incident (code and no code), recheck, still open byte for byte, 3 fail-open cases, `current` missing once, 3 not-awaiting outcomes, retry | per plan | pass; 150/150 in the kit |
+| Falsification: `freshen` short-circuited | the new tests fail | 9 fail |
+| v0.11.2 pending-submit test | pass | pass |
+| `make check` (fmt, clippy, module cycles, cargo test, MSRV 1.88, audit, plugin) | green | green: tests and lint in one run; msrv, audit, plugin and lint re-run on the final tree after the first run hit a full disk |
 
 <!-- panel: repos=relais adds= reviewers=backend,lang:rust,tui,unix body-sha=163b82211d32 -->
