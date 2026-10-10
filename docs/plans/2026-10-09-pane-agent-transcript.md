@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/pane-agent-transcript
 repos: [relais]
 adrs: []
@@ -85,9 +85,9 @@ agent  │ I'll start by reading package.json and the workflows.
 
 One PR on `relais`, branch `feat/pane-agent-transcript`, three commits:
 
-- **P1 — the affordance**: `AgentRow.type` from the spawn and the dim name row under each known agent.
-- **P2 — the agent view**: everything under Where it lives, the hint line, the drawings for loading, deny and slow.
-- **P3 — docs**: `claude-plugin/README.md` (the pane section), `CHANGELOG.md` (Unreleased), `amont agents-md` output if it changes.
+- [x] **P1 — the affordance**: `AgentRow.type` from the spawn and the dim name row under each known agent.
+- [x] **P2 — the agent view**: everything under Where it lives, the hint line, the drawings for loading, deny and slow.
+- [x] **P3 — docs**: `claude-plugin/README.md` (the pane section), `CHANGELOG.md` (Unreleased), `amont agents-md` output if it changes.
 
 ## Verification
 
@@ -97,9 +97,24 @@ One PR on `relais`, branch `feat/pane-agent-transcript`, three commits:
 - `tests/views/relais-pane.test.ts`: existing tests unchanged; at `bodyColumns: 72` every row of the agent view's first three rows fits whole.
 - Live, guided preview on the person's terminal (an interface): `claude --plugin-dir claude-plugin` in a repository with a relais contract, docked at 72 and at 100 columns; start a run and `/relais-status`; click the worker row → its transcript, growing as the worker calls tools, the end followed; wheel up, then back; Tab to `[ back ]`, Enter → the runs view; Escape → the keys return to the prompt, the view stays; open the same worker with `↓ to manage` and compare; after the run, open a finished agent (the real deny case). Measured and recorded in the PR body with the screenshots: `session.messages` calls per minute with one running agent and with one denied finished agent (expected about 60 and 1), the largest state write in bytes and the writes per second with a busy agent shown, the read's latency on the longest transcript at hand, the layout time of the 4096-message fixture.
 
+## Verification record (2026-10-10, before push)
+
+- `make check` → exit 0 → observed: each commit passed the pre-commit gate, Rust tests included; `claude plugin validate claude-plugin` passes.
+- `claude plugin test` → every test passes → observed: 188 pass, 0 fail across 13 files (155 on main, 32 from the feature, 1 from the review).
+- Overlapping refreshes, falsified → with the early flag removed the new test fails, with it the test passes → observed: Expected 1, Received 2 without it; pass with it.
+- Live check on the person's terminal, the guide's steps (click a worker, transcript grows, `[ back ]`, a finished agent) → it works → observed: the person approved after trying it, 2026-10-10. The plan's live measurements (reads per minute, largest write, read latency, layout time) were not taken; the tests bound each.
+- Known: 2-cell characters (CJK) are wrapped by code point, so such a row can run past the body and is cut with `…`; the layout does not break.
+
+## Implementation review
+
+- **approve** on tree `95b391c` (three passes: 66k, 57 s; 73k, 20 s; 76k, 13 s).
+- Fixed: `holds-until:` at the three ceilings; a failed detached read noted on the run; one read when two pumps overlap (new test); the deny test counts the run's note; comments; the `back` press variant removed; the load-time import cycle removed (`hooks/limits.ts`).
+- Deliberate: none.
+
 ## Decision log
 
 - 2026-10-09 — the person: the click in the pane should do what the footer's agent row does; an affordance is still wanted. No API switches the conversation view, so the transcript is drawn in the pane and the hint names the footer.
+- 2026-10-10 — P1 and P2 are one commit: the implementation came back from a relais worker as one patch. relais's own verification could not accept it: `make check` fails inside a relais run on main's `a_spending_replay_outside_the_plugin_is_refused_before_anything_runs` (its command inherits the run's `RELAIS_HOST`), before the plugin tests; that bug is outside this plan. The patch was tested and the review fixes made in the session.
 - 2026-10-09 — check-output page deferred: needs `check_started.log_path` in the protocol first.
 - 2026-10-09 — the person asked for a prompt-engineer review as the user: digit hotkeys, the `b` key and `◂ in view` dropped (not asked for); one byte limit; the header defined; mock-ups made to fit 72 columns; the slow-read guard written once, in the Design.
 
