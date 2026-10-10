@@ -72,9 +72,27 @@ export type Store = {
   // Outcome messages this plugin submitted, so `prompt.submit` does not
   // take them for the person's own words.
   ownPrompts: Set<string>
+  // Outcome messages announcing a state that waits on a person, by their
+  // exact text, until submitted: the pump checks each against what the
+  // ledger holds just before submitting it (runs.ts, `freshen`).
+  pendingOutcomes: Map<string, PendingOutcome>
+  // Whether this session was told its relais gives no `current` state.
+  isCurrentMissingNoted: boolean
   // The session router's memory: router-state, the task, the pinned route,
   // the observations waiting (routing.ts).
   router: RouterMemory
+}
+
+// What an outcome message was built from, to rebuild it if the run's
+// decision is answered before the message goes out.
+export type PendingOutcome = {
+  run: string
+  outcome: string
+  code: string | null
+  // `run` or `replay`, as the headline names it.
+  kind: string
+  // The lines after the headline that stay true: receipt, changes, trial.
+  facts: string[]
 }
 
 // A background promise nobody awaits: once the module unloads its effects
@@ -109,6 +127,8 @@ export const createStore = (): Store => ({
   consent: new Map(),
   declined: new Set(),
   ownPrompts: new Set(),
+  pendingOutcomes: new Map(),
+  isCurrentMissingNoted: false,
   router: createRouterMemory(),
 })
 
