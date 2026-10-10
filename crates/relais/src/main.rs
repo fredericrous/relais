@@ -3576,23 +3576,43 @@ fn native_status_command(run: Option<&str>) -> Result<CliOutcome, CliError> {
     }
 }
 
+/// Why `relais native status` cannot say what holds for a run now.
+#[derive(Debug)]
+enum CurrentUnknown {
+    Home(paths::HomeUnset),
+    NoLedger(std::path::PathBuf),
+    Ledger(relais::ledger::LedgerError),
+}
+
+impl std::fmt::Display for CurrentUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Home(e) => write!(f, "{e}"),
+            Self::NoLedger(path) => write!(f, "no ledger at {}", path.display()),
+            Self::Ledger(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 /// What the ledger holds for `run` now: its state and its decision, open
 /// or answered. `outcome` in the timeline is how the run ended, from its
 /// events; a decision answered since is recorded only in the ledger, so
 /// this is the one place a reader learns it. `Ok(None)` for a run the
 /// ledger does not know. Read-only: a missing, busy or other-schema
 /// ledger is an error to report, never one to create or migrate.
-fn current_of_run(run: &str) -> Result<Option<serde_json::Value>, String> {
-    let path = paths::ledger_path().map_err(|e| e.to_string())?;
+fn current_of_run(run: &str) -> Result<Option<serde_json::Value>, CurrentUnknown> {
+    let path = paths::ledger_path().map_err(CurrentUnknown::Home)?;
     if !path.is_file() {
-        return Err(format!("no ledger at {}", path.display()));
+        return Err(CurrentUnknown::NoLedger(path));
     }
-    let ledger = Ledger::open_read_only(&path).map_err(|e| e.to_string())?;
+    let ledger = Ledger::open_read_only(&path).map_err(CurrentUnknown::Ledger)?;
     let run = RunId::from_stored(run);
-    let Some(state) = ledger.run_status(&run).map_err(|e| e.to_string())? else {
+    let Some(state) = ledger.run_status(&run).map_err(CurrentUnknown::Ledger)? else {
         return Ok(None);
     };
-    let decision = ledger.decision_of_run(&run).map_err(|e| e.to_string())?;
+    let decision = ledger
+        .decision_of_run(&run)
+        .map_err(CurrentUnknown::Ledger)?;
     Ok(Some(serde_json::json!({
         "state": state,
         "decision": decision.map(|d| serde_json::json!({

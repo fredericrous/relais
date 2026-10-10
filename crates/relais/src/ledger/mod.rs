@@ -4755,6 +4755,48 @@ mod tests {
         crate::test_support::temp_dir(&format!("ledger-{label}"))
     }
 
+    /// A read-only open shut out by an exclusive lock gives up after
+    /// `READ_ONLY_BUSY_TIMEOUT`, not the writers' five seconds: it sits
+    /// on the path to a session's next turn. Timed in-process, so the
+    /// bound measures the wait and not the load on the machine.
+    #[test]
+    fn a_read_only_open_gives_up_after_its_own_short_wait() {
+        let (ledger, dir) = temp_ledger();
+        let path = ledger.path().to_path_buf();
+        drop(ledger);
+        let holder = Connection::open(&path).expect("holder");
+        holder
+            .execute_batch(
+                "PRAGMA locking_mode = EXCLUSIVE; \
+                 BEGIN IMMEDIATE; UPDATE schema_migrations SET applied_at = applied_at; COMMIT;",
+            )
+            .expect("take the exclusive lock");
+        let started = std::time::Instant::now();
+        let error = match Ledger::open_read_only(&path) {
+            Ok(_) => panic!("a reader got past an exclusive lock"),
+            Err(error) => error,
+        };
+        let waited = started.elapsed();
+        assert!(
+            matches!(&error, LedgerError::Sqlite(e) if is_busy(e)),
+            "{error}"
+        );
+        assert!(waited >= READ_ONLY_BUSY_TIMEOUT, "gave up after {waited:?}");
+        assert!(waited < LEDGER_BUSY_TIMEOUT, "waited {waited:?}");
+        drop(holder);
+        drop(dir);
+    }
+
+    /// Reading never creates: a missing ledger is an error, and no file,
+    /// directory or journal appears.
+    #[test]
+    fn a_read_only_open_creates_nothing() {
+        let dir = temp_dir("read-only-missing");
+        let path = dir.join("state").join("ledger.sqlite");
+        assert!(Ledger::open_read_only(&path).is_err());
+        assert!(!dir.join("state").exists());
+    }
+
     fn temp_ledger() -> (Ledger, crate::test_support::TempDir) {
         let dir = temp_dir("open");
         let path = dir.join("ledger.sqlite");

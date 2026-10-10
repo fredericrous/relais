@@ -6,7 +6,6 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::time::{Duration, Instant};
 
 use relais::ids::{RunId, TaskId};
 use relais::ledger::{DecisionAnswer, Ledger, Transition};
@@ -55,9 +54,8 @@ impl World {
         std::fs::write(dir.join("events.jsonl"), format!("{line}\n")).expect("events");
     }
 
-    fn status(&self, run: &str) -> (Output, Duration) {
-        let started = Instant::now();
-        let output = Command::new(BIN)
+    fn status(&self, run: &str) -> Output {
+        Command::new(BIN)
             .args(["native", "status", "--run", run])
             .current_dir(&self.root)
             .env("RELAIS_STATE_DIR", &self.state)
@@ -65,12 +63,11 @@ impl World {
             .env("HOME", &self.root)
             .env("USERPROFILE", &self.root)
             .output()
-            .expect("relais runs");
-        (output, started.elapsed())
+            .expect("relais runs")
     }
 
     fn status_json(&self, run: &str) -> (serde_json::Value, String) {
-        let (output, _) = self.status(run);
+        let output = self.status(run);
         assert!(output.status.success(), "{output:?}");
         let json = serde_json::from_slice(&output.stdout).expect("one JSON object");
         (json, String::from_utf8_lossy(&output.stderr).into_owned())
@@ -220,11 +217,6 @@ fn an_empty_state_directory_stays_empty() {
     assert!(!world.state.join("ledger.sqlite-wal").exists());
 }
 
-/// How long the busy cases may take. The bound separates the 250 ms
-/// read-only wait from the writers' 5 s one, with room for a process
-/// start on a loaded CI runner.
-const READ_BOUND: Duration = Duration::from_millis(1_500);
-
 /// Under WAL a writer does not block readers: a transaction holding the
 /// write lock leaves the read, and its answer, intact.
 #[test]
@@ -241,16 +233,17 @@ fn a_writer_in_progress_does_not_hide_the_current_state() {
     writer
         .execute_batch("BEGIN IMMEDIATE; UPDATE runs SET updated_at = updated_at;")
         .expect("hold the write lock");
-    let (output, took) = world.status("run-w");
+    let output = world.status("run-w");
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
     assert_eq!(json["current"]["state"], "needs_decision", "{json}");
-    assert!(took < READ_BOUND, "took {took:?}");
     writer.execute_batch("ROLLBACK").expect("release");
 }
 
 /// A connection in exclusive locking mode shuts every reader out: the
-/// read gives up after its own short wait, prints the timeline without
-/// `current`, and exits 0.
+/// read gives up, prints the timeline without `current`, and exits 0.
+/// How long it waits first is the ledger's own test
+/// (`a_read_only_open_gives_up_after_its_own_short_wait`): timed around a
+/// process start, the bound measured the machine's load instead.
 #[test]
 fn an_exclusive_lock_costs_the_current_state_not_the_timeline() {
     let world = World::new("exclusive");
@@ -268,7 +261,7 @@ fn an_exclusive_lock_costs_the_current_state_not_the_timeline() {
              BEGIN IMMEDIATE; UPDATE runs SET updated_at = updated_at; COMMIT;",
         )
         .expect("take the exclusive lock");
-    let (output, took) = world.status("run-x");
+    let output = world.status("run-x");
     assert!(output.status.success(), "{output:?}");
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
     assert_eq!(json["outcome"]["state"], "needs_decision", "{json}");
@@ -276,7 +269,6 @@ fn an_exclusive_lock_costs_the_current_state_not_the_timeline() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(stderr.lines().count(), 1, "{stderr}");
     assert!(stderr.contains("locked"), "{stderr}");
-    assert!(took < READ_BOUND, "took {took:?}");
     drop(holder);
 }
 
