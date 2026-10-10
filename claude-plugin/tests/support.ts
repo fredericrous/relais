@@ -7,6 +7,8 @@ import { mock } from 'claude-code/testing'
 export type Calls = {
   run: { argv: string[]; init: any }[]
   spawn: any[]
+  // The detached `relais learn cycle` spawns, kept apart from the runs'.
+  learn: any[]
   // What reached the engine's `agent.spawn`, after the plugin's own hook.
   spawned: any[]
   tool: any[]
@@ -41,6 +43,7 @@ export function scriptedEngine(
   const calls: Calls = {
     run: [],
     spawn: [],
+    learn: [],
     spawned: [],
     tool: [],
     toasts: [],
@@ -120,6 +123,10 @@ export function scriptedEngine(
     return { value: script.runResult(e.argv, e.init) }
   })
   on('process.spawn', async function* (_$: any, e: any) {
+    if (e.argv[1] === 'learn') {
+      calls.learn.push(e)
+      return { value: { code: 0, signal: null } }
+    }
     calls.spawn.push(e)
     const queue = queueOf(e.argv[e.argv.indexOf('--task') + 1])
     for (;;) {

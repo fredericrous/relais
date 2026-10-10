@@ -20,4 +20,5 @@ export type Fx = {
   // plugin's own store (the consent records).
   model: { complete: Call }
   kv: { get: Call; set: Call }
+  env: { home: Call; stateDir: Call }
 }

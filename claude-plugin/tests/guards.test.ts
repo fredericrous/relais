@@ -76,3 +76,15 @@ test('a relais agent’s task-notification is dropped; an unrelated one that men
     notification('agent-1'),
   ])
 })
+
+test('tool.check refuses the model’s learning-envelope calls and [learning] writes, naming /relais-learning', async ($: any, on: any) => {
+  await startedRun($, on)
+  const check = (tool: string, input: Record<string, unknown>) => $.tool.check({ tool, input, ...input })
+  const bash = await check('Bash', { command: 'relais native learning-envelope --by me' })
+  expect(bash.decision).toBe('deny')
+  expect(bash.reason).toContain('/relais-learning')
+  const write = await check('Write', { file_path: '/Users/p/.config/relais/machine.toml', content: '[learning]\nauto_promote = {}' })
+  expect(write.decision).toBe('deny')
+  expect(write.reason).toContain('/relais-learning')
+  expect((await check('Bash', { command: 'relais learn last --json' })).decision).not.toBe('deny')
+})

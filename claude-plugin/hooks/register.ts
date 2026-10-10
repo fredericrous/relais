@@ -9,7 +9,8 @@ import type { Fx } from './fx.ts'
 import { DENY_MESSAGE, isRelaisNotification, isRelaisType, relaisAddresses } from './guards.ts'
 import { childOf, contractPath, onChunk, pump, reloadTimeline, startReplay, startRun, statusOf } from './runs.ts'
 import { onboardTool, onPersonPrompt, trustTool, withRoutingSection } from './consent.ts'
-import { machineSettingsGuard, routerEnvelopeGuard } from './guards.ts'
+import { learningEnvelopeGuard, machineSettingsGuard, routerEnvelopeGuard } from './guards.ts'
+import { learningCommand, noteLastCycle, startCycle } from './learning.ts'
 import {
   afterStep,
   beforeStep,
@@ -76,6 +77,7 @@ const effects = ($: any): Fx => ({
     get: (key: string) => $.store.get(key),
     set: (key: string, value: unknown) => $.store.set(key, value),
   },
+  env: { home: () => $.env.get('HOME'), stateDir: () => $.env.get('RELAIS_STATE_DIR') },
 })
 
 // Whether a spawn is relais's own: a pending dispatch, or this plugin's own
@@ -106,6 +108,8 @@ export function register(on: any) {
     // for it (routing.ts). Until then, and on any failure, nothing is routed.
     if (typeof e.cwd === 'string') store.router.cwd = e.cwd
     detach(refreshState(fx, store))
+    detach(noteLastCycle(fx, store))
+    detach(startCycle(fx, store))
     await $.tool.register({
       name: 'run',
       description:
@@ -181,6 +185,10 @@ export function register(on: any) {
       description: "Route the session model by the task (asks you; shows what it allows). '/relais-routing off' turns it off.",
     })
     await $.command.register({
+      name: 'relais-learning',
+      description: "Let relais promote what it learns automatically (asks you). '/relais-learning off' turns it off.",
+    })
+    await $.command.register({
       name: 'relais-flag',
       description: 'Mark the current task as wrong: relais moves it to a stronger model from the next request.',
     })
@@ -197,6 +205,12 @@ export function register(on: any) {
       await onSessionEnd(fx, store, String(e.reason), await fx.clock.now())
     } catch {
       // Fail open: the session ends whatever the router could send.
+    }
+    // After this session's own work: the learning cycle, detached.
+    try {
+      detach(startCycle(effects($), store))
+    } catch {
+      // Fail open.
     }
     // /clear and /resume go on in this module under a new session id.
     if (e.reason !== 'clear' && e.reason !== 'resume') close(store)
@@ -238,7 +252,10 @@ export function register(on: any) {
     const home = await $.env.get('HOME')
     const configDir = await $.env.get('RELAIS_CONFIG_DIR')
     const input = e.input ?? {}
-    const refusal = machineSettingsGuard(e.tool, input, { home, configDir }) ?? routerEnvelopeGuard(e.tool, input)
+    const refusal =
+      learningEnvelopeGuard(e.tool, input, { home, configDir }) ??
+      machineSettingsGuard(e.tool, input, { home, configDir }) ??
+      routerEnvelopeGuard(e.tool, input)
     return refusal ? { decision: 'deny', reason: refusal } : decided
   })
 
@@ -412,6 +429,10 @@ export function register(on: any) {
   on('command.run', { command: 'relais-routing' }, async ($: any, e: any) => ({
     text: await routingCommand(effects($), store, typeof e?.args === 'string' ? e.args : ''),
   })).catch(() => ({ text: 'relais could not change session routing (internal error). Nothing was written.' }))
+
+  on('command.run', { command: 'relais-learning' }, async ($: any, e: any) => ({
+    text: await learningCommand(effects($), store, typeof e?.args === 'string' ? e.args : ''),
+  })).catch(() => ({ text: 'relais could not change automatic promotion (internal error). Nothing was written.' }))
 
   on('command.run', { command: 'relais-flag' }, async ($: any) => ({
     text: await flag(effects($), store),
