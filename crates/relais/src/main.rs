@@ -2227,13 +2227,15 @@ fn learn_cycle_command(
                 }
             }
             let line = format!("deferred: not idle ({agents} agents active)");
-            if let Some(log) = &mut out.log {
-                log.line(&format!(
-                    "{} deferred {agents}",
+            // With `--log` the one line goes to the file, stamped (it is
+            // appended to a log read days later); otherwise to stdout.
+            match &mut out.log {
+                Some(log) => log.line(&format!(
+                    "{} {line}",
                     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-                ));
+                )),
+                None => println!("{line}"),
             }
-            println!("{line}");
             return Ok(CliOutcome::Accepted);
         }
         TrainingDecision::Refused { code, detail } => {

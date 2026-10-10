@@ -20,7 +20,34 @@ A salvaged run can now teach the learner, when its verified patch landed.
 - Each training example records its `label_source`, and `relais evaluate`
   reports acceptance and calibration per source. The label policy version
   is now 2, so datasets and artifacts built before it are distinguishable.
-- The ledger migrates to schema 21 (one nullable column on `decisions`).
+- The ledger migrates to schema 21 (one nullable column on `decisions`) and,
+  with the learning cycle, to schema 22.
+
+relais now retrains itself, and says what it learned.
+
+- `relais learn cycle [--if-due] [--json] [--log PATH] [-q]` builds the
+  dataset, trains, evaluates and, when you allowed it, promotes. It takes the
+  one Training lease without queueing: a second cycle exits 20 and names the
+  holder's pid. While agents of another session run it prints `deferred: not
+  idle`, writes nothing, and exits 0; `--if-due` also exits 0 when the last
+  cycle is under 20 hours old. Each cycle is a `learning_cycles` row, and a
+  killed cycle's row is closed as `interrupted` by the next one.
+- Installing the plugin records the `[learning]` envelope in machine.toml
+  and says how to turn it off. `relais native learning-envelope` writes it
+  (`--off` turns it off and stops a later install from recording it again).
+  Without it a cycle stops at `awaiting_promotion` and prints the `relais
+  promote` line.
+- The active artifact is rolled back on its own when a run it routed was
+  reverted or had a confirmed regression, or when the 95% upper bound of its
+  acceptance over at least 10 routed runs falls below its quality floor.
+  `relais rollback` does it by hand. An artifact trained on the data of a
+  rolled-back one is not promoted, and nothing is promoted before 10 runs
+  have ended since a rollback.
+- `relais learn last [--json]` prints the latest row without touching the
+  ledger. `--log` opens its file itself (0600, rotated at 1 MiB, one old file
+  kept). `relais report` gains a learning section, also in `--json`.
+- New exit code 20 (the Training lease is held). The ledger gains the
+  `learning_cycles` table (schema 22), an additive migration.
 
 An agent's transcript opens inside the relais pane.
 

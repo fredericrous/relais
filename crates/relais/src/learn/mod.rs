@@ -19,6 +19,7 @@ pub mod drift;
 pub mod envelope;
 pub mod evaluate;
 pub mod features;
+pub mod fixtures;
 pub mod learner;
 pub mod predict;
 pub mod promote;

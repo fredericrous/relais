@@ -5077,13 +5077,12 @@ impl Ledger {
             .next())
     }
 
-    /// The most recent row a cycle (not a person) started: what `--if-due`
-    /// measures its 20 hours from.
+    /// The most recent row a cycle (not a person) started, a cycle that
+    /// rolled the artifact back included: what `--if-due` measures its 20
+    /// hours from.
     pub fn last_cycle_started(&self) -> Result<Option<LearningCycleRow>> {
         Ok(self
-            .learning_rows(
-                "WHERE source = 'cycle' AND action != 'rolled_back' ORDER BY id DESC LIMIT 1",
-            )?
+            .learning_rows("WHERE source = 'cycle' ORDER BY id DESC LIMIT 1")?
             .into_iter()
             .next())
     }

@@ -899,3 +899,697 @@ pub fn retain(datasets_dir: &Path, registry: &Registry) -> Result<(), CycleError
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::{DispatchId, TaskId};
+    use crate::learn::dataset::LABEL_POLICY_VERSION;
+    use crate::learn::fixtures::{artifact, evaluation};
+    use crate::lifecycle::{State, UsagePhase};
+    use crate::outcome::{Outcome, OutcomeDetail, Strategy};
+    use crate::policy::Tier;
+    use crate::route::RoutedBy;
+
+    fn at(text: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(text)
+            .expect("a timestamp")
+            .with_timezone(&Utc)
+    }
+
+    // ------------------------------------------------------------ due ----
+
+    #[test]
+    fn a_machine_that_never_ran_a_cycle_is_due() {
+        assert_eq!(due(None, 0, at("2026-10-10T12:00:00Z")), Due::Yes);
+    }
+
+    #[test]
+    fn within_twenty_hours_it_is_not_due_and_names_the_reason_and_the_next_time() {
+        let now = at("2026-10-10T12:00:00Z");
+        let verdict = due(Some("2026-10-10T00:00:00+00:00"), 50, now);
+        let line = verdict.line().expect("not due");
+        assert!(line.starts_with("not due: "), "{line}");
+        assert!(line.contains("started 12 h ago"), "{line}");
+        assert!(line.contains("next due 2026-10-10T20:00Z"), "{line}");
+        // Just inside the window, however much has finished since.
+        assert!(due(Some("2026-10-09T16:00:01Z"), 50, now).line().is_some());
+    }
+
+    #[test]
+    fn after_twenty_hours_it_is_due_only_when_a_run_finished_since() {
+        let now = at("2026-10-10T12:00:00Z");
+        let last = Some("2026-10-09T16:00:00Z");
+        let quiet = due(last, 0, now).line().expect("nothing to learn from");
+        assert!(quiet.contains("no run reached a terminal state"), "{quiet}");
+        assert_eq!(due(last, 1, now), Due::Yes);
+    }
+
+    // ------------------------------------------------------- rollback ----
+
+    /// `accepted` accepted and `rest` not accepted runs.
+    fn mix(accepted: usize, rest: usize) -> Vec<RoutedOutcome> {
+        let mut outcomes = vec![RoutedOutcome::Accepted; accepted];
+        outcomes.extend(vec![RoutedOutcome::NotAccepted; rest]);
+        outcomes
+    }
+
+    #[test]
+    fn at_ten_runs_an_upper_bound_below_the_floor_rolls_back_and_above_does_not() {
+        let floor = 0.75;
+        // 4 of 10: the one-sided 95% upper bound is about 0.71.
+        let upper = clopper_pearson_upper(4, 10, ONE_SIDED_95);
+        assert!(upper < floor, "{upper}");
+        assert!(matches!(
+            rollback_reason(&mix(4, 6), floor),
+            Some(RollbackReason::AcceptanceBelowFloor {
+                accepted: 4,
+                runs: 10,
+                ..
+            })
+        ));
+        // 5 of 10: the bound is about 0.78, so the data cannot rule the floor out.
+        let upper = clopper_pearson_upper(5, 10, ONE_SIDED_95);
+        assert!(upper >= floor, "{upper}");
+        assert_eq!(rollback_reason(&mix(5, 5), floor), None);
+    }
+
+    #[test]
+    fn at_thirty_runs_the_same_rule_holds_with_a_tighter_bound() {
+        let floor = 0.75;
+        // 17 of 30 (57%): the bound is about 0.72; 19 of 30 (63%): about 0.78.
+        let low = clopper_pearson_upper(17, 30, ONE_SIDED_95);
+        let high = clopper_pearson_upper(19, 30, ONE_SIDED_95);
+        assert!(low < floor && floor <= high, "{low} {high}");
+        assert!(rollback_reason(&mix(17, 13), floor).is_some());
+        assert_eq!(rollback_reason(&mix(19, 11), floor), None);
+    }
+
+    #[test]
+    fn under_ten_labelled_runs_the_bound_is_not_consulted() {
+        // 0 of 9 would be far below any floor, and is still not enough runs.
+        assert_eq!(rollback_reason(&mix(0, 9), 0.75), None);
+        // Unlabelled runs do not count toward the ten.
+        let mut outcomes = mix(0, 9);
+        outcomes.extend(vec![RoutedOutcome::Unlabelled; 20]);
+        assert_eq!(rollback_reason(&outcomes, 0.75), None);
+    }
+
+    #[test]
+    fn one_regressed_run_rolls_back_whatever_the_rest_did() {
+        let mut outcomes = mix(3, 0);
+        outcomes.push(RoutedOutcome::Regressed);
+        assert_eq!(
+            rollback_reason(&outcomes, 0.75),
+            Some(RollbackReason::Regressed { runs: 1 })
+        );
+    }
+
+    // ------------------------------------------------------ anti-flap ----
+
+    #[test]
+    fn data_matching_a_rolled_back_artifact_is_withheld() {
+        let rolled_back = [RolledBackData {
+            label_policy_version: Some(2),
+            dataset_fingerprint: Some("fp".into()),
+        }];
+        assert_eq!(
+            withheld("fp", 2, &rolled_back, None, Some(500)),
+            Some(Withheld::SameDataAsRolledBack)
+        );
+        // Another fingerprint, or another label policy, is new data.
+        assert_eq!(withheld("other", 2, &rolled_back, None, Some(500)), None);
+        assert_eq!(withheld("fp", 3, &rolled_back, None, Some(500)), None);
+    }
+
+    #[test]
+    fn nothing_is_promoted_until_ten_runs_ended_after_a_rollback() {
+        assert_eq!(
+            withheld("fp", 2, &[], None, Some(9)),
+            Some(Withheld::TooFewRunsSinceRollback { have: 9, need: 10 })
+        );
+        assert_eq!(withheld("fp", 2, &[], None, Some(10)), None);
+        assert_eq!(
+            withheld("fp", 2, &[], None, None),
+            None,
+            "never rolled back"
+        );
+    }
+
+    #[test]
+    fn the_active_artifacts_own_data_is_nothing_new() {
+        assert_eq!(
+            withheld("fp", 2, &[], Some(("fp", 2)), None),
+            Some(Withheld::SameDataAsActive)
+        );
+    }
+
+    // ------------------------------------------------------------ log ----
+
+    #[test]
+    fn the_log_is_created_0600_and_appended() {
+        let dir = crate::test_support::temp_dir("cycle-log");
+        let path = dir.join("nested").join("learn-cycle.log");
+        CycleLog::open(&path).expect("opens").line("first");
+        CycleLog::open(&path).expect("reopens").line("second");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\nsecond\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn a_log_of_one_mebibyte_is_rotated_keeping_one_old_file() {
+        let dir = crate::test_support::temp_dir("cycle-log-rotate");
+        let path = dir.join("learn-cycle.log");
+        let mut old = path.as_os_str().to_owned();
+        old.push(".1");
+        let old = PathBuf::from(old);
+
+        let big = "x".repeat(LOG_ROTATE_BYTES as usize);
+        std::fs::write(&path, &big).unwrap();
+        std::fs::write(&old, "stale").unwrap();
+        CycleLog::open(&path).expect("rotates").line("fresh");
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), big, "one old file");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh\n");
+
+        // Just under the limit is not rotated.
+        std::fs::write(&path, "y".repeat(LOG_ROTATE_BYTES as usize - 1)).unwrap();
+        CycleLog::open(&path).expect("opens").line("z");
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), big);
+        assert!(std::fs::read_to_string(&path).unwrap().ends_with("yz\n"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&path, &big).unwrap();
+            CycleLog::open(&path).expect("rotates");
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the new file is 0600 too");
+        }
+    }
+
+    // --------------------------------------------------------- ledger ----
+
+    fn repo_policy() -> RepoPolicy {
+        RepoPolicy::from_toml_str(
+            r#"schema_version = 1
+[models.implementation]
+id = "sonnet"
+[[verification.profiles.p.commands]]
+argv = ["true"]
+"#,
+        )
+        .expect("policy")
+    }
+
+    fn contract() -> crate::contract::TaskContract {
+        crate::contract::TaskContract::from_json_str(
+            r#"{"schema_version":1,"kind":"change","objective":"Fix the escaping",
+                "base_ref":"HEAD","write_scope":["crates/**"],"acceptance":["parses"],
+                "verification_profile":"p"}"#,
+        )
+        .expect("contract")
+    }
+
+    struct World {
+        /// Removes the directory when the test ends.
+        _dir: crate::test_support::TempDir,
+        datasets: PathBuf,
+        ledger: Ledger,
+        registry: Registry,
+    }
+
+    impl World {
+        fn new(name: &str) -> Self {
+            let dir = crate::test_support::temp_dir(&format!("cycle-{name}"));
+            let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+            let registry = Registry::open(&dir.join("registry")).expect("registry");
+            Self {
+                datasets: dir.join("datasets"),
+                _dir: dir,
+                ledger,
+                registry,
+            }
+        }
+
+        fn inputs<'a>(&'a self, repo: &'a RepoPolicy, auto_promote: bool) -> CycleInputs<'a> {
+            CycleInputs {
+                ledger: &self.ledger,
+                registry: &self.registry,
+                repo,
+                datasets_dir: &self.datasets,
+                gates: GateSettings {
+                    quality_floor: 0.75,
+                    min_supported_test_records: 20,
+                    max_abstention_rate: 0.5,
+                },
+                auto_promote,
+                now: Utc::now(),
+            }
+        }
+
+        /// A stored artifact that passes every gate, promoted.
+        fn promote(&self, id: &str, fingerprint: &str) {
+            let mut stored = artifact(id, Some(evaluation(id, true)));
+            stored.dataset_fingerprint = fingerprint.into();
+            let mut report = evaluation(id, true);
+            report["dataset_fingerprint"] = serde_json::json!(fingerprint);
+            stored.evaluation = Some(report);
+            self.registry.store(&stored).expect("store");
+            let checked = self.registry.evaluated(id).expect("evidence holds");
+            self.registry.promote(&checked).expect("promote");
+        }
+
+        /// A run the artifact routed, ended in `state` with `outcome`.
+        fn routed_run(
+            &self,
+            artifact_id: &str,
+            name: &str,
+            state: State,
+            outcome: Option<OutcomeKind>,
+        ) {
+            let run = RunId::from_stored(name);
+            let task = TaskId::from_stored(format!("task-{name}"));
+            let contract = contract();
+            let json = serde_json::to_string(&contract.canonical_value()).expect("json");
+            self.ledger
+                .insert_run(&run, "/r", None, &task, "rk")
+                .expect("run");
+            let revision = self
+                .ledger
+                .insert_contract_revision(&run, &contract.hash(), &json, "HEAD", None)
+                .expect("revision");
+            let attempt = self
+                .ledger
+                .insert_attempt(
+                    &run,
+                    revision,
+                    1,
+                    "implementation",
+                    UsagePhase::parse("initial").expect("phase"),
+                )
+                .expect("attempt");
+            self.ledger
+                .record_dispatch_intent(
+                    &DispatchId::from_stored(format!("{name}-d1")),
+                    &run,
+                    Some(attempt),
+                    &serde_json::json!({"model": "sonnet", "effort": "medium"}),
+                    0,
+                    RoutedBy::LearnedArtifact,
+                )
+                .expect("intent");
+            self.ledger
+                .record_prediction(&run, artifact_id, "input", &serde_json::json!({}))
+                .expect("prediction");
+            self.ended(name, state);
+            if let Some(kind) = outcome {
+                let outcome = Outcome::new(
+                    kind,
+                    OutcomeDetail {
+                        candidate_sha: Some("abc123".into()),
+                        strategy: Strategy {
+                            tier: Tier::Implementation,
+                            models: vec!["sonnet".into()],
+                            escalated: false,
+                        },
+                        correction_magnitude: None,
+                        evidence: vec![],
+                        actor: "a person".into(),
+                        note: None,
+                    },
+                )
+                .expect("outcome");
+                self.ledger
+                    .record_outcome(&run, &task, &outcome)
+                    .expect("record");
+            }
+        }
+
+        fn ended(&self, name: &str, state: State) {
+            self.ended_at(name, state, &crate::ledger::now_rfc3339());
+        }
+
+        fn ended_at(&self, name: &str, state: State, stamp: &str) {
+            self.ledger
+                .record_transition(&crate::ledger::Transition {
+                    run_id: RunId::from_stored(name),
+                    attempt_id: None,
+                    from_state: Some(State::Verifying),
+                    to_state: state,
+                    reason: "test".into(),
+                    detail: None,
+                    at: stamp.into(),
+                })
+                .expect("transition");
+        }
+
+        /// A root run that reached a terminal state long after any rollback.
+        fn later_terminal_run(&self, name: &str) {
+            self.ledger
+                .insert_run(
+                    &RunId::from_stored(name),
+                    "/r",
+                    None,
+                    &TaskId::from_stored(format!("task-{name}")),
+                    "rk",
+                )
+                .expect("run");
+            self.ended_at(name, State::Failed, "2999-01-01T00:00:00+00:00");
+        }
+
+        fn rows(&self) -> Vec<crate::ledger::LearningCycleRow> {
+            self.ledger.learning_cycles().expect("rows")
+        }
+    }
+
+    fn silent() -> impl FnMut(Stage) {
+        |_| {}
+    }
+
+    #[test]
+    fn a_cycle_with_nothing_to_learn_from_records_one_row_and_says_why() {
+        let world = World::new("empty");
+        let repo = repo_policy();
+        let report = run_cycle(&world.inputs(&repo, true), &mut silent()).expect("cycle");
+        assert_eq!(report.action, LearningAction::None);
+        assert!(report.verdict.is_some_and(|v| !v.passed));
+        let rows = world.rows();
+        assert_eq!(rows.len(), 1, "exactly one learning_cycles row");
+        assert!(rows[0].ended_at.is_some());
+        assert_eq!(rows[0].source, LearningSource::Cycle);
+        assert_eq!(rows[0].action, LearningAction::None);
+    }
+
+    #[test]
+    fn an_unfinished_row_is_closed_as_interrupted_by_the_next_cycle() {
+        let world = World::new("interrupted");
+        let dead = world.ledger.begin_learning_cycle().expect("begin");
+        assert!(world.rows()[0].ended_at.is_none(), "killed before it ended");
+        let repo = repo_policy();
+        let report = run_cycle(&world.inputs(&repo, true), &mut silent()).expect("cycle");
+        assert_eq!(report.interrupted_closed, 1);
+        let rows = world.rows();
+        let closed = rows.iter().find(|row| row.id == dead).expect("the row");
+        assert_eq!(closed.action, LearningAction::Interrupted);
+        assert!(closed.ended_at.is_some());
+        assert!(
+            rows.iter().all(|row| row.ended_at.is_some()),
+            "no row is left open"
+        );
+    }
+
+    /// `accepted` accepted and `rest` failed runs, all routed by `art-b`.
+    fn seed_routed(world: &World, accepted: usize, rest: usize) {
+        for index in 0..accepted {
+            world.routed_run("art-b", &format!("ok-{index}"), State::Accepted, None);
+        }
+        for index in 0..rest {
+            world.routed_run("art-b", &format!("bad-{index}"), State::Failed, None);
+        }
+    }
+
+    fn two_artifacts(world: &World) {
+        world.promote("art-a", "fp-a");
+        world.promote("art-b", "fp-b");
+    }
+
+    fn assert_rolled_back_by_the_cycle(world: &World) {
+        let repo = repo_policy();
+        let report = run_cycle(&world.inputs(&repo, true), &mut silent()).expect("cycle");
+        assert_eq!(report.action, LearningAction::RolledBack, "{report:?}");
+        assert_eq!(
+            world.registry.active().unwrap().unwrap().artifact_id,
+            "art-a"
+        );
+        let rows = world.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].action, LearningAction::RolledBack);
+        assert_eq!(rows[0].source, LearningSource::Cycle);
+        assert_eq!(rows[0].artifact_id.as_deref(), Some("art-b"));
+        assert_eq!(rows[0].dataset_fingerprint.as_deref(), Some("fp-b"));
+        assert!(rows[0].ended_at.is_some());
+        assert_eq!(
+            world.ledger.last_cycle_started().unwrap().map(|row| row.id),
+            Some(rows[0].id),
+            "a cycle that rolled back is still a cycle for --if-due"
+        );
+    }
+
+    #[test]
+    fn a_reverted_learner_routed_run_rolls_the_artifact_back() {
+        let world = World::new("reverted");
+        two_artifacts(&world);
+        seed_routed(&world, 3, 0);
+        world.routed_run(
+            "art-b",
+            "reverted",
+            State::Accepted,
+            Some(OutcomeKind::Reverted),
+        );
+        assert_rolled_back_by_the_cycle(&world);
+    }
+
+    #[test]
+    fn a_confirmed_regression_of_a_learner_routed_run_rolls_back_too() {
+        let world = World::new("regression");
+        two_artifacts(&world);
+        world.routed_run(
+            "art-b",
+            "regressed",
+            State::Accepted,
+            Some(OutcomeKind::ConfirmedRegression),
+        );
+        assert_rolled_back_by_the_cycle(&world);
+    }
+
+    #[test]
+    fn ten_routed_runs_four_accepted_roll_back_and_five_do_not() {
+        let below = World::new("n10-below");
+        two_artifacts(&below);
+        seed_routed(&below, 4, 6);
+        assert_rolled_back_by_the_cycle(&below);
+
+        let above = World::new("n10-above");
+        two_artifacts(&above);
+        seed_routed(&above, 5, 5);
+        assert_eq!(
+            active_artifact_verdict(&above.ledger, &above.registry).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn thirty_routed_runs_seventeen_accepted_roll_back_and_nineteen_do_not() {
+        let below = World::new("n30-below");
+        two_artifacts(&below);
+        seed_routed(&below, 17, 13);
+        assert!(matches!(
+            active_artifact_verdict(&below.ledger, &below.registry).unwrap(),
+            Some(RollbackReason::AcceptanceBelowFloor { runs: 30, .. })
+        ));
+
+        let above = World::new("n30-above");
+        two_artifacts(&above);
+        seed_routed(&above, 19, 11);
+        assert_eq!(
+            active_artifact_verdict(&above.ledger, &above.registry).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn runs_another_artifact_routed_do_not_count_against_the_active_one() {
+        let world = World::new("other-artifact");
+        two_artifacts(&world);
+        world.routed_run("art-a", "old", State::Accepted, Some(OutcomeKind::Reverted));
+        assert_eq!(
+            active_artifact_verdict(&world.ledger, &world.registry).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn an_artifact_with_no_predecessor_is_never_rolled_back() {
+        let world = World::new("sole");
+        world.promote("art-a", "fp-a");
+        world.routed_run(
+            "art-a",
+            "reverted",
+            State::Accepted,
+            Some(OutcomeKind::Reverted),
+        );
+        assert_eq!(
+            active_artifact_verdict(&world.ledger, &world.registry).unwrap(),
+            None
+        );
+        assert_eq!(
+            roll_back_active(
+                &world.ledger,
+                &world.registry,
+                LearningSource::Person,
+                "x",
+                None
+            )
+            .unwrap(),
+            Err(NothingToRollBack::NoPreviousArtifact)
+        );
+        assert!(
+            world.rows().is_empty(),
+            "nothing was rolled back, nothing recorded"
+        );
+    }
+
+    #[test]
+    fn a_persons_rollback_writes_a_row_with_source_person() {
+        let world = World::new("person");
+        two_artifacts(&world);
+        let rolled = roll_back_active(
+            &world.ledger,
+            &world.registry,
+            LearningSource::Person,
+            "rolled back by a person",
+            None,
+        )
+        .unwrap()
+        .expect("rolled back");
+        assert_eq!(
+            (rolled.from.as_str(), rolled.to.as_str()),
+            ("art-b", "art-a")
+        );
+        let rows = world.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, LearningSource::Person);
+        assert_eq!(rows[0].action, LearningAction::RolledBack);
+        assert_eq!(rows[0].artifact_id.as_deref(), Some("art-b"));
+        assert!(rows[0].ended_at.is_some());
+        assert_eq!(
+            world.ledger.last_cycle_started().unwrap(),
+            None,
+            "a person's rollback starts no cycle"
+        );
+        // A second rollback has nowhere to go.
+        assert_eq!(
+            roll_back_active(
+                &world.ledger,
+                &world.registry,
+                LearningSource::Person,
+                "x",
+                None
+            )
+            .unwrap(),
+            Err(NothingToRollBack::NoPreviousArtifact)
+        );
+        assert_eq!(world.rows().len(), 1);
+    }
+
+    // -------------------------------------------------------- promote ----
+
+    fn stored_candidate(world: &World, id: &str, fingerprint: &str) {
+        let mut candidate = artifact(id, None);
+        candidate.dataset_fingerprint = fingerprint.into();
+        let mut report = evaluation(id, true);
+        report["dataset_fingerprint"] = serde_json::json!(fingerprint);
+        candidate.evaluation = Some(report);
+        world.registry.store(&candidate).expect("store");
+    }
+
+    fn promote_it(world: &World, auto: bool, id: &str) -> CycleReport {
+        let repo = repo_policy();
+        let inputs = world.inputs(&repo, auto);
+        let cycle_id = world.ledger.begin_learning_cycle().expect("begin");
+        let mut report = CycleReport {
+            cycle_id,
+            action: LearningAction::None,
+            artifact_id: Some(id.into()),
+            dataset_fingerprint: None,
+            label_policy_version: None,
+            examples_by_class: BTreeMap::new(),
+            examples_by_source: BTreeMap::new(),
+            cohorts: Vec::new(),
+            verdict: None,
+            interrupted_closed: 0,
+            note: None,
+            error: None,
+            promote_hint: None,
+        };
+        promote_candidate(&inputs, &mut report, id, "note").expect("promote step");
+        report
+    }
+
+    #[test]
+    fn without_the_envelope_a_passing_artifact_waits_and_names_the_command() {
+        let world = World::new("awaiting");
+        stored_candidate(&world, "art-new", "fp-new");
+        let report = promote_it(&world, false, "art-new");
+        assert_eq!(report.action, LearningAction::AwaitingPromotion);
+        assert_eq!(
+            report.promote_hint.as_deref(),
+            Some("relais promote art-new")
+        );
+        assert!(world.registry.active().unwrap().is_none());
+    }
+
+    #[test]
+    fn inside_the_envelope_a_passing_artifact_is_promoted() {
+        let world = World::new("auto");
+        stored_candidate(&world, "art-new", "fp-new");
+        let report = promote_it(&world, true, "art-new");
+        assert_eq!(report.action, LearningAction::Promoted);
+        assert_eq!(
+            world.registry.active().unwrap().unwrap().artifact_id,
+            "art-new"
+        );
+    }
+
+    fn person_rollback_of(world: &World, fingerprint: &str) {
+        world
+            .ledger
+            .record_learning_rollback(
+                LearningSource::Person,
+                &LearningCycleFinish {
+                    label_policy_version: Some(LABEL_POLICY_VERSION),
+                    dataset_fingerprint: Some(fingerprint.into()),
+                    artifact_id: Some("art-bad".into()),
+                    ..LearningCycleFinish::default()
+                },
+            )
+            .expect("rollback row");
+    }
+
+    #[test]
+    fn an_artifact_trained_on_a_rolled_back_artifacts_data_is_not_promoted() {
+        let world = World::new("flap-same");
+        person_rollback_of(&world, "fp-new");
+        for index in 0..12 {
+            world.later_terminal_run(&format!("later-{index}"));
+        }
+        stored_candidate(&world, "art-new", "fp-new");
+        let report = promote_it(&world, true, "art-new");
+        assert_eq!(report.action, LearningAction::None);
+        assert!(world.registry.active().unwrap().is_none());
+        let note = report.note.expect("says why");
+        assert!(note.contains("same data and label policy"), "{note}");
+    }
+
+    #[test]
+    fn nothing_is_promoted_until_ten_runs_ended_after_the_rollback() {
+        let world = World::new("flap-runs");
+        person_rollback_of(&world, "fp-old");
+        stored_candidate(&world, "art-new", "fp-new");
+        for index in 0..9 {
+            world.later_terminal_run(&format!("later-{index}"));
+        }
+        let held = promote_it(&world, true, "art-new");
+        assert_eq!(held.action, LearningAction::None);
+        assert!(held.note.expect("why").contains("9 of the 10"));
+        assert!(world.registry.active().unwrap().is_none());
+
+        world.later_terminal_run("later-9");
+        let promoted = promote_it(&world, true, "art-new");
+        assert_eq!(promoted.action, LearningAction::Promoted);
+    }
+}
