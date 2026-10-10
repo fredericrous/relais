@@ -3536,7 +3536,8 @@ fn read_stopped_report(payload: &str) -> Result<StoppedReport, serde_json::Error
 }
 
 /// `relais native status`: one JSON object, the run's timeline from its
-/// `events.jsonl`, and never the whole file.
+/// `events.jsonl`, and never the whole file — plus `current`, what the
+/// ledger holds for the run now (SPEC §23).
 fn native_status_command(run: Option<&str>) -> Result<CliOutcome, CliError> {
     let artifacts = paths::runs_dir().map_err(CliError::Home)?;
     let Some(run) = run
@@ -3549,7 +3550,15 @@ fn native_status_command(run: Option<&str>) -> Result<CliOutcome, CliError> {
     let path = artifacts.join(&run).join("events.jsonl");
     match std::fs::read_to_string(&path) {
         Ok(events) => {
-            println!("{}", relais::protocol::timeline(&run, &events));
+            let mut timeline = relais::protocol::timeline(&run, &events);
+            match current_of_run(&run) {
+                Ok(Some(current)) => timeline["current"] = current,
+                // A run the ledger never recorded: one refused before it
+                // started. Nothing to say, and nothing wrong.
+                Ok(None) => {}
+                Err(e) => eprintln!("relais native status: no current state for {run}: {e}"),
+            }
+            println!("{timeline}");
             Ok(CliOutcome::Accepted)
         }
         Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {
@@ -3565,6 +3574,35 @@ fn native_status_command(run: Option<&str>) -> Result<CliOutcome, CliError> {
             cause,
         }),
     }
+}
+
+/// What the ledger holds for `run` now: its state and its decision, open
+/// or answered. `outcome` in the timeline is how the run ended, from its
+/// events; a decision answered since is recorded only in the ledger, so
+/// this is the one place a reader learns it. `Ok(None)` for a run the
+/// ledger does not know. Read-only: a missing, busy or other-schema
+/// ledger is an error to report, never one to create or migrate.
+fn current_of_run(run: &str) -> Result<Option<serde_json::Value>, String> {
+    let path = paths::ledger_path().map_err(|e| e.to_string())?;
+    if !path.is_file() {
+        return Err(format!("no ledger at {}", path.display()));
+    }
+    let ledger = Ledger::open_read_only(&path).map_err(|e| e.to_string())?;
+    let run = RunId::from_stored(run);
+    let Some(state) = ledger.run_status(&run).map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    let decision = ledger.decision_of_run(&run).map_err(|e| e.to_string())?;
+    Ok(Some(serde_json::json!({
+        "state": state,
+        "decision": decision.map(|d| serde_json::json!({
+            "raised_state": d.raised_state,
+            "raised_reason": d.raised_reason,
+            "resolution": d.resolution,
+            "actor": d.actor,
+            "resolved_at": d.resolved_at,
+        })),
+    })))
 }
 
 /// Why this `relais run` must not start, if it must not: it comes from the

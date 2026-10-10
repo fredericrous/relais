@@ -51,6 +51,13 @@ pub enum LedgerError {
         found: u64,
         known: u64,
     },
+    /// A read-only open met a ledger on another schema than this binary's,
+    /// older or newer. A reader that cannot migrate cannot tell what the
+    /// columns mean, so it does not read.
+    SchemaMismatch {
+        found: u64,
+        known: u64,
+    },
 }
 
 impl std::fmt::Display for LedgerError {
@@ -66,6 +73,11 @@ impl std::fmt::Display for LedgerError {
                 "ledger: {found} applied migration(s), this relais knows {known} — \
                  a newer relais wrote this ledger; upgrade relais or point \
                  RELAIS_STATE_DIR at another one"
+            ),
+            LedgerError::SchemaMismatch { found, known } => write!(
+                f,
+                "ledger: {found} applied migration(s), this relais reads {known} — \
+                 not read; the next relais that writes it migrates it"
             ),
         }
     }
@@ -1564,6 +1576,12 @@ const COVERED_BY_AN_INCLUSIVE_PARENT: &str = "WITH RECURSIVE covered(event_id) A
 /// the busy handler does not cover.
 const LEDGER_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long a read-only open waits on a lock before it gives up. A
+/// read-only caller sits on somebody's path (the plugin asks just before
+/// a message goes out), and "cannot tell" is an answer it can use; five
+/// seconds of waiting is not.
+const READ_ONLY_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// The pause after the first busy refusal; it doubles up to the cap.
 const FIRST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(1);
 
@@ -2171,6 +2189,35 @@ impl Ledger {
             conn,
             path: path.to_path_buf(),
             clock,
+        })
+    }
+
+    /// The ledger for reading only, when there is one this binary can read.
+    ///
+    /// Unlike [`Self::open`], this creates no directory and no file,
+    /// writes no pragma and runs no migration: a missing ledger is an
+    /// error (`SQLITE_CANTOPEN`), and so is one on any other schema than
+    /// this binary's ([`LedgerError::SchemaMismatch`]). Its busy wait is
+    /// [`READ_ONLY_BUSY_TIMEOUT`], not the writers' five seconds. Every
+    /// write through it fails, which is the point: nothing that only
+    /// reads can change the ledger.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(READ_ONLY_BUSY_TIMEOUT)?;
+        let applied = applied_count(&conn)?;
+        if applied != LEDGER_SCHEMA_VERSION {
+            return Err(LedgerError::SchemaMismatch {
+                found: applied,
+                known: LEDGER_SCHEMA_VERSION,
+            });
+        }
+        Ok(Ledger {
+            conn,
+            path: path.to_path_buf(),
+            clock: Box::new(SystemClock),
         })
     }
 
