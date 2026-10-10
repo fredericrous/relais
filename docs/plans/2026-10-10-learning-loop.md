@@ -1,0 +1,159 @@
+---
+status: active
+branch: feat/learning-loop
+repos: [relais, homelab]
+adrs:
+  - relais ADR-0002 (classifier inputs kept locally)
+  - relais ADR-0003 (automatic promotion envelope)
+  - homelab ADR-0023 (training.compute)
+---
+
+# relais learns: close the loop, explore, and train Laya on its own data
+
+## Review panel
+
+👉 **Decide:** none — approve if strict labels, router evidence, seeded exploration and a homelab Laya experiment are how relais starts learning.
+📍 relais, homelab · reviewed, nothing built · next: relais PR 1 (Phases 1–5). Panel: architect, backend, go, python, rust, typescript, platform, po, tui, unix.
+**Changed by review:** amont gate read per tree after push, at task end; learn cycle gets a non-queuing lease, idle deferral, anti-flap and manual rollback; Laya trains from 3,000 calls in an emptyDir, during a standby window.
+**Verdicts:** round 1: 10 approve-with-changes (1 blocking, fixed); round 2 backend approve-with-changes, twice; 2 person decisions (strict salvages, GPU on standby); 6 findings carried into implementation.
+📄 Full reviews: [2026-10-10-learning-loop.reviews.md](2026-10-10-learning-loop.reviews.md)
+
+## Context
+
+relais was meant to learn which model a task needs (SPEC §16–17 for `relais run` tasks, plan `2026-10-07-session-router.md` R2 for the session router). After three weeks it has learned nothing. The live ledger (`~/.local/state/relais/ledger.sqlite`, 2026-09-20 → 2026-10-10) shows why:
+
+- **The task loop never closed.** `features` holds 241 rows, but nothing has ever run `dataset build`, `train`, `evaluate` or `promote`; `~/.local/state/relais/datasets/` does not exist and `registry/artifacts/` is empty. Nothing schedules them (`main.rs:1170-1172`, CLI only). So `predictions` is empty and no dispatch is `routed_by = learned_artifact`.
+- **Most labels are thrown away.** 122 runs were accepted; 69 of them are `accepted_by_person` and `state_labelling` excludes them all (`learn/dataset.rs:153`). 52 of the 69 reached `needs_review` with reason `review_findings` after the runner's verification passed, but the commit later salvaged contains the worker's verified patch intact in only 3 of them (the patch reverse-applies on the landed tree); the other 49 landed a rewritten change (median 446 changed lines apart). So salvages add about 3 labels, not 52.
+- **The session router has no evidence.** 71 of 81 router tasks end `unknown` (`outcomeOf`, `claude-plugin/hooks/router.ts:897`): 44 are router-created subagent tasks that never run a check, checks are matched against a short prefix list (`BUILT_IN_CHECKS`, `router/state.rs:27`), and a commit whose amont gate passed counts for nothing. One `correction` never produced a `corrected` task row.
+- **Nothing is ever explored.** `explored`, `propensity` and `draw` are hard-coded (`router.ts:934-936`); the plugin ignores the `seed` and `epsilon` that `router-state` already serves. No task kind has been tried on two tiers, so no learner of any size can tell which one is enough.
+
+The person also wants to try **Laya** (Convai, Apache-2.0, 2026-09-18): a 421M ModernBERT-large decision model that answers typed questions (choice / score / yes-no) with calibrated probabilities in one forward pass. Zero-shot it is near chance (0.362 vs 0.318 random); fine-tuned on a task's own data it reached 0.766. Its natural first job here is the haiku classifier the router calls on every prompt (kind, difficulty, scope, uncertainty, verifiable, relation): typed questions, labels available by distillation. Its second, later, is choosing the model itself, which needs the exploration data above.
+
+**Intended outcome:** relais retrains itself on a schedule and says what it learned; the router collects outcomes and exploration it can learn from; a first Laya model is trained on the homelab from relais's own classifier calls and measured against haiku. A Laya model enters the shipped product only through a later plan and its ADR (SPEC §16: an optional research experiment must not become a build, training or runtime requirement).
+
+## Phase 1: labels the learner can use (relais, `learn/dataset.rs`)
+
+- `labelling_of` stays a pure function. A new input, computed by one ledger query before the call, says whether a salvage carries the verified candidate: a closed enum, with a new `Labelling` variant for an accepted-via-salvage positive, so every match site must handle it (ADR-0015). Name and update every caller of `labelling_of`.
+- A salvaged run is positive only when (a) its RAISING transition, read through the helper behind `record_salvage` (`ledger/mod.rs:3100-3124`), never the last row, because same-state `worktree_retired` rows follow it, is into `needs_review` with reason `review_findings` (the runner stops on review findings only after its checks passed, `runner/mod.rs:2671-2672`), and (b) the verified candidate patch survives intact in the landed commit: it reverse-applies on `<salvaged sha>^{tree}` (`git apply --cached --check -R` against a temporary index). Every other salvage stays excluded with its reason.
+- From now on `relais decide --answer salvaged` computes (b) itself and records `candidate_contained: true|false` on the decision. For salvages recorded before, the learn cycle computes it once when the repository and the `candidate_patch` evidence are still on disk, and records it; unreachable ones stay excluded and are counted.
+- The later outcome still applies (`outcome_stands`, `:175`). Each `TrainingExample` records `label_source` (`runner` or `person_salvage_contained`); `evaluate` reports calibration and acceptance per source. The label policy version is bumped.
+- Leave `dataset.rs:367-383` UNCHANGED: it handles `DecisionApproved` (`decide --answer approve`), which approves over verification gaps; it is not the salvage path.
+- Tests: salvage from `needs_review(review_findings)` with a contained patch → positive, source `person_salvage_contained`; same with a rewritten patch → excluded; salvage raised from `interrupted` → excluded; a contained salvage later `reverted` → negative; a `decide --answer approve` run stays non-positive; the runner's own transition code (not a fixture) writes `review_findings` only after a passing verification, falsified by reordering it in the runner, which fails the test.
+
+## Phase 2: the learning cycle (relais)
+
+- New `relais learn cycle [--if-due] [--json]`, composing the existing functions (not shelling out): `dataset build` → `train` → `evaluate` → promote when allowed. `--if-due` does nothing (exit 0, one line naming the reason and the next due time) when the last cycle is under 20 h old, or when no run has reached a terminal state since it.
+- **Due check:** `--if-due` takes the lease BEFORE its due check and before writing the start row, so concurrent session starts cannot both pass the 20 h check.
+- **Admission:** the cycle asks the coordinator for a `ResourceClass::Training` lease (`admission/mod.rs:101`; `max_training_jobs = 1`), the cap group's first production use, with a NEW non-queuing request. Admission queues by default (`admission/mod.rs:1204-1217`), so the request is refused at once when the Training group is full. A second cycle is refused, not queued. `training_when_idle` is set but read nowhere today (`coordinator/mod.rs:49,2330`); enforce it, with tests for both. Idle means no active agent lease other than ones held by the calling session; a not-idle refusal exits 0, prints `deferred: not idle (<n> agents active)`, writes no `learning_cycles` row, and leaves the cycle due. The coordinator starts lazily as for any command. The lease is released when the holder's connection drops; a crashed holder's lease expires by pid liveness.
+- **Record:** a new ledger table `learning_cycles` (next ledger step): started/ended, label policy, dataset fingerprint, examples by class and source, cohorts covered, artifact id, evaluate verdict with every failed gate, action (`none`, `promoted`, `awaiting_promotion`, `rolled_back`), error.
+- **Interruption:** the `learning_cycles` row is inserted at start with `ended` NULL; a later cycle closes an unfinished row as `interrupted`. Datasets and artifacts are written to a temporary file and renamed.
+- **Promotion envelope:** `[learning]` in machine.toml, `auto_promote = { granted_at, by, source }`, recorded exactly as `[session_routing]`'s envelope is (SPEC §30 Authority): by `relais install --claude --write` (source `install`) unless an `off` tombstone exists, or by `/relais-learning on|off` through `relais native learning-envelope`, with the same locked, comment-keeping writer as `router-envelope`. The plugin's `tool.check` guard is extended to refuse the model's own writes of it. Without the envelope the cycle stops at `awaiting_promotion` and prints the `relais promote <id>` line.
+- **Install:** install prints `automatic promotion is on; turn it off with /relais-learning off`, as it does for routing (`main.rs:1408-1409`).
+- **Promotion** goes through the existing `EvaluatedArtifact` → `Registry::promote` path (`learn/registry.rs:260-450`); nothing bypasses `evaluate`'s gates.
+- **Rollback:** each cycle checks the active artifact against the runs it routed (`routed_by = learned_artifact`), labelled by the same policy. It rolls back (`Registry::rollback`) on any `reverted` or `confirmed_regression` outcome of such a run, or when, with at least 10 such runs, the one-sided 95% Clopper–Pearson upper bound of their acceptance is below the floor the artifact's evaluation used (`router/stats.rs:clopper_pearson_upper`). Each rollback is a `learning_cycles` row. Tested with fixtures at n = 10 and n = 30.
+- **Manual rollback:** new `relais rollback [--json]` for task artifacts (calls `Registry::rollback`, which nothing calls today); it writes a `learning_cycles` row with action `rolled_back` and source `person`. The report's learning section and the pane line name it.
+- **Anti-flap:** the cycle refuses to promote an artifact whose dataset fingerprint and label policy match a rolled-back one, and promotes nothing until 10 new terminal runs have been recorded since the last rollback.
+- **Trigger:** the plugin starts the cycle as `relais learn cycle --if-due` through a NEW detached spawn, not `startChild` (`runs.ts:200-224` registers a pane run, passes `--protocol`, announces it and posts an outcome): no `Child` entry, no `--protocol`, no announcement, no outcome message. It starts at `session.start` and at `session.end` (after that session's own leases are released), so a day of parallel sessions still finds an idle moment. If the host kills it at session end, the next cycle closes its row as `interrupted`. At session start the plugin also runs a new read-only `relais learn last --json` and writes one pane line only when the last action since the previous session is `promoted`, `rolled_back` or `error`, naming `relais report`. Test: two session starts produce zero run announcements.
+- **Log:** `--log <path>` (`~/.local/state/relais/learn-cycle.log` for the plugin): relais itself opens the log in append mode, created 0600, rotated at 1 MiB keeping one old file; with `--log`, stdout and stderr go there.
+- **Exit codes and output:** not due → 0, with the reason and the next due time; `awaiting_promotion` → 0; lease held → new `CliOutcome` with exit 20, its message naming the holder's pid and start time; README exit table and the `exit_codes_follow_the_documented_table` test (`tests/portable_scenarios.rs:1046`) updated. Interactive runs print one progress line per stage (build, train, evaluate, promote) on stderr; `-q` silences them.
+- **Retention:** the cycle keeps the 5 newest datasets and every artifact the registry references.
+- **Report:** `relais report` gains a `learning` section: last cycle (when, action, failed gates in words), labelled examples by class and source, the active artifact and the share of dispatches it routed since promotion, the last rollback. "Nothing learned yet, because …" is a sentence, never an empty section. The section keeps every row within 80 columns and is included in `relais report --json`.
+- **Schema:** the new tables and columns are additive migrations. Record during implementation what v0.11.x does when it opens a ledger migrated by v0.12, and the upgrade note names the backup to restore for a downgrade.
+- SPEC §17 and §11 updated in the same commits.
+
+## Phase 3: evidence for the session router (plugin + Rust)
+
+- **Checks:** `BUILT_IN_CHECKS` (`router/state.rs:27`) gains the lint, build and typecheck commands SPEC §30 already names, written as explicit prefixes: `cargo clippy`, `cargo check`, `cargo build`, `pnpm run test`, `pnpm run lint`, `pnpm run build`, `pnpm run typecheck`, `npm run test`, `npm run lint`, `npm run build`, `npm run typecheck`, `tsc`, `go vet`, `go build`, `go test`, `golangci-lint run`, `ruff check`, `mypy`, `pyright`, `make lint`, `make build`. Each check is recorded with its kind (`test`, `lint`, `build`, `gate`), so Phase 8 can weight or filter by kind. Plugin test: `golangci-lint run ./...`, `go vet ./...`, `go test ./...` each become a passing check; a failing exit is a failed check.
+- **The amont gate:** stamps are keyed by TREE and written by pre-push and `amont run pre-push`, not by commit (amont `docs/gate-evidence.md`, `gate_stamp.rs:50-61,79,85`). At task end, asynchronously in `endTask` and bounded by 1 s, for each repository the task edited files in (`git rev-parse --show-toplevel` of the edited paths' directories), the plugin calls new read-only `relais native gate-stamp --cwd <repo>`. It reads `git notes --ref=refs/notes/amont-gate show HEAD^{tree}`, accepts only a first line starting `amont-gate-v1` (any other version is no evidence), and parses the `run <epoch> <gate> pass|fail` lines into `passed[]`/`failed[]`. A `pass` whose epoch is inside the task's window, with no later `fail`, is a passing check `amont-gate@<tree7>` of kind `gate`; a `fail` is a failed check. Reading the end state covers pushes run in the background, which return no exit code. No note → `{stamped:false}`, exit 0; non-zero exit only for git or input failures; diagnostics on stderr. The note format is written into `docs/router-protocol.md` as an external contract.
+- **Subagent tasks:** a subagent's task record is sent, and its entry deleted, at its own `turn.complete`, before its parent ends (`routing.ts:480-485`). So a new record kind `task_outcome` amends it: when a parent task ends, the plugin sends one per subagent task it spawned, and Rust upserts `outcome` with `outcome_source = parent` only over a stored `unknown` (the existing rank rule). Test: a subagent that ended before its parent gets the parent's outcome with `outcome_source = parent`.
+- **Wire compatibility:** new fields are `#[serde(default)]`; a test feeds an old-plugin payload to the new binary.
+- **The lost correction:** a failing test first reproduces a `correction` reassessment on a task whose record is never sent (the ledger case `task-1791639143355-2`), then the fix at its locus guarantees the `corrected` record.
+- **Traceability:** `router_decisions` gains `table_version` (`CAPABILITY_TABLE_VERSION`, `router/table.rs:12`).
+
+## Phase 4: exploration (plugin)
+
+- `RouterState` (`router.ts:54-66`) reads the `seed` and `epsilon` that `router-state` serves (`policy/mod.rs:807`; `epsilon ≤ epsilon_max`, 0 without an envelope).
+- **Draw:** at a main-session `new_task` start, not held out, mode `on`. The draw, defined once for both languages: `u` = the first 8 bytes, big-endian, of SHA-256 over the UTF-8 bytes of `seed`, session id and task id (each length-prefixed); SplitMix64 seeded with `u`; its first output `x`; `draw = (x >> 11) × 2^-53`. TypeScript uses BigInt and the plugin's existing SHA-256 (`router.ts`). Below ε, the tier is one step lower than the table chose, never below research, as approved in the session-router plan §5. Continuations, corrections and subagents are never explored.
+- **Research tier:** when the table's tier is already research, nothing can be lowered: `explored = false`, `propensity = 1`.
+- Recorded: `explored`, `propensity` (ε when lowered, 1 − ε otherwise), `draw`, `would_pass_gate`. The cache gate still applies: a drawn switch down that fails it is recorded `explored, applied = false`. Recovery still applies, and its cost is counted against the drawn arm.
+- **Test vector:** the shared vector covers (seed, session, task) → draw, including non-ASCII ids, and is shared with Rust's `crate::rng::SplitMix64`, which keeps the two in step.
+- **Stop rule:** once at least 20 explored tasks have strong outcomes, if their correction-or-failure rate exceeds that of undrawn tasks in the same strata by more than 15 points, `router-state` serves `epsilon = 0` and a ledger row records the stop with its counts. `relais report` prints both rates.
+- **Report:** `relais report` prints, per stratum (kind × difficulty band × scope), drawn and undrawn tasks with strong outcomes, and the projected date the busiest reaches 20 drawn tasks. Strata rows stay within 80 columns: the top 5, then `+N more`; included in `--json`; with no draws a stratum reads `no projection: 0 drawn`, never a date.
+
+## Phase 5: classifier calls kept for training (plugin + Rust)
+
+- **Capture:** new `router-observe` record kind `classification`: `call_id`, `purpose` (`prompt`|`spawn`), `model`, `prompt_version` (SHA-256 of the system prompt, `router.ts:172-186`), `input` (the exact user content sent, ≤ 3 KB), the raw parsed answer (every field, including the relation, explicit accept or correct, `user_model` and confidence that are lost today on continuations), `parse_ok`, `latency_ms`, `at`. Wire, ledger and protocol doc as in Phase 3.
+- **Storage:** Rust writes the input text to `~/.local/state/relais/classifier/<YYYY-MM-DD>.jsonl` (dir 0700, files 0600) and everything else to a new `router_classifications` table, which holds the text's SHA-256, never the text. Day files older than 90 days are deleted on write and by the learn cycle. `[session_routing] keep_classifier_inputs = false` in machine.toml turns capture off; `RELAIS_SESSION_ROUTING=off` captures nothing.
+- **Day files:** opened `O_APPEND | O_CREAT` with mode 0600 (`OpenOptionsExt::mode`), each line written with a single `write_all`; the directory is forced to 0700 even when it already exists (tested under a permissive umask). Known secret shapes are redacted before writing and counted: provider API keys, bearer tokens, private-key blocks, base64 or hex runs of 40 characters or more.
+- **Export:** `relais router export-classifier --out <file> [--since <date>]` writes one JSON line per call with a parsed answer: `{call_id, at, prompt_version, input, answer, split}`, split by time (newest 20% `test`, next 10% `calibration`, rest `train`), with the capability table and its version in a header line. `--out <file>` is created 0600 through a temporary file in the same directory, then renamed; `--out -` writes to stdout; the counts of what was left out go to stderr.
+
+## Phase 6: laya-lab on wk-3 (homelab)
+
+- **Timing:** the homelab PR and its smoke window start when `relais report` shows at least 2,500 captured calls, so the GPU risk is taken only when there is data to train on.
+- **ADR** (homelab, key `training.compute`): on-demand fine-tuning Job on talos-wk-3-gpu, PyTorch on ROCm against `wk3-igpu-shared`, CPU on the same node when ROCm fails its smoke test. Inference stays llama.cpp on Vulkan (ADR-0016, untouched). Weights are downloaded per run into the pod's ephemeral volume, so `inference.model-storage` (node-local PV for served weights) is not touched. The toleration for ADR-0016's `dedicated=inference` taint does nothing today (the taint was never built) and does not keep CI off wk-3.
+- **Code:** `services/laya-lab/` (pyproject with uv, pure functions, pytest on CPU without torch: ECE with a hand-computed fixture, temperature fit, tier agreement, downgrade count), following the homelab Python services' CI gate (`.forgejo/workflows/build-rag-api.yaml:57-63` pattern). Dependencies: a commented `requirements.in` (ADR-0020) compiled with `uv pip compile --generate-hashes`; torch is excluded (the image provides it) by a constraint, and the job asserts `torch.version.hip` is non-empty on the GPU path. `laya` and the Hugging Face model revision are pinned.
+- **Manifests:** `kubernetes/homelab/apps/laya-lab/` (target namespace `llms`: a pod can only use a ResourceClaim in its own namespace): a suspended CronJob `laya-train` holding the pod template. Image `rocm/pytorch` pinned by digest and mirrored to the Forgejo registry (its compressed size measured first; the node's uplink is ~100 Mb/s), `nodeSelector gpu: amd-strix-halo`, `resourceClaimName: wk3-igpu-shared`, memory requests = limits ≈ 12Gi, CPU ≤ 8, a priorityClass below chat, `backoffLimit: 0`, `activeDeadlineSeconds`, `ttlSecondsAfterFinished`. No PV: an `emptyDir` with a `sizeLimit` holds the code, the export and the downloaded weights, so nothing stays on the node after the pod is deleted. Training caps GPU memory with `torch.cuda.set_per_process_memory_fraction` and sets the batch size from it. Estimate: about 6.7 GB for fp32 weights plus AdamW states, plus 2–4 GB of activations with gradient checkpointing at batch 8 × 1,024 tokens, so 10–12 GiB; on CPU, roughly 3–6 h per run at 3,000 calls.
+- **Script:** `scripts/laya-lab.sh upload|run|fetch` (`set -euo pipefail`; a `trap` deletes what it created on EXIT, INT and TERM; it checks the kube context first; exit codes listed in its usage). `run` creates a Job from the CronJob; an init container waits for the code and export, which the script `kubectl cp`s in; the script follows the Job's logs to completion and prints the `fetch` command. `fetch` copies `report.json` out, then the pod is deleted with its `emptyDir`, so no prompt text remains in the homelab. A failed pod prints the `kubectl` command to inspect it.
+- **train.py:** pick the base checkpoint from the data (multilingual when more than 5% of inputs are not English or exceed 1,024 tokens, else `laya-typed-decisions`). Fine-tune on `train` with one question per classifier field and haiku's answers as targets, in bf16 with gradient checkpointing. Fit one temperature per (question type, option count) on `calibration`; a group with fewer than 30 calibration examples falls back to one shared temperature, and `report.json` records n per group. Evaluate on `test` and write `report.json`: per-field agreement and ECE (15 equal-width bins, reported per field, gated on the worst field), **tier agreement** (capability table applied to both answers), **downgrades** (Laya's tier lower than haiku's), correction recall, CPU latency p50/p95 on the node, device, and the wall time. `report.json` also records the seed, torch, HIP and `laya` versions, the HF revision, the image digest and the code's git sha.
+- **Window** (🧑 the person on standby to power-cycle wk-3; it hard-hung twice on 2026-07-03, `infrastructure/homelab/schematics.yaml:80-97`): (1) image pre-pulled; (2) GPU-only smoke with chat idle: 10 real steps of the pinned checkpoint on synthetic tokens, `attn_implementation="sdpa"`, bf16, gradient checkpointing; (3) the same while chat answers a request. Watched: `talosctl dmesg` for amdgpu errors, node MemAvailable, chat restarts, chat p95 latency through litellm, and recovery time if it hangs. If the Job cannot be scheduled beside chat, the window suspends chat's Flux Kustomization, scales chat to 0 for the run, and restores both after. A hang, an OOM or no device means `LAYA_DEVICE=cpu`, recorded in the ADR.
+
+## Phase 7: first Laya run (live, agent-observed)
+
+- Starts at 3,000 parsed calls (test split ≈ 600).
+- Export, upload, run, fetch; the report is recorded here.
+- **Bars**, each a 95% Clopper–Pearson bound: tier agreement lower bound ≥ 95%; downgrades upper bound ≤ 1% (0 or 1 downgrade in 600 passes); ECE ≤ 0.10 on the worst field. Correction recall is gated only when the test split holds at least 20 corrections; otherwise it is reported as `not measurable (n=k)`.
+- Below a bar, the report says which, and the run repeats at 6,000 calls.
+
+## Phase 8: the learner that chooses the model (relais, data-gated)
+
+- Starts when the busiest stratum has 20 drawn, gate-passing tasks with strong outcomes (Phase 4's projection).
+- Ceiling: if, at day 14 after release, the projected date for the busiest stratum is more than 90 days away, Phase 8 starts with difficulty bands only, as `2026-10-07-session-router.md:211` allows.
+- The R2 package exactly as approved in `2026-10-07-session-router.md` §5: the pure `relais::router` learner, the four activation gates, `relais router evaluate [--json]`, `relais router rollback`, `router_activations`, `router-state` serving `adjustments`, the plugin applying them.
+- **Laya, second job:** export (input, drawn tier, outcome, total cost) for the router and (contract text, arm, label) for `relais run` tasks; laya-lab trains "does this tier succeed" on the same temporal splits; compared with the strata learner and the logistic task learner under the same gates. A Laya backend is adopted only by a later plan with a relais ADR amending SPEC §16.
+
+## Delivery
+
+- **relais PR 1:** Phases 1–5, one commit per phase (structural and behavioural changes apart). It carries relais ADR-0003 with Phase 2 and relais ADR-0002 with Phase 5. Then `v0.12.0` through `tag-release`.
+- **homelab PR:** Phase 6. It carries homelab ADR-0023.
+- 🧑 The person is on standby during the GPU window (Phase 6).
+- **Live:** the observation phase below, then Phase 7 when its data exists.
+- **relais PR 2:** Phase 8, weeks later.
+- Plugin reinstall after the release (`relais install --claude --user --write`, `relais coordinator stop`) is the person's step, as before.
+
+## Decision log
+
+- **D1** Salvaged runs are positive only when the runner's verification passed and the verified patch survives intact in what landed (person, 2026-10-10, confirmed after the measurement: about 3 of 52). The label policy version is bumped.
+- **D2** Classifier inputs are kept locally: day files 0600, 90-day TTL, only a hash in the ledger, with an off switch (person). Becomes relais ADR-0002.
+- **D3** Laya trains on the wk-3 GPU in a declared window with the person on standby for the first smoke test and run, and on that node's CPU if ROCm fails (person, 2026-10-10). A research experiment outside the shipped product (SPEC §16). Becomes homelab ADR-0023.
+- **D4** A promotable task artifact is promoted automatically inside a `[learning]` envelope recorded at install, with automatic rollback (person). Becomes relais ADR-0003.
+- **D5** Exception to `work.one-implementation-pr-per-repo-per-plan`: relais gets two PRs. Phase 8's verification needs weeks of exploration data that only PR 1 produces.
+- **D6** Exploration stays main-session only, as the session-router plan approved. Subagent exploration is decided in Phase 8, on data.
+- **D7** Correction to the diagnosis given in chat: `features` is populated (241 rows); `predictions` is the empty table, by design until an artifact is promoted.
+- **D8** Each training run uses an `emptyDir`, not a PV: no prompt text persists in the homelab after `fetch`, and served weights' storage (ADR-0016) is untouched (platform review).
+- **D9** The homelab PR starts at 2,500 captured calls and Phase 7 at 3,000, because 1,000 calls cannot measure a 1% downgrade bar (backend and product reviews).
+
+## Verification
+
+Before the relais push (each recorded as input → expected → actual):
+
+- `make check` (fmt, clippy `-D warnings`, `scripts/check-module-cycles.py`, tests, MSRV, plugin, audit): expected exit 0.
+- Phase 1, on a scratch copy of the live ledger (`RELAIS_STATE_DIR` in a temp dir, never the real one): `relais dataset build` → 53 runner positives plus about 3 salvage positives (not about 105); the exclusion counts printed with reasons, including the 49 rewritten salvages. Falsification: revert the `labelling_of` change, the salvage test fails.
+- Phase 2, same scratch ledger: `relais learn cycle --json` → one `learning_cycles` row, an artifact in the scratch registry, the evaluate verdict with its gates; a second `--if-due` call → "not due"; with a `[learning]` envelope in the scratch machine.toml and a fixture artifact that passes → `promoted`; with a fixture reverted outcome on a learner-routed run → `rolled_back`; `relais report` shows the learning section.
+- Phase 2, real data: on the scratch ledger, record the `evaluate` verdict and every failed gate, and state the expected first live action (e.g. `none`, with the gate that needs more examples and roughly how many). This is what the person will see.
+- Phase 2, interruption: `kill -9` partway through a cycle → no partial dataset or artifact file, and the next `--if-due` closes the row as `interrupted`.
+- Phase 2, admission: ten concurrent `learn cycle --if-due` → exactly one `learning_cycles` row and one lease holder; the others exit 20. With a fixture agent lease held by another session → `deferred: not idle`, exit 0, no row; with none → the cycle runs.
+- Phase 2, manual rollback: `relais rollback` after a fixture promotion → the previous artifact active and a `person` row.
+- Phase 2, report width: `relais report | awk 'length>80'` → empty.
+- Phase 3: plugin tests run `endTask` over a fixture repo with a passing stamp → a passing `amont-gate@` check; a failed stamp → a failed check; a subagent task ends `completed_verified` from its parent with `outcome_source = parent`; the correction regression test.
+- Phase 4: the shared SplitMix64 vector passes in Rust and TypeScript; 10,000 seeded draws at ε 0.1 explore 10% ± 1%; a held-out session never explores.
+- Phase 5: an observe batch with a `classification` record writes the day file 0600 and a ledger row without text; an 91-day-old file is deleted; with the off switch nothing is written; the export splits by time with a header line.
+- Phase 3/4/5 additions: the gate-stamp Rust tests (pass, fail, missing, other version); the old-plugin payload test; 10,000 seeded draws give identical sequences in Rust and TypeScript and explore 10% ± 1%; `stat -c %a` on day files and the export → 600; two session starts → zero run announcements.
+
+Before the homelab push: `kustomize build` and `kubeconform` on `apps/laya-lab`; the PR's Go lanes are skipped-green (path-filtered), not the 13-minute golangci-lint run. The window observations (Phase 6) are recorded as input → expected → observed, with the device and `talosctl dmesg`.
+
+After the release and the plugin reinstall (agent-observed):
+
+- Within 24 h of the release, at least one `learning_cycles` row (from a session start or end), and none twice inside 20 h.
+- Seven days later: the main-session `unknown` rate from 0.88 (71/81 today) to ≤ 0.40; classification rows ≥ 90% of prompts; explored decisions present with propensities and the stop rule not triggered; any miss opens a fix. Also the share of commit-bearing tasks that end with an `amont-gate@` check.
+
+<!-- panel: repos=relais,homelab reviewers=architect,backend,lang:go,lang:python,lang:rust,lang:typescript,platform,po,tui,unix body-sha=80ad70d072ea -->
