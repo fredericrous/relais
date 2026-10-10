@@ -100,21 +100,22 @@ One PR on `relais`, branch `feat/pane-agent-transcript`, three commits:
 ## Verification record (2026-10-10, before push)
 
 - `make check` → exit 0 → observed: each commit passed the pre-commit gate, Rust tests included; `claude plugin validate claude-plugin` passes.
-- `claude plugin test` → every test passes → observed: 188 pass, 0 fail across 13 files (155 on main, 32 from the feature, 1 from the review).
+- `claude plugin test` → every test passes, on Claude Code 2.1.295 and on CI's pin 2.1.291 → observed: 188 pass, 0 fail on both (155 on main, 32 from the feature, 1 from the review). On 2.1.291, before the label fix: 168 pass, 20 fail, as in CI's first run of PR #191.
 - Overlapping refreshes, falsified → with the early flag removed the new test fails, with it the test passes → observed: Expected 1, Received 2 without it; pass with it.
-- Live check on the person's terminal, the guide's steps (click a worker, transcript grows, `[ back ]`, a finished agent) → it works → observed: the person approved after trying it, 2026-10-10. The plan's live measurements (reads per minute, largest write, read latency, layout time) were not taken; the tests bound each.
+- Live check on the person's terminal, the guide's steps (click a worker, transcript grows, `[ back ]`, a finished agent) → it works → observed: the person approved after trying it, 2026-10-10, on the version before the label fix; the label fix (agent row text as the Button's `label`) is covered by the tests on both versions, not looked at live. The plan's live measurements (reads per minute, largest write, read latency, layout time) were not taken; the tests bound each.
 - Known: 2-cell characters (CJK) are wrapped by code point, so such a row can run past the body and is cut with `…`; the layout does not break.
 
 ## Implementation review
 
-- **approve** on tree `95b391c` (three passes: 66k, 57 s; 73k, 20 s; 76k, 13 s).
-- Fixed: `holds-until:` at the three ceilings; a failed detached read noted on the run; one read when two pumps overlap (new test); the deny test counts the run's note; comments; the `back` press variant removed; the load-time import cycle removed (`hooks/limits.ts`).
+- **approve** on tree `f0d4505` (five passes: 66k, 57 s; 73k, 20 s; 76k, 13 s; then after CI's red plugin job 80k, 20 s and 81k, 8 s).
+- Fixed: `holds-until:` at the three ceilings; a failed detached read noted on the run; one read when two pumps overlap (new test); the deny test counts the run's note; comments; the `back` press variant removed; the load-time import cycle removed (`hooks/limits.ts`); the 2.1.291 comment states only the versions run.
 - Deliberate: none.
 
 ## Decision log
 
 - 2026-10-09 — the person: the click in the pane should do what the footer's agent row does; an affordance is still wanted. No API switches the conversation view, so the transcript is drawn in the pane and the hint names the footer.
 - 2026-10-10 — P1 and P2 are one commit: the implementation came back from a relais worker as one patch. relais's own verification could not accept it: `make check` fails inside a relais run on main's `a_spending_replay_outside_the_plugin_is_refused_before_anything_runs` (its command inherits the run's `RELAIS_HOST`), before the plugin tests; that bug is outside this plan. The patch was tested and the review fixes made in the session.
+- 2026-10-10 — CI pins Claude Code 2.1.291, which refuses a Button with a Text child; the agent rows broke there (20 tests red on PR #191's first CI run, green on 2.1.295 locally). Fixed in `32f3995`: the row's text is the Button's `label`; the view-test helpers read Buttons with the Text rows. The plugin tests are now run on both versions before a push.
 - 2026-10-09 — check-output page deferred: needs `check_started.log_path` in the protocol first.
 - 2026-10-09 — the person asked for a prompt-engineer review as the user: digit hotkeys, the `b` key and `◂ in view` dropped (not asked for); one byte limit; the header defined; mock-ups made to fit 72 columns; the slow-read guard written once, in the Design.
 
