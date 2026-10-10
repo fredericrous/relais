@@ -145,9 +145,9 @@ test('a deny is shown, read once and noted once on the run', async ($: any, on: 
   expect(engine.calls.messages.length).toBe(1)
   let drawn = await mount($)
   expect(drawn.texts.some(t => t === 'transcript unavailable · agent has no saved transcript')).toBe(true)
-  await (await mount($)).ui.press({ key: 'back' })
-  drawn = await mount($)
-  expect(countOf(drawn.texts, 'transcript unavailable')).toBe(1)
+  // The run carries the note exactly once, as the status reply shows it.
+  const [brief] = JSON.parse((await $.tool.call({ tool: 'mcp__relais__status' })).result)
+  expect(brief.stderr.filter((line: string) => line.includes('transcript unavailable')).length).toBe(1)
   void ui
 })
 

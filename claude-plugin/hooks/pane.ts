@@ -3,7 +3,7 @@
 // with its live output, capped by the rows the pane gets.
 
 import type { Fx } from './fx.ts'
-import type { TranscriptState } from './transcript.ts'
+import { MAX_TRANSCRIPT_ROWS, type TranscriptState } from './transcript.ts'
 import {
   type RunModel,
   type Step,
@@ -18,7 +18,8 @@ import {
 } from './timeline.ts'
 
 // What pressing a row's Button does.
-export type Press = { kind: 'agent'; agentId: string; run: string } | { kind: 'back' }
+// What an agent row's press opens; `[ back ]` is drawn by `paneTree` itself.
+export type Press = { kind: 'agent'; agentId: string; run: string }
 
 export type Row = {
   text: string
@@ -91,6 +92,8 @@ function frame(m: RunModel, room: Room, isLast: boolean): { head: Row[]; steps: 
   // One row per agent: a repair continues the same agent under a new
   // dispatch, and it is still one agent (its latest status shown).
   const agents = agentRows(m)
+  // holds-until: a run whose fourth agent matters: its agents past the
+  // third sit under `+n more agents`, not pressable, until that row is a list.
   const shown = agents.slice(0, MAX_AGENT_ROWS)
   if (shown.length === 0) tail.push({ text: 'agents  none', dim: true })
   let hasButton = false
@@ -248,7 +251,7 @@ export function paneTree(fx: Fx, e: any, state: PaneState | undefined, actions: 
     )
   const shown = state?.shown
   if (shown?.kind === 'agent') {
-    const rows = layoutAgentView(shown, state?.runs ?? [], room).slice(-ROWS_CAP)
+    const rows = layoutAgentView(shown, state?.runs ?? [], room).slice(-rowsCap())
     return h(
       Box,
       { flexDirection: 'column' },
@@ -279,5 +282,7 @@ export function paneTree(fx: Fx, e: any, state: PaneState | undefined, actions: 
   )
 }
 
-// Header, rule and the transcript's 400 rows, with the note.
-const ROWS_CAP = 404
+// The header, the rule, the transcript's rows and the one note line. A
+// function, not a constant: pane, ui and transcript import each other, so
+// the cap is read when the pane draws, never while the modules load.
+const rowsCap = () => MAX_TRANSCRIPT_ROWS + 3

@@ -1,7 +1,8 @@
 // transcriptRows: the pure layout of an agent's messages at the pane's width.
 
 import { expect, test } from 'claude-code/testing'
-import { transcriptRows } from '../hooks/transcript.ts'
+import { refreshTranscript, transcriptRows } from '../hooks/transcript.ts'
+import { createStore } from '../hooks/store.ts'
 
 const lines = (n: number, prefix = 'line') => Array.from({ length: n }, (_, i) => `${prefix} ${i + 1}`).join('\n')
 const user = (text: string) => ({ role: 'user', text, toolUses: [] })
@@ -124,4 +125,38 @@ test('all-dim rows stay under 140 000 bytes', () => {
   const rows = transcriptRows(messages, 100, 400)
   expect(rows.every(r => r.dim === true || r.text.startsWith('▸'))).toBe(true)
   expect(stateBytes(rows)).toBeLessThanOrEqual(140_000)
+})
+
+// Two pumps that overlap (the second starts while the first awaits the
+// clock) make one read, not two.
+test('two overlapping refreshes make one read', async () => {
+  const store = createStore()
+  store.shown = {
+    kind: 'agent',
+    agentId: 'agent-1',
+    run: 'run-1',
+    transcript: { kind: 'loading' },
+    generation: 1,
+    columns: 72,
+    refreshedAt: 0,
+    hasLanded: false,
+    status: undefined,
+  }
+  let reads = 0
+  let releaseClock: (value: number) => void = () => undefined
+  const clock = new Promise<number>(resolve => {
+    releaseClock = resolve
+  })
+  const never = new Promise(() => undefined)
+  const fx: any = {
+    clock: { now: () => clock, after: () => ({ cancel: () => undefined }), every: () => ({ cancel: () => undefined }) },
+    session: { messages: () => ((reads += 1), never) },
+    pane: { read: async () => ({ value: undefined }), write: async () => undefined },
+    ui: { status: () => undefined },
+  }
+  const first = refreshTranscript(fx, store)
+  const second = refreshTranscript(fx, store)
+  releaseClock(1000)
+  await Promise.all([first, second])
+  expect(reads).toBe(1)
 })

@@ -17,6 +17,8 @@ export type Shown =
       transcript: TranscriptState
       generation: number
       // The pane's width at the press: the transcript is laid out at it.
+      // holds-until: a person who resizes the pane mid-view minds it; a
+      // resize then shows the old width until the next read.
       columns: number
       // The clock when the last read began.
       refreshedAt: number
@@ -110,7 +112,7 @@ export type Store = {
   isReadingTranscript: boolean
   // The real `session.messages` promise is unsettled (it may outlive the bound).
   pendingMessages: boolean
-  // `generation:reason` of the notes already made on the run.
+  // `generation:kind` (deny or slow) of the notes already made on the run.
   notedReasons: Set<string>
 }
 

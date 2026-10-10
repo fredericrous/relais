@@ -18,6 +18,8 @@ export type TranscriptState =
   | { kind: 'deny'; reason: string }
   | { kind: 'slow' }
 
+// holds-until: a transcript the person wants to read whole in the pane;
+// the full one is Claude Code's own view (`↓ to manage`).
 export const MAX_TRANSCRIPT_ROWS = 400
 export const MAX_MESSAGE_ROWS = 12
 export const MAX_RESULT_ROWS = 3
@@ -176,7 +178,16 @@ export async function refreshTranscript(fx: Fx, store: Store) {
   const shown = store.shown
   if (store.closed || shown.kind !== 'agent') return
   if (store.isReadingTranscript || store.pendingMessages) return
-  const now = await fx.clock.now()
+  // Held before the first await, so two overlapping pumps cannot both read;
+  // released below when no read is due.
+  store.isReadingTranscript = true
+  let now: number
+  try {
+    now = await fx.clock.now()
+  } catch (reason) {
+    store.isReadingTranscript = false
+    throw reason
+  }
   const row = Object.values(store.models)
     .flatMap(m => m.agents)
     .find(a => a.agentId === shown.agentId)
@@ -187,7 +198,10 @@ export async function refreshTranscript(fx: Fx, store: Store) {
     isChanged ||
     !shown.hasLanded ||
     (isRunning && now - shown.refreshedAt >= REFRESH_MS)
-  if (!isDue) return
+  if (!isDue) {
+    store.isReadingTranscript = false
+    return
+  }
   shown.refreshedAt = now
   shown.status = row?.status
   store.transcriptDirty = false
@@ -206,6 +220,13 @@ export async function refreshTranscript(fx: Fx, store: Store) {
           }
         })
         await storeResult(fx, store, shown.generation, shown.agentId, result)
+      } catch (reason) {
+        // A failed store or flush says why the view stopped updating, once,
+        // on the run; the note itself failing leaves nothing else to tell.
+        const message = String((reason as any)?.message ?? reason)
+        await note(fx, store, shown.run, `agent ${shortId(shown.agentId)}: transcript read failed: ${message}`).catch(
+          () => undefined,
+        )
       } finally {
         store.isReadingTranscript = false
       }
