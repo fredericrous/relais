@@ -8,12 +8,14 @@ import {
   decideSpawn,
   evidenceOf,
   fileHash,
+  gateChecks,
   matchesCheck,
   modeEffective,
   newTask,
   onEvidence,
   outcomeOf,
   parseClassification,
+  parseGateStamp,
   parseRouterState,
   revertedPaths,
   sha256Hex,
@@ -192,6 +194,58 @@ test('checks are matched on argv prefixes after env assignments; background and 
   expect(evidenceOf('Bash', { command: 'cargo test' }, { deny: 'no' }, checks)).toBe(undefined)
   expect(evidenceOf('Bash', { command: 'cargo test' }, { result: {}, text: 'ok' }, checks)).toEqual({ kind: 'check', command: 'cargo test', passed: true })
   expect(evidenceOf('Edit', { file_path: '/repo/a' }, { isError: true, text: 'no match' }, checks)).toBe(undefined)
+})
+
+test('lint, vet and test commands are passing checks, each with its kind; a failing exit is a failed check', () => {
+  const ok = { result: {}, text: 'ok' }
+  const failed = { isError: true, result: 'Exit code 1', text: 'Exit code 1' }
+  const run = (command: string, result: unknown) => evidenceOf('Bash', { command }, result, state.checks, state.check_kinds)
+  expect(run('golangci-lint run ./...', ok)).toEqual({ kind: 'check', command: 'golangci-lint run ./...', passed: true, checkKind: 'lint' })
+  expect(run('go vet ./...', ok)).toEqual({ kind: 'check', command: 'go vet ./...', passed: true, checkKind: 'lint' })
+  expect(run('go test ./...', ok)).toEqual({ kind: 'check', command: 'go test ./...', passed: true, checkKind: 'test' })
+  expect(run('go vet ./...', failed)).toEqual({ kind: 'check', command: 'go vet ./...', passed: false, checkKind: 'lint' })
+  expect(run('go build ./...', ok)).toBe(undefined)
+  let task = newTask('t', null, 'x', asClass(), 'research', 0)
+  for (const command of ['golangci-lint run ./...', 'go vet ./...', 'go test ./...']) {
+    task = onEvidence(state, task, run(command, ok)!, '/repo').task
+  }
+  expect(taskRecord(task, 1000, '/repo').checks).toEqual([
+    { name: 'golangci-lint run ./...', kind: 'lint', passed: true },
+    { name: 'go vet ./...', kind: 'lint', passed: true },
+    { name: 'go test ./...', kind: 'test', passed: true },
+  ])
+  expect(outcomeOf(task)).toBe('completed_verified')
+})
+
+test('a relais that serves no check kinds has them read off the argv', () => {
+  const { check_kinds: _kinds, ...served } = ROUTER_STATE
+  const old = parseRouterState(JSON.stringify(served))!
+  expect(old.check_kinds).toEqual(['test', 'test', 'test', 'lint', 'lint'])
+})
+
+test('a gate stamp: a pass inside the window is a passing check, a fail a failed one, outside runs are ignored', () => {
+  const start = 1_000_000_000_000
+  const end = start + 60_000
+  const epoch = (offsetSeconds: number) => start / 1000 + offsetSeconds
+  const stamp = (passed: number[], failed: number[]) =>
+    parseGateStamp(
+      JSON.stringify({
+        stamped: true,
+        tree: 'abcdef0123456789',
+        passed: passed.map(e => ({ gate: 'pre-push', epoch: e })),
+        failed: failed.map(e => ({ gate: 'pre-push', epoch: e })),
+      }),
+    )!
+  const name = 'amont-gate@abcdef0'
+  expect(gateChecks(stamp([epoch(10)], []), start, end)).toEqual([{ name, kind: 'gate', passed: true }])
+  expect(gateChecks(stamp([], [epoch(10)]), start, end)).toEqual([{ name, kind: 'gate', passed: false }])
+  // A fail after the pass: only the failure; a pass after the fail: the last word is a pass.
+  expect(gateChecks(stamp([epoch(10)], [epoch(20)]), start, end)).toEqual([{ name, kind: 'gate', passed: false }])
+  expect(gateChecks(stamp([epoch(20)], [epoch(10)]), start, end).map(c => c.passed)).toEqual([false, true])
+  expect(gateChecks(stamp([epoch(-100), epoch(1000)], [epoch(-50)]), start, end)).toEqual([])
+  expect(gateChecks({ stamped: false }, start, end)).toEqual([])
+  expect(parseGateStamp('{"stamped":false}')).toEqual({ stamped: false })
+  expect(parseGateStamp('nope')).toBe(undefined)
 })
 
 test('mode_effective is router-state’s mode, and shadow without a state', () => {

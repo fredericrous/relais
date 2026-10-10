@@ -376,7 +376,7 @@ export function register(on: any) {
     const fx = effects($)
     onTurn(fx, store, e)
     try {
-      onTurnComplete(store, e, await fx.clock.now())
+      onTurnComplete(fx, store, e, await fx.clock.now())
     } catch {
       // Fail open.
     }

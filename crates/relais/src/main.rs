@@ -569,6 +569,15 @@ enum NativeCommand {
         #[arg(long)]
         session: String,
     },
+    /// What amont's pre-push gate stamped on the repository's current tree
+    /// (SPEC §30), as JSON: `{"stamped":false}` when there is no stamp.
+    /// Reads only; exits non-zero only when git or the directory fails
+    #[command(name = "gate-stamp")]
+    GateStamp {
+        /// The repository
+        #[arg(long)]
+        cwd: PathBuf,
+    },
     /// The session router's records on stdin (decisions, usage,
     /// reassessments, tasks), written in one transaction; 2 when the
     /// payload is invalid, and then nothing is written
@@ -3785,6 +3794,7 @@ fn native_command(cmd: NativeCommand) -> Result<CliOutcome, CliError> {
         NativeCommand::Contract => native_contract_command(),
         NativeCommand::RouterState { session } => Ok(router_state_command(&session)),
         NativeCommand::RouterObserve => Ok(router_observe_command()),
+        NativeCommand::GateStamp { cwd } => Ok(gate_stamp_command(&cwd)),
         NativeCommand::RouterEnvelope {
             by,
             off: true,
@@ -3894,6 +3904,31 @@ fn router_state_command(session: &str) -> CliOutcome {
         }
         Err(e) => {
             eprintln!("relais native router-state: {e}");
+            CliOutcome::OperationalFailure
+        }
+    }
+}
+
+/// `relais native gate-stamp`: 0 with the JSON document on stdout, 1 when
+/// git fails, 2 when `--cwd` is not a directory.
+fn gate_stamp_command(repo: &std::path::Path) -> CliOutcome {
+    if !repo.is_dir() {
+        eprintln!(
+            "relais native gate-stamp: {} is not a directory",
+            repo.display()
+        );
+        return CliOutcome::InvalidInput;
+    }
+    match relais::router::gate::read(repo)
+        .map_err(|e| e.to_string())
+        .and_then(|stamp| serde_json::to_string(&stamp).map_err(|e| e.to_string()))
+    {
+        Ok(text) => {
+            println!("{text}");
+            CliOutcome::Accepted
+        }
+        Err(e) => {
+            eprintln!("relais native gate-stamp: {e}");
             CliOutcome::OperationalFailure
         }
     }

@@ -336,6 +336,8 @@ mod tests {
             exhausted: false,
             turns: 1,
             explicit_quote: None,
+            outcome_source: Some("own".into()),
+            checks: vec![],
         }
     }
 

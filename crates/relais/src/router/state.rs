@@ -22,20 +22,60 @@ pub const TASK_TOKENS_BY_DIFFICULTY: [u64; 5] = [20_000, 60_000, 150_000, 400_00
 /// prior stands in for the observed median.
 pub const MIN_TASKS_FOR_MEDIAN: usize = 10;
 
+/// What a check proves, recorded with each check so the learner can
+/// weight or filter by kind (the plugin adds `gate` for an amont stamp).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckKind {
+    Test,
+    Lint,
+    Build,
+}
+
+impl CheckKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            CheckKind::Test => "test",
+            CheckKind::Lint => "lint",
+            CheckKind::Build => "build",
+        }
+    }
+}
+
 /// Argv prefixes that count as verification everywhere (the contract's
-/// built-in list).
-pub const BUILT_IN_CHECKS: &[&[&str]] = &[
-    &["cargo", "test"],
-    &["cargo", "nextest"],
-    &["npm", "test"],
-    &["pnpm", "test"],
-    &["yarn", "test"],
-    &["bun", "test"],
-    &["pytest"],
-    &["uv", "run", "pytest"],
-    &["go", "test"],
-    &["make", "check"],
-    &["make", "test"],
+/// built-in list), each with its kind. A type check is a `build` (it
+/// compiles), a linter or static analyser a `lint`.
+pub const BUILT_IN_CHECKS: &[(&[&str], CheckKind)] = &[
+    (&["cargo", "test"], CheckKind::Test),
+    (&["cargo", "nextest"], CheckKind::Test),
+    (&["cargo", "clippy"], CheckKind::Lint),
+    (&["cargo", "check"], CheckKind::Build),
+    (&["cargo", "build"], CheckKind::Build),
+    (&["npm", "test"], CheckKind::Test),
+    (&["pnpm", "test"], CheckKind::Test),
+    (&["yarn", "test"], CheckKind::Test),
+    (&["bun", "test"], CheckKind::Test),
+    (&["pnpm", "run", "test"], CheckKind::Test),
+    (&["pnpm", "run", "lint"], CheckKind::Lint),
+    (&["pnpm", "run", "build"], CheckKind::Build),
+    (&["pnpm", "run", "typecheck"], CheckKind::Build),
+    (&["npm", "run", "test"], CheckKind::Test),
+    (&["npm", "run", "lint"], CheckKind::Lint),
+    (&["npm", "run", "build"], CheckKind::Build),
+    (&["npm", "run", "typecheck"], CheckKind::Build),
+    (&["tsc"], CheckKind::Build),
+    (&["pytest"], CheckKind::Test),
+    (&["uv", "run", "pytest"], CheckKind::Test),
+    (&["go", "test"], CheckKind::Test),
+    (&["go", "vet"], CheckKind::Lint),
+    (&["go", "build"], CheckKind::Build),
+    (&["golangci-lint", "run"], CheckKind::Lint),
+    (&["ruff", "check"], CheckKind::Lint),
+    (&["mypy"], CheckKind::Lint),
+    (&["pyright"], CheckKind::Lint),
+    (&["make", "check"], CheckKind::Test),
+    (&["make", "test"], CheckKind::Test),
+    (&["make", "lint"], CheckKind::Lint),
+    (&["make", "build"], CheckKind::Build),
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -79,6 +119,9 @@ pub struct RouterState {
     pub pins: BTreeMap<String, String>,
     pub excluded_models: Vec<String>,
     pub checks: Vec<Vec<String>>,
+    /// The kind (`test`, `lint`, `build`) of each entry of `checks`, same
+    /// order and length.
+    pub check_kinds: Vec<&'static str>,
     pub adjustments: Vec<serde_json::Value>,
 }
 
@@ -166,9 +209,21 @@ pub fn task_token_priors(totals: &[(String, u8, u64)]) -> BTreeMap<String, u64> 
         .collect()
 }
 
-/// The repository's check argv, then the built-in list, each once.
-pub fn checks(repo: Option<&RepoPolicy>) -> Vec<Vec<String>> {
-    let mut out: Vec<Vec<String>> = Vec::new();
+/// The kind of a check argv: the built-in prefix it starts with, else
+/// `test` (a repository's own verification command).
+fn kind_of(argv: &[String]) -> CheckKind {
+    BUILT_IN_CHECKS
+        .iter()
+        .find(|(prefix, _)| {
+            prefix.len() <= argv.len() && prefix.iter().zip(argv).all(|(p, a)| p == a)
+        })
+        .map_or(CheckKind::Test, |(_, kind)| *kind)
+}
+
+/// The repository's check argv, then the built-in list, each once, with
+/// its kind.
+pub fn checks(repo: Option<&RepoPolicy>) -> Vec<(Vec<String>, CheckKind)> {
+    let mut out: Vec<(Vec<String>, CheckKind)> = Vec::new();
     let repo_commands = repo
         .into_iter()
         .flat_map(|repo| repo.verification.profiles.values())
@@ -176,10 +231,11 @@ pub fn checks(repo: Option<&RepoPolicy>) -> Vec<Vec<String>> {
         .map(|command| command.argv.clone());
     let built_in = BUILT_IN_CHECKS
         .iter()
-        .map(|argv| argv.iter().map(|word| word.to_string()).collect());
+        .map(|(argv, _)| argv.iter().map(|word| word.to_string()).collect());
     for argv in repo_commands.chain(built_in) {
-        if !argv.is_empty() && !out.contains(&argv) {
-            out.push(argv);
+        if !argv.is_empty() && !out.iter().any(|(seen, _)| *seen == argv) {
+            let kind = kind_of(&argv);
+            out.push((argv, kind));
         }
     }
     out
@@ -216,6 +272,10 @@ pub fn build(inputs: Inputs<'_>) -> RouterState {
     for (agent, model) in &inputs.definition_pins {
         pins.insert(agent.clone(), model.clone());
     }
+    let (checks, check_kinds): (Vec<Vec<String>>, Vec<&'static str>) = checks(inputs.repo)
+        .into_iter()
+        .map(|(argv, kind)| (argv, kind.as_str()))
+        .unzip();
     RouterState {
         schema: 1,
         mode,
@@ -233,7 +293,8 @@ pub fn build(inputs: Inputs<'_>) -> RouterState {
         },
         pins,
         excluded_models: routing.excluded_models.clone(),
-        checks: checks(inputs.repo),
+        checks,
+        check_kinds,
         adjustments: Vec::new(),
     }
 }
@@ -268,6 +329,29 @@ mod tests {
         assert_eq!(state.epsilon, 0.0);
         assert!(state.adjustments.is_empty());
         assert_eq!(state.checks[0], vec!["cargo", "test"]);
+    }
+
+    #[test]
+    fn every_check_is_served_with_its_kind() {
+        let machine = machine("");
+        let state = build(inputs(&machine, None));
+        assert_eq!(state.checks.len(), state.check_kinds.len());
+        let kind = |words: &[&str]| {
+            let at = state
+                .checks
+                .iter()
+                .position(|argv| argv == words)
+                .unwrap_or_else(|| panic!("{words:?} is not a check"));
+            state.check_kinds[at]
+        };
+        assert_eq!(kind(&["cargo", "test"]), "test");
+        assert_eq!(kind(&["go", "test"]), "test");
+        assert_eq!(kind(&["cargo", "clippy"]), "lint");
+        assert_eq!(kind(&["golangci-lint", "run"]), "lint");
+        assert_eq!(kind(&["go", "vet"]), "lint");
+        assert_eq!(kind(&["pnpm", "run", "typecheck"]), "build");
+        assert_eq!(kind(&["make", "build"]), "build");
+        assert_eq!(kind(&["tsc"]), "build");
     }
 
     #[test]
@@ -382,6 +466,7 @@ mod tests {
             vec![
                 "adjustments",
                 "capability_table",
+                "check_kinds",
                 "checks",
                 "envelope",
                 "epsilon",

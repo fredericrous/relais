@@ -8,6 +8,22 @@ missing here.
 
 ## Unreleased
 
+The session router gets real outcome evidence.
+
+- Lint, build and type-check commands (`cargo clippy|check|build`,
+  `pnpm|npm run lint|build|typecheck`, `tsc`, `go vet|build`,
+  `golangci-lint run`, `ruff check`, `mypy`, `pyright`, `make lint|build`)
+  now count as checks, each recorded with its kind (`test`, `lint`, `build`).
+- New read-only `relais native gate-stamp --cwd <repo>` reads amont's gate
+  stamp on the current tree. At a task's end the plugin turns a stamp made
+  inside the task's window into an `amont-gate@<tree>` check.
+- A subagent task that ended before its parent takes the parent's outcome
+  when its own is unknown (`outcome_source = parent`).
+- A correction now records its task as `corrected` at once, so a session that
+  dies before the task ends no longer leaves a correction with no task.
+- Each routing decision records the capability table's version. The ledger
+  migrates to schema 23 (additive columns).
+
 A salvaged run can now teach the learner, when its verified patch landed.
 
 - `relais decide --answer salvaged` records whether the run's verified

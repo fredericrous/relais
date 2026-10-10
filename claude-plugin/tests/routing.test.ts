@@ -487,3 +487,162 @@ test('a classifier answer that fails to parse, or no router-state, routes nothin
   const { steps } = await personTurn($, engine, 'hello')
   expect(steps[0].model).toBe(SONNET)
 })
+
+// --- evidence for the router (learning-loop Phase 3) ----------------------------------
+
+const SESSION_START_EPOCH = Date.parse('2026-10-06T12:00:00Z') / 1000
+const succeeded = { exitCode: 0, stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+
+// The world around the edited files: `/repo` is a git repository whose tree
+// carries `stamp` (undefined: no gate-stamp answer at all). Returns the
+// gate-stamp calls made.
+function repositoryWithStamp(engine: any, stamp: unknown) {
+  const base = engine.script.runResult
+  const stamped: string[][] = []
+  engine.script.runResult = (argv: string[], init: any) => {
+    if (argv[0] === 'git' && argv[1] === 'rev-parse') return { ...succeeded, stdout: '/repo\n' }
+    if (argv[1] === 'native' && argv[2] === 'gate-stamp') {
+      stamped.push(argv)
+      return stamp === undefined ? { ...succeeded, exitCode: 1, stdout: '', stderr: 'git failed' } : { ...succeeded, stdout: JSON.stringify(stamp) }
+    }
+    return base(argv, init)
+  }
+  return stamped
+}
+
+const treeStamp = (passed: number[], failed: number[]) => ({
+  stamped: true,
+  tree: '0123456789abcdef0123456789abcdef01234567',
+  passed: passed.map(epoch => ({ gate: 'pre-push', epoch })),
+  failed: failed.map(epoch => ({ gate: 'pre-push', epoch })),
+})
+
+test('a passing amont stamp inside the task window is a passing amont-gate check of kind gate', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  const stamped = repositoryWithStamp(engine, treeStamp([SESSION_START_EPOCH], []))
+  await personTurn($, engine, 'rename foo to bar, tests exist')
+  await toolCall($, engine, edit('/repo/src/a.rs'), { result: {}, text: 'ok' })
+  await endSession($, engine)
+  expect(stamped.map(argv => argv.slice(1))).toEqual([['native', 'gate-stamp', '--cwd', '/repo']])
+  const [task] = observed(engine, 'task')
+  expect(task.checks).toEqual([{ name: 'amont-gate@0123456', kind: 'gate', passed: true }])
+  expect(task.outcome).toBe('completed_verified')
+})
+
+test('a failing amont stamp inside the window is a failed check; runs outside the window are ignored', async ($: any, on: any) => {
+  const failing = await routedSession($, on)
+  repositoryWithStamp(failing, treeStamp([], [SESSION_START_EPOCH]))
+  await personTurn($, failing, 'rename foo to bar, tests exist')
+  await toolCall($, failing, edit('/repo/src/a.rs'), { result: {}, text: 'ok' })
+  await endSession($, failing)
+  const [task] = observed(failing, 'task')
+  expect(task.checks).toEqual([{ name: 'amont-gate@0123456', kind: 'gate', passed: false }])
+  expect(task.outcome).toBe('unknown')
+})
+
+async function editedWithStamp($: any, on: any, stamp: unknown) {
+  const engine = await routedSession($, on)
+  repositoryWithStamp(engine, stamp)
+  await personTurn($, engine, 'rename foo to bar, tests exist')
+  await toolCall($, engine, edit('/repo/src/a.rs'), { result: {}, text: 'ok' })
+  await endSession($, engine)
+  return observed(engine, 'task')[0]
+}
+
+test('a stamp from before the task records no gate check', async ($: any, on: any) => {
+  const task = await editedWithStamp($, on, treeStamp([SESSION_START_EPOCH - 3600], [SESSION_START_EPOCH - 60]))
+  expect(task.checks).toEqual([])
+  expect(task.outcome).toBe('unknown')
+})
+
+test('a repository with no stamp records no gate check', async ($: any, on: any) => {
+  expect((await editedWithStamp($, on, { stamped: false })).checks).toEqual([])
+})
+
+test('a gate-stamp that fails leaves the task recorded without it', async ($: any, on: any) => {
+  const task = await editedWithStamp($, on, undefined)
+  expect(task.checks).toEqual([])
+  expect(task.outcome).toBe('unknown')
+})
+
+test('a task that edited nothing never asks for a stamp', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  const stamped = repositoryWithStamp(engine, treeStamp([SESSION_START_EPOCH], []))
+  await personTurn($, engine, 'where is foo defined')
+  await endSession($, engine)
+  expect(stamped).toEqual([])
+  expect(observed(engine, 'task')[0].checks).toEqual([])
+})
+
+test('a lint run is recorded on the task with its kind', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'rename foo to bar, tests exist')
+  await toolCall($, engine, bash('golangci-lint run ./...'), passingCheck)
+  await toolCall($, engine, bash('go vet ./...'), failingCheck)
+  await endSession($, engine)
+  expect(observed(engine, 'task')[0].checks).toEqual([
+    { name: 'golangci-lint run ./...', kind: 'lint', passed: true },
+    { name: 'go vet ./...', kind: 'lint', passed: false },
+  ])
+})
+
+test('a subagent that ended before its parent is amended with the parent’s outcome', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'rename foo to bar, tests exist')
+  await $.agent.spawn({ prompt: 'rename in the module', description: 'rename foo', subagentType: 'general-purpose' })
+  await $.turn.complete({ agentId: 'agent-1', answer: 'done', durationMs: 1, isAborted: false, turnId: 'a1', reason: 'answer' })
+  await settle(engine)
+  await toolCall($, engine, edit('/repo/src/a.rs'), { result: {}, text: 'ok' })
+  await toolCall($, engine, bash('cargo test'), passingCheck)
+  await endSession($, engine)
+  const records = nativeCalls(engine.calls, 'router-observe').flatMap((c: any) => c.payload.records)
+  const sub = records.find((r: any) => r.kind === 'task' && r.agent_id === 'agent-1')
+  expect(sub.outcome).toBe('unknown')
+  const outcomes = records.filter((r: any) => r.kind === 'task_outcome')
+  expect(outcomes.map((r: any) => [r.task_id, r.agent_id, r.outcome])).toEqual([[sub.task_id, 'agent-1', 'completed_verified']])
+  expect(records.indexOf(outcomes[0])).toBeGreaterThan(records.indexOf(sub))
+})
+
+test('a parent whose outcome is unknown sends no task_outcome', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'rename foo to bar, tests exist')
+  await $.agent.spawn({ prompt: 'rename in the module', description: 'rename foo', subagentType: 'general-purpose' })
+  await endSession($, engine)
+  expect(observed(engine, 'task_outcome')).toEqual([])
+})
+
+test('a correction is recorded as a corrected task when it happens, not only when the task ends', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'fix the parser, tests exist')
+  engine.labels.set('still wrong', label({ relation: 'correction', explicit: { value: 'correct', quote: 'still wrong' } }))
+  await personTurn($, engine, 'still wrong')
+  // The session dies here: no turn ends the task, no session.end. The next
+  // prompt's flush is the last thing that reaches relais.
+  await $.prompt.submit({ text: 'anything', wait: false, origin: { kind: 'composer' } })
+  await settle(engine)
+  expect(observed(engine, 'reassess').map((r: any) => r.event)).toEqual(['correction'])
+  const tasks = observed(engine, 'task')
+  expect(tasks.length).toBe(1)
+  expect(tasks[0].outcome).toBe('corrected')
+  expect(tasks[0].completed_at_end).toBe(null)
+})
+
+test('/relais-flag records the corrected task at once too', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'fix the parser, tests exist')
+  await $.command.run({ command: 'relais-flag', args: '', origin: { kind: 'composer' }, presentation: { layout: 'main', columns: 120 } })
+  await $.prompt.submit({ text: 'anything', wait: false, origin: { kind: 'composer' } })
+  await settle(engine)
+  expect(observed(engine, 'reassess').map((r: any) => r.event)).toEqual(['flag'])
+  expect(observed(engine, 'task').map((t: any) => t.outcome)).toEqual(['corrected'])
+})
+
+test('every decision carries the capability table’s version', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'rename foo to bar, tests exist')
+  await $.agent.spawn({ prompt: 'rename in the module', description: 'rename foo', subagentType: 'general-purpose' })
+  await endSession($, engine)
+  const decisions = observed(engine, 'decision')
+  expect(decisions.length).toBe(2)
+  expect(decisions.map((d: any) => d.table_version)).toEqual([1, 1])
+})

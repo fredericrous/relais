@@ -12,6 +12,7 @@
 //! `holdout`, `stats`, `wire`, `pins`, `state`, `report`). R1 has no
 //! learner: `adjustments` is always empty.
 
+pub mod gate;
 pub mod holdout;
 pub mod mode;
 pub mod outcome;

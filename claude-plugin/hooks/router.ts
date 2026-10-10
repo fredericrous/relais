@@ -63,7 +63,13 @@ export type RouterState = {
   pins: Record<string, string>
   excluded_models: string[]
   checks: string[][]
+  // The kind of each entry of `checks` (same order): test, lint or build.
+  // Empty from a relais that predates it: the kind is then read off the argv.
+  check_kinds: string[]
 }
+
+// What a check proves. `gate` is an amont stamp, read at task end.
+export type CheckKind = 'test' | 'lint' | 'build' | 'gate'
 
 // One task: the main session's, or a router-created subagent's.
 export type TaskState = {
@@ -90,9 +96,12 @@ export type TaskState = {
   // that counted as escalating evidence failed with no pass since.
   editedSinceCheck: boolean
   lastCountedFailure: boolean
-  verifications: { command: string; passed: boolean }[]
+  verifications: { command: string; passed: boolean; kind?: CheckKind }[]
   files: string[]
   subagents: string[]
+  // The tasks of the router-created subagents this one spawned: their
+  // parent's outcome amends them when this task ends (`task_outcome`).
+  subagentTasks: { taskId: string; agentId: string | null }[]
   corrected: boolean
   acceptQuote: string | null
   // The person's latest explicit words (accept or correct), for the record.
@@ -298,10 +307,36 @@ export function parseRouterState(text: unknown): RouterState | undefined {
     },
     pins: raw.pins && typeof raw.pins === 'object' ? raw.pins : {},
     excluded_models: Array.isArray(raw.excluded_models) ? raw.excluded_models.filter((m: unknown) => typeof m === 'string') : [],
-    checks: Array.isArray(raw.checks)
-      ? raw.checks.filter((c: unknown) => Array.isArray(c) && c.length > 0 && c.every(a => typeof a === 'string'))
-      : [],
+    ...parseChecks(raw),
   }
+}
+
+const CHECK_KINDS: readonly string[] = ['test', 'lint', 'build']
+
+// The checks and their kinds, kept in step: an entry that is no argv drops
+// its kind with it.
+function parseChecks(raw: any): { checks: string[][]; check_kinds: string[] } {
+  const checks: string[][] = []
+  const check_kinds: string[] = []
+  const kinds: unknown[] = Array.isArray(raw.check_kinds) ? raw.check_kinds : []
+  const list: unknown[] = Array.isArray(raw.checks) ? raw.checks : []
+  list.forEach((c, i) => {
+    if (!Array.isArray(c) || c.length === 0 || !c.every(a => typeof a === 'string')) return
+    checks.push(c)
+    const served = kinds[i]
+    check_kinds.push(typeof served === 'string' && CHECK_KINDS.includes(served) ? served : kindOfArgv(c))
+  })
+  return { checks, check_kinds }
+}
+
+// A check's kind when router-state did not serve it: the words that name it.
+export function kindOfArgv(argv: string[]): CheckKind {
+  const head = argv.slice(0, 3)
+  if (head.includes('test') || head[0] === 'pytest') return 'test'
+  const line = head.join(' ')
+  if (/\b(lint|clippy|vet|ruff|mypy|pyright)\b/.test(line)) return 'lint'
+  if (/\b(build|check|typecheck|tsc)\b/.test(line) && !/^(make|just) check$/.test(line)) return 'build'
+  return 'test'
 }
 
 // --- the mode ---------------------------------------------------------------
@@ -451,6 +486,7 @@ export function newTask(id: string, agentId: string | null, opening: string, c: 
     verifications: [],
     files: [],
     subagents: [],
+    subagentTasks: [],
     corrected: false,
     acceptQuote: null,
     explicitQuote: null,
@@ -647,20 +683,28 @@ function words(segment: string): string[] {
 // its leading `NAME=value` assignments dropped, is matched on its first
 // words against the argv prefixes router-state serves.
 export function matchesCheck(command: string, checks: string[][]): boolean {
+  return checkIndex(command, checks) !== undefined
+}
+
+// The index of the first check a command runs, or undefined.
+export function checkIndex(command: string, checks: string[][]): number | undefined {
   for (const segment of command.split(/&&|;|\n/)) {
     const argv = words(segment.trim())
     while (argv.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[0])) argv.shift()
-    if (checks.some(prefix => prefix.length <= argv.length && prefix.every((w, i) => argv[i] === w))) return true
+    const at = checks.findIndex(prefix => prefix.length <= argv.length && prefix.every((w, i) => argv[i] === w))
+    if (at >= 0) return at
   }
-  return false
+  return undefined
 }
 
 // What a finished tool call says, or undefined when it is no evidence.
 export type Evidence =
   | { kind: 'edit'; file: string | undefined }
-  | { kind: 'check'; command: string; passed: boolean }
+  | { kind: 'check'; command: string; passed: boolean; checkKind?: CheckKind }
 
-export function evidenceOf(tool: string, e: any, result: any, checks: string[][]): Evidence | undefined {
+// `kinds` are router-state's `check_kinds`, aligned with `checks`; without
+// them the evidence carries no kind and the record reads it off the argv.
+export function evidenceOf(tool: string, e: any, result: any, checks: string[][], kinds?: string[]): Evidence | undefined {
   if (!result || result.deny !== undefined) return undefined
   if (EDIT_TOOLS.includes(tool)) {
     if (result.isError) return undefined
@@ -671,13 +715,16 @@ export function evidenceOf(tool: string, e: any, result: any, checks: string[][]
   // A background command returns no exit code.
   if (e.run_in_background === true) return undefined
   const command = typeof e.command === 'string' ? e.command : ''
-  if (!matchesCheck(command, checks)) return undefined
+  const at = checkIndex(command, checks)
+  if (at === undefined) return undefined
+  const served = kinds?.[at]
+  const checkKind = served === 'test' || served === 'lint' || served === 'build' ? served : undefined
   if (result.isError) {
     // S0: a failing command is `isError` with "Exit code N"; an error
     // without one (interrupted, refused) says nothing about the code.
-    return /Exit code \d+/.test(String(result.text ?? result.result ?? '')) ? { kind: 'check', command, passed: false } : undefined
+    return /Exit code \d+/.test(String(result.text ?? result.result ?? '')) ? { kind: 'check', command, passed: false, checkKind } : undefined
   }
-  return { kind: 'check', command, passed: true }
+  return { kind: 'check', command, passed: true, checkKind }
 }
 
 // --- reverts and file hashes (plan §5: missed failures, measured) -----------------
@@ -828,7 +875,11 @@ export function onEvidence(
     const out = rerun(state, t, 'scope_growth')
     return { task: out.task, reassess: out.record }
   }
-  t.verifications.push({ command: clip(evidence.command, 200), passed: evidence.passed })
+  t.verifications.push({
+    command: clip(evidence.command, 200),
+    passed: evidence.passed,
+    kind: evidence.checkKind ?? kindOfArgv(words(evidence.command)),
+  })
   if (t.verifications.length > 20) t.verifications = t.verifications.slice(-20)
   const edited = t.editedSinceCheck
   t.editedSinceCheck = false
@@ -916,6 +967,8 @@ export function decisionRecord(input: {
   holdout: boolean
   applied: boolean
   now: number
+  // The capability table's version the decision was made under.
+  tableVersion?: number
 }) {
   return {
     kind: 'decision',
@@ -935,6 +988,7 @@ export function decisionRecord(input: {
     propensity: null,
     draw: null,
     would_pass_gate: input.decision.wouldPassGate,
+    table_version: input.tableVersion ?? null,
     at: iso(input.now),
   }
 }
@@ -989,7 +1043,58 @@ export function taskRecord(task: TaskState, endedAt: number | null, cwd: string 
     exhausted: task.exhausted,
     turns: task.turns,
     explicit_quote: task.explicitQuote,
+    checks: task.verifications.map(v => ({ name: v.command, kind: v.kind ?? 'test', passed: v.passed })),
   }
+}
+
+// A parent's outcome for a subagent task that ended before it: relais
+// applies it only over an `unknown` outcome of its own.
+export function taskOutcomeRecord(sub: { taskId: string; agentId: string | null }, outcome: Outcome, at: number) {
+  return { kind: 'task_outcome', task_id: sub.taskId, agent_id: sub.agentId, outcome, at: iso(at) }
+}
+
+// --- the amont gate stamp -----------------------------------------------------------------
+
+// `relais native gate-stamp`'s document.
+export type GateStamp = {
+  stamped: boolean
+  tree?: string
+  passed?: { gate: string; epoch: number }[]
+  failed?: { gate: string; epoch: number }[]
+}
+
+export function parseGateStamp(text: unknown): GateStamp | undefined {
+  try {
+    const raw = JSON.parse(String(text ?? ''))
+    if (!raw || typeof raw.stamped !== 'boolean') return undefined
+    if (!raw.stamped) return { stamped: false }
+    const runs = (list: unknown) =>
+      Array.isArray(list)
+        ? list.filter((r: any) => r && typeof r.gate === 'string' && Number.isFinite(r.epoch)).map((r: any) => ({ gate: r.gate, epoch: Number(r.epoch) }))
+        : []
+    return { stamped: true, tree: typeof raw.tree === 'string' ? raw.tree : '', passed: runs(raw.passed), failed: runs(raw.failed) }
+  } catch {
+    return undefined
+  }
+}
+
+// What a stamp says about one task: the runs inside its window [start, end]
+// (ms; stamps are in whole seconds). A pass with no fail after it in the
+// window is a passing check, a fail in the window a failed one; the
+// check is named for the tree, so a later pass is the last word.
+export function gateChecks(stamp: GateStamp, startedAt: number, endedAt: number): { name: string; kind: 'gate'; passed: boolean }[] {
+  if (!stamp.stamped || !stamp.tree) return []
+  const from = Math.floor(startedAt / 1000)
+  const to = Math.ceil(endedAt / 1000)
+  const inside = (r: { epoch: number }) => r.epoch >= from && r.epoch <= to
+  const passes = (stamp.passed ?? []).filter(inside)
+  const fails = (stamp.failed ?? []).filter(inside)
+  const name = `amont-gate@${stamp.tree.slice(0, 7)}`
+  const out: { name: string; kind: 'gate'; passed: boolean }[] = []
+  if (fails.length > 0) out.push({ name, kind: 'gate', passed: false })
+  const lastFail = Math.max(-Infinity, ...fails.map(r => r.epoch))
+  if (passes.some(r => r.epoch > lastFail)) out.push({ name, kind: 'gate', passed: true })
+  return out
 }
 
 // --- the module's memory (Store.router) ----------------------------------------------

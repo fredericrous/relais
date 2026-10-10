@@ -7,7 +7,8 @@ use serde::Deserialize;
 
 use super::outcome::TaskOutcome;
 use crate::ledger::{
-    RouterClass, RouterDecisionRow, RouterReassessRow, RouterRecord, RouterTaskRow, RouterUsageRow,
+    RouterCheck, RouterClass, RouterDecisionRow, RouterReassessRow, RouterRecord,
+    RouterTaskOutcomeRow, RouterTaskRow, RouterUsageRow,
 };
 
 /// The wire schema this relais reads.
@@ -220,6 +221,8 @@ struct Decision {
     propensity: Option<f64>,
     draw: Option<f64>,
     would_pass_gate: bool,
+    #[serde(default)]
+    table_version: Option<u32>,
     at: String,
 }
 
@@ -273,6 +276,26 @@ struct Task {
     exhausted: bool,
     turns: u32,
     explicit_quote: Option<String>,
+    #[serde(default)]
+    checks: Vec<Check>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Check {
+    name: String,
+    kind: String,
+    passed: bool,
+}
+
+/// A parent's outcome for a subagent task that ended before it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskOutcomeRecord {
+    task_id: String,
+    agent_id: Option<String>,
+    outcome: TaskOutcome,
+    at: String,
 }
 
 fn decision(d: Decision) -> Result<RouterRecord, String> {
@@ -319,6 +342,7 @@ fn decision(d: Decision) -> Result<RouterRecord, String> {
         propensity: d.propensity,
         draw: d.draw,
         would_pass_gate: d.would_pass_gate,
+        table_version: d.table_version,
         at: d.at,
     }))
 }
@@ -376,6 +400,19 @@ fn task(t: Task) -> Result<RouterRecord, String> {
     if let Some(ended) = &t.ended_at {
         timestamp("ended_at", ended)?;
     }
+    let mut checks = Vec::with_capacity(t.checks.len());
+    for check in t.checks {
+        named("checks.name", &check.name)?;
+        checks.push(RouterCheck {
+            kind: one_of(
+                "checks.kind",
+                &check.kind,
+                &["test", "lint", "build", "gate"],
+            )?,
+            name: check.name,
+            passed: check.passed,
+        });
+    }
     let mut inferred = Vec::with_capacity(t.inferred.len());
     for signal in &t.inferred {
         let signal = one_of(
@@ -403,6 +440,20 @@ fn task(t: Task) -> Result<RouterRecord, String> {
         exhausted: t.exhausted,
         turns: t.turns,
         explicit_quote: t.explicit_quote,
+        outcome_source: Some("own".into()),
+        checks,
+    }))
+}
+
+fn task_outcome(o: TaskOutcomeRecord) -> Result<RouterRecord, String> {
+    named("task_id", &o.task_id)?;
+    timestamp("at", &o.at)?;
+    Ok(RouterRecord::TaskOutcome(RouterTaskOutcomeRow {
+        outcome: o.outcome.as_str().into(),
+        outcome_rank: o.outcome.rank(),
+        task_id: o.task_id,
+        agent_id: o.agent_id,
+        at: o.at,
     }))
 }
 
@@ -443,7 +494,8 @@ pub fn parse_batch(text: &str) -> Result<Batch, WireError> {
             "usage" => typed(value).and_then(usage),
             "reassess" => typed(value).and_then(reassess),
             "task" => typed(value).and_then(task),
-            _ => Err("kind is not decision|usage|reassess|task".to_string()),
+            "task_outcome" => typed(value).and_then(task_outcome),
+            _ => Err("kind is not decision|usage|reassess|task|task_outcome".to_string()),
         };
         records.push(record.map_err(|detail| WireError {
             record: Some((index, kind.clone())),
@@ -553,6 +605,47 @@ mod tests {
         assert!(matches!(&batch.records[2], RouterRecord::Reassess(r)
             if r.event == "revert" && r.files == vec!["0123456789abcdef"]));
         value["records"][3]["files"] = serde_json::json!(["src/lib.rs"]);
+        assert_eq!(
+            parse_batch(&value.to_string()).unwrap_err().record,
+            Some((3, "task".into()))
+        );
+    }
+
+    /// What the plugin sent before this step: none of the new fields.
+    #[test]
+    fn an_old_plugins_payload_is_recorded() {
+        let batch = parse_batch(&sample_batch("old")).unwrap();
+        assert!(
+            matches!(&batch.records[0], RouterRecord::Decision(d) if d.table_version.is_none())
+        );
+        assert!(matches!(&batch.records[3], RouterRecord::Task(t)
+            if t.checks.is_empty() && t.outcome_source.as_deref() == Some("own")));
+    }
+
+    #[test]
+    fn the_new_fields_and_the_task_outcome_record_parse() {
+        let mut value: serde_json::Value = serde_json::from_str(&sample_batch("s1")).unwrap();
+        value["records"][0]["table_version"] = serde_json::json!(2);
+        value["records"][3]["checks"] = serde_json::json!([
+            { "name": "go vet ./...", "kind": "lint", "passed": true },
+            { "name": "amont-gate@abc1234", "kind": "gate", "passed": false }
+        ]);
+        value["records"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "kind": "task_outcome", "task_id": "t1", "agent_id": "a1",
+                "outcome": "completed_verified", "at": "2026-10-07T10:05:00Z"
+            }));
+        let batch = parse_batch(&value.to_string()).unwrap();
+        assert!(
+            matches!(&batch.records[0], RouterRecord::Decision(d) if d.table_version == Some(2))
+        );
+        assert!(matches!(&batch.records[3], RouterRecord::Task(t) if t.checks.len() == 2));
+        assert!(matches!(&batch.records[4], RouterRecord::TaskOutcome(o)
+            if o.outcome == "completed_verified" && o.outcome_rank == 1
+                && o.agent_id.as_deref() == Some("a1")));
+        value["records"][3]["checks"][0]["kind"] = serde_json::json!("vibes");
         assert_eq!(
             parse_batch(&value.to_string()).unwrap_err().record,
             Some((3, "task".into()))

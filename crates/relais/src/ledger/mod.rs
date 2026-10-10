@@ -26,11 +26,11 @@ use crate::route::RoutedBy;
 
 mod router;
 pub use router::{
-    RouterClass, RouterDecisionRow, RouterProvenance, RouterReassessRow, RouterRecord,
-    RouterTaskRow, RouterUsageRow, RouterWindow,
+    RouterCheck, RouterClass, RouterDecisionRow, RouterProvenance, RouterReassessRow, RouterRecord,
+    RouterTaskOutcomeRow, RouterTaskRow, RouterUsageRow, RouterWindow,
 };
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 22;
+pub const LEDGER_SCHEMA_VERSION: u64 = 23;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -1528,6 +1528,21 @@ const MIGRATIONS: &[(&str, &str)] = &[
         note TEXT
     );
     CREATE INDEX idx_learning_cycles_started ON learning_cycles(started_at);
+    "#,
+    ),
+    (
+        // Evidence for the session router (learning-loop Phase 3): where a
+        // task's outcome came from (`own`: its task record; `parent`: the
+        // task_outcome record its parent's end sent, only over `unknown`),
+        // the checks the task ran with their kinds, and the capability
+        // table's version on each decision. Additive; every task recorded
+        // before this step took its outcome from its own record.
+        "v23",
+        r#"
+    ALTER TABLE router_tasks ADD COLUMN outcome_source TEXT;
+    ALTER TABLE router_tasks ADD COLUMN checks_json TEXT;
+    UPDATE router_tasks SET outcome_source = 'own';
+    ALTER TABLE router_decisions ADD COLUMN table_version INTEGER;
     "#,
     ),
 ];
