@@ -413,14 +413,55 @@ fn a_malformed_relais_toml_fails_the_cycle_with_its_message() {
         .expect("git init");
     assert!(git.status.success());
     std::fs::write(world.repo.join("relais.toml"), "this is = = not toml\n").expect("write");
-    let out = world.relais(&["learn", "cycle"]);
-    assert_ne!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let log = world.root.join("cycle.log");
+    let log_arg = log.to_str().expect("utf8 path");
+    let out = world.relais(&["learn", "cycle", "--if-due", "--log", log_arg]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let logged = std::fs::read_to_string(&log).expect("log");
+    assert!(logged.contains("relais.toml"), "{logged}");
+    let rows = world.rows();
+    assert_eq!(rows.len(), 1, "one error row");
+    assert_eq!(rows[0].action, LearningAction::Error);
+    assert!(rows[0].ended_at.is_some());
     assert!(
-        text(&out.stderr).contains("relais.toml"),
-        "{}",
-        text(&out.stderr)
+        rows[0]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("relais.toml")),
+        "{:?}",
+        rows[0].error
     );
-    assert!(world.rows().is_empty(), "no cycle row was opened");
+}
+
+#[test]
+fn a_finished_row_then_an_interrupted_one_keeps_if_due_by_the_finished_age() {
+    let world = World::new("finished-then-interrupted");
+    let first = world.relais(&["learn", "cycle"]);
+    assert_eq!(first.status.code(), Some(0), "{}", text(&first.stderr));
+    {
+        let ledger = Ledger::open(&world.ledger_path()).expect("ledger");
+        let id = ledger.begin_learning_cycle().expect("begin");
+        ledger
+            .close_unfinished_learning_cycles(id + 1)
+            .expect("close");
+        let last = ledger.last_cycle_started().expect("last").expect("row");
+        assert_eq!(last.action, LearningAction::Interrupted);
+        let report = relais::learn::summary::learning_report(&ledger, None).expect("report");
+        let reason = report.nothing_learned.clone().expect("nothing learned");
+        assert!(
+            reason.contains("interrupted before it finished"),
+            "{reason}"
+        );
+        let cycle = report.last_cycle.expect("a cycle");
+        assert_eq!(cycle.action, LearningAction::Interrupted);
+    }
+    let out = world.relais(&["learn", "cycle", "--if-due"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).starts_with("not due"),
+        "{}",
+        text(&out.stdout)
+    );
 }
 
 #[test]

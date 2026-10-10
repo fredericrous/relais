@@ -2224,7 +2224,7 @@ fn learn_cycle_command(
         }
     };
     let due = |ledger: &Ledger| -> Result<relais::learn::cycle::Due, CliError> {
-        let last = operational(ledger.last_cycle_started(), "learn cycle")?;
+        let last = operational(ledger.last_cycle_for_due_check(), "learn cycle")?;
         let terminal = match &last {
             Some(row) => operational(
                 ledger.terminal_root_runs_since(&row.started_at),
@@ -2305,7 +2305,25 @@ fn learn_cycle_command(
             default_repo_policy()?
         }
         Err(CliError::Locate(_)) => default_repo_policy()?,
-        Err(other) => return Err(other),
+        // Said where the other cycle complaints go (the `--log` file), and
+        // recorded as an error row so `learn last` can note it.
+        Err(other) => {
+            let message = other.to_string();
+            out.complain(&format!("relais learn cycle: {message}"));
+            let id = operational(ledger.begin_learning_cycle(), "learn cycle")?;
+            operational(
+                ledger.finish_learning_cycle(
+                    id,
+                    &relais::ledger::LearningCycleFinish {
+                        action: Some(relais::ledger::LearningAction::Error),
+                        error: Some(message),
+                        ..Default::default()
+                    },
+                ),
+                "learn cycle",
+            )?;
+            return Ok(CliOutcome::OperationalFailure);
+        }
     };
     let registry = registry()?;
     let datasets = datasets_dir()?;

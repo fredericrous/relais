@@ -560,27 +560,42 @@ pub fn routed_outcome(ledger: &Ledger, run: &RunId) -> Result<RoutedOutcome, Led
     })
 }
 
-/// The quality floor an artifact's own evaluation used.
-fn evaluation_floor(artifact: &Artifact) -> Option<f64> {
-    let report: EvalReport = serde_json::from_value(artifact.evaluation.clone()?).ok()?;
-    Some(report.gates.quality_floor)
+/// Why an artifact's own quality floor could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FloorFallback {
+    /// The artifact carries no evaluation report.
+    Missing,
+    /// It carries one that does not parse; the parse error.
+    Unparseable(String),
 }
 
-/// A trace line when the active artifact's evaluation report cannot be
-/// read, so the rollback check used the default quality floor instead of
-/// the artifact's own.
-fn unreadable_floor_note(registry: &Registry) -> Result<Option<String>, CycleError> {
-    let Some(active) = registry.active()? else {
-        return Ok(None);
-    };
-    Ok(match evaluation_floor(&active) {
-        Some(_) => None,
-        None => Some(format!(
-            "evaluation report of active artifact {} is unreadable; the default quality floor {} was used",
-            active.artifact_id,
-            super::evaluate::DEFAULT_QUALITY_FLOOR
-        )),
-    })
+/// The quality floor an artifact's own evaluation used.
+fn evaluation_floor(artifact: &Artifact) -> Result<f64, FloorFallback> {
+    let value = artifact.evaluation.clone().ok_or(FloorFallback::Missing)?;
+    let report: EvalReport =
+        serde_json::from_value(value).map_err(|e| FloorFallback::Unparseable(e.to_string()))?;
+    Ok(report.gates.quality_floor)
+}
+
+/// The trace line for a floor that fell back to the default.
+fn floor_note(artifact_id: &str, why: &FloorFallback) -> String {
+    let default = super::evaluate::DEFAULT_QUALITY_FLOOR;
+    match why {
+        FloorFallback::Missing => format!(
+            "active artifact {artifact_id} has no evaluation report; the default quality floor {default} was used"
+        ),
+        FloorFallback::Unparseable(e) => format!(
+            "evaluation report of active artifact {artifact_id} is unreadable ({e}); the default quality floor {default} was used"
+        ),
+    }
+}
+
+/// Append `note` to the report's note.
+fn add_note(report: &mut CycleReport, note: String) {
+    report.note = Some(match report.note.take() {
+        Some(existing) => format!("{existing}; {note}"),
+        None => note,
+    });
 }
 
 /// What rolling back did.
@@ -591,6 +606,10 @@ pub struct RolledBack {
     /// The artifact that is active now.
     pub to: String,
     pub reason: String,
+    /// What the artifact rolled back from was trained on, for the row that
+    /// records it (the anti-flap rule compares against it).
+    pub label_policy_version: u32,
+    pub dataset_fingerprint: String,
 }
 
 /// Why nothing was rolled back.
@@ -615,8 +634,10 @@ impl std::fmt::Display for NothingToRollBack {
 }
 
 /// Roll the active task artifact back through `Registry::rollback` and
-/// record it as a `learning_cycles` row (`finished` is the row a cycle
-/// already holds, `None` inserts one). The row names the artifact rolled
+/// record it as a `learning_cycles` row. `open_cycle` is the row a running
+/// cycle holds: that cycle writes the row once, when it finishes, so its
+/// other notes (the floor, retention) land in it too; `None` inserts a row
+/// here. The row names the artifact rolled
 /// back FROM and the data it was trained on, which is what the anti-flap
 /// rule later compares against.
 pub fn roll_back_active(
@@ -646,19 +667,60 @@ pub fn roll_back_active(
         note: Some(format!("restored {restored}: {reason}")),
         ..LearningCycleFinish::default()
     };
-    match open_cycle {
-        Some(id) => {
-            ledger.finish_learning_cycle(id, &finish)?;
-        }
-        None => {
-            ledger.record_learning_rollback(source, &finish)?;
-        }
+    if open_cycle.is_none() {
+        ledger.record_learning_rollback(source, &finish)?;
     }
     Ok(Ok(RolledBack {
         from: active.artifact_id,
         to: restored,
         reason: reason.to_string(),
+        label_policy_version: active.label_policy_version,
+        dataset_fingerprint: active.dataset_fingerprint,
     }))
+}
+
+/// What checking the active artifact found.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActiveCheck {
+    /// The reason to roll it back, if there is one.
+    pub reason: Option<RollbackReason>,
+    /// Said when the check fell back to the default quality floor.
+    pub floor_note: Option<String>,
+}
+
+/// Check the active artifact against the runs it routed.
+pub fn active_artifact_check(
+    ledger: &Ledger,
+    registry: &Registry,
+) -> Result<ActiveCheck, CycleError> {
+    let nothing = ActiveCheck {
+        reason: None,
+        floor_note: None,
+    };
+    let Some(active) = registry.active()? else {
+        return Ok(nothing);
+    };
+    // With no predecessor there is nothing to return to; the evidence is
+    // not collected for a rollback that cannot happen.
+    match registry.previous_id()? {
+        Some(previous) if previous != active.artifact_id => {}
+        _ => return Ok(nothing),
+    }
+    let (floor, floor_note) = match evaluation_floor(&active) {
+        Ok(floor) => (floor, None),
+        Err(why) => (
+            super::evaluate::DEFAULT_QUALITY_FLOOR,
+            Some(floor_note(&active.artifact_id, &why)),
+        ),
+    };
+    let mut outcomes = Vec::new();
+    for run in ledger.runs_routed_by_artifact(&active.artifact_id)? {
+        outcomes.push(routed_outcome(ledger, &run)?);
+    }
+    Ok(ActiveCheck {
+        reason: rollback_reason(&outcomes, floor),
+        floor_note,
+    })
 }
 
 /// Check the active artifact against the runs it routed; the reason to
@@ -667,21 +729,7 @@ pub fn active_artifact_verdict(
     ledger: &Ledger,
     registry: &Registry,
 ) -> Result<Option<RollbackReason>, CycleError> {
-    let Some(active) = registry.active()? else {
-        return Ok(None);
-    };
-    // With no predecessor there is nothing to return to; the evidence is
-    // not collected for a rollback that cannot happen.
-    match registry.previous_id()? {
-        Some(previous) if previous != active.artifact_id => {}
-        _ => return Ok(None),
-    }
-    let floor = evaluation_floor(&active).unwrap_or(super::evaluate::DEFAULT_QUALITY_FLOOR);
-    let mut outcomes = Vec::new();
-    for run in ledger.runs_routed_by_artifact(&active.artifact_id)? {
-        outcomes.push(routed_outcome(ledger, &run)?);
-    }
-    Ok(rollback_reason(&outcomes, floor))
+    Ok(active_artifact_check(ledger, registry)?.reason)
 }
 
 /// Run one cycle. The caller holds the Training lease and has decided the
@@ -709,24 +757,22 @@ pub fn run_cycle(
         error: None,
         promote_hint: None,
     };
-    let body = match unreadable_floor_note(inputs.registry) {
-        Ok(trace) => cycle_body(inputs, progress, &mut report).map(|()| trace),
-        Err(e) => Err(e),
-    };
-    match body {
-        Ok(Some(trace)) => {
-            report.note = Some(match report.note.take() {
-                Some(note) => format!("{note}; {trace}"),
-                None => trace,
-            });
+    if let Err(e) = cycle_body(inputs, progress, &mut report) {
+        if let CycleError::Ledger(ledger_error) = e {
+            return Err(ledger_error);
         }
-        Ok(None) => {}
-        Err(e) => {
-            if let CycleError::Ledger(ledger_error) = e {
-                return Err(ledger_error);
-            }
-            report.action = LearningAction::Error;
-            report.error = Some(e.to_string());
+        report.action = LearningAction::Error;
+        report.error = Some(e.to_string());
+    }
+    // Retention is housekeeping: failing at it is worth saying, not worth
+    // losing the cycle's record over. It runs before the row closes so that
+    // the row's note carries what it found.
+    if let Err(e) = retain(inputs.datasets_dir, inputs.registry) {
+        add_note(&mut report, format!("retention: {e}"));
+    }
+    if let Some(dir) = &inputs.classifier_dir {
+        if let Err(e) = crate::router::capture::purge_expired(dir, inputs.now) {
+            add_note(&mut report, format!("classifier inputs: {e}"));
         }
     }
     ledger.finish_learning_cycle(
@@ -744,22 +790,6 @@ pub fn run_cycle(
             note: report.note.clone(),
         },
     )?;
-    // Retention is housekeeping after the row is closed: failing at it is
-    // worth saying, not worth losing the cycle's record over.
-    if let Err(e) = retain(inputs.datasets_dir, inputs.registry) {
-        report.note = Some(match report.note.take() {
-            Some(note) => format!("{note}; retention: {e}"),
-            None => format!("retention: {e}"),
-        });
-    }
-    if let Some(dir) = &inputs.classifier_dir {
-        if let Err(e) = crate::router::capture::purge_expired(dir, inputs.now) {
-            report.note = Some(match report.note.take() {
-                Some(note) => format!("{note}; classifier inputs: {e}"),
-                None => format!("classifier inputs: {e}"),
-            });
-        }
-    }
     Ok(report)
 }
 
@@ -773,7 +803,11 @@ fn cycle_body(
 
     // The active artifact is judged first: a regression is acted on before
     // anything new is trained over it.
-    if let Some(reason) = active_artifact_verdict(ledger, registry)? {
+    let check = active_artifact_check(ledger, registry)?;
+    if let Some(note) = check.floor_note {
+        add_note(report, note);
+    }
+    if let Some(reason) = check.reason {
         match roll_back_active(
             ledger,
             registry,
@@ -784,16 +818,20 @@ fn cycle_body(
             Ok(rolled) => {
                 report.action = LearningAction::RolledBack;
                 report.artifact_id = Some(rolled.from.clone());
-                report.note = Some(format!(
-                    "rolled back {} to {}: {}",
-                    rolled.from, rolled.to, rolled.reason
-                ));
-                // The row is already finished by the rollback; the caller's
-                // finish is then a no-op on a closed row.
+                report.label_policy_version = Some(rolled.label_policy_version);
+                report.dataset_fingerprint = Some(rolled.dataset_fingerprint.clone());
+                add_note(
+                    report,
+                    format!(
+                        "restored {}: {} (rolled back {})",
+                        rolled.to, rolled.reason, rolled.from
+                    ),
+                );
+                // `run_cycle` writes the row once, with every note.
                 return Ok(());
             }
             Err(nothing) => {
-                report.note = Some(format!("rollback wanted ({reason}) but {nothing}"));
+                add_note(report, format!("rollback wanted ({reason}) but {nothing}"));
             }
         }
     }
@@ -825,13 +863,13 @@ fn cycle_body(
                 passed: false,
                 failed_gates: vec![e.to_string()],
             });
-            report.note = Some(salvage_note);
+            add_note(report, salvage_note);
             return Ok(());
         }
         Err(e) => {
             report.error = Some(e.to_string());
             report.action = LearningAction::Error;
-            report.note = Some(salvage_note);
+            add_note(report, salvage_note);
             return Ok(());
         }
     };
@@ -845,7 +883,7 @@ fn cycle_body(
         failed_gates: failures.iter().map(ToString::to_string).collect(),
     });
     if !failures.is_empty() {
-        report.note = Some(salvage_note);
+        add_note(report, salvage_note);
         return Ok(());
     }
     progress(Stage::Promote);
@@ -892,17 +930,17 @@ pub fn promote_candidate(
         active_data,
         runs_since_rollback,
     ) {
-        report.note = Some(format!("{why}; {note}"));
+        add_note(report, format!("{why}; {note}"));
         return Ok(());
     }
     if inputs.auto_promote {
         registry.promote(&evaluated)?;
         report.action = LearningAction::Promoted;
-        report.note = Some(format!("promoted {artifact_id}; {note}"));
+        add_note(report, format!("promoted {artifact_id}; {note}"));
     } else {
         report.action = LearningAction::AwaitingPromotion;
         report.promote_hint = Some(format!("relais promote {artifact_id}"));
-        report.note = Some(note.to_string());
+        add_note(report, note.to_string());
     }
     Ok(())
 }
@@ -910,39 +948,44 @@ pub fn promote_candidate(
 /// Keep the [`KEEP_DATASETS`] newest datasets, and every artifact the
 /// registry points at plus the [`KEEP_ARTIFACTS`] newest.
 pub fn retain(datasets_dir: &Path, registry: &Registry) -> Result<(), CycleError> {
-    let io = |what, path: &Path| {
-        let path = path.to_path_buf();
-        move |cause| CycleError::Io { what, path, cause }
-    };
-    let listing = match std::fs::read_dir(datasets_dir) {
-        Ok(entries) => Some(entries),
-        // No datasets directory yet: nothing to trim.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(io("cannot read", datasets_dir)(e)),
-    };
-    if let Some(entries) = listing {
-        let mut datasets: Vec<PathBuf> = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension().is_some_and(|ext| ext == "json")
-                    && !path
-                        .file_name()
-                        .is_some_and(|name| name.to_string_lossy().starts_with('.'))
-            })
-            .collect();
-        datasets.sort();
-        let excess = datasets.len().saturating_sub(KEEP_DATASETS);
-        for old in datasets.into_iter().take(excess) {
-            std::fs::remove_file(&old).map_err(io("cannot remove", &old))?;
-        }
-    }
+    // A datasets failure is kept, not returned: the artifacts are trimmed
+    // regardless, and the failure is reported after.
+    let datasets = trim_datasets(datasets_dir);
     let mut ids = registry.list();
     ids.sort();
     let excess = ids.len().saturating_sub(KEEP_ARTIFACTS);
     for old in ids.into_iter().take(excess) {
         // Refuses the ids the registry still points at.
         registry.remove_unreferenced(&old)?;
+    }
+    datasets
+}
+
+fn trim_datasets(datasets_dir: &Path) -> Result<(), CycleError> {
+    let io = |what, path: &Path| {
+        let path = path.to_path_buf();
+        move |cause| CycleError::Io { what, path, cause }
+    };
+    let entries = match std::fs::read_dir(datasets_dir) {
+        Ok(entries) => entries,
+        // No datasets directory yet: nothing to trim.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io("cannot read", datasets_dir)(e)),
+    };
+    let mut datasets: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "json")
+                && !path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+        })
+        .collect();
+    datasets.sort();
+    let excess = datasets.len().saturating_sub(KEEP_DATASETS);
+    for old in datasets.into_iter().take(excess) {
+        std::fs::remove_file(&old).map_err(io("cannot remove", &old))?;
     }
     Ok(())
 }
@@ -1511,6 +1554,139 @@ argv = ["true"]
         assert!(
             world.rows().is_empty(),
             "nothing was rolled back, nothing recorded"
+        );
+    }
+
+    #[test]
+    fn a_malformed_evaluation_on_a_rollbackable_artifact_says_the_default_floor_was_used() {
+        let world = World::new("floor-malformed");
+        two_artifacts(&world);
+        let mut active = world.registry.active().unwrap().unwrap();
+        active.evaluation = Some(serde_json::json!({"bogus": 1}));
+        world.registry.store(&active).unwrap();
+        let check = active_artifact_check(&world.ledger, &world.registry).unwrap();
+        let note = check.floor_note.expect("a floor note");
+        assert!(note.contains("unreadable"), "{note}");
+        assert!(note.contains("default quality floor"), "{note}");
+        // The cycle keeps it in the row even when it later errors.
+        let repo = repo_policy();
+        let report = run_cycle(&world.inputs(&repo, true), &mut silent()).expect("cycle");
+        let row = &world.rows()[0];
+        assert!(
+            row.note
+                .as_deref()
+                .is_some_and(|n| n.contains("unreadable")),
+            "{report:?} {row:?}"
+        );
+    }
+
+    #[test]
+    fn a_rollback_row_keeps_the_floor_note_and_what_was_rolled_back() {
+        let world = World::new("rollback-notes");
+        two_artifacts(&world);
+        let mut active = world.registry.active().unwrap().unwrap();
+        active.evaluation = Some(serde_json::json!({"bogus": 1}));
+        world.registry.store(&active).unwrap();
+        seed_routed(&world, 0, 12);
+        let repo = repo_policy();
+        let report = run_cycle(&world.inputs(&repo, true), &mut silent()).expect("cycle");
+        assert_eq!(report.action, LearningAction::RolledBack, "{report:?}");
+        let row = &world.rows()[0];
+        let note = row.note.clone().unwrap_or_default();
+        assert!(note.contains("unreadable"), "{row:?}");
+        assert!(note.contains("restored "), "{row:?}");
+        assert_eq!(row.action, LearningAction::RolledBack, "{row:?}");
+        assert_eq!(
+            row.dataset_fingerprint,
+            Some(active.dataset_fingerprint.clone())
+        );
+        assert_eq!(row.label_policy_version, Some(active.label_policy_version));
+    }
+
+    #[test]
+    fn a_missing_evaluation_is_told_apart_from_a_malformed_one() {
+        let world = World::new("floor-missing");
+        two_artifacts(&world);
+        let mut active = world.registry.active().unwrap().unwrap();
+        active.evaluation = None;
+        world.registry.store(&active).unwrap();
+        let note = active_artifact_check(&world.ledger, &world.registry)
+            .unwrap()
+            .floor_note
+            .expect("a floor note");
+        assert!(note.contains("has no evaluation report"), "{note}");
+    }
+
+    #[test]
+    fn no_predecessor_means_no_floor_note() {
+        let world = World::new("floor-sole");
+        world.promote("art-a", "fp-a");
+        let mut active = world.registry.active().unwrap().unwrap();
+        active.evaluation = Some(serde_json::json!({"bogus": 1}));
+        world.registry.store(&active).unwrap();
+        let check = active_artifact_check(&world.ledger, &world.registry).unwrap();
+        assert_eq!(check.floor_note, None);
+        let repo = repo_policy();
+        run_cycle(&world.inputs(&repo, true), &mut silent()).expect("cycle");
+        let note = world.rows()[0].note.clone().unwrap_or_default();
+        assert!(!note.contains("quality floor"), "{note}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_datasets_directory_is_noted_and_artifacts_are_still_trimmed() {
+        use std::os::unix::fs::PermissionsExt;
+        let world = World::new("retain-unreadable");
+        for index in 0..8 {
+            stored_candidate(&world, &format!("old-{index}"), &format!("fp-{index}"));
+        }
+        std::fs::create_dir_all(&world.datasets).unwrap();
+        std::fs::set_permissions(&world.datasets, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let outcome = retain(&world.datasets, &world.registry);
+        std::fs::set_permissions(&world.datasets, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if std::fs::read_dir(&world.datasets).is_ok() && outcome.is_ok() {
+            // Running with privileges that ignore the mode: nothing to test.
+            return;
+        }
+        let error = outcome.expect_err("the read error is reported");
+        assert!(error.to_string().contains("cannot read"), "{error}");
+        assert_eq!(
+            world.registry.list().len(),
+            KEEP_ARTIFACTS,
+            "trimming ran after the datasets error"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cycle_over_an_unreadable_datasets_directory_notes_the_retention_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let world = World::new("retain-note");
+        for index in 0..8 {
+            stored_candidate(&world, &format!("old-{index}"), &format!("fp-{index}"));
+        }
+        std::fs::create_dir_all(&world.datasets).unwrap();
+        std::fs::set_permissions(&world.datasets, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let repo = repo_policy();
+        let ignored = std::fs::read_dir(&world.datasets).is_ok();
+        let report = run_cycle(&world.inputs(&repo, true), &mut silent());
+        std::fs::set_permissions(&world.datasets, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if ignored {
+            // Running with privileges that ignore the mode: nothing to test.
+            return;
+        }
+        let report = report.expect("cycle");
+        let row = &world.rows()[0];
+        assert!(
+            row.note.as_deref().is_some_and(|n| n.contains("retention")),
+            "{report:?} {row:?}"
+        );
+        // Eight were stored; the cycle adds at most its own candidate.
+        const _: () = assert!(8 > KEEP_ARTIFACTS + 1);
+        assert!(
+            world.registry.list().len() <= KEEP_ARTIFACTS + 1,
+            "old unreferenced artifacts were removed: {:?}",
+            world.registry.list()
         );
     }
 

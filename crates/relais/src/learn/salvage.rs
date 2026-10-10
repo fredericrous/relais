@@ -211,10 +211,20 @@ pub fn candidate_contained(repo: &Path, patch: &Path, sha: &str) -> Containment 
         Err(e) => return Containment::Unreachable(format!("git apply: could not run git: {e}")),
     };
     if applied.status.success() {
-        Containment::Contained
-    } else {
-        Containment::Rewritten
+        return Containment::Contained;
     }
+    // Exit 1 is "the patch does not apply": the commit rewrote it. Any other
+    // status (128: a corrupt patch, a fatal error) says nothing about that.
+    if applied.status.code() == Some(1) {
+        return Containment::Rewritten;
+    }
+    let stderr = String::from_utf8_lossy(&applied.stderr);
+    let stderr = stderr.trim();
+    Containment::Unreachable(if stderr.is_empty() {
+        format!("git apply: {}", applied.status)
+    } else {
+        format!("git apply: {stderr}")
+    })
 }
 
 /// The run's latest `candidate_patch` evidence path, if one was recorded.
@@ -417,6 +427,26 @@ mod tests {
             bad_commit.starts_with("git read-tree: ") && bad_commit.len() > "git read-tree: ".len(),
             "git's stderr is in the reason: {bad_commit}"
         );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn a_corrupt_patch_is_unreachable_with_gits_message() {
+        let fixture = repo("salvage-corrupt");
+        let corrupt = fixture.dir.join("corrupt.patch.out");
+        std::fs::write(
+            &corrupt,
+            "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,x +1,x @@\n",
+        )
+        .unwrap();
+        match candidate_contained(&fixture.dir, &corrupt, &fixture.contained_sha) {
+            // git's own words, not the status fallback (`exit status: 128`).
+            Containment::Unreachable(reason) => assert!(
+                reason.starts_with("git apply: ") && reason.contains("corrupt patch"),
+                "{reason}"
+            ),
+            other => panic!("expected unreachable, got {other:?}"),
+        }
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 

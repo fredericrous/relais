@@ -8,8 +8,23 @@ missing here.
 
 ## Unreleased
 
+**Upgrading migrates the ledger, and an older relais then refuses it.** This
+release adds ledger steps (learning cycles, salvage containment, router
+evidence, exploration stops, classifier calls). v0.11.x opening a migrated
+ledger exits 1 with `a newer relais wrote this ledger`; it reads nothing and
+writes nothing. To be able to go back, copy the ledger before upgrading:
+`sqlite3 ~/.local/state/relais/ledger.sqlite ".backup ~/.local/state/relais/ledger.sqlite.bak-v0.11"`.
+To downgrade, run `relais coordinator stop`, install v0.11.x, and restore that
+copy over `ledger.sqlite`; everything recorded since the upgrade is lost.
+
 The session router gets real outcome evidence.
 
+- The learning report shows an interrupted cycle again (only `--if-due` skips
+  it); a malformed `relais.toml` is logged to `--log`, recorded as an `error`
+  row and exits 1; a fatal `git apply` error is `Unreachable`, not
+  `Rewritten`; artifact retention runs even when the datasets directory
+  cannot be read; the quality-floor note appears only where the default
+  floor is used, and says whether the report is missing or unparseable.
 - The learning cycle's `--if-due` check ignores a row that never finished
   (a killed cycle) or that the next cycle closed as `interrupted`, so such a
   row no longer makes it answer "not due". A malformed `relais.toml` now
