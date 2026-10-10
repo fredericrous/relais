@@ -19,7 +19,7 @@ import {
 } from './timeline.ts'
 import { sendHello } from './callbacks.ts'
 import { onRunDone } from './routing.ts'
-import { detach, type Child, type Store } from './store.ts'
+import { detach, type Child, type PendingOutcome, type Store } from './store.ts'
 import {
   announceRun,
   flush,
@@ -29,6 +29,13 @@ import {
 } from './ui.ts'
 
 const STATUS_TIMEOUT_MS = 10_000
+// The freshness check sits on the path to the session's next turn: a
+// second is long enough for a read-only ledger lookup, short enough not
+// to be felt.
+const FRESHEN_TIMEOUT_MS = 1_000
+// The states whose outcome message asks a person for something, as the
+// `done` line spells them (`State::awaits_a_person` in relais).
+const AWAITS_A_PERSON = new Set(['needs_decision', 'needs_review', 'interrupted'])
 const MAX_SUMMARY = 4000
 const STDERR_TAIL = 5
 
@@ -65,8 +72,12 @@ export async function pump(fx: Fx, store: Store) {
 async function submitVerdicts(fx: Fx, store: Store) {
   while (store.verdicts.length > 0) {
     try {
-      store.ownPrompts.add(store.verdicts[0])
-      await fx.prompt.submit({ text: store.verdicts[0] })
+      // Checked here, at the end of the wait in this queue, because no
+      // later point is ours: the engine runs a `prompt.submit` through
+      // every plugin's hooks but the submitter's.
+      const text = await freshen(fx, store, store.verdicts[0])
+      store.ownPrompts.add(text)
+      await fx.prompt.submit({ text })
     } catch (reason) {
       // Kept for the next tick; said once per streak of failures.
       if (!store.isSubmitFailing) {
@@ -76,8 +87,72 @@ async function submitVerdicts(fx: Fx, store: Store) {
       return
     }
     store.isSubmitFailing = false
-    store.verdicts.shift()
+    // Forgotten only once submitted: a submit that failed is checked
+    // again, from the original text, when the next tick retries it.
+    store.pendingOutcomes.delete(store.verdicts.shift()!)
   }
+}
+
+// The text to deliver for an outcome message, checked against what the
+// ledger holds now. Its decision answered since the run ended rewrites
+// it: the original asks the model to act on something already settled
+// (2026-10-09: an approved run announced as "yours to decide" ten
+// minutes later). Anything else delivers the text unchanged — an outcome
+// lost is worse than one stale.
+async function freshen(fx: Fx, store: Store, text: string): Promise<string> {
+  const pending = store.pendingOutcomes.get(text)
+  if (!pending) return text
+  const say = async (kind: 'failed' | 'answered', message: string) => {
+    if (pending.noted.has(kind)) return
+    pending.noted.add(kind)
+    await note(fx, store, pending.run, message)
+  }
+  let current: any
+  try {
+    const result = await fx.process.run(['relais', 'native', 'status', '--run', pending.run], {
+      timeoutMs: FRESHEN_TIMEOUT_MS,
+    })
+    if (result.exitCode !== 0) {
+      const why = String(result.stderr ?? '').trim().slice(0, 200)
+      await say('failed', `could not check the outcome is still current (status exited ${result.exitCode}${why ? `: ${why}` : ''}); sent as it was`)
+      return text
+    }
+    current = JSON.parse(String(result.stdout ?? '')).current
+  } catch (reason) {
+    await say('failed', `could not check the outcome is still current (${String((reason as any)?.message ?? reason).slice(0, 200)}); sent as it was`)
+    return text
+  }
+  if (!current || typeof current !== 'object') {
+    // An installed relais older than the plugin: said once, not per outcome.
+    if (!store.isCurrentMissingNoted) {
+      store.isCurrentMissingNoted = true
+      await note(fx, store, pending.run, 'relais native status gives no current state (relais older than the plugin?); outcome messages are sent as they were')
+    }
+    return text
+  }
+  const decision = current.decision
+  if (!decision || decision.resolution === null || decision.resolution === undefined) return text
+  // relais's own output, but read as it comes: a rewrite names only
+  // strings, so a shape this plugin does not know sends the text as it was.
+  if (typeof current.state !== 'string' || typeof decision.resolution !== 'string') {
+    await say('failed', 'could not check the outcome is still current (relais native status answered in a shape this plugin does not read); sent as it was')
+    return text
+  }
+  await say('answered', `answered since it ended (${decision.resolution}): the outcome message says so`)
+  return answeredText(pending, decision, current.state)
+}
+
+// An outcome message for a run whose decision a person answered since:
+// what it ended as, what was answered, and that nothing waits. The
+// runner's `detail` and the next step are left out, since both ask for
+// the answer already given.
+function answeredText(pending: PendingOutcome, decision: any, state: string): string {
+  const code = pending.code ? ` (${pending.code})` : ''
+  const headline =
+    `relais ${pending.kind} ${pending.run} finished: ${pending.outcome}${code}. ` +
+    `Since then: ${decision.resolution} by ${decision.actor ?? 'someone'} at ${decision.resolved_at ?? 'an unknown time'}; ` +
+    `the run is now ${state}. Nothing is waiting on you for this run.`
+  return [headline, ...pending.facts].join('\n')
 }
 
 // The run tool's `task`: a contract object, which relais validates and saves
@@ -270,19 +345,15 @@ async function onDone(fx: Fx, store: Store, child: Child, line: any, now: number
     typeof line.run === 'string'
       ? `relais ${trial ? 'replay' : 'run'} ${run} finished: ${outcome}${why}.`
       : `relais ${trial ? 'replay' : 'run'} ${outcome}${why}. Nothing ran.`
-  const text = [
-    headline,
-    receipt ? `Receipt: ${receipt}` : '',
-    summaryText(line.summary),
-    trial ? `Replay trial: ${trial}` : '',
-    code ? NEXT_STEP[code] ?? '' : '',
-  ]
-    .filter(Boolean)
-    .join('\n')
+  const facts = [receipt ? `Receipt: ${receipt}` : '', summaryText(line.summary), trial ? `Replay trial: ${trial}` : ''].filter(Boolean)
+  const text = [headline, ...facts, code ? NEXT_STEP[code] ?? '' : ''].filter(Boolean).join('\n')
   // The stream hook descends from the `run` tool call, and a prompt cannot
   // be submitted from under a tool or command hook: the session's timer
   // (`pump`) sends it.
   store.verdicts.push(text)
+  if (AWAITS_A_PERSON.has(outcome) && typeof line.run === 'string') {
+    store.pendingOutcomes.set(text, { run, outcome, code, kind: trial ? 'replay' : 'run', facts, noted: new Set() })
+  }
 }
 
 // What relais's `done` says the candidate changed: an object

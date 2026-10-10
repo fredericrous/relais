@@ -271,3 +271,235 @@ test('a done line followed by the exit sends exactly one message', async ($: any
   await tick(engine)
   expect(engine.calls.prompts.length).toBe(1)
 })
+
+// Outcomes that wait on a person are checked just before the pump submits
+// them (`freshen`): a decision answered while the message waited in the
+// queue is said, not asked again.
+
+const ok = (stdout = '') => ({ exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
+
+// `relais native status --run <run>` with its `current` key.
+const statusWith = (run: string, current: unknown) =>
+  ok(JSON.stringify({ run, phases: [], decisions: [], cost: [], outcome: null, output: [], events: [], ...(current === undefined ? {} : { current }) }))
+
+const answered = {
+  state: 'accepted',
+  decision: {
+    raised_state: 'needs_decision',
+    raised_reason: 'verification_inputs_changed',
+    resolution: 'decision_approved',
+    actor: 'person',
+    resolved_at: '2026-10-09T11:34:19Z',
+  },
+}
+
+const stillOpen = {
+  state: 'needs_decision',
+  decision: { ...answered.decision, resolution: null, actor: null, resolved_at: null },
+}
+
+const statusCalls = (engine: any, run = RUN) =>
+  engine.calls.run.filter((c: any) => c.argv.join(' ') === `relais native status --run ${run}`)
+
+const needsDecision = (extra: Record<string, unknown> = {}) =>
+  done('needs_decision', {
+    code: 'verification_inputs_changed',
+    detail: 'the checks changed under the run. This is yours to decide',
+    ...extra,
+  })
+
+const paneNotes = async ($: any, run = RUN) => {
+  const reply = await $.tool.call({ tool: 'mcp__relais__status', run })
+  return reply.result as string
+}
+
+// The incident (2026-10-09): outcome A goes out and the engine holds it
+// while the session is busy; outcome B queues behind it in the plugin, and
+// a person approves B's run before A is released.
+const incident = async ($: any, on: any, code: string | null) => {
+  const engine = await startedRun($, on)
+  let current: unknown = stillOpen
+  engine.script.runResult = (argv: string[]) => (argv[2] === 'status' ? statusWith(argv[4], current) : ok())
+  let release: () => void = () => {}
+  engine.script.submitHold = new Promise<void>(resolve => {
+    release = resolve
+  })
+  engine.stream.push('stdout', done('accepted', { run: 'run-a' }))
+  await settle(engine)
+  await tick(engine)
+  expect(engine.calls.prompts.length).toBe(1)
+  engine.stream.push('stdout', phase(0, 'running') + needsDecision({ code }))
+  await settle(engine)
+  await tick(engine)
+  current = answered
+  release()
+  await settle(engine)
+  await tick(engine)
+  await tick(engine)
+  expect(engine.calls.prompts.length).toBe(2)
+  expect(statusCalls(engine).length).toBe(1)
+  return { engine, text: engine.calls.prompts[1].text as string }
+}
+
+test('an outcome answered while it waited behind a held one says so, not "yours to decide"', async ($: any, on: any) => {
+  const { text } = await incident($, on, 'verification_inputs_changed')
+  expect(text).toContain(
+    `relais run ${RUN} finished: needs_decision (verification_inputs_changed). ` +
+      'Since then: decision_approved by person at 2026-10-09T11:34:19Z; the run is now accepted. ' +
+      'Nothing is waiting on you for this run.',
+  )
+  expect(text).not.toContain('yours to decide')
+  expect(text).toContain('Receipt: /runs/r1/receipt.json')
+  expect(text).toContain('Changed: 1 file, +3 -1')
+  expect(await paneNotes($)).toContain('answered since it ended (decision_approved)')
+})
+
+test('an answered outcome without a code has no empty parenthesis', async ($: any, on: any) => {
+  const { text } = await incident($, on, null)
+  expect(text).toContain(`finished: needs_decision. Since then: decision_approved`)
+  expect(text).not.toContain('()')
+})
+
+test('an identical outcome later is checked again: nothing of the first was kept', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  let current: unknown = answered
+  engine.script.runResult = (argv: string[]) => (argv[2] === 'status' ? statusWith(argv[4], current) : ok())
+  engine.stream.push('stdout', phase(0, 'running') + needsDecision())
+  await settle(engine)
+  await tick(engine)
+  expect(engine.calls.prompts[0].text).toContain('Since then: decision_approved')
+  current = stillOpen
+  engine.stream.push('stdout', needsDecision())
+  await settle(engine)
+  await tick(engine)
+  expect(engine.calls.prompts.length).toBe(2)
+  expect(statusCalls(engine).length).toBe(2)
+  expect(engine.calls.prompts[1].text).toContain('This is yours to decide')
+})
+
+test('an outcome whose decision is still open goes out byte for byte', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.script.runResult = (argv: string[]) => (argv[2] === 'status' ? statusWith(argv[4], stillOpen) : ok())
+  engine.stream.push('stdout', phase(0, 'running') + needsDecision())
+  await settle(engine)
+  await tick(engine)
+  expect(engine.calls.prompts.length).toBe(1)
+  expect(engine.calls.prompts[0].text).toBe(
+    [
+      `relais run ${RUN} finished: needs_decision (verification_inputs_changed): the checks changed under the run. This is yours to decide.`,
+      'Receipt: /runs/r1/receipt.json',
+      'Changed: 1 file, +3 -1',
+    ].join('\n'),
+  )
+  expect(statusCalls(engine).length).toBe(1)
+  // The check has its own timeout, not the status tool's ten seconds.
+  expect(statusCalls(engine)[0].init.timeoutMs).toBe(1000)
+})
+
+const failOpen = (name: string, reply: (argv: string[]) => any) =>
+  test(`a status that ${name} sends the outcome as it was, with one note`, async ($: any, on: any) => {
+    const engine = await startedRun($, on)
+    engine.script.runResult = (argv: string[]) => (argv[2] === 'status' ? reply(argv) : ok())
+    engine.stream.push('stdout', phase(0, 'running') + needsDecision())
+    await settle(engine)
+    await tick(engine)
+    expect(engine.calls.prompts.length).toBe(1)
+    expect(engine.calls.prompts[0].text).toContain('This is yours to decide')
+    const said = await paneNotes($)
+    expect(said.split('could not check the outcome is still current').length - 1).toBe(1)
+  })
+
+failOpen('exits non-zero', () => ({ exitCode: 1, stdout: '', stderr: 'ledger busy', isStdoutTruncated: false, isStderrTruncated: false }))
+failOpen('times out', () => {
+  throw new Error('timed out after 1000 ms')
+})
+failOpen('answers with no JSON', () => ok('not json'))
+failOpen('answers in a shape it does not read', (argv: string[]) =>
+  statusWith(argv[4], { state: 7, decision: { ...answered.decision, resolution: { what: 'approved' } } }),
+)
+
+test('a check that failed first and found an answer on a retry says both, once each', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  let isDown = true
+  engine.script.runResult = (argv: string[]) =>
+    argv[2] !== 'status'
+      ? ok()
+      : isDown
+        ? { exitCode: 1, stdout: '', stderr: 'ledger busy', isStdoutTruncated: false, isStderrTruncated: false }
+        : statusWith(argv[4], answered)
+  engine.script.submitFailures = 1
+  engine.stream.push('stdout', phase(0, 'running') + needsDecision())
+  await settle(engine)
+  await tick(engine, 100)
+  expect(engine.calls.prompts.length).toBe(0)
+  isDown = false
+  await tick(engine, 100)
+  expect(engine.calls.prompts.length).toBe(1)
+  expect(engine.calls.prompts[0].text).toContain('Since then: decision_approved')
+  const said = await paneNotes($)
+  expect(said.split('could not check the outcome is still current').length - 1).toBe(1)
+  expect(said.split('answered since it ended').length - 1).toBe(1)
+})
+
+test('an outcome whose submit keeps failing is checked every retry and noted once', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.script.runResult = (argv: string[]) =>
+    argv[2] === 'status' ? { exitCode: 1, stdout: '', stderr: 'ledger busy', isStdoutTruncated: false, isStderrTruncated: false } : ok()
+  engine.script.submitFailures = 3
+  engine.stream.push('stdout', phase(0, 'running') + needsDecision())
+  await settle(engine)
+  for (let i = 0; i < 5; i++) await tick(engine, 100)
+  expect(engine.calls.prompts.length).toBe(1)
+  expect(statusCalls(engine).length).toBe(4)
+  const said = await paneNotes($)
+  expect(said.split('could not check the outcome is still current').length - 1).toBe(1)
+})
+
+test('a relais without `current` is said once per session, not once per outcome', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.script.runResult = (argv: string[]) => (argv[2] === 'status' ? statusWith(argv[4], undefined) : ok())
+  engine.stream.push(
+    'stdout',
+    phase(0, 'running') + needsDecision() + done('needs_review', { code: 'review_findings', detail: 'see the findings' }),
+  )
+  await settle(engine)
+  await tick(engine)
+  await tick(engine)
+  expect(engine.calls.prompts.length).toBe(2)
+  expect(engine.calls.prompts[0].text).toContain('This is yours to decide')
+  expect(engine.calls.prompts[1].text).toContain('see the findings')
+  expect(statusCalls(engine).length).toBe(2)
+  const said = await paneNotes($)
+  expect(said.split('gives no current state').length - 1).toBe(1)
+})
+
+for (const outcome of ['accepted', 'blocked', 'failed']) {
+  test(`a ${outcome} outcome, which waits on nobody, is not checked`, async ($: any, on: any) => {
+    const engine = await startedRun($, on)
+    engine.script.runResult = (argv: string[]) => (argv[2] === 'status' ? statusWith(argv[4], answered) : ok())
+    engine.stream.push('stdout', phase(0, 'running') + done(outcome))
+    await settle(engine)
+    await tick(engine)
+    expect(engine.calls.prompts.length).toBe(1)
+    expect(engine.calls.prompts[0].text).toContain(`finished: ${outcome}`)
+    expect(statusCalls(engine).length).toBe(0)
+  })
+}
+
+test('a retried outcome is checked again, and the retry carries the fresh text', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  let current: unknown = stillOpen
+  engine.script.runResult = (argv: string[]) => (argv[2] === 'status' ? statusWith(argv[4], current) : ok())
+  engine.script.submitFailures = 1
+  engine.stream.push('stdout', phase(0, 'running') + needsDecision())
+  await settle(engine)
+  await tick(engine, 100)
+  expect(engine.calls.prompts.length).toBe(0)
+  // Answered between the failed submit and its retry.
+  current = answered
+  await tick(engine)
+  expect(engine.calls.prompts.length).toBe(1)
+  expect(engine.calls.prompts[0].text).toContain('Since then: decision_approved')
+  expect(engine.calls.prompts[0].text).not.toContain('yours to decide')
+  expect(statusCalls(engine).length).toBe(2)
+})

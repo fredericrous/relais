@@ -51,6 +51,13 @@ pub enum LedgerError {
         found: u64,
         known: u64,
     },
+    /// A read-only open met a ledger on another schema than this binary's,
+    /// older or newer. A reader that cannot migrate cannot tell what the
+    /// columns mean, so it does not read.
+    SchemaMismatch {
+        found: u64,
+        known: u64,
+    },
 }
 
 impl std::fmt::Display for LedgerError {
@@ -66,6 +73,11 @@ impl std::fmt::Display for LedgerError {
                 "ledger: {found} applied migration(s), this relais knows {known} — \
                  a newer relais wrote this ledger; upgrade relais or point \
                  RELAIS_STATE_DIR at another one"
+            ),
+            LedgerError::SchemaMismatch { found, known } => write!(
+                f,
+                "ledger: {found} applied migration(s), this relais reads {known} — \
+                 not read; the next relais that writes it migrates it"
             ),
         }
     }
@@ -1564,6 +1576,12 @@ const COVERED_BY_AN_INCLUSIVE_PARENT: &str = "WITH RECURSIVE covered(event_id) A
 /// the busy handler does not cover.
 const LEDGER_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long a read-only open waits on a lock before it gives up. A
+/// read-only caller sits on somebody's path (the plugin asks just before
+/// a message goes out), and "cannot tell" is an answer it can use; five
+/// seconds of waiting is not.
+const READ_ONLY_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// The pause after the first busy refusal; it doubles up to the cap.
 const FIRST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(1);
 
@@ -2171,6 +2189,35 @@ impl Ledger {
             conn,
             path: path.to_path_buf(),
             clock,
+        })
+    }
+
+    /// The ledger for reading only, when there is one this binary can read.
+    ///
+    /// Unlike [`Self::open`], this creates no directory and no file,
+    /// writes no pragma and runs no migration: a missing ledger is an
+    /// error (`SQLITE_CANTOPEN`), and so is one on any other schema than
+    /// this binary's ([`LedgerError::SchemaMismatch`]). Its busy wait is
+    /// [`READ_ONLY_BUSY_TIMEOUT`], not the writers' five seconds. Every
+    /// write through it fails, which is the point: nothing that only
+    /// reads can change the ledger.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(READ_ONLY_BUSY_TIMEOUT)?;
+        let applied = applied_count(&conn)?;
+        if applied != LEDGER_SCHEMA_VERSION {
+            return Err(LedgerError::SchemaMismatch {
+                found: applied,
+                known: LEDGER_SCHEMA_VERSION,
+            });
+        }
+        Ok(Ledger {
+            conn,
+            path: path.to_path_buf(),
+            clock: Box::new(SystemClock),
         })
     }
 
@@ -4706,6 +4753,48 @@ mod tests {
     /// one directory two tests share (P12).
     fn temp_dir(label: &str) -> crate::test_support::TempDir {
         crate::test_support::temp_dir(&format!("ledger-{label}"))
+    }
+
+    /// A read-only open shut out by an exclusive lock gives up after
+    /// `READ_ONLY_BUSY_TIMEOUT`, not the writers' five seconds: it sits
+    /// on the path to a session's next turn. Timed in-process, so the
+    /// bound measures the wait and not the load on the machine.
+    #[test]
+    fn a_read_only_open_gives_up_after_its_own_short_wait() {
+        let (ledger, dir) = temp_ledger();
+        let path = ledger.path().to_path_buf();
+        drop(ledger);
+        let holder = Connection::open(&path).expect("holder");
+        holder
+            .execute_batch(
+                "PRAGMA locking_mode = EXCLUSIVE; \
+                 BEGIN IMMEDIATE; UPDATE schema_migrations SET applied_at = applied_at; COMMIT;",
+            )
+            .expect("take the exclusive lock");
+        let started = std::time::Instant::now();
+        let error = match Ledger::open_read_only(&path) {
+            Ok(_) => panic!("a reader got past an exclusive lock"),
+            Err(error) => error,
+        };
+        let waited = started.elapsed();
+        assert!(
+            matches!(&error, LedgerError::Sqlite(e) if is_busy(e)),
+            "{error}"
+        );
+        assert!(waited >= READ_ONLY_BUSY_TIMEOUT, "gave up after {waited:?}");
+        assert!(waited < LEDGER_BUSY_TIMEOUT, "waited {waited:?}");
+        drop(holder);
+        drop(dir);
+    }
+
+    /// Reading never creates: a missing ledger is an error, and no file,
+    /// directory or journal appears.
+    #[test]
+    fn a_read_only_open_creates_nothing() {
+        let dir = temp_dir("read-only-missing");
+        let path = dir.join("state").join("ledger.sqlite");
+        assert!(Ledger::open_read_only(&path).is_err());
+        assert!(!dir.join("state").exists());
     }
 
     fn temp_ledger() -> (Ledger, crate::test_support::TempDir) {
