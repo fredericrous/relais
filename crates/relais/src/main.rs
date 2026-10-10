@@ -1758,6 +1758,10 @@ fn latest_dataset() -> Result<relais::learn::dataset::Dataset, CliError> {
 fn dataset_build_command() -> Result<CliOutcome, CliError> {
     let (_, repo) = load_repo_policy()?;
     let ledger = open_ledger()?;
+    // Salvages recorded before containment was computed get it once, while
+    // their repository and candidate patch are still on disk; the rest
+    // stay unknown and are excluded.
+    let backfill = operational(relais::learn::salvage::backfill(&ledger), "dataset build")?;
     // A stored contract revision that does not parse is a corrupt ledger
     // row, not a run without a contract: dataset construction must see
     // the difference, or a version skew silently empties the dataset.
@@ -1795,6 +1799,21 @@ fn dataset_build_command() -> Result<CliOutcome, CliError> {
     println!(
         "records: {} ({} accepted-without-escalation, {} not)",
         distribution.records, distribution.accepted_without_escalation, distribution.other
+    );
+    let from_salvage = dataset
+        .records
+        .iter()
+        .filter(|record| {
+            record.label_source == relais::learn::features::LabelSource::PersonSalvageContained
+        })
+        .count();
+    println!(
+        "label sources: runner {}, person_salvage_contained {from_salvage}",
+        dataset.records.len() - from_salvage
+    );
+    println!(
+        "salvage containment backfill: {} computed, {} unreachable (left unknown, excluded)",
+        backfill.recorded, backfill.unreachable
     );
     println!("coverage: {}", {
         let mut coverage: std::collections::BTreeMap<String, usize> =
@@ -6028,8 +6047,13 @@ fn salvage_command(
         );
         return Ok(CliOutcome::InvalidInput);
     }
+    // Whether the verified candidate patch survives intact in the commit a
+    // person landed is computed here, once, from the run's own evidence;
+    // when the repository or the patch is gone it is recorded as unknown
+    // (NULL) and said so, never guessed.
+    let contained = salvage_containment(ledger, run, candidate_sha)?;
     let Some(original_reason) = operational(
-        ledger.record_salvage(run, candidate_sha, answer.actor, answer.note),
+        ledger.record_salvage_contained(run, candidate_sha, answer.actor, answer.note, contained),
         "decide",
     )?
     else {
@@ -6037,12 +6061,47 @@ fn salvage_command(
         return Ok(CliOutcome::InvalidInput);
     };
     println!(
-        "recorded {} for {run} by {} (originally ended: {})",
+        "recorded {} for {run} by {} (originally ended: {}; candidate contained: {})",
         Reason::DecisionSalvaged.as_str(),
         answer.actor,
-        original_reason.as_str()
+        original_reason.as_str(),
+        match contained {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "unknown",
+        }
     );
     Ok(CliOutcome::Accepted)
+}
+
+/// Whether `run`'s latest verified candidate patch reverse-applies on
+/// `candidate_sha`'s tree. `None`, said on stderr, when the repository or
+/// the patch is unavailable.
+fn salvage_containment(
+    ledger: &Ledger,
+    run: &RunId,
+    candidate_sha: &str,
+) -> Result<Option<bool>, CliError> {
+    let workspace = operational(ledger.run_workspace(run), "decide")?;
+    let contained = match workspace {
+        Some(workspace) => operational(
+            relais::learn::salvage::containment_of_run(
+                ledger,
+                run,
+                &workspace.repo_path,
+                candidate_sha,
+            ),
+            "decide",
+        )?,
+        None => None,
+    };
+    if contained.is_none() {
+        eprintln!(
+            "relais decide: could not tell whether run {run}'s verified candidate landed intact \
+             in {candidate_sha} (repository, patch or commit unavailable); recording it as unknown"
+        );
+    }
+    Ok(contained)
 }
 
 /// Record one piece of evidence produced by another tool, against a run

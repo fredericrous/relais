@@ -724,6 +724,7 @@ mod tests {
             calibration_records: 2,
             test_records: 40,
             calibration_bins: vec![],
+            by_label_source: vec![],
             test_acceptance_rate: Some(0.9),
             baseline_acceptance_rate: Some(0.8),
             mean_cost_selected: None,

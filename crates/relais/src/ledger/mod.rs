@@ -30,7 +30,7 @@ pub use router::{
     RouterTaskRow, RouterUsageRow, RouterWindow,
 };
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 20;
+pub const LEDGER_SCHEMA_VERSION: u64 = 21;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -1492,6 +1492,16 @@ const MIGRATIONS: &[(&str, &str)] = &[
          GROUP BY session, task_id, agent_id;
     "#,
     ),
+    (
+        // Whether the verified candidate patch survives intact in the
+        // commit a person salvaged (SPEC §17 labels): NULL is unknown
+        // (every salvage recorded before this step, or one whose
+        // repository or patch was gone), 1 contained, 0 rewritten.
+        "v21",
+        r#"
+    ALTER TABLE decisions ADD COLUMN candidate_contained INTEGER;
+    "#,
+    ),
 ];
 
 /// One row of `trust_grants`: what [`Ledger::record_trust_grant`] writes.
@@ -2051,6 +2061,9 @@ pub struct DecisionRecord {
     pub actor: Option<String>,
     pub note: Option<String>,
     pub successor_run: Option<RunId>,
+    /// For a salvage: whether the run's verified candidate patch survives
+    /// intact in the salvaged commit. `None` is unknown, never `false`.
+    pub candidate_contained: Option<bool>,
     pub waited_seconds: i64,
 }
 
@@ -2080,6 +2093,7 @@ type DecisionRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<bool>,
 );
 
 /// A `decisions` row as columns, parsed into a [`DecisionRecord`] (P6): an
@@ -2099,6 +2113,7 @@ fn parse_decision_row(row: DecisionRow, now: &str) -> Result<DecisionRecord> {
         actor,
         note,
         successor_run,
+        candidate_contained,
     ) = row;
     let resolution = resolution
         .map(|stored| {
@@ -2120,12 +2135,13 @@ fn parse_decision_row(row: DecisionRow, now: &str) -> Result<DecisionRecord> {
         actor,
         note,
         successor_run: successor_run.map(RunId::from_stored),
+        candidate_contained,
         waited_seconds,
     })
 }
 
 const DECISION_COLUMNS: &str =
-    "run, task, raised_at, raised_state, raised_reason, resolved_at, resolution, actor, note, successor_run";
+    "run, task, raised_at, raised_state, raised_reason, resolved_at, resolution, actor, note, successor_run, candidate_contained";
 
 fn decision_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<DecisionRow> {
     Ok((
@@ -2139,6 +2155,7 @@ fn decision_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<DecisionRow> {
         row.get(7)?,
         row.get(8)?,
         row.get(9)?,
+        row.get(10)?,
     ))
 }
 
@@ -3137,6 +3154,21 @@ impl Ledger {
         actor: &str,
         note: Option<&str>,
     ) -> Result<Option<Reason>> {
+        self.record_salvage_contained(run_id, candidate_sha, actor, note, None)
+    }
+
+    /// [`Self::record_salvage`], also recording whether the run's verified
+    /// candidate patch survives intact in the salvaged commit
+    /// (`candidate_contained`): `Some(true)` contained, `Some(false)`
+    /// rewritten, `None` could not be computed.
+    pub fn record_salvage_contained(
+        &self,
+        run_id: &RunId,
+        candidate_sha: &str,
+        actor: &str,
+        note: Option<&str>,
+        candidate_contained: Option<bool>,
+    ) -> Result<Option<Reason>> {
         let now = self.now();
         let tx = self.write_tx()?;
         let existing: Option<(Option<String>, String, String)> = tx
@@ -3161,7 +3193,8 @@ impl Ledger {
                         detail: unknown.to_string(),
                     })?;
                 let changed = tx.execute(
-                    "UPDATE decisions SET resolved_at = ?2, resolution = ?3, actor = ?4, note = ?5
+                    "UPDATE decisions SET resolved_at = ?2, resolution = ?3, actor = ?4, note = ?5,
+                            candidate_contained = ?6
                      WHERE run = ?1 AND resolved_at IS NULL",
                     params![
                         run_id.as_str(),
@@ -3169,6 +3202,7 @@ impl Ledger {
                         Reason::DecisionSalvaged.as_str(),
                         actor,
                         note,
+                        candidate_contained,
                     ],
                 )?;
                 debug_assert_eq!(changed, 1, "read as open under the same transaction above");
@@ -3206,8 +3240,9 @@ impl Ledger {
                 let task_id = task_id.unwrap_or_else(|| format!("task-legacy-{}", run_id.as_str()));
                 tx.execute(
                     "INSERT INTO decisions
-                        (run, task, raised_at, raised_state, raised_reason, resolved_at, resolution, actor, note)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        (run, task, raised_at, raised_state, raised_reason, resolved_at, resolution, actor, note,
+                         candidate_contained)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
                         run_id.as_str(),
                         task_id,
@@ -3218,6 +3253,7 @@ impl Ledger {
                         Reason::DecisionSalvaged.as_str(),
                         actor,
                         note,
+                        candidate_contained,
                     ],
                 )?;
                 (parse_state(&last_state)?, original_reason)
@@ -3237,6 +3273,40 @@ impl Ledger {
         )?;
         tx.commit()?;
         Ok(Some(original_reason))
+    }
+
+    /// Salvaged runs whose `candidate_contained` was never computed, with
+    /// the repository each ran in: what `dataset build` backfills once.
+    pub fn salvages_without_containment(&self) -> Result<Vec<(RunId, PathBuf)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT decisions.run, runs.repo_path
+               FROM decisions JOIN runs ON runs.id = decisions.run
+              WHERE decisions.resolution = ?1 AND decisions.candidate_contained IS NULL
+              ORDER BY decisions.run",
+        )?;
+        let rows = stmt.query_map([Reason::DecisionSalvaged.as_str()], |row| {
+            Ok((
+                RunId::from_stored(row.get::<_, String>(0)?),
+                PathBuf::from(row.get::<_, String>(1)?),
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Record the containment of a salvage whose answer is still NULL.
+    /// Never overwrites a recorded answer: `Ok(false)` when there was
+    /// nothing to fill.
+    pub fn set_candidate_contained(&self, run_id: &RunId, contained: bool) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE decisions SET candidate_contained = ?2
+              WHERE run = ?1 AND resolution = ?3 AND candidate_contained IS NULL",
+            params![
+                run_id.as_str(),
+                contained,
+                Reason::DecisionSalvaged.as_str()
+            ],
+        )?;
+        Ok(changed > 0)
     }
 
     /// The candidate a person recorded merging when they salvaged a
@@ -4971,6 +5041,60 @@ mod tests {
         );
         // Best effort: the fixture is a temp dir; a leftover costs
         // nothing but disk, and the next run pre-cleans it.
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Containment is recorded with the salvage, stays unknown (NULL) when
+    /// it could not be computed, and a backfill fills only a NULL.
+    #[test]
+    fn a_salvage_records_candidate_containment_and_backfill_only_fills_null() {
+        let (ledger, dir) = temp_ledger();
+        for name in ["run-yes", "run-unknown"] {
+            ledger
+                .insert_run(&run(name), "/repo", None, &task(name), "rk")
+                .expect("run");
+            ledger
+                .record_transition(&Transition {
+                    run_id: run(name),
+                    attempt_id: None,
+                    from_state: Some(State::Verifying),
+                    to_state: State::NeedsReview,
+                    reason: Reason::ReviewFindings.as_str().into(),
+                    detail: None,
+                    at: now_rfc3339(),
+                })
+                .expect("transition");
+        }
+        ledger
+            .record_salvage_contained(&run("run-yes"), "abc", "a person", None, Some(true))
+            .expect("salvage");
+        ledger
+            .record_salvage(&run("run-unknown"), "abc", "a person", None)
+            .expect("salvage");
+        let contained = |name: &str| {
+            ledger
+                .decision_of_run(&run(name))
+                .expect("read")
+                .expect("row")
+                .candidate_contained
+        };
+        assert_eq!(contained("run-yes"), Some(true));
+        assert_eq!(contained("run-unknown"), None);
+        let pending: Vec<_> = ledger
+            .salvages_without_containment()
+            .expect("pending")
+            .into_iter()
+            .map(|(run, _)| run)
+            .collect();
+        assert_eq!(pending, vec![run("run-unknown")]);
+        assert!(!ledger
+            .set_candidate_contained(&run("run-yes"), false)
+            .expect("set"));
+        assert!(ledger
+            .set_candidate_contained(&run("run-unknown"), false)
+            .expect("set"));
+        assert_eq!(contained("run-yes"), Some(true));
+        assert_eq!(contained("run-unknown"), Some(false));
         std::fs::remove_dir_all(&dir).ok();
     }
 

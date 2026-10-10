@@ -8,6 +8,20 @@ missing here.
 
 ## Unreleased
 
+A salvaged run can now teach the learner, when its verified patch landed.
+
+- `relais decide --answer salvaged` records whether the run's verified
+  candidate patch survives intact in the commit you landed
+  (`candidate_contained`). `relais dataset build` labels a salvage positive
+  only when the run was raised from `needs_review` with `review_findings`
+  and that is true; every other salvage stays excluded, with its reason.
+  It backfills older salvages once where the repository and patch still
+  exist, and reports how many stayed unknown.
+- Each training example records its `label_source`, and `relais evaluate`
+  reports acceptance and calibration per source. The label policy version
+  is now 2, so datasets and artifacts built before it are distinguishable.
+- The ledger migrates to schema 21 (one nullable column on `decisions`).
+
 An agent's transcript opens inside the relais pane.
 
 - Each agent row of the pane is now a button, named under it as Claude
