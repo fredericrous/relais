@@ -5139,10 +5139,15 @@ impl Ledger {
 
     /// The most recent row a cycle (not a person) started, a cycle that
     /// rolled the artifact back included: what `--if-due` measures its 20
-    /// hours from.
+    /// hours from. A row that never finished (a killed cycle) or that the
+    /// next cycle closed as `interrupted` does not count: it must never
+    /// make `--if-due` answer "not due".
     pub fn last_cycle_started(&self) -> Result<Option<LearningCycleRow>> {
         Ok(self
-            .learning_rows("WHERE source = 'cycle' ORDER BY id DESC LIMIT 1")?
+            .learning_rows(
+                "WHERE source = 'cycle' AND ended_at IS NOT NULL AND action != 'interrupted'
+                 ORDER BY id DESC LIMIT 1",
+            )?
             .into_iter()
             .next())
     }

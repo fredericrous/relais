@@ -1957,6 +1957,9 @@ fn dataset_build_command() -> Result<CliOutcome, CliError> {
         "salvage containment backfill: {} computed, {} unreachable (left unknown, excluded)",
         backfill.recorded, backfill.unreachable
     );
+    for (reason, count) in &backfill.unreachable_reasons {
+        println!("  unreachable x{count}: {reason}");
+    }
     println!("coverage: {}", {
         let mut coverage: std::collections::BTreeMap<String, usize> =
             std::collections::BTreeMap::new();
@@ -2297,14 +2300,12 @@ fn learn_cycle_command(
         Ok((_, repo)) => repo,
         // A cycle started from a directory with no relais.toml still has a
         // ledger to learn from; task features then read the default policy.
-        Err(_) => RepoPolicy::from_toml_str(&format!(
-            "schema_version = {}\n",
-            relais::policy::POLICY_SCHEMA_VERSION
-        ))
-        .map_err(|cause| CliError::Operational {
-            operation: "learn cycle",
-            cause: Box::new(cause),
-        })?,
+        // Any other failure (a parse error, a permission error) is surfaced.
+        Err(CliError::Read { cause, .. }) if cause.kind() == std::io::ErrorKind::NotFound => {
+            default_repo_policy()?
+        }
+        Err(CliError::Locate(_)) => default_repo_policy()?,
+        Err(other) => return Err(other),
     };
     let registry = registry()?;
     let datasets = datasets_dir()?;
@@ -3157,6 +3158,18 @@ fn load_repo_policy() -> Result<(PathBuf, RepoPolicy), CliError> {
         cause: Box::new(cause),
     })?;
     Ok((root, policy))
+}
+
+/// The repository policy a cycle reads when there is no `relais.toml`.
+fn default_repo_policy() -> Result<RepoPolicy, CliError> {
+    RepoPolicy::from_toml_str(&format!(
+        "schema_version = {}\n",
+        relais::policy::POLICY_SCHEMA_VERSION
+    ))
+    .map_err(|cause| CliError::Operational {
+        operation: "learn cycle",
+        cause: Box::new(cause),
+    })
 }
 
 fn load_machine() -> Result<MachineSettings, CliError> {
@@ -6719,7 +6732,8 @@ fn salvage_containment(
     candidate_sha: &str,
 ) -> Result<Option<bool>, CliError> {
     let workspace = operational(ledger.run_workspace(run), "decide")?;
-    let contained = match workspace {
+    use relais::learn::salvage::Containment;
+    let containment = match workspace {
         Some(workspace) => operational(
             relais::learn::salvage::containment_of_run(
                 ledger,
@@ -6729,15 +6743,15 @@ fn salvage_containment(
             ),
             "decide",
         )?,
-        None => None,
+        None => Containment::Unreachable("the run has no recorded workspace".to_string()),
     };
-    if contained.is_none() {
+    if let Containment::Unreachable(reason) = &containment {
         eprintln!(
             "relais decide: could not tell whether run {run}'s verified candidate landed intact \
-             in {candidate_sha} (repository, patch or commit unavailable); recording it as unknown"
+             in {candidate_sha} ({reason}); recording it as unknown"
         );
     }
-    Ok(contained)
+    Ok(containment.answer())
 }
 
 /// Record one piece of evidence produced by another tool, against a run

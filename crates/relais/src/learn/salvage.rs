@@ -119,34 +119,102 @@ fn git(repo: &Path, index: &Path) -> Command {
         .env("GIT_INDEX_FILE", index)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     command
 }
 
-/// Whether `patch` (the candidate the runner verified) reverse-applies on
-/// the tree of `sha` in `repo`: `Some(true)` the candidate survives intact
-/// in that commit, `Some(false)` the commit rewrote it, `None` when it
-/// cannot be told (repository, commit or patch unavailable, git failing).
-/// Runs `git apply --cached --check -R` against a temporary index, never
-/// the repository's own.
-pub fn candidate_contained(repo: &Path, patch: &Path, sha: &str) -> Option<bool> {
-    if !repo.is_dir() || !patch.is_file() {
-        return None;
+/// What one containment test found. Closed: a git or IO failure is
+/// `Unreachable` with the text that says why, never folded into an answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Containment {
+    /// The candidate survives intact in the commit.
+    Contained,
+    /// The commit rewrote the candidate.
+    Rewritten,
+    /// It cannot be told; the reason is the error text (git's stderr
+    /// included).
+    Unreachable(String),
+}
+
+impl Containment {
+    /// The answer to record, `None` when unreachable.
+    pub fn answer(&self) -> Option<bool> {
+        match self {
+            Self::Contained => Some(true),
+            Self::Rewritten => Some(false),
+            Self::Unreachable(_) => None,
+        }
     }
-    let patch = std::fs::canonicalize(patch).ok()?;
-    let scratch = ScratchIndex::create().ok()?;
+}
+
+/// Run a git command to completion; `Err` is the reason it did not
+/// succeed, with git's stderr.
+fn run_git_step(what: &str, command: &mut Command) -> Result<(), String> {
+    let output = command
+        .output()
+        .map_err(|e| format!("{what}: could not run git: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    Err(if stderr.is_empty() {
+        format!("{what}: {}", output.status)
+    } else {
+        format!("{what}: {stderr}")
+    })
+}
+
+/// Whether `patch` (the candidate the runner verified) reverse-applies on
+/// the tree of `sha` in `repo`: [`Containment::Contained`] the candidate
+/// survives intact in that commit, [`Containment::Rewritten`] the commit
+/// rewrote it, [`Containment::Unreachable`] when it cannot be told
+/// (repository, commit or patch unavailable, git or the filesystem
+/// failing). Runs `git apply --cached --check -R` against a temporary
+/// index, never the repository's own.
+pub fn candidate_contained(repo: &Path, patch: &Path, sha: &str) -> Containment {
+    if !repo.is_dir() {
+        return Containment::Unreachable(format!("{} is not a directory", repo.display()));
+    }
+    if !patch.is_file() {
+        return Containment::Unreachable(format!("{} is not a file", patch.display()));
+    }
+    let patch = match std::fs::canonicalize(patch) {
+        Ok(patch) => patch,
+        Err(e) => {
+            return Containment::Unreachable(format!(
+                "could not canonicalize {}: {e}",
+                patch.display()
+            ))
+        }
+    };
+    let scratch = match ScratchIndex::create() {
+        Ok(scratch) => scratch,
+        Err(e) => {
+            return Containment::Unreachable(format!("could not create a scratch index: {e}"))
+        }
+    };
     let index = scratch.index_file();
     let tree = format!("{sha}^{{tree}}");
-    let loaded = git(repo, &index).args(["read-tree", &tree]).status().ok()?;
-    if !loaded.success() {
-        return None;
+    if let Err(reason) = run_git_step(
+        "git read-tree",
+        git(repo, &index).args(["read-tree", &tree]),
+    ) {
+        return Containment::Unreachable(reason);
     }
-    let applied = git(repo, &index)
+    let applied = match git(repo, &index)
         .args(["apply", "--cached", "--check", "-R"])
         .arg(&patch)
-        .status()
-        .ok()?;
-    Some(applied.success())
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) => return Containment::Unreachable(format!("git apply: could not run git: {e}")),
+    };
+    if applied.status.success() {
+        Containment::Contained
+    } else {
+        Containment::Rewritten
+    }
 }
 
 /// The run's latest `candidate_patch` evidence path, if one was recorded.
@@ -169,24 +237,31 @@ pub fn containment_of_run(
     run: &RunId,
     repo_path: &Path,
     sha: &str,
-) -> Result<Option<bool>, LedgerError> {
+) -> Result<Containment, LedgerError> {
     let Some(repo) = reachable_repo(repo_path) else {
-        return Ok(None);
+        return Ok(Containment::Unreachable(format!(
+            "no repository at {}",
+            repo_path.display()
+        )));
     };
     let Some(patch) = latest_candidate_patch(ledger, run)? else {
-        return Ok(None);
+        return Ok(Containment::Unreachable(
+            "no candidate patch evidence recorded".to_string(),
+        ));
     };
     Ok(candidate_contained(&repo, &patch, sha))
 }
 
 /// What one backfill pass did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BackfillReport {
     /// Salvages whose containment was computed and recorded.
     pub recorded: usize,
     /// Salvages whose repository or patch is gone: they stay NULL and are
     /// excluded from labelling.
     pub unreachable: usize,
+    /// How many salvages were unreachable for each reason.
+    pub unreachable_reasons: std::collections::BTreeMap<String, usize>,
 }
 
 /// Compute `candidate_contained` once for every salvage that has none and
@@ -197,14 +272,19 @@ pub fn backfill(ledger: &Ledger) -> Result<BackfillReport, LedgerError> {
     for (run, repo_path) in ledger.salvages_without_containment()? {
         let contained = match ledger.salvaged_candidate(&run)? {
             Some(sha) => containment_of_run(ledger, &run, &repo_path, &sha)?,
-            None => None,
+            None => Containment::Unreachable("no salvaged candidate commit recorded".to_string()),
         };
         match contained {
-            Some(contained) => {
-                ledger.set_candidate_contained(&run, contained)?;
+            Containment::Unreachable(reason) => {
+                report.unreachable += 1;
+                *report.unreachable_reasons.entry(reason).or_default() += 1;
+            }
+            known => {
+                if let Some(answer) = known.answer() {
+                    ledger.set_candidate_contained(&run, answer)?;
+                }
                 report.recorded += 1;
             }
-            None => report.unreachable += 1,
         }
     }
     Ok(report)
@@ -286,7 +366,7 @@ mod tests {
         let fixture = repo("salvage-contained");
         assert_eq!(
             candidate_contained(&fixture.dir, &fixture.patch, &fixture.contained_sha),
-            Some(true)
+            Containment::Contained
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
@@ -298,7 +378,7 @@ mod tests {
         let before = std::fs::read(&index).unwrap();
         assert_eq!(
             candidate_contained(&fixture.dir, &fixture.patch, &fixture.rewritten_sha),
-            Some(false)
+            Containment::Rewritten
         );
         assert_eq!(
             std::fs::read(&index).unwrap(),
@@ -309,20 +389,33 @@ mod tests {
     }
 
     #[test]
-    fn an_unavailable_repository_patch_or_commit_is_unknown() {
+    fn an_unavailable_repository_patch_or_commit_is_unreachable_with_a_reason() {
         let fixture = repo("salvage-unknown");
         let missing = fixture.dir.join("no-such-dir");
-        assert_eq!(
-            candidate_contained(&missing, &fixture.patch, &fixture.contained_sha),
-            None
-        );
-        assert_eq!(
-            candidate_contained(&fixture.dir, &missing, &fixture.contained_sha),
-            None
-        );
-        assert_eq!(
-            candidate_contained(&fixture.dir, &fixture.patch, &"0".repeat(40)),
-            None
+        let reason = |c: Containment| match c {
+            Containment::Unreachable(reason) => reason,
+            other => panic!("expected unreachable, got {other:?}"),
+        };
+        assert!(reason(candidate_contained(
+            &missing,
+            &fixture.patch,
+            &fixture.contained_sha
+        ))
+        .contains("not a directory"));
+        assert!(reason(candidate_contained(
+            &fixture.dir,
+            &missing,
+            &fixture.contained_sha
+        ))
+        .contains("not a file"));
+        let bad_commit = reason(candidate_contained(
+            &fixture.dir,
+            &fixture.patch,
+            &"0".repeat(40),
+        ));
+        assert!(
+            bad_commit.starts_with("git read-tree: ") && bad_commit.len() > "git read-tree: ".len(),
+            "git's stderr is in the reason: {bad_commit}"
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }

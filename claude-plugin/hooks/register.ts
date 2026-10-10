@@ -108,8 +108,14 @@ export function register(on: any) {
     // for it (routing.ts). Until then, and on any failure, nothing is routed.
     if (typeof e.cwd === 'string') store.router.cwd = e.cwd
     detach(refreshState(fx, store))
-    detach(noteLastCycle(fx, store))
-    detach(startCycle(fx, store))
+    // The previous cycle's row is noted before this session's own cycle
+    // starts, so the new row can never hide a promotion or a rollback.
+    detach(
+      (async () => {
+        await noteLastCycle(fx, store)
+        await startCycle(fx, store)
+      })(),
+    )
     await $.tool.register({
       name: 'run',
       description:

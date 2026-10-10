@@ -55,6 +55,25 @@ for (const [action, names] of [
   })
 }
 
+test('a previous promoted row is noted before this session starts its own cycle', async ($: any, on: any) => {
+  const engine = scriptedEngine(on)
+  lastOf(engine, { id: 5, action: 'promoted' })
+  await start($)
+  await settle(engine)
+  expect(engine.calls.toasts.length).toBe(1)
+  expect(engine.calls.learn.length).toBe(1)
+  expect(engine.calls.toastsAtLearnSpawn).toEqual([1])
+})
+
+test('a cycle that cannot be spawned leaves one pane note', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.script.learnSpawnFails = true
+  await start($)
+  await settle(engine)
+  const status = await $.tool.call({ tool: 'mcp__relais__status' })
+  expect(JSON.stringify(status)).toContain('learning cycle could not be started')
+})
+
 test('the line goes to the pane when a run is there', async ($: any, on: any) => {
   const engine = await startedRun($, on)
   lastOf(engine, { id: 3, action: 'promoted' })

@@ -383,6 +383,47 @@ fn an_unfinished_row_is_closed_as_interrupted_by_the_next_cycle() {
 }
 
 #[test]
+fn an_unfinished_row_never_makes_if_due_answer_not_due() {
+    let world = World::new("unfinished-due");
+    let dead = {
+        let ledger = Ledger::open(&world.ledger_path()).expect("ledger");
+        ledger.begin_learning_cycle().expect("begin")
+    };
+    let out = world.relais(&["learn", "cycle", "--if-due"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        !text(&out.stdout).starts_with("not due"),
+        "{}",
+        text(&out.stdout)
+    );
+    let rows = world.rows();
+    assert_eq!(rows.len(), 2, "the cycle ran");
+    let closed = rows.iter().find(|row| row.id == dead).expect("old row");
+    assert_eq!(closed.action, LearningAction::Interrupted);
+    assert!(closed.ended_at.is_some());
+}
+
+#[test]
+fn a_malformed_relais_toml_fails_the_cycle_with_its_message() {
+    let world = World::new("bad-toml");
+    let git = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&world.repo)
+        .output()
+        .expect("git init");
+    assert!(git.status.success());
+    std::fs::write(world.repo.join("relais.toml"), "this is = = not toml\n").expect("write");
+    let out = world.relais(&["learn", "cycle"]);
+    assert_ne!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert!(
+        text(&out.stderr).contains("relais.toml"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(world.rows().is_empty(), "no cycle row was opened");
+}
+
+#[test]
 fn if_due_within_twenty_hours_exits_0_with_the_reason_and_the_next_time() {
     let world = World::new("if-due");
     let first = world.relais(&["learn", "cycle", "--if-due"]);

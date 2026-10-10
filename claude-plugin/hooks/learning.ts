@@ -23,8 +23,8 @@ export function stateDir(env: { home?: unknown; stateDir?: unknown }): string | 
   return undefined
 }
 
-// Starts `relais learn cycle --if-due` and lets it go: not a Child, and any
-// failure is swallowed. Callers detach it.
+// Starts `relais learn cycle --if-due` and lets it go: not a Child, and a
+// failure to start leaves one pane note. Callers detach it.
 export async function startCycle(fx: Fx, store: Store): Promise<void> {
   try {
     const dir = stateDir({ home: await fx.env.home(), stateDir: await fx.env.stateDir() })
@@ -40,12 +40,23 @@ export async function startCycle(fx: Fx, store: Store): Promise<void> {
       try {
         let step = await stream.next()
         while (!step.done) step = await stream.next()
-      } catch {
-        // Fail open: a cycle that did not start is tried again at the next session.
+      } catch (e) {
+        await noteSpawnFailure(fx, store, e)
       }
     })()
+  } catch (e) {
+    await noteSpawnFailure(fx, store, e)
+  }
+}
+
+// One pane note when the detached cycle could not be started; the cycle is
+// tried again at the next session.
+async function noteSpawnFailure(fx: Fx, store: Store, error: unknown): Promise<void> {
+  try {
+    const why = error instanceof Error ? error.message : String(error)
+    await note(fx, store, undefined, `the learning cycle could not be started (${why}); it is tried again at the next session.`)
   } catch {
-    // Fail open.
+    // Fail open: the note itself is never a reason to fail the session.
   }
 }
 

@@ -10,6 +10,12 @@ missing here.
 
 The session router gets real outcome evidence.
 
+- The learning cycle's `--if-due` check ignores a row that never finished
+  (a killed cycle) or that the next cycle closed as `interrupted`, so such a
+  row no longer makes it answer "not due". A malformed `relais.toml` now
+  fails the cycle instead of being replaced by the default policy, salvage
+  containment reports why it was unreachable, and the plugin notes a
+  promotion before it starts its own cycle.
 - Lint, build and type-check commands (`cargo clippy|check|build`,
   `pnpm|npm run lint|build|typecheck`, `tsc`, `go vet|build`,
   `golangci-lint run`, `ruff check`, `mypy`, `pyright`, `make lint|build`)

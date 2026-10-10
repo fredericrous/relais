@@ -566,6 +566,23 @@ fn evaluation_floor(artifact: &Artifact) -> Option<f64> {
     Some(report.gates.quality_floor)
 }
 
+/// A trace line when the active artifact's evaluation report cannot be
+/// read, so the rollback check used the default quality floor instead of
+/// the artifact's own.
+fn unreadable_floor_note(registry: &Registry) -> Result<Option<String>, CycleError> {
+    let Some(active) = registry.active()? else {
+        return Ok(None);
+    };
+    Ok(match evaluation_floor(&active) {
+        Some(_) => None,
+        None => Some(format!(
+            "evaluation report of active artifact {} is unreadable; the default quality floor {} was used",
+            active.artifact_id,
+            super::evaluate::DEFAULT_QUALITY_FLOOR
+        )),
+    })
+}
+
 /// What rolling back did.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RolledBack {
@@ -692,12 +709,25 @@ pub fn run_cycle(
         error: None,
         promote_hint: None,
     };
-    if let Err(e) = cycle_body(inputs, progress, &mut report) {
-        if let CycleError::Ledger(ledger_error) = e {
-            return Err(ledger_error);
+    let body = match unreadable_floor_note(inputs.registry) {
+        Ok(trace) => cycle_body(inputs, progress, &mut report).map(|()| trace),
+        Err(e) => Err(e),
+    };
+    match body {
+        Ok(Some(trace)) => {
+            report.note = Some(match report.note.take() {
+                Some(note) => format!("{note}; {trace}"),
+                None => trace,
+            });
         }
-        report.action = LearningAction::Error;
-        report.error = Some(e.to_string());
+        Ok(None) => {}
+        Err(e) => {
+            if let CycleError::Ledger(ledger_error) = e {
+                return Err(ledger_error);
+            }
+            report.action = LearningAction::Error;
+            report.error = Some(e.to_string());
+        }
     }
     ledger.finish_learning_cycle(
         cycle_id,
@@ -884,7 +914,13 @@ pub fn retain(datasets_dir: &Path, registry: &Registry) -> Result<(), CycleError
         let path = path.to_path_buf();
         move |cause| CycleError::Io { what, path, cause }
     };
-    if let Ok(entries) = std::fs::read_dir(datasets_dir) {
+    let listing = match std::fs::read_dir(datasets_dir) {
+        Ok(entries) => Some(entries),
+        // No datasets directory yet: nothing to trim.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(io("cannot read", datasets_dir)(e)),
+    };
+    if let Some(entries) = listing {
         let mut datasets: Vec<PathBuf> = entries
             .flatten()
             .map(|entry| entry.path())
