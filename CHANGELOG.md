@@ -6,6 +6,30 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## v0.11.3
+
+An outcome that waits on you says what is true when it arrives.
+
+- A run's outcome message waited in the plugin's queue while the session
+  was busy, and went out as written: on 2026-10-09 a run approved at
+  11:34 was announced at 11:42 as "This is yours to decide". The plugin
+  now checks a `needs_decision`, `needs_review` or `interrupted` outcome
+  just before it sends it. If a person answered it since, the message
+  says what was answered, by whom and when, and that nothing waits. If
+  the check cannot be made, the message goes out as it was (#188).
+- `relais native status` carries `current`: the run's state and decision
+  as the ledger holds them now, read without creating, migrating or
+  waiting more than 250 ms on the ledger (#188).
+- An interrupted run whose worker is gone retires its worktree itself,
+  instead of keeping it for `relais resume --retire` (#186).
+- The status tool returns a run's output lines only when asked
+  (`output: true`), so a status call no longer carries a check's whole
+  log (#187).
+- **After upgrading, run `relais install --claude --user --write`, then
+  restart your Claude Code sessions**: a brew upgrade does not update the
+  plugin Claude Code loads, and a running session keeps the plugin it
+  started with.
+
 ## v0.11.2
 
 One run outcome reaches the model once, however long the session's turn.
