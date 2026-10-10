@@ -31,6 +31,11 @@ const PERSON = 'person │ '
 const AGENT = 'agent  │ '
 const CONTINUED = '       │ '
 const RESULT = '  │ '
+const FAIL = 'FAIL '
+const TOOL = '▸ '
+const TOOL_CONTINUED = '  '
+const RUNNING = ' … running'
+const MAX_TOOL_ROWS = 2
 
 // A row is at most `columns × 3` bytes: a one-cell character is at most 3
 // bytes, so combining marks cannot push a stored row past the bound.
@@ -51,27 +56,92 @@ export function cutBytes(text: string, columns: number): string {
   return out
 }
 
-// `text` cut to `width` code points, the last one `…` when it was cut.
-function cutCells(text: string, width: number): string {
-  const chars = Array.from(text)
-  if (chars.length <= width) return text
-  return chars.slice(0, Math.max(1, width - 1)).join('') + '…'
+// The terminal cells one code point takes: 0 for a combining mark or a
+// zero-width joiner or selector, 2 for an East Asian wide or fullwidth
+// character or an emoji, else 1.
+// holds-until: a script the ranges below miss draws as one cell too few;
+// then the full Unicode East Asian Width table replaces them.
+const ZERO_WIDTH = /^[\p{Mn}\p{Me}\u200B-\u200F\u2060\uFE00-\uFE0F]$/u
+const EMOJI = /^\p{Extended_Pictographic}$/u
+const WIDE_RANGES: ReadonlyArray<readonly [number, number]> = [
+  [0x1100, 0x115f],
+  [0x2e80, 0x303e],
+  [0x3041, 0x33ff],
+  [0x3400, 0x4dbf],
+  [0x4e00, 0x9fff],
+  [0xa000, 0xa4cf],
+  [0xac00, 0xd7a3],
+  [0xf900, 0xfaff],
+  [0xfe30, 0xfe4f],
+  [0xff00, 0xff60],
+  [0xffe0, 0xffe6],
+  [0x20000, 0x3fffd],
+]
+
+export function cellsOf(ch: string): number {
+  if (ZERO_WIDTH.test(ch)) return 0
+  const code = ch.codePointAt(0) ?? 0
+  if (WIDE_RANGES.some(([low, high]) => code >= low && code <= high)) return 2
+  // Pictographs below U+2600 (©, ®, ‼) are narrow on their own; a following
+  // emoji selector widens them (see `cellsAt`).
+  return code >= 0x2600 && EMOJI.test(ch) ? 2 : 1
 }
 
-// One line wrapped at `width` code points, at a space when there is one.
+const EMOJI_SELECTOR = '\uFE0F'
+
+// The cells `chars[i]` takes where it stands: an emoji selector after a
+// narrow pictograph (`‼` or `©` followed by U+FE0F) makes it two cells, so
+// the selector adds one.
+function cellsAt(chars: readonly string[], i: number): number {
+  const ch = chars[i]
+  if (ch === EMOJI_SELECTOR && i > 0 && EMOJI.test(chars[i - 1]) && cellsOf(chars[i - 1]) === 1) return 1
+  return cellsOf(ch)
+}
+
+export const widthOf = (text: string): number => {
+  const chars = Array.from(text)
+  return chars.reduce((n, _, i) => n + cellsAt(chars, i), 0)
+}
+
+// The longest start of `chars` that fits in `width` cells: how many code points.
+function fitting(chars: readonly string[], width: number): number {
+  let cells = 0
+  let count = 0
+  for (let i = 0; i < chars.length; i += 1) {
+    const n = cellsAt(chars, i)
+    if (cells + n > width) break
+    cells += n
+    count += 1
+  }
+  return count
+}
+
+// One line wrapped at `width` cells, at a space when there is one in the
+// row; a run with no space (a path, CJK text) breaks at the width.
 function wrap(line: string, width: number): string[] {
-  const chars = Array.from(line)
-  if (chars.length <= width) return [line]
+  if (widthOf(line) <= width) return [line]
   const out: string[] = []
-  let rest = chars
-  while (rest.length > width) {
-    const space = rest.slice(0, width + 1).lastIndexOf(' ')
-    const at = space > 0 ? space : width
+  let rest = Array.from(line)
+  while (widthOf(rest.join('')) > width) {
+    const fit = Math.max(1, fitting(rest, width))
+    const space = rest.slice(0, fit + 1).lastIndexOf(' ')
+    const at = space > 0 ? space : fit
     out.push(rest.slice(0, at).join(''))
     rest = rest.slice(space > 0 ? at + 1 : at)
   }
   out.push(rest.join(''))
   return out
+}
+
+// `text` wrapped at `width` cells into at most `rows` rows; when more would
+// follow, the last kept row ends in `…`.
+function wrapThenCut(text: string, width: number, rows: number): string[] {
+  const wrapped = wrap(text, width)
+  if (wrapped.length <= rows) return wrapped
+  const kept = wrapped.slice(0, rows)
+  const last = Array.from(kept[rows - 1])
+  kept[rows - 1] = last.slice(0, fitting(last, Math.max(1, width - 1))).join('') + '…'
+  return kept
 }
 
 const linesOf = (text: string): string[] => {
@@ -80,12 +150,26 @@ const linesOf = (text: string): string[] => {
   return lines
 }
 
+// A tool use's `▸ <tool> <what>` row: wrapped onto at most MAX_TOOL_ROWS
+// rows, the last cut with `…` past them; a call in flight ends `… running`.
+function toolRows(use: any, columns: number): TranscriptRow[] {
+  const what = cutLine(activityText({ ...(use?.input ?? {}), tool: use?.tool }))
+  const room = Math.max(1, columns - widthOf(TOOL))
+  const rows = wrapThenCut(what, room, MAX_TOOL_ROWS)
+  if (typeof use?.text !== 'string') {
+    const last = Array.from(rows[rows.length - 1])
+    const fit = fitting(last, Math.max(1, room - widthOf(RUNNING)))
+    rows[rows.length - 1] = last.slice(0, fit).join('') + RUNNING
+  }
+  return rows.map((row, i) => ({ text: (i === 0 ? TOOL : TOOL_CONTINUED) + row }))
+}
+
 function messageRows(m: any, columns: number): TranscriptRow[] {
   const out: TranscriptRow[] = []
   const text = typeof m?.text === 'string' ? m.text : ''
   const lead = m?.role === 'user' ? PERSON : AGENT
   if (text.trim() !== '') {
-    const room = Math.max(1, columns - lead.length)
+    const room = Math.max(1, columns - widthOf(lead))
     const wrapped = linesOf(text).flatMap(line => wrap(line, room))
     wrapped.slice(0, MAX_MESSAGE_ROWS).forEach((row, i) => out.push({ text: (i === 0 ? lead : CONTINUED) + row }))
     if (wrapped.length > MAX_MESSAGE_ROWS) {
@@ -94,23 +178,24 @@ function messageRows(m: any, columns: number): TranscriptRow[] {
   }
   const uses: any[] = Array.isArray(m?.toolUses) ? m.toolUses : []
   for (const use of uses) {
-    const what = cutLine(activityText({ ...(use?.input ?? {}), tool: use?.tool }))
-    const isRunning = typeof use?.text !== 'string'
-    const suffix = ' … running'
-    const row = isRunning
-      ? cutCells(`▸ ${what}`, Math.max(1, columns - suffix.length)) + suffix
-      : cutCells(`▸ ${what}`, columns)
-    out.push({ text: row })
-    if (isRunning) continue
+    out.push(...toolRows(use, columns))
+    if (typeof use?.text !== 'string') continue
     const lines = linesOf(use.text)
     const failed = use.isError === true
     if (lines.length === 0 && failed) lines.push('error')
-    lines.slice(0, MAX_RESULT_ROWS).forEach((line, i) => {
-      if (failed && i === 0) out.push({ text: cutCells(`FAIL ${line}`, columns), color: 'error' })
-      else out.push({ text: cutCells(RESULT + line, columns), dim: true })
+    // Each result line wraps; the first MAX_RESULT_ROWS wrapped rows show.
+    const rows = lines.flatMap((line, i) => {
+      const lead = failed && i === 0 ? FAIL : RESULT
+      return wrap(line, Math.max(1, columns - widthOf(lead))).map((part, j) => ({
+        text: (j === 0 ? lead : RESULT) + part,
+        isFail: failed && i === 0,
+      }))
     })
-    if (lines.length > MAX_RESULT_ROWS) {
-      out.push({ text: `${RESULT}… ${lines.length - MAX_RESULT_ROWS} more rows`, dim: true })
+    rows.slice(0, MAX_RESULT_ROWS).forEach(row =>
+      out.push(row.isFail ? { text: row.text, color: 'error' } : { text: row.text, dim: true }),
+    )
+    if (rows.length > MAX_RESULT_ROWS) {
+      out.push({ text: `${RESULT}… ${rows.length - MAX_RESULT_ROWS} more rows`, dim: true })
     }
   }
   return out

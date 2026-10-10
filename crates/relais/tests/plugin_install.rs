@@ -7,8 +7,10 @@
 //! Unix only: the fake `claude` is a `sh` script.
 #![cfg(unix)]
 
+mod common;
+
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use relais::ids::sha256_hex;
 use relais::test_support::short_temp_dir;
@@ -96,7 +98,7 @@ impl World {
     }
 
     fn relais(&self, args: &[&str]) -> Output {
-        Command::new(BIN)
+        common::relais(BIN)
             .args(args)
             .current_dir(&self.project)
             .env_remove("RELAIS_CLAUDE_BIN")

@@ -11,9 +11,11 @@
 //! function, produces a refusal on stdout for a refusing coordinator and
 //! nothing at all for a granting one, and that it exits zero regardless.
 
+mod common;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use relais::coordinator::{Coordinator, Request};
@@ -59,7 +61,7 @@ impl World {
     /// wired unless the caller started one on `self.socket()` — the
     /// unreachable-coordinator scenarios rely on none existing.
     fn hook(&self, payload: &[u8]) -> (i32, String, String) {
-        let mut child = Command::new(BIN)
+        let mut child = common::relais(BIN)
             .args(["hook"])
             .env("RELAIS_STATE_DIR", &self.state)
             .env("RELAIS_CONFIG_DIR", &self.config)

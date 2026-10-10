@@ -17,6 +17,13 @@ An agent's transcript opens inside the relais pane.
   its result, live while it runs; `[ back ]` returns to the runs. A hint
   under the agents says that `↓ to manage` opens the same agent in Claude
   Code's own view, which a plugin cannot open itself.
+- The transcript is laid out in terminal cells: CJK text and emoji take
+  two cells each, so they wrap at the pane's edge instead of running past
+  it. A long tool call or result line wraps onto more rows before it is
+  cut with `…`.
+- `make check` passes inside a relais run again: the integration tests no
+  longer inherit the run's `RELAIS_HOST`, so relais can verify changes to
+  its own repository.
 - The pane's agent rows still show at most three agents per run.
 - **After upgrading, run `relais install --claude --user --write`, then
   restart your Claude Code sessions**: a running session keeps the plugin
