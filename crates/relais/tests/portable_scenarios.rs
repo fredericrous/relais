@@ -10,6 +10,8 @@
 //! had its PATH lookup broken for a release because of it (audit C2).
 //! They live here, with no shell and no fake worker anywhere.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -103,7 +105,7 @@ impl World {
     /// worktree of the repository, for the scenarios about what a
     /// worktree resolves to.
     fn relais_in(&self, cwd: &Path, args: &[&str]) -> Output {
-        Command::new(BIN)
+        common::relais(BIN)
             .args(args)
             .current_dir(cwd)
             .env("RELAIS_STATE_DIR", &self.state)
@@ -773,7 +775,7 @@ fn hook_probe_record_writes_the_payload_verbatim_and_stays_silent() {
     let dir = world.root.join("recordings");
     std::fs::create_dir_all(&dir).expect("recordings dir");
     let payload = br#"{"hook_event_name":"PreToolUse","tool_name":"Agent"}"#;
-    let output = Command::new(BIN)
+    let output = common::relais(BIN)
         .args(["hook", "--probe", "--record", &dir.to_string_lossy()])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -1779,7 +1781,7 @@ fn native_contract_saves_a_contract_and_refuses_prose() {
     let world = World::new("native-contract");
     world.write_policy();
     let pipe = |stdin: &str| {
-        let mut child = Command::new(BIN)
+        let mut child = common::relais(BIN)
             .args(["native", "contract"])
             .current_dir(&world.repo)
             .env("RELAIS_STATE_DIR", &world.state)
@@ -1842,7 +1844,7 @@ fn a_run_refused_before_it_starts_still_sends_one_done_line_naming_why() {
     let world = World::new("proto-unstarted");
     let task = world.write_task("task.json");
     let plugin_run = |world: &World| {
-        Command::new(BIN)
+        common::relais(BIN)
             .args(["run", "--task", task.to_str().unwrap(), "--protocol"])
             .current_dir(&world.repo)
             .env("RELAIS_STATE_DIR", &world.state)

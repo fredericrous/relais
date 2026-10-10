@@ -4,8 +4,10 @@
 //! an outcome message against it just before the message goes out, so a
 //! decision answered since the run ended is not announced as still open.
 
+mod common;
+
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use relais::ids::{RunId, TaskId};
 use relais::ledger::{DecisionAnswer, Ledger, Transition};
@@ -55,7 +57,7 @@ impl World {
     }
 
     fn status(&self, run: &str) -> Output {
-        Command::new(BIN)
+        common::relais(BIN)
             .args(["native", "status", "--run", run])
             .current_dir(&self.root)
             .env("RELAIS_STATE_DIR", &self.state)

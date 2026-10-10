@@ -12,6 +12,8 @@
 //! and run on Windows too, along with the library-level tests.
 #![cfg(unix)]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Condvar, Mutex};
@@ -303,7 +305,7 @@ amont_agent = "off"
 
     /// A `relais` command in this world's environment.
     fn command(&self, extra_env: &[(&str, &str)]) -> Command {
-        let mut cmd = Command::new(BIN);
+        let mut cmd = common::relais(BIN);
         cmd.current_dir(&self.repo)
             .env("RELAIS_STATE_DIR", &self.state)
             .env("RELAIS_CONFIG_DIR", &self.config)
@@ -422,7 +424,7 @@ struct ScriptedPlugin {
 
 impl ScriptedPlugin {
     fn command(&self) -> Command {
-        let mut cmd = Command::new(BIN);
+        let mut cmd = common::relais(BIN);
         cmd.current_dir(&self.repo)
             .env("RELAIS_STATE_DIR", &self.state)
             .env("RELAIS_CONFIG_DIR", &self.config)

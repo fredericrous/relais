@@ -4,6 +4,8 @@
 //! scenario runs in a world of its own (state, config and home), with no
 //! git, no shell and no harness, so it runs on every platform CI builds.
 
+mod common;
+
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
@@ -41,7 +43,7 @@ impl World {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(BIN);
+        let mut command = common::relais(BIN);
         command
             .args(args)
             .current_dir(&self.repo)
