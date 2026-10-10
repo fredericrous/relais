@@ -274,8 +274,9 @@ export function paneTree(fx: Fx, e: any, state: PaneState | undefined, actions: 
       if (row.button && press?.kind === 'agent') {
         return h(
           Button,
-          // The text as `label`, not a Text child: Claude Code before 2.1.295
-          // refuses a Button with element children, and CI pins 2.1.291.
+          // The text as `label`, not a Text child: Claude Code 2.1.291 (CI's
+          // `CLAUDE_CODE_PIN`) refuses a Button with element children; 2.1.295
+          // accepts it.
           {
             key: row.button.key,
             label: row.text,
