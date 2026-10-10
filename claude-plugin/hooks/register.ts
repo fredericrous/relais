@@ -24,7 +24,7 @@ import {
 } from './routing.ts'
 import { EDIT_TOOLS } from './router.ts'
 import { close, createStore, detach, every, type Store } from './store.ts'
-import { FLUSH_MS, openPane, renderPane, timelineLines } from './ui.ts'
+import { FLUSH_MS, markDirty, openPane, renderPane, timelineLines } from './ui.ts'
 
 const RUN_TOOL = 'mcp__relais__run'
 const REPLAY_TOOL = 'mcp__relais__replay'
@@ -40,7 +40,11 @@ const PERSON_ORIGINS = new Set(['composer', 'bridge', 'sdk'])
 // Every effect the sibling modules use, spelled on `$` here: `claude plugin
 // validate` follows `$` within a file, not across an import.
 const effects = ($: any): Fx => ({
-  session: { id: () => $.session.id(), model: () => $.session.model() },
+  session: {
+    id: () => $.session.id(),
+    model: () => $.session.model(),
+    messages: (args: unknown) => $.session.messages(args),
+  },
   process: {
     run: (argv: string[], init: unknown) => $.process.run(argv, init),
     spawn: (request: unknown) => $.process.spawn(request),
@@ -90,6 +94,8 @@ export function register(on: any) {
   const ensurePump = (fx: Fx) => {
     if (store.hasPump) return
     store.hasPump = true
+    // A reload writes the runs view on its first tick.
+    markDirty(store)
     every(fx, store, FLUSH_MS, () => detach(pump(fx, store)))
   }
 
@@ -412,7 +418,7 @@ export function register(on: any) {
   })).catch(() => ({ text: 'relais could not flag the task (internal error).' }))
 
   on('ui.render', { component: 'Pane', requestId: 'relais' }, ($: any, e: any) =>
-    renderPane(effects($), e),
+    renderPane(effects($), store, e),
   )
 
   // After /clear, /resume or /branch the module's buffers may be gone or stale.

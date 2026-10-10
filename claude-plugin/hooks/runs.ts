@@ -20,6 +20,7 @@ import {
 import { sendHello } from './callbacks.ts'
 import { onRunDone } from './routing.ts'
 import { detach, type Child, type PendingOutcome, type Store } from './store.ts'
+import { refreshTranscript } from './transcript.ts'
 import {
   announceRun,
   flush,
@@ -64,6 +65,7 @@ export async function pump(fx: Fx, store: Store) {
       store.isSubmitting = false
     }
   }
+  await refreshTranscript(fx, store)
   await flush(fx, store)
 }
 

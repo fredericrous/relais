@@ -6,7 +6,7 @@
 type Call = (...args: any[]) => any
 
 export type Fx = {
-  session: { id: Call; model: Call }
+  session: { id: Call; model: Call; messages: Call }
   process: { run: Call; spawn: Call }
   agent: { spawn: Call; list: Call }
   tool: { call: Call }

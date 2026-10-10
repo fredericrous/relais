@@ -66,7 +66,7 @@ export async function handleSpawn(fx: Fx, store: Store, child: Child, line: any)
     return
   }
   open(store, child, { ...openDispatch(dispatch, agent), isBound: true })
-  markAgent(store, dispatch, agent)
+  markAgent(store, dispatch, agent, type)
   sendBound(fx, store, child, dispatch, agent)
   startPoll(fx, store)
 }
@@ -152,10 +152,13 @@ export async function note(fx: Fx, store: Store, run: string | undefined, messag
 }
 
 // The pane's agent rows carry the agent id once it is known.
-function markAgent(store: Store, dispatch: string, agent: string) {
+function markAgent(store: Store, dispatch: string, agent: string, type?: string) {
   for (const model of Object.values(store.models)) {
     const row = model.agents.find(a => a.dispatch === dispatch)
-    if (row) row.agentId = agent
+    if (row) {
+      row.agentId = agent
+      if (type !== undefined) row.type = type
+    }
   }
   store.isDirty = true
 }
@@ -168,8 +171,16 @@ function showStatus(store: Store, listed: any[]) {
       if (seen && seen.status !== row.status) {
         row.status = seen.status
         store.isDirty = true
+        markTranscript(store, row.agentId)
       }
     }
+  }
+}
+
+// The shown agent's transcript is read again on the next tick.
+export function markTranscript(store: Store, agent: string | undefined) {
+  if (agent !== undefined && store.shown.kind === 'agent' && store.shown.agentId === agent) {
+    store.transcriptDirty = true
   }
 }
 
@@ -188,6 +199,7 @@ export function activityText(e: any): string {
 export function onAgentTool(store: Store, e: any, now: number) {
   const agent = typeof e?.agentId === 'string' ? e.agentId : undefined
   if (!agent || !store.agentDispatch.has(agent)) return
+  markTranscript(store, agent)
   for (const [key, model] of Object.entries(store.models)) {
     if (!isLive(model) || !model.agents.some(a => a.agentId === agent)) continue
     store.models = { ...store.models, [key]: applyEvent(model, { kind: 'activity', text: activityText(e) }, now) }

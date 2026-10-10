@@ -66,6 +66,22 @@ does **not** type-check `register.ts`; the tests carry the behaviour.
   and writes one `$.state` value per 100 ms tick; the `ui.render` hook only
   reads it. After `/clear`, `/resume` or `/branch` the timeline is reloaded
   from `relais native status`.
+- **An agent's transcript, in the pane.** Each known agent row is a Button,
+  with a dim row under it naming the agent as Claude Code's tasks footer does
+  (`relais:relais-worker-sonnet-medium`), and a hint under the last run's
+  agents: `Click or Enter an agent: its transcript here · ↓ to manage: full
+  view`. Pressing a row replaces the pane with that agent's transcript, read
+  with `$.session.messages({ agentId })`: a `[ back ]` Button and a header
+  (run, agent, status, model@effort, the run's elapsed time), then `person │`
+  and `agent │` rows (each message cut at 12 rows), `▸ <tool> <what>` rows
+  with the result's first 3 rows, `… running` on a tool use in flight and
+  `FAIL` on an error. Rows are laid out at the pane's width before they are
+  stored, pass through `cutLine`, and the newest 400 are kept. The read runs
+  outside the 100 ms flush, once per tool call of the agent and once a second
+  while it runs, once more when it finishes; it is bounded at 5 s (`transcript
+  slow`), a `{ deny }` reads `transcript unavailable`, and either is noted
+  once on the run. A plugin cannot open Claude Code's own agent view, which is
+  why the hint names `↓ to manage`.
 - **Status line.** Run count, phase, attempt, elapsed time and
   `/relais-status`; after `done` it keeps the outcome until the pane is opened
   or the next run starts.
@@ -78,8 +94,9 @@ does **not** type-check `register.ts`; the tests carry the behaviour.
   (`claude plugin validate` follows `$` only inside a file).
 - `hooks/*.ts` — pure logic and small effectful modules that take that `fx`
   object: `lines` (splitter), `dispatches` (usage and the end signal),
-  `timeline` (the run model), `pane` (layout), `guards`, `callbacks`, `agents`,
-  `runs`, `ui`, `store`.
+  `timeline` (the run model), `pane` (layout), `transcript` (an agent's
+  transcript as pane rows), `guards`, `callbacks`, `agents`, `runs`, `ui`,
+  `store`.
 - `agents/relais-worker-<model>-<effort>.md` — one worker definition per
   `native::worker_agent_types()` pair (`crates/relais/tests/plugin_agents.rs`
   keeps the two in step).
@@ -89,7 +106,8 @@ does **not** type-check `register.ts`; the tests carry the behaviour.
   `mcp__relais__onboard` / `mcp__relais__trust`, a replay with
   `mcp__relais__replay`, progress with `mcp__relais__status` or
   `/relais-status`.
-- `tests/*.test.ts`, `tests/views/relais-pane.test.ts` — the plugin's tests.
+- `tests/*.test.ts`, `tests/views/relais-pane.test.ts`,
+  `tests/views/agent-view.test.ts` — the plugin's tests.
 
 ## Installing
 

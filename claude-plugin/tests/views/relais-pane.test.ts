@@ -37,8 +37,11 @@ async function drawn($: any, engine: any, lines: string[], room: { bodyRows?: nu
     },
     viewport: { columns: 100, rows: 40, isFullscreen: true },
   })
-  const texts = (await ui.findAll({ type: 'Text' })).map((t: any) => t.text as string)
-  return { ui, texts, rows: await ui.findAll({ type: 'Text' }) }
+  // The rows as drawn, in order: Text rows and the agent rows, which are
+  // Buttons whose label is their text.
+  const rows = (await ui.findAll({})).filter((e: any) => e.type === 'Text' || e.type === 'Button')
+  const texts = rows.map((t: any) => t.text as string)
+  return { ui, texts, rows }
 }
 
 const indexOf = (texts: string[], needle: string) => texts.findIndex(t => t.includes(needle))
@@ -331,4 +334,24 @@ test('the status tool returns phases, decisions and cost, and at most 40 output 
   const [run] = JSON.parse((await $.tool.call({ tool: 'mcp__relais__status', output: true })).result)
   expect(run.output.length).toBe(40)
   expect(run.output[39]).toBe('line 70')
+})
+
+test('the agent view’s first three rows fit whole in a 72-column body', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.script.messages = () => [{ role: 'user', text: 'hello', toolUses: [] }]
+  engine.stream.push('stdout', phase(0, 'running') + started(1, 'd1') + spawnLine('d1'))
+  await settle(engine)
+  const { ui } = await drawn($, engine, [])
+  await ui.press({ key: 'agent:agent-1' })
+  await ui.unmount()
+  await engine.clock.advance(200)
+  await settle(engine)
+  const view = await drawn($, engine, [])
+  const back = await view.ui.find({ key: 'back' })
+  expect(back?.type).toBe('Button')
+  const header = view.texts.findIndex(t => t.startsWith('run '))
+  expect(header).toBeGreaterThanOrEqual(0)
+  for (const text of view.texts.slice(header, header + 2)) expect(Array.from(text).length).toBeLessThanOrEqual(72)
+  expect(view.texts.some(t => t.startsWith('Esc hands') || t.includes('Esc hands the keys back'))).toBe(true)
+  expect(Array.from(view.texts.find(t => t.includes('Esc hands'))!).length + '[ back ]'.length).toBeLessThanOrEqual(72)
 })

@@ -3,6 +3,8 @@
 // with its live output, capped by the rows the pane gets.
 
 import type { Fx } from './fx.ts'
+import type { TranscriptState } from './transcript.ts'
+import { MAX_TRANSCRIPT_ROWS } from './limits.ts'
 import {
   type RunModel,
   type Step,
@@ -16,13 +18,27 @@ import {
   stepOutput,
 } from './timeline.ts'
 
-export type Row = { text: string; color?: string; dim?: boolean; bold?: boolean }
+// What pressing a row's Button does.
+// What an agent row's press opens; `[ back ]` is drawn by `paneTree` itself.
+export type Press = { kind: 'agent'; agentId: string; run: string }
+
+export type Row = {
+  text: string
+  color?: string
+  dim?: boolean
+  bold?: boolean
+  // A row drawn as a plain Button keyed `key`; `text` is its label.
+  button?: { key: string; press: Press }
+}
 
 export type Room = { rows: number; columns: number; now: number }
 
 const TITLE_WIDTH = 22
 const MAX_AGENT_ROWS = 3
 const MAX_STDERR_ROWS = 3
+// A runs-view row is at most this many cells before the width cut.
+const MAX_ROW = 70
+const HINT = 'Click or Enter an agent: its transcript here · ↓ to manage: full view'
 // The pane's smallest sensible height; below it the layout still draws, cut.
 const MIN_ROWS = 6
 
@@ -40,7 +56,7 @@ function stepRow(step: Step): Row {
 }
 
 // Rows of a run that are not live output: header, steps, stderr, footer.
-function frame(m: RunModel, room: Room): { head: Row[]; steps: Row[]; tail: Row[] } {
+function frame(m: RunModel, room: Room, isLast: boolean): { head: Row[]; steps: Row[]; tail: Row[] } {
   const head: Row[] = [
     {
       // Before relais names the run, the plugin's placeholder key is no id.
@@ -77,16 +93,27 @@ function frame(m: RunModel, room: Room): { head: Row[]; steps: Row[]; tail: Row[
   // One row per agent: a repair continues the same agent under a new
   // dispatch, and it is still one agent (its latest status shown).
   const agents = agentRows(m)
+  // holds-until: a run whose fourth agent matters: its agents past the
+  // third sit under `+n more agents`, not pressable, until that row is a list.
   const shown = agents.slice(0, MAX_AGENT_ROWS)
   if (shown.length === 0) tail.push({ text: 'agents  none', dim: true })
+  let hasButton = false
   shown.forEach((a, i) => {
     const who = `${a.kind} ${shortId(a.id)}`
     const turns = a.dispatches > 1 ? ` · ${a.dispatches} dispatches` : ''
-    tail.push({ text: `${i === 0 ? 'agents  ' : '        '}● ${pad(who, 16)}${a.status}${turns}` })
+    const text = `${i === 0 ? 'agents  ' : '        '}● ${pad(who, 16)}${a.status}${turns}`
+    if (a.agentId === undefined) {
+      tail.push({ text })
+      return
+    }
+    hasButton = true
+    tail.push({ text, button: { key: `agent:${a.agentId}`, press: { kind: 'agent', agentId: a.agentId, run: m.run } } })
+    if (a.type !== undefined) tail.push({ text: `          ${a.type}`.slice(0, MAX_ROW), dim: true })
   })
   if (agents.length > shown.length) {
     tail.push({ text: `        +${agents.length - shown.length} more agents`, dim: true })
   }
+  if (isLast && hasButton) tail.push({ text: HINT, dim: true })
   tail.push({ text: `cost    ${formatCost(m.cost)}` })
   if (m.outcome) {
 
@@ -101,7 +128,14 @@ function frame(m: RunModel, room: Room): { head: Row[]; steps: Row[]; tail: Row[
   return { head, steps, tail }
 }
 
-type AgentLine = { id: string; kind: string; status: string; dispatches: number }
+type AgentLine = {
+  id: string
+  kind: string
+  status: string
+  dispatches: number
+  agentId: string | undefined
+  type: string | undefined
+}
 
 function agentRows(m: RunModel): AgentLine[] {
   const rows: AgentLine[] = []
@@ -111,8 +145,9 @@ function agentRows(m: RunModel): AgentLine[] {
     if (known) {
       known.status = a.status
       known.dispatches += 1
+      known.type = known.type ?? a.type
     } else {
-      rows.push({ id, kind: a.kind, status: a.status, dispatches: 1 })
+      rows.push({ id, kind: a.kind, status: a.status, dispatches: 1, agentId: a.agentId, type: a.type })
     }
   }
   return rows
@@ -133,7 +168,7 @@ export function layoutPane(runs: RunModel[], room: Room): Row[] {
     return [{ text: 'relais · waiting for the first event', dim: true }]
   }
   const rows = Math.max(room.rows, MIN_ROWS)
-  const frames = runs.map(m => ({ m, ...frame(m, room) }))
+  const frames = runs.map((m, i) => ({ m, ...frame(m, room, i === runs.length - 1) }))
   const fixed = frames.reduce((n, f) => n + f.head.length + f.steps.length + f.m.steps.length + f.tail.length, 0)
   const withOutput = frames.filter(f => isLive(f.m) || f.m.steps.some(s => s.checks.length > 0)).length
   const cap = withOutput > 0 ? Math.floor(Math.max(0, rows - fixed) / withOutput) : 0
@@ -161,32 +196,99 @@ function outputRowsOfFailed(m: RunModel, cap: number): Row[] {
   return check ? check.output.slice(-cap).map(text => ({ text: `  │ ${text}`, color: 'error' as const })) : []
 }
 
-export type PaneState = { runs: RunModel[]; now: number }
+// What the pane shows besides the runs: one agent's transcript.
+export type PaneShown = { kind: 'runs' } | { kind: 'agent'; agentId: string; run: string; transcript: TranscriptState }
 
-// The tree a `Pane` render draws: one `Text` a row, each cut at the end.
-export function paneTree(fx: Fx, e: any, state: PaneState | undefined) {
-  const { Box, Text } = fx.ui.resolve(e)
+export type PaneState = { runs: RunModel[]; now: number; shown?: PaneShown }
+
+export type PaneActions = {
+  openAgent: (agentId: string, run: string, columns: number) => unknown
+  back: () => unknown
+}
+
+const BACK_HINT = '  Esc hands the keys back · ↓ to manage: full view'
+
+// The agent view's rows under the `[ back ]` line: header, rule, transcript.
+export function layoutAgentView(shown: Extract<PaneShown, { kind: 'agent' }>, runs: RunModel[], room: Room): Row[] {
+  const m = runs.find(r => r.run === shown.run)
+  const agent = m?.agents.find(a => a.agentId === shown.agentId)
+  const model = agent ? `${agent.model}${agent.effort ? `@${agent.effort}` : ''}` : ''
+  const header = [
+    `run ${shortId(shown.run)}`,
+    `${agent?.kind ?? 'agent'} ${shortId(shown.agentId)}`,
+    agent?.status,
+    model,
+    m ? mmss(elapsedOf(m, room.now)) : '',
+  ]
+    .filter(Boolean)
+    .join(' · ')
+  const out: Row[] = [{ text: header, bold: true }, rule(room.columns)]
+  const t = shown.transcript
+  if (t.kind === 'loading') out.push({ text: 'loading', dim: true })
+  else if (t.kind === 'deny') out.push({ text: `transcript unavailable · ${t.reason}`, dim: true })
+  else if (t.kind === 'slow') out.push({ text: 'transcript slow · ↓ to manage: full view', dim: true })
+  else {
+    if (t.note) out.push({ text: t.note, dim: true })
+    out.push(...t.rows)
+  }
+  return out
+}
+
+// The tree a `Pane` render draws: one `Text` a row, each cut at the end; the
+// agent rows and `[ back ]` are Buttons.
+export function paneTree(fx: Fx, e: any, state: PaneState | undefined, actions: PaneActions) {
+  const { Box, Text, Button } = fx.ui.resolve(e)
+  const columns = e.props?.bodyColumns ?? 80
   const room: Room = {
     rows: e.props?.scroll?.bodyRows ?? 24,
-    columns: e.props?.bodyColumns ?? 80,
+    columns,
     now: state?.now ?? 0,
+  }
+  const text = (row: Row, key: string) =>
+    h(
+      Text,
+      { key, color: row.color, dimColor: row.dim, bold: row.bold, wrap: 'truncate-end' },
+      row.text,
+    )
+  const shown = state?.shown
+  if (shown?.kind === 'agent') {
+    const rows = layoutAgentView(shown, state?.runs ?? [], room).slice(-ROWS_CAP)
+    return h(
+      Box,
+      { flexDirection: 'column' },
+      h(
+        Box,
+        { key: 'top', flexDirection: 'row' },
+        h(Button, { key: 'back', autoFocus: true, onPress: () => actions.back() }, 'back'),
+        h(Text, { key: 'keys', dimColor: true, wrap: 'truncate-end' }, BACK_HINT),
+      ),
+      ...rows.map((row, i) => text(row, `row:${i}`)),
+    )
   }
   const rows = layoutPane(state?.runs ?? [], room)
   return h(
     Box,
     { flexDirection: 'column' },
-    ...rows.map((row, i) =>
-      h(
-        Text,
-        {
-          key: `row:${i}`,
-          color: row.color,
-          dimColor: row.dim,
-          bold: row.bold,
-          wrap: 'truncate-end',
-        },
-        row.text,
-      ),
-    ),
+    ...rows.map((row, i) => {
+      const press = row.button?.press
+      if (row.button && press?.kind === 'agent') {
+        return h(
+          Button,
+          // The text as `label`, not a Text child: Claude Code 2.1.291 (CI's
+          // `CLAUDE_CODE_PIN`) refuses a Button with element children; 2.1.295
+          // accepts it.
+          {
+            key: row.button.key,
+            label: row.text,
+            plain: true,
+            onPress: () => actions.openAgent(press.agentId, press.run, columns),
+          },
+        )
+      }
+      return text(row, `row:${i}`)
+    }),
   )
 }
+
+// The header, the rule, the transcript's rows and the one note line.
+const ROWS_CAP = MAX_TRANSCRIPT_ROWS + 3
