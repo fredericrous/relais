@@ -418,6 +418,29 @@ failOpen('answers in a shape it does not read', (argv: string[]) =>
   statusWith(argv[4], { state: 7, decision: { ...answered.decision, resolution: { what: 'approved' } } }),
 )
 
+test('a check that failed first and found an answer on a retry says both, once each', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  let isDown = true
+  engine.script.runResult = (argv: string[]) =>
+    argv[2] !== 'status'
+      ? ok()
+      : isDown
+        ? { exitCode: 1, stdout: '', stderr: 'ledger busy', isStdoutTruncated: false, isStderrTruncated: false }
+        : statusWith(argv[4], answered)
+  engine.script.submitFailures = 1
+  engine.stream.push('stdout', phase(0, 'running') + needsDecision())
+  await settle(engine)
+  await tick(engine, 100)
+  expect(engine.calls.prompts.length).toBe(0)
+  isDown = false
+  await tick(engine, 100)
+  expect(engine.calls.prompts.length).toBe(1)
+  expect(engine.calls.prompts[0].text).toContain('Since then: decision_approved')
+  const said = await paneNotes($)
+  expect(said.split('could not check the outcome is still current').length - 1).toBe(1)
+  expect(said.split('answered since it ended').length - 1).toBe(1)
+})
+
 test('an outcome whose submit keeps failing is checked every retry and noted once', async ($: any, on: any) => {
   const engine = await startedRun($, on)
   engine.script.runResult = (argv: string[]) =>

@@ -102,9 +102,9 @@ async function submitVerdicts(fx: Fx, store: Store) {
 async function freshen(fx: Fx, store: Store, text: string): Promise<string> {
   const pending = store.pendingOutcomes.get(text)
   if (!pending) return text
-  const say = async (message: string) => {
-    if (pending.isNoted) return
-    pending.isNoted = true
+  const say = async (kind: 'failed' | 'answered', message: string) => {
+    if (pending.noted.has(kind)) return
+    pending.noted.add(kind)
     await note(fx, store, pending.run, message)
   }
   let current: any
@@ -114,12 +114,12 @@ async function freshen(fx: Fx, store: Store, text: string): Promise<string> {
     })
     if (result.exitCode !== 0) {
       const why = String(result.stderr ?? '').trim().slice(0, 200)
-      await say(`could not check the outcome is still current (status exited ${result.exitCode}${why ? `: ${why}` : ''}); sent as it was`)
+      await say('failed', `could not check the outcome is still current (status exited ${result.exitCode}${why ? `: ${why}` : ''}); sent as it was`)
       return text
     }
     current = JSON.parse(String(result.stdout ?? '')).current
   } catch (reason) {
-    await say(`could not check the outcome is still current (${String((reason as any)?.message ?? reason).slice(0, 200)}); sent as it was`)
+    await say('failed', `could not check the outcome is still current (${String((reason as any)?.message ?? reason).slice(0, 200)}); sent as it was`)
     return text
   }
   if (!current || typeof current !== 'object') {
@@ -135,10 +135,10 @@ async function freshen(fx: Fx, store: Store, text: string): Promise<string> {
   // relais's own output, but read as it comes: a rewrite names only
   // strings, so a shape this plugin does not know sends the text as it was.
   if (typeof current.state !== 'string' || typeof decision.resolution !== 'string') {
-    await say('could not check the outcome is still current (relais native status answered in a shape this plugin does not read); sent as it was')
+    await say('failed', 'could not check the outcome is still current (relais native status answered in a shape this plugin does not read); sent as it was')
     return text
   }
-  await say(`answered since it ended (${decision.resolution}): the outcome message says so`)
+  await say('answered', `answered since it ended (${decision.resolution}): the outcome message says so`)
   return answeredText(pending, decision, current.state)
 }
 
@@ -352,7 +352,7 @@ async function onDone(fx: Fx, store: Store, child: Child, line: any, now: number
   // (`pump`) sends it.
   store.verdicts.push(text)
   if (AWAITS_A_PERSON.has(outcome) && typeof line.run === 'string') {
-    store.pendingOutcomes.set(text, { run, outcome, code, kind: trial ? 'replay' : 'run', facts, isNoted: false })
+    store.pendingOutcomes.set(text, { run, outcome, code, kind: trial ? 'replay' : 'run', facts, noted: new Set() })
   }
 }
 
