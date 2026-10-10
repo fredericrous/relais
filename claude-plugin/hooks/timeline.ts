@@ -450,9 +450,11 @@ export function timelineText(m: RunModel, now: number): string[] {
   return lines
 }
 
-// What the `status` tool returns: phases, decisions, cost, the outcome and at
-// most the last 40 output lines of a run.
-export function statusReply(m: RunModel, now: number) {
+// What the `status` tool returns: phases, decisions, cost and the outcome,
+// and the last 40 output lines of a run only when asked. Those lines are
+// mostly a check's own log: four status calls in one session carried
+// about 12K tokens of `cargo test` lines nobody read (2026-10-10).
+export function statusReply(m: RunModel, now: number, opts: { output?: boolean } = {}) {
   return {
     run: m.run,
     phase: m.phase,
@@ -468,7 +470,7 @@ export function statusReply(m: RunModel, now: number) {
     decisions: m.decisions.map(d => d.text),
     cost: formatCost(m.cost),
     outcome: m.outcome ?? null,
-    output: latestOutput(m, MAX_OUTPUT_LINES),
+    ...(opts.output ? { output: latestOutput(m, MAX_OUTPUT_LINES) } : {}),
     // relais's own human lines and the plugin's failures, the latest few.
     stderr: m.events.filter(e => e.kind === 'stderr').slice(-MAX_STDERR_LINES).map(e => e.text),
   }
