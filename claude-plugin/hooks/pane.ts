@@ -3,7 +3,8 @@
 // with its live output, capped by the rows the pane gets.
 
 import type { Fx } from './fx.ts'
-import { MAX_TRANSCRIPT_ROWS, type TranscriptState } from './transcript.ts'
+import type { TranscriptState } from './transcript.ts'
+import { MAX_TRANSCRIPT_ROWS } from './limits.ts'
 import {
   type RunModel,
   type Step,
@@ -251,7 +252,7 @@ export function paneTree(fx: Fx, e: any, state: PaneState | undefined, actions: 
     )
   const shown = state?.shown
   if (shown?.kind === 'agent') {
-    const rows = layoutAgentView(shown, state?.runs ?? [], room).slice(-rowsCap())
+    const rows = layoutAgentView(shown, state?.runs ?? [], room).slice(-ROWS_CAP)
     return h(
       Box,
       { flexDirection: 'column' },
@@ -282,7 +283,5 @@ export function paneTree(fx: Fx, e: any, state: PaneState | undefined, actions: 
   )
 }
 
-// The header, the rule, the transcript's rows and the one note line. A
-// function, not a constant: pane, ui and transcript import each other, so
-// the cap is read when the pane draws, never while the modules load.
-const rowsCap = () => MAX_TRANSCRIPT_ROWS + 3
+// The header, the rule, the transcript's rows and the one note line.
+const ROWS_CAP = MAX_TRANSCRIPT_ROWS + 3

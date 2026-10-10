@@ -7,6 +7,7 @@ import { activityText, note } from './agents.ts'
 import { cutLine, shortId } from './timeline.ts'
 import { detach, type Store } from './store.ts'
 import { flush, markDirty } from './ui.ts'
+import { MAX_TRANSCRIPT_ROWS } from './limits.ts'
 
 export type TranscriptRow = { text: string; dim?: boolean; color?: string }
 
@@ -18,9 +19,7 @@ export type TranscriptState =
   | { kind: 'deny'; reason: string }
   | { kind: 'slow' }
 
-// holds-until: a transcript the person wants to read whole in the pane;
-// the full one is Claude Code's own view (`↓ to manage`).
-export const MAX_TRANSCRIPT_ROWS = 400
+export { MAX_TRANSCRIPT_ROWS }
 export const MAX_MESSAGE_ROWS = 12
 export const MAX_RESULT_ROWS = 3
 export const READ_BOUND_MS = 5000
