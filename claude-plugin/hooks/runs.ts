@@ -77,7 +77,15 @@ async function submitVerdicts(fx: Fx, store: Store) {
       // every plugin's hooks but the submitter's.
       const text = await freshen(fx, store, store.verdicts[0])
       store.ownPrompts.add(text)
-      await fx.prompt.submit({ text })
+      try {
+        await fx.prompt.submit({ text })
+      } finally {
+        // The submit settles after every `prompt.submit` hook has run, so
+        // a mark still here was never read and never will be: the engine
+        // skips the submitter's own hooks. Kept, it would grow by one per
+        // outcome for the life of the session.
+        store.ownPrompts.delete(text)
+      }
     } catch (reason) {
       // Kept for the next tick; said once per streak of failures.
       if (!store.isSubmitFailing) {
