@@ -94,7 +94,8 @@ up, and the person answers there.
 
 4. Follow it and read the outcome.
    - Progress: call `mcp__relais__status` (phases, decisions, cost and
-     the last lines of output), or tell the person to open
+     outcome; add `output: true` only when the last lines of a check's
+     output are what you need), or tell the person to open
      `/relais-status`.
    - The outcome arrives as a message when the run ends. Do not end your
      turn before it arrives: a run whose session ends goes with it.

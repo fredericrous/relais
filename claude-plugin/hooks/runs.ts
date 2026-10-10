@@ -341,7 +341,7 @@ export async function reloadTimeline(fx: Fx, store: Store, run?: string) {
 }
 
 // The reply of the `status` tool: the models, or relais's own timeline.
-export async function statusOf(fx: Fx, store: Store, run?: string): Promise<string> {
+export async function statusOf(fx: Fx, store: Store, run?: string, opts: { output?: boolean } = {}): Promise<string> {
   const now = await fx.clock.now()
   const known = () => Object.values(store.models).filter(m => !run || m.run === run)
   if (known().length === 0) await reloadTimeline(fx, store, run)
@@ -351,5 +351,5 @@ export async function statusOf(fx: Fx, store: Store, run?: string): Promise<stri
       ? `No relais run is known in this session, and relais's own timeline could not be read: ${store.statusFailure}`
       : 'No relais run is known in this session.'
   }
-  return JSON.stringify(models.map(m => statusReply(m, now)))
+  return JSON.stringify(models.map(m => statusReply(m, now, opts)))
 }

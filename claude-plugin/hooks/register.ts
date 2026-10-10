@@ -154,10 +154,16 @@ export function register(on: any) {
     await $.tool.register({
       name: 'status',
       description:
-        "The phases, decisions, cost and latest output of relais runs: one run by id, or all of this session's.",
+        "The phases, decisions, cost and outcome of relais runs: one run by id, or all of this session's. A run's latest output lines only with output: true.",
       inputSchema: {
         type: 'object',
-        properties: { run: { type: 'string', description: 'A run id; all runs when left out.' } },
+        properties: {
+          run: { type: 'string', description: 'A run id; all runs when left out.' },
+          output: {
+            type: 'boolean',
+            description: "Also return each run's last 40 output lines (a check's own log, often long). Off by default.",
+          },
+        },
       },
     })
     await $.command.register({
@@ -240,7 +246,7 @@ export function register(on: any) {
   })
 
   on('tool.call', { tool: STATUS_TOOL }, async ($: any, e: any) => ({
-    result: await statusOf(effects($), store, typeof e.run === 'string' ? e.run : undefined),
+    result: await statusOf(effects($), store, typeof e.run === 'string' ? e.run : undefined, { output: e.output === true }),
   }))
 
   on('command.run', { command: 'relais-status' }, async ($: any) => {

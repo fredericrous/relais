@@ -180,7 +180,7 @@ test('a worker’s tool calls show under its attempt; another agent’s do not',
   const attempt = indexOf(texts, 'attempt 1 · worker')
   expect(texts.slice(attempt + 1, attempt + 3)).toEqual(['  │ Read src/greet.py', '  │ Bash python3 -m unittest -q'])
   expect(texts.some(t => t.includes('elsewhere.py'))).toBe(false)
-  const reply = await $.tool.call({ tool: 'mcp__relais__status' })
+  const reply = await $.tool.call({ tool: 'mcp__relais__status', output: true })
   expect(JSON.parse(reply.result)[0].output).toEqual(['Read src/greet.py', 'Bash python3 -m unittest -q'])
 })
 
@@ -307,7 +307,7 @@ test('where the pane is placed there is no toast, and /relais-status opens it', 
   }
 })
 
-test('the status tool returns phases, decisions, cost and at most 40 output lines', async ($: any, on: any) => {
+test('the status tool returns phases, decisions and cost, and at most 40 output lines only when asked', async ($: any, on: any) => {
   const engine = await startedRun($, on)
   const many = Array.from({ length: 70 }, (_, i) => `line ${i + 1}`).join('\n') + '\n'
   engine.stream.push(
@@ -321,11 +321,14 @@ test('the status tool returns phases, decisions, cost and at most 40 output line
     ].join(''),
   )
   await settle(engine)
-  const reply = await $.tool.call({ tool: 'mcp__relais__status' })
-  const [run] = JSON.parse(reply.result)
-  expect(run.phase).toBe('verifying')
-  expect(run.decisions).toEqual(['repair · checks_failed'])
+  // By default the reply leaves the output lines out.
+  const [brief] = JSON.parse((await $.tool.call({ tool: 'mcp__relais__status' })).result)
+  expect(brief.phase).toBe('verifying')
+  expect(brief.decisions).toEqual(['repair · checks_failed'])
+  expect('output' in brief).toBe(false)
+  expect(brief.phases.map((p: any) => p.title)).toContain('preflight')
+  // Asked for, they are the last 40.
+  const [run] = JSON.parse((await $.tool.call({ tool: 'mcp__relais__status', output: true })).result)
   expect(run.output.length).toBe(40)
   expect(run.output[39]).toBe('line 70')
-  expect(run.phases.map((p: any) => p.title)).toContain('preflight')
 })
