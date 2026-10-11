@@ -9364,7 +9364,7 @@ mod tests {
 
     #[test]
     fn the_actor_step_refuses_an_unmapped_spelling_by_name_and_changes_nothing() {
-        let dir = crate::test_support::temp_dir("ledger-v25-unmapped");
+        let dir = crate::test_support::temp_dir("ledger-v26-unmapped");
         std::fs::create_dir_all(&dir).expect("mkdir");
         let path = dir.join("ledger.sqlite");
         v26_ledger_with(&path, &["claude", "a stranger"]);
@@ -9383,7 +9383,7 @@ mod tests {
                 row.get(0)
             })
             .expect("count");
-        assert_eq!(applied, 25, "the ledger stays at v25");
+        assert_eq!(applied, 26, "the ledger stays at v26");
         std::fs::remove_dir_all(&dir).ok();
     }
 
