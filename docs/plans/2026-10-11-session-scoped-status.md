@@ -364,18 +364,31 @@ sessions, today. The ledger was v27, and the daemon migrated it to v28.
 | Scoping, another session | `--session 16e94aad…` | only that session's runs | 4 runs, all with `session` 16e94aad… ✅ |
 | Scoping, empty | `--session nobody` | `{"runs":[]}`, exit 0 | as expected ✅ |
 | Orphan reap, alive | running run, live driver pid | not reaped | `running`, verdict `alive` ✅ |
-| Orphan reap, `kill -9` | the driver killed, daemon running | `interrupted` within 15 s, one outcome line | `driver_gone` 4.8 s after the run went live; 1 new outcome line with the full sentence; one daemon log line ✅ |
+| Orphan reap, `kill -9` | the driver killed, daemon running; `driver_since` set hours back so the 60 s grace has passed | `interrupted` within 15 s, one outcome line | `driver_gone` 4.8 s after the run was made live and its driver killed; 1 new outcome line with the full sentence; one daemon log line ✅ |
 | Cancel, no session | `native cancel --run X` | exit 2, names the flag | exit 2, "--session is required" ✅ |
 | Cancel, unknown run | `--run run-nope` | exit 10 | exit 10 ✅ |
 | Cancel, already ended | the reaped run | "already ended: interrupted", exit 0 | as expected ✅ |
 | Cancel, foreign live | another session's run, driver just took it | exit 11 | exit 11, names the session ✅ |
 | Cancel, foreign gone | another session's run, dead driver | "had no live driver; marked cancelled", exit 0 | as expected; `cancelled` / `cancelled_without_worker` ✅ |
 | Cancel, own live | this session's run, driver ignores it | "cancel requested; the driver has not ended yet" after 10 s | as expected, exit 0 ✅ |
+| Cancel, own live, honoured | this session's run; its driver records `cancelled` and exits 3 s later | "run X cancelled", exit 0 | "run run-65d8e7700a416-cd78 cancelled", exit 0 after 3 s ✅ |
+| Per-turn usage, real input | `native usage --dispatch disp-65d8ead9…` with a cumulative of 5,000 input tokens, sent twice; then empty stdin | the delta over the booked 50, once; then exit 2 | one `#1` row of 4,950, the second send books nothing; empty stdin exits 2 with a message ✅ (cost NULL: the isolated config has no `[pricing]`, so the model is unpriced) |
 | Stalled | injected threshold | `stalled: true` | `native_status` test with `RELAIS_STALLED_AFTER_SECS` ✅ |
 | Per-turn cost, plugin | per-turn booking through the runner's stopped path | the rest booked once, one phase | runner and ledger tests; 251 plugin tests ✅ |
 
-The live plugin's per-turn booking in a real Claude Code session is
-checked against the installed release, as Landing says.
+Three checks run against the installed release, as Landing says, and
+not before:
+- the real plugin in two Claude Code sessions (B shows "No relais run is
+  known"; the pane stops counting a reaped run);
+- the plugin's per-turn booking in a live session;
+- the cleanup of `run-65d7dca899789-2d73`.
+
+They need the new binary on the live ledger, which it migrates to v28,
+and the installed 0.14.0 refuses v28. So running them before the
+release would leave the person's relais refusing its own ledger.
+`deliberate: post-release by the plan's Landing`. The reported run is
+already `interrupted` in the live ledger (a session-start sweep reaped
+it), so its cleanup is expected to print "already ended: interrupted".
 
 ## Decision log
 

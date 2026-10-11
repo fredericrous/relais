@@ -12,7 +12,10 @@ Status is scoped to the session, orphaned runs are reaped, a run can be
 cancelled from the session, and cost is booked every turn.
 
 - Ledger schema 28 (v28). An older binary refuses it: run `relais coordinator
-  stop` before using the new binary, so no old daemon keeps the ledger.
+  stop` before using the new binary, so no old daemon keeps the ledger. The
+  step only adds three nullable columns to `runs`; to be able to go back to
+  0.14, back the ledger up first, and restore that copy with the old binary:
+  `sqlite3 ~/.local/state/relais/ledger.sqlite ".backup ledger-v27.sqlite"`.
 - `relais native status --session <id>` lists the runs started from that
   Claude Code session (`{"runs":[…]}`, newest first, at most 20). The
   plugin's `status` tool and `/relais-status` use it, so a fresh session no

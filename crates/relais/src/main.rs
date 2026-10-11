@@ -4707,7 +4707,7 @@ fn native_status_command(run: Option<&str>, session: Option<&str>) -> Result<Cli
     // The ledger first: a reap appends the run's end to its events, which
     // the timeline below must then show.
     let current = match &opened {
-        Ok((ledger, writable)) => current_of_run(ledger, *writable, &run, stalled_after()),
+        Ok((ledger, access)) => current_of_run(ledger, *access, &run, stalled_after()),
         Err(e) => Err(CurrentUnknown::Unavailable(e.to_string())),
     };
     let path = artifacts.join(&run).join("events.jsonl");
@@ -4743,21 +4743,32 @@ fn native_status_command(run: Option<&str>, session: Option<&str>) -> Result<Cli
 /// with exit 0 when the session started none (or there is no ledger).
 fn native_status_of_session(
     artifacts: &Path,
-    opened: Result<(Ledger, bool), CurrentUnknown>,
+    opened: Result<(Ledger, StatusAccess), CurrentUnknown>,
     session: &str,
 ) -> Result<CliOutcome, CliError> {
     let entries = match opened {
-        Ok((ledger, writable)) => {
+        Ok((ledger, access)) => {
             let runs = operational(
                 ledger.runs_of_session(session, SESSION_RUNS_LIMIT),
                 "native status",
             )?;
             let mut entries = Vec::new();
             for run in runs {
-                let current = current_of_run(&ledger, writable, run.as_str(), stalled_after());
-                let events =
-                    std::fs::read_to_string(artifacts.join(run.as_str()).join("events.jsonl"))
-                        .unwrap_or_default();
+                let current = current_of_run(&ledger, access, run.as_str(), stalled_after());
+                let path = artifacts.join(run.as_str()).join("events.jsonl");
+                // A run refused before it wrote anything has no events: an
+                // empty timeline. Any other failure to read them is said.
+                let events = match std::fs::read_to_string(&path) {
+                    Ok(events) => events,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(e) => {
+                        eprintln!(
+                            "relais native status: {run}'s events at {} cannot be read: {e}",
+                            path.display()
+                        );
+                        String::new()
+                    }
+                };
                 let mut timeline = relais::protocol::timeline(run.as_str(), &events);
                 match current {
                     Ok(Some(current)) => timeline["current"] = current,
@@ -4781,7 +4792,16 @@ fn native_status_of_session(
 /// The ledger for `native status`, and whether it may be written: read
 /// only unless it exists at this binary's schema, and never created or
 /// migrated here.
-fn open_status_ledger() -> Result<(Ledger, bool), CurrentUnknown> {
+/// What `native status` may do with an orphan it finds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusAccess {
+    /// The ledger is writable: an orphan is reaped.
+    Reaping,
+    /// The ledger is not: an orphan is only reported (`orphaned: true`).
+    ReadOnly,
+}
+
+fn open_status_ledger() -> Result<(Ledger, StatusAccess), CurrentUnknown> {
     let path = paths::ledger_path().map_err(CurrentUnknown::Home)?;
     if !path.is_file() {
         return Err(CurrentUnknown::NoLedger(path));
@@ -4791,8 +4811,8 @@ fn open_status_ledger() -> Result<(Ledger, bool), CurrentUnknown> {
     // connection, whatever the cause (mode, owner, mount, ACL): SQLite's
     // own answer decides, not a guess from permission bits.
     Ok(match Ledger::open(&path) {
-        Ok(ledger) if ledger.is_read_only().is_ok_and(|ro| !ro) => (ledger, true),
-        Ok(_) | Err(_) => (read_only, false),
+        Ok(ledger) if ledger.is_read_only().is_ok_and(|ro| !ro) => (ledger, StatusAccess::Reaping),
+        Ok(_) | Err(_) => (read_only, StatusAccess::ReadOnly),
     })
 }
 
@@ -4825,12 +4845,12 @@ impl std::fmt::Display for CurrentUnknown {
 /// learns it. `Ok(None)` for a run the ledger does not know.
 ///
 /// A non-terminal run whose driver is provably gone (or silent past the
-/// silence rule) is reaped when `writable`; otherwise it is reported
+/// silence rule) is reaped under `StatusAccess::Reaping`; otherwise it is reported
 /// `orphaned: true` and nothing is written. A non-terminal run silent for
 /// `stalled_after` or more is `stalled: true`.
 fn current_of_run(
     ledger: &Ledger,
-    writable: bool,
+    access: StatusAccess,
     run: &str,
     stalled_after: std::time::Duration,
 ) -> Result<Option<serde_json::Value>, CurrentUnknown> {
@@ -4848,7 +4868,7 @@ fn current_of_run(
         let mut verdict = relais::reap::orphan_verdict_of_run(ledger, &run, silent)
             .map_err(|e| CurrentUnknown::Other(e.to_string()))?;
         if verdict != resume::OrphanVerdict::Alive {
-            if writable {
+            if access == StatusAccess::Reaping {
                 state = reap_for_status(ledger, &runs_dir, &run, state, verdict, silent)
                     .map_err(|e| CurrentUnknown::Other(e.to_string()))?;
                 // Not reaped (a dispatch lives): the run is alive, and

@@ -85,6 +85,13 @@ impl RunOutcome {
     }
 }
 
+/// How a run ended for its driver: by its own last transition, or by
+/// another process that ended it first (whose outcome event stands).
+enum Finish {
+    Own(RunOutcome),
+    Superseded(RunOutcome),
+}
+
 /// The runner's own failure, as distinct from anything a worker did.
 #[derive(Debug)]
 pub enum RunError {
@@ -1254,7 +1261,31 @@ impl<'a> RunEngine<'a> {
     }
 
     fn run(mut self) -> RunOutcome {
-        let outcome = self.run_to_outcome();
+        let outcome = match self.run_to_outcome() {
+            Finish::Own(outcome) => outcome,
+            // Another process ended the run (a reap, a workerless cancel)
+            // and wrote its one outcome event. This driver writes none: a
+            // second would contradict it. The plugin reading this stream
+            // is still told the run is over, with the state the ledger
+            // holds now.
+            Finish::Superseded(outcome) => {
+                if self.config.purpose != Some(crate::lifecycle::RunPurpose::Replay)
+                    && self.parent.is_none()
+                {
+                    let (code, detail) = outcome.terminal.named_reason();
+                    let _ = self.config.wire.send(&Request::Done {
+                        run: Some(self.run_id.as_str()),
+                        outcome: outcome.state().as_str(),
+                        receipt: None,
+                        summary: None,
+                        trial: None,
+                        code: code.as_deref(),
+                        detail,
+                    });
+                }
+                return outcome;
+            }
+        };
         // Whatever `persist_receipt` wrote, whichever way the run ended: an
         // accepted run's receipt, and the pending one a run stopped only by
         // an unmet sign-off stores (`store_pending_receipt`). The artifacts
@@ -1294,9 +1325,10 @@ impl<'a> RunEngine<'a> {
         outcome
     }
 
-    fn run_to_outcome(&mut self) -> RunOutcome {
+    fn run_to_outcome(&mut self) -> Finish {
         match self.run_inner() {
-            Ok(outcome) => outcome,
+            Ok(outcome) => Finish::Own(outcome),
+            Err(RunError::Superseded(_)) => Finish::Superseded(self.superseded_outcome()),
             Err(error) => {
                 // The runner itself failed. Say so on the record if the
                 // record will still take it; the outcome says so either
@@ -1305,16 +1337,37 @@ impl<'a> RunEngine<'a> {
                     "the runner could not continue: {error}; the run is interrupted and \
                      whatever was written is preserved"
                 );
-                let _ = self.transition(
+                match self.transition(
                     State::Interrupted,
                     Reason::RunnerFailure,
                     serde_json::json!({ "error": error.to_string() }),
-                );
-                RunOutcome {
-                    run_id: self.run_id.clone(),
-                    terminal: Terminal::Interrupted { detail },
+                ) {
+                    Err(RunError::Superseded(_)) => Finish::Superseded(self.superseded_outcome()),
+                    // Not recorded (the ledger refused it): the outcome
+                    // still says the run is interrupted, and why.
+                    Ok(()) | Err(_) => Finish::Own(RunOutcome {
+                        run_id: self.run_id.clone(),
+                        terminal: Terminal::Interrupted { detail },
+                    }),
                 }
             }
+        }
+    }
+
+    /// The outcome of a run another process ended: what the ledger holds
+    /// now, `cancelled` or else `interrupted`.
+    fn superseded_outcome(&self) -> RunOutcome {
+        let detail = format!(
+            "run {} was ended by another process (reaped or cancelled)",
+            self.run_id.as_str()
+        );
+        let terminal = match self.config.ledger.run_status(&self.run_id) {
+            Ok(Some(State::Cancelled)) => Terminal::Cancelled { detail },
+            Ok(_) | Err(_) => Terminal::Interrupted { detail },
+        };
+        RunOutcome {
+            run_id: self.run_id.clone(),
+            terminal,
         }
     }
 
@@ -8236,6 +8289,66 @@ mod tests {
             rows.iter().all(|r| r.2 == rows[0].2),
             "one dispatch, one phase: {rows:?}"
         );
+    }
+
+    /// A run reaped while its driver still works: the driver's next
+    /// transition is refused, and `run()` writes no second outcome event —
+    /// the reaper's stands alone.
+    #[test]
+    fn a_driver_whose_run_was_reaped_writes_no_second_outcome() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let ledger_path = fixture.dir.join("ledger.sqlite");
+        let runs_dir = fixture.artifacts.clone();
+        let backend = MockBackend::new(move |spec| {
+            // Mid-dispatch, another process reaps the run.
+            let ledger = Ledger::open(&ledger_path).expect("ledger");
+            let run = ledger
+                .dispatch_booking(&spec.dispatch_id)
+                .expect("booking")
+                .expect("on record")
+                .run_id;
+            let from = ledger.run_status(&run).expect("status").expect("state");
+            let reaped = crate::reap::reap(
+                &ledger,
+                &crate::reap::Reap {
+                    run: &run,
+                    from,
+                    ending: crate::reap::Ending::Interrupted,
+                    detail: "test reap".into(),
+                    extra: serde_json::Value::Null,
+                    events_dir: &runs_dir.join(run.as_str()),
+                },
+                &|_| false,
+            )
+            .expect("reap");
+            assert!(
+                matches!(reaped, crate::reap::Reaped::Moved(_)),
+                "{reaped:?}"
+            );
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(10)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &backend);
+        assert_eq!(outcome.state(), State::Interrupted, "{outcome:?}");
+        let text = std::fs::read_to_string(
+            fixture
+                .artifacts
+                .join(outcome.run_id.as_str())
+                .join("events.jsonl"),
+        )
+        .expect("events");
+        let outcomes: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("\"kind\":\"outcome\""))
+            .collect();
+        assert_eq!(outcomes.len(), 1, "only the reaper's outcome: {outcomes:?}");
+        assert!(outcomes[0].contains("test reap") || outcomes[0].contains("interrupted"));
     }
 
     #[test]

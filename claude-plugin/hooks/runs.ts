@@ -449,7 +449,10 @@ function foreignMarked(models: Record<string, RunModel>, session: string): Recor
 async function refreshRun(fx: Fx, store: Store, run: string) {
   try {
     const result = await fx.process.run(['relais', 'native', 'status', '--run', run], { timeoutMs: STATUS_TIMEOUT_MS })
-    if (result.exitCode !== 0) return
+    if (result.exitCode !== 0) {
+      store.statusFailure = `relais native status --run ${run} exited ${result.exitCode}: ${String(result.stderr ?? '').trim().slice(0, 400)}`
+      return
+    }
     const now = await fx.clock.now()
     const fresh = rebuildRuns(JSON.parse(String(result.stdout ?? '')), now)[run]
     const held = store.models[run]
@@ -459,8 +462,10 @@ async function refreshRun(fx: Fx, store: Store, run: string) {
       : { ...held, stalled: fresh.stalled }
     store.models = { ...store.models, [run]: next }
     markDirty(store)
-  } catch {
-    // The status reply then shows the model as the stream left it.
+  } catch (reason) {
+    // The status reply then shows the model as the stream left it, and
+    // says why it could not be refreshed.
+    store.statusFailure = `relais native status --run ${run} failed: ${String((reason as any)?.message ?? reason).slice(0, 400)}`
   }
 }
 

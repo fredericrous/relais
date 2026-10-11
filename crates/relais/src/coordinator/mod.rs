@@ -951,7 +951,9 @@ fn daemon_log() -> std::process::Stdio {
     };
     let path = dir.join(DAEMON_LOG);
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > DAEMON_LOG_MAX) {
-        let _rotated = std::fs::rename(&path, dir.join(format!("{DAEMON_LOG}.1")));
+        if let Err(e) = std::fs::rename(&path, dir.join(format!("{DAEMON_LOG}.1"))) {
+            eprintln!("relais coordinator: {} not rotated: {e}", path.display());
+        }
     }
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
@@ -962,7 +964,14 @@ fn daemon_log() -> std::process::Stdio {
     }
     match std::fs::create_dir_all(&dir).and_then(|()| options.open(&path)) {
         Ok(file) => file.into(),
-        Err(_) => std::process::Stdio::null(),
+        // Said on the starting CLI's stderr, the one place left to say it.
+        Err(e) => {
+            eprintln!(
+                "relais coordinator: no daemon log at {}: {e}",
+                path.display()
+            );
+            std::process::Stdio::null()
+        }
     }
 }
 
