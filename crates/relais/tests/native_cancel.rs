@@ -1,5 +1,8 @@
 //! `relais native cancel` (SPEC §23), through the real binary: who may
 //! cancel which run, and what each case prints and exits with.
+// Dead drivers are waited-for `true` processes: Unix process semantics,
+// as in release_scenarios.rs.
+#![cfg(unix)]
 
 mod common;
 

@@ -3524,6 +3524,7 @@ mod tests {
         run
     }
 
+    #[cfg(unix)]
     #[test]
     fn starting_over_a_run_with_a_dead_driver_reaps_it_once() {
         let dir = temp_dir("reapst");

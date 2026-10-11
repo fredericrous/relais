@@ -409,6 +409,7 @@ fn a_run_silent_past_the_stall_threshold_is_stalled_and_a_recent_one_is_not() {
     assert!(recent["current"].get("stalled").is_none(), "{recent}");
 }
 
+#[cfg(unix)]
 #[test]
 fn status_reaps_a_run_whose_driver_is_gone_and_leaves_one_outcome() {
     let world = World::new("reap");
@@ -444,7 +445,10 @@ fn status_reaps_a_run_whose_driver_is_gone_and_leaves_one_outcome() {
     assert_eq!(outcomes, 1, "{text}");
 }
 
-/// A run whose driver is gone: a dead pid, stamped long ago.
+/// A run whose driver is gone: a dead pid, stamped long ago. The reaping
+/// tests below are Unix-only: a dead driver is a waited-for `true`, and a
+/// read-only ledger is a mode bit.
+#[cfg(unix)]
 fn with_dead_driver(world: &World, run: &str) {
     let mut child = std::process::Command::new("true").spawn().expect("child");
     let dead = child.id();
@@ -458,6 +462,7 @@ fn with_dead_driver(world: &World, run: &str) {
     .expect("driver");
 }
 
+#[cfg(unix)]
 fn ledger_state(world: &World, run: &str) -> Option<State> {
     let conn = rusqlite::Connection::open(world.ledger_path()).expect("conn");
     let state: Option<String> = conn
@@ -473,6 +478,7 @@ fn ledger_state(world: &World, run: &str) -> Option<State> {
     })
 }
 
+#[cfg(unix)]
 #[test]
 fn a_non_terminal_run_carries_the_orphan_verdict() {
     let world = World::new("verdict");
@@ -488,6 +494,7 @@ fn a_non_terminal_run_carries_the_orphan_verdict() {
     assert!(reaped["current"].get("verdict").is_none(), "{reaped}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_read_only_ledger_reports_the_orphan_and_writes_nothing() {
     use std::os::unix::fs::PermissionsExt;
@@ -508,6 +515,7 @@ fn a_read_only_ledger_reports_the_orphan_and_writes_nothing() {
     assert_eq!(before, after);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_ledger_on_another_schema_is_not_reaped() {
     let world = World::new("noreap");
