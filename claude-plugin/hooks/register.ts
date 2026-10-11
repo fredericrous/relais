@@ -295,7 +295,7 @@ export function register(on: any) {
   })
 
   on('tool.call', { tool: DECIDE_TOOL }, async ($: any, e: any) => decideTool(effects($), store, e)).catch(() => ({
-    result: 'relais decide failed inside the plugin (internal error). Nothing was recorded.',
+    result: 'relais decide failed inside the plugin (internal error); whether the answer was recorded is unknown: check mcp__relais__status for the run before answering again.',
   }))
 
   on('tool.call', { tool: STATUS_TOOL }, async ($: any, e: any) => ({
