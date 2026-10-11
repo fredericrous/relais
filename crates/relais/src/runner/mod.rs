@@ -3736,6 +3736,9 @@ impl<'a> RunEngine<'a> {
         request: &ReviewRequest<'_>,
         spend: &mut RunSpend,
     ) -> ReviewOutcome {
+        // A reviewer gap belongs to the review that made it: a later
+        // review that ends before it builds its prompt carries none.
+        self.reviewer_gap = None;
         let Some((reviewer_tier, same_model)) = reviewer_tier(
             request.authority,
             request.candidate_tier,
@@ -4564,7 +4567,10 @@ fn fit_statements(rules: &[RuleRef], budget: usize) -> (Vec<&RuleRef>, Option<Gu
     let measured: usize = rules.iter().map(line_bytes).sum();
     let gap = GuidanceGap::new(
         GuidanceSource::Reviewer,
-        None,
+        context::guidance::GapCause::OverBudget {
+            measured,
+            budget,
+        },
         format!(
             "{} of {} constraint statements fit the reviewer prompt ({measured} bytes against {budget} left of the {REVIEW_PATCH_BUDGET_BYTES}-byte budget); omitted: {}",
             shown.len(),
@@ -10131,7 +10137,7 @@ mod tests {
                 .iter()
                 .map(|(key, choice)| context::RankedKey {
                     key: key.to_string(),
-                    state: "active".into(),
+                    state: context::guidance::RankState::Active,
                     adr: Some("ADR-0001".into()),
                     choice: Some(choice.to_string()),
                 })
@@ -10301,11 +10307,112 @@ mod tests {
     #[test]
     fn the_receipt_shows_a_guidance_line_only_when_there_is_a_gap() {
         assert_eq!(context::guidance::gap_line(&[]), None);
-        let gap = GuidanceGap::new(GuidanceSource::Relevant, Some(2), "aval exit 2");
+        let gap = GuidanceGap::new(
+            GuidanceSource::Relevant,
+            context::guidance::GapCause::Exited(2),
+            "aval exit 2",
+        );
         assert_eq!(
             context::guidance::gap_line(&[gap]).as_deref(),
             Some("guidance: relevant missing (aval exit 2)")
         );
+    }
+
+    fn engine_note_world(fixture: &Fixture) -> (TaskContract, RepoPolicy, MachineSettings) {
+        let repo = fixture.repo_policy(Vec::new(), 1);
+        let machine = fixture.machine_for(&repo);
+        (fixture.contract(Review::Off), repo, machine)
+    }
+
+    #[test]
+    fn guidance_note_is_empty_without_a_gap_and_names_a_manifest_gap_or_a_reviewer_gap() {
+        let fixture = Fixture::new();
+        let (contract, repo, machine) = engine_note_world(&fixture);
+        let backend = MockBackend::new(|_| unreachable!("no dispatch"));
+        let resolver = |_: &str, _: Option<&str>| AvalVerdict::Unknown;
+        let config = RunConfig {
+            repo_dir: &fixture.repo,
+            contract: &contract,
+            repo_policy: &repo,
+            machine: &machine,
+            ledger: &fixture.ledger,
+            ids: &fixture.ids,
+            backend: &backend,
+            git: &crate::workspace::SystemGit,
+            hooks: &crate::verify::FixedInventory(None),
+            attest: &crate::verify::FixedAttest::default(),
+            artifacts_dir: fixture.artifacts.clone(),
+            aval_resolver: &resolver,
+            predictor: None,
+            gate: None,
+            session_id: "test-session".into(),
+            heartbeat_every: Duration::from_millis(50),
+            task_override: None,
+            purpose: None,
+            run_id: None,
+            wire: Wire::process(),
+        };
+        let mut engine = RunEngine::new(&config, None).expect("engine");
+        let clean = manifest_with(Vec::new());
+        assert_eq!(engine.guidance_note(&clean), None);
+
+        let mut gapped = manifest_with(Vec::new());
+        gapped.guidance.gaps.push(GuidanceGap::new(
+            GuidanceSource::Index,
+            context::guidance::GapCause::NotLaunched,
+            "aval could not be launched",
+        ));
+        let note = engine.guidance_note(&gapped).expect("a manifest gap");
+        assert_eq!(note.matches("guidance:").count(), 1, "{note}");
+        assert!(note.contains("index missing"), "{note}");
+
+        engine.reviewer_gap = Some(GuidanceGap::new(
+            GuidanceSource::Reviewer,
+            context::guidance::GapCause::OverBudget {
+                measured: 10,
+                budget: 5,
+            },
+            "1 of 2 statements fit",
+        ));
+        let note = engine.guidance_note(&clean).expect("a reviewer gap");
+        assert_eq!(note.matches("guidance:").count(), 1, "{note}");
+        assert!(note.contains("reviewer constraints partial"), "{note}");
+
+        // A later review that ends before its prompt is built must not
+        // carry the earlier review's gap into the receipt.
+        let authority = EffectiveAuthority {
+            models: BTreeMap::new(),
+            max_attempts: 1,
+            max_wall_seconds: 60,
+            max_repairs_before_escalation: 1,
+            allow_nested_agents: false,
+            max_agent_depth: 1,
+            max_agents_total: 1,
+            verification_profile: crate::policy::VerificationProfile::default(),
+            review_floor: Review::Off,
+            disallowed_tools: Vec::new(),
+            authority_hash: "hash".into(),
+            grant_key: "key".into(),
+            trust_granted: true,
+            blockers: Vec::new(),
+        };
+        let request = ReviewRequest {
+            manifest: &clean,
+            authority: &authority,
+            candidate_sha: "abc",
+            candidate_tier: Tier::Research,
+            candidate_model: "haiku",
+            verification_inputs_changed: &[],
+            patch_path: PathBuf::from("candidate.patch"),
+            deadline: Instant::now() + Duration::from_secs(60),
+            routed_by: RoutedBy::ConservativeBaseline,
+            covering: None,
+        };
+        let mut spend = RunSpend::zero();
+        let outcome = engine.review_candidate(&request, &mut spend);
+        assert!(matches!(outcome, ReviewOutcome::Unavailable(_)));
+        assert_eq!(engine.guidance_note(&clean), None);
+        std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
     #[test]

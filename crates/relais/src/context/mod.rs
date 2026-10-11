@@ -767,7 +767,7 @@ pub fn gather_guidance(
             guidance.omitted = rules.omitted;
         }
         Err(gap) => {
-            aval_missing = gap.not_installed;
+            aval_missing = gap.is_not_launched();
             guidance.record(gap);
         }
     }
@@ -1225,7 +1225,7 @@ mod tests {
     fn ranked(key: &str, state: &str) -> RankedKey {
         RankedKey {
             key: key.into(),
-            state: state.into(),
+            state: guidance::RankState::from(state.to_string()),
             adr: Some("ADR-0001".into()),
             choice: (state == "active").then(|| "the choice".to_string()),
         }
@@ -1244,8 +1244,8 @@ mod tests {
         }
     }
 
-    fn gap(source: GuidanceSource, exit: Option<i32>) -> GuidanceGap {
-        GuidanceGap::new(source, exit, "boom")
+    fn gap(source: GuidanceSource, cause: guidance::GapCause) -> GuidanceGap {
+        GuidanceGap::new(source, cause, "boom")
     }
 
     #[test]
@@ -1285,10 +1285,14 @@ mod tests {
     fn each_guidance_failure_is_a_gap_and_the_run_continues() {
         let c = contract(&[]);
         let r = repo();
-        for exit in [Some(1), Some(2), None] {
+        for cause in [
+            guidance::GapCause::Exited(1),
+            guidance::GapCause::Exited(2),
+            guidance::GapCause::NoAnswer,
+        ] {
             let broken = Guided {
-                rules: Err(gap(GuidanceSource::Index, exit)),
-                relevant: Err(gap(GuidanceSource::Relevant, exit)),
+                rules: Err(gap(GuidanceSource::Index, cause.clone())),
+                relevant: Err(gap(GuidanceSource::Relevant, cause)),
             };
             let manifest = assemble(inputs(&c, &r, &broken)).expect("never blocks");
             let sources: Vec<GuidanceSource> = manifest
@@ -1320,11 +1324,8 @@ mod tests {
         let c = contract(&[]);
         let r = repo();
         let absent = Guided {
-            rules: Err(GuidanceGap {
-                not_installed: true,
-                ..gap(GuidanceSource::Index, None)
-            }),
-            relevant: Err(gap(GuidanceSource::Relevant, None)),
+            rules: Err(gap(GuidanceSource::Index, guidance::GapCause::NotLaunched)),
+            relevant: Err(gap(GuidanceSource::Relevant, guidance::GapCause::NoAnswer)),
         };
         let manifest = assemble(inputs(&c, &r, &absent)).expect("never blocks");
         assert_eq!(manifest.guidance.gaps.len(), 1);

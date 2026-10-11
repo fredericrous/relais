@@ -211,7 +211,7 @@ with measured and budget bytes, shown in the receipt gap line.
 ## Decision log
 
 - 2026-10-11, Phases 1–2: built by relais run `run-65d8d338c6051-dc00` (sonnet@medium). The run ran out of wall clock in verification; its single red check was `release_scenarios::a_run_awaiting_a_person_is_answered_by_decide_and_drops_off_the_open_list`, which passes alone (13 s). The base was red on two other tests in the same suite under the same load.
-- deliberate: no cancel flag on guidance spawns. `main.rs` builds `AvalCli::new`, with no run cancel flag, so `aval resolve` is not cancellable from the CLI either. Guidance spawns are bounded by their own 5 s `GUIDANCE_TIMEOUT`. Wiring a run cancel flag into `AvalCli` is its own change.
+- `AvalCli` passes its own cancel flag to guidance spawns, but `main.rs` builds `AvalCli::new` without one, so CLI runs are bounded by the 5 s `GUIDANCE_TIMEOUT` only (as `aval resolve` is not cancellable from the CLI either). Wiring a run cancel flag into `AvalCli` is its own change.
 - deliberate: the receipt gap line goes into `VerificationReport.notes`, not a new receipt field (receipt types live in `verify/`).
 - deliberate: when aval cannot be launched, the relevant query is skipped, giving one gap, not two.
 

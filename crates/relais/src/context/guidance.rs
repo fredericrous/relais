@@ -44,24 +44,41 @@ pub enum GuidanceSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuidanceGap {
     pub source: GuidanceSource,
-    /// aval's exit status when it ran to an exit; `None` for a timeout, a
-    /// cancellation or a binary that would not launch.
-    pub exit: Option<i32>,
+    #[serde(default)]
+    pub cause: GapCause,
     pub detail: String,
+}
+
+/// Why guidance is missing: one cause per gap, never a flag pair.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GapCause {
+    /// aval ran to this non-zero exit status.
+    Exited(i32),
+    /// aval timed out, was cancelled or died on a signal.
+    #[default]
+    NoAnswer,
     /// The `aval` binary could not be launched at all: asking it a second
     /// question would fail the same way.
-    #[serde(default)]
-    pub not_installed: bool,
+    NotLaunched,
+    /// The guidance was dropped to fit its byte budget.
+    OverBudget { measured: usize, budget: usize },
+    /// aval answered, and the answer was not the expected shape.
+    Unparseable,
 }
 
 impl GuidanceGap {
-    pub fn new(source: GuidanceSource, exit: Option<i32>, detail: impl Into<String>) -> Self {
+    pub fn new(source: GuidanceSource, cause: GapCause, detail: impl Into<String>) -> Self {
         Self {
             source,
-            exit,
+            cause,
             detail: detail.into(),
-            not_installed: false,
         }
+    }
+
+    /// Asking aval again would fail the same way.
+    pub fn is_not_launched(&self) -> bool {
+        self.cause == GapCause::NotLaunched
     }
 
     /// One phrase for the receipt: `relevant missing (aval exit 2)`.
@@ -111,13 +128,43 @@ pub struct Rules {
     pub omitted: Omitted,
 }
 
+/// A ranked key's state as aval reports it; anything but the two known
+/// states is kept as aval wrote it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum RankState {
+    Active,
+    Undecided,
+    Other(String),
+}
+
+impl From<String> for RankState {
+    fn from(state: String) -> Self {
+        match state.as_str() {
+            "active" => Self::Active,
+            "undecided" => Self::Undecided,
+            _ => Self::Other(state),
+        }
+    }
+}
+
+impl From<RankState> for String {
+    fn from(state: RankState) -> Self {
+        match state {
+            RankState::Active => "active".to_string(),
+            RankState::Undecided => "undecided".to_string(),
+            RankState::Other(other) => other,
+        }
+    }
+}
+
 /// One decision key aval ranked, with its state as aval reported it. A
 /// ranking is a suggestion: a key that is not active is recorded and
 /// never blocks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RankedKey {
     pub key: String,
-    pub state: String,
+    pub state: RankState,
     #[serde(default)]
     pub adr: Option<String>,
     #[serde(default)]
@@ -175,7 +222,7 @@ impl Guidance {
         let keys = self
             .relevant_keys
             .iter()
-            .filter(|ranked| ranked.state == "active")
+            .filter(|ranked| ranked.state == RankState::Active)
             .filter_map(|ranked| {
                 let choice = ranked.choice.as_deref()?;
                 Some(match &ranked.adr {
@@ -213,7 +260,10 @@ pub fn fit_budget(guidance: &mut Guidance, budget: usize) {
         guidance.relevant_rules.clear();
         guidance.record(GuidanceGap::new(
             GuidanceSource::Relevant,
-            None,
+            GapCause::OverBudget {
+                measured: index + relevant,
+                budget,
+            },
             format!(
                 "dropped over budget: guidance measured {} bytes against a {budget}-byte budget",
                 index + relevant
@@ -224,7 +274,10 @@ pub fn fit_budget(guidance: &mut Guidance, budget: usize) {
         guidance.index.clear();
         guidance.record(GuidanceGap::new(
             GuidanceSource::Index,
-            None,
+            GapCause::OverBudget {
+                measured: index,
+                budget,
+            },
             format!(
                 "dropped over budget: index measured {index} bytes against a {budget}-byte budget"
             ),
@@ -293,7 +346,7 @@ pub fn parse_rules_output(stdout: &str) -> Result<Rules, GuidanceGap> {
     let raw: RawRules = serde_json::from_str(stdout.trim()).map_err(|e| {
         GuidanceGap::new(
             GuidanceSource::Index,
-            Some(0),
+            GapCause::Unparseable,
             format!("unparseable aval rules output: {e}"),
         )
     })?;
@@ -329,7 +382,8 @@ struct RawRelevant {
 /// Parse `aval relevant … --json` (aval 1.9.0): the ranked keys with their
 /// state and the ranked rules. An output with neither list is a gap.
 pub fn parse_relevant_output(stdout: &str) -> Result<Relevant, GuidanceGap> {
-    let gap = |detail: String| GuidanceGap::new(GuidanceSource::Relevant, Some(0), detail);
+    let gap =
+        |detail: String| GuidanceGap::new(GuidanceSource::Relevant, GapCause::Unparseable, detail);
     let raw: RawRelevant = serde_json::from_str(stdout.trim())
         .map_err(|e| gap(format!("unparseable aval relevant output: {e}")))?;
     if raw.keys.is_none() && raw.rules.is_none() {
@@ -344,7 +398,7 @@ pub fn parse_relevant_output(stdout: &str) -> Result<Relevant, GuidanceGap> {
             .into_iter()
             .map(|key| RankedKey {
                 key: key.key,
-                state: key.state,
+                state: RankState::from(key.state),
                 adr: key.adr,
                 choice: key.choice,
             })
@@ -446,19 +500,22 @@ pub fn run_aval(
             crate::procs::Ended::Exited(0) => Ok(end.stdout),
             crate::procs::Ended::Exited(code) => Err(GuidanceGap::new(
                 source,
-                Some(code),
+                GapCause::Exited(code),
                 format!("aval exit {code}"),
             )),
-            other => Err(GuidanceGap::new(
+            ended @ (crate::procs::Ended::TimedOut
+            | crate::procs::Ended::Cancelled
+            | crate::procs::Ended::Signalled) => Err(GuidanceGap::new(
                 source,
-                None,
-                format!("aval did not answer: {}", other.describe()),
+                GapCause::NoAnswer,
+                format!("aval did not answer: {}", ended.describe()),
             )),
         },
-        Err(e) => Err(GuidanceGap {
-            not_installed: true,
-            ..GuidanceGap::new(source, None, format!("aval could not be launched: {e}"))
-        }),
+        Err(e) => Err(GuidanceGap::new(
+            source,
+            GapCause::NotLaunched,
+            format!("aval could not be launched: {e}"),
+        )),
     }
 }
 
@@ -504,9 +561,9 @@ mod tests {
     fn relevant_json_keeps_the_active_key_the_undecided_key_and_the_rules() {
         let relevant = parse_relevant_output(RELEVANT_JSON).expect("parses");
         assert_eq!(relevant.keys.len(), 2);
-        assert_eq!(relevant.keys[0].state, "active");
+        assert_eq!(relevant.keys[0].state, RankState::Active);
         assert_eq!(relevant.keys[0].adr.as_deref(), Some("ADR-0001"));
-        assert_eq!(relevant.keys[1].state, "undecided");
+        assert_eq!(relevant.keys[1].state, RankState::Undecided);
         assert_eq!(relevant.keys[1].choice, None);
         assert_eq!(relevant.rules[0].id, "effects.at-the-boundary");
         assert_eq!(relevant.rules[0].level, "constraint");
@@ -621,9 +678,9 @@ mod tests {
         );
 
         let exit1 = sh("exit 1", GuidanceSource::Index, five).unwrap_err();
-        assert_eq!(exit1.exit, Some(1));
+        assert_eq!(exit1.cause, GapCause::Exited(1));
         let exit2 = sh("exit 2", GuidanceSource::Relevant, five).unwrap_err();
-        assert_eq!(exit2.exit, Some(2));
+        assert_eq!(exit2.cause, GapCause::Exited(2));
         assert_eq!(exit2.describe(), "relevant missing (aval exit 2)");
 
         let slow = sh(
@@ -632,7 +689,7 @@ mod tests {
             Duration::from_millis(100),
         )
         .unwrap_err();
-        assert_eq!(slow.exit, None);
+        assert_eq!(slow.cause, GapCause::NoAnswer);
         assert!(slow.detail.contains("timed out"), "{}", slow.detail);
 
         let missing = run_aval(
@@ -644,7 +701,47 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(missing.not_installed, "{missing:?}");
+        assert_eq!(missing.cause, GapCause::NotLaunched, "{missing:?}");
+    }
+
+    #[test]
+    fn a_cancelled_spawn_returns_a_gap_well_before_the_timeout() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancel = AtomicBool::new(false);
+        let timeout = Duration::from_secs(30);
+        let started = std::time::Instant::now();
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(200));
+                cancel.store(true, Ordering::SeqCst);
+            });
+            run_aval(
+                "sleep",
+                &["30".to_string()],
+                Path::new("."),
+                GuidanceSource::Relevant,
+                timeout,
+                Some(&cancel),
+            )
+        });
+        let gap = result.expect_err("a cancelled spawn is a gap");
+        assert_eq!(gap.cause, GapCause::NoAnswer);
+        assert_eq!(gap.source, GuidanceSource::Relevant);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(started.elapsed() < timeout);
+    }
+
+    #[test]
+    fn an_unknown_rank_state_is_kept_as_aval_wrote_it() {
+        assert_eq!(
+            RankState::from("retired".to_string()),
+            RankState::Other("retired".into())
+        );
+        assert_eq!(String::from(RankState::Other("retired".into())), "retired");
     }
 
     fn guidance_with(index: usize, relevant: usize) -> Guidance {
@@ -692,7 +789,7 @@ mod tests {
     #[test]
     fn the_receipt_line_exists_only_for_a_gap() {
         assert_eq!(gap_line(&[]), None);
-        let gap = GuidanceGap::new(GuidanceSource::Relevant, Some(2), "aval exit 2");
+        let gap = GuidanceGap::new(GuidanceSource::Relevant, GapCause::Exited(2), "aval exit 2");
         assert_eq!(
             gap_line(&[gap]).as_deref(),
             Some("guidance: relevant missing (aval exit 2)")
