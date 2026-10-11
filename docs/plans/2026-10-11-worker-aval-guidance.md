@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/worker-aval-guidance
 repos: [relais]
 adrs: []
@@ -171,9 +171,9 @@ with measured and budget bytes, shown in the receipt gap line.
 1. [x] Port + parsers + `assemble` + manifest, with tests (below).
 2. [x] Prompts (worker, reviewer, planner), receipt gap line, SPEC and skill
    text.
-3. `make check` exits 0, implementation review, PR, merge on green, release
+3. [x] `make check` exits 0, implementation review, PR, merge on green, release
    (minor: v0.13.0) so the installed `relais` carries it.
-4. Live: run a contract with write_scope `crates/relais/src/context/**` in
+4. [x] Live: run a contract with write_scope `crates/relais/src/context/**` in
    this repo. Expected: the run's `manifest.json` has `guidance.index`
    containing `errors.never-swallowed` and `guidance.relevant` with ≥1
    rule; the dispatched worker prompt contains the `constraint index` and
@@ -194,7 +194,7 @@ Observed on `eca07d0` (gate `make check`: 1347 unit tests and every integration 
 | Old manifest | JSON without `guidance` → parses | pass: `a_manifest_written_before_guidance_still_parses`, `a_guidance_less_manifest_value_reads_as_empty` |
 | `make check` | exit 0 | exit 0 (pre-commit gate on `eca07d0`) |
 | Packages | each package run emits its own gap events | by reading: package runs go through `RunEngine::run` → `preflight` → the one `assemble` call (`runner/mod.rs:1601`) |
-| Phase 4 live run | as stated in Phases | next phase, after v0.13.0 |
+| Phase 4 live run | relais 0.13.0, write_scope `crates/relais/src/context/**`, review required → guidance in manifest and prompts | pass: run `run-65d8fdb6e6f86-11113` accepted. The manifest has 69 index ids including `errors.never-swallowed`, 5 ranked keys, 5 ranked rules and no gaps. The worker prompt has the `constraint index` and `relevant guidance` fences once each, plus the `aval rule` line. The reviewer prompt has `constraints in force` with the full `errors.never-swallowed` statement and no `aval rule` line. The worker did not run `aval rule`; a one-line doc comment did not call for it. |
 
 ## Decision log
 
@@ -207,7 +207,7 @@ Observed on `eca07d0` (gate `make check`: 1347 unit tests and every integration 
 
 approve-with-changes, then approve-with-changes on the Delta with all six findings resolved (no new finding).
 Fixed: GapCause enum, RankState parse, exhaustive Ended match, cancel test, guidance_note tests, reviewer-gap reset, observed verification above.
-Next phase: 3 (PR, merge, v0.13.0), then 4 (live run).
+Shipped: #203, released in v0.13.0 (#204); Phase 4 observed live.
 Tokens: 74k + 85k; 75 s + 19 s.
 
 <!-- panel: repos=relais reviewers=backend,lang:rust,tui,unix body-sha=5ac21fdc6046 -->
