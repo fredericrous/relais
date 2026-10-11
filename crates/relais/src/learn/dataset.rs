@@ -61,7 +61,11 @@ pub const DATASET_VERSION: u32 = 5;
 /// Version 2 admits a person's salvage as a positive label when the run
 /// was raised from `needs_review` with `review_findings` and its verified
 /// candidate patch survives intact in the landed commit.
-pub const LABEL_POLICY_VERSION: u32 = 2;
+///
+/// Version 3 records who answered (ADR-0004): an orchestrator's approval
+/// is its own route, and an orchestrator's contained salvage its own label
+/// source, so neither is read as the person's judgment.
+pub const LABEL_POLICY_VERSION: u32 = 3;
 
 /// The window dataset construction reads: every run the ledger holds.
 /// Far enough in the past that no relais ledger predates it.
@@ -384,10 +388,15 @@ pub fn build(
         // evidence (raising state and reason, containment) lives on it.
         let decision = read_of(&run_id, "decision", ledger.decision_of_run(&run_id))?;
         let salvage = salvage_evidence_of(decision.as_ref());
+        let by_orchestrator = decision.as_ref().and_then(|record| record.actor.as_deref())
+            == Some(crate::ledger::Actor::Orchestrator.as_str());
         // Infrastructure and unresolved outcomes are excluded, not
         // relabelled (SPEC §17).
         let (accepted, label_source) = match labelling_of(state, outcome_kind, salvage) {
             Labelling::Accepted => (true, LabelSource::Runner),
+            Labelling::AcceptedViaSalvage if by_orchestrator => {
+                (true, LabelSource::OrchestratorSalvageContained)
+            }
             Labelling::AcceptedViaSalvage => (true, LabelSource::PersonSalvageContained),
             Labelling::Failed => (false, LabelSource::Runner),
             Labelling::Excluded(why) => {
@@ -419,7 +428,11 @@ pub fn build(
         // positive label.
         let route =
             if decision.and_then(|record| record.resolution) == Some(Reason::DecisionApproved) {
-                AcceptanceRoute::PersonApproved
+                if by_orchestrator {
+                    AcceptanceRoute::OrchestratorApproved
+                } else {
+                    AcceptanceRoute::PersonApproved
+                }
             } else {
                 AcceptanceRoute::Verified
             };
@@ -1123,6 +1136,7 @@ argv = ["true"]
                     resolution: crate::lifecycle::Reason::DecisionApproved,
                     actor: crate::ledger::Actor::Person,
                     person_quote: None,
+                    recorded_via: crate::ledger::RecordedVia::Cli,
                     note: None,
                     successor_run: None,
                     from_state: State::NeedsDecision,
@@ -1139,6 +1153,52 @@ argv = ["true"]
         );
     }
 
+    /// An orchestrator's approval is kept apart from a person's
+    /// (ADR-0004), and is no label either.
+    #[test]
+    fn an_orchestrator_approved_task_has_its_own_route_and_no_label() {
+        let fixture = LedgerFixture::open("dataset-orchestrator-approved");
+        fixture.dispatched("run-a", "implementation", "initial");
+        fixture
+            .ledger
+            .record_transition(&crate::ledger::Transition {
+                run_id: run_id("run-a"),
+                attempt_id: None,
+                from_state: Some(State::Verifying),
+                to_state: State::NeedsDecision,
+                reason: "worker_dispatched".into(),
+                detail: None,
+                at: crate::ledger::now_rfc3339(),
+            })
+            .expect("transition into needs_decision opens a decision");
+        fixture
+            .ledger
+            .resolve_decision(
+                &run_id("run-a"),
+                &crate::ledger::DecisionAnswer {
+                    resolution: crate::lifecycle::Reason::DecisionApproved,
+                    actor: crate::ledger::Actor::Orchestrator,
+                    person_quote: None,
+                    recorded_via: crate::ledger::RecordedVia::Cli,
+                    note: None,
+                    successor_run: None,
+                    from_state: State::NeedsDecision,
+                    to_state: State::Accepted,
+                },
+            )
+            .expect("resolve");
+        let dataset = fixture.build();
+        assert_eq!(dataset.records.len(), 1);
+        assert_eq!(
+            dataset.records[0].route,
+            AcceptanceRoute::OrchestratorApproved
+        );
+        assert!(
+            !dataset.records[0].accepted_without_escalation,
+            "an orchestrator's approval is never a positive label"
+        );
+    }
+
     /// A run raised into `raised` for `reason`, then salvaged by a person
     /// with the given containment. A same-state retirement row follows, as
     /// it does for every real run: the rule must not read it.
@@ -1148,6 +1208,25 @@ argv = ["true"]
         raised: State,
         reason: &str,
         contained: Option<bool>,
+    ) {
+        salvaged_by(
+            fixture,
+            run,
+            raised,
+            reason,
+            contained,
+            crate::ledger::Actor::Person,
+        );
+    }
+
+    /// [`salvaged_after`], recorded by `actor`.
+    fn salvaged_by(
+        fixture: &LedgerFixture,
+        run: &str,
+        raised: State,
+        reason: &str,
+        contained: Option<bool>,
+        actor: crate::ledger::Actor,
     ) {
         fixture.dispatched(run, "implementation", "initial");
         let transition = |from: State, to: State, reason: &str| crate::ledger::Transition {
@@ -1172,8 +1251,11 @@ argv = ["true"]
             .record_salvage_contained(
                 &run_id(run),
                 "abc123",
-                crate::ledger::Actor::Person,
-                None,
+                crate::ledger::Answerer {
+                    actor,
+                    person_quote: None,
+                    recorded_via: crate::ledger::RecordedVia::Cli,
+                },
                 None,
                 contained,
             )
@@ -1200,6 +1282,27 @@ argv = ["true"]
         let record = only_record(&fixture).expect("a record");
         assert!(record.accepted_without_escalation);
         assert_eq!(record.label_source, LabelSource::PersonSalvageContained);
+    }
+
+    /// The same contained salvage recorded by the orchestrator is still a
+    /// label (containment is mechanical), under its own source (ADR-0004).
+    #[test]
+    fn an_orchestrator_contained_salvage_is_a_positive_under_its_own_source() {
+        let fixture = LedgerFixture::open("dataset-salvage-orchestrator");
+        salvaged_by(
+            &fixture,
+            "run-a",
+            State::NeedsReview,
+            "review_findings",
+            Some(true),
+            crate::ledger::Actor::Orchestrator,
+        );
+        let record = only_record(&fixture).expect("a record");
+        assert!(record.accepted_without_escalation);
+        assert_eq!(
+            record.label_source,
+            LabelSource::OrchestratorSalvageContained
+        );
     }
 
     #[test]
@@ -1355,6 +1458,7 @@ argv = ["true"]
                     resolution: Reason::DecisionApproved,
                     actor: crate::ledger::Actor::Person,
                     person_quote: None,
+                    recorded_via: crate::ledger::RecordedVia::Cli,
                     note: None,
                     successor_run: None,
                     from_state: State::NeedsReview,

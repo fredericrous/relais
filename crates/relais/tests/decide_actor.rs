@@ -256,3 +256,140 @@ fn a_refusal_under_json_prints_error_and_the_matching_exit() {
     let json: serde_json::Value = serde_json::from_slice(&unknown.stdout).expect("json");
     assert_eq!(json["exit"], 10);
 }
+
+impl World {
+    /// `decide` with `--proof-stdin` and `proof` written on its stdin.
+    fn decide_proved(&self, proof: &str, args: &[&str]) -> Output {
+        use std::io::Write;
+        let mut child = common::relais(BIN)
+            .arg("decide")
+            .arg("run-1")
+            .args(args)
+            .arg("--proof-stdin")
+            .current_dir(&self.root)
+            .env("RELAIS_STATE_DIR", &self.state)
+            .env("RELAIS_CONFIG_DIR", self.root.join("cfg"))
+            .env("HOME", &self.root)
+            .env("USERPROFILE", &self.root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("relais runs");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(proof.as_bytes())
+            .expect("write proof");
+        child.wait_with_output().expect("relais ends")
+    }
+
+    fn mint(&self, session: &str) -> String {
+        Ledger::open(&self.state.join("ledger.sqlite"))
+            .expect("ledger")
+            .mint_decide_nonce(session)
+            .expect("mint")
+    }
+
+    fn recorded_via(&self) -> String {
+        rusqlite::Connection::open(self.state.join("ledger.sqlite"))
+            .expect("open")
+            .query_row(
+                "SELECT recorded_via FROM decisions WHERE run = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row")
+    }
+}
+
+#[test]
+fn a_live_plugin_nonce_records_plugin_and_the_ledger_never_holds_it() {
+    let world = World::new("nonce-ok");
+    let nonce = world.mint("s-1");
+    let proof = serde_json::json!({"session": "s-1", "nonce": nonce}).to_string();
+    let output = world.decide_proved(
+        &proof,
+        &[
+            "--answer",
+            "revise",
+            "--actor",
+            "person-via-orchestrator",
+            "--person-quote",
+            "revise it, the scope is too wide",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(world.recorded_via(), "plugin");
+    let bytes = std::fs::read(world.state.join("ledger.sqlite")).expect("ledger bytes");
+    let wal = std::fs::read(world.state.join("ledger.sqlite-wal")).unwrap_or_default();
+    for file in [&bytes, &wal] {
+        assert!(
+            !file.windows(nonce.len()).any(|w| w == nonce.as_bytes()),
+            "the plaintext nonce is never stored"
+        );
+    }
+}
+
+#[test]
+fn a_wrong_or_ended_nonce_records_cli() {
+    for (tag, end) in [("nonce-wrong", false), ("nonce-ended", true)] {
+        let world = World::new(tag);
+        let nonce = world.mint("s-1");
+        let sent = if end {
+            assert!(Ledger::open(&world.state.join("ledger.sqlite"))
+                .expect("ledger")
+                .end_decide_nonce("s-1")
+                .expect("end"));
+            nonce
+        } else {
+            "0".repeat(64)
+        };
+        let proof = serde_json::json!({"session": "s-1", "nonce": sent}).to_string();
+        let output =
+            world.decide_proved(&proof, &["--answer", "revise", "--actor", "orchestrator"]);
+        assert_eq!(output.status.code(), Some(0), "{tag}: {}", stderr(&output));
+        assert_eq!(world.recorded_via(), "cli", "{tag}");
+    }
+}
+
+#[test]
+fn a_stale_nonce_cannot_sign_off_and_the_receipt_is_untouched() {
+    let world = World::new("nonce-crit");
+    world.mint("s-1");
+    let before = world.receipt();
+    let proof = serde_json::json!({"session": "s-1", "nonce": "f".repeat(64)}).to_string();
+    let output = world.decide_proved(
+        &proof,
+        &[
+            "--answer",
+            "approve",
+            "--criterion",
+            "X",
+            "--actor",
+            "person-via-orchestrator",
+            "--person-quote",
+            "yes, approve it",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        stderr(&output).contains("plugin's proof"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(world.receipt(), before);
+    assert_eq!(world.state(), Some(State::NeedsDecision));
+}
+
+#[test]
+fn a_malformed_proof_is_refused_not_read_as_cli() {
+    let world = World::new("nonce-bad");
+    let output = world.decide_proved(
+        "not json",
+        &["--answer", "revise", "--actor", "orchestrator"],
+    );
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert_eq!(world.state(), Some(State::NeedsDecision));
+}

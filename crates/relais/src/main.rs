@@ -357,6 +357,11 @@ enum Command {
         /// to_state, advice}`, or `{error, exit}` on a refusal
         #[arg(long)]
         json: bool,
+        /// Read `{"session", "nonce"}` from stdin: the plugin's proof that
+        /// its decide tool made this call (ADR-0004). A live nonce records
+        /// the answer `recorded_via = plugin`; any other, `cli`
+        #[arg(long = "proof-stdin")]
+        proof_stdin: bool,
         /// Free-form context for the decision
         #[arg(long = "note")]
         note: Option<String>,
@@ -572,6 +577,14 @@ impl GrantSource {
 /// Exit 0 acknowledges; non-zero asks the plugin to retry.
 #[derive(Subcommand)]
 enum NativeCommand {
+    /// Mint the session's decide nonce and print it (ADR-0004); with
+    /// `--end`, forget it. The plugin calls this at session start and end
+    DecideNonce {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        end: bool,
+    },
     /// The session's plugin is alive
     Hello {
         #[arg(long)]
@@ -1372,6 +1385,7 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             actor,
             person_quote,
             json,
+            proof_stdin,
             note,
             successor,
             criterion,
@@ -1386,6 +1400,7 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             criterion: criterion.as_deref(),
             candidate: candidate.as_deref(),
             json,
+            proof_stdin,
         }),
         Command::Evidence { cmd } => match cmd {
             EvidenceCommand::Attach {
@@ -1981,16 +1996,20 @@ fn dataset_build_command() -> Result<CliOutcome, CliError> {
         "records: {} ({} accepted-without-escalation, {} not)",
         distribution.records, distribution.accepted_without_escalation, distribution.other
     );
-    let from_salvage = dataset
-        .records
-        .iter()
-        .filter(|record| {
-            record.label_source == relais::learn::features::LabelSource::PersonSalvageContained
-        })
-        .count();
+    let count_of = |source| {
+        dataset
+            .records
+            .iter()
+            .filter(|record| record.label_source == source)
+            .count()
+    };
+    let by_person = count_of(relais::learn::features::LabelSource::PersonSalvageContained);
+    let by_orchestrator =
+        count_of(relais::learn::features::LabelSource::OrchestratorSalvageContained);
     println!(
-        "label sources: runner {}, person_salvage_contained {from_salvage}",
-        dataset.records.len() - from_salvage
+        "label sources: runner {}, person_salvage_contained {by_person}, \
+         orchestrator_salvage_contained {by_orchestrator}",
+        dataset.records.len() - by_person - by_orchestrator
     );
     println!(
         "salvage containment backfill: {} computed, {} unreachable (left unknown, excluded)",
@@ -4058,6 +4077,18 @@ fn native_command(cmd: NativeCommand) -> Result<CliOutcome, CliError> {
         } => learning_off_command(&by, router_source(source)),
         NativeCommand::LearningEnvelope { by, source, .. } => {
             learning_envelope_command(&by, router_source(source))
+        }
+        NativeCommand::DecideNonce { session, end } => {
+            let ledger = open_ledger()?;
+            if end {
+                operational(ledger.end_decide_nonce(&session), "native decide-nonce")?;
+            } else {
+                println!(
+                    "{}",
+                    operational(ledger.mint_decide_nonce(&session), "native decide-nonce")?
+                );
+            }
+            Ok(CliOutcome::Accepted)
         }
         NativeCommand::Hello { session } => {
             let socket = relais::coordinator::socket_path().map_err(CliError::Home)?;
@@ -7022,6 +7053,7 @@ struct DecideRequest<'a> {
     criterion: Option<&'a str>,
     candidate: Option<&'a str>,
     json: bool,
+    proof_stdin: bool,
 }
 
 /// A refusal of a decision: the exit outcome and the sentence that says
@@ -7101,6 +7133,39 @@ fn decide_command(request: DecideRequest<'_>) -> Result<CliOutcome, CliError> {
     }
 }
 
+/// Why a `person-via-orchestrator` sign-off without a live plugin nonce is
+/// refused: only the plugin's proved call counts as the person's
+/// (ADR-0004).
+const UNPROVED_SIGNOFF: &str = "`--criterion` is refused for `--actor person-via-orchestrator` \
+     without the plugin's proof: only an answer recorded through the decide tool counts as the \
+     person's sign-off";
+
+/// The plugin's proof on stdin (`--proof-stdin`).
+#[derive(serde::Deserialize)]
+struct DecideProof {
+    session: String,
+    nonce: String,
+}
+
+/// Read the `--proof-stdin` frame. A malformed frame is a refusal, never a
+/// silent `cli`: the plugin wrote it, so a bad one is a bug to see.
+fn read_decide_proof() -> Result<DecideProof, Refusal> {
+    use std::io::Read;
+    let mut text = String::new();
+    if let Err(e) = std::io::stdin().take(64 * 1024).read_to_string(&mut text) {
+        return refusal(
+            CliOutcome::InvalidInput,
+            format!("`--proof-stdin`: could not read stdin: {e}"),
+        );
+    }
+    serde_json::from_str(text.trim()).or_else(|e| {
+        refusal(
+            CliOutcome::InvalidInput,
+            format!("`--proof-stdin` expects {{\"session\", \"nonce\"}} on stdin: {e}"),
+        )
+    })
+}
+
 /// The checks that need only the arguments, run before the ledger is
 /// opened so a refused invocation touches nothing.
 fn check_decide_arguments(
@@ -7147,14 +7212,10 @@ fn check_decide_arguments(
                      the person signs it off from their own terminal (`--actor person`)",
                 );
             }
-            Actor::PersonViaOrchestrator => {
-                return refusal(
-                    CliOutcome::InvalidInput,
-                    "`--criterion` is refused for `--actor person-via-orchestrator` here: this \
-                     answer carries no plugin proof, so it cannot count as the person's \
-                     sign-off",
-                );
+            Actor::PersonViaOrchestrator if !request.proof_stdin => {
+                return refusal(CliOutcome::InvalidInput, UNPROVED_SIGNOFF);
             }
+            Actor::PersonViaOrchestrator => {}
             Actor::Person => {}
         }
     }
@@ -7176,7 +7237,28 @@ fn decide_inner(request: &DecideRequest<'_>) -> Result<Decision, CliError> {
         request.candidate,
     );
     let person_quote = request.person_quote.map(str::trim);
+    let proof = if request.proof_stdin {
+        match read_decide_proof() {
+            Ok(proof) => Some(proof),
+            Err(refused) => return Ok(Err(refused)),
+        }
+    } else {
+        None
+    };
     let ledger = open_ledger()?;
+    let recorded_via = match &proof {
+        Some(proof) => operational(
+            ledger.verify_decide_nonce(&proof.session, &proof.nonce),
+            "decide",
+        )?,
+        None => relais::ledger::RecordedVia::Cli,
+    };
+    if criterion.is_some()
+        && actor == relais::ledger::Actor::PersonViaOrchestrator
+        && recorded_via != relais::ledger::RecordedVia::Plugin
+    {
+        return Ok(refusal(CliOutcome::InvalidInput, UNPROVED_SIGNOFF));
+    }
     let run = RunId::from_stored(run_id);
     let Some(state) = operational(ledger.run_status(&run), "decide")? else {
         return Ok(refusal(
@@ -7198,6 +7280,7 @@ fn decide_inner(request: &DecideRequest<'_>) -> Result<Decision, CliError> {
             &SalvageAnswer {
                 actor,
                 person_quote,
+                recorded_via,
                 note,
                 criterion,
                 successor,
@@ -7267,7 +7350,7 @@ fn decide_inner(request: &DecideRequest<'_>) -> Result<Decision, CliError> {
             ));
         }
         operational(
-            ledger.record_human_signoff(&run, criterion_id, actor, note),
+            ledger.record_human_signoff(&run, criterion_id, actor, recorded_via, note),
             "decide",
         )?;
         reseal_receipt_with_signoff(&ledger, &run, criterion_id)?;
@@ -7295,6 +7378,7 @@ fn decide_inner(request: &DecideRequest<'_>) -> Result<Decision, CliError> {
                 resolution,
                 actor,
                 person_quote,
+                recorded_via,
                 note,
                 successor_run: successor_run.as_ref(),
                 from_state: state,
@@ -7325,6 +7409,7 @@ fn decide_inner(request: &DecideRequest<'_>) -> Result<Decision, CliError> {
 struct SalvageAnswer<'a> {
     actor: relais::ledger::Actor,
     person_quote: Option<&'a str>,
+    recorded_via: relais::ledger::RecordedVia,
     note: Option<&'a str>,
     criterion: Option<&'a str>,
     successor: Option<&'a str>,
@@ -7387,8 +7472,11 @@ fn salvage_command(
         ledger.record_salvage_contained(
             run,
             candidate_sha,
-            answer.actor,
-            answer.person_quote,
+            relais::ledger::Answerer {
+                actor: answer.actor,
+                person_quote: answer.person_quote,
+                recorded_via: answer.recorded_via,
+            },
             answer.note,
             contained,
         ),
@@ -8419,6 +8507,7 @@ mod tests {
                     resolution: Reason::DecisionRevised,
                     actor: relais::ledger::Actor::Person,
                     person_quote: None,
+                    recorded_via: relais::ledger::RecordedVia::Cli,
                     note: None,
                     successor_run: None,
                     from_state: State::NeedsReview,

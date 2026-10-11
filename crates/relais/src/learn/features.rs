@@ -360,6 +360,10 @@ pub enum AcceptanceRoute {
     Verified,
     /// A person approved it; the run may carry no receipt at all.
     PersonApproved,
+    /// The orchestrating session approved it (ADR-0004). Kept apart from
+    /// [`Self::PersonApproved`] so the two can be measured separately;
+    /// like it, never a positive label.
+    OrchestratorApproved,
 }
 
 /// Where an example's positive-or-negative label came from: the runner's
@@ -375,6 +379,10 @@ pub enum LabelSource {
     /// A person salvaged a run the runner stopped for review findings, and
     /// the verified candidate patch is contained in what landed.
     PersonSalvageContained,
+    /// The same evidence, recorded by the orchestrating session (ADR-0004).
+    /// Still a label: containment is mechanical (the verified patch
+    /// reverse-applies on what landed), whoever recorded it.
+    OrchestratorSalvageContained,
 }
 
 impl LabelSource {
@@ -382,6 +390,7 @@ impl LabelSource {
         match self {
             Self::Runner => "runner",
             Self::PersonSalvageContained => "person_salvage_contained",
+            Self::OrchestratorSalvageContained => "orchestrator_salvage_contained",
         }
     }
 }

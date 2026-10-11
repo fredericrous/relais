@@ -1642,6 +1642,11 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ALTER TABLE human_signoffs ADD COLUMN actor_raw TEXT;
     ALTER TABLE human_signoffs ADD COLUMN person_quote TEXT;
     ALTER TABLE human_signoffs ADD COLUMN recorded_via TEXT;
+    CREATE TABLE decide_nonces (
+        session TEXT PRIMARY KEY,
+        nonce_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
     UPDATE decisions SET actor_raw = actor, recorded_via = 'legacy';
     UPDATE human_signoffs SET actor_raw = actor, recorded_via = 'legacy';
     UPDATE decisions SET actor = CASE actor
@@ -1761,10 +1766,41 @@ impl std::fmt::Display for Actor {
     }
 }
 
-/// How an answer reached relais. Only `cli` is written today; `plugin`
-/// arrives with the plugin nonce, and `legacy` marks rows from before the
-/// column existed.
-pub const RECORDED_VIA_CLI: &str = "cli";
+/// How an answer reached relais (ADR-0004): through the plugin's decide
+/// tool, proved by the session's nonce, or from any other command line.
+/// Rows written before the column existed read `legacy`, which nothing
+/// writes now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordedVia {
+    /// The call carried the plugin session's nonce
+    /// ([`Ledger::verify_decide_nonce`]).
+    Plugin,
+    /// Anything else: a terminal, a script, or a model shelling out.
+    Cli,
+}
+
+impl RecordedVia {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RecordedVia::Plugin => "plugin",
+            RecordedVia::Cli => "cli",
+        }
+    }
+}
+
+/// Who answered a salvage, and how the answer reached relais: the three
+/// facts [`Ledger::record_salvage_contained`] stores beside the answer.
+#[derive(Debug, Clone, Copy)]
+pub struct Answerer<'a> {
+    pub actor: Actor,
+    /// The person's words, when `actor` is [`Actor::PersonViaOrchestrator`].
+    pub person_quote: Option<&'a str>,
+    pub recorded_via: RecordedVia,
+}
+
+/// How long a minted decide nonce is honoured when its session never said
+/// it ended (a crash, a kill): past this, minting any nonce sweeps it.
+const DECIDE_NONCE_TTL_DAYS: i64 = 7;
 
 /// One row of `trust_grants`: what [`Ledger::record_trust_grant`] writes.
 #[derive(Debug, Clone, Copy)]
@@ -2385,6 +2421,8 @@ pub struct DecisionAnswer<'a> {
     pub actor: Actor,
     /// The person's words, when `actor` is [`Actor::PersonViaOrchestrator`].
     pub person_quote: Option<&'a str>,
+    /// How the answer reached relais.
+    pub recorded_via: RecordedVia,
     pub note: Option<&'a str>,
     pub successor_run: Option<&'a RunId>,
     /// The state the run was waiting in.
@@ -3478,7 +3516,7 @@ impl Ledger {
                 answer.note,
                 answer.successor_run.map(RunId::as_str),
                 answer.person_quote,
-                RECORDED_VIA_CLI,
+                answer.recorded_via.as_str(),
             ],
         )?;
         if changed > 0 {
@@ -3539,7 +3577,17 @@ impl Ledger {
         actor: Actor,
         note: Option<&str>,
     ) -> Result<Option<Reason>> {
-        self.record_salvage_contained(run_id, candidate_sha, actor, None, note, None)
+        self.record_salvage_contained(
+            run_id,
+            candidate_sha,
+            Answerer {
+                actor,
+                person_quote: None,
+                recorded_via: RecordedVia::Cli,
+            },
+            note,
+            None,
+        )
     }
 
     /// [`Self::record_salvage`], also recording whether the run's verified
@@ -3550,11 +3598,15 @@ impl Ledger {
         &self,
         run_id: &RunId,
         candidate_sha: &str,
-        actor: Actor,
-        person_quote: Option<&str>,
+        answerer: Answerer<'_>,
         note: Option<&str>,
         candidate_contained: Option<bool>,
     ) -> Result<Option<Reason>> {
+        let Answerer {
+            actor,
+            person_quote,
+            recorded_via,
+        } = answerer;
         let now = self.now();
         let tx = self.write_tx()?;
         let existing: Option<(Option<String>, String, String)> = tx
@@ -3591,7 +3643,7 @@ impl Ledger {
                         note,
                         candidate_contained,
                         person_quote,
-                        RECORDED_VIA_CLI,
+                        recorded_via.as_str(),
                     ],
                 )?;
                 debug_assert_eq!(changed, 1, "read as open under the same transaction above");
@@ -3644,7 +3696,7 @@ impl Ledger {
                         note,
                         candidate_contained,
                         person_quote,
-                        RECORDED_VIA_CLI,
+                        recorded_via.as_str(),
                     ],
                 )?;
                 (parse_state(&last_state)?, original_reason)
@@ -3742,6 +3794,7 @@ impl Ledger {
         run_id: &RunId,
         criterion_id: &str,
         actor: Actor,
+        recorded_via: RecordedVia,
         note: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
@@ -3754,10 +3807,69 @@ impl Ledger {
                 actor.as_str(),
                 note,
                 self.now(),
-                RECORDED_VIA_CLI
+                recorded_via.as_str()
             ],
         )?;
         Ok(())
+    }
+
+    /// Mint the nonce that proves a plugin session's decide calls
+    /// (ADR-0004): 32 bytes from the OS, returned once as hex; only its
+    /// SHA-256 is stored, so reading the ledger never yields it. Minting
+    /// again for a session replaces its nonce, and every nonce older than
+    /// [`DECIDE_NONCE_TTL_DAYS`] is swept, whichever session it was for.
+    pub fn mint_decide_nonce(&self, session: &str) -> Result<String> {
+        let mut bytes = [0u8; 32];
+        {
+            use std::io::Read;
+            std::fs::File::open("/dev/urandom")
+                .and_then(|mut f| f.read_exact(&mut bytes))
+                .map_err(|e| LedgerError::Corrupt {
+                    what: "the OS random source".into(),
+                    detail: e.to_string(),
+                })?;
+        }
+        let nonce: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let now = self.now();
+        let cutoff = chrono::DateTime::parse_from_rfc3339(&now)
+            .map(|t| (t - chrono::Duration::days(DECIDE_NONCE_TTL_DAYS)).to_rfc3339())
+            .unwrap_or_else(|_| now.clone());
+        let tx = self.write_tx()?;
+        tx.execute("DELETE FROM decide_nonces WHERE created_at < ?1", [&cutoff])?;
+        tx.execute(
+            "INSERT OR REPLACE INTO decide_nonces (session, nonce_hash, created_at)
+             VALUES (?1, ?2, ?3)",
+            params![session, crate::ids::sha256_hex(nonce.as_bytes()), now],
+        )?;
+        tx.commit()?;
+        Ok(nonce)
+    }
+
+    /// Forget a session's nonce: its session ended. `Ok(false)` when there
+    /// was none.
+    pub fn end_decide_nonce(&self, session: &str) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM decide_nonces WHERE session = ?1", [session])?;
+        Ok(changed > 0)
+    }
+
+    /// Whether `nonce` is the live nonce of `session`:
+    /// [`RecordedVia::Plugin`] when it is, [`RecordedVia::Cli`] for a
+    /// wrong, ended or swept one.
+    pub fn verify_decide_nonce(&self, session: &str, nonce: &str) -> Result<RecordedVia> {
+        let stored: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT nonce_hash FROM decide_nonces WHERE session = ?1",
+                [session],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(match stored {
+            Some(hash) if hash == crate::ids::sha256_hex(nonce.as_bytes()) => RecordedVia::Plugin,
+            _ => RecordedVia::Cli,
+        })
     }
 
     /// Record a trust grant `relais trust grant` just wrote to
@@ -5754,6 +5866,7 @@ mod tests {
                     resolution: Reason::DecisionRecorded,
                     actor: Actor::Person,
                     person_quote: None,
+                    recorded_via: crate::ledger::RecordedVia::Cli,
                     note: None,
                     successor_run: None,
                     from_state: State::Prepared,
@@ -5779,6 +5892,7 @@ mod tests {
                     resolution: Reason::DecisionApproved,
                     actor: Actor::Person,
                     person_quote: None,
+                    recorded_via: crate::ledger::RecordedVia::Cli,
                     note: Some("looks fine"),
                     successor_run: Some(&run("run-successor")),
                     from_state: State::NeedsDecision,
@@ -5810,6 +5924,7 @@ mod tests {
                     resolution: Reason::DecisionRejected,
                     actor: Actor::Person,
                     person_quote: None,
+                    recorded_via: crate::ledger::RecordedVia::Cli,
                     note: None,
                     successor_run: None,
                     from_state: State::Accepted,
@@ -5852,8 +5967,11 @@ mod tests {
             .record_salvage_contained(
                 &run("run-yes"),
                 "abc",
-                Actor::Person,
-                None,
+                Answerer {
+                    actor: Actor::Person,
+                    person_quote: None,
+                    recorded_via: RecordedVia::Cli,
+                },
                 None,
                 Some(true),
             )
@@ -6075,6 +6193,7 @@ mod tests {
                     resolution: Reason::DecisionApproved,
                     actor: Actor::Person,
                     person_quote: None,
+                    recorded_via: crate::ledger::RecordedVia::Cli,
                     note: None,
                     successor_run: None,
                     from_state: State::NeedsDecision,

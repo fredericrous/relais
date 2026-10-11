@@ -108,6 +108,7 @@ fn approve(ledger: &Ledger, run: &str) {
                 resolution: Reason::DecisionApproved,
                 actor: relais::ledger::Actor::Person,
                 person_quote: None,
+                recorded_via: relais::ledger::RecordedVia::Cli,
                 note: None,
                 successor_run: None,
                 from_state: State::NeedsDecision,
