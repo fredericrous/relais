@@ -302,6 +302,7 @@ on that data; its design notes stay below.
 
 - relais: approve on the Delta (100k, 34 s); round 1 approve-with-changes (85k, 63 s): 6 findings, all fixed in 5ecb907 (section_changed unknown, unreadable report line, cycle settings as input, preview/ingest split, exhaustive match, exit 1).
 - amont-agent #94: approve on its final round, after 14 findings over four rounds, all fixed; recorded in its pointer plan.
+- relais, after CI lint (`check-module-cycles.py`: one trailing test module) moved two tests in ed6e0ed: approve, fresh round (102k, 17 s).
 - deliberate: the other-uid refusal is code-only (chown needs root); "still learning" is a header line (Decision log).
 
 ## Outcome
