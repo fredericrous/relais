@@ -1798,6 +1798,20 @@ pub struct Answerer<'a> {
     pub recorded_via: RecordedVia,
 }
 
+/// What [`Ledger::person_answer_counts`] counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct PersonAnswerCounts {
+    /// Every answer that counts as the person's, ever.
+    pub total: usize,
+    /// `person` answers resolved since the window's start.
+    pub recent_person: usize,
+    /// Proved `person-via-orchestrator` answers resolved since then.
+    pub recent_proxied: usize,
+    /// `person-via-orchestrator` answers recorded without the plugin's
+    /// proof: zero unless something went around the decide tool.
+    pub unproved_proxied: usize,
+}
+
 /// How long a minted decide nonce is honoured when its session never said
 /// it ended (a crash, a kill): past this, minting any nonce sweeps it.
 const DECIDE_NONCE_TTL_DAYS: i64 = 7;
@@ -3461,6 +3475,50 @@ impl Ledger {
     /// Every run still waiting for a person to answer it, oldest raised
     /// first — the queue `relais report` lists and `relais decide`
     /// closes one row at a time from.
+    /// How many answers count as the person's judgment (ADR-0004), for the
+    /// decision advisor's data gate: a `person` answer, or a
+    /// `person-via-orchestrator` one the plugin proved, on a
+    /// `needs_decision` or `needs_review` run. `legacy` rows never count.
+    /// `since` bounds the recent counts; `total` is every counted answer.
+    pub fn person_answer_counts(&self, since: &str) -> Result<PersonAnswerCounts> {
+        let counted = "raised_state IN ('needs_decision', 'needs_review')
+             AND ((actor = 'person' AND recorded_via != 'legacy')
+               OR (actor = 'person-via-orchestrator' AND recorded_via = 'plugin'))";
+        let count = |sql: String, since: Option<&str>| -> Result<usize> {
+            let n: i64 = match since {
+                Some(since) => self.conn.query_row(&sql, [since], |row| row.get(0))?,
+                None => self.conn.query_row(&sql, [], |row| row.get(0))?,
+            };
+            Ok(n.max(0) as usize)
+        };
+        Ok(PersonAnswerCounts {
+            total: count(
+                format!("SELECT COUNT(*) FROM decisions WHERE {counted}"),
+                None,
+            )?,
+            recent_person: count(
+                format!(
+                    "SELECT COUNT(*) FROM decisions WHERE {counted} AND actor = 'person'
+                     AND resolved_at >= ?1"
+                ),
+                Some(since),
+            )?,
+            recent_proxied: count(
+                format!(
+                    "SELECT COUNT(*) FROM decisions WHERE {counted}
+                     AND actor = 'person-via-orchestrator' AND resolved_at >= ?1"
+                ),
+                Some(since),
+            )?,
+            unproved_proxied: count(
+                "SELECT COUNT(*) FROM decisions
+                  WHERE actor = 'person-via-orchestrator' AND recorded_via = 'cli'"
+                    .to_string(),
+                None,
+            )?,
+        })
+    }
+
     pub fn open_decisions(&self) -> Result<Vec<DecisionRecord>> {
         let now = self.now();
         let mut stmt = self.conn.prepare(&format!(
@@ -9156,6 +9214,86 @@ mod tests {
             [],
         )
         .expect("open decision");
+    }
+
+    /// Only a `person` answer or a plugin-proved proxy on a
+    /// needs_decision/needs_review run counts; legacy and cli proxies do not.
+    #[test]
+    fn person_answers_count_only_what_the_person_said() {
+        let dir = crate::test_support::temp_dir("ledger-person-answers");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let row = |run: &str, state: &str, actor: &str, via: &str, at: &str| {
+            ledger
+                .conn
+                .execute(
+                    "INSERT INTO decisions (run, task, raised_at, raised_state, raised_reason,
+                         resolved_at, resolution, actor, actor_raw, recorded_via)
+                     VALUES (?1, 't', ?5, ?2, 'x', ?5, 'decision_revised', ?3, ?3, ?4)",
+                    params![run, state, actor, via, at],
+                )
+                .expect("row");
+        };
+        row(
+            "r1",
+            "needs_decision",
+            "person",
+            "cli",
+            "2026-10-10T00:00:00+00:00",
+        );
+        row(
+            "r2",
+            "needs_review",
+            "person-via-orchestrator",
+            "plugin",
+            "2026-10-10T00:00:00+00:00",
+        );
+        row(
+            "r3",
+            "needs_review",
+            "person-via-orchestrator",
+            "cli",
+            "2026-10-10T00:00:00+00:00",
+        );
+        row(
+            "r4",
+            "needs_review",
+            "person",
+            "legacy",
+            "2026-10-10T00:00:00+00:00",
+        );
+        row(
+            "r5",
+            "interrupted",
+            "person",
+            "cli",
+            "2026-10-10T00:00:00+00:00",
+        );
+        row(
+            "r6",
+            "needs_review",
+            "orchestrator",
+            "plugin",
+            "2026-10-10T00:00:00+00:00",
+        );
+        row(
+            "r7",
+            "needs_decision",
+            "person",
+            "cli",
+            "2026-01-01T00:00:00+00:00",
+        );
+        let counts = ledger
+            .person_answer_counts("2026-09-01T00:00:00+00:00")
+            .expect("counts");
+        assert_eq!(
+            counts,
+            PersonAnswerCounts {
+                total: 3,
+                recent_person: 1,
+                recent_proxied: 1,
+                unproved_proxied: 1,
+            }
+        );
     }
 
     #[test]

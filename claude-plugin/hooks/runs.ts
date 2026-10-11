@@ -37,6 +37,10 @@ const FRESHEN_TIMEOUT_MS = 1_000
 // The states whose outcome message asks a person for something, as the
 // `done` line spells them (`State::awaits_a_person` in relais).
 const AWAITS_A_PERSON = new Set(['needs_decision', 'needs_review', 'interrupted'])
+// The closing line of an outcome that waits on a person: the step that
+// settles it (ADR-0004).
+export const DECIDE_STEP =
+  'Decide it, then record the answer with mcp__relais__decide (approve, revise, reject, salvaged, abandon or decided). When the request or the approved plan does not answer it, ask the person and record their answer with on_behalf_of_person and their own words as person_quote.'
 const MAX_SUMMARY = 4000
 const STDERR_TAIL = 5
 
@@ -99,7 +103,10 @@ async function submitVerdicts(fx: Fx, store: Store) {
     store.isSubmitFailing = false
     // Forgotten only once submitted: a submit that failed is checked
     // again, from the original text, when the next tick retries it.
-    store.pendingOutcomes.delete(store.verdicts.shift()!)
+    const sent = store.verdicts.shift()!
+    const pending = store.pendingOutcomes.get(sent)
+    if (pending) store.outcomeDeliveredAt.set(pending.run, await fx.clock.now())
+    store.pendingOutcomes.delete(sent)
   }
 }
 
@@ -356,12 +363,13 @@ async function onDone(fx: Fx, store: Store, child: Child, line: any, now: number
       ? `relais ${trial ? 'replay' : 'run'} ${run} finished: ${outcome}${why}.`
       : `relais ${trial ? 'replay' : 'run'} ${outcome}${why}. Nothing ran.`
   const facts = [receipt ? `Receipt: ${receipt}` : '', summaryText(line.summary), trial ? `Replay trial: ${trial}` : ''].filter(Boolean)
-  const text = [headline, ...facts, code ? NEXT_STEP[code] ?? '' : ''].filter(Boolean).join('\n')
+  const awaits = AWAITS_A_PERSON.has(outcome) && typeof line.run === 'string'
+  const text = [headline, ...facts, code ? NEXT_STEP[code] ?? '' : '', awaits ? DECIDE_STEP : ''].filter(Boolean).join('\n')
   // The stream hook descends from the `run` tool call, and a prompt cannot
   // be submitted from under a tool or command hook: the session's timer
   // (`pump`) sends it.
   store.verdicts.push(text)
-  if (AWAITS_A_PERSON.has(outcome) && typeof line.run === 'string') {
+  if (awaits) {
     store.pendingOutcomes.set(text, { run, outcome, code, kind: trial ? 'replay' : 'run', facts, noted: new Set() })
   }
 }
