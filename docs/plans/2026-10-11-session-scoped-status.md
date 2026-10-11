@@ -434,5 +434,6 @@ it), so its cleanup is expected to print "already ended: interrupted".
 - `deliberate:` #7. On a ledger read error, `superseded_outcome` defaults to `interrupted`. The reaper's outcome event is already written and stands.
 - `deliberate:` #8. Three checks run after the release, as Landing says: the new binary would move the live ledger to v28, which 0.14.0 refuses.
 - **By hand:** `coordinator::process_alive` re-exports `procs::alive`, which counts EPERM as alive (`procs.rs:761`).
+- **CI fix:** `test (windows-latest)` failed because the new reaping tests use Unix process and file semantics. A third delta resolved it (109k tokens, 33 s): those tests are `cfg(unix)`, and `native_cancel.rs` as a whole file, as `release_scenarios.rs` is (`deliberate:`). On Windows, `start_time` gives `None`, so a reused pid there falls to the silence rule; `alive` never reads a live process as dead.
 
 <!-- panel: repos=relais reviewers=backend,lang:rust,tui,unix body-sha=2552bb4c132a -->
