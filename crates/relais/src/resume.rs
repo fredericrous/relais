@@ -91,6 +91,89 @@ pub fn orphan_of(silent: Duration, wall: AttemptWall) -> Option<Orphan> {
     })
 }
 
+/// How long a driver that took a run is presumed alive whatever the probes
+/// say: a resume of an old run stamps a new driver, and its first minute
+/// must not be judged against a pid that has only just been recorded.
+pub const DRIVER_GRACE: Duration = Duration::from_secs(60);
+
+/// What the ledger and the filesystem say about one non-terminal run's
+/// driver, gathered by the caller so [`orphan_verdict`] stays pure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanFacts {
+    pub driver_pid: Option<u32>,
+    /// The driver's process start time as recorded when it took the run.
+    pub driver_started: Option<String>,
+    /// When the driver took the run; `None` for a row no driver stamped.
+    pub driver_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// The pids of the run's open dispatches (those that have one).
+    pub dispatch_pids: Vec<u32>,
+    /// How long the run has written nothing; `None` when unknown.
+    pub silent_for: Option<Duration>,
+    /// The silence past which a run whose driver cannot be judged by pid
+    /// is presumed orphaned (attempt wall time plus [`DRIVER_MARGIN`]).
+    pub silence_threshold: Duration,
+}
+
+/// What the evidence says about a run's driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanVerdict {
+    /// The driver is provably gone: reap the run.
+    Gone,
+    /// The driver, or a dispatch, is alive, or nothing says otherwise: the
+    /// run is never reaped, however silent it is.
+    Alive,
+    /// Liveness cannot be judged by pid, and the run has been silent past
+    /// the threshold: the silence rule applies.
+    Silent,
+}
+
+/// Judge one run's driver. `alive` is the liveness probe (EPERM counts as
+/// alive: `procs::alive`), `start_time` reads a process start time.
+///
+/// Gone needs all of: the driver took the run more than [`DRIVER_GRACE`]
+/// ago; its pid is dead or now has another start time (a reused pid); no
+/// dispatch pid is alive. A live dispatch keeps the run in every case. A
+/// live driver with the recorded start time is Alive however silent.
+/// Silence decides only when pid evidence is missing: no recorded pid, or
+/// a start time that cannot be compared.
+pub fn orphan_verdict(
+    facts: &OrphanFacts,
+    alive: &dyn Fn(u32) -> bool,
+    start_time: &dyn Fn(u32) -> Option<String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> OrphanVerdict {
+    if facts.dispatch_pids.iter().any(|pid| alive(*pid)) {
+        return OrphanVerdict::Alive;
+    }
+    let past_grace = facts.driver_since.is_none_or(|since| {
+        now.signed_duration_since(since)
+            .to_std()
+            .is_ok_and(|age| age > DRIVER_GRACE)
+    });
+    let by_silence = || match facts.silent_for {
+        Some(silent) if silent > facts.silence_threshold => OrphanVerdict::Silent,
+        Some(_) | None => OrphanVerdict::Alive,
+    };
+    let gone = || {
+        if past_grace {
+            OrphanVerdict::Gone
+        } else {
+            OrphanVerdict::Alive
+        }
+    };
+    let Some(pid) = facts.driver_pid else {
+        return by_silence();
+    };
+    if !alive(pid) {
+        return gone();
+    }
+    match (start_time(pid), facts.driver_started.as_deref()) {
+        (Some(now_started), Some(recorded)) if now_started == recorded => OrphanVerdict::Alive,
+        (Some(_), Some(_)) => gone(),
+        (None, _) | (_, None) => by_silence(),
+    }
+}
+
 /// What reconciliation established about one dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchVerdict {
@@ -348,6 +431,100 @@ mod tests {
             queued,
             cancelled: false,
         }
+    }
+
+    fn facts() -> OrphanFacts {
+        OrphanFacts {
+            driver_pid: Some(100),
+            driver_started: Some("t0".into()),
+            driver_since: Some(at(-3600)),
+            dispatch_pids: vec![],
+            silent_for: Some(Duration::from_secs(5)),
+            silence_threshold: Duration::from_secs(3600),
+        }
+    }
+
+    fn at(offset_seconds: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() + chrono::Duration::seconds(offset_seconds)
+    }
+
+    fn verdict(facts: &OrphanFacts, alive: bool, started: Option<&str>) -> OrphanVerdict {
+        let started = started.map(str::to_string);
+        orphan_verdict(facts, &|_| alive, &|_| started.clone(), chrono::Utc::now())
+    }
+
+    #[test]
+    fn a_dead_driver_pid_is_gone() {
+        assert_eq!(verdict(&facts(), false, None), OrphanVerdict::Gone);
+    }
+
+    #[test]
+    fn a_live_driver_with_its_start_time_is_never_reaped_however_silent() {
+        let mut f = facts();
+        f.silent_for = Some(Duration::from_secs(5 * 3600));
+        assert_eq!(verdict(&f, true, Some("t0")), OrphanVerdict::Alive);
+    }
+
+    #[test]
+    fn a_reused_pid_with_another_start_time_is_gone() {
+        assert_eq!(verdict(&facts(), true, Some("t9")), OrphanVerdict::Gone);
+    }
+
+    #[test]
+    fn no_pid_and_silent_past_the_threshold_is_silent() {
+        let mut f = facts();
+        f.driver_pid = None;
+        f.silent_for = Some(Duration::from_secs(7200));
+        assert_eq!(verdict(&f, true, None), OrphanVerdict::Silent);
+    }
+
+    #[test]
+    fn no_pid_and_recent_is_alive() {
+        let mut f = facts();
+        f.driver_pid = None;
+        assert_eq!(verdict(&f, false, None), OrphanVerdict::Alive);
+    }
+
+    #[test]
+    fn an_unreadable_start_time_falls_back_to_silence() {
+        let mut f = facts();
+        f.silent_for = Some(Duration::from_secs(7200));
+        assert_eq!(verdict(&f, true, None), OrphanVerdict::Silent);
+        f.silent_for = Some(Duration::from_secs(5));
+        assert_eq!(verdict(&f, true, None), OrphanVerdict::Alive);
+    }
+
+    #[test]
+    fn a_live_dispatch_pid_keeps_the_run_in_every_case() {
+        let probe_alive = |pid: u32| pid == 555;
+        let no_start = |_: u32| None;
+        let now = chrono::Utc::now();
+        let mut cases = vec![facts()];
+        let mut silent = facts();
+        silent.driver_pid = None;
+        silent.silent_for = Some(Duration::from_secs(7200));
+        cases.push(silent);
+        let mut reused = facts();
+        reused.driver_started = Some("other".into());
+        cases.push(reused);
+        for mut f in cases {
+            f.dispatch_pids = vec![554, 555];
+            assert_eq!(
+                orphan_verdict(&f, &probe_alive, &no_start, now),
+                OrphanVerdict::Alive,
+                "{f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_driver_that_took_the_run_under_a_minute_ago_is_not_gone() {
+        let mut f = facts();
+        f.driver_since = Some(at(-30));
+        assert_eq!(verdict(&f, false, None), OrphanVerdict::Alive);
+        assert_eq!(verdict(&f, true, Some("t9")), OrphanVerdict::Alive);
+        f.driver_since = Some(at(-61));
+        assert_eq!(verdict(&f, false, None), OrphanVerdict::Gone);
     }
 
     const NOTHING_IS_ALIVE: &dyn Fn(Pid) -> bool = &|_| false;

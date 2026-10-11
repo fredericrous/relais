@@ -31,6 +31,7 @@ pub mod paths;
 pub mod policy;
 pub mod procs;
 pub mod protocol;
+pub mod reap;
 pub mod repo;
 pub mod report;
 pub mod resume;

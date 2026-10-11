@@ -3219,7 +3219,7 @@ fn interrupt_unbound_run(run_id: &str) -> Result<(), CliError> {
         return Ok(());
     };
     match interrupt_orphan(&ledger, &run, state, &orphan)? {
-        OrphanOutcome::Interrupted => {}
+        OrphanOutcome::Ended(_) => {}
         OrphanOutcome::KeptAlive(why) => {
             println!("{run_id}: left as it is, {why}");
         }
@@ -5946,12 +5946,12 @@ fn resume_command(run_id: &str, retire: Retire) -> Result<CliOutcome, CliError> 
     if !state.is_terminal() {
         if let Some(orphan) = orphan_of_run(&ledger, &run)? {
             match interrupt_orphan(&ledger, &run, state, &orphan)? {
-                OrphanOutcome::Interrupted => {
+                OrphanOutcome::Ended(ended) => {
                     return match retire {
                         Retire::Keep => Ok(CliOutcome::ResumeReconciled),
                         Retire::Retire => {
                             let reconciliation = reconcile_run(&ledger, &run)?;
-                            retire_run(&ledger, &run, State::Interrupted, &reconciliation)?;
+                            retire_run(&ledger, &run, ended, &reconciliation)?;
                             Ok(CliOutcome::ResumeReconciled)
                         }
                     };
@@ -6126,69 +6126,54 @@ fn orphan_of_run(ledger: &Ledger, run: &RunId) -> Result<Option<resume::Orphan>,
 
 /// What became of an orphaned run.
 enum OrphanOutcome {
-    Interrupted,
+    /// The run is no longer running; this is the state it is in now (the
+    /// interrupted state this call wrote, or the one a racing process did).
+    Ended(State),
     /// A dispatch of the run is provably alive: nothing was changed.
     KeptAlive(String),
 }
 
-/// Move an orphaned run to `interrupted` (`driver_gone`) and close its open
-/// dispatches so none is judged live again; the decision is recorded with
-/// the silence and the threshold. Every dispatch is judged first, by PID
-/// alone (a native session's hello is not evidence its agent lives): a
-/// dispatch whose process is alive keeps the run as it is.
+/// Move an orphaned run to `interrupted` through the library's reap (a
+/// compare-and-set that closes its dispatches and ends its events only when
+/// it wins), and print what it returns.
 fn interrupt_orphan(
     ledger: &Ledger,
     run: &RunId,
     state: State,
     orphan: &resume::Orphan,
 ) -> Result<OrphanOutcome, CliError> {
-    let live = run_live_dispatches(ledger, run)?;
-    let judged = resume::reconcile(&live, None, &|pid| {
-        relais::coordinator::process_alive(pid.get())
-    });
-    let alive: Vec<String> = judged
-        .verdicts
-        .iter()
-        .filter(|verdict| matches!(verdict, resume::DispatchVerdict::StillAlive { .. }))
-        .map(resume::DispatchVerdict::describe)
-        .collect();
-    if !alive.is_empty() {
-        return Ok(OrphanOutcome::KeptAlive(format!(
-            "dispatch {} is alive",
-            alive.join(", ")
-        )));
-    }
-    for verdict in &judged.verdicts {
-        operational(
-            ledger.finish_dispatch(verdict.dispatch(), Reason::DriverGone.as_str()),
-            "resume",
-        )?;
-    }
-    let never_launched = operational(
-        ledger.close_open_dispatches(run, Reason::DriverGone.as_str()),
+    let events_dir = paths::runs_dir()
+        .map_err(CliError::Home)?
+        .join(run.as_str());
+    let reaped = operational(
+        relais::reap::reap(
+            ledger,
+            &relais::reap::Reap {
+                run,
+                from: state,
+                ending: relais::reap::Ending::Interrupted,
+                detail: orphan.detail(),
+                extra: serde_json::json!({
+                    "silent_seconds": orphan.silent.as_secs(),
+                    "threshold_seconds": orphan.threshold.as_secs(),
+                }),
+                events_dir: &events_dir,
+            },
+            &|pid| relais::coordinator::process_alive(pid.get()),
+        ),
         "resume",
     )?;
-    let closed = judged.verdicts.len() + never_launched;
-    let detail = orphan.detail();
-    operational(
-        ledger.record_transition(&relais::ledger::Transition {
-            run_id: run.clone(),
-            attempt_id: None,
-            from_state: Some(state),
-            to_state: State::Interrupted,
-            reason: Reason::DriverGone.as_str().to_string(),
-            detail: Some(serde_json::json!({
-                "detail": detail,
-                "silent_seconds": orphan.silent.as_secs(),
-                "threshold_seconds": orphan.threshold.as_secs(),
-                "dispatches_closed": closed,
-            })),
-            at: relais::ledger::now_rfc3339(),
-        }),
-        "resume",
-    )?;
-    println!("{run}: {state} -> interrupted ({detail})");
-    Ok(OrphanOutcome::Interrupted)
+    match reaped {
+        relais::reap::Reaped::Moved(message) => {
+            println!("{message}");
+            Ok(OrphanOutcome::Ended(State::Interrupted))
+        }
+        relais::reap::Reaped::AlreadyMoved => {
+            let now = operational(ledger.run_status(run), "resume")?.unwrap_or(state);
+            Ok(OrphanOutcome::Ended(now))
+        }
+        relais::reap::Reaped::KeptAlive(why) => Ok(OrphanOutcome::KeptAlive(why)),
+    }
 }
 
 /// The dispatches the ledger still records as live for one run.
@@ -6263,7 +6248,7 @@ fn retire_all_command() -> Result<CliOutcome, CliError> {
             state
         } else if let Some(orphan) = orphan_of_run(&ledger, &run)? {
             match interrupt_orphan(&ledger, &run, state, &orphan)? {
-                OrphanOutcome::Interrupted => State::Interrupted,
+                OrphanOutcome::Ended(ended) => ended,
                 OrphanOutcome::KeptAlive(why) => {
                     println!(
                         "{}: kept, silent past its threshold but {why} ({})",

@@ -139,6 +139,10 @@ pub enum Event {
         /// pane's outcome row, and a timeline rebuilt from the events.
         #[serde(skip_serializing_if = "Option::is_none")]
         summary: Option<Summary>,
+        /// Why the run ended this way, as a sentence, when a process other
+        /// than the driver ended it (a reap).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// A line the process wrote to stdout or stderr under `--protocol`.
     Stderr {
@@ -431,6 +435,31 @@ impl EventLog {
     }
 }
 
+/// Append one event to `artifacts/events.jsonl` from a process that is not
+/// the run's driver (a reaper): one `write_all` of one whole line on an
+/// `O_APPEND` file, so concurrent writers never interleave; no `seq`, so it
+/// never collides with the driver's numbering; and nothing is written to
+/// this process's stdout, which may be a protocol channel of its own.
+pub fn append_event(run: &str, artifacts: &Path, event: &Event) -> io::Result<()> {
+    let stderr_seq = None;
+    let mut line = serde_json::to_string(&Line {
+        relais: "event",
+        run,
+        seq: None,
+        stderr_seq,
+        at: chrono::Utc::now().to_rfc3339(),
+        event,
+    })
+    .expect("an event is plain data");
+    line.push('\n');
+    std::fs::create_dir_all(artifacts)?;
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(artifacts.join("events.jsonl"))?
+        .write_all(line.as_bytes())
+}
+
 /// Where a run's events go. Cheap to clone and pass around; a silent one
 /// (no run, no file) does nothing.
 #[derive(Debug, Clone)]
@@ -565,6 +594,7 @@ pub fn timeline(run: &str, events_jsonl: &str) -> serde_json::Value {
                     "state": event["state"],
                     "receipt": event["receipt"],
                     "summary": event["summary"],
+                    "reason": event["reason"],
                 });
             }
             Some("output") => {
@@ -714,6 +744,67 @@ impl Channel {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_out_of_process_writer_appends_seqless_lines_the_timeline_reads() {
+        let dir = crate::test_support::short_temp_dir("ap1");
+        let artifacts = dir.join("run-w");
+        append_event(
+            "run-w",
+            &artifacts,
+            &Event::Stderr {
+                text: "driver_gone: x".into(),
+            },
+        )
+        .expect("stderr");
+        append_event(
+            "run-w",
+            &artifacts,
+            &Event::Outcome {
+                state: "interrupted".into(),
+                receipt: None,
+                summary: None,
+                reason: Some("run run-w interrupted: its driver (pid 1) is gone".into()),
+            },
+        )
+        .expect("outcome");
+        let text = std::fs::read_to_string(artifacts.join("events.jsonl")).expect("events");
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.lines().all(|l| !l.contains("\"seq\"")), "{text}");
+        let timeline = timeline("run-w", &text);
+        assert_eq!(timeline["outcome"]["state"], "interrupted");
+    }
+
+    #[test]
+    fn ten_thousand_lines_appended_concurrently_all_parse() {
+        let dir = crate::test_support::short_temp_dir("ap2");
+        let artifacts = std::sync::Arc::new(dir.join("run-c"));
+        let handles: Vec<_> = (0..8)
+            .map(|worker| {
+                let artifacts = artifacts.clone();
+                std::thread::spawn(move || {
+                    for n in 0..1250 {
+                        append_event(
+                            "run-c",
+                            &artifacts,
+                            &Event::Stderr {
+                                text: format!("worker {worker} line {n} {}", "x".repeat(200)),
+                            },
+                        )
+                        .expect("append");
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("join");
+        }
+        let text = std::fs::read_to_string(artifacts.join("events.jsonl")).expect("events");
+        assert_eq!(text.lines().count(), 10_000);
+        for line in text.lines() {
+            serde_json::from_str::<serde_json::Value>(line).expect("a whole JSON line");
+        }
+    }
+
     use super::*;
 
     fn lines(path: &Path) -> Vec<serde_json::Value> {
@@ -782,6 +873,7 @@ mod tests {
                 insertions: 3,
                 deletions: 1,
             }),
+            reason: None,
         });
         let text = std::fs::read_to_string(dir.join("run-1/events.jsonl")).expect("events");
         let timeline = timeline("run-1", &text);

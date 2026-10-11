@@ -1202,6 +1202,7 @@ impl<'a> RunEngine<'a> {
             state: outcome.state().as_str().to_string(),
             receipt: receipt.clone(),
             summary,
+            reason: None,
         });
         // A replay's `done` waits for its trial to be recorded: its caller
         // sends it (`relais dataset replay`).
