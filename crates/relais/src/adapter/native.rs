@@ -340,7 +340,138 @@ fn usage_of_report(usage: Option<&AgentUsage>, prices: Option<&PriceTable>) -> B
         },
         timestamp: String::new(),
     };
-    usage_of(std::slice::from_ref(&record), prices)
+    let clean = sanitized_model(&record.model);
+    let mut booked = usage_of(std::slice::from_ref(&record), prices);
+    // The reason names the model the plugin sent, and that is text from
+    // outside: it is shown cleaned, and `effective_model` stays as sent.
+    if !record.model.is_empty() {
+        for reason in &mut booked.unpriced {
+            *reason = reason.replace(&record.model, &clean);
+        }
+    }
+    booked
+}
+
+/// The longest model name a cost event shows.
+const MODEL_NAME_SHOWN: usize = 40;
+
+/// A model name as the plugin sent it, made safe to show: escape sequences
+/// and control characters dropped, at most [`MODEL_NAME_SHOWN`] characters.
+pub fn sanitized_model(model: &str) -> String {
+    let mut shown = String::new();
+    let mut chars = model.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            match chars.next() {
+                // CSI: parameters up to a final byte in `@`..`~`.
+                Some('[') => {
+                    for next in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: up to BEL or the string terminator `ESC \`.
+                Some(']') => {
+                    while let Some(next) = chars.next() {
+                        if next == '\u{7}' {
+                            break;
+                        }
+                        if next == '\u{1b}' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) | None => {}
+            }
+        } else if !c.is_control() {
+            shown.push(c);
+        }
+    }
+    shown.chars().take(MODEL_NAME_SHOWN).collect()
+}
+
+/// What the plugin sends after each turn of a dispatch's agent: the
+/// cumulative usage so far, and the transcript messages it is made of.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct TurnReport {
+    #[serde(rename = "agent")]
+    pub agent_id: String,
+    #[serde(default)]
+    pub turns: Option<u64>,
+    #[serde(default)]
+    pub usage: Option<AgentUsage>,
+    #[serde(default)]
+    pub message_ids: Vec<String>,
+}
+
+/// What booking a turn's cumulative usage came to.
+#[derive(Debug, PartialEq)]
+pub enum TurnBooked {
+    /// The dispatch is not on the ledger.
+    NoSuchDispatch,
+    /// Nothing was new: a lower or equal cumulative, or a retry.
+    Nothing,
+    /// The delta was booked; `unpriced` names why it could not be priced.
+    Booked {
+        run_id: crate::ids::RunId,
+        cost: Option<i64>,
+        completeness: crate::money::CostCompleteness,
+        unpriced_reason: Option<String>,
+    },
+}
+
+/// Books a dispatch's cumulative usage as the delta over what the ledger
+/// already holds for it, in one transaction: the same booking `stopped`
+/// ends with, so the two never count a token twice.
+pub fn book_turn_usage(
+    ledger: &crate::ledger::Ledger,
+    dispatch: &str,
+    report: &TurnReport,
+    prices: Option<&PriceTable>,
+) -> Result<TurnBooked, crate::ledger::LedgerError> {
+    let Some(context) = ledger.dispatch_booking(dispatch)? else {
+        return Ok(TurnBooked::NoSuchDispatch);
+    };
+    let booked = usage_of_report(report.usage.as_ref(), prices);
+    let usage = &booked.usage;
+    let event = crate::ledger::UsageEvent {
+        event_id: dispatch.to_string(),
+        run_id: context.run_id.clone(),
+        attempt_id: context.attempt_id,
+        parent_event_id: None,
+        model: booked.effective_model.clone(),
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
+        cost: usage.cost.micros(),
+        cost_kind: crate::money::CostKind::EstimatedApiEquivalent,
+        completeness: usage.cost.completeness(),
+        inclusive: usage.cost.inclusive(),
+        at: ledger.now(),
+        phase: context.phase,
+        duration_ms: None,
+        requested_model: context.requested_model,
+        requested_effort: context.requested_effort,
+        harness: context.harness,
+    };
+    Ok(
+        match ledger.record_usage_delta(
+            &event,
+            &report.message_ids,
+            crate::ledger::Booking::Turn,
+        )? {
+            None => TurnBooked::Nothing,
+            Some(delta) => TurnBooked::Booked {
+                run_id: context.run_id,
+                cost: delta.cost.map(MicroUsd::to_micros),
+                completeness: delta.completeness,
+                unpriced_reason: (!booked.unpriced.is_empty()).then(|| booked.unpriced.join("; ")),
+            },
+        },
+    )
 }
 
 /// A launch that did not reach a result.

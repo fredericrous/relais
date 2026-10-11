@@ -1877,6 +1877,74 @@ fn insert_usage_event(conn: &Connection, event: &UsageEvent) -> Result<bool> {
     Ok(inserted == 1)
 }
 
+/// Which booking of a dispatch's usage a row is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Booking {
+    /// A turn while the dispatch runs (`native usage`): keyed
+    /// `<dispatch>#<n>`, never by the bare id.
+    Turn,
+    /// The booking at the dispatch's end (`native stopped`, the runner):
+    /// the one row keyed by the bare dispatch id, written even at a zero
+    /// delta. Its presence is what says the dispatch reported
+    /// (`run_dispatch_report_counts`), so a dispatch killed mid-flight
+    /// with per-turn rows still reads as not reported.
+    Final,
+}
+
+/// What a dispatch's usage rows already hold, summed.
+struct BookedFigures {
+    rows: i64,
+    /// Whether the bare-id row, the final booking, is among them.
+    has_final: bool,
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    cost: i64,
+}
+
+/// What a dispatch's usage row needs besides the usage itself.
+#[derive(Debug, Clone)]
+pub struct DispatchBooking {
+    pub run_id: RunId,
+    pub attempt_id: Option<i64>,
+    pub phase: Option<UsagePhase>,
+    pub requested_model: Option<String>,
+    pub requested_effort: Option<String>,
+    pub harness: Option<String>,
+}
+
+/// The part of a cumulative usage event that is new over `booked`: the
+/// whole event when nothing is booked yet, otherwise each figure less what
+/// is booked, clamped at zero, in a row named after the dispatch and the
+/// rows before it. `None` when no figure grew.
+fn delta_event(event: &UsageEvent, booked: &BookedFigures, event_id: String) -> Option<UsageEvent> {
+    if booked.rows == 0 {
+        return Some(UsageEvent {
+            event_id,
+            ..event.clone()
+        });
+    }
+    let over = |total: Option<i64>, held: i64| total.map(|total| total.saturating_sub(held).max(0));
+    let input = over(event.input_tokens, booked.input);
+    let output = over(event.output_tokens, booked.output);
+    let cache_read = over(event.cache_read_tokens, booked.cache_read);
+    let cache_write = over(event.cache_write_tokens, booked.cache_write);
+    let cost = over(event.cost.map(MicroUsd::to_micros), booked.cost);
+    let grew = [input, output, cache_read, cache_write, cost]
+        .iter()
+        .any(|figure| figure.is_some_and(|figure| figure > 0));
+    grew.then(|| UsageEvent {
+        event_id,
+        input_tokens: input,
+        output_tokens: output,
+        cache_read_tokens: cache_read,
+        cache_write_tokens: cache_write,
+        cost: cost.map(MicroUsd::from_micros),
+        ..event.clone()
+    })
+}
+
 /// A run's recorded driver: pid, process start time, since when.
 pub type RunDriver = (Option<i64>, Option<String>, Option<String>);
 
@@ -4312,6 +4380,130 @@ impl Ledger {
         Ok(inserted)
     }
 
+    /// Books a dispatch's cumulative usage, `event`, as only what is new:
+    /// the figure over what the dispatch's earlier usage rows already hold,
+    /// each figure clamped at zero, so a lower or equal cumulative books
+    /// nothing and a retry books once. The message ids go through the same
+    /// dedup as [`Self::record_native_usage`]. All in one `BEGIN IMMEDIATE`
+    /// transaction, so concurrent callers see each other's rows. Returns the
+    /// event that was booked, `None` when nothing was new.
+    pub fn record_usage_delta(
+        &self,
+        event: &UsageEvent,
+        message_ids: &[String],
+        booking: Booking,
+    ) -> Result<Option<UsageEvent>> {
+        let tx = self.write_tx()?;
+        // The dispatch's rows: the bare id, and every `<id>#…` — a range
+        // on the `event_id` key ('#' is 0x23, '$' the next byte), so the
+        // lookup stays on the index however large the table grows.
+        let booked = tx.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(event_id = ?1), 0) > 0,
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_write_tokens), 0),
+                    COALESCE(SUM(cost_micros), 0)
+             FROM usage_events
+             WHERE event_id = ?1 OR (event_id >= ?1 || '#' AND event_id < ?1 || '$')",
+            params![event.event_id],
+            |row| {
+                Ok(BookedFigures {
+                    rows: row.get(0)?,
+                    has_final: row.get(1)?,
+                    input: row.get(2)?,
+                    output: row.get(3)?,
+                    cache_read: row.get(4)?,
+                    cache_write: row.get(5)?,
+                    cost: row.get(6)?,
+                })
+            },
+        )?;
+        let numbered = format!("{}#{}", event.event_id, booked.rows);
+        let delta = match booking {
+            // The final row is written once, even at zero: it is the
+            // dispatch's "reported" marker.
+            Booking::Final if !booked.has_final => Some(
+                delta_event(event, &booked, event.event_id.clone()).unwrap_or_else(|| UsageEvent {
+                    event_id: event.event_id.clone(),
+                    input_tokens: event.input_tokens.map(|_| 0),
+                    output_tokens: event.output_tokens.map(|_| 0),
+                    cache_read_tokens: event.cache_read_tokens.map(|_| 0),
+                    cache_write_tokens: event.cache_write_tokens.map(|_| 0),
+                    cost: event.cost.map(|_| MicroUsd::from_micros(0)),
+                    ..event.clone()
+                }),
+            ),
+            Booking::Final | Booking::Turn => delta_event(event, &booked, numbered),
+        };
+        if let Some(delta) = &delta {
+            insert_usage_event(&tx, delta)?;
+        }
+        // One dispatch, one phase: the final booking knows the phase the
+        // runner books it under (a planner's `planning`, a package child's
+        // role), which the per-turn rows could only guess from the intent.
+        if booking == Booking::Final {
+            tx.execute(
+                "UPDATE usage_events SET phase = ?2
+                 WHERE event_id >= ?1 || '#' AND event_id < ?1 || '$'",
+                params![event.event_id, event.phase.map(UsagePhase::as_str)],
+            )?;
+        }
+        for message_id in message_ids {
+            tx.execute(
+                "INSERT OR IGNORE INTO native_usage_messages
+                    (message_id, dispatch_id, run_id, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![message_id, event.event_id, event.run_id.as_str(), event.at],
+            )?;
+            tx.execute(
+                "DELETE FROM orchestration_usage WHERE message_id = ?1",
+                params![message_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(delta)
+    }
+
+    /// What a native dispatch's usage rows need to book a figure for it:
+    /// its run, attempt, phase and requested model, from its intent.
+    pub fn dispatch_booking(&self, dispatch_id: &str) -> Result<Option<DispatchBooking>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT run_id, attempt_id, intent_json FROM dispatches WHERE dispatch_id = ?1",
+                params![dispatch_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((run_id, attempt_id, intent)) = row else {
+            return Ok(None);
+        };
+        let intent: serde_json::Value =
+            serde_json::from_str(&intent).map_err(|e| LedgerError::Corrupt {
+                what: format!("dispatch {dispatch_id}'s intent"),
+                detail: e.to_string(),
+            })?;
+        let text = |key: &str| intent[key].as_str().map(str::to_string);
+        Ok(Some(DispatchBooking {
+            run_id: RunId::from_stored(&run_id),
+            attempt_id,
+            // A kind that is not a usage phase (the planner's `plan`)
+            // books no phase here; the final booking sets the phase
+            // the runner books it under on every per-turn row.
+            phase: text("kind").and_then(|kind| UsagePhase::parse(&kind).ok()),
+            requested_model: text("model"),
+            requested_effort: text("effort"),
+            harness: text("harness"),
+        }))
+    }
+
     /// Was this transcript message booked to a native run's attempt?
     pub fn is_native_booked(&self, message_id: &str) -> Result<bool> {
         Ok(self.conn.query_row(
@@ -6416,6 +6608,100 @@ mod tests {
             "the refused salvage leaves the person's own answer exactly as it left it"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A dispatch killed after its per-turn bookings never booked its
+    /// final row, so it does not count as reported: the run's cost is a
+    /// lower bound, not complete.
+    #[test]
+    fn per_turn_rows_alone_do_not_make_a_dispatch_reported() {
+        let (ledger, _dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-k"), "/repo", None, &task("run-k"), "rk")
+            .expect("run");
+        for id in ["disp-done", "disp-killed"] {
+            ledger
+                .record_dispatch_intent(
+                    &dispatch(id),
+                    &run("run-k"),
+                    None,
+                    &serde_json::json!({}),
+                    0,
+                    RoutedBy::ConservativeBaseline,
+                )
+                .expect("intent");
+        }
+        ledger
+            .record_usage_delta(&event("disp-done", "run-k", 5), &[], Booking::Final)
+            .expect("final");
+        let turn = ledger
+            .record_usage_delta(&event("disp-killed", "run-k", 3), &[], Booking::Turn)
+            .expect("turn")
+            .expect("booked");
+        assert_eq!(
+            turn.event_id, "disp-killed#0",
+            "a turn never takes the bare id"
+        );
+        assert_eq!(
+            ledger
+                .run_cost_completeness(&run("run-k"))
+                .expect("completeness"),
+            CostCompleteness::IncompleteLowerBound
+        );
+    }
+
+    /// A final booking with nothing new still writes the bare-id row: it
+    /// is the dispatch's "reported" marker, at zero.
+    #[test]
+    fn a_final_booking_with_nothing_new_still_marks_the_dispatch_reported() {
+        let (ledger, _dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-z"), "/repo", None, &task("run-z"), "rk")
+            .expect("run");
+        ledger
+            .record_usage_delta(&event("disp-z", "run-z", 7), &[], Booking::Turn)
+            .expect("turn");
+        let last = ledger
+            .record_usage_delta(&event("disp-z", "run-z", 7), &[], Booking::Final)
+            .expect("final")
+            .expect("the marker is written");
+        assert_eq!(last.event_id, "disp-z");
+        assert_eq!(last.input_tokens, Some(0));
+        assert_eq!(
+            ledger.run_cost(&run("run-z")).expect("cost"),
+            MicroUsd::from_micros(7)
+        );
+    }
+
+    /// An intent that does not parse is a corrupt row, reported, never a
+    /// booking with every field silently empty.
+    #[test]
+    fn a_corrupt_intent_is_reported_not_booked_blank() {
+        let (ledger, _dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-c"), "/repo", None, &task("run-c"), "rk")
+            .expect("run");
+        ledger
+            .record_dispatch_intent(
+                &dispatch("disp-c"),
+                &run("run-c"),
+                None,
+                &serde_json::json!({}),
+                0,
+                RoutedBy::ConservativeBaseline,
+            )
+            .expect("intent");
+        ledger
+            .conn
+            .execute(
+                "UPDATE dispatches SET intent_json = '{not json' WHERE dispatch_id = 'disp-c'",
+                [],
+            )
+            .expect("corrupt");
+        assert!(matches!(
+            ledger.dispatch_booking("disp-c"),
+            Err(LedgerError::Corrupt { .. })
+        ));
     }
 
     fn event(event_id: &str, run_id: &str, micros: i64) -> UsageEvent {

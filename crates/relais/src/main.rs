@@ -603,6 +603,13 @@ enum NativeCommand {
         #[arg(long)]
         dispatch: String,
     },
+    /// The dispatch's agent finished a turn; `{"agent", "turns", "usage",
+    /// "message_ids"}` on stdin, the usage cumulative over the dispatch.
+    /// Books only what the ledger does not hold yet for the dispatch
+    Usage {
+        #[arg(long)]
+        dispatch: String,
+    },
     /// Cancel one run, from the session that started it. A run with no
     /// live driver is marked cancelled at once, from any session; a run
     /// with a live driver of another session is refused (11)
@@ -4219,6 +4226,7 @@ fn native_command(cmd: NativeCommand) -> Result<CliOutcome, CliError> {
             native_status_command(run.as_deref(), session.as_deref())
         }
         NativeCommand::Cancel { run, session } => native_cancel_command(&run, session.as_deref()),
+        NativeCommand::Usage { dispatch } => native_usage_command(&dispatch),
         NativeCommand::Contract => native_contract_command(),
         NativeCommand::RouterState { session } => Ok(router_state_command(&session)),
         NativeCommand::RouterObserve => Ok(router_observe_command()),
@@ -4582,6 +4590,61 @@ fn router_off_command(by: &str, source: relais::router::Source) -> Result<CliOut
         &serde_json::json!({ "schema": 1, "envelope": null, "off": off, "removed": had_envelope }),
     )?;
     Ok(CliOutcome::Accepted)
+}
+
+/// `relais native usage`: books the dispatch's cumulative usage as the
+/// delta over what is already booked, and tells the run's events. Empty or
+/// terminal stdin is a usage error (2), never a wait.
+fn native_usage_command(dispatch: &str) -> Result<CliOutcome, CliError> {
+    use relais::adapter::native::{book_turn_usage, TurnBooked, TurnReport};
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return Err(CliError::Usage {
+            detail: "native usage: the report goes on stdin, which is a terminal".into(),
+        });
+    }
+    let payload = read_stdin()?;
+    if payload.trim().is_empty() {
+        return Err(CliError::Usage {
+            detail: "native usage: stdin is empty; expected the dispatch's usage report".into(),
+        });
+    }
+    let report: TurnReport = serde_json::from_str(&payload).map_err(|e| CliError::Usage {
+        detail: format!("native usage: the payload on stdin is not a usage report: {e}"),
+    })?;
+    let prices = load_machine_pricing()?;
+    let ledger = open_ledger()?;
+    match operational(
+        book_turn_usage(&ledger, dispatch, &report, prices.as_ref()),
+        "native usage",
+    )? {
+        TurnBooked::NoSuchDispatch => {
+            eprintln!("relais native usage: no dispatch {dispatch} on record");
+            Ok(CliOutcome::UnknownRun)
+        }
+        TurnBooked::Nothing => Ok(CliOutcome::Accepted),
+        TurnBooked::Booked {
+            run_id,
+            cost,
+            completeness,
+            unpriced_reason,
+        } => {
+            let artifacts = paths::runs_dir()
+                .map_err(CliError::Home)?
+                .join(run_id.as_str());
+            let event = relais::protocol::Event::Cost {
+                booked: cost,
+                completeness,
+                unpriced_reason,
+            };
+            // The ledger holds the booking; a run that cannot be told of it
+            // is said, not undone.
+            if let Err(e) = relais::protocol::append_event(run_id.as_str(), &artifacts, &event) {
+                eprintln!("relais native usage: booked, but the run's events are not written: {e}");
+            }
+            Ok(CliOutcome::Accepted)
+        }
+    }
 }
 
 fn native_gate() -> Result<relais::coordinator::RemoteGate, CliError> {
@@ -6839,16 +6902,22 @@ fn report_command(
 /// defaults" posture `coordinator daemon` already takes reading this
 /// file, not an error just because nobody has priced anything yet.
 fn load_price_table() -> Result<PriceTable, CliError> {
+    Ok(load_machine_pricing()?.unwrap_or_else(PriceTable::empty))
+}
+
+/// The machine's `[pricing]` table; `None` when it has none, so a cost can
+/// say that no table is the reason it is unknown.
+fn load_machine_pricing() -> Result<Option<PriceTable>, CliError> {
     let path = paths::machine_settings_path().map_err(CliError::Home)?;
     match std::fs::read_to_string(&path) {
-        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => Ok(PriceTable::empty()),
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(cause) => Err(CliError::Read {
             what: "the machine settings",
             path,
             cause,
         }),
         Ok(text) => match MachineSettings::from_toml_str(&text) {
-            Ok(machine) => Ok(machine.pricing.unwrap_or_else(PriceTable::empty)),
+            Ok(machine) => Ok(machine.pricing),
             Err(e) => Err(CliError::Invalid {
                 what: "the machine settings",
                 path,

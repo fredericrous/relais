@@ -110,6 +110,10 @@ pub enum Event {
     Cost {
         booked: Option<i64>,
         completeness: CostCompleteness,
+        /// Why the cost is unknown, when a model could not be priced: the
+        /// pricing table's reason, with the model name sanitized.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unpriced_reason: Option<String>,
     },
     CheckStarted {
         label: String,
@@ -588,6 +592,7 @@ pub fn timeline(run: &str, events_jsonl: &str) -> serde_json::Value {
             Some("cost") => cost.push(serde_json::json!({
                 "booked": event["booked"],
                 "completeness": event["completeness"],
+                "unpriced_reason": event["unpriced_reason"],
             })),
             Some("outcome") => {
                 outcome = serde_json::json!({
@@ -826,6 +831,7 @@ mod tests {
         events.emit(Event::Cost {
             booked: Some(5),
             completeness: CostCompleteness::Actual,
+            unpriced_reason: None,
         });
         events.emit(Event::Stderr { text: "hi".into() });
         let written = lines(&dir.join("run-1/events.jsonl"));
@@ -864,6 +870,7 @@ mod tests {
         events.emit(Event::Cost {
             booked: Some(5),
             completeness: CostCompleteness::Actual,
+            unpriced_reason: None,
         });
         events.emit(Event::Outcome {
             state: "accepted".into(),

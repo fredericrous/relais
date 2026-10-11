@@ -639,10 +639,11 @@ fn dispatch_ended(dispatch: String, launched: &Launched) -> Event {
 }
 
 /// What a usage event just recorded booked, for the run's events.
-fn cost_booked(event: &UsageEvent) -> Event {
+fn cost_booked(event: &UsageEvent, unpriced: &[String]) -> Event {
     Event::Cost {
         booked: event.cost.map(MicroUsd::to_micros),
         completeness: event.completeness,
+        unpriced_reason: (!unpriced.is_empty()).then(|| unpriced.join("; ")),
     }
 }
 
@@ -870,13 +871,16 @@ impl<'a> RunEngine<'a> {
         event: &UsageEvent,
         result: &LaunchResult,
     ) -> Result<(), LedgerError> {
-        let ledger = self.config.ledger;
-        if result.booked_message_ids.is_empty() {
-            ledger.record_usage(event)?;
-        } else {
-            ledger.record_native_usage(event, &result.booked_message_ids)?;
+        // Only what the dispatch's per-turn bookings have not already
+        // booked: `native usage` may have booked most of it.
+        let booked = self.config.ledger.record_usage_delta(
+            event,
+            &result.booked_message_ids,
+            crate::ledger::Booking::Final,
+        )?;
+        if let Some(booked) = booked {
+            self.events.emit(cost_booked(&booked, &result.unpriced));
         }
-        self.events.emit(cost_booked(event));
         if result.session_id.is_some() && result.booked_message_ids.is_empty() {
             self.events.emit(Event::Decision {
                 what: "rollback_ids_missing".into(),
@@ -8139,6 +8143,100 @@ mod tests {
     }
 
     // -- the harness boundary (SPEC §8, §9, §11) --------------------------
+
+    /// The stopped path after per-turn bookings: the runner books only the
+    /// rest of the dispatch's usage, as the one bare-id row that says the
+    /// dispatch reported, and every row of the dispatch ends in one phase.
+    #[test]
+    fn stopped_after_per_turn_usage_books_only_the_rest_in_one_phase() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let ledger_path = fixture.dir.join("ledger.sqlite");
+        let worker = Arc::new(std::sync::Mutex::new(None::<String>));
+        let seen = Arc::clone(&worker);
+        let opened = ledger_path.clone();
+        let backend = MockBackend::new(move |spec| {
+            if spec.prompt.contains("semantic reviewer") {
+                return MockOutcome {
+                    result_text: Some("FINDINGS: none".into()),
+                    exit_code: Some(0),
+                    usage: Some(usage(40)),
+                    ..Default::default()
+                };
+            }
+            // What `native usage` books mid-flight: 60 of the 100 input
+            // tokens the worker ends up reporting, with no phase.
+            let ledger = Ledger::open(&opened).expect("ledger");
+            let booking = ledger
+                .dispatch_booking(&spec.dispatch_id)
+                .expect("booking")
+                .expect("the dispatch is on record");
+            ledger
+                .record_usage_delta(
+                    &UsageEvent {
+                        event_id: spec.dispatch_id.clone(),
+                        run_id: booking.run_id,
+                        attempt_id: None,
+                        parent_event_id: None,
+                        model: Some("m".into()),
+                        input_tokens: Some(60),
+                        output_tokens: Some(1),
+                        cache_read_tokens: None,
+                        cache_write_tokens: None,
+                        cost: Some(MicroUsd::from_micros(6)),
+                        cost_kind: CostKind::EstimatedApiEquivalent,
+                        completeness: CostCompleteness::Actual,
+                        inclusive: false,
+                        at: ledger.now(),
+                        phase: None,
+                        duration_ms: None,
+                        requested_model: None,
+                        requested_effort: None,
+                        harness: None,
+                    },
+                    &[],
+                    crate::ledger::Booking::Turn,
+                )
+                .expect("per-turn booking");
+            *seen.lock().expect("lock") = Some(spec.dispatch_id.clone());
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(10)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &backend);
+        assert!(
+            matches!(outcome.terminal, Terminal::Accepted(_)),
+            "{outcome:?}"
+        );
+        let dispatch = worker.lock().expect("lock").clone().expect("worker ran");
+        let conn = rusqlite::Connection::open(&ledger_path).expect("conn");
+        let rows: Vec<(String, i64, Option<String>)> = conn
+            .prepare(
+                "SELECT event_id, input_tokens, phase FROM usage_events
+                 WHERE event_id = ?1 OR (event_id >= ?1 || '#' AND event_id < ?1 || '$')
+                 ORDER BY event_id",
+            )
+            .expect("prepare")
+            .query_map([&dispatch], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows");
+        assert_eq!(rows.len(), 2, "one per-turn row, one final: {rows:?}");
+        assert_eq!(rows[0].0, dispatch, "the final row carries the bare id");
+        assert_eq!(rows[0].1, 40, "the runner booked only the rest");
+        assert_eq!(rows.iter().map(|r| r.1).sum::<i64>(), 100);
+        assert!(rows[0].2.is_some(), "the runner books a phase");
+        assert!(
+            rows.iter().all(|r| r.2 == rows[0].2),
+            "one dispatch, one phase: {rows:?}"
+        );
+    }
 
     #[test]
     fn unreported_usage_is_unknown_in_the_receipt_not_zero() {
