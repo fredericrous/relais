@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/review-outcomes
 repos: [relais, amont-agent]
 adrs:
@@ -152,7 +152,7 @@ on that data; its design notes stay below.
       reviews (docs/plans/*.reviews.md across the repos) whose plan reached
       a push; the time-to-decision estimate is restated from it. Results
       recorded in the Decision log.
-- [ ] Phase 1 — amont-agent: lift the `toolUseResult.agentId` capture in
+- [x] Phase 1 — amont-agent: lift the `toolUseResult.agentId` capture in
       `completed_agents` (src/plan_review.rs ~l.813-816) out of the
       `resumable` branch and extend `Completed` (~l.685) with agent_id,
       model, tokens, duration. `amont-agent plan-review record` (stdin JSON
@@ -168,7 +168,7 @@ on that data; its design notes stay below.
       agent_id, and two concurrent `record` processes on the same transcript
       yield one row per reviewer; the saved body is written once and is mode
       0600.
-- [ ] Phase 2 — relais: `relais native review-outcome` (Behaviour 6), join
+- [x] Phase 2 — relais: `relais native review-outcome` (Behaviour 6), join
       by agent id, label `miss|clean|unknown` into the `review_outcomes`
       table, `LabelSource::Review`, `DATASET_VERSION` bump, README exit-code
       table and `exit_codes_follow_the_documented_table` update. Tests for
@@ -249,6 +249,25 @@ on that data; its design notes stay below.
   `~/Developer/Perso`) carries `body-sha=` of one of the plan's rounds. The
   remit table ships in every ledger row (`remit`), so relais never calls
   amont-agent to read it.
+- 2026-10-11 — the plan-review skill is `~/.claude/skills/plan-review/SKILL.md`,
+  a local file in no repository; it was changed in the implementing session
+  (step 4 runs `plan-review record` before the plan is edited, step 7's 📍
+  line names each role's model). It calls a command only amont-agent >
+  2.33.1 has, so the amont-agent release carrying Phase 1 must ship before
+  the next plan review records anything.
+
+- 2026-10-11 — implementation: the report states "still learning" once, in
+  the section header, not on every row: no class can be decided before
+  Phase 8, and the 80 columns are spent on tokens by model (whole models,
+  then `+N`). Phase 8 brings a per-row state back when states can differ.
+  A later in-remit `high` finding whose section was absent from round 1,
+  changed since, or not named labels the reviewer `unknown`
+  (`section_changed`), as Behaviour 2 says; a missing body is
+  `missing_body`.
+- 2026-10-11 — implementation: the Phase 2 relais run was interrupted
+  (its plugin heartbeat lapsed while this session blocked on a CI poll);
+  its preserved candidate was applied and finished in-session, recorded
+  as `salvaged`.
 
 ## Verification
 
@@ -256,16 +275,44 @@ on that data; its design notes stay below.
 - Phase 1: run a real plan-review round, call the record command → one row
   per reviewer in `outcomes.jsonl` (mode 0600), rerun writes nothing new
   (exit 0, "already recorded"), two concurrent runs yield one row per
-  reviewer → observed.
+  reviewer → observed 2026-10-11, branch binary on this plan's own review
+  transcript, scratch config dir: `wrote 8 rows (round 5, plan
+  1a0350da061a)`, 8 reviewers with agent id, model, tokens and seconds;
+  rerun exit 0 `already recorded round 5 of 1a0350da061a; nothing
+  written`; two concurrent runs from an empty dir → 8 rows; dirs 0700,
+  ledger 0600, the round-5 body saved.
 - Phase 2: replay the ledger of a past plan → labels match a hand reading of
   its reviews file; `--dry-run` prints them without writing; a symlinked
   ledger exits 3; `relais report` shows n, clean, miss, unknown and tokens by
   model per class with "still learning" wording, and `relais report |
-  awk 'length>80'` is empty → observed. Phase 3–4 checks sit under their
-  deferred notes in Phases.
+  awk 'length>80'` is empty → observed 2026-10-11, branch binary, scratch
+  `RELAIS_STATE_DIR`, the Phase 1 ledger of this plan's own review (8 rows,
+  one backend `high` finding on `Behaviour` with no area, only the round-5
+  body saved): `labelled 8: clean 3, miss 0, unknown 5 (not_pushed 0,
+  no_later_review 1, missing_body 4, section_changed 0)`, which matches the hand reading:
+  rust, tui and unix clean (the finding names no area in their remit),
+  backend rounds 1–4 `missing_body` (the round-1 body was never saved),
+  round 5 `no_later_review`. Re-ingest gave the same (also after the review fixes); a symlinked ledger
+  exited 3 (`… is a symlink`). The report's Reviewers section lists the four
+  classes with tokens by model (`opus-5-5 56k, sonnet-5-5 55k, +1`) under
+  "every class still learning"; `awk 'length>80'` printed 0 lines.
+  Phase 3–4 checks sit under their deferred notes in Phases.
+
+## Implementation review
+
+- relais: approve on the Delta (100k, 34 s); round 1 approve-with-changes (85k, 63 s): 6 findings, all fixed in 5ecb907 (section_changed unknown, unreadable report line, cycle settings as input, preview/ingest split, exhaustive match, exit 1).
+- amont-agent #94: approve on its final round, after 14 findings over four rounds, all fixed; recorded in its pointer plan.
+- deliberate: the other-uid refusal is code-only (chown needs root); "still learning" is a header line (Decision log).
 
 ## Outcome
 
-Filled when the plan closes.
+Reviewers now have an outcome. amont-agent ≥ the release after 2.33.1
+records each panel round (`plan-review record`, amont-agent #94); relais
+labels them `clean|miss|unknown` (`native review-outcome`, run at the start
+of every `learn cycle`) and `relais report` shows n, clean, miss, unknown
+and tokens by model per reviewer role. On this plan's own panel: 3 clean,
+5 unknown, because the round-1 body predates `record`. The draw, twin,
+adoption and rollback stay with the learning-loop plan's Phase 8, which
+starts from these counts.
 
 <!-- panel: repos=relais,amont-agent reviewers=backend,lang:rust,tui,unix body-sha=1a0350da061a -->
