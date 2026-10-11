@@ -18,9 +18,48 @@
 //! corrupt row the ledger refuses, not a missing PID, and the two lead to
 //! different verdicts here.
 
+use std::time::Duration;
+
 use crate::admission::RunStatus;
 use crate::ids::{DispatchId, Pid};
 use crate::ledger::LiveDispatch;
+
+/// An attempt's wall time when neither the contract nor the policy names one.
+pub const DEFAULT_WALL_SECONDS: u64 = 2700;
+/// How long past the attempt wall time a run may stay silent before its
+/// driver is presumed gone: the runner ends an attempt at its wall time and
+/// records it, so no live driver is silent for longer.
+pub const DRIVER_MARGIN: Duration = Duration::from_secs(15 * 60);
+
+/// A non-terminal run whose driver has stopped writing for too long.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Orphan {
+    pub silent: Duration,
+    pub threshold: Duration,
+}
+
+impl Orphan {
+    /// The sentence recorded with the `driver_gone` transition.
+    pub fn detail(&self) -> String {
+        format!(
+            "the driving `relais run` is gone: nothing was written for {}s, past the {}s              threshold (attempt wall time plus a {}s margin)",
+            self.silent.as_secs(),
+            self.threshold.as_secs(),
+            DRIVER_MARGIN.as_secs()
+        )
+    }
+}
+
+/// The attempt wall time: the contract's, else the policy's, else the default.
+pub fn attempt_wall(contract: Option<u64>, policy: Option<u64>) -> Duration {
+    Duration::from_secs(contract.or(policy).unwrap_or(DEFAULT_WALL_SECONDS))
+}
+
+/// Whether a run silent for `silent` is orphaned, given its attempt wall time.
+pub fn orphan_of(silent: Duration, wall: Duration) -> Option<Orphan> {
+    let threshold = wall + DRIVER_MARGIN;
+    (silent > threshold).then_some(Orphan { silent, threshold })
+}
 
 /// What reconciliation established about one dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,6 +322,18 @@ mod tests {
 
     const NOTHING_IS_ALIVE: &dyn Fn(Pid) -> bool = &|_| false;
     const EVERYTHING_IS_ALIVE: &dyn Fn(Pid) -> bool = &|_| true;
+
+    #[test]
+    fn a_run_is_orphaned_only_past_wall_time_plus_margin() {
+        let wall = attempt_wall(Some(600), Some(1200));
+        assert_eq!(wall, Duration::from_secs(600));
+        assert_eq!(attempt_wall(None, Some(1200)), Duration::from_secs(1200));
+        assert_eq!(attempt_wall(None, None), Duration::from_secs(2700));
+        assert_eq!(orphan_of(Duration::from_secs(1500), wall), None);
+        let orphan = orphan_of(Duration::from_secs(1501), wall).expect("orphaned");
+        assert_eq!(orphan.threshold, Duration::from_secs(1500));
+        assert!(orphan.detail().contains("1501s"), "{}", orphan.detail());
+    }
 
     #[test]
     fn a_live_worker_refuses_the_resume() {

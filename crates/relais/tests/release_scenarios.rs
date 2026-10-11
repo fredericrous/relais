@@ -3411,6 +3411,128 @@ fn a_leftover_worktree_is_retired_by_resume_with_its_tree_named() {
     assert!(one_out.contains("no worktree is retained"), "{one_out}");
 }
 
+// SPEC §12: a non-terminal run whose driver is gone (its events.jsonl silent
+// past the attempt wall time plus a margin) is interrupted as `driver_gone`
+// and its worktree retired; one silent for less is kept.
+fn make_non_terminal(world: &World, run_id: &str, events_age: std::time::Duration) {
+    let ledger =
+        relais::ledger::Ledger::open(&world.state.join("ledger.sqlite")).expect("open ledger");
+    let run = relais::ids::RunId::from_stored(run_id);
+    let from = ledger.run_status(&run).expect("status");
+    ledger
+        .record_transition(&relais::ledger::Transition {
+            run_id: run.clone(),
+            attempt_id: None,
+            from_state: from,
+            to_state: relais::lifecycle::State::Running,
+            reason: "worker_dispatched".into(),
+            detail: None,
+            at: relais::ledger::now_rfc3339(),
+        })
+        .expect("running");
+    let events = world.run_dir(run_id).join("events.jsonl");
+    if !events.exists() {
+        std::fs::write(&events, "{}\n").expect("events");
+    }
+    std::fs::File::options()
+        .write(true)
+        .open(&events)
+        .expect("open events")
+        .set_modified(std::time::SystemTime::now() - events_age)
+        .expect("age events");
+}
+
+fn leftover_worktree(world: &World, run_id: &str) -> PathBuf {
+    let leftover = world.worktree(run_id);
+    git(
+        &world.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            &leftover.to_string_lossy(),
+            "HEAD",
+        ],
+    );
+    std::fs::write(leftover.join("src/leftover.rs"), "// never exported\n").expect("write");
+    leftover
+}
+
+#[test]
+fn an_orphaned_run_is_interrupted_and_its_worktree_retired() {
+    let world = World::new("orphan");
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    let task = world.write_task("task.json", "off");
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(5), "{}", text(&run.stderr));
+    let run_id = world.only_run_id();
+
+    // Silent for a minute: a live driver may be between events; kept.
+    make_non_terminal(&world, &run_id, std::time::Duration::from_secs(60));
+    let leftover = leftover_worktree(&world, &run_id);
+    let kept = world.relais(&["resume", "--retire", "--all"]);
+    let out = text(&kept.stdout);
+    assert!(out.contains("kept, the run is running"), "{out}");
+    assert!(leftover.exists());
+
+    // Silent for three hours: the driver is gone.
+    make_non_terminal(&world, &run_id, std::time::Duration::from_secs(3 * 3600));
+    let swept = world.relais(&["resume", "--retire", "--all"]);
+    let out = text(&swept.stdout);
+    assert_eq!(
+        swept.status.code(),
+        Some(0),
+        "{out}\n{}",
+        text(&swept.stderr)
+    );
+    assert!(out.contains("-> interrupted"), "{out}");
+    assert!(out.contains(&format!("{run_id}: retired")), "{out}");
+    assert!(!leftover.exists(), "the worktree is retired");
+    let explained = text(&world.relais(&["explain", &run_id]).stdout);
+    assert!(explained.contains("driver_gone"), "{explained}");
+    let ledger =
+        relais::ledger::Ledger::open(&world.state.join("ledger.sqlite")).expect("open ledger");
+    assert_eq!(
+        ledger
+            .run_status(&relais::ids::RunId::from_stored(&run_id))
+            .expect("status"),
+        Some(relais::lifecycle::State::Interrupted)
+    );
+}
+
+// SPEC §23: cancelling a run no worker process is bound to interrupts it.
+#[test]
+fn cancel_of_a_run_with_no_bound_worker_interrupts_it() {
+    let world = World::new("cancelunbound");
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    let task = world.write_task("task.json", "off");
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(5), "{}", text(&run.stderr));
+    let run_id = world.only_run_id();
+    make_non_terminal(&world, &run_id, std::time::Duration::from_secs(1));
+    let cancel = world.relais(&["coordinator", "cancel", "--run", &run_id]);
+    let out = text(&cancel.stdout);
+    assert_eq!(
+        cancel.status.code(),
+        Some(0),
+        "{out}\n{}",
+        text(&cancel.stderr)
+    );
+    assert!(out.contains("-> interrupted"), "{out}");
+    let ledger =
+        relais::ledger::Ledger::open(&world.state.join("ledger.sqlite")).expect("open ledger");
+    assert_eq!(
+        ledger
+            .run_status(&relais::ids::RunId::from_stored(&run_id))
+            .expect("status"),
+        Some(relais::lifecycle::State::Interrupted)
+    );
+    world.stop_coordinator();
+}
+
 // SPEC §14: a worker cannot obtain acceptance by modifying policy. The
 // repository's own relais.toml is protected: a candidate that touches it
 // is needs_decision, and the run is judged with the policy loaded from

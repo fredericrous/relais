@@ -2501,6 +2501,29 @@ impl Ledger {
         status.map(|s| parse_state(&s)).transpose()
     }
 
+    /// When a run's row was last written (`runs.updated_at`, RFC 3339):
+    /// every transition rewrites it. `None` when the run is not on record.
+    pub fn run_updated_at(&self, id: &RunId) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT updated_at FROM runs WHERE id = ?1",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(LedgerError::from)
+    }
+
+    /// Close every dispatch of a run that never recorded a terminal state,
+    /// as `state`, so none is judged live again. Returns how many.
+    pub fn close_open_dispatches(&self, id: &RunId, state: &str) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE dispatches SET state = ?2, updated_at = ?3
+             WHERE run_id = ?1 AND state IN ('intent', 'launched')",
+            params![id.as_str(), state, self.now()],
+        )?)
+    }
+
     /// Why a run exists, when it is not ordinary work (SPEC §17). `None`
     /// covers both a run written before migration v14 and an ordinary
     /// run written since — the column is nullable and nothing in this

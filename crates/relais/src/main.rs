@@ -192,6 +192,10 @@ enum Command {
         /// Every run rather than one: the default when no run is named
         #[arg(long, requires = "retire", conflicts_with = "run_id")]
         all: bool,
+        /// Append this command's output to a file instead of the terminal;
+        /// for a detached sweep that has no terminal
+        #[arg(long)]
+        log: Option<PathBuf>,
     },
     /// Cost and outcome reporting since a date (SPEC §11)
     Report {
@@ -1227,9 +1231,11 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             run_id,
             retire,
             all: _,
-        } => match run_id {
-            Some(run_id) => resume_command(&run_id, Retire::from_flag(retire)),
-            None => retire_all_command(),
+            log,
+        } => match (log, run_id) {
+            (Some(log), _) => resume_logged(&log),
+            (None, Some(run_id)) => resume_command(&run_id, Retire::from_flag(retire)),
+            (None, None) => retire_all_command(),
         },
         Command::Report {
             since,
@@ -3081,6 +3087,7 @@ fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome, CliError> 
             dispatch,
             session,
         } => {
+            let cancelled_run = run.clone();
             let request = match (run, dispatch, session) {
                 (Some(run_id), None, None) => Request::CancelRun { run_id },
                 (None, Some(dispatch_id), None) => Request::CancelDispatch { dispatch_id },
@@ -3101,6 +3108,9 @@ fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome, CliError> 
                         dispatches.len(),
                         dispatches.join(", ")
                     );
+                    if let (Some(run_id), true) = (cancelled_run, dispatches.is_empty()) {
+                        interrupt_unbound_run(&run_id)?;
+                    }
                     Ok(CliOutcome::Accepted)
                 }
                 Ok(other) => {
@@ -3129,6 +3139,82 @@ fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome, CliError> 
                     Ok(CliOutcome::Blocked)
                 }
             }
+        }
+    }
+}
+
+/// `coordinator cancel --run` that signalled no worker: nothing bound will
+/// ever end the run, so a non-terminal one is interrupted rather than left
+/// `running`.
+fn interrupt_unbound_run(run_id: &str) -> Result<(), CliError> {
+    let ledger = open_ledger()?;
+    let run = RunId::from_stored(run_id);
+    let Some(state) = operational(ledger.run_status(&run), "coordinator cancel")? else {
+        return Ok(());
+    };
+    if state.is_terminal() {
+        return Ok(());
+    }
+    operational(
+        ledger.close_open_dispatches(&run, Reason::CancelledWithoutWorker.as_str()),
+        "coordinator cancel",
+    )?;
+    operational(
+        ledger.record_transition(&relais::ledger::Transition {
+            run_id: run.clone(),
+            attempt_id: None,
+            from_state: Some(state),
+            to_state: State::Interrupted,
+            reason: Reason::CancelledWithoutWorker.as_str().to_string(),
+            detail: Some(serde_json::json!({
+                "detail": "cancel found no bound worker process to signal",
+            })),
+            at: relais::ledger::now_rfc3339(),
+        }),
+        "coordinator cancel",
+    )?;
+    println!("{run_id}: {state} -> interrupted (no bound worker process was running it)");
+    Ok(())
+}
+
+/// Run this same `relais resume` again with its output appended to `log`
+/// (a timestamp line first), and report whether it succeeded. A detached
+/// sweep has no terminal to write to.
+fn resume_logged(log: &Path) -> Result<CliOutcome, CliError> {
+    use std::io::Write;
+    let open = || -> std::io::Result<std::fs::File> {
+        if let Some(parent) = log.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+    };
+    let attempt = || -> std::io::Result<std::process::ExitStatus> {
+        let mut file = open()?;
+        writeln!(file, "--- {} relais resume", relais::ledger::now_rfc3339())?;
+        let mut args = std::env::args_os().skip(1);
+        let mut kept = Vec::new();
+        while let Some(arg) = args.next() {
+            if arg == "--log" {
+                args.next();
+            } else if !arg.to_string_lossy().starts_with("--log=") {
+                kept.push(arg);
+            }
+        }
+        std::process::Command::new(std::env::current_exe()?)
+            .args(kept)
+            .stdout(file.try_clone()?)
+            .stderr(file)
+            .status()
+    };
+    match attempt() {
+        Ok(status) if status.success() => Ok(CliOutcome::Accepted),
+        Ok(_) => Ok(CliOutcome::OperationalFailure),
+        Err(e) => {
+            eprintln!("relais resume: cannot write the log {}: {e}", log.display());
+            Ok(CliOutcome::OperationalFailure)
         }
     }
 }
@@ -5720,6 +5806,19 @@ fn resume_command(run_id: &str, retire: Retire) -> Result<CliOutcome, CliError> 
     // An absent terminal result never means nothing executed (SPEC §12).
     // The policy is `resume::reconcile`, a pure function with a test per
     // row; this handler does the ledger write and the printing.
+    if !state.is_terminal() {
+        if let Some(orphan) = orphan_of_run(&ledger, &run)? {
+            interrupt_orphan(&ledger, &run, state, &orphan)?;
+            return match retire {
+                Retire::Keep => Ok(CliOutcome::ResumeReconciled),
+                Retire::Retire => {
+                    let reconciliation = reconcile_run(&ledger, &run)?;
+                    retire_run(&ledger, &run, State::Interrupted, &reconciliation)?;
+                    Ok(CliOutcome::ResumeReconciled)
+                }
+            };
+        }
+    }
     let reconciliation = reconcile_run(&ledger, &run)?;
     if state.is_terminal() {
         println!("{run_id} is already terminal: {state}");
@@ -5773,6 +5872,80 @@ fn resume_command(run_id: &str, retire: Retire) -> Result<CliOutcome, CliError> 
         }
     }
     Ok(CliOutcome::ResumeReconciled)
+}
+
+/// How long a run's driver has been silent: since `events.jsonl` was last
+/// written, else since the run's row was. `None` when neither is known.
+fn run_silence(ledger: &Ledger, run: &RunId) -> Result<Option<std::time::Duration>, CliError> {
+    let events = paths::runs_dir()
+        .map_err(CliError::Home)?
+        .join(run.as_str())
+        .join("events.jsonl");
+    let last_write = match std::fs::metadata(&events).and_then(|meta| meta.modified()) {
+        Ok(modified) => Some(modified),
+        Err(_) => operational(ledger.run_updated_at(run), "resume")?
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
+            .map(std::time::SystemTime::from),
+    };
+    Ok(last_write.map(|at| {
+        std::time::SystemTime::now()
+            .duration_since(at)
+            .unwrap_or_default()
+    }))
+}
+
+/// Whether a non-terminal run has lost its driver (SPEC §12): silent for
+/// longer than its attempt wall time plus a margin.
+fn orphan_of_run(ledger: &Ledger, run: &RunId) -> Result<Option<resume::Orphan>, CliError> {
+    let Some(silent) = run_silence(ledger, run)? else {
+        return Ok(None);
+    };
+    let contract_wall = operational(ledger.run_contract_and_tier(run), "resume")
+        .ok()
+        .flatten()
+        .and_then(|(contract, _)| contract.limits.wall_seconds);
+    let policy_wall = load_repo_policy()
+        .ok()
+        .map(|(_, policy)| policy.execution.max_wall_seconds);
+    Ok(resume::orphan_of(
+        silent,
+        resume::attempt_wall(contract_wall, policy_wall),
+    ))
+}
+
+/// Move an orphaned run to `interrupted` (`driver_gone`) and close its open
+/// dispatches so none is judged live again; the decision is recorded with
+/// the silence and the threshold.
+fn interrupt_orphan(
+    ledger: &Ledger,
+    run: &RunId,
+    state: State,
+    orphan: &resume::Orphan,
+) -> Result<(), CliError> {
+    let closed = operational(
+        ledger.close_open_dispatches(run, Reason::DriverGone.as_str()),
+        "resume",
+    )?;
+    let detail = orphan.detail();
+    operational(
+        ledger.record_transition(&relais::ledger::Transition {
+            run_id: run.clone(),
+            attempt_id: None,
+            from_state: Some(state),
+            to_state: State::Interrupted,
+            reason: Reason::DriverGone.as_str().to_string(),
+            detail: Some(serde_json::json!({
+                "detail": detail,
+                "silent_seconds": orphan.silent.as_secs(),
+                "threshold_seconds": orphan.threshold.as_secs(),
+                "dispatches_closed": closed,
+            })),
+            at: relais::ledger::now_rfc3339(),
+        }),
+        "resume",
+    )?;
+    println!("{run}: {state} -> interrupted ({detail})");
+    Ok(())
 }
 
 /// Judge every dispatch the ledger still records as live for one run.
@@ -5838,14 +6011,19 @@ fn retire_all_command() -> Result<CliOutcome, CliError> {
             );
             continue;
         };
-        if !state.is_terminal() {
+        let state = if state.is_terminal() {
+            state
+        } else if let Some(orphan) = orphan_of_run(&ledger, &run)? {
+            interrupt_orphan(&ledger, &run, state, &orphan)?;
+            State::Interrupted
+        } else {
             println!(
                 "{}: kept, the run is {state} ({})",
                 worktree.run_id,
                 worktree.path.display()
             );
             continue;
-        }
+        };
         let reconciliation = reconcile_run(&ledger, &run)?;
         match retire_worktree(&ledger, &run, state, &reconciliation, &worktree.path)? {
             Retired::Retired => {}

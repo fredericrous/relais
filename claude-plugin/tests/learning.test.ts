@@ -33,6 +33,24 @@ test('session start and end spawn the cycle detached: no run, no announcement, n
   expect(engine.calls.prompts.length).toBe(0)
 })
 
+test('session start sweeps orphaned runs detached: no run, no announcement, no outcome', async ($: any, on: any) => {
+  const engine = scriptedEngine(on)
+  await start($)
+  await settle(engine)
+  expect(engine.calls.resume.length).toBe(1)
+  expect(engine.calls.resume[0].argv).toEqual([
+    'relais',
+    'resume',
+    '--retire',
+    '--all',
+    '--log',
+    '/Users/p/.local/state/relais/resume.log',
+  ])
+  expect(engine.calls.spawn.length).toBe(0)
+  expect(engine.calls.prompts.length).toBe(0)
+  expect(engine.calls.toasts.length).toBe(0)
+})
+
 for (const [action, names] of [
   ['promoted', ['relais report', 'relais rollback']],
   ['rolled_back', ['relais report']],

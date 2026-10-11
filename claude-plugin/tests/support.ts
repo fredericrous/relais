@@ -9,6 +9,8 @@ export type Calls = {
   spawn: any[]
   // The detached `relais learn cycle` spawns, kept apart from the runs'.
   learn: any[]
+  // The detached `relais resume --retire --all` sweeps.
+  resume: any[]
   // How many toasts had been shown when each learn spawn arrived.
   toastsAtLearnSpawn: number[]
   // What reached the engine's `agent.spawn`, after the plugin's own hook.
@@ -46,6 +48,7 @@ export function scriptedEngine(
     run: [],
     spawn: [],
     learn: [],
+    resume: [],
     toastsAtLearnSpawn: [],
     spawned: [],
     tool: [],
@@ -132,6 +135,10 @@ export function scriptedEngine(
       calls.learn.push(e)
       calls.toastsAtLearnSpawn.push(calls.toasts.length)
       if (script.learnSpawnFails) throw new Error('spawn refused')
+      return { value: { code: 0, signal: null } }
+    }
+    if (e.argv[1] === 'resume') {
+      calls.resume.push(e)
       return { value: { code: 0, signal: null } }
     }
     calls.spawn.push(e)
