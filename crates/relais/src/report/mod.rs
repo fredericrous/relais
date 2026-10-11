@@ -65,8 +65,8 @@ fn accepted_by_person(
 /// status` prints, so its JSON agrees with the sentence a person sees),
 /// so a downstream parser can tell an old shape from a new one instead of
 /// guessing from key presence. 9: `never_shipped_tasks`. 10:
-/// `repair_outcomes`.
-pub const REPORT_SCHEMA_VERSION: u32 = 10;
+/// `repair_outcomes`. 11: `advisor_data`.
+pub const REPORT_SCHEMA_VERSION: u32 = 11;
 
 /// A dimension `relais report --by` groups the window's tasks over (SPEC
 /// §11: "compare like task classes and policy versions"). Total over the
@@ -571,6 +571,10 @@ pub struct Report {
     /// because a decision opened before the window is exactly as owed to
     /// a person today as one opened inside it.
     pub open_decisions: Vec<DecisionRecord>,
+    /// The decision advisor's data gate (ADR-0004, plan
+    /// 2026-10-11-orchestrator-decides 4c): how many answers count as the
+    /// person's, how fast they arrive, and when the gate projects to open.
+    pub advisor_data: AdvisorData,
     /// Present only when `--by <dimension>` was given; the default report
     /// is unchanged when it is absent.
     pub cohorts: Option<CohortReport>,
@@ -680,6 +684,68 @@ impl EnforcementReport {
     }
 }
 
+/// How many answers the decision advisor's data gate needs (plan
+/// 2026-10-11-orchestrator-decides, 4c).
+pub const ADVISOR_GATE: usize = 200;
+/// The window the arrival rate is measured over, in days.
+const ADVISOR_RATE_DAYS: i64 = 30;
+
+/// The decision advisor's data gate, as `relais report` prints it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct AdvisorData {
+    pub counts: crate::ledger::PersonAnswerCounts,
+    pub gate: usize,
+    /// Counted answers per week over the last 30 days.
+    pub per_week: f64,
+    /// Weeks until the gate opens at that rate; `None` when nothing
+    /// arrived in the window, or the gate is already open (`total >= gate`).
+    pub weeks_to_gate: Option<f64>,
+}
+
+impl AdvisorData {
+    fn from_counts(counts: crate::ledger::PersonAnswerCounts) -> Self {
+        let recent = (counts.recent_person + counts.recent_proxied) as f64;
+        let per_week = recent / (ADVISOR_RATE_DAYS as f64 / 7.0);
+        let missing = ADVISOR_GATE.saturating_sub(counts.total);
+        let weeks_to_gate = (missing > 0 && per_week > 0.0).then(|| missing as f64 / per_week);
+        Self {
+            counts,
+            gate: ADVISOR_GATE,
+            per_week,
+            weeks_to_gate,
+        }
+    }
+
+    fn line(&self) -> String {
+        let c = self.counts;
+        let mut out = format!(
+            "advisor data: {} of {} answers counted as the person's ({:.1}/week over {} days: \
+             person {}, via the orchestrator {}); ",
+            c.total, self.gate, self.per_week, ADVISOR_RATE_DAYS, c.recent_person, c.recent_proxied
+        );
+        match self.weeks_to_gate {
+            _ if c.total >= self.gate => out.push_str("the gate is open\n"),
+            Some(weeks) => out.push_str(&format!("the gate opens in about {weeks:.0} weeks\n")),
+            None => out.push_str("no answer in the window, so no date can be projected\n"),
+        }
+        if c.unproved_proxied > 0 {
+            out.push_str(&format!(
+                "  {} person-via-orchestrator answer(s) recorded without the plugin's proof \
+                 (recorded_via=cli): not counted\n",
+                c.unproved_proxied
+            ));
+        }
+        out
+    }
+}
+
+fn advisor_data(ledger: &Ledger) -> Result<AdvisorData, crate::ledger::LedgerError> {
+    let since = chrono::Utc::now() - chrono::Duration::days(ADVISOR_RATE_DAYS);
+    Ok(AdvisorData::from_counts(
+        ledger.person_answer_counts(&since.to_rfc3339())?,
+    ))
+}
+
 pub fn runs_report(
     ledger: &Ledger,
     since: &str,
@@ -756,6 +822,7 @@ pub fn runs_report(
     // count by state would keep reporting answered runs as waiting, and
     // disagree with the list of open decisions printed below it.
     let open_decisions = ledger.open_decisions()?;
+    let advisor_data = advisor_data(ledger)?;
     let pending_decisions = open_decisions
         .iter()
         .filter(|decision| runs.iter().any(|run| run.run_id == decision.run.as_str()))
@@ -985,6 +1052,7 @@ pub fn runs_report(
         pending_feedback,
         backfilled_tasks,
         open_decisions,
+        advisor_data,
         cohorts,
         repair_outcomes,
         enforcement: EnforcementReport::observed(),
@@ -1151,6 +1219,7 @@ impl Report {
                 ));
             }
         }
+        out.push_str(&self.advisor_data.line());
         if let Some(cohort_report) = &self.cohorts {
             out.push('\n');
             out.push_str(&format!("by {}:\n", cohort_report.dimension.as_str()));
@@ -1677,6 +1746,7 @@ mod tests {
             pending_feedback: 1,
             backfilled_tasks: 0,
             open_decisions: vec![],
+            advisor_data: AdvisorData::default(),
             cohorts: None,
             repair_outcomes: Vec::new(),
             trial_spend: None,
@@ -1870,6 +1940,38 @@ mod tests {
 
     /// A downstream parser keys off exact top-level field names; a rename
     /// here should fail this test, not the parser in production.
+    /// 12 counted answers in the window: 12 / (30 / 7) = 2.8 a week, and
+    /// the 188 still missing take about 67 weeks at that rate.
+    #[test]
+    fn the_advisor_gate_projects_from_the_last_thirty_days() {
+        let data = AdvisorData::from_counts(crate::ledger::PersonAnswerCounts {
+            total: 12,
+            recent_person: 9,
+            recent_proxied: 3,
+            unproved_proxied: 0,
+        });
+        assert!((data.per_week - 2.8).abs() < 1e-9, "{}", data.per_week);
+        assert_eq!(data.weeks_to_gate.map(f64::round), Some(67.0));
+        assert!(data.line().contains("12 of 200"), "{}", data.line());
+        assert!(data.line().contains("about 67 weeks"), "{}", data.line());
+        let idle = AdvisorData::from_counts(crate::ledger::PersonAnswerCounts {
+            total: 12,
+            unproved_proxied: 2,
+            ..Default::default()
+        });
+        assert_eq!(idle.weeks_to_gate, None);
+        assert!(
+            idle.line().contains("no date can be projected"),
+            "{}",
+            idle.line()
+        );
+        assert!(
+            idle.line().contains("2 person-via-orchestrator"),
+            "{}",
+            idle.line()
+        );
+    }
+
     #[test]
     fn the_reports_json_shape_has_exactly_the_documented_top_level_keys() {
         let dir = temp_dir("json-shape");
@@ -1887,6 +1989,7 @@ mod tests {
                 "accepted_tasks",
                 "accepted_tasks_by_person",
                 "accepted_tasks_by_relais",
+                "advisor_data",
                 "backfilled_tasks",
                 "cohorts",
                 "cost_completeness",
@@ -2100,7 +2203,9 @@ mod tests {
                 &run,
                 &crate::ledger::DecisionAnswer {
                     resolution: Reason::DecisionApproved,
-                    actor: "a person",
+                    actor: crate::ledger::Actor::Person,
+                    person_quote: None,
+                    recorded_via: crate::ledger::RecordedVia::Cli,
                     note: None,
                     successor_run: None,
                     from_state: State::NeedsDecision,
@@ -2176,7 +2281,9 @@ mod tests {
                 &run,
                 &crate::ledger::DecisionAnswer {
                     resolution: crate::lifecycle::Reason::DecisionRevised,
-                    actor: "fredericrous",
+                    actor: crate::ledger::Actor::Person,
+                    person_quote: None,
+                    recorded_via: crate::ledger::RecordedVia::Cli,
                     note: None,
                     successor_run: None,
                     from_state: State::NeedsReview,
@@ -2503,7 +2610,9 @@ mod tests {
                 &revised,
                 &crate::ledger::DecisionAnswer {
                     resolution: Reason::DecisionRevised,
-                    actor: "a person",
+                    actor: crate::ledger::Actor::Person,
+                    person_quote: None,
+                    recorded_via: crate::ledger::RecordedVia::Cli,
                     note: None,
                     successor_run: None,
                     from_state: State::NeedsReview,
@@ -2528,7 +2637,7 @@ mod tests {
             })
             .expect("transition");
         ledger
-            .record_salvage(&salvaged, "deadbeef", "a person", None)
+            .record_salvage(&salvaged, "deadbeef", crate::ledger::Actor::Person, None)
             .expect("salvage")
             .expect("a terminal run with no prior decision salvages");
 
@@ -3547,7 +3656,7 @@ mod tests {
             "{text}"
         );
         let json = serde_json::to_value(&report).expect("serializes");
-        assert_eq!(json["schema_version"], 10);
+        assert_eq!(json["schema_version"], 11);
         assert!(json["repair_outcomes"].is_array());
         std::fs::remove_dir_all(&dir).ok();
     }

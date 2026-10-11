@@ -1,5 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import { event, line, settle, startedRun, startQueued } from './support.ts'
+import { DECIDE_STEP } from '../hooks/runs.ts'
 
 const RUN = 'run-65d322006dd13-c35c'
 
@@ -47,6 +48,7 @@ test('done toasts the outcome, tells the model, and the status line keeps the ou
   expect(engine.calls.toasts.some((t: string) => t.includes('accepted') && t.includes('receipt.json'))).toBe(true)
   expect(engine.calls.prompts.length).toBe(1)
   const text = engine.calls.prompts[0].text
+  expect(text).not.toContain('mcp__relais__decide')
   expect(text).toContain('accepted')
   expect(text).toContain('/runs/r1/receipt.json')
   expect(text).toContain(`relais run ${RUN} finished: accepted.`)
@@ -368,6 +370,7 @@ test('an identical outcome later is checked again: nothing of the first was kept
   await settle(engine)
   await tick(engine)
   expect(engine.calls.prompts[0].text).toContain('Since then: decision_approved')
+  expect(engine.calls.prompts[0].text).not.toContain('mcp__relais__decide')
   current = stillOpen
   engine.stream.push('stdout', needsDecision())
   await settle(engine)
@@ -389,6 +392,7 @@ test('an outcome whose decision is still open goes out byte for byte', async ($:
       `relais run ${RUN} finished: needs_decision (verification_inputs_changed): the checks changed under the run. This is yours to decide.`,
       'Receipt: /runs/r1/receipt.json',
       'Changed: 1 file, +3 -1',
+      DECIDE_STEP,
     ].join('\n'),
   )
   expect(statusCalls(engine).length).toBe(1)

@@ -75,6 +75,20 @@ export function machineSettingsGuard(
   return file !== '' && (file === path || named(file)) ? MACHINE_SETTINGS_MESSAGE : undefined
 }
 
+export const DECIDE_MESSAGE =
+  'Record a decision with mcp__relais__decide, not relais decide in Bash: the tool sets who answered and proves the call was its own (ADR-0004). The person answers from their own terminal.'
+
+// Why the model's Bash call should go through the decide tool, or
+// undefined: `relais decide` as a command (at the start, or after `;`,
+// `&`, `|`, `(` or `$(`). Text that only mentions it — a grep, an echo —
+// passes. A reminder, not a boundary, as the others are: relais itself
+// records such a call as `cli`, never as the plugin's.
+export function decideGuard(tool: string, input: Record<string, unknown>): string | undefined {
+  if (tool !== 'Bash') return undefined
+  const command = String(input.command ?? '')
+  return /(?:^|[;&|(\n])\s*(?:\S*\/)?relais\s+decide\b/.test(command) ? DECIDE_MESSAGE : undefined
+}
+
 export const LEARNING_ENVELOPE_MESSAGE =
   "Automatic promotion of learned routing is the person's to turn on or off: the person turns it on or off with /relais-learning (or `relais install --claude`). The model does not run learning-envelope or write the [learning] block of the machine settings."
 

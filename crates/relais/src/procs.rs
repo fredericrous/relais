@@ -1122,6 +1122,41 @@ mod imp {
     }
 }
 
+/// Fill `bytes` from the operating system's random source: what makes a
+/// decide nonce unguessable. Unix reads `/dev/urandom`; Windows asks
+/// `BCryptGenRandom` for the system-preferred generator.
+#[cfg(unix)]
+pub fn os_random(bytes: &mut [u8]) -> std::io::Result<()> {
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom")?.read_exact(bytes)
+}
+
+#[cfg(windows)]
+pub fn os_random(bytes: &mut [u8]) -> std::io::Result<()> {
+    use windows_sys::Win32::Security::Cryptography::{
+        BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+    };
+    let len = u32::try_from(bytes.len())
+        .map_err(|_| std::io::Error::other("too many random bytes asked for"))?;
+    // SAFETY: a null algorithm handle with BCRYPT_USE_SYSTEM_PREFERRED_RNG
+    // is the documented form; the buffer is valid for `len` bytes.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            len,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "BCryptGenRandom failed with NTSTATUS {status:#x}"
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // A9: a persistent accept failure the loop cannot make progress on

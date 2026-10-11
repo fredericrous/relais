@@ -100,6 +100,15 @@ export type Store = {
   pendingOutcomes: Map<string, PendingOutcome>
   // Whether this session was told its relais gives no `current` state.
   isCurrentMissingNoted: boolean
+  // The session's decide proof (decide.ts): minted at session start, sent
+  // on stdin with every decide call, forgotten at session end.
+  decideNonce: { session: string; nonce: string } | undefined
+  // When each run's outcome message reached the model, in the clock's ms:
+  // a person's answer to it can only come after.
+  outcomeDeliveredAt: Map<string, number>
+  // The person's latest prompt in this session and when it arrived, kept
+  // before any filter reads it: the decide tool checks a quote against it.
+  lastPersonPrompt: { text: string; at: number } | undefined
   // The session router's memory: router-state, the task, the pinned route,
   // the observations waiting (routing.ts).
   router: RouterMemory
@@ -166,6 +175,9 @@ export const createStore = (): Store => ({
   ownPrompts: new Set(),
   pendingOutcomes: new Map(),
   isCurrentMissingNoted: false,
+  decideNonce: undefined,
+  outcomeDeliveredAt: new Map(),
+  lastPersonPrompt: undefined,
   router: createRouterMemory(),
   shown: { kind: 'runs' },
   generation: 0,

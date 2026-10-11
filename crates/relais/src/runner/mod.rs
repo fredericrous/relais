@@ -2415,7 +2415,7 @@ impl<'a> RunEngine<'a> {
             let detail = format!(
                 "the candidate changes what verification is: {}; these are the profile's own \
                  inputs, so passing its checks would not mean what the policy says it means. \
-                 This is yours to decide, not a reviewer's — the candidate and its patch are \
+                 It is not a reviewer's to decide — the candidate and its patch are \
                  preserved",
                 touched_inputs.policy.join(", ")
             );

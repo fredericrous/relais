@@ -35,6 +35,25 @@ there is one), it has its own 16 KiB budget, and it never counts toward a
 sizing problem. `architecture.keys` stays the binding way to depend on a
 decision.
 
+The orchestrating session answers decisions, and says who decided
+(ADR-0004). The plugin gains `mcp__relais__decide`; an outcome waiting on a
+person now ends with the step that records its answer. `relais decide
+--actor` takes `orchestrator`, `person` (only from a terminal) or
+`person-via-orchestrator` (with `--person-quote`); an old spelling is
+refused naming its replacement, and the orchestrator never signs off a
+human criterion. `--json` prints the answer or `{error, exit}`. Ledger
+schema 27 maps every earlier actor spelling, keeps the original in
+`actor_raw`, stamps old rows `recorded_via = legacy`, and first writes
+`ledger.sqlite.bak-v27` with `VACUUM INTO`; a binary older than this
+release then refuses the ledger, and going back means restoring that
+backup. The plugin proves its own calls with a per-session nonce on stdin
+(`recorded_via = plugin`); this is tamper-evidence, not prevention. The
+learning label policy is version 3: an orchestrator's approval and its
+contained salvage are counted apart from the person's. `relais report`
+(schema 11) prints the decision advisor's data gate. After upgrading,
+reinstall the plugin as for v0.12.0 and restart sessions, so the decide
+tool exists.
+
 ## v0.12.1
 
 Runs that died stop holding their worktrees: relais reconciles them itself

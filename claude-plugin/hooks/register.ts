@@ -6,10 +6,11 @@
 import { dispatchOfDescription, onAgentTool, onTurn } from './agents.ts'
 import { HELLO_EVERY_MS, sendHello } from './callbacks.ts'
 import type { Fx } from './fx.ts'
+import { DECIDE_INPUT_SCHEMA, DECIDE_TOOL_DESCRIPTION, decideTool, endNonce, mintNonce } from './decide.ts'
 import { DENY_MESSAGE, isRelaisNotification, isRelaisType, relaisAddresses } from './guards.ts'
 import { childOf, contractPath, onChunk, pump, reloadTimeline, startReplay, startRun, statusOf } from './runs.ts'
 import { onboardTool, onPersonPrompt, trustTool, withRoutingSection } from './consent.ts'
-import { learningEnvelopeGuard, machineSettingsGuard, routerEnvelopeGuard } from './guards.ts'
+import { decideGuard, learningEnvelopeGuard, machineSettingsGuard, routerEnvelopeGuard } from './guards.ts'
 import { learningCommand, noteLastCycle, startCycle, startResumeSweep } from './learning.ts'
 import {
   afterStep,
@@ -32,6 +33,7 @@ const REPLAY_TOOL = 'mcp__relais__replay'
 const STATUS_TOOL = 'mcp__relais__status'
 const ONBOARD_TOOL = 'mcp__relais__onboard'
 const TRUST_TOOL = 'mcp__relais__trust'
+const DECIDE_TOOL = 'mcp__relais__decide'
 const CONSENT_FAILED = 'declined: relais could not ask the person (internal error). Nothing was written or allowed.'
 // The prompts a person makes: typed, through the bridge, or a headless
 // run's own. Every other origin (notifications, schedules, peers, plugins)
@@ -184,6 +186,14 @@ export function register(on: any) {
         },
       },
     })
+    await $.tool.register({
+      name: 'decide',
+      description: DECIDE_TOOL_DESCRIPTION,
+      inputSchema: DECIDE_INPUT_SCHEMA,
+    })
+    // The proof the decide tool sends: minted in the background; until it
+    // exists an answer records `cli`.
+    detach(mintNonce(fx, store, await fx.session.id()))
     await $.command.register({
       name: 'relais-status',
       description: "Open the relais pane: this session's runs, live.",
@@ -213,6 +223,13 @@ export function register(on: any) {
       await onSessionEnd(fx, store, String(e.reason), await fx.clock.now())
     } catch {
       // Fail open: the session ends whatever the router could send.
+    }
+    // Detached: the session's end never waits on relais. A nonce left
+    // behind is swept by relais when the next one is minted.
+    try {
+      if (e.reason !== 'clear' && e.reason !== 'resume') detach(endNonce(effects($), store))
+    } catch {
+      // Fail open.
     }
     // After this session's own work: the learning cycle, detached.
     try {
@@ -263,7 +280,8 @@ export function register(on: any) {
     const refusal =
       learningEnvelopeGuard(e.tool, input, { home, configDir }) ??
       machineSettingsGuard(e.tool, input, { home, configDir }) ??
-      routerEnvelopeGuard(e.tool, input)
+      routerEnvelopeGuard(e.tool, input) ??
+      decideGuard(e.tool, input)
     return refusal ? { decision: 'deny', reason: refusal } : decided
   })
 
@@ -275,6 +293,10 @@ export function register(on: any) {
     ensurePump(fx)
     return { result: await startReplay(fx, store, { task: e.task, recipe: e.recipe, cwd: e.cwd }) }
   })
+
+  on('tool.call', { tool: DECIDE_TOOL }, async ($: any, e: any) => decideTool(effects($), store, e)).catch(() => ({
+    result: 'relais decide failed inside the plugin (internal error); whether the answer was recorded is unknown: check mcp__relais__status for the run before answering again.',
+  }))
 
   on('tool.call', { tool: STATUS_TOOL }, async ($: any, e: any) => ({
     result: await statusOf(effects($), store, typeof e.run === 'string' ? e.run : undefined, { output: e.output === true }),
@@ -415,6 +437,14 @@ export function register(on: any) {
       // Whether this plugin submitted it is read before onPersonPrompt
       // consumes the mark.
       const isOwn = typeof e.text === 'string' && store.ownPrompts.has(e.text)
+      // Kept before any filter: the decide tool reads the person's words.
+      if (!isOwn && PERSON_ORIGINS.has(e.origin?.kind) && typeof e.text === 'string') {
+        try {
+          store.lastPersonPrompt = { text: e.text, at: await $.clock.now() }
+        } catch {
+          // Fail open: no quote can then be checked, and none is accepted.
+        }
+      }
       onPersonPrompt(store, e.text)
       if (!isOwn && PERSON_ORIGINS.has(e.origin?.kind) && typeof e.text === 'string') {
         try {

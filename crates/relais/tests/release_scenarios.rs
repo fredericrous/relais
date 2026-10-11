@@ -303,6 +303,57 @@ amont_agent = "off"
             .expect("relais runs")
     }
 
+    /// A `relais` command run with a terminal as its stdin and output,
+    /// as the person types one: `--actor person` is refused anywhere
+    /// else. The pty's output (stdout and stderr together) comes back as
+    /// BOTH of the returned streams.
+    #[cfg(unix)]
+    fn relais_on_a_terminal(&self, args: &[&str]) -> Output {
+        let inner = self.command(&[]);
+        let mut script = Command::new("script");
+        if cfg!(target_os = "macos") {
+            script.args(["-q", "/dev/null"]).arg(inner.get_program());
+            script.args(inner.get_args());
+        } else {
+            let mut line = vec![inner.get_program().to_string_lossy().into_owned()];
+            line.extend(inner.get_args().map(|a| a.to_string_lossy().into_owned()));
+            line.extend(args.iter().map(|a| a.to_string()));
+            let quoted: Vec<String> = line
+                .iter()
+                .map(|word| format!("'{}'", word.replace('\'', "'\\''")))
+                .collect();
+            script.args(["-qec", &quoted.join(" "), "/dev/null"]);
+        }
+        if cfg!(target_os = "macos") {
+            script.args(args);
+        }
+        if let Some(dir) = inner.get_current_dir() {
+            script.current_dir(dir);
+        }
+        for (key, value) in inner.get_envs() {
+            match value {
+                Some(value) => script.env(key, value),
+                None => script.env_remove(key),
+            };
+        }
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("RELAIS_") {
+                script.env_remove(&key);
+            }
+        }
+        for (key, value) in inner.get_envs() {
+            if let Some(value) = value {
+                script.env(key, value);
+            }
+        }
+        let mut output = script
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("script runs");
+        output.stderr = output.stdout.clone();
+        output
+    }
+
     /// A `relais` command in this world's environment.
     fn command(&self, extra_env: &[(&str, &str)]) -> Command {
         let mut cmd = common::relais(BIN);
@@ -1690,13 +1741,23 @@ fn a_salvaged_run_keeps_its_reason_counts_as_accepted_and_takes_feedback() {
     // The ordinary answers do not reach a run that never awaited a
     // person.
     let approve = world.relais(&[
-        "decide", &run_id, "--answer", "approve", "--actor", "a person",
+        "decide",
+        &run_id,
+        "--answer",
+        "approve",
+        "--actor",
+        "orchestrator",
     ]);
     assert_eq!(approve.status.code(), Some(2), "{}", text(&approve.stderr));
 
     // `salvaged` requires `--candidate`.
     let no_candidate = world.relais(&[
-        "decide", &run_id, "--answer", "salvaged", "--actor", "a person",
+        "decide",
+        &run_id,
+        "--answer",
+        "salvaged",
+        "--actor",
+        "orchestrator",
     ]);
     assert_eq!(
         no_candidate.status.code(),
@@ -1712,7 +1773,7 @@ fn a_salvaged_run_keeps_its_reason_counts_as_accepted_and_takes_feedback() {
         "--answer",
         "salvaged",
         "--actor",
-        "a person",
+        "orchestrator",
         "--candidate",
         "handmerged123",
         "--note",
@@ -1734,7 +1795,7 @@ fn a_salvaged_run_keeps_its_reason_counts_as_accepted_and_takes_feedback() {
         "--answer",
         "salvaged",
         "--actor",
-        "someone else",
+        "orchestrator",
         "--candidate",
         "other456",
     ]);
@@ -1863,7 +1924,7 @@ fn a_run_waiting_on_a_person_is_salvaged_counted_and_takes_feedback() {
         "--answer",
         "salvaged",
         "--actor",
-        "a person",
+        "orchestrator",
         "--candidate",
         "handmerged789",
         "--note",
@@ -1899,7 +1960,7 @@ fn a_run_waiting_on_a_person_is_salvaged_counted_and_takes_feedback() {
         "--answer",
         "decided",
         "--actor",
-        "someone else",
+        "orchestrator",
     ]);
     assert_eq!(
         redecide.status.code(),
@@ -1913,7 +1974,7 @@ fn a_run_waiting_on_a_person_is_salvaged_counted_and_takes_feedback() {
         "--answer",
         "salvaged",
         "--actor",
-        "someone else",
+        "orchestrator",
         "--candidate",
         "other456",
     ]);
@@ -1930,7 +1991,7 @@ fn a_run_waiting_on_a_person_is_salvaged_counted_and_takes_feedback() {
     let explained = text(&explain.stdout);
     assert!(explained.contains("decision_salvaged"), "{explained}");
     assert!(explained.contains("scope_exceeded"), "{explained}");
-    assert!(explained.contains("a person"), "{explained}");
+    assert!(explained.contains("orchestrator"), "{explained}");
 
     // The primary metric counts the task as accepted by a person, with
     // the run's own spend attached to it — the number three packages in
@@ -2314,7 +2375,7 @@ fn a_run_awaiting_a_person_is_answered_by_decide_and_drops_off_the_open_list() {
         "--answer",
         "decided",
         "--actor",
-        "the release suite",
+        "orchestrator",
         "--note",
         "the scope was intentional; the task will be revised",
     ]);
@@ -2333,7 +2394,7 @@ fn a_run_awaiting_a_person_is_answered_by_decide_and_drops_off_the_open_list() {
     let explain = world.relais(&["explain", &run_id]);
     let explained = text(&explain.stdout);
     assert!(explained.contains("decision_recorded"), "{explained}");
-    assert!(explained.contains("the release suite"), "{explained}");
+    assert!(explained.contains("orchestrator"), "{explained}");
     assert!(
         explained.contains("the scope was intentional"),
         "{explained}"
@@ -2353,7 +2414,7 @@ fn a_run_awaiting_a_person_is_answered_by_decide_and_drops_off_the_open_list() {
         "--answer",
         "decided",
         "--actor",
-        "someone else",
+        "orchestrator",
     ]);
     assert_eq!(
         redecide.status.code(),
@@ -2788,7 +2849,7 @@ fn every_decide_answer_ends_the_run_they_answered_with_its_own_terminal_status()
             "--answer",
             answer,
             "--actor",
-            "the release suite",
+            "orchestrator",
         ]);
         assert_eq!(
             decide.status.code(),
@@ -2816,6 +2877,11 @@ fn every_decide_answer_ends_the_run_they_answered_with_its_own_terminal_status()
 /// an ACCEPTED run with a receipt — accepts it exactly like a
 /// relais-accepted one. An unknown criterion id is refused first, naming
 /// the ids the contract actually declares.
+// Unix only: the sign-off is `--actor person`, which relais accepts only
+// from a terminal, and the test makes one with `script(1)`; Windows has no
+// equivalent a test can drive. The refusals themselves run everywhere
+// (tests/decide_actor.rs).
+#[cfg(unix)]
 #[test]
 fn a_human_sign_off_gap_is_cleared_only_by_decide_and_then_feedback_accepts_it() {
     let world = World::new("signoff");
@@ -2870,13 +2936,13 @@ fn a_human_sign_off_gap_is_cleared_only_by_decide_and_then_feedback_accepts_it()
         "the checks passed; nothing but the sign-off gap remained, so no reviewer ran"
     );
 
-    let bad_criterion = world.relais(&[
+    let bad_criterion = world.relais_on_a_terminal(&[
         "decide",
         &run_id,
         "--answer",
         "approve",
         "--actor",
-        "a person",
+        "person",
         "--criterion",
         "not-a-real-id",
     ]);
@@ -2897,13 +2963,13 @@ fn a_human_sign_off_gap_is_cleared_only_by_decide_and_then_feedback_accepts_it()
     // settled what a test was declared to settle — the second acceptance
     // path this mechanism exists to refuse. The id is real and the
     // contract does declare it, so only the evidence kind refuses it.
-    let wrong_kind = world.relais(&[
+    let wrong_kind = world.relais_on_a_terminal(&[
         "decide",
         &run_id,
         "--answer",
         "approve",
         "--actor",
-        "a person",
+        "person",
         "--criterion",
         &tested_entry.id(),
     ]);
@@ -2919,13 +2985,13 @@ fn a_human_sign_off_gap_is_cleared_only_by_decide_and_then_feedback_accepts_it()
         text(&wrong_kind.stderr)
     );
 
-    let decide = world.relais(&[
+    let decide = world.relais_on_a_terminal(&[
         "decide",
         &run_id,
         "--answer",
         "approve",
         "--actor",
-        "a person",
+        "person",
         "--note",
         "looks fine",
         "--criterion",
@@ -3022,7 +3088,7 @@ fn relais_feedback_accepts_a_person_approved_run_with_no_receipt() {
         "--answer",
         "approve",
         "--actor",
-        "the release suite",
+        "orchestrator",
     ]);
     assert_eq!(decide.status.code(), Some(0), "{}", text(&decide.stderr));
 

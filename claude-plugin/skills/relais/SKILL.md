@@ -108,6 +108,20 @@ up, and the person answers there.
      artifacts path is on every terminal state. A run refused before it
      started says `Nothing ran` and names why.
 
+5. Answer a run that waits on a decision (needs_decision, needs_review,
+   interrupted) and record it with `mcp__relais__decide`: approve,
+   revise (`successor` names the run that carries the revision), reject,
+   salvaged (`candidate` is the commit that landed it), abandon or
+   decided, with a `note` naming the evidence.
+   - Answer it yourself when the request or the approved plan already
+     answers it. Otherwise ask the person, then record their answer with
+     `on_behalf_of_person: true` and their own words, verbatim, as
+     `person_quote`.
+   - Never run `relais decide` in Bash: the tool records who answered
+     and proves the call was its own. relais refuses what may not be
+     answered (an approval with open verification gaps) and says why;
+     read that answer, do not route around it.
+
 ## Rules
 
 - The contract is frozen once the run starts; changing objective, scope,
@@ -115,7 +129,8 @@ up, and the person answers there.
 - Acceptance criteria must be executable by the verification profile; a
   worker's completion message is never acceptance.
 - If the run needs a decision, make it explicitly — do not let a model
-  invent it.
+  invent it. A decision is not made until it is recorded with
+  `mcp__relais__decide`.
 
 ## Done when
 
@@ -128,5 +143,7 @@ up, and the person answers there.
   Bash) and reached a terminal state (accepted, needs_decision,
   needs_review, blocked, failed, budget_exhausted or interrupted), and
   that state, not a worker's own summary, was read;
-- a `needs_decision` outcome was resolved explicitly, not guessed;
+- a `needs_decision`, `needs_review` or `interrupted` outcome was
+  answered explicitly, not guessed, and recorded with
+  `mcp__relais__decide`;
 - for `accepted`, the printed artifacts path was checked, not assumed.

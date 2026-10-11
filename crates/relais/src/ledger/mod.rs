@@ -33,7 +33,7 @@ pub use router::{
     RouterTaskRow, RouterUsageRow, RouterWindow,
 };
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 26;
+pub const LEDGER_SCHEMA_VERSION: u64 = 27;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -1619,7 +1619,202 @@ const MIGRATIONS: &[(&str, &str)] = &[
     );
     "#,
     ),
+    (
+        // Who decided, typed (orchestrator-decides plan, Phase 1): the
+        // free-text `actor` becomes one of three values, the original
+        // spelling is kept in `actor_raw`, and each answer records how it
+        // reached relais (`recorded_via`; every existing row is
+        // `legacy`), the person's words when the orchestrator typed for
+        // them (`person_quote`), and the advisor's stored advice (columns
+        // only; nothing writes them yet). `apply_actor_step` refuses, by
+        // name, a spelling the CASE below does not map BEFORE this runs
+        // (the CASE has no ELSE on purpose: an unmapped spelling must
+        // never become a silent NULL), and backs the ledger up first.
+        "v27",
+        r#"
+    ALTER TABLE decisions ADD COLUMN actor_raw TEXT;
+    ALTER TABLE decisions ADD COLUMN person_quote TEXT;
+    ALTER TABLE decisions ADD COLUMN recorded_via TEXT;
+    ALTER TABLE decisions ADD COLUMN advice_p_approve REAL;
+    ALTER TABLE decisions ADD COLUMN advice_model TEXT;
+    ALTER TABLE decisions ADD COLUMN advice_revision TEXT;
+    ALTER TABLE decisions ADD COLUMN advice_null_reason TEXT;
+    ALTER TABLE human_signoffs ADD COLUMN actor_raw TEXT;
+    ALTER TABLE human_signoffs ADD COLUMN person_quote TEXT;
+    ALTER TABLE human_signoffs ADD COLUMN recorded_via TEXT;
+    CREATE TABLE decide_nonces (
+        session TEXT PRIMARY KEY,
+        nonce_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    UPDATE decisions SET actor_raw = actor, recorded_via = 'legacy';
+    UPDATE human_signoffs SET actor_raw = actor, recorded_via = 'legacy';
+    UPDATE decisions SET actor = CASE actor
+        WHEN 'claude' THEN 'orchestrator'
+        WHEN 'claude-orchestrator' THEN 'orchestrator'
+        WHEN 'claude-session' THEN 'orchestrator'
+        WHEN 'claude (for the person)' THEN 'person-via-orchestrator'
+        WHEN 'Frédéric Rousseau (via Claude Code)' THEN 'person-via-orchestrator'
+        WHEN 'fredericrous' THEN 'person'
+        WHEN 'person' THEN 'person'
+        WHEN 'orchestrator' THEN 'orchestrator'
+        WHEN 'person-via-orchestrator' THEN 'person-via-orchestrator'
+    END
+    WHERE actor IS NOT NULL;
+    UPDATE human_signoffs SET actor = CASE actor
+        WHEN 'claude' THEN 'orchestrator'
+        WHEN 'claude-orchestrator' THEN 'orchestrator'
+        WHEN 'claude-session' THEN 'orchestrator'
+        WHEN 'claude (for the person)' THEN 'person-via-orchestrator'
+        WHEN 'Frédéric Rousseau (via Claude Code)' THEN 'person-via-orchestrator'
+        WHEN 'fredericrous' THEN 'person'
+        WHEN 'person' THEN 'person'
+        WHEN 'orchestrator' THEN 'orchestrator'
+        WHEN 'person-via-orchestrator' THEN 'person-via-orchestrator'
+    END;
+    "#,
+    ),
 ];
+
+/// `advice_p_approve, advice_model, advice_revision, advice_null_reason`.
+type StoredAdvice = (Option<f64>, Option<String>, Option<String>, Option<String>);
+
+/// The version of the step that types the actor; it needs a backup and a
+/// pre-check that a SQL batch cannot do.
+const ACTOR_STEP: &str = "v27";
+
+/// Every actor spelling a ledger written before the typed [`Actor`] may
+/// hold, and the actor it becomes. The v27 SQL `CASE` repeats this table;
+/// a test runs each row through the migration so the two cannot drift.
+pub const LEGACY_ACTORS: &[(&str, Actor)] = &[
+    ("claude", Actor::Orchestrator),
+    ("claude-orchestrator", Actor::Orchestrator),
+    ("claude-session", Actor::Orchestrator),
+    ("claude (for the person)", Actor::PersonViaOrchestrator),
+    (
+        "Frédéric Rousseau (via Claude Code)",
+        Actor::PersonViaOrchestrator,
+    ),
+    ("fredericrous", Actor::Person),
+    ("person", Actor::Person),
+];
+
+/// Who decided (orchestrator-decides plan, Phase 1). Exactly three
+/// values; there is no free-text name because the machine has one person.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum Actor {
+    /// The root Claude Code session decided on its own authority.
+    #[serde(rename = "orchestrator")]
+    Orchestrator,
+    /// The person decided, typing the command in their own terminal.
+    #[serde(rename = "person")]
+    Person,
+    /// The person said it, the orchestrator typed it; a quote of the
+    /// person's words is recorded with the answer.
+    #[serde(rename = "person-via-orchestrator")]
+    PersonViaOrchestrator,
+}
+
+impl Actor {
+    pub const ALL: [Actor; 3] = [
+        Actor::Orchestrator,
+        Actor::Person,
+        Actor::PersonViaOrchestrator,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Actor::Orchestrator => "orchestrator",
+            Actor::Person => "person",
+            Actor::PersonViaOrchestrator => "person-via-orchestrator",
+        }
+    }
+
+    /// Parse what the command line names. An old spelling is refused with
+    /// the actor that replaces it; any other string with the three values.
+    pub fn parse(text: &str) -> std::result::Result<Actor, String> {
+        if let Some(actor) = Actor::ALL.into_iter().find(|a| a.as_str() == text) {
+            return Ok(actor);
+        }
+        if let Some((_, actor)) = LEGACY_ACTORS.iter().find(|(old, _)| *old == text) {
+            return Err(format!("`{text}` is now `{}`", actor.as_str()));
+        }
+        Err(format!(
+            "unknown actor `{text}` — one of: {}",
+            Actor::ALL.map(Actor::as_str).join(", ")
+        ))
+    }
+
+    /// Read a stored actor leniently: a canonical value, or a legacy
+    /// spelling mapped to its replacement.
+    pub fn from_stored(text: &str) -> Option<Actor> {
+        Actor::ALL
+            .into_iter()
+            .find(|a| a.as_str() == text)
+            .or_else(|| {
+                LEGACY_ACTORS
+                    .iter()
+                    .find(|(old, _)| *old == text)
+                    .map(|(_, actor)| *actor)
+            })
+    }
+}
+
+impl std::fmt::Display for Actor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// How an answer reached relais (ADR-0004): through the plugin's decide
+/// tool, proved by the session's nonce, or from any other command line.
+/// Rows written before the column existed read `legacy`, which nothing
+/// writes now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordedVia {
+    /// The call carried the plugin session's nonce
+    /// ([`Ledger::verify_decide_nonce`]).
+    Plugin,
+    /// Anything else: a terminal, a script, or a model shelling out.
+    Cli,
+}
+
+impl RecordedVia {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RecordedVia::Plugin => "plugin",
+            RecordedVia::Cli => "cli",
+        }
+    }
+}
+
+/// Who answered a salvage, and how the answer reached relais: the three
+/// facts [`Ledger::record_salvage_contained`] stores beside the answer.
+#[derive(Debug, Clone, Copy)]
+pub struct Answerer<'a> {
+    pub actor: Actor,
+    /// The person's words, when `actor` is [`Actor::PersonViaOrchestrator`].
+    pub person_quote: Option<&'a str>,
+    pub recorded_via: RecordedVia,
+}
+
+/// What [`Ledger::person_answer_counts`] counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct PersonAnswerCounts {
+    /// Every answer that counts as the person's, ever.
+    pub total: usize,
+    /// `person` answers resolved since the window's start.
+    pub recent_person: usize,
+    /// Proved `person-via-orchestrator` answers resolved since then.
+    pub recent_proxied: usize,
+    /// `person-via-orchestrator` answers recorded without the plugin's
+    /// proof: zero unless something went around the decide tool.
+    pub unproved_proxied: usize,
+}
+
+/// How long a minted decide nonce is honoured when its session never said
+/// it ended (a crash, a kill): past this, minting any nonce sweeps it.
+const DECIDE_NONCE_TTL_DAYS: i64 = 7;
 
 /// One row of `trust_grants`: what [`Ledger::record_trust_grant`] writes.
 #[derive(Debug, Clone, Copy)]
@@ -1819,8 +2014,89 @@ fn migrate(conn: &Connection, clock: &dyn Clock) -> Result<()> {
         });
     }
     for (version, sql) in MIGRATIONS {
+        if *version == ACTOR_STEP {
+            prepare_actor_step(conn)?;
+        }
         apply_step(conn, version, sql, &clock.now_rfc3339())?;
     }
+    Ok(())
+}
+
+/// Before v27 runs: refuse, naming the spelling, if `decisions` or
+/// `human_signoffs` holds an actor the step does not map, and back the
+/// ledger up with `VACUUM INTO` (a file copy can miss WAL pages), then
+/// rename the copy into place. Does nothing when the step is already
+/// applied or the ledger holds no answer yet (a fresh file).
+fn prepare_actor_step(conn: &Connection) -> Result<()> {
+    let pending: Option<String> = conn
+        .query_row(
+            "SELECT version FROM schema_migrations WHERE version = ?1",
+            [ACTOR_STEP],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if pending.is_some() {
+        return Ok(());
+    }
+    let has_table = |name: &str| -> Result<bool> {
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [name],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    };
+    for table in ["decisions", "human_signoffs"] {
+        if !has_table(table)? {
+            continue;
+        }
+        let mut stmt = conn.prepare(&format!(
+            "SELECT DISTINCT actor FROM {table} WHERE actor IS NOT NULL"
+        ))?;
+        let spellings = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if let Some(unmapped) = spellings
+            .iter()
+            .find(|text| Actor::from_stored(text).is_none())
+        {
+            return Err(LedgerError::Corrupt {
+                what: format!("an actor in `{table}`"),
+                detail: format!(
+                    "`{unmapped}` is not a spelling schema step {ACTOR_STEP} maps to an actor; \
+                     the ledger was left untouched"
+                ),
+            });
+        }
+    }
+    // A ledger with no earlier answer has nothing to lose — and a fresh
+    // file several openers are creating at once must not race to back
+    // itself up.
+    let mut rows = 0_i64;
+    for table in ["decisions", "human_signoffs"] {
+        if has_table(table)? {
+            rows += conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        }
+    }
+    if rows == 0 {
+        return Ok(());
+    }
+    let Some(path) = conn.path().filter(|p| !p.is_empty()) else {
+        return Ok(());
+    };
+    let backup = format!("{path}.bak-{ACTOR_STEP}");
+    let partial = format!("{backup}.partial");
+    match std::fs::remove_file(&partial) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    conn.execute("VACUUM INTO ?1", [&partial])?;
+    std::fs::rename(&partial, &backup)?;
     Ok(())
 }
 
@@ -2156,7 +2432,11 @@ pub struct ChildOf<'a> {
 /// they are one answer and every caller has all of them at once.
 pub struct DecisionAnswer<'a> {
     pub resolution: Reason,
-    pub actor: &'a str,
+    pub actor: Actor,
+    /// The person's words, when `actor` is [`Actor::PersonViaOrchestrator`].
+    pub person_quote: Option<&'a str>,
+    /// How the answer reached relais.
+    pub recorded_via: RecordedVia,
     pub note: Option<&'a str>,
     pub successor_run: Option<&'a RunId>,
     /// The state the run was waiting in.
@@ -3195,6 +3475,50 @@ impl Ledger {
     /// Every run still waiting for a person to answer it, oldest raised
     /// first — the queue `relais report` lists and `relais decide`
     /// closes one row at a time from.
+    /// How many answers count as the person's judgment (ADR-0004), for the
+    /// decision advisor's data gate: a `person` answer, or a
+    /// `person-via-orchestrator` one the plugin proved, on a
+    /// `needs_decision` or `needs_review` run. `legacy` rows never count.
+    /// `since` bounds the recent counts; `total` is every counted answer.
+    pub fn person_answer_counts(&self, since: &str) -> Result<PersonAnswerCounts> {
+        let counted = "raised_state IN ('needs_decision', 'needs_review')
+             AND ((actor = 'person' AND recorded_via != 'legacy')
+               OR (actor = 'person-via-orchestrator' AND recorded_via = 'plugin'))";
+        let count = |sql: String, since: Option<&str>| -> Result<usize> {
+            let n: i64 = match since {
+                Some(since) => self.conn.query_row(&sql, [since], |row| row.get(0))?,
+                None => self.conn.query_row(&sql, [], |row| row.get(0))?,
+            };
+            Ok(n.max(0) as usize)
+        };
+        Ok(PersonAnswerCounts {
+            total: count(
+                format!("SELECT COUNT(*) FROM decisions WHERE {counted}"),
+                None,
+            )?,
+            recent_person: count(
+                format!(
+                    "SELECT COUNT(*) FROM decisions WHERE {counted} AND actor = 'person'
+                     AND resolved_at >= ?1"
+                ),
+                Some(since),
+            )?,
+            recent_proxied: count(
+                format!(
+                    "SELECT COUNT(*) FROM decisions WHERE {counted}
+                     AND actor = 'person-via-orchestrator' AND resolved_at >= ?1"
+                ),
+                Some(since),
+            )?,
+            unproved_proxied: count(
+                "SELECT COUNT(*) FROM decisions
+                  WHERE actor = 'person-via-orchestrator' AND recorded_via = 'cli'"
+                    .to_string(),
+                None,
+            )?,
+        })
+    }
+
     pub fn open_decisions(&self) -> Result<Vec<DecisionRecord>> {
         let now = self.now();
         let mut stmt = self.conn.prepare(&format!(
@@ -3239,15 +3563,18 @@ impl Ledger {
         let now = self.now();
         let tx = self.write_tx()?;
         let changed = tx.execute(
-            "UPDATE decisions SET resolved_at = ?2, resolution = ?3, actor = ?4, note = ?5, successor_run = ?6
+            "UPDATE decisions SET resolved_at = ?2, resolution = ?3, actor = ?4, actor_raw = ?4,
+                    note = ?5, successor_run = ?6, person_quote = ?7, recorded_via = ?8
              WHERE run = ?1 AND resolved_at IS NULL",
             params![
                 run_id.as_str(),
                 now,
                 answer.resolution.as_str(),
-                answer.actor,
+                answer.actor.as_str(),
                 answer.note,
                 answer.successor_run.map(RunId::as_str),
+                answer.person_quote,
+                answer.recorded_via.as_str(),
             ],
         )?;
         if changed > 0 {
@@ -3305,10 +3632,20 @@ impl Ledger {
         &self,
         run_id: &RunId,
         candidate_sha: &str,
-        actor: &str,
+        actor: Actor,
         note: Option<&str>,
     ) -> Result<Option<Reason>> {
-        self.record_salvage_contained(run_id, candidate_sha, actor, note, None)
+        self.record_salvage_contained(
+            run_id,
+            candidate_sha,
+            Answerer {
+                actor,
+                person_quote: None,
+                recorded_via: RecordedVia::Cli,
+            },
+            note,
+            None,
+        )
     }
 
     /// [`Self::record_salvage`], also recording whether the run's verified
@@ -3319,10 +3656,15 @@ impl Ledger {
         &self,
         run_id: &RunId,
         candidate_sha: &str,
-        actor: &str,
+        answerer: Answerer<'_>,
         note: Option<&str>,
         candidate_contained: Option<bool>,
     ) -> Result<Option<Reason>> {
+        let Answerer {
+            actor,
+            person_quote,
+            recorded_via,
+        } = answerer;
         let now = self.now();
         let tx = self.write_tx()?;
         let existing: Option<(Option<String>, String, String)> = tx
@@ -3347,16 +3689,19 @@ impl Ledger {
                         detail: unknown.to_string(),
                     })?;
                 let changed = tx.execute(
-                    "UPDATE decisions SET resolved_at = ?2, resolution = ?3, actor = ?4, note = ?5,
-                            candidate_contained = ?6
+                    "UPDATE decisions SET resolved_at = ?2, resolution = ?3, actor = ?4, actor_raw = ?4,
+                            note = ?5, candidate_contained = ?6, person_quote = ?7,
+                            recorded_via = ?8
                      WHERE run = ?1 AND resolved_at IS NULL",
                     params![
                         run_id.as_str(),
                         now,
                         Reason::DecisionSalvaged.as_str(),
-                        actor,
+                        actor.as_str(),
                         note,
                         candidate_contained,
+                        person_quote,
+                        recorded_via.as_str(),
                     ],
                 )?;
                 debug_assert_eq!(changed, 1, "read as open under the same transaction above");
@@ -3395,8 +3740,8 @@ impl Ledger {
                 tx.execute(
                     "INSERT INTO decisions
                         (run, task, raised_at, raised_state, raised_reason, resolved_at, resolution, actor, note,
-                         candidate_contained)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                         candidate_contained, actor_raw, person_quote, recorded_via)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?8, ?11, ?12)",
                     params![
                         run_id.as_str(),
                         task_id,
@@ -3405,9 +3750,11 @@ impl Ledger {
                         last_reason,
                         now,
                         Reason::DecisionSalvaged.as_str(),
-                        actor,
+                        actor.as_str(),
                         note,
                         candidate_contained,
+                        person_quote,
+                        recorded_via.as_str(),
                     ],
                 )?;
                 (parse_state(&last_state)?, original_reason)
@@ -3504,16 +3851,78 @@ impl Ledger {
         &self,
         run_id: &RunId,
         criterion_id: &str,
-        actor: &str,
+        actor: Actor,
+        recorded_via: RecordedVia,
         note: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO human_signoffs
-                (run_id, criterion_id, actor, note, recorded_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![run_id.as_str(), criterion_id, actor, note, self.now()],
+                (run_id, criterion_id, actor, actor_raw, note, recorded_at, recorded_via)
+             VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6)",
+            params![
+                run_id.as_str(),
+                criterion_id,
+                actor.as_str(),
+                note,
+                self.now(),
+                recorded_via.as_str()
+            ],
         )?;
         Ok(())
+    }
+
+    /// Mint the nonce that proves a plugin session's decide calls
+    /// (ADR-0004): 32 bytes from the OS, returned once as hex; only its
+    /// SHA-256 is stored, so reading the ledger never yields it. Minting
+    /// again for a session replaces its nonce, and every nonce older than
+    /// [`DECIDE_NONCE_TTL_DAYS`] is swept, whichever session it was for.
+    pub fn mint_decide_nonce(&self, session: &str) -> Result<String> {
+        let mut bytes = [0u8; 32];
+        crate::procs::os_random(&mut bytes).map_err(|e| LedgerError::Corrupt {
+            what: "the OS random source".into(),
+            detail: e.to_string(),
+        })?;
+        let nonce: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let now = self.now();
+        let cutoff = chrono::DateTime::parse_from_rfc3339(&now)
+            .map(|t| (t - chrono::Duration::days(DECIDE_NONCE_TTL_DAYS)).to_rfc3339())
+            .unwrap_or_else(|_| now.clone());
+        let tx = self.write_tx()?;
+        tx.execute("DELETE FROM decide_nonces WHERE created_at < ?1", [&cutoff])?;
+        tx.execute(
+            "INSERT OR REPLACE INTO decide_nonces (session, nonce_hash, created_at)
+             VALUES (?1, ?2, ?3)",
+            params![session, crate::ids::sha256_hex(nonce.as_bytes()), now],
+        )?;
+        tx.commit()?;
+        Ok(nonce)
+    }
+
+    /// Forget a session's nonce: its session ended. `Ok(false)` when there
+    /// was none.
+    pub fn end_decide_nonce(&self, session: &str) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM decide_nonces WHERE session = ?1", [session])?;
+        Ok(changed > 0)
+    }
+
+    /// Whether `nonce` is the live nonce of `session`:
+    /// [`RecordedVia::Plugin`] when it is, [`RecordedVia::Cli`] for a
+    /// wrong, ended or swept one.
+    pub fn verify_decide_nonce(&self, session: &str, nonce: &str) -> Result<RecordedVia> {
+        let stored: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT nonce_hash FROM decide_nonces WHERE session = ?1",
+                [session],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(match stored {
+            Some(hash) if hash == crate::ids::sha256_hex(nonce.as_bytes()) => RecordedVia::Plugin,
+            _ => RecordedVia::Cli,
+        })
     }
 
     /// Record a trust grant `relais trust grant` just wrote to
@@ -3549,6 +3958,34 @@ impl Ledger {
                 |row| row.get::<_, String>(0),
             )
             .optional()?)
+    }
+
+    /// The advisor's stored advice for one run's decision, as JSON, or
+    /// `null` when none was stored (no advisor yet: the columns exist, and
+    /// nothing writes them).
+    pub fn decision_advice(&self, run_id: &RunId) -> Result<serde_json::Value> {
+        let row: Option<StoredAdvice> = self
+            .conn
+            .query_row(
+                "SELECT advice_p_approve, advice_model, advice_revision, advice_null_reason
+                   FROM decisions WHERE run = ?1",
+                [run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            Some((p_approve, model, revision, null_reason))
+                if p_approve.is_some() || null_reason.is_some() =>
+            {
+                serde_json::json!({
+                    "p_approve": p_approve,
+                    "model": model,
+                    "revision": revision,
+                    "null_reason": null_reason,
+                })
+            }
+            _ => serde_json::Value::Null,
+        })
     }
 
     /// Every criterion a person has signed off for one run, with who
@@ -5480,7 +5917,9 @@ mod tests {
                 &run("run-d"),
                 &DecisionAnswer {
                     resolution: Reason::DecisionRecorded,
-                    actor: "a person",
+                    actor: Actor::Person,
+                    person_quote: None,
+                    recorded_via: crate::ledger::RecordedVia::Cli,
                     note: None,
                     successor_run: None,
                     from_state: State::Prepared,
@@ -5504,7 +5943,9 @@ mod tests {
                 &run("run-d"),
                 &DecisionAnswer {
                     resolution: Reason::DecisionApproved,
-                    actor: "a person",
+                    actor: Actor::Person,
+                    person_quote: None,
+                    recorded_via: crate::ledger::RecordedVia::Cli,
                     note: Some("looks fine"),
                     successor_run: Some(&run("run-successor")),
                     from_state: State::NeedsDecision,
@@ -5517,7 +5958,7 @@ mod tests {
             .expect("read")
             .expect("still on record");
         assert_eq!(decision.resolution, Some(Reason::DecisionApproved));
-        assert_eq!(decision.actor.as_deref(), Some("a person"));
+        assert_eq!(decision.actor.as_deref(), Some("person"));
         assert_eq!(decision.note.as_deref(), Some("looks fine"));
         assert_eq!(decision.successor_run, Some(run("run-successor")));
         assert!(decision.resolved_at.is_some());
@@ -5534,7 +5975,9 @@ mod tests {
                 &run("run-d"),
                 &DecisionAnswer {
                     resolution: Reason::DecisionRejected,
-                    actor: "someone else",
+                    actor: Actor::Person,
+                    person_quote: None,
+                    recorded_via: crate::ledger::RecordedVia::Cli,
                     note: None,
                     successor_run: None,
                     from_state: State::Accepted,
@@ -5574,10 +6017,20 @@ mod tests {
                 .expect("transition");
         }
         ledger
-            .record_salvage_contained(&run("run-yes"), "abc", "a person", None, Some(true))
+            .record_salvage_contained(
+                &run("run-yes"),
+                "abc",
+                Answerer {
+                    actor: Actor::Person,
+                    person_quote: None,
+                    recorded_via: RecordedVia::Cli,
+                },
+                None,
+                Some(true),
+            )
             .expect("salvage");
         ledger
-            .record_salvage(&run("run-unknown"), "abc", "a person", None)
+            .record_salvage(&run("run-unknown"), "abc", Actor::Person, None)
             .expect("salvage");
         let contained = |name: &str| {
             ledger
@@ -5637,7 +6090,12 @@ mod tests {
             .expect("read")
             .is_none());
         let original_reason = ledger
-            .record_salvage(&run("run-s"), "abc123", "a person", Some("merged by hand"))
+            .record_salvage(
+                &run("run-s"),
+                "abc123",
+                Actor::Person,
+                Some("merged by hand"),
+            )
             .expect("salvage")
             .expect("a terminal run with no prior decision salvages");
         assert_eq!(original_reason, Reason::BehavioralFailure);
@@ -5660,7 +6118,7 @@ mod tests {
             "the run's own reason for ending survives, not overwritten by the salvage"
         );
         assert_eq!(decision.resolution, Some(Reason::DecisionSalvaged));
-        assert_eq!(decision.actor.as_deref(), Some("a person"));
+        assert_eq!(decision.actor.as_deref(), Some("person"));
         assert!(decision.resolved_at.is_some());
         assert!(
             ledger.open_decisions().expect("open").is_empty(),
@@ -5669,7 +6127,7 @@ mod tests {
         // A second salvage of the same run is refused: it already
         // carries a decision.
         assert!(ledger
-            .record_salvage(&run("run-s"), "def456", "someone else", None)
+            .record_salvage(&run("run-s"), "def456", Actor::Orchestrator, None)
             .expect("salvage")
             .is_none());
         assert_eq!(
@@ -5727,7 +6185,12 @@ mod tests {
             "nobody has answered yet"
         );
         let original_reason = ledger
-            .record_salvage(&run("run-w"), "abc123", "a person", Some("merged by hand"))
+            .record_salvage(
+                &run("run-w"),
+                "abc123",
+                Actor::Person,
+                Some("merged by hand"),
+            )
             .expect("salvage")
             .expect("an open decision salvages");
         assert_eq!(original_reason, Reason::ScopeExceeded);
@@ -5750,7 +6213,7 @@ mod tests {
             "the reason the run started waiting for survives, not the worktree retirement"
         );
         assert_eq!(decision.resolution, Some(Reason::DecisionSalvaged));
-        assert_eq!(decision.actor.as_deref(), Some("a person"));
+        assert_eq!(decision.actor.as_deref(), Some("person"));
         assert!(decision.resolved_at.is_some());
         assert!(
             ledger.open_decisions().expect("open").is_empty(),
@@ -5781,7 +6244,9 @@ mod tests {
                 &run("run-r"),
                 &DecisionAnswer {
                     resolution: Reason::DecisionApproved,
-                    actor: "a person",
+                    actor: Actor::Person,
+                    person_quote: None,
+                    recorded_via: crate::ledger::RecordedVia::Cli,
                     note: None,
                     successor_run: None,
                     from_state: State::NeedsDecision,
@@ -5791,7 +6256,7 @@ mod tests {
             .expect("resolve");
         assert!(
             ledger
-                .record_salvage(&run("run-r"), "def456", "someone else", None)
+                .record_salvage(&run("run-r"), "def456", Actor::Orchestrator, None)
                 .expect("salvage")
                 .is_none(),
             "a decision a person already answered still refuses a salvage"
@@ -8701,5 +9166,233 @@ mod tests {
         assert_eq!(evidence[0].kind, EvidenceKind::SandboxDenials);
         assert_eq!(evidence[0].kind.to_string(), "sandbox_denials");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A ledger pinned at v25 with one decision and one sign-off per
+    /// actor spelling in `spellings`, plus an open decision (no actor).
+    fn v26_ledger_with(path: &std::path::Path, spellings: &[&str]) {
+        let conn = Connection::open(path).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );",
+        )
+        .expect("migrations table");
+        for (version, sql) in &MIGRATIONS[..26] {
+            conn.execute_batch(sql).expect("step");
+            conn.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![version, "2026-10-01T00:00:00+00:00"],
+            )
+            .expect("record");
+        }
+        for (i, spelling) in spellings.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO decisions (run, task, raised_at, raised_state, raised_reason,
+                                        resolved_at, resolution, actor)
+                 VALUES (?1, 't', '2026-10-01T00:00:00+00:00', 'needs_decision', 'scope_exceeded',
+                         '2026-10-01T00:01:00+00:00', 'decision_approved', ?2)",
+                params![format!("run-{i}"), spelling],
+            )
+            .expect("decision");
+            conn.execute(
+                "INSERT INTO human_signoffs (run_id, criterion_id, actor, recorded_at)
+                 VALUES (?1, 'c', ?2, '2026-10-01T00:01:00+00:00')",
+                params![format!("run-{i}"), spelling],
+            )
+            .expect("signoff");
+        }
+        conn.execute(
+            "INSERT INTO decisions (run, task, raised_at, raised_state, raised_reason)
+             VALUES ('run-open', 't', '2026-10-01T00:00:00+00:00', 'needs_review', 'x')",
+            [],
+        )
+        .expect("open decision");
+    }
+
+    /// Only a `person` answer or a plugin-proved proxy on a
+    /// needs_decision/needs_review run counts; legacy and cli proxies do not.
+    #[test]
+    fn person_answers_count_only_what_the_person_said() {
+        let dir = crate::test_support::temp_dir("ledger-person-answers");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let row = |run: &str, state: &str, actor: &str, via: &str, at: &str| {
+            ledger
+                .conn
+                .execute(
+                    "INSERT INTO decisions (run, task, raised_at, raised_state, raised_reason,
+                         resolved_at, resolution, actor, actor_raw, recorded_via)
+                     VALUES (?1, 't', ?5, ?2, 'x', ?5, 'decision_revised', ?3, ?3, ?4)",
+                    params![run, state, actor, via, at],
+                )
+                .expect("row");
+        };
+        row(
+            "r1",
+            "needs_decision",
+            "person",
+            "cli",
+            "2026-10-10T00:00:00+00:00",
+        );
+        row(
+            "r2",
+            "needs_review",
+            "person-via-orchestrator",
+            "plugin",
+            "2026-10-10T00:00:00+00:00",
+        );
+        row(
+            "r3",
+            "needs_review",
+            "person-via-orchestrator",
+            "cli",
+            "2026-10-10T00:00:00+00:00",
+        );
+        row(
+            "r4",
+            "needs_review",
+            "person",
+            "legacy",
+            "2026-10-10T00:00:00+00:00",
+        );
+        row(
+            "r5",
+            "interrupted",
+            "person",
+            "cli",
+            "2026-10-10T00:00:00+00:00",
+        );
+        row(
+            "r6",
+            "needs_review",
+            "orchestrator",
+            "plugin",
+            "2026-10-10T00:00:00+00:00",
+        );
+        row(
+            "r7",
+            "needs_decision",
+            "person",
+            "cli",
+            "2026-01-01T00:00:00+00:00",
+        );
+        let counts = ledger
+            .person_answer_counts("2026-09-01T00:00:00+00:00")
+            .expect("counts");
+        assert_eq!(
+            counts,
+            PersonAnswerCounts {
+                total: 3,
+                recent_person: 1,
+                recent_proxied: 1,
+                unproved_proxied: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn the_actor_step_maps_every_legacy_spelling_keeps_the_original_and_backs_up() {
+        let dir = crate::test_support::temp_dir("ledger-v26-to-v27");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("ledger.sqlite");
+        let spellings: Vec<&str> = LEGACY_ACTORS.iter().map(|(old, _)| *old).collect();
+        assert_eq!(spellings.len(), 7, "the seven spellings of the live ledger");
+        v26_ledger_with(&path, &spellings);
+        let ledger = Ledger::open(&path).expect("upgrade to v27");
+        assert_eq!(
+            ledger.schema_version().expect("version"),
+            LEDGER_SCHEMA_VERSION
+        );
+        for (i, (old, expected)) in LEGACY_ACTORS.iter().enumerate() {
+            for (table, key) in [("decisions", "run"), ("human_signoffs", "run_id")] {
+                let (actor, raw, via): (String, String, String) = ledger
+                    .conn
+                    .query_row(
+                        &format!(
+                            "SELECT actor, actor_raw, recorded_via FROM {table} WHERE {key} = ?1"
+                        ),
+                        [format!("run-{i}")],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .expect("row");
+                assert_eq!(actor, expected.as_str(), "{table}: {old}");
+                assert_eq!(raw, *old, "{table}: the original is kept");
+                assert_eq!(via, "legacy", "{table}");
+            }
+        }
+        let nulls: i64 = ledger
+            .conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM decisions WHERE recorded_via IS NULL)
+                      + (SELECT COUNT(*) FROM human_signoffs WHERE recorded_via IS NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(nulls, 0, "every existing row is stamped legacy");
+        let open_actor: Option<String> = ledger
+            .conn
+            .query_row(
+                "SELECT actor FROM decisions WHERE run = 'run-open'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("open row");
+        assert_eq!(open_actor, None, "an open decision still has no actor");
+        let backup = dir.join("ledger.sqlite.bak-v27");
+        assert!(backup.is_file(), "the VACUUM INTO backup is written");
+        let old = Connection::open(&backup).expect("backup opens");
+        let kept: String = old
+            .query_row(
+                "SELECT actor FROM decisions WHERE run = 'run-0'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("backup row");
+        assert_eq!(
+            kept, "claude",
+            "the backup holds the pre-migration spelling"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_actor_step_refuses_an_unmapped_spelling_by_name_and_changes_nothing() {
+        let dir = crate::test_support::temp_dir("ledger-v26-unmapped");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("ledger.sqlite");
+        v26_ledger_with(&path, &["claude", "a stranger"]);
+        let refused = match Ledger::open(&path) {
+            Ok(_) => panic!("an unmapped spelling must refuse"),
+            Err(e) => e.to_string(),
+        };
+        assert!(refused.contains("a stranger"), "{refused}");
+        assert!(
+            !dir.join("ledger.sqlite.bak-v27").exists(),
+            "no backup for a refusal"
+        );
+        let conn = Connection::open(&path).expect("open");
+        let applied: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(applied, 26, "the ledger stays at v26");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn actor_parse_names_the_replacement_and_lists_the_three_values() {
+        for actor in Actor::ALL {
+            assert_eq!(Actor::parse(actor.as_str()), Ok(actor));
+        }
+        assert!(Actor::parse("claude")
+            .unwrap_err()
+            .contains("`orchestrator`"));
+        let unknown = Actor::parse("bob").unwrap_err();
+        for actor in Actor::ALL {
+            assert!(unknown.contains(actor.as_str()), "{unknown}");
+        }
     }
 }
