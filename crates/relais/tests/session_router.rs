@@ -757,16 +757,17 @@ fn ledger_bytes(world: &World) -> Vec<u8> {
     bytes
 }
 
-fn mode_of(path: &std::path::Path) -> u32 {
+/// A Unix permission mode is checked where it exists; Windows has none.
+fn assert_mode(path: &std::path::Path, expected: u32) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, expected, "{}", path.display());
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
-        0o600
+        let _ = (path, expected);
     }
 }
 
@@ -783,13 +784,13 @@ fn a_classification_writes_a_private_redacted_day_file_and_a_ledger_row_without_
     assert_eq!(code(&output), 0, "{}", stderr(&output));
 
     let dir = classifier_dir(&world);
-    assert_eq!(mode_of(&dir), 0o700);
+    assert_mode(&dir, 0o700);
     let files: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
         .map(|e| e.unwrap().path())
         .collect();
     assert_eq!(files.len(), 1, "{files:?}");
-    assert_eq!(mode_of(&files[0]), 0o600);
+    assert_mode(&files[0], 0o600);
     let line = std::fs::read_to_string(&files[0]).unwrap();
     assert!(line.contains("rename zebrafish to bar"), "{line}");
     assert!(!line.contains("SECRETSECRET"), "{line}");
@@ -937,7 +938,7 @@ fn the_export_splits_by_time_behind_a_header_and_is_created_0600() {
         out.to_str().unwrap(),
     ]);
     assert_eq!(code(&output), 0, "{}", stderr(&output));
-    assert_eq!(mode_of(&out), 0o600);
+    assert_mode(&out, 0o600);
     let leftovers: Vec<_> = std::fs::read_dir(&world.root)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -1058,9 +1059,9 @@ fn day_files_stay_private_under_a_permissive_umask() {
         .unwrap();
     let output = child.wait_with_output().unwrap();
     assert_eq!(code(&output), 0, "{}", stderr(&output));
-    assert_eq!(mode_of(&dir), 0o700);
+    assert_mode(&dir, 0o700);
     for entry in std::fs::read_dir(&dir).unwrap() {
-        assert_eq!(mode_of(&entry.unwrap().path()), 0o600);
+        assert_mode(&entry.unwrap().path(), 0o600);
     }
     // The export under the same umask is 0600 as well.
     let out = world.root.join("out.jsonl");
@@ -1077,5 +1078,5 @@ fn day_files_stay_private_under_a_permissive_umask() {
         .output()
         .unwrap();
     assert_eq!(code(&status), 0, "{}", stderr(&status));
-    assert_eq!(mode_of(&out), 0o600);
+    assert_mode(&out, 0o600);
 }
