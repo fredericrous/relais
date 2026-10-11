@@ -6,7 +6,11 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
-## Unreleased
+## v0.12.1
+
+Runs that died stop holding their worktrees: relais reconciles them itself
+at session start and frees the disk they held (#197, #198). After upgrading,
+reinstall the plugin as for v0.12.0 so the session-start sweep runs.
 
 `relais resume --retire [--all|<run>]` also removes the verification checkouts
 (`<state>/verify/<run>/verify-base` and any per-attempt one) a run left behind
