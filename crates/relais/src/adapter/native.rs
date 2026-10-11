@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::admission::{
     AgentStatus, AgentUsage, Gate, GateError, NativeAsk, NativeProgress, NativeState,
@@ -43,6 +43,37 @@ const WORKER_MISSING: &str = "native_worker_missing";
 
 /// The label an attempt ends with when the session's plugin stopped saying hello.
 const MOD_GONE: &str = "mod_gone";
+
+/// A pass of the wait loop that took this much longer than its sleep means
+/// the host was suspended in between (a laptop lid, deep sleep): a process
+/// is not scheduled while the machine sleeps, so neither the plugin's
+/// heartbeat nor this loop ran.
+const SUSPEND_GAP: Duration = Duration::from_secs(10);
+
+/// Notices the host sleeping between two passes of a wait loop.
+struct SuspendWatch {
+    wall: SystemTime,
+    mono: Instant,
+}
+
+impl SuspendWatch {
+    fn new(wall: SystemTime, mono: Instant) -> Self {
+        Self { wall, mono }
+    }
+
+    /// How long the host slept since the last pass, if it did. The shorter of
+    /// the two clocks' gaps, so a clock that does not count sleep (or a wall
+    /// clock that was set back) reports nothing, and a gap that the monotonic
+    /// clock counted is the one handed back to charge nowhere.
+    fn pass(&mut self, wall: SystemTime, mono: Instant) -> Option<Duration> {
+        let wall_gap = wall.duration_since(self.wall).unwrap_or_default();
+        let mono_gap = mono.saturating_duration_since(self.mono);
+        self.wall = wall;
+        self.mono = mono;
+        let slept = wall_gap.min(mono_gap).saturating_sub(ADMISSION_POLL);
+        (slept >= SUSPEND_GAP).then_some(slept)
+    }
+}
 
 /// Consecutive unanswered status polls that end the wait: a coordinator
 /// that has stopped answering cannot tell this attempt anything.
@@ -377,13 +408,24 @@ impl<'a> NativeBackend<'a> {
 
     /// Wait until the registered request has run to its stop, or cannot.
     fn await_stop(&self, spec: &LaunchSpec, route: &Route) -> Awaited {
-        let started = Instant::now();
+        let mut started = Instant::now();
+        let mut watch = SuspendWatch::new(SystemTime::now(), started);
+        // After the host wakes, the plugin gets a fresh hello window before
+        // its silence counts: its heartbeat timer was asleep with everything
+        // else, and has not had a chance to fire yet.
+        let mut woke_until: Option<Instant> = None;
         let mut failures = 0u32;
         // The agent the last poll found the dispatch bound to: once the run
         // is cancelled the coordinator settles the dispatch, and its record
         // no longer names the agent.
         let mut running: Option<String> = None;
         loop {
+            let now = Instant::now();
+            if let Some(slept) = watch.pass(SystemTime::now(), now) {
+                // Time the machine spent asleep is not time the attempt used.
+                started += slept;
+                woke_until = Some(now + self.waits.hello_lapse);
+            }
             if let Some(cancelled) = self.cancelled(spec, running.as_deref()) {
                 return cancelled;
             }
@@ -434,7 +476,8 @@ impl<'a> NativeBackend<'a> {
                     if let Some(awaited) = self.settled(spec, route, &progress, started) {
                         return awaited;
                     }
-                    let alive = hello_age.is_some_and(|age| age < self.waits.hello_lapse);
+                    let alive = hello_age.is_some_and(|age| age < self.waits.hello_lapse)
+                        || woke_until.is_some_and(|until| Instant::now() < until);
                     if !alive {
                         return Awaited::Ended {
                             ended: Ended::Exited(1),
@@ -716,6 +759,47 @@ impl Backend for NativeBackend<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::{SuspendWatch, ADMISSION_POLL, SUSPEND_GAP};
+    use std::time::{Duration, Instant, SystemTime};
+
+    #[test]
+    fn a_pass_after_the_usual_sleep_reports_no_suspend() {
+        let (wall, mono) = (SystemTime::now(), Instant::now());
+        let mut watch = SuspendWatch::new(wall, mono);
+        assert_eq!(
+            watch.pass(wall + ADMISSION_POLL, mono + ADMISSION_POLL),
+            None
+        );
+    }
+
+    #[test]
+    fn a_long_gap_on_both_clocks_is_a_suspend() {
+        let (wall, mono) = (SystemTime::now(), Instant::now());
+        let mut watch = SuspendWatch::new(wall, mono);
+        let gap = Duration::from_secs(600);
+        let slept = watch.pass(wall + gap, mono + gap).expect("a suspend");
+        assert_eq!(slept, gap - ADMISSION_POLL);
+        assert!(slept >= SUSPEND_GAP);
+    }
+
+    #[test]
+    fn a_monotonic_clock_that_skips_sleep_reports_nothing() {
+        let (wall, mono) = (SystemTime::now(), Instant::now());
+        let mut watch = SuspendWatch::new(wall, mono);
+        assert_eq!(
+            watch.pass(wall + Duration::from_secs(600), mono + ADMISSION_POLL),
+            None
+        );
+    }
+
+    #[test]
+    fn a_wall_clock_set_back_reports_nothing() {
+        let (wall, mono) = (SystemTime::now(), Instant::now());
+        let mut watch = SuspendWatch::new(wall, mono);
+        let back = wall - Duration::from_secs(600);
+        assert_eq!(watch.pass(back, mono + Duration::from_secs(600)), None);
+    }
+
     use std::path::Path;
 
     use super::*;
