@@ -13,7 +13,7 @@ adrs:
 ## Review panel
 
 👉 **Decide:** none — approve if strict labels, router evidence, seeded exploration and a homelab Laya experiment are how relais starts learning.
-📍 relais, homelab · reviewed, nothing built · next: relais PR 1 (Phases 1–5). Panel: architect, backend, go, python, rust, typescript, platform, po, tui, unix.
+📍 relais, homelab · Phases 1–5 built and verified (relais PR 1) · next: Phase 6 once `relais report` shows 2,500 captured calls. Panel: architect, backend, go, python, rust, typescript, platform, po, tui, unix.
 **Changed by review:** amont gate read per tree after push, at task end; learn cycle gets a non-queuing lease, idle deferral, anti-flap and manual rollback; Laya trains from 3,000 calls in an emptyDir, during a standby window.
 **Verdicts:** round 1: 10 approve-with-changes (1 blocking, fixed); round 2 backend approve-with-changes, twice; 2 person decisions (strict salvages, GPU on standby); 6 findings carried into implementation.
 📄 Full reviews: [2026-10-10-learning-loop.reviews.md](2026-10-10-learning-loop.reviews.md)
@@ -136,6 +136,12 @@ The person also wants to try **Laya** (Convai, Apache-2.0, 2026-09-18): a 421M M
 - **D12** The redaction tests' fake secrets are assembled at run time: as literals they tripped the repository's secret scan.
 - **D13** A contained salvage later `reverted` is a negative whose `label_source` reads `runner` (`Labelling::Failed` carries no source). Deliberate for now: negatives are few and the source of a positive is what `evaluate` splits on.
 
+## Implementation review
+
+**approve-with-changes**, round 1 (106k tokens, 140 s), delta (134k, 36 s): all seven round-1 findings resolved.
+Fixed: a killed cycle blocked the due check; pane race; swallowed policy, git and IO errors; rollback closing its row early (falsified); downgrade note; live concurrency and kill -9 checks.
+Deliberate: a malformed `relais.toml` writes an `error` row that counts as a cycle, so the next try waits 20 h — a broken config needs the person, and the pane says so once. The unreadable-directory tests return early under root; CI runs as the non-root `runner` user (`ubuntu-latest`).
+
 ## Verification
 
 Before the relais push (each recorded as input → expected → actual):
@@ -158,13 +164,14 @@ Observed before the relais push (2026-10-10/11, relais PR 1):
 - Phase 1: `relais dataset build` on a scratch copy of the live ledger (`RELAIS_STATE_DIR`/`RELAIS_CONFIG_DIR` in /tmp; the real ledger's md5 unchanged) → expected 53 runner + ~3 salvage → actual 50 examples (29 accepted without escalation, 21 not; one per task, 53 superseded runs excluded), label sources runner 47 / person_salvage_contained 3, 49 rewritten salvages excluded with their reason, 16 salvages not raised from review findings excluded, label policy v2. Falsification: `ReviewedAndContained` mapped to `Excluded` → 3 salvage tests fail; restored.
 - Phase 2, real data: `relais learn cycle` on a fresh scratch copy → action `none`; an artifact trained; failed gates: research tier 1 training record (< 5), escalation tier 3 (< 5), acceptance not measurable against the 0.75 floor, 0 test records support the selected route (< 20). This is the first live verdict to expect: promotion waits on research- and escalation-tier data, which Phase 4's exploration produces.
 - Phase 2, report: the `learning` section says `Nothing learned yet, because the last cycle … trained nothing promotable: …` and lists each gate; `awk 'length>80'` over the section → empty (the only longer lines are the pre-existing per-run cost rows). `--if-due` right after → `not due: … next due 2026-10-11T16:56Z`, exit 0.
+- Phase 2, live CLI (branch binary, scratch ledger copy, after the review fixes): ten concurrent `relais learn cycle` → exactly one `learning_cycles` row (`none`), nine exit 20 with `another learning cycle holds the Training lease (pid 57543, started …); not queued`. `kill -9` of a cycle while its row was open → exit 137, one row with `ended_at` NULL, no temporary dataset or artifact file; the next `relais learn cycle --if-due` → ran (cycle 3) and closed the killed row as `interrupted`, exit 0. Cycle 3 on the 2026-10-11 ledger: 54 examples (30/24), research tier now clears its count; still failing: escalation 3 records (< 5), acceptance not measurable against 0.75, 0 test records support the route (< 20), and the calibration temperature −0.48 is not positive.
 - Phase 2, tests (`crates/relais/tests/learning_cycle.rs`, `learn::cycle`): concurrent cycles → one row, the other exit 20; idle deferral, dead-pid lease, interruption, Clopper–Pearson rollback at n = 10/30, anti-flap, `relais rollback`, log 0600 and rotation → pass.
 - Phase 2b: plugin suite 197/197 twice (13 failures on a first run at load average 85, none on reruns); the cycle is a detached spawn, not `startChild`; the CLI flags it calls exist.
 - Phase 3: gate stamps read per tree inside the task window (a later pass ends on the pass); `task_outcome` updates only `outcome = 'unknown'` (read in `ledger/router.rs`); relais's `make check` green twice on the candidate.
 - Phase 4: the draw vector agrees in Rust and TypeScript, including non-ASCII ids (`0.24444899038069579`, `0.8532650270632014`, …); propensity 1 at research, ε when lowered, 1 − ε otherwise; `make check` green twice on the candidate.
 - Phase 5: `router::capture` 6/6 and `session_router` 19/19, including a private redacted day file with a ledger row without the text, the off switches capturing nothing, 90-day deletion, the export created 0600, and day files 0600 under a permissive umask.
 - Downgrade: the installed v0.11.3 on a ledger the branch migrated (scratch copy) → expected a clean refusal → actual `relais: the ledger is unavailable: ledger: 22 applied migration(s), this relais knows 20 — a newer relais wrote this ledger; upgrade relais or point RELAIS_STATE_DIR at another one`, exit 1. A downgrade restores a backup taken before the upgrade (CHANGELOG upgrade note).
-- `make check` on the rebased branch: exit 0 (fmt, clippy, module cycles, every Rust suite with no failure, MSRV 1.88.0 build, plugin 230 pass / 0 fail, audit).
+- `make check` on the final tree (63a88201…, after the review fixes) → expected exit 0 → actual exit 0: fmt, clippy, module cycles, every Rust suite with no failure, MSRV 1.88.0 build, plugin 232 pass / 0 fail, audit.
 
 Before the homelab push: `kustomize build` and `kubeconform` on `apps/laya-lab`; the PR's Go lanes are skipped-green (path-filtered), not the 13-minute golangci-lint run. The window observations (Phase 6) are recorded as input → expected → observed, with the device and `talosctl dmesg`.
 
