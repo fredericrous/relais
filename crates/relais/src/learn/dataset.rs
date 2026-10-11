@@ -13,9 +13,10 @@
 use serde::{Deserialize, Serialize};
 
 use super::features::{
-    expand, AcceptanceRoute, FeatureSchema, RecipeIdentity, SparseVec, TaskFeatures,
+    expand, AcceptanceRoute, FeatureSchema, LabelSource, RecipeIdentity, SparseVec, TaskFeatures,
     TrainingExample,
 };
+use super::salvage::{salvage_evidence_of, SalvageEvidence};
 use crate::ids::{sha256_hex, TaskId};
 use crate::ledger::{Ledger, LedgerError};
 use crate::lifecycle::{Reason, State};
@@ -43,8 +44,9 @@ pub type ContractLookup<'a> = dyn Fn(&str) -> Result<Option<ContractMaterial>, L
 /// produced the run too (`RecipeIdentity::recipe_id`, formerly
 /// `ProfileIdentity`), not only its model/effort/harness — a version-3
 /// dataset pools two revisions of one recipe as if they were the same
-/// thing. Rebuild with `relais dataset build` to train again.
-pub const DATASET_VERSION: u32 = 4;
+/// thing. Version 5 records each example's `label_source`. Rebuild with
+/// `relais dataset build` to train again.
+pub const DATASET_VERSION: u32 = 5;
 
 /// The version of the rule in [`labelling_of`] and the acceptance
 /// decision at [`build`]'s `route == AcceptanceRoute::Verified` check —
@@ -55,7 +57,11 @@ pub const DATASET_VERSION: u32 = 4;
 /// comparable. Bump this whenever either decision changes, independently
 /// of `DATASET_VERSION` — the record layout and the labelling rule are
 /// two different things that happen to change together today.
-pub const LABEL_POLICY_VERSION: u32 = 1;
+///
+/// Version 2 admits a person's salvage as a positive label when the run
+/// was raised from `needs_review` with `review_findings` and its verified
+/// candidate patch survives intact in the landed commit.
+pub const LABEL_POLICY_VERSION: u32 = 2;
 
 /// The window dataset construction reads: every run the ledger holds.
 /// Far enough in the past that no relais ledger predates it.
@@ -124,6 +130,10 @@ fn read_of<T>(
 pub enum Labelling {
     /// The run was accepted: positive unless escalation was attempted.
     Accepted,
+    /// A person salvaged the run after the runner's verification passed
+    /// and its review stopped it, and the verified candidate survives
+    /// intact in the landed commit: positive, from the person's side.
+    AcceptedViaSalvage,
     /// The run failed after the ladder ran out: a negative label.
     Failed,
     /// Not a reasoning outcome, with the reason it is excluded.
@@ -192,27 +202,57 @@ pub(crate) fn outcome_stands(kind: OutcomeKind) -> Option<bool> {
 /// here until it says which way it falls: they used to be read only from
 /// `state`, so a reverted or later-regressed task kept the positive label
 /// its run's terminal state gave it forever.
-pub fn labelling_of(state: State, outcome: Option<OutcomeKind>) -> Labelling {
-    let base = state_labelling(state);
-    if base != Labelling::Accepted {
+pub fn labelling_of(
+    state: State,
+    outcome: Option<OutcomeKind>,
+    salvage: SalvageEvidence,
+) -> Labelling {
+    let base = match (state, salvage) {
+        (State::AcceptedByPerson, salvage) => salvaged_labelling(salvage),
+        (state, _) => state_labelling(state),
+    };
+    if !matches!(base, Labelling::Accepted | Labelling::AcceptedViaSalvage) {
         return base;
     }
     match outcome {
         // No outcome recorded yet is not evidence of anything: the run
         // was accepted, and absence of feedback is never a positive
         // label in its own right, only the accepted label already earned.
-        None => Labelling::Accepted,
+        None => base,
         // Not a wildcard: `kind` is bound and handed to the one
         // exhaustive match over `OutcomeKind` there is, so a new variant
         // still fails to compile — in `outcome_stands`, once, instead of
         // here and there.
         Some(kind) => match outcome_stands(kind) {
-            Some(true) => Labelling::Accepted,
+            Some(true) => base,
             Some(false) => Labelling::Failed,
             None => Labelling::Excluded(
                 "never shipped, abandoned for reasons unrelated to quality: no quality label",
             ),
         },
+    }
+}
+
+/// The labelling a salvaged (or merely person-accepted) run earns before
+/// any later outcome is applied. Total over [`SalvageEvidence`]: a new
+/// kind of evidence does not compile here until it says which way it falls.
+fn salvaged_labelling(salvage: SalvageEvidence) -> Labelling {
+    match salvage {
+        SalvageEvidence::NotSalvaged => {
+            Labelling::Excluded("accepted by a person, not the runner's own reasoning verdict")
+        }
+        SalvageEvidence::ReviewedAndContained => Labelling::AcceptedViaSalvage,
+        SalvageEvidence::ReviewedAndRewritten => {
+            Labelling::Excluded("salvaged, but the landed commit rewrote the verified candidate")
+        }
+        SalvageEvidence::ReviewedContainmentUnknown => Labelling::Excluded(
+            "salvaged, but whether the verified candidate landed intact is unknown \
+             (repository or patch unreachable)",
+        ),
+        SalvageEvidence::RaisedElsewhere => Labelling::Excluded(
+            "salvaged, but the run was not raised from needs_review with review_findings: \
+             the runner never verified a candidate",
+        ),
     }
 }
 
@@ -340,11 +380,16 @@ pub fn build(
         // positive label.
         let latest_outcome = read_of(&run_id, "latest outcome", ledger.latest_outcome(&task_id))?;
         let outcome_kind = latest_outcome.as_ref().map(|stored| stored.outcome.kind);
+        // The decision is read once, before labelling: a salvage's
+        // evidence (raising state and reason, containment) lives on it.
+        let decision = read_of(&run_id, "decision", ledger.decision_of_run(&run_id))?;
+        let salvage = salvage_evidence_of(decision.as_ref());
         // Infrastructure and unresolved outcomes are excluded, not
         // relabelled (SPEC §17).
-        let accepted = match labelling_of(state, outcome_kind) {
-            Labelling::Accepted => true,
-            Labelling::Failed => false,
+        let (accepted, label_source) = match labelling_of(state, outcome_kind, salvage) {
+            Labelling::Accepted => (true, LabelSource::Runner),
+            Labelling::AcceptedViaSalvage => (true, LabelSource::PersonSalvageContained),
+            Labelling::Failed => (false, LabelSource::Runner),
             Labelling::Excluded(why) => {
                 exclusions.push(format!("{run_id}: {state}: {why}"));
                 continue;
@@ -372,7 +417,6 @@ pub fn build(
         // the dataset — `route` names how it was actually accepted, so
         // the dataset reads honestly — it just never contributes a
         // positive label.
-        let decision = read_of(&run_id, "decision", ledger.decision_of_run(&run_id))?;
         let route =
             if decision.and_then(|record| record.resolution) == Some(Reason::DecisionApproved) {
                 AcceptanceRoute::PersonApproved
@@ -463,6 +507,7 @@ pub fn build(
             sparse,
             accepted_without_escalation,
             route,
+            label_source,
             outcome_stood,
             correction_magnitude,
             complete_cost: cost,
@@ -647,6 +692,7 @@ mod tests {
             sparse: SparseVec(vec![(0, 1.0)]),
             accepted_without_escalation: accepted,
             route: AcceptanceRoute::Verified,
+            label_source: LabelSource::Runner,
             outcome_stood: None,
             correction_magnitude: None,
             complete_cost: crate::money::MicroUsd::from_micros(100),
@@ -1092,6 +1138,235 @@ argv = ["true"]
         );
     }
 
+    /// A run raised into `raised` for `reason`, then salvaged by a person
+    /// with the given containment. A same-state retirement row follows, as
+    /// it does for every real run: the rule must not read it.
+    fn salvaged_after(
+        fixture: &LedgerFixture,
+        run: &str,
+        raised: State,
+        reason: &str,
+        contained: Option<bool>,
+    ) {
+        fixture.dispatched(run, "implementation", "initial");
+        let transition = |from: State, to: State, reason: &str| crate::ledger::Transition {
+            run_id: run_id(run),
+            attempt_id: None,
+            from_state: Some(from),
+            to_state: to,
+            reason: reason.into(),
+            detail: None,
+            at: crate::ledger::now_rfc3339(),
+        };
+        fixture
+            .ledger
+            .record_transition(&transition(State::Verifying, raised, reason))
+            .expect("raise");
+        fixture
+            .ledger
+            .record_transition(&transition(raised, raised, "worktree_retired"))
+            .expect("retire");
+        fixture
+            .ledger
+            .record_salvage_contained(&run_id(run), "abc123", "a person", None, contained)
+            .expect("salvage")
+            .expect("salvaged");
+    }
+
+    fn only_record(fixture: &LedgerFixture) -> Option<TrainingExample> {
+        fixture.build().records.into_iter().next()
+    }
+
+    /// A salvage raised from needs_review(review_findings) whose verified
+    /// patch landed intact is a positive, sourced from the person.
+    #[test]
+    fn a_contained_salvage_after_review_findings_is_a_positive() {
+        let fixture = LedgerFixture::open("dataset-salvage-contained");
+        salvaged_after(
+            &fixture,
+            "run-a",
+            State::NeedsReview,
+            "review_findings",
+            Some(true),
+        );
+        let record = only_record(&fixture).expect("a record");
+        assert!(record.accepted_without_escalation);
+        assert_eq!(record.label_source, LabelSource::PersonSalvageContained);
+    }
+
+    #[test]
+    fn a_rewritten_salvage_is_excluded_with_a_reason() {
+        let fixture = LedgerFixture::open("dataset-salvage-rewritten");
+        salvaged_after(
+            &fixture,
+            "run-a",
+            State::NeedsReview,
+            "review_findings",
+            Some(false),
+        );
+        let dataset = fixture.build();
+        assert!(dataset.records.is_empty());
+        assert!(
+            dataset.exclusions.iter().any(|e| e.contains("rewrote")),
+            "{:?}",
+            dataset.exclusions
+        );
+    }
+
+    #[test]
+    fn a_salvage_with_unknown_containment_is_excluded() {
+        let fixture = LedgerFixture::open("dataset-salvage-unknown");
+        salvaged_after(
+            &fixture,
+            "run-a",
+            State::NeedsReview,
+            "review_findings",
+            None,
+        );
+        let dataset = fixture.build();
+        assert!(dataset.records.is_empty());
+        assert!(dataset.exclusions.iter().any(|e| e.contains("unknown")));
+    }
+
+    #[test]
+    fn a_salvage_raised_from_interrupted_is_excluded_even_when_contained() {
+        let fixture = LedgerFixture::open("dataset-salvage-interrupted");
+        salvaged_after(
+            &fixture,
+            "run-a",
+            State::Interrupted,
+            "worker_dispatched",
+            Some(true),
+        );
+        let dataset = fixture.build();
+        assert!(dataset.records.is_empty());
+        assert!(dataset
+            .exclusions
+            .iter()
+            .any(|e| e.contains("not raised from needs_review")));
+    }
+
+    #[test]
+    fn a_needs_review_salvage_for_another_reason_is_excluded() {
+        let fixture = LedgerFixture::open("dataset-salvage-other-reason");
+        salvaged_after(
+            &fixture,
+            "run-a",
+            State::NeedsReview,
+            "worker_dispatched",
+            Some(true),
+        );
+        assert!(fixture.build().records.is_empty());
+    }
+
+    #[test]
+    fn a_contained_salvage_later_reverted_is_a_negative() {
+        let fixture = LedgerFixture::open("dataset-salvage-reverted");
+        salvaged_after(
+            &fixture,
+            "run-a",
+            State::NeedsReview,
+            "review_findings",
+            Some(true),
+        );
+        let outcome = crate::outcome::Outcome::new(
+            OutcomeKind::Reverted,
+            crate::outcome::OutcomeDetail {
+                candidate_sha: Some("abc123".into()),
+                strategy: crate::outcome::Strategy {
+                    tier: Tier::Implementation,
+                    models: vec!["sonnet".into()],
+                    escalated: false,
+                },
+                correction_magnitude: None,
+                evidence: vec![],
+                actor: "a person".into(),
+                note: None,
+            },
+        )
+        .expect("outcome");
+        fixture
+            .ledger
+            .record_outcome(&run_id("run-a"), &task_id("run-a"), &outcome)
+            .expect("record");
+        let record = only_record(&fixture).expect("a record");
+        assert!(!record.accepted_without_escalation);
+        assert_eq!(record.outcome_stood, Some(false));
+    }
+
+    /// `labelling_of` stays pure: the same state with each kind of
+    /// evidence, no ledger.
+    #[test]
+    fn labelling_reads_salvage_evidence_only_for_a_person_accepted_state() {
+        use SalvageEvidence::*;
+        assert_eq!(
+            labelling_of(State::AcceptedByPerson, None, ReviewedAndContained),
+            Labelling::AcceptedViaSalvage
+        );
+        for evidence in [
+            NotSalvaged,
+            RaisedElsewhere,
+            ReviewedAndRewritten,
+            ReviewedContainmentUnknown,
+        ] {
+            assert!(matches!(
+                labelling_of(State::AcceptedByPerson, None, evidence),
+                Labelling::Excluded(_)
+            ));
+        }
+        // Evidence never turns another state into a positive.
+        assert_eq!(
+            labelling_of(State::Failed, None, ReviewedAndContained),
+            Labelling::Failed
+        );
+    }
+
+    /// `decide --answer approve` stays a person-approved route and never a
+    /// positive label, whatever the salvage rule admits.
+    #[test]
+    fn a_decide_approve_run_is_never_a_positive_and_has_a_runner_source() {
+        let fixture = LedgerFixture::open("dataset-approve-not-salvage");
+        fixture.dispatched("run-a", "implementation", "initial");
+        fixture
+            .ledger
+            .record_transition(&crate::ledger::Transition {
+                run_id: run_id("run-a"),
+                attempt_id: None,
+                from_state: Some(State::Verifying),
+                to_state: State::NeedsReview,
+                reason: "review_findings".into(),
+                detail: None,
+                at: crate::ledger::now_rfc3339(),
+            })
+            .expect("raise");
+        fixture
+            .ledger
+            .resolve_decision(
+                &run_id("run-a"),
+                &crate::ledger::DecisionAnswer {
+                    resolution: Reason::DecisionApproved,
+                    actor: "a person",
+                    note: None,
+                    successor_run: None,
+                    from_state: State::NeedsReview,
+                    to_state: State::AcceptedByPerson,
+                },
+            )
+            .expect("resolve");
+        let dataset = fixture.build();
+        assert!(
+            dataset
+                .records
+                .iter()
+                .all(|r| !r.accepted_without_escalation),
+            "an approval is never a positive"
+        );
+        assert!(dataset
+            .records
+            .iter()
+            .all(|r| r.label_source == LabelSource::Runner));
+    }
+
     #[test]
     fn a_reviewed_run_is_not_labelled_as_escalated() {
         let fixture = LedgerFixture::open("dataset");
@@ -1156,7 +1431,10 @@ argv = ["true"]
             State::Cancelled,
         ] {
             assert!(
-                matches!(labelling_of(state, None), Labelling::Excluded(_)),
+                matches!(
+                    labelling_of(state, None, SalvageEvidence::NotSalvaged),
+                    Labelling::Excluded(_)
+                ),
                 "{state} is not an evidence-backed reasoning label"
             );
             let fixture = LedgerFixture::open("dataset-state");
@@ -1174,8 +1452,14 @@ argv = ["true"]
                 dataset.exclusions[0]
             );
         }
-        assert_eq!(labelling_of(State::Accepted, None), Labelling::Accepted);
-        assert_eq!(labelling_of(State::Failed, None), Labelling::Failed);
+        assert_eq!(
+            labelling_of(State::Accepted, None, SalvageEvidence::NotSalvaged),
+            Labelling::Accepted
+        );
+        assert_eq!(
+            labelling_of(State::Failed, None, SalvageEvidence::NotSalvaged),
+            Labelling::Failed
+        );
     }
 
     /// D1: a task whose latest recorded outcome is `reverted` or a
@@ -1184,28 +1468,51 @@ argv = ["true"]
     #[test]
     fn a_reverted_or_regressed_outcome_withdraws_an_accepted_label() {
         assert_eq!(
-            labelling_of(State::Accepted, Some(OutcomeKind::Reverted)),
+            labelling_of(
+                State::Accepted,
+                Some(OutcomeKind::Reverted),
+                SalvageEvidence::NotSalvaged
+            ),
             Labelling::Failed
         );
         assert_eq!(
-            labelling_of(State::Accepted, Some(OutcomeKind::ConfirmedRegression)),
+            labelling_of(
+                State::Accepted,
+                Some(OutcomeKind::ConfirmedRegression),
+                SalvageEvidence::NotSalvaged
+            ),
             Labelling::Failed
         );
         assert_eq!(
-            labelling_of(State::Accepted, Some(OutcomeKind::AcceptedUnchanged)),
+            labelling_of(
+                State::Accepted,
+                Some(OutcomeKind::AcceptedUnchanged),
+                SalvageEvidence::NotSalvaged
+            ),
             Labelling::Accepted
         );
         assert_eq!(
-            labelling_of(State::Accepted, Some(OutcomeKind::Corrected)),
+            labelling_of(
+                State::Accepted,
+                Some(OutcomeKind::Corrected),
+                SalvageEvidence::NotSalvaged
+            ),
             Labelling::Accepted
         );
         // Absence of feedback is never a positive label BY ITSELF, but it
         // also never withdraws one already earned by verified acceptance.
-        assert_eq!(labelling_of(State::Accepted, None), Labelling::Accepted);
+        assert_eq!(
+            labelling_of(State::Accepted, None, SalvageEvidence::NotSalvaged),
+            Labelling::Accepted
+        );
         // A non-accepted state is untouched by outcome: there is no
         // accepted change for an outcome to speak about.
         assert_eq!(
-            labelling_of(State::Failed, Some(OutcomeKind::Reverted)),
+            labelling_of(
+                State::Failed,
+                Some(OutcomeKind::Reverted),
+                SalvageEvidence::NotSalvaged
+            ),
             Labelling::Failed
         );
 
@@ -1215,7 +1522,8 @@ argv = ["true"]
         // classified one way in the label and the other in the example.
         for kind in OutcomeKind::ALL {
             assert_eq!(
-                labelling_of(State::Accepted, Some(kind)) == Labelling::Accepted,
+                labelling_of(State::Accepted, Some(kind), SalvageEvidence::NotSalvaged)
+                    == Labelling::Accepted,
                 outcome_stands(kind) == Some(true),
                 "the label and `outcome_stands` disagree about {kind:?}"
             );
@@ -1227,7 +1535,11 @@ argv = ["true"]
     #[test]
     fn a_never_shipped_outcome_is_excluded_from_training() {
         assert!(matches!(
-            labelling_of(State::Accepted, Some(OutcomeKind::NeverShipped)),
+            labelling_of(
+                State::Accepted,
+                Some(OutcomeKind::NeverShipped),
+                SalvageEvidence::NotSalvaged
+            ),
             Labelling::Excluded(_)
         ));
         assert_eq!(outcome_stands(OutcomeKind::NeverShipped), None);

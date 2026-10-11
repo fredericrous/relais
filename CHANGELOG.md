@@ -8,6 +8,103 @@ missing here.
 
 ## Unreleased
 
+**Upgrading migrates the ledger, and an older relais then refuses it.** This
+release adds ledger steps (learning cycles, salvage containment, router
+evidence, exploration stops, classifier calls). v0.11.x opening a migrated
+ledger exits 1 with `a newer relais wrote this ledger`; it reads nothing and
+writes nothing. To be able to go back, copy the ledger before upgrading:
+`sqlite3 ~/.local/state/relais/ledger.sqlite ".backup ~/.local/state/relais/ledger.sqlite.bak-v0.11"`.
+To downgrade, run `relais coordinator stop`, install v0.11.x, and restore that
+copy over `ledger.sqlite`; everything recorded since the upgrade is lost.
+
+The session router gets real outcome evidence.
+
+- The learning report shows an interrupted cycle again (only `--if-due` skips
+  it); a malformed `relais.toml` is logged to `--log`, recorded as an `error`
+  row and exits 1; a fatal `git apply` error is `Unreachable`, not
+  `Rewritten`; artifact retention runs even when the datasets directory
+  cannot be read; the quality-floor note appears only where the default
+  floor is used, and says whether the report is missing or unparseable.
+- The learning cycle's `--if-due` check ignores a row that never finished
+  (a killed cycle) or that the next cycle closed as `interrupted`, so such a
+  row no longer makes it answer "not due". A malformed `relais.toml` now
+  fails the cycle instead of being replaced by the default policy, salvage
+  containment reports why it was unreachable, and the plugin notes a
+  promotion before it starts its own cycle.
+- Lint, build and type-check commands (`cargo clippy|check|build`,
+  `pnpm|npm run lint|build|typecheck`, `tsc`, `go vet|build`,
+  `golangci-lint run`, `ruff check`, `mypy`, `pyright`, `make lint|build`)
+  now count as checks, each recorded with its kind (`test`, `lint`, `build`).
+- New read-only `relais native gate-stamp --cwd <repo>` reads amont's gate
+  stamp on the current tree. At a task's end the plugin turns a stamp made
+  inside the task's window into an `amont-gate@<tree>` check.
+- A subagent task that ended before its parent takes the parent's outcome
+  when its own is unknown (`outcome_source = parent`).
+- A correction now records its task as `corrected` at once, so a session that
+  dies before the task ends no longer leaves a correction with no task.
+- Each routing decision records the capability table's version. The ledger
+  migrates to schema 23 (additive columns).
+- Seeded downward exploration: at a main-session task start, outside the
+  hold-out and in mode `on`, a draw below `epsilon` starts the task one tier
+  lower (never below research, never for continuations, corrections or
+  subagents). The draw is defined once for Rust and the plugin, and each
+  decision records `explored`, `propensity`, `draw` and `would_pass_gate`.
+- Automatic stop rule: once 20 explored tasks have strong outcomes, if their
+  corrected share exceeds the undrawn tasks' in the same strata by more than
+  15 points, `router-state` serves `epsilon = 0` and the ledger records the
+  stop with its counts (schema 24, additive).
+- `relais report` shows, per stratum (kind, difficulty band, scope), drawn and
+  undrawn tasks with strong outcomes, both corrected shares and the projected
+  date the busiest stratum reaches 20 drawn tasks; also in `--json`.
+
+The session router keeps its classifier calls to train a local model on (relais ADR-0002).
+
+- The plugin sends a `classification` record for every classifier call, prompt or spawn: the exact input (at most 3 KB), the parsed answer with every field, the prompt version, whether it parsed and the latency. relais writes the input text to a local day file (`<state dir>/classifier/<YYYY-MM-DD>.jsonl`, directory 0700, files 0600), with provider API keys, bearer tokens, private key blocks and long base64 or hex runs redacted, and deletes files older than 90 days when it writes and in `relais learn cycle`. The ledger holds only the text's SHA-256 (schema 25, a new `router_classifications` table).
+- `[session_routing] keep_classifier_inputs = false` in machine.toml, `RELAIS_SESSION_ROUTING=off` and routing turned off capture nothing. Upgrade relais before the plugin: an older relais refuses the new record kind.
+- New `relais router export-classifier --out <file|-> [--since <date>]` writes the parsed calls as JSON lines behind a header with the capability table and its version, split by time into train, calibration and test. It is the one way the text leaves the machine.
+- `relais report` shows how many parsed classifier calls are kept.
+
+A salvaged run can now teach the learner, when its verified patch landed.
+
+- `relais decide --answer salvaged` records whether the run's verified
+  candidate patch survives intact in the commit you landed
+  (`candidate_contained`). `relais dataset build` labels a salvage positive
+  only when the run was raised from `needs_review` with `review_findings`
+  and that is true; every other salvage stays excluded, with its reason.
+  It backfills older salvages once where the repository and patch still
+  exist, and reports how many stayed unknown.
+- Each training example records its `label_source`, and `relais evaluate`
+  reports acceptance and calibration per source. The label policy version
+  is now 2, so datasets and artifacts built before it are distinguishable.
+- The ledger migrates to schema 21 (one nullable column on `decisions`) and,
+  with the learning cycle, to schema 22.
+
+relais now retrains itself, and says what it learned.
+
+- `relais learn cycle [--if-due] [--json] [--log PATH] [-q]` builds the
+  dataset, trains, evaluates and, when you allowed it, promotes. It takes the
+  one Training lease without queueing: a second cycle exits 20 and names the
+  holder's pid. While agents of another session run it prints `deferred: not
+  idle`, writes nothing, and exits 0; `--if-due` also exits 0 when the last
+  cycle is under 20 hours old. Each cycle is a `learning_cycles` row, and a
+  killed cycle's row is closed as `interrupted` by the next one.
+- Installing the plugin records the `[learning]` envelope in machine.toml
+  and says how to turn it off. `relais native learning-envelope` writes it
+  (`--off` turns it off and stops a later install from recording it again).
+  Without it a cycle stops at `awaiting_promotion` and prints the `relais
+  promote` line.
+- The active artifact is rolled back on its own when a run it routed was
+  reverted or had a confirmed regression, or when the 95% upper bound of its
+  acceptance over at least 10 routed runs falls below its quality floor.
+  `relais rollback` does it by hand. An artifact trained on the data of a
+  rolled-back one is not promoted, and nothing is promoted before 10 runs
+  have ended since a rollback.
+- `relais learn last [--json]` prints the latest row without touching the
+  ledger. `--log` opens its file itself (0600, rotated at 1 MiB, one old file
+  kept). `relais report` gains a learning section, also in `--json`.
+- New exit code 20 (the Training lease is held). The ledger gains the
+  `learning_cycles` table (schema 22), an additive migration.
+
 An agent's transcript opens inside the relais pane.
 
 - Each agent row of the pane is now a button, named under it as Claude

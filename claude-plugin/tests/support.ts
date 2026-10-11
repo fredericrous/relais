@@ -7,6 +7,10 @@ import { mock } from 'claude-code/testing'
 export type Calls = {
   run: { argv: string[]; init: any }[]
   spawn: any[]
+  // The detached `relais learn cycle` spawns, kept apart from the runs'.
+  learn: any[]
+  // How many toasts had been shown when each learn spawn arrived.
+  toastsAtLearnSpawn: number[]
   // What reached the engine's `agent.spawn`, after the plugin's own hook.
   spawned: any[]
   tool: any[]
@@ -41,6 +45,8 @@ export function scriptedEngine(
   const calls: Calls = {
     run: [],
     spawn: [],
+    learn: [],
+    toastsAtLearnSpawn: [],
     spawned: [],
     tool: [],
     toasts: [],
@@ -73,6 +79,8 @@ export function scriptedEngine(
     stepUsage: (e: any): any => ({ ...zeroUsage, input_tokens: 10, output_tokens: 5, model: e.model }),
     // Whether `agent.spawn` names the started agent (a workflow's remote one does not).
     spawnHasAgentId: true,
+    // The detached learning cycle cannot be spawned.
+    learnSpawnFails: false,
     // `$.ui.ask`'s answer; a throw is a dismissal.
     ask: (_question: string, _options: string[]): any => {
       throw new Error('dismissed')
@@ -120,6 +128,12 @@ export function scriptedEngine(
     return { value: script.runResult(e.argv, e.init) }
   })
   on('process.spawn', async function* (_$: any, e: any) {
+    if (e.argv[1] === 'learn') {
+      calls.learn.push(e)
+      calls.toastsAtLearnSpawn.push(calls.toasts.length)
+      if (script.learnSpawnFails) throw new Error('spawn refused')
+      return { value: { code: 0, signal: null } }
+    }
     calls.spawn.push(e)
     const queue = queueOf(e.argv[e.argv.indexOf('--task') + 1])
     for (;;) {

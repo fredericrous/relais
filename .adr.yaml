@@ -27,6 +27,10 @@ dir: .adr/records
 keys:
   routing.session-model:
     description: Whether relais chooses the model of the person's own Claude Code session, and within what authority
+  learning.automatic-promotion:
+    description: Whether relais promotes a gate-passing task artifact without a person, inside what envelope, and how it rolls back
+  learning.classifier-capture:
+    description: Whether relais keeps the text of the session router's classifier calls to train a local model, where, for how long, and what leaves the machine
 
 # Which parts of this repository have which traits (aval 1.7, SEMANTICS
 # section 2.5), as `aval traits --detect` proposed and a reviewer accepted.

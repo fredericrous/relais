@@ -447,6 +447,51 @@ impl Registry {
         self.write_pointer(&self.active_path(), evaluated.artifact_id())
     }
 
+    /// The id the active pointer names, without loading the artifact.
+    pub fn active_id(&self) -> std::result::Result<Option<String>, ArtifactError> {
+        self.pointer(&self.active_path())
+    }
+
+    /// The id rollback would restore, without loading the artifact.
+    pub fn previous_id(&self) -> std::result::Result<Option<String>, ArtifactError> {
+        self.pointer(&self.previous_path())
+    }
+
+    /// When the active pointer last changed (a promotion or a rollback),
+    /// as RFC 3339; `None` when nothing is active or the filesystem does
+    /// not say.
+    pub fn active_changed_at(&self) -> Option<String> {
+        let modified = std::fs::metadata(self.active_path())
+            .ok()?
+            .modified()
+            .ok()?;
+        Some(
+            chrono::DateTime::<chrono::Utc>::from(modified)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+    }
+
+    /// Delete artifact `artifact_id`, unless the registry still points at
+    /// it. Whether a file was removed.
+    pub fn remove_unreferenced(
+        &self,
+        artifact_id: &str,
+    ) -> std::result::Result<bool, ArtifactError> {
+        for id in [self.active_id()?, self.previous_id()?]
+            .into_iter()
+            .flatten()
+        {
+            if id == artifact_id {
+                return Ok(false);
+            }
+        }
+        match std::fs::remove_file(self.artifacts_dir().join(format!("{artifact_id}.json"))) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(ArtifactError::Io(e)),
+        }
+    }
+
     pub fn rollback(&self) -> std::result::Result<Option<String>, ArtifactError> {
         let Some(id) = self.pointer(&self.previous_path())? else {
             return Ok(None);
@@ -483,56 +528,9 @@ impl EvaluatedArtifact {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::learn::evaluate::{
-        Calibration, Coefficients, EvalReport, PromotionGates, EVAL_SCHEMA_VERSION,
-    };
-    use crate::learn::features::{feature_dim, FeatureSchema, RecipeIdentity, Standardization};
-    use crate::learn::learner::FitReport;
-    use crate::policy::Tier;
-
-    fn artifact(id: &str, evaluation: Option<serde_json::Value>) -> Artifact {
-        // Every array is the schema's dimension, as a real artifact's is.
-        let dim = feature_dim(&FeatureSchema::standard());
-        Artifact {
-            schema_version: ARTIFACT_SCHEMA_VERSION,
-            artifact_id: id.into(),
-            feature_schema: FeatureSchema::standard(),
-            standardization: Standardization {
-                means: vec![0.0; dim],
-                stds: vec![1.0; dim],
-            },
-            acceptance: LogisticModel {
-                dim,
-                weights: vec![1.0; dim],
-                bias: 0.0,
-            },
-            cost: CostModel {
-                dim,
-                weights: vec![0.5; dim],
-                bias: 0.0,
-                cohort_means: vec![("change".into(), 120.0)],
-                observed_log_min: 0.0,
-                observed_log_max: 10.0,
-            },
-            tiers_supported: vec![Tier::Implementation],
-            observed_identities: vec![(
-                Tier::Implementation,
-                vec![RecipeIdentity {
-                    model: "sonnet".into(),
-                    effort: None,
-                    harness: None,
-                    recipe_id: None,
-                }],
-            )],
-            cohorts: vec!["change".into()],
-            label_policy_version: crate::learn::dataset::LABEL_POLICY_VERSION,
-            dataset_fingerprint: "abc".into(),
-            solver: SolverSettings::default(),
-            trained_at: "2026-09-18".into(),
-            relais_version: crate::version().into(),
-            evaluation,
-        }
-    }
+    use crate::learn::evaluate::EVAL_SCHEMA_VERSION;
+    use crate::learn::features::{feature_dim, FeatureSchema};
+    use crate::learn::fixtures::{artifact, evaluation};
 
     /// A registry directory nobody else can collide with, pre-cleaned so
     /// a crashed earlier run cannot make this one pass: the process owns
@@ -682,57 +680,6 @@ mod tests {
 
         // The well-shaped fixture still loads.
         assert!(artifact("art-dim-ok", None).validate().is_ok());
-    }
-
-    /// The evaluator's report, as `relais train` stores it — the ONLY
-    /// shape promotion may read. A hand-written `{"gates_passed": true}`
-    /// here once let promotion pass its test while refusing every real
-    /// artifact.
-    fn evaluation(artifact_id: &str, gates_passed: bool) -> serde_json::Value {
-        let gates = PromotionGates {
-            gates_passed,
-            min_records_per_tier: 5,
-            min_supported_test_records: 20,
-            quality_floor: 0.75,
-            max_abstention_rate: 0.5,
-            coverage: vec![("implementation".into(), 5)],
-            test_records: 40,
-            supported_test_records: if gates_passed { 25 } else { 1 },
-            test_acceptance_rate: Some(0.9),
-            abstention_rate: 0.1,
-            acceptance_fit: FitReport {
-                iterations: 40,
-                converged: true,
-                final_loss: 0.1,
-            },
-            cost_fit: FitReport {
-                iterations: 40,
-                converged: true,
-                final_loss: 0.1,
-            },
-            calibration: Calibration::Fitted {
-                scale: 1.1,
-                offset: 0.0,
-            },
-            cost_coefficients: Coefficients::Finite,
-        };
-        let report = EvalReport {
-            version: EVAL_SCHEMA_VERSION,
-            artifact_id: artifact_id.into(),
-            dataset_fingerprint: "abc".into(),
-            train_records: 10,
-            calibration_records: 2,
-            test_records: 40,
-            calibration_bins: vec![],
-            test_acceptance_rate: Some(0.9),
-            baseline_acceptance_rate: Some(0.8),
-            mean_cost_selected: None,
-            mean_cost_baseline: None,
-            abstention_rate: 0.1,
-            coverage: vec![("implementation".into(), 5)],
-            gates,
-        };
-        serde_json::to_value(report).expect("serializes")
     }
 
     #[test]

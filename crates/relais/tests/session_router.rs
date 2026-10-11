@@ -600,3 +600,483 @@ fn the_report_prices_routing_spend_and_says_unknown_for_an_unpriced_model() {
     assert_eq!(value["session_routing"]["arms"][0]["arm"], "routed");
     assert!(value["session_routing"]["arms"][1]["cost"].is_null());
 }
+
+/// One session's batch of `n` main-session tasks, each with the
+/// exploration fields the draw recorded and an outcome.
+fn exploration_batch(session: &str, tasks: &[(String, bool, &str)]) -> String {
+    let mut records = Vec::new();
+    for (task, drawn, outcome) in tasks {
+        let class = serde_json::json!({
+            "kind": "edit", "difficulty": 3, "scope": "local",
+            "uncertainty": "low", "verifiable": true, "confidence": 0.9
+        });
+        records.push(serde_json::json!({
+            "kind": "decision", "task_id": task, "turn_id": format!("{task}-u1"), "agent_id": null,
+            "relation": "new_task", "class": class,
+            "tier": if *drawn { "research" } else { "implementation" },
+            "model": "claude-sonnet-5-5", "effort": null, "reason": "table",
+            "mode_effective": "on", "holdout": false, "applied": true,
+            "explored": drawn, "propensity": if *drawn { 0.1 } else { 0.9 }, "draw": 0.05,
+            "would_pass_gate": true, "at": "2026-10-07T10:00:00Z"
+        }));
+        records.push(serde_json::json!({
+            "kind": "task", "task_id": task, "agent_id": null,
+            "started_at": "2026-10-07T10:00:00Z", "ended_at": "2026-10-07T10:05:00Z",
+            "class": class, "outcome": outcome, "inferred": [],
+            "escalations": 0, "exhausted": false, "turns": 1, "explicit_quote": null
+        }));
+    }
+    serde_json::json!({ "schema": 1, "session": session, "records": records }).to_string()
+}
+
+/// 20 drawn tasks, `drawn_corrected` of them corrected, and 40 clean
+/// undrawn ones, in a world with an envelope.
+fn world_with_exploration(tag: &str, drawn_corrected: usize) -> World {
+    let world = World::new(tag);
+    std::fs::write(
+        world.machine(),
+        "schema_version = 1\n[session_routing]\nepsilon = 0.1\n\
+         envelope = { granted_at = \"2026-10-07T00:00:00Z\", by = \"me\", epsilon_max = 0.1, source = \"cli\" }\n",
+    )
+    .unwrap();
+    let mut tasks = Vec::new();
+    for i in 0..20 {
+        let outcome = if i < drawn_corrected {
+            "corrected"
+        } else {
+            "completed_verified"
+        };
+        tasks.push((format!("d{i}"), true, outcome));
+    }
+    for i in 0..40 {
+        tasks.push((format!("u{i}"), false, "completed_verified"));
+    }
+    let output = world.relais_stdin(
+        &["native", "router-observe"],
+        &exploration_batch("s-explore", &tasks),
+    );
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    world
+}
+
+#[test]
+fn drawn_tasks_doing_worse_than_undrawn_stop_exploration_and_the_stop_is_recorded() {
+    let world = world_with_exploration("stop", 4);
+    let state = world.state_json(&world.relais(&["native", "router-state", "--session", "s-9"]));
+    assert_eq!(state["epsilon"], 0.0);
+    let stops = world.ledger().router_exploration_stops().unwrap();
+    assert_eq!(stops.len(), 1);
+    assert_eq!(
+        (
+            stops[0].drawn,
+            stops[0].drawn_bad,
+            stops[0].undrawn,
+            stops[0].undrawn_bad
+        ),
+        (20, 4, 40, 0)
+    );
+    // Read again with nothing new: still stopped, no second row.
+    let again = world.state_json(&world.relais(&["native", "router-state", "--session", "s-10"]));
+    assert_eq!(again["epsilon"], 0.0);
+    assert_eq!(world.ledger().router_exploration_stops().unwrap().len(), 1);
+    // The report says so.
+    let text = stdout(&world.relais(&["report", "--since", "2026-10-01", "--no-import"]));
+    assert!(
+        text.contains("edit d3 local: drawn 20 (20%), undrawn 40 (0%)"),
+        "{text}"
+    );
+    assert!(text.contains("stopped "), "{text}");
+    let section = text
+        .split("  exploration (")
+        .nth(1)
+        .and_then(|rest| rest.split("\nlearning:").next())
+        .expect("an exploration section");
+    assert!(
+        section.lines().all(|line| line.chars().count() <= 80),
+        "{section}"
+    );
+}
+
+#[test]
+fn at_fifteen_points_exploration_goes_on_and_no_stop_is_recorded() {
+    let world = world_with_exploration("go", 3);
+    let state = world.state_json(&world.relais(&["native", "router-state", "--session", "s-9"]));
+    assert_eq!(state["epsilon"], 0.1);
+    assert!(world
+        .ledger()
+        .router_exploration_stops()
+        .unwrap()
+        .is_empty());
+    let json = world.relais(&["report", "--since", "2026-10-01", "--no-import", "--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let exploration = &value["session_routing"]["exploration"];
+    assert_eq!(exploration["strata"][0]["drawn"], 20);
+    assert_eq!(exploration["strata"][0]["projection"]["state"], "reached");
+    assert!(exploration["stop"].is_null());
+}
+
+// --- classifier calls kept for training (learning-loop Phase 5, ADR-0002) ---
+
+const PROMPT_VERSION: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+fn classification(call: &str, at: &str, input: &str, parsed: bool) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "classification", "call_id": call, "purpose": "prompt",
+        "model": "claude-haiku-5-5", "prompt_version": PROMPT_VERSION, "input": input,
+        "answer": if parsed { serde_json::json!({
+            "relation": "new_task", "kind": "edit", "difficulty": 2, "scope": "local",
+            "uncertainty": "low", "verifiable": true,
+            "explicit": { "value": "none", "quote": null },
+            "user_model": null, "user_model_for": null, "confidence": 0.9 }) }
+            else { serde_json::Value::Null },
+        "parse_ok": parsed, "latency_ms": 350, "at": at
+    })
+}
+
+fn observe_classifications(world: &World, records: Vec<serde_json::Value>) -> Output {
+    world.relais_stdin(
+        &["native", "router-observe"],
+        &serde_json::json!({ "schema": 1, "session": "s1", "records": records }).to_string(),
+    )
+}
+
+fn classifier_dir(world: &World) -> PathBuf {
+    world.state.join("classifier")
+}
+
+/// The bytes of every ledger file (database and journal), for "the text is
+/// nowhere in the ledger".
+fn ledger_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for entry in std::fs::read_dir(&world.state).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            bytes.extend(std::fs::read(path).unwrap());
+        }
+    }
+    bytes
+}
+
+/// A Unix permission mode is checked where it exists; Windows has none.
+fn assert_mode(path: &std::path::Path, expected: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, expected, "{}", path.display());
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, expected);
+    }
+}
+
+#[test]
+fn a_classification_writes_a_private_redacted_day_file_and_a_ledger_row_without_the_text() {
+    let world = World::new("cls");
+    // Assembled at run time so the source holds no secret-shaped literal.
+    let secret = format!("{}{}", "sk-ant-", "api03-SECRETSECRETSECRET");
+    let text = format!("ACTIVE TASK: none\n\nREQUEST:\nrename zebrafish to bar, key {secret}");
+    let output = observe_classifications(
+        &world,
+        vec![classification("c1", "2026-10-07T10:00:00Z", &text, true)],
+    );
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+
+    let dir = classifier_dir(&world);
+    assert_mode(&dir, 0o700);
+    let files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_mode(&files[0], 0o600);
+    let line = std::fs::read_to_string(&files[0]).unwrap();
+    assert!(line.contains("rename zebrafish to bar"), "{line}");
+    assert!(!line.contains("SECRETSECRET"), "{line}");
+    assert!(
+        line.contains("[REDACTED:api-key]") && line.contains("\"redactions\":1"),
+        "{line}"
+    );
+
+    let ledger = world.ledger();
+    assert_eq!(ledger.router_classification_counts().unwrap(), (1, 1));
+    let rows = ledger.router_classifications_parsed(None).unwrap();
+    assert_eq!(
+        rows[0].1.input_sha256,
+        relais::ids::sha256_hex(text.as_bytes())
+    );
+    drop(ledger);
+    let bytes = ledger_bytes(&world);
+    assert!(
+        !bytes.windows(9).any(|w| w == b"zebrafish"),
+        "the text is in the ledger"
+    );
+}
+
+#[test]
+fn the_off_switches_capture_nothing() {
+    // keep_classifier_inputs = false
+    let world = World::new("cls-off");
+    std::fs::write(
+        world.machine(),
+        "schema_version = 1\n[session_routing]\nkeep_classifier_inputs = false\n",
+    )
+    .unwrap();
+    let records = vec![
+        classification("c1", "2026-10-07T10:00:00Z", "rename foo", true),
+        serde_json::from_str(&batch("s", "t1", "unknown", "claude-haiku-5-5"))
+            .map(|v: serde_json::Value| v["records"][4].clone())
+            .unwrap(),
+    ];
+    let output = observe_classifications(&world, records);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(!classifier_dir(&world).exists());
+    assert_eq!(
+        world.ledger().router_classification_counts().unwrap(),
+        (0, 0)
+    );
+    // The rest of the batch is still recorded.
+    assert!(world
+        .ledger()
+        .router_task("s1", "t1", None)
+        .unwrap()
+        .is_some());
+
+    // RELAIS_SESSION_ROUTING=off
+    let world = World::new("cls-env");
+    let mut child = world
+        .command(&["native", "router-observe"])
+        .env("RELAIS_SESSION_ROUTING", "off")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            serde_json::json!({ "schema": 1, "session": "s1", "records": [
+                classification("c1", "2026-10-07T10:00:00Z", "rename foo", true)] })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(!classifier_dir(&world).exists());
+    assert_eq!(
+        world.ledger().router_classification_counts().unwrap(),
+        (0, 0)
+    );
+}
+
+#[test]
+fn a_write_deletes_day_files_older_than_ninety_days() {
+    let world = World::new("cls-ttl");
+    let dir = classifier_dir(&world);
+    std::fs::create_dir_all(&dir).unwrap();
+    let today = chrono::Utc::now().date_naive();
+    let name = |ago: i64| {
+        format!(
+            "{}.jsonl",
+            (today - chrono::Duration::days(ago)).format("%Y-%m-%d")
+        )
+    };
+    for ago in [90, 91] {
+        std::fs::write(dir.join(name(ago)), "{}\n").unwrap();
+    }
+    let output = observe_classifications(
+        &world,
+        vec![classification(
+            "c1",
+            "2026-10-07T10:00:00Z",
+            "rename foo",
+            true,
+        )],
+    );
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(dir.join(name(90)).exists());
+    assert!(!dir.join(name(91)).exists());
+    assert!(dir.join(name(0)).exists());
+}
+
+#[test]
+fn the_export_splits_by_time_behind_a_header_and_is_created_0600() {
+    let world = World::new("cls-export");
+    let mut records: Vec<serde_json::Value> = (0..10)
+        .map(|i| {
+            classification(
+                &format!("c{i}"),
+                &format!("2026-10-{:02}T10:00:00Z", i + 1),
+                &format!("request number {i}"),
+                true,
+            )
+        })
+        .collect();
+    records.push(classification(
+        "bad",
+        "2026-10-05T10:00:00Z",
+        "no parse",
+        false,
+    ));
+    let output = observe_classifications(&world, records);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(
+        world.ledger().router_classification_counts().unwrap(),
+        (11, 10)
+    );
+
+    // To a file: 0600, and no temporary file left beside it.
+    let out = world.root.join("export.jsonl");
+    let output = world.relais(&[
+        "router",
+        "export-classifier",
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_mode(&out, 0o600);
+    let leftovers: Vec<_> = std::fs::read_dir(&world.root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".export"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+    let text = std::fs::read_to_string(&out).unwrap();
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 11);
+    assert_eq!(lines[0]["capability_table_version"], 1);
+    assert_eq!(
+        lines[0]["capability_table"]["rules"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    let splits: Vec<&str> = lines[1..]
+        .iter()
+        .map(|l| l["split"].as_str().unwrap())
+        .collect();
+    assert_eq!(splits.iter().filter(|s| **s == "train").count(), 7);
+    assert_eq!(&splits[7..], ["calibration", "test", "test"]);
+    assert_eq!(lines[1]["call_id"], "c0");
+    assert_eq!(lines[1]["input"], "request number 0");
+    assert_eq!(lines[1]["prompt_version"], PROMPT_VERSION);
+    assert_eq!(lines[1]["answer"]["relation"], "new_task");
+    let left_out = stderr(&output);
+    assert!(
+        left_out.contains("10 call(s) written") && left_out.contains("1 unparsed"),
+        "{left_out}"
+    );
+
+    // To stdout, from a date.
+    let output = world.relais(&[
+        "router",
+        "export-classifier",
+        "--out",
+        "-",
+        "--since",
+        "2026-10-06",
+    ]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let lines = stdout(&output);
+    assert_eq!(lines.lines().count(), 6, "{lines}");
+    assert!(
+        stderr(&output).contains("5 before --since"),
+        "{}",
+        stderr(&output)
+    );
+
+    let output = world.relais(&[
+        "router",
+        "export-classifier",
+        "--out",
+        "-",
+        "--since",
+        "yesterday",
+    ]);
+    assert_ne!(code(&output), 0);
+}
+
+#[test]
+fn the_report_counts_the_parsed_calls_kept() {
+    let world = World::new("cls-report");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&batch("s1", "t1", "completed_verified", "claude-haiku-5-5")).unwrap();
+    let records = value["records"].as_array_mut().unwrap();
+    records.push(classification("c1", "2026-10-07T10:00:00Z", "one", true));
+    records.push(classification("c2", "2026-10-07T10:00:01Z", "two", true));
+    records.push(classification("c3", "2026-10-07T10:00:02Z", "three", false));
+    let output = world.relais_stdin(&["native", "router-observe"], &value.to_string());
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let text = stdout(&world.relais(&["report", "--since", "2026-10-01", "--no-import"]));
+    assert!(
+        text.contains("classifier calls kept for training: 2 parsed"),
+        "{text}"
+    );
+    let json = world.relais(&["report", "--since", "2026-10-01", "--no-import", "--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["session_routing"]["classifier"]["captured"], 2);
+}
+
+/// The directory and the file are private whatever the umask: the binary
+/// runs under `umask 000`, and the directory already exists, world
+/// readable.
+#[cfg(unix)]
+#[test]
+fn day_files_stay_private_under_a_permissive_umask() {
+    use std::os::unix::fs::PermissionsExt;
+    let world = World::new("cls-umask");
+    let dir = classifier_dir(&world);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let payload = serde_json::json!({ "schema": 1, "session": "s1", "records": [
+        classification("c1", "2026-10-07T10:00:00Z", "rename foo", true)] })
+    .to_string();
+    let mut child = Command::new("sh")
+        .args(["-c", "umask 000; exec \"$0\" native router-observe", BIN])
+        .current_dir(&world.repo)
+        .env("RELAIS_STATE_DIR", &world.state)
+        .env("RELAIS_CONFIG_DIR", &world.config)
+        .env("HOME", &world.root)
+        .env_remove("RELAIS_SESSION_ROUTING")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_mode(&dir, 0o700);
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        assert_mode(&entry.unwrap().path(), 0o600);
+    }
+    // The export under the same umask is 0600 as well.
+    let out = world.root.join("out.jsonl");
+    let status = Command::new("sh")
+        .args([
+            "-c",
+            "umask 000; exec \"$0\" router export-classifier --out \"$1\"",
+            BIN,
+            out.to_str().unwrap(),
+        ])
+        .env("RELAIS_STATE_DIR", &world.state)
+        .env("RELAIS_CONFIG_DIR", &world.config)
+        .env("HOME", &world.root)
+        .output()
+        .unwrap();
+    assert_eq!(code(&status), 0, "{}", stderr(&status));
+    assert_mode(&out, 0o600);
+}

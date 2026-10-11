@@ -362,6 +362,30 @@ pub enum AcceptanceRoute {
     PersonApproved,
 }
 
+/// Where an example's positive-or-negative label came from: the runner's
+/// own verified acceptance, or a person's salvage whose verified candidate
+/// patch survives intact in the commit that landed (SPEC §17). Recorded per
+/// example so `evaluate` can report each source on its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LabelSource {
+    /// The runner's verification (and review) reached the verdict.
+    #[default]
+    Runner,
+    /// A person salvaged a run the runner stopped for review findings, and
+    /// the verified candidate patch is contained in what landed.
+    PersonSalvageContained,
+}
+
+impl LabelSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Runner => "runner",
+            Self::PersonSalvageContained => "person_salvage_contained",
+        }
+    }
+}
+
 /// A complete training example: features, the label (evidence-backed),
 /// and the complete-strategy cost. Attempt-level outcomes stay distinct
 /// from complete-strategy outcomes (SPEC §17): `accepted_without_escalation`
@@ -392,6 +416,10 @@ pub struct TrainingExample {
     /// dataset reads honestly rather than as if verification alone had
     /// decided every example.
     pub route: AcceptanceRoute,
+    /// Where the label came from; datasets built before the salvage rule
+    /// carry only runner labels.
+    #[serde(default)]
+    pub label_source: LabelSource,
     /// Whether the accepted change was still standing under its most
     /// recently recorded final outcome (SPEC §20): `Some(true)` for
     /// `accepted_unchanged`/`corrected`, `Some(false)` for

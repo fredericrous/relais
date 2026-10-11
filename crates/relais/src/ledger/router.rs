@@ -5,6 +5,7 @@
 //! here carrying its rank.
 
 use rusqlite::{params, OptionalExtension};
+use serde::{Deserialize, Serialize};
 
 use super::{Ledger, Result};
 
@@ -38,6 +39,9 @@ pub struct RouterDecisionRow {
     pub propensity: Option<f64>,
     pub draw: Option<f64>,
     pub would_pass_gate: bool,
+    /// The capability table's version the decision was made under; absent
+    /// from a plugin that predates the field.
+    pub table_version: Option<u32>,
     pub at: String,
 }
 
@@ -96,15 +100,61 @@ pub struct RouterTaskRow {
     pub exhausted: bool,
     pub turns: u32,
     pub explicit_quote: Option<String>,
+    /// Where `outcome` came from: `own` (this task's record) or `parent`
+    /// (its parent's end, see [`RouterTaskOutcomeRow`]).
+    pub outcome_source: Option<String>,
+    /// The checks the task ran, with their kinds.
+    pub checks: Vec<RouterCheck>,
+}
+
+/// One check a task ran: a command or an amont gate stamp, with its kind
+/// (`test`, `lint`, `build`, `gate`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouterCheck {
+    pub name: String,
+    pub kind: String,
+    pub passed: bool,
+}
+
+/// A parent task's outcome sent for a subagent task that ended before it:
+/// it replaces the subagent's stored outcome only when that is `unknown`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouterTaskOutcomeRow {
+    pub task_id: String,
+    pub agent_id: Option<String>,
+    pub outcome: String,
+    pub outcome_rank: u8,
+    pub at: String,
+}
+
+/// One classifier call, keyed `(session, call_id)`. It holds everything but
+/// the call's text: `input_sha256` stands for it (the text is in a local
+/// day file, `router::capture`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouterClassificationRow {
+    pub call_id: String,
+    /// `prompt` or `spawn`.
+    pub purpose: String,
+    pub model: String,
+    /// SHA-256 of the classifier's system prompt.
+    pub prompt_version: String,
+    pub input_sha256: String,
+    /// The parsed answer, every field, as JSON; `None` when it did not parse.
+    pub answer_json: Option<String>,
+    pub parse_ok: bool,
+    pub latency_ms: Option<u64>,
+    pub at: String,
 }
 
 /// One record of a `router-observe` batch.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RouterRecord {
+    Classification(RouterClassificationRow),
     Decision(RouterDecisionRow),
     Usage(RouterUsageRow),
     Reassess(RouterReassessRow),
     Task(RouterTaskRow),
+    TaskOutcome(RouterTaskOutcomeRow),
 }
 
 /// One `router_provenance` row: an envelope written or removed, with who
@@ -132,6 +182,34 @@ pub struct RouterWindow {
     pub usage: Vec<(String, RouterUsageRow)>,
     /// `(session, holdout, applied)` per decision.
     pub decisions: Vec<(String, bool, bool)>,
+}
+
+/// One main-session task, as the exploration evidence reads it: its class,
+/// how it ended and what the draw did at its start.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExplorationTask {
+    pub kind: String,
+    pub difficulty: u8,
+    pub scope: String,
+    pub outcome: String,
+    pub started_at: String,
+    /// The draw lowered the tier (`explored`) and the switch was applied.
+    pub drawn: bool,
+    /// The draw ran and passed the task over: eligible (a propensity was
+    /// recorded), not lowered, not held out.
+    pub undrawn: bool,
+}
+
+/// One time the exploration stop rule fired, with the counts it saw
+/// (drawn and undrawn tasks with strong outcomes in the strata the draws
+/// fall in; `*_bad` are the corrected ones).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RouterExplorationStop {
+    pub at: String,
+    pub drawn: usize,
+    pub drawn_bad: usize,
+    pub undrawn: usize,
+    pub undrawn_bad: usize,
 }
 
 /// An absent id, as a key column stores it.
@@ -225,6 +303,16 @@ fn merge_task(stored: RouterTaskRow, incoming: &RouterTaskRow) -> RouterTaskRow 
         } else {
             stored.explicit_quote.or(incoming.explicit_quote.clone())
         },
+        outcome_source: if promote {
+            incoming.outcome_source.clone().or(stored.outcome_source)
+        } else {
+            stored.outcome_source.or(incoming.outcome_source.clone())
+        },
+        checks: if incoming.checks.is_empty() {
+            stored.checks
+        } else {
+            incoming.checks.clone()
+        },
     }
 }
 
@@ -246,7 +334,7 @@ fn read_class(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<Option<
 const TASK_COLUMNS: &str =
     "task_id, agent_id, started_at, ended_at, class_kind, difficulty, scope, \
      uncertainty, verifiable, confidence, outcome, outcome_rank, inferred_json, escalations, \
-     exhausted, turns, explicit_quote, completed_at_end, files_json";
+     exhausted, turns, explicit_quote, completed_at_end, files_json, outcome_source, checks_json";
 
 fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouterTaskRow> {
     read_task_at(row, 0)
@@ -269,9 +357,9 @@ impl Ledger {
                             (session, task_id, turn_id, agent_id, relation, class_kind, difficulty,
                              scope, uncertainty, verifiable, confidence, tier, model, effort, reason,
                              mode_effective, holdout, applied, explored, propensity, draw,
-                             would_pass_gate, at, recorded_at)
+                             would_pass_gate, at, recorded_at, table_version)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+                                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
                          ON CONFLICT (session, task_id, turn_id, agent_id) DO UPDATE SET
                             relation = excluded.relation, class_kind = excluded.class_kind,
                             difficulty = excluded.difficulty, scope = excluded.scope,
@@ -282,7 +370,7 @@ impl Ledger {
                             holdout = excluded.holdout, applied = excluded.applied,
                             explored = excluded.explored, propensity = excluded.propensity,
                             draw = excluded.draw, would_pass_gate = excluded.would_pass_gate,
-                            at = excluded.at",
+                            at = excluded.at, table_version = excluded.table_version",
                         params![
                             session,
                             d.task_id,
@@ -308,6 +396,7 @@ impl Ledger {
                             d.would_pass_gate,
                             d.at,
                             now,
+                            d.table_version,
                         ],
                     )?;
                 }
@@ -387,15 +476,17 @@ impl Ledger {
                         .expect("a list of strings serializes");
                     let files =
                         serde_json::to_string(&merged.files).expect("a list of strings serializes");
+                    let checks =
+                        serde_json::to_string(&merged.checks).expect("a list of checks serializes");
                     tx.execute(
                         "INSERT INTO router_tasks
                             (session, task_id, agent_id, started_at, ended_at, class_kind,
                              difficulty, scope, uncertainty, verifiable, confidence, outcome,
                              outcome_rank, inferred_json, escalations, exhausted, turns,
                              explicit_quote, completed_at_end, files_json, recorded_at,
-                             updated_at)
+                             updated_at, outcome_source, checks_json)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                                 ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21)
+                                 ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21, ?22, ?23)
                          ON CONFLICT (session, task_id, agent_id) DO UPDATE SET
                             started_at = excluded.started_at, ended_at = excluded.ended_at,
                             class_kind = excluded.class_kind, difficulty = excluded.difficulty,
@@ -407,7 +498,9 @@ impl Ledger {
                             turns = excluded.turns, explicit_quote = excluded.explicit_quote,
                             completed_at_end = excluded.completed_at_end,
                             files_json = excluded.files_json,
-                            updated_at = excluded.updated_at",
+                            updated_at = excluded.updated_at,
+                            outcome_source = excluded.outcome_source,
+                            checks_json = excluded.checks_json",
                         params![
                             session,
                             merged.task_id,
@@ -430,6 +523,54 @@ impl Ledger {
                             merged.completed_at_end,
                             files,
                             now,
+                            merged.outcome_source.as_deref().unwrap_or("own"),
+                            checks,
+                        ],
+                    )?;
+                }
+                RouterRecord::Classification(c) => {
+                    tx.execute(
+                        "INSERT INTO router_classifications
+                            (session, call_id, purpose, model, prompt_version, input_sha256,
+                             answer_json, parse_ok, latency_ms, at, recorded_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                         ON CONFLICT (session, call_id) DO UPDATE SET
+                            purpose = excluded.purpose, model = excluded.model,
+                            prompt_version = excluded.prompt_version,
+                            input_sha256 = excluded.input_sha256,
+                            answer_json = excluded.answer_json, parse_ok = excluded.parse_ok,
+                            latency_ms = excluded.latency_ms, at = excluded.at",
+                        params![
+                            session,
+                            c.call_id,
+                            c.purpose,
+                            c.model,
+                            c.prompt_version,
+                            c.input_sha256,
+                            c.answer_json,
+                            c.parse_ok,
+                            c.latency_ms.map(saturating_i64),
+                            c.at,
+                            now,
+                        ],
+                    )?;
+                }
+                RouterRecord::TaskOutcome(o) => {
+                    // Only over a stored `unknown`, and only with a real
+                    // outcome; a task that has no row yet is left alone.
+                    tx.execute(
+                        "UPDATE router_tasks
+                            SET outcome = ?1, outcome_rank = ?2, outcome_source = 'parent',
+                                updated_at = ?3
+                          WHERE session = ?4 AND task_id = ?5 AND agent_id = ?6
+                            AND outcome = 'unknown' AND outcome_rank < ?2",
+                        params![
+                            o.outcome,
+                            o.outcome_rank,
+                            now,
+                            session,
+                            o.task_id,
+                            key(&o.agent_id),
                         ],
                     )?;
                 }
@@ -479,6 +620,49 @@ impl Ledger {
         Ok(counts)
     }
 
+    /// How many classifier calls are kept, and how many of them parsed:
+    /// the count the first Laya run waits on.
+    pub fn router_classification_counts(&self) -> Result<(u64, u64)> {
+        let (all, parsed): (i64, i64) = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(parse_ok), 0) FROM router_classifications",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((all.max(0) as u64, parsed.max(0) as u64))
+    }
+
+    /// Every kept classifier call that parsed, `at` or later, oldest
+    /// first. The text is not here (see [`RouterClassificationRow`]).
+    pub fn router_classifications_parsed(
+        &self,
+        since: Option<&str>,
+    ) -> Result<Vec<(String, RouterClassificationRow)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session, call_id, purpose, model, prompt_version, input_sha256,
+                    answer_json, parse_ok, latency_ms, at
+               FROM router_classifications
+              WHERE parse_ok = 1 AND answer_json IS NOT NULL AND at >= ?1
+              ORDER BY at, session, call_id",
+        )?;
+        let rows = stmt.query_map(params![since.unwrap_or("")], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                RouterClassificationRow {
+                    call_id: row.get(1)?,
+                    purpose: row.get(2)?,
+                    model: row.get(3)?,
+                    prompt_version: row.get(4)?,
+                    input_sha256: row.get(5)?,
+                    answer_json: row.get(6)?,
+                    parse_ok: row.get(7)?,
+                    latency_ms: row.get::<_, Option<i64>>(8)?.map(|n| n.max(0) as u64),
+                    at: row.get(9)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// `(kind, difficulty, total tokens)` of every task whose outcome is
     /// one of `outcomes` and that has a class: what the per-class median
     /// priors are computed from.
@@ -506,6 +690,86 @@ impl Ledger {
             }
         }
         Ok(out)
+    }
+
+    /// Every main-session task that has a class and a `new_task` decision,
+    /// with what the exploration draw did at its start: drawn (lowered and
+    /// applied) or undrawn (the draw ran, passed it over, not held out).
+    pub fn router_exploration_tasks(&self) -> Result<Vec<ExplorationTask>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.class_kind, t.difficulty, t.scope, t.outcome, t.started_at,
+                    d.explored, d.applied, d.propensity, d.holdout
+               FROM router_tasks t
+               JOIN router_decisions d
+                 ON d.session = t.session AND d.task_id = t.task_id
+                AND d.agent_id = '' AND d.relation = 'new_task'
+              WHERE t.agent_id = '' AND t.class_kind IS NOT NULL AND t.scope IS NOT NULL
+                AND t.difficulty IS NOT NULL
+              ORDER BY t.started_at, t.session, t.task_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let explored: bool = row.get(5)?;
+            let applied: bool = row.get(6)?;
+            let propensity: Option<f64> = row.get(7)?;
+            let holdout: bool = row.get(8)?;
+            Ok(ExplorationTask {
+                kind: row.get(0)?,
+                difficulty: row.get::<_, i64>(1)?.clamp(0, 255) as u8,
+                scope: row.get(2)?,
+                outcome: row.get(3)?,
+                started_at: row.get(4)?,
+                drawn: explored && applied && !holdout,
+                undrawn: !explored && propensity.is_some() && !holdout,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Record that the stop rule fired, unless the latest stop row already
+    /// holds these counts (the rule is re-read at every session start).
+    /// Whether a row was written.
+    pub fn record_router_exploration_stop(&self, stop: &RouterExplorationStop) -> Result<bool> {
+        if let Some(latest) = self.router_exploration_stops()?.pop() {
+            if (
+                latest.drawn,
+                latest.drawn_bad,
+                latest.undrawn,
+                latest.undrawn_bad,
+            ) == (stop.drawn, stop.drawn_bad, stop.undrawn, stop.undrawn_bad)
+            {
+                return Ok(false);
+            }
+        }
+        self.conn.execute(
+            "INSERT INTO router_exploration_stops (at, drawn, drawn_bad, undrawn, undrawn_bad)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                stop.at,
+                stop.drawn as i64,
+                stop.drawn_bad as i64,
+                stop.undrawn as i64,
+                stop.undrawn_bad as i64
+            ],
+        )?;
+        Ok(true)
+    }
+
+    /// Every stop row, oldest first.
+    pub fn router_exploration_stops(&self) -> Result<Vec<RouterExplorationStop>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT at, drawn, drawn_bad, undrawn, undrawn_bad
+               FROM router_exploration_stops ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RouterExplorationStop {
+                at: row.get(0)?,
+                drawn: row.get::<_, i64>(1)?.max(0) as usize,
+                drawn_bad: row.get::<_, i64>(2)?.max(0) as usize,
+                undrawn: row.get::<_, i64>(3)?.max(0) as usize,
+                undrawn_bad: row.get::<_, i64>(4)?.max(0) as usize,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Record an envelope write or removal.
@@ -657,6 +921,17 @@ fn read_task_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<Rout
         exhausted: row.get(offset + 14)?,
         turns: row.get::<_, i64>(offset + 15)?.max(0) as u32,
         explicit_quote: row.get(offset + 16)?,
+        outcome_source: row.get(offset + 19)?,
+        checks: match row.get::<_, Option<String>>(offset + 20)? {
+            None => Vec::new(),
+            Some(text) => serde_json::from_str(&text).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    offset + 20,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?,
+        },
     })
 }
 
@@ -691,6 +966,8 @@ mod tests {
             exhausted: false,
             turns: 1,
             explicit_quote: None,
+            outcome_source: Some("own".into()),
+            checks: vec![],
         }
     }
 
@@ -791,6 +1068,135 @@ mod tests {
             Some("completed_verified")
         );
         assert_eq!(stored.files, vec!["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"]);
+    }
+
+    fn parent_outcome(task_id: &str, agent: Option<&str>, outcome: &str, rank: u8) -> RouterRecord {
+        RouterRecord::TaskOutcome(RouterTaskOutcomeRow {
+            task_id: task_id.into(),
+            agent_id: agent.map(String::from),
+            outcome: outcome.into(),
+            outcome_rank: rank,
+            at: "2026-10-07T10:05:00Z".into(),
+        })
+    }
+
+    fn subagent_task(id: &str, outcome: &str, rank: u8) -> RouterRecord {
+        RouterRecord::Task(RouterTaskRow {
+            task_id: id.into(),
+            agent_id: Some("a1".into()),
+            ..task(outcome, rank)
+        })
+    }
+
+    #[test]
+    fn a_subagent_that_ended_before_its_parent_gets_the_parents_outcome() {
+        let (ledger, _dir) = ledger();
+        ledger
+            .record_router_batch("s", &[subagent_task("sub", "unknown", 0)])
+            .unwrap();
+        ledger
+            .record_router_batch(
+                "s",
+                &[parent_outcome("sub", Some("a1"), "completed_verified", 1)],
+            )
+            .unwrap();
+        let stored = ledger.router_task("s", "sub", Some("a1")).unwrap().unwrap();
+        assert_eq!(stored.outcome, "completed_verified");
+        assert_eq!(stored.outcome_rank, 1);
+        assert_eq!(stored.outcome_source.as_deref(), Some("parent"));
+    }
+
+    #[test]
+    fn a_subagent_with_its_own_outcome_keeps_it_and_its_source() {
+        let (ledger, _dir) = ledger();
+        ledger
+            .record_router_batch("s", &[subagent_task("sub", "completed_accepted", 1)])
+            .unwrap();
+        ledger
+            .record_router_batch("s", &[parent_outcome("sub", Some("a1"), "corrected", 2)])
+            .unwrap();
+        let stored = ledger.router_task("s", "sub", Some("a1")).unwrap().unwrap();
+        assert_eq!(stored.outcome, "completed_accepted");
+        assert_eq!(stored.outcome_source.as_deref(), Some("own"));
+    }
+
+    #[test]
+    fn a_later_own_record_outranks_a_parent_outcome() {
+        let (ledger, _dir) = ledger();
+        ledger
+            .record_router_batch(
+                "s",
+                &[
+                    subagent_task("sub", "unknown", 0),
+                    parent_outcome("sub", Some("a1"), "completed_verified", 1),
+                    // A parent outcome for a task never recorded changes nothing.
+                    parent_outcome("ghost", None, "corrected", 2),
+                    subagent_task("sub", "corrected", 2),
+                ],
+            )
+            .unwrap();
+        let stored = ledger.router_task("s", "sub", Some("a1")).unwrap().unwrap();
+        assert_eq!(stored.outcome, "corrected");
+        assert_eq!(stored.outcome_source.as_deref(), Some("own"));
+        assert!(ledger.router_task("s", "ghost", None).unwrap().is_none());
+    }
+
+    #[test]
+    fn checks_and_the_tables_version_are_stored() {
+        let (ledger, _dir) = ledger();
+        let checks = vec![
+            RouterCheck {
+                name: "go vet ./...".into(),
+                kind: "lint".into(),
+                passed: true,
+            },
+            RouterCheck {
+                name: "amont-gate@abc1234".into(),
+                kind: "gate".into(),
+                passed: false,
+            },
+        ];
+        let decision = RouterDecisionRow {
+            task_id: "t1".into(),
+            turn_id: None,
+            agent_id: None,
+            relation: "new_task".into(),
+            class: None,
+            tier: "research".into(),
+            model: "claude-haiku-5-5".into(),
+            effort: None,
+            reason: "table".into(),
+            mode_effective: "shadow".into(),
+            holdout: false,
+            applied: false,
+            explored: false,
+            propensity: None,
+            draw: None,
+            would_pass_gate: true,
+            table_version: Some(3),
+            at: "2026-10-07T10:00:00Z".into(),
+        };
+        ledger
+            .record_router_batch(
+                "s",
+                &[
+                    RouterRecord::Decision(decision),
+                    RouterRecord::Task(RouterTaskRow {
+                        checks: checks.clone(),
+                        ..task("unknown", 0)
+                    }),
+                ],
+            )
+            .unwrap();
+        let stored = ledger.router_task("s", "t1", None).unwrap().unwrap();
+        assert_eq!(stored.checks, checks);
+        let version: Option<i64> = ledger
+            .conn
+            .query_row("SELECT table_version FROM router_decisions", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, Some(3));
     }
 
     #[test]

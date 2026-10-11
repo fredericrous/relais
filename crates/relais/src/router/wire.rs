@@ -5,9 +5,11 @@
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
+use super::capture::{ClassifierInput, INPUT_MAX_BYTES};
 use super::outcome::TaskOutcome;
 use crate::ledger::{
-    RouterClass, RouterDecisionRow, RouterReassessRow, RouterRecord, RouterTaskRow, RouterUsageRow,
+    RouterCheck, RouterClass, RouterClassificationRow, RouterDecisionRow, RouterReassessRow,
+    RouterRecord, RouterTaskOutcomeRow, RouterTaskRow, RouterUsageRow,
 };
 
 /// The wire schema this relais reads.
@@ -18,6 +20,9 @@ pub const WIRE_SCHEMA: u32 = 1;
 pub struct Batch {
     pub session: String,
     pub records: Vec<RouterRecord>,
+    /// The text of each `classification` record, which the ledger does not
+    /// hold (only its hash): for the local day file, if capture is on.
+    pub inputs: Vec<ClassifierInput>,
 }
 
 /// Why a payload was refused: the record (by index and kind) and what is
@@ -220,6 +225,8 @@ struct Decision {
     propensity: Option<f64>,
     draw: Option<f64>,
     would_pass_gate: bool,
+    #[serde(default)]
+    table_version: Option<u32>,
     at: String,
 }
 
@@ -273,6 +280,190 @@ struct Task {
     exhausted: bool,
     turns: u32,
     explicit_quote: Option<String>,
+    #[serde(default)]
+    checks: Vec<Check>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Check {
+    name: String,
+    kind: String,
+    passed: bool,
+}
+
+/// A parent's outcome for a subagent task that ended before it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskOutcomeRecord {
+    task_id: String,
+    agent_id: Option<String>,
+    outcome: TaskOutcome,
+    at: String,
+}
+
+/// One classifier call (Phase 5 of the learning loop). The answer is the
+/// plugin's parse of the reply, every field; absent when it did not parse.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Classification {
+    call_id: String,
+    purpose: String,
+    model: String,
+    prompt_version: String,
+    input: String,
+    #[serde(default)]
+    answer: Option<Answer>,
+    parse_ok: bool,
+    #[serde(default)]
+    latency_ms: Option<u64>,
+    at: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Answer {
+    relation: String,
+    kind: String,
+    difficulty: u8,
+    scope: String,
+    uncertainty: String,
+    verifiable: bool,
+    #[serde(default)]
+    explicit: Explicit,
+    #[serde(default)]
+    user_model: Option<String>,
+    #[serde(default)]
+    user_model_for: Option<String>,
+    confidence: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Explicit {
+    value: String,
+    #[serde(default)]
+    quote: Option<String>,
+}
+
+impl Default for Explicit {
+    fn default() -> Self {
+        Self {
+            value: "none".into(),
+            quote: None,
+        }
+    }
+}
+
+/// The answer as stored (the person's quoted words are text: they go to the
+/// day file, not the ledger) and the quote.
+fn answer_json(answer: &Answer) -> Result<(String, Option<String>), String> {
+    let relation = one_of(
+        "answer.relation",
+        &answer.relation,
+        &["new_task", "continuation", "correction"],
+    )?;
+    let kind = one_of(
+        "answer.kind",
+        &answer.kind,
+        &["question", "edit", "debug", "design", "review"],
+    )?;
+    if !(1..=5).contains(&answer.difficulty) {
+        return Err(format!(
+            "answer.difficulty {} is not 1 to 5",
+            answer.difficulty
+        ));
+    }
+    let scope = one_of(
+        "answer.scope",
+        &answer.scope,
+        &["local", "module", "cross-cutting", "unknown"],
+    )?;
+    let uncertainty = one_of(
+        "answer.uncertainty",
+        &answer.uncertainty,
+        &["low", "medium", "high"],
+    )?;
+    let explicit = one_of(
+        "answer.explicit.value",
+        &answer.explicit.value,
+        &["accept", "correct", "none"],
+    )?;
+    if let Some(who) = &answer.user_model_for {
+        one_of("answer.user_model_for", who, &["session", "subagent"])?;
+    }
+    unit("answer.confidence", Some(answer.confidence))?;
+    let json = serde_json::json!({
+        "relation": relation,
+        "kind": kind,
+        "difficulty": answer.difficulty,
+        "scope": scope,
+        "uncertainty": uncertainty,
+        "verifiable": answer.verifiable,
+        "explicit": { "value": explicit },
+        "user_model": answer.user_model,
+        "user_model_for": answer.user_model_for,
+        "confidence": answer.confidence,
+    });
+    Ok((json.to_string(), answer.explicit.quote.clone()))
+}
+
+fn classification(
+    session: &str,
+    c: Classification,
+) -> Result<(RouterRecord, ClassifierInput), String> {
+    named("call_id", &c.call_id)?;
+    named("model", &c.model)?;
+    timestamp("at", &c.at)?;
+    one_of("purpose", &c.purpose, &["prompt", "spawn"])?;
+    let version_ok = c.prompt_version.len() == 64
+        && c.prompt_version
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !version_ok {
+        return Err(format!(
+            "prompt_version `{}` is not 64 lowercase hex digits",
+            c.prompt_version
+        ));
+    }
+    if c.input.len() > INPUT_MAX_BYTES {
+        return Err(format!(
+            "input is {} bytes; at most {INPUT_MAX_BYTES}",
+            c.input.len()
+        ));
+    }
+    let (answer_json, quote) = match &c.answer {
+        Some(answer) => {
+            let (json, quote) = answer_json(answer)?;
+            (Some(json), quote)
+        }
+        None => (None, None),
+    };
+    if c.parse_ok && answer_json.is_none() {
+        return Err("parse_ok is true but there is no answer".into());
+    }
+    if !c.parse_ok && answer_json.is_some() {
+        return Err("parse_ok is false but there is an answer".into());
+    }
+    let row = RouterClassificationRow {
+        input_sha256: crate::ids::sha256_hex(c.input.as_bytes()),
+        call_id: c.call_id.clone(),
+        purpose: c.purpose,
+        model: c.model,
+        prompt_version: c.prompt_version,
+        answer_json,
+        parse_ok: c.parse_ok,
+        latency_ms: c.latency_ms,
+        at: c.at.clone(),
+    };
+    let input = ClassifierInput {
+        session: session.to_string(),
+        call_id: c.call_id,
+        at: c.at,
+        input: c.input,
+        quote,
+    };
+    Ok((RouterRecord::Classification(row), input))
 }
 
 fn decision(d: Decision) -> Result<RouterRecord, String> {
@@ -319,6 +510,7 @@ fn decision(d: Decision) -> Result<RouterRecord, String> {
         propensity: d.propensity,
         draw: d.draw,
         would_pass_gate: d.would_pass_gate,
+        table_version: d.table_version,
         at: d.at,
     }))
 }
@@ -376,6 +568,19 @@ fn task(t: Task) -> Result<RouterRecord, String> {
     if let Some(ended) = &t.ended_at {
         timestamp("ended_at", ended)?;
     }
+    let mut checks = Vec::with_capacity(t.checks.len());
+    for check in t.checks {
+        named("checks.name", &check.name)?;
+        checks.push(RouterCheck {
+            kind: one_of(
+                "checks.kind",
+                &check.kind,
+                &["test", "lint", "build", "gate"],
+            )?,
+            name: check.name,
+            passed: check.passed,
+        });
+    }
     let mut inferred = Vec::with_capacity(t.inferred.len());
     for signal in &t.inferred {
         let signal = one_of(
@@ -403,6 +608,20 @@ fn task(t: Task) -> Result<RouterRecord, String> {
         exhausted: t.exhausted,
         turns: t.turns,
         explicit_quote: t.explicit_quote,
+        outcome_source: Some("own".into()),
+        checks,
+    }))
+}
+
+fn task_outcome(o: TaskOutcomeRecord) -> Result<RouterRecord, String> {
+    named("task_id", &o.task_id)?;
+    timestamp("at", &o.at)?;
+    Ok(RouterRecord::TaskOutcome(RouterTaskOutcomeRow {
+        outcome: o.outcome.as_str().into(),
+        outcome_rank: o.outcome.rank(),
+        task_id: o.task_id,
+        agent_id: o.agent_id,
+        at: o.at,
     }))
 }
 
@@ -426,6 +645,7 @@ pub fn parse_batch(text: &str) -> Result<Batch, WireError> {
     }
     named("session", &envelope.session).map_err(envelope_error)?;
     let mut records = Vec::with_capacity(envelope.records.len());
+    let mut inputs = Vec::new();
     for (index, value) in envelope.records.into_iter().enumerate() {
         let mut value = value;
         let kind = value
@@ -443,7 +663,16 @@ pub fn parse_batch(text: &str) -> Result<Batch, WireError> {
             "usage" => typed(value).and_then(usage),
             "reassess" => typed(value).and_then(reassess),
             "task" => typed(value).and_then(task),
-            _ => Err("kind is not decision|usage|reassess|task".to_string()),
+            "task_outcome" => typed(value).and_then(task_outcome),
+            "classification" => typed(value)
+                .and_then(|c| classification(&envelope.session, c))
+                .map(|(record, input)| {
+                    inputs.push(input);
+                    record
+                }),
+            _ => Err(
+                "kind is not decision|usage|reassess|task|task_outcome|classification".to_string(),
+            ),
         };
         records.push(record.map_err(|detail| WireError {
             record: Some((index, kind.clone())),
@@ -453,6 +682,7 @@ pub fn parse_batch(text: &str) -> Result<Batch, WireError> {
     Ok(Batch {
         session: envelope.session,
         records,
+        inputs,
     })
 }
 
@@ -557,6 +787,148 @@ mod tests {
             parse_batch(&value.to_string()).unwrap_err().record,
             Some((3, "task".into()))
         );
+    }
+
+    /// What the plugin sent before this step: none of the new fields.
+    #[test]
+    fn an_old_plugins_payload_is_recorded() {
+        let batch = parse_batch(&sample_batch("old")).unwrap();
+        assert!(
+            matches!(&batch.records[0], RouterRecord::Decision(d) if d.table_version.is_none())
+        );
+        assert!(matches!(&batch.records[3], RouterRecord::Task(t)
+            if t.checks.is_empty() && t.outcome_source.as_deref() == Some("own")));
+    }
+
+    #[test]
+    fn the_new_fields_and_the_task_outcome_record_parse() {
+        let mut value: serde_json::Value = serde_json::from_str(&sample_batch("s1")).unwrap();
+        value["records"][0]["table_version"] = serde_json::json!(2);
+        value["records"][3]["checks"] = serde_json::json!([
+            { "name": "go vet ./...", "kind": "lint", "passed": true },
+            { "name": "amont-gate@abc1234", "kind": "gate", "passed": false }
+        ]);
+        value["records"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "kind": "task_outcome", "task_id": "t1", "agent_id": "a1",
+                "outcome": "completed_verified", "at": "2026-10-07T10:05:00Z"
+            }));
+        let batch = parse_batch(&value.to_string()).unwrap();
+        assert!(
+            matches!(&batch.records[0], RouterRecord::Decision(d) if d.table_version == Some(2))
+        );
+        assert!(matches!(&batch.records[3], RouterRecord::Task(t) if t.checks.len() == 2));
+        assert!(matches!(&batch.records[4], RouterRecord::TaskOutcome(o)
+            if o.outcome == "completed_verified" && o.outcome_rank == 1
+                && o.agent_id.as_deref() == Some("a1")));
+        value["records"][3]["checks"][0]["kind"] = serde_json::json!("vibes");
+        assert_eq!(
+            parse_batch(&value.to_string()).unwrap_err().record,
+            Some((3, "task".into()))
+        );
+    }
+
+    fn classification_record() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "classification", "call_id": "c1", "purpose": "prompt",
+            "model": "claude-haiku-5-5", "prompt_version": "a".repeat(64),
+            "input": "ACTIVE TASK: none\n\nREQUEST:\nrename foo to bar",
+            "answer": { "relation": "new_task", "kind": "edit", "difficulty": 1, "scope": "local",
+                        "uncertainty": "low", "verifiable": true,
+                        "explicit": { "value": "correct", "quote": "that is wrong" },
+                        "user_model": "opus", "user_model_for": "session", "confidence": 0.9 },
+            "parse_ok": true, "latency_ms": 420, "at": "2026-10-07T10:00:00Z"
+        })
+    }
+
+    fn with_record(record: serde_json::Value) -> String {
+        serde_json::json!({ "schema": 1, "session": "s1", "records": [record] }).to_string()
+    }
+
+    #[test]
+    fn a_classification_keeps_its_text_apart_from_the_row() {
+        let batch = parse_batch(&with_record(classification_record())).unwrap();
+        let RouterRecord::Classification(row) = &batch.records[0] else {
+            panic!("not a classification: {:?}", batch.records[0]);
+        };
+        assert_eq!(
+            row.input_sha256,
+            crate::ids::sha256_hex("ACTIVE TASK: none\n\nREQUEST:\nrename foo to bar".as_bytes())
+        );
+        assert!(row.parse_ok && row.latency_ms == Some(420));
+        let answer = row.answer_json.as_deref().unwrap();
+        // The row has the answer's every field and none of the words.
+        for field in [
+            "relation",
+            "kind",
+            "difficulty",
+            "scope",
+            "uncertainty",
+            "verifiable",
+            "user_model",
+            "confidence",
+        ] {
+            assert!(answer.contains(field), "{field}: {answer}");
+        }
+        assert!(answer.contains("correct") && answer.contains("opus"));
+        assert!(!answer.contains("that is wrong"), "{answer}");
+        assert!(!format!("{row:?}").contains("rename foo"));
+        assert_eq!(batch.inputs.len(), 1);
+        assert_eq!(
+            batch.inputs[0].input,
+            "ACTIVE TASK: none\n\nREQUEST:\nrename foo to bar"
+        );
+        assert_eq!(batch.inputs[0].quote.as_deref(), Some("that is wrong"));
+    }
+
+    #[test]
+    fn an_unparsed_call_and_a_minimal_answer_are_recorded() {
+        let mut value = classification_record();
+        value["answer"] = serde_json::Value::Null;
+        value["parse_ok"] = serde_json::json!(false);
+        value.as_object_mut().unwrap().remove("latency_ms");
+        let batch = parse_batch(&with_record(value)).unwrap();
+        assert!(matches!(&batch.records[0], RouterRecord::Classification(c)
+            if !c.parse_ok && c.answer_json.is_none() && c.latency_ms.is_none()));
+
+        // `explicit`, `user_model` and `user_model_for` default.
+        let mut value = classification_record();
+        let answer = value["answer"].as_object_mut().unwrap();
+        answer.remove("explicit");
+        answer.remove("user_model");
+        answer.remove("user_model_for");
+        assert!(parse_batch(&with_record(value)).is_ok());
+    }
+
+    #[test]
+    fn a_bad_classification_names_itself() {
+        let bad = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut value = classification_record();
+            edit(&mut value);
+            parse_batch(&with_record(value)).unwrap_err()
+        };
+        let error = bad(&|v| v["purpose"] = serde_json::json!("chat"));
+        assert_eq!(error.record, Some((0, "classification".into())));
+        assert!(bad(&|v| v["prompt_version"] = serde_json::json!("abc"))
+            .detail
+            .contains("prompt_version"));
+        assert!(bad(&|v| v["input"] = serde_json::json!("x".repeat(3073)))
+            .detail
+            .contains("3072"));
+        assert!(bad(&|v| v["answer"]["difficulty"] = serde_json::json!(9))
+            .detail
+            .contains("difficulty"));
+        assert!(bad(&|v| v["parse_ok"] = serde_json::json!(false))
+            .detail
+            .contains("parse_ok"));
+        assert!(bad(&|v| v["cost"] = serde_json::json!(1))
+            .detail
+            .contains("cost"));
+        let mut value = classification_record();
+        value["input"] = serde_json::json!("x".repeat(3072));
+        assert!(parse_batch(&with_record(value)).is_ok());
     }
 
     #[test]

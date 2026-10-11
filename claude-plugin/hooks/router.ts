@@ -56,6 +56,11 @@ export type RouterState = {
   mode_reason?: string
   envelope: unknown
   holdout: boolean
+  // The session's exploration seed and the rate in force (0 without an
+  // envelope, or once the stop rule fired). From a relais that predates
+  // them: '' and 0, so nothing is explored.
+  seed: string
+  epsilon: number
   tiers: Record<Tier, { model: string; effort: Effort | null }>
   capability_table: { version: number; rules: { when: Record<string, unknown>; tier: Tier }[] }
   rates: Record<string, { input: number; output: number; cache_read: number; cache_write: number } | null>
@@ -63,7 +68,13 @@ export type RouterState = {
   pins: Record<string, string>
   excluded_models: string[]
   checks: string[][]
+  // The kind of each entry of `checks` (same order): test, lint or build.
+  // Empty from a relais that predates it: the kind is then read off the argv.
+  check_kinds: string[]
 }
+
+// What a check proves. `gate` is an amont stamp, read at task end.
+export type CheckKind = 'test' | 'lint' | 'build' | 'gate'
 
 // One task: the main session's, or a router-created subagent's.
 export type TaskState = {
@@ -90,9 +101,12 @@ export type TaskState = {
   // that counted as escalating evidence failed with no pass since.
   editedSinceCheck: boolean
   lastCountedFailure: boolean
-  verifications: { command: string; passed: boolean }[]
+  verifications: { command: string; passed: boolean; kind?: CheckKind }[]
   files: string[]
   subagents: string[]
+  // The tasks of the router-created subagents this one spawned: their
+  // parent's outcome amends them when this task ends (`task_outcome`).
+  subagentTasks: { taskId: string; agentId: string | null }[]
   corrected: boolean
   acceptQuote: string | null
   // The person's latest explicit words (accept or correct), for the record.
@@ -100,7 +114,15 @@ export type TaskState = {
   relaisAccepted: boolean
   inferred: string[]
   lastReason: Reason
+  // The task started one tier below the table's choice, by the exploration
+  // draw: its floor stays one below the table's for the whole task.
+  exploredDown: boolean
 }
+
+// What the exploration draw decided for a task start. Absent on a decision
+// the draw did not apply to (continuations, corrections, subagents, held-out
+// sessions, mode not `on`).
+export type Exploration = { explored: boolean; propensity: number; draw: number }
 
 export type Decision = {
   tier: Tier
@@ -111,6 +133,7 @@ export type Decision = {
   // mode is `on` and the session is not held out.
   override: boolean
   wouldPassGate: boolean
+  exploration?: Exploration
 }
 
 export const CLASSIFIER_MAX_TOKENS = 160
@@ -287,6 +310,8 @@ export function parseRouterState(text: unknown): RouterState | undefined {
     mode_reason: typeof raw.mode_reason === 'string' ? raw.mode_reason : undefined,
     envelope: raw.envelope ?? null,
     holdout: raw.holdout === true,
+    seed: typeof raw.seed === 'string' ? raw.seed : '',
+    epsilon: typeof raw.epsilon === 'number' && raw.epsilon > 0 && raw.epsilon <= 1 ? raw.epsilon : 0,
     tiers,
     capability_table: rules.length > 0 ? { version: Number(raw.capability_table.version) || 1, rules } : DEFAULT_TABLE,
     rates: raw.rates && typeof raw.rates === 'object' ? raw.rates : {},
@@ -298,10 +323,36 @@ export function parseRouterState(text: unknown): RouterState | undefined {
     },
     pins: raw.pins && typeof raw.pins === 'object' ? raw.pins : {},
     excluded_models: Array.isArray(raw.excluded_models) ? raw.excluded_models.filter((m: unknown) => typeof m === 'string') : [],
-    checks: Array.isArray(raw.checks)
-      ? raw.checks.filter((c: unknown) => Array.isArray(c) && c.length > 0 && c.every(a => typeof a === 'string'))
-      : [],
+    ...parseChecks(raw),
   }
+}
+
+const CHECK_KINDS: readonly string[] = ['test', 'lint', 'build']
+
+// The checks and their kinds, kept in step: an entry that is no argv drops
+// its kind with it.
+function parseChecks(raw: any): { checks: string[][]; check_kinds: string[] } {
+  const checks: string[][] = []
+  const check_kinds: string[] = []
+  const kinds: unknown[] = Array.isArray(raw.check_kinds) ? raw.check_kinds : []
+  const list: unknown[] = Array.isArray(raw.checks) ? raw.checks : []
+  list.forEach((c, i) => {
+    if (!Array.isArray(c) || c.length === 0 || !c.every(a => typeof a === 'string')) return
+    checks.push(c)
+    const served = kinds[i]
+    check_kinds.push(typeof served === 'string' && CHECK_KINDS.includes(served) ? served : kindOfArgv(c))
+  })
+  return { checks, check_kinds }
+}
+
+// A check's kind when router-state did not serve it: the words that name it.
+export function kindOfArgv(argv: string[]): CheckKind {
+  const head = argv.slice(0, 3)
+  if (head.includes('test') || head[0] === 'pytest') return 'test'
+  const line = head.join(' ')
+  if (/\b(lint|clippy|vet|ruff|mypy|pyright)\b/.test(line)) return 'lint'
+  if (/\b(build|check|typecheck|tsc)\b/.test(line) && !/^(make|just) check$/.test(line)) return 'build'
+  return 'test'
 }
 
 // --- the mode ---------------------------------------------------------------
@@ -317,6 +368,14 @@ export function modeEffective(state: RouterState | undefined): Mode {
 export const rank = (tier: Tier) => TIERS.indexOf(tier)
 export const higher = (a: Tier, b: Tier): Tier => (rank(a) >= rank(b) ? a : b)
 const stepUp = (tier: Tier): Tier => TIERS[Math.min(TIERS.length - 1, rank(tier) + 1)]
+const stepDown = (tier: Tier): Tier => TIERS[Math.max(0, rank(tier) - 1)]
+
+// The tier the table asks for a task now: one step lower for a task the
+// exploration draw lowered, never below research.
+const floorTier = (state: RouterState, task: TaskState): Tier => {
+  const table = tableTier(state.capability_table, task.class)
+  return task.exploredDown ? stepDown(table) : table
+}
 
 // The capability table's tier for a classification: the first rule whose
 // conditions all hold. A condition the plugin does not know never holds.
@@ -384,7 +443,13 @@ export const shortModel = (model: string) => model.replace(/^claude-/, '')
 
 const effortOf = (state: RouterState, task: TaskState): Effort | null => task.effort ?? state.tiers[task.tier].effort
 
-export function decisionOf(state: RouterState, task: TaskState, reason: Reason, wouldPassGate = true): Decision {
+export function decisionOf(
+  state: RouterState,
+  task: TaskState,
+  reason: Reason,
+  wouldPassGate = true,
+  exploration?: Exploration,
+): Decision {
   return {
     tier: task.tier,
     model: task.userModel ?? state.tiers[task.tier].model,
@@ -392,6 +457,7 @@ export function decisionOf(state: RouterState, task: TaskState, reason: Reason, 
     reason,
     override: task.override,
     wouldPassGate,
+    ...(exploration ? { exploration } : {}),
   }
 }
 
@@ -451,12 +517,14 @@ export function newTask(id: string, agentId: string | null, opening: string, c: 
     verifications: [],
     files: [],
     subagents: [],
+    subagentTasks: [],
     corrected: false,
     acceptQuote: null,
     explicitQuote: null,
     relaisAccepted: false,
     inferred: [],
     lastReason: 'table',
+    exploredDown: false,
   }
 }
 
@@ -475,6 +543,9 @@ export type MainInput = {
   lastModel: string | undefined
   contextTokens: number
   newTaskId: string
+  // The session's id, which the exploration draw is keyed by; without it
+  // nothing is explored.
+  session?: string
   now: number
 }
 
@@ -522,7 +593,7 @@ export function decideMain(input: MainInput): MainOutput {
   task.class = { ...task.class, difficulty: Math.max(task.class.difficulty, cls.difficulty) }
   const reassess: ReassessRecord[] = []
   let reason: Reason = 'explicit_kept'
-  const raised = higher(task.tier, tableTier(state.capability_table, task.class))
+  const raised = higher(task.tier, floorTier(state, task))
   if (raised !== task.tier) {
     task.tier = raised
     task.override = true
@@ -568,6 +639,13 @@ function startTask(input: MainInput, cls: Classification): MainOutput {
   // Below /model only through the table's research rule.
   let tier = table
   if (sessionTier && rank(table) < rank(sessionTier) && table !== 'research') tier = sessionTier
+  // Exploration: below epsilon the initial tier is one step lower, never
+  // below research. At research nothing can be lowered.
+  const exploration = exploreAt(input, tier)
+  if (exploration?.explored) {
+    tier = stepDown(tier)
+    task.exploredDown = true
+  }
   task.tier = tier
   let reason: Reason = 'table'
   let wouldPassGate = true
@@ -585,7 +663,18 @@ function startTask(input: MainInput, cls: Classification): MainOutput {
     }
   }
   task.lastReason = reason
-  return { task, ended, decision: decisionOf(state, task, reason, wouldPassGate), relation: 'new_task', reassess: [] }
+  return { task, ended, decision: decisionOf(state, task, reason, wouldPassGate, exploration), relation: 'new_task', reassess: [] }
+}
+
+// The draw for a main-session task start: only in mode `on`, outside the
+// hold-out, with an epsilon in force and a seed and session to key it by.
+function exploreAt(input: MainInput, tier: Tier): Exploration | undefined {
+  const { state, session } = input
+  if (state.mode !== 'on' || state.holdout || !(state.epsilon > 0) || !state.seed || !session) return undefined
+  const draw = explorationDraw(state.seed, session, input.newTaskId)
+  if (tier === 'research') return { explored: false, propensity: 1, draw }
+  const explored = draw < state.epsilon
+  return { explored, propensity: explored ? state.epsilon : 1 - state.epsilon, draw }
 }
 
 // A task the next one replaced: no complaint followed it.
@@ -622,7 +711,7 @@ export function escalate(state: RouterState, task: TaskState, event: ReassessEve
 export function rerun(state: RouterState, task: TaskState, event: 'scope_growth' | 'spawn'): { task: TaskState; record: ReassessRecord } {
   const t = clone(task)
   const from = t.tier
-  const raised = higher(t.tier, tableTier(state.capability_table, t.class))
+  const raised = higher(t.tier, floorTier(state, t))
   if (raised !== t.tier) {
     t.tier = raised
     t.override = true
@@ -647,20 +736,28 @@ function words(segment: string): string[] {
 // its leading `NAME=value` assignments dropped, is matched on its first
 // words against the argv prefixes router-state serves.
 export function matchesCheck(command: string, checks: string[][]): boolean {
+  return checkIndex(command, checks) !== undefined
+}
+
+// The index of the first check a command runs, or undefined.
+export function checkIndex(command: string, checks: string[][]): number | undefined {
   for (const segment of command.split(/&&|;|\n/)) {
     const argv = words(segment.trim())
     while (argv.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[0])) argv.shift()
-    if (checks.some(prefix => prefix.length <= argv.length && prefix.every((w, i) => argv[i] === w))) return true
+    const at = checks.findIndex(prefix => prefix.length <= argv.length && prefix.every((w, i) => argv[i] === w))
+    if (at >= 0) return at
   }
-  return false
+  return undefined
 }
 
 // What a finished tool call says, or undefined when it is no evidence.
 export type Evidence =
   | { kind: 'edit'; file: string | undefined }
-  | { kind: 'check'; command: string; passed: boolean }
+  | { kind: 'check'; command: string; passed: boolean; checkKind?: CheckKind }
 
-export function evidenceOf(tool: string, e: any, result: any, checks: string[][]): Evidence | undefined {
+// `kinds` are router-state's `check_kinds`, aligned with `checks`; without
+// them the evidence carries no kind and the record reads it off the argv.
+export function evidenceOf(tool: string, e: any, result: any, checks: string[][], kinds?: string[]): Evidence | undefined {
   if (!result || result.deny !== undefined) return undefined
   if (EDIT_TOOLS.includes(tool)) {
     if (result.isError) return undefined
@@ -671,13 +768,16 @@ export function evidenceOf(tool: string, e: any, result: any, checks: string[][]
   // A background command returns no exit code.
   if (e.run_in_background === true) return undefined
   const command = typeof e.command === 'string' ? e.command : ''
-  if (!matchesCheck(command, checks)) return undefined
+  const at = checkIndex(command, checks)
+  if (at === undefined) return undefined
+  const served = kinds?.[at]
+  const checkKind = served === 'test' || served === 'lint' || served === 'build' ? served : undefined
   if (result.isError) {
     // S0: a failing command is `isError` with "Exit code N"; an error
     // without one (interrupted, refused) says nothing about the code.
-    return /Exit code \d+/.test(String(result.text ?? result.result ?? '')) ? { kind: 'check', command, passed: false } : undefined
+    return /Exit code \d+/.test(String(result.text ?? result.result ?? '')) ? { kind: 'check', command, passed: false, checkKind } : undefined
   }
-  return { kind: 'check', command, passed: true }
+  return { kind: 'check', command, passed: true, checkKind }
 }
 
 // --- reverts and file hashes (plan §5: missed failures, measured) -----------------
@@ -694,7 +794,11 @@ const K = new Uint32Array([
 ])
 
 export function sha256Hex(text: string): string {
-  const data = encoder.encode(text)
+  return Array.from(sha256Words(encoder.encode(text)), x => x.toString(16).padStart(8, '0')).join('')
+}
+
+// The eight 32-bit words of the SHA-256 of `data`.
+function sha256Words(data: Uint8Array): Uint32Array {
   const length = ((data.length + 9 + 63) >> 6) << 6
   const bytes = new Uint8Array(length)
   bytes.set(data)
@@ -734,7 +838,40 @@ export function sha256Hex(text: string): string {
     h[6] += g
     h[7] += hh
   }
-  return Array.from(h, x => x.toString(16).padStart(8, '0')).join('')
+  return h
+}
+
+// --- exploration (docs/router-protocol.md, "Exploration") ----------------------------
+
+const MASK64 = (1n << 64n) - 1n
+
+// The first output of SplitMix64 seeded with `seed` (crate::rng::SplitMix64).
+export function splitMix64First(seed: bigint): bigint {
+  const state = (seed + 0x9e3779b97f4a7c15n) & MASK64
+  let z = state
+  z = ((z ^ (z >> 30n)) * 0xbf58476d1ce4e5b9n) & MASK64
+  z = ((z ^ (z >> 27n)) * 0x94d049bb133111ebn) & MASK64
+  return z ^ (z >> 31n)
+}
+
+// The exploration draw in [0, 1), the same function as Rust's
+// `crate::rng::exploration_draw`: u is the first 8 bytes, big-endian, of
+// SHA-256 over the UTF-8 bytes of seed, session and task, each preceded by
+// its byte length as a 4-byte big-endian integer; x is SplitMix64(u)'s
+// first output; the draw is (x >> 11) * 2^-53.
+export function explorationDraw(seed: string, session: string, task: string): number {
+  const parts = [seed, session, task].map(part => encoder.encode(part))
+  const data = new Uint8Array(parts.reduce((n, part) => n + 4 + part.length, 0))
+  const view = new DataView(data.buffer)
+  let at = 0
+  for (const part of parts) {
+    view.setUint32(at, part.length)
+    data.set(part, at + 4)
+    at += 4 + part.length
+  }
+  const words = sha256Words(data)
+  const u = (BigInt(words[0]) << 32n) | BigInt(words[1])
+  return Number(splitMix64First(u) >> 11n) * 2 ** -53
 }
 
 // A path as the repository names it: relative to the session's cwd, no
@@ -828,7 +965,11 @@ export function onEvidence(
     const out = rerun(state, t, 'scope_growth')
     return { task: out.task, reassess: out.record }
   }
-  t.verifications.push({ command: clip(evidence.command, 200), passed: evidence.passed })
+  t.verifications.push({
+    command: clip(evidence.command, 200),
+    passed: evidence.passed,
+    kind: evidence.checkKind ?? kindOfArgv(words(evidence.command)),
+  })
   if (t.verifications.length > 20) t.verifications = t.verifications.slice(-20)
   const edited = t.editedSinceCheck
   t.editedSinceCheck = false
@@ -916,6 +1057,8 @@ export function decisionRecord(input: {
   holdout: boolean
   applied: boolean
   now: number
+  // The capability table's version the decision was made under.
+  tableVersion?: number
 }) {
   return {
     kind: 'decision',
@@ -931,10 +1074,11 @@ export function decisionRecord(input: {
     mode_effective: input.mode,
     holdout: input.holdout,
     applied: input.applied,
-    explored: false,
-    propensity: null,
-    draw: null,
+    explored: input.decision.exploration?.explored ?? false,
+    propensity: input.decision.exploration?.propensity ?? null,
+    draw: input.decision.exploration?.draw ?? null,
     would_pass_gate: input.decision.wouldPassGate,
+    table_version: input.tableVersion ?? null,
     at: iso(input.now),
   }
 }
@@ -966,6 +1110,59 @@ export function usageRecord(input: {
   }
 }
 
+// The classifier input the contract allows: at most this many bytes.
+export const CLASSIFICATION_INPUT_BYTES = 3072
+
+let classifierVersionMemo: string | undefined
+
+// The classifier's prompt version: the SHA-256 of its system prompt, so a
+// training set says which prompt labelled each call.
+export function classifierVersion(): string {
+  classifierVersionMemo ??= sha256Hex(CLASSIFIER_SYSTEM)
+  return classifierVersionMemo
+}
+
+// One classifier call, kept for training (docs/router-protocol.md): the
+// text sent, and the parsed answer with every field, or null when the
+// reply did not parse. relais keeps the text in a local file and only its
+// hash in the ledger.
+export function classificationRecord(input: {
+  callId: string
+  purpose: 'prompt' | 'spawn'
+  model: string
+  text: string
+  cls: Classification | undefined
+  latencyMs: number | null
+  now: number
+}) {
+  const c = input.cls
+  return {
+    kind: 'classification',
+    call_id: input.callId,
+    purpose: input.purpose,
+    model: input.model,
+    prompt_version: classifierVersion(),
+    input: clip(input.text, CLASSIFICATION_INPUT_BYTES),
+    answer: c
+      ? {
+          relation: c.relation,
+          kind: c.kind,
+          difficulty: c.difficulty,
+          scope: c.scope,
+          uncertainty: c.uncertainty,
+          verifiable: c.verifiable,
+          explicit: { value: c.explicit.value, quote: c.explicit.quote },
+          user_model: c.user_model,
+          user_model_for: c.user_model_for,
+          confidence: c.confidence,
+        }
+      : null,
+    parse_ok: c !== undefined,
+    latency_ms: input.latencyMs !== null && Number.isFinite(input.latencyMs) ? Math.max(0, Math.round(input.latencyMs)) : null,
+    at: iso(input.now),
+  }
+}
+
 export function reassessRecord(task: TaskState, r: ReassessRecord, now: number) {
   return { kind: 'reassess', task_id: task.id, agent_id: task.agentId, ...r, at: iso(now) }
 }
@@ -989,7 +1186,58 @@ export function taskRecord(task: TaskState, endedAt: number | null, cwd: string 
     exhausted: task.exhausted,
     turns: task.turns,
     explicit_quote: task.explicitQuote,
+    checks: task.verifications.map(v => ({ name: v.command, kind: v.kind ?? 'test', passed: v.passed })),
   }
+}
+
+// A parent's outcome for a subagent task that ended before it: relais
+// applies it only over an `unknown` outcome of its own.
+export function taskOutcomeRecord(sub: { taskId: string; agentId: string | null }, outcome: Outcome, at: number) {
+  return { kind: 'task_outcome', task_id: sub.taskId, agent_id: sub.agentId, outcome, at: iso(at) }
+}
+
+// --- the amont gate stamp -----------------------------------------------------------------
+
+// `relais native gate-stamp`'s document.
+export type GateStamp = {
+  stamped: boolean
+  tree?: string
+  passed?: { gate: string; epoch: number }[]
+  failed?: { gate: string; epoch: number }[]
+}
+
+export function parseGateStamp(text: unknown): GateStamp | undefined {
+  try {
+    const raw = JSON.parse(String(text ?? ''))
+    if (!raw || typeof raw.stamped !== 'boolean') return undefined
+    if (!raw.stamped) return { stamped: false }
+    const runs = (list: unknown) =>
+      Array.isArray(list)
+        ? list.filter((r: any) => r && typeof r.gate === 'string' && Number.isFinite(r.epoch)).map((r: any) => ({ gate: r.gate, epoch: Number(r.epoch) }))
+        : []
+    return { stamped: true, tree: typeof raw.tree === 'string' ? raw.tree : '', passed: runs(raw.passed), failed: runs(raw.failed) }
+  } catch {
+    return undefined
+  }
+}
+
+// What a stamp says about one task: the runs inside its window [start, end]
+// (ms; stamps are in whole seconds). A pass with no fail after it in the
+// window is a passing check, a fail in the window a failed one; the
+// check is named for the tree, so a later pass is the last word.
+export function gateChecks(stamp: GateStamp, startedAt: number, endedAt: number): { name: string; kind: 'gate'; passed: boolean }[] {
+  if (!stamp.stamped || !stamp.tree) return []
+  const from = Math.floor(startedAt / 1000)
+  const to = Math.ceil(endedAt / 1000)
+  const inside = (r: { epoch: number }) => r.epoch >= from && r.epoch <= to
+  const passes = (stamp.passed ?? []).filter(inside)
+  const fails = (stamp.failed ?? []).filter(inside)
+  const name = `amont-gate@${stamp.tree.slice(0, 7)}`
+  const out: { name: string; kind: 'gate'; passed: boolean }[] = []
+  if (fails.length > 0) out.push({ name, kind: 'gate', passed: false })
+  const lastFail = Math.max(-Infinity, ...fails.map(r => r.epoch))
+  if (passes.some(r => r.epoch > lastFail)) out.push({ name, kind: 'gate', passed: true })
+  return out
 }
 
 // --- the module's memory (Store.router) ----------------------------------------------

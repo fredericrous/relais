@@ -9,9 +9,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
+use super::explore::{self, ExplorationTask, Projection, StratumCounts};
 use super::outcome::TaskOutcome;
 use super::stats::cluster_bootstrap_ratio;
-use crate::ledger::{RouterUsageRow, RouterWindow};
+use crate::ledger::{RouterExplorationStop, RouterUsageRow, RouterWindow};
 use crate::money::MicroUsd;
 use crate::orchestration::{price, CacheWrites, PriceTable, Speed, UsageRecord};
 
@@ -45,6 +46,9 @@ pub struct Arm {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Classifier {
     pub calls: usize,
+    /// Parsed classifier calls kept for training, over the whole ledger
+    /// (not the window): what the first local-model run waits on.
+    pub captured: u64,
     pub cost: Option<MicroUsd>,
     pub unpriced_models: Vec<String>,
 }
@@ -63,6 +67,100 @@ pub struct SessionRoutingReport {
     /// Cache-write tokens on the first request after a model switch,
     /// within one session's main thread or one subagent.
     pub cache_rebuild_tokens: u64,
+    pub exploration: ExplorationReport,
+}
+
+/// The strata rows `relais report` prints: at most this many, then
+/// `+N more`.
+pub const STRATA_SHOWN: usize = 5;
+
+/// One stratum (kind x difficulty band x scope): tasks with strong
+/// outcomes, drawn (the exploration lowered their tier) against undrawn,
+/// with each arm's correction-or-failure rate.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StratumRow {
+    pub stratum: String,
+    pub kind: String,
+    pub band: &'static str,
+    pub scope: String,
+    pub drawn: usize,
+    pub drawn_rate: Option<f64>,
+    pub undrawn: usize,
+    pub undrawn_rate: Option<f64>,
+    pub projection: Projection,
+}
+
+/// Exploration's evidence: the busiest strata first and the stop, if any.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ExplorationReport {
+    pub strata: Vec<StratumRow>,
+    /// Strata beyond [`STRATA_SHOWN`].
+    pub more: usize,
+    /// The latest recorded stop.
+    pub stop: Option<RouterExplorationStop>,
+}
+
+/// The exploration section from the ledger's tasks and the latest stop.
+pub fn exploration(
+    tasks: &[ExplorationTask],
+    stop: Option<RouterExplorationStop>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ExplorationReport {
+    let all = explore::strata(tasks);
+    let row = |s: &StratumCounts| StratumRow {
+        stratum: s.label(),
+        kind: s.kind.clone(),
+        band: s.band,
+        scope: s.scope.clone(),
+        drawn: s.drawn,
+        drawn_rate: explore::drawn_rate(s),
+        undrawn: s.undrawn,
+        undrawn_rate: explore::undrawn_rate(s),
+        projection: explore::project(s, now),
+    };
+    ExplorationReport {
+        strata: all.iter().take(STRATA_SHOWN).map(row).collect(),
+        more: all.len().saturating_sub(STRATA_SHOWN),
+        stop,
+    }
+}
+
+fn percent(rate: Option<f64>) -> String {
+    rate.map_or_else(|| "n/a".to_string(), |r| format!("{:.0}%", r * 100.0))
+}
+
+impl ExplorationReport {
+    /// Lines of at most 80 columns; nothing when no task has a strong
+    /// outcome and no stop was recorded.
+    pub fn render(&self) -> String {
+        if self.strata.is_empty() && self.stop.is_none() {
+            return String::new();
+        }
+        let mut out = String::from(
+            "  exploration (strata: kind, difficulty band, scope; rates: corrected share):\n",
+        );
+        for row in &self.strata {
+            out.push_str(&format!(
+                "    {}: drawn {} ({}), undrawn {} ({})\n      {}\n",
+                row.stratum,
+                row.drawn,
+                percent(row.drawn_rate),
+                row.undrawn,
+                percent(row.undrawn_rate),
+                row.projection.render()
+            ));
+        }
+        if self.more > 0 {
+            out.push_str(&format!("    +{} more\n", self.more));
+        }
+        if let Some(stop) = &self.stop {
+            out.push_str(&format!(
+                "    stopped {}\n      drawn {}/{} corrected, undrawn {}/{}\n",
+                stop.at, stop.drawn_bad, stop.drawn, stop.undrawn_bad, stop.undrawn
+            ));
+        }
+        out
+    }
 }
 
 fn priced(row: &RouterUsageRow, pricing: &PriceTable) -> Option<MicroUsd> {
@@ -120,7 +218,11 @@ fn cache_rebuild_tokens(usage: &[(String, RouterUsageRow)]) -> u64 {
 }
 
 /// The section, from the window's rows.
-pub fn session_routing(window: &RouterWindow, pricing: &PriceTable) -> SessionRoutingReport {
+pub fn session_routing(
+    window: &RouterWindow,
+    pricing: &PriceTable,
+    exploration: ExplorationReport,
+) -> SessionRoutingReport {
     // Each session's arm: held out wins, then routed, else shadow.
     let mut arm_of: BTreeMap<&str, &'static str> = BTreeMap::new();
     for (session, _) in &window.tasks {
@@ -229,10 +331,12 @@ pub fn session_routing(window: &RouterWindow, pricing: &PriceTable) -> SessionRo
         unknown_rate: (tasks > 0).then(|| unknown as f64 / tasks as f64),
         classifier: Classifier {
             calls: classifier_rows.len(),
+            captured: 0,
             cost: classifier_cost,
             unpriced_models: classifier_unpriced,
         },
         cache_rebuild_tokens: cache_rebuild_tokens(&window.usage),
+        exploration,
     }
 }
 
@@ -291,9 +395,14 @@ impl SessionRoutingReport {
             self.classifier.calls
         ));
         out.push_str(&format!(
+            "  classifier calls kept for training: {} parsed\n",
+            self.classifier.captured
+        ));
+        out.push_str(&format!(
             "  cache rebuilt after a model switch: {} token(s) written\n",
             self.cache_rebuild_tokens
         ));
+        out.push_str(&self.exploration.render());
         out
     }
 }
@@ -336,6 +445,8 @@ mod tests {
             exhausted: false,
             turns: 1,
             explicit_quote: None,
+            outcome_source: Some("own".into()),
+            checks: vec![],
         }
     }
 
@@ -391,7 +502,7 @@ mod tests {
 
     #[test]
     fn a_priced_arm_has_a_cost_per_completed_task_and_an_unpriced_one_is_unknown() {
-        let report = session_routing(&window(), &pricing());
+        let report = session_routing(&window(), &pricing(), ExplorationReport::default());
         let routed = &report.arms[0];
         assert_eq!(
             (routed.arm, routed.sessions, routed.tasks),
@@ -423,7 +534,7 @@ mod tests {
 
     #[test]
     fn counts_unknown_rate_classifier_and_rebuilds() {
-        let report = session_routing(&window(), &pricing());
+        let report = session_routing(&window(), &pricing(), ExplorationReport::default());
         assert_eq!(
             (
                 report.tasks,
@@ -447,8 +558,68 @@ mod tests {
 
     #[test]
     fn the_interval_is_the_same_every_time() {
-        let a = session_routing(&window(), &pricing());
-        let b = session_routing(&window(), &pricing());
+        let a = session_routing(&window(), &pricing(), ExplorationReport::default());
+        let b = session_routing(&window(), &pricing(), ExplorationReport::default());
         assert_eq!(a, b);
+    }
+
+    fn explored(kind: &str, difficulty: u8, scope: &str, drawn: bool) -> ExplorationTask {
+        ExplorationTask {
+            kind: kind.into(),
+            difficulty,
+            scope: scope.into(),
+            outcome: "completed_verified".into(),
+            started_at: "2026-10-01T00:00:00Z".into(),
+            drawn,
+            undrawn: !drawn,
+        }
+    }
+
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-10-11T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn exploration_rows_stay_within_80_columns_top_five_then_more() {
+        let kinds = ["question", "edit", "debug", "design", "review"];
+        let mut tasks = Vec::new();
+        for (i, kind) in kinds.iter().enumerate() {
+            for scope in ["cross-cutting", "local"] {
+                for _ in 0..=i {
+                    tasks.push(explored(kind, 5, scope, true));
+                }
+                tasks.push(explored(kind, 5, scope, false));
+            }
+        }
+        let report = exploration(&tasks, None, now());
+        assert_eq!(report.strata.len(), 5);
+        assert_eq!(report.more, 5);
+        // The busiest first.
+        assert_eq!(report.strata[0].drawn, 5);
+        let text = report.render();
+        assert!(text.contains("    +5 more"), "{text}");
+        let widest = text.lines().map(|l| l.chars().count()).max().unwrap();
+        assert!(widest <= 80, "{widest} columns:\n{text}");
+    }
+
+    #[test]
+    fn a_stratum_with_no_draws_reads_no_projection_never_a_date() {
+        let tasks = vec![explored("edit", 3, "local", false)];
+        let report = exploration(&tasks, None, now());
+        let text = report.render();
+        assert!(text.contains("no projection: 0 drawn"), "{text}");
+        assert!(!text.contains("projected 20"), "{text}");
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["strata"][0]["projection"]["state"], "no_draws");
+        assert_eq!(json["strata"][0]["drawn"], 0);
+    }
+
+    #[test]
+    fn a_stratum_with_draws_projects_the_day_it_reaches_twenty() {
+        let tasks: Vec<_> = (0..5).map(|_| explored("edit", 3, "local", true)).collect();
+        let text = exploration(&tasks, None, now()).render();
+        assert!(text.contains("20 drawn projected 2026-11-10"), "{text}");
     }
 }

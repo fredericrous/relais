@@ -76,6 +76,13 @@ split wherever a caller has to act differently.
 | 17 | `recipe promote` refused: the comparison does not clear every gate; nothing was written |
 | 18 | `trust grant` refused: the key is not this policy's; `relais trust show` prints the current one |
 | 19 | `init --detect` found no verification command and none was typed; nothing was written |
+| 20 | `learn cycle`: another cycle holds the Training lease (its pid and start time are named); nothing was queued and no row was written |
+
+`learn cycle` exits 0 where it did nothing wrong and nothing at all: `deferred:
+not idle (<n> agents active)` (another session's agents are running; the cycle
+stays due), `not due: …` under `--if-due`, and `awaiting_promotion` (an
+artifact passed every gate and `relais promote <id>` is yours to run). An
+error inside a cycle exits 1.
 
 The session-router commands (`native router-state`, `router-observe`,
 `router-envelope`) use 0, 1 and 2 only: 2 is a bad payload or

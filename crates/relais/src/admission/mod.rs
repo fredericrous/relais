@@ -283,6 +283,33 @@ impl Refusal {
     }
 }
 
+/// The process that holds the Training lease, as far as the coordinator
+/// knows it: who to name when a second cycle is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrainingHolder {
+    pub pid: Option<u32>,
+    /// When the holder took the lease (RFC 3339, the holder's own clock).
+    pub started_at: String,
+}
+
+/// What asking for the Training lease came to (SPEC §17, §23). It is a
+/// NON-QUEUING request: where [`AdmissionState::request`] queues a request
+/// at a cap, this refuses it at once, because a learning cycle that waits
+/// behind another is a second cycle on the same data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum TrainingDecision {
+    /// The caller holds the lease; release it with `end_training`.
+    Granted,
+    /// The Training group is full. The holder, when known, is named.
+    Busy { holder: Option<TrainingHolder> },
+    /// `training_when_idle` is set and `agents` other sessions' agents are
+    /// active. Nothing is held.
+    NotIdle { agents: u32 },
+    /// A hard limit refused the request outright.
+    Refused { code: Refusal, detail: String },
+}
+
 /// What a heartbeat answers: whether the coordinator still knows the
 /// dispatch, and whether its run or subtree was cancelled meanwhile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1007,6 +1034,10 @@ pub struct AdmissionState {
     /// The native dispatches relais asked the parent session to run
     /// (`native.rs`), each keyed by a dispatch above.
     native: native::NativeRegistry,
+    /// When each Training lease holder took it (RFC 3339 from the holder),
+    /// keyed by dispatch. Read only to name a holder; entries whose
+    /// dispatch is gone are dropped on the next lookup.
+    training_started: BTreeMap<String, String>,
 }
 
 /// Default duration a hook-admitted agent's lease is held before it
@@ -1043,6 +1074,7 @@ impl AdmissionState {
             stopped: BTreeSet::new(),
             admitted_by_source: BTreeMap::new(),
             native: native::NativeRegistry::default(),
+            training_started: BTreeMap::new(),
         }
     }
 
@@ -1218,6 +1250,144 @@ impl AdmissionState {
         Decision::Queued {
             position: self.queue.len(),
         }
+    }
+
+    /// Ask for the Training lease WITHOUT queueing (SPEC §17): granted, or
+    /// refused at once with the reason.
+    ///
+    /// Three things decide, in this order:
+    /// 1. A holder whose process is provably gone is released first, so a
+    ///    crashed cycle's lease expires by pid liveness here, not only at
+    ///    the next reconcile.
+    /// 2. A full Training group is `Busy`, naming the holder.
+    /// 3. With `training_when_idle`, any live agent of ANOTHER session is
+    ///    `NotIdle`: the calling session's own agents do not count. An
+    ///    agent whose bound process is dead, or whose lease has lapsed, is
+    ///    not live.
+    ///
+    /// On a grant the caller's `pid` is bound to the seat, so reconcile
+    /// frees it if the caller dies.
+    pub fn request_training(
+        &mut self,
+        request: &DispatchRequest,
+        pid: u32,
+        started_at: &str,
+        now: Instant,
+        alive: &dyn Fn(u32) -> bool,
+    ) -> TrainingDecision {
+        let request = self.resolve_caller(request);
+        if self.finished.contains(&request.dispatch_id) {
+            return TrainingDecision::Refused {
+                code: Refusal::AlreadyFinished,
+                detail: format!("dispatch {} already ran and settled", request.dispatch_id),
+            };
+        }
+        if request.resource != ResourceClass::Training {
+            return TrainingDecision::Refused {
+                code: Refusal::UnknownRun,
+                detail: format!(
+                    "a training lease is asked for with the training class, not {}",
+                    request.resource.as_str()
+                ),
+            };
+        }
+        if self.dispatches.contains_key(&request.dispatch_id) {
+            // The caller asking again for the seat it already holds.
+            return TrainingDecision::Granted;
+        }
+        if let Some(Decision::Refused { code, detail }) = self.check_hard_limits(&request) {
+            return TrainingDecision::Refused { code, detail };
+        }
+        self.release_dead_training_holders(now, alive);
+        self.register_session(&request.session_id);
+        if !self.admissible(&request) {
+            return TrainingDecision::Busy {
+                holder: self.training_holder(),
+            };
+        }
+        if self.limits.training_when_idle {
+            let agents = self.live_agents_outside(&request.session_id, now, alive);
+            if agents > 0 {
+                return TrainingDecision::NotIdle { agents };
+            }
+        }
+        let dispatch_id = request.dispatch_id.clone();
+        self.admit(
+            request,
+            now,
+            Lifecycle::Claimed,
+            AdmissionCount::First,
+            Attribution::Recorded,
+        );
+        self.bind_checked(&dispatch_id, None, Some(pid), now);
+        self.training_started
+            .insert(dispatch_id, started_at.to_string());
+        TrainingDecision::Granted
+    }
+
+    /// The caller is done training: its seat and run go, settled at zero
+    /// (a lease reserves no money).
+    pub fn end_training(&mut self, dispatch_id: &str, run_id: &str, now: Instant) {
+        self.settle(dispatch_id, Some(0), now);
+        self.release(dispatch_id, now);
+        self.finish_run(run_id);
+        self.training_started.remove(dispatch_id);
+    }
+
+    /// Free every Training seat whose bound process is not alive.
+    fn release_dead_training_holders(&mut self, now: Instant, alive: &dyn Fn(u32) -> bool) {
+        let dead: Vec<String> = self
+            .dispatches
+            .iter()
+            .filter(|(_, dispatch)| {
+                dispatch.class == ResourceClass::Training
+                    && dispatch.lifecycle.holds_seat()
+                    && matches!(dispatch.binding, Binding::Bound { pid, .. } if !alive(pid))
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in dead {
+            self.settle(&id, None, now);
+            self.release(&id, now);
+            self.training_started.remove(&id);
+        }
+    }
+
+    /// The Training seat holder, if one holds it.
+    fn training_holder(&mut self) -> Option<TrainingHolder> {
+        self.training_started
+            .retain(|id, _| self.dispatches.contains_key(id));
+        self.dispatches
+            .iter()
+            .find(|(_, dispatch)| {
+                dispatch.class == ResourceClass::Training && dispatch.lifecycle.holds_seat()
+            })
+            .map(|(id, dispatch)| TrainingHolder {
+                pid: dispatch.binding.pid(),
+                started_at: self.training_started.get(id).cloned().unwrap_or_default(),
+            })
+    }
+
+    /// Agents (remote model work) holding a live seat for any session but
+    /// `session`. Live: a bound process that answers, or a lease or
+    /// unbound seat still inside its grace.
+    fn live_agents_outside(&self, session: &str, now: Instant, alive: &dyn Fn(u32) -> bool) -> u32 {
+        self.dispatches
+            .values()
+            .filter(|dispatch| {
+                dispatch.class.cap_group() == CapGroup::Remote
+                    && dispatch.lifecycle.holds_seat()
+                    && dispatch.session_id != session
+                    && match &dispatch.binding {
+                        Binding::Bound { pid, .. } => alive(*pid),
+                        other => !Self::lease_is_stale(
+                            other,
+                            now.saturating_duration_since(dispatch.last_heartbeat),
+                            self.agent_lease_ttl,
+                        ),
+                    }
+            })
+            .count() as u32
     }
 
     /// Limits that never queue: an unknown run, depth, the run's
@@ -5120,5 +5290,203 @@ mod tests {
         assert_eq!(gate.status().runs["run-a"].active, 0);
         gate.cancel_run("run-a");
         assert_eq!(gate.enforcement(), Enforcement::InProcess);
+    }
+
+    // ---- the Training lease (SPEC §17, §23) ----
+
+    fn idle_state(training_when_idle: bool) -> AdmissionState {
+        let mut limits = limits();
+        limits.training_when_idle = training_when_idle;
+        let mut state = AdmissionState::new(limits);
+        let t = Instant::now();
+        for (run, session) in [("run-a", "tab-a"), ("run-b", "tab-b"), ("learn-1", "me")] {
+            state.register_run(
+                &RunRegistration {
+                    run_id: run.into(),
+                    session_id: session.into(),
+                    budget_micros: None,
+                    max_agents: None,
+                    max_depth: None,
+                },
+                t,
+            );
+        }
+        state
+    }
+
+    fn training(dispatch: &str, run: &str, session: &str) -> DispatchRequest {
+        let mut request = req(dispatch, run, session);
+        request.resource = ResourceClass::Training;
+        request
+    }
+
+    fn alive_all(_: u32) -> bool {
+        true
+    }
+
+    #[test]
+    fn a_second_training_request_is_refused_at_once_naming_the_holder() {
+        let mut state = idle_state(false);
+        let t = Instant::now();
+        let first = state.request_training(
+            &training("learn-1", "learn-1", "me"),
+            4242,
+            "2026-10-10T10:00:00Z",
+            t,
+            &alive_all,
+        );
+        assert_eq!(first, TrainingDecision::Granted);
+        let second = state.request_training(
+            &training("learn-2", "run-a", "tab-a"),
+            4343,
+            "2026-10-10T10:05:00Z",
+            t,
+            &alive_all,
+        );
+        assert_eq!(
+            second,
+            TrainingDecision::Busy {
+                holder: Some(TrainingHolder {
+                    pid: Some(4242),
+                    started_at: "2026-10-10T10:00:00Z".into(),
+                })
+            },
+            "refused, not queued, with the holder's pid and start time"
+        );
+        assert_eq!(state.status(t).queued, 0, "nothing waits behind the holder");
+        // The ordinary request path still queues at the same cap.
+        assert!(matches!(
+            state.request(&training("queued", "run-b", "tab-b"), t),
+            Decision::Queued { .. }
+        ));
+    }
+
+    #[test]
+    fn ending_training_gives_the_lease_back() {
+        let mut state = idle_state(false);
+        let t = Instant::now();
+        state.request_training(
+            &training("learn-1", "learn-1", "me"),
+            1,
+            "then",
+            t,
+            &alive_all,
+        );
+        state.end_training("learn-1", "learn-1", t);
+        assert_eq!(
+            state.request_training(
+                &training("learn-2", "run-a", "tab-a"),
+                2,
+                "now",
+                t,
+                &alive_all
+            ),
+            TrainingDecision::Granted
+        );
+    }
+
+    #[test]
+    fn a_crashed_holder_s_lease_expires_by_pid_liveness() {
+        let mut state = idle_state(false);
+        let t = Instant::now();
+        state.request_training(
+            &training("learn-1", "learn-1", "me"),
+            999_001,
+            "then",
+            t,
+            &alive_all,
+        );
+        // The holder's pid is gone: a dead-pid fixture lease.
+        let dead = |pid: u32| pid != 999_001;
+        assert_eq!(
+            state.request_training(&training("learn-2", "run-a", "tab-a"), 2, "now", t, &dead),
+            TrainingDecision::Granted,
+            "the dead holder's seat is freed by the next request"
+        );
+    }
+
+    fn agent(state: &mut AdmissionState, dispatch: &str, run: &str, session: &str, pid: u32) {
+        let t = Instant::now();
+        assert_eq!(
+            state.request(&req(dispatch, run, session), t),
+            Decision::Granted
+        );
+        assert_eq!(
+            state.bind(dispatch, Some("agent"), Some(pid), t, &alive_all),
+            BindOutcome::Bound
+        );
+    }
+
+    #[test]
+    fn training_when_idle_defers_to_another_sessions_agents() {
+        let mut state = idle_state(true);
+        agent(&mut state, "d1", "run-a", "tab-a", 77);
+        let t = Instant::now();
+        assert_eq!(
+            state.request_training(
+                &training("learn-1", "learn-1", "me"),
+                1,
+                "now",
+                t,
+                &alive_all
+            ),
+            TrainingDecision::NotIdle { agents: 1 }
+        );
+        assert_eq!(
+            state
+                .status(t)
+                .active_by_class
+                .get("training")
+                .copied()
+                .unwrap_or(0),
+            0,
+            "a deferral holds nothing"
+        );
+    }
+
+    #[test]
+    fn the_calling_sessions_own_agents_do_not_count_as_busy() {
+        let mut state = idle_state(true);
+        agent(&mut state, "mine", "learn-1", "me", 78);
+        let t = Instant::now();
+        assert_eq!(
+            state.request_training(
+                &training("learn-1", "learn-1", "me"),
+                1,
+                "now",
+                t,
+                &alive_all
+            ),
+            TrainingDecision::Granted
+        );
+    }
+
+    #[test]
+    fn a_dead_pid_agent_lease_does_not_defer_the_cycle() {
+        let mut state = idle_state(true);
+        agent(&mut state, "d1", "run-a", "tab-a", 999_002);
+        let t = Instant::now();
+        let dead = |pid: u32| pid != 999_002;
+        assert_eq!(
+            state.request_training(&training("learn-1", "learn-1", "me"), 1, "now", t, &dead),
+            TrainingDecision::Granted
+        );
+    }
+
+    #[test]
+    fn with_the_setting_off_other_sessions_agents_do_not_defer() {
+        let mut state = idle_state(false);
+        agent(&mut state, "d1", "run-a", "tab-a", 79);
+        let t = Instant::now();
+        assert_eq!(
+            state.request_training(
+                &training("learn-1", "learn-1", "me"),
+                1,
+                "now",
+                t,
+                &alive_all
+            ),
+            TrainingDecision::Granted
+        );
     }
 }

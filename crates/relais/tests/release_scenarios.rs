@@ -310,7 +310,10 @@ amont_agent = "off"
             .env("RELAIS_STATE_DIR", &self.state)
             .env("RELAIS_CONFIG_DIR", &self.config)
             .env("RELAIS_CLAUDE_BIN", &self.claude)
-            .env("RELAIS_SESSION_ID", "tab-test");
+            .env("RELAIS_SESSION_ID", "tab-test")
+            // Hermetic: a suite run inside a relais worker inherits the
+            // plugin's host, which would admit what these tests refuse.
+            .env_remove("RELAIS_HOST");
         for (key, value) in extra_env {
             cmd.env(key, value);
         }
@@ -429,7 +432,10 @@ impl ScriptedPlugin {
             .env("RELAIS_STATE_DIR", &self.state)
             .env("RELAIS_CONFIG_DIR", &self.config)
             .env("RELAIS_CLAUDE_BIN", &self.claude)
-            .env("RELAIS_SESSION_ID", "tab-test");
+            .env("RELAIS_SESSION_ID", "tab-test")
+            // Hermetic: a suite run inside a relais worker inherits the
+            // plugin's host, which would admit what these tests refuse.
+            .env_remove("RELAIS_HOST");
         cmd
     }
 

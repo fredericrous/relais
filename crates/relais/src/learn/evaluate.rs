@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 
 use super::dataset::{temporal_splits, Dataset, TemporalSplits};
 use super::features::{
-    expand, feature_dim, FeatureSchema, RecipeIdentity, SparseVec, Standardization, TrainingExample,
+    expand, feature_dim, FeatureSchema, LabelSource, RecipeIdentity, SparseVec, Standardization,
+    TrainingExample,
 };
 use super::learner::{CostModel, FitReport, LogisticModel, SolverSettings};
 use crate::money::MicroUsd;
@@ -42,6 +43,20 @@ pub struct CalibrationBin {
     pub predicted_mid: f64,
     pub observed: f64,
     pub count: usize,
+}
+
+/// Acceptance and calibration on the test split for the examples of one
+/// label source (SPEC §17): salvage-sourced labels are reported beside the
+/// runner's own, never pooled out of sight.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LabelSourceReport {
+    pub source: LabelSource,
+    /// Test-split examples carrying this source.
+    pub test_records: usize,
+    /// Share of them labelled accepted-without-escalation.
+    pub acceptance_rate: Option<f64>,
+    /// Calibration of the acceptance model on just these examples.
+    pub calibration_bins: Vec<CalibrationBin>,
 }
 
 /// Which of the two fitted models a fit report or a divergence belongs to.
@@ -295,6 +310,10 @@ pub struct EvalReport {
     /// temperature was NOT fitted on. The calibration split fits; the test
     /// split reports.
     pub calibration_bins: Vec<CalibrationBin>,
+    /// Acceptance and calibration per label source, on the test split.
+    /// Empty in a report stored before label sources existed.
+    #[serde(default)]
+    pub by_label_source: Vec<LabelSourceReport>,
     pub test_acceptance_rate: Option<f64>,
     /// Baseline: the conservative configured route (each record's own
     /// floor tier) — what cold-start routing achieves without any learned
@@ -544,6 +563,7 @@ pub fn train_and_evaluate(
     // tuning", report calibration on held-out data). The calibration
     // split's one job is fitting the temperature.
     let calibration_bins = calibration_curve(&acceptance, &standardization, &test);
+    let by_label_source = label_source_reports(&acceptance, &standardization, &test);
 
     let measured = measure(Measurement {
         test: &test,
@@ -597,6 +617,7 @@ pub fn train_and_evaluate(
             calibration_records: calibration.len(),
             test_records: measured.test_records,
             calibration_bins,
+            by_label_source,
             test_acceptance_rate: measured.test_acceptance_rate,
             baseline_acceptance_rate: measured.baseline_acceptance_rate,
             mean_cost_selected: measured.mean_cost_selected,
@@ -641,6 +662,38 @@ fn calibration_curve(
             predicted_mid: sum / count as f64,
             observed: positives as f64 / count as f64,
             count,
+        })
+        .collect()
+}
+
+/// Acceptance and calibration on the test split, one entry per label source
+/// present, in source order.
+fn label_source_reports(
+    acceptance: &LogisticModel,
+    standardization: &Standardization,
+    test: &[&TrainingExample],
+) -> Vec<LabelSourceReport> {
+    let mut sources: Vec<LabelSource> = test.iter().map(|record| record.label_source).collect();
+    sources.sort();
+    sources.dedup();
+    sources
+        .into_iter()
+        .map(|source| {
+            let own: Vec<&TrainingExample> = test
+                .iter()
+                .copied()
+                .filter(|record| record.label_source == source)
+                .collect();
+            let accepted = own
+                .iter()
+                .filter(|record| record.accepted_without_escalation)
+                .count();
+            LabelSourceReport {
+                source,
+                test_records: own.len(),
+                acceptance_rate: (!own.is_empty()).then(|| accepted as f64 / own.len() as f64),
+                calibration_bins: calibration_curve(acceptance, standardization, &own),
+            }
         })
         .collect()
 }
@@ -968,6 +1021,26 @@ impl EvalReport {
                 bin.predicted_mid, bin.observed, bin.count
             ));
         }
+        for report in &self.by_label_source {
+            out.push_str(&format!(
+                "label source {}: {} test record(s), acceptance {}\n",
+                report.source.as_str(),
+                report.test_records,
+                match report.acceptance_rate {
+                    Some(rate) => format!("{rate:.2}"),
+                    None => "n/a".into(),
+                }
+            ));
+            for bin in &report.calibration_bins {
+                out.push_str(&format!(
+                    "  calibration ({}): predicted {:.2} → observed {:.2} (n={})\n",
+                    report.source.as_str(),
+                    bin.predicted_mid,
+                    bin.observed,
+                    bin.count
+                ));
+            }
+        }
         out.push_str(&format!(
             "fit: acceptance {} in {} iteration(s), loss {:.6}; cost {} in {} iteration(s), loss \
              {:.6}\n",
@@ -1078,6 +1151,7 @@ mod tests {
             sparse,
             accepted_without_escalation: accepted,
             route: AcceptanceRoute::Verified,
+            label_source: LabelSource::Runner,
             outcome_stood: None,
             correction_magnitude: None,
             complete_cost: MicroUsd::from_micros(if accepted { 100 } else { 900 }),
@@ -1173,6 +1247,57 @@ mod tests {
     /// construction. Here the calibration split is all-accepted and the
     /// test split all-rejected: bins measured on the fitting set would
     /// report an observed frequency of 1.0 in every bin.
+    #[test]
+    fn acceptance_and_calibration_are_reported_per_label_source() {
+        let mut records: Vec<TrainingExample> = (0..20)
+            .map(|day| {
+                record(
+                    &format!("f{day}"),
+                    &format!("2026-09-{:02}T00:00:00+00:00", day + 1),
+                    day % 2 == 0,
+                    Tier::Implementation,
+                )
+            })
+            .collect();
+        // Two salvage-sourced examples, the newest, land in the test split.
+        for record in records.iter_mut().skip(18) {
+            record.label_source = LabelSource::PersonSalvageContained;
+        }
+        let dataset = Dataset {
+            version: crate::learn::dataset::DATASET_VERSION,
+            label_policy_version: crate::learn::dataset::LABEL_POLICY_VERSION,
+            fingerprint: "fp".into(),
+            built_at: "2026-10-01T00:00:00+00:00".into(),
+            exclusions: vec![],
+            route_coverage: Default::default(),
+            records,
+        };
+        let settings = EvalSettings {
+            artifact_id: "a".into(),
+            solver: SolverSettings::default(),
+            quality_floor: DEFAULT_QUALITY_FLOOR,
+            min_records_per_tier: 1,
+            min_supported_test_records: 1,
+            max_abstention_rate: 1.0,
+        };
+        let report = train_and_evaluate(&dataset, &settings)
+            .expect("trains")
+            .report;
+        let sources: Vec<LabelSource> = report.by_label_source.iter().map(|r| r.source).collect();
+        assert!(sources.contains(&LabelSource::Runner), "{sources:?}");
+        let salvage = report
+            .by_label_source
+            .iter()
+            .find(|r| r.source == LabelSource::PersonSalvageContained)
+            .expect("salvage source reported");
+        assert_eq!(salvage.test_records, 2);
+        let total: usize = report.by_label_source.iter().map(|r| r.test_records).sum();
+        assert_eq!(total, report.test_records);
+        assert!(report
+            .render()
+            .contains("label source person_salvage_contained"));
+    }
+
     #[test]
     fn calibration_bins_are_reported_on_records_the_fit_never_saw() {
         let mut records = Vec::new();

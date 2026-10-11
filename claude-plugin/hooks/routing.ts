@@ -11,6 +11,7 @@ import {
   CLASSIFIER_MAX_TOKENS,
   CLASSIFIER_SYSTEM,
   CLASSIFIER_TIMEOUT_MS,
+  classificationRecord,
   classifierPrompt,
   clip,
   decideMain,
@@ -20,11 +21,14 @@ import {
   DEFAULT_MODEL_IDS,
   escalate,
   evidenceOf,
+  gateChecks,
   hash,
   modeEffective,
   newTask,
   onEvidence,
+  outcomeOf,
   parseClassification,
+  parseGateStamp,
   parseRouterState,
   reassessRecord,
   rerun,
@@ -32,6 +36,7 @@ import {
   revertRecord,
   routeStatus,
   spawnPrompt,
+  taskOutcomeRecord,
   taskRecord,
   TIERS,
   usageRecord,
@@ -47,6 +52,9 @@ import { markDirty } from './ui.ts'
 
 const STATE_TIMEOUT_MS = 10_000
 const OBSERVE_TIMEOUT_MS = 20_000
+// The amont gate stamp is read at task end, and never holds it up longer.
+const GATE_TIMEOUT_MS = 1000
+const GATE_REPOSITORIES = 5
 // The first request of a turn waits this long for the classifier at most,
 // and leaves 500 ms of the hook's own budget.
 const PIN_WAIT_MS = 2000
@@ -135,18 +143,18 @@ function refresh(fx: Fx, store: Store): Promise<void> {
 export async function onPrompt(fx: Fx, store: Store, text: string) {
   const r = store.router
   if (r.isTaskEndRequested && r.task) {
-    endTask(store, r.task, await fx.clock.now())
+    await endTask(fx, store, r.task, await fx.clock.now())
     r.task = undefined
   }
   r.isTaskEndRequested = false
   detach(flushObservations(fx, store))
   if (!r.state && !r.isStale) return
   const seq = ++r.seq
-  const promise = classifyPrompt(fx, store, text).catch(() => undefined)
+  const promise = classifyPrompt(fx, store, text, seq).catch(() => undefined)
   r.pendingRoute = { seq, promise }
 }
 
-async function classifyPrompt(fx: Fx, store: Store, text: string): Promise<Classified | undefined> {
+async function classifyPrompt(fx: Fx, store: Store, text: string, seq: number): Promise<Classified | undefined> {
   const r = store.router
   const session = await fx.session.id()
   if (session !== r.session || r.isStale) {
@@ -156,9 +164,9 @@ async function classifyPrompt(fx: Fx, store: Store, text: string): Promise<Class
   if (!r.state || r.state.mode === 'off') return undefined
   const [sessionModel, reply] = await Promise.all([
     Promise.resolve(fx.session.model()).catch(() => undefined),
-    complete(fx, store, classifierPrompt(text, r.task)),
+    classify(fx, store, classifierPrompt(text, r.task), 'prompt', seq),
   ])
-  return { ...reply, text, cls: reply.ok ? parseClassification(reply.text) : undefined, sessionModel }
+  return { ...reply, text, sessionModel }
 }
 
 const classifierModel = (store: Store) => {
@@ -178,6 +186,33 @@ async function complete(fx: Fx, store: Store, prompt: string) {
     timeoutMs: CLASSIFIER_TIMEOUT_MS,
   })
   return { ok: reply?.isAnswered === true, text: reply?.text, usage: reply?.usage, model, at: await fx.clock.now() }
+}
+
+// One classifier call, parsed, and kept for training whatever came of it
+// (an unparsed reply is a record too). Kept here, not where the decision is
+// taken, so a reply that lands after the turn stopped waiting is kept as
+// well. Fails open: the record is a side effect and never costs the call.
+async function classify(fx: Fx, store: Store, prompt: string, purpose: 'prompt' | 'spawn', seq: number) {
+  const started = await fx.clock.now()
+  const reply = await complete(fx, store, prompt)
+  const cls = reply.ok ? parseClassification(reply.text) : undefined
+  try {
+    queue(
+      store,
+      classificationRecord({
+        callId: `classifier:${reply.at}:${seq}:${purpose}`,
+        purpose,
+        model: reply.model,
+        text: prompt,
+        cls,
+        latencyMs: reply.at - started,
+        now: reply.at,
+      }),
+    )
+  } catch {
+    // The call's answer is what routing needs; the record is not.
+  }
+  return { ...reply, cls }
 }
 
 function queueClassifierUsage(store: Store, taskId: string, c: { usage: any; model: string; at: number } | undefined) {
@@ -229,15 +264,17 @@ async function pin(fx: Fx, store: Store, e: any, remainingMs: number) {
     lastModel: r.lastModel,
     contextTokens: r.lastContext,
     newTaskId: `task-${now}-${++r.seq}`,
+    session: r.session,
     now,
   })
-  if (out.ended) endTask(store, out.ended, now)
+  if (out.ended) detach(endTask(fx, store, out.ended, now))
   if (out.relation === 'new_task') r.forceNew = false
   r.task = out.task
   r.route = { turnId: e.turnId, decision: out.decision }
   if (out.task) {
     queueClassifierUsage(store, out.task.id, classified)
     for (const record of out.reassess) queue(store, reassessRecord(out.task, record, now))
+    if (out.relation === 'correction') queueCorrected(store, out.task)
     if (out.decision && out.relation) {
       queue(
         store,
@@ -251,6 +288,7 @@ async function pin(fx: Fx, store: Store, e: any, remainingMs: number) {
           holdout: state.holdout,
           applied: out.decision.override && isApplying(r),
           now,
+          tableVersion: state.capability_table.version,
         }),
       )
     }
@@ -286,6 +324,9 @@ async function keyUnkeyed(fx: Fx, store: Store, agentId: string): Promise<TaskSt
   delete r.unkeyed[description]
   const task = { ...entry.task, agentId }
   r.subtasks[agentId] = task
+  if (r.task) {
+    r.task = { ...r.task, subagentTasks: r.task.subagentTasks.map(s => (s.taskId === task.id ? { ...s, agentId } : s)) }
+  }
   return task
 }
 
@@ -330,13 +371,13 @@ export async function routeSpawn(fx: Fx, store: Store, e: any, next: any, remain
   const type = String(e.subagentType ?? e.subagent_type ?? '')
   const description = String(e.description ?? '')
   const prompt = String(e.prompt ?? '')
-  let classified: Awaited<ReturnType<typeof complete>> | undefined
+  let classified: Awaited<ReturnType<typeof classify>> | undefined
   let cls: Classification | undefined
   if (!state.pins[type]) {
-    const got = await within(fx, complete(fx, store, spawnPrompt(type, description, prompt)).catch(() => undefined), waitFor(remainingMs))
+    const got = await within(fx, classify(fx, store, spawnPrompt(type, description, prompt), 'spawn', ++r.seq).catch(() => undefined), waitFor(remainingMs))
     if (got !== TIMEOUT && got) {
       classified = got
-      cls = got.ok ? parseClassification(got.text) : undefined
+      cls = got.cls
     }
   }
   const spawn = decideSpawn({ state, type, cls, personModel: r.task?.subagentModel ?? null })
@@ -359,7 +400,7 @@ async function afterSpawn(
     state: RouterState
     spawn: ReturnType<typeof decideSpawn>
     applied: boolean
-    classified: Awaited<ReturnType<typeof complete>> | undefined
+    classified: Awaited<ReturnType<typeof classify>> | undefined
     description: string
     prompt: string
     result: any
@@ -376,6 +417,8 @@ async function afterSpawn(
     if (agentId) r.subtasks[agentId] = task
     else keepUnkeyed(r, description, prompt, task)
     owner = task
+    // The parent's end amends this task's outcome (`task_outcome`).
+    if (r.task) r.task = { ...r.task, subagentTasks: [...r.task.subagentTasks, { taskId: task.id, agentId: agentId ?? null }].slice(-20) }
   }
   if (classified) queueClassifierUsage(store, owner?.id ?? 'unassigned', classified)
   if (spawn.decision && owner) {
@@ -391,6 +434,7 @@ async function afterSpawn(
         holdout: state.holdout,
         applied,
         now,
+        tableVersion: state.capability_table.version,
       }),
     )
   }
@@ -428,7 +472,7 @@ export function onToolResult(fx: Fx, store: Store, e: any, result: any, now: num
   const task = agentId ? r.subtasks[agentId] : r.task
   if (!task) return
   noteRevert(store, state, task, e, result, now)
-  const evidence = evidenceOf(String(e.tool), e, result, state.checks)
+  const evidence = evidenceOf(String(e.tool), e, result, state.checks, state.check_kinds)
   if (!evidence) return
   const out = onEvidence(state, task, evidence, r.cwd)
   if (agentId) r.subtasks[agentId] = out.task
@@ -468,6 +512,7 @@ export async function flag(fx: Fx, store: Store): Promise<string> {
   const out = escalate(r.state, corrected, 'flag')
   r.task = out.task
   queue(store, reassessRecord(out.task, out.record, now))
+  queueCorrected(store, out.task)
   refreshRoute(store)
   const to = decisionOf(r.state, out.task, 'recovery')
   return `Flagged: this task counts as corrected, and its next request runs at ${to.tier} (${to.model}${to.effort ? `, effort ${to.effort}` : ''})${modeOf(r) === 'on' ? '' : ` once routing is on (now ${modeOf(r)})`}.`
@@ -475,21 +520,80 @@ export async function flag(fx: Fx, store: Store): Promise<string> {
 
 // --- turn.complete, session.end -----------------------------------------------------------
 
-export function onTurnComplete(store: Store, e: any, now: number) {
+export function onTurnComplete(fx: Fx, store: Store, e: any, now: number) {
   const r = store.router
   if (e.agentId) {
     const task = r.subtasks[e.agentId]
     if (!task) return
     delete r.subtasks[e.agentId]
     if (e.isAborted && !task.inferred.includes('aborted')) task.inferred.push('aborted')
-    endTask(store, task, now)
+    detach(endTask(fx, store, task, now))
     return
   }
   if (e.isAborted && r.task && !r.task.inferred.includes('aborted')) r.task.inferred.push('aborted')
 }
 
-function endTask(store: Store, task: TaskState, now: number) {
-  queue(store, taskRecord(task, now, store.router.cwd))
+// A correction is a fact the moment it happens: the task is recorded as
+// `corrected` then, not only when it ends, because a session that dies
+// before its end (a crash, a kill) would leave the reassessment in the
+// ledger with no task for it to belong to. The end's record, later,
+// carries the outcome at the end; relais keeps the first one it gets.
+function queueCorrected(store: Store, task: TaskState) {
+  queue(store, taskRecord(task, null, store.router.cwd))
+}
+
+// The task ends: the amont stamp on the trees it edited is read (bounded,
+// failing open) and folded in as checks, the task is recorded, and each
+// subagent task it spawned is amended with its outcome.
+async function endTask(fx: Fx, store: Store, task: TaskState, now: number) {
+  const gate = await gateEvidence(fx, store, task, now).catch(() => [])
+  const ended: TaskState =
+    gate.length === 0 ? task : { ...task, verifications: [...task.verifications, ...gate].slice(-20) }
+  queue(store, taskRecord(ended, now, store.router.cwd))
+  const outcome = outcomeOf(ended)
+  if (outcome === 'unknown') return
+  for (const sub of ended.subagentTasks ?? []) {
+    if (sub.agentId) queue(store, taskOutcomeRecord(sub, outcome, now))
+  }
+}
+
+// The directory a path lies in, the session's cwd for a bare name.
+function directoryOf(file: string, cwd: string | undefined): string | undefined {
+  const absolute = file.startsWith('/') ? file : cwd ? `${cwd.replace(/\/+$/, '')}/${file}` : undefined
+  if (!absolute) return undefined
+  const at = absolute.lastIndexOf('/')
+  return at <= 0 ? '/' : absolute.slice(0, at)
+}
+
+// The gate checks of the repositories the task edited files in, or none
+// when anything is slow or fails.
+async function gateEvidence(fx: Fx, store: Store, task: TaskState, now: number): Promise<{ command: string; kind: 'gate'; passed: boolean }[]> {
+  if (task.files.length === 0) return []
+  const read = readGateChecks(fx, store, task, now)
+  read.catch(() => {})
+  const got = await within(fx, read, GATE_TIMEOUT_MS)
+  return got === TIMEOUT ? [] : got
+}
+
+async function readGateChecks(fx: Fx, store: Store, task: TaskState, now: number) {
+  const cwd = store.router.cwd
+  const directories = [...new Set(task.files.map(file => directoryOf(file, cwd)).filter((d): d is string => !!d))]
+  const toplevels = await Promise.all(
+    directories.map(async dir => {
+      const result = await fx.process.run(['git', 'rev-parse', '--show-toplevel'], { cwd: dir, timeoutMs: GATE_TIMEOUT_MS }).catch(() => undefined)
+      return result?.exitCode === 0 ? String(result.stdout ?? '').trim() : ''
+    }),
+  )
+  const repositories = [...new Set(toplevels.filter(t => t !== ''))].slice(0, GATE_REPOSITORIES)
+  const stamps = await Promise.all(
+    repositories.map(async repository => {
+      const result = await fx.process
+        .run(['relais', 'native', 'gate-stamp', '--cwd', repository], { cwd: repository, timeoutMs: GATE_TIMEOUT_MS })
+        .catch(() => undefined)
+      return result?.exitCode === 0 ? parseGateStamp(result.stdout) : undefined
+    }),
+  )
+  return stamps.flatMap(stamp => (stamp ? gateChecks(stamp, task.startedAt, now) : [])).map(c => ({ command: c.name, kind: c.kind, passed: c.passed }))
 }
 
 // A relais run ended: its acceptance verifies the task, which ends at the
@@ -505,8 +609,9 @@ export function onRunDone(store: Store, outcome: string) {
 // /clear or a resume the module goes on under another session: a new task.
 export async function onSessionEnd(fx: Fx, store: Store, reason: string, now: number) {
   const r = store.router
-  if (r.task) endTask(store, r.task, now)
-  for (const task of Object.values(r.subtasks)) endTask(store, task, now)
+  // The subagents first, so the parent's outcome amends the ones still open.
+  await Promise.all(Object.values(r.subtasks).map(task => endTask(fx, store, task, now)))
+  if (r.task) await endTask(fx, store, r.task, now)
   r.task = undefined
   r.subtasks = {}
   r.unkeyed = {}

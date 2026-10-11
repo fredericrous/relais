@@ -1096,6 +1096,61 @@ fn exit_codes_follow_the_documented_table() {
     // 0 — and the ordinary path still exits 0.
     assert_eq!(world.relais(&["doctor", "--json"]).status.code(), Some(3));
     assert_eq!(world.relais(&["report", "--json"]).status.code(), Some(0));
+
+    // 20 — `learn cycle` while another process holds the Training lease.
+    // The holder here is this test; the refusal names its pid.
+    let (coordinator, listener) = relais::coordinator::Coordinator::start(
+        &world.state.join("relais.sock"),
+        relais::policy::ConcurrencyLimits {
+            max_active_agents: Some(8),
+            max_active_agents_per_session: Some(8),
+            max_heavy_commands: Some(2),
+            max_training_jobs: Some(1),
+            max_agent_depth: Some(3),
+            max_agents_per_run: Some(24),
+            training_when_idle: true,
+        },
+        None,
+        relais::admission::DEFAULT_AGENT_LEASE_TTL,
+    )
+    .expect("coordinator starts");
+    let server = std::thread::spawn(move || {
+        let _ = coordinator.serve(listener);
+    });
+    let client = relais::coordinator::Client::new(world.state.join("relais.sock"));
+    for _ in 0..100 {
+        if client.ping().is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let lease = client
+        .acquire_training("tab-holder", std::process::id(), "2026-10-10T10:00:00Z")
+        .expect("lease");
+    let held = world.relais(&["learn", "cycle"]);
+    assert_eq!(held.status.code(), Some(20), "{}", text(&held.stderr));
+    assert!(
+        text(&held.stderr).contains(&format!("pid {}", std::process::id())),
+        "the refusal names the holder: {}",
+        text(&held.stderr)
+    );
+    client.end_training(&lease).expect("release");
+
+    // 0 — a cycle that ran, and the three answers that did nothing wrong
+    // and nothing at all: `not due` (below), `deferred: not idle` and
+    // `awaiting_promotion` (a passing artifact with no `[learning]`
+    // envelope, in learning_cycle.rs and learn/cycle.rs).
+    let ran = world.relais(&["learn", "cycle", "--if-due"]);
+    assert_eq!(ran.status.code(), Some(0), "{}", text(&ran.stderr));
+    let not_due = world.relais(&["learn", "cycle", "--if-due"]);
+    assert_eq!(not_due.status.code(), Some(0), "{}", text(&not_due.stderr));
+    assert!(
+        text(&not_due.stdout).starts_with("not due: "),
+        "{}",
+        text(&not_due.stdout)
+    );
+    let _ = client.request(&relais::coordinator::Request::Shutdown);
+    let _ = server.join();
 }
 
 /// The case a trailing `remove_dir_all` always missed: the test body

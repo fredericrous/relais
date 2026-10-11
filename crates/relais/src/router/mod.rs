@@ -12,6 +12,10 @@
 //! `holdout`, `stats`, `wire`, `pins`, `state`, `report`). R1 has no
 //! learner: `adjustments` is always empty.
 
+pub mod capture;
+pub mod explore;
+pub mod export;
+pub mod gate;
 pub mod holdout;
 pub mod mode;
 pub mod outcome;
@@ -186,6 +190,41 @@ fn completed_task_tokens(path: &Path) -> Vec<(String, u8, u64)> {
     }
 }
 
+/// Whether the exploration stop rule holds: read only when the ledger
+/// already exists and an epsilon is in force. When it fires, the stop and
+/// the counts it saw are recorded. A ledger that cannot be read or written
+/// is said and the rule does not stop (it errs toward the envelope's rate,
+/// which the person set).
+fn exploration_stopped(path: &Path, epsilon_in_force: bool) -> bool {
+    if !epsilon_in_force || !path.exists() {
+        return false;
+    }
+    let run = || -> Result<bool, LedgerError> {
+        let ledger = Ledger::open(path)?;
+        let strata = explore::strata(&ledger.router_exploration_tasks()?);
+        let check = explore::stop_check(&strata);
+        if check.stop {
+            ledger.record_router_exploration_stop(&crate::ledger::RouterExplorationStop {
+                at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                drawn: check.drawn,
+                drawn_bad: check.drawn_bad,
+                undrawn: check.undrawn,
+                undrawn_bad: check.undrawn_bad,
+            })?;
+        }
+        Ok(check.stop)
+    };
+    match run() {
+        Ok(stopped) => stopped,
+        Err(e) => {
+            eprintln!(
+                "relais native router-state: warning: the ledger could not be read ({e}); exploration stop rule not applied"
+            );
+            false
+        }
+    }
+}
+
 /// `relais native router-state --session <id>`, run in `cwd`.
 pub fn router_state(session: &str, cwd: &Path) -> Result<state::RouterState, StateError> {
     let machine_path = crate::paths::machine_settings_path().map_err(StateError::Home)?;
@@ -203,6 +242,10 @@ pub fn router_state(session: &str, cwd: &Path) -> Result<state::RouterState, Sta
         env_mode: env_mode.as_deref(),
         completed_task_tokens,
         definition_pins: definition_pins(&dirs),
+        exploration_stopped: exploration_stopped(
+            &ledger_path,
+            machine.session_routing.effective_epsilon() > 0.0,
+        ),
     }))
 }
 
@@ -213,6 +256,9 @@ pub enum ObserveError {
     Payload(wire::WireError),
     /// Exit 1: the ledger failed; the plugin retries.
     Ledger(LedgerError),
+    /// Exit 1: a classifier input could not be written; nothing was
+    /// recorded, and the plugin retries.
+    Capture(std::io::Error),
 }
 
 impl std::fmt::Display for ObserveError {
@@ -220,16 +266,70 @@ impl std::fmt::Display for ObserveError {
         match self {
             ObserveError::Payload(e) => write!(f, "bad payload, nothing written: {e}"),
             ObserveError::Ledger(e) => write!(f, "{e}"),
+            ObserveError::Capture(e) => {
+                write!(
+                    f,
+                    "classifier inputs could not be written, nothing recorded: {e}"
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for ObserveError {}
 
+/// Whether this machine keeps classifier inputs (ADR-0002): off when
+/// `[session_routing] keep_classifier_inputs = false`, when routing is off
+/// (the tombstone, or `RELAIS_SESSION_ROUTING=off`), and when machine.toml
+/// cannot be read, which is said: a person who may have turned capture off
+/// is not guessed at.
+pub fn capture_policy(
+    machine_path: &Path,
+    state_dir: &Path,
+    env_mode: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> capture::CapturePolicy {
+    let machine = match read_machine(machine_path) {
+        Ok(machine) => machine,
+        Err(e) => {
+            eprintln!("relais native router-observe: warning: {e}; classifier inputs are not kept");
+            return capture::CapturePolicy::Off;
+        }
+    };
+    let routing = &machine.session_routing;
+    let (mode, _) = mode::resolve_mode(routing.envelope.is_some(), routing.off.is_some(), env_mode);
+    if mode == mode::Mode::Off || !routing.keep_classifier_inputs {
+        return capture::CapturePolicy::Off;
+    }
+    capture::CapturePolicy::On {
+        dir: state_dir.join("classifier"),
+        now,
+    }
+}
+
 /// Validate the whole payload, then write every record in one
-/// transaction. The number of records written (duplicates included).
-pub fn observe(ledger_path: &Path, payload: &str) -> Result<usize, ObserveError> {
-    let batch = wire::parse_batch(payload).map_err(ObserveError::Payload)?;
+/// transaction. The number of records written (duplicates included). With
+/// capture off, classification records are dropped: no file and no row.
+pub fn observe(
+    ledger_path: &Path,
+    payload: &str,
+    policy: &capture::CapturePolicy,
+) -> Result<usize, ObserveError> {
+    let mut batch = wire::parse_batch(payload).map_err(ObserveError::Payload)?;
+    match policy {
+        capture::CapturePolicy::Off => {
+            batch
+                .records
+                .retain(|record| !matches!(record, crate::ledger::RouterRecord::Classification(_)));
+            batch.inputs.clear();
+        }
+        capture::CapturePolicy::On { dir, now } => {
+            // The text first: a row without it is of no use to training,
+            // and a retry after a failed ledger write repeats a line,
+            // which the export drops by call id.
+            capture::write_inputs(dir, *now, &batch.inputs).map_err(ObserveError::Capture)?;
+        }
+    }
     let ledger = Ledger::open(ledger_path).map_err(ObserveError::Ledger)?;
     ledger
         .record_router_batch(&batch.session, &batch.records)
@@ -346,7 +446,14 @@ pub fn report_section(
         return Ok(None);
     }
     let pricing = pricing.clone().with_built_in_defaults();
-    Ok(Some(report::session_routing(&window, &pricing)))
+    let exploration = report::exploration(
+        &ledger.router_exploration_tasks()?,
+        ledger.router_exploration_stops()?.pop(),
+        chrono::Utc::now(),
+    );
+    let mut section = report::session_routing(&window, &pricing, exploration);
+    section.classifier.captured = ledger.router_classification_counts()?.1;
+    Ok(Some(section))
 }
 
 #[cfg(test)]

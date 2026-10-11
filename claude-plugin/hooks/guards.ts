@@ -74,3 +74,31 @@ export function machineSettingsGuard(
   const file = String(input.file_path ?? '')
   return file !== '' && (file === path || named(file)) ? MACHINE_SETTINGS_MESSAGE : undefined
 }
+
+export const LEARNING_ENVELOPE_MESSAGE =
+  "Automatic promotion of learned routing is the person's to turn on or off: the person turns it on or off with /relais-learning (or `relais install --claude`). The model does not run learning-envelope or write the [learning] block of the machine settings."
+
+const LEARNING_BLOCK = /\[learning\]|\bauto_promote\b/
+
+// Why the model's call may not record or remove the learning envelope, or
+// undefined: `relais native learning-envelope` in Bash, and a write of the
+// `[learning]` block into machine.toml. A reminder, as the routing one is.
+export function learningEnvelopeGuard(
+  tool: string,
+  input: Record<string, unknown>,
+  env: { home?: string; configDir?: string },
+): string | undefined {
+  const path = machineSettingsPath(env)
+  const isMachine = (text: string) =>
+    (path !== undefined && text.includes(path)) || text.includes('.config/relais/machine.toml') || /(^|\/)machine\.toml\b/.test(text)
+  if (tool === 'Bash') {
+    const command = String(input.command ?? '')
+    if (/\blearning-envelope\b/.test(command)) return LEARNING_ENVELOPE_MESSAGE
+    return isMachine(command) && LEARNING_BLOCK.test(command) ? LEARNING_ENVELOPE_MESSAGE : undefined
+  }
+  const file = String(input.file_path ?? '')
+  if (file === '' || !isMachine(file)) return undefined
+  const edits = Array.isArray(input.edits) ? input.edits.map((x: any) => x?.new_string) : []
+  const written = [input.content, input.new_string, input.new_source, ...edits].map(x => String(x ?? '')).join('\n')
+  return LEARNING_BLOCK.test(written) ? LEARNING_ENVELOPE_MESSAGE : undefined
+}

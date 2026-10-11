@@ -37,7 +37,8 @@ export const ROUTER_STATE = {
   priors: { task_tokens_by_difficulty: [20000, 60000, 150000, 400000, 800000], task_tokens: {} },
   pins: { 'pinned-agent': 'opus' },
   excluded_models: [],
-  checks: [['cargo', 'test'], ['npm', 'test']],
+  checks: [['cargo', 'test'], ['npm', 'test'], ['go', 'test'], ['go', 'vet'], ['golangci-lint', 'run']],
+  check_kinds: ['test', 'test', 'test', 'lint', 'lint'],
   adjustments: [],
 }
 

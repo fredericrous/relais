@@ -4936,6 +4936,7 @@ mod tests {
                 efforts: Default::default(),
                 sandbox: Default::default(),
                 session_routing: Default::default(),
+                learning: Default::default(),
             }
         }
 
@@ -6807,6 +6808,100 @@ mod tests {
             panic!("expected needs_review, got {outcome:?}");
         };
         assert!(detail.contains("criterion"), "{detail}");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// The label rule for salvages (SPEC §17) trusts that `review_findings`
+    /// means the runner's checks had already passed. The runner's own
+    /// transition code writes it: here the review runs only because the
+    /// candidate passed its check (the worker removed the file the check
+    /// wants gone), and the reviewer's findings are what park the run.
+    #[test]
+    fn review_findings_are_recorded_only_after_a_passing_verification() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let reviews = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&reviews);
+        let backend = MockBackend::new(move |spec| {
+            if spec.prompt.contains("semantic reviewer") {
+                // The check passed iff the worker's change is in place.
+                assert!(
+                    !spec.work_dir.join("src/main.rs").exists(),
+                    "the reviewer ran on a candidate that does not pass the check"
+                );
+                seen.fetch_add(1, Ordering::SeqCst);
+                return MockOutcome {
+                    result_text: Some("FINDINGS:\n- src/main.rs: stale config\n".into()),
+                    exit_code: Some(0),
+                    ..Default::default()
+                };
+            }
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("remove");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &backend);
+        assert!(
+            matches!(outcome.terminal, Terminal::NeedsReview { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(reviews.load(Ordering::SeqCst), 1);
+        let transitions = fixture.ledger.transitions(&outcome.run_id).expect("rows");
+        assert!(
+            transitions
+                .iter()
+                .any(|t| t.to_state == State::NeedsReview
+                    && t.reason == Reason::ReviewFindings.as_str()),
+            "{transitions:?}"
+        );
+        let kinds: Vec<EvidenceKind> = fixture
+            .ledger
+            .evidence(&outcome.run_id)
+            .expect("evidence")
+            .iter()
+            .map(|row| row.kind)
+            .collect();
+        assert!(kinds.contains(&EvidenceKind::CheckLog), "{kinds:?}");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// The converse: a candidate that fails verification never reaches the
+    /// reviewer, so a run is never parked for `review_findings` without a
+    /// passing verification — whatever the reviewer would have said.
+    #[test]
+    fn a_failing_verification_never_records_review_findings() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let reviews = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&reviews);
+        let backend = MockBackend::new(move |spec| {
+            if spec.prompt.contains("semantic reviewer") {
+                seen.fetch_add(1, Ordering::SeqCst);
+                return MockOutcome {
+                    result_text: Some("FINDINGS:\n- everything\n".into()),
+                    exit_code: Some(0),
+                    ..Default::default()
+                };
+            }
+            // Never removes src/main.rs: the check keeps failing.
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &backend);
+        assert_eq!(reviews.load(Ordering::SeqCst), 0, "{outcome:?}");
+        let transitions = fixture.ledger.transitions(&outcome.run_id).expect("rows");
+        assert!(
+            transitions
+                .iter()
+                .all(|t| t.reason != Reason::ReviewFindings.as_str()),
+            "{transitions:?}"
+        );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 

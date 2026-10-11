@@ -645,6 +645,11 @@ pub enum PolicyError {
         field: &'static str,
         detail: String,
     },
+    /// A `[learning]` value that names nobody.
+    InvalidLearning {
+        field: &'static str,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for PolicyError {
@@ -668,6 +673,9 @@ impl std::fmt::Display for PolicyError {
             Self::InvalidRecipe(err) => write!(f, "{err}"),
             Self::InvalidSessionRouting { field, detail } => {
                 write!(f, "[session_routing] {field}: {detail}")
+            }
+            Self::InvalidLearning { field, detail } => {
+                write!(f, "[learning] {field}: {detail}")
             }
         }
     }
@@ -733,6 +741,63 @@ pub struct MachineSettings {
     /// unchanged; with no `envelope` the router only observes (`shadow`).
     #[serde(default)]
     pub session_routing: SessionRoutingSettings,
+    /// `[learning]`: whether the learning cycle may promote a task
+    /// artifact that passed every gate (SPEC §17, relais ADR-0003).
+    /// Machine-owned: a repository can neither grant nor widen it. With no
+    /// `auto_promote` the cycle stops at `awaiting_promotion`.
+    #[serde(default)]
+    pub learning: LearningSettings,
+}
+
+/// `[learning]` in machine.toml. Only `auto_promote` is authority, and
+/// only the plugin installer and `relais native learning-envelope` write
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LearningSettings {
+    /// What the person granted once: a gate-passing task artifact is
+    /// promoted by the cycle itself, and rolled back by it on evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_promote: Option<AutoPromote>,
+    /// The person turned automatic promotion off: a tombstone that keeps
+    /// the installer from recording it again. Recording the grant
+    /// removes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub off: Option<AutoPromoteOff>,
+}
+
+impl LearningSettings {
+    fn validate(&self) -> Result<(), PolicyError> {
+        if let Some(grant) = &self.auto_promote {
+            if grant.by.trim().is_empty() {
+                return Err(PolicyError::InvalidLearning {
+                    field: "auto_promote.by",
+                    detail: "names nobody".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `[learning] auto_promote = { granted_at, by, source }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoPromote {
+    pub granted_at: String,
+    pub by: String,
+    /// `install`, `plugin-ask`, or `cli (unattributed)`.
+    pub source: String,
+}
+
+/// `[learning] off = { at, by, source }`: automatic promotion was turned
+/// off and stays off until a grant is recorded again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoPromoteOff {
+    pub at: String,
+    pub by: String,
+    pub source: String,
 }
 
 /// `[session_routing]` in machine.toml (SPEC §30). Only `envelope` is
@@ -766,6 +831,9 @@ pub struct SessionRoutingSettings {
     pub excluded_models: Vec<String>,
     /// The success floor a learned adjustment must clear (R2).
     pub quality_floor: f64,
+    /// Keep each classifier call's input text, locally, to train a model
+    /// on (ADR-0002): `false` captures nothing, no file and no ledger row.
+    pub keep_classifier_inputs: bool,
 }
 
 impl Default for SessionRoutingSettings {
@@ -779,6 +847,7 @@ impl Default for SessionRoutingSettings {
             pinned_agents: Vec::new(),
             excluded_models: Vec::new(),
             quality_floor: 0.85,
+            keep_classifier_inputs: true,
         }
     }
 }
@@ -1369,6 +1438,7 @@ impl MachineSettings {
             grant.validate(key)?;
         }
         self.session_routing.validate()?;
+        self.learning.validate()?;
         Ok(())
     }
 }
@@ -1957,6 +2027,13 @@ keys = ["output.contract"]
         );
     }
 
+    #[test]
+    fn keeping_classifier_inputs_is_on_unless_the_person_turns_it_off() {
+        let off = "schema_version = 1\n\n[session_routing]\nkeep_classifier_inputs = false\n";
+        let machine = MachineSettings::from_toml_str(off).expect("parses");
+        assert!(!machine.session_routing.keep_classifier_inputs);
+    }
+
     /// A machine.toml from before `[session_routing]` (the shape every
     /// installed relais wrote) parses, and means shadow: no envelope.
     #[test]
@@ -1969,6 +2046,7 @@ keys = ["output.contract"]
         assert_eq!(routing.holdout_rate, 0.1);
         assert_eq!(routing.epsilon, 0.1);
         assert_eq!(routing.quality_floor, 0.85);
+        assert!(routing.keep_classifier_inputs);
         assert_eq!(routing.effective_epsilon(), 0.0);
         assert_eq!(routing.full_model_id("haiku"), "claude-haiku-5-5");
         assert_eq!(routing.full_model_id("sonnet"), "claude-sonnet-5-5");

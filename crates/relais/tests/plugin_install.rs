@@ -466,7 +466,13 @@ fn an_install_never_replaces_an_envelope_the_person_recorded() {
     std::fs::write(&machine, mine).unwrap();
     let out = world.relais(&["install", "--claude", "--write"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
-    assert_eq!(std::fs::read_to_string(&machine).unwrap(), mine);
+    // The person's bytes are kept as they were; the only addition is the
+    // learning envelope an install records when none exists.
+    let after = std::fs::read_to_string(&machine).unwrap();
+    assert!(after.starts_with(mine), "{after}");
+    let added = &after[mine.len()..];
+    assert!(added.contains("[learning]"), "{after}");
+    assert!(!added.contains("session_routing"), "{after}");
 }
 
 /// Off sticks: once the person turned routing off, a later install does
