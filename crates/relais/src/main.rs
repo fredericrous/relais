@@ -603,6 +603,18 @@ enum NativeCommand {
         #[arg(long)]
         dispatch: String,
     },
+    /// Cancel one run, from the session that started it. A run with no
+    /// live driver is marked cancelled at once, from any session; a run
+    /// with a live driver of another session is refused (11)
+    Cancel {
+        /// The run
+        #[arg(long)]
+        run: String,
+        /// The Claude Code session id asking; required, so a session never
+        /// cancels another's live run
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Print a run's timeline as one JSON object: phases, decisions, cost,
     /// outcome and the last 40 lines of check output
     Status {
@@ -3168,7 +3180,7 @@ fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome, CliError> 
                         dispatches.join(", ")
                     );
                     if let (Some(run_id), true) = (cancelled_run, dispatches.is_empty()) {
-                        interrupt_unbound_run(&run_id)?;
+                        return finish_workerless_cancel(&run_id);
                     }
                     Ok(CliOutcome::Accepted)
                 }
@@ -3202,33 +3214,188 @@ fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome, CliError> 
     }
 }
 
-/// `coordinator cancel --run` that signalled no worker: the run is
-/// interrupted only when it is also orphaned by the silence rule (the same
-/// judgement as `resume`); otherwise its driver may still be working, and
-/// nothing changes.
-fn interrupt_unbound_run(run_id: &str) -> Result<(), CliError> {
+/// `coordinator cancel --run` that signalled no worker: the same path as
+/// `native cancel`, with the operator's authority (no session to match).
+fn finish_workerless_cancel(run_id: &str) -> Result<CliOutcome, CliError> {
     let ledger = open_ledger()?;
     let run = RunId::from_stored(run_id);
-    let Some(state) = operational(ledger.run_status(&run), "coordinator cancel")? else {
-        return Ok(());
-    };
-    if state.is_terminal() {
-        return Ok(());
-    }
-    let Some(orphan) = orphan_of_run(&ledger, &run)? else {
-        println!(
-            "{run_id}: has no bound worker process and is left to its driver; \
-             `relais resume --retire {run_id}` interrupts it once the driver is gone"
-        );
-        return Ok(());
-    };
-    match interrupt_orphan(&ledger, &run, state, &orphan)? {
-        OrphanOutcome::Ended(_) => {}
-        OrphanOutcome::KeptAlive(why) => {
-            println!("{run_id}: left as it is, {why}");
+    match cancel_standing(&ledger, &run)? {
+        CancelStanding::Unknown => {
+            eprintln!("relais coordinator cancel: run {run_id} is not on record");
+            Ok(CliOutcome::UnknownRun)
+        }
+        CancelStanding::Settled(line) => {
+            println!("{line}");
+            Ok(CliOutcome::Accepted)
+        }
+        CancelStanding::Live { .. } => {
+            println!("{}", await_cancel(&ledger, &run)?);
+            Ok(CliOutcome::Accepted)
         }
     }
-    Ok(())
+}
+
+/// Where a run stands when a cancel arrives.
+enum CancelStanding {
+    /// The ledger has no such run.
+    Unknown,
+    /// Nothing is left to cancel: the line to print (already ended, or
+    /// reaped by this call because its driver is gone).
+    Settled(String),
+    /// A live driver; `session` is the session that started the run.
+    Live { session: Option<String> },
+}
+
+/// How long `native cancel` waits for a live driver to end its run.
+const CANCEL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Judge a run for cancelling: an ended run is reported as it is, one whose
+/// driver is gone or silent is reaped as cancelled (any session may clear
+/// it), and any other is live.
+fn cancel_standing(ledger: &Ledger, run: &RunId) -> Result<CancelStanding, CliError> {
+    let Some(state) = operational(ledger.run_status(run), "native cancel")? else {
+        return Ok(CancelStanding::Unknown);
+    };
+    if state.is_terminal() {
+        return Ok(CancelStanding::Settled(format!(
+            "run {run} already ended: {state}"
+        )));
+    }
+    match reap_if_driverless(ledger, run, state)? {
+        Some(line) => Ok(CancelStanding::Settled(line)),
+        None => Ok(CancelStanding::Live {
+            session: operational(ledger.run_root_session(run), "native cancel")?,
+        }),
+    }
+}
+
+/// Reap a non-terminal run as cancelled when its driver is Gone or Silent.
+/// `None` when the driver may be alive, or a dispatch of the run is.
+fn reap_if_driverless(
+    ledger: &Ledger,
+    run: &RunId,
+    state: State,
+) -> Result<Option<String>, CliError> {
+    let runs_dir = paths::runs_dir().map_err(CliError::Home)?;
+    let silent = operational(
+        relais::reap::run_silence(ledger, &runs_dir, run),
+        "native cancel",
+    )?;
+    let verdict = operational(
+        relais::reap::orphan_verdict_of_run(ledger, run, silent),
+        "native cancel",
+    )?;
+    if verdict == resume::OrphanVerdict::Alive {
+        return Ok(None);
+    }
+    let events_dir = runs_dir.join(run.as_str());
+    let reaped = relais::reap::reap(
+        ledger,
+        &relais::reap::Reap {
+            run,
+            from: state,
+            ending: relais::reap::Ending::Cancelled,
+            detail: relais::reap::orphan_detail(ledger, run, verdict, silent),
+            extra: serde_json::json!({ "verdict": format!("{verdict:?}") }),
+            events_dir: &events_dir,
+        },
+        &|pid| relais::coordinator::process_alive(pid.get()),
+    );
+    match reaped {
+        Ok(relais::reap::Reaped::Moved(_)) => {}
+        // The ledger holds the reap; only the events file missed it.
+        Err(e @ relais::reap::ReapError::EventsNotWritten { .. }) => {
+            eprintln!("relais native cancel: {e}");
+        }
+        Ok(relais::reap::Reaped::AlreadyMoved) => {
+            let now = operational(ledger.run_status(run), "native cancel")?.unwrap_or(state);
+            return Ok(Some(format!("run {run} already ended: {now}")));
+        }
+        Ok(relais::reap::Reaped::KeptAlive(_)) => return Ok(None),
+        Err(e) => {
+            return Err(CliError::Operational {
+                operation: "native cancel",
+                cause: Box::new(e),
+            })
+        }
+    }
+    Ok(Some(format!(
+        "run {run} had no live driver; marked cancelled"
+    )))
+}
+
+/// After a cancel was asked of the coordinator: wait for the driver to end
+/// the run, reaping it as cancelled if the driver dies meanwhile. The line
+/// to print.
+fn await_cancel(ledger: &Ledger, run: &RunId) -> Result<String, CliError> {
+    let until = std::time::Instant::now() + CANCEL_WAIT;
+    loop {
+        let state = operational(ledger.run_status(run), "native cancel")?;
+        match state {
+            Some(State::Cancelled) => return Ok(format!("run {run} cancelled")),
+            Some(ended) if ended.is_terminal() => {
+                return Ok(format!("run {run} already ended: {ended}"))
+            }
+            Some(open) => {
+                if let Some(line) = reap_if_driverless(ledger, run, open)? {
+                    return Ok(line);
+                }
+            }
+            None => return Ok(format!("run {run} is not on record")),
+        }
+        if std::time::Instant::now() >= until {
+            return Ok("cancel requested; the driver has not ended yet".to_string());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// `relais native cancel --run X --session S` (SPEC §23): end a run.
+fn native_cancel_command(run_id: &str, session: Option<&str>) -> Result<CliOutcome, CliError> {
+    let Some(session) = session else {
+        return Err(CliError::Usage {
+            detail: "native cancel: --session is required".into(),
+        });
+    };
+    let ledger = open_ledger()?;
+    let run = RunId::from_stored(run_id);
+    match cancel_standing(&ledger, &run)? {
+        CancelStanding::Unknown => {
+            eprintln!("relais native cancel: run {run_id} is not on record");
+            Ok(CliOutcome::UnknownRun)
+        }
+        CancelStanding::Settled(line) => {
+            println!("{line}");
+            Ok(CliOutcome::Accepted)
+        }
+        CancelStanding::Live { session: owner } if owner.as_deref() != Some(session) => {
+            println!(
+                "run {run_id} belongs to live session {}; cancel it from that session",
+                owner.as_deref().unwrap_or("(none recorded)")
+            );
+            Ok(CliOutcome::ResumeRefusedLive)
+        }
+        CancelStanding::Live { .. } => {
+            let socket = relais::coordinator::socket_path().map_err(CliError::Home)?;
+            let client = relais::coordinator::Client::new(socket);
+            match client.request(&relais::coordinator::Request::CancelRun {
+                run_id: run_id.to_string(),
+            }) {
+                Ok(relais::coordinator::Response::Cancelled { .. }) => {
+                    println!("{}", await_cancel(&ledger, &run)?);
+                    Ok(CliOutcome::Accepted)
+                }
+                Ok(other) => {
+                    eprintln!("relais native cancel: unexpected reply {other:?}");
+                    Ok(CliOutcome::OperationalFailure)
+                }
+                Err(e) => {
+                    eprintln!("relais native cancel: {e}");
+                    Ok(CliOutcome::Blocked)
+                }
+            }
+        }
+    }
 }
 
 /// Run this same `relais resume` again with its output appended to `log`
@@ -4051,6 +4218,7 @@ fn native_command(cmd: NativeCommand) -> Result<CliOutcome, CliError> {
         NativeCommand::Status { run, session } => {
             native_status_command(run.as_deref(), session.as_deref())
         }
+        NativeCommand::Cancel { run, session } => native_cancel_command(&run, session.as_deref()),
         NativeCommand::Contract => native_contract_command(),
         NativeCommand::RouterState { session } => Ok(router_state_command(&session)),
         NativeCommand::RouterObserve => Ok(router_observe_command()),

@@ -2276,6 +2276,15 @@ impl Gate for RemoteGate {
         }
     }
 
+    fn run_cancelled(&self, run_id: &str) -> Result<bool, GateError> {
+        match self.call("run_cancelled", Request::Status)? {
+            Response::Status { snapshot } => {
+                Ok(snapshot.runs.get(run_id).is_some_and(|run| run.cancelled))
+            }
+            other => Err(Self::unexpected("run_cancelled", &other)),
+        }
+    }
+
     fn enforcement(&self) -> Enforcement {
         Enforcement::Coordinator
     }

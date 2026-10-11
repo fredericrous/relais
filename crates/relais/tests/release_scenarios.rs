@@ -3245,8 +3245,9 @@ fn coordinator_cancel_and_stop_leave_state_consistent() {
     let task = world.write_task("task.json", "off");
     let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
     assert_eq!(run.status.code(), Some(0), "{}", text(&run.stderr));
+    // A run that is not on record is the CLI's unknown-run status (10).
     let cancel = world.relais(&["coordinator", "cancel", "--run", "not-a-run"]);
-    assert_eq!(cancel.status.code(), Some(0), "{}", text(&cancel.stderr));
+    assert_eq!(cancel.status.code(), Some(10), "{}", text(&cancel.stderr));
     let stop = world.relais(&["coordinator", "stop"]);
     assert_eq!(stop.status.code(), Some(0));
     // The daemon unlinks its endpoint as it exits: wait for that rather
@@ -3701,9 +3702,9 @@ fn a_live_runs_verification_checkout_is_kept_and_an_orphans_is_removed() {
     assert!(!checkout.exists());
 }
 
-// SPEC §23: cancelling a run no worker process is bound to interrupts it.
+// SPEC §23: cancelling a run whose driver is gone ends it cancelled.
 #[test]
-fn cancel_of_a_run_with_no_bound_worker_interrupts_it() {
+fn cancel_of_a_run_with_no_bound_worker_cancels_it() {
     let world = World::new("cancelunbound");
     let hash = world.write_policy(1);
     world.write_machine(&hash, "");
@@ -3712,6 +3713,7 @@ fn cancel_of_a_run_with_no_bound_worker_interrupts_it() {
     assert_eq!(run.status.code(), Some(5), "{}", text(&run.stderr));
     let run_id = world.only_run_id();
     make_non_terminal(&world, &run_id, std::time::Duration::from_secs(3 * 3600));
+    driver_took_the_run_ago(&world, &run_id, std::time::Duration::from_secs(3 * 3600));
     let cancel = world.relais(&["coordinator", "cancel", "--run", &run_id]);
     let out = text(&cancel.stdout);
     assert_eq!(
@@ -3720,16 +3722,32 @@ fn cancel_of_a_run_with_no_bound_worker_interrupts_it() {
         "{out}\n{}",
         text(&cancel.stderr)
     );
-    assert!(out.contains("-> interrupted"), "{out}");
+    assert!(
+        out.contains("had no live driver; marked cancelled"),
+        "{out}"
+    );
     let ledger =
         relais::ledger::Ledger::open(&world.state.join("ledger.sqlite")).expect("open ledger");
     assert_eq!(
         ledger
             .run_status(&relais::ids::RunId::from_stored(&run_id))
             .expect("status"),
-        Some(relais::lifecycle::State::Interrupted)
+        Some(relais::lifecycle::State::Cancelled)
     );
     world.stop_coordinator();
+}
+
+/// The run's driver took it `ago`: past the 60 s grace, its dead pid (the
+/// `relais run` of the fixture has exited) makes the verdict Gone.
+fn driver_took_the_run_ago(world: &World, run_id: &str, ago: std::time::Duration) {
+    let since = (chrono::Utc::now() - chrono::Duration::from_std(ago).expect("age")).to_rfc3339();
+    rusqlite::Connection::open(world.state.join("ledger.sqlite"))
+        .expect("open")
+        .execute(
+            "UPDATE runs SET driver_since = ?1 WHERE id = ?2",
+            rusqlite::params![since, run_id],
+        )
+        .expect("age the driver");
 }
 
 fn run_state(world: &World, run_id: &str) -> Option<relais::lifecycle::State> {
@@ -3892,7 +3910,8 @@ fn the_orphan_threshold_comes_from_the_runs_own_repository() {
     assert!(!leftover.exists(), "{out}");
 }
 
-// SPEC §23: cancelling a run whose driver may be working changes nothing.
+// SPEC §23: cancelling a run whose driver took it within the grace
+// changes nothing: the cancel is requested and the run left to its driver.
 #[test]
 fn cancel_of_a_run_with_no_bound_worker_and_a_recent_event_is_left_alone() {
     let (world, run_id) = orphan_world("cancelrecent");
@@ -3900,9 +3919,8 @@ fn cancel_of_a_run_with_no_bound_worker_and_a_recent_event_is_left_alone() {
     let cancel = world.relais(&["coordinator", "cancel", "--run", &run_id]);
     let out = text(&cancel.stdout);
     assert_eq!(cancel.status.code(), Some(0), "{out}");
-    assert!(out.contains("no bound worker process"), "{out}");
     assert!(
-        out.contains(&format!("relais resume --retire {run_id}")),
+        out.contains("cancel requested; the driver has not ended yet"),
         "{out}"
     );
     assert_eq!(

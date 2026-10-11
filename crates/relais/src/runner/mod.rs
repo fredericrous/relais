@@ -397,6 +397,9 @@ pub(crate) struct RunEngine<'a> {
     /// The reviewer's constraint statements that did not fit its prompt:
     /// known only once the review prompt is built, shown in the receipt.
     reviewer_gap: Option<GuidanceGap>,
+    /// Set once the coordinator reports this run cancelled while no
+    /// dispatch heartbeat was running (a check, or between phases).
+    cancel_asked: Arc<AtomicBool>,
     /// Everything this run does, as events (SPEC §29).
     pub(crate) events: Events,
 }
@@ -689,6 +692,7 @@ impl<'a> RunEngine<'a> {
             harness: None,
             own_write_leases: std::collections::BTreeSet::new(),
             reviewer_gap: None,
+            cancel_asked: Arc::new(AtomicBool::new(false)),
             events,
         })
     }
@@ -724,6 +728,64 @@ impl<'a> RunEngine<'a> {
             detail,
         });
         Ok(())
+    }
+
+    /// Run `work` while a watcher asks the coordinator, every
+    /// `heartbeat_every`, whether this run is cancelled: a cancel reaches
+    /// a dispatch on its heartbeat, but a verification check has none. The
+    /// flag handed to `work` turns true on a cancel and stays true.
+    fn while_watching_cancel<T>(&self, work: impl FnOnce(Option<&AtomicBool>) -> T) -> T {
+        let Some(gate) = self.config.gate else {
+            return work(None);
+        };
+        let done = AtomicBool::new(false);
+        let every = self.config.heartbeat_every;
+        let (run_id, asked) = (self.run_id.as_str(), &*self.cancel_asked);
+        std::thread::scope(|scope| {
+            let done = &done;
+            scope.spawn(move || {
+                let mut last: Option<Instant> = None;
+                while !done.load(Ordering::SeqCst) {
+                    if last.is_none_or(|last| last.elapsed() >= every) {
+                        last = Some(Instant::now());
+                        if gate.run_cancelled(run_id).unwrap_or(false) {
+                            asked.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            });
+            let result = work(Some(asked));
+            done.store(true, Ordering::SeqCst);
+            result
+        })
+    }
+
+    /// Whether the coordinator has cancelled this run: the watcher saw it,
+    /// or the gate says so now.
+    fn cancel_requested(&self) -> bool {
+        self.cancel_asked.load(Ordering::SeqCst)
+            || self
+                .config
+                .gate
+                .is_some_and(|gate| gate.run_cancelled(self.run_id.as_str()).unwrap_or(false))
+    }
+
+    /// Between phases: a run cancelled at the coordinator ends cancelled
+    /// here, through the same transition as any other end.
+    fn end_if_cancelled(&mut self) -> Result<Option<RunOutcome>, RunError> {
+        if !self.cancel_requested() {
+            return Ok(None);
+        }
+        self.cancel_asked.store(true, Ordering::SeqCst);
+        let detail =
+            "the run was cancelled through the coordinator; its evidence is kept".to_string();
+        Ok(Some(self.finish(
+            Reason::CancelledByUser,
+            serde_json::json!({ "detail": detail }),
+            Terminal::Cancelled { detail },
+        )?))
     }
 
     /// Record a terminal transition and end the run with it.
@@ -1321,14 +1383,21 @@ impl<'a> RunEngine<'a> {
         // the checks it is told to pass. This is also the one place the
         // setup is proven when the baseline came from the cache: a
         // cached verdict skipped the base's copy, not the machine.
-        let setup = verify::run_setup(
-            &worktree_path,
-            &preflight.authority.verification_profile,
-            &baseline.logs_dir,
-            "task",
-            &self.events,
-        )?;
+        let setup = self.while_watching_cancel(|cancel| {
+            verify::run_setup(
+                &worktree_path,
+                &preflight.authority.verification_profile,
+                &baseline.logs_dir,
+                "task",
+                &self.events,
+                cancel,
+            )
+        })?;
         self.record_logs(None, EvidenceKind::SetupLog, &setup)?;
+        if let Some(outcome) = self.end_if_cancelled()? {
+            self.retire_worktree(&worktree, &outcome)?;
+            return Ok(outcome);
+        }
         let outcome = match verify::setup_failure(&setup) {
             // The worktree exists and no worker has touched it; whatever
             // the setup left there — an installed `node_modules` the
@@ -1750,14 +1819,23 @@ impl<'a> RunEngine<'a> {
                     // setup that did not succeed leaves nothing for the
                     // commands to run against — blocked, before any
                     // worker is bought (SPEC §10).
-                    let setup = verify::run_setup(
-                        baseline.path(),
-                        &authority.verification_profile,
-                        &logs_dir,
-                        "base",
-                        &self.events,
-                    )?;
+                    let setup = self.while_watching_cancel(|cancel| {
+                        verify::run_setup(
+                            baseline.path(),
+                            &authority.verification_profile,
+                            &logs_dir,
+                            "base",
+                            &self.events,
+                            cancel,
+                        )
+                    })?;
                     self.record_logs(None, EvidenceKind::SetupLog, &setup)?;
+                    if let Some(outcome) = self.end_if_cancelled()? {
+                        if let Err(e) = baseline.release() {
+                            eprintln!("relais: {e}");
+                        }
+                        return Ok(Phase::Ended(outcome));
+                    }
                     if let Some(failed) = verify::setup_failure(&setup) {
                         let detail = setup_failure_detail(failed, "the base revision");
                         if let Err(e) = baseline.release() {
@@ -1767,14 +1845,23 @@ impl<'a> RunEngine<'a> {
                             self.fail_preflight(BlockCode::VerificationSetupFailed, detail)?,
                         ));
                     }
-                    let checks = verify::run_profile(
-                        baseline.path(),
-                        &authority.verification_profile,
-                        &logs_dir,
-                        "base",
-                        &self.events,
-                    )?;
+                    let checks = self.while_watching_cancel(|cancel| {
+                        verify::run_profile(
+                            baseline.path(),
+                            &authority.verification_profile,
+                            &logs_dir,
+                            "base",
+                            &self.events,
+                            cancel,
+                        )
+                    })?;
                     self.record_logs(None, EvidenceKind::CheckLog, &checks)?;
+                    if let Some(outcome) = self.end_if_cancelled()? {
+                        if let Err(e) = baseline.release() {
+                            eprintln!("relais: {e}");
+                        }
+                        return Ok(Phase::Ended(outcome));
+                    }
                     // A check that gave no verdict at the base — the
                     // program was not found (exit 127), or the wall clock
                     // cut it off before it reported a status — leaves
@@ -1874,6 +1961,9 @@ impl<'a> RunEngine<'a> {
         };
 
         loop {
+            if let Some(outcome) = self.end_if_cancelled()? {
+                return Ok(outcome);
+            }
             if let Some(outcome) = self.ceiling_reached(&progress, ctx.deadline)? {
                 return Ok(outcome);
             }
@@ -2536,6 +2626,9 @@ impl<'a> RunEngine<'a> {
                 ));
             }
         };
+        if let Some(outcome) = self.end_if_cancelled()? {
+            return Ok(Step::Ended(outcome));
+        }
         // An inspection judges its report: a gap about the profile's own
         // checks is recorded, not a stop. The acceptance-evidence gaps
         // keep their handling below.
@@ -3521,14 +3614,18 @@ impl<'a> RunEngine<'a> {
             // proved the setup, so it is not spent again either.
             (Some(outcomes), _) => outcomes.to_vec(),
             (None, Some(holder)) => {
-                let setup = verify::run_setup(
-                    holder.path(),
-                    &authority.verification_profile,
-                    logs_dir,
-                    &label.log_prefix(),
-                    &self.events,
-                )
-                .map_err(|e| e.to_string())?;
+                let setup = self
+                    .while_watching_cancel(|cancel| {
+                        verify::run_setup(
+                            holder.path(),
+                            &authority.verification_profile,
+                            logs_dir,
+                            &label.log_prefix(),
+                            &self.events,
+                            cancel,
+                        )
+                    })
+                    .map_err(|e| e.to_string())?;
                 self.record_logs(None, EvidenceKind::SetupLog, &setup)
                     .map_err(|e| format!("the ledger refused a setup-log evidence row: {e}"))?;
                 match verify::setup_failure(&setup) {
@@ -3547,14 +3644,18 @@ impl<'a> RunEngine<'a> {
                         ));
                         Vec::new()
                     }
-                    None => verify::run_profile(
-                        holder.path(),
-                        &authority.verification_profile,
-                        logs_dir,
-                        &label.log_prefix(),
-                        &self.events,
-                    )
-                    .map_err(|e| e.to_string())?,
+                    None => self
+                        .while_watching_cancel(|cancel| {
+                            verify::run_profile(
+                                holder.path(),
+                                &authority.verification_profile,
+                                logs_dir,
+                                &label.log_prefix(),
+                                &self.events,
+                                cancel,
+                            )
+                        })
+                        .map_err(|e| e.to_string())?,
                 }
             }
             (None, None) => {
@@ -8565,6 +8666,73 @@ mod tests {
         );
     }
 
+    /// A cancel that arrives while a verification check runs: no dispatch
+    /// heartbeat is running then, so the runner asks the coordinator itself,
+    /// stops the check, and ends the run cancelled with one outcome event.
+    #[test]
+    fn a_run_cancelled_while_its_check_runs_stops_the_check_and_ends_cancelled() {
+        let fixture = Fixture::new();
+        let hanging = CommandSpec {
+            name: None,
+            junit: None,
+            argv: vec!["sh".into(), "-c".into(), "sleep 60".into()],
+            timeout_seconds: 120,
+        };
+        let repo = fixture.repo_policy(vec![hanging], 3);
+        let machine = fixture.machine_for(&repo);
+        let gate = Arc::new(crate::admission::LocalGate::new(
+            ConcurrencyLimits::default(),
+        ));
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = counting_worker(Arc::clone(&launches));
+        let canceller = Arc::clone(&gate);
+        let started = Instant::now();
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                // The run registers, then its base check starts and hangs.
+                while canceller.status().runs.is_empty() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                std::thread::sleep(Duration::from_millis(500));
+                for run_id in canceller.status().runs.keys() {
+                    canceller.cancel_run(run_id);
+                }
+            });
+            fixture.execute_managed(
+                &fixture.contract(Review::Off),
+                &repo,
+                &machine,
+                &backend,
+                gate.as_ref(),
+            )
+        });
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the check was stopped, not waited for: {:?}",
+            started.elapsed()
+        );
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Cancelled { .. },
+        } = outcome
+        else {
+            panic!("expected cancellation, got {outcome:?}");
+        };
+        assert_eq!(launches.load(Ordering::SeqCst), 0, "no worker was bought");
+        assert_eq!(
+            fixture.ledger.run_status(&run_id).expect("status"),
+            Some(State::Cancelled)
+        );
+        let events =
+            std::fs::read_to_string(fixture.artifacts.join(run_id.as_str()).join("events.jsonl"))
+                .expect("events.jsonl");
+        let outcomes = events
+            .lines()
+            .filter(|line| line.contains("\"kind\":\"outcome\""))
+            .count();
+        assert_eq!(outcomes, 1, "{events}");
+    }
+
     #[test]
     fn cancellation_through_the_gate_stops_the_worker_and_preserves_the_worktree() {
         let fixture = Fixture::new();
@@ -10934,6 +11102,9 @@ mod tests {
         }
         fn write_lease_holder(&self, worktree: &str) -> Result<Option<String>, GateError> {
             self.inner.write_lease_holder(worktree)
+        }
+        fn run_cancelled(&self, run_id: &str) -> Result<bool, GateError> {
+            self.inner.run_cancelled(run_id)
         }
         fn enforcement(&self) -> crate::admission::Enforcement {
             self.inner.enforcement()

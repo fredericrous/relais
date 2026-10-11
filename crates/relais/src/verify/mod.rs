@@ -826,12 +826,21 @@ pub fn run_command(
     label: &str,
     log_stem: &str,
 ) -> Result<CheckOutcome, VerifyError> {
-    run_observed(dir, spec, logs_dir, label, log_stem, &Events::silent())
+    run_observed(
+        dir,
+        spec,
+        logs_dir,
+        label,
+        log_stem,
+        &Events::silent(),
+        None,
+    )
 }
 
 /// [`run_command`], reporting the check to `events` as it runs: its start,
 /// its output as the log grows (bounded, see `follow`), and its end. With
-/// silent events no follower runs at all.
+/// silent events no follower runs at all. A `cancel` flag that turns true
+/// stops the check, which then ends [`Ended::Cancelled`].
 pub fn run_observed(
     dir: &Path,
     spec: &CommandSpec,
@@ -839,6 +848,7 @@ pub fn run_observed(
     label: &str,
     log_stem: &str,
     events: &Events,
+    cancel: Option<&AtomicBool>,
 ) -> Result<CheckOutcome, VerifyError> {
     let timeout = command_timeout(spec)?;
     std::fs::create_dir_all(logs_dir)?;
@@ -888,7 +898,7 @@ pub fn run_observed(
             // it ends: a `cargo test` grandchild left running in a
             // worktree that is about to be removed corrupts the next
             // thing that reads it (audit V1).
-            match wait_following(&mut child, timeout, &log_path, label, events) {
+            match wait_following(&mut child, timeout, &log_path, label, events, cancel) {
                 Ok(ended) => ended,
                 Err(e) => {
                     ended_with(None);
@@ -954,14 +964,15 @@ fn wait_following(
     log_path: &Path,
     label: &str,
     events: &Events,
+    cancel: Option<&AtomicBool>,
 ) -> Result<Ended, VerifyError> {
     if events.is_silent() {
-        return Ok(crate::procs::wait_for_exit(child, timeout, None)?.ended);
+        return Ok(crate::procs::wait_for_exit(child, timeout, cancel)?.ended);
     }
     let (ended_tx, ended_rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         scope.spawn(move || follow::follow(log_path, label, events, &ended_rx));
-        let waited = crate::procs::wait_for_exit(child, timeout, None);
+        let waited = crate::procs::wait_for_exit(child, timeout, cancel);
         // Dropping the sender wakes the follower for its final read.
         drop(ended_tx);
         Ok(waited?.ended)
@@ -1069,13 +1080,14 @@ pub fn run_profile(
     logs_dir: &Path,
     prefix: &str,
     events: &Events,
+    cancel: Option<&AtomicBool>,
 ) -> Result<Vec<CheckOutcome>, VerifyError> {
     let mut outcomes = Vec::new();
     for (index, command) in profile.commands.iter().enumerate() {
         let label = check_label(command);
         let log_stem = format!("{prefix}-cmd{index}");
         outcomes.push(run_observed(
-            dir, command, logs_dir, &label, &log_stem, events,
+            dir, command, logs_dir, &label, &log_stem, events, cancel,
         )?);
     }
     Ok(outcomes)
@@ -1102,12 +1114,13 @@ pub fn run_setup(
     logs_dir: &Path,
     prefix: &str,
     events: &Events,
+    cancel: Option<&AtomicBool>,
 ) -> Result<Vec<CheckOutcome>, VerifyError> {
     let mut outcomes = Vec::new();
     for (index, command) in profile.setup.iter().enumerate() {
         let label = setup_label(command);
         let log_stem = format!("{prefix}-setup{index}");
-        let outcome = run_observed(dir, command, logs_dir, &label, &log_stem, events)?;
+        let outcome = run_observed(dir, command, logs_dir, &label, &log_stem, events, cancel)?;
         let failed = outcome.failed();
         outcomes.push(outcome);
         if failed {
@@ -2411,9 +2424,10 @@ mod tests {
             inputs: Vec::new(),
             cache_baseline: false,
         };
-        let base = run_profile(&dir, &profile, &logs, "base", &Events::silent()).expect("base");
-        let candidate =
-            run_profile(&dir, &profile, &logs, "attempt1", &Events::silent()).expect("candidate");
+        let base =
+            run_profile(&dir, &profile, &logs, "base", &Events::silent(), None).expect("base");
+        let candidate = run_profile(&dir, &profile, &logs, "attempt1", &Events::silent(), None)
+            .expect("candidate");
         assert_eq!(base[0].label, check_label(&profile.commands[0]));
         assert!(base[0].label.starts_with("sh@"), "{}", base[0].label);
         assert_eq!(
@@ -2433,8 +2447,8 @@ mod tests {
             ],
             ..profile.clone()
         };
-        let again =
-            run_profile(&dir, &reordered, &logs, "attempt2", &Events::silent()).expect("reordered");
+        let again = run_profile(&dir, &reordered, &logs, "attempt2", &Events::silent(), None)
+            .expect("reordered");
         assert_eq!(again[1].label, base[0].label);
         assert_ne!(again[0].label, base[0].label);
         std::fs::remove_dir_all(&dir).ok();
@@ -2723,7 +2737,8 @@ mod tests {
             inputs: Vec::new(),
             cache_baseline: false,
         };
-        let setup = run_setup(&dir, &profile, &logs, "base", &Events::silent()).expect("setup");
+        let setup =
+            run_setup(&dir, &profile, &logs, "base", &Events::silent(), None).expect("setup");
         assert_eq!(setup.len(), 1);
         assert!(!setup[0].failed());
         assert!(
@@ -2742,7 +2757,8 @@ mod tests {
             "a setup label never equals the check label of the same argv"
         );
         assert!(setup_failure(&setup).is_none());
-        let checks = run_profile(&dir, &profile, &logs, "base", &Events::silent()).expect("checks");
+        let checks =
+            run_profile(&dir, &profile, &logs, "base", &Events::silent(), None).expect("checks");
         assert!(
             !checks[0].failed(),
             "the command sees what the setup installed"
@@ -2767,7 +2783,8 @@ mod tests {
             inputs: Vec::new(),
             cache_baseline: false,
         };
-        let setup = run_setup(&dir, &profile, &logs, "task", &Events::silent()).expect("setup ran");
+        let setup =
+            run_setup(&dir, &profile, &logs, "task", &Events::silent(), None).expect("setup ran");
         assert_eq!(setup.len(), 1, "the second command was not attempted");
         let failed = setup_failure(&setup).expect("the failure is reported");
         assert_eq!(failed.ended, Ended::Exited(1));
@@ -2971,7 +2988,16 @@ mod tests {
         let dir = temp_dir("observed");
         let events = Events::for_run("run-o", &dir.join("art"));
         let slow = command(&["sh", "-c", "echo one; sleep 0.4; echo two"], 10);
-        run_observed(&dir, &slow, &dir.join("logs"), "slow", "s-cmd0", &events).expect("runs");
+        run_observed(
+            &dir,
+            &slow,
+            &dir.join("logs"),
+            "slow",
+            "s-cmd0",
+            &events,
+            None,
+        )
+        .expect("runs");
         let written = written_events(&dir.join("art"));
         let kinds: Vec<&str> = written
             .iter()
@@ -3006,7 +3032,15 @@ mod tests {
         std::fs::write(&script, "#!/bin/sh\necho never\n").expect("script");
         let events = Events::for_run("run-x", &dir.join("art"));
         let spec = command(&[script.to_str().expect("utf-8")], 10);
-        let result = run_observed(&dir, &spec, &dir.join("logs"), "noexec", "x-cmd0", &events);
+        let result = run_observed(
+            &dir,
+            &spec,
+            &dir.join("logs"),
+            "noexec",
+            "x-cmd0",
+            &events,
+            None,
+        );
         assert!(
             result.is_err(),
             "a permission error is an error: {result:?}"
@@ -3027,7 +3061,16 @@ mod tests {
         let dir = temp_dir("missing");
         let events = Events::for_run("run-m", &dir.join("art"));
         let spec = command(&["relais-no-such-program-anywhere"], 10);
-        run_observed(&dir, &spec, &dir.join("logs"), "missing", "m-cmd0", &events).expect("runs");
+        run_observed(
+            &dir,
+            &spec,
+            &dir.join("logs"),
+            "missing",
+            "m-cmd0",
+            &events,
+            None,
+        )
+        .expect("runs");
         let written = written_events(&dir.join("art"));
         let kinds: Vec<&str> = written
             .iter()
@@ -3064,8 +3107,16 @@ mod tests {
             let events = Events::for_run("run-f", &dir.join(format!("art{round}")));
             let start = std::time::Instant::now();
             followed = Some(
-                run_observed(&dir, &flood, &dir.join("logs"), "flood", "seen", &events)
-                    .expect("runs"),
+                run_observed(
+                    &dir,
+                    &flood,
+                    &dir.join("logs"),
+                    "flood",
+                    "seen",
+                    &events,
+                    None,
+                )
+                .expect("runs"),
             );
             followed_took = followed_took.min(start.elapsed());
         }
