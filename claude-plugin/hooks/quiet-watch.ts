@@ -41,8 +41,9 @@ async function watch(fx: Fx, store: Store) {
       step = await stream.next()
     }
     code = typeof step.value?.code === 'number' ? step.value.code : null
-  } catch {
-    // A watcher that could not start is a watcher that exited.
+  } catch (error) {
+    // A watcher that could not start is a watcher that exited; why is kept.
+    memory.lastError = error instanceof Error ? error.message : String(error)
     code = null
   }
   if (store.closed) return
@@ -52,6 +53,9 @@ async function watch(fx: Fx, store: Store) {
     return
   }
   memory.watcher = 'down'
+  // Its live runs go with it: entries still live are announced again by the
+  // respawned watcher, and those that ended meanwhile would never end here.
+  memory.runs = new Map([...memory.runs].filter(([, run]) => run.failure !== undefined))
   markDirty(store)
   const since = (await fx.clock.now()) - (memory.lastSpawnAt ?? 0)
   after(fx, store, Math.max(0, RESPAWN_MS - since), () => detach(watch(fx, store)))

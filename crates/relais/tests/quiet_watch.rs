@@ -12,6 +12,8 @@ use serde_json::{json, Value};
 struct Watcher {
     child: Child,
     lines: Receiver<Value>,
+    /// The first line, read while waiting for the watcher to be ready.
+    first: std::cell::RefCell<Option<Value>>,
 }
 
 impl Drop for Watcher {
@@ -46,7 +48,18 @@ fn watch(active: &Path) -> Watcher {
             }
         }
     });
-    Watcher { child, lines }
+    // Ready once it has said anything (it beats at startup). macOS can hold
+    // the first exec of a freshly linked binary for many seconds on a loaded
+    // machine, and `cargo test` relinks it with other features than `cargo
+    // build`: the timed assertions start after this, not at spawn.
+    let first = lines
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the watcher said nothing within 60 s");
+    Watcher {
+        child,
+        lines,
+        first: std::cell::RefCell::new(Some(first)),
+    }
 }
 
 impl Watcher {
@@ -54,6 +67,12 @@ impl Watcher {
     fn next(&self, wait: Duration) -> Option<Value> {
         let end = Instant::now() + wait;
         loop {
+            if let Some(v) = self.first.borrow_mut().take() {
+                if v["event"] == "heartbeat" {
+                    continue;
+                }
+                return Some(v);
+            }
             let left = end.saturating_duration_since(Instant::now());
             match self.lines.recv_timeout(left) {
                 Ok(v) if v["event"] == "heartbeat" => continue,
@@ -190,6 +209,10 @@ fn a_dead_pid_without_ended_is_never_started() {
 fn a_heartbeat_arrives_within_six_seconds() {
     let dir = scratch("beat");
     let w = watch(&dir.join("active"));
+    // With no entries, the first line is the startup beat; the next one
+    // comes within the 5 s interval.
+    let first = w.first.borrow_mut().take().unwrap();
+    assert_eq!(first, json!({"relais": "quiet", "event": "heartbeat"}));
     let v = w.lines.recv_timeout(Duration::from_secs(6)).unwrap();
     assert_eq!(v, json!({"relais": "quiet", "event": "heartbeat"}));
     let _ = fs::remove_dir_all(&dir);

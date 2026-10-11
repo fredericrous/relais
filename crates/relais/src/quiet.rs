@@ -326,8 +326,34 @@ fn finish_ended(id: &str, path: &Path, e: &Entry, ended: u64, runs: &mut Runs) -
             events.push(ended_event(id, e.exit, ended));
         }
     }
-    let _ = fs::remove_file(path);
+    if let Err(err) = fs::remove_file(path) {
+        if err.kind() != io::ErrorKind::NotFound {
+            // Keep the run, closed, so the next poll does not announce the
+            // same entry again every 250 ms; say why once.
+            if !runs.contains_key(id) {
+                eprintln!(
+                    "relais quiet watch: cannot remove {}: {err}",
+                    path.display()
+                );
+            }
+            let mut closed = Run::new(&e.log);
+            closed.closed = true;
+            runs.insert(id.to_string(), closed);
+        }
+    }
     events
+}
+
+/// Whether a run whose pid is alive is still this run: the pid may have been
+/// reused by another process after the run died without writing `ended`. Its
+/// log must still exist, and it or the run must be younger than
+/// [`STALE_MS`] — a long, silent build is not cut short, but a reused pid
+/// cannot keep a dead run on screen forever.
+fn plausibly_live(e: &Entry, now_ms: u64) -> bool {
+    let Some(log_age) = age_ms(&e.log, now_ms) else {
+        return false;
+    };
+    log_age < STALE_MS || now_ms.saturating_sub(e.started) < STALE_MS
 }
 
 /// A run seen live that stopped without writing `ended`: it ends with a
@@ -348,7 +374,7 @@ pub fn poll(dir: &Path, runs: &mut Runs, now_ms: u64) -> Vec<Value> {
         let Some(e) = read_entry(path) else { continue };
         if let Some(ended) = e.ended {
             events.extend(finish_ended(id, path, &e, ended, runs));
-        } else if procs::alive(e.pid) {
+        } else if procs::alive(e.pid) && plausibly_live(&e, now_ms) {
             let run = runs.entry(id.clone()).or_insert_with(|| {
                 events.push(started_event(id, &e));
                 Run::new(&e.log)
@@ -467,5 +493,56 @@ mod tests {
         let next = window(50, Some(20));
         assert_eq!((next.from, next.jumped, next.reset), (20, false, false));
         assert!(window(5, Some(20)).reset);
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("relais-quiet-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn entry_json(log: &Path, pid: u32, started: u64, extra: &str) -> String {
+        format!(
+            r#"{{"v":1,"tool":"amont","session":"s","check":"c","repo":"/r","log":{},"pid":{pid},"started":{started}{extra}}}"#,
+            serde_json::to_string(&log.to_string_lossy()).unwrap()
+        )
+    }
+
+    #[test]
+    fn a_live_pid_whose_log_is_gone_is_not_this_run() {
+        let dir = scratch_dir("reuse");
+        let log = dir.join("gone.log.tmp");
+        let now = super::now_ms();
+        fs::write(
+            dir.join("1-0.json"),
+            entry_json(&log, std::process::id(), now, ""),
+        )
+        .unwrap();
+        let mut runs = Runs::new();
+        let events = poll(&dir, &mut runs, now);
+        assert!(events.iter().all(|e| e["event"] != "started"), "{events:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_ended_entry_that_cannot_be_removed_is_announced_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("stuck");
+        let log = dir.join("x.log");
+        fs::write(&log, "line\n").unwrap();
+        let now = super::now_ms();
+        fs::write(
+            dir.join("1-0.json"),
+            entry_json(&log, 0x7fff_fff0, now, r#","exit":1,"ended":1"#),
+        )
+        .unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let mut runs = Runs::new();
+        let first = poll(&dir, &mut runs, now);
+        let second = poll(&dir, &mut runs, now + 250);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(first.iter().any(|e| e["event"] == "ended"), "{first:?}");
+        assert!(second.is_empty(), "announced again: {second:?}");
     }
 }

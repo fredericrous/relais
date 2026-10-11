@@ -38,6 +38,8 @@ export type QuietMemory = {
   opened: Set<string>
   // Runs drawn at the last tick, to see a run cross the anti-flash.
   drawn: ReadonlySet<string>
+  // Why the watcher could not start, when it could not.
+  lastError?: string
 }
 
 export const createQuietMemory = (): QuietMemory => ({
