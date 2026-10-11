@@ -6,10 +6,10 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
-## Unreleased
+## v0.15.0
 
 Status is scoped to the session, orphaned runs are reaped, a run can be
-cancelled from the session, and cost is booked every turn.
+cancelled from the session, and cost is booked every turn (#208).
 
 - Ledger schema 28 (v28). An older binary refuses it: run `relais coordinator
   stop` before using the new binary, so no old daemon keeps the ledger. The
@@ -33,6 +33,13 @@ cancelled from the session, and cost is booked every turn.
   after every turn, so an agent that never stops still has a cost; a model
   without a price reads `unpriced (<model>)`.
 - The daemon writes its own log, `coordinator.log` in the state directory, one line per reap.
+- On Windows, where relais cannot read a process's start time, a run whose
+  driver died is reaped by the silence rule (the attempt's wall time plus 15
+  minutes) rather than within one 15-second tick.
+- `relais native review-outcome` reads amont-agent's merge rows: a fallback
+  subagent's verified row becomes its router task's outcome (written only
+  over an unknown one, so a second ingest changes nothing), and the summary
+  and the report's Reviewers section carry the merge counts (#207).
 
 ## v0.14.0
 
