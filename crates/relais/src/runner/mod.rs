@@ -96,6 +96,9 @@ pub enum RunError {
     Verify(verify::VerifyError),
     /// No identifier could be minted for a run or a dispatch.
     Id(crate::ids::IdError),
+    /// Another process ended the run (reaped, cancelled) while this one
+    /// drove it: the transition was not written and the driver stops.
+    Superseded(RunId),
     Other(String),
 }
 
@@ -107,6 +110,11 @@ impl std::fmt::Display for RunError {
             Self::Workspace(e) => write!(f, "workspace: {e}"),
             Self::Verify(e) => write!(f, "verification: {e}"),
             Self::Id(e) => write!(f, "{e}"),
+            Self::Superseded(run) => write!(
+                f,
+                "run {} was ended by another process (reaped or cancelled)",
+                run.as_str()
+            ),
             Self::Other(detail) => f.write_str(detail),
         }
     }
@@ -694,15 +702,21 @@ impl<'a> RunEngine<'a> {
         detail: serde_json::Value,
     ) -> Result<(), RunError> {
         let from = self.state;
-        self.config.ledger.record_transition(&Transition {
-            run_id: self.run_id.clone(),
-            attempt_id: None,
-            from_state: Some(from),
-            to_state: to,
-            reason: reason.as_str().to_string(),
-            detail: Some(detail.clone()),
-            at: self.config.ledger.now(),
-        })?;
+        let wrote = self.config.ledger.transition_if(
+            from,
+            &Transition {
+                run_id: self.run_id.clone(),
+                attempt_id: None,
+                from_state: Some(from),
+                to_state: to,
+                reason: reason.as_str().to_string(),
+                detail: Some(detail.clone()),
+                at: self.config.ledger.now(),
+            },
+        )?;
+        if !wrote {
+            return Err(RunError::Superseded(self.run_id.clone()));
+        }
         self.state = to;
         self.events.emit(Event::Phase {
             state: to.as_str().to_string(),
@@ -5400,6 +5414,93 @@ mod tests {
     }
 
     // -- release scenarios (SPEC §14) -------------------------------------
+
+    #[test]
+    fn a_driver_whose_run_was_ended_elsewhere_stops_without_writing() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let machine = fixture.machine_for(&repo);
+        let contract = fixture.contract(Review::Off);
+        let backend = conditional_worker("relais task");
+        let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
+            adr: "ADR-0001".into(),
+            choice: None,
+            reason: None,
+        };
+        let config = RunConfig {
+            repo_dir: &fixture.repo,
+            contract: &contract,
+            repo_policy: &repo,
+            machine: &machine,
+            ledger: &fixture.ledger,
+            ids: &fixture.ids,
+            backend: &backend,
+            git: &crate::workspace::SystemGit,
+            hooks: &crate::verify::FixedInventory(None),
+            attest: &crate::verify::FixedAttest::default(),
+            artifacts_dir: fixture.artifacts.clone(),
+            aval_resolver: &resolver,
+            predictor: None,
+            gate: None,
+            session_id: "test-session".into(),
+            heartbeat_every: Duration::from_millis(50),
+            task_override: None,
+            purpose: None,
+            run_id: None,
+            wire: Wire::process(),
+        };
+        let mut engine = RunEngine::new(&config, None).expect("engine");
+        let run_id = engine.run_id.clone();
+        fixture
+            .ledger
+            .insert_run(
+                &run_id,
+                "/repo",
+                None,
+                &crate::ids::TaskId::from_stored("t"),
+                "rk",
+            )
+            .expect("insert");
+        engine
+            .transition(
+                State::Running,
+                Reason::WorkerDispatched,
+                serde_json::json!({}),
+            )
+            .expect("the first transition lands");
+
+        // Another process reaps the run.
+        fixture
+            .ledger
+            .record_transition(&Transition {
+                run_id: run_id.clone(),
+                attempt_id: None,
+                from_state: Some(State::Running),
+                to_state: State::Interrupted,
+                reason: Reason::DriverGone.as_str().to_string(),
+                detail: None,
+                at: fixture.ledger.now(),
+            })
+            .expect("reap");
+        let before = fixture.ledger.transitions(&run_id).expect("rows").len();
+        let events = fixture.artifacts.join(run_id.as_str()).join("events.jsonl");
+        let events_before = std::fs::read_to_string(&events).unwrap_or_default();
+
+        let err = engine
+            .transition(
+                State::Verifying,
+                Reason::WorkerDispatched,
+                serde_json::json!({}),
+            )
+            .expect_err("the reaped run is not the driver's to end");
+        assert!(matches!(err, RunError::Superseded(_)), "{err}");
+        assert_eq!(
+            fixture.ledger.transitions(&run_id).expect("rows").len(),
+            before
+        );
+        let events_after = std::fs::read_to_string(&events).unwrap_or_default();
+        assert_eq!(events_before, events_after, "no Phase or Outcome event");
+    }
 
     #[test]
     fn bounded_change_routes_verifies_and_receives_a_bound_receipt() {

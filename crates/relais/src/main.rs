@@ -5991,18 +5991,7 @@ fn resume_command(run_id: &str, retire: Retire) -> Result<CliOutcome, CliError> 
         )?;
     }
     let detail = reconciliation.detail();
-    operational(
-        ledger.record_transition(&relais::ledger::Transition {
-            run_id: run.clone(),
-            attempt_id: None,
-            from_state: Some(state),
-            to_state: State::Interrupted,
-            reason: Reason::ReconciledInterrupted.as_str().to_string(),
-            detail: Some(serde_json::json!({ "detail": detail })),
-            at: relais::ledger::now_rfc3339(),
-        }),
-        "resume",
-    )?;
+    record_resume_interruption(&ledger, &run, state, &detail)?;
     println!(
         "{run_id}: {state} -> interrupted ({detail}). Changes are preserved under {}; nothing \
          was replayed. Start a NEW run with a revised contract if the task is still wanted",
@@ -6020,6 +6009,28 @@ fn resume_command(run_id: &str, retire: Retire) -> Result<CliOutcome, CliError> 
         }
     }
     Ok(CliOutcome::ResumeReconciled)
+}
+
+/// The resume's own transition: the resuming process re-enters the run,
+/// so the same write records it as the run's driver.
+fn record_resume_interruption(
+    ledger: &Ledger,
+    run: &RunId,
+    from: State,
+    detail: &str,
+) -> Result<(), CliError> {
+    operational(
+        ledger.record_transition_as_driver(&relais::ledger::Transition {
+            run_id: run.clone(),
+            attempt_id: None,
+            from_state: Some(from),
+            to_state: State::Interrupted,
+            reason: Reason::ReconciledInterrupted.as_str().to_string(),
+            detail: Some(serde_json::json!({ "detail": detail })),
+            at: relais::ledger::now_rfc3339(),
+        }),
+        "resume",
+    )
 }
 
 /// How long a run's driver has been silent: since `events.jsonl` was last
@@ -7745,6 +7756,23 @@ mod tests {
         let dir = relais::test_support::short_temp_dir(&format!("main-{label}"));
         let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger opens");
         (ledger, dir)
+    }
+
+    #[test]
+    fn resume_records_the_resuming_process_as_the_driver() {
+        let (ledger, dir) = temp_ledger("resume-driver");
+        let run = RunId::from_stored("run-resume");
+        let task = relais::ids::TaskId::from_stored("task-resume");
+        ledger
+            .insert_run(&run, "/repo", None, &task, "rk")
+            .expect("run");
+        record_resume_interruption(&ledger, &run, State::Prepared, "reconciled")
+            .unwrap_or_else(|_| panic!("resume records"));
+        let (pid, started, since) = ledger.run_driver(&run).expect("driver columns");
+        assert_eq!(pid, Some(i64::from(std::process::id())));
+        assert!(started.is_some(), "driver_started");
+        assert!(since.is_some(), "driver_since");
+        drop(dir);
     }
 
     #[test]

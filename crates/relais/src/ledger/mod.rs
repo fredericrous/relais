@@ -1877,6 +1877,9 @@ fn insert_usage_event(conn: &Connection, event: &UsageEvent) -> Result<bool> {
     Ok(inserted == 1)
 }
 
+/// A run's recorded driver: pid, process start time, since when.
+pub type RunDriver = (Option<i64>, Option<String>, Option<String>);
+
 pub struct Ledger {
     conn: Connection,
     path: std::path::PathBuf,
@@ -3498,6 +3501,16 @@ impl Ledger {
         self.write_transition(&tx, transition)?;
         tx.commit()?;
         Ok(true)
+    }
+
+    /// The driver a run records: its pid, the process start time and when
+    /// it took the run. Each is `None` for a run no driver has stamped.
+    pub fn run_driver(&self, run: &RunId) -> Result<RunDriver> {
+        Ok(self.conn.query_row(
+            "SELECT driver_pid, driver_started, driver_since FROM runs WHERE id = ?1",
+            [run.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?)
     }
 
     fn record_transition_inner(&self, transition: &Transition, as_driver: bool) -> Result<()> {
