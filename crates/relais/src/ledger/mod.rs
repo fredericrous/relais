@@ -2514,6 +2514,20 @@ impl Ledger {
             .map_err(LedgerError::from)
     }
 
+    /// The repository a run was started in (`runs.repo_path`); `None` when
+    /// the run is not on record.
+    pub fn run_repo_path(&self, id: &RunId) -> Result<Option<PathBuf>> {
+        let path: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT repo_path FROM runs WHERE id = ?1",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(path.map(PathBuf::from))
+    }
+
     /// Close every dispatch of a run that never recorded a terminal state,
     /// as `state`, so none is judged live again. Returns how many.
     pub fn close_open_dispatches(&self, id: &RunId, state: &str) -> Result<usize> {

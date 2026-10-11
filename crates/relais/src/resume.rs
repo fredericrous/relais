@@ -32,17 +32,25 @@ pub const DEFAULT_WALL_SECONDS: u64 = 2700;
 pub const DRIVER_MARGIN: Duration = Duration::from_secs(15 * 60);
 
 /// A non-terminal run whose driver has stopped writing for too long.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Orphan {
     pub silent: Duration,
     pub threshold: Duration,
+    /// Why the default wall time stood in, when it did.
+    pub defaulted_because: Option<String>,
 }
 
 impl Orphan {
     /// The sentence recorded with the `driver_gone` transition.
     pub fn detail(&self) -> String {
+        let basis = match &self.defaulted_because {
+            Some(reason) => format!(
+                ", the {DEFAULT_WALL_SECONDS}s default wall time having been used because {reason}"
+            ),
+            None => String::new(),
+        };
         format!(
-            "the driving `relais run` is gone: nothing was written for {}s, past the {}s              threshold (attempt wall time plus a {}s margin)",
+            "the driving `relais run` is gone: nothing was written for {}s, past the {}s threshold (attempt wall time plus a {}s margin{basis})",
             self.silent.as_secs(),
             self.threshold.as_secs(),
             DRIVER_MARGIN.as_secs()
@@ -50,15 +58,37 @@ impl Orphan {
     }
 }
 
-/// The attempt wall time: the contract's, else the policy's, else the default.
-pub fn attempt_wall(contract: Option<u64>, policy: Option<u64>) -> Duration {
-    Duration::from_secs(contract.or(policy).unwrap_or(DEFAULT_WALL_SECONDS))
+/// An attempt's wall time, and why the default stood in for it if it did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptWall {
+    pub duration: Duration,
+    pub defaulted_because: Option<String>,
+}
+
+/// The attempt wall time: the contract's, else the policy's, else the
+/// default. `policy` is the reason the policy could not be read when it
+/// could not, so a default is never silent.
+pub fn attempt_wall(contract: Option<u64>, policy: Result<u64, String>) -> AttemptWall {
+    match (contract, policy) {
+        (Some(seconds), _) | (None, Ok(seconds)) => AttemptWall {
+            duration: Duration::from_secs(seconds),
+            defaulted_because: None,
+        },
+        (None, Err(reason)) => AttemptWall {
+            duration: Duration::from_secs(DEFAULT_WALL_SECONDS),
+            defaulted_because: Some(reason),
+        },
+    }
 }
 
 /// Whether a run silent for `silent` is orphaned, given its attempt wall time.
-pub fn orphan_of(silent: Duration, wall: Duration) -> Option<Orphan> {
-    let threshold = wall + DRIVER_MARGIN;
-    (silent > threshold).then_some(Orphan { silent, threshold })
+pub fn orphan_of(silent: Duration, wall: AttemptWall) -> Option<Orphan> {
+    let threshold = wall.duration + DRIVER_MARGIN;
+    (silent > threshold).then_some(Orphan {
+        silent,
+        threshold,
+        defaulted_because: wall.defaulted_because,
+    })
 }
 
 /// What reconciliation established about one dispatch.
@@ -325,14 +355,33 @@ mod tests {
 
     #[test]
     fn a_run_is_orphaned_only_past_wall_time_plus_margin() {
-        let wall = attempt_wall(Some(600), Some(1200));
-        assert_eq!(wall, Duration::from_secs(600));
-        assert_eq!(attempt_wall(None, Some(1200)), Duration::from_secs(1200));
-        assert_eq!(attempt_wall(None, None), Duration::from_secs(2700));
-        assert_eq!(orphan_of(Duration::from_secs(1500), wall), None);
+        let wall = attempt_wall(Some(600), Ok(1200));
+        assert_eq!(wall.duration, Duration::from_secs(600));
+        assert_eq!(
+            attempt_wall(None, Ok(1200)).duration,
+            Duration::from_secs(1200)
+        );
+        assert_eq!(
+            attempt_wall(None, Err("x".into())).duration,
+            Duration::from_secs(2700)
+        );
+        assert_eq!(orphan_of(Duration::from_secs(1500), wall.clone()), None);
         let orphan = orphan_of(Duration::from_secs(1501), wall).expect("orphaned");
         assert_eq!(orphan.threshold, Duration::from_secs(1500));
-        assert!(orphan.detail().contains("1501s"), "{}", orphan.detail());
+        assert_eq!(
+            orphan.detail(),
+            "the driving `relais run` is gone: nothing was written for 1501s, past the 1500s threshold (attempt wall time plus a 900s margin)"
+        );
+    }
+
+    #[test]
+    fn a_defaulted_wall_time_says_why() {
+        let wall = attempt_wall(None, Err("no relais.toml was readable".into()));
+        let orphan = orphan_of(Duration::from_secs(9000), wall).expect("orphaned");
+        assert_eq!(
+            orphan.detail(),
+            "the driving `relais run` is gone: nothing was written for 9000s, past the 3600s threshold (attempt wall time plus a 900s margin, the 2700s default wall time having been used because no relais.toml was readable)"
+        );
     }
 
     #[test]

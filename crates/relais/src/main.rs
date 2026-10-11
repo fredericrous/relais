@@ -3143,9 +3143,10 @@ fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome, CliError> 
     }
 }
 
-/// `coordinator cancel --run` that signalled no worker: nothing bound will
-/// ever end the run, so a non-terminal one is interrupted rather than left
-/// `running`.
+/// `coordinator cancel --run` that signalled no worker: the run is
+/// interrupted only when it is also orphaned by the silence rule (the same
+/// judgement as `resume`); otherwise its driver may still be working, and
+/// nothing changes.
 fn interrupt_unbound_run(run_id: &str) -> Result<(), CliError> {
     let ledger = open_ledger()?;
     let run = RunId::from_stored(run_id);
@@ -3155,25 +3156,19 @@ fn interrupt_unbound_run(run_id: &str) -> Result<(), CliError> {
     if state.is_terminal() {
         return Ok(());
     }
-    operational(
-        ledger.close_open_dispatches(&run, Reason::CancelledWithoutWorker.as_str()),
-        "coordinator cancel",
-    )?;
-    operational(
-        ledger.record_transition(&relais::ledger::Transition {
-            run_id: run.clone(),
-            attempt_id: None,
-            from_state: Some(state),
-            to_state: State::Interrupted,
-            reason: Reason::CancelledWithoutWorker.as_str().to_string(),
-            detail: Some(serde_json::json!({
-                "detail": "cancel found no bound worker process to signal",
-            })),
-            at: relais::ledger::now_rfc3339(),
-        }),
-        "coordinator cancel",
-    )?;
-    println!("{run_id}: {state} -> interrupted (no bound worker process was running it)");
+    let Some(orphan) = orphan_of_run(&ledger, &run)? else {
+        println!(
+            "{run_id}: has no bound worker process and is left to its driver; \
+             `relais resume --retire {run_id}` interrupts it once the driver is gone"
+        );
+        return Ok(());
+    };
+    match interrupt_orphan(&ledger, &run, state, &orphan)? {
+        OrphanOutcome::Interrupted => {}
+        OrphanOutcome::KeptAlive(why) => {
+            println!("{run_id}: left as it is, {why}");
+        }
+    }
     Ok(())
 }
 
@@ -5808,15 +5803,26 @@ fn resume_command(run_id: &str, retire: Retire) -> Result<CliOutcome, CliError> 
     // row; this handler does the ledger write and the printing.
     if !state.is_terminal() {
         if let Some(orphan) = orphan_of_run(&ledger, &run)? {
-            interrupt_orphan(&ledger, &run, state, &orphan)?;
-            return match retire {
-                Retire::Keep => Ok(CliOutcome::ResumeReconciled),
-                Retire::Retire => {
-                    let reconciliation = reconcile_run(&ledger, &run)?;
-                    retire_run(&ledger, &run, State::Interrupted, &reconciliation)?;
-                    Ok(CliOutcome::ResumeReconciled)
+            match interrupt_orphan(&ledger, &run, state, &orphan)? {
+                OrphanOutcome::Interrupted => {
+                    return match retire {
+                        Retire::Keep => Ok(CliOutcome::ResumeReconciled),
+                        Retire::Retire => {
+                            let reconciliation = reconcile_run(&ledger, &run)?;
+                            retire_run(&ledger, &run, State::Interrupted, &reconciliation)?;
+                            Ok(CliOutcome::ResumeReconciled)
+                        }
+                    };
                 }
-            };
+                OrphanOutcome::KeptAlive(why) => {
+                    println!(
+                        "{run_id}: kept, silent past its threshold but {why}; resume does not \
+                         re-dispatch while a worker may be running, `relais coordinator cancel \
+                         --run {run_id}` stops it"
+                    );
+                    return Ok(CliOutcome::ResumeRefusedLive);
+                }
+            }
         }
     }
     let reconciliation = reconcile_run(&ledger, &run)?;
@@ -5894,38 +5900,122 @@ fn run_silence(ledger: &Ledger, run: &RunId) -> Result<Option<std::time::Duratio
     }))
 }
 
+/// The checkout whose `relais.toml` governs a run: the run's own
+/// repository, else — when that is a removed `-wt-` worktree — the primary
+/// checkout it was made from. Never the process cwd.
+fn run_policy_root(repo_path: &Path) -> PathBuf {
+    if repo_path.exists() {
+        return repo_path.to_path_buf();
+    }
+    let primary = repo_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.split_once("-wt-"))
+        .map(|(primary, _)| primary)
+        .filter(|primary| !primary.is_empty())
+        .and_then(|primary| repo_path.parent().map(|parent| parent.join(primary)));
+    primary.unwrap_or_else(|| repo_path.to_path_buf())
+}
+
+/// A run's policy `max_wall_seconds`, read from its own repository, or the
+/// reason it could not be.
+fn run_policy_wall(ledger: &Ledger, run: &RunId) -> Result<u64, String> {
+    let repo_path = ledger
+        .run_repo_path(run)
+        .map_err(|e| format!("the run's repository could not be read from the ledger ({e})"))?
+        .ok_or_else(|| "the run records no repository".to_string())?;
+    let root = relais::repo::locate_repo_root(&run_policy_root(&repo_path)).map_err(|e| {
+        format!(
+            "the policy of {} could not be located ({e})",
+            repo_path.display()
+        )
+    })?;
+    let path = root.join("relais.toml");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("{} could not be read ({e})", path.display()))?;
+    RepoPolicy::from_toml_str(&text)
+        .map(|policy| policy.execution.max_wall_seconds)
+        .map_err(|e| format!("{} is not a valid policy ({e})", path.display()))
+}
+
 /// Whether a non-terminal run has lost its driver (SPEC §12): silent for
 /// longer than its attempt wall time plus a margin.
 fn orphan_of_run(ledger: &Ledger, run: &RunId) -> Result<Option<resume::Orphan>, CliError> {
     let Some(silent) = run_silence(ledger, run)? else {
         return Ok(None);
     };
-    let contract_wall = operational(ledger.run_contract_and_tier(run), "resume")
-        .ok()
-        .flatten()
-        .and_then(|(contract, _)| contract.limits.wall_seconds);
-    let policy_wall = load_repo_policy()
-        .ok()
-        .map(|(_, policy)| policy.execution.max_wall_seconds);
+    // One run's unreadable contract must not stop a sweep over every run:
+    // it falls back to the repository's policy, then to the default, and
+    // the recorded detail says why.
+    let (contract_wall, contract_unreadable) = match ledger.run_contract_and_tier(run) {
+        Ok(found) => (
+            found.and_then(|(contract, _)| contract.limits.wall_seconds),
+            None,
+        ),
+        Err(e) => (
+            None,
+            Some(format!("the run's contract could not be read ({e})")),
+        ),
+    };
+    let policy_wall = if contract_wall.is_some() {
+        Ok(0)
+    } else {
+        run_policy_wall(ledger, run).map_err(|policy| match &contract_unreadable {
+            Some(contract) => format!("{contract}, and {policy}"),
+            None => policy,
+        })
+    };
     Ok(resume::orphan_of(
         silent,
         resume::attempt_wall(contract_wall, policy_wall),
     ))
 }
 
+/// What became of an orphaned run.
+enum OrphanOutcome {
+    Interrupted,
+    /// A dispatch of the run is provably alive: nothing was changed.
+    KeptAlive(String),
+}
+
 /// Move an orphaned run to `interrupted` (`driver_gone`) and close its open
 /// dispatches so none is judged live again; the decision is recorded with
-/// the silence and the threshold.
+/// the silence and the threshold. Every dispatch is judged first, by PID
+/// alone (a native session's hello is not evidence its agent lives): a
+/// dispatch whose process is alive keeps the run as it is.
 fn interrupt_orphan(
     ledger: &Ledger,
     run: &RunId,
     state: State,
     orphan: &resume::Orphan,
-) -> Result<(), CliError> {
-    let closed = operational(
+) -> Result<OrphanOutcome, CliError> {
+    let live = run_live_dispatches(ledger, run)?;
+    let judged = resume::reconcile(&live, None, &|pid| {
+        relais::coordinator::process_alive(pid.get())
+    });
+    let alive: Vec<String> = judged
+        .verdicts
+        .iter()
+        .filter(|verdict| matches!(verdict, resume::DispatchVerdict::StillAlive { .. }))
+        .map(resume::DispatchVerdict::describe)
+        .collect();
+    if !alive.is_empty() {
+        return Ok(OrphanOutcome::KeptAlive(format!(
+            "dispatch {} is alive",
+            alive.join(", ")
+        )));
+    }
+    for verdict in &judged.verdicts {
+        operational(
+            ledger.finish_dispatch(verdict.dispatch(), Reason::DriverGone.as_str()),
+            "resume",
+        )?;
+    }
+    let never_launched = operational(
         ledger.close_open_dispatches(run, Reason::DriverGone.as_str()),
         "resume",
     )?;
+    let closed = judged.verdicts.len() + never_launched;
     let detail = orphan.detail();
     operational(
         ledger.record_transition(&relais::ledger::Transition {
@@ -5945,17 +6035,25 @@ fn interrupt_orphan(
         "resume",
     )?;
     println!("{run}: {state} -> interrupted ({detail})");
-    Ok(())
+    Ok(OrphanOutcome::Interrupted)
+}
+
+/// The dispatches the ledger still records as live for one run.
+fn run_live_dispatches(
+    ledger: &Ledger,
+    run: &RunId,
+) -> Result<Vec<relais::ledger::LiveDispatch>, CliError> {
+    Ok(operational(ledger.live_dispatches(), "resume")?
+        .into_iter()
+        .filter(|live| live.run == *run)
+        .collect())
 }
 
 /// Judge every dispatch the ledger still records as live for one run.
 /// No coordinator answering is not evidence about the run, only the
 /// absence of evidence: `reconcile` treats it as such.
 fn reconcile_run(ledger: &Ledger, run: &RunId) -> Result<resume::Reconciliation, CliError> {
-    let live: Vec<_> = operational(ledger.live_dispatches(), "resume")?
-        .into_iter()
-        .filter(|live| live.run == *run)
-        .collect();
+    let live = run_live_dispatches(ledger, run)?;
     let coordinator_view = relais::coordinator::socket_path()
         .ok()
         .map(relais::coordinator::Client::new)
@@ -6014,8 +6112,17 @@ fn retire_all_command() -> Result<CliOutcome, CliError> {
         let state = if state.is_terminal() {
             state
         } else if let Some(orphan) = orphan_of_run(&ledger, &run)? {
-            interrupt_orphan(&ledger, &run, state, &orphan)?;
-            State::Interrupted
+            match interrupt_orphan(&ledger, &run, state, &orphan)? {
+                OrphanOutcome::Interrupted => State::Interrupted,
+                OrphanOutcome::KeptAlive(why) => {
+                    println!(
+                        "{}: kept, silent past its threshold but {why} ({})",
+                        worktree.run_id,
+                        worktree.path.display()
+                    );
+                    continue;
+                }
+            }
         } else {
             println!(
                 "{}: kept, the run is {state} ({})",
