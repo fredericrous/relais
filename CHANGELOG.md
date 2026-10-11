@@ -6,6 +6,18 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## Unreleased
+
+Plan reviewers get an outcome. `relais native review-outcome` reads the
+ledger `amont-agent plan-review record` writes (amont-agent after 2.33.1),
+labels each reviewer `clean`, `miss` or `unknown` into a new
+`review_outcomes` table (ledger schema 26), and `relais learn cycle` runs it
+first, as a note that never fails the cycle. `relais report` and `--json`
+gain a `Reviewers` section: per class, the labelled reviews, clean, miss,
+unknown and tokens by model. The ledger is refused (exit 3) when it is a
+symlink, someone else's, or open to group or other. Nothing routes on these
+labels yet.
+
 ## v0.12.1
 
 Runs that died stop holding their worktrees: relais reconciles them itself

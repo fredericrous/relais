@@ -391,6 +391,9 @@ pub struct CycleInputs<'a> {
     /// The classifier input day files (ADR-0002): the cycle deletes those
     /// past their 90 days, as every write of one does.
     pub classifier_dir: Option<PathBuf>,
+    /// Ingest amont-agent's reviewer outcomes at the start of the cycle,
+    /// with the default ledger and plan root.
+    pub ingest_review_outcomes: bool,
     pub now: DateTime<Utc>,
 }
 
@@ -757,6 +760,13 @@ pub fn run_cycle(
         error: None,
         promote_hint: None,
     };
+    // Reviewer labels are a side record: whatever happens to them, the
+    // cycle goes on and only its note says so.
+    if inputs.ingest_review_outcomes {
+        if let Some(note) = crate::review_outcome::cycle_note(ledger) {
+            add_note(&mut report, note);
+        }
+    }
     if let Err(e) = cycle_body(inputs, progress, &mut report) {
         if let CycleError::Ledger(ledger_error) = e {
             return Err(ledger_error);
@@ -1238,6 +1248,7 @@ argv = ["true"]
                 },
                 auto_promote,
                 classifier_dir: None,
+                ingest_review_outcomes: false,
                 now: Utc::now(),
             }
         }
