@@ -406,3 +406,160 @@ fn a_row_whose_body_was_never_saved_parses_and_borrows_the_plans_repos() {
     );
     assert!(!out(&o).contains("invalid"), "{}", out(&o));
 }
+
+/// A router task row with outcome `unknown`, as the plugin records a
+/// routed subagent spawn, keyed by the agent id amont-agent also carries.
+fn seed_router_task(ledger: &Ledger, session: &str, task_id: &str, agent_id: &str) {
+    use relais::ledger::{RouterRecord, RouterTaskRow};
+    ledger
+        .record_router_batch(
+            session,
+            &[RouterRecord::Task(RouterTaskRow {
+                task_id: task_id.into(),
+                agent_id: Some(agent_id.into()),
+                started_at: "2026-10-11T10:00:00Z".into(),
+                ended_at: None,
+                class: None,
+                outcome: "unknown".into(),
+                outcome_rank: 0,
+                completed_at_end: None,
+                inferred: vec![],
+                files: vec![],
+                escalations: 0,
+                exhausted: false,
+                turns: 1,
+                explicit_quote: None,
+                outcome_source: Some("own".into()),
+                checks: vec![],
+            })],
+        )
+        .expect("router task");
+}
+
+fn merge_row(mode: &str, agent: Option<&str>, verified: Option<bool>) -> Value {
+    let mut row = json!({
+        "schema": "amont-agent-review-merge-v1", "recorded_at": 7,
+        "plan_path": "/p/plan.md", "body_sha_before": SHA1, "body_sha_after": SHA2,
+        "round": 1, "accepted": 3, "applied": 2, "unmatched": ["tui#3: absent"],
+        "mode": mode,
+    });
+    if let Some(agent) = agent {
+        row["agent_id"] = json!(agent);
+        row["model"] = json!("claude-sonnet-5-5");
+        row["tokens"] = json!(9000);
+        row["seconds"] = json!(12.5);
+        row["verified"] = json!(verified);
+    }
+    row
+}
+
+#[test]
+fn a_subagent_merge_row_settles_its_router_task_once() {
+    let world = World::new("merge");
+    world.panel();
+    let mut lines: Vec<String> = std::fs::read_to_string(world.ledger_file())
+        .expect("ledger")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    lines.push(merge_row("command", None, None).to_string());
+    lines.push(merge_row("subagent", Some("apply-1"), Some(true)).to_string());
+    lines.push(merge_row("subagent", Some("apply-2"), Some(false)).to_string());
+    lines.push(merge_row("subagent", Some("apply-nowhere"), Some(true)).to_string());
+    lines.push(merge_row("subagent", Some("apply-1"), Some(false)).to_string());
+    world.write_ledger(&lines);
+    {
+        let ledger = world.ledger();
+        seed_router_task(&ledger, "s1", "task-1", "apply-1");
+        seed_router_task(&ledger, "s1", "task-2", "apply-2");
+    }
+
+    let o = world.run(&["--dry-run"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(
+        out(&o).contains("; merge: 1 applied by command, 3 by subagent (2 verified)"),
+        "{}",
+        out(&o)
+    );
+    let ledger = world.ledger();
+    let before = ledger
+        .router_task("s1", "task-1", Some("apply-1"))
+        .expect("row")
+        .expect("task");
+    assert_eq!(before.outcome, "unknown", "a dry run writes nothing");
+
+    for _ in 0..2 {
+        let o = world.run(&[]);
+        assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+        assert!(
+            out(&o).contains("3 by subagent (2 verified), 1 merge(s) with no task on record"),
+            "{}",
+            out(&o)
+        );
+        let t1 = ledger
+            .router_task("s1", "task-1", Some("apply-1"))
+            .expect("row")
+            .expect("task");
+        assert_eq!(
+            (
+                t1.outcome.as_str(),
+                t1.outcome_rank,
+                t1.outcome_source.as_deref()
+            ),
+            ("completed_verified", 1, Some("merge")),
+            "the first row for apply-1 stands"
+        );
+        let t2 = ledger
+            .router_task("s1", "task-2", Some("apply-2"))
+            .expect("row")
+            .expect("task");
+        assert_eq!(
+            (
+                t2.outcome.as_str(),
+                t2.outcome_rank,
+                t2.outcome_source.as_deref()
+            ),
+            ("corrected", 2, Some("merge"))
+        );
+    }
+    let totals = ledger.merge_outcome_totals().expect("totals");
+    assert_eq!((totals.by_subagent, totals.verified), (2, 1));
+
+    let o = world.relais(&["report", "--no-import"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let text = out(&o);
+    assert!(text.contains("merge: 2 by subagent (1 verified)"), "{text}");
+    // The Reviewers section's own lines; the router section above it has a
+    // width of its own.
+    let section = text.split("Reviewers:").nth(1).expect("reviewers section");
+    for line in section.lines().take_while(|l| !l.is_empty()) {
+        assert!(line.chars().count() <= 80, "{line}");
+    }
+    let o = world.relais(&["report", "--no-import", "--json"]);
+    let v: Value = serde_json::from_slice(&o.stdout).expect("json");
+    assert_eq!(v["review_outcomes"]["merges_by_subagent"], json!(2));
+    assert_eq!(v["review_outcomes"]["merges_verified"], json!(1));
+}
+
+#[test]
+fn a_merge_row_with_unknown_fields_or_another_schema_is_invalid() {
+    let world = World::new("merge-invalid");
+    let mut other = merge_row("subagent", Some("a"), Some(true));
+    other["schema"] = json!("amont-agent-review-merge-v2");
+    let mut extra = merge_row("command", None, None);
+    extra["surprise"] = json!(1);
+    let no_agent = merge_row("subagent", None, None);
+    world.write_ledger(&[
+        other.to_string(),
+        extra.to_string(),
+        no_agent.to_string(),
+        merge_row("command", None, None).to_string(),
+    ]);
+    let o = world.run(&["--dry-run"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(
+        out(&o).contains("labelled 0: clean 0, miss 0, unknown 0, invalid 3; merge: 1 applied by command, 0 by subagent (0 verified)"),
+        "{}",
+        out(&o)
+    );
+}

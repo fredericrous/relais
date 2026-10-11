@@ -19,9 +19,13 @@ use serde::Deserialize;
 
 use crate::ledger::{Ledger, LedgerError, ReviewOutcomeRow};
 use crate::paths;
+use crate::router::outcome::TaskOutcome;
 
 /// The only `schema` value a row may carry.
 const ROW_SCHEMA: &str = "amont-agent-review-outcome-v1";
+/// The schema of a merge row: what `amont-agent plan-apply` wrote when it
+/// applied a review's patches (plan-review-edits-apply, Behaviour 3 and 5).
+const MERGE_SCHEMA: &str = "amont-agent-review-merge-v1";
 /// Where amont-agent keeps its ledger, under the Claude config directory.
 const LEDGER_PARTS: [&str; 3] = ["amont-agent", "plan-review", "outcomes.jsonl"];
 /// The environment variable amont-agent resolves its plan root from.
@@ -113,6 +117,48 @@ struct Row {
     verdict: Option<Verdict>,
     remit: Vec<String>,
     findings: Vec<Finding>,
+}
+
+/// One merge row: a `command` row when `plan-apply` applied the patches
+/// itself, a `subagent` row when a fallback subagent applied the rest and
+/// `--record-fallback` checked its work.
+/// Every field is named so that the row is validated whole
+/// (`deny_unknown_fields`, each type); only the mode, the agent id and the
+/// verdict are read.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct MergeRow {
+    schema: String,
+    recorded_at: i64,
+    plan_path: String,
+    body_sha_before: Option<String>,
+    body_sha_after: Option<String>,
+    round: Option<u32>,
+    accepted: u64,
+    applied: u64,
+    unmatched: Vec<String>,
+    mode: MergeMode,
+    agent_id: Option<String>,
+    model: Option<String>,
+    tokens: Option<u64>,
+    seconds: Option<f64>,
+    verified: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum MergeMode {
+    Command,
+    Subagent,
+}
+
+/// A fallback subagent's merge row, as the router learns from it: the
+/// agent id both sides carry and whether `plan-apply --check` passed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeOutcome {
+    pub agent_id: String,
+    pub verified: bool,
 }
 
 /// Why a review could not be called either way.
@@ -396,6 +442,10 @@ pub struct Labelled {
     /// Lines that did not parse, or carried another schema.
     pub invalid: usize,
     reasons: Vec<Option<Reason>>,
+    /// `command` merge rows: counted, never written.
+    pub merges_by_command: usize,
+    /// `subagent` merge rows with an agent id, each a task outcome.
+    pub merges: Vec<MergeOutcome>,
 }
 
 /// The state of a file as the trust boundary sees it.
@@ -486,6 +536,8 @@ pub fn read(settings: &Settings) -> Result<Option<Labelled>, IngestError> {
     let bytes = std::fs::read(&settings.ledger).map_err(|e| unreadable(&e))?;
     let mut invalid = 0;
     let mut rows: Vec<Row> = Vec::new();
+    let mut merges_by_command = 0;
+    let mut merges: Vec<MergeOutcome> = Vec::new();
     for line in bytes
         .split(|b| *b == b'\n')
         .filter(|l| !l.trim_ascii().is_empty())
@@ -496,7 +548,27 @@ pub fn read(settings: &Settings) -> Result<Option<Labelled>, IngestError> {
                 if !rows.iter().any(|seen| seen.agent_id == row.agent_id) {
                     rows.push(row);
                 }
+                continue;
             }
+            _ => {}
+        }
+        match serde_json::from_slice::<MergeRow>(line) {
+            Ok(row) if row.schema == MERGE_SCHEMA => match (row.mode, row.agent_id) {
+                (MergeMode::Command, _) => merges_by_command += 1,
+                (MergeMode::Subagent, Some(agent_id)) => {
+                    // The fallback is recorded once per launch; the first stands.
+                    if !merges
+                        .iter()
+                        .any(|seen: &MergeOutcome| seen.agent_id == agent_id)
+                    {
+                        merges.push(MergeOutcome {
+                            agent_id,
+                            verified: row.verified.unwrap_or(false),
+                        });
+                    }
+                }
+                (MergeMode::Subagent, None) => invalid += 1,
+            },
             _ => invalid += 1,
         }
     }
@@ -543,6 +615,8 @@ pub fn read(settings: &Settings) -> Result<Option<Labelled>, IngestError> {
         rows,
         invalid,
         reasons,
+        merges_by_command,
+        merges,
     }))
 }
 
@@ -581,6 +655,26 @@ impl Labelled {
                 of(Reason::SectionChanged)
             ));
         }
+        if self.merges_by_command > 0 || !self.merges.is_empty() {
+            line.push_str(&format!(
+                "; merge: {} applied by command, {} by subagent ({} verified)",
+                self.merges_by_command,
+                self.merges.len(),
+                self.merges.iter().filter(|m| m.verified).count()
+            ));
+        }
+        line
+    }
+
+    /// The summary after a write, naming the merge rows whose agent id
+    /// named no task on record.
+    pub fn summary_after(&self, unmatched_merges: usize) -> String {
+        let mut line = self.summary();
+        if unmatched_merges > 0 {
+            line.push_str(&format!(
+                ", {unmatched_merges} merge(s) with no task on record"
+            ));
+        }
         line
     }
 
@@ -602,13 +696,37 @@ impl Labelled {
             .collect()
     }
 
-    /// Join each review to its router task and write them all.
-    pub fn record(&self, ledger: &Ledger) -> Result<(), LedgerError> {
+    /// Join each review to its router task and write them all; then each
+    /// fallback subagent's merge row becomes its router task's outcome
+    /// (`completed_verified` when the check passed, else `corrected`),
+    /// written only over a stored `unknown`, so a second ingest changes
+    /// nothing. Returns how many merge rows named no task on record.
+    pub fn record(&self, ledger: &Ledger) -> Result<usize, LedgerError> {
         let mut rows = self.rows.clone();
         for row in &mut rows {
             row.router_task_id = ledger.router_task_for_agent(&row.agent_id)?;
         }
-        ledger.record_review_outcomes(&rows)
+        ledger.record_review_outcomes(&rows)?;
+        let mut unmatched = 0;
+        for merge in &self.merges {
+            match ledger.router_task_for_agent(&merge.agent_id)? {
+                Some(task_id) => {
+                    let outcome = if merge.verified {
+                        TaskOutcome::CompletedVerified
+                    } else {
+                        TaskOutcome::Corrected
+                    };
+                    ledger.record_merge_outcome(
+                        &task_id,
+                        &merge.agent_id,
+                        outcome.as_str(),
+                        outcome.rank(),
+                    )?;
+                }
+                None => unmatched += 1,
+            }
+        }
+        Ok(unmatched)
     }
 }
 
@@ -621,8 +739,8 @@ pub fn cycle_note(ledger: &Ledger, settings: &Result<Settings, String>) -> Optio
         let Some(labelled) = labelled else {
             return Ok(None);
         };
-        labelled.record(ledger).map_err(|e| e.to_string())?;
-        Ok(Some(labelled.summary()))
+        let unmatched = labelled.record(ledger).map_err(|e| e.to_string())?;
+        Ok(Some(labelled.summary_after(unmatched)))
     });
     match outcome {
         Ok(summary) => summary.map(|summary| format!("review outcomes {summary}")),
@@ -862,6 +980,8 @@ mod tests {
                 .collect(),
             invalid: 2,
             reasons: out.iter().map(|l| l.reason()).collect(),
+            merges_by_command: 0,
+            merges: Vec::new(),
         };
         assert_eq!(labelled.lines(), vec!["r rust round 1 unknown not_pushed"]);
         assert_eq!(

@@ -26,7 +26,7 @@ use crate::route::RoutedBy;
 
 mod review;
 mod router;
-pub use review::{ReviewClassTotals, ReviewOutcomeRow};
+pub use review::{MergeTotals, ReviewClassTotals, ReviewOutcomeRow};
 pub use router::{
     ExplorationTask, RouterCheck, RouterClass, RouterClassificationRow, RouterDecisionRow,
     RouterExplorationStop, RouterProvenance, RouterReassessRow, RouterRecord, RouterTaskOutcomeRow,

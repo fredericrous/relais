@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::ledger::{Ledger, ReviewClassTotals};
+use crate::ledger::{Ledger, MergeTotals, ReviewClassTotals};
 
 /// Classes shown; the rest count under `more`.
 const TOP_CLASSES: usize = 5;
@@ -38,23 +38,34 @@ pub struct ReviewerReport {
     /// Why the ledger could not answer; the section says so instead of
     /// claiming there is nothing yet.
     pub unreadable: Option<String>,
+    /// Router tasks a fallback subagent's merge row settled (plan-review-
+    /// edits-apply, Behaviour 5). What `plan-apply` applied by command
+    /// leaves no task and no ledger row here: it is counted in the ingest's
+    /// own summary line.
+    pub merges_by_subagent: u64,
+    pub merges_verified: u64,
 }
 
 /// The section from the ledger. Reading it never fails a report: a ledger
 /// that cannot answer is a one-line section naming why.
 pub fn reviewer_report(ledger: &Ledger) -> ReviewerReport {
-    match ledger.review_class_totals() {
-        Ok(totals) => build(totals),
+    match ledger
+        .review_class_totals()
+        .and_then(|totals| Ok((totals, ledger.merge_outcome_totals()?)))
+    {
+        Ok((totals, merges)) => build(totals, merges),
         Err(e) => ReviewerReport {
             classes: Vec::new(),
             more: 0,
             empty: false,
             unreadable: Some(e.to_string()),
+            merges_by_subagent: 0,
+            merges_verified: 0,
         },
     }
 }
 
-fn build(totals: Vec<ReviewClassTotals>) -> ReviewerReport {
+fn build(totals: Vec<ReviewClassTotals>, merges: MergeTotals) -> ReviewerReport {
     let mut classes: Vec<ReviewerClass> = totals
         .into_iter()
         .map(|t| ReviewerClass {
@@ -70,10 +81,12 @@ fn build(totals: Vec<ReviewClassTotals>) -> ReviewerReport {
     let more = classes.len().saturating_sub(TOP_CLASSES);
     classes.truncate(TOP_CLASSES);
     ReviewerReport {
-        empty: classes.is_empty(),
+        empty: classes.is_empty() && merges.by_subagent == 0,
         classes,
         more,
         unreadable: None,
+        merges_by_subagent: merges.by_subagent,
+        merges_verified: merges.verified,
     }
 }
 
@@ -138,6 +151,12 @@ impl ReviewerReport {
         if self.empty {
             return format!("\n{EMPTY}\n");
         }
+        if self.classes.is_empty() {
+            return format!(
+                "\nReviewers: {EMPTY}\n  merge: {} by subagent ({} verified)\n",
+                self.merges_by_subagent, self.merges_verified
+            );
+        }
         // Every class is still learning until Phase 8 decides one, so the
         // header says it once and the row keeps its width for the tokens.
         let mut out = format!(
@@ -159,6 +178,12 @@ impl ReviewerReport {
         }
         if self.more > 0 {
             out.push_str(&format!("  +{} more\n", self.more));
+        }
+        if self.merges_by_subagent > 0 {
+            out.push_str(&format!(
+                "  merge: {} by subagent ({} verified)\n",
+                self.merges_by_subagent, self.merges_verified
+            ));
         }
         out
     }
@@ -186,7 +211,7 @@ mod tests {
 
     #[test]
     fn nothing_ingested_is_the_empty_sentence() {
-        let report = build(Vec::new());
+        let report = build(Vec::new(), MergeTotals::default());
         assert!(report.empty && report.classes.is_empty() && report.more == 0);
         assert_eq!(
             report.render(),
@@ -196,13 +221,16 @@ mod tests {
 
     #[test]
     fn rows_name_their_columns_and_say_still_learning() {
-        let report = build(vec![totals(
-            "backend",
-            9,
-            3,
-            2,
-            &[("claude-fable-5-1", 120_000), ("claude-sonnet-5-5", 30_000)],
-        )]);
+        let report = build(
+            vec![totals(
+                "backend",
+                9,
+                3,
+                2,
+                &[("claude-fable-5-1", 120_000), ("claude-sonnet-5-5", 30_000)],
+            )],
+            MergeTotals::default(),
+        );
         let text = report.render();
         assert!(text.contains("tokens by model"), "{text}");
         let row = text.lines().find(|l| l.contains("backend")).expect("row");
@@ -216,7 +244,7 @@ mod tests {
         let all: Vec<_> = (0..8u64)
             .map(|i| totals(&format!("role{i}"), i, 0, 0, &[]))
             .collect();
-        let report = build(all);
+        let report = build(all, MergeTotals::default());
         assert_eq!(report.classes.len(), 5);
         assert_eq!(report.classes[0].class, "role7");
         assert_eq!(report.more, 3);
@@ -234,6 +262,10 @@ mod tests {
             (0..7)
                 .map(|i| totals(&format!("{long}{i}"), 1_000_000, 2, 3, &pairs))
                 .collect(),
+            MergeTotals {
+                by_subagent: 9_999_999,
+                verified: 9_999_999,
+            },
         );
         for line in report.render().lines() {
             assert!(
@@ -260,12 +292,38 @@ mod tests {
     }
 
     #[test]
+    fn merges_by_subagent_print_their_line_with_or_without_classes() {
+        let merges = MergeTotals {
+            by_subagent: 3,
+            verified: 2,
+        };
+        let alone = build(Vec::new(), merges);
+        assert!(!alone.empty);
+        assert!(
+            alone.render().contains("merge: 3 by subagent (2 verified)"),
+            "{}",
+            alone.render()
+        );
+        let with = build(vec![totals("tui", 1, 0, 0, &[])], merges);
+        let text = with.render();
+        assert!(text.contains("  tui "), "{text}");
+        assert!(
+            text.ends_with("merge: 3 by subagent (2 verified)\n"),
+            "{text}"
+        );
+        let none = build(vec![totals("tui", 1, 0, 0, &[])], MergeTotals::default());
+        assert!(!none.render().contains("merge:"));
+    }
+
+    #[test]
     fn a_ledger_that_cannot_answer_says_so_not_that_nothing_is_there() {
         let report = ReviewerReport {
             classes: Vec::new(),
             more: 0,
             empty: false,
             unreadable: Some("no such table: review_outcomes".into()),
+            merges_by_subagent: 0,
+            merges_verified: 0,
         };
         let text = report.render();
         assert!(

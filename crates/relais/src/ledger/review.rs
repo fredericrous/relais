@@ -33,6 +33,13 @@ pub struct ReviewOutcomeRow {
     pub recorded_at: i64,
 }
 
+/// Router tasks settled by a fallback subagent's merge row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MergeTotals {
+    pub by_subagent: u64,
+    pub verified: u64,
+}
+
 /// One class's labelled reviews and the tokens they spent.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ReviewClassTotals {
@@ -113,6 +120,49 @@ impl Ledger {
                 |row| row.get(0),
             )
             .optional()?)
+    }
+
+    /// A fallback subagent's merge outcome, over its router task: written
+    /// only where the stored outcome is still `unknown` and the new rank is
+    /// higher, with `outcome_source = 'merge'`, so a second ingest changes
+    /// nothing. The `router-observe` statement is not reused: it keys on
+    /// the session, which the amont-agent ledger does not carry, and names
+    /// the parent as its source. `outcome` and `rank` are the wire
+    /// contract's (`router::outcome::TaskOutcome`), resolved by the caller:
+    /// the ledger does not depend on the router. Returns whether a row
+    /// changed.
+    pub fn record_merge_outcome(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        outcome: &str,
+        rank: u8,
+    ) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE router_tasks
+                SET outcome = ?1, outcome_rank = ?2, outcome_source = 'merge',
+                    updated_at = ?3
+              WHERE task_id = ?4 AND agent_id = ?5
+                AND outcome = 'unknown' AND outcome_rank < ?2",
+            params![outcome, i64::from(rank), self.now(), task_id, agent_id,],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// How many router tasks a fallback subagent's merge row settled, and
+    /// how many of those were verified.
+    pub fn merge_outcome_totals(&self) -> Result<MergeTotals> {
+        let (by_subagent, verified) = self.conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN outcome = 'completed_verified' THEN 1 ELSE 0 END), 0)
+               FROM router_tasks WHERE outcome_source = 'merge'",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        Ok(MergeTotals {
+            by_subagent: by_subagent.max(0) as u64,
+            verified: verified.max(0) as u64,
+        })
     }
 
     /// Every class's label counts and token totals, by class name.

@@ -4264,11 +4264,14 @@ fn review_outcome_ingest(ledger: Option<PathBuf>, plan_root: Option<PathBuf>) ->
     let written = open_ledger()
         .map_err(|e| e.to_string())
         .and_then(|ledger| labelled.record(&ledger).map_err(|e| e.to_string()));
-    if let Err(e) = written {
-        eprintln!("relais native review-outcome: {e}");
-        return CliOutcome::OperationalFailure;
-    }
-    println!("{}", labelled.summary());
+    let unmatched = match written {
+        Ok(unmatched) => unmatched,
+        Err(e) => {
+            eprintln!("relais native review-outcome: {e}");
+            return CliOutcome::OperationalFailure;
+        }
+    };
+    println!("{}", labelled.summary_after(unmatched));
     CliOutcome::Accepted
 }
 
