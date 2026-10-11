@@ -179,11 +179,13 @@ pub fn candidate_contained(repo: &Path, patch: &Path, sha: &str) -> Containment 
     if !patch.is_file() {
         return Containment::Unreachable(format!("{} is not a file", patch.display()));
     }
-    let patch = match std::fs::canonicalize(patch) {
+    // Absolute, because git runs from the repository; not canonical: on
+    // Windows that is a verbatim `\\?\C:\...` path git cannot open.
+    let patch = match std::path::absolute(patch) {
         Ok(patch) => patch,
         Err(e) => {
             return Containment::Unreachable(format!(
-                "could not canonicalize {}: {e}",
+                "could not make {} absolute: {e}",
                 patch.display()
             ))
         }
