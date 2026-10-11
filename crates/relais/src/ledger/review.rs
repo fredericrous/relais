@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 use rusqlite::{params, OptionalExtension};
 
 use super::{Ledger, Result};
-use crate::router::outcome::TaskOutcome;
 
 /// One labelled review, keyed by the reviewer's agent id.
 #[derive(Debug, Clone, PartialEq)]
@@ -128,12 +127,16 @@ impl Ledger {
     /// higher, with `outcome_source = 'merge'`, so a second ingest changes
     /// nothing. The `router-observe` statement is not reused: it keys on
     /// the session, which the amont-agent ledger does not carry, and names
-    /// the parent as its source. Returns whether a row changed.
+    /// the parent as its source. `outcome` and `rank` are the wire
+    /// contract's (`router::outcome::TaskOutcome`), resolved by the caller:
+    /// the ledger does not depend on the router. Returns whether a row
+    /// changed.
     pub fn record_merge_outcome(
         &self,
         task_id: &str,
         agent_id: &str,
-        outcome: TaskOutcome,
+        outcome: &str,
+        rank: u8,
     ) -> Result<bool> {
         let changed = self.conn.execute(
             "UPDATE router_tasks
@@ -141,13 +144,7 @@ impl Ledger {
                     updated_at = ?3
               WHERE task_id = ?4 AND agent_id = ?5
                 AND outcome = 'unknown' AND outcome_rank < ?2",
-            params![
-                outcome.as_str(),
-                i64::from(outcome.rank()),
-                self.now(),
-                task_id,
-                agent_id,
-            ],
+            params![outcome, i64::from(rank), self.now(), task_id, agent_id,],
         )?;
         Ok(changed > 0)
     }

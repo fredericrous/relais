@@ -716,7 +716,12 @@ impl Labelled {
                     } else {
                         TaskOutcome::Corrected
                     };
-                    ledger.record_merge_outcome(&task_id, &merge.agent_id, outcome)?;
+                    ledger.record_merge_outcome(
+                        &task_id,
+                        &merge.agent_id,
+                        outcome.as_str(),
+                        outcome.rank(),
+                    )?;
                 }
                 None => unmatched += 1,
             }
