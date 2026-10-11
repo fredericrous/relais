@@ -121,6 +121,10 @@ pub enum Reason {
     NotPushed,
     NoLaterReview,
     MissingBody,
+    /// A later in-remit `high` finding names a section that was not in the
+    /// round-1 body unchanged, or names none: this reviewer may never have
+    /// seen what the later one found (plan Behaviour 2).
+    SectionChanged,
 }
 
 impl Reason {
@@ -129,6 +133,7 @@ impl Reason {
             Self::NotPushed => "not_pushed",
             Self::NoLaterReview => "no_later_review",
             Self::MissingBody => "missing_body",
+            Self::SectionChanged => "section_changed",
         }
     }
 }
@@ -153,7 +158,7 @@ impl Label {
     fn reason(self) -> Option<Reason> {
         match self {
             Self::Unknown(reason) => Some(reason),
-            _ => None,
+            Self::Clean | Self::Miss => None,
         }
     }
 }
@@ -243,41 +248,46 @@ fn label_row(
                 .as_ref()
                 .is_some_and(|area| row.remit.contains(area))
     };
-    let mut undecidable = false;
+    // Why a later finding could not be judged; the first one wins, since
+    // a missing body hides whether the section changed too.
+    let mut undecidable: Option<Reason> = None;
+    let mut note = |reason: Reason| {
+        undecidable.get_or_insert(reason);
+    };
     for later_row in later {
         for finding in &later_row.findings {
-            let Some(section) = finding.section.as_deref().filter(|s| !s.is_empty()) else {
-                continue;
-            };
             if !matches!(finding.severity, Severity::High | Severity::Blocking)
                 || !in_remit(finding)
             {
                 continue;
             }
-            let (Some(first), Some(last)) = (body(&row.first_round_sha), body(&later_row.body_sha))
-            else {
-                undecidable = true;
+            let Some(section) = finding.section.as_deref().filter(|s| !s.is_empty()) else {
+                note(Reason::SectionChanged);
                 continue;
             };
-            // Only a section that stood unchanged in round 1 was there to
-            // be found by this reviewer.
-            match (section_text(&first, section), section_text(&last, section)) {
-                (Some(then), Some(now)) if then == now => {}
-                _ => continue,
-            }
-            if !row
+            if row
                 .findings
                 .iter()
                 .any(|own| own.section.as_deref() == Some(section))
             {
-                return Label::Miss;
+                continue;
+            }
+            let (Some(first), Some(last)) = (body(&row.first_round_sha), body(&later_row.body_sha))
+            else {
+                note(Reason::MissingBody);
+                continue;
+            };
+            // Only a section that stood unchanged since round 1 was there
+            // to be found by this reviewer; otherwise nobody can say.
+            match (section_text(&first, section), section_text(&last, section)) {
+                (Some(then), Some(now)) if then == now => return Label::Miss,
+                _ => note(Reason::SectionChanged),
             }
         }
     }
-    if undecidable {
-        Label::Unknown(Reason::MissingBody)
-    } else {
-        Label::Clean
+    match undecidable {
+        Some(reason) => Label::Unknown(reason),
+        None => Label::Clean,
     }
 }
 
@@ -564,10 +574,11 @@ impl Labelled {
                     .count()
             };
             line.push_str(&format!(
-                " (not_pushed {}, no_later_review {}, missing_body {})",
+                " (not_pushed {}, no_later_review {}, missing_body {}, section_changed {})",
                 of(Reason::NotPushed),
                 of(Reason::NoLaterReview),
-                of(Reason::MissingBody)
+                of(Reason::MissingBody),
+                of(Reason::SectionChanged)
             ));
         }
         line
@@ -601,19 +612,18 @@ impl Labelled {
     }
 }
 
-/// What the learn cycle notes: the ingest with default settings, or the
-/// reason it did not happen. `None` when there is no ledger to read.
-pub fn cycle_note(ledger: &Ledger) -> Option<String> {
-    let outcome = Settings::resolve(None, None)
-        .map_err(|e| e.to_string())
-        .and_then(|settings| {
-            let labelled = read(&settings).map_err(|e| e.to_string())?;
-            let Some(labelled) = labelled else {
-                return Ok(None);
-            };
-            labelled.record(ledger).map_err(|e| e.to_string())?;
-            Ok(Some(labelled.summary()))
-        });
+/// What the learn cycle notes: the ingest with the settings its caller
+/// resolved, or the reason it did not happen. `None` when there is no
+/// ledger to read.
+pub fn cycle_note(ledger: &Ledger, settings: &Result<Settings, String>) -> Option<String> {
+    let outcome = settings.clone().and_then(|settings| {
+        let labelled = read(&settings).map_err(|e| e.to_string())?;
+        let Some(labelled) = labelled else {
+            return Ok(None);
+        };
+        labelled.record(ledger).map_err(|e| e.to_string())?;
+        Ok(Some(labelled.summary()))
+    });
     match outcome {
         Ok(summary) => summary.map(|summary| format!("review outcomes {summary}")),
         Err(e) => Some(format!("review outcomes: {e}")),
@@ -724,14 +734,41 @@ mod tests {
     }
 
     #[test]
-    fn a_section_that_changed_since_round_one_does_not_count() {
+    fn a_section_that_changed_since_round_one_is_unknown() {
         let rows = [
             row("r", "rust", 1, "b1"),
             with_finding(row("b", "backend", 2, "b2"), "Phases", "cli", "high"),
         ];
         assert_eq!(
             labels(&rows, true, &[FIRST, ("b2", BODY2_SAME)])[0],
-            Label::Clean
+            Label::Unknown(Reason::SectionChanged)
+        );
+    }
+
+    #[test]
+    fn a_section_absent_from_round_one_is_unknown() {
+        let rows = [
+            row("r", "rust", 1, "b1"),
+            with_finding(row("b", "backend", 2, "b2"), "Rollout", "cli", "high"),
+        ];
+        let later = format!("{BODY2_SAME}\n## Rollout\n\nNew.\n");
+        assert_eq!(
+            labels(&rows, true, &[FIRST, ("b2", &later)])[0],
+            Label::Unknown(Reason::SectionChanged)
+        );
+    }
+
+    #[test]
+    fn a_high_finding_naming_no_section_is_unknown() {
+        let mut later = with_finding(row("b", "backend", 2, "b2"), "", "cli", "high");
+        later["findings"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("section");
+        let rows = [row("r", "rust", 1, "b1"), later];
+        assert_eq!(
+            labels(&rows, true, &[FIRST, ("b2", BODY2_SAME)])[0],
+            Label::Unknown(Reason::SectionChanged)
         );
     }
 
@@ -830,7 +867,7 @@ mod tests {
         assert_eq!(
             labelled.summary(),
             "labelled 1: clean 0, miss 0, unknown 1, invalid 2 \
-             (not_pushed 1, no_later_review 0, missing_body 0)"
+             (not_pushed 1, no_later_review 0, missing_body 0, section_changed 0)"
         );
     }
 

@@ -35,12 +35,23 @@ pub struct ReviewerReport {
     /// Classes beyond the ones listed.
     pub more: usize,
     pub empty: bool,
+    /// Why the ledger could not answer; the section says so instead of
+    /// claiming there is nothing yet.
+    pub unreadable: Option<String>,
 }
 
 /// The section from the ledger. Reading it never fails a report: a ledger
-/// that cannot answer is an empty section.
+/// that cannot answer is a one-line section naming why.
 pub fn reviewer_report(ledger: &Ledger) -> ReviewerReport {
-    build(ledger.review_class_totals().unwrap_or_default())
+    match ledger.review_class_totals() {
+        Ok(totals) => build(totals),
+        Err(e) => ReviewerReport {
+            classes: Vec::new(),
+            more: 0,
+            empty: false,
+            unreadable: Some(e.to_string()),
+        },
+    }
 }
 
 fn build(totals: Vec<ReviewClassTotals>) -> ReviewerReport {
@@ -62,6 +73,7 @@ fn build(totals: Vec<ReviewClassTotals>) -> ReviewerReport {
         empty: classes.is_empty(),
         classes,
         more,
+        unreadable: None,
     }
 }
 
@@ -117,6 +129,12 @@ fn clip(text: &str, max: usize) -> String {
 impl ReviewerReport {
     /// The text section, every line within 80 columns.
     pub fn render(&self) -> String {
+        if let Some(why) = &self.unreadable {
+            return format!(
+                "\n{}\n",
+                clip(&format!("reviewer outcomes unreadable: {why}"), WIDTH)
+            );
+        }
         if self.empty {
             return format!("\n{EMPTY}\n");
         }
@@ -244,5 +262,26 @@ mod fitting {
         assert_eq!(tokens_text(&by, 40), "opus-5-5 56k, sonnet-5-5 55k, +1");
         assert_eq!(tokens_text(&by, 100).matches(", ").count(), 2);
         assert_eq!(tokens_text(&by, 3), "+3");
+    }
+}
+
+#[cfg(test)]
+mod unreadable {
+    use super::*;
+
+    #[test]
+    fn a_ledger_that_cannot_answer_says_so_not_that_nothing_is_there() {
+        let report = ReviewerReport {
+            classes: Vec::new(),
+            more: 0,
+            empty: false,
+            unreadable: Some("no such table: review_outcomes".into()),
+        };
+        let text = report.render();
+        assert!(
+            text.contains("reviewer outcomes unreadable: no such table"),
+            "{text}"
+        );
+        assert!(!text.contains(EMPTY), "{text}");
     }
 }

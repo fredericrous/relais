@@ -86,8 +86,8 @@ unset) and labels each reviewer `clean`, `miss` or `unknown` into the
 section and `learn cycle` runs the ingest at its start (a failure there is a
 cycle note, never a failed cycle). It prints `labelled N: clean a, miss b,
 unknown c`; `--dry-run` lists one line per reviewer and writes nothing. It
-exits 0 (also when there is no ledger), 1 when the relais ledger fails, 2 when
-the ledger file is unreadable, and 3 (the table above) when the ledger is a
+exits 0 (also when there is no ledger), 1 when the ledger file cannot be read
+or the relais ledger fails, 2 on a usage error, and 3 (the table above) when the ledger is a
 symlink, not owned by the running user, or open to group or other. It never
 writes `machine.toml`.
 

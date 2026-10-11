@@ -2366,7 +2366,9 @@ fn learn_cycle_command(
         },
         auto_promote: machine.learning.auto_promote.is_some(),
         classifier_dir: paths::state_dir().ok().map(|dir| dir.join("classifier")),
-        ingest_review_outcomes: true,
+        review_outcomes: Some(
+            relais::review_outcome::Settings::resolve(None, None).map_err(|e| e.to_string()),
+        ),
         now: chrono::Utc::now(),
     };
     let mut stage_number = 0;
@@ -4016,7 +4018,11 @@ fn native_command(cmd: NativeCommand) -> Result<CliOutcome, CliError> {
             ledger,
             plan_root,
             dry_run,
-        } => Ok(review_outcome_command(ledger, plan_root, dry_run)),
+        } => Ok(if dry_run {
+            review_outcome_preview(ledger, plan_root)
+        } else {
+            review_outcome_ingest(ledger, plan_root)
+        }),
         NativeCommand::GateStamp { cwd } => Ok(gate_stamp_command(&cwd)),
         NativeCommand::RouterEnvelope {
             by,
@@ -4158,48 +4164,63 @@ fn gate_stamp_command(repo: &std::path::Path) -> CliOutcome {
 }
 
 /// `relais native review-outcome`: 0 done (or no ledger to read), 1 the
-/// relais ledger failed, 2 the usage or the ledger file is unreadable, 3
-/// the ledger file crosses the trust boundary.
-fn review_outcome_command(
+/// ledger file or the relais ledger failed, 2 the usage, 3 the ledger file
+/// crosses the trust boundary. `Err` carries the exit for a run that stops
+/// before labelling; `Ok(None)` is no ledger at all.
+fn review_outcome_labels(
     ledger: Option<PathBuf>,
     plan_root: Option<PathBuf>,
-    dry_run: bool,
-) -> CliOutcome {
+) -> Result<Option<relais::review_outcome::Labelled>, CliOutcome> {
     use relais::review_outcome::{read, IngestError, Settings};
-    let settings = match Settings::resolve(ledger, plan_root) {
-        Ok(settings) => settings,
-        Err(e) => {
-            eprintln!("relais native review-outcome: {e}");
-            return CliOutcome::InvalidInput;
-        }
-    };
-    let labelled = match read(&settings) {
-        Ok(Some(labelled)) => labelled,
+    let settings = Settings::resolve(ledger, plan_root).map_err(|e| {
+        eprintln!("relais native review-outcome: {e}");
+        CliOutcome::InvalidInput
+    })?;
+    match read(&settings) {
+        Ok(Some(labelled)) => Ok(Some(labelled)),
         Ok(None) => {
             println!("no reviewer outcomes at {}", settings.ledger.display());
-            return CliOutcome::Accepted;
+            Ok(None)
         }
         Err(e) => {
             eprintln!("relais native review-outcome: {e}");
-            return match e {
+            Err(match e {
                 IngestError::Refused(_) => CliOutcome::Blocked,
-                IngestError::Unreadable(_) => CliOutcome::InvalidInput,
-                IngestError::Ledger(_) => CliOutcome::OperationalFailure,
-            };
+                IngestError::Unreadable(_) | IngestError::Ledger(_) => {
+                    CliOutcome::OperationalFailure
+                }
+            })
         }
+    }
+}
+
+/// `--dry-run`: each label and the summary, and nothing written.
+fn review_outcome_preview(ledger: Option<PathBuf>, plan_root: Option<PathBuf>) -> CliOutcome {
+    let labelled = match review_outcome_labels(ledger, plan_root) {
+        Ok(Some(labelled)) => labelled,
+        Ok(None) => return CliOutcome::Accepted,
+        Err(outcome) => return outcome,
     };
-    if dry_run {
-        for line in labelled.lines() {
-            println!("{line}");
-        }
-    } else {
-        let written = open_ledger()
-            .map_err(|e| e.to_string())
-            .and_then(|ledger| labelled.record(&ledger).map_err(|e| e.to_string()));
-        if let Err(e) = written {
-            eprintln!("relais native review-outcome: {e}");
-            return CliOutcome::OperationalFailure;
-        }
+    for line in labelled.lines() {
+        println!("{line}");
+    }
+    println!("{}", labelled.summary());
+    CliOutcome::Accepted
+}
+
+/// The labels, written to the `review_outcomes` table.
+fn review_outcome_ingest(ledger: Option<PathBuf>, plan_root: Option<PathBuf>) -> CliOutcome {
+    let labelled = match review_outcome_labels(ledger, plan_root) {
+        Ok(Some(labelled)) => labelled,
+        Ok(None) => return CliOutcome::Accepted,
+        Err(outcome) => return outcome,
+    };
+    let written = open_ledger()
+        .map_err(|e| e.to_string())
+        .and_then(|ledger| labelled.record(&ledger).map_err(|e| e.to_string()));
+    if let Err(e) = written {
+        eprintln!("relais native review-outcome: {e}");
+        return CliOutcome::OperationalFailure;
     }
     println!("{}", labelled.summary());
     CliOutcome::Accepted

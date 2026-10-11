@@ -171,7 +171,7 @@ fn a_missed_high_finding_labels_the_earlier_reviewer_a_miss() {
         "{text}"
     );
     assert!(
-        text.contains("labelled 2: clean 0, miss 1, unknown 1 (not_pushed 0, no_later_review 1, missing_body 0)"),
+        text.contains("labelled 2: clean 0, miss 1, unknown 1 (not_pushed 0, no_later_review 1, missing_body 0, section_changed 0)"),
         "{text}"
     );
 }
