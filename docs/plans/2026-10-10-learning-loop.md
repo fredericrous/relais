@@ -139,6 +139,7 @@ The person also wants to try **Laya** (Convai, Apache-2.0, 2026-09-18): a 421M M
 ## Implementation review
 
 **approve-with-changes**, round 1 (106k tokens, 140 s), delta (134k, 36 s): all seven round-1 findings resolved.
+Second delta (Windows path fix, 135k, 16 s): **approve**, no findings.
 Fixed: a killed cycle blocked the due check; pane race; swallowed policy, git and IO errors; rollback closing its row early (falsified); downgrade note; live concurrency and kill -9 checks.
 Deliberate: a malformed `relais.toml` writes an `error` row that counts as a cycle, so the next try waits 20 h — a broken config needs the person, and the pane says so once. The unreadable-directory tests return early under root; CI runs as the non-root `runner` user (`ubuntu-latest`).
 
@@ -172,6 +173,7 @@ Observed before the relais push (2026-10-10/11, relais PR 1):
 - Phase 5: `router::capture` 6/6 and `session_router` 19/19, including a private redacted day file with a ledger row without the text, the off switches capturing nothing, 90-day deletion, the export created 0600, and day files 0600 under a permissive umask.
 - Downgrade: the installed v0.11.3 on a ledger the branch migrated (scratch copy) → expected a clean refusal → actual `relais: the ledger is unavailable: ledger: 22 applied migration(s), this relais knows 20 — a newer relais wrote this ledger; upgrade relais or point RELAIS_STATE_DIR at another one`, exit 1. A downgrade restores a backup taken before the upgrade (CHANGELOG upgrade note).
 - `make check` on the final tree (63a88201…, after the review fixes) → expected exit 0 → actual exit 0: fmt, clippy, module cycles, every Rust suite with no failure, MSRV 1.88.0 build, plugin 232 pass / 0 fail, audit.
+- CI on the pushed branch: `test (windows-latest)` failed 3 salvage tests — `canonicalize` gave a verbatim `\\?\C:\...` path `git apply` cannot open. Fixed with `std::path::absolute` (5556091, tree acf6fdcc…); locally clippy clean, `learn::salvage` 5/5, commit gate 28 checks; the Windows job is read again on the PR before the merge.
 
 Before the homelab push: `kustomize build` and `kubeconform` on `apps/laya-lab`; the PR's Go lanes are skipped-green (path-filtered), not the 13-minute golangci-lint run. The window observations (Phase 6) are recorded as input → expected → observed, with the device and `talosctl dmesg`.
 
