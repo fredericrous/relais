@@ -78,6 +78,19 @@ split wherever a caller has to act differently.
 | 19 | `init --detect` found no verification command and none was typed; nothing was written |
 | 20 | `learn cycle`: another cycle holds the Training lease (its pid and start time are named); nothing was queued and no row was written |
 
+`relais native review-outcome [--ledger <path>] [--plan-root <dir>] [--dry-run]`
+ingests amont-agent's plan-review outcomes ledger (default
+`$CLAUDE_CONFIG_DIR/amont-agent/plan-review/outcomes.jsonl`, `~/.claude` when
+unset) and labels each reviewer `clean`, `miss` or `unknown` into the
+`review_outcomes` table; `relais report` shows the per-class `Reviewers`
+section and `learn cycle` runs the ingest at its start (a failure there is a
+cycle note, never a failed cycle). It prints `labelled N: clean a, miss b,
+unknown c`; `--dry-run` lists one line per reviewer and writes nothing. It
+exits 0 (also when there is no ledger), 1 when the ledger file cannot be read
+or the relais ledger fails, 2 on a usage error, and 3 (the table above) when the ledger is a
+symlink, not owned by the running user, or open to group or other. It never
+writes `machine.toml`.
+
 `learn cycle` exits 0 where it did nothing wrong and nothing at all: `deferred:
 not idle (<n> agents active)` (another session's agents are running; the cycle
 stays due), `not due: …` under `--if-due`, and `awaiting_promotion` (an

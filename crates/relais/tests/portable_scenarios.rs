@@ -126,6 +126,9 @@ impl World {
             // unset (`paths::resolve_home`), and the CI matrix runs
             // there, so both have to point into the world.
             .env("USERPROFILE", &self.root)
+            // Nor the Claude config directory of whoever runs the suite:
+            // `learn cycle` reads reviewer outcomes from under it.
+            .env_remove("CLAUDE_CONFIG_DIR")
             .output()
             .expect("relais runs")
     }
@@ -1096,6 +1099,32 @@ fn exit_codes_follow_the_documented_table() {
     // 0 — and the ordinary path still exits 0.
     assert_eq!(world.relais(&["doctor", "--json"]).status.code(), Some(3));
     assert_eq!(world.relais(&["report", "--json"]).status.code(), Some(0));
+
+    // 0 and 3 — `native review-outcome`: no ledger is nothing to do, and a
+    // symlinked ledger is refused before a byte of it is read.
+    let reviews = world.root.join("reviews");
+    std::fs::create_dir_all(&reviews).expect("reviews dir");
+    let outcomes = reviews.join("outcomes.jsonl");
+    let ingest = |path: &Path| {
+        world.relais(&[
+            "native",
+            "review-outcome",
+            "--ledger",
+            path.to_str().unwrap(),
+            "--plan-root",
+            world.root.to_str().unwrap(),
+        ])
+    };
+    assert_eq!(ingest(&outcomes).status.code(), Some(0));
+    #[cfg(unix)]
+    {
+        let target = reviews.join("target.jsonl");
+        std::fs::write(&target, "").expect("target");
+        std::os::unix::fs::symlink(&target, &outcomes).expect("symlink");
+        let refused = ingest(&outcomes);
+        assert_eq!(refused.status.code(), Some(3), "{}", text(&refused.stderr));
+        assert!(text(&refused.stderr).contains("symlink"));
+    }
 
     // 20 — `learn cycle` while another process holds the Training lease.
     // The holder here is this test; the refusal names its pid.

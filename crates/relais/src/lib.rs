@@ -34,6 +34,7 @@ pub mod protocol;
 pub mod repo;
 pub mod report;
 pub mod resume;
+pub mod review_outcome;
 pub mod rng;
 pub mod route;
 pub mod router;

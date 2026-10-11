@@ -24,14 +24,16 @@ use crate::outcome::{Outcome, OutcomeDetail, OutcomeKind};
 use crate::policy::Tier;
 use crate::route::RoutedBy;
 
+mod review;
 mod router;
+pub use review::{ReviewClassTotals, ReviewOutcomeRow};
 pub use router::{
     ExplorationTask, RouterCheck, RouterClass, RouterClassificationRow, RouterDecisionRow,
     RouterExplorationStop, RouterProvenance, RouterReassessRow, RouterRecord, RouterTaskOutcomeRow,
     RouterTaskRow, RouterUsageRow, RouterWindow,
 };
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 25;
+pub const LEDGER_SCHEMA_VERSION: u64 = 26;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -1588,6 +1590,33 @@ const MIGRATIONS: &[(&str, &str)] = &[
         PRIMARY KEY (session, call_id)
     );
     CREATE INDEX idx_router_classifications_at ON router_classifications(at);
+    "#,
+    ),
+    (
+        // The plan-review panel's outcomes (plan-review-learns-model
+        // Phase 2), written by `relais native review-outcome`: one row per
+        // reviewer launch, keyed by its agent id, labelled `clean`, `miss`
+        // or `unknown`. Not router outcomes, so not in `router_tasks`.
+        // Additive: a binary that predates it never reads the table.
+        "v26",
+        r#"
+    CREATE TABLE review_outcomes (
+        agent_id TEXT PRIMARY KEY,
+        plan_path TEXT NOT NULL,
+        role TEXT NOT NULL,
+        class TEXT NOT NULL,
+        round INTEGER NOT NULL,
+        body_sha TEXT NOT NULL,
+        model TEXT,
+        tokens INTEGER,
+        seconds REAL,
+        verdict TEXT,
+        label TEXT NOT NULL,
+        label_reason TEXT,
+        router_task_id TEXT,
+        recorded_at INTEGER NOT NULL,
+        labelled_at TEXT NOT NULL
+    );
     "#,
     ),
 ];

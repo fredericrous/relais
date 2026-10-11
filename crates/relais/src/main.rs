@@ -613,6 +613,24 @@ enum NativeCommand {
     /// payload is invalid, and then nothing is written
     #[command(name = "router-observe")]
     RouterObserve,
+    /// Ingest amont-agent's plan-review outcomes ledger: label each
+    /// reviewer clean, miss or unknown into the relais ledger. Refuses
+    /// (3) a ledger that is a symlink, not ours, or open to group or
+    /// other; never writes machine.toml
+    #[command(name = "review-outcome")]
+    ReviewOutcome {
+        /// The outcomes ledger (default: amont-agent's, under the Claude
+        /// config directory)
+        #[arg(long)]
+        ledger: Option<PathBuf>,
+        /// Where the repositories' docs/plans live (default:
+        /// $AMONT_AGENT_PLAN_ROOT, else ~/Developer/Perso)
+        #[arg(long)]
+        plan_root: Option<PathBuf>,
+        /// Print the labels that would be assigned; write nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Record the person's routing envelope in machine.toml (SPEC §30),
     /// or with `--off` remove it and record that routing is off. Run by
     /// the plugin after its own question; typed in a shell it is recorded
@@ -2348,6 +2366,9 @@ fn learn_cycle_command(
         },
         auto_promote: machine.learning.auto_promote.is_some(),
         classifier_dir: paths::state_dir().ok().map(|dir| dir.join("classifier")),
+        review_outcomes: Some(
+            relais::review_outcome::Settings::resolve(None, None).map_err(|e| e.to_string()),
+        ),
         now: chrono::Utc::now(),
     };
     let mut stage_number = 0;
@@ -3993,6 +4014,15 @@ fn native_command(cmd: NativeCommand) -> Result<CliOutcome, CliError> {
         NativeCommand::Contract => native_contract_command(),
         NativeCommand::RouterState { session } => Ok(router_state_command(&session)),
         NativeCommand::RouterObserve => Ok(router_observe_command()),
+        NativeCommand::ReviewOutcome {
+            ledger,
+            plan_root,
+            dry_run,
+        } => Ok(if dry_run {
+            review_outcome_preview(ledger, plan_root)
+        } else {
+            review_outcome_ingest(ledger, plan_root)
+        }),
         NativeCommand::GateStamp { cwd } => Ok(gate_stamp_command(&cwd)),
         NativeCommand::RouterEnvelope {
             by,
@@ -4131,6 +4161,69 @@ fn gate_stamp_command(repo: &std::path::Path) -> CliOutcome {
             CliOutcome::OperationalFailure
         }
     }
+}
+
+/// `relais native review-outcome`: 0 done (or no ledger to read), 1 the
+/// ledger file or the relais ledger failed, 2 the usage, 3 the ledger file
+/// crosses the trust boundary. `Err` carries the exit for a run that stops
+/// before labelling; `Ok(None)` is no ledger at all.
+fn review_outcome_labels(
+    ledger: Option<PathBuf>,
+    plan_root: Option<PathBuf>,
+) -> Result<Option<relais::review_outcome::Labelled>, CliOutcome> {
+    use relais::review_outcome::{read, IngestError, Settings};
+    let settings = Settings::resolve(ledger, plan_root).map_err(|e| {
+        eprintln!("relais native review-outcome: {e}");
+        CliOutcome::InvalidInput
+    })?;
+    match read(&settings) {
+        Ok(Some(labelled)) => Ok(Some(labelled)),
+        Ok(None) => {
+            println!("no reviewer outcomes at {}", settings.ledger.display());
+            Ok(None)
+        }
+        Err(e) => {
+            eprintln!("relais native review-outcome: {e}");
+            Err(match e {
+                IngestError::Refused(_) => CliOutcome::Blocked,
+                IngestError::Unreadable(_) | IngestError::Ledger(_) => {
+                    CliOutcome::OperationalFailure
+                }
+            })
+        }
+    }
+}
+
+/// `--dry-run`: each label and the summary, and nothing written.
+fn review_outcome_preview(ledger: Option<PathBuf>, plan_root: Option<PathBuf>) -> CliOutcome {
+    let labelled = match review_outcome_labels(ledger, plan_root) {
+        Ok(Some(labelled)) => labelled,
+        Ok(None) => return CliOutcome::Accepted,
+        Err(outcome) => return outcome,
+    };
+    for line in labelled.lines() {
+        println!("{line}");
+    }
+    println!("{}", labelled.summary());
+    CliOutcome::Accepted
+}
+
+/// The labels, written to the `review_outcomes` table.
+fn review_outcome_ingest(ledger: Option<PathBuf>, plan_root: Option<PathBuf>) -> CliOutcome {
+    let labelled = match review_outcome_labels(ledger, plan_root) {
+        Ok(Some(labelled)) => labelled,
+        Ok(None) => return CliOutcome::Accepted,
+        Err(outcome) => return outcome,
+    };
+    let written = open_ledger()
+        .map_err(|e| e.to_string())
+        .and_then(|ledger| labelled.record(&ledger).map_err(|e| e.to_string()));
+    if let Err(e) = written {
+        eprintln!("relais native review-outcome: {e}");
+        return CliOutcome::OperationalFailure;
+    }
+    println!("{}", labelled.summary());
+    CliOutcome::Accepted
 }
 
 /// `relais native router-observe`: 0 recorded (duplicates included), 2
@@ -6397,6 +6490,7 @@ fn report_command(
         relais::learn::summary::learning_report(&ledger, registry_for_report.as_ref()),
         "the learning section",
     )?);
+    report.review_outcomes = Some(report::reviewer_report(&ledger));
     report.orchestration.unattributable = not_imported.unattributable;
     report.orchestration.transcript_missing = not_imported.transcript_missing;
     // Best-effort: a report is still a report with no coordinator

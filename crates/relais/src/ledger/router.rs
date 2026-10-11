@@ -936,7 +936,7 @@ fn read_task_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<Rout
 }
 
 /// Token counts are `u64` on the wire and INTEGER (i64) in SQLite.
-fn saturating_i64(value: u64) -> i64 {
+pub(super) fn saturating_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 

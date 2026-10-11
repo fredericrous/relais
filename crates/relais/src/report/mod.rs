@@ -11,10 +11,12 @@
 //! here converts token savings into subscription fee savings.
 
 mod repairs;
+mod reviewers;
 
 use serde::Serialize;
 
 pub use repairs::{EffortRepairs, RepairCost};
+pub use reviewers::{reviewer_report, ReviewerClass, ReviewerReport};
 
 use crate::ledger::{DecisionRecord, Ledger, PhaseCost, TaskOrigin};
 use crate::lifecycle::{Reason, RunPurpose, State};
@@ -612,6 +614,10 @@ pub struct Report {
     /// `None`; `relais report` fills it from the ledger and the registry,
     /// always: with nothing learned it is a sentence saying why.
     pub learning: Option<crate::learn::summary::LearningReport>,
+    /// The plan-review panel's reviewers, per class. `runs_report` leaves
+    /// it `None`; `relais report` fills it from the ledger, always: with
+    /// nothing ingested it is the empty state.
+    pub review_outcomes: Option<ReviewerReport>,
 }
 
 /// Orchestration spend imported from Claude Code session transcripts
@@ -986,6 +992,7 @@ pub fn runs_report(
         cost_per_accepted_task_with_orchestration,
         session_routing: None,
         learning: None,
+        review_outcomes: None,
         trial_spend,
         observational,
     })
@@ -1272,6 +1279,9 @@ impl Report {
         }
         if let Some(learning) = &self.learning {
             out.push_str(&learning.render());
+        }
+        if let Some(reviewers) = &self.review_outcomes {
+            out.push_str(&reviewers.render());
         }
     }
 }
@@ -1681,6 +1691,7 @@ mod tests {
             cost_per_accepted_task_with_orchestration: Some(MicroUsd::from_micros(10)),
             session_routing: None,
             learning: None,
+            review_outcomes: None,
         };
         let rendered = report.render();
         assert!(
@@ -1892,6 +1903,7 @@ mod tests {
                 "pending_decisions",
                 "pending_feedback",
                 "repair_outcomes",
+                "review_outcomes",
                 "runs",
                 "schema_version",
                 "session_routing",
