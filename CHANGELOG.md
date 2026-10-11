@@ -6,6 +6,14 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## Unreleased
+
+A run refused because the Claude Code version could not be read now says why
+the probe failed (timed out, killed by a signal, exited non-zero) instead of
+"`claude --version` printed nothing". The release scenarios no longer
+SIGKILL the process group of an agent reaped earlier, whose pid the system
+may have given to another process, such as another scenario's probe.
+
 ## v0.15.0
 
 Status is scoped to the session, orphaned runs are reaped, a run can be

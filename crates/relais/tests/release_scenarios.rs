@@ -548,6 +548,12 @@ impl ScriptedPlugin {
         // Through the library, as relais itself does: one kill path, no
         // dependence on how a platform's kill(1) parses a negative operand.
         let _ = relais::procs::kill_group(pgid);
+        // Reaped and killed: the pid may be reused, so the end-of-run sweep
+        // must not signal this group again.
+        groups
+            .lock()
+            .expect("groups")
+            .retain(|group| *group != pgid);
         text(&out.stdout)
             .lines()
             .rev()

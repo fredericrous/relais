@@ -63,14 +63,27 @@ fn claude_code_version(printed: &str) -> Option<(u64, u64, u64)> {
 /// Why this Claude Code is outside the plugin's supported range, if it is.
 /// A version that cannot be read is outside it too: nothing says it works.
 pub fn unsupported_claude_code(printed: Option<&str>) -> Option<String> {
+    unsupported_claude_code_because(printed, None)
+}
+
+/// As `unsupported_claude_code`, naming `probe_failure` (why the probe
+/// could not read a version) when one is known.
+pub fn unsupported_claude_code_because(
+    printed: Option<&str>,
+    probe_failure: Option<&str>,
+) -> Option<String> {
     let installed = printed.map(str::trim).filter(|text| !text.is_empty());
     let supported = installed
         .and_then(claude_code_version)
         .is_some_and(|version| version >= CLAUDE_CODE_FROM && version < CLAUDE_CODE_BELOW);
     (!supported).then(|| {
+        let shown = match (installed, probe_failure) {
+            (Some(text), _) => text.to_string(),
+            (None, Some(failure)) => format!("unknown ({failure})"),
+            (None, None) => "unknown (`claude --version` printed nothing)".to_string(),
+        };
         format!(
-            "the relais plugin supports Claude Code {SUPPORTED_CLAUDE_CODE}; installed: {}",
-            installed.unwrap_or("unknown (`claude --version` printed nothing)")
+            "the relais plugin supports Claude Code {SUPPORTED_CLAUDE_CODE}; installed: {shown}"
         )
     })
 }
@@ -230,6 +243,13 @@ mod tests {
         let unknown = unsupported_claude_code(None).expect("unreadable is unsupported");
         assert!(unknown.contains(SUPPORTED_CLAUDE_CODE), "{unknown}");
         assert!(unsupported_claude_code(Some("not a version")).is_some());
+        let failed = unsupported_claude_code_because(
+            None,
+            Some("`claude --version` exited or was killed by signal 9"),
+        )
+        .expect("an unreadable version is unsupported");
+        assert!(failed.contains("killed by signal 9"), "{failed}");
+        assert!(!failed.contains("printed nothing"), "{failed}");
     }
 
     #[test]
