@@ -54,7 +54,7 @@ quick-xml = "0.42"
 libc = "0.2"
 
 # Process handles and the Toolhelp snapshot. Microsoft's own raw bindings,
-# no build script, feature-gated to the four modules `procs` touches.
+# no build script, feature-gated to the modules `procs` touches.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
