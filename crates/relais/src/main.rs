@@ -8115,7 +8115,12 @@ mod tests {
             .unwrap_or_else(|_| panic!("resume records"));
         let (pid, started, since) = ledger.run_driver(&run).expect("driver columns");
         assert_eq!(pid, Some(i64::from(std::process::id())));
-        assert!(started.is_some(), "driver_started");
+        // A token on Unix, `None` on Windows (no start-time reader there).
+        assert_eq!(
+            started,
+            relais::procs::start_time(std::process::id()),
+            "driver_started"
+        );
         assert!(since.is_some(), "driver_since");
         drop(dir);
     }

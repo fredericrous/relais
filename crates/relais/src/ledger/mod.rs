@@ -9219,7 +9219,13 @@ mod tests {
     fn assert_driver_recorded(ledger: &Ledger, id: &str) {
         let (pid, started, since) = driver_of(ledger, id);
         assert_eq!(pid, Some(i64::from(std::process::id())), "{id}: pid");
-        assert!(started.is_some(), "{id}: start time");
+        // What this platform can read: a token on Unix, `None` on Windows,
+        // where no start-time reader exists.
+        assert_eq!(
+            started,
+            crate::procs::start_time(std::process::id()),
+            "{id}: start time"
+        );
         assert!(since.is_some(), "{id}: since");
     }
 
