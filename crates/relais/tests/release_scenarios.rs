@@ -3502,6 +3502,101 @@ fn an_orphaned_run_is_interrupted_and_its_worktree_retired() {
     );
 }
 
+fn leftover_verify_base(world: &World, run_id: &str) -> PathBuf {
+    let checkout = world.state.join("verify").join(run_id).join("verify-base");
+    git(
+        &world.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            &checkout.to_string_lossy(),
+            "HEAD",
+        ],
+    );
+    // Setup output: untracked, holds no work.
+    std::fs::write(checkout.join("setup-output.bin"), "built\n").expect("write");
+    checkout
+}
+
+// SPEC §12: a verification checkout a run left behind is removed by
+// `resume --retire` once the run is terminal and provably dead; one with a
+// modified tracked file is kept and reported; a live run's is kept.
+#[test]
+fn a_leftover_verification_checkout_is_removed_by_resume() {
+    let world = World::new("verifyleft");
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    let task = world.write_task("task.json", "off");
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(5), "{}", text(&run.stderr));
+    let run_id = world.only_run_id();
+    let checkout = leftover_verify_base(&world, &run_id);
+
+    // A tracked modification: kept and reported.
+    let tracked = git(&checkout, &["ls-files"]);
+    let file = tracked.lines().next().expect("a tracked file");
+    std::fs::write(checkout.join(file), "// edited\n").expect("edit");
+    let kept = world.relais(&["resume", "--retire", "--all"]);
+    let out = text(&kept.stdout);
+    assert!(out.contains("tracked modifications"), "{out}");
+    assert!(checkout.exists());
+
+    // Restored: removed, with the run, the path and the bytes.
+    git(&checkout, &["checkout", "--", "."]);
+    let swept = world.relais(&["resume", "--retire", "--all"]);
+    let out = text(&swept.stdout);
+    assert_eq!(
+        swept.status.code(),
+        Some(0),
+        "{out}\n{}",
+        text(&swept.stderr)
+    );
+    assert!(
+        out.contains(&run_id) && out.contains("bytes reclaimed"),
+        "{out}"
+    );
+    assert!(
+        out.contains(&checkout.to_string_lossy().into_owned()),
+        "{out}"
+    );
+    assert!(!checkout.exists());
+    let listed = git(&world.repo, &["worktree", "list"]);
+    assert!(!listed.contains("verify-base"), "{listed}");
+}
+
+#[test]
+fn a_live_runs_verification_checkout_is_kept_and_an_orphans_is_removed() {
+    let world = World::new("verifyorphan");
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    let task = world.write_task("task.json", "off");
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(5), "{}", text(&run.stderr));
+    let run_id = world.only_run_id();
+    let checkout = leftover_verify_base(&world, &run_id);
+
+    make_non_terminal(&world, &run_id, std::time::Duration::from_secs(60));
+    let kept = world.relais(&["resume", "--retire", "--all"]);
+    let out = text(&kept.stdout);
+    assert!(out.contains("kept, the run is running"), "{out}");
+    assert!(checkout.exists());
+
+    make_non_terminal(&world, &run_id, std::time::Duration::from_secs(3 * 3600));
+    let swept = world.relais(&["resume", "--retire", "--all"]);
+    let out = text(&swept.stdout);
+    assert_eq!(
+        swept.status.code(),
+        Some(0),
+        "{out}\n{}",
+        text(&swept.stderr)
+    );
+    assert!(out.contains("-> interrupted"), "{out}");
+    assert!(out.contains("removed verification checkout"), "{out}");
+    assert!(!checkout.exists());
+}
+
 // SPEC §23: cancelling a run no worker process is bound to interrupts it.
 #[test]
 fn cancel_of_a_run_with_no_bound_worker_interrupts_it() {

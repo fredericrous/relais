@@ -766,6 +766,61 @@ pub fn retained_worktrees(state_dir: &Path) -> Result<Vec<RetainedWorktree>> {
     Ok(found)
 }
 
+/// Under the state directory: `verify/<run>/` holds a run's verification
+/// checkouts (the runner's `verify_root`).
+const VERIFY_DIR: &str = "verify";
+
+/// Every verification checkout still under `state_dir/verify/<run>/`: the
+/// `verify-base` baseline and any per-attempt checkout a run that died
+/// mid-verification left behind. Each carries a `.git`; path order.
+pub fn retained_verify_worktrees(state_dir: &Path) -> Result<Vec<RetainedWorktree>> {
+    let mut found = Vec::new();
+    collect_worktree_runs(&mut found, &state_dir.join(VERIFY_DIR))?;
+    found.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(found)
+}
+
+/// What removing a verification checkout did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyRetirement {
+    Removed {
+        bytes_reclaimed: u64,
+    },
+    /// Tracked files differ from the checked-out commit, so someone
+    /// edited it: kept.
+    Modified {
+        files: Vec<String>,
+    },
+}
+
+/// Remove a verification checkout. It holds no work by construction (a
+/// detached checkout of a base or candidate commit plus setup output), so
+/// nothing is exported; one with tracked modifications is kept.
+pub fn retire_verification(path: &Path) -> Result<VerifyRetirement> {
+    let status = git(path, &["status", "--porcelain", "--untracked-files=no"])?;
+    let files: Vec<String> = status
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    if !files.is_empty() {
+        return Ok(VerifyRetirement::Modified { files });
+    }
+    let bytes_reclaimed = dir_size(path)?;
+    let common_dir = git(
+        path,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let common = Path::new(common_dir.trim());
+    git(
+        common,
+        &["worktree", "remove", "--force", &path.to_string_lossy()],
+    )?;
+    git(common, &["worktree", "prune"])?;
+    remove_if_empty(path.parent())?;
+    Ok(VerifyRetirement::Removed { bytes_reclaimed })
+}
+
 /// `<worktrees>/<run>/<name>`: each run's directories that are worktrees.
 fn collect_worktree_runs(found: &mut Vec<RetainedWorktree>, worktrees: &Path) -> Result<()> {
     for run_dir in subdirectories(worktrees)? {
