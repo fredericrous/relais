@@ -151,6 +151,7 @@ The person decided (2026-10-11): **the orchestrator approves**, and **Laya advis
 - **D12** `record_salvage_contained` takes an `Answerer {actor, person_quote, recorded_via}` rather than eight arguments (clippy `too_many_arguments`; the lint is kept).
 - **D13** Phase 1a went through relais first: run `run-65d8bdbaebfc4-12c71` was interrupted when the coordinator restarted mid-run (answered `abandon`); run `run-65d8c0c602ccb-e32c` wrote the change and ran out of its 45-minute wall clock repairing an unrelated plugin timing flake under load 135. Its candidate was applied and finished here; Phases 1b, 1c and 2 were done in the session. The salvage of `e32c` was recorded with a malformed `--candidate` (an `sqlite3` error string, from a wrong column name); relais refuses a second answer, so the row stays and says `candidate contained: unknown`. What reads it: the dataset's containment backfill (`learn/salvage.rs:284`) asks git for that candidate, fails, and leaves it unknown, which `salvaged_labelling` excludes; `relais feedback` on that one task would name the malformed candidate. No label is affected.
 - **D14** Medium review finding 10 (backend round 2) is implemented: the plugin keeps `lastPersonPrompt` before the `relais` filter, records `outcomeDeliveredAt[run]` when the outcome is submitted, requires a quote of at least 12 characters in whole words, and refuses an outcome delivered in another session.
+- **D15** The nonce's OS random source lives in `procs.rs` (`os_random`), the one module allowed to name a platform API (`scripts/check-module-cycles.py`): `/dev/urandom` on unix, `BCryptGenRandom` on Windows through the already-present `windows-sys` with one more feature, no new crate.
 
 ## Implementation review
 
@@ -159,6 +160,7 @@ The person decided (2026-10-11): **the orchestrator approves**, and **Laya advis
 - Deliberate: the chained `.catch` on `on('tool.call', …)` is the plugin API's fallback handler, the same pattern as the onboard and trust tools (`register.ts:242-252`), not a misplaced try/catch.
 - Noted: the PR does not claim `export-decisions` (Phase 4c).
 - Delta (tree `dbc7f28a`): **approve** (64k tokens, 9 s); all four findings resolved, none new.
+- CI on PR #202 failed on windows-latest only: the nonce read `/dev/urandom`. Fixed (`d2e69fd`): `procs::os_random` uses `BCryptGenRandom` on Windows; the terminal sign-off scenario is unix-only (it needs `script(1)`). Fresh round 1 on tree `db1d39d8`: **approve** (30k tokens, 28 s), one low finding (a stale count in a Cargo.toml comment) fixed in `63ea9f7`; Delta on `0227ea10`: **approve** (30k tokens, 6 s).
 - Next: merge, release, reinstall the plugin, then Phase 3 (the live check and the sweep of the open rows).
 
 <!-- panel: repos=relais,homelab reviewers=architect,backend,lang:go,lang:python,lang:rust,lang:typescript,platform,po,tui,unix body-sha=fdb0e4b341aa -->
