@@ -31,6 +31,10 @@ keys:
     description: Whether relais promotes a gate-passing task artifact without a person, inside what envelope, and how it rolls back
   learning.classifier-capture:
     description: Whether relais keeps the text of the session router's classifier calls to train a local model, where, for how long, and what leaves the machine
+  decisions.who-answers:
+    description: Who may answer a run waiting on a person, how the answer records who decided, and what counts as the person's judgment
+  decisions.advisor:
+    description: Whether a model advises a decision, how relais calls it, and whether its advice can gate an answer
 
 # Which parts of this repository have which traits (aval 1.7, SEMANTICS
 # section 2.5), as `aval traits --detect` proposed and a reviewer accepted.
