@@ -1,6 +1,7 @@
 ---
 title: "relais: session-scoped status, orphan reaping, cancel tool, per-turn cost"
 status: active
+next: v0.15.0 release, then the post-release checks in Verification results
 date: 2026-10-11
 branch: fix/session-scoped-status
 repos: [relais]
@@ -425,5 +426,13 @@ it), so its cleanup is expected to print "already ended: interrupted".
   slice's tree was checked: either the gate ran before the rebase, or a
   relais baseline ran on the rebased HEAD. The push gate runs `make
   check` on the final tree.
+
+## Implementation review
+
+- **Verdict:** approve-with-changes in round 1 (89k tokens, 161 s); approve-with-changes in the Delta (103k tokens, 56 s).
+- **Fixed:** the second outcome after a reap (`Finish::Superseded`); unrecorded verification rows; `native usage` on real input; the v28 backup note; the flag argument (`StatusAccess`); the swallowed errors.
+- `deliberate:` #7. On a ledger read error, `superseded_outcome` defaults to `interrupted`. The reaper's outcome event is already written and stands.
+- `deliberate:` #8. Three checks run after the release, as Landing says: the new binary would move the live ledger to v28, which 0.14.0 refuses.
+- **By hand:** `coordinator::process_alive` re-exports `procs::alive`, which counts EPERM as alive (`procs.rs:761`).
 
 <!-- panel: repos=relais reviewers=backend,lang:rust,tui,unix body-sha=2552bb4c132a -->
