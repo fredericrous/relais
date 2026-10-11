@@ -142,7 +142,7 @@ on that data; its design notes stay below.
 
 ## Phases
 
-- [ ] Phase 0 — read-only checks, before any code: (a) router `mode` and
+- [x] Phase 0 — read-only checks, before any code: (a) router `mode` and
       envelope on this machine, (b) whether `plan-review-*` spawns reach
       `routeSpawn` as routed or abstained today (`state.pins`), (c) that the
       subagent agent id seen by relais (relais routing.ts:412
@@ -211,6 +211,27 @@ on that data; its design notes stay below.
   ~50% labelled fraction).
 - Phase 0 (d): labelled fraction of the 77 recorded reviews — to be
   measured; the time-to-decision estimate is restated from it.
+- 2026-10-11 — Phase 0 results (read-only, this machine):
+  (a) router mode `on` for every decision through 2026-10-11T08:06Z; of 72
+  subagent decisions 17 were holdout (applied=0), none explored.
+  (b) `plan-review-*` spawns are routed by the table, not pinned (reason
+  `table`, applied=1): this plan's own panel ran backend, rust and unix at
+  `escalation` (claude-fable-5-1) and two backend re-reads at
+  `implementation` (claude-sonnet-5-5). So the table already routes backend
+  down by difficulty; the "never routed down" non-goal binds Phase 8's
+  draw, and Phase 8 must pin backend/architect if it is to hold. 3 of the
+  8 spawns (tui, two backend re-reads) have no router row at all.
+  (c) the ids agree: `toolUseResult.agentId` in the transcript equals
+  `router_tasks.agent_id` for every reviewer that has a row; no fallback
+  join is needed. Model, tokens and seconds are in the transcript too:
+  `resolvedModel` on the launch result; `totalTokens`/`totalDurationMs` on a
+  foreground result, `<subagent_tokens>`/`<duration_ms>` in a background
+  notification.
+  (d) of 43 reviewed plans in `~/.claude/plans`, 35 landed in a repository
+  (body sha found in a `docs/plans/` file), carrying 74 of their 85
+  reviews: a pushed fraction near 0.87. Restated: 19 ÷ (2–3 × 0.87) gives
+  roughly 7–11 plans for the pooled class, before the unchanged-section
+  condition turns some of those labels `unknown`.
 - 2026-10-11 — per-stratum tier rows, not `Registry::promote`: it has a
   single global active/previous pointer.
 - 2026-10-11 — D6 decision: wait for Phase 8. This plan builds Phases 0–2
@@ -219,6 +240,15 @@ on that data; its design notes stay below.
   data). learning-loop D6 stays untouched.
 - 2026-10-11 — miss floor 15%: 19 zero-miss reviews, or 1 miss at 30; taken
   as the Phase 8 default. D6 is left for Phase 8.
+
+- 2026-10-11 — implementation: `LabelSource::Review` and the
+  `DATASET_VERSION` bump move to Phase 8 (carried finding): the
+  `review_outcomes` table feeds no dataset yet, so nothing needs a
+  rebuild. "Reaches a push" is read as: a `docs/plans/*.md` in one of the
+  row's repos (under amont-agent's plan root, `AMONT_AGENT_PLAN_ROOT` or
+  `~/Developer/Perso`) carries `body-sha=` of one of the plan's rounds. The
+  remit table ships in every ledger row (`remit`), so relais never calls
+  amont-agent to read it.
 
 ## Verification
 
