@@ -6,7 +6,17 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
-## Unreleased
+## v0.12.0
+
+relais starts learning: it retrains itself on a schedule and says why it has
+not promoted anything yet, the session router collects outcomes and seeded
+exploration it can learn from, and classifier calls are kept locally to
+train a local model on (#195).
+
+**After upgrading, run `relais install --claude --user --write` (it also
+records automatic promotion; `/relais-learning off` turns it off), then
+`relais coordinator stop`, and restart your Claude Code sessions**: a brew
+upgrade does not update the installed plugin or the running coordinator.
 
 **Upgrading migrates the ledger, and an older relais then refuses it.** This
 release adds ledger steps (learning cycles, salvage containment, router
