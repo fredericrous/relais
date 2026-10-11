@@ -168,8 +168,8 @@ with measured and budget bytes, shown in the receipt gap line.
 
 ## Phases
 
-1. Port + parsers + `assemble` + manifest, with tests (below).
-2. Prompts (worker, reviewer, planner), receipt gap line, SPEC and skill
+1. [x] Port + parsers + `assemble` + manifest, with tests (below).
+2. [x] Prompts (worker, reviewer, planner), receipt gap line, SPEC and skill
    text.
 3. `make check` exits 0, implementation review, PR, merge on green, release
    (minor: v0.13.0) so the installed `relais` carries it.
@@ -182,31 +182,19 @@ with measured and budget bytes, shown in the receipt gap line.
 
 ## Verification
 
-- Unit (context): parse fixtures captured from aval 1.9.0 for `rules` and
-  `relevant` (active key, undecided key, rules, malformed → gap); index
-  grouping, and every rendered id token is exactly an id returned by
-  `aval rules`; glob → path reduction (`a/b/**/*.rs` → `a/b`, `**` → none,
-  `{a,b}/**` → none, `*/x` → none, literal file kept); undecided ranked key
-  never blocks.
-- Unit (failure): non-zero exit, exit 2, timeout and malformed JSON each
-  give a `GuidanceGap` with the block absent and the run continuing;
-  cancelling during `relevant` stops the spawn.
-- Unit (argv): objective starting with `--`, path `-rf`, oversize objective
-  truncated to 2 KiB on a char boundary.
-- Unit (sizing): over `GUIDANCE_BUDGET_BYTES` drops relevant first, then
-  index, each recorded as a gap with measured and budget bytes; guidance
-  never raises `SizingProblem`; a reviewer budget that fits N of M
-  statements gives exactly the first N whole statements and a gap naming
-  the omitted ids, also in the receipt line.
-- Unit (runner): `build_prompt` contains both fences, each fenced once; the
-  `aval rule` line is absent when the index is; fence escapes for an id and
-  a `choice` containing the end marker, and a statement with newlines (same
-  test shape as the existing constraints-fence test ~9930); the receipt
-  shows the gap line only when there is a gap; the reviewer prompt never
-  contains `aval rule`, in the full and the partial case.
-- Old manifest JSON without `guidance` still deserializes.
-- `make check` exits 0 (the CI command).
-- Phase 4 live run, as stated there.
+Observed on `eca07d0` (gate `make check`: 1347 unit tests and every integration suite passed; relais run `run-65d8e596b8948-144e1` accepted, `make check` exit 0).
+
+| Check | Input → expected | Observed |
+|---|---|---|
+| Unit (context) | aval 1.9.0 fixtures, index, globs, undecided key → as stated | pass: `rules_json_parses_to_the_active_rules_and_the_omitted_counts`, `relevant_json_keeps_the_active_key_the_undecided_key_and_the_rules`, `malformed_output_is_a_gap_naming_its_source`, `index_lines_carry_full_ids_grouped_by_prefix`, `a_glob_is_reduced_to_its_literal_directory`, `guidance_is_recorded_and_an_undecided_ranked_key_never_blocks`, `an_unknown_rank_state_is_kept_as_aval_wrote_it` |
+| Unit (failure) | exit, exit 2, timeout, bad JSON, cancel → gap, run continues | pass: `every_way_a_spawn_fails_is_a_gap`, `each_guidance_failure_is_a_gap_and_the_run_continues`, `malformed_json_from_the_spawn_layer_becomes_a_gap_too`, `an_aval_that_will_not_launch_is_one_gap`, `a_cancelled_spawn_returns_a_gap_well_before_the_timeout` |
+| Unit (argv) | `--`-objective, `-rf` path, 2 KiB cut → joined form | pass: `argv_uses_the_joined_form_for_flag_looking_values` |
+| Unit (sizing) | over budget, never SizingProblem, reviewer N of M | pass: `over_budget_drops_relevant_first_then_the_index`, `over_the_guidance_budget_the_relevant_block_goes_first`, `guidance_never_raises_a_sizing_problem`, `a_reviewer_budget_that_fits_n_of_m_gives_n_whole_statements_and_a_gap` |
+| Unit (runner) | fences once, no `aval rule` without index, escapes, planner, reviewer, receipt | pass: `the_worker_prompt_fences_the_index_and_the_relevant_block_once_each`, `without_an_index_there_is_no_aval_rule_line_and_no_empty_fence`, `an_id_and_a_choice_carrying_the_end_marker_cannot_close_their_fence`, `the_planner_gets_the_relevant_block_and_never_the_index`, `the_reviewer_reads_full_statements_and_never_aval_rule`, `the_reviewer_does_not_read_a_rule_twice`, `a_binding_key_is_not_repeated_among_the_relevant_ones`, `the_receipt_shows_a_guidance_line_only_when_there_is_a_gap`, `guidance_note_is_empty_without_a_gap_and_names_a_manifest_gap_or_a_reviewer_gap` |
+| Old manifest | JSON without `guidance` → parses | pass: `a_manifest_written_before_guidance_still_parses`, `a_guidance_less_manifest_value_reads_as_empty` |
+| `make check` | exit 0 | exit 0 (pre-commit gate on `eca07d0`) |
+| Packages | each package run emits its own gap events | by reading: package runs go through `RunEngine::run` → `preflight` → the one `assemble` call (`runner/mod.rs:1601`) |
+| Phase 4 live run | as stated in Phases | next phase, after v0.13.0 |
 
 ## Decision log
 
@@ -214,5 +202,12 @@ with measured and budget bytes, shown in the receipt gap line.
 - `AvalCli` passes its own cancel flag to guidance spawns, but `main.rs` builds `AvalCli::new` without one, so CLI runs are bounded by the 5 s `GUIDANCE_TIMEOUT` only (as `aval resolve` is not cancellable from the CLI either). Wiring a run cancel flag into `AvalCli` is its own change.
 - deliberate: the receipt gap line goes into `VerificationReport.notes`, not a new receipt field (receipt types live in `verify/`).
 - deliberate: when aval cannot be launched, the relevant query is skipped, giving one gap, not two.
+
+## Implementation review
+
+approve-with-changes, then approve-with-changes on the Delta with all six findings resolved (no new finding).
+Fixed: GapCause enum, RankState parse, exhaustive Ended match, cancel test, guidance_note tests, reviewer-gap reset, observed verification above.
+Next phase: 3 (PR, merge, v0.13.0), then 4 (live run).
+Tokens: 74k + 85k; 75 s + 19 s.
 
 <!-- panel: repos=relais reviewers=backend,lang:rust,tui,unix body-sha=5ac21fdc6046 -->
