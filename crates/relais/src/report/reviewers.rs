@@ -243,11 +243,6 @@ mod tests {
             );
         }
     }
-}
-
-#[cfg(test)]
-mod fitting {
-    use super::*;
 
     #[test]
     fn models_that_do_not_fit_are_counted_not_cut() {
@@ -263,11 +258,6 @@ mod fitting {
         assert_eq!(tokens_text(&by, 100).matches(", ").count(), 2);
         assert_eq!(tokens_text(&by, 3), "+3");
     }
-}
-
-#[cfg(test)]
-mod unreadable {
-    use super::*;
 
     #[test]
     fn a_ledger_that_cannot_answer_says_so_not_that_nothing_is_there() {
