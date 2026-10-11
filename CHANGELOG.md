@@ -6,7 +6,13 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
-## Unreleased
+## v0.13.0
+
+Workers see the repository's rules: a relais worker now gets the active
+constraint index and the decisions aval ranks as relevant, the reviewer the
+full constraint statements, without a contract naming them (#203). Plan
+reviewers get an outcome (#201), and a run survives a host suspend mid-attempt
+(#200).
 
 Plan reviewers get an outcome. `relais native review-outcome` reads the
 ledger `amont-agent plan-review record` writes (amont-agent after 2.33.1),
