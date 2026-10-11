@@ -11,6 +11,7 @@ import { DENY_MESSAGE, isRelaisNotification, isRelaisType, relaisAddresses } fro
 import { cancelRun, childOf, contractPath, onChunk, pump, reloadTimeline, startReplay, startRun, statusOf } from './runs.ts'
 import { onboardTool, onPersonPrompt, trustTool, withRoutingSection } from './consent.ts'
 import { decideGuard, learningEnvelopeGuard, machineSettingsGuard, routerEnvelopeGuard } from './guards.ts'
+import { ensureWatcher } from './quiet-watch.ts'
 import { learningCommand, noteLastCycle, startCycle, startResumeSweep } from './learning.ts'
 import {
   afterStep,
@@ -225,6 +226,7 @@ export function register(on: any) {
       description: 'Mark the current task as wrong: relais moves it to a stronger model from the next request.',
     })
     ensurePump(fx)
+    ensureWatcher(fx, store)
     detach(sendHello(fx, store))
     every(fx, store, HELLO_EVERY_MS, () => detach(sendHello(fx, store)))
     return next(e)

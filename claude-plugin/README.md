@@ -66,6 +66,19 @@ does **not** type-check `register.ts`; the tests carry the behaviour.
   and writes one `$.state` value per 100 ms tick; the `ui.render` hook only
   reads it. After `/clear`, `/resume` or `/branch` the timeline is reloaded
   from `relais native status`.
+- **Quiet runs, in the pane.** A check or command an agent runs through
+  amont or `amont-agent quiet` writes its output to a log, not the console.
+  The plugin spawns `relais quiet watch --protocol` once (its own read loop,
+  no run entry; exit 2, an older relais, is noted and never respawned, any
+  other exit is respawned at most once per 30 s with a dim `quiet watcher
+  down` line meanwhile) and folds its JSON lines. Runs of the sessions this
+  module served are drawn below all relais runs, as dim Text only: a head
+  `amont · clippy · 0:12` and the last lines under `  │ `, once a run has run
+  1 s. A pass drops on `ended`; a failure stays in the error colour until the
+  next quiet run of the same session, tool and check. At most three heads
+  (live first), the rest under `+n more quiet runs`, inside the rows the
+  relais runs leave. The first run past 1 s (or a failure) opens the pane on
+  a pump tick; the status line lists live and failed quiet runs.
 - **An agent's transcript, in the pane.** Each known agent row is a Button,
   with a dim row under it naming the agent as Claude Code's tasks footer does
   (`relais:relais-worker-sonnet-medium`), and a hint under the last run's
@@ -96,7 +109,7 @@ does **not** type-check `register.ts`; the tests carry the behaviour.
   (`claude plugin validate` follows `$` only inside a file).
 - `hooks/*.ts` — pure logic and small effectful modules that take that `fx`
   object: `lines` (splitter), `dispatches` (usage and the end signal),
-  `timeline` (the run model), `pane` (layout), `transcript` (an agent's
+  `timeline` (the run model), `pane` (layout), `quiet` and `quiet-watch` (quiet runs), `transcript` (an agent's
   transcript as pane rows), `guards`, `callbacks`, `agents`, `runs`, `ui`,
   `store`.
 - `agents/relais-worker-<model>-<effort>.md` — one worker definition per
@@ -109,7 +122,7 @@ does **not** type-check `register.ts`; the tests carry the behaviour.
   `mcp__relais__replay`, progress with `mcp__relais__status` or
   `/relais-status`.
 - `tests/*.test.ts`, `tests/views/relais-pane.test.ts`,
-  `tests/views/agent-view.test.ts` — the plugin's tests.
+  `tests/views/quiet-pane.test.ts`, `tests/views/agent-view.test.ts` — the plugin's tests.
 
 ## Installing
 
