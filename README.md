@@ -97,6 +97,15 @@ stays due), `not due: …` under `--if-due`, and `awaiting_promotion` (an
 artifact passed every gate and `relais promote <id>` is yours to run). An
 error inside a cycle exits 1.
 
+`native cancel --run X --session S` exits 0 when the run is cancelled, was
+already over, or had no live driver and was marked cancelled (and also when the
+driver has not ended within 10 s: `cancel requested; the driver has not ended
+yet`); 2 without `--session`; 3 when the coordinator cannot be reached; 10 for
+a run not on record; 11 for a run with a live driver of another session
+(`run X belongs to live session <id>; cancel it from that session`).
+`relais coordinator cancel --run` takes the same path for a run with no bound
+worker.
+
 The session-router commands (`native router-state`, `router-observe`,
 `router-envelope`) use 0, 1 and 2 only: 2 is a bad payload or
 invocation (nothing written), 1 a failure to retry.

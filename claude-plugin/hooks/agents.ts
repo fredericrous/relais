@@ -2,8 +2,8 @@
 // each turn's usage, and the one `stopped` a dispatch ends with.
 
 import type { Fx } from './fx.ts'
-import { type Dispatch, observe, openDispatch, stoppedPayload, withTurn } from './dispatches.ts'
-import { sendBound, sendStopped } from './callbacks.ts'
+import { type Dispatch, observe, openDispatch, stoppedPayload, usagePayload, withTurn } from './dispatches.ts'
+import { sendBound, sendStopped, sendUsage } from './callbacks.ts'
 import { detach, every, type Child, type Store } from './store.ts'
 import { applyEvent, isLive } from './timeline.ts'
 
@@ -207,12 +207,24 @@ export function onAgentTool(store: Store, e: any, now: number) {
   }
 }
 
+// The ids that name this turn's responses, for relais's dedup: the turn's
+// own list when it carries one, else the turn id.
+function messageIdsOf(e: any): string[] {
+  if (Array.isArray(e?.messageIds)) return e.messageIds.filter((id: unknown): id is string => typeof id === 'string')
+  return typeof e?.turnId === 'string' ? [e.turnId] : []
+}
+
 // `turn.complete` of an agent a dispatch owns: its usage joins the total.
 export function onTurn(fx: Fx, store: Store, e: any) {
   const dispatch = store.agentDispatch.get(e.agentId)
   const d = dispatch ? store.dispatches.get(dispatch) : undefined
   if (!d || d.isStopped) return
-  store.dispatches.set(d.id, withTurn(d, { usage: e.usage, answer: e.answer }))
+  const turned = withTurn(d, { usage: e.usage, answer: e.answer })
+  store.dispatches.set(d.id, turned)
+  // The cost is booked every turn, not only at the agent's end: an agent
+  // that never stops would otherwise book nothing.
+  const child = store.dispatchChild.get(d.id)
+  if (child) sendUsage(fx, store, child, d.id, usagePayload(turned, messageIdsOf(e)))
   detach(check(fx, store))
 }
 

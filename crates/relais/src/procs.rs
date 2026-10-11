@@ -34,6 +34,18 @@ pub fn alive(pid: u32) -> bool {
     imp::alive(pid)
 }
 
+/// When a process started, as an opaque token that is stable for the life
+/// of that process and differs for a later process that reuses its pid.
+/// `None` when it cannot be read (the process is gone, another pid
+/// namespace hides it, or the platform has no reader): the caller then
+/// has no evidence either way and must not invent one.
+pub fn start_time(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    imp::start_time(pid)
+}
+
 /// Which request was being delivered, for the error that says it was
 /// not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -753,6 +765,68 @@ mod imp {
         std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 
+    /// macOS: `sysctl(KERN_PROC_PID)` fills a `kinfo_proc`, whose first
+    /// member `kp_proc` begins with `p_starttime`, a `timeval` (i64
+    /// seconds, i32 microseconds). `libc` ships no `kinfo_proc` for Apple
+    /// targets, so the buffer is read raw at those two offsets.
+    #[cfg(target_os = "macos")]
+    pub fn start_time(pid: u32) -> Option<String> {
+        let mut mib = [
+            libc::CTL_KERN,
+            libc::KERN_PROC,
+            libc::KERN_PROC_PID,
+            pid as libc::c_int,
+        ];
+        let mut size: libc::size_t = 0;
+        // SAFETY: a size query with a null buffer; `mib` outlives the call.
+        let sized = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                4,
+                std::ptr::null_mut(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if sized != 0 || size < 12 {
+            return None;
+        }
+        let mut buffer = vec![0u8; size];
+        // SAFETY: `buffer` is `size` writable bytes; the kernel writes at
+        // most `size` and updates it to the length written.
+        let read = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                4,
+                buffer.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if read != 0 || size < 12 {
+            return None;
+        }
+        let seconds = i64::from_ne_bytes(buffer[0..8].try_into().ok()?);
+        let micros = i32::from_ne_bytes(buffer[8..12].try_into().ok()?);
+        if seconds == 0 {
+            return None;
+        }
+        Some(format!("{seconds}.{micros:06}"))
+    }
+
+    /// Linux: field 22 of `/proc/<pid>/stat`, the start time in clock
+    /// ticks since boot. The command name (field 2) may hold spaces and
+    /// parentheses, so fields are counted after its LAST `)`.
+    #[cfg(not(target_os = "macos"))]
+    pub fn start_time(pid: u32) -> Option<String> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after_name = &stat[stat.rfind(')')? + 1..];
+        // `after_name` starts at field 3 (state); field 22 is index 19.
+        after_name.split_whitespace().nth(19).map(str::to_string)
+    }
+
     pub fn signal(pid: u32, signal: super::SignalKind) -> io::Result<()> {
         let number = match signal {
             // SIGTERM asks; SIGKILL is the escalation a whole grace
@@ -969,6 +1043,10 @@ mod imp {
         GetExitCodeProcess, OpenProcess, TerminateProcess, CREATE_NEW_PROCESS_GROUP,
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     };
+
+    pub fn start_time(_pid: u32) -> Option<String> {
+        None
+    }
 
     pub fn alive(pid: u32) -> bool {
         // SAFETY: a query-only handle; closed before returning.
@@ -1372,6 +1450,16 @@ mod tests {
             end.stdout,
             end.stderr
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_start_time_of_this_process_is_known_and_stable() {
+        let first = start_time(std::process::id());
+        assert!(first.is_some(), "no start time for the current process");
+        assert_eq!(first, start_time(std::process::id()));
+        assert_eq!(start_time(0), None);
+        assert_eq!(start_time(u32::MAX - 7), None);
     }
 
     #[test]

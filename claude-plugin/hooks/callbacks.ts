@@ -45,6 +45,11 @@ export const sendBound = (fx: Fx, store: Store, child: Child, dispatch: string, 
 export const sendStopped = (fx: Fx, store: Store, child: Child, dispatch: string, payload: unknown) =>
   deliver(fx, store, child, ['stopped', '--dispatch', dispatch], payload)
 
+// The same retrying delivery: a usage that lands late or twice is harmless,
+// relais keeps the highest cumulative.
+export const sendUsage = (fx: Fx, store: Store, child: Child, dispatch: string, payload: unknown) =>
+  deliver(fx, store, child, ['usage', '--dispatch', dispatch], payload)
+
 // Hello is a heartbeat: a missed one is replaced by the next, never retried.
 export async function sendHello(fx: Fx, store: Store) {
   if (store.closed) return

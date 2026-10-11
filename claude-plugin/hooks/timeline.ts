@@ -49,7 +49,11 @@ export type AgentRow = {
 
 export type Entry = { at: number; kind: string; text: string }
 
-export type Cost = { booked: number | null; completeness: string }
+// `unpriced` is the model the pricing table could not price, when a cost
+// event said so.
+export type Cost = { booked: number | null; completeness: string; unpriced?: string }
+
+export type Outcome = { state: string; receipt: string | null; changed: string; reason?: string }
 
 export type RunModel = {
   run: string
@@ -62,12 +66,18 @@ export type RunModel = {
   agents: AgentRow[]
   decisions: Entry[]
   cost: Cost | undefined
-  outcome: { state: string; receipt: string | null; changed: string } | undefined
+  outcome: Outcome | undefined
   events: Entry[]
   ledger: string | undefined
   // The Claude Code session relais bound the run to: its first stderr line
   // says so, which is metadata, not an error.
   session: string | undefined
+  // Whether the run belongs to another Claude Code session: it is in memory
+  // because it was asked for by id, and the pane and the list leave it out.
+  foreign: boolean
+  // The hint for a live run that has been silent a while ("no events for
+  // 12m"): plain text, a hint and not a verdict.
+  stalled: string | undefined
   // What the next worker attempt is, after a `repairing`/`escalating`
   // transition: its step is titled by it.
   retry: 'repair' | 'escalation' | undefined
@@ -88,6 +98,8 @@ export const emptyRun = (run: string, startedAt: number): RunModel => ({
   events: [],
   ledger: undefined,
   session: undefined,
+  foreign: false,
+  stalled: undefined,
   retry: undefined,
 })
 
@@ -270,7 +282,9 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
           ? null
           : (prior?.booked ?? 0) + event.booked
       const completeness = worseCompleteness(prior?.completeness, event.completeness)
-      return withEntry({ ...m, cost: { booked, completeness } }, at, 'cost', formatCost({ booked, completeness }))
+      const unpriced = unpricedModel(event.unpriced_reason) ?? prior?.unpriced
+      const cost: Cost = { booked, completeness, ...(unpriced ? { unpriced } : {}) }
+      return withEntry({ ...m, cost }, at, 'cost', formatCost(cost))
     }
     case 'check_started': {
       const check: Check = {
@@ -314,7 +328,13 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
         ...m,
         phase: event.state,
         endedAt: at,
-        outcome: { state: event.state, receipt: event.receipt ?? null, changed },
+        stalled: undefined,
+        outcome: {
+          state: event.state,
+          receipt: event.receipt ?? null,
+          changed,
+          ...(typeof event.reason === 'string' && event.reason ? { reason: event.reason } : {}),
+        },
       }
       return withEntry(m, at, 'outcome', `${event.state}${changed ? ` · ${changed}` : ''}${event.receipt ? ` · ${event.receipt}` : ''}`)
     }
@@ -339,6 +359,17 @@ const withEntry = (m: RunModel, at: number, kind: string, text: string): RunMode
   ...m,
   events: pushEntry(m.events, { at, kind, text: cutLine(text) }),
 })
+
+// The model an `unpriced_reason` sentence names ("<model> has no
+// [pricing.models] entry", "<model>'s [pricing.models] entry has no …"): its
+// first word. Control characters are stripped and the name capped at 40.
+export function unpricedModel(reason: unknown): string | undefined {
+  if (typeof reason !== 'string') return undefined
+  // eslint-disable-next-line no-control-regex
+  const clean = reason.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/[\u0000-\u001f\u007f]/g, '')
+  const word = /^\s*(\S+)/.exec(clean)?.[1]?.replace(/'s$/, '')
+  return word ? word.slice(0, 40) : undefined
+}
 
 const ORDER = ['actual', 'estimated', 'incomplete_lower_bound', 'unknown']
 function worseCompleteness(a: string | undefined, b: string): string {
@@ -376,6 +407,9 @@ export function elapsedOf(m: RunModel, now: number): number {
 
 // Micro-USD as the pane shows it: cents under a dollar, dollars above.
 export function formatCost(cost: Cost | undefined): string {
+  if (cost?.unpriced && (cost.booked === null || cost.completeness === 'unknown')) {
+    return `unpriced (${cost.unpriced})`
+  }
   if (!cost || cost.booked === null || cost.completeness === 'unknown') return 'unknown'
   const dollars = cost.booked / 1_000_000
   const tag = cost.completeness === 'actual' ? '' : cost.completeness === 'estimated' ? ' est' : ' ≥'
@@ -417,7 +451,7 @@ export function changedText(summary: unknown): string {
 }
 
 // An outcome as one line: the state, what changed, the receipt.
-export function outcomeText(outcome: { state: string; receipt: string | null; changed: string }): string {
+export function outcomeText(outcome: Outcome): string {
   const changed = outcome.changed ? ` · ${outcome.changed}` : ''
   const receipt = outcome.receipt ? ` · receipt ${outcome.receipt}` : ''
   return `${outcome.state}${changed}${receipt}`
@@ -429,7 +463,7 @@ export function statusLine(
   now: number,
   heldOutcome: string | undefined,
 ): string | undefined {
-  const live = Object.values(models).filter(isLive)
+  const live = Object.values(models).filter(m => isLive(m) && !m.foreign)
   // Claude Code draws the line under the plugin's name, so it does not repeat it.
   if (live.length === 0) return heldOutcome ? `${heldOutcome} · /relais-status` : undefined
   const latest = live[live.length - 1]
@@ -449,7 +483,9 @@ export function timelineText(m: RunModel, now: number): string[] {
   }
   for (const d of m.decisions) lines.push(`decision · ${d.text}`)
   lines.push(`cost ${formatCost(m.cost)}`)
+  if (m.stalled && isLive(m)) lines.push(m.stalled)
   if (m.outcome) lines.push(`outcome ${outcomeText(m.outcome)}`)
+  if (m.outcome?.reason) lines.push(m.outcome.reason)
   return lines
 }
 
@@ -473,23 +509,51 @@ export function statusReply(m: RunModel, now: number, opts: { output?: boolean }
     decisions: m.decisions.map(d => d.text),
     cost: formatCost(m.cost),
     outcome: m.outcome ?? null,
+    ...(m.stalled && isLive(m) ? { stalled: m.stalled } : {}),
+    ...(m.foreign ? { session: m.session, foreign: true } : {}),
     ...(opts.output ? { output: latestOutput(m, MAX_OUTPUT_LINES) } : {}),
     // relais's own human lines and the plugin's failures, the latest few.
     stderr: m.events.filter(e => e.kind === 'stderr').slice(-MAX_STDERR_LINES).map(e => e.text),
   }
 }
 
-// A run rebuilt from `relais native status`' timeline (one JSON object):
-// the events it lists are folded as the stream's would be.
-export function rebuildRuns(
-  timeline: unknown,
-  now: number,
-): Record<string, RunModel> {
-  const lines = Array.isArray((timeline as any)?.events) ? (timeline as any).events : []
-  let models: Record<string, RunModel> = {}
+// The hint a live run's `current` gives when it has been silent a while.
+export function stalledHint(current: any): string | undefined {
+  if (current?.stalled !== true) return undefined
+  const seconds = current.silent_seconds
+  return typeof seconds === 'number' ? `no events for ${Math.floor(seconds / 60)}m` : 'no events for a while'
+}
+
+// One timeline (what `native status --run` prints, or one entry of
+// `--session`'s `runs`) folded into `models`: its events as the stream's
+// would be, then what the ledger's `current` adds. A terminal
+// `current.state` with no outcome event among the events is an outcome:
+// the driver died or was reaped without writing one.
+function rebuildOne(models: Record<string, RunModel>, timeline: any, now: number): Record<string, RunModel> {
+  const lines = Array.isArray(timeline?.events) ? timeline.events : []
+  let out = models
   for (const line of lines) {
-    const run = line.run ?? (timeline as any).run
-    models = applyLine(models, { run, at: line.at, event: line.event ?? line }, now)
+    const run = line.run ?? timeline.run
+    out = applyLine(out, { run, at: line.at, event: line.event ?? line }, now)
   }
+  const run = typeof timeline?.run === 'string' ? timeline.run : undefined
+  const current = timeline?.current
+  if (!run || !current || typeof current !== 'object') return out
+  let model = out[run] ?? emptyRun(run, now)
+  if (typeof current.session === 'string' && current.session) model = { ...model, session: current.session }
+  if (isLive(model) && typeof current.state === 'string' && FINAL_STATES.includes(current.state)) {
+    model = applyEvent(model, { kind: 'outcome', state: current.state, receipt: null, reason: current.reason }, now)
+  } else if (isLive(model)) {
+    model = { ...model, stalled: stalledHint(current) }
+  }
+  return { ...out, [run]: model }
+}
+
+// Runs rebuilt from `relais native status`: one timeline object (`--run`),
+// or `{runs: [timeline…]}` (`--session`).
+export function rebuildRuns(timeline: unknown, now: number): Record<string, RunModel> {
+  const entries = Array.isArray((timeline as any)?.runs) ? (timeline as any).runs : [timeline]
+  let models: Record<string, RunModel> = {}
+  for (const entry of entries) models = rebuildOne(models, entry, now)
   return models
 }

@@ -2930,6 +2930,12 @@ pub trait Gate {
     fn write_lease_holder(&self, _worktree: &str) -> Result<Option<String>, GateError> {
         Ok(None)
     }
+    /// Whether the run was cancelled at the coordinator: what a driver
+    /// with no dispatch heartbeat running asks to learn of a run-level
+    /// cancel. A run the gate does not know is not cancelled.
+    fn run_cancelled(&self, _run_id: &str) -> Result<bool, GateError> {
+        Ok(false)
+    }
     /// What this gate can enforce, for reports (SPEC §23: observed-only
     /// paths are labelled, never claimed as guarantees).
     fn enforcement(&self) -> Enforcement;
@@ -3259,6 +3265,14 @@ impl Gate for LocalGate {
             .admission()
             .write_lease_holder(worktree)
             .map(|(holder, _)| holder.to_string()))
+    }
+
+    fn run_cancelled(&self, run_id: &str) -> Result<bool, GateError> {
+        Ok(self
+            .status()
+            .runs
+            .get(run_id)
+            .is_some_and(|run| run.cancelled))
     }
 
     fn enforcement(&self) -> Enforcement {

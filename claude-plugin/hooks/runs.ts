@@ -30,6 +30,8 @@ import {
 } from './ui.ts'
 
 const STATUS_TIMEOUT_MS = 10_000
+// `native cancel` waits up to 10 s for the driver's outcome itself.
+const CANCEL_TIMEOUT_MS = 20_000
 // The freshness check sits on the path to the session's next turn: a
 // second is long enough for a read-only ledger lookup, short enough not
 // to be felt.
@@ -277,7 +279,7 @@ function onStderr(store: Store, child: Child, carry: Carry, text: string, now: n
 
 // relais's first stderr line names the session it bound the run to
 // (`session: <id> (<source>)`): metadata, kept apart from its errors.
-const SESSION_LINE = /^session: (.+)$/
+const SESSION_LINE = /^session: (\S+)/
 
 function addStderr(store: Store, child: Child, text: string, now: number) {
   const model = store.models[child.key] ?? emptyRun(child.key, now)
@@ -406,9 +408,13 @@ function endUnfinished(store: Store, child: Child, code: number | null, now: num
 }
 
 // The timeline rebuilt from `relais native status`, for what the module's
-// memory no longer holds (after /clear, /resume or /branch).
+// memory no longer holds (after /clear, /resume or /branch). Without `run`
+// it asks for this session's runs (`--session`), never the machine's latest;
+// with one it is an explicit lookup that works for any session's run, and a
+// run of another session is kept marked `foreign`.
 export async function reloadTimeline(fx: Fx, store: Store, run?: string) {
-  const argv = ['relais', 'native', 'status', ...(run ? ['--run', run] : [])]
+  const session = await fx.session.id()
+  const argv = ['relais', 'native', 'status', ...(run ? ['--run', run] : ['--session', session])]
   try {
     const result = await fx.process.run(argv, { timeoutMs: STATUS_TIMEOUT_MS })
     if (result.exitCode !== 0) {
@@ -418,7 +424,7 @@ export async function reloadTimeline(fx: Fx, store: Store, run?: string) {
     store.statusFailure = undefined
     const text: string = result.stdout
     const now = await fx.clock.now()
-    const rebuilt: Record<string, RunModel> = rebuildRuns(JSON.parse(text), now)
+    const rebuilt = foreignMarked(rebuildRuns(JSON.parse(text), now), session)
     // A run the module is still reading is fresher than the file.
     store.models = { ...rebuilt, ...store.models }
     markDirty(store)
@@ -429,10 +435,48 @@ export async function reloadTimeline(fx: Fx, store: Store, run?: string) {
   }
 }
 
-// The reply of the `status` tool: the models, or relais's own timeline.
+// A run whose ledger session is not `session` is another session's.
+function foreignMarked(models: Record<string, RunModel>, session: string): Record<string, RunModel> {
+  return Object.fromEntries(
+    Object.entries(models).map(([key, m]) => [key, { ...m, foreign: m.session !== undefined && m.session !== session }]),
+  )
+}
+
+// What the ledger says now about a run the module holds live: an outcome it
+// holds (a reap or a cancel by another process wrote none to the stream),
+// and whether it has gone quiet. A run the status cannot be read for stays
+// as it was.
+async function refreshRun(fx: Fx, store: Store, run: string) {
+  try {
+    const result = await fx.process.run(['relais', 'native', 'status', '--run', run], { timeoutMs: STATUS_TIMEOUT_MS })
+    if (result.exitCode !== 0) {
+      store.statusFailure = `relais native status --run ${run} exited ${result.exitCode}: ${String(result.stderr ?? '').trim().slice(0, 400)}`
+      return
+    }
+    const now = await fx.clock.now()
+    const fresh = rebuildRuns(JSON.parse(String(result.stdout ?? '')), now)[run]
+    const held = store.models[run]
+    if (!fresh || !held || !isLive(held)) return
+    const next = fresh.outcome
+      ? applyEvent(held, { kind: 'outcome', state: fresh.outcome.state, receipt: fresh.outcome.receipt, reason: fresh.outcome.reason }, now)
+      : { ...held, stalled: fresh.stalled }
+    store.models = { ...store.models, [run]: next }
+    markDirty(store)
+  } catch (reason) {
+    // The status reply then shows the model as the stream left it, and
+    // says why it could not be refreshed.
+    store.statusFailure = `relais native status --run ${run} failed: ${String((reason as any)?.message ?? reason).slice(0, 400)}`
+  }
+}
+
+// The reply of the `status` tool: this session's models, or the one asked
+// for by id (marked `foreign` when another session started it). Every live
+// model is checked against the ledger first.
 export async function statusOf(fx: Fx, store: Store, run?: string, opts: { output?: boolean } = {}): Promise<string> {
   const now = await fx.clock.now()
-  const known = () => Object.values(store.models).filter(m => !run || m.run === run)
+  const known = () => Object.values(store.models).filter(m => (run ? m.run === run : !m.foreign))
+  const live = known().filter(m => isLive(m) && !m.run.startsWith('starting-'))
+  await Promise.all(live.map(m => refreshRun(fx, store, m.run)))
   if (known().length === 0) await reloadTimeline(fx, store, run)
   const models = known()
   if (models.length === 0) {
@@ -441,4 +485,32 @@ export async function statusOf(fx: Fx, store: Store, run?: string, opts: { outpu
       : 'No relais run is known in this session.'
   }
   return JSON.stringify(models.map(m => statusReply(m, now, opts)))
+}
+
+// The `cancel` tool: `relais native cancel --run <run> --session <session>`.
+// Its stdout line and exit status come back as they were. A run it ended is
+// marked stopped in the store, so no late `stopped` is sent for it.
+export async function cancelRun(fx: Fx, store: Store, run: string): Promise<string> {
+  const session = await fx.session.id()
+  let result: { exitCode: number; stdout?: string; stderr?: string }
+  try {
+    result = await fx.process.run(['relais', 'native', 'cancel', '--run', run, '--session', session], {
+      timeoutMs: CANCEL_TIMEOUT_MS,
+    })
+  } catch (reason) {
+    return `relais native cancel could not run: ${String((reason as any)?.message ?? reason).slice(0, 400)}\nexit status: unknown`
+  }
+  const line = String(result.stdout ?? '').trim() || String(result.stderr ?? '').trim().slice(0, 400)
+  // Only a run that has ended: one whose driver was told to stop but has
+  // not yet ended still waits for its dispatches' `stopped`.
+  if (result.exitCode === 0 && !line.startsWith('cancel requested')) stopDispatchesOf(store, run)
+  return `${line}\nexit status: ${result.exitCode}`
+}
+
+// The run's dispatches are over: `stopped` for them would only be refused.
+function stopDispatchesOf(store: Store, run: string) {
+  for (const [id, child] of store.dispatchChild) {
+    const d = store.dispatches.get(id)
+    if (child.key === run && d && !d.isStopped) store.dispatches.set(id, { ...d, isStopped: true })
+  }
 }

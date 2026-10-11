@@ -168,7 +168,7 @@ test('the session line relais starts with is footer metadata, not a red stderr r
   // Only the first such line is the binding; a later one is relais's own text.
   expect(red.map((r: any) => r.text)).toEqual(['stderr │ real trouble', 'stderr │ session: again'])
   const session = rows.find((r: any) => r.text.startsWith('session '))
-  expect(session.text).toBe('session a4a9604e (explicit override (RELAIS_SESSION_ID))')
+  expect(session.text).toBe('session a4a9604e')
   expect(session.props.dimColor).toBe(true)
 })
 

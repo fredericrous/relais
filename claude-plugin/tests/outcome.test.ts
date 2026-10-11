@@ -205,7 +205,7 @@ test('after /clear the timeline is reloaded from relais native status', async ($
   expect(run.decisions).toEqual(['repair · checks_failed'])
   expect(run.phases.map((p: any) => p.title)).toEqual(['preflight', 'attempt 1 · worker'])
   expect(run.maxAttempts).toBe(3)
-  expect(engine.calls.run.some((c: any) => c.argv.join(' ') === 'relais native status')).toBe(true)
+  expect(engine.calls.run.some((c: any) => c.argv.join(' ') === 'relais native status --session session-1')).toBe(true)
 })
 
 test('a child that exits with its run unfinished ends that run as interrupted', async ($: any, on: any) => {

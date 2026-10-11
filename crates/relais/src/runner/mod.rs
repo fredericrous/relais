@@ -85,6 +85,13 @@ impl RunOutcome {
     }
 }
 
+/// How a run ended for its driver: by its own last transition, or by
+/// another process that ended it first (whose outcome event stands).
+enum Finish {
+    Own(RunOutcome),
+    Superseded(RunOutcome),
+}
+
 /// The runner's own failure, as distinct from anything a worker did.
 #[derive(Debug)]
 pub enum RunError {
@@ -96,6 +103,9 @@ pub enum RunError {
     Verify(verify::VerifyError),
     /// No identifier could be minted for a run or a dispatch.
     Id(crate::ids::IdError),
+    /// Another process ended the run (reaped, cancelled) while this one
+    /// drove it: the transition was not written and the driver stops.
+    Superseded(RunId),
     Other(String),
 }
 
@@ -107,6 +117,11 @@ impl std::fmt::Display for RunError {
             Self::Workspace(e) => write!(f, "workspace: {e}"),
             Self::Verify(e) => write!(f, "verification: {e}"),
             Self::Id(e) => write!(f, "{e}"),
+            Self::Superseded(run) => write!(
+                f,
+                "run {} was ended by another process (reaped or cancelled)",
+                run.as_str()
+            ),
             Self::Other(detail) => f.write_str(detail),
         }
     }
@@ -389,6 +404,9 @@ pub(crate) struct RunEngine<'a> {
     /// The reviewer's constraint statements that did not fit its prompt:
     /// known only once the review prompt is built, shown in the receipt.
     reviewer_gap: Option<GuidanceGap>,
+    /// Set once the coordinator reports this run cancelled while no
+    /// dispatch heartbeat was running (a check, or between phases).
+    cancel_asked: Arc<AtomicBool>,
     /// Everything this run does, as events (SPEC §29).
     pub(crate) events: Events,
 }
@@ -628,10 +646,11 @@ fn dispatch_ended(dispatch: String, launched: &Launched) -> Event {
 }
 
 /// What a usage event just recorded booked, for the run's events.
-fn cost_booked(event: &UsageEvent) -> Event {
+fn cost_booked(event: &UsageEvent, unpriced: &[String]) -> Event {
     Event::Cost {
         booked: event.cost.map(MicroUsd::to_micros),
         completeness: event.completeness,
+        unpriced_reason: (!unpriced.is_empty()).then(|| unpriced.join("; ")),
     }
 }
 
@@ -681,6 +700,7 @@ impl<'a> RunEngine<'a> {
             harness: None,
             own_write_leases: std::collections::BTreeSet::new(),
             reviewer_gap: None,
+            cancel_asked: Arc::new(AtomicBool::new(false)),
             events,
         })
     }
@@ -694,15 +714,21 @@ impl<'a> RunEngine<'a> {
         detail: serde_json::Value,
     ) -> Result<(), RunError> {
         let from = self.state;
-        self.config.ledger.record_transition(&Transition {
-            run_id: self.run_id.clone(),
-            attempt_id: None,
-            from_state: Some(from),
-            to_state: to,
-            reason: reason.as_str().to_string(),
-            detail: Some(detail.clone()),
-            at: self.config.ledger.now(),
-        })?;
+        let wrote = self.config.ledger.transition_if(
+            from,
+            &Transition {
+                run_id: self.run_id.clone(),
+                attempt_id: None,
+                from_state: Some(from),
+                to_state: to,
+                reason: reason.as_str().to_string(),
+                detail: Some(detail.clone()),
+                at: self.config.ledger.now(),
+            },
+        )?;
+        if !wrote {
+            return Err(RunError::Superseded(self.run_id.clone()));
+        }
         self.state = to;
         self.events.emit(Event::Phase {
             state: to.as_str().to_string(),
@@ -710,6 +736,64 @@ impl<'a> RunEngine<'a> {
             detail,
         });
         Ok(())
+    }
+
+    /// Run `work` while a watcher asks the coordinator, every
+    /// `heartbeat_every`, whether this run is cancelled: a cancel reaches
+    /// a dispatch on its heartbeat, but a verification check has none. The
+    /// flag handed to `work` turns true on a cancel and stays true.
+    fn while_watching_cancel<T>(&self, work: impl FnOnce(Option<&AtomicBool>) -> T) -> T {
+        let Some(gate) = self.config.gate else {
+            return work(None);
+        };
+        let done = AtomicBool::new(false);
+        let every = self.config.heartbeat_every;
+        let (run_id, asked) = (self.run_id.as_str(), &*self.cancel_asked);
+        std::thread::scope(|scope| {
+            let done = &done;
+            scope.spawn(move || {
+                let mut last: Option<Instant> = None;
+                while !done.load(Ordering::SeqCst) {
+                    if last.is_none_or(|last| last.elapsed() >= every) {
+                        last = Some(Instant::now());
+                        if gate.run_cancelled(run_id).unwrap_or(false) {
+                            asked.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            });
+            let result = work(Some(asked));
+            done.store(true, Ordering::SeqCst);
+            result
+        })
+    }
+
+    /// Whether the coordinator has cancelled this run: the watcher saw it,
+    /// or the gate says so now.
+    fn cancel_requested(&self) -> bool {
+        self.cancel_asked.load(Ordering::SeqCst)
+            || self
+                .config
+                .gate
+                .is_some_and(|gate| gate.run_cancelled(self.run_id.as_str()).unwrap_or(false))
+    }
+
+    /// Between phases: a run cancelled at the coordinator ends cancelled
+    /// here, through the same transition as any other end.
+    fn end_if_cancelled(&mut self) -> Result<Option<RunOutcome>, RunError> {
+        if !self.cancel_requested() {
+            return Ok(None);
+        }
+        self.cancel_asked.store(true, Ordering::SeqCst);
+        let detail =
+            "the run was cancelled through the coordinator; its evidence is kept".to_string();
+        Ok(Some(self.finish(
+            Reason::CancelledByUser,
+            serde_json::json!({ "detail": detail }),
+            Terminal::Cancelled { detail },
+        )?))
     }
 
     /// Record a terminal transition and end the run with it.
@@ -794,13 +878,16 @@ impl<'a> RunEngine<'a> {
         event: &UsageEvent,
         result: &LaunchResult,
     ) -> Result<(), LedgerError> {
-        let ledger = self.config.ledger;
-        if result.booked_message_ids.is_empty() {
-            ledger.record_usage(event)?;
-        } else {
-            ledger.record_native_usage(event, &result.booked_message_ids)?;
+        // Only what the dispatch's per-turn bookings have not already
+        // booked: `native usage` may have booked most of it.
+        let booked = self.config.ledger.record_usage_delta(
+            event,
+            &result.booked_message_ids,
+            crate::ledger::Booking::Final,
+        )?;
+        if let Some(booked) = booked {
+            self.events.emit(cost_booked(&booked, &result.unpriced));
         }
-        self.events.emit(cost_booked(event));
         if result.session_id.is_some() && result.booked_message_ids.is_empty() {
             self.events.emit(Event::Decision {
                 what: "rollback_ids_missing".into(),
@@ -1174,7 +1261,31 @@ impl<'a> RunEngine<'a> {
     }
 
     fn run(mut self) -> RunOutcome {
-        let outcome = self.run_to_outcome();
+        let outcome = match self.run_to_outcome() {
+            Finish::Own(outcome) => outcome,
+            // Another process ended the run (a reap, a workerless cancel)
+            // and wrote its one outcome event. This driver writes none: a
+            // second would contradict it. The plugin reading this stream
+            // is still told the run is over, with the state the ledger
+            // holds now.
+            Finish::Superseded(outcome) => {
+                if self.config.purpose != Some(crate::lifecycle::RunPurpose::Replay)
+                    && self.parent.is_none()
+                {
+                    let (code, detail) = outcome.terminal.named_reason();
+                    let _ = self.config.wire.send(&Request::Done {
+                        run: Some(self.run_id.as_str()),
+                        outcome: outcome.state().as_str(),
+                        receipt: None,
+                        summary: None,
+                        trial: None,
+                        code: code.as_deref(),
+                        detail,
+                    });
+                }
+                return outcome;
+            }
+        };
         // Whatever `persist_receipt` wrote, whichever way the run ended: an
         // accepted run's receipt, and the pending one a run stopped only by
         // an unmet sign-off stores (`store_pending_receipt`). The artifacts
@@ -1188,6 +1299,7 @@ impl<'a> RunEngine<'a> {
             state: outcome.state().as_str().to_string(),
             receipt: receipt.clone(),
             summary,
+            reason: None,
         });
         // A replay's `done` waits for its trial to be recorded: its caller
         // sends it (`relais dataset replay`).
@@ -1213,9 +1325,10 @@ impl<'a> RunEngine<'a> {
         outcome
     }
 
-    fn run_to_outcome(&mut self) -> RunOutcome {
+    fn run_to_outcome(&mut self) -> Finish {
         match self.run_inner() {
-            Ok(outcome) => outcome,
+            Ok(outcome) => Finish::Own(outcome),
+            Err(RunError::Superseded(_)) => Finish::Superseded(self.superseded_outcome()),
             Err(error) => {
                 // The runner itself failed. Say so on the record if the
                 // record will still take it; the outcome says so either
@@ -1224,16 +1337,37 @@ impl<'a> RunEngine<'a> {
                     "the runner could not continue: {error}; the run is interrupted and \
                      whatever was written is preserved"
                 );
-                let _ = self.transition(
+                match self.transition(
                     State::Interrupted,
                     Reason::RunnerFailure,
                     serde_json::json!({ "error": error.to_string() }),
-                );
-                RunOutcome {
-                    run_id: self.run_id.clone(),
-                    terminal: Terminal::Interrupted { detail },
+                ) {
+                    Err(RunError::Superseded(_)) => Finish::Superseded(self.superseded_outcome()),
+                    // Not recorded (the ledger refused it): the outcome
+                    // still says the run is interrupted, and why.
+                    Ok(()) | Err(_) => Finish::Own(RunOutcome {
+                        run_id: self.run_id.clone(),
+                        terminal: Terminal::Interrupted { detail },
+                    }),
                 }
             }
+        }
+    }
+
+    /// The outcome of a run another process ended: what the ledger holds
+    /// now, `cancelled` or else `interrupted`.
+    fn superseded_outcome(&self) -> RunOutcome {
+        let detail = format!(
+            "run {} was ended by another process (reaped or cancelled)",
+            self.run_id.as_str()
+        );
+        let terminal = match self.config.ledger.run_status(&self.run_id) {
+            Ok(Some(State::Cancelled)) => Terminal::Cancelled { detail },
+            Ok(_) | Err(_) => Terminal::Interrupted { detail },
+        };
+        RunOutcome {
+            run_id: self.run_id.clone(),
+            terminal,
         }
     }
 
@@ -1306,14 +1440,21 @@ impl<'a> RunEngine<'a> {
         // the checks it is told to pass. This is also the one place the
         // setup is proven when the baseline came from the cache: a
         // cached verdict skipped the base's copy, not the machine.
-        let setup = verify::run_setup(
-            &worktree_path,
-            &preflight.authority.verification_profile,
-            &baseline.logs_dir,
-            "task",
-            &self.events,
-        )?;
+        let setup = self.while_watching_cancel(|cancel| {
+            verify::run_setup(
+                &worktree_path,
+                &preflight.authority.verification_profile,
+                &baseline.logs_dir,
+                "task",
+                &self.events,
+                cancel,
+            )
+        })?;
         self.record_logs(None, EvidenceKind::SetupLog, &setup)?;
+        if let Some(outcome) = self.end_if_cancelled()? {
+            self.retire_worktree(&worktree, &outcome)?;
+            return Ok(outcome);
+        }
         let outcome = match verify::setup_failure(&setup) {
             // The worktree exists and no worker has touched it; whatever
             // the setup left there — an installed `node_modules` the
@@ -1735,14 +1876,23 @@ impl<'a> RunEngine<'a> {
                     // setup that did not succeed leaves nothing for the
                     // commands to run against — blocked, before any
                     // worker is bought (SPEC §10).
-                    let setup = verify::run_setup(
-                        baseline.path(),
-                        &authority.verification_profile,
-                        &logs_dir,
-                        "base",
-                        &self.events,
-                    )?;
+                    let setup = self.while_watching_cancel(|cancel| {
+                        verify::run_setup(
+                            baseline.path(),
+                            &authority.verification_profile,
+                            &logs_dir,
+                            "base",
+                            &self.events,
+                            cancel,
+                        )
+                    })?;
                     self.record_logs(None, EvidenceKind::SetupLog, &setup)?;
+                    if let Some(outcome) = self.end_if_cancelled()? {
+                        if let Err(e) = baseline.release() {
+                            eprintln!("relais: {e}");
+                        }
+                        return Ok(Phase::Ended(outcome));
+                    }
                     if let Some(failed) = verify::setup_failure(&setup) {
                         let detail = setup_failure_detail(failed, "the base revision");
                         if let Err(e) = baseline.release() {
@@ -1752,14 +1902,23 @@ impl<'a> RunEngine<'a> {
                             self.fail_preflight(BlockCode::VerificationSetupFailed, detail)?,
                         ));
                     }
-                    let checks = verify::run_profile(
-                        baseline.path(),
-                        &authority.verification_profile,
-                        &logs_dir,
-                        "base",
-                        &self.events,
-                    )?;
+                    let checks = self.while_watching_cancel(|cancel| {
+                        verify::run_profile(
+                            baseline.path(),
+                            &authority.verification_profile,
+                            &logs_dir,
+                            "base",
+                            &self.events,
+                            cancel,
+                        )
+                    })?;
                     self.record_logs(None, EvidenceKind::CheckLog, &checks)?;
+                    if let Some(outcome) = self.end_if_cancelled()? {
+                        if let Err(e) = baseline.release() {
+                            eprintln!("relais: {e}");
+                        }
+                        return Ok(Phase::Ended(outcome));
+                    }
                     // A check that gave no verdict at the base — the
                     // program was not found (exit 127), or the wall clock
                     // cut it off before it reported a status — leaves
@@ -1859,6 +2018,9 @@ impl<'a> RunEngine<'a> {
         };
 
         loop {
+            if let Some(outcome) = self.end_if_cancelled()? {
+                return Ok(outcome);
+            }
             if let Some(outcome) = self.ceiling_reached(&progress, ctx.deadline)? {
                 return Ok(outcome);
             }
@@ -2521,6 +2683,9 @@ impl<'a> RunEngine<'a> {
                 ));
             }
         };
+        if let Some(outcome) = self.end_if_cancelled()? {
+            return Ok(Step::Ended(outcome));
+        }
         // An inspection judges its report: a gap about the profile's own
         // checks is recorded, not a stop. The acceptance-evidence gaps
         // keep their handling below.
@@ -3506,14 +3671,18 @@ impl<'a> RunEngine<'a> {
             // proved the setup, so it is not spent again either.
             (Some(outcomes), _) => outcomes.to_vec(),
             (None, Some(holder)) => {
-                let setup = verify::run_setup(
-                    holder.path(),
-                    &authority.verification_profile,
-                    logs_dir,
-                    &label.log_prefix(),
-                    &self.events,
-                )
-                .map_err(|e| e.to_string())?;
+                let setup = self
+                    .while_watching_cancel(|cancel| {
+                        verify::run_setup(
+                            holder.path(),
+                            &authority.verification_profile,
+                            logs_dir,
+                            &label.log_prefix(),
+                            &self.events,
+                            cancel,
+                        )
+                    })
+                    .map_err(|e| e.to_string())?;
                 self.record_logs(None, EvidenceKind::SetupLog, &setup)
                     .map_err(|e| format!("the ledger refused a setup-log evidence row: {e}"))?;
                 match verify::setup_failure(&setup) {
@@ -3532,14 +3701,18 @@ impl<'a> RunEngine<'a> {
                         ));
                         Vec::new()
                     }
-                    None => verify::run_profile(
-                        holder.path(),
-                        &authority.verification_profile,
-                        logs_dir,
-                        &label.log_prefix(),
-                        &self.events,
-                    )
-                    .map_err(|e| e.to_string())?,
+                    None => self
+                        .while_watching_cancel(|cancel| {
+                            verify::run_profile(
+                                holder.path(),
+                                &authority.verification_profile,
+                                logs_dir,
+                                &label.log_prefix(),
+                                &self.events,
+                                cancel,
+                            )
+                        })
+                        .map_err(|e| e.to_string())?,
                 }
             }
             (None, None) => {
@@ -5400,6 +5573,93 @@ mod tests {
     }
 
     // -- release scenarios (SPEC §14) -------------------------------------
+
+    #[test]
+    fn a_driver_whose_run_was_ended_elsewhere_stops_without_writing() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let machine = fixture.machine_for(&repo);
+        let contract = fixture.contract(Review::Off);
+        let backend = conditional_worker("relais task");
+        let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
+            adr: "ADR-0001".into(),
+            choice: None,
+            reason: None,
+        };
+        let config = RunConfig {
+            repo_dir: &fixture.repo,
+            contract: &contract,
+            repo_policy: &repo,
+            machine: &machine,
+            ledger: &fixture.ledger,
+            ids: &fixture.ids,
+            backend: &backend,
+            git: &crate::workspace::SystemGit,
+            hooks: &crate::verify::FixedInventory(None),
+            attest: &crate::verify::FixedAttest::default(),
+            artifacts_dir: fixture.artifacts.clone(),
+            aval_resolver: &resolver,
+            predictor: None,
+            gate: None,
+            session_id: "test-session".into(),
+            heartbeat_every: Duration::from_millis(50),
+            task_override: None,
+            purpose: None,
+            run_id: None,
+            wire: Wire::process(),
+        };
+        let mut engine = RunEngine::new(&config, None).expect("engine");
+        let run_id = engine.run_id.clone();
+        fixture
+            .ledger
+            .insert_run(
+                &run_id,
+                "/repo",
+                None,
+                &crate::ids::TaskId::from_stored("t"),
+                "rk",
+            )
+            .expect("insert");
+        engine
+            .transition(
+                State::Running,
+                Reason::WorkerDispatched,
+                serde_json::json!({}),
+            )
+            .expect("the first transition lands");
+
+        // Another process reaps the run.
+        fixture
+            .ledger
+            .record_transition(&Transition {
+                run_id: run_id.clone(),
+                attempt_id: None,
+                from_state: Some(State::Running),
+                to_state: State::Interrupted,
+                reason: Reason::DriverGone.as_str().to_string(),
+                detail: None,
+                at: fixture.ledger.now(),
+            })
+            .expect("reap");
+        let before = fixture.ledger.transitions(&run_id).expect("rows").len();
+        let events = fixture.artifacts.join(run_id.as_str()).join("events.jsonl");
+        let events_before = std::fs::read_to_string(&events).unwrap_or_default();
+
+        let err = engine
+            .transition(
+                State::Verifying,
+                Reason::WorkerDispatched,
+                serde_json::json!({}),
+            )
+            .expect_err("the reaped run is not the driver's to end");
+        assert!(matches!(err, RunError::Superseded(_)), "{err}");
+        assert_eq!(
+            fixture.ledger.transitions(&run_id).expect("rows").len(),
+            before
+        );
+        let events_after = std::fs::read_to_string(&events).unwrap_or_default();
+        assert_eq!(events_before, events_after, "no Phase or Outcome event");
+    }
 
     #[test]
     fn bounded_change_routes_verifies_and_receives_a_bound_receipt() {
@@ -7937,6 +8197,160 @@ mod tests {
 
     // -- the harness boundary (SPEC §8, §9, §11) --------------------------
 
+    /// The stopped path after per-turn bookings: the runner books only the
+    /// rest of the dispatch's usage, as the one bare-id row that says the
+    /// dispatch reported, and every row of the dispatch ends in one phase.
+    #[test]
+    fn stopped_after_per_turn_usage_books_only_the_rest_in_one_phase() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let ledger_path = fixture.dir.join("ledger.sqlite");
+        let worker = Arc::new(std::sync::Mutex::new(None::<String>));
+        let seen = Arc::clone(&worker);
+        let opened = ledger_path.clone();
+        let backend = MockBackend::new(move |spec| {
+            if spec.prompt.contains("semantic reviewer") {
+                return MockOutcome {
+                    result_text: Some("FINDINGS: none".into()),
+                    exit_code: Some(0),
+                    usage: Some(usage(40)),
+                    ..Default::default()
+                };
+            }
+            // What `native usage` books mid-flight: 60 of the 100 input
+            // tokens the worker ends up reporting, with no phase.
+            let ledger = Ledger::open(&opened).expect("ledger");
+            let booking = ledger
+                .dispatch_booking(&spec.dispatch_id)
+                .expect("booking")
+                .expect("the dispatch is on record");
+            ledger
+                .record_usage_delta(
+                    &UsageEvent {
+                        event_id: spec.dispatch_id.clone(),
+                        run_id: booking.run_id,
+                        attempt_id: None,
+                        parent_event_id: None,
+                        model: Some("m".into()),
+                        input_tokens: Some(60),
+                        output_tokens: Some(1),
+                        cache_read_tokens: None,
+                        cache_write_tokens: None,
+                        cost: Some(MicroUsd::from_micros(6)),
+                        cost_kind: CostKind::EstimatedApiEquivalent,
+                        completeness: CostCompleteness::Actual,
+                        inclusive: false,
+                        at: ledger.now(),
+                        phase: None,
+                        duration_ms: None,
+                        requested_model: None,
+                        requested_effort: None,
+                        harness: None,
+                    },
+                    &[],
+                    crate::ledger::Booking::Turn,
+                )
+                .expect("per-turn booking");
+            *seen.lock().expect("lock") = Some(spec.dispatch_id.clone());
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(10)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &backend);
+        assert!(
+            matches!(outcome.terminal, Terminal::Accepted(_)),
+            "{outcome:?}"
+        );
+        let dispatch = worker.lock().expect("lock").clone().expect("worker ran");
+        let conn = rusqlite::Connection::open(&ledger_path).expect("conn");
+        let rows: Vec<(String, i64, Option<String>)> = conn
+            .prepare(
+                "SELECT event_id, input_tokens, phase FROM usage_events
+                 WHERE event_id = ?1 OR (event_id >= ?1 || '#' AND event_id < ?1 || '$')
+                 ORDER BY event_id",
+            )
+            .expect("prepare")
+            .query_map([&dispatch], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows");
+        assert_eq!(rows.len(), 2, "one per-turn row, one final: {rows:?}");
+        assert_eq!(rows[0].0, dispatch, "the final row carries the bare id");
+        assert_eq!(rows[0].1, 40, "the runner booked only the rest");
+        assert_eq!(rows.iter().map(|r| r.1).sum::<i64>(), 100);
+        assert!(rows[0].2.is_some(), "the runner books a phase");
+        assert!(
+            rows.iter().all(|r| r.2 == rows[0].2),
+            "one dispatch, one phase: {rows:?}"
+        );
+    }
+
+    /// A run reaped while its driver still works: the driver's next
+    /// transition is refused, and `run()` writes no second outcome event —
+    /// the reaper's stands alone.
+    #[test]
+    fn a_driver_whose_run_was_reaped_writes_no_second_outcome() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo_policy(vec![main_gone_check()], 3);
+        let ledger_path = fixture.dir.join("ledger.sqlite");
+        let runs_dir = fixture.artifacts.clone();
+        let backend = MockBackend::new(move |spec| {
+            // Mid-dispatch, another process reaps the run.
+            let ledger = Ledger::open(&ledger_path).expect("ledger");
+            let run = ledger
+                .dispatch_booking(&spec.dispatch_id)
+                .expect("booking")
+                .expect("on record")
+                .run_id;
+            let from = ledger.run_status(&run).expect("status").expect("state");
+            let reaped = crate::reap::reap(
+                &ledger,
+                &crate::reap::Reap {
+                    run: &run,
+                    from,
+                    ending: crate::reap::Ending::Interrupted,
+                    detail: "test reap".into(),
+                    extra: serde_json::Value::Null,
+                    events_dir: &runs_dir.join(run.as_str()),
+                },
+                &|_| false,
+            )
+            .expect("reap");
+            assert!(
+                matches!(reaped, crate::reap::Reaped::Moved(_)),
+                "{reaped:?}"
+            );
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("fix");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(10)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute(&fixture.contract(Review::Required), &repo, &backend);
+        assert_eq!(outcome.state(), State::Interrupted, "{outcome:?}");
+        let text = std::fs::read_to_string(
+            fixture
+                .artifacts
+                .join(outcome.run_id.as_str())
+                .join("events.jsonl"),
+        )
+        .expect("events");
+        let outcomes: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("\"kind\":\"outcome\""))
+            .collect();
+        assert_eq!(outcomes.len(), 1, "only the reaper's outcome: {outcomes:?}");
+        assert!(outcomes[0].contains("test reap") || outcomes[0].contains("interrupted"));
+    }
+
     #[test]
     fn unreported_usage_is_unknown_in_the_receipt_not_zero() {
         let fixture = Fixture::new();
@@ -8461,6 +8875,73 @@ mod tests {
             fixture.ledger.run_status(&outcome.run_id).expect("status"),
             Some(State::Blocked)
         );
+    }
+
+    /// A cancel that arrives while a verification check runs: no dispatch
+    /// heartbeat is running then, so the runner asks the coordinator itself,
+    /// stops the check, and ends the run cancelled with one outcome event.
+    #[test]
+    fn a_run_cancelled_while_its_check_runs_stops_the_check_and_ends_cancelled() {
+        let fixture = Fixture::new();
+        let hanging = CommandSpec {
+            name: None,
+            junit: None,
+            argv: vec!["sh".into(), "-c".into(), "sleep 60".into()],
+            timeout_seconds: 120,
+        };
+        let repo = fixture.repo_policy(vec![hanging], 3);
+        let machine = fixture.machine_for(&repo);
+        let gate = Arc::new(crate::admission::LocalGate::new(
+            ConcurrencyLimits::default(),
+        ));
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = counting_worker(Arc::clone(&launches));
+        let canceller = Arc::clone(&gate);
+        let started = Instant::now();
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                // The run registers, then its base check starts and hangs.
+                while canceller.status().runs.is_empty() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                std::thread::sleep(Duration::from_millis(500));
+                for run_id in canceller.status().runs.keys() {
+                    canceller.cancel_run(run_id);
+                }
+            });
+            fixture.execute_managed(
+                &fixture.contract(Review::Off),
+                &repo,
+                &machine,
+                &backend,
+                gate.as_ref(),
+            )
+        });
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the check was stopped, not waited for: {:?}",
+            started.elapsed()
+        );
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Cancelled { .. },
+        } = outcome
+        else {
+            panic!("expected cancellation, got {outcome:?}");
+        };
+        assert_eq!(launches.load(Ordering::SeqCst), 0, "no worker was bought");
+        assert_eq!(
+            fixture.ledger.run_status(&run_id).expect("status"),
+            Some(State::Cancelled)
+        );
+        let events =
+            std::fs::read_to_string(fixture.artifacts.join(run_id.as_str()).join("events.jsonl"))
+                .expect("events.jsonl");
+        let outcomes = events
+            .lines()
+            .filter(|line| line.contains("\"kind\":\"outcome\""))
+            .count();
+        assert_eq!(outcomes, 1, "{events}");
     }
 
     #[test]
@@ -10832,6 +11313,9 @@ mod tests {
         }
         fn write_lease_holder(&self, worktree: &str) -> Result<Option<String>, GateError> {
             self.inner.write_lease_holder(worktree)
+        }
+        fn run_cancelled(&self, run_id: &str) -> Result<bool, GateError> {
+            self.inner.run_cancelled(run_id)
         }
         fn enforcement(&self) -> crate::admission::Enforcement {
             self.inner.enforcement()

@@ -33,7 +33,7 @@ pub use router::{
     RouterTaskRow, RouterUsageRow, RouterWindow,
 };
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 27;
+pub const LEDGER_SCHEMA_VERSION: u64 = 28;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -1674,6 +1674,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
     END;
     "#,
     ),
+    (
+        // The process that drives a run, recorded when it takes the run:
+        // its pid, that process's start time (a reused pid has another),
+        // and when it took the run. Additive and nullable: a row written
+        // before this step has no driver on record, never a guessed one.
+        "v28",
+        r#"
+    ALTER TABLE runs ADD COLUMN driver_pid INTEGER;
+    ALTER TABLE runs ADD COLUMN driver_started TEXT;
+    ALTER TABLE runs ADD COLUMN driver_since TEXT;
+    "#,
+    ),
 ];
 
 /// `advice_p_approve, advice_model, advice_revision, advice_null_reason`.
@@ -1864,6 +1876,77 @@ fn insert_usage_event(conn: &Connection, event: &UsageEvent) -> Result<bool> {
     )?;
     Ok(inserted == 1)
 }
+
+/// Which booking of a dispatch's usage a row is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Booking {
+    /// A turn while the dispatch runs (`native usage`): keyed
+    /// `<dispatch>#<n>`, never by the bare id.
+    Turn,
+    /// The booking at the dispatch's end (`native stopped`, the runner):
+    /// the one row keyed by the bare dispatch id, written even at a zero
+    /// delta. Its presence is what says the dispatch reported
+    /// (`run_dispatch_report_counts`), so a dispatch killed mid-flight
+    /// with per-turn rows still reads as not reported.
+    Final,
+}
+
+/// What a dispatch's usage rows already hold, summed.
+struct BookedFigures {
+    rows: i64,
+    /// Whether the bare-id row, the final booking, is among them.
+    has_final: bool,
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    cost: i64,
+}
+
+/// What a dispatch's usage row needs besides the usage itself.
+#[derive(Debug, Clone)]
+pub struct DispatchBooking {
+    pub run_id: RunId,
+    pub attempt_id: Option<i64>,
+    pub phase: Option<UsagePhase>,
+    pub requested_model: Option<String>,
+    pub requested_effort: Option<String>,
+    pub harness: Option<String>,
+}
+
+/// The part of a cumulative usage event that is new over `booked`: the
+/// whole event when nothing is booked yet, otherwise each figure less what
+/// is booked, clamped at zero, in a row named after the dispatch and the
+/// rows before it. `None` when no figure grew.
+fn delta_event(event: &UsageEvent, booked: &BookedFigures, event_id: String) -> Option<UsageEvent> {
+    if booked.rows == 0 {
+        return Some(UsageEvent {
+            event_id,
+            ..event.clone()
+        });
+    }
+    let over = |total: Option<i64>, held: i64| total.map(|total| total.saturating_sub(held).max(0));
+    let input = over(event.input_tokens, booked.input);
+    let output = over(event.output_tokens, booked.output);
+    let cache_read = over(event.cache_read_tokens, booked.cache_read);
+    let cache_write = over(event.cache_write_tokens, booked.cache_write);
+    let cost = over(event.cost.map(MicroUsd::to_micros), booked.cost);
+    let grew = [input, output, cache_read, cache_write, cost]
+        .iter()
+        .any(|figure| figure.is_some_and(|figure| figure > 0));
+    grew.then(|| UsageEvent {
+        event_id,
+        input_tokens: input,
+        output_tokens: output,
+        cache_read_tokens: cache_read,
+        cache_write_tokens: cache_write,
+        cost: cost.map(MicroUsd::from_micros),
+        ..event.clone()
+    })
+}
+
+/// A run's recorded driver: pid, process start time, since when.
+pub type RunDriver = (Option<i64>, Option<String>, Option<String>);
 
 pub struct Ledger {
     conn: Connection,
@@ -2401,6 +2484,24 @@ fn append_transition(tx: &rusqlite::Transaction<'_>, transition: &Transition) ->
     Ok(())
 }
 
+/// Record this process as the run's driver: its pid, its start time (the
+/// token that tells a reused pid from the driver) and when it took the run.
+/// Runs inside the caller's transaction, so the driver is on record in the
+/// same commit as the transition that makes it the driver.
+fn stamp_driver(tx: &rusqlite::Transaction<'_>, run: &RunId, now: &str) -> Result<()> {
+    let pid = std::process::id();
+    tx.execute(
+        "UPDATE runs SET driver_pid = ?2, driver_started = ?3, driver_since = ?4 WHERE id = ?1",
+        params![
+            run.as_str(),
+            i64::from(pid),
+            crate::procs::start_time(pid),
+            now
+        ],
+    )?;
+    Ok(())
+}
+
 /// A run's status as a projection of its transition history (P3): the
 /// last transition's `to_state`, falling back to the `runs.status` column
 /// only for a row with no transition at all — an old ledger's run, written
@@ -2606,6 +2707,14 @@ impl Ledger {
         })
     }
 
+    /// Whether SQLite opened this connection read-only. [`Self::open`] on a
+    /// file it cannot write (another owner, a read-only mount, an ACL)
+    /// falls back to a read-only connection without an error; this is the
+    /// one answer that covers every such cause.
+    pub fn is_read_only(&self) -> Result<bool> {
+        Ok(self.conn.is_readonly(rusqlite::DatabaseName::Main)?)
+    }
+
     /// The ledger for reading only, when there is one this binary can read.
     ///
     /// Unlike [`Self::open`], this creates no directory and no file,
@@ -2695,6 +2804,7 @@ impl Ledger {
                 task.as_str()
             ],
         )?;
+        stamp_driver(&tx, id, &now)?;
         tx.commit()?;
         Ok(())
     }
@@ -2729,6 +2839,7 @@ impl Ledger {
                 task.as_str()
             ],
         )?;
+        stamp_driver(&tx, id, &now)?;
         tx.commit()?;
         Ok(())
     }
@@ -2808,6 +2919,29 @@ impl Ledger {
             )
             .optional()?;
         status.map(|s| parse_state(&s)).transpose()
+    }
+
+    /// Every run that has not reached a terminal state, with its state. A
+    /// row whose status this binary cannot read is skipped, not fatal: one
+    /// bad row must not stop the reap sweep for every other run.
+    pub fn non_terminal_runs(&self) -> Result<Vec<(RunId, State)>> {
+        let mut statement = self
+            .conn
+            .prepare(&format!("SELECT id, {PROJECTED_STATUS} FROM runs"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut open = Vec::new();
+        for (id, status) in rows {
+            match parse_state(&status) {
+                Ok(state) if !state.is_terminal() => open.push((RunId::from_stored(&id), state)),
+                Ok(_) => {}
+                Err(e) => eprintln!("relais: run {id} has an unreadable status, not judged: {e}"),
+            }
+        }
+        Ok(open)
     }
 
     /// When a run's row was last written (`runs.updated_at`, RFC 3339):
@@ -3437,8 +3571,59 @@ impl Ledger {
     /// waiting on a person without a row recording that it started to.
     /// Nothing here closes one: only `resolve_decision` does that.
     pub fn record_transition(&self, transition: &Transition) -> Result<()> {
+        self.record_transition_inner(transition, false)
+    }
+
+    /// [`Self::record_transition`] by a process that re-enters a run (a
+    /// resume): the same transaction also records that process as the
+    /// run's driver.
+    pub fn record_transition_as_driver(&self, transition: &Transition) -> Result<()> {
+        self.record_transition_inner(transition, true)
+    }
+
+    /// Compare-and-set: record `transition` only when the run's projected
+    /// state is `expected_from`, all inside one `BEGIN IMMEDIATE`. Returns
+    /// whether it wrote. A driver whose run was reaped meanwhile (the state
+    /// moved on) writes nothing, so it can never overwrite the reap.
+    pub fn transition_if(&self, expected_from: State, transition: &Transition) -> Result<bool> {
         let tx = self.write_tx()?;
-        append_transition(&tx, transition)?;
+        let current: Option<String> = tx
+            .query_row(
+                &format!("SELECT {PROJECTED_STATUS} FROM runs WHERE id = ?1"),
+                [transition.run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current.as_deref() != Some(expected_from.as_str()) {
+            return Ok(false);
+        }
+        self.write_transition(&tx, transition)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The driver a run records: its pid, the process start time and when
+    /// it took the run. Each is `None` for a run no driver has stamped.
+    pub fn run_driver(&self, run: &RunId) -> Result<RunDriver> {
+        Ok(self.conn.query_row(
+            "SELECT driver_pid, driver_started, driver_since FROM runs WHERE id = ?1",
+            [run.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?)
+    }
+
+    fn record_transition_inner(&self, transition: &Transition, as_driver: bool) -> Result<()> {
+        let tx = self.write_tx()?;
+        self.write_transition(&tx, transition)?;
+        if as_driver {
+            stamp_driver(&tx, &transition.run_id, &transition.at)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn write_transition(&self, tx: &Transaction<'_>, transition: &Transition) -> Result<()> {
+        append_transition(tx, transition)?;
         if transition.to_state.awaits_a_person() {
             let task_id: Option<String> = tx
                 .query_row(
@@ -3468,7 +3653,6 @@ impl Ledger {
                 ],
             )?;
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -3590,6 +3774,7 @@ impl Ledger {
                     at: now.clone(),
                 },
             )?;
+            stamp_driver(&tx, run_id, &now)?;
         }
         tx.commit()?;
         Ok(changed > 0)
@@ -3769,9 +3954,10 @@ impl Ledger {
                 to_state: State::AcceptedByPerson,
                 reason: Reason::DecisionSalvaged.as_str().to_string(),
                 detail: Some(serde_json::json!({ "candidate_sha": candidate_sha })),
-                at: now,
+                at: now.clone(),
             },
         )?;
+        stamp_driver(&tx, run_id, &now)?;
         tx.commit()?;
         Ok(Some(original_reason))
     }
@@ -4192,6 +4378,130 @@ impl Ledger {
         }
         tx.commit()?;
         Ok(inserted)
+    }
+
+    /// Books a dispatch's cumulative usage, `event`, as only what is new:
+    /// the figure over what the dispatch's earlier usage rows already hold,
+    /// each figure clamped at zero, so a lower or equal cumulative books
+    /// nothing and a retry books once. The message ids go through the same
+    /// dedup as [`Self::record_native_usage`]. All in one `BEGIN IMMEDIATE`
+    /// transaction, so concurrent callers see each other's rows. Returns the
+    /// event that was booked, `None` when nothing was new.
+    pub fn record_usage_delta(
+        &self,
+        event: &UsageEvent,
+        message_ids: &[String],
+        booking: Booking,
+    ) -> Result<Option<UsageEvent>> {
+        let tx = self.write_tx()?;
+        // The dispatch's rows: the bare id, and every `<id>#…` — a range
+        // on the `event_id` key ('#' is 0x23, '$' the next byte), so the
+        // lookup stays on the index however large the table grows.
+        let booked = tx.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(event_id = ?1), 0) > 0,
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_write_tokens), 0),
+                    COALESCE(SUM(cost_micros), 0)
+             FROM usage_events
+             WHERE event_id = ?1 OR (event_id >= ?1 || '#' AND event_id < ?1 || '$')",
+            params![event.event_id],
+            |row| {
+                Ok(BookedFigures {
+                    rows: row.get(0)?,
+                    has_final: row.get(1)?,
+                    input: row.get(2)?,
+                    output: row.get(3)?,
+                    cache_read: row.get(4)?,
+                    cache_write: row.get(5)?,
+                    cost: row.get(6)?,
+                })
+            },
+        )?;
+        let numbered = format!("{}#{}", event.event_id, booked.rows);
+        let delta = match booking {
+            // The final row is written once, even at zero: it is the
+            // dispatch's "reported" marker.
+            Booking::Final if !booked.has_final => Some(
+                delta_event(event, &booked, event.event_id.clone()).unwrap_or_else(|| UsageEvent {
+                    event_id: event.event_id.clone(),
+                    input_tokens: event.input_tokens.map(|_| 0),
+                    output_tokens: event.output_tokens.map(|_| 0),
+                    cache_read_tokens: event.cache_read_tokens.map(|_| 0),
+                    cache_write_tokens: event.cache_write_tokens.map(|_| 0),
+                    cost: event.cost.map(|_| MicroUsd::from_micros(0)),
+                    ..event.clone()
+                }),
+            ),
+            Booking::Final | Booking::Turn => delta_event(event, &booked, numbered),
+        };
+        if let Some(delta) = &delta {
+            insert_usage_event(&tx, delta)?;
+        }
+        // One dispatch, one phase: the final booking knows the phase the
+        // runner books it under (a planner's `planning`, a package child's
+        // role), which the per-turn rows could only guess from the intent.
+        if booking == Booking::Final {
+            tx.execute(
+                "UPDATE usage_events SET phase = ?2
+                 WHERE event_id >= ?1 || '#' AND event_id < ?1 || '$'",
+                params![event.event_id, event.phase.map(UsagePhase::as_str)],
+            )?;
+        }
+        for message_id in message_ids {
+            tx.execute(
+                "INSERT OR IGNORE INTO native_usage_messages
+                    (message_id, dispatch_id, run_id, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![message_id, event.event_id, event.run_id.as_str(), event.at],
+            )?;
+            tx.execute(
+                "DELETE FROM orchestration_usage WHERE message_id = ?1",
+                params![message_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(delta)
+    }
+
+    /// What a native dispatch's usage rows need to book a figure for it:
+    /// its run, attempt, phase and requested model, from its intent.
+    pub fn dispatch_booking(&self, dispatch_id: &str) -> Result<Option<DispatchBooking>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT run_id, attempt_id, intent_json FROM dispatches WHERE dispatch_id = ?1",
+                params![dispatch_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((run_id, attempt_id, intent)) = row else {
+            return Ok(None);
+        };
+        let intent: serde_json::Value =
+            serde_json::from_str(&intent).map_err(|e| LedgerError::Corrupt {
+                what: format!("dispatch {dispatch_id}'s intent"),
+                detail: e.to_string(),
+            })?;
+        let text = |key: &str| intent[key].as_str().map(str::to_string);
+        Ok(Some(DispatchBooking {
+            run_id: RunId::from_stored(&run_id),
+            attempt_id,
+            // A kind that is not a usage phase (the planner's `plan`)
+            // books no phase here; the final booking sets the phase
+            // the runner books it under on every per-turn row.
+            phase: text("kind").and_then(|kind| UsagePhase::parse(&kind).ok()),
+            requested_model: text("model"),
+            requested_effort: text("effort"),
+            harness: text("harness"),
+        }))
     }
 
     /// Was this transcript message booked to a native run's attempt?
@@ -5135,6 +5445,37 @@ impl Ledger {
             |row| row.get(0),
         )?;
         Ok(MicroUsd::from_micros(micros))
+    }
+
+    /// The runs started from one Claude Code session (`runs.root_session`),
+    /// newest first, at most `limit`.
+    pub fn runs_of_session(&self, session: &str, limit: usize) -> Result<Vec<RunId>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM runs WHERE root_session = ?1
+                 ORDER BY created_at DESC, rowid DESC LIMIT ?2",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = stmt.query_map(params![session, limit], |row| row.get::<_, String>(0))?;
+        let ids = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids
+            .iter()
+            .map(String::as_str)
+            .map(RunId::from_stored)
+            .collect())
+    }
+
+    /// The session a run was started from; `None` when the run is unknown
+    /// or has none.
+    pub fn run_root_session(&self, run: &RunId) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT root_session FROM runs WHERE id = ?1",
+                [run.as_str()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// Every session id that is the `root_session` of at least one run
@@ -6269,6 +6610,100 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A dispatch killed after its per-turn bookings never booked its
+    /// final row, so it does not count as reported: the run's cost is a
+    /// lower bound, not complete.
+    #[test]
+    fn per_turn_rows_alone_do_not_make_a_dispatch_reported() {
+        let (ledger, _dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-k"), "/repo", None, &task("run-k"), "rk")
+            .expect("run");
+        for id in ["disp-done", "disp-killed"] {
+            ledger
+                .record_dispatch_intent(
+                    &dispatch(id),
+                    &run("run-k"),
+                    None,
+                    &serde_json::json!({}),
+                    0,
+                    RoutedBy::ConservativeBaseline,
+                )
+                .expect("intent");
+        }
+        ledger
+            .record_usage_delta(&event("disp-done", "run-k", 5), &[], Booking::Final)
+            .expect("final");
+        let turn = ledger
+            .record_usage_delta(&event("disp-killed", "run-k", 3), &[], Booking::Turn)
+            .expect("turn")
+            .expect("booked");
+        assert_eq!(
+            turn.event_id, "disp-killed#0",
+            "a turn never takes the bare id"
+        );
+        assert_eq!(
+            ledger
+                .run_cost_completeness(&run("run-k"))
+                .expect("completeness"),
+            CostCompleteness::IncompleteLowerBound
+        );
+    }
+
+    /// A final booking with nothing new still writes the bare-id row: it
+    /// is the dispatch's "reported" marker, at zero.
+    #[test]
+    fn a_final_booking_with_nothing_new_still_marks_the_dispatch_reported() {
+        let (ledger, _dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-z"), "/repo", None, &task("run-z"), "rk")
+            .expect("run");
+        ledger
+            .record_usage_delta(&event("disp-z", "run-z", 7), &[], Booking::Turn)
+            .expect("turn");
+        let last = ledger
+            .record_usage_delta(&event("disp-z", "run-z", 7), &[], Booking::Final)
+            .expect("final")
+            .expect("the marker is written");
+        assert_eq!(last.event_id, "disp-z");
+        assert_eq!(last.input_tokens, Some(0));
+        assert_eq!(
+            ledger.run_cost(&run("run-z")).expect("cost"),
+            MicroUsd::from_micros(7)
+        );
+    }
+
+    /// An intent that does not parse is a corrupt row, reported, never a
+    /// booking with every field silently empty.
+    #[test]
+    fn a_corrupt_intent_is_reported_not_booked_blank() {
+        let (ledger, _dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-c"), "/repo", None, &task("run-c"), "rk")
+            .expect("run");
+        ledger
+            .record_dispatch_intent(
+                &dispatch("disp-c"),
+                &run("run-c"),
+                None,
+                &serde_json::json!({}),
+                0,
+                RoutedBy::ConservativeBaseline,
+            )
+            .expect("intent");
+        ledger
+            .conn
+            .execute(
+                "UPDATE dispatches SET intent_json = '{not json' WHERE dispatch_id = 'disp-c'",
+                [],
+            )
+            .expect("corrupt");
+        assert!(matches!(
+            ledger.dispatch_booking("disp-c"),
+            Err(LedgerError::Corrupt { .. })
+        ));
+    }
+
     fn event(event_id: &str, run_id: &str, micros: i64) -> UsageEvent {
         UsageEvent {
             event_id: event_id.into(),
@@ -6767,6 +7202,44 @@ mod tests {
             window_two,
             MicroUsd::from_micros(1_000),
             "only the later one"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn runs_of_session_returns_only_that_session_newest_first_capped() {
+        let (ledger, dir) = temp_ledger();
+        for i in 0..25 {
+            ledger
+                .insert_run(
+                    &run(&format!("run-a{i:02}")),
+                    "/repo",
+                    Some("sess-a"),
+                    &task("a"),
+                    "rk",
+                )
+                .expect("run a");
+        }
+        ledger
+            .insert_run(&run("run-b"), "/repo", Some("sess-b"), &task("b"), "rk")
+            .expect("run b");
+        ledger
+            .insert_run(&run("run-n"), "/repo", None, &task("n"), "rk")
+            .expect("run n");
+        let runs = ledger.runs_of_session("sess-a", 20).expect("runs");
+        assert_eq!(runs.len(), 20);
+        assert_eq!(runs[0].as_str(), "run-a24");
+        assert_eq!(runs[19].as_str(), "run-a05");
+        assert!(runs.iter().all(|r| r.as_str().starts_with("run-a")));
+        let b = ledger.runs_of_session("sess-b", 20).expect("runs");
+        assert_eq!(b, vec![run("run-b")]);
+        assert!(ledger
+            .runs_of_session("nobody", 20)
+            .expect("runs")
+            .is_empty());
+        assert_eq!(
+            ledger.run_root_session(&run("run-b")).expect("session"),
+            Some("sess-b".to_string())
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -8729,6 +9202,254 @@ mod tests {
         let history = ledger.transitions(&run("run-t")).expect("history");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].to_state, State::Blocked);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn driver_of(ledger: &Ledger, id: &str) -> (Option<i64>, Option<String>, Option<String>) {
+        ledger
+            .conn
+            .query_row(
+                "SELECT driver_pid, driver_started, driver_since FROM runs WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("driver columns")
+    }
+
+    fn assert_driver_recorded(ledger: &Ledger, id: &str) {
+        let (pid, started, since) = driver_of(ledger, id);
+        assert_eq!(pid, Some(i64::from(std::process::id())), "{id}: pid");
+        // What this platform can read: a token on Unix, `None` on Windows,
+        // where no start-time reader exists.
+        assert_eq!(
+            started,
+            crate::procs::start_time(std::process::id()),
+            "{id}: start time"
+        );
+        assert!(since.is_some(), "{id}: since");
+    }
+
+    fn step(run_id: &str, from: State, to: State) -> Transition {
+        Transition {
+            run_id: run(run_id),
+            attempt_id: None,
+            from_state: Some(from),
+            to_state: to,
+            reason: crate::lifecycle::Reason::BlockedPreflight.as_str().into(),
+            detail: None,
+            at: now_rfc3339(),
+        }
+    }
+
+    /// A ledger frozen at v26 upgrades to v28: the three driver columns
+    /// appear, NULL on the row written before them.
+    #[test]
+    fn v28_adds_the_driver_columns_to_an_older_ledger() {
+        assert_eq!(LEDGER_SCHEMA_VERSION, 28);
+        let dir = temp_dir("v26-to-v28");
+        let path = dir.join("ledger.sqlite");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );",
+            )
+            .expect("migrations table");
+            // Up to v26: v27 (the typed actor) and v28 run in `open`.
+            for (version, sql) in &MIGRATIONS[..26] {
+                conn.execute_batch(sql).expect("apply step");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, "then"],
+                )
+                .expect("record step");
+            }
+            conn.execute(
+                "INSERT INTO runs (id, repo_path, status, created_at, updated_at)
+                 VALUES ('run-old', '/r', 'prepared', 'then', 'then')",
+                [],
+            )
+            .expect("a run written before v28");
+        }
+        let ledger = Ledger::open(&path).expect("upgrade");
+        assert_eq!(ledger.schema_version().expect("version"), 28);
+        assert_eq!(driver_of(&ledger, "run-old"), (None, None, None));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every way a process takes a run records it as the driver.
+    #[test]
+    fn every_driver_entry_point_records_the_driver() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-root"), "/r", None, &task("run-root"), "rk")
+            .expect("insert_run");
+        assert_driver_recorded(&ledger, "run-root");
+
+        ledger
+            .insert_child_run(
+                &run("run-child"),
+                "/r",
+                None,
+                ChildOf {
+                    parent_run: &run("run-root"),
+                    package_id: &PackageId::from_stored("pkg-1"),
+                },
+                &task("run-root"),
+                "rk",
+            )
+            .expect("insert_child_run");
+        assert_driver_recorded(&ledger, "run-child");
+
+        // Resume: a transition recorded by the re-entering process.
+        ledger
+            .insert_run(&run("run-resume"), "/r", None, &task("run-resume"), "rk")
+            .expect("run");
+        ledger
+            .conn
+            .execute(
+                "UPDATE runs SET driver_pid = NULL, driver_started = NULL, driver_since = NULL",
+                [],
+            )
+            .expect("clear");
+        ledger
+            .record_transition_as_driver(&step("run-resume", State::Prepared, State::Interrupted))
+            .expect("resume");
+        assert_driver_recorded(&ledger, "run-resume");
+
+        // Decide re-entry: a person's answer.
+        ledger
+            .insert_run(&run("run-decide"), "/r", None, &task("run-decide"), "rk")
+            .expect("run");
+        ledger
+            .record_transition(&step("run-decide", State::Prepared, State::NeedsDecision))
+            .expect("raise");
+        ledger
+            .conn
+            .execute(
+                "UPDATE runs SET driver_pid = NULL, driver_started = NULL, driver_since = NULL",
+                [],
+            )
+            .expect("clear");
+        let answered = ledger
+            .resolve_decision(
+                &run("run-decide"),
+                &DecisionAnswer {
+                    resolution: Reason::DecisionApproved,
+                    actor: Actor::Person,
+                    person_quote: None,
+                    recorded_via: crate::ledger::RecordedVia::Cli,
+                    note: None,
+                    successor_run: None,
+                    from_state: State::NeedsDecision,
+                    to_state: State::Accepted,
+                },
+            )
+            .expect("decide");
+        assert!(answered);
+        assert_driver_recorded(&ledger, "run-decide");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transition_if_writes_nothing_when_the_state_differs() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-c"), "/r", None, &task("run-c"), "rk")
+            .expect("run");
+        let wrote = ledger
+            .transition_if(
+                State::Verifying,
+                &step("run-c", State::Verifying, State::Blocked),
+            )
+            .expect("cas");
+        assert!(!wrote);
+        assert!(ledger
+            .transitions(&run("run-c"))
+            .expect("history")
+            .is_empty());
+        assert_eq!(
+            ledger.run_status(&run("run-c")).expect("status"),
+            Some(State::Prepared)
+        );
+        let wrote = ledger
+            .transition_if(
+                State::Prepared,
+                &step("run-c", State::Prepared, State::Blocked),
+            )
+            .expect("cas");
+        assert!(wrote);
+        assert_eq!(
+            ledger.run_status(&run("run-c")).expect("status"),
+            Some(State::Blocked)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn two_concurrent_transition_ifs_leave_one_row() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-r"), "/r", None, &task("run-r"), "rk")
+            .expect("run");
+        let path = ledger.path().to_path_buf();
+        let handles: Vec<_> = [State::Blocked, State::Interrupted]
+            .into_iter()
+            .map(|to| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let ledger = Ledger::open(&path).expect("open");
+                    ledger
+                        .transition_if(State::Prepared, &step("run-r", State::Prepared, to))
+                        .expect("cas")
+                })
+            })
+            .collect();
+        let wrote: Vec<bool> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread"))
+            .collect();
+        assert_eq!(wrote.iter().filter(|w| **w).count(), 1, "{wrote:?}");
+        assert_eq!(ledger.transitions(&run("run-r")).expect("history").len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A driver whose run was reaped to interrupted from outside writes
+    /// no row when it later tries to move the run on.
+    #[test]
+    fn a_driver_transition_after_a_reap_writes_no_row() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-g"), "/r", None, &task("run-g"), "rk")
+            .expect("run");
+        ledger
+            .transition_if(
+                State::Prepared,
+                &step("run-g", State::Prepared, State::Verifying),
+            )
+            .expect("driver moves");
+        // The reaper.
+        assert!(ledger
+            .transition_if(
+                State::Verifying,
+                &step("run-g", State::Verifying, State::Interrupted)
+            )
+            .expect("reap"));
+        // The driver's own next and final transitions.
+        for to in [State::Accepted, State::Failed] {
+            assert!(!ledger
+                .transition_if(State::Verifying, &step("run-g", State::Verifying, to))
+                .expect("late"));
+        }
+        let history = ledger.transitions(&run("run-g")).expect("history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].to_state, State::Interrupted);
+        assert_eq!(
+            ledger.run_status(&run("run-g")).expect("status"),
+            Some(State::Interrupted)
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

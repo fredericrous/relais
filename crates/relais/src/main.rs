@@ -603,12 +603,35 @@ enum NativeCommand {
         #[arg(long)]
         dispatch: String,
     },
+    /// The dispatch's agent finished a turn; `{"agent", "turns", "usage",
+    /// "message_ids"}` on stdin, the usage cumulative over the dispatch.
+    /// Books only what the ledger does not hold yet for the dispatch
+    Usage {
+        #[arg(long)]
+        dispatch: String,
+    },
+    /// Cancel one run, from the session that started it. A run with no
+    /// live driver is marked cancelled at once, from any session; a run
+    /// with a live driver of another session is refused (11)
+    Cancel {
+        /// The run
+        #[arg(long)]
+        run: String,
+        /// The Claude Code session id asking; required, so a session never
+        /// cancels another's live run
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Print a run's timeline as one JSON object: phases, decisions, cost,
     /// outcome and the last 40 lines of check output
     Status {
-        /// The run; the latest when omitted
+        /// The run; the latest on this machine when omitted
         #[arg(long)]
         run: Option<String>,
+        /// Every run started from this Claude Code session id, newest
+        /// first (at most 20), as {"runs":[...]}
+        #[arg(long, conflicts_with = "run")]
+        session: Option<String>,
     },
     /// A task contract on stdin, validated and saved under the
     /// repository's `.relais/tasks/`; prints the path `relais run --task`
@@ -3164,7 +3187,7 @@ fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome, CliError> 
                         dispatches.join(", ")
                     );
                     if let (Some(run_id), true) = (cancelled_run, dispatches.is_empty()) {
-                        interrupt_unbound_run(&run_id)?;
+                        return finish_workerless_cancel(&run_id);
                     }
                     Ok(CliOutcome::Accepted)
                 }
@@ -3198,33 +3221,188 @@ fn coordinator_command(cmd: CoordinatorCommand) -> Result<CliOutcome, CliError> 
     }
 }
 
-/// `coordinator cancel --run` that signalled no worker: the run is
-/// interrupted only when it is also orphaned by the silence rule (the same
-/// judgement as `resume`); otherwise its driver may still be working, and
-/// nothing changes.
-fn interrupt_unbound_run(run_id: &str) -> Result<(), CliError> {
+/// `coordinator cancel --run` that signalled no worker: the same path as
+/// `native cancel`, with the operator's authority (no session to match).
+fn finish_workerless_cancel(run_id: &str) -> Result<CliOutcome, CliError> {
     let ledger = open_ledger()?;
     let run = RunId::from_stored(run_id);
-    let Some(state) = operational(ledger.run_status(&run), "coordinator cancel")? else {
-        return Ok(());
-    };
-    if state.is_terminal() {
-        return Ok(());
-    }
-    let Some(orphan) = orphan_of_run(&ledger, &run)? else {
-        println!(
-            "{run_id}: has no bound worker process and is left to its driver; \
-             `relais resume --retire {run_id}` interrupts it once the driver is gone"
-        );
-        return Ok(());
-    };
-    match interrupt_orphan(&ledger, &run, state, &orphan)? {
-        OrphanOutcome::Interrupted => {}
-        OrphanOutcome::KeptAlive(why) => {
-            println!("{run_id}: left as it is, {why}");
+    match cancel_standing(&ledger, &run)? {
+        CancelStanding::Unknown => {
+            eprintln!("relais coordinator cancel: run {run_id} is not on record");
+            Ok(CliOutcome::UnknownRun)
+        }
+        CancelStanding::Settled(line) => {
+            println!("{line}");
+            Ok(CliOutcome::Accepted)
+        }
+        CancelStanding::Live { .. } => {
+            println!("{}", await_cancel(&ledger, &run)?);
+            Ok(CliOutcome::Accepted)
         }
     }
-    Ok(())
+}
+
+/// Where a run stands when a cancel arrives.
+enum CancelStanding {
+    /// The ledger has no such run.
+    Unknown,
+    /// Nothing is left to cancel: the line to print (already ended, or
+    /// reaped by this call because its driver is gone).
+    Settled(String),
+    /// A live driver; `session` is the session that started the run.
+    Live { session: Option<String> },
+}
+
+/// How long `native cancel` waits for a live driver to end its run.
+const CANCEL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Judge a run for cancelling: an ended run is reported as it is, one whose
+/// driver is gone or silent is reaped as cancelled (any session may clear
+/// it), and any other is live.
+fn cancel_standing(ledger: &Ledger, run: &RunId) -> Result<CancelStanding, CliError> {
+    let Some(state) = operational(ledger.run_status(run), "native cancel")? else {
+        return Ok(CancelStanding::Unknown);
+    };
+    if state.is_terminal() {
+        return Ok(CancelStanding::Settled(format!(
+            "run {run} already ended: {state}"
+        )));
+    }
+    match reap_if_driverless(ledger, run, state)? {
+        Some(line) => Ok(CancelStanding::Settled(line)),
+        None => Ok(CancelStanding::Live {
+            session: operational(ledger.run_root_session(run), "native cancel")?,
+        }),
+    }
+}
+
+/// Reap a non-terminal run as cancelled when its driver is Gone or Silent.
+/// `None` when the driver may be alive, or a dispatch of the run is.
+fn reap_if_driverless(
+    ledger: &Ledger,
+    run: &RunId,
+    state: State,
+) -> Result<Option<String>, CliError> {
+    let runs_dir = paths::runs_dir().map_err(CliError::Home)?;
+    let silent = operational(
+        relais::reap::run_silence(ledger, &runs_dir, run),
+        "native cancel",
+    )?;
+    let verdict = operational(
+        relais::reap::orphan_verdict_of_run(ledger, run, silent),
+        "native cancel",
+    )?;
+    if verdict == resume::OrphanVerdict::Alive {
+        return Ok(None);
+    }
+    let events_dir = runs_dir.join(run.as_str());
+    let reaped = relais::reap::reap(
+        ledger,
+        &relais::reap::Reap {
+            run,
+            from: state,
+            ending: relais::reap::Ending::Cancelled,
+            detail: relais::reap::orphan_detail(ledger, run, verdict, silent),
+            extra: serde_json::json!({ "verdict": format!("{verdict:?}") }),
+            events_dir: &events_dir,
+        },
+        &|pid| relais::coordinator::process_alive(pid.get()),
+    );
+    match reaped {
+        Ok(relais::reap::Reaped::Moved(_)) => {}
+        // The ledger holds the reap; only the events file missed it.
+        Err(e @ relais::reap::ReapError::EventsNotWritten { .. }) => {
+            eprintln!("relais native cancel: {e}");
+        }
+        Ok(relais::reap::Reaped::AlreadyMoved) => {
+            let now = operational(ledger.run_status(run), "native cancel")?.unwrap_or(state);
+            return Ok(Some(format!("run {run} already ended: {now}")));
+        }
+        Ok(relais::reap::Reaped::KeptAlive(_)) => return Ok(None),
+        Err(e) => {
+            return Err(CliError::Operational {
+                operation: "native cancel",
+                cause: Box::new(e),
+            })
+        }
+    }
+    Ok(Some(format!(
+        "run {run} had no live driver; marked cancelled"
+    )))
+}
+
+/// After a cancel was asked of the coordinator: wait for the driver to end
+/// the run, reaping it as cancelled if the driver dies meanwhile. The line
+/// to print.
+fn await_cancel(ledger: &Ledger, run: &RunId) -> Result<String, CliError> {
+    let until = std::time::Instant::now() + CANCEL_WAIT;
+    loop {
+        let state = operational(ledger.run_status(run), "native cancel")?;
+        match state {
+            Some(State::Cancelled) => return Ok(format!("run {run} cancelled")),
+            Some(ended) if ended.is_terminal() => {
+                return Ok(format!("run {run} already ended: {ended}"))
+            }
+            Some(open) => {
+                if let Some(line) = reap_if_driverless(ledger, run, open)? {
+                    return Ok(line);
+                }
+            }
+            None => return Ok(format!("run {run} is not on record")),
+        }
+        if std::time::Instant::now() >= until {
+            return Ok("cancel requested; the driver has not ended yet".to_string());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// `relais native cancel --run X --session S` (SPEC §23): end a run.
+fn native_cancel_command(run_id: &str, session: Option<&str>) -> Result<CliOutcome, CliError> {
+    let Some(session) = session else {
+        return Err(CliError::Usage {
+            detail: "native cancel: --session is required".into(),
+        });
+    };
+    let ledger = open_ledger()?;
+    let run = RunId::from_stored(run_id);
+    match cancel_standing(&ledger, &run)? {
+        CancelStanding::Unknown => {
+            eprintln!("relais native cancel: run {run_id} is not on record");
+            Ok(CliOutcome::UnknownRun)
+        }
+        CancelStanding::Settled(line) => {
+            println!("{line}");
+            Ok(CliOutcome::Accepted)
+        }
+        CancelStanding::Live { session: owner } if owner.as_deref() != Some(session) => {
+            println!(
+                "run {run_id} belongs to live session {}; cancel it from that session",
+                owner.as_deref().unwrap_or("(none recorded)")
+            );
+            Ok(CliOutcome::ResumeRefusedLive)
+        }
+        CancelStanding::Live { .. } => {
+            let socket = relais::coordinator::socket_path().map_err(CliError::Home)?;
+            let client = relais::coordinator::Client::new(socket);
+            match client.request(&relais::coordinator::Request::CancelRun {
+                run_id: run_id.to_string(),
+            }) {
+                Ok(relais::coordinator::Response::Cancelled { .. }) => {
+                    println!("{}", await_cancel(&ledger, &run)?);
+                    Ok(CliOutcome::Accepted)
+                }
+                Ok(other) => {
+                    eprintln!("relais native cancel: unexpected reply {other:?}");
+                    Ok(CliOutcome::OperationalFailure)
+                }
+                Err(e) => {
+                    eprintln!("relais native cancel: {e}");
+                    Ok(CliOutcome::Blocked)
+                }
+            }
+        }
+    }
 }
 
 /// Run this same `relais resume` again with its output appended to `log`
@@ -4044,7 +4222,11 @@ fn plan_trial_lines(
 /// the run timeline it reads back (SPEC §23, §29). Exit 0 acknowledges.
 fn native_command(cmd: NativeCommand) -> Result<CliOutcome, CliError> {
     match cmd {
-        NativeCommand::Status { run } => native_status_command(run.as_deref()),
+        NativeCommand::Status { run, session } => {
+            native_status_command(run.as_deref(), session.as_deref())
+        }
+        NativeCommand::Cancel { run, session } => native_cancel_command(&run, session.as_deref()),
+        NativeCommand::Usage { dispatch } => native_usage_command(&dispatch),
         NativeCommand::Contract => native_contract_command(),
         NativeCommand::RouterState { session } => Ok(router_state_command(&session)),
         NativeCommand::RouterObserve => Ok(router_observe_command()),
@@ -4410,6 +4592,61 @@ fn router_off_command(by: &str, source: relais::router::Source) -> Result<CliOut
     Ok(CliOutcome::Accepted)
 }
 
+/// `relais native usage`: books the dispatch's cumulative usage as the
+/// delta over what is already booked, and tells the run's events. Empty or
+/// terminal stdin is a usage error (2), never a wait.
+fn native_usage_command(dispatch: &str) -> Result<CliOutcome, CliError> {
+    use relais::adapter::native::{book_turn_usage, TurnBooked, TurnReport};
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return Err(CliError::Usage {
+            detail: "native usage: the report goes on stdin, which is a terminal".into(),
+        });
+    }
+    let payload = read_stdin()?;
+    if payload.trim().is_empty() {
+        return Err(CliError::Usage {
+            detail: "native usage: stdin is empty; expected the dispatch's usage report".into(),
+        });
+    }
+    let report: TurnReport = serde_json::from_str(&payload).map_err(|e| CliError::Usage {
+        detail: format!("native usage: the payload on stdin is not a usage report: {e}"),
+    })?;
+    let prices = load_machine_pricing()?;
+    let ledger = open_ledger()?;
+    match operational(
+        book_turn_usage(&ledger, dispatch, &report, prices.as_ref()),
+        "native usage",
+    )? {
+        TurnBooked::NoSuchDispatch => {
+            eprintln!("relais native usage: no dispatch {dispatch} on record");
+            Ok(CliOutcome::UnknownRun)
+        }
+        TurnBooked::Nothing => Ok(CliOutcome::Accepted),
+        TurnBooked::Booked {
+            run_id,
+            cost,
+            completeness,
+            unpriced_reason,
+        } => {
+            let artifacts = paths::runs_dir()
+                .map_err(CliError::Home)?
+                .join(run_id.as_str());
+            let event = relais::protocol::Event::Cost {
+                booked: cost,
+                completeness,
+                unpriced_reason,
+            };
+            // The ledger holds the booking; a run that cannot be told of it
+            // is said, not undone.
+            if let Err(e) = relais::protocol::append_event(run_id.as_str(), &artifacts, &event) {
+                eprintln!("relais native usage: booked, but the run's events are not written: {e}");
+            }
+            Ok(CliOutcome::Accepted)
+        }
+    }
+}
+
 fn native_gate() -> Result<relais::coordinator::RemoteGate, CliError> {
     let socket = relais::coordinator::socket_path().map_err(CliError::Home)?;
     Ok(relais::coordinator::RemoteGate::new(socket))
@@ -4436,11 +4673,30 @@ fn read_stopped_report(payload: &str) -> Result<StoppedReport, serde_json::Error
     serde_json::from_str(payload)
 }
 
-/// `relais native status`: one JSON object, the run's timeline from its
-/// `events.jsonl`, and never the whole file — plus `current`, what the
-/// ledger holds for the run now (SPEC §23).
-fn native_status_command(run: Option<&str>) -> Result<CliOutcome, CliError> {
+/// The most runs `relais native status --session` lists.
+const SESSION_RUNS_LIMIT: usize = 20;
+
+/// The stall threshold in force: [`resume::STALLED_AFTER`], unless
+/// `RELAIS_STALLED_AFTER_SECS` names another (the seam tests inject through).
+fn stalled_after() -> std::time::Duration {
+    std::env::var("RELAIS_STALLED_AFTER_SECS")
+        .ok()
+        .and_then(|seconds| seconds.parse::<u64>().ok())
+        .map_or(resume::STALLED_AFTER, std::time::Duration::from_secs)
+}
+
+/// `relais native status`: the run's timeline from its `events.jsonl`, and
+/// never the whole file — plus `current`, what the ledger holds for the run
+/// now (SPEC §23). With `--session`, `{"runs":[...]}`: one such entry for
+/// each run that session started, newest first. Without either flag, the
+/// latest run on this machine (a CLI convenience; the plugin passes
+/// `--session`).
+fn native_status_command(run: Option<&str>, session: Option<&str>) -> Result<CliOutcome, CliError> {
     let artifacts = paths::runs_dir().map_err(CliError::Home)?;
+    let opened = open_status_ledger();
+    if let Some(session) = session {
+        return native_status_of_session(&artifacts, opened, session);
+    }
     let Some(run) = run
         .map(str::to_string)
         .or_else(|| relais::protocol::latest_run(&artifacts))
@@ -4448,11 +4704,17 @@ fn native_status_command(run: Option<&str>) -> Result<CliOutcome, CliError> {
         eprintln!("relais native status: no run has written events yet");
         return Ok(CliOutcome::UnknownRun);
     };
+    // The ledger first: a reap appends the run's end to its events, which
+    // the timeline below must then show.
+    let current = match &opened {
+        Ok((ledger, access)) => current_of_run(ledger, *access, &run, stalled_after()),
+        Err(e) => Err(CurrentUnknown::Unavailable(e.to_string())),
+    };
     let path = artifacts.join(&run).join("events.jsonl");
     match std::fs::read_to_string(&path) {
         Ok(events) => {
             let mut timeline = relais::protocol::timeline(&run, &events);
-            match current_of_run(&run) {
+            match current {
                 Ok(Some(current)) => timeline["current"] = current,
                 // A run the ledger never recorded: one refused before it
                 // started. Nothing to say, and nothing wrong.
@@ -4477,12 +4739,92 @@ fn native_status_command(run: Option<&str>) -> Result<CliOutcome, CliError> {
     }
 }
 
+/// `relais native status --session`: `{"runs":[...]}`, and `{"runs":[]}`
+/// with exit 0 when the session started none (or there is no ledger).
+fn native_status_of_session(
+    artifacts: &Path,
+    opened: Result<(Ledger, StatusAccess), CurrentUnknown>,
+    session: &str,
+) -> Result<CliOutcome, CliError> {
+    let entries = match opened {
+        Ok((ledger, access)) => {
+            let runs = operational(
+                ledger.runs_of_session(session, SESSION_RUNS_LIMIT),
+                "native status",
+            )?;
+            let mut entries = Vec::new();
+            for run in runs {
+                let current = current_of_run(&ledger, access, run.as_str(), stalled_after());
+                let path = artifacts.join(run.as_str()).join("events.jsonl");
+                // A run refused before it wrote anything has no events: an
+                // empty timeline. Any other failure to read them is said.
+                let events = match std::fs::read_to_string(&path) {
+                    Ok(events) => events,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(e) => {
+                        eprintln!(
+                            "relais native status: {run}'s events at {} cannot be read: {e}",
+                            path.display()
+                        );
+                        String::new()
+                    }
+                };
+                let mut timeline = relais::protocol::timeline(run.as_str(), &events);
+                match current {
+                    Ok(Some(current)) => timeline["current"] = current,
+                    Ok(None) => {}
+                    Err(e) => eprintln!("relais native status: no current state for {run}: {e}"),
+                }
+                entries.push(timeline);
+            }
+            entries
+        }
+        Err(CurrentUnknown::NoLedger(_)) => Vec::new(),
+        Err(e) => {
+            eprintln!("relais native status: the ledger cannot be read: {e}");
+            Vec::new()
+        }
+    };
+    println!("{}", serde_json::json!({ "runs": entries }));
+    Ok(CliOutcome::Accepted)
+}
+
+/// The ledger for `native status`, and whether it may be written: read
+/// only unless it exists at this binary's schema, and never created or
+/// migrated here.
+/// What `native status` may do with an orphan it finds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusAccess {
+    /// The ledger is writable: an orphan is reaped.
+    Reaping,
+    /// The ledger is not: an orphan is only reported (`orphaned: true`).
+    ReadOnly,
+}
+
+fn open_status_ledger() -> Result<(Ledger, StatusAccess), CurrentUnknown> {
+    let path = paths::ledger_path().map_err(CurrentUnknown::Home)?;
+    if !path.is_file() {
+        return Err(CurrentUnknown::NoLedger(path));
+    }
+    let read_only = Ledger::open_read_only(&path).map_err(CurrentUnknown::Ledger)?;
+    // `Ledger::open` on a ledger it cannot write falls back to a read-only
+    // connection, whatever the cause (mode, owner, mount, ACL): SQLite's
+    // own answer decides, not a guess from permission bits.
+    Ok(match Ledger::open(&path) {
+        Ok(ledger) if ledger.is_read_only().is_ok_and(|ro| !ro) => (ledger, StatusAccess::Reaping),
+        Ok(_) | Err(_) => (read_only, StatusAccess::ReadOnly),
+    })
+}
+
 /// Why `relais native status` cannot say what holds for a run now.
 #[derive(Debug)]
 enum CurrentUnknown {
     Home(paths::HomeUnset),
     NoLedger(std::path::PathBuf),
     Ledger(relais::ledger::LedgerError),
+    /// The ledger was not opened, for the reason already given.
+    Unavailable(String),
+    Other(String),
 }
 
 impl std::fmt::Display for CurrentUnknown {
@@ -4491,31 +4833,66 @@ impl std::fmt::Display for CurrentUnknown {
             Self::Home(e) => write!(f, "{e}"),
             Self::NoLedger(path) => write!(f, "no ledger at {}", path.display()),
             Self::Ledger(e) => write!(f, "{e}"),
+            Self::Unavailable(why) | Self::Other(why) => write!(f, "{why}"),
         }
     }
 }
 
-/// What the ledger holds for `run` now: its state and its decision, open
-/// or answered. `outcome` in the timeline is how the run ended, from its
-/// events; a decision answered since is recorded only in the ledger, so
-/// this is the one place a reader learns it. `Ok(None)` for a run the
-/// ledger does not know. Read-only: a missing, busy or other-schema
-/// ledger is an error to report, never one to create or migrate.
-fn current_of_run(run: &str) -> Result<Option<serde_json::Value>, CurrentUnknown> {
-    let path = paths::ledger_path().map_err(CurrentUnknown::Home)?;
-    if !path.is_file() {
-        return Err(CurrentUnknown::NoLedger(path));
-    }
-    let ledger = Ledger::open_read_only(&path).map_err(CurrentUnknown::Ledger)?;
+/// What the ledger holds for `run` now: its state, its decision (open or
+/// answered), who started it and how long it has been silent. `outcome` in
+/// the timeline is how the run ended, from its events; a decision answered
+/// since is recorded only in the ledger, so this is the one place a reader
+/// learns it. `Ok(None)` for a run the ledger does not know.
+///
+/// A non-terminal run whose driver is provably gone (or silent past the
+/// silence rule) is reaped under `StatusAccess::Reaping`; otherwise it is reported
+/// `orphaned: true` and nothing is written. A non-terminal run silent for
+/// `stalled_after` or more is `stalled: true`.
+fn current_of_run(
+    ledger: &Ledger,
+    access: StatusAccess,
+    run: &str,
+    stalled_after: std::time::Duration,
+) -> Result<Option<serde_json::Value>, CurrentUnknown> {
     let run = RunId::from_stored(run);
-    let Some(state) = ledger.run_status(&run).map_err(CurrentUnknown::Ledger)? else {
+    let ledgered = |e| CurrentUnknown::Ledger(e);
+    let Some(mut state) = ledger.run_status(&run).map_err(ledgered)? else {
         return Ok(None);
     };
-    let decision = ledger
-        .decision_of_run(&run)
-        .map_err(CurrentUnknown::Ledger)?;
-    Ok(Some(serde_json::json!({
+    let runs_dir = paths::runs_dir().map_err(|e| CurrentUnknown::Other(e.to_string()))?;
+    let silent = relais::reap::run_silence(ledger, &runs_dir, &run)
+        .map_err(|e| CurrentUnknown::Other(e.to_string()))?;
+    let mut orphaned = false;
+    let mut verdict_seen = None;
+    if !state.is_terminal() {
+        let mut verdict = relais::reap::orphan_verdict_of_run(ledger, &run, silent)
+            .map_err(|e| CurrentUnknown::Other(e.to_string()))?;
+        if verdict != resume::OrphanVerdict::Alive {
+            if access == StatusAccess::Reaping {
+                state = reap_for_status(ledger, &runs_dir, &run, state, verdict, silent)
+                    .map_err(|e| CurrentUnknown::Other(e.to_string()))?;
+                // Not reaped (a dispatch lives): the run is alive, and
+                // the verdict says so rather than contradicting the state.
+                if !state.is_terminal() {
+                    verdict = resume::OrphanVerdict::Alive;
+                }
+            } else {
+                orphaned = true;
+            }
+        }
+        // A verdict describes a run still open; a reaped one has its state.
+        if !state.is_terminal() {
+            verdict_seen = Some(verdict);
+        }
+    }
+    let decision = ledger.decision_of_run(&run).map_err(ledgered)?;
+    let session = ledger.run_root_session(&run).map_err(ledgered)?;
+    let stalled =
+        !state.is_terminal() && silent.is_some_and(|s| resume::is_stalled(s, stalled_after));
+    let mut current = serde_json::json!({
         "state": state,
+        "session": session,
+        "silent_seconds": silent.map(|s| s.as_secs()),
         "decision": decision.map(|d| serde_json::json!({
             "raised_state": d.raised_state,
             "raised_reason": d.raised_reason,
@@ -4523,7 +4900,50 @@ fn current_of_run(run: &str) -> Result<Option<serde_json::Value>, CurrentUnknown
             "actor": d.actor,
             "resolved_at": d.resolved_at,
         })),
-    })))
+    });
+    if stalled {
+        current["stalled"] = true.into();
+    }
+    if orphaned {
+        current["orphaned"] = true.into();
+    }
+    if let Some(verdict) = verdict_seen {
+        current["verdict"] = match verdict {
+            resume::OrphanVerdict::Alive => "alive",
+            resume::OrphanVerdict::Silent => "silent",
+            resume::OrphanVerdict::Gone => "gone",
+        }
+        .into();
+    }
+    Ok(Some(current))
+}
+
+/// Reap a run `native status` found orphaned; the state it is in after.
+fn reap_for_status(
+    ledger: &Ledger,
+    runs_dir: &Path,
+    run: &RunId,
+    state: State,
+    verdict: resume::OrphanVerdict,
+    silent: Option<std::time::Duration>,
+) -> Result<State, CliError> {
+    let detail = relais::reap::orphan_detail(ledger, run, verdict, silent);
+    let reaped = relais::reap::reap_orphan(ledger, runs_dir, run, state, verdict, detail);
+    match reaped {
+        Ok(relais::reap::Reaped::Moved(message)) => eprintln!("relais native status: {message}"),
+        Ok(relais::reap::Reaped::AlreadyMoved | relais::reap::Reaped::KeptAlive(_)) => {}
+        // The ledger holds the reap; only the events file missed it.
+        Err(e @ relais::reap::ReapError::EventsNotWritten { .. }) => {
+            eprintln!("relais native status: {e}");
+        }
+        Err(e) => {
+            return Err(CliError::Operational {
+                operation: "native status",
+                cause: Box::new(e),
+            })
+        }
+    }
+    Ok(operational(ledger.run_status(run), "native status")?.unwrap_or(state))
 }
 
 /// Why this `relais run` must not start, if it must not: it comes from the
@@ -5946,12 +6366,12 @@ fn resume_command(run_id: &str, retire: Retire) -> Result<CliOutcome, CliError> 
     if !state.is_terminal() {
         if let Some(orphan) = orphan_of_run(&ledger, &run)? {
             match interrupt_orphan(&ledger, &run, state, &orphan)? {
-                OrphanOutcome::Interrupted => {
+                OrphanOutcome::Ended(ended) => {
                     return match retire {
                         Retire::Keep => Ok(CliOutcome::ResumeReconciled),
                         Retire::Retire => {
                             let reconciliation = reconcile_run(&ledger, &run)?;
-                            retire_run(&ledger, &run, State::Interrupted, &reconciliation)?;
+                            retire_run(&ledger, &run, ended, &reconciliation)?;
                             Ok(CliOutcome::ResumeReconciled)
                         }
                     };
@@ -5991,18 +6411,7 @@ fn resume_command(run_id: &str, retire: Retire) -> Result<CliOutcome, CliError> 
         )?;
     }
     let detail = reconciliation.detail();
-    operational(
-        ledger.record_transition(&relais::ledger::Transition {
-            run_id: run.clone(),
-            attempt_id: None,
-            from_state: Some(state),
-            to_state: State::Interrupted,
-            reason: Reason::ReconciledInterrupted.as_str().to_string(),
-            detail: Some(serde_json::json!({ "detail": detail })),
-            at: relais::ledger::now_rfc3339(),
-        }),
-        "resume",
-    )?;
+    record_resume_interruption(&ledger, &run, state, &detail)?;
     println!(
         "{run_id}: {state} -> interrupted ({detail}). Changes are preserved under {}; nothing \
          was replayed. Start a NEW run with a revised contract if the task is still wanted",
@@ -6022,162 +6431,103 @@ fn resume_command(run_id: &str, retire: Retire) -> Result<CliOutcome, CliError> 
     Ok(CliOutcome::ResumeReconciled)
 }
 
-/// How long a run's driver has been silent: since `events.jsonl` was last
-/// written, else since the run's row was. `None` when neither is known.
-fn run_silence(ledger: &Ledger, run: &RunId) -> Result<Option<std::time::Duration>, CliError> {
-    let events = paths::runs_dir()
-        .map_err(CliError::Home)?
-        .join(run.as_str())
-        .join("events.jsonl");
-    let last_write = match std::fs::metadata(&events).and_then(|meta| meta.modified()) {
-        Ok(modified) => Some(modified),
-        Err(_) => operational(ledger.run_updated_at(run), "resume")?
-            .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
-            .map(std::time::SystemTime::from),
-    };
-    Ok(last_write.map(|at| {
-        std::time::SystemTime::now()
-            .duration_since(at)
-            .unwrap_or_default()
-    }))
-}
-
-/// The checkout whose `relais.toml` governs a run: the run's own
-/// repository, else — when that is a removed `-wt-` worktree — the primary
-/// checkout it was made from. Never the process cwd.
-fn run_policy_root(repo_path: &Path) -> PathBuf {
-    if repo_path.exists() {
-        return repo_path.to_path_buf();
-    }
-    let primary = repo_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.split_once("-wt-"))
-        .map(|(primary, _)| primary)
-        .filter(|primary| !primary.is_empty())
-        .and_then(|primary| repo_path.parent().map(|parent| parent.join(primary)));
-    primary.unwrap_or_else(|| repo_path.to_path_buf())
-}
-
-/// A run's policy `max_wall_seconds`, read from its own repository, or the
-/// reason it could not be.
-fn run_policy_wall(ledger: &Ledger, run: &RunId) -> Result<u64, String> {
-    let repo_path = ledger
-        .run_repo_path(run)
-        .map_err(|e| format!("the run's repository could not be read from the ledger ({e})"))?
-        .ok_or_else(|| "the run records no repository".to_string())?;
-    let root = relais::repo::locate_repo_root(&run_policy_root(&repo_path)).map_err(|e| {
-        format!(
-            "the policy of {} could not be located ({e})",
-            repo_path.display()
-        )
-    })?;
-    let path = root.join("relais.toml");
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("{} could not be read ({e})", path.display()))?;
-    RepoPolicy::from_toml_str(&text)
-        .map(|policy| policy.execution.max_wall_seconds)
-        .map_err(|e| format!("{} is not a valid policy ({e})", path.display()))
+/// The resume's own transition: the resuming process re-enters the run,
+/// so the same write records it as the run's driver.
+fn record_resume_interruption(
+    ledger: &Ledger,
+    run: &RunId,
+    from: State,
+    detail: &str,
+) -> Result<(), CliError> {
+    operational(
+        ledger.record_transition_as_driver(&relais::ledger::Transition {
+            run_id: run.clone(),
+            attempt_id: None,
+            from_state: Some(from),
+            to_state: State::Interrupted,
+            reason: Reason::ReconciledInterrupted.as_str().to_string(),
+            detail: Some(serde_json::json!({ "detail": detail })),
+            at: relais::ledger::now_rfc3339(),
+        }),
+        "resume",
+    )
 }
 
 /// Whether a non-terminal run has lost its driver (SPEC §12): silent for
 /// longer than its attempt wall time plus a margin.
 fn orphan_of_run(ledger: &Ledger, run: &RunId) -> Result<Option<resume::Orphan>, CliError> {
-    let Some(silent) = run_silence(ledger, run)? else {
+    let runs_dir = paths::runs_dir().map_err(CliError::Home)?;
+    let Some(silent) = operational(relais::reap::run_silence(ledger, &runs_dir, run), "resume")?
+    else {
         return Ok(None);
-    };
-    // One run's unreadable contract must not stop a sweep over every run:
-    // it falls back to the repository's policy, then to the default, and
-    // the recorded detail says why.
-    let (contract_wall, contract_unreadable) = match ledger.run_contract_and_tier(run) {
-        Ok(found) => (
-            found.and_then(|(contract, _)| contract.limits.wall_seconds),
-            None,
-        ),
-        Err(e) => (
-            None,
-            Some(format!("the run's contract could not be read ({e})")),
-        ),
-    };
-    let policy_wall = if contract_wall.is_some() {
-        Ok(0)
-    } else {
-        run_policy_wall(ledger, run).map_err(|policy| match &contract_unreadable {
-            Some(contract) => format!("{contract}, and {policy}"),
-            None => policy,
-        })
     };
     Ok(resume::orphan_of(
         silent,
-        resume::attempt_wall(contract_wall, policy_wall),
+        relais::reap::attempt_wall_of_run(ledger, run),
     ))
 }
 
 /// What became of an orphaned run.
 enum OrphanOutcome {
-    Interrupted,
+    /// The run is no longer running; this is the state it is in now (the
+    /// interrupted state this call wrote, or the one a racing process did).
+    Ended(State),
     /// A dispatch of the run is provably alive: nothing was changed.
     KeptAlive(String),
 }
 
-/// Move an orphaned run to `interrupted` (`driver_gone`) and close its open
-/// dispatches so none is judged live again; the decision is recorded with
-/// the silence and the threshold. Every dispatch is judged first, by PID
-/// alone (a native session's hello is not evidence its agent lives): a
-/// dispatch whose process is alive keeps the run as it is.
+/// Move an orphaned run to `interrupted` through the library's reap (a
+/// compare-and-set that closes its dispatches and ends its events only when
+/// it wins), and print what it returns.
 fn interrupt_orphan(
     ledger: &Ledger,
     run: &RunId,
     state: State,
     orphan: &resume::Orphan,
 ) -> Result<OrphanOutcome, CliError> {
-    let live = run_live_dispatches(ledger, run)?;
-    let judged = resume::reconcile(&live, None, &|pid| {
-        relais::coordinator::process_alive(pid.get())
-    });
-    let alive: Vec<String> = judged
-        .verdicts
-        .iter()
-        .filter(|verdict| matches!(verdict, resume::DispatchVerdict::StillAlive { .. }))
-        .map(resume::DispatchVerdict::describe)
-        .collect();
-    if !alive.is_empty() {
-        return Ok(OrphanOutcome::KeptAlive(format!(
-            "dispatch {} is alive",
-            alive.join(", ")
-        )));
-    }
-    for verdict in &judged.verdicts {
-        operational(
-            ledger.finish_dispatch(verdict.dispatch(), Reason::DriverGone.as_str()),
-            "resume",
-        )?;
-    }
-    let never_launched = operational(
-        ledger.close_open_dispatches(run, Reason::DriverGone.as_str()),
-        "resume",
-    )?;
-    let closed = judged.verdicts.len() + never_launched;
-    let detail = orphan.detail();
-    operational(
-        ledger.record_transition(&relais::ledger::Transition {
-            run_id: run.clone(),
-            attempt_id: None,
-            from_state: Some(state),
-            to_state: State::Interrupted,
-            reason: Reason::DriverGone.as_str().to_string(),
-            detail: Some(serde_json::json!({
-                "detail": detail,
+    let events_dir = paths::runs_dir()
+        .map_err(CliError::Home)?
+        .join(run.as_str());
+    let reaped = relais::reap::reap(
+        ledger,
+        &relais::reap::Reap {
+            run,
+            from: state,
+            ending: relais::reap::Ending::Interrupted,
+            detail: orphan.detail(),
+            extra: serde_json::json!({
                 "silent_seconds": orphan.silent.as_secs(),
                 "threshold_seconds": orphan.threshold.as_secs(),
-                "dispatches_closed": closed,
-            })),
-            at: relais::ledger::now_rfc3339(),
-        }),
-        "resume",
-    )?;
-    println!("{run}: {state} -> interrupted ({detail})");
-    Ok(OrphanOutcome::Interrupted)
+            }),
+            events_dir: &events_dir,
+        },
+        &|pid| relais::coordinator::process_alive(pid.get()),
+    );
+    let reaped = match reaped {
+        Ok(reaped) => reaped,
+        // The ledger holds the reap; only the events file missed it.
+        Err(e @ relais::reap::ReapError::EventsNotWritten { .. }) => {
+            eprintln!("relais resume: {e}");
+            return Ok(OrphanOutcome::Ended(State::Interrupted));
+        }
+        Err(e) => {
+            return Err(CliError::Operational {
+                operation: "resume",
+                cause: Box::new(e),
+            })
+        }
+    };
+    match reaped {
+        relais::reap::Reaped::Moved(message) => {
+            println!("{message}");
+            Ok(OrphanOutcome::Ended(State::Interrupted))
+        }
+        relais::reap::Reaped::AlreadyMoved => {
+            let now = operational(ledger.run_status(run), "resume")?.unwrap_or(state);
+            Ok(OrphanOutcome::Ended(now))
+        }
+        relais::reap::Reaped::KeptAlive(why) => Ok(OrphanOutcome::KeptAlive(why)),
+    }
 }
 
 /// The dispatches the ledger still records as live for one run.
@@ -6252,7 +6602,7 @@ fn retire_all_command() -> Result<CliOutcome, CliError> {
             state
         } else if let Some(orphan) = orphan_of_run(&ledger, &run)? {
             match interrupt_orphan(&ledger, &run, state, &orphan)? {
-                OrphanOutcome::Interrupted => State::Interrupted,
+                OrphanOutcome::Ended(ended) => ended,
                 OrphanOutcome::KeptAlive(why) => {
                     println!(
                         "{}: kept, silent past its threshold but {why} ({})",
@@ -6572,16 +6922,22 @@ fn report_command(
 /// defaults" posture `coordinator daemon` already takes reading this
 /// file, not an error just because nobody has priced anything yet.
 fn load_price_table() -> Result<PriceTable, CliError> {
+    Ok(load_machine_pricing()?.unwrap_or_else(PriceTable::empty))
+}
+
+/// The machine's `[pricing]` table; `None` when it has none, so a cost can
+/// say that no table is the reason it is unknown.
+fn load_machine_pricing() -> Result<Option<PriceTable>, CliError> {
     let path = paths::machine_settings_path().map_err(CliError::Home)?;
     match std::fs::read_to_string(&path) {
-        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => Ok(PriceTable::empty()),
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(cause) => Err(CliError::Read {
             what: "the machine settings",
             path,
             cause,
         }),
         Ok(text) => match MachineSettings::from_toml_str(&text) {
-            Ok(machine) => Ok(machine.pricing.unwrap_or_else(PriceTable::empty)),
+            Ok(machine) => Ok(machine.pricing),
             Err(e) => Err(CliError::Invalid {
                 what: "the machine settings",
                 path,
@@ -7745,6 +8101,28 @@ mod tests {
         let dir = relais::test_support::short_temp_dir(&format!("main-{label}"));
         let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger opens");
         (ledger, dir)
+    }
+
+    #[test]
+    fn resume_records_the_resuming_process_as_the_driver() {
+        let (ledger, dir) = temp_ledger("resume-driver");
+        let run = RunId::from_stored("run-resume");
+        let task = relais::ids::TaskId::from_stored("task-resume");
+        ledger
+            .insert_run(&run, "/repo", None, &task, "rk")
+            .expect("run");
+        record_resume_interruption(&ledger, &run, State::Prepared, "reconciled")
+            .unwrap_or_else(|_| panic!("resume records"));
+        let (pid, started, since) = ledger.run_driver(&run).expect("driver columns");
+        assert_eq!(pid, Some(i64::from(std::process::id())));
+        // A token on Unix, `None` on Windows (no start-time reader there).
+        assert_eq!(
+            started,
+            relais::procs::start_time(std::process::id()),
+            "driver_started"
+        );
+        assert!(since.is_some(), "driver_since");
+        drop(dir);
     }
 
     #[test]
