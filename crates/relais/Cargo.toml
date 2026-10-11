@@ -63,6 +63,9 @@ windows-sys = { version = "0.61", features = [
     # LockFileEx: the coordinator's election lock, which the kernel
     # releases however the daemon dies (C7).
     "Win32_Storage_FileSystem",
+    # BCryptGenRandom: the decide nonce's OS random bytes (ADR-0004), the
+    # counterpart of /dev/urandom on unix.
+    "Win32_Security_Cryptography",
 ] }
 
 [dev-dependencies]

@@ -307,6 +307,7 @@ amont_agent = "off"
     /// as the person types one: `--actor person` is refused anywhere
     /// else. The pty's output (stdout and stderr together) comes back as
     /// BOTH of the returned streams.
+    #[cfg(unix)]
     fn relais_on_a_terminal(&self, args: &[&str]) -> Output {
         let inner = self.command(&[]);
         let mut script = Command::new("script");
@@ -2876,6 +2877,11 @@ fn every_decide_answer_ends_the_run_they_answered_with_its_own_terminal_status()
 /// an ACCEPTED run with a receipt — accepts it exactly like a
 /// relais-accepted one. An unknown criterion id is refused first, naming
 /// the ids the contract actually declares.
+// Unix only: the sign-off is `--actor person`, which relais accepts only
+// from a terminal, and the test makes one with `script(1)`; Windows has no
+// equivalent a test can drive. The refusals themselves run everywhere
+// (tests/decide_actor.rs).
+#[cfg(unix)]
 #[test]
 fn a_human_sign_off_gap_is_cleared_only_by_decide_and_then_feedback_accepts_it() {
     let world = World::new("signoff");

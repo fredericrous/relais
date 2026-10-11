@@ -3878,15 +3878,10 @@ impl Ledger {
     /// [`DECIDE_NONCE_TTL_DAYS`] is swept, whichever session it was for.
     pub fn mint_decide_nonce(&self, session: &str) -> Result<String> {
         let mut bytes = [0u8; 32];
-        {
-            use std::io::Read;
-            std::fs::File::open("/dev/urandom")
-                .and_then(|mut f| f.read_exact(&mut bytes))
-                .map_err(|e| LedgerError::Corrupt {
-                    what: "the OS random source".into(),
-                    detail: e.to_string(),
-                })?;
-        }
+        crate::procs::os_random(&mut bytes).map_err(|e| LedgerError::Corrupt {
+            what: "the OS random source".into(),
+            detail: e.to_string(),
+        })?;
         let nonce: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         let now = self.now();
         let cutoff = chrono::DateTime::parse_from_rfc3339(&now)
