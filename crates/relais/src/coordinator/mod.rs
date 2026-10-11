@@ -522,6 +522,9 @@ pub struct Coordinator {
     /// way at all — is what lets the next coordinator elect.
     lock: LockFile,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// The ledger the reconcile thread opens its own connection to, to
+    /// reap orphaned runs; `None` when the daemon runs without one.
+    ledger_path: Option<PathBuf>,
 }
 
 /// Atomic election (SPEC §23): an OS lock on `coordinator.lock`, held
@@ -711,6 +714,7 @@ impl Coordinator {
                 lock_path,
                 lock,
                 shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                ledger_path: ledger.map(|ledger| ledger.path().to_path_buf()),
             },
             listener,
         ))
@@ -732,8 +736,13 @@ impl Coordinator {
     pub fn serve(self, listener: Listener) -> Result<(), CoordinatorError> {
         let reconcile_state = Arc::clone(&self.state);
         let reconcile_shutdown = Arc::clone(&self.shutdown);
+        let reconcile_ledger = self.ledger_path.clone();
         let reconciler = std::thread::spawn(move || {
-            reconcile_loop(&reconcile_state, &reconcile_shutdown);
+            reconcile_loop(
+                &reconcile_state,
+                &reconcile_shutdown,
+                reconcile_ledger.as_deref(),
+            );
         });
 
         let (work, queue) = std::sync::mpsc::sync_channel::<Stream>(ACCEPT_BACKLOG);
@@ -845,9 +854,21 @@ impl Coordinator {
 /// One tick of lease reconciliation: what the state machine decided is
 /// delivered after the guard is gone, and the idle decision is made and
 /// acted on under one guard (A5).
-fn reconcile_loop(state: &Mutex<AdmissionState>, shutdown: &std::sync::atomic::AtomicBool) {
+fn reconcile_loop(
+    state: &Mutex<AdmissionState>,
+    shutdown: &std::sync::atomic::AtomicBool,
+    ledger_path: Option<&Path>,
+) {
     let mut idle_since: Option<Instant> = None;
+    // Opened on this thread, on first need, and again after a failure.
+    let mut ledger: Option<Ledger> = None;
+    // The first sweep reaps what died while no daemon was watching. It
+    // runs here, once `serve` is accepting, never in `start`: a busy
+    // ledger would otherwise outlast `ensure_running`'s START_TIMEOUT.
+    sweep_tick(ledger_path, &mut ledger);
     while wait_for_tick(shutdown) {
+        // Ledger and file I/O happen here, before the admission lock.
+        sweep_tick(ledger_path, &mut ledger);
         let now = Instant::now();
         let report = {
             let mut state = lock_state(state);
@@ -881,6 +902,74 @@ fn reconcile_loop(state: &Mutex<AdmissionState>, shutdown: &std::sync::atomic::A
         deliver_signals(state, report.to_signal);
     }
 }
+
+/// One reap sweep on the reconcile thread's own ledger, opened on first
+/// need and again after a failure to open.
+fn sweep_tick(ledger_path: Option<&Path>, ledger: &mut Option<Ledger>) {
+    let Some(path) = ledger_path else { return };
+    if ledger.is_none() {
+        match Ledger::open(path) {
+            Ok(opened) => *ledger = Some(opened),
+            Err(e) => eprintln!("relais coordinator: reap sweep: ledger: {e}"),
+        }
+    }
+    if let Some(ledger) = ledger {
+        sweep_and_log(ledger);
+    }
+}
+
+/// Reap the orphaned runs the ledger holds, writing each reap, and each
+/// failure, to the daemon's log as one line. The runs' artifacts live
+/// beside the ledger, in the state directory.
+fn sweep_and_log(ledger: &Ledger) {
+    let runs_dir = ledger
+        .path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(crate::paths::RUNS_DIR);
+    match crate::reap::sweep(ledger, &runs_dir) {
+        Ok(done) => {
+            for line in &done.reaped {
+                eprintln!("relais coordinator: {line}");
+            }
+            for failure in &done.failures {
+                eprintln!("relais coordinator: reap sweep: {failure}");
+            }
+        }
+        Err(e) => eprintln!("relais coordinator: reap sweep: {e}"),
+    }
+}
+
+/// Where a daemon started on demand writes its stderr: each reap and
+/// each sweep failure is one line there, so neither is lost to
+/// /dev/null. Owner-only, beside the ledger; past `DAEMON_LOG_MAX` the
+/// previous file is kept once as `coordinator.log.1`. A log that cannot
+/// be opened costs the log, never the daemon.
+fn daemon_log() -> std::process::Stdio {
+    let Ok(dir) = crate::paths::state_dir() else {
+        return std::process::Stdio::null();
+    };
+    let path = dir.join(DAEMON_LOG);
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > DAEMON_LOG_MAX) {
+        let _rotated = std::fs::rename(&path, dir.join(format!("{DAEMON_LOG}.1")));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match std::fs::create_dir_all(&dir).and_then(|()| options.open(&path)) {
+        Ok(file) => file.into(),
+        Err(_) => std::process::Stdio::null(),
+    }
+}
+
+/// The daemon's log file, in the state directory.
+pub const DAEMON_LOG: &str = "coordinator.log";
+/// The size past which the daemon's log is rotated at the next start.
+const DAEMON_LOG_MAX: u64 = 1024 * 1024;
 
 /// Wait one reconcile period, in slices, and say whether there is still
 /// work to do. `serve` joins this thread before it unlinks anything, so
@@ -2345,7 +2434,7 @@ pub fn ensure_running(socket_path: &Path) -> Result<Client, CoordinatorError> {
         .args(["coordinator", "daemon"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(daemon_log());
     // Detached from this CLI's group (Unix) or console group (Windows),
     // so the CLI exiting cannot take the coordinator down.
     crate::procs::own_process_group(&mut command);
@@ -3380,6 +3469,122 @@ mod tests {
             !dir.join("coordinator.lock").exists(),
             "nor a lock nobody holds"
         );
+    }
+
+    /// A running run whose driver row says `pid`, taken long ago.
+    fn running_run_with_driver(ledger_path: &Path, pid: u32, started: Option<String>) -> RunId {
+        let ledger = Ledger::open(ledger_path).expect("ledger");
+        let run = RunId::from_stored("run-orphan");
+        ledger
+            .insert_run(
+                &run,
+                "/repo",
+                None,
+                &crate::ids::TaskId::from_stored("task-orphan"),
+                "rk",
+            )
+            .expect("run");
+        ledger
+            .record_transition(&crate::ledger::Transition {
+                run_id: run.clone(),
+                attempt_id: None,
+                from_state: Some(crate::lifecycle::State::Prepared),
+                to_state: crate::lifecycle::State::Running,
+                reason: "start".into(),
+                detail: None,
+                at: crate::ledger::now_rfc3339(),
+            })
+            .expect("running");
+        rusqlite::Connection::open(ledger_path)
+            .expect("second connection")
+            .execute(
+                "UPDATE runs SET driver_pid = ?1, driver_started = ?2, \
+                 driver_since = '2020-01-01T00:00:00Z' WHERE id = 'run-orphan'",
+                rusqlite::params![i64::from(pid), started],
+            )
+            .expect("driver");
+        run
+    }
+
+    #[test]
+    fn starting_over_a_run_with_a_dead_driver_reaps_it_once() {
+        let dir = temp_dir("reapst");
+        let socket = dir.join("relais.sock");
+        let ledger_path = dir.join("ledger.sqlite");
+        let mut child = std::process::Command::new("true").spawn().expect("spawn");
+        let dead = child.id();
+        child.wait().expect("wait");
+        let run = running_run_with_driver(&ledger_path, dead, None);
+        let ledger = Ledger::open(&ledger_path).expect("ledger");
+        let (coordinator, listener) = Coordinator::start(
+            &socket,
+            limits(),
+            Some(&ledger),
+            crate::admission::DEFAULT_AGENT_LEASE_TTL,
+        )
+        .expect("start");
+        // `start` reaps nothing: the first sweep is the reconcile
+        // thread's, once `serve` runs, so a busy ledger cannot hold up
+        // the start.
+        assert_eq!(
+            ledger.run_status(&run).expect("status"),
+            Some(crate::lifecycle::State::Running)
+        );
+        let server = std::thread::spawn(move || coordinator.serve(listener));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ledger.run_status(&run).expect("status") != Some(crate::lifecycle::State::Interrupted)
+        {
+            assert!(Instant::now() < deadline, "the first sweep did not reap");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let client = Client::new(socket.clone());
+        client.request(&Request::Shutdown).expect("shutdown");
+        let _ = client.ping();
+        server.join().expect("server").expect("served");
+        let text =
+            std::fs::read_to_string(dir.join("runs/run-orphan/events.jsonl")).expect("events");
+        let outcomes = text
+            .lines()
+            .filter(|l| l.contains("\"kind\":\"outcome\""))
+            .count();
+        assert_eq!(outcomes, 1, "{text}");
+    }
+
+    #[test]
+    fn a_sweep_over_a_live_driver_reaps_nothing() {
+        let dir = temp_dir("reapal");
+        let ledger_path = dir.join("ledger.sqlite");
+        let me = std::process::id();
+        let run = running_run_with_driver(&ledger_path, me, crate::procs::start_time(me));
+        let ledger = Ledger::open(&ledger_path).expect("ledger");
+        let done = crate::reap::sweep(&ledger, &dir.join("runs")).expect("sweep");
+        assert!(done.reaped.is_empty(), "{:?}", done.reaped);
+        assert_eq!(
+            ledger.run_status(&run).expect("status"),
+            Some(crate::lifecycle::State::Running)
+        );
+    }
+
+    #[test]
+    fn a_failing_sweep_does_not_fail_start() {
+        let dir = temp_dir("reapfl");
+        let socket = dir.join("relais.sock");
+        let ledger_path = dir.join("ledger.sqlite");
+        let ledger = Ledger::open(&ledger_path).expect("ledger");
+        // The table the runs' states are read from, gone: the sweep cannot
+        // list the runs, while the live set is still readable.
+        rusqlite::Connection::open(&ledger_path)
+            .expect("second connection")
+            .execute("DROP TABLE transitions", [])
+            .expect("drop");
+        assert!(crate::reap::sweep(&ledger, &dir.join("runs")).is_err());
+        let started = Coordinator::start(
+            &socket,
+            limits(),
+            Some(&ledger),
+            crate::admission::DEFAULT_AGENT_LEASE_TTL,
+        );
+        assert!(started.is_ok(), "{:?}", started.err());
     }
 
     #[test]

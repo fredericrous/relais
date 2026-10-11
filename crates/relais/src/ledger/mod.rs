@@ -2853,6 +2853,29 @@ impl Ledger {
         status.map(|s| parse_state(&s)).transpose()
     }
 
+    /// Every run that has not reached a terminal state, with its state. A
+    /// row whose status this binary cannot read is skipped, not fatal: one
+    /// bad row must not stop the reap sweep for every other run.
+    pub fn non_terminal_runs(&self) -> Result<Vec<(RunId, State)>> {
+        let mut statement = self
+            .conn
+            .prepare(&format!("SELECT id, {PROJECTED_STATUS} FROM runs"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut open = Vec::new();
+        for (id, status) in rows {
+            match parse_state(&status) {
+                Ok(state) if !state.is_terminal() => open.push((RunId::from_stored(&id), state)),
+                Ok(_) => {}
+                Err(e) => eprintln!("relais: run {id} has an unreadable status, not judged: {e}"),
+            }
+        }
+        Ok(open)
+    }
+
     /// When a run's row was last written (`runs.updated_at`, RFC 3339):
     /// every transition rewrites it. `None` when the run is not on record.
     pub fn run_updated_at(&self, id: &RunId) -> Result<Option<String>> {

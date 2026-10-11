@@ -4608,15 +4608,17 @@ fn current_of_run(
     let Some(mut state) = ledger.run_status(&run).map_err(ledgered)? else {
         return Ok(None);
     };
-    let silent = run_silence(ledger, &run).map_err(|e| CurrentUnknown::Other(e.to_string()))?;
+    let runs_dir = paths::runs_dir().map_err(|e| CurrentUnknown::Other(e.to_string()))?;
+    let silent = relais::reap::run_silence(ledger, &runs_dir, &run)
+        .map_err(|e| CurrentUnknown::Other(e.to_string()))?;
     let mut orphaned = false;
     let mut verdict_seen = None;
     if !state.is_terminal() {
-        let mut verdict = orphan_verdict_of_run(ledger, &run, silent)
+        let mut verdict = relais::reap::orphan_verdict_of_run(ledger, &run, silent)
             .map_err(|e| CurrentUnknown::Other(e.to_string()))?;
         if verdict != resume::OrphanVerdict::Alive {
             if writable {
-                state = reap_for_status(ledger, &run, state, verdict, silent)
+                state = reap_for_status(ledger, &runs_dir, &run, state, verdict, silent)
                     .map_err(|e| CurrentUnknown::Other(e.to_string()))?;
                 // Not reaped (a dispatch lives): the run is alive, and
                 // the verdict says so rather than contradicting the state.
@@ -4665,67 +4667,17 @@ fn current_of_run(
     Ok(Some(current))
 }
 
-/// What the evidence says about a non-terminal run's driver.
-fn orphan_verdict_of_run(
-    ledger: &Ledger,
-    run: &RunId,
-    silent: Option<std::time::Duration>,
-) -> Result<resume::OrphanVerdict, CliError> {
-    let (pid, started, since) = operational(ledger.run_driver(run), "native status")?;
-    let wall = attempt_wall_of_run(ledger, run);
-    let facts = resume::OrphanFacts {
-        driver_pid: pid.and_then(|pid| u32::try_from(pid).ok()),
-        driver_started: started,
-        driver_since: since
-            .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
-            .map(|at| at.with_timezone(&chrono::Utc)),
-        dispatch_pids: run_live_dispatches(ledger, run)?
-            .iter()
-            .filter_map(|live| live.pid.map(|pid| pid.get()))
-            .collect(),
-        silent_for: silent,
-        silence_threshold: wall.duration + resume::DRIVER_MARGIN,
-    };
-    Ok(resume::orphan_verdict(
-        &facts,
-        &|pid| relais::coordinator::process_alive(pid),
-        &relais::procs::start_time,
-        chrono::Utc::now(),
-    ))
-}
-
 /// Reap a run `native status` found orphaned; the state it is in after.
 fn reap_for_status(
     ledger: &Ledger,
+    runs_dir: &Path,
     run: &RunId,
     state: State,
     verdict: resume::OrphanVerdict,
     silent: Option<std::time::Duration>,
 ) -> Result<State, CliError> {
-    let events_dir = paths::runs_dir()
-        .map_err(CliError::Home)?
-        .join(run.as_str());
-    let detail = match (verdict, silent) {
-        (resume::OrphanVerdict::Silent, Some(silent)) => {
-            match resume::orphan_of(silent, attempt_wall_of_run(ledger, run)) {
-                Some(orphan) => orphan.detail(),
-                None => format!("nothing was written for {}s", silent.as_secs()),
-            }
-        }
-        _ => "its driver process is gone".to_string(),
-    };
-    let reaped = relais::reap::reap(
-        ledger,
-        &relais::reap::Reap {
-            run,
-            from: state,
-            ending: relais::reap::Ending::Interrupted,
-            detail,
-            extra: serde_json::json!({ "verdict": format!("{verdict:?}") }),
-            events_dir: &events_dir,
-        },
-        &|pid| relais::coordinator::process_alive(pid.get()),
-    );
+    let detail = relais::reap::orphan_detail(ledger, run, verdict, silent);
+    let reaped = relais::reap::reap_orphan(ledger, runs_dir, run, state, verdict, detail);
     match reaped {
         Ok(relais::reap::Reaped::Moved(message)) => eprintln!("relais native status: {message}"),
         Ok(relais::reap::Reaped::AlreadyMoved | relais::reap::Reaped::KeptAlive(_)) => {}
@@ -6250,98 +6202,18 @@ fn record_resume_interruption(
     )
 }
 
-/// How long a run's driver has been silent: since `events.jsonl` was last
-/// written, else since the run's row was. `None` when neither is known.
-fn run_silence(ledger: &Ledger, run: &RunId) -> Result<Option<std::time::Duration>, CliError> {
-    let events = paths::runs_dir()
-        .map_err(CliError::Home)?
-        .join(run.as_str())
-        .join("events.jsonl");
-    let last_write = match std::fs::metadata(&events).and_then(|meta| meta.modified()) {
-        Ok(modified) => Some(modified),
-        Err(_) => operational(ledger.run_updated_at(run), "resume")?
-            .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
-            .map(std::time::SystemTime::from),
-    };
-    Ok(last_write.map(|at| {
-        std::time::SystemTime::now()
-            .duration_since(at)
-            .unwrap_or_default()
-    }))
-}
-
-/// The checkout whose `relais.toml` governs a run: the run's own
-/// repository, else — when that is a removed `-wt-` worktree — the primary
-/// checkout it was made from. Never the process cwd.
-fn run_policy_root(repo_path: &Path) -> PathBuf {
-    if repo_path.exists() {
-        return repo_path.to_path_buf();
-    }
-    let primary = repo_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.split_once("-wt-"))
-        .map(|(primary, _)| primary)
-        .filter(|primary| !primary.is_empty())
-        .and_then(|primary| repo_path.parent().map(|parent| parent.join(primary)));
-    primary.unwrap_or_else(|| repo_path.to_path_buf())
-}
-
-/// A run's policy `max_wall_seconds`, read from its own repository, or the
-/// reason it could not be.
-fn run_policy_wall(ledger: &Ledger, run: &RunId) -> Result<u64, String> {
-    let repo_path = ledger
-        .run_repo_path(run)
-        .map_err(|e| format!("the run's repository could not be read from the ledger ({e})"))?
-        .ok_or_else(|| "the run records no repository".to_string())?;
-    let root = relais::repo::locate_repo_root(&run_policy_root(&repo_path)).map_err(|e| {
-        format!(
-            "the policy of {} could not be located ({e})",
-            repo_path.display()
-        )
-    })?;
-    let path = root.join("relais.toml");
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("{} could not be read ({e})", path.display()))?;
-    RepoPolicy::from_toml_str(&text)
-        .map(|policy| policy.execution.max_wall_seconds)
-        .map_err(|e| format!("{} is not a valid policy ({e})", path.display()))
-}
-
 /// Whether a non-terminal run has lost its driver (SPEC §12): silent for
 /// longer than its attempt wall time plus a margin.
 fn orphan_of_run(ledger: &Ledger, run: &RunId) -> Result<Option<resume::Orphan>, CliError> {
-    let Some(silent) = run_silence(ledger, run)? else {
+    let runs_dir = paths::runs_dir().map_err(CliError::Home)?;
+    let Some(silent) = operational(relais::reap::run_silence(ledger, &runs_dir, run), "resume")?
+    else {
         return Ok(None);
     };
-    Ok(resume::orphan_of(silent, attempt_wall_of_run(ledger, run)))
-}
-
-/// A run's attempt wall time: its contract's, else its repository's
-/// policy's, else the default.
-fn attempt_wall_of_run(ledger: &Ledger, run: &RunId) -> resume::AttemptWall {
-    // One run's unreadable contract must not stop a sweep over every run:
-    // it falls back to the repository's policy, then to the default, and
-    // the recorded detail says why.
-    let (contract_wall, contract_unreadable) = match ledger.run_contract_and_tier(run) {
-        Ok(found) => (
-            found.and_then(|(contract, _)| contract.limits.wall_seconds),
-            None,
-        ),
-        Err(e) => (
-            None,
-            Some(format!("the run's contract could not be read ({e})")),
-        ),
-    };
-    let policy_wall = if contract_wall.is_some() {
-        Ok(0)
-    } else {
-        run_policy_wall(ledger, run).map_err(|policy| match &contract_unreadable {
-            Some(contract) => format!("{contract}, and {policy}"),
-            None => policy,
-        })
-    };
-    resume::attempt_wall(contract_wall, policy_wall)
+    Ok(resume::orphan_of(
+        silent,
+        relais::reap::attempt_wall_of_run(ledger, run),
+    ))
 }
 
 /// What became of an orphaned run.

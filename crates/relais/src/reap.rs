@@ -8,13 +8,15 @@
 //! ([`protocol::append_event`]) because this process is not the driver. The
 //! function returns its message; the caller prints or logs it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::ids::{Pid, RunId};
 use crate::ledger::{Ledger, LedgerError, Transition};
 use crate::lifecycle::{Reason, State};
+use crate::policy::RepoPolicy;
 use crate::protocol::{self, Event};
-use crate::resume::{self, DispatchVerdict};
+use crate::resume::{self, DispatchVerdict, OrphanVerdict};
 
 /// How a reaped run ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +189,235 @@ fn sentence_of(run: &RunId, ending: Ending, driver_pid: Option<i64>) -> String {
     format!(
         "run {run} {verb}: {driver}; the worktree is kept, `relais resume --retire {run}` removes it"
     )
+}
+
+/// How long a run's driver has been silent: since `events.jsonl` (under
+/// `runs_dir/<run>/`) was last written, else since the run's row was.
+/// `None` when neither is known.
+pub fn run_silence(
+    ledger: &Ledger,
+    runs_dir: &Path,
+    run: &RunId,
+) -> Result<Option<Duration>, LedgerError> {
+    let events = runs_dir.join(run.as_str()).join("events.jsonl");
+    let last_write = match std::fs::metadata(&events).and_then(|meta| meta.modified()) {
+        Ok(modified) => Some(modified),
+        Err(_) => ledger
+            .run_updated_at(run)?
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
+            .map(std::time::SystemTime::from),
+    };
+    Ok(last_write.map(|at| {
+        std::time::SystemTime::now()
+            .duration_since(at)
+            .unwrap_or_default()
+    }))
+}
+
+/// The checkout whose `relais.toml` governs a run: the run's own
+/// repository, else, when that is a removed `-wt-` worktree, the primary
+/// checkout it was made from. Never the process cwd.
+fn run_policy_root(repo_path: &Path) -> PathBuf {
+    if repo_path.exists() {
+        return repo_path.to_path_buf();
+    }
+    let primary = repo_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.split_once("-wt-"))
+        .map(|(primary, _)| primary)
+        .filter(|primary| !primary.is_empty())
+        .and_then(|primary| repo_path.parent().map(|parent| parent.join(primary)));
+    primary.unwrap_or_else(|| repo_path.to_path_buf())
+}
+
+/// A run's policy `max_wall_seconds`, read from its own repository, or the
+/// reason it could not be.
+pub fn run_policy_wall(ledger: &Ledger, run: &RunId) -> Result<u64, String> {
+    let repo_path = ledger
+        .run_repo_path(run)
+        .map_err(|e| format!("the run's repository could not be read from the ledger ({e})"))?
+        .ok_or_else(|| "the run records no repository".to_string())?;
+    let root = crate::repo::locate_repo_root(&run_policy_root(&repo_path)).map_err(|e| {
+        format!(
+            "the policy of {} could not be located ({e})",
+            repo_path.display()
+        )
+    })?;
+    let path = root.join("relais.toml");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("{} could not be read ({e})", path.display()))?;
+    RepoPolicy::from_toml_str(&text)
+        .map(|policy| policy.execution.max_wall_seconds)
+        .map_err(|e| format!("{} is not a valid policy ({e})", path.display()))
+}
+
+/// A run's attempt wall time: its contract's, else its repository's
+/// policy's, else the default.
+pub fn attempt_wall_of_run(ledger: &Ledger, run: &RunId) -> resume::AttemptWall {
+    // One run's unreadable contract must not stop a sweep over every run:
+    // it falls back to the repository's policy, then to the default, and
+    // the recorded detail says why.
+    let (contract_wall, contract_unreadable) = match ledger.run_contract_and_tier(run) {
+        Ok(found) => (
+            found.and_then(|(contract, _)| contract.limits.wall_seconds),
+            None,
+        ),
+        Err(e) => (
+            None,
+            Some(format!("the run's contract could not be read ({e})")),
+        ),
+    };
+    let policy_wall = if contract_wall.is_some() {
+        Ok(0)
+    } else {
+        run_policy_wall(ledger, run).map_err(|policy| match &contract_unreadable {
+            Some(contract) => format!("{contract}, and {policy}"),
+            None => policy,
+        })
+    };
+    resume::attempt_wall(contract_wall, policy_wall)
+}
+
+/// What the evidence says about a non-terminal run's driver.
+pub fn orphan_verdict_of_run(
+    ledger: &Ledger,
+    run: &RunId,
+    silent: Option<Duration>,
+) -> Result<OrphanVerdict, LedgerError> {
+    let (pid, started, since) = ledger.run_driver(run)?;
+    let wall = attempt_wall_of_run(ledger, run);
+    let facts = resume::OrphanFacts {
+        driver_pid: pid.and_then(|pid| u32::try_from(pid).ok()),
+        driver_started: started,
+        driver_since: since
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
+            .map(|at| at.with_timezone(&chrono::Utc)),
+        dispatch_pids: ledger
+            .live_dispatches()?
+            .iter()
+            .filter(|live| live.run == *run)
+            .filter_map(|live| live.pid.map(|pid| pid.get()))
+            .collect(),
+        silent_for: silent,
+        silence_threshold: wall.duration + resume::DRIVER_MARGIN,
+    };
+    Ok(resume::orphan_verdict(
+        &facts,
+        &crate::procs::alive,
+        &crate::procs::start_time,
+        chrono::Utc::now(),
+    ))
+}
+
+/// The evidence sentence for reaping a run judged `verdict`.
+pub fn orphan_detail(
+    ledger: &Ledger,
+    run: &RunId,
+    verdict: OrphanVerdict,
+    silent: Option<Duration>,
+) -> String {
+    match (verdict, silent) {
+        (OrphanVerdict::Silent, Some(silent)) => {
+            match resume::orphan_of(silent, attempt_wall_of_run(ledger, run)) {
+                Some(orphan) => orphan.detail(),
+                None => format!("nothing was written for {}s", silent.as_secs()),
+            }
+        }
+        _ => "its driver process is gone".to_string(),
+    }
+}
+
+/// Reap a run judged orphaned, whose events live under `runs_dir/<run>/`.
+pub fn reap_orphan(
+    ledger: &Ledger,
+    runs_dir: &Path,
+    run: &RunId,
+    state: State,
+    verdict: OrphanVerdict,
+    detail: String,
+) -> Result<Reaped, ReapError> {
+    let events_dir = runs_dir.join(run.as_str());
+    reap(
+        ledger,
+        &Reap {
+            run,
+            from: state,
+            ending: Ending::Interrupted,
+            detail,
+            extra: serde_json::json!({ "verdict": format!("{verdict:?}") }),
+            events_dir: &events_dir,
+        },
+        &|pid| crate::procs::alive(pid.get()),
+    )
+}
+
+/// One run a sweep reaped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweepLine {
+    pub run: RunId,
+    pub verdict: OrphanVerdict,
+    pub reason: String,
+}
+
+impl std::fmt::Display for SweepLine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "reaped {} (verdict {:?}): {}",
+            self.run, self.verdict, self.reason
+        )
+    }
+}
+
+/// What a sweep did: the runs it reaped, and what went wrong with others.
+#[derive(Debug, Default)]
+pub struct Sweep {
+    pub reaped: Vec<SweepLine>,
+    /// One sentence per run the sweep could not judge or reap cleanly.
+    pub failures: Vec<String>,
+}
+
+/// Judge every non-terminal run and reap each `Gone` or `Silent` one.
+/// Prints nothing: the caller shows `reaped` and `failures`. Fails only
+/// when the runs cannot be listed.
+pub fn sweep(ledger: &Ledger, runs_dir: &Path) -> Result<Sweep, LedgerError> {
+    // holds-until: the ledger holds more than a few dozen non-terminal
+    // runs at once. Each run reloads the live dispatches and its attempt
+    // wall twice per 15 s tick (verdict, then reap); at today's handful of
+    // open runs that is a few small queries. Past it, load both once per
+    // sweep and pass them in.
+    let mut done = Sweep::default();
+    for (run, state) in ledger.non_terminal_runs()? {
+        let judged = run_silence(ledger, runs_dir, &run)
+            .and_then(|silent| orphan_verdict_of_run(ledger, &run, silent).map(|v| (v, silent)));
+        let (verdict, silent) = match judged {
+            Ok(judged) => judged,
+            Err(e) => {
+                done.failures.push(format!("{run}: not judged: {e}"));
+                continue;
+            }
+        };
+        if verdict == OrphanVerdict::Alive {
+            continue;
+        }
+        let reason = orphan_detail(ledger, &run, verdict, silent);
+        let line = SweepLine {
+            run: run.clone(),
+            verdict,
+            reason: reason.clone(),
+        };
+        match reap_orphan(ledger, runs_dir, &run, state, verdict, reason) {
+            Ok(Reaped::Moved(_)) => done.reaped.push(line),
+            Ok(Reaped::AlreadyMoved | Reaped::KeptAlive(_)) => {}
+            Err(e @ ReapError::EventsNotWritten { .. }) => {
+                done.reaped.push(line);
+                done.failures.push(format!("{run}: {e}"));
+            }
+            Err(e) => done.failures.push(format!("{run}: not reaped: {e}")),
+        }
+    }
+    Ok(done)
 }
 
 #[cfg(test)]
