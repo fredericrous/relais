@@ -57,16 +57,27 @@ Outcome: while an agent-run quiet check or command is live, relais's pane shows 
 
 ### relais (one PR, owns the plan)
 
-- [ ] **3. `relais quiet watch --protocol`.** New clap subcommand, no `--session` flag: polls the directory, drops dead-pid entries, tails each log from an offset (a new row starts at the last 16 KB, an incomplete trailing line is held, `\r` splits lines, one last drain happens when the entry disappears). Line cutting is the same as `cutLine` (`timeline.ts:112-120`): CSI sequences stripped before control characters, tabs to two spaces, length counted in UTF-16 units like the TS (240). It emits one JSON line per event — `{"relais":"quiet","event":"started","id","session","tool","check","repo","started"}`, `{"relais":"quiet","event":"output","id","lines":[…]}`, `{"relais":"quiet","event":"ended","id","exit","ended"}` (`exit` null when the entry vanished without one) — plus a heartbeat line every 5 s. It never relies on stdin: it exits when a stdout write fails (the heartbeat makes a dead reader visible) or when its parent pid changes. Tests (Rust): a null-session entry is emitted with `session` null; each `started` carries its session; appended lines arrive in order; a removed entry yields `ended` carrying `exit`; a dead-pid entry is never `started`; a line-cutting fixture (ANSI colour, a tab, wide characters) matching `cutLine`.
+- [x] **3. `relais quiet watch --protocol`.** New clap subcommand, no `--session` flag: polls the directory, drops dead-pid entries, tails each log from an offset (a new row starts at the last 16 KB, an incomplete trailing line is held, `\r` splits lines, one last drain happens when the entry disappears). Line cutting is the same as `cutLine` (`timeline.ts:112-120`): CSI sequences stripped before control characters, tabs to two spaces, length counted in UTF-16 units like the TS (240). It emits one JSON line per event — `{"relais":"quiet","event":"started","id","session","tool","check","repo","started"}`, `{"relais":"quiet","event":"output","id","lines":[…]}`, `{"relais":"quiet","event":"ended","id","exit","ended"}` (`exit` null when the entry vanished without one) — plus a heartbeat line every 5 s. It never relies on stdin: it exits when a stdout write fails (the heartbeat makes a dead reader visible) or when its parent pid changes. Tests (Rust): a null-session entry is emitted with `session` null; each `started` carries its session; appended lines arrive in order; a removed entry yields `ended` carrying `exit`; a dead-pid entry is never `started`; a line-cutting fixture (ANSI colour, a tab, wide characters) matching `cutLine`.
 - [x] **4. Plugin: spawn, fold, draw.** `register.ts` spawns the watcher through `$.process.spawn` on its own path: no `store.models` entry, no `store.starting`/`childOf`, no `announceRun`; its exit never draws a run. The spawn is idempotent like `ensurePump` (one watcher per plugin module; it outlives /clear and /resume); the host kills it at session end/unload. Restart policy, one rule: exit code 2 (an older relais without `quiet watch`: clap usage error) → noted once, never respawned, nothing drawn; any other exit while the module lives → respawned at most once per 30 s, and meanwhile the pane shows one dim `quiet watcher down` line. The watcher's own read loop takes each stdout chunk from the stream it holds (`step.value`; the module's `process.spawn` hook only reads `childOf` children, `register.ts:337-339`, and `drain` discards chunks, `runs.ts:261-262`), keeps its own partial-line carry, and `runs.ts` folds `"relais":"quiet"` lines into a new `quiet` map in the store (`timeline.ts`-style fold, output capped at 10 lines via `appendOutput`; `{"relais":"quiet","event":"heartbeat"}` is ignored and does not `markDirty`). Every entry is kept; the pane and status line draw only those whose `session` is in `store.sessions`, so a session added after a run's `started` (/resume) still shows it; a test splits one protocol line across two chunks; the first quiet run of a session to pass the 1 s anti-flash, or to end failed, calls `openPane` (toast rule in Decisions); a sub-second pass never opens it. `pane.ts` draws the quiet section per Decisions (below all relais runs, Text only, dim `  │ ` lines, `  │ waiting for output`, 1 s anti-flash, failed run kept) inside the budget stated there; `ui.ts flush` treats a live quiet run as live (1 s refresh). `tests/support.ts` gains a `quiet` branch in its `process.spawn` fake (as `learn`/`resume`) with its own feed, so `calls.spawn` stays runs only. Tests in `tests/views/relais-pane.test.ts` with fed protocol lines: a quiet run draws its head and last lines; a passed run drops on `ended`, a failed one stays; quiet rows are `Text` only, drawn after all relais runs, and the agent Buttons' order is unchanged; a watcher live with no quiet run leaves the empty state unchanged and `hasLiveRun` false; first quiet `started` opens the pane and a second does not toast again; exit 2 → no respawn; crash → respawn after 30 s; a pane test that fails without the session filter (sessions A/B/C); a pane test that fails without the relais-first budget.
 - [x] **4b. Status line.** `statusText` (`ui.ts:55`) adds live quiet runs (`amont clippy 0:12`) so an unplaced pane still shows them; test it.
-- [ ] **4c. Person review.** Before any release, show the person fixture-fed pane renders (live, waiting, failed, 3 heads plus `+n more`, at 8 and 24 rows) and take their call.
-- [ ] **5. Contract doc.** `docs/quiet-runs.md` (relais): the entry file, its fields (`exit`, `ended`) and lifetime, the session filter in the plugin; README pane section mentions quiet runs.
+- [x] **4c. Person review.** Before any release, show the person fixture-fed pane renders (live, waiting, failed, 3 heads plus `+n more`, at 8 and 24 rows) and take their call.
+- [x] **5. Contract doc.** `docs/quiet-runs.md` (relais): the entry file, its fields (`exit`, `ended`) and lifetime, the session filter in the plugin; README pane section mentions quiet runs.
 - Releases: amont, amont-agent, relais via `tag-release`, in that order; brew upgrades; relais plugin reinstall (`relais install --claude --user --write`) is the person's step, as before.
 
 ### Live (agent-observed)
 
 - [ ] **6. Observe.** In a fresh session after the reinstall: run `amont run clippy --all-files` on amont-agent and `amont-agent quiet -- sleep 20` through the agent; the pane opened on its own and shows each row with live lines and drops it at the end; a second Claude session's quiet run does not appear in this one's pane.
+
+## Decision log
+
+- 2026-10-11: the relais runs for phases 3 and 4 ended `needs_review` (their reviewers stopped without a result; `make check` passed on both candidates); the session reviewed both against the carried findings and committed them.
+- The watcher re-reads a log that shrank from its start instead of ending the row (amont's logs only grow; re-reading is harmless), and its first heartbeat goes out at startup; `docs/quiet-runs.md` states both.
+- The ended entry names the renamed `.log` when the tool's rename succeeded (amont and amont-agent agree); the watcher's last drain reads it at the offset it kept from the `.log.tmp`.
+- An entry is written only inside a Claude Code session (both tools): a session-less entry is never drawn, and amont's own test suite, run under an agent's gate, had written 27 fixture entries into the real directory under that agent's session.
+- Pid-reuse guard: a live pid also needs its log to exist and the log or the run to be younger than an hour; an ended entry that cannot be deleted stays closed instead of being announced every poll.
+- Kept deliberate: live vs failed stays an optional `failure` field on `QuietRun`, not a union (implementation review, low): the refactor touches the fold, pane and tests for no behaviour change.
+- The watcher tests wait for its first line (up to 60 s) before timing anything: `cargo test` relinks the binary with other features than `cargo build`, and macOS held the first exec in `_dyld_start` past the tests' 6 s windows at load ~250.
+- End to end, branch binaries (2026-10-11): a failing `amont-agent quiet` run gave `started` (its session) → one `output` per line, live → `ended` exit 3 → entry deleted; `amont run clippy --all-files` gave `started` → live `output` → `ended` exit 0.
 
 ## Non-goals
 
@@ -82,21 +93,21 @@ Outcome: while an agent-run quiet check or command is live, relais's pane shows 
 | two concurrent captures in one amont process | two entry files | — |
 | capture `open` with a dead-pid entry present | the stale entry is swept | — |
 | `amont-agent quiet -- sleep 5` | entry present during; after exit and after SIGINT it carries `exit`/`ended` and a later sweep removes it once older than 60 s | — |
-| pane test: `started` for A and B, store.sessions={A}; then /clear adds C, C `started` | A's and C's rows drawn, B's never | — |
-| append 3 lines to a watched log | one or more `output` events carrying them in order | — |
-| remove an entry / dead-pid entry | `ended` / never `started` | — |
-| line-cutting fixture: ANSI colour, a tab, wide characters | same cut as `cutLine` | — |
-| pane test: fed `ended` with exit 1 | head row in error colour and last lines stay until the next quiet `started` | — |
-| pane test: fed `ended` with exit 0 | row drops at once | — |
-| pane test: fed `started` + `output` | head row `amont · clippy · 0:0x` and the lines, dim `  │ ` prefix | — |
-| pane test: `started`, no `output` yet | `  │ waiting for output` | — |
-| pane test: relais run + quiet run, 8 and 24 rows | relais rows equal the same test without the quiet run (baseline); quiet run gets only the remainder | — |
-| pane test: 6 concurrent quiet runs | 3 head rows + `+3 more quiet runs` | — |
-| watcher live, no quiet run | empty state unchanged, `hasLiveRun` false | — |
-| watcher exits 2 / crashes | no respawn, nothing drawn / respawn after 30 s with `quiet watcher down` meanwhile | — |
-| first quiet `started` in a session; then a second | pane opens; no second toast | — |
-| pre-commit with sub-second checks | none flashes; the pane does not open | — |
-| pane test: `ended` with exit 1 under 1 s after `started` | head row and last lines drawn; the same with exit 0 draws nothing | — |
+| pane test: `started` for A and B, store.sessions={A}; then /clear adds C, C `started` | A's and C's rows drawn, B's never | pane tests (`quiet-pane.test.ts`): only A and the /resume-added C draw; B never |
+| append 3 lines to a watched log | one or more `output` events carrying them in order | `live_entry_streams_started_output_and_ended`: in order, partial line held until its newline |
+| remove an entry / dead-pid entry | `ended` / never `started` | `ended` with exit null / `a_dead_pid_without_ended_is_never_started` |
+| line-cutting fixture: ANSI colour, a tab, wide characters | same cut as `cutLine` | `lines_are_cut_as_timeline_cut_line_does` (a surrogate pair split by the cut is dropped whole; a Rust string cannot hold half) |
+| pane test: fed `ended` with exit 1 | head row in error colour and last lines stay until the next quiet `started` | kept in error colour until a `started` of the same session, tool and check; siblings and other sessions leave it (carried finding 3) |
+| pane test: fed `ended` with exit 0 | row drops at once | drops at once |
+| pane test: fed `started` + `output` | head row `amont · clippy · 0:0x` and the lines, dim `  │ ` prefix | `amont · clippy · 0:01` + dim `  │ ` lines (person saw the render, 4c) |
+| pane test: `started`, no `output` yet | `  │ waiting for output` | `  │ waiting for output` (render 2, 4c) |
+| pane test: relais run + quiet run, 8 and 24 rows | relais rows equal the same test without the quiet run (baseline); quiet run gets only the remainder | relais rows equal the baseline at 8 and 24; the quiet head and one line follow (render 5, 4c) |
+| pane test: 6 concurrent quiet runs | 3 head rows + `+3 more quiet runs` | 3 heads + `+3 more quiet runs` (render 4, 4c) |
+| watcher live, no quiet run | empty state unchanged, `hasLiveRun` false | empty state unchanged, `hasLiveRun` false |
+| watcher exits 2 / crashes | no respawn, nothing drawn / respawn after 30 s with `quiet watcher down` meanwhile | not respawned / respawned after 30 s with `quiet watcher down`; a dead watcher's live runs are dropped |
+| first quiet `started` in a session; then a second | pane opens; no second toast | pane opens on the pump tick once a run passes 1 s (not on `started`); no second toast (carried finding 1) |
+| pre-commit with sub-second checks | none flashes; the pane does not open | pane test: a sub-second pass never draws or opens the pane; a sub-second failure does |
+| pane test: `ended` with exit 1 under 1 s after `started` | head row and last lines drawn; the same with exit 0 draws nothing | drawn with its lines; exit 0 draws nothing |
 | live: agent runs `amont run clippy --all-files` | row appears with live lines, drops at end | — |
 | live: quiet run from another Claude session | not shown | — |
 | live: `amont-agent quiet -- sh -c 'for i in 1 2 3 4 5; do date +%s; sleep 2; done'` | each line in the pane within 0.5 s of its timestamp | — |
