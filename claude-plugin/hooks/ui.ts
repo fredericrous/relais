@@ -24,7 +24,7 @@ const DECISION_MERGE_MS = 3000
 const asJson = (value: unknown) => JSON.parse(JSON.stringify(value))
 
 const runsOf = (store: Store): RunModel[] =>
-  Object.values(store.models).sort((a, b) => a.startedAt - b.startedAt)
+  Object.values(store.models).filter(m => !m.foreign).sort((a, b) => a.startedAt - b.startedAt)
 
 export const hasLiveRun = (store: Store) => runsOf(store).some(isLive)
 

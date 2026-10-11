@@ -42,6 +42,39 @@ const HINT = 'Click or Enter an agent: its transcript here · ↓ to manage: ful
 // The pane's smallest sensible height; below it the layout still draws, cut.
 const MIN_ROWS = 6
 
+// The widest a row of prose may be: it wraps at a word boundary past this.
+const WRAP_COLUMNS = 80
+
+// `text` as rows of at most `width` cells, broken at spaces (a word longer
+// than a row is cut), the continuation rows indented by `indent`.
+export function wrapWords(text: string, width: number, indent: string): string[] {
+  const rows: string[] = []
+  let row = ''
+  const flush = () => {
+    if (row !== '') rows.push(row)
+    row = ''
+  }
+  for (const word of text.split(/\s+/).filter(Boolean)) {
+    const lead = rows.length === 0 ? '' : indent
+    let rest = word
+    // A word wider than a row is cut at the row's width.
+    while (lead.length + rest.length > width) {
+      flush()
+      const cut = width - indent.length
+      rows.push(`${rows.length === 0 ? '' : indent}${rest.slice(0, cut)}`)
+      rest = rest.slice(cut)
+    }
+    if (row === '') row = `${rows.length === 0 ? '' : indent}${rest}`
+    else if (row.length + 1 + rest.length <= width) row = `${row} ${rest}`
+    else {
+      flush()
+      row = `${indent}${rest}`
+    }
+  }
+  flush()
+  return rows
+}
+
 const pad = (text: string, width: number) => (text.length >= width ? text + ' ' : text.padEnd(width))
 
 const rule = (columns: number): Row => ({ text: '─'.repeat(Math.max(1, columns)), dim: true })
@@ -115,6 +148,7 @@ function frame(m: RunModel, room: Room, isLast: boolean): { head: Row[]; steps: 
   }
   if (isLast && hasButton) tail.push({ text: HINT, dim: true })
   tail.push({ text: `cost    ${formatCost(m.cost)}` })
+  if (m.stalled && isLive(m)) tail.push({ text: m.stalled, dim: true })
   if (m.outcome) {
 
     tail.push({
@@ -123,8 +157,12 @@ function frame(m: RunModel, room: Room, isLast: boolean): { head: Row[]; steps: 
       color: m.outcome.state.startsWith('accepted') ? undefined : 'error',
     })
   }
+  if (m.outcome?.reason) {
+    for (const text of wrapWords(m.outcome.reason, WRAP_COLUMNS, '        ')) tail.push({ text, dim: true })
+  }
   if (m.ledger) tail.push({ text: `ledger  ${m.ledger}`, dim: true })
-  if (m.session) tail.push({ text: `session ${m.session}`, dim: true })
+  // The full id is in `status --run`'s reply; the pane shows a prefix.
+  if (m.session) tail.push({ text: `session ${m.session.slice(0, 8)}`, dim: true })
   return { head, steps, tail }
 }
 

@@ -613,6 +613,16 @@ Multiple interactive Claude Code sessions, each spawning multiple agents, are a 
 
 The existing one-repository-per-run contract remains: many runs across many repositories can coexist. A session can contain several runs, and a run can contain an agent tree. An agent finishing one invocation may later resume; agent identity and invocation identity are distinct.
 
+### Status scope, cancel and per-turn cost
+
+The plugin's `status` tool and `/relais-status` show this session's runs (started from this Claude Code session id). `relais native status --session <id>` prints `{"runs":[timeline…]}`, newest first and at most 20, one per ledger run whose `root_session` is the id; with no rows it prints `{"runs":[]}` and exits 0. `relais native status --run <id>` is an explicit lookup and works for any session's run: its `current` carries the run's `session`, and the plugin returns a run of another session only when asked for by id, marked `foreign: true` and with its `session`. With neither flag, `native status` means the latest run on the machine and is for the command line only. The pane shows a session id as its first 8 characters; `status --run` has the full id. A session id that changes on `/clear` stops listing the runs of the old id; asking with `run` still finds them.
+
+`current.state` is trusted over the event file: a terminal state with no `outcome` event is an ended run, and the reason of a reaped run is a sentence the status reply and the pane show. A live run silent for 10 minutes or more has `current.stalled`, shown as the plain-text hint "no events for 12m". It is a hint, not a verdict.
+
+`cancel {run}` is an MCP tool beside `status`. It runs `relais native cancel --run <run> --session <session>` (`--session` is required) and returns the one stdout line and the exit status: cancelled or reaped 0, already ended 0, a run belonging to another live session 11, an unknown run 10, a usage error 2. The plugin marks the run's dispatches stopped, so it sends no late `stopped` for them.
+
+Cost is booked every turn, not only when an agent stops. After each turn of a dispatch's agent the plugin sends the dispatch's cumulative usage `{agent, turns, usage, message_ids}` to `relais native usage --dispatch <id>`, through the same retrying delivery as `stopped`. relais keeps the highest cumulative per dispatch, so a late, repeated or out-of-order delivery books nothing twice, and `stopped` books only what is left. A model the pricing table cannot price reads `cost: unpriced (<model>)` instead of `unknown`.
+
 ### One coordinator per OS user
 
 A shared Rust coordinator, started lazily by the CLI/integration, manages registrations, admission, resource leases and aggregate accounting. Use a permission-restricted local Unix socket on macOS/Linux and an equivalent local IPC mechanism on other supported platforms. Atomically elect one coordinator; simultaneous startup must not create independent schedulers.

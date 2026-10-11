@@ -8,7 +8,7 @@ import { HELLO_EVERY_MS, sendHello } from './callbacks.ts'
 import type { Fx } from './fx.ts'
 import { DECIDE_INPUT_SCHEMA, DECIDE_TOOL_DESCRIPTION, decideTool, endNonce, mintNonce } from './decide.ts'
 import { DENY_MESSAGE, isRelaisNotification, isRelaisType, relaisAddresses } from './guards.ts'
-import { childOf, contractPath, onChunk, pump, reloadTimeline, startReplay, startRun, statusOf } from './runs.ts'
+import { cancelRun, childOf, contractPath, onChunk, pump, reloadTimeline, startReplay, startRun, statusOf } from './runs.ts'
 import { onboardTool, onPersonPrompt, trustTool, withRoutingSection } from './consent.ts'
 import { decideGuard, learningEnvelopeGuard, machineSettingsGuard, routerEnvelopeGuard } from './guards.ts'
 import { learningCommand, noteLastCycle, startCycle, startResumeSweep } from './learning.ts'
@@ -31,6 +31,7 @@ import { FLUSH_MS, markDirty, openPane, renderPane, timelineLines } from './ui.t
 const RUN_TOOL = 'mcp__relais__run'
 const REPLAY_TOOL = 'mcp__relais__replay'
 const STATUS_TOOL = 'mcp__relais__status'
+const CANCEL_TOOL = 'mcp__relais__cancel'
 const ONBOARD_TOOL = 'mcp__relais__onboard'
 const TRUST_TOOL = 'mcp__relais__trust'
 const DECIDE_TOOL = 'mcp__relais__decide'
@@ -174,7 +175,7 @@ export function register(on: any) {
     await $.tool.register({
       name: 'status',
       description:
-        "The phases, decisions, cost and outcome of relais runs: one run by id, or all of this session's. A run's latest output lines only with output: true.",
+        "The phases, decisions, cost and outcome of relais runs: one run by id, or all of this session's runs (started from this Claude Code session id). A run of another session is returned only when asked for by id, marked foreign: true. A run's latest output lines only with output: true.",
       inputSchema: {
         type: 'object',
         properties: {
@@ -184,6 +185,19 @@ export function register(on: any) {
             description: "Also return each run's last 40 output lines (a check's own log, often long). Off by default.",
           },
         },
+      },
+    })
+    await $.tool.register({
+      name: 'cancel',
+      description:
+        "Cancel a relais run started from this Claude Code session: a live one is told to stop, one whose driver is gone is marked cancelled. Returns relais's one-line answer and its exit status (11: the run belongs to another live session).",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          run: { type: 'string', description: 'The run id to cancel.' },
+          cwd: { type: 'string', description: 'The repository (absolute path); optional.' },
+        },
+        required: ['run'],
       },
     })
     await $.tool.register({
@@ -301,6 +315,11 @@ export function register(on: any) {
   on('tool.call', { tool: STATUS_TOOL }, async ($: any, e: any) => ({
     result: await statusOf(effects($), store, typeof e.run === 'string' ? e.run : undefined, { output: e.output === true }),
   }))
+
+  on('tool.call', { tool: CANCEL_TOOL }, async ($: any, e: any) => {
+    if (typeof e.run !== 'string' || e.run.length === 0) return { deny: 'relais cancel needs a run id.' }
+    return { result: await cancelRun(effects($), store, e.run) }
+  })
 
   on('command.run', { command: 'relais-status' }, async ($: any) => {
     const fx = effects($)

@@ -118,3 +118,9 @@ export function observe(
 export function stoppedPayload(d: Dispatch, status: string) {
   return { agent: d.agent, status, usage: d.usage, answer: d.answer }
 }
+
+// What `relais native usage` takes: the dispatch's usage cumulative over its
+// turns so far, and the ids of the turn just added.
+export function usagePayload(d: Dispatch, messageIds: string[]) {
+  return { agent: d.agent, turns: d.turns, usage: d.usage, message_ids: messageIds }
+}

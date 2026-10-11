@@ -6,6 +6,31 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## Unreleased
+
+Status is scoped to the session, orphaned runs are reaped, a run can be
+cancelled from the session, and cost is booked every turn.
+
+- Ledger schema 28 (v28). An older binary refuses it: run `relais coordinator
+  stop` before using the new binary, so no old daemon keeps the ledger.
+- `relais native status --session <id>` lists the runs started from that
+  Claude Code session (`{"runs":[…]}`, newest first, at most 20). The
+  plugin's `status` tool and `/relais-status` use it, so a fresh session no
+  longer adopts another session's latest run; a run of another session is
+  returned only when asked for by id, marked `foreign: true`. `native status`
+  with no flag still means the latest run on the machine.
+- A run whose driver is gone is marked interrupted by the daemon, with a
+  reason sentence the status reply shows; a live run silent for 10 minutes
+  shows "no events for 12m".
+- `relais native cancel --run <id> --session <id>` and the plugin's
+  `cancel` tool cancel a run: exit 0 when cancelled, reaped or already ended,
+  11 for a run of another live session, 10 for an unknown run.
+  `relais coordinator cancel --run` on a run not on record now exits 10.
+- `relais native usage --dispatch <id>` books an agent's cumulative usage
+  after every turn, so an agent that never stops still has a cost; a model
+  without a price reads `unpriced (<model>)`.
+- The daemon writes its own log, `coordinator.log` in the state directory, one line per reap.
+
 ## v0.14.0
 
 The orchestrating session answers decisions and says who decided (#202,
