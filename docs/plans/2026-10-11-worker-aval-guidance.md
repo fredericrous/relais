@@ -31,14 +31,15 @@ So a worker writes code without `errors.never-swallowed`,
 `functions.no-flag-arguments` and the rest, and the reviewer judges the
 candidate without them, though a review is meant to block on a constraint.
 
-Intended outcome: every worker and planner prompt carries (1) the index of
+Intended outcome: every worker prompt carries (1) the index of
 active constraint ids, the same one-line-per-prefix index the session gets
 (ADR-0026 `guidance.session-load`: an index, detail on demand), with an
 instruction to run `aval rule <id>` before writing code a constraint
 governs, and (2) the few decisions and rules aval ranks as relevant to the
 write scope and the objective, in full. The reviewer cannot run aval (its
 tools are Read, Grep, Glob, LSP), so it gets the full statement of every
-active constraint instead of the index. Guidance never blocks a run. The
+active constraint instead of the index. The planner gets the relevant
+block only. Guidance never blocks a run. The
 binding key set (contract + mapping, which blocks on
 contradiction/undecided) is unchanged.
 
@@ -64,7 +65,8 @@ rule `errors.never-swallowed` (constraint): <statement>
 ```
 
 Ids are full and copy-pastable, grouped by prefix. The `aval rule <id>`
-line appears only in worker and planner prompts that carry the index, never
+line appears only in worker prompts that carry the index (the planner gets
+the relevant block alone), never
 in the reviewer prompt (the reviewer cannot run aval). Both blocks use the existing fenced
 `data_list_block` (project text, never instructions — SPEC §16). Keys
 already in `constraints` (binding) are not repeated in the relevant block.
@@ -91,8 +93,10 @@ never falls back to the bare id index.
   `state == "active"` (choice) and `rules[]` (id, level, statement). A
   ranked key that is not active is recorded in the manifest and left out of
   the prompt: the ranking is a suggestion, so it never blocks the run.
-- Latency: 26 ms + 165 ms per `assemble`, ×(1 + packages) per run. No cache
-  needed.
+- Latency: the index (26 ms) is fetched once per run and shared by every
+  package (cached in `AvalCli`); the ranking (165 ms) is asked once per
+  `assemble`, so ×(1 + packages) per run. Each guidance spawn has its own
+  5 s timeout (`tooling::GUIDANCE_TIMEOUT`), not the 30 s probe timeout.
 
 ### Failure policy
 
@@ -110,7 +114,7 @@ reused.
 
 Guidance is not counted in the binding `package_bytes` / `SizingProblem`
 check. It has its own cap, `GUIDANCE_BUDGET_BYTES` = 16 KiB, for the worker
-and planner blocks. Over the cap, the relevant block is dropped first, then
+block and the planner's relevant block. Over the cap, the relevant block is dropped first, then
 the index; each drop is a `GuidanceGap` with measured and budget bytes.
 Expected on this repo: index 2.1 KB + top-5 ≈ 3 KB, well inside.
 
@@ -203,5 +207,12 @@ with measured and budget bytes, shown in the receipt gap line.
 - Old manifest JSON without `guidance` still deserializes.
 - `make check` exits 0 (the CI command).
 - Phase 4 live run, as stated there.
+
+## Decision log
+
+- 2026-10-11, Phases 1–2: built by relais run `run-65d8d338c6051-dc00` (sonnet@medium). The run ran out of wall clock in verification; its single red check was `release_scenarios::a_run_awaiting_a_person_is_answered_by_decide_and_drops_off_the_open_list`, which passes alone (13 s). The base was red on two other tests in the same suite under the same load.
+- deliberate: no cancel flag on guidance spawns. `main.rs` builds `AvalCli::new`, with no run cancel flag, so `aval resolve` is not cancellable from the CLI either. Guidance spawns are bounded by their own 5 s `GUIDANCE_TIMEOUT`. Wiring a run cancel flag into `AvalCli` is its own change.
+- deliberate: the receipt gap line goes into `VerificationReport.notes`, not a new receipt field (receipt types live in `verify/`).
+- deliberate: when aval cannot be launched, the relevant query is skipped, giving one gap, not two.
 
 <!-- panel: repos=relais reviewers=backend,lang:rust,tui,unix body-sha=5ac21fdc6046 -->

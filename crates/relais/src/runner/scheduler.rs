@@ -1018,7 +1018,7 @@ fn accept_integrated(
         checks: assembled.checks,
         gaps: Vec::new(),
         gaps_not_judged: Vec::new(),
-        notes: Vec::new(),
+        notes: engine.guidance_note(root.manifest).into_iter().collect(),
         baseline_failures: root.baseline_failures.to_vec(),
         amont_bypasses: assembled.amont_bypasses,
         amont_downgrades: assembled.amont_downgrades,
@@ -1132,6 +1132,7 @@ fn propose_plan(engine: &mut RunEngine<'_>, root: &RootContext<'_>) -> Result<Pr
     if !root.manifest.constraints.is_empty() {
         prompt.push_str(&data_list_block("constraints", &root.manifest.constraints));
     }
+    prompt.push_str(&super::relevant_block(&root.manifest.guidance, &[]));
     let dispatch_id = engine.config.ids.dispatch_id()?;
     let spent = engine.config.ledger.run_cost(&engine.run_id)?;
     let remaining_budget = engine

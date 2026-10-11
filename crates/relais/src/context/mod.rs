@@ -11,15 +11,21 @@
 //! only a contradiction blocks affected work, and a missing answer gates
 //! only tasks that depend on it.
 
+pub mod guidance;
+
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::contract::TaskContract;
 use crate::ids::sha256_hex;
 use crate::policy::RepoPolicy;
 use crate::workspace::Git;
+pub use guidance::{
+    Guidance, GuidanceGap, GuidanceSource, RankedKey, Relevant, RelevantQuery, RuleRef, Rules,
+    GUIDANCE_BUDGET_BYTES,
+};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -121,6 +127,19 @@ pub fn parse_aval_output(exit_code: i32, stdout: &str) -> AvalVerdict {
 pub trait DecisionResolver {
     /// Resolve one decision key, optionally within a scope.
     fn resolve(&self, key: &str, scope: Option<&str>) -> AvalVerdict;
+
+    /// The active constraint rules, for the index and the reviewer. A
+    /// failure is a gap, never a verdict: guidance does not block a run.
+    /// The default knows none, so a resolver that only answers keys
+    /// (a closure, a test) needs nothing more.
+    fn constraint_rules(&self) -> Result<Rules, GuidanceGap> {
+        Ok(Rules::default())
+    }
+
+    /// aval's advisory ranking for a query. Same failure policy.
+    fn relevant(&self, _query: &RelevantQuery) -> Result<Relevant, GuidanceGap> {
+        Ok(Relevant::default())
+    }
 }
 
 /// A closure is a resolver: the shape tests and the CLI both already use.
@@ -137,12 +156,19 @@ where
 pub struct AvalCli {
     root: PathBuf,
     cancel: Option<Arc<AtomicBool>>,
+    /// The constraint index is the same for every package of a run, so it
+    /// is fetched once per `AvalCli` (one per run) and shared.
+    rules: OnceLock<Result<Rules, GuidanceGap>>,
 }
 
 impl AvalCli {
     /// Resolve decisions for the corpus rooted at `root`.
     pub fn new(root: PathBuf) -> Self {
-        Self { root, cancel: None }
+        Self {
+            root,
+            cancel: None,
+            rules: OnceLock::new(),
+        }
     }
 
     /// The same, with the run's cancel flag: a corpus tool that hangs
@@ -151,6 +177,7 @@ impl AvalCli {
         Self {
             root,
             cancel: Some(cancel),
+            rules: OnceLock::new(),
         }
     }
 }
@@ -158,6 +185,34 @@ impl AvalCli {
 impl DecisionResolver for AvalCli {
     fn resolve(&self, key: &str, scope: Option<&str>) -> AvalVerdict {
         aval_resolve(&self.root, key, scope, self.cancel.as_deref())
+    }
+
+    fn constraint_rules(&self) -> Result<Rules, GuidanceGap> {
+        self.rules
+            .get_or_init(|| {
+                guidance::run_aval(
+                    "aval",
+                    &guidance::rules_args(),
+                    &self.root,
+                    GuidanceSource::Index,
+                    crate::tooling::GUIDANCE_TIMEOUT,
+                    self.cancel.as_deref(),
+                )
+                .and_then(|stdout| guidance::parse_rules_output(&stdout))
+            })
+            .clone()
+    }
+
+    fn relevant(&self, query: &RelevantQuery) -> Result<Relevant, GuidanceGap> {
+        guidance::run_aval(
+            "aval",
+            &guidance::relevant_args(query),
+            &self.root,
+            GuidanceSource::Relevant,
+            crate::tooling::GUIDANCE_TIMEOUT,
+            self.cancel.as_deref(),
+        )
+        .and_then(|stdout| guidance::parse_relevant_output(&stdout))
     }
 }
 
@@ -482,6 +537,11 @@ pub struct ContextManifest {
     /// before this was recorded.
     #[serde(default)]
     pub env_protection: String,
+    /// Advisory guidance (SPEC §7): the constraint index, the full
+    /// statements, aval's ranking and every gap. Evidence only; it is not
+    /// compared and never counts toward `package_bytes`.
+    #[serde(default)]
+    pub guidance: Guidance,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -551,6 +611,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         resolver,
     } = inputs;
 
+    let manifest_aval_version = tool_versions.aval.clone();
     let mut keys: Vec<String> = contract.architecture.keys.clone();
     for mapping in &repo.architecture.mapping {
         let touched = contract
@@ -590,6 +651,16 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         }
         resolved.push((key.clone(), verdict));
     }
+
+    let guidance = gather_guidance(
+        resolver,
+        &RelevantQuery {
+            paths: guidance::query_paths(contract.scope_patterns(), &contract.read_hints),
+            text: contract.objective.clone(),
+        },
+        &keys,
+        manifest_aval_version,
+    );
 
     // The constraint is the decision in the record's own words — what
     // `aval resolve --json` carries as `choice` and `reason`; the full
@@ -662,6 +733,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         sandbox: SandboxRecord::default(),
         confinement: Confinement::session(),
         env_protection: "session".to_string(),
+        guidance,
     };
 
     if manifest.package_bytes > manifest.budget_bytes {
@@ -671,6 +743,51 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         });
     }
     Ok(manifest)
+}
+
+/// Ask the resolver for the advisory guidance. Nothing here can fail a
+/// run: each failure becomes a gap, and guidance over its own budget is
+/// trimmed (`guidance::fit_budget`). Keys already binding are not repeated
+/// in the relevant block.
+pub fn gather_guidance(
+    resolver: &dyn DecisionResolver,
+    query: &RelevantQuery,
+    binding_keys: &[String],
+    aval_version: Option<String>,
+) -> Guidance {
+    let mut guidance = Guidance {
+        aval_version,
+        ..Guidance::default()
+    };
+    let mut aval_missing = false;
+    match resolver.constraint_rules() {
+        Ok(rules) => {
+            guidance.index = rules.rules.iter().map(|rule| rule.id.clone()).collect();
+            guidance.rules = rules.rules;
+            guidance.omitted = rules.omitted;
+        }
+        Err(gap) => {
+            aval_missing = gap.not_installed;
+            guidance.record(gap);
+        }
+    }
+    // An aval that will not launch fails the second question the same
+    // way: one gap, not two.
+    if !aval_missing {
+        match resolver.relevant(query) {
+            Ok(relevant) => {
+                guidance.relevant_keys = relevant
+                    .keys
+                    .into_iter()
+                    .filter(|ranked| !binding_keys.contains(&ranked.key))
+                    .collect();
+                guidance.relevant_rules = relevant.rules;
+            }
+            Err(gap) => guidance.record(gap),
+        }
+    }
+    guidance::fit_budget(&mut guidance, GUIDANCE_BUDGET_BYTES);
+    guidance
 }
 
 /// Same conservative overlap logic as the router, applied between the
@@ -1076,5 +1193,195 @@ mod tests {
                 .all(|file| !file.blob.is_empty() && file.path.starts_with("src/")),
             "every row is a real file"
         );
+    }
+    /// A resolver with canned guidance answers.
+    struct Guided {
+        rules: Result<Rules, GuidanceGap>,
+        relevant: Result<Relevant, GuidanceGap>,
+    }
+
+    impl DecisionResolver for Guided {
+        fn resolve(&self, key: &str, scope: Option<&str>) -> AvalVerdict {
+            active(key, scope)
+        }
+
+        fn constraint_rules(&self) -> Result<Rules, GuidanceGap> {
+            self.rules.clone()
+        }
+
+        fn relevant(&self, _query: &RelevantQuery) -> Result<Relevant, GuidanceGap> {
+            self.relevant.clone()
+        }
+    }
+
+    fn rule(id: &str) -> RuleRef {
+        RuleRef {
+            id: id.into(),
+            level: "constraint".into(),
+            statement: format!("statement of {id}"),
+        }
+    }
+
+    fn ranked(key: &str, state: &str) -> RankedKey {
+        RankedKey {
+            key: key.into(),
+            state: state.into(),
+            adr: Some("ADR-0001".into()),
+            choice: (state == "active").then(|| "the choice".to_string()),
+        }
+    }
+
+    fn good() -> Guided {
+        Guided {
+            rules: Ok(Rules {
+                rules: vec![rule("errors.never-swallowed"), rule("errors.typed-values")],
+                omitted: guidance::Omitted::default(),
+            }),
+            relevant: Ok(Relevant {
+                keys: vec![ranked("a.b", "active"), ranked("c.d", "undecided")],
+                rules: vec![rule("effects.at-the-boundary")],
+            }),
+        }
+    }
+
+    fn gap(source: GuidanceSource, exit: Option<i32>) -> GuidanceGap {
+        GuidanceGap::new(source, exit, "boom")
+    }
+
+    #[test]
+    fn guidance_is_recorded_and_an_undecided_ranked_key_never_blocks() {
+        let c = contract(&[]);
+        let r = repo();
+        let manifest = assemble(inputs(&c, &r, &good())).expect("assembles");
+        let g = &manifest.guidance;
+        assert_eq!(g.index, ["errors.never-swallowed", "errors.typed-values"]);
+        assert_eq!(g.rules.len(), 2);
+        assert_eq!(g.aval_version.as_deref(), Some("1.3.2"));
+        assert_eq!(g.relevant_keys.len(), 2, "the undecided key is recorded");
+        assert_eq!(
+            g.relevant_entries(&[]).len(),
+            2,
+            "and left out of the prompt"
+        );
+        assert!(g.gaps.is_empty());
+        assert!(manifest.architecture.resolved.is_empty());
+    }
+
+    #[test]
+    fn a_binding_key_is_not_repeated_among_the_relevant_ones() {
+        let c = contract(&["a.b"]);
+        let r = repo();
+        let manifest = assemble(inputs(&c, &r, &good())).expect("assembles");
+        let keys: Vec<&str> = manifest
+            .guidance
+            .relevant_keys
+            .iter()
+            .map(|ranked| ranked.key.as_str())
+            .collect();
+        assert_eq!(keys, ["c.d"]);
+    }
+
+    #[test]
+    fn each_guidance_failure_is_a_gap_and_the_run_continues() {
+        let c = contract(&[]);
+        let r = repo();
+        for exit in [Some(1), Some(2), None] {
+            let broken = Guided {
+                rules: Err(gap(GuidanceSource::Index, exit)),
+                relevant: Err(gap(GuidanceSource::Relevant, exit)),
+            };
+            let manifest = assemble(inputs(&c, &r, &broken)).expect("never blocks");
+            let sources: Vec<GuidanceSource> = manifest
+                .guidance
+                .gaps
+                .iter()
+                .map(|gap| gap.source)
+                .collect();
+            assert_eq!(sources, [GuidanceSource::Index, GuidanceSource::Relevant]);
+            assert!(manifest.guidance.index.is_empty());
+            assert!(manifest.guidance.relevant_entries(&[]).is_empty());
+        }
+    }
+
+    #[test]
+    fn malformed_json_from_the_spawn_layer_becomes_a_gap_too() {
+        let c = contract(&[]);
+        let r = repo();
+        let malformed = Guided {
+            rules: guidance::parse_rules_output("not json"),
+            relevant: guidance::parse_relevant_output("{"),
+        };
+        let manifest = assemble(inputs(&c, &r, &malformed)).expect("never blocks");
+        assert_eq!(manifest.guidance.gaps.len(), 2);
+    }
+
+    #[test]
+    fn an_aval_that_will_not_launch_is_one_gap() {
+        let c = contract(&[]);
+        let r = repo();
+        let absent = Guided {
+            rules: Err(GuidanceGap {
+                not_installed: true,
+                ..gap(GuidanceSource::Index, None)
+            }),
+            relevant: Err(gap(GuidanceSource::Relevant, None)),
+        };
+        let manifest = assemble(inputs(&c, &r, &absent)).expect("never blocks");
+        assert_eq!(manifest.guidance.gaps.len(), 1);
+    }
+
+    #[test]
+    fn guidance_never_raises_a_sizing_problem() {
+        let c = contract(&[]);
+        let mut r = repo();
+        // Smaller than the guidance, large enough for the package itself.
+        let package = c.objective.len()
+            + c.acceptance
+                .iter()
+                .map(|a| a.statement().len())
+                .sum::<usize>()
+            + c.read_hints.iter().map(String::len).sum::<usize>();
+        r.context.budget_bytes = package;
+        let huge = Guided {
+            rules: Ok(Rules {
+                rules: (0..400).map(|i| rule(&format!("g{i}.rule-{i}"))).collect(),
+                omitted: guidance::Omitted::default(),
+            }),
+            relevant: Ok(Relevant::default()),
+        };
+        let manifest = assemble(inputs(&c, &r, &huge)).expect("guidance is not package bytes");
+        assert_eq!(manifest.package_bytes, package);
+    }
+
+    #[test]
+    fn over_the_guidance_budget_the_relevant_block_goes_first() {
+        let c = contract(&[]);
+        let r = repo();
+        let big = Guided {
+            rules: good().rules,
+            relevant: Ok(Relevant {
+                keys: vec![],
+                rules: vec![RuleRef {
+                    statement: "x".repeat(GUIDANCE_BUDGET_BYTES),
+                    ..rule("big.rule")
+                }],
+            }),
+        };
+        let manifest = assemble(inputs(&c, &r, &big)).expect("assembles");
+        assert_eq!(manifest.guidance.index.len(), 2);
+        assert!(manifest.guidance.relevant_rules.is_empty());
+        assert_eq!(manifest.guidance.gaps[0].source, GuidanceSource::Relevant);
+    }
+
+    #[test]
+    fn a_manifest_written_before_guidance_still_parses() {
+        let mut older = serde_json::to_value(manifest()).expect("json");
+        assert!(older
+            .as_object_mut()
+            .expect("an object")
+            .remove("guidance")
+            .is_some());
+        let parsed: ContextManifest = serde_json::from_value(older).expect("still parses");
+        assert_eq!(parsed.guidance, Guidance::default());
     }
 }

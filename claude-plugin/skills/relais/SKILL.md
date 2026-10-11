@@ -25,6 +25,10 @@ person for its fields.
 - **Acceptance:** what a command can verify. The plan's verification
   items that a command can check, and the repository's checks passing.
   Never "looks right" or a worker's own completion message.
+- **Decisions:** name `architecture.keys` in the contract when the task
+  depends on a decision: that is binding. The worker also sees the
+  constraint index and aval's relevance ranking, but that is advisory
+  and never blocks.
 - **Verification profile:** `"default"`, unless the repository's
   `relais.toml` names another the work calls for.
 

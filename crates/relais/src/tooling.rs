@@ -31,6 +31,12 @@ use crate::procs::{run_with_timeout, Ended};
 /// busy laptop.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long one guidance question (`aval rules`, `aval relevant`) may
+/// take. Guidance is advisory and the run waits for it before it starts,
+/// so it gets a bound of its own, far below a probe's: a slow aval is a
+/// gap in the guidance, not a delayed run.
+pub const GUIDANCE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Availability of required integrations at run time. Kept out of
 /// `effective_authority` on purpose: the intersection stays a pure function
 /// over policy files, while PATH probing belongs to doctor, plan and run.
