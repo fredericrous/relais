@@ -37,6 +37,9 @@ fn strong(outcome: &str) -> Option<TaskOutcome> {
 /// Strong-outcome counts of one stratum.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StratumCounts {
+    /// `new_task` (the person's session) or `subagent` (a spawn): main and
+    /// spawn draws are never pooled.
+    pub relation: String,
     pub kind: String,
     pub band: &'static str,
     pub scope: String,
@@ -48,9 +51,25 @@ pub struct StratumCounts {
     pub first_drawn_at: Option<String>,
 }
 
+/// The short relation prefix a stratum label starts with: `main` for the
+/// person's session, `sub` for a subagent spawn.
+pub fn relation_prefix(relation: &str) -> &'static str {
+    if relation == "subagent" {
+        "sub"
+    } else {
+        "main"
+    }
+}
+
 impl StratumCounts {
     pub fn label(&self) -> String {
-        format!("{} {} {}", self.kind, self.band, self.scope)
+        format!(
+            "{} {} {} {}",
+            relation_prefix(&self.relation),
+            self.kind,
+            self.band,
+            self.scope
+        )
     }
 }
 
@@ -69,7 +88,8 @@ pub fn undrawn_rate(s: &StratumCounts) -> Option<f64> {
 /// Per-stratum counts of tasks with strong outcomes: busiest stratum
 /// (most drawn, then most tasks, then label) first.
 pub fn strata(tasks: &[ExplorationTask]) -> Vec<StratumCounts> {
-    let mut by_key: BTreeMap<(String, &'static str, String), StratumCounts> = BTreeMap::new();
+    let mut by_key: BTreeMap<(String, String, &'static str, String), StratumCounts> =
+        BTreeMap::new();
     for task in tasks {
         let Some(outcome) = strong(&task.outcome) else {
             continue;
@@ -79,8 +99,14 @@ pub fn strata(tasks: &[ExplorationTask]) -> Vec<StratumCounts> {
         }
         let bad = outcome == TaskOutcome::Corrected;
         let entry = by_key
-            .entry((task.kind.clone(), band(task.difficulty), task.scope.clone()))
+            .entry((
+                task.relation.clone(),
+                task.kind.clone(),
+                band(task.difficulty),
+                task.scope.clone(),
+            ))
             .or_insert_with(|| StratumCounts {
+                relation: task.relation.clone(),
                 kind: task.kind.clone(),
                 band: band(task.difficulty),
                 scope: task.scope.clone(),
@@ -166,18 +192,23 @@ pub enum Projection {
     /// No draw yet: nothing to project from.
     NoDraws,
     Reached,
-    /// `date` is `YYYY-MM-DD`.
+    /// `date` is `YYYY-MM-DD`; `drawn` is how far the stratum is.
     On {
         date: String,
+        drawn: usize,
     },
 }
 
 impl Projection {
+    /// How far the stratum is from the [`MIN_DRAWN`] drawn tasks the stop
+    /// rule and the learner wait for, always with the count.
     pub fn render(&self) -> String {
         match self {
-            Projection::NoDraws => "no projection: 0 drawn".to_string(),
+            Projection::NoDraws => format!("no projection: 0 of {MIN_DRAWN} drawn tasks"),
             Projection::Reached => format!("{MIN_DRAWN} drawn reached"),
-            Projection::On { date } => format!("{MIN_DRAWN} drawn projected {date}"),
+            Projection::On { date, drawn } => {
+                format!("{drawn} of {MIN_DRAWN} drawn tasks, {MIN_DRAWN} projected {date}")
+            }
         }
     }
 }
@@ -201,7 +232,10 @@ pub fn project(s: &StratumCounts, now: DateTime<Utc>) -> Projection {
     let date = (now + Duration::seconds(seconds))
         .format("%Y-%m-%d")
         .to_string();
-    Projection::On { date }
+    Projection::On {
+        date,
+        drawn: s.drawn,
+    }
 }
 
 #[cfg(test)]
@@ -210,6 +244,7 @@ mod tests {
 
     fn task(drawn: bool, bad: bool) -> ExplorationTask {
         ExplorationTask {
+            relation: "new_task".into(),
             kind: "edit".into(),
             difficulty: 3,
             scope: "local".into(),
@@ -297,16 +332,45 @@ mod tests {
         assert_eq!(project(&s, now), Projection::Reached);
         // 5 drawn in 10 days: 15 more take 30 days.
         s.drawn = 5;
+        let on = project(&s, now);
         assert_eq!(
-            project(&s, now),
+            on,
             Projection::On {
-                date: "2026-11-10".into()
+                date: "2026-11-10".into(),
+                drawn: 5
             }
         );
+        assert_eq!(on.render(), "5 of 20 drawn tasks, 20 projected 2026-11-10");
         s.drawn = 0;
         s.first_drawn_at = None;
         let none = project(&s, now);
         assert_eq!(none, Projection::NoDraws);
-        assert_eq!(none.render(), "no projection: 0 drawn");
+        assert_eq!(none.render(), "no projection: 0 of 20 drawn tasks");
+    }
+
+    #[test]
+    fn main_and_subagent_draws_are_separate_strata() {
+        let mut tasks = fixture(4);
+        // The same class drawn by spawns, all clean: a separate stratum,
+        // labelled `sub`, and the main stratum's rate is untouched.
+        for _ in 0..20 {
+            let mut spawn = task(true, false);
+            spawn.relation = "subagent".into();
+            tasks.push(spawn);
+        }
+        for _ in 0..40 {
+            let mut spawn = task(false, false);
+            spawn.relation = "subagent".into();
+            tasks.push(spawn);
+        }
+        let strata = strata(&tasks);
+        assert_eq!(strata.len(), 2);
+        let labels: Vec<String> = strata.iter().map(StratumCounts::label).collect();
+        assert_eq!(labels, ["main edit d3 local", "sub edit d3 local"]);
+        assert_eq!(drawn_rate(&strata[0]), Some(0.2));
+        assert_eq!(drawn_rate(&strata[1]), Some(0.0));
+        // The stop rule stays one rule over every stratum with draws: 4 of
+        // 40 drawn against 0 of 80 undrawn is 10 points, under the margin.
+        assert!(!stop_check(&strata).stop);
     }
 }

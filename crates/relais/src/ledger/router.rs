@@ -184,10 +184,13 @@ pub struct RouterWindow {
     pub decisions: Vec<(String, bool, bool)>,
 }
 
-/// One main-session task, as the exploration evidence reads it: its class,
-/// how it ended and what the draw did at its start.
+/// One task the draw could apply to, as the exploration evidence reads it:
+/// a main-session new task or a subagent spawn (`relation`), its class, how
+/// it ended and what the draw did at its start.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExplorationTask {
+    /// `new_task` (the person's session) or `subagent` (a spawn).
+    pub relation: String,
     pub kind: String,
     pub difficulty: u8,
     pub scope: String,
@@ -695,9 +698,16 @@ impl Ledger {
     /// Every main-session task that has a class and a `new_task` decision,
     /// with what the exploration draw did at its start: drawn (lowered and
     /// applied) or undrawn (the draw ran, passed it over, not held out).
+    ///
+    /// Two arms: the main session's `new_task` decisions, and subagent
+    /// spawns. A spawn is joined on `(session, task_id)` alone: its decision
+    /// row is written before the spawn is keyed (`agent_id` empty) while its
+    /// task row may carry the real agent id, and a spawn that never keys
+    /// keeps the empty id on both, so any `agent_id` condition would drop
+    /// drawn spawns from the stop rule. Spawn task ids are unique per session.
     pub fn router_exploration_tasks(&self) -> Result<Vec<ExplorationTask>> {
         let mut stmt = self.conn.prepare(
-            "SELECT t.class_kind, t.difficulty, t.scope, t.outcome, t.started_at,
+            "SELECT d.relation, t.class_kind, t.difficulty, t.scope, t.outcome, t.started_at,
                     d.explored, d.applied, d.propensity, d.holdout
                FROM router_tasks t
                JOIN router_decisions d
@@ -705,19 +715,29 @@ impl Ledger {
                 AND d.agent_id = '' AND d.relation = 'new_task'
               WHERE t.agent_id = '' AND t.class_kind IS NOT NULL AND t.scope IS NOT NULL
                 AND t.difficulty IS NOT NULL
-              ORDER BY t.started_at, t.session, t.task_id",
+             UNION ALL
+             SELECT d.relation, t.class_kind, t.difficulty, t.scope, t.outcome, t.started_at,
+                    d.explored, d.applied, d.propensity, d.holdout
+               FROM router_tasks t
+               JOIN router_decisions d
+                 ON d.session = t.session AND d.task_id = t.task_id
+                AND d.relation = 'subagent'
+              WHERE t.class_kind IS NOT NULL AND t.scope IS NOT NULL
+                AND t.difficulty IS NOT NULL
+              ORDER BY 6, 1",
         )?;
         let rows = stmt.query_map([], |row| {
-            let explored: bool = row.get(5)?;
-            let applied: bool = row.get(6)?;
-            let propensity: Option<f64> = row.get(7)?;
-            let holdout: bool = row.get(8)?;
+            let explored: bool = row.get(6)?;
+            let applied: bool = row.get(7)?;
+            let propensity: Option<f64> = row.get(8)?;
+            let holdout: bool = row.get(9)?;
             Ok(ExplorationTask {
-                kind: row.get(0)?,
-                difficulty: row.get::<_, i64>(1)?.clamp(0, 255) as u8,
-                scope: row.get(2)?,
-                outcome: row.get(3)?,
-                started_at: row.get(4)?,
+                relation: row.get(0)?,
+                kind: row.get(1)?,
+                difficulty: row.get::<_, i64>(2)?.clamp(0, 255) as u8,
+                scope: row.get(3)?,
+                outcome: row.get(4)?,
+                started_at: row.get(5)?,
                 drawn: explored && applied && !holdout,
                 undrawn: !explored && propensity.is_some() && !holdout,
             })

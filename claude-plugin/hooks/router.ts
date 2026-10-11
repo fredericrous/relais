@@ -119,9 +119,11 @@ export type TaskState = {
   exploredDown: boolean
 }
 
-// What the exploration draw decided for a task start. Absent on a decision
-// the draw did not apply to (continuations, corrections, subagents, held-out
-// sessions, mode not `on`).
+// What the exploration draw decided for a task start: a main-session new
+// task or a table-routed subagent spawn. Absent on a decision the draw did
+// not apply to (continuations, corrections, pinned, person-named or abstained
+// spawns, a spawn whose lowered model is excluded, held-out sessions, mode
+// not `on`).
 export type Exploration = { explored: boolean; propensity: number; draw: number }
 
 export type Decision = {
@@ -666,15 +668,21 @@ function startTask(input: MainInput, cls: Classification): MainOutput {
   return { task, ended, decision: decisionOf(state, task, reason, wouldPassGate, exploration), relation: 'new_task', reassess: [] }
 }
 
-// The draw for a main-session task start: only in mode `on`, outside the
-// hold-out, with an epsilon in force and a seed and session to key it by.
-function exploreAt(input: MainInput, tier: Tier): Exploration | undefined {
-  const { state, session } = input
+// The draw for a task start, keyed by (seed, session, task id) so the ledger
+// can recompute it: only in mode `on`, outside the hold-out, with an epsilon
+// in force and a seed and session to key it by. At research nothing can be
+// lowered: not explored, propensity 1.
+export function drawAt(state: RouterState, session: string | null | undefined, taskId: string, tier: Tier): Exploration | undefined {
   if (state.mode !== 'on' || state.holdout || !(state.epsilon > 0) || !state.seed || !session) return undefined
-  const draw = explorationDraw(state.seed, session, input.newTaskId)
+  const draw = explorationDraw(state.seed, session, taskId)
   if (tier === 'research') return { explored: false, propensity: 1, draw }
   const explored = draw < state.epsilon
   return { explored, propensity: explored ? state.epsilon : 1 - state.epsilon, draw }
+}
+
+// The draw for a main-session task start.
+function exploreAt(input: MainInput, tier: Tier): Exploration | undefined {
+  return drawAt(input.state, input.session, input.newTaskId, tier)
 }
 
 // A task the next one replaced: no complaint followed it.
@@ -999,11 +1007,15 @@ export type SpawnDecision = {
 // `personModel` is a model the PERSON named for subagents (the active main
 // task's `subagentModel`). A model named inside the spawn's own prompt was
 // written by the parent agent: a preference relais overrides, never a pin.
+// `session` and `taskId` (the subagent task's id, minted before the spawn)
+// key the exploration draw; without them nothing is drawn.
 export function decideSpawn(input: {
   state: RouterState
   type: string
   cls: Classification | undefined
   personModel?: string | null
+  session?: string | null
+  taskId?: string
 }): SpawnDecision {
   const { state, type, cls } = input
   const pinned = state.pins[type]
@@ -1025,12 +1037,27 @@ export function decideSpawn(input: {
     }
   }
   if (!cls || !c) return { decision: undefined, isRouted: false, class: undefined }
-  const tier = tableTier(state.capability_table, c)
+  let tier = tableTier(state.capability_table, c)
   const model = state.tiers[tier].model
   if (cls.confidence < LOW_CONFIDENCE || state.excluded_models.includes(model)) {
     return { decision: { tier, model, effort: null, reason: 'abstained', override: false, wouldPassGate: true }, isRouted: false, class: c }
   }
-  return { decision: { tier, model, effort: state.tiers[tier].effort, reason: 'table', override: true, wouldPassGate: true }, isRouted: true, class: c }
+  // Exploration: below epsilon the subagent starts one tier lower, never
+  // below research, and never on a model the person excluded (then nothing
+  // is drawn). A new subagent has no cache, so no gate applies.
+  let exploration: Exploration | undefined
+  if (input.taskId) {
+    const lowered = stepDown(tier)
+    if (lowered === tier || !state.excluded_models.includes(state.tiers[lowered].model)) {
+      exploration = drawAt(state, input.session, input.taskId, tier)
+      if (exploration?.explored) tier = lowered
+    }
+  }
+  return {
+    decision: { tier, model: state.tiers[tier].model, effort: state.tiers[tier].effort, reason: 'table', override: true, wouldPassGate: true, exploration },
+    isRouted: true,
+    class: c,
+  }
 }
 
 // --- outcomes -------------------------------------------------------------------

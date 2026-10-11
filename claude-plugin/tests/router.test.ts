@@ -19,6 +19,7 @@ import {
   parseClassification,
   parseGateStamp,
   parseRouterState,
+  rerun,
   revertedPaths,
   sha256Hex,
   tableTier,
@@ -394,7 +395,7 @@ test('a drawn switch down that fails the cache gate is explored and not applied'
   expect(record).toMatchObject({ explored: true, applied: false, would_pass_gate: false })
 })
 
-test('held-out, shadow, epsilon 0, no session, continuations, corrections and subagents are never explored', () => {
+test('held-out, shadow, epsilon 0, no session, continuations and corrections are never explored', () => {
   const id = taskIdWhere(true)
   const held = decideMain({ ...mainInput(), state: { ...state, holdout: true }, session: SESSION, newTaskId: id })
   const shadow = decideMain({ ...mainInput(), state: { ...state, mode: 'shadow' }, session: SESSION, newTaskId: id })
@@ -412,8 +413,57 @@ test('held-out, shadow, epsilon 0, no session, continuations, corrections and su
   expect(next.task!.tier).toBe('research')
   const corrected = main({ task: started.task, cls: cls({ relation: 'correction' }), session: SESSION, newTaskId: id })
   expect(corrected.decision!.exploration).toBe(undefined)
-  const spawn = decideSpawn({ state, type: 'Explore', cls: cls() })
-  expect(spawn.decision!.exploration).toBe(undefined)
+})
+
+test('a table-routed spawn draws with its own task id; pins, person models, abstentions, excluded models, held-out and shadow spawns never draw', () => {
+  const below = taskIdWhere(true)
+  const drawn = decideSpawn({ state, type: 'Explore', cls: cls(), session: SESSION, taskId: below })
+  expect(drawn.isRouted).toBe(true)
+  expect(drawn.decision).toMatchObject({ tier: 'research', model: 'claude-haiku-5-5', reason: 'table', override: true, wouldPassGate: true })
+  expect(drawn.decision!.exploration).toMatchObject({ explored: true, propensity: 0.1 })
+  expect(drawn.decision!.exploration!.draw).toBe(explorationDraw(state.seed, SESSION, below))
+  const record = decisionRecord({ task: newTask(below, null, 'x', asClass(), 'research', 0), turnId: null, agentId: 'a1', relation: 'subagent', decision: drawn.decision!, mode: 'on', holdout: false, applied: true, now: 0 })
+  expect(record).toMatchObject({ task_id: below, explored: true, propensity: 0.1, applied: true })
+  const undrawn = decideSpawn({ state, type: 'Explore', cls: cls(), session: SESSION, taskId: taskIdWhere(false) })
+  expect(undrawn.decision).toMatchObject({ tier: 'implementation', model: 'claude-sonnet-5-5' })
+  expect(undrawn.decision!.exploration).toMatchObject({ explored: false, propensity: 0.9 })
+  const never = [
+    decideSpawn({ state, type: 'pinned-agent', cls: cls(), session: SESSION, taskId: below }),
+    decideSpawn({ state, type: 'Explore', cls: cls(), personModel: 'opus', session: SESSION, taskId: below }),
+    decideSpawn({ state, type: 'Explore', cls: cls({ confidence: 0.2 }), session: SESSION, taskId: below }),
+    decideSpawn({ state: { ...state, excluded_models: ['claude-haiku-5-5'] }, type: 'Explore', cls: cls(), session: SESSION, taskId: below }),
+    decideSpawn({ state: { ...state, holdout: true }, type: 'Explore', cls: cls(), session: SESSION, taskId: below }),
+    decideSpawn({ state: { ...state, mode: 'shadow' }, type: 'Explore', cls: cls(), session: SESSION, taskId: below }),
+    decideSpawn({ state, type: 'Explore', cls: cls(), taskId: below }),
+    decideSpawn({ state, type: 'Explore', cls: cls(), session: SESSION }),
+  ]
+  for (const out of never) {
+    expect(out.decision!.exploration).toBe(undefined)
+    expect(out.decision!.tier).not.toBe('research')
+  }
+  // The excluded lowered model keeps the table's tier, still routed.
+  expect(never[3].decision).toMatchObject({ tier: 'implementation', reason: 'table' })
+  expect(never[3].isRouted).toBe(true)
+})
+
+test('a drawn spawn starts one tier lower and its rerun keeps that floor', () => {
+  const below = taskIdWhere(true)
+  const drawn = decideSpawn({ state, type: 'Explore', cls: cls(), session: SESSION, taskId: below })
+  const task = newTask(below, 'a1', 'x', drawn.class!, drawn.decision!.tier, 0)
+  task.exploredDown = !!drawn.decision!.exploration?.explored
+  expect(task.tier).toBe('research')
+  const grown = rerun(state, task, 'scope_growth')
+  expect(grown.task.tier).toBe('research')
+  // Without the floor the table would raise it straight back.
+  const forgot = rerun(state, { ...task, exploredDown: false }, 'scope_growth')
+  expect(forgot.task.tier).toBe('implementation')
+})
+
+test('a research spawn records propensity 1 and explored false', () => {
+  const easy = decideSpawn({ state, type: 'Explore', cls: cls({ difficulty: 1, kind: 'question' }), session: SESSION, taskId: taskIdWhere(true) })
+  expect(easy.decision!.tier).toBe('research')
+  expect(easy.decision!.exploration).toMatchObject({ explored: false, propensity: 1 })
+  expect(easy.decision!.exploration!.draw).toBeLessThan(0.1)
 })
 
 test('10,000 seeded task starts at epsilon 0.1 explore 10% +/- 1%', () => {

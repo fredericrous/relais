@@ -80,6 +80,9 @@ pub const STRATA_SHOWN: usize = 5;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StratumRow {
     pub stratum: String,
+    /// `new_task` or `subagent`: main-session and spawn draws are separate
+    /// strata.
+    pub relation: String,
     pub kind: String,
     pub band: &'static str,
     pub scope: String,
@@ -109,6 +112,7 @@ pub fn exploration(
     let all = explore::strata(tasks);
     let row = |s: &StratumCounts| StratumRow {
         stratum: s.label(),
+        relation: s.relation.clone(),
         kind: s.kind.clone(),
         band: s.band,
         scope: s.scope.clone(),
@@ -137,7 +141,7 @@ impl ExplorationReport {
             return String::new();
         }
         let mut out = String::from(
-            "  exploration (strata: kind, difficulty band, scope; rates: corrected share):\n",
+            "  exploration (strata: kind, difficulty band, scope; rates: corrected share;\n   main = the person's session, sub = subagent spawn):\n",
         );
         for row in &self.strata {
             out.push_str(&format!(
@@ -564,7 +568,18 @@ mod tests {
     }
 
     fn explored(kind: &str, difficulty: u8, scope: &str, drawn: bool) -> ExplorationTask {
+        spawned("new_task", kind, difficulty, scope, drawn)
+    }
+
+    fn spawned(
+        relation: &str,
+        kind: &str,
+        difficulty: u8,
+        scope: &str,
+        drawn: bool,
+    ) -> ExplorationTask {
         ExplorationTask {
+            relation: relation.into(),
             kind: kind.into(),
             difficulty,
             scope: scope.into(),
@@ -609,17 +624,63 @@ mod tests {
         let tasks = vec![explored("edit", 3, "local", false)];
         let report = exploration(&tasks, None, now());
         let text = report.render();
-        assert!(text.contains("no projection: 0 drawn"), "{text}");
+        assert!(
+            text.contains("no projection: 0 of 20 drawn tasks"),
+            "{text}"
+        );
         assert!(!text.contains("projected 20"), "{text}");
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["strata"][0]["projection"]["state"], "no_draws");
         assert_eq!(json["strata"][0]["drawn"], 0);
+        assert_eq!(json["strata"][0]["relation"], "new_task");
     }
 
     #[test]
     fn a_stratum_with_draws_projects_the_day_it_reaches_twenty() {
         let tasks: Vec<_> = (0..5).map(|_| explored("edit", 3, "local", true)).collect();
         let text = exploration(&tasks, None, now()).render();
-        assert!(text.contains("20 drawn projected 2026-11-10"), "{text}");
+        assert!(
+            text.contains("5 of 20 drawn tasks, 20 projected 2026-11-10"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn strata_rows_name_their_relation_and_stay_within_80_columns() {
+        // The longest label: the longest kind, band and scope, for a spawn.
+        let mut tasks: Vec<_> = (0..3)
+            .map(|_| spawned("subagent", "question", 5, "cross-cutting", true))
+            .collect();
+        tasks.push(spawned("subagent", "question", 5, "cross-cutting", false));
+        tasks.push(explored("question", 5, "cross-cutting", false));
+        let report = exploration(&tasks, None, now());
+        assert_eq!(
+            report
+                .strata
+                .iter()
+                .map(|r| r.stratum.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "sub question d4-5 cross-cutting",
+                "main question d4-5 cross-cutting"
+            ]
+        );
+        assert_eq!(report.strata[0].relation, "subagent");
+        let text = report.render();
+        assert!(text.contains("sub = subagent spawn"), "{text}");
+        // Worst-case widths: five-digit counts and 100% rates on the longest
+        // label, with a projection line.
+        let mut wide = report.clone();
+        wide.strata[0].drawn = 99_999;
+        wide.strata[0].drawn_rate = Some(1.0);
+        wide.strata[0].undrawn = 99_999;
+        wide.strata[0].undrawn_rate = Some(1.0);
+        wide.strata[0].projection = Projection::On {
+            date: "2026-12-31".into(),
+            drawn: 19,
+        };
+        let text = wide.render();
+        let widest = text.lines().map(|l| l.chars().count()).max().unwrap();
+        assert!(widest <= 80, "{widest} columns:\n{text}");
     }
 }
