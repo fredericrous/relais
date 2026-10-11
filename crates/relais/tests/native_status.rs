@@ -106,7 +106,8 @@ fn approve(ledger: &Ledger, run: &str) {
             &RunId::from_stored(run),
             &DecisionAnswer {
                 resolution: Reason::DecisionApproved,
-                actor: "person",
+                actor: relais::ledger::Actor::Person,
+                person_quote: None,
                 note: None,
                 successor_run: None,
                 from_state: State::NeedsDecision,

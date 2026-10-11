@@ -1121,7 +1121,8 @@ argv = ["true"]
                 &run_id("run-a"),
                 &crate::ledger::DecisionAnswer {
                     resolution: crate::lifecycle::Reason::DecisionApproved,
-                    actor: "a person",
+                    actor: crate::ledger::Actor::Person,
+                    person_quote: None,
                     note: None,
                     successor_run: None,
                     from_state: State::NeedsDecision,
@@ -1168,7 +1169,14 @@ argv = ["true"]
             .expect("retire");
         fixture
             .ledger
-            .record_salvage_contained(&run_id(run), "abc123", "a person", None, contained)
+            .record_salvage_contained(
+                &run_id(run),
+                "abc123",
+                crate::ledger::Actor::Person,
+                None,
+                None,
+                contained,
+            )
             .expect("salvage")
             .expect("salvaged");
     }
@@ -1345,7 +1353,8 @@ argv = ["true"]
                 &run_id("run-a"),
                 &crate::ledger::DecisionAnswer {
                     resolution: Reason::DecisionApproved,
-                    actor: "a person",
+                    actor: crate::ledger::Actor::Person,
+                    person_quote: None,
                     note: None,
                     successor_run: None,
                     from_state: State::NeedsReview,

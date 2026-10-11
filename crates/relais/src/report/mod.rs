@@ -2100,7 +2100,8 @@ mod tests {
                 &run,
                 &crate::ledger::DecisionAnswer {
                     resolution: Reason::DecisionApproved,
-                    actor: "a person",
+                    actor: crate::ledger::Actor::Person,
+                    person_quote: None,
                     note: None,
                     successor_run: None,
                     from_state: State::NeedsDecision,
@@ -2176,7 +2177,8 @@ mod tests {
                 &run,
                 &crate::ledger::DecisionAnswer {
                     resolution: crate::lifecycle::Reason::DecisionRevised,
-                    actor: "fredericrous",
+                    actor: crate::ledger::Actor::Person,
+                    person_quote: None,
                     note: None,
                     successor_run: None,
                     from_state: State::NeedsReview,
@@ -2503,7 +2505,8 @@ mod tests {
                 &revised,
                 &crate::ledger::DecisionAnswer {
                     resolution: Reason::DecisionRevised,
-                    actor: "a person",
+                    actor: crate::ledger::Actor::Person,
+                    person_quote: None,
                     note: None,
                     successor_run: None,
                     from_state: State::NeedsReview,
@@ -2528,7 +2531,7 @@ mod tests {
             })
             .expect("transition");
         ledger
-            .record_salvage(&salvaged, "deadbeef", "a person", None)
+            .record_salvage(&salvaged, "deadbeef", crate::ledger::Actor::Person, None)
             .expect("salvage")
             .expect("a terminal run with no prior decision salvages");
 

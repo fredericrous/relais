@@ -343,9 +343,20 @@ enum Command {
         /// What the person decided
         #[arg(long = "answer")]
         answer: DecideAnswer,
-        /// Who is recording this decision
+        /// Who is deciding: `orchestrator` (the Claude Code session on its
+        /// own authority), `person` (the person, typing in their own
+        /// terminal) or `person-via-orchestrator` (the person said it, the
+        /// orchestrator typed it; needs `--person-quote`)
         #[arg(long = "actor")]
         actor: String,
+        /// The person's own words; required by, and only meaningful with,
+        /// `--actor person-via-orchestrator`
+        #[arg(long = "person-quote")]
+        person_quote: Option<String>,
+        /// Print one JSON object: `{run, resolution, actor, from_state,
+        /// to_state, advice}`, or `{error, exit}` on a refusal
+        #[arg(long)]
+        json: bool,
         /// Free-form context for the decision
         #[arg(long = "note")]
         note: Option<String>,
@@ -1359,19 +1370,23 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             run_id,
             answer,
             actor,
+            person_quote,
+            json,
             note,
             successor,
             criterion,
             candidate,
-        } => decide_command(
-            &run_id,
+        } => decide_command(DecideRequest {
+            run_id: &run_id,
             answer,
-            &actor,
-            note.as_deref(),
-            successor.as_deref(),
-            criterion.as_deref(),
-            candidate.as_deref(),
-        ),
+            actor: &actor,
+            person_quote: person_quote.as_deref(),
+            note: note.as_deref(),
+            successor: successor.as_deref(),
+            criterion: criterion.as_deref(),
+            candidate: candidate.as_deref(),
+            json,
+        }),
         Command::Evidence { cmd } => match cmd {
             EvidenceCommand::Attach {
                 run_id,
@@ -6995,20 +7010,179 @@ fn open_verification_gaps(ledger: &Ledger, run: &RunId) -> Result<Vec<String>, C
         .collect())
 }
 
-fn decide_command(
-    run_id: &str,
+/// One `relais decide` invocation's arguments, bundled because they
+/// answer one decision together.
+struct DecideRequest<'a> {
+    run_id: &'a str,
     answer: DecideAnswer,
-    actor: &str,
-    note: Option<&str>,
-    successor: Option<&str>,
-    criterion: Option<&str>,
-    candidate: Option<&str>,
-) -> Result<CliOutcome, CliError> {
+    actor: &'a str,
+    person_quote: Option<&'a str>,
+    note: Option<&'a str>,
+    successor: Option<&'a str>,
+    criterion: Option<&'a str>,
+    candidate: Option<&'a str>,
+    json: bool,
+}
+
+/// A refusal of a decision: the exit outcome and the sentence that says
+/// why. Printed to stderr, or as `{error, exit}` under `--json`.
+struct Refusal {
+    outcome: CliOutcome,
+    message: String,
+}
+
+fn refusal<T>(outcome: CliOutcome, message: impl Into<String>) -> Result<T, Refusal> {
+    Err(Refusal {
+        outcome,
+        message: message.into(),
+    })
+}
+
+/// What a recorded decision reports, for both the sentence and `--json`.
+struct Decided {
+    run: String,
+    resolution: Reason,
+    actor: relais::ledger::Actor,
+    from_state: State,
+    to_state: State,
+    advice: serde_json::Value,
+    sentence: String,
+}
+
+type Decision = Result<Decided, Refusal>;
+
+fn decide_command(request: DecideRequest<'_>) -> Result<CliOutcome, CliError> {
+    let json = request.json;
+    match decide_inner(&request) {
+        Ok(Ok(done)) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "run": done.run,
+                        "resolution": done.resolution.as_str(),
+                        "actor": done.actor.as_str(),
+                        "from_state": done.from_state.as_str(),
+                        "to_state": done.to_state.as_str(),
+                        "advice": done.advice,
+                    })
+                );
+            } else {
+                println!("{}", done.sentence);
+            }
+            Ok(CliOutcome::Accepted)
+        }
+        Ok(Err(refused)) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "error": refused.message,
+                        "exit": exit_code(&refused.outcome),
+                    })
+                );
+            } else {
+                eprintln!("relais decide: {}", refused.message);
+            }
+            Ok(refused.outcome)
+        }
+        Err(e) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "error": e.to_string(),
+                        "exit": exit_code(&e.outcome()),
+                    })
+                );
+            }
+            Err(e)
+        }
+    }
+}
+
+/// The checks that need only the arguments, run before the ledger is
+/// opened so a refused invocation touches nothing.
+fn check_decide_arguments(
+    request: &DecideRequest<'_>,
+    stdin_is_terminal: bool,
+) -> Result<relais::ledger::Actor, Refusal> {
+    use relais::ledger::Actor;
+    let actor = match Actor::parse(request.actor) {
+        Ok(actor) => actor,
+        Err(message) => return refusal(CliOutcome::InvalidInput, message),
+    };
+    let quote = request.person_quote.map(str::trim);
+    match (actor, quote) {
+        (Actor::PersonViaOrchestrator, None | Some("")) => {
+            return refusal(
+                CliOutcome::InvalidInput,
+                "`--actor person-via-orchestrator` requires `--person-quote <text>`: the \
+                 person's own words",
+            );
+        }
+        (Actor::PersonViaOrchestrator, Some(_)) => {}
+        (_, Some(_)) => {
+            return refusal(
+                CliOutcome::InvalidInput,
+                "`--person-quote` only applies to `--actor person-via-orchestrator`",
+            );
+        }
+        (_, None) => {}
+    }
+    if actor == Actor::Person && !stdin_is_terminal {
+        return refusal(
+            CliOutcome::InvalidInput,
+            "`--actor person` is for the person at their own terminal, and stdin is not one — \
+             run it from a terminal, or record it with `--actor person-via-orchestrator \
+             --person-quote <their words>`",
+        );
+    }
+    if request.criterion.is_some() {
+        match actor {
+            Actor::Orchestrator => {
+                return refusal(
+                    CliOutcome::InvalidInput,
+                    "`--criterion` signs off a human criterion and an orchestrator never does: \
+                     the person signs it off from their own terminal (`--actor person`)",
+                );
+            }
+            Actor::PersonViaOrchestrator => {
+                return refusal(
+                    CliOutcome::InvalidInput,
+                    "`--criterion` is refused for `--actor person-via-orchestrator` here: this \
+                     answer carries no plugin proof, so it cannot count as the person's \
+                     sign-off",
+                );
+            }
+            Actor::Person => {}
+        }
+    }
+    Ok(actor)
+}
+
+fn decide_inner(request: &DecideRequest<'_>) -> Result<Decision, CliError> {
+    use std::io::IsTerminal;
+    let actor = match check_decide_arguments(request, std::io::stdin().is_terminal()) {
+        Ok(actor) => actor,
+        Err(refused) => return Ok(Err(refused)),
+    };
+    let run_id = request.run_id;
+    let (answer, note, successor, criterion, candidate) = (
+        request.answer,
+        request.note,
+        request.successor,
+        request.criterion,
+        request.candidate,
+    );
+    let person_quote = request.person_quote.map(str::trim);
     let ledger = open_ledger()?;
     let run = RunId::from_stored(run_id);
     let Some(state) = operational(ledger.run_status(&run), "decide")? else {
-        eprintln!("relais decide: unknown run {run_id}");
-        return Ok(CliOutcome::UnknownRun);
+        return Ok(refusal(
+            CliOutcome::UnknownRun,
+            format!("unknown run {run_id}"),
+        ));
     };
     // `salvaged` answers a run no other answer can reach: one whose
     // candidate a person finished and merged themselves, whether the run
@@ -7023,6 +7197,7 @@ fn decide_command(
             state,
             &SalvageAnswer {
                 actor,
+                person_quote,
                 note,
                 criterion,
                 successor,
@@ -7031,20 +7206,24 @@ fn decide_command(
         );
     }
     if !state.awaits_a_person() {
-        eprintln!(
-            "relais decide: run {run_id} is {state}, not waiting on a person — nothing to decide"
-        );
-        return Ok(CliOutcome::InvalidInput);
+        return Ok(refusal(
+            CliOutcome::InvalidInput,
+            format!("run {run_id} is {state}, not waiting on a person — nothing to decide"),
+        ));
     }
     if let Some(criterion_id) = criterion {
         if answer != DecideAnswer::Approve {
-            eprintln!("relais decide: `--criterion` only applies to `--answer approve`");
-            return Ok(CliOutcome::InvalidInput);
+            return Ok(refusal(
+                CliOutcome::InvalidInput,
+                "`--criterion` only applies to `--answer approve`",
+            ));
         }
         let Some((contract, _tier)) = operational(ledger.run_contract_and_tier(&run), "decide")?
         else {
-            eprintln!("relais decide: run {run_id} carries no recorded contract");
-            return Ok(CliOutcome::OperationalFailure);
+            return Ok(refusal(
+                CliOutcome::OperationalFailure,
+                format!("run {run_id} carries no recorded contract"),
+            ));
         };
         let declared: Vec<String> = contract.acceptance.iter().map(|entry| entry.id()).collect();
         let Some(entry) = contract
@@ -7052,12 +7231,14 @@ fn decide_command(
             .iter()
             .find(|entry| entry.id() == criterion_id)
         else {
-            eprintln!(
-                "relais decide: run {run_id} names no acceptance criterion `{criterion_id}` — \
-                 this contract declares: {}",
-                declared.join(", ")
-            );
-            return Ok(CliOutcome::InvalidInput);
+            return Ok(refusal(
+                CliOutcome::InvalidInput,
+                format!(
+                    "run {run_id} names no acceptance criterion `{criterion_id}` — \
+                     this contract declares: {}",
+                    declared.join(", ")
+                ),
+            ));
         };
         // Signing off a criterion the contract settles some OTHER way is
         // the second acceptance path this whole mechanism exists to
@@ -7068,20 +7249,22 @@ fn decide_command(
         // untrue about how the criterion was met, and a receipt nobody
         // can trust is worse than a run that stays blocked.
         if !matches!(entry.evidence(), Some(Evidence::HumanSignOff)) {
-            eprintln!(
-                "relais decide: acceptance criterion `{criterion_id}` is not settled by a human \
-                 sign-off but by {} — a sign-off answers only a criterion that asked for one",
-                match entry.evidence() {
-                    Some(Evidence::Check { name }) => format!("check `{name}`"),
-                    Some(Evidence::Test { authorship, .. }) =>
-                        format!("a test ({})", authorship_label(*authorship)),
-                    Some(Evidence::LlmReview) => "an LLM review".to_string(),
-                    Some(Evidence::AmontGate { gate }) => format!("amont gate `{gate}`"),
-                    Some(Evidence::HumanSignOff) => unreachable!("guarded above"),
-                    None => "the verification profile as a whole".to_string(),
-                }
-            );
-            return Ok(CliOutcome::InvalidInput);
+            return Ok(refusal(
+                CliOutcome::InvalidInput,
+                format!(
+                    "acceptance criterion `{criterion_id}` is not settled by a human \
+                     sign-off but by {} — a sign-off answers only a criterion that asked for one",
+                    match entry.evidence() {
+                        Some(Evidence::Check { name }) => format!("check `{name}`"),
+                        Some(Evidence::Test { authorship, .. }) =>
+                            format!("a test ({})", authorship_label(*authorship)),
+                        Some(Evidence::LlmReview) => "an LLM review".to_string(),
+                        Some(Evidence::AmontGate { gate }) => format!("amont gate `{gate}`"),
+                        Some(Evidence::HumanSignOff) => unreachable!("guarded above"),
+                        None => "the verification profile as a whole".to_string(),
+                    }
+                ),
+            ));
         }
         operational(
             ledger.record_human_signoff(&run, criterion_id, actor, note),
@@ -7092,42 +7275,56 @@ fn decide_command(
     if answer == DecideAnswer::Approve {
         let gaps = open_verification_gaps(&ledger, &run)?;
         if !gaps.is_empty() {
-            eprintln!(
-                "relais decide: run {run_id} still carries verification gaps ({}) — a waiver is \
-                 a policy or contract change, never a CLI flag",
-                gaps.join("; ")
-            );
-            return Ok(CliOutcome::InvalidInput);
+            return Ok(refusal(
+                CliOutcome::InvalidInput,
+                format!(
+                    "run {run_id} still carries verification gaps ({}) — a waiver is \
+                     a policy or contract change, never a CLI flag",
+                    gaps.join("; ")
+                ),
+            ));
         }
     }
     let successor_run = successor.map(RunId::from_stored);
     let resolution = answer.resolution();
+    let to_state = answer.terminal_state();
     let resolved = operational(
         ledger.resolve_decision(
             &run,
             &relais::ledger::DecisionAnswer {
                 resolution,
                 actor,
+                person_quote,
                 note,
                 successor_run: successor_run.as_ref(),
                 from_state: state,
-                to_state: answer.terminal_state(),
+                to_state,
             },
         ),
         "decide",
     )?;
     if !resolved {
-        eprintln!("relais decide: run {run_id} has no open decision on record");
-        return Ok(CliOutcome::InvalidInput);
+        return Ok(refusal(
+            CliOutcome::InvalidInput,
+            format!("run {run_id} has no open decision on record"),
+        ));
     }
-    println!("recorded {} for {run_id} by {actor}", resolution.as_str());
-    Ok(CliOutcome::Accepted)
+    Ok(Ok(Decided {
+        run: run_id.to_string(),
+        resolution,
+        actor,
+        from_state: state,
+        to_state,
+        advice: operational(ledger.decision_advice(&run), "decide")?,
+        sentence: format!("recorded {} for {run_id} by {actor}", resolution.as_str()),
+    }))
 }
 
 /// The CLI flags `--answer salvaged` reads, grouped because they answer
 /// one decision together (mirrors [`relais::ledger::DecisionAnswer`]).
 struct SalvageAnswer<'a> {
-    actor: &'a str,
+    actor: relais::ledger::Actor,
+    person_quote: Option<&'a str>,
     note: Option<&'a str>,
     criterion: Option<&'a str>,
     successor: Option<&'a str>,
@@ -7137,7 +7334,7 @@ struct SalvageAnswer<'a> {
 /// `relais decide --answer salvaged --candidate <sha>`: a run relais
 /// itself never accepted, whose candidate a person finished and merged
 /// anyway (SPEC's decision spine) — terminal, or still waiting on a
-/// person. Distinct from every other answer in `decide_command`: a run
+/// person. Distinct from every other answer in `decide_inner`: a run
 /// that never awaited a person opened no decision row for
 /// `resolve_decision` to close, and even a run that IS waiting is
 /// answered here rather than there, because this is about what happened
@@ -7149,29 +7346,37 @@ fn salvage_command(
     run: &RunId,
     state: State,
     answer: &SalvageAnswer<'_>,
-) -> Result<CliOutcome, CliError> {
+) -> Result<Decision, CliError> {
     let Some(candidate_sha) = answer.candidate else {
-        eprintln!("relais decide: `--answer salvaged` requires `--candidate <sha>`");
-        return Ok(CliOutcome::InvalidInput);
+        return Ok(refusal(
+            CliOutcome::InvalidInput,
+            "`--answer salvaged` requires `--candidate <sha>`",
+        ));
     };
     if answer.criterion.is_some() {
-        eprintln!("relais decide: `--criterion` does not apply to `--answer salvaged`");
-        return Ok(CliOutcome::InvalidInput);
+        return Ok(refusal(
+            CliOutcome::InvalidInput,
+            "`--criterion` does not apply to `--answer salvaged`",
+        ));
     }
     if answer.successor.is_some() {
-        eprintln!("relais decide: `--successor` does not apply to `--answer salvaged`");
-        return Ok(CliOutcome::InvalidInput);
+        return Ok(refusal(
+            CliOutcome::InvalidInput,
+            "`--successor` does not apply to `--answer salvaged`",
+        ));
     }
     // Salvage answers a run that has stopped running, without relais
     // itself producing an accepted candidate: never one still in flight,
     // never one already accepted the ordinary way or already salvaged
     // once.
     if !state.is_terminal() || state.is_accepted() {
-        eprintln!(
-            "relais decide: run {run} is {state} — `salvaged` answers a run that has already \
-             stopped without an accepted candidate, not one still in flight or already accepted"
-        );
-        return Ok(CliOutcome::InvalidInput);
+        return Ok(refusal(
+            CliOutcome::InvalidInput,
+            format!(
+                "run {run} is {state} — `salvaged` answers a run that has already \
+                 stopped without an accepted candidate, not one still in flight or already accepted"
+            ),
+        ));
     }
     // Whether the verified candidate patch survives intact in the commit a
     // person landed is computed here, once, from the run's own evidence;
@@ -7179,25 +7384,41 @@ fn salvage_command(
     // (NULL) and said so, never guessed.
     let contained = salvage_containment(ledger, run, candidate_sha)?;
     let Some(original_reason) = operational(
-        ledger.record_salvage_contained(run, candidate_sha, answer.actor, answer.note, contained),
+        ledger.record_salvage_contained(
+            run,
+            candidate_sha,
+            answer.actor,
+            answer.person_quote,
+            answer.note,
+            contained,
+        ),
         "decide",
     )?
     else {
-        eprintln!("relais decide: run {run} already carries a decision on record");
-        return Ok(CliOutcome::InvalidInput);
+        return Ok(refusal(
+            CliOutcome::InvalidInput,
+            format!("run {run} already carries a decision on record"),
+        ));
     };
-    println!(
-        "recorded {} for {run} by {} (originally ended: {}; candidate contained: {})",
-        Reason::DecisionSalvaged.as_str(),
-        answer.actor,
-        original_reason.as_str(),
-        match contained {
-            Some(true) => "yes",
-            Some(false) => "no",
-            None => "unknown",
-        }
-    );
-    Ok(CliOutcome::Accepted)
+    Ok(Ok(Decided {
+        run: run.to_string(),
+        resolution: Reason::DecisionSalvaged,
+        actor: answer.actor,
+        from_state: state,
+        to_state: State::AcceptedByPerson,
+        advice: operational(ledger.decision_advice(run), "decide")?,
+        sentence: format!(
+            "recorded {} for {run} by {} (originally ended: {}; candidate contained: {})",
+            Reason::DecisionSalvaged.as_str(),
+            answer.actor,
+            original_reason.as_str(),
+            match contained {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "unknown",
+            }
+        ),
+    }))
 }
 
 /// Whether `run`'s latest verified candidate patch reverse-applies on
@@ -8196,7 +8417,8 @@ mod tests {
                 &revised,
                 &relais::ledger::DecisionAnswer {
                     resolution: Reason::DecisionRevised,
-                    actor: "a person",
+                    actor: relais::ledger::Actor::Person,
+                    person_quote: None,
                     note: None,
                     successor_run: None,
                     from_state: State::NeedsReview,
@@ -8221,7 +8443,7 @@ mod tests {
             })
             .expect("transition");
         ledger
-            .record_salvage(&salvaged, "deadbeef", "a person", None)
+            .record_salvage(&salvaged, "deadbeef", relais::ledger::Actor::Person, None)
             .expect("salvage")
             .expect("a terminal run with no prior decision salvages");
 
