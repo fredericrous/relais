@@ -315,6 +315,7 @@ fn entry_files(dir: &Path) -> Vec<(String, PathBuf)> {
 /// writer has usually exited by then.
 fn finish_ended(id: &str, path: &Path, e: &Entry, ended: u64, runs: &mut Runs) -> Vec<Value> {
     let mut events = Vec::new();
+    let was_closed = matches!(runs.get(id), Some(r) if r.closed);
     match runs.remove(id) {
         Some(run) if run.closed => {}
         seen => {
@@ -330,7 +331,7 @@ fn finish_ended(id: &str, path: &Path, e: &Entry, ended: u64, runs: &mut Runs) -
         if err.kind() != io::ErrorKind::NotFound {
             // Keep the run, closed, so the next poll does not announce the
             // same entry again every 250 ms; say why once.
-            if !runs.contains_key(id) {
+            if !was_closed {
                 eprintln!(
                     "relais quiet watch: cannot remove {}: {err}",
                     path.display()
@@ -388,7 +389,16 @@ pub fn poll(dir: &Path, runs: &mut Runs, now_ms: u64) -> Vec<Value> {
                 events.extend(finish_vanished(id, run, now_ms));
             }
         } else if age_ms(path, now_ms).is_some_and(|age| age > STALE_MS) {
-            let _ = fs::remove_file(path);
+            // Nothing is announced for a stale entry, so a failed delete only
+            // loses the file's removal; the next poll tries again.
+            if let Err(err) = fs::remove_file(path) {
+                if err.kind() != io::ErrorKind::NotFound {
+                    eprintln!(
+                        "relais quiet watch: cannot remove {}: {err}",
+                        path.display()
+                    );
+                }
+            }
         }
     }
     let present: Vec<&String> = files.iter().map(|(id, _)| id).collect();
@@ -538,6 +548,13 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        // Root deletes from a 0500 directory anyway: then the stuck path
+        // cannot be exercised here, and the test says nothing.
+        let probe = dir.join("probe");
+        if fs::write(&probe, "").is_ok() {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
         let mut runs = Runs::new();
         let first = poll(&dir, &mut runs, now);
         let second = poll(&dir, &mut runs, now + 250);
