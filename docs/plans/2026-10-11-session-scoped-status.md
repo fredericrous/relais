@@ -345,11 +345,72 @@ A bug report (run `run-65d7dca899789-2d73`) showed four defects:
 - **PR:** one PR, worktree from `origin/main`, branch
   `fix/session-scoped-status`. Merge on green with the implementation
   review.
-- **Release:** cut `v0.13.0`. It is a minor version for the new tool and
+- **Release:** cut `v0.15.0` (v0.13.0 and v0.14.0 were taken meanwhile; see the Decision log). It is a minor version for the new tool and
   subcommands, and the binary and plugin must ship together. Then run step
   2 of Verification against the installed release.
-- **Migration:** binaries older than v26 refuse a v26 ledger
+- **Migration:** binaries older than v28 refuse a v28 ledger
   (`ledger/mod.rs:2316`). The upgrade runs `relais coordinator stop`
   before the new binary is used, and the CHANGELOG says so.
+
+## Verification results
+
+The pre-push checks ran on 2026-10-11. They used the worktree's release
+build (`0e23cc1`) on an isolated copy of the live ledger: 31 runs from 9
+sessions, today. The ledger was v27, and the daemon migrated it to v28.
+
+| Check | Input | Expected | Actual |
+|---|---|---|---|
+| Scoping, this session | `native status --session 3aa68d2b…` | only this session's runs | 9 runs, all with `session` 3aa68d2b… ✅ |
+| Scoping, another session | `--session 16e94aad…` | only that session's runs | 4 runs, all with `session` 16e94aad… ✅ |
+| Scoping, empty | `--session nobody` | `{"runs":[]}`, exit 0 | as expected ✅ |
+| Orphan reap, alive | running run, live driver pid | not reaped | `running`, verdict `alive` ✅ |
+| Orphan reap, `kill -9` | the driver killed, daemon running | `interrupted` within 15 s, one outcome line | `driver_gone` 4.8 s after the run went live; 1 new outcome line with the full sentence; one daemon log line ✅ |
+| Cancel, no session | `native cancel --run X` | exit 2, names the flag | exit 2, "--session is required" ✅ |
+| Cancel, unknown run | `--run run-nope` | exit 10 | exit 10 ✅ |
+| Cancel, already ended | the reaped run | "already ended: interrupted", exit 0 | as expected ✅ |
+| Cancel, foreign live | another session's run, driver just took it | exit 11 | exit 11, names the session ✅ |
+| Cancel, foreign gone | another session's run, dead driver | "had no live driver; marked cancelled", exit 0 | as expected; `cancelled` / `cancelled_without_worker` ✅ |
+| Cancel, own live | this session's run, driver ignores it | "cancel requested; the driver has not ended yet" after 10 s | as expected, exit 0 ✅ |
+| Stalled | injected threshold | `stalled: true` | `native_status` test with `RELAIS_STALLED_AFTER_SECS` ✅ |
+| Per-turn cost, plugin | per-turn booking through the runner's stopped path | the rest booked once, one phase | runner and ledger tests; 251 plugin tests ✅ |
+
+The live plugin's per-turn booking in a real Claude Code session is
+checked against the installed release, as Landing says.
+
+## Decision log
+
+- **Release number.** v0.13.0 and v0.14.0 were released from `main` while
+  this branch was in progress. The driver migration is therefore **v28**,
+  not v26, and this work ships as **v0.15.0**.
+- **v27 and free-text actors.** v0.14.0's typed-actor migration (v27)
+  refused the live ledger. Four decision rows held a free-text actor this
+  session had passed to `relais decide`. Those rows were re-spelled
+  `claude-orchestrator`, after a backup at
+  `~/.local/state/relais/ledger.sqlite.bak-20261011-actor-fix`, and v27
+  then migrated the ledger normally.
+- **v27 hard refusal.** v27 refuses the whole ledger on an unmapped actor
+  spelling. This is left to the person: it is upstream and outside this
+  plan.
+- **First status after upgrade.** `native status` never migrates, so on a
+  v27 ledger `--session` prints `{"runs":[]}` (with a stderr line) until
+  a writer migrates it. The daemon's first start does that.
+- **"Resume re-entry" stamps no live driver.** In relais, resume
+  reconciles a run; it does not re-drive one. Its stamp lands on a run it
+  moves to `interrupted`, which is terminal. Decide re-entry is the real
+  re-entry, and it is stamped.
+- **Daemon log.** The on-demand daemon had stderr set to /dev/null, so it
+  now writes `coordinator.log` (0600, rotated past 1 MiB) in the state
+  directory. Without it, reap lines and sweep errors were lost.
+- **`coordinator cancel` on an unknown run** now exits 10 (unknown run)
+  instead of 0. This is in the CHANGELOG.
+- **How the work was done.** It went through relais in nine runs. Several
+  of them ran out of the 45-minute wall clock, because this repository's
+  `make check` takes 12–20 minutes per verification. Review findings
+  (relais's own reviewer) were fixed in this session, and each decision
+  is recorded in the ledger as `orchestrator`.
+- **Rebase.** The intermediate commits were replayed without hooks. Every
+  slice's tree was checked: either the gate ran before the rebase, or a
+  relais baseline ran on the rebased HEAD. The push gate runs `make
+  check` on the final tree.
 
 <!-- panel: repos=relais reviewers=backend,lang:rust,tui,unix body-sha=2552bb4c132a -->
