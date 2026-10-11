@@ -49,6 +49,33 @@ export async function startCycle(fx: Fx, store: Store): Promise<void> {
   }
 }
 
+// Starts `relais resume --retire --all` at session start and lets it go: it
+// interrupts the runs whose driver is gone and retires their worktrees. Not a
+// run, no pane note, no outcome message; a failure to start is silent.
+export async function startResumeSweep(fx: Fx, store: Store): Promise<void> {
+  try {
+    const dir = stateDir({ home: await fx.env.home(), stateDir: await fx.env.stateDir() })
+    if (dir === undefined) return
+    const session = await fx.session.id()
+    const request = {
+      argv: ['relais', 'resume', '--retire', '--all', '--log', `${dir}/resume.log`],
+      ...(store.router.cwd ? { cwd: store.router.cwd } : {}),
+      env: { RELAIS_HOST: 'claude-code-mod', RELAIS_SESSION_ID: session },
+    }
+    const stream = fx.process.spawn(request)
+    void (async () => {
+      try {
+        let step = await stream.next()
+        while (!step.done) step = await stream.next()
+      } catch {
+        // Fail open: the sweep is tried again at the next session.
+      }
+    })()
+  } catch {
+    // Fail open.
+  }
+}
+
 // One pane note when the detached cycle could not be started; the cycle is
 // tried again at the next session.
 async function noteSpawnFailure(fx: Fx, store: Store, error: unknown): Promise<void> {

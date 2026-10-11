@@ -10,7 +10,7 @@ import { DENY_MESSAGE, isRelaisNotification, isRelaisType, relaisAddresses } fro
 import { childOf, contractPath, onChunk, pump, reloadTimeline, startReplay, startRun, statusOf } from './runs.ts'
 import { onboardTool, onPersonPrompt, trustTool, withRoutingSection } from './consent.ts'
 import { learningEnvelopeGuard, machineSettingsGuard, routerEnvelopeGuard } from './guards.ts'
-import { learningCommand, noteLastCycle, startCycle } from './learning.ts'
+import { learningCommand, noteLastCycle, startCycle, startResumeSweep } from './learning.ts'
 import {
   afterStep,
   beforeStep,
@@ -116,6 +116,8 @@ export function register(on: any) {
         await startCycle(fx, store)
       })(),
     )
+    // Orphaned runs are reconciled in the background; nothing is announced.
+    detach(startResumeSweep(fx, store))
     await $.tool.register({
       name: 'run',
       description:

@@ -54,6 +54,13 @@ pub enum Reason {
     ProcessCrash,
     CancelledByUser,
     ReconciledInterrupted,
+    /// The driving `relais run` of a non-terminal run is gone: its
+    /// `events.jsonl` stayed silent past the attempt wall time plus a
+    /// margin, and no live driver would (SPEC §12).
+    DriverGone,
+    /// `relais coordinator cancel --run` found no bound worker process to
+    /// signal, so nothing else would ever end the run.
+    CancelledWithoutWorker,
     BlockedPreflight,
     EscalationNotAuthorized,
     ModelUnavailable,
@@ -155,7 +162,7 @@ impl Reason {
     ///
     /// The length is fixed, so a variant added to the enum without being
     /// added here does not compile the `match` that walks it.
-    pub const ALL: [Self; 52] = [
+    pub const ALL: [Self; 54] = [
         Self::ChecksAndReviewPassed,
         Self::BehavioralFailure,
         Self::RepairExhausted,
@@ -170,6 +177,8 @@ impl Reason {
         Self::ProcessCrash,
         Self::CancelledByUser,
         Self::ReconciledInterrupted,
+        Self::DriverGone,
+        Self::CancelledWithoutWorker,
         Self::BlockedPreflight,
         Self::EscalationNotAuthorized,
         Self::ModelUnavailable,
@@ -226,6 +235,8 @@ impl Reason {
             Self::ProcessCrash => "process_crash",
             Self::CancelledByUser => "cancelled_by_user",
             Self::ReconciledInterrupted => "reconciled_interrupted",
+            Self::DriverGone => "driver_gone",
+            Self::CancelledWithoutWorker => "cancelled_without_worker",
             Self::BlockedPreflight => "blocked_preflight",
             Self::EscalationNotAuthorized => "escalation_not_authorized",
             Self::ModelUnavailable => "model_unavailable",

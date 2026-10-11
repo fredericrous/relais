@@ -6,6 +6,20 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## Unreleased
+
+Runs whose driver is gone no longer sit `running` for ever. A non-terminal run
+whose `events.jsonl` has been silent for longer than its attempt wall time
+plus 15 minutes is moved to `interrupted` (reason `driver_gone`) by
+`relais resume <run>` or `relais resume --retire [--all]`, and with
+`--retire` its worktree is retired, tracked work exported first. A run with
+a live worker process is never interrupted, and the wall time is read from the
+run's own repository. `relais coordinator cancel --run` of a run with no bound
+worker process interrupts it only when it is also orphaned, and otherwise
+leaves it to its driver. The plugin runs
+`relais resume --retire --all` detached at session start, logging to
+`resume.log` in the state directory. `relais resume` gains `--log <file>`.
+
 ## v0.12.0
 
 relais starts learning: it retrains itself on a schedule and says why it has
