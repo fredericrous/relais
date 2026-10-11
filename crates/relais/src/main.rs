@@ -4556,9 +4556,12 @@ fn open_status_ledger() -> Result<(Ledger, bool), CurrentUnknown> {
         return Err(CurrentUnknown::NoLedger(path));
     }
     let read_only = Ledger::open_read_only(&path).map_err(CurrentUnknown::Ledger)?;
+    // `Ledger::open` on a ledger it cannot write falls back to a read-only
+    // connection, whatever the cause (mode, owner, mount, ACL): SQLite's
+    // own answer decides, not a guess from permission bits.
     Ok(match Ledger::open(&path) {
-        Ok(writable) => (writable, true),
-        Err(_) => (read_only, false),
+        Ok(ledger) if ledger.is_read_only().is_ok_and(|ro| !ro) => (ledger, true),
+        Ok(_) | Err(_) => (read_only, false),
     })
 }
 
@@ -4607,16 +4610,26 @@ fn current_of_run(
     };
     let silent = run_silence(ledger, &run).map_err(|e| CurrentUnknown::Other(e.to_string()))?;
     let mut orphaned = false;
+    let mut verdict_seen = None;
     if !state.is_terminal() {
-        let verdict = orphan_verdict_of_run(ledger, &run, silent)
+        let mut verdict = orphan_verdict_of_run(ledger, &run, silent)
             .map_err(|e| CurrentUnknown::Other(e.to_string()))?;
         if verdict != resume::OrphanVerdict::Alive {
             if writable {
                 state = reap_for_status(ledger, &run, state, verdict, silent)
                     .map_err(|e| CurrentUnknown::Other(e.to_string()))?;
+                // Not reaped (a dispatch lives): the run is alive, and
+                // the verdict says so rather than contradicting the state.
+                if !state.is_terminal() {
+                    verdict = resume::OrphanVerdict::Alive;
+                }
             } else {
                 orphaned = true;
             }
+        }
+        // A verdict describes a run still open; a reaped one has its state.
+        if !state.is_terminal() {
+            verdict_seen = Some(verdict);
         }
     }
     let decision = ledger.decision_of_run(&run).map_err(ledgered)?;
@@ -4640,6 +4653,14 @@ fn current_of_run(
     }
     if orphaned {
         current["orphaned"] = true.into();
+    }
+    if let Some(verdict) = verdict_seen {
+        current["verdict"] = match verdict {
+            resume::OrphanVerdict::Alive => "alive",
+            resume::OrphanVerdict::Silent => "silent",
+            resume::OrphanVerdict::Gone => "gone",
+        }
+        .into();
     }
     Ok(Some(current))
 }
@@ -6344,24 +6365,35 @@ fn interrupt_orphan(
     let events_dir = paths::runs_dir()
         .map_err(CliError::Home)?
         .join(run.as_str());
-    let reaped = operational(
-        relais::reap::reap(
-            ledger,
-            &relais::reap::Reap {
-                run,
-                from: state,
-                ending: relais::reap::Ending::Interrupted,
-                detail: orphan.detail(),
-                extra: serde_json::json!({
-                    "silent_seconds": orphan.silent.as_secs(),
-                    "threshold_seconds": orphan.threshold.as_secs(),
-                }),
-                events_dir: &events_dir,
-            },
-            &|pid| relais::coordinator::process_alive(pid.get()),
-        ),
-        "resume",
-    )?;
+    let reaped = relais::reap::reap(
+        ledger,
+        &relais::reap::Reap {
+            run,
+            from: state,
+            ending: relais::reap::Ending::Interrupted,
+            detail: orphan.detail(),
+            extra: serde_json::json!({
+                "silent_seconds": orphan.silent.as_secs(),
+                "threshold_seconds": orphan.threshold.as_secs(),
+            }),
+            events_dir: &events_dir,
+        },
+        &|pid| relais::coordinator::process_alive(pid.get()),
+    );
+    let reaped = match reaped {
+        Ok(reaped) => reaped,
+        // The ledger holds the reap; only the events file missed it.
+        Err(e @ relais::reap::ReapError::EventsNotWritten { .. }) => {
+            eprintln!("relais resume: {e}");
+            return Ok(OrphanOutcome::Ended(State::Interrupted));
+        }
+        Err(e) => {
+            return Err(CliError::Operational {
+                operation: "resume",
+                cause: Box::new(e),
+            })
+        }
+    };
     match reaped {
         relais::reap::Reaped::Moved(message) => {
             println!("{message}");

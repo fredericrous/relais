@@ -431,6 +431,10 @@ fn status_reaps_a_run_whose_driver_is_gone_and_leaves_one_outcome() {
         let json = world.json_with(&["--run", "run-gone"], &[]);
         assert_eq!(json["current"]["state"], "interrupted", "{json}");
         assert_eq!(json["outcome"]["state"], "interrupted", "{json}");
+        assert!(
+            json["current"].get("verdict").is_none(),
+            "a verdict describes an open run, not a reaped one: {json}"
+        );
     }
     let text = std::fs::read_to_string(world.events_path("run-gone")).expect("events");
     let outcomes = text
@@ -440,11 +444,77 @@ fn status_reaps_a_run_whose_driver_is_gone_and_leaves_one_outcome() {
     assert_eq!(outcomes, 1, "{text}");
 }
 
+/// A run whose driver is gone: a dead pid, stamped long ago.
+fn with_dead_driver(world: &World, run: &str) {
+    let mut child = std::process::Command::new("true").spawn().expect("child");
+    let dead = child.id();
+    child.wait().expect("wait");
+    let long_ago = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    let conn = rusqlite::Connection::open(world.ledger_path()).expect("conn");
+    conn.execute(
+        "UPDATE runs SET driver_pid = ?1, driver_started = 'gone', driver_since = ?2 WHERE id = ?3",
+        rusqlite::params![dead, long_ago, run],
+    )
+    .expect("driver");
+}
+
+fn ledger_state(world: &World, run: &str) -> Option<State> {
+    let conn = rusqlite::Connection::open(world.ledger_path()).expect("conn");
+    let state: Option<String> = conn
+        .query_row(
+            "SELECT to_state FROM transitions WHERE run_id = ?1 ORDER BY id DESC LIMIT 1",
+            [run],
+            |row| row.get(0),
+        )
+        .ok();
+    state.map(|s| match s.as_str() {
+        "running" => State::Running,
+        other => panic!("unexpected state {other}"),
+    })
+}
+
+#[test]
+fn a_non_terminal_run_carries_the_orphan_verdict() {
+    let world = World::new("verdict");
+    running(&world.ledger(), "run-v", Some("s"));
+    world.events("run-v", "none");
+    let alive = world.json_with(&["--run", "run-v"], &[]);
+    assert_eq!(alive["current"]["verdict"], "alive", "{alive}");
+    // A gone driver on a writable ledger is reaped at once: the state says
+    // so, and no verdict contradicts it (the read-only case keeps "gone").
+    with_dead_driver(&world, "run-v");
+    let reaped = world.json_with(&["--run", "run-v"], &[]);
+    assert_eq!(reaped["current"]["state"], "interrupted", "{reaped}");
+    assert!(reaped["current"].get("verdict").is_none(), "{reaped}");
+}
+
+#[test]
+fn a_read_only_ledger_reports_the_orphan_and_writes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let world = World::new("rolock");
+    running(&world.ledger(), "run-rl", Some("s"));
+    world.events("run-rl", "none");
+    with_dead_driver(&world, "run-rl");
+    let before = std::fs::read_to_string(world.events_path("run-rl")).expect("events");
+    let path = world.ledger_path();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).expect("chmod");
+    let json = world.json_with(&["--run", "run-rl"], &[]);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    assert_eq!(json["current"]["orphaned"], true, "{json}");
+    assert_eq!(json["current"]["state"], "running", "{json}");
+    assert_eq!(json["current"]["verdict"], "gone", "{json}");
+    assert_eq!(ledger_state(&world, "run-rl"), Some(State::Running));
+    let after = std::fs::read_to_string(world.events_path("run-rl")).expect("events");
+    assert_eq!(before, after);
+}
+
 #[test]
 fn a_ledger_on_another_schema_is_not_reaped() {
     let world = World::new("noreap");
     running(&world.ledger(), "run-ro", Some("s"));
     world.events("run-ro", "none");
+    with_dead_driver(&world, "run-ro");
+    let events_before = std::fs::read_to_string(world.events_path("run-ro")).expect("events");
     let conn = rusqlite::Connection::open(world.ledger_path()).expect("conn");
     conn.execute(
         "INSERT INTO schema_migrations (version, applied_at) VALUES ('v999', 'now')",
@@ -454,4 +524,8 @@ fn a_ledger_on_another_schema_is_not_reaped() {
     drop(conn);
     let json = world.json_with(&["--run", "run-ro"], &[]);
     assert!(json.get("current").is_none(), "{json}");
+    assert_eq!(ledger_state(&world, "run-ro"), Some(State::Running));
+    let events_after = std::fs::read_to_string(world.events_path("run-ro")).expect("events");
+    assert_eq!(events_before, events_after);
+    assert!(!events_after.lines().any(|l| l.contains("interrupted")));
 }

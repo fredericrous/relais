@@ -2639,6 +2639,14 @@ impl Ledger {
         })
     }
 
+    /// Whether SQLite opened this connection read-only. [`Self::open`] on a
+    /// file it cannot write (another owner, a read-only mount, an ACL)
+    /// falls back to a read-only connection without an error; this is the
+    /// one answer that covers every such cause.
+    pub fn is_read_only(&self) -> Result<bool> {
+        Ok(self.conn.is_readonly(rusqlite::DatabaseName::Main)?)
+    }
+
     /// The ledger for reading only, when there is one this binary can read.
     ///
     /// Unlike [`Self::open`], this creates no directory and no file,

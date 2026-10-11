@@ -3568,6 +3568,44 @@ fn an_orphaned_run_is_interrupted_and_its_worktree_retired() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn an_orphan_whose_events_cannot_be_written_is_still_interrupted_and_retired() {
+    use std::os::unix::fs::PermissionsExt;
+    let world = World::new("orphanevents");
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    let task = world.write_task("task.json", "off");
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(5), "{}", text(&run.stderr));
+    let run_id = world.only_run_id();
+    make_non_terminal(&world, &run_id, std::time::Duration::from_secs(3 * 3600));
+    let leftover = leftover_worktree(&world, &run_id);
+    let events = world.state.join("runs").join(&run_id).join("events.jsonl");
+    let mode = |path: &std::path::Path, bits| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).expect("chmod");
+    };
+    mode(&events, 0o444);
+    let swept = world.relais(&["resume", "--retire", "--all"]);
+    mode(&events, 0o644);
+    let out = text(&swept.stdout);
+    assert_eq!(
+        swept.status.code(),
+        Some(0),
+        "{out}\n{}",
+        text(&swept.stderr)
+    );
+    assert!(!leftover.exists(), "the worktree is retired: {out}");
+    let ledger =
+        relais::ledger::Ledger::open(&world.state.join("ledger.sqlite")).expect("open ledger");
+    assert_eq!(
+        ledger
+            .run_status(&relais::ids::RunId::from_stored(&run_id))
+            .expect("status"),
+        Some(relais::lifecycle::State::Interrupted)
+    );
+}
+
 fn leftover_verify_base(world: &World, run_id: &str) -> PathBuf {
     let checkout = world.state.join("verify").join(run_id).join("verify-base");
     git(
