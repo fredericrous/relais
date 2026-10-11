@@ -33,7 +33,7 @@ pub use router::{
     RouterTaskRow, RouterUsageRow, RouterWindow,
 };
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 27;
+pub const LEDGER_SCHEMA_VERSION: u64 = 28;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -1674,6 +1674,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
     END;
     "#,
     ),
+    (
+        // The process that drives a run, recorded when it takes the run:
+        // its pid, that process's start time (a reused pid has another),
+        // and when it took the run. Additive and nullable: a row written
+        // before this step has no driver on record, never a guessed one.
+        "v28",
+        r#"
+    ALTER TABLE runs ADD COLUMN driver_pid INTEGER;
+    ALTER TABLE runs ADD COLUMN driver_started TEXT;
+    ALTER TABLE runs ADD COLUMN driver_since TEXT;
+    "#,
+    ),
 ];
 
 /// `advice_p_approve, advice_model, advice_revision, advice_null_reason`.
@@ -2401,6 +2413,24 @@ fn append_transition(tx: &rusqlite::Transaction<'_>, transition: &Transition) ->
     Ok(())
 }
 
+/// Record this process as the run's driver: its pid, its start time (the
+/// token that tells a reused pid from the driver) and when it took the run.
+/// Runs inside the caller's transaction, so the driver is on record in the
+/// same commit as the transition that makes it the driver.
+fn stamp_driver(tx: &rusqlite::Transaction<'_>, run: &RunId, now: &str) -> Result<()> {
+    let pid = std::process::id();
+    tx.execute(
+        "UPDATE runs SET driver_pid = ?2, driver_started = ?3, driver_since = ?4 WHERE id = ?1",
+        params![
+            run.as_str(),
+            i64::from(pid),
+            crate::procs::start_time(pid),
+            now
+        ],
+    )?;
+    Ok(())
+}
+
 /// A run's status as a projection of its transition history (P3): the
 /// last transition's `to_state`, falling back to the `runs.status` column
 /// only for a row with no transition at all — an old ledger's run, written
@@ -2695,6 +2725,7 @@ impl Ledger {
                 task.as_str()
             ],
         )?;
+        stamp_driver(&tx, id, &now)?;
         tx.commit()?;
         Ok(())
     }
@@ -2729,6 +2760,7 @@ impl Ledger {
                 task.as_str()
             ],
         )?;
+        stamp_driver(&tx, id, &now)?;
         tx.commit()?;
         Ok(())
     }
@@ -3437,8 +3469,49 @@ impl Ledger {
     /// waiting on a person without a row recording that it started to.
     /// Nothing here closes one: only `resolve_decision` does that.
     pub fn record_transition(&self, transition: &Transition) -> Result<()> {
+        self.record_transition_inner(transition, false)
+    }
+
+    /// [`Self::record_transition`] by a process that re-enters a run (a
+    /// resume): the same transaction also records that process as the
+    /// run's driver.
+    pub fn record_transition_as_driver(&self, transition: &Transition) -> Result<()> {
+        self.record_transition_inner(transition, true)
+    }
+
+    /// Compare-and-set: record `transition` only when the run's projected
+    /// state is `expected_from`, all inside one `BEGIN IMMEDIATE`. Returns
+    /// whether it wrote. A driver whose run was reaped meanwhile (the state
+    /// moved on) writes nothing, so it can never overwrite the reap.
+    pub fn transition_if(&self, expected_from: State, transition: &Transition) -> Result<bool> {
         let tx = self.write_tx()?;
-        append_transition(&tx, transition)?;
+        let current: Option<String> = tx
+            .query_row(
+                &format!("SELECT {PROJECTED_STATUS} FROM runs WHERE id = ?1"),
+                [transition.run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current.as_deref() != Some(expected_from.as_str()) {
+            return Ok(false);
+        }
+        self.write_transition(&tx, transition)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    fn record_transition_inner(&self, transition: &Transition, as_driver: bool) -> Result<()> {
+        let tx = self.write_tx()?;
+        self.write_transition(&tx, transition)?;
+        if as_driver {
+            stamp_driver(&tx, &transition.run_id, &transition.at)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn write_transition(&self, tx: &Transaction<'_>, transition: &Transition) -> Result<()> {
+        append_transition(tx, transition)?;
         if transition.to_state.awaits_a_person() {
             let task_id: Option<String> = tx
                 .query_row(
@@ -3468,7 +3541,6 @@ impl Ledger {
                 ],
             )?;
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -3590,6 +3662,7 @@ impl Ledger {
                     at: now.clone(),
                 },
             )?;
+            stamp_driver(&tx, run_id, &now)?;
         }
         tx.commit()?;
         Ok(changed > 0)
@@ -3769,9 +3842,10 @@ impl Ledger {
                 to_state: State::AcceptedByPerson,
                 reason: Reason::DecisionSalvaged.as_str().to_string(),
                 detail: Some(serde_json::json!({ "candidate_sha": candidate_sha })),
-                at: now,
+                at: now.clone(),
             },
         )?;
+        stamp_driver(&tx, run_id, &now)?;
         tx.commit()?;
         Ok(Some(original_reason))
     }
@@ -8729,6 +8803,248 @@ mod tests {
         let history = ledger.transitions(&run("run-t")).expect("history");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].to_state, State::Blocked);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn driver_of(ledger: &Ledger, id: &str) -> (Option<i64>, Option<String>, Option<String>) {
+        ledger
+            .conn
+            .query_row(
+                "SELECT driver_pid, driver_started, driver_since FROM runs WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("driver columns")
+    }
+
+    fn assert_driver_recorded(ledger: &Ledger, id: &str) {
+        let (pid, started, since) = driver_of(ledger, id);
+        assert_eq!(pid, Some(i64::from(std::process::id())), "{id}: pid");
+        assert!(started.is_some(), "{id}: start time");
+        assert!(since.is_some(), "{id}: since");
+    }
+
+    fn step(run_id: &str, from: State, to: State) -> Transition {
+        Transition {
+            run_id: run(run_id),
+            attempt_id: None,
+            from_state: Some(from),
+            to_state: to,
+            reason: crate::lifecycle::Reason::BlockedPreflight.as_str().into(),
+            detail: None,
+            at: now_rfc3339(),
+        }
+    }
+
+    /// A ledger frozen at v26 upgrades to v28: the three driver columns
+    /// appear, NULL on the row written before them.
+    #[test]
+    fn v28_adds_the_driver_columns_to_an_older_ledger() {
+        assert_eq!(LEDGER_SCHEMA_VERSION, 28);
+        let dir = temp_dir("v26-to-v28");
+        let path = dir.join("ledger.sqlite");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );",
+            )
+            .expect("migrations table");
+            // Up to v26: v27 (the typed actor) and v28 run in `open`.
+            for (version, sql) in &MIGRATIONS[..26] {
+                conn.execute_batch(sql).expect("apply step");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, "then"],
+                )
+                .expect("record step");
+            }
+            conn.execute(
+                "INSERT INTO runs (id, repo_path, status, created_at, updated_at)
+                 VALUES ('run-old', '/r', 'prepared', 'then', 'then')",
+                [],
+            )
+            .expect("a run written before v28");
+        }
+        let ledger = Ledger::open(&path).expect("upgrade");
+        assert_eq!(ledger.schema_version().expect("version"), 28);
+        assert_eq!(driver_of(&ledger, "run-old"), (None, None, None));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every way a process takes a run records it as the driver.
+    #[test]
+    fn every_driver_entry_point_records_the_driver() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-root"), "/r", None, &task("run-root"), "rk")
+            .expect("insert_run");
+        assert_driver_recorded(&ledger, "run-root");
+
+        ledger
+            .insert_child_run(
+                &run("run-child"),
+                "/r",
+                None,
+                ChildOf {
+                    parent_run: &run("run-root"),
+                    package_id: &PackageId::from_stored("pkg-1"),
+                },
+                &task("run-root"),
+                "rk",
+            )
+            .expect("insert_child_run");
+        assert_driver_recorded(&ledger, "run-child");
+
+        // Resume: a transition recorded by the re-entering process.
+        ledger
+            .insert_run(&run("run-resume"), "/r", None, &task("run-resume"), "rk")
+            .expect("run");
+        ledger
+            .conn
+            .execute(
+                "UPDATE runs SET driver_pid = NULL, driver_started = NULL, driver_since = NULL",
+                [],
+            )
+            .expect("clear");
+        ledger
+            .record_transition_as_driver(&step("run-resume", State::Prepared, State::Interrupted))
+            .expect("resume");
+        assert_driver_recorded(&ledger, "run-resume");
+
+        // Decide re-entry: a person's answer.
+        ledger
+            .insert_run(&run("run-decide"), "/r", None, &task("run-decide"), "rk")
+            .expect("run");
+        ledger
+            .record_transition(&step("run-decide", State::Prepared, State::NeedsDecision))
+            .expect("raise");
+        ledger
+            .conn
+            .execute(
+                "UPDATE runs SET driver_pid = NULL, driver_started = NULL, driver_since = NULL",
+                [],
+            )
+            .expect("clear");
+        let answered = ledger
+            .resolve_decision(
+                &run("run-decide"),
+                &DecisionAnswer {
+                    resolution: Reason::DecisionApproved,
+                    actor: Actor::Person,
+                    person_quote: None,
+                    recorded_via: crate::ledger::RecordedVia::Cli,
+                    note: None,
+                    successor_run: None,
+                    from_state: State::NeedsDecision,
+                    to_state: State::Accepted,
+                },
+            )
+            .expect("decide");
+        assert!(answered);
+        assert_driver_recorded(&ledger, "run-decide");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transition_if_writes_nothing_when_the_state_differs() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-c"), "/r", None, &task("run-c"), "rk")
+            .expect("run");
+        let wrote = ledger
+            .transition_if(
+                State::Verifying,
+                &step("run-c", State::Verifying, State::Blocked),
+            )
+            .expect("cas");
+        assert!(!wrote);
+        assert!(ledger
+            .transitions(&run("run-c"))
+            .expect("history")
+            .is_empty());
+        assert_eq!(
+            ledger.run_status(&run("run-c")).expect("status"),
+            Some(State::Prepared)
+        );
+        let wrote = ledger
+            .transition_if(
+                State::Prepared,
+                &step("run-c", State::Prepared, State::Blocked),
+            )
+            .expect("cas");
+        assert!(wrote);
+        assert_eq!(
+            ledger.run_status(&run("run-c")).expect("status"),
+            Some(State::Blocked)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn two_concurrent_transition_ifs_leave_one_row() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-r"), "/r", None, &task("run-r"), "rk")
+            .expect("run");
+        let path = ledger.path().to_path_buf();
+        let handles: Vec<_> = [State::Blocked, State::Interrupted]
+            .into_iter()
+            .map(|to| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let ledger = Ledger::open(&path).expect("open");
+                    ledger
+                        .transition_if(State::Prepared, &step("run-r", State::Prepared, to))
+                        .expect("cas")
+                })
+            })
+            .collect();
+        let wrote: Vec<bool> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread"))
+            .collect();
+        assert_eq!(wrote.iter().filter(|w| **w).count(), 1, "{wrote:?}");
+        assert_eq!(ledger.transitions(&run("run-r")).expect("history").len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A driver whose run was reaped to interrupted from outside writes
+    /// no row when it later tries to move the run on.
+    #[test]
+    fn a_driver_transition_after_a_reap_writes_no_row() {
+        let (ledger, dir) = temp_ledger();
+        ledger
+            .insert_run(&run("run-g"), "/r", None, &task("run-g"), "rk")
+            .expect("run");
+        ledger
+            .transition_if(
+                State::Prepared,
+                &step("run-g", State::Prepared, State::Verifying),
+            )
+            .expect("driver moves");
+        // The reaper.
+        assert!(ledger
+            .transition_if(
+                State::Verifying,
+                &step("run-g", State::Verifying, State::Interrupted)
+            )
+            .expect("reap"));
+        // The driver's own next and final transitions.
+        for to in [State::Accepted, State::Failed] {
+            assert!(!ledger
+                .transition_if(State::Verifying, &step("run-g", State::Verifying, to))
+                .expect("late"));
+        }
+        let history = ledger.transitions(&run("run-g")).expect("history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].to_state, State::Interrupted);
+        assert_eq!(
+            ledger.run_status(&run("run-g")).expect("status"),
+            Some(State::Interrupted)
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
