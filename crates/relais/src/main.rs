@@ -4948,13 +4948,16 @@ fn reap_for_status(
 
 /// Why this `relais run` must not start, if it must not: it comes from the
 /// relais plugin, whose session said hello recently, on a Claude Code the
-/// plugin supports. `installed` is what `claude --version` printed.
+/// plugin supports. `installed` is what `claude --version` printed;
+/// `probe_failure` is why the probe could not say, when it could not.
 fn run_refusal(
     gate: &dyn Gate,
     session: &str,
     installed: Option<&str>,
+    probe_failure: Option<&str>,
 ) -> Result<Option<String>, GateError> {
-    if let Some(detail) = relais::native::unsupported_claude_code(installed) {
+    if let Some(detail) = relais::native::unsupported_claude_code_because(installed, probe_failure)
+    {
         return Ok(Some(detail));
     }
     Ok(relais::native::hello_refusal(
@@ -5011,11 +5014,13 @@ fn run_command(
     let gate = relais::coordinator::RemoteGate::new(socket);
     // Before anything is dispatched: the plugin of this session is alive,
     // and the Claude Code it runs on is one the plugin supports.
-    let capabilities = backend.probe();
-    let installed = capabilities
+    let report = backend.probe_report();
+    let installed = report
         .as_ref()
+        .ok()
         .and_then(|capabilities| capabilities.version.as_deref());
-    match run_refusal(&gate, &session.id, installed) {
+    let probe_failure = report.as_ref().err().map(ToString::to_string);
+    match run_refusal(&gate, &session.id, installed, probe_failure.as_deref()) {
         Ok(None) => {}
         Ok(Some(detail)) => return Err(CliError::Usage { detail }),
         Err(e) => {
@@ -5028,7 +5033,7 @@ fn run_command(
     }
     // Learned routing reads the registry's active artifact, pinned for
     // this run (SPEC §17); disabled routing leaves everything else intact.
-    let harness = capabilities.as_ref().map(|capabilities| {
+    let harness = report.as_ref().ok().map(|capabilities| {
         format!(
             "{} {}",
             backend.name(),
@@ -5478,11 +5483,13 @@ fn replay_command(
     let session = relais::coordinator::resolve_session();
     // Before the checkout and before anything is dispatched: the plugin of
     // this session is alive, on a Claude Code it supports.
-    let capabilities = backend.probe();
-    let installed = capabilities
+    let report = backend.probe_report();
+    let installed = report
         .as_ref()
+        .ok()
         .and_then(|capabilities| capabilities.version.as_deref());
-    match run_refusal(&gate, &session.id, installed) {
+    let probe_failure = report.as_ref().err().map(ToString::to_string);
+    match run_refusal(&gate, &session.id, installed, probe_failure.as_deref()) {
         Ok(None) => {}
         Ok(Some(detail)) => return Err(CliError::Usage { detail }),
         Err(e) => {
@@ -8129,20 +8136,33 @@ mod tests {
     fn a_run_is_refused_without_a_recent_hello_or_on_a_claude_code_outside_the_range() {
         let gate = relais::admission::LocalGate::new(Default::default());
         let supported = Some("2.1.291 (Claude Code)");
-        let silent = run_refusal(&gate, "s1", supported)
+        let silent = run_refusal(&gate, "s1", supported, None)
             .expect("answers")
             .expect("no hello is refused");
         assert!(silent.contains("hello"), "{silent}");
         gate.native_hello("s1").expect("hello");
-        assert_eq!(run_refusal(&gate, "s1", supported).expect("answers"), None);
-        assert!(run_refusal(&gate, "other", supported)
+        assert_eq!(
+            run_refusal(&gate, "s1", supported, None).expect("answers"),
+            None
+        );
+        assert!(run_refusal(&gate, "other", supported, None)
             .expect("answers")
             .is_some());
-        let old = run_refusal(&gate, "s1", Some("2.1.0 (Claude Code)"))
+        let old = run_refusal(&gate, "s1", Some("2.1.0 (Claude Code)"), None)
             .expect("answers")
             .expect("refused");
         assert!(old.contains(relais::native::SUPPORTED_CLAUDE_CODE), "{old}");
         assert!(old.contains("2.1.0"), "{old}");
+        let failed = run_refusal(
+            &gate,
+            "s1",
+            None,
+            Some("`claude --version` killed by signal 9"),
+        )
+        .expect("answers")
+        .expect("refused");
+        assert!(failed.contains("killed by signal 9"), "{failed}");
+        assert!(!failed.contains("printed nothing"), "{failed}");
     }
 
     /// A session transcript: one assistant message with this id.
