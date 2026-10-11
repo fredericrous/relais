@@ -18,6 +18,17 @@ unknown and tokens by model. The ledger is refused (exit 3) when it is a
 symlink, someone else's, or open to group or other. Nothing routes on these
 labels yet.
 
+Workers, planners and reviewers now see the repository's aval guidance
+without the contract naming it. A worker prompt carries the index of active
+constraint ids (with the `aval rule <id>` line) and the decisions and rules
+aval ranks as relevant to the write scope and objective; the planner gets
+the ranking; the reviewer, which cannot run aval, gets the full statement of
+every constraint. Guidance is advisory and never blocks a run: a missing or
+failing aval is a recorded gap (`guidance:` line in the receipt, only when
+there is one), it has its own 16 KiB budget, and it never counts toward a
+sizing problem. `architecture.keys` stays the binding way to depend on a
+decision.
+
 ## v0.12.1
 
 Runs that died stop holding their worktrees: relais reconciles them itself
