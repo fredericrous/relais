@@ -50,6 +50,7 @@ an `agent_id` as task outcomes.
 
 ## Decision log
 - 2026-10-11 — pointer plan: the decision and the reviews live in amont-agent.
+- 2026-10-11 — the amont gate does not run `scripts/check-module-cycles.py` while `make lint` and CI do (`ci.mirrors-the-local-check`); adding it to `amont.conf` needs the person's `amont trust`, so it is left for them.
 - 2026-10-11 — the report's merge line counts only what the relais ledger holds
   (router tasks with `outcome_source = 'merge'`): a `command` merge leaves no
   task and no row here, so "N applied by command" is printed by the ingest's
@@ -62,7 +63,7 @@ an `agent_id` as task outcomes.
 
 ## Implementation review
 
-- Round 1 `approve` (32k, 21 s); relais Phase 3 only.
+- Round 1 `approve` (32k, 21 s), Delta `approve` (35k, 9 s) after CI's module-cycle check failed: `record_merge_outcome` takes the outcome's name and rank so the ledger does not import the router; relais Phase 3 only.
 - deliberate: the EMPTY sentence stays above a merge line when no class exists yet — it is true, no reviewer outcome has been labelled.
 - deliberate: a merge row whose task is already settled is a silent no-op — the `WHERE outcome = 'unknown'` guard is the rule, not an omission.
 - deliberate: `#[allow(dead_code)]` with a doc comment rather than `#[expect(reason)]` — cosmetic, not worth a code change after the review.
