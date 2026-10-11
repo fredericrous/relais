@@ -8,6 +8,14 @@ missing here.
 
 ## Unreleased
 
+`relais resume --retire [--all|<run>]` also removes the verification checkouts
+(`<state>/verify/<run>/verify-base` and any per-attempt one) a run left behind
+when it died mid-verification, which were never listed before. They hold no
+work, so nothing is exported; a terminal run whose dispatches are provably
+dead loses them, a checkout with a modified tracked file is kept and reported,
+and a run that is not terminal keeps them. Each removal prints the run, the
+path and the bytes reclaimed.
+
 Runs whose driver is gone no longer sit `running` for ever. A non-terminal run
 whose `events.jsonl` has been silent for longer than its attempt wall time
 plus 15 minutes is moved to `interrupted` (reason `driver_gone`) by

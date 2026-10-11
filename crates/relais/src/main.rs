@@ -6090,16 +6090,13 @@ fn reconcile_run(ledger: &Ledger, run: &RunId) -> Result<resume::Reconciliation,
 fn retire_all_command() -> Result<CliOutcome, CliError> {
     let ledger = open_ledger()?;
     let state_dir = paths::state_dir().map_err(CliError::Home)?;
-    let retained = operational(
-        workspace::retained_worktrees(&state_dir),
-        "listing the retained worktrees",
-    )?;
+    let retained = retained_with_verification(&state_dir)?;
     if retained.is_empty() {
         println!("no run worktree is retained under {}", state_dir.display());
         return Ok(CliOutcome::Accepted);
     }
     let mut failed = false;
-    for worktree in retained {
+    for (worktree, kind) in retained {
         let run = RunId::from_stored(worktree.run_id.clone());
         let Some(state) = operational(ledger.run_status(&run), "resume")? else {
             println!(
@@ -6132,7 +6129,7 @@ fn retire_all_command() -> Result<CliOutcome, CliError> {
             continue;
         };
         let reconciliation = reconcile_run(&ledger, &run)?;
-        match retire_worktree(&ledger, &run, state, &reconciliation, &worktree.path)? {
+        match retire_any(&ledger, &run, state, &reconciliation, &worktree.path, kind)? {
             Retired::Retired => {}
             Retired::Kept => failed = true,
         }
@@ -6144,6 +6141,92 @@ fn retire_all_command() -> Result<CliOutcome, CliError> {
     })
 }
 
+/// What a retained checkout is: a task worktree (tracked work exported
+/// first) or a verification checkout (holds no work, removed as is).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckoutKind {
+    Task,
+    Verification,
+}
+
+/// Every retained task worktree and verification checkout, in that order.
+fn retained_with_verification(
+    state_dir: &Path,
+) -> Result<Vec<(workspace::RetainedWorktree, CheckoutKind)>, CliError> {
+    let tasks = operational(
+        workspace::retained_worktrees(state_dir),
+        "listing the retained worktrees",
+    )?;
+    let verifications = operational(
+        workspace::retained_verify_worktrees(state_dir),
+        "listing the retained verification checkouts",
+    )?;
+    Ok(tasks
+        .into_iter()
+        .map(|w| (w, CheckoutKind::Task))
+        .chain(
+            verifications
+                .into_iter()
+                .map(|w| (w, CheckoutKind::Verification)),
+        )
+        .collect())
+}
+
+fn retire_any(
+    ledger: &Ledger,
+    run: &RunId,
+    state: State,
+    reconciliation: &resume::Reconciliation,
+    path: &Path,
+    kind: CheckoutKind,
+) -> Result<Retired, CliError> {
+    match kind {
+        CheckoutKind::Task => retire_worktree(ledger, run, state, reconciliation, path),
+        CheckoutKind::Verification => Ok(retire_verification_checkout(run, reconciliation, path)),
+    }
+}
+
+/// One verification checkout of a terminal run: removed once its
+/// dispatches are provably dead, unless a tracked file was modified.
+fn retire_verification_checkout(
+    run: &RunId,
+    reconciliation: &resume::Reconciliation,
+    path: &Path,
+) -> Retired {
+    if !reconciliation.all_provably_dead() {
+        println!(
+            "{run}: kept, a dispatch may still write it: {} ({})",
+            reconciliation.refusal(),
+            path.display()
+        );
+        return Retired::Kept;
+    }
+    match workspace::retire_verification(path) {
+        Ok(workspace::VerifyRetirement::Removed { bytes_reclaimed }) => {
+            println!(
+                "{run}: removed verification checkout {} — {bytes_reclaimed} bytes reclaimed",
+                path.display()
+            );
+            Retired::Retired
+        }
+        Ok(workspace::VerifyRetirement::Modified { files }) => {
+            println!(
+                "{run}: kept, verification checkout {} has tracked modifications: {}",
+                path.display(),
+                files.join("; ")
+            );
+            Retired::Kept
+        }
+        Err(e) => {
+            eprintln!(
+                "relais resume: {run}: kept, {} could not be removed: {e}",
+                path.display()
+            );
+            Retired::Kept
+        }
+    }
+}
+
 /// Retire every worktree one terminal run still holds.
 fn retire_run(
     ledger: &Ledger,
@@ -6152,20 +6235,17 @@ fn retire_run(
     reconciliation: &resume::Reconciliation,
 ) -> Result<CliOutcome, CliError> {
     let state_dir = paths::state_dir().map_err(CliError::Home)?;
-    let retained: Vec<_> = operational(
-        workspace::retained_worktrees(&state_dir),
-        "listing the retained worktrees",
-    )?
-    .into_iter()
-    .filter(|worktree| worktree.run_id == run.as_str())
-    .collect();
+    let retained: Vec<_> = retained_with_verification(&state_dir)?
+        .into_iter()
+        .filter(|(worktree, _)| worktree.run_id == run.as_str())
+        .collect();
     if retained.is_empty() {
         println!("{run}: no worktree is retained");
         return Ok(CliOutcome::Accepted);
     }
     let mut failed = false;
-    for worktree in retained {
-        match retire_worktree(ledger, run, state, reconciliation, &worktree.path)? {
+    for (worktree, kind) in retained {
+        match retire_any(ledger, run, state, reconciliation, &worktree.path, kind)? {
             Retired::Retired => {}
             Retired::Kept => failed = true,
         }
