@@ -31,6 +31,16 @@ pub const DEFAULT_WALL_SECONDS: u64 = 2700;
 /// records it, so no live driver is silent for longer.
 pub const DRIVER_MARGIN: Duration = Duration::from_secs(15 * 60);
 
+/// How long a non-terminal run may write nothing before status flags it
+/// `stalled`. A hint for a reader, never a verdict: it reaps nothing.
+pub const STALLED_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// Whether a run silent for `silent` is stalled past `after` (injected, so a
+/// test needs no ten-minute wait).
+pub fn is_stalled(silent: Duration, after: Duration) -> bool {
+    silent >= after
+}
+
 /// A non-terminal run whose driver has stopped writing for too long.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Orphan {
@@ -401,6 +411,15 @@ pub fn reconcile_with_sessions(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_run_is_stalled_only_past_the_injected_threshold() {
+        let after = Duration::from_secs(60);
+        assert!(is_stalled(Duration::from_secs(60), after));
+        assert!(is_stalled(Duration::from_secs(120), after));
+        assert!(!is_stalled(Duration::from_secs(5), after));
+        assert_eq!(STALLED_AFTER, Duration::from_secs(600));
+    }
+
     use super::*;
     use crate::ids::RunId;
 

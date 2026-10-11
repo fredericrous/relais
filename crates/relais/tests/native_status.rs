@@ -316,3 +316,142 @@ fn a_ledger_on_another_schema_is_not_read() {
     assert!(json.get("current").is_none(), "{json}");
     assert!(stderr.contains("migration"), "{stderr}");
 }
+
+/// A run still `running`, as a driver that never stamped itself leaves it.
+fn running(ledger: &Ledger, run: &str, session: Option<&str>) {
+    let id = RunId::from_stored(run);
+    ledger
+        .insert_run(&id, "/repo", session, &TaskId::from_stored(run), "rk")
+        .expect("run");
+    ledger
+        .record_transition(&Transition {
+            run_id: id,
+            attempt_id: None,
+            from_state: Some(State::Prepared),
+            to_state: State::Running,
+            reason: Reason::WorkerDispatched.as_str().into(),
+            detail: None,
+            at: ledger.now(),
+        })
+        .expect("running");
+}
+
+impl World {
+    fn status_with(&self, args: &[&str], envs: &[(&str, &str)]) -> Output {
+        let mut cmd = common::relais(BIN);
+        cmd.args(["native", "status"])
+            .args(args)
+            .current_dir(&self.root)
+            .env("RELAIS_STATE_DIR", &self.state)
+            .env("RELAIS_CONFIG_DIR", self.root.join("cfg"))
+            .env("HOME", &self.root)
+            .env("USERPROFILE", &self.root);
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        cmd.output().expect("relais runs")
+    }
+
+    fn json_with(&self, args: &[&str], envs: &[(&str, &str)]) -> serde_json::Value {
+        let output = self.status_with(args, envs);
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice(&output.stdout).expect("one JSON object")
+    }
+
+    fn events_path(&self, run: &str) -> PathBuf {
+        self.state.join("runs").join(run).join("events.jsonl")
+    }
+}
+
+#[test]
+fn a_session_with_no_runs_prints_an_empty_list_and_exits_zero() {
+    let world = World::new("sess0");
+    // No ledger at all.
+    assert_eq!(
+        world.json_with(&["--session", "nobody"], &[]),
+        serde_json::json!({ "runs": [] })
+    );
+    // A ledger that holds only another session's run.
+    running(&world.ledger(), "run-other", Some("sess-other"));
+    assert_eq!(
+        world.json_with(&["--session", "nobody"], &[]),
+        serde_json::json!({ "runs": [] })
+    );
+    let mine = world.json_with(&["--session", "sess-other"], &[]);
+    assert_eq!(mine["runs"].as_array().expect("runs").len(), 1, "{mine}");
+    assert_eq!(mine["runs"][0]["current"]["session"], "sess-other");
+}
+
+#[test]
+fn a_run_silent_past_the_stall_threshold_is_stalled_and_a_recent_one_is_not() {
+    let world = World::new("stall");
+    running(&world.ledger(), "run-st", Some("s"));
+    world.events("run-st", "none");
+    let events = std::fs::File::options()
+        .write(true)
+        .open(world.events_path("run-st"))
+        .expect("events");
+    events
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))
+        .expect("mtime");
+    drop(events);
+    let stalled = world.json_with(&["--run", "run-st"], &[("RELAIS_STALLED_AFTER_SECS", "60")]);
+    assert_eq!(stalled["current"]["stalled"], true, "{stalled}");
+    assert!(stalled["current"]["silent_seconds"].as_u64().expect("secs") >= 120);
+    assert_eq!(
+        stalled["current"]["state"], "running",
+        "never reaped by stall"
+    );
+    let recent = world.json_with(
+        &["--run", "run-st"],
+        &[("RELAIS_STALLED_AFTER_SECS", "3600")],
+    );
+    assert!(recent["current"].get("stalled").is_none(), "{recent}");
+}
+
+#[test]
+fn status_reaps_a_run_whose_driver_is_gone_and_leaves_one_outcome() {
+    let world = World::new("reap");
+    let ledger = world.ledger();
+    running(&ledger, "run-gone", Some("s"));
+    // A pid that is certainly dead: a child that has been waited for.
+    let mut child = std::process::Command::new("true").spawn().expect("child");
+    let dead = child.id();
+    child.wait().expect("wait");
+    let long_ago = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    let conn = rusqlite::Connection::open(world.ledger_path()).expect("conn");
+    conn.execute(
+        "UPDATE runs SET driver_pid = ?1, driver_started = 'gone', driver_since = ?2 WHERE id = 'run-gone'",
+        rusqlite::params![dead, long_ago],
+    )
+    .expect("driver");
+    drop(conn);
+    drop(ledger);
+    for _ in 0..2 {
+        let json = world.json_with(&["--run", "run-gone"], &[]);
+        assert_eq!(json["current"]["state"], "interrupted", "{json}");
+        assert_eq!(json["outcome"]["state"], "interrupted", "{json}");
+    }
+    let text = std::fs::read_to_string(world.events_path("run-gone")).expect("events");
+    let outcomes = text
+        .lines()
+        .filter(|l| l.contains("\"kind\":\"outcome\""))
+        .count();
+    assert_eq!(outcomes, 1, "{text}");
+}
+
+#[test]
+fn a_ledger_on_another_schema_is_not_reaped() {
+    let world = World::new("noreap");
+    running(&world.ledger(), "run-ro", Some("s"));
+    world.events("run-ro", "none");
+    let conn = rusqlite::Connection::open(world.ledger_path()).expect("conn");
+    conn.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES ('v999', 'now')",
+        [],
+    )
+    .expect("a newer step");
+    drop(conn);
+    let json = world.json_with(&["--run", "run-ro"], &[]);
+    assert!(json.get("current").is_none(), "{json}");
+}

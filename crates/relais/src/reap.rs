@@ -38,6 +38,40 @@ pub enum Reaped {
     KeptAlive(String),
 }
 
+/// Why a reap did not complete cleanly.
+#[derive(Debug)]
+pub enum ReapError {
+    /// The ledger could not be read or written; nothing was moved by us.
+    Ledger(LedgerError),
+    /// The run was moved in the ledger (and its dispatches closed), but its
+    /// end could not be appended to `events.jsonl`: timeline readers will
+    /// still see the run as running. `message` is what the reap did.
+    EventsNotWritten {
+        message: String,
+        cause: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for ReapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ledger(e) => write!(f, "{e}"),
+            Self::EventsNotWritten { message, cause } => write!(
+                f,
+                "{message}, but its end could not be appended to events.jsonl: {cause}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReapError {}
+
+impl From<LedgerError> for ReapError {
+    fn from(e: LedgerError) -> Self {
+        Self::Ledger(e)
+    }
+}
+
 /// What to reap and why.
 #[derive(Debug, Clone)]
 pub struct Reap<'a> {
@@ -59,7 +93,7 @@ pub fn reap(
     ledger: &Ledger,
     request: &Reap<'_>,
     alive: &dyn Fn(Pid) -> bool,
-) -> Result<Reaped, LedgerError> {
+) -> Result<Reaped, ReapError> {
     let Reap {
         run,
         from,
@@ -113,26 +147,31 @@ pub fn reap(
     ledger.close_open_dispatches(run, reason.as_str())?;
     let sentence = sentence_of(run, ending, driver_pid);
     let name = run.as_str();
-    // `events.jsonl` is a view of the ledger: a failed append must not
-    // undo a reap that is already recorded.
-    let _ = protocol::append_event(
+    let message = format!("{run}: {from} -> {to} ({detail})");
+    // Both lines are attempted, so a failed first does not hide the end;
+    // the ledger already records the reap, so a failure is reported, not
+    // undone.
+    let stderr = protocol::append_event(
         name,
         events_dir,
         &Event::Stderr {
-            text: format!("driver_gone: {sentence}"),
+            text: format!("{}: {sentence}", reason.as_str()),
         },
     );
-    let _ = protocol::append_event(
+    let outcome = protocol::append_event(
         name,
         events_dir,
         &Event::Outcome {
             state: to.as_str().to_string(),
             receipt: None,
             summary: None,
-            reason: Some(sentence.clone()),
+            reason: Some(sentence),
         },
     );
-    Ok(Reaped::Moved(format!("{run}: {from} -> {to} ({detail})")))
+    match stderr.and(outcome) {
+        Ok(()) => Ok(Reaped::Moved(message)),
+        Err(cause) => Err(ReapError::EventsNotWritten { message, cause }),
+    }
 }
 
 /// The full sentence a reaped run's outcome carries.
@@ -239,6 +278,43 @@ mod tests {
             "{reason}"
         );
         assert!(text.lines().all(|l| !l.contains("\"seq\"")), "{text}");
+    }
+
+    #[test]
+    fn an_events_append_failure_is_reported_not_discarded() {
+        let (dir, path, run) = world("reapf");
+        let ledger = Ledger::open(&path).expect("ledger");
+        // A file where the events directory should be: every append fails.
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, "x").expect("file");
+        let err = reap(
+            &ledger,
+            &request(&run, Ending::Interrupted, &blocker),
+            &|_| false,
+        )
+        .expect_err("the append failure is returned");
+        assert!(matches!(err, ReapError::EventsNotWritten { .. }), "{err}");
+        assert!(err.to_string().contains("events.jsonl"), "{err}");
+        // The ledger move stands.
+        assert_eq!(
+            ledger.run_status(&run).expect("status"),
+            Some(State::Interrupted)
+        );
+    }
+
+    #[test]
+    fn the_stderr_prefix_names_the_ending() {
+        for (ending, prefix) in [
+            (Ending::Interrupted, "driver_gone:"),
+            (Ending::Cancelled, "cancelled_without_worker:"),
+        ] {
+            let (dir, path, run) = world("reapp");
+            let ledger = Ledger::open(&path).expect("ledger");
+            let events = dir.join("ev");
+            reap(&ledger, &request(&run, ending, &events), &|_| false).expect("reap");
+            let text = std::fs::read_to_string(events.join("events.jsonl")).expect("events");
+            assert!(text.contains(&format!("\"text\":\"{prefix} ")), "{text}");
+        }
     }
 
     #[test]

@@ -5224,6 +5224,37 @@ impl Ledger {
         Ok(MicroUsd::from_micros(micros))
     }
 
+    /// The runs started from one Claude Code session (`runs.root_session`),
+    /// newest first, at most `limit`.
+    pub fn runs_of_session(&self, session: &str, limit: usize) -> Result<Vec<RunId>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM runs WHERE root_session = ?1
+                 ORDER BY created_at DESC, rowid DESC LIMIT ?2",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = stmt.query_map(params![session, limit], |row| row.get::<_, String>(0))?;
+        let ids = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids
+            .iter()
+            .map(String::as_str)
+            .map(RunId::from_stored)
+            .collect())
+    }
+
+    /// The session a run was started from; `None` when the run is unknown
+    /// or has none.
+    pub fn run_root_session(&self, run: &RunId) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT root_session FROM runs WHERE id = ?1",
+                [run.as_str()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// Every session id that is the `root_session` of at least one run
     /// (SPEC §11): the population `relais usage import` and `relais
     /// report` import orchestration spend for. A worker's own session is
@@ -6854,6 +6885,44 @@ mod tests {
             window_two,
             MicroUsd::from_micros(1_000),
             "only the later one"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn runs_of_session_returns_only_that_session_newest_first_capped() {
+        let (ledger, dir) = temp_ledger();
+        for i in 0..25 {
+            ledger
+                .insert_run(
+                    &run(&format!("run-a{i:02}")),
+                    "/repo",
+                    Some("sess-a"),
+                    &task("a"),
+                    "rk",
+                )
+                .expect("run a");
+        }
+        ledger
+            .insert_run(&run("run-b"), "/repo", Some("sess-b"), &task("b"), "rk")
+            .expect("run b");
+        ledger
+            .insert_run(&run("run-n"), "/repo", None, &task("n"), "rk")
+            .expect("run n");
+        let runs = ledger.runs_of_session("sess-a", 20).expect("runs");
+        assert_eq!(runs.len(), 20);
+        assert_eq!(runs[0].as_str(), "run-a24");
+        assert_eq!(runs[19].as_str(), "run-a05");
+        assert!(runs.iter().all(|r| r.as_str().starts_with("run-a")));
+        let b = ledger.runs_of_session("sess-b", 20).expect("runs");
+        assert_eq!(b, vec![run("run-b")]);
+        assert!(ledger
+            .runs_of_session("nobody", 20)
+            .expect("runs")
+            .is_empty());
+        assert_eq!(
+            ledger.run_root_session(&run("run-b")).expect("session"),
+            Some("sess-b".to_string())
         );
         std::fs::remove_dir_all(&dir).ok();
     }

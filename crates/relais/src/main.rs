@@ -606,9 +606,13 @@ enum NativeCommand {
     /// Print a run's timeline as one JSON object: phases, decisions, cost,
     /// outcome and the last 40 lines of check output
     Status {
-        /// The run; the latest when omitted
+        /// The run; the latest on this machine when omitted
         #[arg(long)]
         run: Option<String>,
+        /// Every run started from this Claude Code session id, newest
+        /// first (at most 20), as {"runs":[...]}
+        #[arg(long, conflicts_with = "run")]
+        session: Option<String>,
     },
     /// A task contract on stdin, validated and saved under the
     /// repository's `.relais/tasks/`; prints the path `relais run --task`
@@ -4044,7 +4048,9 @@ fn plan_trial_lines(
 /// the run timeline it reads back (SPEC §23, §29). Exit 0 acknowledges.
 fn native_command(cmd: NativeCommand) -> Result<CliOutcome, CliError> {
     match cmd {
-        NativeCommand::Status { run } => native_status_command(run.as_deref()),
+        NativeCommand::Status { run, session } => {
+            native_status_command(run.as_deref(), session.as_deref())
+        }
         NativeCommand::Contract => native_contract_command(),
         NativeCommand::RouterState { session } => Ok(router_state_command(&session)),
         NativeCommand::RouterObserve => Ok(router_observe_command()),
@@ -4436,11 +4442,30 @@ fn read_stopped_report(payload: &str) -> Result<StoppedReport, serde_json::Error
     serde_json::from_str(payload)
 }
 
-/// `relais native status`: one JSON object, the run's timeline from its
-/// `events.jsonl`, and never the whole file — plus `current`, what the
-/// ledger holds for the run now (SPEC §23).
-fn native_status_command(run: Option<&str>) -> Result<CliOutcome, CliError> {
+/// The most runs `relais native status --session` lists.
+const SESSION_RUNS_LIMIT: usize = 20;
+
+/// The stall threshold in force: [`resume::STALLED_AFTER`], unless
+/// `RELAIS_STALLED_AFTER_SECS` names another (the seam tests inject through).
+fn stalled_after() -> std::time::Duration {
+    std::env::var("RELAIS_STALLED_AFTER_SECS")
+        .ok()
+        .and_then(|seconds| seconds.parse::<u64>().ok())
+        .map_or(resume::STALLED_AFTER, std::time::Duration::from_secs)
+}
+
+/// `relais native status`: the run's timeline from its `events.jsonl`, and
+/// never the whole file — plus `current`, what the ledger holds for the run
+/// now (SPEC §23). With `--session`, `{"runs":[...]}`: one such entry for
+/// each run that session started, newest first. Without either flag, the
+/// latest run on this machine (a CLI convenience; the plugin passes
+/// `--session`).
+fn native_status_command(run: Option<&str>, session: Option<&str>) -> Result<CliOutcome, CliError> {
     let artifacts = paths::runs_dir().map_err(CliError::Home)?;
+    let opened = open_status_ledger();
+    if let Some(session) = session {
+        return native_status_of_session(&artifacts, opened, session);
+    }
     let Some(run) = run
         .map(str::to_string)
         .or_else(|| relais::protocol::latest_run(&artifacts))
@@ -4448,11 +4473,17 @@ fn native_status_command(run: Option<&str>) -> Result<CliOutcome, CliError> {
         eprintln!("relais native status: no run has written events yet");
         return Ok(CliOutcome::UnknownRun);
     };
+    // The ledger first: a reap appends the run's end to its events, which
+    // the timeline below must then show.
+    let current = match &opened {
+        Ok((ledger, writable)) => current_of_run(ledger, *writable, &run, stalled_after()),
+        Err(e) => Err(CurrentUnknown::Unavailable(e.to_string())),
+    };
     let path = artifacts.join(&run).join("events.jsonl");
     match std::fs::read_to_string(&path) {
         Ok(events) => {
             let mut timeline = relais::protocol::timeline(&run, &events);
-            match current_of_run(&run) {
+            match current {
                 Ok(Some(current)) => timeline["current"] = current,
                 // A run the ledger never recorded: one refused before it
                 // started. Nothing to say, and nothing wrong.
@@ -4477,12 +4508,69 @@ fn native_status_command(run: Option<&str>) -> Result<CliOutcome, CliError> {
     }
 }
 
+/// `relais native status --session`: `{"runs":[...]}`, and `{"runs":[]}`
+/// with exit 0 when the session started none (or there is no ledger).
+fn native_status_of_session(
+    artifacts: &Path,
+    opened: Result<(Ledger, bool), CurrentUnknown>,
+    session: &str,
+) -> Result<CliOutcome, CliError> {
+    let entries = match opened {
+        Ok((ledger, writable)) => {
+            let runs = operational(
+                ledger.runs_of_session(session, SESSION_RUNS_LIMIT),
+                "native status",
+            )?;
+            let mut entries = Vec::new();
+            for run in runs {
+                let current = current_of_run(&ledger, writable, run.as_str(), stalled_after());
+                let events =
+                    std::fs::read_to_string(artifacts.join(run.as_str()).join("events.jsonl"))
+                        .unwrap_or_default();
+                let mut timeline = relais::protocol::timeline(run.as_str(), &events);
+                match current {
+                    Ok(Some(current)) => timeline["current"] = current,
+                    Ok(None) => {}
+                    Err(e) => eprintln!("relais native status: no current state for {run}: {e}"),
+                }
+                entries.push(timeline);
+            }
+            entries
+        }
+        Err(CurrentUnknown::NoLedger(_)) => Vec::new(),
+        Err(e) => {
+            eprintln!("relais native status: the ledger cannot be read: {e}");
+            Vec::new()
+        }
+    };
+    println!("{}", serde_json::json!({ "runs": entries }));
+    Ok(CliOutcome::Accepted)
+}
+
+/// The ledger for `native status`, and whether it may be written: read
+/// only unless it exists at this binary's schema, and never created or
+/// migrated here.
+fn open_status_ledger() -> Result<(Ledger, bool), CurrentUnknown> {
+    let path = paths::ledger_path().map_err(CurrentUnknown::Home)?;
+    if !path.is_file() {
+        return Err(CurrentUnknown::NoLedger(path));
+    }
+    let read_only = Ledger::open_read_only(&path).map_err(CurrentUnknown::Ledger)?;
+    Ok(match Ledger::open(&path) {
+        Ok(writable) => (writable, true),
+        Err(_) => (read_only, false),
+    })
+}
+
 /// Why `relais native status` cannot say what holds for a run now.
 #[derive(Debug)]
 enum CurrentUnknown {
     Home(paths::HomeUnset),
     NoLedger(std::path::PathBuf),
     Ledger(relais::ledger::LedgerError),
+    /// The ledger was not opened, for the reason already given.
+    Unavailable(String),
+    Other(String),
 }
 
 impl std::fmt::Display for CurrentUnknown {
@@ -4491,31 +4579,54 @@ impl std::fmt::Display for CurrentUnknown {
             Self::Home(e) => write!(f, "{e}"),
             Self::NoLedger(path) => write!(f, "no ledger at {}", path.display()),
             Self::Ledger(e) => write!(f, "{e}"),
+            Self::Unavailable(why) | Self::Other(why) => write!(f, "{why}"),
         }
     }
 }
 
-/// What the ledger holds for `run` now: its state and its decision, open
-/// or answered. `outcome` in the timeline is how the run ended, from its
-/// events; a decision answered since is recorded only in the ledger, so
-/// this is the one place a reader learns it. `Ok(None)` for a run the
-/// ledger does not know. Read-only: a missing, busy or other-schema
-/// ledger is an error to report, never one to create or migrate.
-fn current_of_run(run: &str) -> Result<Option<serde_json::Value>, CurrentUnknown> {
-    let path = paths::ledger_path().map_err(CurrentUnknown::Home)?;
-    if !path.is_file() {
-        return Err(CurrentUnknown::NoLedger(path));
-    }
-    let ledger = Ledger::open_read_only(&path).map_err(CurrentUnknown::Ledger)?;
+/// What the ledger holds for `run` now: its state, its decision (open or
+/// answered), who started it and how long it has been silent. `outcome` in
+/// the timeline is how the run ended, from its events; a decision answered
+/// since is recorded only in the ledger, so this is the one place a reader
+/// learns it. `Ok(None)` for a run the ledger does not know.
+///
+/// A non-terminal run whose driver is provably gone (or silent past the
+/// silence rule) is reaped when `writable`; otherwise it is reported
+/// `orphaned: true` and nothing is written. A non-terminal run silent for
+/// `stalled_after` or more is `stalled: true`.
+fn current_of_run(
+    ledger: &Ledger,
+    writable: bool,
+    run: &str,
+    stalled_after: std::time::Duration,
+) -> Result<Option<serde_json::Value>, CurrentUnknown> {
     let run = RunId::from_stored(run);
-    let Some(state) = ledger.run_status(&run).map_err(CurrentUnknown::Ledger)? else {
+    let ledgered = |e| CurrentUnknown::Ledger(e);
+    let Some(mut state) = ledger.run_status(&run).map_err(ledgered)? else {
         return Ok(None);
     };
-    let decision = ledger
-        .decision_of_run(&run)
-        .map_err(CurrentUnknown::Ledger)?;
-    Ok(Some(serde_json::json!({
+    let silent = run_silence(ledger, &run).map_err(|e| CurrentUnknown::Other(e.to_string()))?;
+    let mut orphaned = false;
+    if !state.is_terminal() {
+        let verdict = orphan_verdict_of_run(ledger, &run, silent)
+            .map_err(|e| CurrentUnknown::Other(e.to_string()))?;
+        if verdict != resume::OrphanVerdict::Alive {
+            if writable {
+                state = reap_for_status(ledger, &run, state, verdict, silent)
+                    .map_err(|e| CurrentUnknown::Other(e.to_string()))?;
+            } else {
+                orphaned = true;
+            }
+        }
+    }
+    let decision = ledger.decision_of_run(&run).map_err(ledgered)?;
+    let session = ledger.run_root_session(&run).map_err(ledgered)?;
+    let stalled =
+        !state.is_terminal() && silent.is_some_and(|s| resume::is_stalled(s, stalled_after));
+    let mut current = serde_json::json!({
         "state": state,
+        "session": session,
+        "silent_seconds": silent.map(|s| s.as_secs()),
         "decision": decision.map(|d| serde_json::json!({
             "raised_state": d.raised_state,
             "raised_reason": d.raised_reason,
@@ -4523,7 +4634,92 @@ fn current_of_run(run: &str) -> Result<Option<serde_json::Value>, CurrentUnknown
             "actor": d.actor,
             "resolved_at": d.resolved_at,
         })),
-    })))
+    });
+    if stalled {
+        current["stalled"] = true.into();
+    }
+    if orphaned {
+        current["orphaned"] = true.into();
+    }
+    Ok(Some(current))
+}
+
+/// What the evidence says about a non-terminal run's driver.
+fn orphan_verdict_of_run(
+    ledger: &Ledger,
+    run: &RunId,
+    silent: Option<std::time::Duration>,
+) -> Result<resume::OrphanVerdict, CliError> {
+    let (pid, started, since) = operational(ledger.run_driver(run), "native status")?;
+    let wall = attempt_wall_of_run(ledger, run);
+    let facts = resume::OrphanFacts {
+        driver_pid: pid.and_then(|pid| u32::try_from(pid).ok()),
+        driver_started: started,
+        driver_since: since
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
+            .map(|at| at.with_timezone(&chrono::Utc)),
+        dispatch_pids: run_live_dispatches(ledger, run)?
+            .iter()
+            .filter_map(|live| live.pid.map(|pid| pid.get()))
+            .collect(),
+        silent_for: silent,
+        silence_threshold: wall.duration + resume::DRIVER_MARGIN,
+    };
+    Ok(resume::orphan_verdict(
+        &facts,
+        &|pid| relais::coordinator::process_alive(pid),
+        &relais::procs::start_time,
+        chrono::Utc::now(),
+    ))
+}
+
+/// Reap a run `native status` found orphaned; the state it is in after.
+fn reap_for_status(
+    ledger: &Ledger,
+    run: &RunId,
+    state: State,
+    verdict: resume::OrphanVerdict,
+    silent: Option<std::time::Duration>,
+) -> Result<State, CliError> {
+    let events_dir = paths::runs_dir()
+        .map_err(CliError::Home)?
+        .join(run.as_str());
+    let detail = match (verdict, silent) {
+        (resume::OrphanVerdict::Silent, Some(silent)) => {
+            match resume::orphan_of(silent, attempt_wall_of_run(ledger, run)) {
+                Some(orphan) => orphan.detail(),
+                None => format!("nothing was written for {}s", silent.as_secs()),
+            }
+        }
+        _ => "its driver process is gone".to_string(),
+    };
+    let reaped = relais::reap::reap(
+        ledger,
+        &relais::reap::Reap {
+            run,
+            from: state,
+            ending: relais::reap::Ending::Interrupted,
+            detail,
+            extra: serde_json::json!({ "verdict": format!("{verdict:?}") }),
+            events_dir: &events_dir,
+        },
+        &|pid| relais::coordinator::process_alive(pid.get()),
+    );
+    match reaped {
+        Ok(relais::reap::Reaped::Moved(message)) => eprintln!("relais native status: {message}"),
+        Ok(relais::reap::Reaped::AlreadyMoved | relais::reap::Reaped::KeptAlive(_)) => {}
+        // The ledger holds the reap; only the events file missed it.
+        Err(e @ relais::reap::ReapError::EventsNotWritten { .. }) => {
+            eprintln!("relais native status: {e}");
+        }
+        Err(e) => {
+            return Err(CliError::Operational {
+                operation: "native status",
+                cause: Box::new(e),
+            })
+        }
+    }
+    Ok(operational(ledger.run_status(run), "native status")?.unwrap_or(state))
 }
 
 /// Why this `relais run` must not start, if it must not: it comes from the
@@ -6097,6 +6293,12 @@ fn orphan_of_run(ledger: &Ledger, run: &RunId) -> Result<Option<resume::Orphan>,
     let Some(silent) = run_silence(ledger, run)? else {
         return Ok(None);
     };
+    Ok(resume::orphan_of(silent, attempt_wall_of_run(ledger, run)))
+}
+
+/// A run's attempt wall time: its contract's, else its repository's
+/// policy's, else the default.
+fn attempt_wall_of_run(ledger: &Ledger, run: &RunId) -> resume::AttemptWall {
     // One run's unreadable contract must not stop a sweep over every run:
     // it falls back to the repository's policy, then to the default, and
     // the recorded detail says why.
@@ -6118,10 +6320,7 @@ fn orphan_of_run(ledger: &Ledger, run: &RunId) -> Result<Option<resume::Orphan>,
             None => policy,
         })
     };
-    Ok(resume::orphan_of(
-        silent,
-        resume::attempt_wall(contract_wall, policy_wall),
-    ))
+    resume::attempt_wall(contract_wall, policy_wall)
 }
 
 /// What became of an orphaned run.
