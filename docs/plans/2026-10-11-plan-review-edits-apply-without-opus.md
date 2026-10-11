@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/merge-outcome
 repos: [amont-agent, relais, dotfiles]
 canonical: amont-agent:docs/plans/2026-10-11-plan-review-edits-apply-without-opus.md
@@ -31,7 +31,7 @@ an `agent_id` as task outcomes.
 - Exit codes unchanged; README table unchanged.
 
 ## Phases
-- [ ] Phase 3 — the ingest, the ledger writer, the report line, tests with a
+- [x] Phase 3 — the ingest, the ledger writer, the report line, tests with a
       fixture ledger holding review, command-merge and subagent-merge rows:
       the subagent row updates the matching `router_tasks` row once, a second
       ingest changes nothing, a row with no task on record is counted.
@@ -39,7 +39,31 @@ an `agent_id` as task outcomes.
 ## Verification
 - `cargo test -p relais review_outcome`, and a piloted
   `relais native review-outcome --ledger <fixture> --dry-run` printing the
-  merge counts → observed.
+  merge counts → observed 2026-10-11: `cargo test -p relais --test
+  review_outcome` 13 passed (new: `a_subagent_merge_row_settles_its_router_task_once`,
+  `a_merge_row_with_unknown_fields_or_another_schema_is_invalid`); `--lib`
+  suite green; clippy `-D warnings` clean; `exit_codes_follow_the_documented_table`
+  passes with no new codes. Pilot on a scratch ledger holding one `command` and
+  one `subagent` row: `--dry-run` printed `labelled 0: clean 0, miss 0, unknown 0;
+  merge: 1 applied by command, 1 by subagent (1 verified)`, exit 0, and created
+  no state.
 
 ## Decision log
 - 2026-10-11 — pointer plan: the decision and the reviews live in amont-agent.
+- 2026-10-11 — the report's merge line counts only what the relais ledger holds
+  (router tasks with `outcome_source = 'merge'`): a `command` merge leaves no
+  task and no row here, so "N applied by command" is printed by the ingest's
+  summary, not by `relais report`. A table for it would be a ledger step for a
+  count the amont-agent ledger already has.
+- 2026-10-11 — relais itself could not run this phase (`run blocked
+  (operational_failure)`: its ledger's `decisions` table holds four rows whose
+  actor `claude (approved plan 2026-10-11-session-scoped-status)` schema v27
+  refuses to read); done in the session.
+
+## Implementation review
+
+- Round 1 `approve` (32k, 21 s); relais Phase 3 only.
+- deliberate: the EMPTY sentence stays above a merge line when no class exists yet — it is true, no reviewer outcome has been labelled.
+- deliberate: a merge row whose task is already settled is a silent no-op — the `WHERE outcome = 'unknown'` guard is the rule, not an omission.
+- deliberate: `#[allow(dead_code)]` with a doc comment rather than `#[expect(reason)]` — cosmetic, not worth a code change after the review.
+- Would still check by hand (reviewer): a real `--record-fallback` flow's agent id against `router_tasks.agent_id` (Phase 4 observes it).
