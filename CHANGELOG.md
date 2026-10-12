@@ -6,6 +6,8 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## Unreleased
+
 ## v0.16.0
 
 An agent-run quiet check now shows live in the pane (#211).
@@ -23,8 +25,6 @@ An agent-run quiet check now shows live in the pane (#211).
   quiet runs.
 - To get the pane, reinstall the plugin:
   `relais install --claude --user --write`.
-
-## v0.16.0
 
 relais learns from what it actually routes: subagent spawns are explored,
 a replay adds an arm observation to the dataset instead of removing one,
