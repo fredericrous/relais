@@ -1,7 +1,6 @@
 ---
 title: "relais: session-scoped status, orphan reaping, cancel tool, per-turn cost"
-status: active
-next: v0.15.0 release, then the post-release checks in Verification results
+status: done
 date: 2026-10-11
 branch: fix/session-scoped-status
 repos: [relais]
@@ -390,6 +389,22 @@ release would leave the person's relais refusing its own ledger.
 `deliberate: post-release by the plan's Landing`. The reported run is
 already `interrupted` in the live ledger (a session-start sweep reaped
 it), so its cleanup is expected to print "already ended: interrupted".
+
+Post-release results (v0.15.0 installed, later 0.16.0; ledger migrated
+to v28; the v27 copy is kept at `ledger-v27-before-0.15.0.sqlite`):
+
+| Check | Input | Expected | Actual |
+|---|---|---|---|
+| Reported run cleanup | `relais native cancel --run run-65d7dca899789-2d73 --session acd8389b…` | "already ended: interrupted", exit 0 | as expected ✅ |
+| Live status scoping, CLI | `native status --session` for this session and for the report's session | each lists only its own runs | 9 and 14 runs, no mixing ✅ |
+| Plugin scoping after restart | `status` tool in a resumed session with an empty store | only this session's runs | exactly this session's 9 runs ✅ |
+| No bleed between sessions | the person ran relais from another session | that run absent here | the person observed no bleed (2026-10-12) ✅ |
+| Per-turn cost in a live session | a live run's cost before it ends | an amount, not `unknown` | not observed live; the person accepted it on the runner, ledger and plugin tests and the real-input `native usage` check above |
+
+Found while checking: the `status` reply builds a run's state from its
+events, so a decision answered later (`relais decide`) still shows the
+state the run stopped in. This bug predates this plan; it is a follow-up,
+not part of it.
 
 ## Decision log
 
