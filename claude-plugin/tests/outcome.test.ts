@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import { event, line, settle, startedRun, startQueued } from './support.ts'
-import { DECIDE_STEP } from '../hooks/runs.ts'
+import { DECIDE_STEP, FEEDBACK_STEP } from '../hooks/runs.ts'
 
 const RUN = 'run-65d322006dd13-c35c'
 
@@ -54,6 +54,7 @@ test('done toasts the outcome, tells the model, and the status line keeps the ou
   expect(text).toContain(`relais run ${RUN} finished: accepted.`)
   expect(text).toContain('Changed: 1 file, +3 -1')
   expect(text).not.toContain('Replay trial')
+  expect(text.split('\n').pop()).toBe(FEEDBACK_STEP)
   expect(lastStatus(engine)).toContain('accepted')
   // It stays: nothing wipes it while time passes. Ten seconds outlasts
   // the 3 s toast merge and a 2 s poll; a full minute of 100 ms flushes
@@ -486,6 +487,7 @@ for (const outcome of ['accepted', 'blocked', 'failed']) {
     await tick(engine)
     expect(engine.calls.prompts.length).toBe(1)
     expect(engine.calls.prompts[0].text).toContain(`finished: ${outcome}`)
+    expect(engine.calls.prompts[0].text.includes(FEEDBACK_STEP)).toBe(outcome === 'accepted')
     expect(statusCalls(engine).length).toBe(0)
   })
 }

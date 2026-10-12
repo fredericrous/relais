@@ -186,7 +186,23 @@ pub struct OutcomeDetail {
     /// stored before this field existed still reads back as `None`.
     #[serde(default)]
     pub note: Option<String>,
+    /// Who or what produced the row: `detected` for a revert relais found
+    /// in git itself (`learn::revert`). Additive like `note`: a row stored
+    /// before this field existed reads back as `None`, and `None` is not
+    /// written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
+
+/// `OutcomeDetail::source` of an outcome the orchestrator reported through
+/// the plugin: stored only when the plugin's decide nonce verified
+/// (`relais feedback --proof-stdin`, ADR-0004).
+pub const SOURCE_ORCHESTRATOR: &str = "orchestrator";
+
+/// `OutcomeDetail::source` of an outcome recorded from a command line
+/// without a verified plugin nonce: it labels like any outcome and is left
+/// out of the orchestrator-against-git agreement.
+pub const SOURCE_CLI: &str = "cli";
 
 /// A typed outcome: a kind together with the detail its kind requires.
 /// Constructed only through [`Outcome::new`], so a stored row can never
@@ -264,6 +280,7 @@ mod tests {
             evidence: vec![],
             actor: "a reviewer".into(),
             note: None,
+            source: None,
         }
     }
 
@@ -378,5 +395,22 @@ mod tests {
             Err(OutcomeError::MagnitudeRefused(OutcomeKind::NeverShipped))
         );
         assert!(Outcome::new(OutcomeKind::NeverShipped, detail(None)).is_ok());
+    }
+
+    #[test]
+    fn a_row_stored_without_source_reads_back_and_a_detected_one_round_trips() {
+        let mut value = serde_json::to_value(detail(None)).unwrap();
+        value.as_object_mut().unwrap().remove("source");
+        value.as_object_mut().unwrap().remove("note");
+        let old: OutcomeDetail = serde_json::from_value(value).unwrap();
+        assert_eq!(old.source, None);
+        assert!(serde_json::to_value(&old).unwrap().get("source").is_none());
+
+        let mut detected = detail(None);
+        detected.source = Some("detected".into());
+        let json = serde_json::to_string(&detected).unwrap();
+        let back: OutcomeDetail = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, detected);
+        assert_eq!(back.source.as_deref(), Some("detected"));
     }
 }

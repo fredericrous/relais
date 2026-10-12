@@ -44,6 +44,10 @@ const AWAITS_A_PERSON = new Set(['needs_decision', 'needs_review', 'interrupted'
 // settles it (ADR-0004).
 export const DECIDE_STEP =
   'Decide it, then record the answer with mcp__relais__decide (approve, revise, reject, salvaged, abandon or decided). When the request or the approved plan does not answer it, ask the person and record their answer with on_behalf_of_person and their own words as person_quote.'
+// The closing line of an accepted outcome: a later undo is recorded by the
+// feedback tool (D23).
+export const FEEDBACK_STEP =
+  'When you revert or fix this change later, record it with mcp__relais__feedback.'
 const MAX_SUMMARY = 4000
 const STDERR_TAIL = 5
 
@@ -368,7 +372,7 @@ async function onDone(fx: Fx, store: Store, child: Child, line: any, now: number
       : `relais ${trial ? 'replay' : 'run'} ${outcome}${why}. Nothing ran.`
   const facts = [receipt ? `Receipt: ${receipt}` : '', summaryText(line.summary), trial ? `Replay trial: ${trial}` : ''].filter(Boolean)
   const awaits = AWAITS_A_PERSON.has(outcome) && typeof line.run === 'string'
-  const text = [headline, ...facts, code ? NEXT_STEP[code] ?? '' : '', awaits ? DECIDE_STEP : ''].filter(Boolean).join('\n')
+  const text = [headline, ...facts, code ? NEXT_STEP[code] ?? '' : '', awaits ? DECIDE_STEP : '', outcome === 'accepted' && typeof line.run === 'string' && !trial ? FEEDBACK_STEP : ''].filter(Boolean).join('\n')
   // The stream hook descends from the `run` tool call, and a prompt cannot
   // be submitted from under a tool or command hook: the session's timer
   // (`pump`) sends it.

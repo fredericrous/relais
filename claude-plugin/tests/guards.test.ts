@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import { continueLine, RELAIS_AGENT_TYPE, settle, spawnLine, startedRun } from './support.ts'
-import { containsWords, decideTool, mintNonce } from '../hooks/decide.ts'
+import { containsWords, decideTool, feedbackTool, mintNonce } from '../hooks/decide.ts'
 import { DECIDE_MESSAGE, decideGuard } from '../hooks/guards.ts'
 import { createStore } from '../hooks/store.ts'
 
@@ -186,4 +186,34 @@ test('the Bash reminder catches relais decide as a command, not as text', () => 
     expect(decideGuard('Bash', { command })).toBe(undefined)
   }
   expect(decideGuard('Write', { command: 'relais decide r' })).toBe(undefined)
+})
+
+test('the feedback tool fixes the actor, sends the nonce on stdin only, and denies corrected without a magnitude', async () => {
+  const w = world(() => ({ exitCode: 0, stdout: JSON.stringify({ run: 'run-1', task: 't', outcome: 'reverted', actor: 'orchestrator', source: 'orchestrator' }), stderr: '' }))
+  await mintNonce(w.fx, w.store, 'session-1')
+  const out: any = await feedbackTool(w.fx, w.store, { task: 't1', outcome: 'reverted', evidence: 'abc123', actor: 'person' } as any)
+  const call = w.calls.find(c => c.argv[1] === 'feedback')!
+  expect(call.argv).toEqual(['relais', 'feedback', '--task', 't1', '--outcome', 'reverted', '--actor', 'orchestrator', '--json', '--evidence', 'abc123', '--proof-stdin'])
+  expect(call.argv.join(' ')).not.toContain(NONCE)
+  expect(JSON.parse(call.stdin!)).toEqual({ session: 'session-1', nonce: NONCE })
+  expect(out.result).toContain('by orchestrator')
+  const before = w.calls.length
+  const denied: any = await feedbackTool(w.fx, w.store, { run: 'run-1', outcome: 'corrected' })
+  expect(denied.deny).toContain('requires a correction magnitude')
+  expect(w.calls.length).toBe(before)
+  await feedbackTool(w.fx, w.store, { run: 'run-1', outcome: 'corrected', magnitude: 0.2 })
+  expect(w.calls[w.calls.length - 1].argv).toEqual(['relais', 'feedback', 'run-1', '--outcome', 'corrected', '--actor', 'orchestrator', '--json', '--magnitude', '0.2', '--proof-stdin'])
+})
+
+test("a feedback refusal comes back verbatim from relais's {error, exit}", async () => {
+  const w = world(() => ({ exitCode: 10, stdout: JSON.stringify({ error: 'unknown run run-9', exit: 10 }), stderr: '' }))
+  const out: any = await feedbackTool(w.fx, w.store, { run: 'run-9', outcome: 'regression' })
+  expect(out.result).toBe('relais refused the feedback (exit 10): unknown run run-9')
+})
+
+test('the Bash reminder catches relais feedback as a command, not as text', () => {
+  for (const command of ['relais feedback run-1 --outcome reverted', 'cd x && relais feedback r']) {
+    expect(decideGuard('Bash', { command })).toBe(DECIDE_MESSAGE)
+  }
+  expect(decideGuard('Bash', { command: 'grep -rn "relais feedback" docs/' })).toBe(undefined)
 })

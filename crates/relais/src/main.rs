@@ -295,12 +295,22 @@ enum Command {
         /// feedback
         #[arg(long = "evidence")]
         evidence: Vec<String>,
-        /// Who is recording this feedback
+        /// Who is recording this feedback: `orchestrator`, `person` or
+        /// `person-via-orchestrator` (the same three as `decide`)
         #[arg(long = "actor")]
         actor: String,
         /// Free-form context for this outcome
         #[arg(long = "note")]
         note: Option<String>,
+        /// Print one JSON object: `{run, task, outcome, actor, source}`, or
+        /// `{error, exit}` on a refusal
+        #[arg(long)]
+        json: bool,
+        /// Read `{"session", "nonce"}` from stdin: the plugin's proof that
+        /// its feedback tool made this call (ADR-0004). A live nonce stores
+        /// the outcome's `source` as `orchestrator`; any other, as `cli`
+        #[arg(long = "proof-stdin")]
+        proof_stdin: bool,
     },
     /// Install the Claude Code integration; preview-first, --write applies
     /// (SPEC §3). User-level installation is explicit, not the default.
@@ -1387,6 +1397,8 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             evidence,
             actor,
             note,
+            json,
+            proof_stdin,
         } => feedback_command(FeedbackRequest {
             run_id,
             task,
@@ -1396,6 +1408,8 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             evidence,
             actor,
             note,
+            json,
+            proof_stdin,
         }),
         Command::Install {
             claude,
@@ -1999,6 +2013,14 @@ fn dataset_build_command() -> Result<CliOutcome, CliError> {
     // their repository and candidate patch are still on disk; the rest
     // stay unknown and are excluded.
     let backfill = operational(relais::learn::salvage::backfill(&ledger), "dataset build")?;
+    // Then the reverts git shows, before the dataset is read: one flips its
+    // task's label to a failure.
+    let detection =
+        relais::learn::revert::RevertDetection::from_settings(&load_machine()?.learning);
+    let reverts = operational(
+        relais::learn::revert::detect_if(detection, &ledger, chrono::Utc::now()),
+        "dataset build",
+    )?;
     // A stored contract revision that does not parse is a corrupt ledger
     // row, not a run without a contract: dataset construction must see
     // the difference, or a version skew silently empties the dataset.
@@ -2066,6 +2088,10 @@ fn dataset_build_command() -> Result<CliOutcome, CliError> {
     );
     for line in dataset.counterfactual_gap.render_lines() {
         println!("{line}");
+    }
+    println!("{}", reverts.summary());
+    for line in reverts.unknown_lines() {
+        eprintln!("{line}");
     }
     println!(
         "salvage containment backfill: {} computed, {} unreachable (left unknown, excluded)",
@@ -2455,6 +2481,7 @@ fn learn_cycle_command(
             max_abstention_rate: machine.routing.max_abstention_rate,
         },
         auto_promote: machine.learning.auto_promote.is_some(),
+        revert_detection: relais::learn::revert::RevertDetection::from_settings(&machine.learning),
         classifier_dir: paths::state_dir().ok().map(|dir| dir.join("classifier")),
         review_outcomes: Some(
             relais::review_outcome::Settings::resolve(None, None).map_err(|e| e.to_string()),
@@ -7235,7 +7262,7 @@ fn feedback_run(
     ledger: &Ledger,
     run_id: Option<&str>,
     task: Option<&str>,
-) -> Result<std::result::Result<RunId, CliOutcome>, CliError> {
+) -> Result<std::result::Result<RunId, Refusal>, CliError> {
     if let Some(run_id) = run_id {
         return Ok(Ok(RunId::from_stored(run_id)));
     }
@@ -7246,8 +7273,10 @@ fn feedback_run(
             return Ok(Ok(candidate));
         }
     }
-    eprintln!("relais feedback: task {task_id} has no accepted run on record");
-    Ok(Err(CliOutcome::UnknownRun))
+    Ok(refusal(
+        CliOutcome::UnknownRun,
+        format!("task {task_id} has no accepted run on record"),
+    ))
 }
 
 /// One `relais feedback` invocation's arguments, bundled so the handler
@@ -7261,9 +7290,78 @@ struct FeedbackRequest {
     evidence: Vec<String>,
     actor: String,
     note: Option<String>,
+    json: bool,
+    proof_stdin: bool,
+}
+
+/// What a recorded outcome reports, for both the sentence and `--json`.
+struct Recorded {
+    run: RunId,
+    task: TaskId,
+    outcome: &'static str,
+    actor: relais::ledger::Actor,
+    source: &'static str,
 }
 
 fn feedback_command(request: FeedbackRequest) -> Result<CliOutcome, CliError> {
+    let json = request.json;
+    match feedback_inner(request) {
+        Ok(Ok(done)) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "run": done.run.as_str(),
+                        "task": done.task.as_str(),
+                        "outcome": done.outcome,
+                        "actor": done.actor.as_str(),
+                        "source": done.source,
+                    })
+                );
+            } else {
+                println!("recorded {} for {}", done.outcome, done.run);
+            }
+            Ok(CliOutcome::Accepted)
+        }
+        Ok(Err(refused)) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "error": refused.message,
+                        "exit": exit_code(&refused.outcome),
+                    })
+                );
+            } else {
+                eprintln!("relais feedback: {}", refused.message);
+            }
+            Ok(refused.outcome)
+        }
+        Err(e) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "error": e.to_string(),
+                        "exit": exit_code(&e.outcome()),
+                    })
+                );
+            }
+            Err(e)
+        }
+    }
+}
+
+/// The `source` an outcome is stored with: `orchestrator` only when the
+/// plugin's nonce verified, `cli` for every other call.
+fn feedback_source(via: relais::ledger::RecordedVia) -> &'static str {
+    match via {
+        relais::ledger::RecordedVia::Plugin => relais::outcome::SOURCE_ORCHESTRATOR,
+        relais::ledger::RecordedVia::Cli => relais::outcome::SOURCE_CLI,
+    }
+}
+
+fn feedback_inner(request: FeedbackRequest) -> Result<Result<Recorded, Refusal>, CliError> {
     let FeedbackRequest {
         run_id,
         task,
@@ -7273,16 +7371,39 @@ fn feedback_command(request: FeedbackRequest) -> Result<CliOutcome, CliError> {
         evidence,
         actor,
         note,
+        json: _,
+        proof_stdin,
     } = request;
+    let actor = match relais::ledger::Actor::parse(&actor) {
+        Ok(actor) => actor,
+        Err(message) => return Ok(refusal(CliOutcome::InvalidInput, message)),
+    };
+    let proof = if proof_stdin {
+        match read_decide_proof() {
+            Ok(proof) => Some(proof),
+            Err(refused) => return Ok(Err(refused)),
+        }
+    } else {
+        None
+    };
     let ledger = open_ledger()?;
+    let via = match &proof {
+        Some(proof) => operational(
+            ledger.verify_decide_nonce(&proof.session, &proof.nonce),
+            "feedback",
+        )?,
+        None => relais::ledger::RecordedVia::Cli,
+    };
     let run = match feedback_run(&ledger, run_id.as_deref(), task.as_deref())? {
         Ok(run) => run,
-        Err(outcome) => return Ok(outcome),
+        Err(refused) => return Ok(Err(refused)),
     };
     let state = operational(ledger.run_status(&run), "feedback")?;
     let Some(state) = state else {
-        eprintln!("relais feedback: unknown run {run}");
-        return Ok(CliOutcome::UnknownRun);
+        return Ok(refusal(
+            CliOutcome::UnknownRun,
+            format!("unknown run {run}"),
+        ));
     };
     // SPEC §20: feedback is attributed to the candidate; absence of
     // feedback is never a positive label. Only a run that reached an
@@ -7290,15 +7411,19 @@ fn feedback_command(request: FeedbackRequest) -> Result<CliOutcome, CliError> {
     // salvage of a terminal run's work — has one whose later life is
     // worth recording.
     if !state.is_accepted() {
-        eprintln!(
-            "relais feedback: run {run} is {state}, not accepted — final outcome feedback \
-             records what happened to an ACCEPTED change"
-        );
-        return Ok(CliOutcome::InvalidInput);
+        return Ok(refusal(
+            CliOutcome::InvalidInput,
+            format!(
+                "run {run} is {state}, not accepted — final outcome feedback \
+                 records what happened to an ACCEPTED change"
+            ),
+        ));
     }
     let Some(task_id) = operational(ledger.task_of_run(&run), "feedback")? else {
-        eprintln!("relais feedback: run {run} carries no task identity");
-        return Ok(CliOutcome::OperationalFailure);
+        return Ok(refusal(
+            CliOutcome::OperationalFailure,
+            format!("run {run} carries no task identity"),
+        ));
     };
     // A salvaged run's candidate is never relais's own: it is whatever a
     // person named with `--candidate` on `relais decide --answer
@@ -7319,8 +7444,10 @@ fn feedback_command(request: FeedbackRequest) -> Result<CliOutcome, CliError> {
         match operational(ledger.receipt(&run), "feedback")? {
             Some((receipt, _hash)) => {
                 let Some(sha) = receipt["candidate_sha"].as_str() else {
-                    eprintln!("relais feedback: run {run}'s receipt names no candidate");
-                    return Ok(CliOutcome::OperationalFailure);
+                    return Ok(refusal(
+                        CliOutcome::OperationalFailure,
+                        format!("run {run}'s receipt names no candidate"),
+                    ));
                 };
                 Some(sha.to_string())
             }
@@ -7333,11 +7460,13 @@ fn feedback_command(request: FeedbackRequest) -> Result<CliOutcome, CliError> {
     };
     match (&recorded_candidate, &candidate) {
         (Some(recorded), Some(candidate)) if candidate != recorded => {
-            eprintln!(
-                "relais feedback: --candidate {candidate} does not match run {run}'s accepted \
-                 candidate {recorded}"
-            );
-            return Ok(CliOutcome::InvalidInput);
+            return Ok(refusal(
+                CliOutcome::InvalidInput,
+                format!(
+                    "--candidate {candidate} does not match run {run}'s accepted \
+                     candidate {recorded}"
+                ),
+            ));
         }
         // Nothing in the ledger says what this run built, so nothing can
         // check the caller's claim. Storing it anyway would put an
@@ -7346,12 +7475,14 @@ fn feedback_command(request: FeedbackRequest) -> Result<CliOutcome, CliError> {
         // source of truth). The outcome itself is still recordable —
         // without a candidate it cannot vouch for.
         (None, Some(candidate)) => {
-            eprintln!(
-                "relais feedback: run {run} has no recorded candidate to check --candidate \
-                 {candidate} against — record the outcome without it, or name the run that \
-                 produced the candidate"
-            );
-            return Ok(CliOutcome::InvalidInput);
+            return Ok(refusal(
+                CliOutcome::InvalidInput,
+                format!(
+                    "run {run} has no recorded candidate to check --candidate \
+                     {candidate} against — record the outcome without it, or name the run that \
+                     produced the candidate"
+                ),
+            ));
         }
         (Some(_), Some(_)) | (Some(_), None) | (None, None) => {}
     }
@@ -7360,22 +7491,22 @@ fn feedback_command(request: FeedbackRequest) -> Result<CliOutcome, CliError> {
     // the caller (SPEC §20).
     let Some((_contract, tier)) = operational(ledger.run_contract_and_tier(&run), "feedback")?
     else {
-        eprintln!("relais feedback: run {run} carries no recorded attempt");
-        return Ok(CliOutcome::OperationalFailure);
+        return Ok(refusal(
+            CliOutcome::OperationalFailure,
+            format!("run {run} carries no recorded attempt"),
+        ));
     };
     let escalated = operational(ledger.escalation_attempted(&run), "feedback")?;
     let models = operational(ledger.models_used(&run), "feedback")?;
     let magnitude = match magnitude {
         Some(value) => match relais::outcome::CorrectionMagnitude::new(value) {
             Ok(magnitude) => Some(magnitude),
-            Err(e) => {
-                eprintln!("relais feedback: {e}");
-                return Ok(CliOutcome::InvalidInput);
-            }
+            Err(e) => return Ok(refusal(CliOutcome::InvalidInput, e.to_string())),
         },
         None => None,
     };
     let kind = outcome.into();
+    let source = feedback_source(via);
     let detail = relais::outcome::OutcomeDetail {
         candidate_sha,
         strategy: relais::outcome::Strategy {
@@ -7385,19 +7516,22 @@ fn feedback_command(request: FeedbackRequest) -> Result<CliOutcome, CliError> {
         },
         correction_magnitude: magnitude,
         evidence,
-        actor,
+        actor: actor.as_str().to_string(),
         note,
+        source: Some(source.to_string()),
     };
     let recorded = match relais::outcome::Outcome::new(kind, detail) {
         Ok(outcome) => outcome,
-        Err(e) => {
-            eprintln!("relais feedback: {e}");
-            return Ok(CliOutcome::InvalidInput);
-        }
+        Err(e) => return Ok(refusal(CliOutcome::InvalidInput, e.to_string())),
     };
     operational(ledger.record_outcome(&run, &task_id, &recorded), "feedback")?;
-    println!("recorded {} for {run}", kind.as_str());
-    Ok(CliOutcome::Accepted)
+    Ok(Ok(Recorded {
+        run,
+        task: task_id,
+        outcome: kind.as_str(),
+        actor,
+        source,
+    }))
 }
 
 /// The verification gaps named by the transition that raised a run's
@@ -7470,6 +7604,7 @@ struct DecideRequest<'a> {
 
 /// A refusal of a decision: the exit outcome and the sentence that says
 /// why. Printed to stderr, or as `{error, exit}` under `--json`.
+#[derive(Debug)]
 struct Refusal {
     outcome: CliOutcome,
     message: String,

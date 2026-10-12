@@ -76,17 +76,17 @@ export function machineSettingsGuard(
 }
 
 export const DECIDE_MESSAGE =
-  'Record a decision with mcp__relais__decide, not relais decide in Bash: the tool sets who answered and proves the call was its own (ADR-0004). The person answers from their own terminal.'
+  'Record a decision with mcp__relais__decide, and an outcome with mcp__relais__feedback, not relais decide or relais feedback in Bash: the tools set who answered and prove the call was their own (ADR-0004). The person answers from their own terminal.'
 
-// Why the model's Bash call should go through the decide tool, or
-// undefined: `relais decide` as a command (at the start, or after `;`,
+// Why the model's Bash call should go through the decide or feedback tool, or
+// undefined: `relais decide` or `relais feedback` as a command (at the start, or after `;`,
 // `&`, `|`, `(` or `$(`). Text that only mentions it — a grep, an echo —
 // passes. A reminder, not a boundary, as the others are: relais itself
 // records such a call as `cli`, never as the plugin's.
 export function decideGuard(tool: string, input: Record<string, unknown>): string | undefined {
   if (tool !== 'Bash') return undefined
   const command = String(input.command ?? '')
-  return /(?:^|[;&|(\n])\s*(?:\S*\/)?relais\s+decide\b/.test(command) ? DECIDE_MESSAGE : undefined
+  return /(?:^|[;&|(\n])\s*(?:\S*\/)?relais\s+(?:decide|feedback)\b/.test(command) ? DECIDE_MESSAGE : undefined
 }
 
 export const LEARNING_ENVELOPE_MESSAGE =

@@ -10,6 +10,12 @@ missing here.
 
 The session router's classifier sends its system prompt without a prompt-cache mark. Marked, it wrote about 930 tokens to the cache on 311 of 340 calls, billed above plain input, and read anything back on 11.
 
+The plugin gains `mcp__relais__feedback`, which lets the orchestrating session record that it reverted, fixed or found a regression in an accepted change (actor `orchestrator`, proven by the session nonce on stdin), and an `accepted` outcome message now ends by telling it so.
+
+Decisions now have a label rule (`DECISION_LABEL_POLICY_VERSION` 1): each answered review or decision is yes, no or excluded with a `label_source`, the outcome outranking the answer, and `relais report` (schema 12, `decision_labels` replaces `advisor_data`) counts yes and no by source, projects the date the 30 yes and 30 no test floor is reached, and shows how far the orchestrator's reported reverts agree with the ones git shows. `relais feedback` gains `--json`, `--proof-stdin` (a verified plugin nonce stores the outcome's `source` as `orchestrator`, else `cli`) and a typed `--actor` (`orchestrator`, `person`, `person-via-orchestrator`). Breaking: `relais report --json` drops `advisor_data` for `decision_labels`, and `relais feedback --actor` refuses the free-text actors it used to accept (an old spelling names its replacement). `[learning] revert_detection_off = true` turns revert detection off.
+
+relais now records a `reverted` outcome itself (`source = detected`) when git shows an accepted change landed and was undone within 30 days, which labels that task's run a failure (label policy version 4).
+
 ## v0.16.1
 
 With several Claude sessions open, a quiet check that passed could be

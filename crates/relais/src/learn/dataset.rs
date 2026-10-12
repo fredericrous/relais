@@ -70,7 +70,11 @@ pub const DATASET_VERSION: u32 = 6;
 /// Version 3 records who answered (ADR-0004): an orchestrator's approval
 /// is its own route, and an orchestrator's contained salvage its own label
 /// source, so neither is read as the person's judgment.
-pub const LABEL_POLICY_VERSION: u32 = 3;
+///
+/// Version 4 reads reverts relais detects in git (`learn::revert`) as
+/// task outcomes: an accepted run whose task has a detected revert is a
+/// failure like any other reverted task.
+pub const LABEL_POLICY_VERSION: u32 = 4;
 
 /// The window dataset construction reads: every run the ledger holds.
 /// Far enough in the past that no relais ledger predates it.
@@ -1207,6 +1211,7 @@ mod tests {
                 evidence: vec![],
                 actor: "a person".into(),
                 note: None,
+                source: None,
             },
         )
         .expect("outcome");
@@ -1952,6 +1957,51 @@ argv = ["true"]
     }
 
     #[test]
+    fn an_accepted_run_whose_task_has_a_detected_revert_is_failed() {
+        let fixture = LedgerFixture::open("dataset-detected-revert");
+        fixture.dispatched("run-a", "implementation", "initial");
+        fixture.settle("run-a", State::Accepted);
+        assert!(
+            only_record(&fixture)
+                .expect("a record")
+                .accepted_without_escalation
+        );
+        let outcome = crate::outcome::Outcome::new(
+            OutcomeKind::Reverted,
+            crate::outcome::OutcomeDetail {
+                candidate_sha: None,
+                strategy: crate::outcome::Strategy {
+                    tier: Tier::Implementation,
+                    models: vec!["sonnet".into()],
+                    escalated: false,
+                },
+                correction_magnitude: None,
+                evidence: vec![],
+                actor: "relais".into(),
+                note: None,
+                source: Some("detected".into()),
+            },
+        )
+        .expect("outcome");
+        fixture
+            .ledger
+            .record_outcome(&run_id("run-a"), &task_id("run-a"), &outcome)
+            .expect("record");
+        let record = only_record(&fixture).expect("a record");
+        assert!(!record.accepted_without_escalation);
+        assert_eq!(record.outcome_stood, Some(false));
+        assert_eq!(
+            labelling_of(
+                State::Accepted,
+                Some(OutcomeKind::Reverted),
+                SalvageEvidence::NotSalvaged
+            ),
+            Labelling::Failed
+        );
+        assert_eq!(LABEL_POLICY_VERSION, 4);
+    }
+
+    #[test]
     fn a_contained_salvage_later_reverted_is_a_negative() {
         let fixture = LedgerFixture::open("dataset-salvage-reverted");
         salvaged_after(
@@ -1974,6 +2024,7 @@ argv = ["true"]
                 evidence: vec![],
                 actor: "a person".into(),
                 note: None,
+                source: None,
             },
         )
         .expect("outcome");

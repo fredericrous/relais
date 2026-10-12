@@ -173,6 +173,28 @@ fn run_git_step(what: &str, command: &mut Command) -> Result<(), String> {
 /// failing). Runs `git apply --cached --check -R` against a temporary
 /// index, never the repository's own.
 pub fn candidate_contained(repo: &Path, patch: &Path, sha: &str) -> Containment {
+    patch_check(repo, patch, sha, Direction::Reverse)
+}
+
+/// Which way a patch is checked against a tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Direction {
+    /// The patch's result is already in the tree (`git apply -R`).
+    Reverse,
+    /// The patch's change is still to be made (`git apply`).
+    Forward,
+}
+
+/// `git apply --cached --check` (reversed for [`Direction::Reverse`]) of
+/// `patch` on the tree of `sha`, against a temporary index.
+/// [`Containment::Contained`] reads "the check passed", [`Containment::Rewritten`]
+/// "the patch does not apply that way", whichever the direction.
+pub(super) fn patch_check(
+    repo: &Path,
+    patch: &Path,
+    sha: &str,
+    direction: Direction,
+) -> Containment {
     if !repo.is_dir() {
         return Containment::Unreachable(format!("{} is not a directory", repo.display()));
     }
@@ -204,11 +226,12 @@ pub fn candidate_contained(repo: &Path, patch: &Path, sha: &str) -> Containment 
     ) {
         return Containment::Unreachable(reason);
     }
-    let applied = match git(repo, &index)
-        .args(["apply", "--cached", "--check", "-R"])
-        .arg(&patch)
-        .output()
-    {
+    let mut apply = git(repo, &index);
+    apply.args(["apply", "--cached", "--check"]);
+    if direction == Direction::Reverse {
+        apply.arg("-R");
+    }
+    let applied = match apply.arg(&patch).output() {
         Ok(output) => output,
         Err(e) => return Containment::Unreachable(format!("git apply: could not run git: {e}")),
     };

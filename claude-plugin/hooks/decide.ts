@@ -160,3 +160,75 @@ export async function decideTool(fx: Fx, store: Store, input: DecideInput): Prom
     result: `Recorded ${reply?.resolution ?? answer} for ${run} by ${reply?.actor ?? actor}: ${reply?.from_state ?? '?'} -> ${reply?.to_state ?? '?'}.`,
   }
 }
+
+export const FEEDBACK_OUTCOMES = ['reverted', 'regression', 'corrected'] as const
+
+export const FEEDBACK_TOOL_DESCRIPTION =
+  'Record what became of a change relais accepted, the moment you revert it, fix it or find it regressed: reverted, regression (a confirmed regression) or corrected (needs magnitude, 0 to 1, how large the correction was). Name the run, or the task whose accepted run it is. evidence is a commit sha or a note; relais refuses what it cannot record and says why.'
+
+export const FEEDBACK_INPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    run: { type: 'string', description: 'The run id whose accepted change this is about (or task).' },
+    task: { type: 'string', description: 'The task whose accepted run this is about (or run).' },
+    outcome: { type: 'string', enum: [...FEEDBACK_OUTCOMES], description: 'What happened to the change.' },
+    evidence: { type: 'string', description: 'A commit sha, URL or note supporting it.' },
+    candidate: { type: 'string', description: 'The candidate this is about; relais checks it against the run.' },
+    magnitude: { type: 'number', description: 'How large the correction was; required for corrected.' },
+    note: { type: 'string', description: 'Free-form context.' },
+  },
+  required: ['outcome'],
+}
+
+export type FeedbackInput = {
+  run?: unknown
+  task?: unknown
+  outcome?: unknown
+  evidence?: unknown
+  candidate?: unknown
+  magnitude?: unknown
+  note?: unknown
+}
+
+// The feedback tool (ADR-0004, D23): the orchestrator reports what became
+// of an accepted change. The actor is fixed here, never typed by the
+// model, and the nonce travels on stdin only.
+export async function feedbackTool(fx: Fx, store: Store, input: FeedbackInput): Promise<{ deny: string } | { result: string }> {
+  const outcome = input.outcome
+  if (typeof outcome !== 'string' || !(FEEDBACK_OUTCOMES as readonly string[]).includes(outcome)) {
+    return { deny: `relais feedback needs outcome: one of ${FEEDBACK_OUTCOMES.join(', ')}.` }
+  }
+  const run = typeof input.run === 'string' && input.run !== '' ? input.run : undefined
+  const task = typeof input.task === 'string' && input.task !== '' ? input.task : undefined
+  if ((run === undefined) === (task === undefined)) return { deny: 'relais feedback needs exactly one of run (the run id) or task.' }
+  const magnitude = typeof input.magnitude === 'number' && Number.isFinite(input.magnitude) ? input.magnitude : undefined
+  if (outcome === 'corrected' && magnitude === undefined) return { deny: 'outcome `corrected` requires a correction magnitude' }
+  const argv = ['relais', 'feedback', ...(run !== undefined ? [run] : ['--task', task!]), '--outcome', outcome, '--actor', 'orchestrator', '--json']
+  if (magnitude !== undefined) argv.push('--magnitude', String(magnitude))
+  for (const [flag, value] of [
+    ['--evidence', input.evidence],
+    ['--candidate', input.candidate],
+    ['--note', input.note],
+  ] as const) {
+    if (typeof value === 'string' && value !== '') argv.push(flag, value)
+  }
+  const proof = store.decideNonce
+  if (proof) argv.push('--proof-stdin')
+  const result = await fx.process.run(argv, {
+    timeoutMs: DECIDE_TIMEOUT_MS,
+    ...(proof ? { stdin: JSON.stringify({ session: proof.session, nonce: proof.nonce }) } : {}),
+  })
+  let reply: any
+  try {
+    reply = JSON.parse(String(result.stdout ?? '').trim())
+  } catch {
+    const why = String(result.stderr ?? '').trim().slice(0, 1000)
+    return { result: `relais feedback failed (exit ${result.exitCode})${why ? `: ${why}` : ''}` }
+  }
+  if (typeof reply?.error === 'string') {
+    return { result: `relais refused the feedback (exit ${reply.exit ?? result.exitCode}): ${reply.error}` }
+  }
+  const subject = run ?? `task ${task}`
+  await note(fx, store, run, `recorded ${outcome} for ${subject} as ${reply?.actor ?? 'orchestrator'}`)
+  return { result: `Recorded ${reply?.outcome ?? outcome} for ${reply?.run ?? subject} by ${reply?.actor ?? 'orchestrator'} (source ${reply?.source ?? '?'}).` }
+}
