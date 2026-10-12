@@ -1109,7 +1109,9 @@ fn converged_label(converged: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::learn::features::{AcceptanceRoute, RecipeIdentity, TaskFeatures, TrainingExample};
+    use crate::learn::features::{
+        AcceptanceRoute, Origin, RecipeIdentity, TaskFeatures, TrainingExample,
+    };
 
     /// A record whose label is learnable from its inputs: accepted tasks
     /// share one objective vocabulary, rejected ones another, so the
@@ -1143,6 +1145,8 @@ mod tests {
         let sparse = expand(&task, tier, objective, &identity, &schema);
         TrainingExample {
             family: family.into(),
+            task_id: format!("{family}@{at}"),
+            origin: Origin::Live,
             tier,
             floor: Tier::Implementation,
             task,
@@ -1198,6 +1202,7 @@ mod tests {
             fingerprint: "f".into(),
             built_at: "now".into(),
             route_coverage: Default::default(),
+            counterfactual_gap: Default::default(),
         }
     }
 
@@ -1234,6 +1239,7 @@ mod tests {
             fingerprint: "f".into(),
             built_at: "now".into(),
             route_coverage: Default::default(),
+            counterfactual_gap: Default::default(),
         };
         let outcome = train_and_evaluate(&dataset, &settings(0.75, 5)).expect("trains");
         assert!(
@@ -1270,6 +1276,7 @@ mod tests {
             built_at: "2026-10-01T00:00:00+00:00".into(),
             exclusions: vec![],
             route_coverage: Default::default(),
+            counterfactual_gap: Default::default(),
             records,
         };
         let settings = EvalSettings {
@@ -1325,6 +1332,7 @@ mod tests {
             fingerprint: "f".into(),
             built_at: "now".into(),
             route_coverage: Default::default(),
+            counterfactual_gap: Default::default(),
         };
         let outcome = train_and_evaluate(&dataset, &settings(0.75, 5)).expect("trains");
         let report = &outcome.report;
@@ -1355,6 +1363,7 @@ mod tests {
             fingerprint: "f".into(),
             built_at: "now".into(),
             route_coverage: Default::default(),
+            counterfactual_gap: Default::default(),
         };
         assert!(matches!(
             train_and_evaluate(&dataset, &settings(0.75, 5)),
@@ -1546,6 +1555,7 @@ mod tests {
             fingerprint: "f".into(),
             built_at: "now".into(),
             route_coverage: Default::default(),
+            counterfactual_gap: Default::default(),
         };
         let outcome = train_and_evaluate(&dataset, &settings(0.5, 5)).expect("trains");
         assert_eq!(
@@ -1722,6 +1732,7 @@ mod tests {
             fingerprint: "fingerprint-1".into(),
             built_at: "now".into(),
             route_coverage: Default::default(),
+            counterfactual_gap: Default::default(),
         };
         let error = train_and_evaluate(&dataset, &settings(0.75, 5)).expect_err("refuses");
         assert!(

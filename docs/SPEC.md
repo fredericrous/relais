@@ -496,7 +496,7 @@ Relais includes an opt-in dataset collection command that replays suitable compl
 
 Alternatively, authorized low-risk trials randomly assign among eligible strategies and log their actual probabilities. Routing trials stay within machine-owned risk, resource and data-handling limits. Inverse-propensity or other off-policy estimates require adequate action support; do not infer performance for profiles with zero observation probability.
 
-Collect difficult failures as well as easy successes. Avoid counting many retries or near-identical task variants as independent examples. Pairwise labels, if used by an alternative learner, require comparable observed outcomes rather than an LLM judge's unsupported preference.
+Collect difficult failures as well as easy successes. Avoid counting many retries or near-identical task variants as independent examples. Pairwise labels, if used by an alternative learner, require comparable observed outcomes rather than an LLM judge's unsupported preference. A settled, non-errored replay arm (§24) enters `relais dataset build` as its own example, origin `replay`, labelled from its own verified state and the recipe its trial names, in its source task's family beside the source run's own example: the one observation of the same task on another arm. The dataset reports its `counterfactual gap` — accepted tasks with no observation one tier cheaper — with the estimated cost of replaying them; it is a report line, and `relais dataset replay` stays a person's command.
 
 ### Dataset construction and training
 
@@ -823,7 +823,7 @@ Compatibility references: Claude Code hook semantics and subagent depth/concurre
 
 ## 24. Task replay
 
-`relais dataset replay --task <id> --recipe <candidate.toml>` re-runs a task's already-accepted run under a candidate recipe, so the candidate has to earn its own result rather than borrow the incumbent's. This is NOT a promotion mechanism and does not compare, score, rank or promote anything: it produces exactly one arm's result for one task. A single replay, or a small deliberately-run set of them, is not evidence that a recipe should be promoted — that judgment, if it is ever made, is a later mechanism's job, not this command's.
+`relais dataset replay --task <id> --recipe <candidate.toml>` re-runs a task's already-accepted run under a candidate recipe, so the candidate has to earn its own result rather than borrow the incumbent's. This is NOT a promotion mechanism and does not compare, score, rank or promote anything: it produces exactly one arm's result for one task. That result is an arm observation of the task, never a later attempt at it: `relais dataset build` keeps the source run's example and adds the replay's beside it (§17), where a build before dataset version 6 let the replay supersede the source. A single replay, or a small deliberately-run set of them, is not evidence that a recipe should be promoted — that judgment, if it is ever made, is a later mechanism's job, not this command's.
 
 ### Admission
 

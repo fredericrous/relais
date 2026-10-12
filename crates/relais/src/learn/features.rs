@@ -395,6 +395,27 @@ impl LabelSource {
     }
 }
 
+/// Where an example's run came from: the task's own live run, or a replay
+/// of that task on another arm (`relais dataset replay`, SPEC §24). A
+/// replay is an arm observation of its task, never a later attempt at it:
+/// the source run keeps its own example and the two share a family.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    #[default]
+    Live,
+    Replay,
+}
+
+impl Origin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Replay => "replay",
+        }
+    }
+}
+
 /// A complete training example: features, the label (evidence-backed),
 /// and the complete-strategy cost. Attempt-level outcomes stay distinct
 /// from complete-strategy outcomes (SPEC §17): `accepted_without_escalation`
@@ -403,6 +424,13 @@ impl LabelSource {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrainingExample {
     pub family: String,
+    /// The task this example observes. Empty in a dataset built before
+    /// version 6; the evaluator then counts each record as its own task.
+    #[serde(default)]
+    pub task_id: String,
+    /// Whether the run was the task's own, or a replay arm (version 6).
+    #[serde(default)]
+    pub origin: Origin,
     /// The tier this task was actually dispatched to.
     pub tier: Tier,
     /// The routing floor the contract had at dispatch time: the tier the

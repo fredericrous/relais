@@ -13,13 +13,14 @@
 use serde::{Deserialize, Serialize};
 
 use super::features::{
-    expand, AcceptanceRoute, FeatureSchema, LabelSource, RecipeIdentity, SparseVec, TaskFeatures,
-    TrainingExample,
+    expand, AcceptanceRoute, FeatureSchema, LabelSource, Origin, RecipeIdentity, SparseVec,
+    TaskFeatures, TrainingExample,
 };
 use super::salvage::{salvage_evidence_of, SalvageEvidence};
-use crate::ids::{sha256_hex, TaskId};
-use crate::ledger::{Ledger, LedgerError};
-use crate::lifecycle::{Reason, State};
+use crate::ids::{sha256_hex, RunId, TaskId};
+use crate::ledger::{Ledger, LedgerError, TrialOutcome};
+use crate::lifecycle::{Reason, RunPurpose, State};
+use crate::money::MicroUsd;
 use crate::outcome::OutcomeKind;
 use crate::policy::{RepoPolicy, Tier};
 use crate::route::RoutedBy;
@@ -44,9 +45,13 @@ pub type ContractLookup<'a> = dyn Fn(&str) -> Result<Option<ContractMaterial>, L
 /// produced the run too (`RecipeIdentity::recipe_id`, formerly
 /// `ProfileIdentity`), not only its model/effort/harness — a version-3
 /// dataset pools two revisions of one recipe as if they were the same
-/// thing. Version 5 records each example's `label_source`. Rebuild with
-/// `relais dataset build` to train again.
-pub const DATASET_VERSION: u32 = 5;
+/// thing. Version 5 records each example's `label_source`. Version 6
+/// records each example's `task_id` and `origin`, and reads a replay run
+/// (SPEC §24) as an arm observation of its task beside the source run's
+/// own example, where a version-5 build let the replay supersede the
+/// source and then excluded the replay itself; it also carries the
+/// `counterfactual_gap`. Rebuild with `relais dataset build` to train again.
+pub const DATASET_VERSION: u32 = 6;
 
 /// The version of the rule in [`labelling_of`] and the acceptance
 /// decision at [`build`]'s `route == AcceptanceRoute::Verified` check —
@@ -273,6 +278,122 @@ pub struct Dataset {
     /// How the dataset's records break down by the route (SPEC §6) that
     /// dispatched them.
     pub route_coverage: RouteCoverage,
+    /// Accepted tasks with no observation one tier cheaper (version 6).
+    #[serde(default)]
+    pub counterfactual_gap: CounterfactualGap,
+}
+
+/// Accepted live examples whose task has no example one tier cheaper: the
+/// counterfactual a replay would supply (SPEC §24). The estimate prices
+/// those replays at the mean complete cost observed at the cheaper tier,
+/// and is unknown, never zero, when that tier has no priced observation.
+/// A report line, never an action: `relais dataset replay` stays a
+/// person's command.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CounterfactualGap {
+    pub tasks: usize,
+    pub estimate: Option<MicroUsd>,
+    pub basis: String,
+}
+
+impl CounterfactualGap {
+    /// Two lines: the count, then the command that fills it with its
+    /// estimated cost, or `cost unknown` and why, never `$0`.
+    pub fn render_lines(&self) -> Vec<String> {
+        let count = format!(
+            "counterfactual gap: {} accepted task(s) lack a cheaper arm",
+            self.tasks
+        );
+        let next = match &self.estimate {
+            Some(cost) => format!("  next: relais dataset replay (estimated cost ~{cost})"),
+            None if self.tasks == 0 => "  next: nothing to replay".to_string(),
+            None => format!(
+                "  next: relais dataset replay (cost unknown: {})",
+                self.basis
+            ),
+        };
+        vec![count, next]
+    }
+}
+
+/// The tier one step cheaper, when there is one.
+fn tier_below(tier: Tier) -> Option<Tier> {
+    match tier {
+        Tier::Research => None,
+        Tier::Implementation => Some(Tier::Research),
+        Tier::Escalation => Some(Tier::Implementation),
+    }
+}
+
+/// See [`CounterfactualGap`]. Pure over the records.
+pub fn counterfactual_gap(records: &[TrainingExample]) -> CounterfactualGap {
+    let mut tiers_of_task: std::collections::BTreeMap<&str, std::collections::BTreeSet<Tier>> =
+        std::collections::BTreeMap::new();
+    for record in records {
+        tiers_of_task
+            .entry(record.task_id.as_str())
+            .or_default()
+            .insert(record.tier);
+    }
+    let mean_cost_at = |tier: Tier| -> Option<i64> {
+        let costs: Vec<i64> = records
+            .iter()
+            .filter(|record| record.cost_complete && record.tier == tier)
+            .map(|record| record.complete_cost.to_micros())
+            .collect();
+        (!costs.is_empty()).then(|| costs.iter().sum::<i64>() / costs.len() as i64)
+    };
+    let mut tasks = 0usize;
+    let mut total: Option<i64> = Some(0);
+    let mut unpriced: std::collections::BTreeSet<Tier> = std::collections::BTreeSet::new();
+    for record in records
+        .iter()
+        .filter(|record| record.origin == Origin::Live && record.accepted_without_escalation)
+    {
+        let Some(cheaper) = tier_below(record.tier) else {
+            continue;
+        };
+        if tiers_of_task
+            .get(record.task_id.as_str())
+            .is_some_and(|tiers| tiers.contains(&cheaper))
+        {
+            continue;
+        }
+        tasks += 1;
+        match mean_cost_at(cheaper) {
+            Some(mean) => total = total.map(|sum| sum + mean),
+            None => {
+                total = None;
+                unpriced.insert(cheaper);
+            }
+        }
+    }
+    let (estimate, basis) = if tasks == 0 {
+        (None, "no accepted task lacks a cheaper arm".to_string())
+    } else {
+        match total {
+            Some(sum) => (
+                Some(MicroUsd::from_micros(sum)),
+                format!("{tasks} replay(s) at the mean complete cost observed one tier cheaper"),
+            ),
+            None => (
+                None,
+                format!(
+                    "no priced run at {}",
+                    unpriced
+                        .iter()
+                        .map(|tier| tier.as_str())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                ),
+            ),
+        }
+    };
+    CounterfactualGap {
+        tasks,
+        estimate,
+        basis,
+    }
 }
 
 /// A record whose dispatch's `routed_by` was never recorded (ledger
@@ -335,6 +456,14 @@ impl Dataset {
 /// Every ledger read is fallible and every failure stops the build: an
 /// unreadable ledger produces an error a person sees, never a smaller
 /// dataset that looks like a quiet week.
+///
+/// Two kinds of run: a task's own LIVE runs, of which the most recent
+/// attempt represents the task, and REPLAYS of the task on another arm
+/// (`relais dataset replay`, SPEC §24), each an observation of its own
+/// arm. A replay shares its source's task id, so it used to supersede the
+/// accepted source run and, excluded itself for want of a trial match,
+/// left the task with no example at all. Replays are read after every
+/// live run, join the source example's family, and never displace it.
 pub fn build(
     ledger: &Ledger,
     contract_of: &ContractLookup<'_>,
@@ -358,35 +487,187 @@ pub fn build(
     // is its most recent attempt — the one worth representing it, since a
     // retry exists only because an earlier attempt did not stand.
     let mut seen_tasks: std::collections::HashSet<TaskId> = std::collections::HashSet::new();
+    // The live example each task got: its run and family, so a replay
+    // joins it and a replay of a superseded source is refused.
+    let mut live_of_task: std::collections::HashMap<TaskId, (RunId, String)> =
+        std::collections::HashMap::new();
+    let mut replays: Vec<(RunId, TaskId)> = Vec::new();
+    let reading = Reading {
+        ledger,
+        contract_of,
+        repo_policy,
+        schema: &schema,
+    };
     for (run_id, _repo, _status, _created) in runs {
         let Some(task_id) = read_of(&run_id, "task identity", ledger.task_of_run(&run_id))? else {
             exclusions.push(format!("{run_id}: no task identity recorded"));
             continue;
         };
+        // A replay is an arm observation of its task, never a later
+        // attempt at it: read after every live run, below.
+        let purpose = read_of(&run_id, "purpose", ledger.run_purpose(&run_id))?;
+        if purpose == Some(RunPurpose::Replay) {
+            replays.push((run_id, task_id));
+            continue;
+        }
         if !seen_tasks.insert(task_id.clone()) {
             exclusions.push(format!(
                 "{run_id}: superseded by a later attempt at task {task_id}"
             ));
             continue;
         }
-        let material = read_of(&run_id, "contract revision", contract_of(run_id.as_str()))?;
-        let Some((contract, objective, tier_name)) = material else {
-            exclusions.push(format!("{run_id}: no contract revision recorded"));
+        match reading.example_of(&run_id, &task_id, Observation::Live)? {
+            Err(why) => exclusions.push(why),
+            Ok(built) => {
+                tally_route(&mut route_by_route, &mut route_excluded, built.routed_by);
+                live_of_task.insert(task_id, (run_id, built.example.family.clone()));
+                records.push(built.example);
+            }
+        }
+    }
+    // Oldest first: a stable order keeps the fingerprint stable.
+    replays.reverse();
+    for (run_id, task_id) in replays {
+        let trials = read_of(&run_id, "trials", ledger.trials_by_task(&task_id))?;
+        let Some(trial) = trials
+            .iter()
+            .find(|trial| trial.arm_run_id.as_ref() == Some(&run_id))
+        else {
+            exclusions.push(format!(
+                "{run_id}: replay: no trial row names it as its arm (recorded before ledger v17)"
+            ));
             continue;
         };
-        let Some(state) = read_of(&run_id, "state", ledger.run_status(&run_id))? else {
-            exclusions.push(format!("{run_id}: no state recorded"));
+        let Some(outcome) = trial.outcome else {
+            exclusions.push(format!("{run_id}: replay: its trial is not settled"));
             continue;
+        };
+        // An infrastructure fault is never a reasoning failure (SPEC §17).
+        if outcome == TrialOutcome::Errored {
+            exclusions.push(format!(
+                "{run_id}: replay: its trial errored; an infrastructure fault is no label"
+            ));
+            continue;
+        }
+        let Some((source_run, family)) = live_of_task.get(&task_id) else {
+            exclusions.push(format!(
+                "{run_id}: replay of task {task_id}, which has no live example"
+            ));
+            continue;
+        };
+        if *source_run != trial.source_run_id {
+            exclusions.push(format!(
+                "{run_id}: replay of {}, a superseded attempt at task {task_id}",
+                trial.source_run_id
+            ));
+            continue;
+        }
+        let observation = Observation::Replay {
+            recipe_id: trial.arm_recipe_id.clone(),
+            family: family.clone(),
+        };
+        match reading.example_of(&run_id, &task_id, observation)? {
+            Err(why) => exclusions.push(why),
+            Ok(built) => {
+                tally_route(&mut route_by_route, &mut route_excluded, built.routed_by);
+                records.push(built.example);
+            }
+        }
+    }
+    let counterfactual_gap = counterfactual_gap(&records);
+    // The records are owned structs of numbers, strings and vectors:
+    // serialization has no failure mode, and a fingerprint over
+    // `unwrap_or_default()`'s empty string would have been the SAME hash
+    // for every dataset that failed to serialize.
+    let fingerprint_source =
+        serde_json::to_string(&records).expect("training examples are plain owned data");
+    let fingerprint = sha256_hex(fingerprint_source.as_bytes());
+    Ok(Dataset {
+        version: DATASET_VERSION,
+        label_policy_version: LABEL_POLICY_VERSION,
+        records,
+        exclusions,
+        fingerprint,
+        built_at: crate::ledger::now_rfc3339(),
+        route_coverage: RouteCoverage {
+            by_route: route_by_route,
+            excluded: route_excluded,
+            excluded_reason: ROUTE_COVERAGE_EXCLUDED_REASON.to_string(),
+        },
+        counterfactual_gap,
+    })
+}
+
+/// Which arm a run observed: the task's own live run, or a replay whose
+/// recipe its trial names and whose family is its source example's.
+enum Observation {
+    Live,
+    Replay { recipe_id: String, family: String },
+}
+
+/// One run's example and the route its dispatch recorded.
+struct Built {
+    example: TrainingExample,
+    routed_by: Option<RoutedBy>,
+}
+
+/// What every run is read with.
+struct Reading<'a> {
+    ledger: &'a Ledger,
+    contract_of: &'a ContractLookup<'a>,
+    repo_policy: &'a RepoPolicy,
+    schema: &'a FeatureSchema,
+}
+
+fn tally_route(
+    by_route: &mut std::collections::BTreeMap<String, usize>,
+    excluded: &mut usize,
+    routed_by: Option<RoutedBy>,
+) {
+    // The route this dispatch recorded (SPEC §6), for the per-route
+    // breakdown. A `None` is a fact — no routing decision was ever
+    // captured for it — and is excluded from `by_route` rather than
+    // counted under any of the routes it might have taken.
+    match routed_by {
+        Some(routed_by) => *by_route.entry(routed_by.as_str().to_string()).or_insert(0) += 1,
+        None => *excluded += 1,
+    }
+}
+
+impl Reading<'_> {
+    /// One run's example, or (`Err`) the reason it is excluded; a failed
+    /// ledger read is the outer error and stops the build.
+    fn example_of(
+        &self,
+        run_id: &RunId,
+        task_id: &TaskId,
+        observation: Observation,
+    ) -> Result<Result<Built, String>, DatasetError> {
+        let ledger = self.ledger;
+        let material = read_of(
+            run_id,
+            "contract revision",
+            (self.contract_of)(run_id.as_str()),
+        )?;
+        let Some((contract, objective, tier_name)) = material else {
+            return Ok(Err(format!("{run_id}: no contract revision recorded")));
+        };
+        let Some(state) = read_of(run_id, "state", ledger.run_status(run_id))? else {
+            return Ok(Err(format!("{run_id}: no state recorded")));
         };
         // A task's later recorded outcome (SPEC §20) can withdraw its
         // positive label even when its state alone said accepted — a
         // reverted change or a later confirmed regression is never a
-        // positive label.
-        let latest_outcome = read_of(&run_id, "latest outcome", ledger.latest_outcome(&task_id))?;
+        // positive label. It describes the landed SOURCE patch, so a
+        // replay arm reads none: its own verified state is its evidence.
+        let latest_outcome = match &observation {
+            Observation::Live => read_of(run_id, "latest outcome", ledger.latest_outcome(task_id))?,
+            Observation::Replay { .. } => None,
+        };
         let outcome_kind = latest_outcome.as_ref().map(|stored| stored.outcome.kind);
         // The decision is read once, before labelling: a salvage's
         // evidence (raising state and reason, containment) lives on it.
-        let decision = read_of(&run_id, "decision", ledger.decision_of_run(&run_id))?;
+        let decision = read_of(run_id, "decision", ledger.decision_of_run(run_id))?;
         let salvage = salvage_evidence_of(decision.as_ref());
         let by_orchestrator = decision.as_ref().and_then(|record| record.actor.as_deref())
             == Some(crate::ledger::Actor::Orchestrator.as_str());
@@ -399,14 +680,10 @@ pub fn build(
             }
             Labelling::AcceptedViaSalvage => (true, LabelSource::PersonSalvageContained),
             Labelling::Failed => (false, LabelSource::Runner),
-            Labelling::Excluded(why) => {
-                exclusions.push(format!("{run_id}: {state}: {why}"));
-                continue;
-            }
+            Labelling::Excluded(why) => return Ok(Err(format!("{run_id}: {state}: {why}"))),
         };
         let Some(tier) = Tier::parse(&tier_name) else {
-            exclusions.push(format!("{run_id}: unknown tier `{tier_name}`"));
-            continue;
+            return Ok(Err(format!("{run_id}: unknown tier `{tier_name}`")));
         };
         // A cheap worker rescued by a stronger worker did not succeed
         // without escalation. The attempt table's phase says whether the
@@ -414,9 +691,9 @@ pub fn build(
         // the escalation tier is not an escalation, and counting it as
         // one labelled every reviewed run a failure of its worker.
         let escalated = read_of(
-            &run_id,
+            run_id,
             "escalation attempts",
-            ledger.escalation_attempted(&run_id),
+            ledger.escalation_attempted(run_id),
         )?;
         // A person's approval (`relais decide --answer approve`) accepts
         // the candidate, but it is not the VERIFIED acceptance SPEC §17
@@ -443,11 +720,11 @@ pub fn build(
             .as_ref()
             .and_then(|stored| stored.outcome.detail.correction_magnitude)
             .map(|magnitude| magnitude.get());
-        let cost = read_of(&run_id, "cost", ledger.run_cost(&run_id))?;
+        let cost = read_of(run_id, "cost", ledger.run_cost(run_id))?;
         let completeness = read_of(
-            &run_id,
+            run_id,
             "cost completeness",
-            ledger.run_cost_completeness(&run_id),
+            ledger.run_cost_completeness(run_id),
         )?;
         // Complete means every part of the run is costed: a figure the
         // harness reported, or (every dispatch native) every token priced
@@ -459,95 +736,72 @@ pub fn build(
             crate::money::CostCompleteness::IncompleteLowerBound
             | crate::money::CostCompleteness::Unknown => false,
         };
-        let task = TaskFeatures::extract(&contract, repo_policy);
+        let task = TaskFeatures::extract(&contract, self.repo_policy);
         // The identity that actually ran. Without a dispatch intent there
         // is no model to attribute the outcome to, and a default identity
         // would credit the empty model with this run's evidence.
         let intent = read_of(
-            &run_id,
+            run_id,
             "first dispatch intent",
-            ledger.first_dispatch_intent(&run_id),
+            ledger.first_dispatch_intent(run_id),
         )?;
         let Some(base_identity) = intent.as_ref().and_then(identity_of_intent) else {
-            exclusions.push(format!(
+            return Ok(Err(format!(
                 "{run_id}: no dispatch intent naming a model; the outcome cannot be attributed"
-            ));
-            continue;
+            )));
         };
-        // The route this dispatch recorded (SPEC §6), for the per-route
-        // breakdown. A `None` here is a fact — no routing decision was
-        // ever captured for it — and is excluded from `by_route` rather
-        // than counted under any of the routes it might have taken.
-        let routed_by: Option<RoutedBy> = read_of(
-            &run_id,
-            "routed by",
-            ledger.first_dispatch_routed_by(&run_id),
-        )?;
-        match routed_by {
-            Some(routed_by) => {
-                *route_by_route
-                    .entry(routed_by.as_str().to_string())
-                    .or_insert(0) += 1;
-            }
-            None => route_excluded += 1,
-        }
-        let eligibility = crate::route::eligible_tiers(&contract, repo_policy, &repo_policy.models);
-        // The recipe that produced this run, reconstructed the same pure
-        // way the router itself would decide it (SPEC §17): two revisions
-        // of one recipe are never pooled as if they were the same thing.
-        let recipe_id =
-            crate::route::covering_recipe_id(&contract, repo_policy, &eligibility.tiers);
+        let routed_by: Option<RoutedBy> =
+            read_of(run_id, "routed by", ledger.first_dispatch_routed_by(run_id))?;
+        let eligibility =
+            crate::route::eligible_tiers(&contract, self.repo_policy, &self.repo_policy.models);
+        // The recipe that produced this run: for a live run, reconstructed
+        // the same pure way the router itself would decide it (SPEC §17);
+        // for a replay, the arm its trial names — never the incumbent the
+        // current policy covers the task with, which would credit the
+        // wrong recipe. Two revisions of one recipe are never pooled.
+        let (recipe_id, family, origin) = match observation {
+            Observation::Live => (
+                crate::route::covering_recipe_id(&contract, self.repo_policy, &eligibility.tiers),
+                task_family(&contract),
+                Origin::Live,
+            ),
+            Observation::Replay { recipe_id, family } => (Some(recipe_id), family, Origin::Replay),
+        };
         let identity = RecipeIdentity {
             recipe_id,
             ..base_identity
         };
-        let sparse: SparseVec = expand(&task, tier, &objective, &identity, &schema);
-        let transitions = read_of(&run_id, "transitions", ledger.transitions(&run_id))?;
+        let sparse: SparseVec = expand(&task, tier, &objective, &identity, self.schema);
+        let transitions = read_of(run_id, "transitions", ledger.transitions(run_id))?;
         let Some(dispatched_at) = transitions.first().map(|transition| transition.at.clone())
         else {
             // An empty timestamp sorts before every real one, so such a
             // record would land in the training split whatever its date.
-            exclusions.push(format!("{run_id}: no transition recorded; undatable"));
-            continue;
+            return Ok(Err(format!("{run_id}: no transition recorded; undatable")));
         };
-        records.push(TrainingExample {
-            family: task_family(&contract),
-            tier,
-            floor: eligibility.floor,
-            task,
-            objective: objective.clone(),
-            identity,
-            sparse,
-            accepted_without_escalation,
-            route,
-            label_source,
-            outcome_stood,
-            correction_magnitude,
-            complete_cost: cost,
-            cost_complete,
-            dispatched_at,
-        });
+        Ok(Ok(Built {
+            example: TrainingExample {
+                family,
+                task_id: task_id.as_str().to_string(),
+                origin,
+                tier,
+                floor: eligibility.floor,
+                task,
+                objective: objective.clone(),
+                identity,
+                sparse,
+                accepted_without_escalation,
+                route,
+                label_source,
+                outcome_stood,
+                correction_magnitude,
+                complete_cost: cost,
+                cost_complete,
+                dispatched_at,
+            },
+            routed_by,
+        }))
     }
-    // The records are owned structs of numbers, strings and vectors:
-    // serialization has no failure mode, and a fingerprint over
-    // `unwrap_or_default()`'s empty string would have been the SAME hash
-    // for every dataset that failed to serialize.
-    let fingerprint_source =
-        serde_json::to_string(&records).expect("training examples are plain owned data");
-    let fingerprint = sha256_hex(fingerprint_source.as_bytes());
-    Ok(Dataset {
-        version: DATASET_VERSION,
-        label_policy_version: LABEL_POLICY_VERSION,
-        records,
-        exclusions,
-        fingerprint,
-        built_at: crate::ledger::now_rfc3339(),
-        route_coverage: RouteCoverage {
-            by_route: route_by_route,
-            excluded: route_excluded,
-            excluded_reason: ROUTE_COVERAGE_EXCLUDED_REASON.to_string(),
-        },
-    })
 }
 
 /// The model/effort/harness identity a dispatch intent records, or `None`
@@ -697,6 +951,8 @@ mod tests {
     fn example(family: &str, at: &str, accepted: bool) -> TrainingExample {
         TrainingExample {
             family: family.into(),
+            task_id: format!("{family}@{at}"),
+            origin: Origin::Live,
             tier: Tier::Implementation,
             floor: Tier::Implementation,
             task: TaskFeatures::extract(&contract(), &repo_policy()),
@@ -795,6 +1051,273 @@ mod tests {
             records.len(),
             "a straddling family is moved, not discarded"
         );
+    }
+
+    /// An accepted live run `source` of task `task`, replayed as `replay`
+    /// at the research tier with a settled, accepted trial.
+    fn accepted_then_replayed(fixture: &LedgerFixture, task: &str, source: &str, replay: &str) {
+        fixture.dispatched_for_task(source, task, "implementation", "initial");
+        fixture.usage("u-source", source, "sonnet");
+        fixture.usage("u-source-2", source, "sonnet");
+        fixture.settle(source, State::Accepted);
+        fixture.replayed(
+            replay,
+            task,
+            source,
+            "research",
+            Some(TrialOutcome::Accepted),
+        );
+        fixture.usage("u-replay", replay, "haiku");
+        fixture.settle(replay, State::Accepted);
+    }
+
+    #[test]
+    fn a_replay_does_not_supersede_its_accepted_source() {
+        let fixture = LedgerFixture::open("dataset-replay-keeps-source");
+        accepted_then_replayed(&fixture, "task-t", "run-src", "run-rep");
+        let dataset = fixture.build();
+        let mut origins: Vec<(Origin, Tier, bool)> = dataset
+            .records
+            .iter()
+            .map(|r| (r.origin, r.tier, r.accepted_without_escalation))
+            .collect();
+        origins.sort();
+        assert_eq!(
+            origins,
+            [
+                (Origin::Live, Tier::Implementation, true),
+                (Origin::Replay, Tier::Research, true)
+            ],
+            "{:?}",
+            dataset.exclusions
+        );
+        assert!(
+            !dataset.exclusions.iter().any(|e| e.contains("superseded")),
+            "{:?}",
+            dataset.exclusions
+        );
+        // The two share a task and a family, so they split together.
+        assert_eq!(dataset.records[0].task_id, dataset.records[1].task_id);
+        assert_eq!(dataset.records[0].family, dataset.records[1].family);
+        let splits = temporal_splits(&dataset.records, 0.2, 0.2);
+        assert_eq!(splits.test.len(), 2, "both in the latest split");
+    }
+
+    #[test]
+    fn a_replay_example_carries_its_own_tier_identity_recipe_and_cost() {
+        let fixture = LedgerFixture::open("dataset-replay-identity");
+        accepted_then_replayed(&fixture, "task-t", "run-src", "run-rep");
+        let dataset = fixture.build();
+        let replay = dataset
+            .records
+            .iter()
+            .find(|r| r.origin == Origin::Replay)
+            .expect("a replay example");
+        let source = dataset
+            .records
+            .iter()
+            .find(|r| r.origin == Origin::Live)
+            .expect("the source example");
+        assert_eq!(replay.tier, Tier::Research);
+        assert_eq!(replay.identity.recipe_id.as_deref(), Some("cheap-rev2"));
+        assert_ne!(replay.identity.recipe_id, source.identity.recipe_id);
+        assert_eq!(
+            replay.complete_cost.to_micros(),
+            10,
+            "its own usage, not the source's"
+        );
+        assert_eq!(replay.task_id, "task-t");
+        assert_eq!(
+            dataset.counterfactual_gap.tasks, 0,
+            "the replay fills the gap"
+        );
+    }
+
+    #[test]
+    fn an_errored_or_unsettled_replay_is_excluded_with_a_reason() {
+        let fixture = LedgerFixture::open("dataset-replay-errored");
+        fixture.dispatched_for_task("run-src", "task-t", "implementation", "initial");
+        fixture.settle("run-src", State::Accepted);
+        fixture.replayed(
+            "run-err",
+            "task-t",
+            "run-src",
+            "research",
+            Some(TrialOutcome::Errored),
+        );
+        fixture.settle("run-err", State::Accepted);
+        fixture.replayed("run-open", "task-t", "run-src", "research", None);
+        fixture.settle("run-open", State::Accepted);
+        let dataset = fixture.build();
+        assert_eq!(dataset.records.len(), 1, "{:?}", dataset.exclusions);
+        assert_eq!(dataset.records[0].origin, Origin::Live);
+        assert!(
+            dataset
+                .exclusions
+                .iter()
+                .any(|e| e.starts_with("run-err: replay: its trial errored")),
+            "{:?}",
+            dataset.exclusions
+        );
+        assert!(
+            dataset
+                .exclusions
+                .iter()
+                .any(|e| e.starts_with("run-open: replay: no trial row names it")),
+            "{:?}",
+            dataset.exclusions
+        );
+    }
+
+    #[test]
+    fn a_replay_whose_trial_predates_v17_is_excluded_by_name_and_its_source_still_yields() {
+        let fixture = LedgerFixture::open("dataset-replay-pre-v17");
+        fixture.dispatched_for_task("run-src", "task-t", "implementation", "initial");
+        fixture.settle("run-src", State::Accepted);
+        fixture.replayed_before_v17("run-rep", "task-t", "run-src");
+        fixture.settle("run-rep", State::Accepted);
+        let dataset = fixture.build();
+        assert_eq!(dataset.records.len(), 1, "{:?}", dataset.exclusions);
+        assert_eq!(dataset.records[0].origin, Origin::Live);
+        assert!(dataset.records[0].accepted_without_escalation);
+        assert!(
+            dataset.exclusions.iter().any(|e| {
+                e
+                == "run-rep: replay: no trial row names it as its arm (recorded before ledger v17)"
+            }),
+            "{:?}",
+            dataset.exclusions
+        );
+    }
+
+    #[test]
+    fn a_reverted_source_does_not_relabel_its_replay() {
+        let fixture = LedgerFixture::open("dataset-replay-reverted-source");
+        accepted_then_replayed(&fixture, "task-t", "run-src", "run-rep");
+        let outcome = crate::outcome::Outcome::new(
+            OutcomeKind::Reverted,
+            crate::outcome::OutcomeDetail {
+                candidate_sha: Some("abc123".into()),
+                strategy: crate::outcome::Strategy {
+                    tier: Tier::Implementation,
+                    models: vec!["sonnet".into()],
+                    escalated: false,
+                },
+                correction_magnitude: None,
+                evidence: vec![],
+                actor: "a person".into(),
+                note: None,
+            },
+        )
+        .expect("outcome");
+        fixture
+            .ledger
+            .record_outcome(&run_id("run-src"), &TaskId::from_stored("task-t"), &outcome)
+            .expect("record");
+        let dataset = fixture.build();
+        let by_origin = |origin| {
+            dataset
+                .records
+                .iter()
+                .find(|r| r.origin == origin)
+                .expect("an example")
+        };
+        assert!(!by_origin(Origin::Live).accepted_without_escalation);
+        assert_eq!(by_origin(Origin::Live).outcome_stood, Some(false));
+        assert!(by_origin(Origin::Replay).accepted_without_escalation);
+        assert_eq!(by_origin(Origin::Replay).outcome_stood, None);
+    }
+
+    #[test]
+    fn a_replay_of_a_superseded_source_is_excluded() {
+        // Every ledger write takes a clock tick: enough of them, in order,
+        // so `run-new` is created after `run-old`.
+        let times: Vec<String> = (0..60)
+            .map(|minute| format!("2026-10-01T00:{minute:02}:00+00:00"))
+            .collect();
+        let fixture = LedgerFixture::open_with_clock("dataset-replay-superseded", times);
+        fixture.dispatched_for_task("run-old", "task-t", "implementation", "initial");
+        fixture.settle("run-old", State::Accepted);
+        fixture.dispatched_for_task("run-new", "task-t", "implementation", "initial");
+        fixture.settle("run-new", State::Accepted);
+        fixture.replayed(
+            "run-rep",
+            "task-t",
+            "run-old",
+            "research",
+            Some(TrialOutcome::Accepted),
+        );
+        fixture.settle("run-rep", State::Accepted);
+        let dataset = fixture.build();
+        assert_eq!(dataset.records.len(), 1, "{:?}", dataset.exclusions);
+        assert!(
+            dataset
+                .exclusions
+                .iter()
+                .any(|e| e == "run-rep: replay of run-old, a superseded attempt at task task-t"),
+            "{:?}",
+            dataset.exclusions
+        );
+    }
+
+    #[test]
+    fn old_examples_without_origin_read_as_live() {
+        let mut value = serde_json::to_value(example("f", "2026-09-01T00:00:00+00:00", true))
+            .expect("serializes");
+        let fields = value.as_object_mut().expect("an object");
+        fields.remove("origin");
+        fields.remove("task_id");
+        let example: TrainingExample = serde_json::from_value(value).expect("parses");
+        assert_eq!(example.origin, Origin::Live);
+        assert_eq!(example.task_id, "");
+    }
+
+    #[test]
+    fn counterfactual_gap_counts_tasks_without_a_cheaper_arm_and_prices_unknown_as_unknown() {
+        let at = "2026-09-01T00:00:00+00:00";
+        let mut escalated = example("f1", at, true);
+        escalated.tier = Tier::Escalation;
+        escalated.task_id = "t1".into();
+        let mut covered = example("f2", at, true);
+        covered.tier = Tier::Escalation;
+        covered.task_id = "t2".into();
+        let mut covering = example("f2", at, false);
+        covering.origin = Origin::Replay;
+        covering.task_id = "t2".into();
+        // `covering` observed implementation for t2 (cost 100, complete).
+        let records = vec![escalated.clone(), covered, covering];
+        let gap = counterfactual_gap(&records);
+        assert_eq!(gap.tasks, 1, "t1 lacks implementation; t2 has it");
+        assert_eq!(
+            gap.estimate.map(|c| c.to_micros()),
+            Some(100),
+            "priced at the mean implementation cost"
+        );
+        assert_eq!(
+            gap.render_lines(),
+            [
+                "counterfactual gap: 1 accepted task(s) lack a cheaper arm",
+                "  next: relais dataset replay (estimated cost ~$0.0001)"
+            ]
+        );
+        // Nothing priced at the cheaper tier: unknown, never zero.
+        let gap = counterfactual_gap(&[escalated]);
+        assert_eq!(gap.tasks, 1);
+        assert_eq!(gap.estimate, None);
+        assert_eq!(gap.basis, "no priced run at implementation");
+        assert!(
+            gap.render_lines()[1].contains("cost unknown"),
+            "{:?}",
+            gap.render_lines()
+        );
+        // A research example has nothing cheaper; a negative is not a gap.
+        let mut research = example("f3", at, true);
+        research.tier = Tier::Research;
+        let mut failed = example("f4", at, false);
+        failed.tier = Tier::Escalation;
+        let gap = counterfactual_gap(&[research, failed]);
+        assert_eq!(gap.tasks, 0);
+        assert_eq!(gap.render_lines()[1], "  next: nothing to replay");
     }
 
     fn contract() -> crate::contract::TaskContract {
@@ -973,6 +1496,64 @@ argv = ["true"]
                     at: crate::ledger::now_rfc3339(),
                 })
                 .expect("transition");
+        }
+
+        /// A replay of `task` on `tier` (its own run, purpose `Replay`,
+        /// contract revision, attempt and intent), with a settled trial
+        /// naming it as the arm of `source`, unless `trial` is `None`.
+        fn replayed(
+            &self,
+            run: &str,
+            task: &str,
+            source: &str,
+            tier: &str,
+            trial: Option<TrialOutcome>,
+        ) {
+            self.dispatched_for_task(run, task, tier, "initial");
+            self.ledger
+                .set_run_purpose(&run_id(run), RunPurpose::Replay)
+                .expect("purpose");
+            let Some(outcome) = trial else {
+                return;
+            };
+            let trial_id = crate::ids::TrialId::from_stored(format!("trial-{run}"));
+            self.ledger
+                .insert_replay_trial(&crate::ledger::NewReplayTrial {
+                    trial_id: &trial_id,
+                    task_id: &TaskId::from_stored(task),
+                    source_run_id: &run_id(source),
+                    incumbent_recipe_id: "incumbent",
+                    arm_recipe_id: "cheap-rev2",
+                    base_sha: "base",
+                    contract_hash: "contract",
+                    verification_profile_hash: "profile",
+                    workspace_isolation: "fresh_checkout_no_accepted_answer",
+                    arm_run_id: &run_id(run),
+                })
+                .expect("replay trial");
+            self.ledger
+                .settle_trial(
+                    &trial_id,
+                    outcome,
+                    outcome == TrialOutcome::Accepted,
+                    crate::ledger::TrialCost::UNKNOWN,
+                    1,
+                )
+                .expect("settle");
+        }
+
+        /// Like [`Self::replayed`] with a settled trial, then the trial's
+        /// `arm_run_id` nulled: what a row written before ledger v17 reads
+        /// back as.
+        fn replayed_before_v17(&self, run: &str, task: &str, source: &str) {
+            self.replayed(run, task, source, "research", Some(TrialOutcome::Accepted));
+            let conn = rusqlite::Connection::open(self.dir.join("ledger.sqlite"))
+                .expect("raw connection to the same ledger file");
+            conn.execute(
+                "UPDATE trials SET arm_run_id = NULL WHERE arm_run_id = ?1",
+                rusqlite::params![run_id(run).as_str()],
+            )
+            .expect("null arm_run_id");
         }
 
         fn build(&self) -> Dataset {
@@ -1849,6 +2430,7 @@ revision = 1
             fingerprint: "f".into(),
             built_at: "now".into(),
             route_coverage: Default::default(),
+            counterfactual_gap: Default::default(),
         };
         assert_eq!(
             dataset.acceptance_labels(),
