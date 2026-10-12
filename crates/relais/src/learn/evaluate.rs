@@ -14,10 +14,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::dataset::{temporal_splits, Dataset, TemporalSplits};
+use super::dataset::{temporal_splits, CounterfactualGap, Dataset, TemporalSplits};
 use super::features::{
-    expand, feature_dim, FeatureSchema, LabelSource, RecipeIdentity, SparseVec, Standardization,
-    TrainingExample,
+    expand, feature_dim, FeatureSchema, LabelSource, Origin, RecipeIdentity, SparseVec,
+    Standardization, TrainingExample,
 };
 use super::learner::{CostModel, FitReport, LogisticModel, SolverSettings};
 use crate::money::MicroUsd;
@@ -294,6 +294,43 @@ impl PromotionGates {
     }
 }
 
+/// One point of the floor sweep: what the test split looks like when the
+/// router takes the cheapest arm whose predicted acceptance clears `floor`.
+/// The sweep informs the choice of `[routing] quality_floor`; the gate
+/// still measures the configured floor alone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SweepPoint {
+    pub floor: f64,
+    /// Whether this point is the configured `[routing] quality_floor`.
+    pub configured: bool,
+    /// Test tasks whose selected arm one of their records ran at.
+    pub supported_test_records: usize,
+    pub acceptance_rate: Option<f64>,
+    pub mean_cost_micros: Option<i64>,
+    pub abstention_rate: f64,
+}
+
+/// The floors the sweep measures: 0.50 to 0.95 by 0.05, plus the
+/// configured floor, deduplicated on hundredths (an `f64` grid built by
+/// repeated addition drifts off 0.75) and sorted.
+pub fn sweep_floors(configured: f64) -> Vec<f64> {
+    let configured_hundredths = (configured * 100.0).round() as i64;
+    let mut hundredths: Vec<i64> = (50..=95).step_by(5).collect();
+    hundredths.push(configured_hundredths);
+    hundredths.sort_unstable();
+    hundredths.dedup();
+    hundredths
+        .into_iter()
+        .map(|h| {
+            if h == configured_hundredths {
+                configured
+            } else {
+                h as f64 / 100.0
+            }
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvalReport {
     pub version: u32,
@@ -314,6 +351,17 @@ pub struct EvalReport {
     /// Empty in a report stored before label sources existed.
     #[serde(default)]
     pub by_label_source: Vec<LabelSourceReport>,
+    /// What the test split looks like at each floor of the sweep, the
+    /// configured floor among them (SPEC §17: a report beside the gate,
+    /// never the gate). Empty in a report stored before the sweep existed.
+    #[serde(default)]
+    pub floor_sweep: Vec<SweepPoint>,
+    /// The dataset's examples by origin (`live`, `replay`); empty before.
+    #[serde(default)]
+    pub examples_by_origin: std::collections::BTreeMap<String, usize>,
+    /// The dataset's counterfactual gap; absent in a report stored before.
+    #[serde(default)]
+    pub counterfactual_gap: Option<CounterfactualGap>,
     pub test_acceptance_rate: Option<f64>,
     /// Baseline: the conservative configured route (each record's own
     /// floor tier) — what cold-start routing achieves without any learned
@@ -618,6 +666,17 @@ pub fn train_and_evaluate(
             test_records: measured.test_records,
             calibration_bins,
             by_label_source,
+            floor_sweep: measured.floor_sweep,
+            examples_by_origin: dataset.records.iter().fold(
+                std::collections::BTreeMap::new(),
+                |mut counts, record| {
+                    *counts
+                        .entry(record.origin.as_str().to_string())
+                        .or_insert(0) += 1;
+                    counts
+                },
+            ),
+            counterfactual_gap: Some(dataset.counterfactual_gap.clone()),
             test_acceptance_rate: measured.test_acceptance_rate,
             baseline_acceptance_rate: measured.baseline_acceptance_rate,
             mean_cost_selected: measured.mean_cost_selected,
@@ -714,7 +773,8 @@ struct Measurement<'a> {
     quality_floor: f64,
 }
 
-/// What the held-out split measured.
+/// What the held-out split measured, at the configured floor, plus the
+/// same numbers at every floor of the sweep.
 struct Measured {
     test_records: usize,
     supported: usize,
@@ -723,6 +783,7 @@ struct Measured {
     mean_cost_selected: Option<i64>,
     mean_cost_baseline: Option<i64>,
     abstention_rate: f64,
+    floor_sweep: Vec<SweepPoint>,
 }
 
 /// An arm the evaluation offers for one record, with the identity inference
@@ -844,8 +905,10 @@ fn is_evidence_for(record: &TrainingExample, candidate: &Candidate) -> bool {
 /// floor tier. Pooling research and implementation records regardless of
 /// each record's own floor made the baseline a mixture no route produces.
 fn measure(inputs: Measurement<'_>) -> Measured {
-    let select = |record: &TrainingExample| -> Option<Candidate> {
-        let mut candidates = candidates_for(record, inputs.tiers, inputs.identities);
+    // The arms and their estimates for one record: computed once, then
+    // selected from at every floor of the sweep.
+    let estimates_for = |record: &TrainingExample| -> (Vec<Candidate>, Estimates) {
+        let candidates = candidates_for(record, inputs.tiers, inputs.identities);
         let mut acceptance = Vec::new();
         let mut cost = Vec::new();
         for candidate in &candidates {
@@ -879,38 +942,101 @@ fn measure(inputs: Measurement<'_>) -> Measured {
             cost,
             raw: serde_json::Value::Null,
         };
-        let arms: Vec<Arm> = candidates
-            .iter()
-            .map(|candidate| candidate.arm.clone())
-            .collect();
-        let selected = select_learned(&estimates, &arms, inputs.quality_floor)?;
-        let at = candidates
-            .iter()
-            .position(|candidate| candidate.arm == selected)?;
-        Some(candidates.swap_remove(at))
+        (candidates, estimates)
     };
 
-    let mut test_records = 0;
-    let mut abstentions = 0;
-    let mut supported = 0;
-    let mut accepted_on_support = 0;
+    // The unit is the TASK, not the record: a source run and its replays
+    // share the task's features, so they make one selection and one
+    // abstention unit, and the record whose arm the selection names is the
+    // task's evidence (at most one, their arms differing). A record from a
+    // dataset built before task ids counts as its own task. The task is
+    // represented by its live record, else its first.
+    let mut tasks: Vec<Vec<&TrainingExample>> = Vec::new();
+    let mut index_of_task: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for record in inputs.test {
+        if record.task_id.is_empty() {
+            tasks.push(vec![record]);
+            continue;
+        }
+        match index_of_task.get(record.task_id.as_str()) {
+            Some(&at) => tasks[at].push(record),
+            None => {
+                index_of_task.insert(record.task_id.as_str(), tasks.len());
+                tasks.push(vec![record]);
+            }
+        }
+    }
+    let per_task: Vec<(Vec<Candidate>, Estimates, &[&TrainingExample])> = tasks
+        .iter()
+        .map(|records| {
+            let representative = records
+                .iter()
+                .find(|record| record.origin == Origin::Live)
+                .unwrap_or(&records[0]);
+            let (candidates, estimates) = estimates_for(representative);
+            (candidates, estimates, records.as_slice())
+        })
+        .collect();
+
+    let same_floor = |a: f64, b: f64| (a * 100.0).round() as i64 == (b * 100.0).round() as i64;
+    let floor_sweep: Vec<SweepPoint> = sweep_floors(inputs.quality_floor)
+        .into_iter()
+        .map(|floor| {
+            let mut abstentions = 0;
+            let mut supported = 0;
+            let mut accepted_on_support = 0;
+            let mut selected_costs: Vec<i64> = Vec::new();
+            for (candidates, estimates, records) in &per_task {
+                let arms: Vec<Arm> = candidates
+                    .iter()
+                    .map(|candidate| candidate.arm.clone())
+                    .collect();
+                let Some(selected) = select_learned(estimates, &arms, floor) else {
+                    abstentions += 1;
+                    continue;
+                };
+                let Some(candidate) = candidates.iter().find(|c| c.arm == selected) else {
+                    continue;
+                };
+                if let Some(record) = records
+                    .iter()
+                    .find(|record| is_evidence_for(record, candidate))
+                {
+                    supported += 1;
+                    if record.accepted_without_escalation {
+                        accepted_on_support += 1;
+                    }
+                    selected_costs.push(record.complete_cost.to_micros());
+                }
+            }
+            SweepPoint {
+                floor,
+                configured: same_floor(floor, inputs.quality_floor),
+                supported_test_records: supported,
+                acceptance_rate: (supported > 0)
+                    .then(|| accepted_on_support as f64 / supported as f64),
+                mean_cost_micros: mean_of(&selected_costs),
+                abstention_rate: if per_task.is_empty() {
+                    0.0
+                } else {
+                    abstentions as f64 / per_task.len() as f64
+                },
+            }
+        })
+        .collect();
+    let at_configured = floor_sweep
+        .iter()
+        .find(|point| point.configured)
+        .cloned()
+        .expect("sweep_floors always includes the configured floor");
+
+    // The baseline is per record: what cold-start routing does for each
+    // record's own task is its floor tier, whatever arm a replay ran at.
     let mut baseline_size = 0;
     let mut baseline_accepted = 0;
-    let mut selected_costs: Vec<i64> = Vec::new();
     let mut baseline_costs: Vec<i64> = Vec::new();
     for record in inputs.test {
-        test_records += 1;
-        match select(record) {
-            None => abstentions += 1,
-            Some(selected) if is_evidence_for(record, &selected) => {
-                supported += 1;
-                if record.accepted_without_escalation {
-                    accepted_on_support += 1;
-                }
-                selected_costs.push(record.complete_cost.to_micros());
-            }
-            Some(_) => {}
-        }
         if record.tier == record.floor {
             baseline_size += 1;
             if record.accepted_without_escalation {
@@ -920,19 +1046,15 @@ fn measure(inputs: Measurement<'_>) -> Measured {
         }
     }
     Measured {
-        test_records,
-        supported,
-        test_acceptance_rate: (supported > 0)
-            .then(|| accepted_on_support as f64 / supported as f64),
+        test_records: per_task.len(),
+        supported: at_configured.supported_test_records,
+        test_acceptance_rate: at_configured.acceptance_rate,
         baseline_acceptance_rate: (baseline_size > 0)
             .then(|| baseline_accepted as f64 / baseline_size as f64),
-        mean_cost_selected: mean_of(&selected_costs),
+        mean_cost_selected: at_configured.mean_cost_micros,
         mean_cost_baseline: mean_of(&baseline_costs),
-        abstention_rate: if test_records > 0 {
-            abstentions as f64 / test_records as f64
-        } else {
-            0.0
-        },
+        abstention_rate: at_configured.abstention_rate,
+        floor_sweep,
     }
 }
 
@@ -1015,6 +1137,43 @@ impl EvalReport {
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
+        if !self.examples_by_origin.is_empty() {
+            out.push_str(&format!(
+                "examples by origin: {}\n",
+                self.examples_by_origin
+                    .iter()
+                    .map(|(origin, count)| format!("{origin} {count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if let Some(gap) = &self.counterfactual_gap {
+            for line in gap.render_lines() {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+        for point in &self.floor_sweep {
+            out.push_str(&format!(
+                "floor sweep: {:.2}{} supported {} acceptance {} mean cost {} abstention {:.2}\n",
+                point.floor,
+                if point.configured {
+                    " (configured)"
+                } else {
+                    ""
+                },
+                point.supported_test_records,
+                match point.acceptance_rate {
+                    Some(rate) => format!("{rate:.2}"),
+                    None => "n/a".into(),
+                },
+                match micros_of(point.mean_cost_micros) {
+                    Some(cost) => cost.to_string(),
+                    None => "n/a".into(),
+                },
+                point.abstention_rate
+            ));
+        }
         for bin in &self.calibration_bins {
             out.push_str(&format!(
                 "calibration (held-out test split): predicted {:.2} → observed {:.2} (n={})\n",
@@ -1162,6 +1321,124 @@ mod tests {
             cost_complete: true,
             dispatched_at: at.into(),
         }
+    }
+
+    #[test]
+    fn the_sweep_floors_are_the_grid_plus_the_configured_floor_once() {
+        let on_grid = sweep_floors(0.75);
+        assert_eq!(on_grid.len(), 10, "{on_grid:?}");
+        assert_eq!(on_grid.iter().filter(|f| **f == 0.75).count(), 1);
+        let eight = sweep_floors(0.8);
+        assert_eq!(eight.len(), 10, "{eight:?}");
+        let off_grid = sweep_floors(0.72);
+        assert_eq!(off_grid.len(), 11, "{off_grid:?}");
+        assert!(off_grid.contains(&0.72));
+        assert!(
+            off_grid.windows(2).all(|w| w[0] < w[1]),
+            "sorted: {off_grid:?}"
+        );
+    }
+
+    #[test]
+    fn abstention_never_falls_as_the_floor_rises() {
+        let outcome = train_and_evaluate(&dataset(), &settings(0.75, 5)).expect("trains");
+        let sweep = &outcome.report.floor_sweep;
+        assert_eq!(sweep.len(), 10, "{sweep:?}");
+        assert!(
+            sweep.windows(2).all(|w| w[0].floor < w[1].floor),
+            "sorted by floor: {sweep:?}"
+        );
+        // The feasible set only shrinks as the floor rises; cost and
+        // acceptance are measured on supported records only and need not
+        // be monotonic.
+        assert!(
+            sweep
+                .windows(2)
+                .all(|w| w[0].abstention_rate <= w[1].abstention_rate),
+            "{sweep:?}"
+        );
+        assert_eq!(sweep.iter().filter(|point| point.configured).count(), 1);
+        let text = outcome.report.render();
+        assert!(text.contains("floor sweep: 0.75 (configured)"), "{text}");
+        assert!(text.contains("examples by origin: live 40"), "{text}");
+        assert!(text.contains("counterfactual gap: "), "{text}");
+    }
+
+    #[test]
+    fn the_configured_floor_is_in_the_sweep_and_matches_the_gate_numbers() {
+        let outcome = train_and_evaluate(&dataset(), &settings(0.6, 5)).expect("trains");
+        let report = &outcome.report;
+        let configured = report
+            .floor_sweep
+            .iter()
+            .find(|point| point.configured)
+            .expect("the configured floor");
+        assert_eq!(configured.floor, 0.6);
+        assert_eq!(configured.abstention_rate, report.abstention_rate);
+        assert_eq!(
+            configured.supported_test_records,
+            report.gates.supported_test_records
+        );
+        assert_eq!(configured.acceptance_rate, report.test_acceptance_rate);
+        assert_eq!(configured.mean_cost_micros, report.mean_cost_selected);
+    }
+
+    #[test]
+    fn a_report_without_floor_sweep_still_parses() {
+        let mut stored = super::super::fixtures::evaluation("art-old", true);
+        let fields = stored.as_object_mut().expect("an object");
+        fields.remove("floor_sweep");
+        fields.remove("examples_by_origin");
+        fields.remove("counterfactual_gap");
+        let report: EvalReport = serde_json::from_value(stored).expect("an old report parses");
+        assert!(report.floor_sweep.is_empty());
+        assert!(report.examples_by_origin.is_empty());
+        assert_eq!(report.counterfactual_gap, None);
+        assert_eq!(report.version, EVAL_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_source_and_its_replay_count_one_abstention() {
+        let mut with_replays = dataset();
+        let originals = with_replays.records.clone();
+        // Every task replayed at research: same task id, another arm.
+        for record in &originals {
+            let mut replay = record.clone();
+            replay.origin = Origin::Replay;
+            replay.tier = Tier::Research;
+            replay.sparse = expand(
+                &replay.task,
+                replay.tier,
+                &replay.objective,
+                &replay.identity,
+                &FeatureSchema::standard(),
+            );
+            with_replays.records.push(replay);
+        }
+        let outcome = train_and_evaluate(&with_replays, &settings(0.75, 5)).expect("trains");
+        let splits = temporal_splits(&with_replays.records, 0.2, 0.2);
+        let distinct_tasks = splits
+            .test
+            .iter()
+            .map(|record| record.task_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        assert!(
+            splits.test.len() > distinct_tasks,
+            "replays are in the test split"
+        );
+        assert_eq!(
+            outcome.report.test_records, distinct_tasks,
+            "tasks, not records, are the unit"
+        );
+        assert_eq!(outcome.report.gates.test_records, distinct_tasks);
+        assert_eq!(
+            outcome.report.examples_by_origin,
+            std::collections::BTreeMap::from([
+                ("live".to_string(), 40),
+                ("replay".to_string(), 40)
+            ])
+        );
     }
 
     /// Gate thresholds that let the small fixtures below say something
