@@ -177,9 +177,13 @@ const classifierModel = (store: Store) => {
 
 async function complete(fx: Fx, store: Store, prompt: string) {
   const model = classifierModel(store)
+  // The system prompt goes unmarked for the prompt cache. Marked, 311 of
+  // 340 calls from 2026-10-08 to 2026-10-12 wrote about 930 tokens each to
+  // the cache, billed above plain input, and 11 read anything back, calls
+  // seconds apart included.
   const reply = await fx.model.complete({
     model,
-    system: [{ text: CLASSIFIER_SYSTEM, cache: true }],
+    system: CLASSIFIER_SYSTEM,
     prompt,
     maxTokens: CLASSIFIER_MAX_TOKENS,
     effort: 'low',

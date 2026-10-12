@@ -33,6 +33,8 @@ test('the engine’s turn.step receives the routed full model id, and later step
   expect(request.effort).toBe('low')
   expect(request.maxTokens).toBe(160)
   expect(request.timeoutMs).toBe(3000)
+  // A plain string: no block is marked for the prompt cache.
+  expect(request.system).toBe(CLASSIFIER_SYSTEM)
 })
 
 test('a failed verification after an edit escalates one tier from the next request', async ($: any, on: any) => {

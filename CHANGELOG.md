@@ -10,6 +10,8 @@ missing here.
 
 A model name that is empty or only whitespace now counts as no model: it is unverified rather than substituted, stored as NULL, and never becomes what an alias runs as.
 
+The session router's classifier sends its system prompt without a prompt-cache mark. Marked, it wrote about 930 tokens to the cache on 311 of 340 calls, billed above plain input, and read anything back on 11.
+
 ## v0.16.0
 
 An agent-run quiet check now shows live in the pane (#211).
