@@ -316,8 +316,10 @@ fn walk(
     let patch_text = std::fs::read_to_string(patch)
         .map_err(|e| Stop::Unknown(format!("{}: {e}", patch.display())))?;
     let paths = patch_paths(&patch_text);
+    // An empty candidate (an inspection, a run that changed nothing) has
+    // nothing that could land or be undone: not unknown, just no revert.
     if paths.is_empty() {
-        return Err(Stop::Unknown(format!("{} names no path", patch.display())));
+        return Ok(Finding::NoRevert);
     }
     // The default branch's tip: origin's HEAD, else main, else master,
     // else wherever HEAD is. `for-each-ref` prints in refname order, not
@@ -404,9 +406,8 @@ fn walk(
     Ok(Finding::NoRevert)
 }
 
-/// The outcome to record for a detected revert of `run`: the strategy is
-/// read off the ledger, as `relais feedback` does.
-/// The detected outcome for a run, or why it cannot be built.
+/// The detected outcome for a run (its strategy read off the ledger, as
+/// `relais feedback` does), or why it cannot be built.
 fn detected_outcome(
     ledger: &Ledger,
     candidate: &RevertCandidate,
@@ -431,6 +432,37 @@ fn detected_outcome(
         source: Some(SOURCE.to_string()),
     };
     Ok(Outcome::new(OutcomeKind::Reverted, detail).map_err(|e| e.to_string()))
+}
+
+/// Whether revert detection runs: the person's `[learning]
+/// revert_detection_off` turns it off (the first step of the undo).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevertDetection {
+    On,
+    Off,
+}
+
+impl RevertDetection {
+    /// From the machine settings' `[learning]` table.
+    pub fn from_settings(learning: &crate::policy::LearningSettings) -> Self {
+        if learning.revert_detection_off {
+            Self::Off
+        } else {
+            Self::On
+        }
+    }
+}
+
+/// Detect reverts, or report that the person turned detection off.
+pub fn detect_if(
+    detection: RevertDetection,
+    ledger: &Ledger,
+    now: DateTime<Utc>,
+) -> Result<RevertReport, LedgerError> {
+    match detection {
+        RevertDetection::On => detect(ledger, now),
+        RevertDetection::Off => Ok(RevertReport::off()),
+    }
 }
 
 /// Look for detected reverts among the runs that ended in the last
@@ -859,6 +891,14 @@ mod tests {
             .unwrap()
             .execute("UPDATE outcomes SET at = ?1", [at])
             .unwrap();
+    }
+
+    #[test]
+    fn an_empty_candidate_is_no_revert_not_unknown() {
+        let w = world("revert-empty-patch", &day(3));
+        std::fs::write(&w.patch, "").unwrap();
+        let report = detect(&w.ledger, now()).unwrap();
+        assert_eq!((report.unknown, report.recorded), (0, 0), "{report:?}");
     }
 
     #[test]
