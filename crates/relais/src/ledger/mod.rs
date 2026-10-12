@@ -1844,6 +1844,9 @@ pub struct TrustGrantRecord<'a> {
 
 /// The one `usage_events` insert: a duplicate event id is ignored.
 fn insert_usage_event(conn: &Connection, event: &UsageEvent) -> Result<bool> {
+    // A blank model is no model: store NULL, never "".
+    let not_blank =
+        |model: &Option<String>| model.as_ref().filter(|m| !m.trim().is_empty()).cloned();
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO usage_events
             (event_id, run_id, attempt_id, parent_event_id, model,
@@ -1857,7 +1860,7 @@ fn insert_usage_event(conn: &Connection, event: &UsageEvent) -> Result<bool> {
             event.run_id.as_str(),
             event.attempt_id,
             event.parent_event_id,
-            event.model,
+            not_blank(&event.model),
             event.input_tokens,
             event.output_tokens,
             event.cache_read_tokens,
@@ -1869,7 +1872,7 @@ fn insert_usage_event(conn: &Connection, event: &UsageEvent) -> Result<bool> {
             event.at,
             event.phase.map(UsagePhase::as_str),
             event.duration_ms,
-            event.requested_model,
+            not_blank(&event.requested_model),
             event.requested_effort,
             event.harness,
         ],
@@ -3131,6 +3134,7 @@ impl Ledger {
         let mut stmt = self.conn.prepare(
             "SELECT requested_model, model, MIN(at), MAX(at), COUNT(*) FROM usage_events
              WHERE requested_model IS NOT NULL AND model IS NOT NULL
+               AND TRIM(requested_model) <> '' AND TRIM(model) <> ''
              GROUP BY requested_model, model
              ORDER BY requested_model, MIN(at), model",
         )?;
@@ -3169,7 +3173,8 @@ impl Ledger {
         for run in self.run_tree(run_id)? {
             let mut stmt = self.conn.prepare(
                 "SELECT DISTINCT requested_model, model FROM usage_events
-                 WHERE run_id = ?1 AND requested_model IS NOT NULL AND model IS NOT NULL",
+                 WHERE run_id = ?1 AND requested_model IS NOT NULL AND model IS NOT NULL
+                   AND TRIM(requested_model) <> '' AND TRIM(model) <> ''",
             )?;
             let rows = stmt.query_map([run.as_str()], |row| {
                 Ok(ModelPair {
@@ -9762,6 +9767,29 @@ mod tests {
         );
         put("d", None, Some("claude-old"), "2026-09-01T00:00:00+00:00");
         put("e", Some("sonnet"), None, "2026-09-02T00:00:00+00:00");
+        put("f", Some("sonnet"), Some(""), "2026-09-03T00:00:00+00:00");
+        put("g", Some("sonnet"), Some("  "), "2026-09-04T00:00:00+00:00");
+        let stored: Vec<Option<String>> = ledger
+            .conn
+            .prepare("SELECT model FROM usage_events WHERE event_id IN ('f','g')")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("rows");
+        assert_eq!(stored, vec![None, None]);
+        ledger
+            .conn
+            .execute(
+                "INSERT INTO usage_events (event_id, run_id, model, requested_model, at,
+                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                    cost_kind, completeness, inclusive)
+                 SELECT 'h', run_id, '', 'sonnet', at, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens, cost_kind, completeness, inclusive
+                 FROM usage_events WHERE event_id = 'a'",
+                [],
+            )
+            .expect("older relais row");
         let observations = ledger.model_observations().expect("observations");
         assert_eq!(
             observations,

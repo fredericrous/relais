@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+A model name that is empty or only whitespace now counts as no model: it is unverified rather than substituted, stored as NULL, and never becomes what an alias runs as.
+
 ## v0.16.0
 
 An agent-run quiet check now shows live in the pane (#211).
