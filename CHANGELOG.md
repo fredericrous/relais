@@ -6,7 +6,9 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
-## Unreleased
+## v0.17.0
+
+relais starts collecting the labels its decision advisor will learn from (#229): every answered decision gets a yes/no label from what happened to it, relais detects reverts in git itself, and the orchestrator records the reverts and fixes it makes through `mcp__relais__feedback`; `relais report` shows the counts and when training can start. Breaking: `relais report --json` replaces `advisor_data` with `decision_labels`, and `relais feedback --actor` takes only `orchestrator`, `person` or `person-via-orchestrator`. After upgrading, reinstall the plugin as for v0.12.0 and restart sessions, so the feedback tool exists.
 
 The session router's classifier sends its system prompt without a prompt-cache mark. Marked, it wrote about 930 tokens to the cache on 311 of 340 calls, billed above plain input, and read anything back on 11.
 
