@@ -6,7 +6,23 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
-## Unreleased
+## v0.16.0
+
+An agent-run quiet check now shows live in the pane (#211).
+
+- Since amont 1.50 and amont-agent 2.35, a check an agent runs is quiet: its
+  output goes to a log and the agent sees one line.
+- With amont ≥ 1.51 and amont-agent ≥ 2.37, each such run also writes an
+  active-run entry (`docs/quiet-runs.md`).
+- The plugin spawns `relais quiet watch --protocol` to read those entries.
+- The pane draws each run below the relais runs: tool · check · elapsed,
+  then its last lines. It shows only this session's runs.
+- A run that passes drops off when it ends. A run that fails stays until the
+  same check runs again.
+- The pane opens itself once a run has lasted 1 s, and the status line lists
+  quiet runs.
+- To get the pane, reinstall the plugin:
+  `relais install --claude --user --write`.
 
 A run refused because the Claude Code version could not be read now says why
 the probe failed (timed out, killed by a signal, exited non-zero) instead of
