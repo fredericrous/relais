@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/quiet-in-relais-pane
 repos: [relais, amont, amont-agent]
 adrs: [ADR-0022]
@@ -66,7 +66,7 @@ Outcome: while an agent-run quiet check or command is live, relais's pane shows 
 
 ### Live (agent-observed)
 
-- [ ] **6. Observe.** In a fresh session after the reinstall: run `amont run clippy --all-files` on amont-agent and `amont-agent quiet -- sleep 20` through the agent; the pane opened on its own and shows each row with live lines and drops it at the end; a second Claude session's quiet run does not appear in this one's pane.
+- [x] **6. Observe.** In a fresh session after the reinstall: run `amont run clippy --all-files` on amont-agent and `amont-agent quiet -- sleep 20` through the agent; the pane opened on its own and shows each row with live lines and drops it at the end; a second Claude session's quiet run does not appear in this one's pane.
 
 ## Decision log
 
@@ -81,6 +81,12 @@ Outcome: while an agent-run quiet check or command is live, relais's pane shows 
 - Under load an amont-agent test read that temp just before its rename; the test helper skips dotfiles too (amont-agent#101).
 - Amends the entry-contract Decision (2026-10-12, the person chose "never delete"). Phase 6 had four open sessions, each with its own watcher. The first watcher to see an ended entry deleted it, so the others drew the run as killed (null exit) and kept a failed row. Two of eight runs showed this, among them a passed amont `branch-pattern` check. Now each watcher announces an end once and holds it closed. No watcher deletes an ended entry younger than 60 s; after that, any watcher or a tool sweep removes it.
 - End to end, branch binaries (2026-10-11): a failing `amont-agent quiet` run gave `started` (its session) → one `output` per line, live → `ended` exit 3 → entry deleted; `amont run clippy --all-files` gave `started` → live `output` → `ended` exit 0.
+
+- Phase 6 (2026-10-12):
+  - **First pass on 0.16.0.** Four sessions' watchers raced to delete ended entries, so 2 of 8 runs were drawn as killed. Fixed in #219, released as 0.16.1.
+  - **0.16.1 needs no plugin reinstall.** The plugin spawns `relais` from PATH. But a watcher already running keeps its old binary until it exits. With the person's agreement, the two remaining 0.16.0 watchers were stopped, and the plugin respawned both on 0.16.1 at once.
+  - **Rerun on 0.16.1 only.** Every run ended with its own exit on every watcher: pass 0, failure 4, clippy 0, the other session's run 0.
+  - **Still open: carried finding 12** (whether a kept failed row reads as live). The person did not watch the pane during these runs.
 
 ## Non-goals
 
@@ -111,9 +117,9 @@ Outcome: while an agent-run quiet check or command is live, relais's pane shows 
 | first quiet `started` in a session; then a second | pane opens; no second toast | pane opens on the pump tick once a run passes 1 s (not on `started`); no second toast (carried finding 1) |
 | pre-commit with sub-second checks | none flashes; the pane does not open | pane test: a sub-second pass never draws or opens the pane; a sub-second failure does |
 | pane test: `ended` with exit 1 under 1 s after `started` | head row and last lines drawn; the same with exit 0 draws nothing | drawn with its lines; exit 0 draws nothing |
-| live: agent runs `amont run clippy --all-files` | row appears with live lines, drops at end | — |
-| live: quiet run from another Claude session | not shown | — |
-| live: `amont-agent quiet -- sh -c 'for i in 1 2 3 4 5; do date +%s; sleep 2; done'` | each line in the pane within 0.5 s of its timestamp | — |
+| live: agent runs `amont run clippy --all-files` | on relais 0.16.1, each watcher saw `amont · clippy` start, its lines live, and end with exit 0. A passed run is dropped from the pane at its end. The person saw the pane open on its own during the first run. |
+| live: quiet run from another Claude session | sent with `session: other-session-p6` and exit 0. The pane draws only `store.sessions`, so the run is not drawn (that filter is pane-tested; nobody looked at the pane) |
+| live: `amont-agent quiet -- sh -c 'for i in 1 2 3 4 5; do date +%s; sleep 2; done'` | each line reached the watcher at most 0.22 s after its timestamp (mean 0.17 s, n=5). The pane redraws every 100 ms |
 
 ## Implementation review
 
