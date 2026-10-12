@@ -94,13 +94,15 @@ pub struct DecisionLabels {
     pub unproved_proxied: usize,
 }
 
-impl Default for DecisionLabels {
-    fn default() -> Self {
+impl DecisionLabels {
+    /// No labelled decision yet, projected as of `now` (taken, not read:
+    /// the clock is the caller's).
+    pub fn empty(now: DateTime<Utc>) -> Self {
         Self {
             label_policy_version: DECISION_LABEL_POLICY_VERSION,
             by_source: count_by_source(&[]).0,
             excluded: 0,
-            floor: project_floor(&[], Utc::now()),
+            floor: project_floor(&[], now),
             agreement: Fraction::default(),
             coverage: Fraction::default(),
             unproved_proxied: 0,
@@ -564,7 +566,7 @@ mod tests {
 
     #[test]
     fn the_lines_name_every_figure() {
-        let labels = DecisionLabels::default();
+        let labels = DecisionLabels::empty(now());
         let text = labels.lines();
         assert!(text.contains("decision labels (policy v1)"), "{text}");
         assert!(text.contains("rewritten"), "{text}");

@@ -395,6 +395,8 @@ pub struct CycleInputs<'a> {
     /// Where amont-agent's reviewer outcomes are read at the start of the
     /// cycle (or why they could not be located); `None` skips the ingest.
     pub review_outcomes: Option<Result<crate::review_outcome::Settings, String>>,
+    /// `[learning] revert_detection_off` is not set.
+    pub detect_reverts: bool,
     pub now: DateTime<Utc>,
 }
 
@@ -423,11 +425,16 @@ pub struct CycleReport {
 pub fn build_dataset(
     ledger: &Ledger,
     repo: &RepoPolicy,
+    detect_reverts: bool,
     now: DateTime<Utc>,
 ) -> Result<(Dataset, BackfillReport, revert::RevertReport), CycleError> {
     let backfill = salvage::backfill(ledger)?;
     // Before the dataset is read: a detected revert flips its task's label.
-    let reverts = revert::detect(ledger, now)?;
+    let reverts = if detect_reverts {
+        revert::detect(ledger, now)?
+    } else {
+        revert::RevertReport::off()
+    };
     let contract_of = |run_id: &str| -> Result<Option<dataset::ContractMaterial>, LedgerError> {
         let run = RunId::from_stored(run_id);
         let Some((contract, tier)) = ledger.run_contract_and_tier(&run)? else {
@@ -855,7 +862,8 @@ fn cycle_body(
     }
 
     progress(Stage::Build);
-    let (dataset, backfill, reverts) = build_dataset(ledger, inputs.repo, inputs.now)?;
+    let (dataset, backfill, reverts) =
+        build_dataset(ledger, inputs.repo, inputs.detect_reverts, inputs.now)?;
     let dataset_path = write_dataset(inputs.datasets_dir, &dataset, inputs.now)?;
     report.dataset_fingerprint = Some(dataset.fingerprint.clone());
     report.label_policy_version = Some(dataset.label_policy_version);
@@ -1269,6 +1277,7 @@ argv = ["true"]
                 auto_promote,
                 classifier_dir: None,
                 review_outcomes: None,
+                detect_reverts: true,
                 now: Utc::now(),
             }
         }

@@ -764,6 +764,12 @@ pub struct LearningSettings {
     /// removes it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub off: Option<AutoPromoteOff>,
+    /// The person turned revert detection off (`learn::revert`): neither
+    /// `dataset build` nor the learn cycle looks for reverts. The undo of
+    /// a wrong detection is this, then deleting the `source = detected`
+    /// rows, then rebuilding the dataset.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub revert_detection_off: bool,
 }
 
 impl LearningSettings {

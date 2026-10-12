@@ -2015,10 +2015,14 @@ fn dataset_build_command() -> Result<CliOutcome, CliError> {
     let backfill = operational(relais::learn::salvage::backfill(&ledger), "dataset build")?;
     // Then the reverts git shows, before the dataset is read: one flips its
     // task's label to a failure.
-    let reverts = operational(
-        relais::learn::revert::detect(&ledger, chrono::Utc::now()),
-        "dataset build",
-    )?;
+    let reverts = if load_machine()?.learning.revert_detection_off {
+        relais::learn::revert::RevertReport::off()
+    } else {
+        operational(
+            relais::learn::revert::detect(&ledger, chrono::Utc::now()),
+            "dataset build",
+        )?
+    };
     // A stored contract revision that does not parse is a corrupt ledger
     // row, not a run without a contract: dataset construction must see
     // the difference, or a version skew silently empties the dataset.
@@ -2088,6 +2092,9 @@ fn dataset_build_command() -> Result<CliOutcome, CliError> {
         println!("{line}");
     }
     println!("{}", reverts.summary());
+    for line in reverts.unknown_lines() {
+        eprintln!("{line}");
+    }
     println!(
         "salvage containment backfill: {} computed, {} unreachable (left unknown, excluded)",
         backfill.recorded, backfill.unreachable
@@ -2476,6 +2483,7 @@ fn learn_cycle_command(
             max_abstention_rate: machine.routing.max_abstention_rate,
         },
         auto_promote: machine.learning.auto_promote.is_some(),
+        detect_reverts: !machine.learning.revert_detection_off,
         classifier_dir: paths::state_dir().ok().map(|dir| dir.join("classifier")),
         review_outcomes: Some(
             relais::review_outcome::Settings::resolve(None, None).map_err(|e| e.to_string()),

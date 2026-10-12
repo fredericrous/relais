@@ -1690,7 +1690,11 @@ mod tests {
             pending_feedback: 1,
             backfilled_tasks: 0,
             open_decisions: vec![],
-            decision_labels: DecisionLabels::default(),
+            decision_labels: DecisionLabels::empty(
+                chrono::DateTime::parse_from_rfc3339("2026-10-12T00:00:00+00:00")
+                    .expect("fixed time")
+                    .with_timezone(&chrono::Utc),
+            ),
             cohorts: None,
             repair_outcomes: Vec::new(),
             trial_spend: None,

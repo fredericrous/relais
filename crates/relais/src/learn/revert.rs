@@ -54,14 +54,45 @@ pub struct RevertReport {
     pub skipped: usize,
     /// Runs whose repository, patch or git could not answer.
     pub unknown: usize,
+    /// Why, per distinct reason (first 200 characters), with its count:
+    /// printed so an unknown is never unexplained.
+    pub unknown_reasons: std::collections::BTreeMap<String, usize>,
+    /// Detection did not run: `[learning] revert_detection_off`.
+    pub off: bool,
     /// `reverted` rows written.
     pub recorded: usize,
     pub elapsed: Duration,
 }
 
 impl RevertReport {
+    /// The report of a build in which the person turned detection off.
+    pub fn off() -> Self {
+        Self {
+            off: true,
+            ..Self::default()
+        }
+    }
+
+    fn note_unknown(&mut self, reason: &str) {
+        self.unknown += 1;
+        let key: String = reason.chars().take(200).collect();
+        *self.unknown_reasons.entry(key).or_default() += 1;
+    }
+
+    /// One line per distinct unknown reason, for stderr.
+    pub fn unknown_lines(&self) -> Vec<String> {
+        self.unknown_reasons
+            .iter()
+            .map(|(reason, n)| format!("  unknown x{n}: {reason}"))
+            .collect()
+    }
+
     /// The line a build prints.
     pub fn summary(&self) -> String {
+        if self.off {
+            return "revert detection: off ([learning] revert_detection_off in machine.toml)"
+                .to_string();
+        }
         format!(
             "revert detection: {} run(s) scanned, {} git call(s), {} skipped (call cap), \
              {} unknown (repository or patch unreachable), {} recorded, {:.1} s",
@@ -254,6 +285,28 @@ fn inspect(repo: &Path, patch: &Path, ended_at: DateTime<Utc>, meter: &mut Meter
     }
 }
 
+/// The preferred tip among `for-each-ref`'s `<refname> <sha>` lines:
+/// origin's HEAD, then `main`, then `master`; `HEAD` when none exists.
+fn default_tip(refs: &str) -> String {
+    let named: Vec<(&str, &str)> = refs
+        .lines()
+        .filter_map(|line| line.trim().split_once(' '))
+        .collect();
+    [
+        "refs/remotes/origin/HEAD",
+        "refs/heads/main",
+        "refs/heads/master",
+    ]
+    .iter()
+    .find_map(|want| {
+        named
+            .iter()
+            .find(|(name, _)| name == want)
+            .map(|(_, sha)| sha.to_string())
+    })
+    .unwrap_or_else(|| "HEAD".to_string())
+}
+
 fn walk(
     repo: &Path,
     patch: &Path,
@@ -267,19 +320,21 @@ fn walk(
         return Err(Stop::Unknown(format!("{} names no path", patch.display())));
     }
     // The default branch's tip: origin's HEAD, else main, else master,
-    // else wherever HEAD is.
+    // else wherever HEAD is. `for-each-ref` prints in refname order, not
+    // argument order, so the preference is applied here: a local `main`
+    // that lags origin must never stand in for origin's tip.
     let refs = metered_git(
         meter,
         repo,
         &[
             "for-each-ref",
-            "--format=%(objectname)",
+            "--format=%(refname) %(objectname)",
             "refs/remotes/origin/HEAD",
             "refs/heads/main",
             "refs/heads/master",
         ],
     )?;
-    let tip = refs.lines().next().unwrap_or("HEAD").trim().to_string();
+    let tip = default_tip(&refs);
     let end = metered_git(
         meter,
         repo,
@@ -351,12 +406,16 @@ fn walk(
 
 /// The outcome to record for a detected revert of `run`: the strategy is
 /// read off the ledger, as `relais feedback` does.
+/// The detected outcome for a run, or why it cannot be built.
 fn detected_outcome(
     ledger: &Ledger,
     candidate: &RevertCandidate,
-) -> Result<Option<Outcome>, LedgerError> {
+) -> Result<Result<Outcome, String>, LedgerError> {
     let Some((_contract, tier)) = ledger.run_contract_and_tier(&candidate.run)? else {
-        return Ok(None);
+        return Ok(Err(format!(
+            "run {} carries no recorded contract",
+            candidate.run
+        )));
     };
     let detail = OutcomeDetail {
         candidate_sha: None,
@@ -371,7 +430,7 @@ fn detected_outcome(
         note: Some("a later commit undid this change".to_string()),
         source: Some(SOURCE.to_string()),
     };
-    Ok(Outcome::new(OutcomeKind::Reverted, detail).ok())
+    Ok(Outcome::new(OutcomeKind::Reverted, detail).map_err(|e| e.to_string()))
 }
 
 /// Look for detected reverts among the runs that ended in the last
@@ -389,12 +448,15 @@ pub fn detect(ledger: &Ledger, now: DateTime<Utc>) -> Result<RevertReport, Ledge
         report.git_calls += meter.spent;
         match finding {
             Finding::Skipped => report.skipped += 1,
-            Finding::Unknown(_) => report.unknown += 1,
+            Finding::Unknown(reason) => report.note_unknown(&reason),
             Finding::NoRevert => {}
             Finding::Reverted { landing, undo } => {
-                let Some(outcome) = detected_outcome(ledger, &candidate)? else {
-                    report.unknown += 1;
-                    continue;
+                let outcome = match detected_outcome(ledger, &candidate)? {
+                    Ok(outcome) => outcome,
+                    Err(reason) => {
+                        report.note_unknown(&reason);
+                        continue;
+                    }
                 };
                 if ledger.record_detected_revert(
                     &candidate.run,
@@ -725,6 +787,51 @@ mod tests {
         let report = detect(&w.ledger, now()).unwrap();
         assert_eq!(report.recorded, 1, "{report:?}");
         assert_eq!(w.reverted_rows().len(), 1);
+    }
+
+    #[test]
+    fn an_orchestrator_revert_after_the_undo_coexists_and_two_builds_add_one_row() {
+        let w = world("revert-both-sources", &day(3));
+        w.land(&day(5));
+        run_git_at(&w.root, &day(10), &["revert", "--no-edit", "HEAD"]);
+        let task = TaskId::from_stored("task-a");
+        // The orchestrator reported it on day 11, after the undo.
+        record(&w, &task, OutcomeKind::Reverted, &day(11));
+        rusqlite::Connection::open(w.dir.join("ledger.sqlite"))
+            .unwrap()
+            .execute(
+                "UPDATE outcomes SET detail_json = json_set(detail_json, '$.source', 'orchestrator')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(detect(&w.ledger, now()).unwrap().recorded, 1);
+        assert_eq!(detect(&w.ledger, now()).unwrap().recorded, 0);
+        let mut sources: Vec<Option<String>> = w
+            .reverted_rows()
+            .into_iter()
+            .map(|row| row.outcome.detail.source)
+            .collect();
+        sources.sort();
+        assert_eq!(
+            sources,
+            vec![
+                Some("detected".to_string()),
+                Some("orchestrator".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn the_tip_prefers_origin_head_over_a_lagging_local_main() {
+        // `for-each-ref` prints in refname order: heads before remotes.
+        let refs = "refs/heads/main aaa\nrefs/heads/master bbb\nrefs/remotes/origin/HEAD ccc\n";
+        assert_eq!(default_tip(refs), "ccc");
+        assert_eq!(
+            default_tip("refs/heads/master bbb\nrefs/heads/main aaa\n"),
+            "aaa"
+        );
+        assert_eq!(default_tip("refs/heads/master bbb\n"), "bbb");
+        assert_eq!(default_tip(""), "HEAD");
     }
 
     fn record(w: &World, task: &TaskId, kind: OutcomeKind, at: &str) {

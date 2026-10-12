@@ -202,8 +202,11 @@ pub fn decision_label_of(facts: &DecisionFacts) -> DecisionLabel {
         Reason::DecisionRecorded => {
             DecisionLabel::Excluded("decided or recorded: neither a yes nor a no")
         }
-        // `Reason` is the whole lifecycle's vocabulary; every other reason
-        // is not a decision answer.
+        // `Reason` is the whole lifecycle's vocabulary (54 variants); every
+        // other reason is not a decision answer. A decision reason added
+        // later and forgotten here fails
+        // `every_decision_reason_is_labelled_not_left_as_a_non_answer`,
+        // which walks `Reason::ALL`, instead of being silently excluded.
         _ => DecisionLabel::Excluded(NOT_AN_ANSWER),
     }
 }
@@ -305,6 +308,22 @@ mod tests {
 
     fn outcome(kind: OutcomeKind, reporter: Reporter) -> Option<TaskOutcome> {
         Some(TaskOutcome { kind, reporter })
+    }
+
+    #[test]
+    fn every_decision_reason_is_labelled_not_left_as_a_non_answer() {
+        let decision_reasons: Vec<Reason> = Reason::ALL
+            .into_iter()
+            .filter(|reason| reason.as_str().starts_with("decision_"))
+            .collect();
+        assert!(decision_reasons.len() >= 6, "{decision_reasons:?}");
+        for reason in decision_reasons {
+            assert_ne!(
+                decision_label_of(&facts(reason)),
+                Excluded(NOT_AN_ANSWER),
+                "{reason:?} is a decision answer, so the label rule must name it"
+            );
+        }
     }
 
     #[test]
