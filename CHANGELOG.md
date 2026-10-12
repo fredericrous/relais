@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+The session router's classifier sends its system prompt without a prompt-cache mark. Marked, it wrote about 930 tokens to the cache on 311 of 340 calls, billed above plain input, and read anything back on 11.
+
 ## v0.16.1
 
 With several Claude sessions open, a quiet check that passed could be
