@@ -34,7 +34,7 @@ Outcome: while an agent-run quiet check or command is live, relais's pane shows 
 ## Decisions
 
 - **Reuse the pane's one data path: a child process emitting JSON lines.** A new `relais quiet watch --protocol` (Rust, in the relais binary) watches the active-run directory and tails each log from an offset, emitting events the plugin folds like run events. The plugin gains no file access and no new `Fx` member; it spawns one more child.
-- **Contract between the tools and relais: one JSON file per live run.** `${XDG_STATE_HOME:-~/.local/state}/quiet/active/<pid>-<n>.json`, written atomically (temp + rename; file 0600, dir 0700; the dir is `$QUIET_ACTIVE_DIR` when set, used by every test, and `%LOCALAPPDATA%\quiet\active` on Windows) when a capture starts: `{"v":1,"tool":"amont"|"amont-agent","session":"<CLAUDE_CODE_SESSION_ID or null>","check":"<name>","repo":"<toplevel or cwd>","log":"<abs .log.tmp path>","pid":<n>,"started":<unix ms>}`. When it ends, the tool rewrites the entry with `"exit":<code>` and `"ended":<unix ms>` and leaves it: the watcher emits `ended` (a null `exit` means killed and is drawn as failed), then deletes it, and any tool's sweep removes ended entries older than 60 s, so a run that ends inside one 250 ms poll is still seen with its exit. `<n>` disambiguates amont's concurrent pre-commit checks within one process. Documented once in relais `docs/` and pointed to from both tools.
+- **Contract between the tools and relais: one JSON file per live run.** `${XDG_STATE_HOME:-~/.local/state}/quiet/active/<pid>-<n>.json`, written atomically (temp + rename; file 0600, dir 0700; the dir is `$QUIET_ACTIVE_DIR` when set, used by every test, and `%LOCALAPPDATA%\quiet\active` on Windows) when a capture starts inside a Claude Code session (no entry is written without `CLAUDE_CODE_SESSION_ID`): `{"v":1,"tool":"amont"|"amont-agent","session":"<CLAUDE_CODE_SESSION_ID>","check":"<name>","repo":"<toplevel or cwd>","log":"<abs .log.tmp path>","pid":<n>,"started":<unix ms>}`. When it ends, the tool rewrites the entry with `"exit":<code>` and `"ended":<unix ms>` and leaves it: the watcher emits `ended` (a null `exit` means killed and is drawn as failed), then deletes it, and any tool's sweep removes ended entries older than 60 s, so a run that ends inside one 250 ms poll is still seen with its exit. `<n>` disambiguates amont's concurrent pre-commit checks within one process. Documented once in relais `docs/` and pointed to from both tools.
 - **Scoped by session id, in the plugin.** The watcher takes no `--session` flag: it emits each entry's `session`; the plugin keeps entries whose `session` is in `store.sessions` (every id this module served, so /clear and /resume keep working, `register.ts:109`, `:254`); an entry with no session (a run outside Claude Code) is never shown. No process-tree walking.
 - **Stale entries are dropped, not trusted.** A killed run leaves its file: the watcher ignores an entry whose `pid` is dead (`libc::kill(pid,0)` on unix with EPERM counted as alive, `windows-sys` OpenProcess on Windows, and the log must still exist with a recent mtime to guard against pid reuse), and removes it only if its owner is dead and it is older than 1 h. An entry carrying `ended` is never stale: the watcher emits it whatever the pid or log state, then deletes it. Each tool's next capture `open` also sweeps its own dead-pid entries, so stale files do not wait for a relais session. The tools never depend on the watcher.
 - **No new dependency in relais for watching.** Poll the directory and each log every 250 ms (a handful of files; `notify` is not worth its tree). Reads at an offset, at most the last 64 KiB per poll (seek to max(offset, len-65536)), emitting at most 10 lines per run per poll; a log that shrank or vanished ends that row.
@@ -49,11 +49,11 @@ Outcome: while an agent-run quiet check or command is live, relais's pane shows 
 
 ### amont (one PR)
 
-- [ ] **1. Active-run entry.** In `crates/amont-runtime/src/capture.rs`, `Capture::open` first sweeps this tool's dead-pid entries and any ended entry older than 60 s, then writes the entry after the `.tmp` opens (session from `CLAUDE_CODE_SESSION_ID`, repo from the git toplevel); `Capture::finish` and a new `impl Drop for Capture` rewrite it with `"exit"` and `"ended"` (`exit` null on Drop without a code; idempotent via a `done` flag) and leave it for the watcher or a later sweep to remove (an early return or panic must not leave a live-pid entry); a write failure is ignored (the excerpt and log never depend on it). The runtime crate has no dependencies, so the JSON is hand-written with a tested string escaper (test: a path with a quote and a backslash); `<n>` comes from a process-wide `AtomicU32`; on Windows the state dir is `%LOCALAPPDATA%` (or the entry is skipped). Unit tests: entry written with the documented fields, rewritten with `exit`/`ended` on finish and left in place, a second concurrent capture in one process gets its own file, a dead-pid entry is swept on open, unwritable state dir → capture still works.
+- [x] **1. Active-run entry.** (amont#318; written only inside a session) In `crates/amont-runtime/src/capture.rs`, `Capture::open` first sweeps this tool's dead-pid entries and any ended entry older than 60 s, then writes the entry after the `.tmp` opens (session from `CLAUDE_CODE_SESSION_ID`, repo from the git toplevel); `Capture::finish` and a new `impl Drop for Capture` rewrite it with `"exit"` and `"ended"` (`exit` null on Drop without a code; idempotent via a `done` flag) and leave it for the watcher or a later sweep to remove (an early return or panic must not leave a live-pid entry); a write failure is ignored (the excerpt and log never depend on it). The runtime crate has no dependencies, so the JSON is hand-written with a tested string escaper (test: a path with a quote and a backslash); `<n>` comes from a process-wide `AtomicU32`; on Windows the state dir is `%LOCALAPPDATA%` (or the entry is skipped). Unit tests: entry written with the documented fields, rewritten with `exit`/`ended` on finish and left in place, a second concurrent capture in one process gets its own file, a dead-pid entry is swept on open, unwritable state dir → capture still works.
 
 ### amont-agent (one PR)
 
-- [ ] **2. Active-run entry.** Same in `src/quiet.rs` (`check` = the program name, `tool` = `amont-agent`): sweep on open, write `exit`/`ended` at the end and leave the entry for the watcher or a later sweep. Tests in `tests/quiet.rs`: entry present while a `sleep` child runs; after exit and after SIGINT it carries `exit`/`ended`; a later `quiet` run's sweep removes it once older than 60 s.
+- [x] **2. Active-run entry.** (amont-agent#100, released v2.37.0) Same in `src/quiet.rs` (`check` = the program name, `tool` = `amont-agent`): sweep on open, write `exit`/`ended` at the end and leave the entry for the watcher or a later sweep. Tests in `tests/quiet.rs`: entry present while a `sleep` child runs; after exit and after SIGINT it carries `exit`/`ended`; a later `quiet` run's sweep removes it once older than 60 s.
 
 ### relais (one PR, owns the plan)
 
@@ -77,6 +77,8 @@ Outcome: while an agent-run quiet check or command is live, relais's pane shows 
 - Pid-reuse guard: a live pid also needs its log to exist and the log or the run to be younger than an hour; an ended entry that cannot be deleted stays closed instead of being announced every poll.
 - Kept deliberate: live vs failed stays an optional `failure` field on `QuietRun`, not a union (implementation review, low): the refactor touches the fold, pane and tests for no behaviour change.
 - The watcher tests wait for its first line (up to 60 s) before timing anything: `cargo test` relinks the binary with other features than `cargo build`, and macOS held the first exec in `_dyld_start` past the tests' 6 s windows at load ~250.
+- amont-agent's atomic temp is a dotfile ending in `.json`; the watcher skips dotfiles, or the temp's rename would end a run as killed and keep a failed row (found closing amont, 2026-10-12).
+- Under load an amont-agent test read that temp just before its rename; the test helper skips dotfiles too (amont-agent#101).
 - End to end, branch binaries (2026-10-11): a failing `amont-agent quiet` run gave `started` (its session) → one `output` per line, live → `ended` exit 3 → entry deleted; `amont run clippy --all-files` gave `started` → live `output` → `ended` exit 0.
 
 ## Non-goals
@@ -89,10 +91,10 @@ Outcome: while an agent-run quiet check or command is live, relais's pane shows 
 
 | Input | Expected | Actual |
 |---|---|---|
-| amont capture opened then finished (unit) | entry file with documented fields appears, then carries `exit`/`ended` and stays until the watcher or a sweep removes it | — |
-| two concurrent captures in one amont process | two entry files | — |
-| capture `open` with a dead-pid entry present | the stale entry is swept | — |
-| `amont-agent quiet -- sleep 5` | entry present during; after exit and after SIGINT it carries `exit`/`ended` and a later sweep removes it once older than 60 s | — |
+| amont capture opened then finished (unit) | entry file with documented fields appears, then carries `exit`/`ended` and stays until the watcher or a sweep removes it | `active.rs` unit tests: fields, then `exit`/`ended`, left in place; `quiet_run.rs`: a quiet run leaves an ended entry with its result |
+| two concurrent captures in one amont process | two entry files | two files (`<pid>-0`, `<pid>-1`) |
+| capture `open` with a dead-pid entry present | the stale entry is swept | swept on unix; off unix every pid counts as alive, so only ended entries go |
+| `amont-agent quiet -- sleep 5` | entry present during; after exit and after SIGINT it carries `exit`/`ended` and a later sweep removes it once older than 60 s | `tests/quiet.rs`: present during, `exit`/`ended` after exit and SIGINT, swept past 60 s; a command that cannot start records 127 |
 | pane test: `started` for A and B, store.sessions={A}; then /clear adds C, C `started` | A's and C's rows drawn, B's never | pane tests (`quiet-pane.test.ts`): only A and the /resume-added C draw; B never |
 | append 3 lines to a watched log | one or more `output` events carrying them in order | `live_entry_streams_started_output_and_ended`: in order, partial line held until its newline |
 | remove an entry / dead-pid entry | `ended` / never `started` | `ended` with exit null / `a_dead_pid_without_ended_is_never_started` |
@@ -111,5 +113,12 @@ Outcome: while an agent-run quiet check or command is live, relais's pane shows 
 | live: agent runs `amont run clippy --all-files` | row appears with live lines, drops at end | — |
 | live: quiet run from another Claude session | not shown | — |
 | live: `amont-agent quiet -- sh -c 'for i in 1 2 3 4 5; do date +%s; sleep 2; done'` | each line in the pane within 0.5 s of its timestamp | — |
+
+## Implementation review
+
+- relais: approve on tree 4526ed37, after three deltas (resumed reviewer). Fixed: ended runs are closed once, sweep errors are reported once, the dotfile temp is skipped, and the Windows test build works.
+- amont: approve-with-changes (delta on c66d6af). The contract wording above is fixed here; the CHANGELOG session line goes in amont 1.51.0.
+- amont-agent: approve on tree 1de7f960; released v2.37.0.
+- Next: phase 6, live, after the person reinstalls the plugin.
 
 <!-- panel: repos=relais,amont,amont-agent adds=lang:typescript,ui reviewers=backend,language:rust,language:typescript,react,ui-design,ux-research,game-ux body-sha=6e179a158a84 -->
