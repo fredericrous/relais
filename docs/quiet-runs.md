@@ -16,7 +16,8 @@ plugin draws in its pane. The tools never depend on the watcher.
 ## The entry file
 
 `<pid>-<n>.json`, 0600, written atomically (a temp file that does not end
-in `.json`, then a rename). `<n>` tells apart the concurrent checks of one
+in `.json` or whose name starts with `.`, then a rename); the watcher
+ignores dotfiles. `<n>` tells apart the concurrent checks of one
 process. The file's name without `.json` is the run's `id`.
 
 | field     | type             | meaning                                                              |

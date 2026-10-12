@@ -304,7 +304,10 @@ fn entry_files(dir: &Path) -> Vec<(String, PathBuf)> {
         .filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        // A dotfile is a writer's temp (amont-agent's ends in `.json`),
+        // renamed away the next moment: seen, it would end as killed.
         .filter_map(|p| Some((p.file_stem()?.to_str()?.to_string(), p)))
+        .filter(|(id, _)| !id.starts_with('.'))
         .collect();
     files.sort();
     files
@@ -389,14 +392,18 @@ pub fn poll(dir: &Path, runs: &mut Runs, now_ms: u64) -> Vec<Value> {
                 events.extend(finish_vanished(id, run, now_ms));
             }
         } else if age_ms(path, now_ms).is_some_and(|age| age > STALE_MS) {
-            // Nothing is announced for a stale entry, so a failed delete only
-            // loses the file's removal; the next poll tries again.
+            // Nothing is announced for a stale entry. One that cannot be
+            // deleted is held as a closed run, so the branch above skips it
+            // and the reason is said once.
             if let Err(err) = fs::remove_file(path) {
                 if err.kind() != io::ErrorKind::NotFound {
                     eprintln!(
                         "relais quiet watch: cannot remove {}: {err}",
                         path.display()
                     );
+                    let mut run = Run::new(&e.log);
+                    run.closed = true;
+                    runs.insert(id.clone(), run);
                 }
             }
         }
@@ -520,6 +527,24 @@ mod tests {
     }
 
     #[test]
+    fn a_writers_dotfile_temp_is_not_a_run() {
+        let dir = scratch_dir("dot");
+        let log = dir.join("x.log.tmp");
+        fs::write(&log, "line\n").unwrap();
+        let now = super::now_ms();
+        let body = entry_json(&log, std::process::id(), now, "");
+        fs::write(dir.join(".amont-agent-tmp-1-1-0.json"), &body).unwrap();
+        let mut runs = Runs::new();
+        let first = poll(&dir, &mut runs, now);
+        fs::remove_file(dir.join(".amont-agent-tmp-1-1-0.json")).unwrap();
+        let second = poll(&dir, &mut runs, now + 250);
+        assert!(
+            first.is_empty() && second.is_empty(),
+            "{first:?} {second:?}"
+        );
+    }
+
+    #[test]
     fn a_live_pid_whose_log_is_gone_is_not_this_run() {
         let dir = scratch_dir("reuse");
         let log = dir.join("gone.log.tmp");
@@ -561,5 +586,31 @@ mod tests {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(first.iter().any(|e| e["event"] == "ended"), "{first:?}");
         assert!(second.is_empty(), "announced again: {second:?}");
+    }
+
+    #[test]
+    fn a_stale_entry_that_cannot_be_removed_is_held_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("stale-stuck");
+        let log = dir.join("x.log");
+        fs::write(&log, "line\n").unwrap();
+        let now = super::now_ms();
+        fs::write(dir.join("1-0.json"), entry_json(&log, 0x7fff_fff0, now, "")).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let probe = dir.join("probe");
+        if fs::write(&probe, "").is_ok() {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let mut runs = Runs::new();
+        let later = now + STALE_MS + 1000;
+        let first = poll(&dir, &mut runs, later);
+        let second = poll(&dir, &mut runs, later + 250);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            first.is_empty() && second.is_empty(),
+            "{first:?} {second:?}"
+        );
+        assert!(runs.get("1-0").is_some_and(|r| r.closed), "not held");
     }
 }
