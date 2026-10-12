@@ -417,6 +417,8 @@ pub fn verify_model(
     effective: Option<&str>,
     approved_substitutions: &[crate::policy::ApprovedSubstitution],
 ) -> ModelVerification {
+    // A model that is empty or only whitespace is no model.
+    let effective = effective.filter(|model| !model.trim().is_empty());
     match effective {
         Some(effective) if model_matches(requested, effective) => ModelVerification::Matches,
         Some(effective)
@@ -649,6 +651,14 @@ mod tests {
                 effective: "claude-haiku-4-5".into(),
             }
         );
+        for blank in ["", "  "] {
+            assert_eq!(
+                verify_model("haiku", Some(blank), &[]),
+                ModelVerification::Unverified {
+                    requested: "haiku".into()
+                }
+            );
+        }
         assert_eq!(
             verify_model("sonnet", None, &[]),
             ModelVerification::Unverified {
