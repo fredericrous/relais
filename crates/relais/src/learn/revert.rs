@@ -318,8 +318,13 @@ fn walk(
     let paths = patch_paths(&patch_text);
     // An empty candidate (an inspection, a run that changed nothing) has
     // nothing that could land or be undone: not unknown, just no revert.
-    if paths.is_empty() {
+    // A non-empty patch with no path it can read (a binary change, a
+    // malformed patch) stays unknown.
+    if patch_text.trim().is_empty() {
         return Ok(Finding::NoRevert);
+    }
+    if paths.is_empty() {
+        return Err(Stop::Unknown(format!("{} names no path", patch.display())));
     }
     // The default branch's tip: origin's HEAD, else main, else master,
     // else wherever HEAD is. `for-each-ref` prints in refname order, not
@@ -899,6 +904,18 @@ mod tests {
         std::fs::write(&w.patch, "").unwrap();
         let report = detect(&w.ledger, now()).unwrap();
         assert_eq!((report.unknown, report.recorded), (0, 0), "{report:?}");
+    }
+
+    #[test]
+    fn a_non_empty_patch_with_no_readable_path_stays_unknown() {
+        let w = world("revert-binary-patch", &day(3));
+        std::fs::write(
+            &w.patch,
+            "diff --git a/logo.png b/logo.png\nindex 1111111..2222222 100644\nBinary files a/logo.png and b/logo.png differ\n",
+        )
+        .unwrap();
+        let report = detect(&w.ledger, now()).unwrap();
+        assert_eq!((report.unknown, report.recorded), (1, 0), "{report:?}");
     }
 
     #[test]
