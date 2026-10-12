@@ -45,7 +45,10 @@ Unknown fields are ignored.
    and then holds it as a closed run. Watchers share the directory, so
    none deletes an ended entry younger than 60 s; any watcher or tool
    sweep removes it after that. An ended entry older than 60 s that a
-   watcher never announced is deleted without an event. The check for
+   watcher never announced is deleted without an event; a watcher that
+   starts within 60 s of an end (a new or restarted session) announces it
+   once, so a failure that recent is drawn there too. The 60 s compare
+   `ended` with the watcher's clock; both are the same machine's. The check for
    `ended` comes before the pid check: the writer has usually exited by
    then. A tool's own sweep also removes its dead-pid entries.
 4. An entry without `ended` whose pid is dead (`kill(pid, 0)` on unix,
