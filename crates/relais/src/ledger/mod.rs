@@ -328,6 +328,19 @@ pub struct StoredOutcome {
     pub at: String,
 }
 
+/// One `reverted` outcome row, as the report's agreement reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevertedReport {
+    pub task: TaskId,
+    /// `detected` (git), `orchestrator` (the plugin's proved call), `cli`
+    /// or none (a row stored before the field existed).
+    pub source: Option<String>,
+    /// When the row was written.
+    pub reported_at: String,
+    /// When the undo commit was made, for a detected row.
+    pub undone_at: Option<String>,
+}
+
 /// A run whose accepted change may have landed and been undone since.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevertCandidate {
@@ -3731,6 +3744,41 @@ impl Ledger {
             .collect()
     }
 
+    /// Every decision somebody has answered, oldest raised first: what the
+    /// decision label rule (`learn::decision_label`) reads.
+    pub fn answered_decisions(&self) -> Result<Vec<DecisionRecord>> {
+        let now = self.now();
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {DECISION_COLUMNS} FROM decisions WHERE resolved_at IS NOT NULL
+             ORDER BY raised_at, run"
+        ))?;
+        let rows = stmt.query_map([], decision_row_from)?;
+        rows.collect::<std::result::Result<Vec<DecisionRow>, _>>()?
+            .into_iter()
+            .map(|row| parse_decision_row(row, &now))
+            .collect()
+    }
+
+    /// Every `reverted` outcome row with the source that recorded it, for
+    /// the report's agreement between the orchestrator and git. A row with
+    /// no task identity is left out: agreement is counted over tasks.
+    pub fn reverted_reports(&self) -> Result<Vec<RevertedReport>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id, json_extract(detail_json, '$.source'), at,
+                    json_extract(detail_json, '$.undo_at')
+               FROM outcomes WHERE kind = ?1 AND task_id IS NOT NULL ORDER BY id",
+        )?;
+        let rows = stmt.query_map([OutcomeKind::Reverted.as_str()], |row| {
+            Ok(RevertedReport {
+                task: TaskId::from_stored(row.get::<_, String>(0)?),
+                source: row.get(1)?,
+                reported_at: row.get(2)?,
+                undone_at: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// One run's own decision row, open or resolved — what `relais
     /// explain` reads back. `None` for a run that never raised one.
     pub fn decision_of_run(&self, run_id: &RunId) -> Result<Option<DecisionRecord>> {
@@ -5110,6 +5158,7 @@ impl Ledger {
         if let Some(object) = detail.as_object_mut() {
             object.insert("landing_sha".into(), landing_sha.into());
             object.insert("undo_sha".into(), undo_sha.into());
+            object.insert("undo_at".into(), undo_at.to_rfc3339().into());
         }
         tx.execute(
             "INSERT INTO outcomes (run_id, task_id, candidate_sha, kind, detail_json, at)

@@ -872,7 +872,7 @@ minimum_tier = "escalation"
         "--outcome",
         "accepted",
         "--actor",
-        "the release suite",
+        "orchestrator",
     ]);
     assert_eq!(
         feedback.status.code(),
@@ -930,7 +930,7 @@ fn a_reverted_outcome_leaves_accepted_unchanged_and_drops_standing() {
         "--outcome",
         "reverted",
         "--actor",
-        "the release suite",
+        "orchestrator",
     ]);
     assert_eq!(
         feedback.status.code(),
@@ -974,7 +974,7 @@ fn feedback_note_is_recorded_and_shown_by_explain() {
         "--outcome",
         "accepted",
         "--actor",
-        "the release suite",
+        "orchestrator",
         "--note",
         "merged as-is, no follow-up needed",
     ]);
@@ -1014,7 +1014,7 @@ fn feedback_without_a_note_leaves_the_outcome_line_bare() {
         "--outcome",
         "accepted",
         "--actor",
-        "the release suite",
+        "orchestrator",
     ]);
     assert_eq!(
         feedback.status.code(),
@@ -1059,7 +1059,7 @@ fn explain_shows_each_runs_own_outcome_note_not_a_later_runs() {
         "--outcome",
         "accepted",
         "--actor",
-        "the release suite",
+        "orchestrator",
         "--note",
         "run one's own note",
     ]);
@@ -1086,7 +1086,7 @@ fn explain_shows_each_runs_own_outcome_note_not_a_later_runs() {
         "--outcome",
         "accepted",
         "--actor",
-        "the release suite",
+        "orchestrator",
         "--note",
         "run two's own note",
     ]);
@@ -1841,7 +1841,7 @@ fn a_salvaged_run_keeps_its_reason_counts_as_accepted_and_takes_feedback() {
         "--candidate",
         "not-the-one",
         "--actor",
-        "a person",
+        "orchestrator",
     ]);
     assert_eq!(
         mismatch.status.code(),
@@ -1859,7 +1859,7 @@ fn a_salvaged_run_keeps_its_reason_counts_as_accepted_and_takes_feedback() {
         "--candidate",
         "handmerged123",
         "--actor",
-        "a person",
+        "orchestrator",
     ]);
     assert_eq!(
         feedback.status.code(),
@@ -2024,7 +2024,7 @@ fn a_run_waiting_on_a_person_is_salvaged_counted_and_takes_feedback() {
         "--magnitude",
         "0.25",
         "--actor",
-        "a person",
+        "orchestrator",
     ]);
     assert_eq!(
         feedback.status.code(),
@@ -3040,7 +3040,7 @@ fn a_human_sign_off_gap_is_cleared_only_by_decide_and_then_feedback_accepts_it()
         "--outcome",
         "accepted",
         "--actor",
-        "a person",
+        "orchestrator",
     ]);
     assert_eq!(
         feedback.status.code(),
@@ -3108,7 +3108,7 @@ fn relais_feedback_accepts_a_person_approved_run_with_no_receipt() {
         "--outcome",
         "accepted",
         "--actor",
-        "a person",
+        "orchestrator",
         "--candidate",
         "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
     ]);
@@ -3125,7 +3125,7 @@ fn relais_feedback_accepts_a_person_approved_run_with_no_receipt() {
         "--outcome",
         "accepted",
         "--actor",
-        "a person",
+        "orchestrator",
     ]);
     assert_eq!(
         feedback.status.code(),

@@ -15,6 +15,7 @@
 pub mod comparison;
 pub mod cycle;
 pub mod dataset;
+pub mod decision_label;
 pub mod drift;
 pub mod envelope;
 pub mod evaluate;

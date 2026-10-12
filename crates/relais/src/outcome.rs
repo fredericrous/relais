@@ -194,6 +194,16 @@ pub struct OutcomeDetail {
     pub source: Option<String>,
 }
 
+/// `OutcomeDetail::source` of an outcome the orchestrator reported through
+/// the plugin: stored only when the plugin's decide nonce verified
+/// (`relais feedback --proof-stdin`, ADR-0004).
+pub const SOURCE_ORCHESTRATOR: &str = "orchestrator";
+
+/// `OutcomeDetail::source` of an outcome recorded from a command line
+/// without a verified plugin nonce: it labels like any outcome and is left
+/// out of the orchestrator-against-git agreement.
+pub const SOURCE_CLI: &str = "cli";
+
 /// A typed outcome: a kind together with the detail its kind requires.
 /// Constructed only through [`Outcome::new`], so a stored row can never
 /// carry a magnitude a `reverted` outcome refuses, or lack one a
