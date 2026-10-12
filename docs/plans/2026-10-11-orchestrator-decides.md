@@ -11,7 +11,7 @@ adrs:
 ## Review panel
 
 👉 **Decide:** none — approve if the orchestrator reports a no through `mcp__relais__feedback` when it reverts or fixes, beside git detection and reviewed rewrites.
-📍 relais, homelab · Phases 1–3 done, 4a measured (local fails, → 4b′) · amendment 2026-10-12: Laya learns from the orchestrator's answers corrected by outcomes, and answers when confident · amendments 2–3 (no-label sources D22, orchestrator feedback D23) · next: a not-data-gated PR with the label rule, revert detection and the report's projection. Panel: architect, backend, go, python, rust, typescript, platform, po, tui, unix.
+📍 relais, homelab · Phases 1–3 done, 4a measured (local fails, → 4b′) · amendment 2026-10-12: Laya learns from the orchestrator's answers corrected by outcomes, and answers when confident · amendments 2–3 (no-label sources D22, orchestrator feedback D23) · labels, revert detection, the feedback tool and the report built on feat/decision-labels (2026-10-12) · next: merge, release, reinstall the plugin, then 4b/4c when the floor projects (≈ 2027-03). Panel: architect, backend, go, python, rust, typescript, platform, po, tui, unix.
 **Changed by review:** (amendment) rewritten salvages are down-weighted test-grade no labels, every metric reported with and without them (D22); answer labels never in calibration/test; kill switch on the Wilson upper bound.
 **Verdicts:** original panel as before; amendment 1: five backend passes, two blockers fixed; amendment 2: backend approve-with-changes twice, 3 findings carried; amendment 3: backend approve after two blockers fixed (nonce-proved source, revert dedupe).
 📄 Full reviews: [2026-10-11-orchestrator-decides.reviews.md](2026-10-11-orchestrator-decides.reviews.md)
@@ -187,7 +187,6 @@ Splits are 60/20/20 by `raised_at`; calibration and test hold outcome and rewrit
 - After 4d ships: advisor answers per week, their outcome precision, and agreement on the shadow sample.
 - Tool refusals that are not relais policy refusals: any in week 1 → revisit the guard.
 - `mcp__relais__feedback` calls per week, and the share of git-detected reverts the orchestrator also reported within 7 days (0 reverted outcomes in 76 today); below 50% after a month, git detection carries the no labels and the instruction is not holding.
-- Ordering: the feedback PR rebases on the in-flight run that adds `OutcomeDetail.source`.
 - After 4b ships: advice coverage, timeouts, failures, and agreement with orchestrator answers and with outcome labels in `relais report`.
 
 ## Verification
@@ -214,12 +213,21 @@ Splits are 60/20/20 by `raised_at`; calibration and test hold outcome and rewrit
 - Plugin (`claude plugin test`): the decide tool's argv, proof only on stdin, the quote gate (not delivered here; written before the outcome; under 12 characters; not whole words; accepted), relais's `{error, exit}` passed through verbatim, the Bash reminder's denied and allowed forms, the outcome closing line present for `needs_decision` and absent for `accepted` and answered outcomes. Observed in the 240/240 run.
 - Not observable before release: the tool inside a live Claude Code session (needs the released plugin installed) — that is Phase 3's first step, and the live-check row of Verification above.
 
+## Verification record (2026-10-12, branch feat/decision-labels, before push)
+
+- `make check` on the tree rebased onto `8cd9f39` → exit 0 each time the tree changed: fmt, clippy `-D warnings`, module cycles, cargo test (`learn::revert` 16/16, `learn::decision_label` 13/13, `tests/feedback_cli.rs`), MSRV, audit, plugin 280/280.
+- Revert detection on a `VACUUM INTO` copy of the live ledger (scratch `RELAIS_STATE_DIR`, branch binary `relais dataset build`): expected a bounded walk that records no false revert → first run 69 scanned, 1,724 git calls, 24 skipped (50-call cap), 18 unknown, 0 recorded, 73 s; second run 0 recorded (idempotent). After the tip fix (origin/HEAD over a lagging local `main`): 70 scanned, 1,727 calls, 24 skipped, 18 unknown, 0 recorded, 36 s. The printed reasons: 16 unknowns were empty candidate patches (inspections). After making an empty patch no revert, a third pilot: 70 scanned, 1,727 calls, 24 skipped, **2 unknown** (a corrupt patch, a run with no patch evidence), 0 recorded, 76 s.
+- Cross-check: `git log --grep '^Revert|This reverts commit'` over 60 days in relais, amont-agent, website-builder, duro-design-system, homelab → 4 hits, all homelab image-promotion bot reverts, none a relais change: 0 detected is right.
+- `relais report` on the copy (branch binary): "decision labels (policy v1)": outcome 24 yes / 0 no, detected 0/0, orchestrator 0/0, rewritten 0 / 65, answer 4 / 37, not labelled 63; "test-split floor: 150 of each class needed … projected to be reached about 2027-03-19"; "agreement 0 of 0 tasks, coverage 0 of 0".
+- Live outcome-message check (Phase 2's open row): observed 2026-10-12. The installed plugin's needs_decision outcome for `run-65da13fcad132-180e6` ended with "Decide it, then record the answer with mcp__relais__decide (approve, revise, reject, salvaged, abandon or decided). …".
+- Open, for the person: the 50-calls-per-run cap skipped 24 of 70 runs (about a third, likely the busiest histories). Whether to raise it is measured after release, not guessed here.
+- Not observable before release: the feedback tool in a live session (needs the released plugin).
+
 ## Not in scope
 
 - Laya answering below its data-derived thresholds, or a human-sign-off criterion, an interrupted run or a changed-verification question at any score.
 - Laya's other jobs (classifier, model choice): learning-loop Phases 6–8.
 - Changing which runs reach `needs_decision`.
-- `relais feedback --actor` (`main.rs:293`) stays a free string.
 
 ## Decision log
 
@@ -256,5 +264,7 @@ Splits are 60/20/20 by `raised_at`; calibration and test hold outcome and rewrit
 - Delta (tree `dbc7f28a`): **approve** (64k tokens, 9 s); all four findings resolved, none new.
 - CI on PR #202 failed on windows-latest only: the nonce read `/dev/urandom`. Fixed (`d2e69fd`): `procs::os_random` uses `BCryptGenRandom` on Windows; the terminal sign-off scenario is unix-only (it needs `script(1)`). Fresh round 1 on tree `db1d39d8`: **approve** (30k tokens, 28 s), one low finding (a stale count in a Cargo.toml comment) fixed in `63ea9f7`; Delta on `0227ea10`: **approve** (30k tokens, 6 s).
 - Next: merge, release, reinstall the plugin, then Phase 3 (the live check and the sweep of the open rows). Phase 3 done 2026-10-12; Phase 4a measured 2026-10-12 (→ 4b′); next: 4b/4c, data-gated.
+- Branch feat/decision-labels, round 1 (117k, 158 s) approve-with-changes: high, the default-branch tip could be a stale local `main` (`for-each-ref` sorts by refname), fixed with `default_tip` and a test; medium, the undo re-detected its rows, fixed with `[learning] revert_detection_off`; medium, a `Reason` catch-all, kept with a test over `Reason::ALL`; medium, unknown reasons discarded, now printed; medium, this record; lows, breaking changes in CHANGELOG, report clock taken as an argument, the both-sources fixture. Delta (127k, 32 s): flag argument → `RevertDetection` enum; a stale doc line. Confirmation (133k, 18 s): an empty-patch rule that also hid non-empty unreadable patches, narrowed to empty text with a binary-patch test.
+  Confirmation (137k, 11 s) **approve**, after the call cap got its `holds-until:` comment. Deliberate: the comment says "the first pilot" skipped 24 of 70; the first scanned 69 and the later two 70 (a wording nit left so the reviewed tree stays the pushed one).
 
 <!-- panel: repos=relais,homelab reviewers=architect,backend,lang:go,lang:python,lang:rust,lang:typescript,platform,po,tui,unix body-sha=eb3e83015a09 -->
