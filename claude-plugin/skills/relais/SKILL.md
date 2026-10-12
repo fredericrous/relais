@@ -122,6 +122,11 @@ up, and the person answers there.
      answered (an approval with open verification gaps) and says why;
      read that answer, do not route around it.
 
+6. When you later revert or fix a change relais accepted, record it with
+   `mcp__relais__feedback` (`outcome`: reverted, regression or corrected
+   with a `magnitude`; `evidence` a sha or note). Never run
+   `relais feedback` in Bash.
+
 ## Rules
 
 - The contract is frozen once the run starts; changing objective, scope,
