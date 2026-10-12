@@ -193,7 +193,7 @@ export function hash(text: string): string {
 
 // --- the classifier ---------------------------------------------------------
 
-// Fixed, so the prompt cache holds it from one call to the next.
+// Fixed, so its hash (`prompt_version`) names one prompt.
 export const CLASSIFIER_SYSTEM = [
   'You label one request a person typed to a coding agent. Reply with ONE JSON object and nothing else:',
   '{"relation":"new_task|continuation|correction","kind":"question|edit|debug|design|review","difficulty":1,"scope":"local|module|cross-cutting|unknown","uncertainty":"low|medium|high","verifiable":true,"explicit":{"value":"accept|correct|none","quote":null},"user_model":null,"user_model_for":null,"confidence":0.8}',

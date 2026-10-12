@@ -177,9 +177,11 @@ const classifierModel = (store: Store) => {
 
 async function complete(fx: Fx, store: Store, prompt: string) {
   const model = classifierModel(store)
+  // A plain string, never marked for the prompt cache: the mark wrote the
+  // cache on nearly every call and was almost never read back.
   const reply = await fx.model.complete({
     model,
-    system: [{ text: CLASSIFIER_SYSTEM, cache: true }],
+    system: CLASSIFIER_SYSTEM,
     prompt,
     maxTokens: CLASSIFIER_MAX_TOKENS,
     effort: 'low',
