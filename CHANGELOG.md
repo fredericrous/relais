@@ -8,11 +8,62 @@ missing here.
 
 ## Unreleased
 
-A run refused because the Claude Code version could not be read now says why
-the probe failed (timed out, killed by a signal, exited non-zero) instead of
-"`claude --version` printed nothing". The release scenarios no longer
-SIGKILL the process group of an agent reaped earlier, whose pid the system
-may have given to another process, such as another scenario's probe.
+## v0.16.0
+
+relais learns from what it actually routes: subagent spawns are explored,
+a replay adds an arm observation to the dataset instead of removing one,
+and the report shows the test split across quality floors (plan
+`docs/plans/2026-10-11-learning-faucet.md`). No ledger step.
+
+- The session router's exploration draw now applies to a table-routed
+  subagent spawn as well as a main-session new task, inside the same
+  envelope and rate: never a pinned type, a model the person named, an
+  abstention, or a spawn whose lowered model is excluded (then nothing is
+  drawn). The draw is keyed by the subagent task's id, minted before the
+  spawn, which the `decision` and `task` records share; a drawn spawn keeps
+  its lowered floor for its own re-runs. Strata carry the relation (`main`
+  / `sub`) so the two are never pooled; one stop rule still ends both.
+  `relais report` labels the rows, adds a legend, and reads
+  `no projection: 0 of 20 drawn tasks` or `N of 20 drawn tasks, 20
+  projected <date>`; `--json` strata carry `relation`. Reinstall the plugin
+  (`relais install --claude --user --write`, `relais coordinator stop`).
+- Dataset version 6: a `relais dataset replay` run is an arm observation of
+  its task, never a later attempt at it. A version-5 build let the replay
+  supersede the accepted source run and then excluded the replay itself,
+  leaving the task with no example; now the source keeps its example and a
+  settled, non-errored replay with a trial row naming it (ledger v17 or
+  later) joins beside it, in the same family, with the recipe its trial
+  names. Examples carry `task_id` and `origin` (`live` / `replay`), and the
+  dataset reports its `counterfactual gap`: accepted tasks with no
+  observation one tier cheaper, with the estimated cost of replaying them
+  (`cost unknown`, never `$0`, without a priced run). Rebuild with `relais
+  dataset build`. An installed 0.15.0 given a version-6 dataset file reads
+  it as before and ignores the fields it does not know (`relais train` has
+  no dataset-version check; `learn cycle` builds its own dataset anyway).
+  The label policy is unchanged (version 3).
+- `relais evaluate` and `train` report a floor sweep: the test split at
+  every quality floor from 0.50 to 0.95 (and the configured one), as
+  supported tasks, acceptance, mean cost and abstention. The gate still
+  measures the configured `[routing] quality_floor` alone. The gate's
+  `test_records`, `supported_test_records` and `abstention_rate` now count
+  TASKS, not records: a source run and its replay make one selection and
+  one abstention unit. The numbers are identical on a dataset without
+  replay examples; `EVAL_SCHEMA_VERSION` stays 4, so an artifact awaiting
+  promotion is not stranded.
+- `relais report`'s learning section gains, from the latest cycle's
+  artifact: examples by origin, the counterfactual gap (two lines, the
+  command on its own line), and the floor sweep (at most five rows around
+  the configured floor, which is named). When the artifact is missing or
+  unreadable the section says `floor sweep: unavailable (reason)`; when it
+  predates the sweep, `not in this artifact; run relais learn cycle`. New
+  `--json` keys (`relation`, `floor_sweep`, `examples_by_origin`,
+  `counterfactual_gap`) are additive and `null` when unknown, never 0.
+- A run refused because the Claude Code version could not be read now says
+  why the probe failed (timed out, killed by a signal, exited non-zero)
+  instead of "`claude --version` printed nothing". The release scenarios no
+  longer SIGKILL the process group of an agent reaped earlier, whose pid
+  the system may have given to another process, such as another
+  scenario's probe.
 
 ## v0.15.0
 
