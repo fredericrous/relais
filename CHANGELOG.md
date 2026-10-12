@@ -8,7 +8,17 @@ missing here.
 
 ## Unreleased
 
-A model name that is empty or only whitespace now counts as no model: it is unverified rather than substituted, stored as NULL, and never becomes what an alias runs as.
+## v0.16.1
+
+With several Claude sessions open, a quiet check that passed could be
+drawn as a kept failure (#219). Each session runs its own watcher over the
+same directory, and the first watcher to see an ended entry deleted it. The
+others then took the run for killed. Now each watcher announces an end once
+and holds it, and an ended entry is deleted only once it is older than
+60 s. The plugin runs `relais` from PATH, so it needs no reinstall. A
+session picks up the new watcher when it next starts.
+
+A model name that is empty or only whitespace now counts as no model (#220): it is unverified rather than substituted, stored as NULL, and never becomes what an alias runs as.
 
 ## v0.16.0
 
