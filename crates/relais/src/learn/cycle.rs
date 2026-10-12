@@ -26,6 +26,7 @@ use crate::router::stats::clopper_pearson_upper;
 use super::dataset::{self, Dataset, DatasetError, Labelling};
 use super::evaluate::{self, EvalReport, EvalSettings, TrainError};
 use super::registry::{Artifact, ArtifactError, Registry};
+use super::revert;
 use super::salvage::{self, BackfillReport};
 
 /// A cycle that started less than this long ago makes the next one "not due".
@@ -422,8 +423,11 @@ pub struct CycleReport {
 pub fn build_dataset(
     ledger: &Ledger,
     repo: &RepoPolicy,
-) -> Result<(Dataset, BackfillReport), CycleError> {
+    now: DateTime<Utc>,
+) -> Result<(Dataset, BackfillReport, revert::RevertReport), CycleError> {
     let backfill = salvage::backfill(ledger)?;
+    // Before the dataset is read: a detected revert flips its task's label.
+    let reverts = revert::detect(ledger, now)?;
     let contract_of = |run_id: &str| -> Result<Option<dataset::ContractMaterial>, LedgerError> {
         let run = RunId::from_stored(run_id);
         let Some((contract, tier)) = ledger.run_contract_and_tier(&run)? else {
@@ -432,7 +436,11 @@ pub fn build_dataset(
         let objective = contract.objective.clone();
         Ok(Some((contract, objective, tier.as_str().to_string())))
     };
-    Ok((dataset::build(ledger, &contract_of, repo)?, backfill))
+    Ok((
+        dataset::build(ledger, &contract_of, repo)?,
+        backfill,
+        reverts,
+    ))
 }
 
 /// Write `dataset` to `dir/<timestamp>.json` through a temporary file and a
@@ -847,7 +855,7 @@ fn cycle_body(
     }
 
     progress(Stage::Build);
-    let (dataset, backfill) = build_dataset(ledger, inputs.repo)?;
+    let (dataset, backfill, reverts) = build_dataset(ledger, inputs.repo, inputs.now)?;
     let dataset_path = write_dataset(inputs.datasets_dir, &dataset, inputs.now)?;
     report.dataset_fingerprint = Some(dataset.fingerprint.clone());
     report.label_policy_version = Some(dataset.label_policy_version);
@@ -862,11 +870,12 @@ fn cycle_body(
             .count()
     };
     let salvage_note = format!(
-        "{} excluded; salvage containment: {} computed, {} unreachable; origins: live {}, \
+        "{} excluded; salvage containment: {} computed, {} unreachable; {}; origins: live {}, \
          replay {}; counterfactual gap: {} task(s) (dataset {})",
         dataset.exclusions.len(),
         backfill.recorded,
         backfill.unreachable,
+        reverts.summary(),
         origin_count(crate::learn::features::Origin::Live),
         origin_count(crate::learn::features::Origin::Replay),
         dataset.counterfactual_gap.tasks,
@@ -1333,6 +1342,7 @@ argv = ["true"]
                         evidence: vec![],
                         actor: "a person".into(),
                         note: None,
+                        source: None,
                     },
                 )
                 .expect("outcome");

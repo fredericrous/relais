@@ -2950,6 +2950,7 @@ mod tests {
                         evidence: vec![],
                         actor: "a person".into(),
                         note: None,
+                        source: None,
                     },
                 )
                 .expect("outcome");
@@ -3029,6 +3030,7 @@ mod tests {
                 evidence: vec![],
                 actor: "a person".into(),
                 note: None,
+                source: None,
             },
         )
         .expect("outcome");

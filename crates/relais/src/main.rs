@@ -1999,6 +1999,12 @@ fn dataset_build_command() -> Result<CliOutcome, CliError> {
     // their repository and candidate patch are still on disk; the rest
     // stay unknown and are excluded.
     let backfill = operational(relais::learn::salvage::backfill(&ledger), "dataset build")?;
+    // Then the reverts git shows, before the dataset is read: one flips its
+    // task's label to a failure.
+    let reverts = operational(
+        relais::learn::revert::detect(&ledger, chrono::Utc::now()),
+        "dataset build",
+    )?;
     // A stored contract revision that does not parse is a corrupt ledger
     // row, not a run without a contract: dataset construction must see
     // the difference, or a version skew silently empties the dataset.
@@ -2067,6 +2073,7 @@ fn dataset_build_command() -> Result<CliOutcome, CliError> {
     for line in dataset.counterfactual_gap.render_lines() {
         println!("{line}");
     }
+    println!("{}", reverts.summary());
     println!(
         "salvage containment backfill: {} computed, {} unreachable (left unknown, excluded)",
         backfill.recorded, backfill.unreachable
@@ -7387,6 +7394,7 @@ fn feedback_command(request: FeedbackRequest) -> Result<CliOutcome, CliError> {
         evidence,
         actor,
         note,
+        source: None,
     };
     let recorded = match relais::outcome::Outcome::new(kind, detail) {
         Ok(outcome) => outcome,

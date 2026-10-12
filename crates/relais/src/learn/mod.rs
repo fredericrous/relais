@@ -24,5 +24,6 @@ pub mod learner;
 pub mod predict;
 pub mod promote;
 pub mod registry;
+pub mod revert;
 pub mod salvage;
 pub mod summary;
