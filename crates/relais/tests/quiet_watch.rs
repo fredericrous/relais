@@ -91,7 +91,11 @@ impl Watcher {
 }
 
 fn dead_pid() -> u32 {
-    let mut child = Command::new("true").spawn().unwrap();
+    let mut child = if cfg!(windows) {
+        Command::new("cmd").args(["/C", "exit"]).spawn().unwrap()
+    } else {
+        Command::new("true").spawn().unwrap()
+    };
     let pid = child.id();
     child.wait().unwrap();
     pid

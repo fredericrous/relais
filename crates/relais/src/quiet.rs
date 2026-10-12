@@ -588,6 +588,7 @@ mod tests {
         assert!(second.is_empty(), "announced again: {second:?}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_stale_entry_that_cannot_be_removed_is_held_closed() {
         use std::os::unix::fs::PermissionsExt;
