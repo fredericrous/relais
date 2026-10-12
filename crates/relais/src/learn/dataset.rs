@@ -305,10 +305,10 @@ impl CounterfactualGap {
             self.tasks
         );
         let next = match &self.estimate {
-            Some(cost) => format!("  next: relais dataset replay (estimated cost ~{cost})"),
-            None if self.tasks == 0 => "  next: nothing to replay".to_string(),
+            Some(cost) => format!("  to fill it: relais dataset replay (estimated cost ~{cost})"),
+            None if self.tasks == 0 => "  to fill it: nothing to replay".to_string(),
             None => format!(
-                "  next: relais dataset replay (cost unknown: {})",
+                "  to fill it: relais dataset replay (cost unknown: {})",
                 self.basis
             ),
         };
@@ -534,7 +534,7 @@ pub fn build(
             .find(|trial| trial.arm_run_id.as_ref() == Some(&run_id))
         else {
             exclusions.push(format!(
-                "{run_id}: replay: no trial row names it as its arm (recorded before ledger v17)"
+                "{run_id}: replay: no trial row names it as its arm (a row written before ledger v17 has none)"
             ));
             continue;
         };
@@ -1183,7 +1183,7 @@ mod tests {
         assert!(
             dataset.exclusions.iter().any(|e| {
                 e
-                == "run-rep: replay: no trial row names it as its arm (recorded before ledger v17)"
+                == "run-rep: replay: no trial row names it as its arm (a row written before ledger v17 has none)"
             }),
             "{:?}",
             dataset.exclusions
@@ -1297,7 +1297,7 @@ mod tests {
             gap.render_lines(),
             [
                 "counterfactual gap: 1 accepted task(s) lack a cheaper arm",
-                "  next: relais dataset replay (estimated cost ~$0.0001)"
+                "  to fill it: relais dataset replay (estimated cost ~$0.0001)"
             ]
         );
         // Nothing priced at the cheaper tier: unknown, never zero.
@@ -1317,7 +1317,7 @@ mod tests {
         failed.tier = Tier::Escalation;
         let gap = counterfactual_gap(&[research, failed]);
         assert_eq!(gap.tasks, 0);
-        assert_eq!(gap.render_lines()[1], "  next: nothing to replay");
+        assert_eq!(gap.render_lines()[1], "  to fill it: nothing to replay");
     }
 
     fn contract() -> crate::contract::TaskContract {

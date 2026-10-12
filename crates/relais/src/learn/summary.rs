@@ -54,9 +54,9 @@ pub struct LearningReport {
     pub last_cycle: Option<LastCycle>,
     pub examples_by_class: BTreeMap<String, u64>,
     pub examples_by_source: BTreeMap<String, u64>,
-    /// The latest cycle's dataset by origin (`live`, `replay`); empty when
-    /// its artifact predates origins.
-    pub examples_by_origin: BTreeMap<String, usize>,
+    /// The latest cycle's dataset by origin (`live`, `replay`); `null` when
+    /// its artifact is unavailable or predates origins.
+    pub examples_by_origin: Option<BTreeMap<String, usize>>,
     /// The latest cycle's counterfactual gap; `null` when unavailable.
     pub counterfactual_gap: Option<CounterfactualGap>,
     /// The latest cycle's floor sweep; `null`, never `[]`, when the artifact
@@ -74,6 +74,12 @@ pub struct LearningReport {
 enum LatestEvaluation {
     Report(Box<EvalReport>),
     Unavailable(String),
+}
+
+/// A report's origin counts, `None` when it predates them: an empty map
+/// would read as "no examples" where the truth is "not recorded".
+fn origins_of(report: &EvalReport) -> Option<BTreeMap<String, usize>> {
+    (!report.examples_by_origin.is_empty()).then(|| report.examples_by_origin.clone())
 }
 
 fn latest_evaluation(
@@ -138,23 +144,20 @@ pub fn learning_report(
     let (examples_by_origin, counterfactual_gap, floor_sweep, floor_sweep_note) =
         match latest_evaluation(registry, last_cycle_row.as_ref()) {
             LatestEvaluation::Report(report) if report.floor_sweep.is_empty() => (
-                report.examples_by_origin.clone(),
+                origins_of(&report),
                 report.counterfactual_gap.clone(),
                 None,
                 Some("not in this artifact; run relais learn cycle".to_string()),
             ),
             LatestEvaluation::Report(report) => (
-                report.examples_by_origin.clone(),
+                origins_of(&report),
                 report.counterfactual_gap.clone(),
                 Some(report.floor_sweep.clone()),
                 None,
             ),
-            LatestEvaluation::Unavailable(why) => (
-                BTreeMap::new(),
-                None,
-                None,
-                Some(format!("unavailable ({why})")),
-            ),
+            LatestEvaluation::Unavailable(why) => {
+                (None, None, None, Some(format!("unavailable ({why})")))
+            }
         };
     Ok(LearningReport {
         nothing_learned,
@@ -338,12 +341,11 @@ impl LearningReport {
                 &join(&self.examples_by_source),
             ));
         }
-        if !self.examples_by_origin.is_empty() {
+        if let Some(origins) = &self.examples_by_origin {
             out.push_str(&wrapped(
                 "  examples by origin: ",
                 "    ",
-                &self
-                    .examples_by_origin
+                &origins
                     .iter()
                     .map(|(origin, count)| format!("{origin} {count}"))
                     .collect::<Vec<_>>()
@@ -442,7 +444,7 @@ mod tests {
             }),
             examples_by_class: BTreeMap::from([("other".into(), 3)]),
             examples_by_source: BTreeMap::from([("runner".into(), 3)]),
-            examples_by_origin: BTreeMap::from([("live".into(), 3), ("replay".into(), 1)]),
+            examples_by_origin: Some(BTreeMap::from([("live".into(), 3), ("replay".into(), 1)])),
             counterfactual_gap: Some(CounterfactualGap {
                 tasks: 14,
                 estimate: None,
@@ -502,7 +504,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("next: relais dataset replay (estimated cost ~$123456.789012)"),
+            text.contains("to fill it: relais dataset replay (estimated cost ~$123456.789012)"),
             "{text}"
         );
     }
@@ -546,12 +548,17 @@ mod tests {
         let mut report = report();
         report.floor_sweep = None;
         report.floor_sweep_note = Some("not in this artifact; run relais learn cycle".into());
+        report.examples_by_origin = None;
+        report.counterfactual_gap = None;
         let text = report.render();
         assert!(
             text.contains("floor sweep: not in this artifact; run relais learn cycle"),
             "{text}"
         );
+        assert!(!text.contains("examples by origin"), "{text}");
         let json = serde_json::to_value(&report).unwrap();
         assert!(json["floor_sweep"].is_null(), "{json}");
+        assert!(json["examples_by_origin"].is_null(), "{json}");
+        assert!(json["counterfactual_gap"].is_null(), "{json}");
     }
 }
