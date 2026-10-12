@@ -53,7 +53,10 @@ export type Entry = { at: number; kind: string; text: string }
 // event said so.
 export type Cost = { booked: number | null; completeness: string; unpriced?: string }
 
-export type Outcome = { state: string; receipt: string | null; changed: string; reason?: string }
+// `answer` is the decision answered after the run stopped: the outcome state
+// is then the state the ledger holds now, not the one the run ended as.
+export type Answer = { resolution: string; actor: string | null }
+export type Outcome = { state: string; receipt: string | null; changed: string; reason?: string; answer?: Answer }
 
 export type RunModel = {
   run: string
@@ -454,7 +457,10 @@ export function changedText(summary: unknown): string {
 export function outcomeText(outcome: Outcome): string {
   const changed = outcome.changed ? ` · ${outcome.changed}` : ''
   const receipt = outcome.receipt ? ` · receipt ${outcome.receipt}` : ''
-  return `${outcome.state}${changed}${receipt}`
+  const answer = outcome.answer
+    ? ` (decided: ${outcome.answer.resolution}${outcome.answer.actor ? ` by ${outcome.answer.actor}` : ''})`
+    : ''
+  return `${outcome.state}${answer}${changed}${receipt}`
 }
 
 // The status line: the live runs, or the outcome kept after `done`.
@@ -546,7 +552,19 @@ function rebuildOne(models: Record<string, RunModel>, timeline: any, now: number
   } else if (isLive(model)) {
     model = { ...model, stalled: stalledHint(current) }
   }
+  model = answeredModel(model, current)
   return { ...out, [run]: model }
+}
+
+// A run whose decision was answered after it stopped: the ledger's state
+// replaces the outcome's, and the answer is kept beside it.
+function answeredModel(model: RunModel, current: any): RunModel {
+  const decision = current.decision
+  if (!model.outcome || typeof current.state !== 'string' || current.state === model.outcome.state) return model
+  if (!decision || typeof decision.resolution !== 'string') return model
+  const actor = typeof decision.actor === 'string' ? decision.actor : null
+  const answer: Answer = { resolution: decision.resolution, actor }
+  return { ...model, phase: current.state, outcome: { ...model.outcome, state: current.state, answer } }
 }
 
 // Runs rebuilt from `relais native status`: one timeline object (`--run`),

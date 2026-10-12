@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { formatCost, rebuildRuns, applyEvent, emptyRun } from '../hooks/timeline.ts'
+import { formatCost, rebuildRuns, applyEvent, emptyRun, outcomeText, statusReply } from '../hooks/timeline.ts'
 import { wrapWords } from '../hooks/pane.ts'
 import { nativeCalls, scriptedEngine, settle, spawnLine, startedRun, turn } from './support.ts'
 
@@ -156,4 +156,63 @@ test('a long reason wraps at a word boundary within 80 columns', () => {
   expect(rows.length).toBeGreaterThan(1)
   for (const row of rows) expect(row.length).toBeLessThanOrEqual(80)
   expect(rows.map(r => r.trim()).join(' ')).toBe(reason)
+})
+
+const reviewEvents = (run: string) => [
+  ev(run, 0, { kind: 'phase', state: 'running', reason: 'x', detail: {} }),
+  ev(run, 1, { kind: 'outcome', state: 'needs_review', receipt: null }),
+]
+const salvaged = { resolution: 'decision_salvaged', actor: 'orchestrator' }
+
+test('rebuildRuns shows a decision answered after the run stopped', () => {
+  const models = rebuildRuns(
+    timelineOf('run-a', { state: 'accepted_by_person', decision: salvaged }, reviewEvents('run-a')),
+    NOW,
+  )
+  const reply = statusReply(models['run-a'], NOW)
+  expect(reply.phase).toBe('accepted_by_person')
+  expect(reply.outcome?.state).toBe('accepted_by_person')
+  expect(reply.outcome?.answer).toEqual({ resolution: 'decision_salvaged', actor: 'orchestrator' })
+  expect(outcomeText(models['run-a'].outcome!)).toContain('(decided: decision_salvaged by orchestrator)')
+})
+
+test('a run whose decision is still open keeps its needs_review state', () => {
+  const models = rebuildRuns(
+    timelineOf('run-a', { state: 'needs_review', decision: { resolution: null, actor: null } }, reviewEvents('run-a')),
+    NOW,
+  )
+  expect(models['run-a'].outcome?.state).toBe('needs_review')
+  expect(models['run-a'].outcome?.answer).toBeUndefined()
+})
+
+const doneLine = (run: string, outcome: string) => JSON.stringify({ relais: 'done', run, outcome }) + '\n'
+
+test('statusOf refreshes a model that awaits a person and replies with the answered state', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.stream.push('stdout', JSON.stringify(ev('run-nr', 0, { kind: 'phase', state: 'running', reason: 'x', detail: {} })) + '\n')
+  engine.stream.push('stdout', doneLine('run-nr', 'needs_review'))
+  await settle(engine)
+  engine.script.runResult = (argv: string[]) =>
+    argv[2] === 'status'
+      ? result(JSON.stringify(timelineOf('run-nr', { state: 'accepted_by_person', decision: salvaged }, reviewEvents('run-nr'))))
+      : result('')
+  const before = nativeCalls(engine.calls, 'status').length
+  const [run] = JSON.parse((await $.tool.call({ tool: 'mcp__relais__status' })).result)
+  const calls = nativeCalls(engine.calls, 'status').slice(before)
+  expect(calls.some((c: any) => c.argv.join(' ') === 'relais native status --run run-nr')).toBe(true)
+  expect(run.phase).toBe('accepted_by_person')
+  expect(run.outcome.state).toBe('accepted_by_person')
+  expect(run.outcome.answer.resolution).toBe('decision_salvaged')
+})
+
+test('statusOf does not refresh a terminal model that awaits no person', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  engine.stream.push('stdout', JSON.stringify(ev('run-ok', 0, { kind: 'phase', state: 'running', reason: 'x', detail: {} })) + '\n')
+  engine.stream.push('stdout', doneLine('run-ok', 'accepted'))
+  await settle(engine)
+  engine.script.runResult = () => result('')
+  const before = nativeCalls(engine.calls, 'status').length
+  const [run] = JSON.parse((await $.tool.call({ tool: 'mcp__relais__status' })).result)
+  expect(run.outcome.state).toBe('accepted')
+  expect(nativeCalls(engine.calls, 'status').length).toBe(before)
 })
