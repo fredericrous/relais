@@ -125,6 +125,7 @@ The learning loop shipped in v0.12.0 (plan `2026-10-10-learning-loop.md`) and th
 - **D13** An installed 0.15.0 reads a version-6 dataset and ignores the fields it does not know: `relais train` has no dataset-version check, and `learn cycle` builds its own dataset (review round-2 finding 5, observed on the scratch copy).
 - **D14** The plugin suite's timeouts under load (75, then 31 failures, every one a 5-second timeout from another project's iOS simulator at a load average of 100–770) are not findings against this change: every test added or changed here passed, and the gate's own run was green. The Phase 2 gate's one failed attempt (22 release scenarios whose `claude --version` probe timed out) passed on retry at load 35.
 - **D15** `registry.active().ok().flatten()` in `learn/summary.rs` predates this change (it was at `summary.rs:71` on `origin/main`); the implementation review flagged it as a possible `errors.never-swallowed` breach, and it is left for its own change.
+- **D16** (2026-10-12, person) Phase 4's entry D15 in `2026-10-10-learning-loop.md` called Laya replacing haiku a smoke test of the training rig. The person corrected it: saving cost is a priority, so replacing the haiku classifier with Laya is the product path. The correction is learning-loop D17.
 
 ## Implementation review
 
