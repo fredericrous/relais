@@ -11,6 +11,8 @@ export type Calls = {
   learn: any[]
   // The detached `relais resume --retire --all` sweeps.
   resume: any[]
+  // The `relais quiet watch --protocol` spawns, kept apart from the runs'.
+  quiet: any[]
   // How many toasts had been shown when each learn spawn arrived.
   toastsAtLearnSpawn: number[]
   // What reached the engine's `agent.spawn`, after the plugin's own hook.
@@ -39,7 +41,7 @@ export const zeroUsage = { input_tokens: 0, output_tokens: 0, cache_read_input_t
 
 export function scriptedEngine(
   on: any,
-  options: { session?: string; isPlaced?: boolean; store?: Record<string, unknown> } = {},
+  options: { session?: string; isPlaced?: boolean; store?: Record<string, unknown>; quiet?: boolean } = {},
 ) {
   const clock = mock.clock(on, { now: Date.parse('2026-10-06T12:00:00Z') })
   mock.store(on, options.store ?? {})
@@ -49,6 +51,7 @@ export function scriptedEngine(
     spawn: [],
     learn: [],
     resume: [],
+    quiet: [],
     toastsAtLearnSpawn: [],
     spawned: [],
     tool: [],
@@ -120,10 +123,17 @@ export function scriptedEngine(
     },
   })
   const stream = feed('fix-it.json')
+  // The quiet watcher's own feed: protocol lines, one chunk at a time.
+  const quietFeed = feed('quiet-watch')
 
   on('session.id', () => ({ value: options.session ?? 'session-1' }))
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
-  on('session.end', (_$: any, e: any) => ({ sessionId: e.sessionId }))
+  on('session.end', (_$: any, e: any) => {
+    // The host kills the module's children when the session ends for good:
+    // the quiet watcher then exits, which its (closed) module does not answer.
+    if (options.quiet && e.reason !== 'clear' && e.reason !== 'resume') quietFeed.end(0)
+    return { sessionId: e.sessionId }
+  })
   on('tool.register', (_$: any, e: any) => ({ value: { tool: `mcp__relais__${e.name}` } }))
   on('command.register', (_$: any, e: any) => ({ value: { command: e.name } }))
   on('process.run', (_$: any, e: any) => {
@@ -140,6 +150,20 @@ export function scriptedEngine(
     if (e.argv[1] === 'resume') {
       calls.resume.push(e)
       return { value: { code: 0, signal: null } }
+    }
+    if (e.argv[1] === 'quiet') {
+      calls.quiet.push(e)
+      // A watcher that stays up keeps a spawn pending, which slows the mock
+      // clock's long advances: only a test of quiet runs asks for one. The
+      // others get an older relais (exit 2: no `quiet watch`).
+      if (!options.quiet) return { value: { code: 2, signal: null } }
+      const quietQueue = queueOf('quiet-watch')
+      for (;;) {
+        while (quietQueue.items.length === 0) await new Promise<void>(resolve => (quietQueue.wake = resolve))
+        const next = quietQueue.items.shift()
+        if ('end' in next) return { value: { code: next.end, signal: null } }
+        yield next
+      }
     }
     calls.spawn.push(e)
     const queue = queueOf(e.argv[e.argv.indexOf('--task') + 1])
@@ -228,7 +252,7 @@ export function scriptedEngine(
     return { text: e.text }
   })
 
-  return { clock, calls, stream, feed, script, agents }
+  return { clock, calls, stream, feed, script, agents, quiet: quietFeed }
 }
 
 export type Engine = ReturnType<typeof scriptedEngine>
@@ -245,7 +269,7 @@ export async function startQueued(engine: Engine) {
 }
 
 // A session with the plugin loaded and one run started.
-export async function startedRun($: any, on: any, options: { isPlaced?: boolean } = {}) {
+export async function startedRun($: any, on: any, options: { isPlaced?: boolean; quiet?: boolean } = {}) {
   const engine = scriptedEngine(on, options)
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
   await settle(engine)
@@ -301,3 +325,7 @@ export const nativeCalls = (calls: Calls, verb: string) =>
   calls.run
     .filter(c => c.argv[1] === 'native' && c.argv[2] === verb)
     .map(c => ({ argv: c.argv, init: c.init, payload: c.init?.stdin ? JSON.parse(c.init.stdin) : undefined }))
+
+// A line of the quiet watcher's protocol (`relais quiet watch --protocol`).
+export const quietLine = (event: string, body: Record<string, unknown> = {}) =>
+  line({ relais: 'quiet', event, ...body })

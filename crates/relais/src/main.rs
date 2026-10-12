@@ -126,6 +126,12 @@ enum Command {
         #[arg(long = "command", value_name = "TEXT", requires = "detect")]
         command: Option<String>,
     },
+    /// Watch the runs that amont and amont-agent keep quiet
+    /// (docs/quiet-runs.md)
+    Quiet {
+        #[command(subcommand)]
+        cmd: QuietCommand,
+    },
     /// Show what a trust grant for this repository's policy would let
     /// relais run, or record one in machine.toml (SPEC §5)
     Trust {
@@ -394,6 +400,17 @@ enum Command {
         /// Where `--probe` writes the payload
         #[arg(long = "record")]
         record: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum QuietCommand {
+    /// Poll the active-run directory and print one JSON line per event
+    /// until stdout closes or the parent process changes. Reads no stdin.
+    Watch {
+        /// Print the protocol lines (required: there is no other format)
+        #[arg(long, required = true)]
+        protocol: bool,
     },
 }
 
@@ -1289,6 +1306,7 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             run_command(&task, revise.as_deref(), &origin)
         }
         Command::Native { cmd } => native_command(cmd),
+        Command::Quiet { cmd } => quiet_command(cmd),
         Command::Trust { cmd } => trust_command(cmd),
         Command::Status { run_id } => status_command(run_id.as_deref()),
         Command::Explain { run_id } => explain_command(&run_id),
@@ -2854,6 +2872,19 @@ fn print_document<T: serde::Serialize>(document: &T) -> Result<(), CliError> {
     let text = operational(serde_json::to_string_pretty(document), "rendering JSON")?;
     println!("{text}");
     Ok(())
+}
+
+/// `relais quiet watch --protocol`: the watcher ends when its reader goes
+/// away, which is how it is meant to stop, so that is success.
+fn quiet_command(cmd: QuietCommand) -> Result<CliOutcome, CliError> {
+    let QuietCommand::Watch { .. } = cmd;
+    let Some(dir) = relais::quiet::active_dir(|name| std::env::var_os(name)) else {
+        return Err(CliError::Usage {
+            detail: "quiet watch: set QUIET_ACTIVE_DIR (no home or state directory found)".into(),
+        });
+    };
+    let _ = relais::quiet::watch(&dir, &mut std::io::stdout());
+    Ok(CliOutcome::Accepted)
 }
 
 fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {

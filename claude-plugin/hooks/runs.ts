@@ -21,6 +21,7 @@ import { sendHello } from './callbacks.ts'
 import { onRunDone } from './routing.ts'
 import { detach, type Child, type PendingOutcome, type Store } from './store.ts'
 import { refreshTranscript } from './transcript.ts'
+import { hasQuietWork, tickQuiet } from './quiet-watch.ts'
 import {
   announceRun,
   flush,
@@ -72,6 +73,7 @@ export async function pump(fx: Fx, store: Store) {
     }
   }
   await refreshTranscript(fx, store)
+  if (hasQuietWork(store)) await tickQuiet(fx, store)
   await flush(fx, store)
 }
 

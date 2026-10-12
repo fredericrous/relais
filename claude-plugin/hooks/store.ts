@@ -6,6 +6,7 @@ import type { Dispatch } from './dispatches.ts'
 import type { RunModel } from './timeline.ts'
 import { createRouterMemory, type RouterMemory } from './router.ts'
 import type { TranscriptState } from './transcript.ts'
+import { createQuietMemory, type QuietMemory } from './quiet.ts'
 
 // What the pane shows: the runs, or one agent's transcript.
 export type Shown =
@@ -123,6 +124,8 @@ export type Store = {
   pendingMessages: boolean
   // `generation:kind` (deny or slow) of the notes already made on the run.
   notedReasons: Set<string>
+  // The quiet runs the watcher reported (quiet.ts).
+  quiet: QuietMemory
 }
 
 // What an outcome message was built from, to rebuild it if the run's
@@ -185,6 +188,7 @@ export const createStore = (): Store => ({
   isReadingTranscript: false,
   pendingMessages: false,
   notedReasons: new Set(),
+  quiet: createQuietMemory(),
 })
 
 // Timers go through here so that unloading can clear every one.

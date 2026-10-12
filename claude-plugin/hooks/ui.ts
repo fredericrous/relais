@@ -5,6 +5,7 @@
 import type { Fx } from './fx.ts'
 import { after, type Store } from './store.ts'
 import { paneTree } from './pane.ts'
+import { drawnQuiet, hasLiveQuiet, quietStatus } from './quiet.ts'
 import {
   isLive,
   statusLine,
@@ -26,7 +27,7 @@ const asJson = (value: unknown) => JSON.parse(JSON.stringify(value))
 const runsOf = (store: Store): RunModel[] =>
   Object.values(store.models).filter(m => !m.foreign).sort((a, b) => a.startedAt - b.startedAt)
 
-export const hasLiveRun = (store: Store) => runsOf(store).some(isLive)
+export const hasLiveRun = (store: Store) => runsOf(store).some(isLive) || hasLiveQuiet(store)
 
 export const markDirty = (store: Store) => {
   store.isDirty = true
@@ -47,13 +48,18 @@ export async function flush(fx: Fx, store: Store) {
   if (!store.isDirty && !isStale) return
   store.isDirty = false
   store.flushedAt = now
-  await fx.pane.write(asJson({ runs: runsOf(store), now, shown: viewOf(store.shown) }))
+  const quiet = { runs: drawnQuiet(store, now), down: store.quiet.watcher === 'down' }
+  await fx.pane.write(asJson({ runs: runsOf(store), now, shown: viewOf(store.shown), quiet }))
   fx.ui.status(statusText(store, now))
 }
 
 // The run's status and the router's, side by side; either may be absent.
 export function statusText(store: Store, now: number): string | undefined {
-  const parts = [statusLine(store.models, now, store.heldOutcome), store.router.status].filter(Boolean)
+  const parts = [
+    statusLine(store.models, now, store.heldOutcome),
+    quietStatus(drawnQuiet(store, now), now),
+    store.router.status,
+  ].filter(Boolean)
   return parts.length > 0 ? parts.join(' · ') : undefined
 }
 

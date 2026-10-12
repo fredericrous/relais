@@ -5,6 +5,7 @@
 import type { Fx } from './fx.ts'
 import type { TranscriptState } from './transcript.ts'
 import { MAX_TRANSCRIPT_ROWS } from './limits.ts'
+import { MAX_QUIET_LINES, quietElapsed, type QuietRun } from './quiet.ts'
 import {
   type RunModel,
   type Step,
@@ -201,11 +202,26 @@ function outputRows(m: RunModel, cap: number): Row[] {
   return lines.slice(-cap).map(text => ({ text: `  │ ${text}`, dim: true }))
 }
 
-export function layoutPane(runs: RunModel[], room: Room): Row[] {
-  if (runs.length === 0) {
-    return [{ text: 'relais · waiting for the first event', dim: true }]
+// The quiet runs to draw (already of this session and past the anti-flash),
+// live ones first, and whether the watcher is down.
+export type QuietPane = { runs: QuietRun[]; down: boolean }
+
+const MAX_QUIET_HEADS = 3
+const NO_QUIET: QuietPane = { runs: [], down: false }
+
+export function layoutPane(runs: RunModel[], room: Room, quiet: QuietPane = NO_QUIET): Row[] {
+  const down: Row[] = quiet.down ? [{ text: 'quiet watcher down', dim: true }] : []
+  if (runs.length === 0 && quiet.runs.length === 0) {
+    return [{ text: 'relais · waiting for the first event', dim: true }, ...down]
   }
   const rows = Math.max(room.rows, MIN_ROWS)
+  const relais = relaisRows(runs, room, rows)
+  return [...relais.out, ...quietRows(quiet.runs, room, rows - relais.used), ...down]
+}
+
+// The relais runs' rows, and how many rows they use at most (the fixed rows
+// and the output cap's share): the quiet runs get only what is left.
+function relaisRows(runs: RunModel[], room: Room, rows: number): { out: Row[]; used: number } {
   const frames = runs.map((m, i) => ({ m, ...frame(m, room, i === runs.length - 1) }))
   const fixed = frames.reduce((n, f) => n + f.head.length + f.steps.length + f.m.steps.length + f.tail.length, 0)
   const withOutput = frames.filter(f => isLive(f.m) || f.m.steps.some(s => s.checks.length > 0)).length
@@ -222,6 +238,26 @@ export function layoutPane(runs: RunModel[], room: Room): Row[] {
     if (!isLive(f.m) && !f.m.outcome?.state.startsWith('accepted')) out.push(...outputRowsOfFailed(f.m, cap))
     out.push(...f.steps, ...f.tail)
   }
+  return { out, used: fixed + cap * withOutput }
+}
+
+// Quiet runs below every relais run: Text only, so the agent Buttons keep
+// their keyboard order. At most MAX_QUIET_HEADS heads (the caller sorts live
+// before kept failures), each with its share of the `spare` rows.
+function quietRows(runs: QuietRun[], room: Room, spare: number): Row[] {
+  const heads = runs.slice(0, MAX_QUIET_HEADS)
+  const more = runs.length - heads.length
+  const left = Math.max(0, spare - heads.length - (more > 0 ? 1 : 0))
+  const each = heads.length === 0 ? 0 : Math.min(MAX_QUIET_LINES, Math.floor(left / heads.length))
+  const out: Row[] = []
+  for (const run of heads) {
+    const text = `${run.tool} · ${run.check} · ${mmss(quietElapsed(run, room.now))}`
+    out.push(run.failure ? { text, color: 'error' } : { text, dim: true })
+    const lines = run.lines.slice(-each).map(l => ({ text: `  │ ${l}`, dim: true }))
+    if (lines.length > 0) out.push(...lines)
+    else if (each > 0 && !run.failure) out.push({ text: '  │ waiting for output', dim: true })
+  }
+  if (more > 0) out.push({ text: `+${more} more quiet runs`, dim: true })
   return out
 }
 
@@ -237,7 +273,7 @@ function outputRowsOfFailed(m: RunModel, cap: number): Row[] {
 // What the pane shows besides the runs: one agent's transcript.
 export type PaneShown = { kind: 'runs' } | { kind: 'agent'; agentId: string; run: string; transcript: TranscriptState }
 
-export type PaneState = { runs: RunModel[]; now: number; shown?: PaneShown }
+export type PaneState = { runs: RunModel[]; now: number; shown?: PaneShown; quiet?: QuietPane }
 
 export type PaneActions = {
   openAgent: (agentId: string, run: string, columns: number) => unknown
@@ -303,7 +339,7 @@ export function paneTree(fx: Fx, e: any, state: PaneState | undefined, actions: 
       ...rows.map((row, i) => text(row, `row:${i}`)),
     )
   }
-  const rows = layoutPane(state?.runs ?? [], room)
+  const rows = layoutPane(state?.runs ?? [], room, state?.quiet)
   return h(
     Box,
     { flexDirection: 'column' },

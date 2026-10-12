@@ -10,6 +10,8 @@ export type RelaisPaneState = {
   // What the pane shows: the runs, or one agent's transcript (the render
   // derives everything from this, never from the engine's `props.view`).
   shown: RelaisPaneShown
+  // Quiet runs (hooks/quiet.ts): those to draw, and whether the watcher is down.
+  quiet?: { runs: unknown[]; down: boolean }
 }
 
 // A transcript row, laid out at the pane's width and sanitised before it is stored.
