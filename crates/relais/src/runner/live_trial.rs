@@ -106,8 +106,9 @@ fn admit_one(
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read it: {e}"))?;
     let parsed = RepoPolicy::from_toml_str(&text).map_err(|e| format!("does not parse: {e}"))?;
     let bounds = trial_bounds(repo, machine);
-    let candidate = route::validate_candidate(repo, &parsed, &bounds)
-        .map_err(|rejection| format!("inadmissible: {rejection}"))?;
+    let candidate =
+        route::validate_candidate(repo, &parsed, &bounds, route::CandidateAdmission::Promote)
+            .map_err(|rejection| format!("inadmissible: {rejection}"))?;
     let authority_hash = candidate.policy().authority_hash();
     let key = grant_key(&authority_hash, identity);
     if !machine.trust.contains_key(&key) {
@@ -343,9 +344,11 @@ pub fn decide(env: &Environment<'_>) -> Result<Decision, LedgerError> {
     let usage = usage_today(env.ledger, envelope)?;
     let (_start, utc_day) = today(env.ledger)?;
 
-    let eligible = route::eligible_tiers(env.contract, env.repo, &env.repo.models);
+    let facts = route::TaskFacts::live_of(env.contract);
+    let eligible = route::eligible_tiers(env.contract, env.repo, &env.repo.models, facts);
     let control_recipe_id =
-        route::covering_recipe_id(env.contract, env.repo, &eligible.tiers).unwrap_or_default();
+        route::covering_recipe_id(env.contract, env.repo, &eligible.tiers, facts)
+            .unwrap_or_default();
 
     let Admission {
         admitted,
@@ -355,8 +358,9 @@ pub fn decide(env: &Environment<'_>) -> Result<Decision, LedgerError> {
     let mut arm_ids: Vec<CandidateArm> = Vec::new();
     for candidate in admitted {
         let policy = candidate.policy();
-        let tiers = route::eligible_tiers(env.contract, policy, &policy.models);
-        let Some(recipe_policy_id) = route::covering_recipe_id(env.contract, policy, &tiers.tiers)
+        let tiers = route::eligible_tiers(env.contract, policy, &policy.models, facts);
+        let Some(recipe_policy_id) =
+            route::covering_recipe_id(env.contract, policy, &tiers.tiers, facts)
         else {
             dropped.push(Dropped {
                 path: candidate.path,

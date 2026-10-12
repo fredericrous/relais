@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalog::EffortCatalogs;
 use crate::contract::scope::{scope_contained_in, write_scope_could_touch};
-use crate::contract::{Kind, Review, Task, TaskContract};
+use crate::contract::{Kind, Review, Task, TaskContract, TaskType};
 use crate::money::MicroUsd;
 use crate::policy::{
     BlockCode, Blocker, EffectiveAuthority, EffortId, MachineSettings, ModelProfile, RecipeSpec,
@@ -28,7 +28,8 @@ mod rung;
 pub mod trial;
 pub use arm::{learner_arms, Arm};
 pub use candidate::{
-    default_tuning_bounds, validate_candidate, CandidateRecipe, CandidateRejection, TuningBounds,
+    default_tuning_bounds, validate_candidate, CandidateAdmission, CandidateRecipe,
+    CandidateRejection, TuningBounds,
 };
 pub use ladder::{held_repair_models, held_text, held_would_text, Ladder, RungIndex, RungRole};
 pub use rung::{authority_ceiling, models_in_play, resolve_catalogs, EffortRequest, Rung};
@@ -62,7 +63,55 @@ pub struct Estimates {
     pub raw: serde_json::Value,
 }
 
+/// Who is asking for a route, which decides whether a research-tier
+/// `change` recipe may be honoured (docs/plans/2026-10-12-task-types.md).
+/// Set by the caller; [`route`] stays pure. Only the replay command sets
+/// `Replay`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Admission {
+    /// A live run. A research-tier `change` recipe is ignored, even one
+    /// that names task types.
+    #[default]
+    Live,
+    /// A replay of a recorded task, to measure a candidate. Admits a
+    /// research-tier `change` for a recipe that names the task's type.
+    Replay,
+}
+
+/// What a recipe's coverage depends on besides the contract's kind and
+/// scope: the routed task type, whether a design is present, and the
+/// admission. One value so [`eligible_tiers`] and [`covering_recipe_id`]
+/// cannot be called with a different reading than [`route`] uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TaskFacts {
+    pub task_type: Option<TaskType>,
+    pub has_design: bool,
+    pub admission: Admission,
+}
+
+impl TaskFacts {
+    /// Live admission with the contract's own declared type and design.
+    /// For callers that rebuild a route's recipe without the ledger at
+    /// hand (evidence keying, trial arms); the router itself is given the
+    /// ledger's classified type as well.
+    // holds-until: the predictor trait and dataset construction carry the
+    // routed type, so a task typed only by the classifier is keyed too.
+    pub fn live_of(contract: &TaskContract) -> Self {
+        Self {
+            task_type: contract.task_type,
+            has_design: contract.design.is_some(),
+            admission: Admission::Live,
+        }
+    }
+}
+
 pub struct RouteInputs<'a> {
+    /// The routed task type: the contract's declared type, else the
+    /// ledger's classified one, chosen by the caller.
+    pub task_type: Option<TaskType>,
+    /// Whether the task carries a program design.
+    pub has_design: bool,
+    pub admission: Admission,
     pub contract: &'a TaskContract,
     pub repo: &'a RepoPolicy,
     pub machine: &'a MachineSettings,
@@ -482,6 +531,7 @@ pub fn eligible_tiers(
     contract: &TaskContract,
     repo: &RepoPolicy,
     configured: &std::collections::BTreeMap<Tier, ModelProfile>,
+    facts: TaskFacts,
 ) -> Eligibility {
     let mut reasons = Vec::new();
     let mut floor = kind_floor(contract.kind());
@@ -513,6 +563,25 @@ pub fn eligible_tiers(
             floor = rule_floor;
         }
     }
+    // A research-tier `change` is admitted only for a replay, only when the
+    // recipe that wins for this task names its type, and only when no risk
+    // rule fired above research: each task's own risk floor still applies,
+    // so a typed task touching a protected path stays at implementation.
+    if floor == Tier::Implementation
+        && contract.kind() == Kind::Change
+        && facts.admission == Admission::Replay
+        && rule_floor.is_none_or(|rule| rule <= Tier::Research)
+    {
+        let all = [Tier::Research, Tier::Implementation, Tier::Escalation];
+        let winner = covering_recipe_spec(contract, repo, &all, facts);
+        if winner.is_some_and(|spec| spec.tier == Tier::Research && !spec.task_type.is_empty()) {
+            reasons.push(RouteReason::new(
+                "typed_research_replay",
+                "replay: a recipe naming this task's type admits the research tier",
+            ));
+            floor = Tier::Research;
+        }
+    }
     let keys: Vec<Tier> = configured.keys().copied().collect();
     Eligibility {
         floor,
@@ -530,11 +599,25 @@ fn covering_recipe_spec<'a>(
     contract: &TaskContract,
     repo: &'a RepoPolicy,
     eligible: &[Tier],
+    facts: TaskFacts,
 ) -> Option<&'a RecipeSpec> {
-    crate::policy::select_highest_enabled_revision(&repo.recipes, |spec| {
-        let recipe = Recipe::from(spec);
-        eligible.contains(&recipe.tier) && recipe_covers(contract, &recipe)
-    })
+    let covers =
+        |spec: &RecipeSpec| eligible.contains(&spec.tier) && recipe_covers(contract, spec, facts);
+    // Revisions compare across names, so a recipe naming the task's type is
+    // preferred first (`change-routing` at revision 5 must not displace
+    // `change-<type>` at revision 2), and among those a `requires_design`
+    // one when the task has a design.
+    let typed = |spec: &RecipeSpec| !spec.task_type.is_empty() && covers(spec);
+    let preferred = if facts.has_design {
+        crate::policy::select_highest_enabled_revision(&repo.recipes, |spec| {
+            spec.requires_design && typed(spec)
+        })
+    } else {
+        None
+    };
+    preferred
+        .or_else(|| crate::policy::select_highest_enabled_revision(&repo.recipes, typed))
+        .or_else(|| crate::policy::select_highest_enabled_revision(&repo.recipes, covers))
 }
 
 /// The [`RecipeSpec::recipe_id`] of the recipe that produced this task's
@@ -548,15 +631,26 @@ pub fn covering_recipe_id(
     contract: &TaskContract,
     repo: &RepoPolicy,
     eligible: &[Tier],
+    facts: TaskFacts,
 ) -> Option<String> {
-    covering_recipe_spec(contract, repo, eligible).map(RecipeSpec::recipe_id)
+    covering_recipe_spec(contract, repo, eligible, facts).map(RecipeSpec::recipe_id)
 }
 
-fn recipe_covers(contract: &TaskContract, recipe: &Recipe) -> bool {
+fn recipe_covers(contract: &TaskContract, recipe: &RecipeSpec, facts: TaskFacts) -> bool {
     if let Some(kind) = recipe.kind {
         if contract.kind() != kind {
             return false;
         }
+    }
+    if !recipe.task_type.is_empty()
+        && !facts
+            .task_type
+            .is_some_and(|task_type| recipe.task_type.contains(&task_type))
+    {
+        return false;
+    }
+    if recipe.requires_design && !facts.has_design {
+        return false;
     }
     if recipe.scope_within.is_empty() {
         return true;
@@ -575,6 +669,9 @@ fn recipe_covers(contract: &TaskContract, recipe: &Recipe) -> bool {
 
 pub fn route(inputs: RouteInputs<'_>) -> Routed {
     let RouteInputs {
+        task_type,
+        has_design,
+        admission,
         contract,
         repo,
         machine,
@@ -582,6 +679,11 @@ pub fn route(inputs: RouteInputs<'_>) -> Routed {
         predictor,
         catalogs,
     } = inputs;
+    let facts = TaskFacts {
+        task_type,
+        has_design,
+        admission,
+    };
 
     let mut reasons = Vec::new();
 
@@ -608,7 +710,7 @@ pub fn route(inputs: RouteInputs<'_>) -> Routed {
         floor,
         tiers: eligible,
         reasons: eligibility_reasons,
-    } = eligible_tiers(contract, repo, &authority.models);
+    } = eligible_tiers(contract, repo, &authority.models, facts);
     reasons.extend(eligibility_reasons);
 
     // Worker-supplied risk hints increase caution, never lower floors
@@ -664,7 +766,7 @@ pub fn route(inputs: RouteInputs<'_>) -> Routed {
     // The effort the learner chose for the initial rung, when it chose one.
     let mut start_effort: Option<EffortId> = None;
     let floors = risk_floor(contract, &repo.risk).efforts;
-    let covering_spec = covering_recipe_spec(contract, repo, &eligible);
+    let covering_spec = covering_recipe_spec(contract, repo, &eligible, facts);
     let covering = covering_spec.map(Recipe::from);
     let selected: (Tier, RoutedBy) = if let Some(recipe) = &covering {
         reasons.push(RouteReason::new(
@@ -1097,6 +1199,9 @@ mod tests {
     ) -> Routed {
         let authority = effective_authority(repo, machine, contract, &identity());
         route(RouteInputs {
+            task_type: None,
+            has_design: false,
+            admission: Admission::Live,
             contract,
             repo,
             machine,
@@ -1314,13 +1419,13 @@ mod tests {
         let machine = machine_for(&repo);
         let contract = change_contract(&["crates/amont/trust/**"]);
         let authority = effective_authority(&repo, &machine, &contract, &identity());
-        let eligibility = eligible_tiers(&contract, &repo, &authority.models);
+        let eligibility = eligible_tiers(&contract, &repo, &authority.models, TaskFacts::default());
         assert_eq!(eligibility.floor, Tier::Escalation);
         assert_eq!(eligibility.tiers, vec![Tier::Escalation]);
 
         let inspect = inspect_contract();
         let authority = effective_authority(&repo, &machine, &inspect, &identity());
-        let eligibility = eligible_tiers(&inspect, &repo, &authority.models);
+        let eligibility = eligible_tiers(&inspect, &repo, &authority.models, TaskFacts::default());
         assert_eq!(eligibility.floor, Tier::Research);
         assert_eq!(
             eligibility.tiers,
@@ -1459,6 +1564,9 @@ mod tests {
             (Tier::Escalation, 0.95, 4000),
         ]);
         let d = expect_route(route(RouteInputs {
+            task_type: None,
+            has_design: false,
+            admission: Admission::Live,
             contract: &change_contract(&["crates/amont/**"]),
             repo: &repo,
             machine: &machine,
@@ -1485,6 +1593,9 @@ mod tests {
             (Tier::Escalation, 0.40, 900),
         ]);
         let d = expect_route(route(RouteInputs {
+            task_type: None,
+            has_design: false,
+            admission: Admission::Live,
             contract: &change_contract(&["crates/amont/**"]),
             repo: &repo,
             machine: &machine,
@@ -1737,6 +1848,9 @@ mod tests {
             favoured: favoured.clone(),
         };
         let d = expect_route(route(RouteInputs {
+            task_type: None,
+            has_design: false,
+            admission: Admission::Live,
             contract: &contract,
             repo: &repo,
             machine: &machine,
@@ -1777,6 +1891,9 @@ mod tests {
             favoured: favoured.clone(),
         };
         let d = expect_route(route(RouteInputs {
+            task_type: None,
+            has_design: false,
+            admission: Admission::Live,
             contract: &contract,
             repo: &repo,
             machine: &machine,
@@ -1840,6 +1957,9 @@ mod tests {
             &identity(),
         );
         let d = expect_route(route(RouteInputs {
+            task_type: None,
+            has_design: false,
+            admission: Admission::Live,
             contract: &change_contract(&["crates/amont/**"]),
             repo: &repo,
             machine: &machine,
@@ -1920,6 +2040,8 @@ mod tests {
             execution: None,
             context: None,
             review: None,
+            task_type: Vec::new(),
+            requires_design: false,
         });
         let machine = machine_for(&repo);
         let docs = change_contract(&["docs/guide.md"]);
@@ -1949,6 +2071,8 @@ mod tests {
             execution: None,
             context: None,
             review: None,
+            task_type: Vec::new(),
+            requires_design: false,
         });
         let machine = machine_for(&repo);
         let everything = change_contract(&["**"]);
@@ -1977,6 +2101,199 @@ mod tests {
             enabled,
             ..crate::policy::RecipeSpec::covering("docs-touchup", Tier::Implementation)
         }
+    }
+
+    fn typed_change(
+        name: &str,
+        revision: u32,
+        tier: Tier,
+        task_type: TaskType,
+        requires_design: bool,
+    ) -> crate::policy::RecipeSpec {
+        crate::policy::RecipeSpec {
+            kind: Some(Kind::Change),
+            scope_within: vec!["**".into()],
+            revision,
+            task_type: vec![task_type],
+            requires_design,
+            ..crate::policy::RecipeSpec::covering(name, tier)
+        }
+    }
+
+    fn route_typed(
+        contract: &TaskContract,
+        repo: &RepoPolicy,
+        task_type: Option<TaskType>,
+        has_design: bool,
+        admission: Admission,
+    ) -> Route {
+        let machine = machine_for(repo);
+        let authority = effective_authority(repo, &machine, contract, &identity());
+        expect_route(route(RouteInputs {
+            task_type,
+            has_design,
+            admission,
+            contract,
+            repo,
+            machine: &machine,
+            authority: &authority,
+            predictor: None,
+            catalogs: &EffortCatalogs::default(),
+        }))
+    }
+
+    /// A repository with one typed recipe at the research tier and an
+    /// implementation-tier risk rule over `**/trust/**`.
+    fn typed_research_repo() -> RepoPolicy {
+        let mut repo = repo_policy();
+        repo.risk.push(RiskRule {
+            paths: vec!["**/trust/**".into()],
+            minimum_tier: Tier::Implementation,
+            review: None,
+            minimum_effort: None,
+        });
+        repo.recipes.push(typed_change(
+            "change-ui",
+            1,
+            Tier::Research,
+            TaskType::Ui,
+            false,
+        ));
+        repo
+    }
+
+    #[test]
+    fn a_typed_research_recipe_under_replay_routes_a_safe_path_to_research_and_a_protected_one_to_implementation(
+    ) {
+        let repo = typed_research_repo();
+        let safe = change_contract(&["docs/guide.md"]);
+        let d = route_typed(&safe, &repo, Some(TaskType::Ui), false, Admission::Replay);
+        assert_eq!(d.tier, Tier::Research);
+        assert_eq!(d.routed_by, RoutedBy::DeterministicRecipe);
+        let protected = change_contract(&["crates/x/trust/keys.rs"]);
+        let d = route_typed(
+            &protected,
+            &repo,
+            Some(TaskType::Ui),
+            false,
+            Admission::Replay,
+        );
+        assert_eq!(d.tier, Tier::Implementation);
+        // Another type, or none, is not covered even under replay.
+        for other in [Some(TaskType::Infra), None] {
+            let d = route_typed(&safe, &repo, other, false, Admission::Replay);
+            assert_eq!(d.tier, Tier::Implementation, "{other:?}");
+        }
+    }
+
+    /// This repository's own `relais.toml`: a typed contract routes to the
+    /// implementation tier through `change-<type>`, a typeless one through
+    /// `change-routing`, exactly as before the per-type recipes were seeded.
+    #[test]
+    fn the_seeded_per_type_recipes_leave_routing_unchanged() {
+        let repo = RepoPolicy::from_toml_str(include_str!("../../../../relais.toml"))
+            .expect("this repository's own relais.toml parses");
+        let contract = TaskContract::from_json_str(
+            &serde_json::json!({
+                "schema_version": 1,
+                "kind": "change",
+                "objective": "Fix a doc",
+                "base_ref": "HEAD",
+                "write_scope": ["docs/guide.md"],
+                "acceptance": ["it reads"],
+                "verification_profile": "default",
+            })
+            .to_string(),
+        )
+        .expect("contract parses");
+        let reason_of = |task_type: Option<TaskType>, has_design: bool| {
+            let d = route_typed(&contract, &repo, task_type, has_design, Admission::Live);
+            assert_eq!(d.tier, Tier::Implementation);
+            d.covering.map(|recipe| recipe.name)
+        };
+        assert_eq!(reason_of(None, false).as_deref(), Some("change-routing"));
+        assert_eq!(
+            reason_of(Some(TaskType::Ui), false).as_deref(),
+            Some("change-ui")
+        );
+        assert_eq!(
+            reason_of(Some(TaskType::Feature), false).as_deref(),
+            Some("change-feature")
+        );
+        assert_eq!(
+            reason_of(Some(TaskType::Feature), true).as_deref(),
+            Some("change-feature-designed")
+        );
+        // Not seeded for `report`: the untyped recipe covers it.
+        assert_eq!(
+            reason_of(Some(TaskType::Report), false).as_deref(),
+            Some("change-routing")
+        );
+    }
+
+    #[test]
+    fn live_routing_ignores_a_typed_research_recipe_written_by_hand() {
+        let repo = typed_research_repo();
+        let safe = change_contract(&["docs/guide.md"]);
+        let d = route_typed(&safe, &repo, Some(TaskType::Ui), false, Admission::Live);
+        assert_eq!(d.tier, Tier::Implementation);
+        assert_ne!(d.routed_by, RoutedBy::DeterministicRecipe);
+    }
+
+    #[test]
+    fn a_recipe_naming_the_type_is_preferred_and_a_design_prefers_the_designed_one() {
+        let mut repo = repo_policy();
+        let mut routing = docs_recipe(5, true);
+        routing.name = "change-routing".into();
+        routing.scope_within = vec!["**".into()];
+        repo.recipes.push(routing);
+        repo.recipes.push(typed_change(
+            "change-feature",
+            2,
+            Tier::Implementation,
+            TaskType::Feature,
+            false,
+        ));
+        repo.recipes.push(typed_change(
+            "change-feature-designed",
+            1,
+            Tier::Implementation,
+            TaskType::Feature,
+            true,
+        ));
+        let contract = change_contract(&["docs/guide.md"]);
+        let name = |repo: &RepoPolicy, has_design: bool, task_type: Option<TaskType>| {
+            let facts = TaskFacts {
+                task_type,
+                has_design,
+                admission: Admission::Live,
+            };
+            let all = [Tier::Research, Tier::Implementation, Tier::Escalation];
+            covering_recipe_spec(&contract, repo, &all, facts).map(|spec| spec.name.clone())
+        };
+        // Revision 5 of the untyped recipe does not displace revision 2.
+        assert_eq!(
+            name(&repo, false, Some(TaskType::Feature)).as_deref(),
+            Some("change-feature")
+        );
+        // With a design, the designed recipe wins at a lower revision.
+        assert_eq!(
+            name(&repo, true, Some(TaskType::Feature)).as_deref(),
+            Some("change-feature-designed")
+        );
+        // A type no recipe names falls back to the untyped one.
+        assert_eq!(
+            name(&repo, true, Some(TaskType::Ui)).as_deref(),
+            Some("change-routing")
+        );
+        // Without a design a requires_design recipe never covers.
+        repo.recipes.retain(|spec| spec.name != "change-feature");
+        repo.recipes.retain(|spec| spec.name != "change-routing");
+        assert_eq!(name(&repo, false, Some(TaskType::Feature)), None);
+        assert_eq!(
+            name(&repo, true, Some(TaskType::Feature)).as_deref(),
+            Some("change-feature-designed")
+        );
     }
 
     #[test]
@@ -2036,12 +2353,12 @@ mod tests {
 
         let mut repo_rev0 = repo_policy();
         repo_rev0.recipes.push(docs_recipe(0, true));
-        let id_rev0 = covering_recipe_id(&docs, &repo_rev0, &eligible);
+        let id_rev0 = covering_recipe_id(&docs, &repo_rev0, &eligible, TaskFacts::default());
         assert!(id_rev0.is_some());
 
         let mut repo_rev1 = repo_policy();
         repo_rev1.recipes.push(docs_recipe(1, true));
-        let id_rev1 = covering_recipe_id(&docs, &repo_rev1, &eligible);
+        let id_rev1 = covering_recipe_id(&docs, &repo_rev1, &eligible, TaskFacts::default());
         assert_ne!(
             id_rev0, id_rev1,
             "two runs differing only in the recipe revision that produced them are different \
@@ -2050,7 +2367,8 @@ mod tests {
 
         let mut repo_rev0_again = repo_policy();
         repo_rev0_again.recipes.push(docs_recipe(0, true));
-        let id_rev0_again = covering_recipe_id(&docs, &repo_rev0_again, &eligible);
+        let id_rev0_again =
+            covering_recipe_id(&docs, &repo_rev0_again, &eligible, TaskFacts::default());
         assert_eq!(
             id_rev0, id_rev0_again,
             "two runs under a byte-identical recipe are the same identity"
@@ -2058,7 +2376,7 @@ mod tests {
 
         let no_recipe = repo_policy();
         assert_eq!(
-            covering_recipe_id(&docs, &no_recipe, &eligible),
+            covering_recipe_id(&docs, &no_recipe, &eligible, TaskFacts::default()),
             None,
             "no configured recipe covers this task"
         );
@@ -2562,6 +2880,9 @@ mod tests {
         let open = machine_for(&repo);
         let authority = effective_authority(&repo, &open, &contract, &identity());
         let d = expect_route(route(RouteInputs {
+            task_type: None,
+            has_design: false,
+            admission: Admission::Live,
             contract: &contract,
             repo: &repo,
             machine: &machine,
@@ -2733,7 +3054,9 @@ mod tests {
             tuned.revision = 1;
             let mut candidate = incumbent.clone();
             candidate.recipes.push(tuned.clone());
-            let validated = validate_candidate(&incumbent, &candidate, &bounds).is_ok();
+            let validated =
+                validate_candidate(&incumbent, &candidate, &bounds, CandidateAdmission::Promote)
+                    .is_ok();
 
             let mut routed = incumbent.clone();
             routed.recipes = vec![tuned];
@@ -2759,7 +3082,8 @@ mod tests {
         let bounds = default_tuning_bounds(incumbent, machine_allowed.as_deref(), catalogs);
         let mut candidate = incumbent.clone();
         candidate.recipes.push(tuned.clone());
-        let admitted = validate_candidate(incumbent, &candidate, &bounds).is_ok();
+        let admitted =
+            validate_candidate(incumbent, &candidate, &bounds, CandidateAdmission::Promote).is_ok();
 
         let mut routed = incumbent.clone();
         routed.recipes = vec![tuned];
@@ -3215,7 +3539,7 @@ mod tests {
                 let borrowed: Vec<&str> = scope.iter().map(String::as_str).collect();
                 change_contract(&borrowed)
             };
-            let eligibility = eligible_tiers(&contract, &repo, &configured);
+            let eligibility = eligible_tiers(&contract, &repo, &configured, TaskFacts::default());
             let kind_floor = kind_floor(contract.kind());
             prop_assert!(
                 eligibility.floor >= kind_floor,

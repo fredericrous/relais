@@ -756,8 +756,13 @@ impl Reading<'_> {
         };
         let routed_by: Option<RoutedBy> =
             read_of(run_id, "routed by", ledger.first_dispatch_routed_by(run_id))?;
-        let eligibility =
-            crate::route::eligible_tiers(&contract, self.repo_policy, &self.repo_policy.models);
+        let facts = crate::route::TaskFacts::live_of(&contract);
+        let eligibility = crate::route::eligible_tiers(
+            &contract,
+            self.repo_policy,
+            &self.repo_policy.models,
+            facts,
+        );
         // The recipe that produced this run: for a live run, reconstructed
         // the same pure way the router itself would decide it (SPEC §17);
         // for a replay, the arm its trial names — never the incumbent the
@@ -765,7 +770,12 @@ impl Reading<'_> {
         // wrong recipe. Two revisions of one recipe are never pooled.
         let (recipe_id, family, origin) = match observation {
             Observation::Live => (
-                crate::route::covering_recipe_id(&contract, self.repo_policy, &eligibility.tiers),
+                crate::route::covering_recipe_id(
+                    &contract,
+                    self.repo_policy,
+                    &eligibility.tiers,
+                    facts,
+                ),
                 task_family(&contract),
                 Origin::Live,
             ),

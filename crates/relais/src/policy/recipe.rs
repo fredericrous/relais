@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::contract::{Kind, Review};
+use crate::contract::{Kind, Review, TaskType};
 use crate::ids::canonical_json_hash;
 
 use super::{ContextPolicy, ExecutionPolicy, ModelProfile, Tier};
@@ -103,6 +103,21 @@ pub struct RecipeSpec {
     /// scope touches without a repository editing those rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<Review>,
+    /// The task types this recipe covers; empty covers every type, as a
+    /// recipe written before the field existed always did. A NARROWING
+    /// knob: a candidate may add a list to a recipe that had none, never
+    /// widen an existing one. Naming a type is also what lets a
+    /// research-tier `change` recipe be admitted under a replay (SPEC §6).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_type: Vec<TaskType>,
+    /// Whether this recipe covers only a contract that names a design.
+    /// A narrowing knob: a candidate may turn it on, never off.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub requires_design: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl RecipeSpec {
@@ -218,6 +233,8 @@ impl RecipeSpec {
             execution: None,
             context: None,
             review: None,
+            task_type: Vec::new(),
+            requires_design: false,
         }
     }
 }
@@ -373,6 +390,8 @@ mod tests {
             execution: None,
             context: None,
             review: None,
+            task_type: Vec::new(),
+            requires_design: false,
         }
     }
 

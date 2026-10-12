@@ -112,6 +112,22 @@ impl Ledger {
         row.map(stored_type).transpose().map(Option::flatten)
     }
 
+    /// The type routing uses for a task: the contract's declared one, else
+    /// the ledger's (classified) one. `unclassified` routes as no type.
+    pub fn routing_type(
+        &self,
+        task: &TaskId,
+        declared: Option<TaskType>,
+    ) -> Result<Option<TaskType>> {
+        if declared.is_some() {
+            return Ok(declared);
+        }
+        Ok(self
+            .task_type_of(task)?
+            .map(|stored| stored.task_type)
+            .filter(|task_type| *task_type != TaskType::Unclassified))
+    }
+
     /// How many tasks carry a type at all.
     pub fn typed_task_count(&self) -> Result<u64> {
         let count: i64 = self.conn.query_row(

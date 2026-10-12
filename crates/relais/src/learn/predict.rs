@@ -64,7 +64,12 @@ pub fn estimate_from_registry(
             tiers.push(arm.tier);
         }
     }
-    let recipe_id = crate::route::covering_recipe_id(contract, repo_policy, &tiers);
+    let recipe_id = crate::route::covering_recipe_id(
+        contract,
+        repo_policy,
+        &tiers,
+        crate::route::TaskFacts::live_of(contract),
+    );
     // The identity an arm would dispatch WITH — the same tokens the
     // dataset builder reads back from the dispatch intent and the recipe
     // that would cover it, at the arm's own effort.

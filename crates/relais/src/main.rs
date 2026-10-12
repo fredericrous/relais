@@ -4281,7 +4281,15 @@ fn plan_command(
         .as_ref()
         .map(|registry| RegistryPredictor::new(registry, &repo, harness.as_deref()));
     let catalogs = route::resolve_catalogs(&repo, &authority, &machine, probe.efforts.as_ref());
+    let task_type = match (&task_override, contract.task_type) {
+        (_, Some(declared)) => Some(declared),
+        (Some(task), None) => operational(open_ledger()?.routing_type(task, None), "plan")?,
+        (None, None) => None,
+    };
     let decision = route::route(route::RouteInputs {
+        task_type,
+        has_design: contract.design.is_some(),
+        admission: route::Admission::Live,
         contract: &contract,
         repo: &repo,
         machine: &machine,
@@ -5528,7 +5536,12 @@ fn replay_command(
     // Admitted through the same door a learner's proposal is — never a
     // second, looser one for replay.
     let bounds = tuning_bounds(&incumbent);
-    let candidate = match route::validate_candidate(&incumbent, &candidate_policy, &bounds) {
+    let candidate = match route::validate_candidate(
+        &incumbent,
+        &candidate_policy,
+        &bounds,
+        route::CandidateAdmission::Replay,
+    ) {
         Ok(candidate) => candidate,
         Err(rejection) => {
             eprintln!("relais dataset replay: candidate refused: {rejection}");
@@ -5618,19 +5631,45 @@ fn replay_command(
         return Ok(CliOutcome::Blocked);
     }
 
-    let incumbent_eligible = route::eligible_tiers(&source_contract, &incumbent, &incumbent.models);
-    let incumbent_recipe_id =
-        route::covering_recipe_id(&source_contract, &incumbent, &incumbent_eligible.tiers)
-            .unwrap_or_default();
+    // The recorded contract carries no type; the ledger's (declared or
+    // classified) one comes in through the facts.
+    let task_type = operational(
+        ledger.routing_type(&task_id, source_contract.task_type),
+        "dataset replay",
+    )?;
+    let incumbent_facts = route::TaskFacts {
+        task_type,
+        has_design: source_contract.design.is_some(),
+        admission: route::Admission::Live,
+    };
+    let replay_facts = route::TaskFacts {
+        admission: route::Admission::Replay,
+        ..incumbent_facts
+    };
+    let incumbent_eligible = route::eligible_tiers(
+        &source_contract,
+        &incumbent,
+        &incumbent.models,
+        incumbent_facts,
+    );
+    let incumbent_recipe_id = route::covering_recipe_id(
+        &source_contract,
+        &incumbent,
+        &incumbent_eligible.tiers,
+        incumbent_facts,
+    )
+    .unwrap_or_default();
     let candidate_eligible = route::eligible_tiers(
         &source_contract,
         candidate.policy(),
         &candidate.policy().models,
+        replay_facts,
     );
     let arm_recipe = route::covering_recipe_id(
         &source_contract,
         candidate.policy(),
         &candidate_eligible.tiers,
+        replay_facts,
     );
 
     println!(
@@ -6022,6 +6061,8 @@ struct RecipeSpecFull {
     execution: Option<relais::policy::ExecutionPolicy>,
     context: Option<relais::policy::ContextPolicy>,
     review: Option<relais::contract::Review>,
+    task_type: Vec<relais::contract::TaskType>,
+    requires_design: bool,
 }
 
 impl From<&RecipeSpec> for RecipeSpecFull {
@@ -6037,6 +6078,8 @@ impl From<&RecipeSpec> for RecipeSpecFull {
             execution,
             context,
             review,
+            task_type,
+            requires_design,
         } = spec.clone();
         Self {
             name,
@@ -6049,6 +6092,8 @@ impl From<&RecipeSpec> for RecipeSpecFull {
             execution,
             context,
             review,
+            task_type,
+            requires_design,
         }
     }
 }
@@ -6150,7 +6195,12 @@ fn recipe_diff_command(candidate_path: &Path) -> Result<CliOutcome, CliError> {
     }
 
     let bounds = tuning_bounds(&incumbent);
-    match route::validate_candidate(&incumbent, &candidate_policy, &bounds) {
+    match route::validate_candidate(
+        &incumbent,
+        &candidate_policy,
+        &bounds,
+        route::CandidateAdmission::Promote,
+    ) {
         Ok(_) => println!(
             "admissible: route::validate_candidate would ADMIT this candidate — admissible is \
              not approved: it still needs its own trust grant, and nothing here grants, \
@@ -6187,7 +6237,12 @@ fn recipe_evaluate_command(candidate_path: &Path) -> Result<CliOutcome, CliError
     // Admitted through the same door a learner's proposal, or a replay's
     // candidate, is — never a second, looser one for evaluation.
     let bounds = tuning_bounds(&incumbent);
-    let candidate = match route::validate_candidate(&incumbent, &candidate_policy, &bounds) {
+    let candidate = match route::validate_candidate(
+        &incumbent,
+        &candidate_policy,
+        &bounds,
+        route::CandidateAdmission::Promote,
+    ) {
         Ok(candidate) => candidate,
         Err(rejection) => {
             eprintln!("relais recipe evaluate: candidate refused: {rejection}");
@@ -6320,7 +6375,12 @@ fn recipe_promote_command(candidate_path: &Path, mode: AmendMode) -> Result<CliO
             cause: Box::new(cause),
         })?;
     let bounds = tuning_bounds(&incumbent);
-    let candidate = match route::validate_candidate(&incumbent, &candidate_policy, &bounds) {
+    let candidate = match route::validate_candidate(
+        &incumbent,
+        &candidate_policy,
+        &bounds,
+        route::CandidateAdmission::Promote,
+    ) {
         Ok(candidate) => candidate,
         Err(rejection) => {
             eprintln!("relais recipe promote: candidate refused: {rejection}");
@@ -8996,6 +9056,8 @@ mod tests {
             execution: None,
             context: None,
             review: None,
+            task_type: Vec::new(),
+            requires_design: false,
         }
     }
 
@@ -9027,6 +9089,8 @@ mod tests {
             execution: base_execution,
             context: base_context,
             review: base_review,
+            task_type: base_task_type,
+            requires_design: base_requires_design,
         } = base.clone();
 
         let cases: Vec<(&str, RecipeSpec)> = vec![
@@ -9093,6 +9157,20 @@ mod tests {
                     ..base.clone()
                 },
             ),
+            (
+                "task_type",
+                RecipeSpec {
+                    task_type: vec![relais::contract::TaskType::Feature],
+                    ..base.clone()
+                },
+            ),
+            (
+                "requires_design",
+                RecipeSpec {
+                    requires_design: true,
+                    ..base.clone()
+                },
+            ),
         ];
         // The destructure above stands for the whole field list; assert
         // against it so the base used in every case really is the base.
@@ -9104,6 +9182,8 @@ mod tests {
         assert_eq!(base_execution, None);
         assert_eq!(base_context, None);
         assert_eq!(base_review, None);
+        assert!(base_task_type.is_empty());
+        assert!(!base_requires_design);
 
         // The case list must name every field the diff compares. The
         // destructure above only forces a binding for a new field, not a

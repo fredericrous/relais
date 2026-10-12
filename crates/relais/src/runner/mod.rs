@@ -1667,7 +1667,21 @@ impl<'a> RunEngine<'a> {
             self.config.machine,
             capabilities.as_ref().map(|c| &c.accepted_efforts),
         );
+        // The declared type, else the ledger's classified one. Only a run
+        // the replay command started (`RunPurpose::Replay`, set nowhere
+        // else) is admitted below the implementation tier for a change.
+        let task_type = match ledger.task_of_run(&self.run_id)? {
+            Some(task) => ledger.routing_type(&task, self.config.contract.task_type)?,
+            None => self.config.contract.task_type,
+        };
         let decision = match route(RouteInputs {
+            task_type,
+            has_design: self.config.contract.design.is_some(),
+            admission: if self.config.purpose == Some(crate::lifecycle::RunPurpose::Replay) {
+                crate::route::Admission::Replay
+            } else {
+                crate::route::Admission::Live
+            },
             contract: self.config.contract,
             repo: self.config.repo_policy,
             machine: self.config.machine,
