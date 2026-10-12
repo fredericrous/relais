@@ -11,7 +11,7 @@ adrs:
 ## Review panel
 
 👉 **Decide:** none — approve if a typed, recorded orchestrator answer with Laya advice (once trained) is how decisions get settled.
-📍 relais, homelab · plan reviewed, nothing built · next: relais PR 1 (Phases 1–2), then the Phase 3 sweep. Panel: architect, backend, go, python, rust, typescript, platform, po, tui, unix.
+📍 relais, homelab · Phases 1–3 done (v0.14.0, sweep 2026-10-12) · next: Phase 4a, the Laya cost spike. Panel: architect, backend, go, python, rust, typescript, platform, po, tui, unix.
 **Changed by review:** advice computed once when the row opens, never on a read path; orchestrator cannot sign off human criteria; advisor ships with 4c, not PR 1.
 **Verdicts:** round 1: 9 approve-with-changes, 1 approve; round 2 and two deltas backend approve-with-changes; 1 blocker went to the person (D8: tamper-evidence); 5 findings carried into implementation.
 📄 Full reviews: [2026-10-11-orchestrator-decides.reviews.md](2026-10-11-orchestrator-decides.reviews.md)
@@ -59,48 +59,48 @@ The person decided (2026-10-11): **the orchestrator approves**, and **Laya advis
 ## Phase 3: answer the 29 open rows (live, agent-run) — done
 
 - The list comes from `Ledger::open_decisions` (`ledger/mod.rs:3169`, already used by the report). For each open row: read the run (`relais explain`), its contract objective and candidate sha, and look for what landed (`git log --all` on the run's repo for the objective or the candidate's patch, the strict salvage test D1 of the learning-loop plan: does the verified patch reverse-apply on the landed tree).
-- Answer each with `mcp__relais__decide`, actor `orchestrator`, a note naming the evidence: `salvaged --candidate <sha>` when the patch landed intact; `revise --successor <run>` when a later run carried the work; `abandon` otherwise. No `approve` in the sweep: an approval months after the fact has no candidate anyone checked.
+- Answer each with `mcp__relais__decide`, actor `orchestrator`, a note naming the evidence: `salvaged --candidate <sha>` when the work landed, intact or rewritten by a later commit (relais records which, as `candidate_contained`; only an intact one is a label); `revise --successor <run>` when a later run carried the work; `abandon` otherwise. No `approve` in the sweep: an approval months after the fact has no candidate anyone checked.
 - The result (row → answer → evidence) is recorded in this plan; it is also the replay table for the Phase 1 rollback. `relais status` afterwards shows no run waiting from before 2026-10-11.
 
 ### Sweep record (2026-10-12, relais 0.16.0 installed, plugin reinstalled)
 
 - Live check of the tool, first answer of the sweep: `mcp__relais__decide` on `run-65d1e031e6d73-776c` (salvaged, website-builder `5c03526`) → "Recorded decision_salvaged … by orchestrator: needs_review -> accepted_by_person"; the row reads `actor = orchestrator`, `recorded_via = plugin`, `candidate_contained = 0`.
 - Evidence per row: the run's contract objective, its last candidate patch, whether that patch reverse-applies on today's `main` (none did), the `main` commits touching its files since the run's base, and a subject or `-S` search; each landing commit verified an ancestor of `origin/HEAD`. relais computed the containment of each salvage itself.
-- Result: 23 salvaged (1 contained, 20 rewritten, 2 unknown), 5 abandoned, 1 revised; every row `orchestrator`/`plugin`; no decision raised before 2026-10-11 is open. `relais report`: "awaiting a human: 8 run(s)", all 8 raised after 2026-10-11 10:00 by other sessions, left to them.
+- Result: 23 salvaged (1 contained, 20 rewritten, 2 unknown; rewritten means the work landed in a commit that changed the run's patch, see D18), 5 abandoned, 1 revised; every row `orchestrator`/`plugin`; no decision raised before 2026-10-11 is open. `relais report`: "awaiting a human: 8 run(s)", all 8 raised after 2026-10-11 10:00 by other sessions, left to them. `relais status` (2026-10-12) lists none of the 29 as waiting; its oldest still-open waiting run was raised 2026-10-11T10:36. It still lists 17 runs in a waiting state whose decisions were answered before this plan (revise, abandon or recorded through an older relais that left the run's projected state unchanged); not touched here.
 - Two abandons name work still open: Kbd/BarChart sits unmerged on duro-design-system `feat/kbd-barchart` with no PR, and the empty-model usage filter (`Ledger::model_observations`) never landed.
 - The live outcome-message check (a run waiting on a person ending with the decide step) is not observed yet: no run reached `needs_decision` in a session since the reinstall. The plugin test covers it.
 
-| run | raised | answer | containment | evidence |
-|---|---|---|---|---|
-| `run-65ca7d74d5c9f-1852d` | needs_review | salvaged | rewritten | P2 (the route carries the rung) landed on relais main as 33b3dfb (#144). |
-| `run-65ca9a939c4bb-43ef` | needs_review | salvaged | rewritten | P3 (the resolved effort ladder) landed on relais main as ccdb30a (#145). |
-| `run-65d09a8c399d5-3ca0` | needs_decision | abandoned | — | an onboarding probe ('report the top-level layout') that wrote LAYOUT.md files outside its scope; nothing was meant to land and nothing did. |
-| `run-65d09a8c05212-3ca2` | needs_decision | abandoned | — | an onboarding probe ('report the top-level layout') whose candidate held a .pnpm-store; nothing was meant to land and nothing did. |
-| `run-65d0ae85cd7e9-7166` | needs_review | salvaged | rewritten | the Popover compound component landed on duro-design-system main as 1108ab6f (#62). |
-| `run-65d1dcfe14ab3-15d04` | needs_review | salvaged | rewritten | the happier-relay app landed on homelab main as df6e7d90e 'feat(happier-relay): deploy the Happier relay server'. |
-| `run-65d1e031e6d73-776c` | needs_review | salvaged | rewritten | the objective (Duro token var names in the builder-webapp build) landed on website-builder main as 5c03526 'fix(webapp): name Duro token vars as Duro does'; the run's own candidate patch does not reverse-apply on today's main. |
-| `run-65d1e7809bd21-efca` | needs_review | salvaged | rewritten | Icon/Inline creation on (R3) landed on website-builder main as b9a626b 'feat: icon and inline creation on'. |
-| `run-65d284fd76485-16f2` | needs_decision | salvaged | rewritten | ToggleGroup wrap/maxRows (phase 1b) landed on duro-design-system main as 6ed3f195 'feat(ui): popover layers, icon choice ToggleGroup' (#66). |
-| `run-65d28999d35b0-8fac` | needs_review | salvaged | rewritten | the cert-free LAN/tailnet entry for happier-relay landed on homelab main as 842f58d7b. |
-| `run-65d2abaf85a1f-d1c0` | needs_review | salvaged | rewritten | icon-choice list phases 2b-2d landed on website-builder main as 95b7057 'feat(editor): icons chosen from an icon list'. |
-| `run-65d3014dce4e6-1533e` | needs_decision | salvaged | rewritten | the sizes and borders token groups landed on duro-design-system main as e5e3c329 'feat!: every measure is a token (Duro 5.0)' (#68). |
-| `run-65d309c10845b-7dbe` | needs_review | salvaged | rewritten | vault-dr Phase 1 (recover nas unseal-key) landed on homelab main as d20c96151. |
-| `run-65d3103d060f0-15ca1` | needs_review | salvaged | rewritten | vault-dr Phase 2 (transit record and operation lease) landed on homelab main as 60c1109e5. |
-| `run-65d3584300d3a-15776` | needs_review | salvaged | rewritten | plan-phases-open Phase 1 (Stop hook parsing and decisions) landed on amont-agent main in 4343768 (#78). |
-| `run-65d35b3a4089b-ea6d` | needs_decision | salvaged | rewritten | plan-phases-open Phase 2 (the rule) landed on amont-agent main in 4343768 (#78). |
-| `run-65d3c1efe90c3-12046` | needs_decision | salvaged | rewritten | inline-one-row-grid Phase A landed on website-builder main as 211d142 'feat(schemas): inline-grid container, capability 3'. |
-| `run-65d3c6599ccae-60b3` | needs_review | salvaged | rewritten | inline-one-row-grid Phase B (alignInlineRow, authoring) landed on website-builder main as 592ca83. |
-| `run-65d3caadb2985-d984` | needs_review | salvaged | rewritten | inline-one-row-grid Phase C (editor one-row grid) landed on website-builder main as 050c233 'feat(editor): inline as a one-row grid'. |
-| `run-65d599c6d3404-1518c` | interrupted | revised | — | crashed; the same publish-errors task was retried as run-65d59d4f49932-4139. |
-| `run-65d59d4f49932-4139` | interrupted | salvaged | — | publish errors in sentences landed on website-builder main as 8207b4b. |
-| `run-65d61867e66e1-1650e` | needs_decision | salvaged | contained | status-bar glyphs and drag-thumb sizes landed on duro-design-system main as 14c434ad (#99). |
-| `run-65d62b4052541-e5fa` | needs_decision | abandoned | — | Kbd and BarChart are not on duro-design-system main; the work continued by hand on branch feat/kbd-barchart (last commit a9a5c3a2, 2026-10-09), never opened as a PR. This run is not what carries it. |
-| `run-65d6352662dd0-174bb` | needs_decision | salvaged | rewritten | FileTrigger, media glyphs and media sizes landed on duro-design-system main as 20d98ff1 (#101). |
-| `run-65d316abbddda-14448` | interrupted | salvaged | rewritten | the vault-dr Phase 3 roller landed on homelab main as 2763b3bfc 'feat(vault): roll homelab Vault onto a new token'. |
-| `run-65d77dd7060ef-169d2` | interrupted | abandoned | — | the empty-model usage fix did not land: Ledger::model_observations on relais main still filters only IS NOT NULL, not empty models. Still an open problem, not carried by this run. |
-| `run-65d7dca899789-2d73` | interrupted | salvaged | — | learning-loop Phase 2 (learn cycle, rollback, envelope) landed on relais main in e04270b (#195). |
-| `run-65d7994f93597-509c` | interrupted | abandoned | — | zero attempts, nothing produced; the scenario-world env isolation it asked for landed separately in 0177f51 (#192). |
-| `run-65d8b504185f3-1666f` | needs_decision | salvaged | rewritten | LSP call recording landed on amont-agent main as 15ab958 'feat(lsp): a session remembers what it asked; 2.33.0' (#91). |
+| run | raised | state | answer | containment | evidence |
+|---|---|---|---|---|---|
+| `run-65ca7d74d5c9f-1852d` | 2026-09-30 | needs_review | salvaged | rewritten | P2 (the route carries the rung) landed on relais main as 33b3dfb (#144). |
+| `run-65ca9a939c4bb-43ef` | 2026-09-30 | needs_review | salvaged | rewritten | P3 (the resolved effort ladder) landed on relais main as ccdb30a (#145). |
+| `run-65d09a8c399d5-3ca0` | 2026-10-04 | needs_decision | abandoned | — | an onboarding probe ('report the top-level layout') that wrote LAYOUT.md files outside its scope; nothing was meant to land and nothing did. |
+| `run-65d09a8c05212-3ca2` | 2026-10-04 | needs_decision | abandoned | — | an onboarding probe ('report the top-level layout') whose candidate held a .pnpm-store; nothing was meant to land and nothing did. |
+| `run-65d0ae85cd7e9-7166` | 2026-10-04 | needs_review | salvaged | rewritten | the Popover compound component landed on duro-design-system main as 1108ab6f (#62). |
+| `run-65d1dcfe14ab3-15d04` | 2026-10-05 | needs_review | salvaged | rewritten | the happier-relay app landed on homelab main as df6e7d90e 'feat(happier-relay): deploy the Happier relay server'. |
+| `run-65d1e031e6d73-776c` | 2026-10-05 | needs_review | salvaged | rewritten | the objective (Duro token var names in the builder-webapp build) landed on website-builder main as 5c03526 'fix(webapp): name Duro token vars as Duro does'; the run's own candidate patch does not reverse-apply on today's main. |
+| `run-65d1e7809bd21-efca` | 2026-10-05 | needs_review | salvaged | rewritten | Icon/Inline creation on (R3) landed on website-builder main as b9a626b 'feat: icon and inline creation on'. |
+| `run-65d284fd76485-16f2` | 2026-10-06 | needs_decision | salvaged | rewritten | ToggleGroup wrap/maxRows (phase 1b) landed on duro-design-system main as 6ed3f195 'feat(ui): popover layers, icon choice ToggleGroup' (#66). |
+| `run-65d28999d35b0-8fac` | 2026-10-06 | needs_review | salvaged | rewritten | the cert-free LAN/tailnet entry for happier-relay landed on homelab main as 842f58d7b. |
+| `run-65d2abaf85a1f-d1c0` | 2026-10-06 | needs_review | salvaged | rewritten | icon-choice list phases 2b-2d landed on website-builder main as 95b7057 'feat(editor): icons chosen from an icon list'. |
+| `run-65d3014dce4e6-1533e` | 2026-10-06 | needs_decision | salvaged | rewritten | the sizes and borders token groups landed on duro-design-system main as e5e3c329 'feat!: every measure is a token (Duro 5.0)' (#68). |
+| `run-65d309c10845b-7dbe` | 2026-10-06 | needs_review | salvaged | rewritten | vault-dr Phase 1 (recover nas unseal-key) landed on homelab main as d20c96151. |
+| `run-65d3103d060f0-15ca1` | 2026-10-06 | needs_review | salvaged | rewritten | vault-dr Phase 2 (transit record and operation lease) landed on homelab main as 60c1109e5. |
+| `run-65d3584300d3a-15776` | 2026-10-07 | needs_review | salvaged | rewritten | plan-phases-open Phase 1 (Stop hook parsing and decisions) landed on amont-agent main in 4343768 (#78). |
+| `run-65d35b3a4089b-ea6d` | 2026-10-07 | needs_decision | salvaged | rewritten | plan-phases-open Phase 2 (the rule) landed on amont-agent main in 4343768 (#78). |
+| `run-65d3c1efe90c3-12046` | 2026-10-07 | needs_decision | salvaged | rewritten | inline-one-row-grid Phase A landed on website-builder main as 211d142 'feat(schemas): inline-grid container, capability 3'. |
+| `run-65d3c6599ccae-60b3` | 2026-10-07 | needs_review | salvaged | rewritten | inline-one-row-grid Phase B (alignInlineRow, authoring) landed on website-builder main as 592ca83. |
+| `run-65d3caadb2985-d984` | 2026-10-07 | needs_review | salvaged | rewritten | inline-one-row-grid Phase C (editor one-row grid) landed on website-builder main as 050c233 'feat(editor): inline as a one-row grid'. |
+| `run-65d599c6d3404-1518c` | 2026-10-08 | interrupted | revised | — | crashed; the same publish-errors task was retried as run-65d59d4f49932-4139. |
+| `run-65d59d4f49932-4139` | 2026-10-08 | interrupted | salvaged | unknown | publish errors in sentences landed on website-builder main as 8207b4b. |
+| `run-65d61867e66e1-1650e` | 2026-10-09 | needs_decision | salvaged | contained | status-bar glyphs and drag-thumb sizes landed on duro-design-system main as 14c434ad (#99). |
+| `run-65d62b4052541-e5fa` | 2026-10-09 | needs_decision | abandoned | — | Kbd and BarChart are not on duro-design-system main; the work continued by hand on branch feat/kbd-barchart (last commit a9a5c3a2, 2026-10-09), never opened as a PR. This run is not what carries it. |
+| `run-65d6352662dd0-174bb` | 2026-10-09 | needs_decision | salvaged | rewritten | FileTrigger, media glyphs and media sizes landed on duro-design-system main as 20d98ff1 (#101). |
+| `run-65d316abbddda-14448` | 2026-10-11 | interrupted | salvaged | rewritten | the vault-dr Phase 3 roller landed on homelab main as 2763b3bfc 'feat(vault): roll homelab Vault onto a new token'. |
+| `run-65d77dd7060ef-169d2` | 2026-10-11 | interrupted | abandoned | — | the empty-model usage fix did not land: Ledger::model_observations on relais main still filters only IS NOT NULL, not empty models. Still an open problem, not carried by this run. |
+| `run-65d7dca899789-2d73` | 2026-10-11 | interrupted | salvaged | unknown | learning-loop Phase 2 (learn cycle, rollback, envelope) landed on relais main in e04270b (#195). |
+| `run-65d7994f93597-509c` | 2026-10-11 | interrupted | abandoned | — | zero attempts, nothing produced; the scenario-world env isolation it asked for landed separately in 0177f51 (#192). |
+| `run-65d8b504185f3-1666f` | 2026-10-11 | needs_decision | salvaged | rewritten | LSP call recording landed on amont-agent main as 15ab958 'feat(lsp): a session remembers what it asked; 2.33.0' (#91). |
 
 ## Phase 4: Laya advises the approval (data-gated)
 
@@ -194,6 +194,7 @@ The person decided (2026-10-11): **the orchestrator approves**, and **Laya advis
 - **D15** The nonce's OS random source lives in `procs.rs` (`os_random`), the one module allowed to name a platform API (`scripts/check-module-cycles.py`): `/dev/urandom` on unix, `BCryptGenRandom` on Windows through the already-present `windows-sys` with one more feature, no new crate.
 - **D16** (2026-10-12) The advisor (Phase 4) uses Laya's calibrated per-question probability, never its `act_probability` head, which the model card says "carries no usable signal yet"; a temperature is fitted per question type on the calibration split before any advice is shown, because the shipped checkpoints are over-confident (mean ECE 0.47 before refit, 0.08 after).
 - **D17** (2026-10-12) Nothing is salvaged from `microsoft/best-route-llm` for the advisor either; see `2026-10-10-learning-loop.md` D16.
+- **D18** (2026-10-12) Phase 3 classed work that landed in a later, rewriting commit as `salvaged` (containment `rewritten`), not `revise` or `abandon`: that is relais's own meaning of salvaged ("a person finished and merged specific work"), and containment keeps it out of the labels. The plan's first wording allowed salvaged only for an intact patch, which no row met; the rule above is amended to what was done.
 
 ## Implementation review
 
