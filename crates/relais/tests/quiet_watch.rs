@@ -167,10 +167,14 @@ fn live_entry_streams_started_output_and_ended() {
 }
 
 #[test]
-fn an_entry_first_seen_ended_yields_started_output_ended_then_is_deleted() {
+fn an_entry_first_seen_ended_yields_started_output_ended_once_and_stays_on_disk() {
     let dir = scratch("ended");
     let active = dir.join("active");
     let log = dir.join("a.log.tmp");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     append(&log, b"error: boom\nlast words");
     write_entry(
         &active,
@@ -178,7 +182,7 @@ fn an_entry_first_seen_ended_yields_started_output_ended_then_is_deleted() {
         &log,
         dead_pid(),
         json!("s"),
-        json!({"exit": 1, "ended": 2000}),
+        json!({"exit": 1, "ended": now}),
     );
     let w = watch(&active);
     w.expect("started");
@@ -186,13 +190,10 @@ fn an_entry_first_seen_ended_yields_started_output_ended_then_is_deleted() {
     let ended = w.expect("ended");
     assert_eq!(
         (ended["exit"].clone(), ended["ended"].clone()),
-        (json!(1), json!(2000))
+        (json!(1), json!(now))
     );
-    let end = Instant::now() + Duration::from_secs(3);
-    while active.join("2-1.json").exists() && Instant::now() < end {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(!active.join("2-1.json").exists());
+    assert!(w.next(Duration::from_secs(1)).is_none(), "announced again");
+    assert!(active.join("2-1.json").exists(), "younger than 60 s: kept");
     let _ = fs::remove_dir_all(&dir);
 }
 

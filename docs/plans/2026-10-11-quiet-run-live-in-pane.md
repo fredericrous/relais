@@ -79,6 +79,7 @@ Outcome: while an agent-run quiet check or command is live, relais's pane shows 
 - The watcher tests wait for its first line (up to 60 s) before timing anything: `cargo test` relinks the binary with other features than `cargo build`, and macOS held the first exec in `_dyld_start` past the tests' 6 s windows at load ~250.
 - amont-agent's atomic temp is a dotfile ending in `.json`; the watcher skips dotfiles, or the temp's rename would end a run as killed and keep a failed row (found closing amont, 2026-10-12).
 - Under load an amont-agent test read that temp just before its rename; the test helper skips dotfiles too (amont-agent#101).
+- Amends the entry-contract Decision (2026-10-12, the person chose "never delete"). Phase 6 had four open sessions, each with its own watcher. The first watcher to see an ended entry deleted it, so the others drew the run as killed (null exit) and kept a failed row. Two of eight runs showed this, among them a passed amont `branch-pattern` check. Now each watcher announces an end once and holds it closed. No watcher deletes an ended entry younger than 60 s; after that, any watcher or a tool sweep removes it.
 - End to end, branch binaries (2026-10-11): a failing `amont-agent quiet` run gave `started` (its session) → one `output` per line, live → `ended` exit 3 → entry deleted; `amont run clippy --all-files` gave `started` → live `output` → `ended` exit 0.
 
 ## Non-goals
@@ -120,5 +121,7 @@ Outcome: while an agent-run quiet check or command is live, relais's pane shows 
 - amont: approve-with-changes (delta on c66d6af). The contract wording above is fixed here; the CHANGELOG session line goes in amont 1.51.0.
 - amont-agent: approve on tree 1de7f960; released v2.37.0.
 - Next: phase 6, live, after the person reinstalls the plugin.
+
+- Keep-ended fix (`9573b5c`): **approve-with-changes**. The doc now says that a watcher started within 60 s of an end announces it. The future-`ended` skew finding is kept deliberate, because `ended` is the same machine's clock. Next: release 0.16.1, then phase 6 again.
 
 <!-- panel: repos=relais,amont,amont-agent adds=lang:typescript,ui reviewers=backend,language:rust,language:typescript,react,ui-design,ux-research,game-ux body-sha=6e179a158a84 -->
