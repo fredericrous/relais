@@ -177,10 +177,8 @@ const classifierModel = (store: Store) => {
 
 async function complete(fx: Fx, store: Store, prompt: string) {
   const model = classifierModel(store)
-  // The system prompt goes unmarked for the prompt cache. Marked, 311 of
-  // 340 calls from 2026-10-08 to 2026-10-12 wrote about 930 tokens each to
-  // the cache, billed above plain input, and 11 read anything back, calls
-  // seconds apart included.
+  // A plain string, never marked for the prompt cache: the mark wrote the
+  // cache on nearly every call and was almost never read back.
   const reply = await fx.model.complete({
     model,
     system: CLASSIFIER_SYSTEM,
