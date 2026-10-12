@@ -41,10 +41,13 @@ Unknown fields are ignored.
 2. When the run ends, the tool rewrites the entry with `exit` and `ended`
    and leaves it. A run that ends inside one 250 ms poll is still seen
    with its exit.
-3. The watcher emits `ended` for an entry carrying `ended` and then
-   deletes it. The check for `ended` comes before the pid check: the
-   writer has usually exited by then. A tool's own sweep removes ended
-   entries older than 60 s and its dead-pid entries.
+3. Each watcher emits `ended` for an entry carrying `ended` exactly once
+   and then holds it as a closed run. Watchers share the directory, so
+   none deletes an ended entry younger than 60 s; any watcher or tool
+   sweep removes it after that. An ended entry older than 60 s that a
+   watcher never announced is deleted without an event. The check for
+   `ended` comes before the pid check: the writer has usually exited by
+   then. A tool's own sweep also removes its dead-pid entries.
 4. An entry without `ended` whose pid is dead (`kill(pid, 0)` on unix,
    with EPERM counted as alive; `OpenProcess` on Windows) is ignored: it
    never yields `started`, and the watcher removes it only when the file

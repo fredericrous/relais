@@ -34,6 +34,8 @@ const MAX_LINES: usize = 10;
 const MAX_LINE: usize = 240;
 /// A dead-pid entry that never ended is removed once this old.
 const STALE_MS: u64 = 60 * 60 * 1000;
+/// An ended entry stays on disk this long, so every watcher can announce it.
+const ENDED_KEEP_MS: u64 = 60_000;
 /// Polls a seen run may have a dead pid and no `ended` before it is
 /// closed: the tool writes `ended` just after its process stops.
 const DEAD_GRACE_POLLS: u32 = 4;
@@ -313,35 +315,47 @@ fn entry_files(dir: &Path) -> Vec<(String, PathBuf)> {
     files
 }
 
-/// An entry that carries `ended`: emit what was never emitted, then the
-/// end, then delete the file. Checked before pid liveness, because the
-/// writer has usually exited by then.
-fn finish_ended(id: &str, path: &Path, e: &Entry, ended: u64, runs: &mut Runs) -> Vec<Value> {
+/// An entry that carries `ended`: announce it once, then hold it as a closed
+/// run. The file is shared with other watchers, so it is deleted only once
+/// `ended` is older than [`ENDED_KEEP_MS`]; an entry this watcher never saw
+/// and that is already that old is old news and is not announced.
+/// Checked before pid liveness, because the writer has usually exited by then.
+fn finish_ended(
+    id: &str,
+    path: &Path,
+    e: &Entry,
+    ended: u64,
+    runs: &mut Runs,
+    now_ms: u64,
+) -> Vec<Value> {
     let mut events = Vec::new();
     let was_closed = matches!(runs.get(id), Some(r) if r.closed);
-    match runs.remove(id) {
-        Some(run) if run.closed => {}
-        seen => {
-            let mut run = seen.unwrap_or_else(|| {
-                events.push(started_event(id, e));
-                Run::new(&e.log)
-            });
-            events.extend(output_event(id, read_lines(&e.log, &mut run.tail, true)));
-            events.push(ended_event(id, e.exit, ended));
-        }
+    let old = now_ms.saturating_sub(ended) > ENDED_KEEP_MS;
+    let seen = runs.remove(id);
+    if !was_closed && (seen.is_some() || !old) {
+        let mut run = seen.unwrap_or_else(|| {
+            events.push(started_event(id, e));
+            Run::new(&e.log)
+        });
+        events.extend(output_event(id, read_lines(&e.log, &mut run.tail, true)));
+        events.push(ended_event(id, e.exit, ended));
+    }
+    let mut closed = Run::new(&e.log);
+    closed.closed = true;
+    if !old {
+        runs.insert(id.to_string(), closed);
+        return events;
     }
     if let Err(err) = fs::remove_file(path) {
         if err.kind() != io::ErrorKind::NotFound {
-            // Keep the run, closed, so the next poll does not announce the
-            // same entry again every 250 ms; say why once.
+            // Keep the run, closed, so the next poll does not try again every
+            // 250 ms; say why once.
             if !was_closed {
                 eprintln!(
                     "relais quiet watch: cannot remove {}: {err}",
                     path.display()
                 );
             }
-            let mut closed = Run::new(&e.log);
-            closed.closed = true;
             runs.insert(id.to_string(), closed);
         }
     }
@@ -377,7 +391,7 @@ pub fn poll(dir: &Path, runs: &mut Runs, now_ms: u64) -> Vec<Value> {
     for (id, path) in &files {
         let Some(e) = read_entry(path) else { continue };
         if let Some(ended) = e.ended {
-            events.extend(finish_ended(id, path, &e, ended, runs));
+            events.extend(finish_ended(id, path, &e, ended, runs, now_ms));
         } else if procs::alive(e.pid) && plausibly_live(&e, now_ms) {
             let run = runs.entry(id.clone()).or_insert_with(|| {
                 events.push(started_event(id, &e));
@@ -559,6 +573,96 @@ mod tests {
         assert!(events.iter().all(|e| e["event"] != "started"), "{events:?}");
     }
 
+    fn ended_events(events: &[Value]) -> Vec<&Value> {
+        events.iter().filter(|e| e["event"] == "ended").collect()
+    }
+
+    #[test]
+    fn two_watchers_both_announce_one_ended_with_the_entrys_exit() {
+        let dir = scratch_dir("two");
+        let log = dir.join("x.log");
+        fs::write(&log, "line\n").unwrap();
+        let now = super::now_ms();
+        let path = dir.join("1-0.json");
+        fs::write(&path, entry_json(&log, 0x7fff_fff0, now, "")).unwrap();
+        let (mut a, mut b) = (Runs::new(), Runs::new());
+        let mut all = Vec::new();
+        all.extend(poll(&dir, &mut a, now));
+        all.extend(poll(&dir, &mut b, now));
+        fs::write(
+            &path,
+            entry_json(
+                &log,
+                0x7fff_fff0,
+                now,
+                &format!(r#","exit":4,"ended":{now}"#),
+            ),
+        )
+        .unwrap();
+        let (mut ea, mut eb) = (Vec::new(), Vec::new());
+        for step in 1..4 {
+            ea.extend(poll(&dir, &mut a, now + step * 250));
+            eb.extend(poll(&dir, &mut b, now + step * 250));
+        }
+        for events in [&ea, &eb] {
+            let ended = ended_events(events);
+            assert_eq!(ended.len(), 1, "{events:?}");
+            assert_eq!(ended[0]["exit"], 4, "{events:?}");
+        }
+        assert!(ended_events(&all).is_empty(), "{all:?}");
+    }
+
+    #[test]
+    fn an_ended_entry_is_deleted_only_after_the_keep_time() {
+        let dir = scratch_dir("keep");
+        let log = dir.join("x.log");
+        fs::write(&log, "line\n").unwrap();
+        let ended = super::now_ms();
+        let path = dir.join("1-0.json");
+        fs::write(
+            &path,
+            entry_json(
+                &log,
+                0x7fff_fff0,
+                ended,
+                &format!(r#","exit":0,"ended":{ended}"#),
+            ),
+        )
+        .unwrap();
+        let mut runs = Runs::new();
+        let first = poll(&dir, &mut runs, ended + 1000);
+        assert_eq!(ended_events(&first).len(), 1, "{first:?}");
+        assert!(path.exists(), "deleted too early");
+        let later = poll(&dir, &mut runs, ended + 61_000);
+        assert!(later.is_empty(), "{later:?}");
+        assert!(!path.exists(), "not deleted after the keep time");
+        assert!(poll(&dir, &mut runs, ended + 61_250).is_empty());
+        assert!(runs.is_empty());
+    }
+
+    #[test]
+    fn an_old_ended_entry_never_seen_is_deleted_unannounced() {
+        let dir = scratch_dir("old");
+        let log = dir.join("x.log");
+        fs::write(&log, "line\n").unwrap();
+        let ended = super::now_ms();
+        let path = dir.join("1-0.json");
+        fs::write(
+            &path,
+            entry_json(
+                &log,
+                0x7fff_fff0,
+                ended,
+                &format!(r#","exit":0,"ended":{ended}"#),
+            ),
+        )
+        .unwrap();
+        let mut runs = Runs::new();
+        let events = poll(&dir, &mut runs, ended + 61_000);
+        assert!(events.is_empty(), "{events:?}");
+        assert!(!path.exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn an_ended_entry_that_cannot_be_removed_is_announced_once() {
@@ -569,7 +673,12 @@ mod tests {
         let now = super::now_ms();
         fs::write(
             dir.join("1-0.json"),
-            entry_json(&log, 0x7fff_fff0, now, r#","exit":1,"ended":1"#),
+            entry_json(
+                &log,
+                0x7fff_fff0,
+                now,
+                &format!(r#","exit":1,"ended":{now}"#),
+            ),
         )
         .unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
@@ -582,10 +691,14 @@ mod tests {
         }
         let mut runs = Runs::new();
         let first = poll(&dir, &mut runs, now);
-        let second = poll(&dir, &mut runs, now + 250);
+        let later = now + ENDED_KEEP_MS + 1000;
+        let second = poll(&dir, &mut runs, later);
+        let third = poll(&dir, &mut runs, later + 250);
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(first.iter().any(|e| e["event"] == "ended"), "{first:?}");
         assert!(second.is_empty(), "announced again: {second:?}");
+        assert!(third.is_empty(), "announced again: {third:?}");
+        assert!(runs.get("1-0").is_some_and(|r| r.closed), "not held");
     }
 
     #[cfg(unix)]
