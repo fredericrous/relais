@@ -220,6 +220,22 @@ test('a subagent is routed only when the router created it; the parent’s model
   expect(stranger.model).toBe(OPUS)
 })
 
+test('the spawn’s decision record and its subagent task share the pre-allocated id', async ($: any, on: any) => {
+  const engine = await routedSession($, on)
+  await personTurn($, engine, 'rename foo to bar, tests exist')
+  engine.labels.set('look up', label({ kind: 'question', difficulty: 1 }))
+  await $.agent.spawn({ prompt: 'look up where foo is defined', description: 'find foo', subagentType: 'Explore', model: 'opus' })
+  await $.turn.complete({ agentId: 'agent-1', answer: 'done', durationMs: 1, isAborted: false, turnId: 's1', reason: 'answer' })
+  await endSession($, engine)
+  const decision = observed(engine, 'decision').find((d: any) => d.relation === 'subagent')
+  const task = observed(engine, 'task').find((t: any) => t.agent_id === 'agent-1')
+  expect(decision.task_id).toBe(task.task_id)
+  expect(decision.task_id).toMatch(/^task-\d+-\d+$/)
+  // A research spawn: the draw ran and nothing could be lowered.
+  expect([decision.explored, decision.propensity]).toEqual([false, 1])
+  expect(typeof decision.draw).toBe('number')
+})
+
 test('a subagent’s failed check escalates only that subagent', async ($: any, on: any) => {
   const engine = await routedSession($, on)
   const { turnId } = await personTurn($, engine, 'rename foo to bar, tests exist')

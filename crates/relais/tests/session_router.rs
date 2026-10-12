@@ -682,7 +682,7 @@ fn drawn_tasks_doing_worse_than_undrawn_stop_exploration_and_the_stop_is_recorde
     // The report says so.
     let text = stdout(&world.relais(&["report", "--since", "2026-10-01", "--no-import"]));
     assert!(
-        text.contains("edit d3 local: drawn 20 (20%), undrawn 40 (0%)"),
+        text.contains("main edit d3 local: drawn 20 (20%), undrawn 40 (0%)"),
         "{text}"
     );
     assert!(text.contains("stopped "), "{text}");
@@ -694,6 +694,107 @@ fn drawn_tasks_doing_worse_than_undrawn_stop_exploration_and_the_stop_is_recorde
     assert!(
         section.lines().all(|line| line.chars().count() <= 80),
         "{section}"
+    );
+}
+
+/// One session's batch of subagent spawns: a decision with relation
+/// `subagent` (its `agent_id` empty when the spawn was not keyed) and the
+/// task the spawn left, keyed or not.
+fn spawn_batch(session: &str, tasks: &[(String, bool, &str, Option<&str>)]) -> String {
+    let mut records = Vec::new();
+    for (task, drawn, outcome, agent) in tasks {
+        let class = serde_json::json!({
+            "kind": "edit", "difficulty": 3, "scope": "local",
+            "uncertainty": "low", "verifiable": true, "confidence": 0.9
+        });
+        records.push(serde_json::json!({
+            "kind": "decision", "task_id": task, "turn_id": null, "agent_id": null,
+            "relation": "subagent", "class": class,
+            "tier": if *drawn { "research" } else { "implementation" },
+            "model": "claude-sonnet-5-5", "effort": null, "reason": "table",
+            "mode_effective": "on", "holdout": false, "applied": true,
+            "explored": drawn, "propensity": if *drawn { 0.1 } else { 0.9 }, "draw": 0.05,
+            "would_pass_gate": true, "at": "2026-10-07T10:00:00Z"
+        }));
+        records.push(serde_json::json!({
+            "kind": "task", "task_id": task, "agent_id": agent,
+            "started_at": "2026-10-07T10:00:00Z", "ended_at": "2026-10-07T10:05:00Z",
+            "class": class, "outcome": outcome, "inferred": [],
+            "escalations": 0, "exhausted": false, "turns": 1, "explicit_quote": null
+        }));
+    }
+    serde_json::json!({ "schema": 1, "session": session, "records": records }).to_string()
+}
+
+#[test]
+fn subagent_draws_reach_the_strata_and_the_stop_rule() {
+    // 20 clean main draws and 40 clean undrawn: no stop on their own.
+    let world = world_with_exploration("spawns", 0);
+    // 20 drawn spawns, 4 corrected, keyed and unkeyed alike, and 40 clean
+    // undrawn spawns: a `sub` stratum of its own, and the one stop rule
+    // now sees 4 of 40 drawn corrected against 0 of 80 undrawn (10 points).
+    let mut spawns = Vec::new();
+    for i in 0..20 {
+        let outcome = if i < 4 {
+            "corrected"
+        } else {
+            "completed_verified"
+        };
+        let agent = if i % 2 == 0 {
+            Some("agent-keyed")
+        } else {
+            None
+        };
+        spawns.push((format!("sd{i}"), true, outcome, agent));
+    }
+    for i in 0..40 {
+        spawns.push((
+            format!("su{i}"),
+            false,
+            "completed_verified",
+            Some("agent-keyed"),
+        ));
+    }
+    let output = world.relais_stdin(
+        &["native", "router-observe"],
+        &spawn_batch("s-explore", &spawns),
+    );
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let text = stdout(&world.relais(&["report", "--since", "2026-10-01", "--no-import"]));
+    assert!(
+        text.contains("main edit d3 local: drawn 20 (0%), undrawn 40 (0%)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("sub edit d3 local: drawn 20 (20%), undrawn 40 (0%)"),
+        "{text}"
+    );
+    assert!(text.contains("sub = subagent spawn"), "{text}");
+    let state = world.state_json(&world.relais(&["native", "router-state", "--session", "s-9"]));
+    assert_eq!(state["epsilon"], 0.1, "10 points over: no stop");
+    // Nine more corrected spawn draws: 13 of 40 is 32 points over.
+    let mut worse = Vec::new();
+    for i in 0..9 {
+        worse.push((format!("sw{i}"), true, "corrected", None));
+    }
+    let output = world.relais_stdin(
+        &["native", "router-observe"],
+        &spawn_batch("s-explore", &worse),
+    );
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let state = world.state_json(&world.relais(&["native", "router-state", "--session", "s-9"]));
+    assert_eq!(state["epsilon"], 0.0, "spawn draws stop every draw");
+    let stops = world.ledger().router_exploration_stops().unwrap();
+    assert_eq!(stops.len(), 1);
+    assert_eq!((stops[0].drawn, stops[0].drawn_bad), (49, 13));
+    let json = world.relais(&["report", "--since", "2026-10-01", "--no-import", "--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let strata = value["session_routing"]["exploration"]["strata"]
+        .as_array()
+        .unwrap();
+    assert!(
+        strata.iter().any(|s| s["relation"] == "subagent"),
+        "{strata:?}"
     );
 }
 

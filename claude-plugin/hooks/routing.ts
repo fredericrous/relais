@@ -380,13 +380,16 @@ export async function routeSpawn(fx: Fx, store: Store, e: any, next: any, remain
       cls = got.cls
     }
   }
-  const spawn = decideSpawn({ state, type, cls, personModel: r.task?.subagentModel ?? null })
+  // The subagent task's id is minted before the spawn: the exploration draw
+  // is keyed by it, so the ledger can recompute the draw from the record.
+  const taskId = `task-${await fx.clock.now()}-${++r.seq}`
+  const spawn = decideSpawn({ state, type, cls, personModel: r.task?.subagentModel ?? null, session: r.session, taskId })
   const applied = !!spawn.decision?.override && isApplying(r)
   const result = await next(applied && spawn.decision ? { ...e, model: spawn.decision.model } : e)
   // The subagent is started: nothing below may throw, or the hook's error
   // handler would see a failure after `next` and the spawn could repeat.
   try {
-    await afterSpawn(fx, store, { state, spawn, applied, classified, description, prompt, result })
+    await afterSpawn(fx, store, { state, spawn, applied, classified, description, prompt, result, taskId })
   } catch (reason) {
     await note(fx, store, undefined, `relais router: the spawn's bookkeeping failed: ${String((reason as any)?.message ?? reason).slice(0, 200)}`).catch(() => {})
   }
@@ -404,16 +407,20 @@ async function afterSpawn(
     description: string
     prompt: string
     result: any
+    taskId: string
   },
 ) {
   const r = store.router
-  const { state, spawn, applied, classified, description, prompt, result } = input
+  const { state, spawn, applied, classified, description, prompt, result, taskId } = input
   const now = await fx.clock.now()
   const agentId: string | undefined = typeof result?.agentId === 'string' ? result.agentId : undefined
   let owner: TaskState | undefined = r.task
   if (spawn.isRouted && spawn.decision && spawn.class) {
-    const task = newTask(`task-${now}-${++r.seq}`, agentId ?? null, `${description}\n${prompt}`, spawn.class, spawn.decision.tier, now)
+    const task = newTask(taskId, agentId ?? null, `${description}\n${prompt}`, spawn.class, spawn.decision.tier, now)
     task.lastReason = 'table'
+    // A drawn spawn keeps its lowered floor: its own re-runs may raise the
+    // tier to one step under the table's, never back to it.
+    task.exploredDown = !!spawn.decision.exploration?.explored
     if (agentId) r.subtasks[agentId] = task
     else keepUnkeyed(r, description, prompt, task)
     owner = task

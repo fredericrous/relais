@@ -780,6 +780,27 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A report stored before the floor sweep, the origin counts and the
+    /// counterfactual gap existed still passes: the fields default, and
+    /// `EVAL_SCHEMA_VERSION` did not move for them (a bump would have
+    /// stranded an artifact awaiting promotion).
+    #[test]
+    fn a_report_stored_before_the_sweep_still_passes_evaluated() {
+        let (registry, dir) = temp_registry("pre-sweep");
+        let mut before = evaluation("art-before", true);
+        let fields = before.as_object_mut().expect("an object");
+        fields.remove("floor_sweep");
+        fields.remove("examples_by_origin");
+        fields.remove("counterfactual_gap");
+        registry
+            .store(&artifact("art-before", Some(before)))
+            .expect("store");
+        registry
+            .evaluated("art-before")
+            .expect("an old report is still evidence");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// L9: the stored verdict is recomputed, never believed. A report
     /// whose `gates_passed` was flipped to true does not promote.
     #[test]

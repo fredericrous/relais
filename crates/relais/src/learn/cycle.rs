@@ -854,11 +854,22 @@ fn cycle_body(
     report.examples_by_class = class_counts(&dataset);
     report.examples_by_source = source_counts(&dataset);
     report.cohorts = cohorts_covered(&dataset);
+    let origin_count = |origin| {
+        dataset
+            .records
+            .iter()
+            .filter(|record| record.origin == origin)
+            .count()
+    };
     let salvage_note = format!(
-        "{} excluded; salvage containment: {} computed, {} unreachable (dataset {})",
+        "{} excluded; salvage containment: {} computed, {} unreachable; origins: live {}, \
+         replay {}; counterfactual gap: {} task(s) (dataset {})",
         dataset.exclusions.len(),
         backfill.recorded,
         backfill.unreachable,
+        origin_count(crate::learn::features::Origin::Live),
+        origin_count(crate::learn::features::Origin::Replay),
+        dataset.counterfactual_gap.tasks,
         dataset_path.display()
     );
 

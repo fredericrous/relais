@@ -9,9 +9,15 @@ use serde::Serialize;
 
 use crate::ledger::{LearningAction, LearningCycleRow, LearningSource, Ledger, LedgerError};
 
+use super::dataset::CounterfactualGap;
+use super::evaluate::{EvalReport, SweepPoint};
 use super::registry::Registry;
 
 const WIDTH: usize = 80;
+
+/// How many sweep rows the section shows: the configured floor and its
+/// two neighbours either side.
+const SWEEP_ROWS: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LastCycle {
@@ -48,8 +54,55 @@ pub struct LearningReport {
     pub last_cycle: Option<LastCycle>,
     pub examples_by_class: BTreeMap<String, u64>,
     pub examples_by_source: BTreeMap<String, u64>,
+    /// The latest cycle's dataset by origin (`live`, `replay`); `null` when
+    /// its artifact is unavailable or predates origins.
+    pub examples_by_origin: Option<BTreeMap<String, usize>>,
+    /// The latest cycle's counterfactual gap; `null` when unavailable.
+    pub counterfactual_gap: Option<CounterfactualGap>,
+    /// The latest cycle's floor sweep; `null`, never `[]`, when the artifact
+    /// is missing, unreadable or predates the sweep (`floor_sweep_note`
+    /// says which).
+    pub floor_sweep: Option<Vec<SweepPoint>>,
+    pub floor_sweep_note: Option<String>,
     pub active_artifact: Option<ActiveArtifact>,
     pub last_rollback: Option<LastRollback>,
+}
+
+/// The latest cycle's stored evaluation, read leniently: `evaluated()`
+/// refuses failed gates and other versions, and this is a report, not a
+/// promotion.
+enum LatestEvaluation {
+    Report(Box<EvalReport>),
+    Unavailable(String),
+}
+
+/// A report's origin counts, `None` when it predates them: an empty map
+/// would read as "no examples" where the truth is "not recorded".
+fn origins_of(report: &EvalReport) -> Option<BTreeMap<String, usize>> {
+    (!report.examples_by_origin.is_empty()).then(|| report.examples_by_origin.clone())
+}
+
+fn latest_evaluation(
+    registry: Option<&Registry>,
+    last: Option<&LearningCycleRow>,
+) -> LatestEvaluation {
+    let Some(registry) = registry else {
+        return LatestEvaluation::Unavailable("the registry did not open".into());
+    };
+    let Some(id) = last.and_then(|row| row.artifact_id.as_deref()) else {
+        return LatestEvaluation::Unavailable("no cycle has written an artifact yet".into());
+    };
+    let artifact = match registry.load(id) {
+        Ok(artifact) => artifact,
+        Err(e) => return LatestEvaluation::Unavailable(format!("artifact {id}: {e}")),
+    };
+    let Some(evaluation) = artifact.evaluation else {
+        return LatestEvaluation::Unavailable(format!("artifact {id} carries no evaluation"));
+    };
+    match serde_json::from_value::<EvalReport>(evaluation) {
+        Ok(report) => LatestEvaluation::Report(Box::new(report)),
+        Err(e) => LatestEvaluation::Unavailable(format!("artifact {id}: {e}")),
+    }
 }
 
 fn minute(stamp: &str) -> String {
@@ -88,8 +141,30 @@ pub fn learning_report(
         Some(_) => None,
         None => Some(reason_nothing_learned(last_cycle_row.as_ref())),
     };
+    let (examples_by_origin, counterfactual_gap, floor_sweep, floor_sweep_note) =
+        match latest_evaluation(registry, last_cycle_row.as_ref()) {
+            LatestEvaluation::Report(report) if report.floor_sweep.is_empty() => (
+                origins_of(&report),
+                report.counterfactual_gap.clone(),
+                None,
+                Some("not in this artifact; run relais learn cycle".to_string()),
+            ),
+            LatestEvaluation::Report(report) => (
+                origins_of(&report),
+                report.counterfactual_gap.clone(),
+                Some(report.floor_sweep.clone()),
+                None,
+            ),
+            LatestEvaluation::Unavailable(why) => {
+                (None, None, None, Some(format!("unavailable ({why})")))
+            }
+        };
     Ok(LearningReport {
         nothing_learned,
+        examples_by_origin,
+        counterfactual_gap,
+        floor_sweep,
+        floor_sweep_note,
         last_cycle: last_cycle_row.map(|row| LastCycle {
             at: row.started_at,
             action: row.action,
@@ -149,6 +224,39 @@ fn reason_nothing_learned(last: Option<&LearningCycleRow>) -> String {
         },
     };
     format!("Nothing learned yet, because {because}.")
+}
+
+/// The [`SWEEP_ROWS`] points around the configured floor: it and its two
+/// neighbours either side, shifted at the ends so five are shown when
+/// there are five.
+fn sweep_window(points: &[SweepPoint]) -> &[SweepPoint] {
+    let at = points
+        .iter()
+        .position(|point| point.configured)
+        .unwrap_or(0);
+    let start = at.saturating_sub(SWEEP_ROWS / 2);
+    let end = (start + SWEEP_ROWS).min(points.len());
+    let start = end.saturating_sub(SWEEP_ROWS);
+    &points[start..end]
+}
+
+/// One sweep row; the configured floor is named, never marked alone.
+fn sweep_row(point: &SweepPoint) -> String {
+    let percent = |rate: Option<f64>| {
+        rate.map_or_else(|| "n/a".to_string(), |r| format!("{:.0}%", r * 100.0))
+    };
+    format!(
+        "floor {:.2}{}  accepted {}  abstain {}  {}  n={}",
+        point.floor,
+        if point.configured { " configured" } else { "" },
+        percent(point.acceptance_rate),
+        percent(Some(point.abstention_rate)),
+        match super::evaluate::micros_of(point.mean_cost_micros) {
+            Some(cost) => format!("{cost}/task"),
+            None => "cost n/a".to_string(),
+        },
+        point.supported_test_records
+    )
 }
 
 /// `text` wrapped to the section width, every line after the first indented.
@@ -233,6 +341,37 @@ impl LearningReport {
                 &join(&self.examples_by_source),
             ));
         }
+        if let Some(origins) = &self.examples_by_origin {
+            out.push_str(&wrapped(
+                "  examples by origin: ",
+                "    ",
+                &origins
+                    .iter()
+                    .map(|(origin, count)| format!("{origin} {count}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+        if let Some(gap) = &self.counterfactual_gap {
+            for line in gap.render_lines() {
+                out.push_str(&wrapped("  ", "    ", &line));
+            }
+        }
+        match &self.floor_sweep {
+            Some(points) => {
+                out.push_str("  floor sweep (test split; the configured floor is named):\n");
+                for point in sweep_window(points) {
+                    out.push_str(&wrapped("    ", "      ", &sweep_row(point)));
+                }
+            }
+            None => {
+                out.push_str(&wrapped(
+                    "  floor sweep: ",
+                    "    ",
+                    self.floor_sweep_note.as_deref().unwrap_or("unavailable"),
+                ));
+            }
+        }
         match &self.active_artifact {
             Some(active) => {
                 out.push_str(&wrapped(
@@ -305,9 +444,33 @@ mod tests {
             }),
             examples_by_class: BTreeMap::from([("other".into(), 3)]),
             examples_by_source: BTreeMap::from([("runner".into(), 3)]),
+            examples_by_origin: Some(BTreeMap::from([("live".into(), 3), ("replay".into(), 1)])),
+            counterfactual_gap: Some(CounterfactualGap {
+                tasks: 14,
+                estimate: None,
+                basis: "no priced run at research/implementation".into(),
+            }),
+            floor_sweep: Some(sweep(0.75)),
+            floor_sweep_note: None,
             active_artifact: None,
             last_rollback: None,
         }
+    }
+
+    /// Ten grid points with worst-case widths: 100% rates, a three-digit
+    /// dollar cost and five-digit support.
+    fn sweep(configured: f64) -> Vec<SweepPoint> {
+        super::super::evaluate::sweep_floors(configured)
+            .into_iter()
+            .map(|floor| SweepPoint {
+                floor,
+                configured: (floor * 100.0).round() == (configured * 100.0).round(),
+                supported_test_records: 99_999,
+                acceptance_rate: Some(1.0),
+                mean_cost_micros: Some(123_450_000),
+                abstention_rate: 1.0,
+            })
+            .collect()
     }
 
     #[test]
@@ -321,10 +484,81 @@ mod tests {
 
     #[test]
     fn every_row_stays_within_80_columns() {
-        let text = report().render();
+        let mut report = report();
+        report.counterfactual_gap = Some(CounterfactualGap {
+            tasks: 99_999,
+            estimate: Some(crate::money::MicroUsd::from_micros(123_456_789_012)),
+            basis: "priced".into(),
+        });
+        let text = report.render();
         for line in text.lines() {
             assert!(line.chars().count() <= 80, "{line:?}");
         }
         assert!(text.contains("gate: "), "{text}");
+        assert!(
+            text.contains("examples by origin: live 3, replay 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("counterfactual gap: 99999 accepted task(s) lack a cheaper arm"),
+            "{text}"
+        );
+        assert!(
+            text.contains("to fill it: relais dataset replay (estimated cost ~$123456.789012)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_sweep_shows_at_most_five_rows_with_the_configured_floor_named() {
+        let text = report().render();
+        let rows: Vec<&str> = text
+            .lines()
+            .filter(|line| line.trim_start().starts_with("floor 0."))
+            .collect();
+        assert_eq!(rows.len(), 5, "{text}");
+        assert_eq!(
+            rows.iter().filter(|row| row.contains("configured")).count(),
+            1,
+            "{text}"
+        );
+        assert!(rows[2].contains("floor 0.75 configured"), "{text}");
+        assert!(rows[0].contains("floor 0.65"), "{text}");
+        assert!(rows[4].contains("floor 0.85"), "{text}");
+        assert!(rows[2].contains("$123.45/task"), "{text}");
+        // At the ends the window shifts, and five are still shown.
+        let mut low = report();
+        low.floor_sweep = Some(sweep(0.5));
+        let text = low.render();
+        let rows: Vec<&str> = text
+            .lines()
+            .filter(|line| line.trim_start().starts_with("floor 0."))
+            .collect();
+        assert_eq!(rows.len(), 5, "{text}");
+        assert!(rows[0].contains("floor 0.50 configured"), "{text}");
+        // The gap with no priced run says so, never `$0`.
+        // The line wraps at 80 columns, so the two halves are checked apart.
+        assert!(text.contains("(cost unknown: no priced run at"), "{text}");
+        assert!(text.contains("research/implementation)"), "{text}");
+        assert!(!text.contains("$0)"), "{text}");
+    }
+
+    #[test]
+    fn a_missing_sweep_is_an_explicit_line_and_null_in_json() {
+        let mut report = report();
+        report.floor_sweep = None;
+        report.floor_sweep_note = Some("not in this artifact; run relais learn cycle".into());
+        report.examples_by_origin = None;
+        report.counterfactual_gap = None;
+        let text = report.render();
+        assert!(
+            text.contains("floor sweep: not in this artifact; run relais learn cycle"),
+            "{text}"
+        );
+        assert!(!text.contains("examples by origin"), "{text}");
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json["floor_sweep"].is_null(), "{json}");
+        assert!(json["examples_by_origin"].is_null(), "{json}");
+        assert!(json["counterfactual_gap"].is_null(), "{json}");
     }
 }

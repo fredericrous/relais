@@ -2052,6 +2052,21 @@ fn dataset_build_command() -> Result<CliOutcome, CliError> {
          orchestrator_salvage_contained {by_orchestrator}",
         dataset.records.len() - by_person - by_orchestrator
     );
+    let origin_count = |origin| {
+        dataset
+            .records
+            .iter()
+            .filter(|record| record.origin == origin)
+            .count()
+    };
+    println!(
+        "examples by origin: live {}, replay {}",
+        origin_count(relais::learn::features::Origin::Live),
+        origin_count(relais::learn::features::Origin::Replay)
+    );
+    for line in dataset.counterfactual_gap.render_lines() {
+        println!("{line}");
+    }
     println!(
         "salvage containment backfill: {} computed, {} unreachable (left unknown, excluded)",
         backfill.recorded, backfill.unreachable
