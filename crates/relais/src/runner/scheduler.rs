@@ -689,6 +689,10 @@ fn run_package(
         // inherits the root's, already on record by the time any
         // package's preflight runs.
         task_id: None,
+        // A package is the same kind of work as its root and is handed
+        // the same design.
+        task_type: contract.task_type,
+        design: contract.design.clone(),
     };
     let mut child_machine: MachineSettings = engine.config.machine.clone();
     child_machine.spending.per_run_micros = remaining_budget;

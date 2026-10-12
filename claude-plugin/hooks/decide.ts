@@ -14,6 +14,16 @@ const NONCE_TIMEOUT_MS = 10_000
 const MIN_QUOTE_CHARS = 12
 export const ANSWERS = ['approve', 'revise', 'reject', 'salvaged', 'abandon', 'decided'] as const
 
+// The eight task types a contract may declare (relais TaskType, taxonomy
+// version 1), in the order the Rust list has them. A plugin test pins this
+// to `TaskType::DECLARABLE` in crates/relais/src/contract/mod.rs; relais
+// refuses any other spelling.
+export const TASK_TYPES = ['report', 'mechanical', 'pattern', 'review-fix', 'feature', 'refactor', 'ui', 'infra'] as const
+
+// What the run tool says a task contract is, built from TASK_TYPES so the
+// two cannot drift.
+export const RUN_CONTRACT_DESCRIPTION = `The task contract: {schema_version: 1, kind: "change" | "inspect", task_type: ${TASK_TYPES.map(type => `"${type}"`).join(' | ')} (declare the one that fits the work), objective, base_ref: "HEAD", write_scope: [globs], read_hints: [paths], acceptance: [criteria a command can verify], verification_profile: "default", review: "optional"}. A path to a contract .json file is also accepted.`
+
 export const DECIDE_TOOL_DESCRIPTION =
   "Record the answer to a relais run waiting on a decision (needs_decision, needs_review, interrupted): approve, revise, reject, salvaged, abandon or decided. A decision is not made until it is recorded here. Answer it yourself when the request or the approved plan already answers it; otherwise ask the person, and record their answer with on_behalf_of_person and their own words as person_quote. relais refuses what may not be answered (an approval with open verification gaps) and says why."
 

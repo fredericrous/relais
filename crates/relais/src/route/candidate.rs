@@ -1748,6 +1748,8 @@ mod tests {
             review: Default::default(),
             decomposition: None,
             task_id: None,
+            task_type: None,
+            design: None,
         };
         match crate::route::risk_floor(&contract, risk).tier {
             Some(rule_floor) if rule_floor > floor => rule_floor,

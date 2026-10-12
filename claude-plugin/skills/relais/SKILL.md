@@ -29,6 +29,8 @@ person for its fields.
   depends on a decision: that is binding. The worker also sees the
   constraint index and aval's relevance ranking, but that is advisory
   and never blocks.
+- **Task type:** declare one `task_type` (report, mechanical, pattern,
+  review-fix, feature, refactor, ui or infra), the one that fits the work.
 - **Verification profile:** `"default"`, unless the repository's
   `relais.toml` names another the work calls for.
 

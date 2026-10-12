@@ -26,14 +26,16 @@ use crate::route::RoutedBy;
 
 mod review;
 mod router;
+mod task_types;
 pub use review::{MergeTotals, ReviewClassTotals, ReviewOutcomeRow};
 pub use router::{
     ExplorationTask, RouterCheck, RouterClass, RouterClassificationRow, RouterDecisionRow,
     RouterExplorationStop, RouterProvenance, RouterReassessRow, RouterRecord, RouterTaskOutcomeRow,
     RouterTaskRow, RouterUsageRow, RouterWindow,
 };
+pub use task_types::{ImportedTaskTypes, StoredTaskType, TaskExportRow, TaskTypeSource};
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 28;
+pub const LEDGER_SCHEMA_VERSION: u64 = 29;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -1710,6 +1712,20 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ALTER TABLE runs ADD COLUMN driver_since TEXT;
     "#,
     ),
+    (
+        // A task's type (docs/plans/2026-10-12-task-types.md): the label,
+        // how it was given (`declared` by the contract, `classified` for
+        // history) and the taxonomy version it was given under, plus the
+        // design a trial's arm was handed. Additive and nullable: a task
+        // that predates the step has no type, never a guessed one.
+        "v29",
+        r#"
+    ALTER TABLE tasks ADD COLUMN task_type TEXT;
+    ALTER TABLE tasks ADD COLUMN task_type_source TEXT;
+    ALTER TABLE tasks ADD COLUMN taxonomy_version INTEGER;
+    ALTER TABLE trials ADD COLUMN design_sha256 TEXT;
+    "#,
+    ),
 ];
 
 /// `advice_p_approve, advice_model, advice_revision, advice_null_reason`.
@@ -2816,9 +2832,38 @@ impl Ledger {
         task: &TaskId,
         repo_key: &str,
     ) -> Result<()> {
+        self.insert_typed_run(id, repo_path, root_session, task, repo_key, None)
+    }
+
+    /// [`Ledger::insert_run`] for a contract that declares a task type:
+    /// the type is written with the task, in the same transaction. A
+    /// declared type replaces a classified one and an earlier declared one
+    /// (the contract of the newest run is the orchestrator's latest word);
+    /// `None` leaves whatever the task has.
+    pub fn insert_typed_run(
+        &self,
+        id: &RunId,
+        repo_path: &str,
+        root_session: Option<&str>,
+        task: &TaskId,
+        repo_key: &str,
+        declared: Option<crate::contract::TaskType>,
+    ) -> Result<()> {
         let now = self.now();
         let tx = self.write_tx()?;
         Self::ensure_task(&tx, task, repo_key, id, &now)?;
+        if let Some(task_type) = declared {
+            tx.execute(
+                "UPDATE tasks SET task_type = ?2, task_type_source = ?3, taxonomy_version = ?4
+                  WHERE task_id = ?1",
+                params![
+                    task.as_str(),
+                    task_type.as_str(),
+                    task_types::TaskTypeSource::Declared.as_str(),
+                    crate::contract::TASK_TYPE_TAXONOMY_VERSION
+                ],
+            )?;
+        }
         tx.execute(
             "INSERT INTO runs (id, repo_path, status, root_session, created_at, updated_at, task_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
@@ -9430,7 +9475,7 @@ mod tests {
     /// appear, NULL on the row written before them.
     #[test]
     fn v28_adds_the_driver_columns_to_an_older_ledger() {
-        assert_eq!(LEDGER_SCHEMA_VERSION, 28);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 29);
         let dir = temp_dir("v26-to-v28");
         let path = dir.join("ledger.sqlite");
         {
@@ -9459,8 +9504,49 @@ mod tests {
             .expect("a run written before v28");
         }
         let ledger = Ledger::open(&path).expect("upgrade");
-        assert_eq!(ledger.schema_version().expect("version"), 28);
+        assert_eq!(ledger.schema_version().expect("version"), 29);
         assert_eq!(driver_of(&ledger, "run-old"), (None, None, None));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A ledger frozen at v26 upgrades to v29: a task written before it
+    /// has no type, never a guessed one, and a trial no design.
+    #[test]
+    fn v29_adds_task_types_and_the_trial_design_without_touching_old_rows() {
+        let dir = temp_dir("v26-to-v29");
+        let path = dir.join("ledger.sqlite");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );",
+            )
+            .expect("migrations table");
+            for (version, sql) in &MIGRATIONS[..26] {
+                conn.execute_batch(sql).expect("apply step");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, "then"],
+                )
+                .expect("record step");
+            }
+            conn.execute(
+                "INSERT INTO tasks (task_id, repo_key, first_run, origin, created_at)
+                 VALUES ('task-old', 'rk', 'run-old', 'created', 'then')",
+                [],
+            )
+            .expect("a task written before v29");
+        }
+        let ledger = Ledger::open(&path).expect("upgrade");
+        assert_eq!(ledger.schema_version().expect("version"), 29);
+        assert_eq!(
+            ledger
+                .task_type_of(&task("old"))
+                .expect("reads the new columns"),
+            None
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

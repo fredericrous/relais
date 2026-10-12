@@ -6,6 +6,14 @@ mechanical pull-request list too, generated; this file is the part a human
 wrote, and the release workflow refuses to tag a version whose section is
 missing here.
 
+## Unreleased
+
+Every task can now carry a task type (phase 1 of the task-types plan, `docs/plans/2026-10-12-task-types.md`). A contract may declare `task_type`, one of `report`, `mechanical`, `pattern`, `review-fix`, `feature`, `refactor`, `ui` or `infra`; any other value is refused naming the eight, and a contract without one hashes exactly as before. The type is stored with the task (ledger step v29: `tasks.task_type`, `task_type_source`, `taxonomy_version`), and `relais report --by task-type` groups cost, acceptance and escalation by it (arms per tier in `--json` only). The run tool's contract description lists the types from an exported `TASK_TYPES`, pinned to the Rust list by tests, and the relais skill tells the orchestrator to declare one: after upgrading, reinstall the plugin as for v0.12.0.
+
+A contract may also name a `design`: a repo-relative markdown file of at most 16 KiB, read at preflight from the base revision (never the working tree), refused inside the write scope or when missing or oversized, put verbatim in the worker's context package, counted in `package_bytes` and recorded as `design_sha256` in the manifest. The reviewer is handed the same design.
+
+`relais dataset export-tasks --out <file|->` writes the recorded tasks as JSON lines (objective, scope and acceptance, no file contents; a file is mode 0600, a closed pipe ends quietly) and `relais dataset import-task-types <file>` stores a classifier's labels in one transaction: a file with any bad row is refused whole (exit 2, `<file>:<line>: <reason>`), a declared type is never overwritten, and importing again changes nothing.
+
 ## v0.17.0
 
 relais starts collecting the labels its decision advisor will learn from (#229): every answered decision gets a yes/no label from what happened to it, relais detects reverts in git itself, and the orchestrator records the reverts and fixes it makes through `mcp__relais__feedback`; `relais report` shows the counts and when training can start. Breaking: `relais report --json` replaces `advisor_data` with `decision_labels`, and `relais feedback --actor` takes only `orchestrator`, `person` or `person-via-orchestrator`. After upgrading, reinstall the plugin as for v0.12.0 and restart sessions, so the feedback tool exists.

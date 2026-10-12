@@ -11,6 +11,7 @@ import {
   DECIDE_TOOL_DESCRIPTION,
   FEEDBACK_INPUT_SCHEMA,
   FEEDBACK_TOOL_DESCRIPTION,
+  RUN_CONTRACT_DESCRIPTION,
   decideTool,
   endNonce,
   feedbackTool,
@@ -141,8 +142,7 @@ export function register(on: any) {
         properties: {
           task: {
             type: 'object',
-            description:
-              'The task contract: {schema_version: 1, kind: "change" | "inspect", objective, base_ref: "HEAD", write_scope: [globs], read_hints: [paths], acceptance: [criteria a command can verify], verification_profile: "default", review: "optional"}. A path to a contract .json file is also accepted.',
+            description: RUN_CONTRACT_DESCRIPTION,
           },
           cwd: { type: 'string', description: 'The repository to work in (absolute path).' },
         },

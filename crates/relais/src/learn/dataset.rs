@@ -1594,7 +1594,7 @@ argv = ["true"]
     /// recent attempt, not one per attempt.
     #[test]
     fn a_task_retried_to_acceptance_contributes_one_record() {
-        let times: Vec<String> = (0..30)
+        let times: Vec<String> = (0..80)
             .map(|minute| format!("2026-01-01T00:{minute:02}:00+00:00"))
             .collect();
         let fixture = LedgerFixture::open_with_clock("dataset-retry", times);
@@ -1637,7 +1637,7 @@ argv = ["true"]
             (CostCompleteness::IncompleteLowerBound, false),
             (CostCompleteness::Unknown, false),
         ] {
-            let times: Vec<String> = (0..30)
+            let times: Vec<String> = (0..80)
                 .map(|minute| format!("2026-01-01T00:{minute:02}:00+00:00"))
                 .collect();
             let fixture = LedgerFixture::open_with_clock("dataset-estimated", times);

@@ -1503,12 +1503,13 @@ impl<'a> RunEngine<'a> {
                     Some(task) => task.clone(),
                     None => derive_task_id(&this_repo_key, &self.config.contract.hash()),
                 };
-                let inserted = ledger.insert_run(
+                let inserted = ledger.insert_typed_run(
                     &self.run_id,
                     &self.config.repo_dir.to_string_lossy(),
                     Some(&self.config.session_id),
                     &task,
                     &this_repo_key,
+                    self.config.contract.task_type,
                 );
                 // Before anything can be dispatched. A purpose written
                 // after the run finishes is absent for every path that
@@ -1739,6 +1740,21 @@ impl<'a> RunEngine<'a> {
                 )?))
             }
         };
+        // The design is read from the base revision, like the hints, and an
+        // unreadable one refuses the contract before any worker is paid for.
+        let design = match &self.config.contract.design {
+            None => None,
+            Some(path) => {
+                match context::read_design(self.config.git, self.config.repo_dir, base_sha, path) {
+                    Ok(design) => Some(design),
+                    Err(e) => {
+                        return Ok(Phase::Ended(
+                            self.fail_preflight(BlockCode::DesignUnreadable, e.to_string())?,
+                        ))
+                    }
+                }
+            }
+        };
         let assembled = context::assemble(context::ContextInputs {
             contract: self.config.contract,
             repo: self.config.repo_policy,
@@ -1758,6 +1774,7 @@ impl<'a> RunEngine<'a> {
                 .map(crate::backend::Capabilities::turn_ceiling)
                 .unwrap_or_default(),
             resolver: self.config.aval_resolver,
+            design,
         });
         match assembled {
             Ok(manifest) => {
@@ -4029,6 +4046,11 @@ impl<'a> RunEngine<'a> {
                 &request.manifest.constraints,
             ));
         }
+        // The reviewer judges the change against the same design the
+        // worker was handed.
+        if let Some(design) = &request.manifest.design {
+            prompt.push_str(&data_block("program design", design));
+        }
         // The patch is read first: the constraint statements share its
         // budget, and the patch is what the reviewer cannot do without.
         let patch = read_patch(&request.patch_path, REVIEW_PATCH_BUDGET_BYTES);
@@ -4807,6 +4829,10 @@ fn build_prompt(
     }
     prompt.push_str(&constraint_index_block(&manifest.guidance));
     prompt.push_str(&relevant_block(&manifest.guidance, &[]));
+    if let Some(design) = &manifest.design {
+        prompt.push_str("the program design below was decided before you; build to its shape.\n");
+        prompt.push_str(&data_block("program design", design));
+    }
     let scope = contract.scope_patterns();
     if !scope.is_empty() {
         prompt.push_str(&format!(
@@ -10496,6 +10522,8 @@ mod tests {
             confinement: Default::default(),
             env_protection: String::new(),
             guidance: Default::default(),
+            design: None,
+            design_sha256: None,
         }
     }
 
@@ -11190,6 +11218,8 @@ mod tests {
             confinement: Default::default(),
             env_protection: String::new(),
             guidance: Default::default(),
+            design: None,
+            design_sha256: None,
         };
         let prompt = build_prompt(&contract, &manifest, 2, None, AttemptKind::Initial);
         assert!(
@@ -11197,6 +11227,19 @@ mod tests {
             "the number is the profile's commands, not the attempt ceiling: {prompt}"
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    #[test]
+    fn the_design_goes_verbatim_into_the_worker_prompt() {
+        let fixture = Fixture::new();
+        let contract = fixture.contract(Review::Off);
+        let mut manifest = manifest_with(Vec::new());
+        let plain = build_prompt(&contract, &manifest, 1, None, AttemptKind::Initial);
+        assert!(!plain.contains("program design"), "{plain}");
+        manifest.design = Some("## file tree\n+ src/new.rs".into());
+        let prompt = build_prompt(&contract, &manifest, 1, None, AttemptKind::Initial);
+        assert!(prompt.contains("## file tree\n+ src/new.rs"), "{prompt}");
+        assert!(prompt.contains("program design"), "{prompt}");
     }
 
     // -- fix regression tests (review R1–R11, X5) --------------------------

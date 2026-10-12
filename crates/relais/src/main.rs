@@ -213,7 +213,9 @@ enum Command {
         json: bool,
         /// Group the window's tasks into cohorts over one dimension, so
         /// cost, acceptance, escalation and correction figures compare
-        /// like task classes rather than blending every task together
+        /// like task classes rather than blending every task together.
+        /// `task-type` groups by the task's type (what kind of work it
+        /// is); it is not `task-class`, which is the verification profile
         #[arg(long, value_enum)]
         by: Option<report::Dimension>,
         /// Skip importing orchestration usage before rendering: the
@@ -553,6 +555,28 @@ enum DatasetCommand {
         /// the relais plugin starts a replay that spends
         #[arg(long)]
         protocol: bool,
+    },
+    /// Write one JSON line per recorded task, for a classifier: task id,
+    /// repo, kind, objective, write scope and acceptance, with no file
+    /// contents. relais links no model; the orchestrator labels the
+    /// export and `import-task-types` reads the labels back
+    #[command(name = "export-tasks")]
+    ExportTasks {
+        /// The file to create (mode 0600, through a temporary file in its
+        /// directory, then renamed), or `-` for stdout
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Read classified task types, one JSON line each
+    /// (`{"task_id": ..., "task_type": ...}`), and store them as
+    /// `classified`. Every row is checked first: a file with an unknown
+    /// task id or type is refused whole (exit 2, each bad row printed as
+    /// `<file>:<line>: <reason>`) and writes nothing. A declared type is
+    /// never overwritten, and importing the same file again changes nothing
+    #[command(name = "import-task-types")]
+    ImportTaskTypes {
+        /// The file of labels
+        file: PathBuf,
     },
 }
 
@@ -1344,6 +1368,8 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
         },
         Command::Dataset { cmd } => match cmd {
             DatasetCommand::Build => dataset_build_command(),
+            DatasetCommand::ExportTasks { out } => export_tasks_command(&out),
+            DatasetCommand::ImportTaskTypes { file } => import_task_types_command(&file),
             DatasetCommand::Replay {
                 task,
                 recipe,
@@ -2637,6 +2663,85 @@ fn export_classifier_command(out: &Path, since: Option<&str>) -> Result<CliOutco
         return Ok(CliOutcome::OperationalFailure);
     }
     eprintln!("{}", export.counts.summary());
+    Ok(CliOutcome::Accepted)
+}
+
+/// `relais dataset export-tasks --out <file|->`. Exit 0 written, 1 on a
+/// ledger or IO failure. A closed stdout (`| head -1`) is the reader
+/// finishing, not a failure: it ends quietly with exit 0.
+fn export_tasks_command(out: &Path) -> Result<CliOutcome, CliError> {
+    let ledger = open_ledger()?;
+    let rows = operational(ledger.export_tasks(), "export-tasks")?;
+    let mut text = String::new();
+    for row in &rows {
+        text.push_str(&serde_json::to_string(row).expect("an export row serializes"));
+        text.push('\n');
+    }
+    if out == Path::new("-") {
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        match stdout
+            .write_all(text.as_bytes())
+            .and_then(|()| stdout.flush())
+        {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                return Ok(CliOutcome::Accepted)
+            }
+            Err(e) => {
+                eprintln!("relais dataset export-tasks: stdout: {e}");
+                return Ok(CliOutcome::OperationalFailure);
+            }
+        }
+    } else if let Err(e) = relais::fsutil::write_atomic_with_mode(out, &text, Some(0o600)) {
+        eprintln!("relais dataset export-tasks: {}: {e}", out.display());
+        return Ok(CliOutcome::OperationalFailure);
+    }
+    eprintln!(
+        "relais dataset export-tasks: {} task(s) written",
+        rows.len()
+    );
+    Ok(CliOutcome::Accepted)
+}
+
+/// `relais dataset import-task-types <file>`. Every row is validated
+/// before anything is written; one bad row refuses the file (exit 2).
+fn import_task_types_command(file: &Path) -> Result<CliOutcome, CliError> {
+    let text = match std::fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("relais dataset import-task-types: {}: {e}", file.display());
+            return Ok(CliOutcome::OperationalFailure);
+        }
+    };
+    let ledger = open_ledger()?;
+    let known = operational(ledger.task_id_set(), "import-task-types")?;
+    let labels = match relais::task_labels::parse_labels(&text, &known) {
+        Ok(labels) => labels,
+        Err(problems) => {
+            for problem in &problems {
+                eprintln!("{}:{}: {}", file.display(), problem.line, problem.reason);
+            }
+            eprintln!(
+                "relais dataset import-task-types: {} bad row(s); nothing was written",
+                problems.len()
+            );
+            return Ok(CliOutcome::InvalidInput);
+        }
+    };
+    let imported = operational(ledger.import_task_types(&labels), "import-task-types")?;
+    let by_type: Vec<String> = imported
+        .applied
+        .iter()
+        .map(|(task_type, count)| format!("{task_type} {count}"))
+        .collect();
+    eprintln!(
+        "relais dataset import-task-types: {} labelled ({}), {} unchanged, {} kept as declared",
+        imported.applied.values().sum::<u32>(),
+        by_type.join(", "),
+        imported.unchanged,
+        imported.kept_declared
+    );
     Ok(CliOutcome::Accepted)
 }
 
@@ -4156,6 +4261,16 @@ fn plan_command(
             "relais plan: blocked (read_hint_unresolvable): {unresolvable} (base {base_sha})"
         );
         return Ok(CliOutcome::Blocked);
+    }
+    // And the design: `run` refuses a contract whose design is missing,
+    // oversized or not text at the base revision, so `plan` does too.
+    if let Some(design) = &contract.design {
+        if let Err(e) =
+            relais::context::read_design(&relais::workspace::SystemGit, &root, &base_sha, design)
+        {
+            eprintln!("relais plan: blocked (design_unreadable): {e} (base {base_sha})");
+            return Ok(CliOutcome::Blocked);
+        }
     }
     let repo_identity = relais::repo::identity(&root);
     let authority = effective_authority(&repo, &machine, &contract, &repo_identity);

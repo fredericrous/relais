@@ -480,6 +480,90 @@ pub fn fingerprint_hints(
     }
 }
 
+/// The program design a contract names, as it was at the base revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesignInput {
+    pub path: String,
+    pub text: String,
+}
+
+/// Why a contract's design could not be read at preflight. Each is a
+/// refusal of the contract, before any worker is paid for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DesignError {
+    /// No such file at the base revision, or git would not answer.
+    Missing { path: String, detail: String },
+    /// Over [`crate::contract::MAX_DESIGN_BYTES`].
+    TooLarge { path: String, bytes: usize },
+    /// Not UTF-8: it could not be put verbatim in a prompt.
+    NotText { path: String },
+}
+
+impl std::fmt::Display for DesignError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing { path, detail } => {
+                write!(
+                    f,
+                    "the design `{path}` cannot be read at the base revision: {detail}"
+                )
+            }
+            Self::TooLarge { path, bytes } => write!(
+                f,
+                "the design `{path}` is {bytes} bytes, over the {} byte limit",
+                crate::contract::MAX_DESIGN_BYTES
+            ),
+            Self::NotText { path } => write!(f, "the design `{path}` is not UTF-8 text"),
+        }
+    }
+}
+
+impl std::error::Error for DesignError {}
+
+/// Read the contract's design from `base_sha` itself (`git show`), never
+/// from the working tree, so the worker is handed what the base revision
+/// holds whatever the tree does later. The size is asked first so an
+/// oversized file is never loaded.
+pub fn read_design(
+    git: &dyn Git,
+    repo_dir: &Path,
+    base_sha: &str,
+    path: &str,
+) -> Result<DesignInput, DesignError> {
+    let object = format!("{base_sha}:{path}");
+    let missing = |detail: String| DesignError::Missing {
+        path: path.to_string(),
+        detail,
+    };
+    let size_text = git
+        .run(repo_dir, &["cat-file", "-s", &object])
+        .map_err(|e| missing(e.to_string()))?;
+    let bytes: usize = size_text
+        .trim()
+        .parse()
+        .map_err(|_| missing(format!("git answered `{}` for its size", size_text.trim())))?;
+    if bytes > crate::contract::MAX_DESIGN_BYTES {
+        return Err(DesignError::TooLarge {
+            path: path.to_string(),
+            bytes,
+        });
+    }
+    let text = git
+        .run(repo_dir, &["show", &object])
+        .map_err(|e| missing(e.to_string()))?;
+    // `git` text comes back lossy: a length that differs from the blob's
+    // means a byte was replaced.
+    if text.len() != bytes {
+        return Err(DesignError::NotText {
+            path: path.to_string(),
+        });
+    }
+    Ok(DesignInput {
+        path: path.to_string(),
+        text,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolVersions {
     pub relais: String,
@@ -542,6 +626,14 @@ pub struct ContextManifest {
     /// compared and never counts toward `package_bytes`.
     #[serde(default)]
     pub guidance: Guidance,
+    /// The contract's program design, verbatim as it was at the base
+    /// revision. It is part of the package the worker receives, so its
+    /// bytes count in `package_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design: Option<String>,
+    /// SHA-256 of `design`; the contract hash covers only the path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -592,6 +684,9 @@ pub struct ContextInputs<'a> {
     /// The decision corpus, as a port, so tests supply verdicts without
     /// invoking the real binary.
     pub resolver: &'a dyn DecisionResolver,
+    /// The contract's design as read from the base revision
+    /// ([`read_design`]); `None` when the contract names none.
+    pub design: Option<DesignInput>,
 }
 
 /// Assemble the context manifest. Fails on contradiction (blocked), on
@@ -609,6 +704,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         tool_versions,
         turn_ceiling,
         resolver,
+        design,
     } = inputs;
 
     let manifest_aval_version = tool_versions.aval.clone();
@@ -713,7 +809,8 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
             .read_hints
             .iter()
             .map(|hint| hint.len())
-            .sum::<usize>();
+            .sum::<usize>()
+        + design.as_ref().map_or(0, |design| design.text.len());
 
     let manifest = ContextManifest {
         contract_hash: contract_hash.to_string(),
@@ -734,6 +831,8 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         confinement: Confinement::session(),
         env_protection: "session".to_string(),
         guidance,
+        design_sha256: design.as_ref().map(|d| sha256_hex(d.text.as_bytes())),
+        design: design.map(|d| d.text),
     };
 
     if manifest.package_bytes > manifest.budget_bytes {
@@ -859,6 +958,7 @@ mod tests {
             },
             turn_ceiling: crate::backend::TurnCeiling::Unavailable,
             resolver,
+            design: None,
         }
     }
 
@@ -1384,5 +1484,87 @@ mod tests {
             .is_some());
         let parsed: ContextManifest = serde_json::from_value(older).expect("still parses");
         assert_eq!(parsed.guidance, Guidance::default());
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        crate::workspace::SystemGit
+            .run(dir, args)
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+    }
+
+    /// A repository whose base commit holds `docs/design.md` with
+    /// `committed`, and whose working tree then differs.
+    fn repo_with_design(committed: &str) -> (crate::test_support::TempDir, PathBuf, String) {
+        let dir = crate::test_support::temp_dir("design");
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(repo.join("docs")).expect("mkdir");
+        let no_hooks = dir.join("no-hooks");
+        std::fs::create_dir_all(&no_hooks).expect("mkdir");
+        git_in(&repo, &["init", "-q"]);
+        git_in(
+            &repo,
+            &["config", "core.hooksPath", &no_hooks.to_string_lossy()],
+        );
+        git_in(&repo, &["config", "user.email", "relais@test"]);
+        git_in(&repo, &["config", "user.name", "relais test"]);
+        std::fs::write(repo.join("docs/design.md"), committed).expect("write");
+        git_in(&repo, &["add", "-A"]);
+        git_in(&repo, &["commit", "-q", "-m", "base"]);
+        let sha = crate::workspace::SystemGit
+            .run(&repo, &["rev-parse", "HEAD"])
+            .expect("sha")
+            .trim()
+            .to_string();
+        std::fs::write(repo.join("docs/design.md"), "edited after the base\n").expect("write");
+        (dir, repo, sha)
+    }
+
+    #[test]
+    fn a_design_is_read_from_the_base_sha_not_the_working_tree() {
+        let committed = "# design\n".to_string() + &"x".repeat(10 * 1024) + "\n";
+        let (_dir, repo, sha) = repo_with_design(&committed);
+        let design = read_design(&crate::workspace::SystemGit, &repo, &sha, "docs/design.md")
+            .expect("reads");
+        assert_eq!(design.text, committed);
+    }
+
+    #[test]
+    fn a_missing_or_oversized_design_is_refused() {
+        let big = "y".repeat(20 * 1024);
+        let (_dir, repo, sha) = repo_with_design(&big);
+        let git = crate::workspace::SystemGit;
+        assert!(matches!(
+            read_design(&git, &repo, &sha, "docs/design.md"),
+            Err(DesignError::TooLarge { bytes, .. }) if bytes == 20 * 1024
+        ));
+        assert!(matches!(
+            read_design(&git, &repo, &sha, "docs/absent.md"),
+            Err(DesignError::Missing { .. })
+        ));
+    }
+
+    #[test]
+    fn a_design_goes_verbatim_in_the_package_and_is_counted_and_hashed() {
+        let c = contract(&[]);
+        let mut r = repo();
+        r.context.budget_bytes = 64 * 1024;
+        let without = assemble(inputs(&c, &r, &active)).expect("assembles");
+        assert_eq!(without.design, None);
+        assert_eq!(without.design_sha256, None);
+
+        let text = "# design\n".to_string() + &"z".repeat(10 * 1024);
+        let mut with = inputs(&c, &r, &active);
+        with.design = Some(DesignInput {
+            path: "docs/design.md".into(),
+            text: text.clone(),
+        });
+        let manifest = assemble(with).expect("assembles");
+        assert_eq!(manifest.design.as_deref(), Some(text.as_str()));
+        assert_eq!(manifest.package_bytes, without.package_bytes + text.len());
+        assert_eq!(
+            manifest.design_sha256,
+            Some(sha256_hex(text.as_bytes())),
+            "the manifest records the design's sha-256"
+        );
     }
 }

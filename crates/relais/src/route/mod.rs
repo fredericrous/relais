@@ -458,6 +458,8 @@ fn floor_contract(task: Task) -> TaskContract {
         review: Default::default(),
         decomposition: None,
         task_id: None,
+        task_type: None,
+        design: None,
     }
 }
 

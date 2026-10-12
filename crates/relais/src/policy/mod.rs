@@ -1522,6 +1522,9 @@ pub enum BlockCode {
     /// is refused up front, or ends after the attempt that showed it,
     /// rather than on a budget refusal it did not earn (SPEC §11).
     NativeUnpriced,
+    /// The contract's `design` cannot be read at the base revision: it is
+    /// missing there, oversized or not text.
+    DesignUnreadable,
 }
 
 impl BlockCode {
@@ -1559,6 +1562,7 @@ impl BlockCode {
             Self::SandboxWeakened => "sandbox_weakened",
             Self::SandboxUnverified => "sandbox_unverified",
             Self::NativeUnpriced => "native_unpriced",
+            Self::DesignUnreadable => "design_unreadable",
         }
     }
 }
