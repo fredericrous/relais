@@ -37,6 +37,10 @@ pub const WINDOW_DAYS: i64 = 60;
 /// How soon after the landing an undo still counts.
 pub const REVERT_WITHIN_DAYS: i64 = 30;
 /// Most git calls spent on one run.
+// holds-until: skipped runs stay under a third of those scanned. The first
+// pilot (2026-10-12) skipped 24 of 70, right at that line, so the cap is
+// measured after release (plan 2026-10-11-orchestrator-decides,
+// Verification record) and raised if the busiest histories keep hitting it.
 pub const CALLS_PER_RUN: usize = 50;
 /// Most git calls spent in one build.
 pub const CALLS_PER_BUILD: usize = 2_000;
