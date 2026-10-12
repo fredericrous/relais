@@ -11,7 +11,7 @@ adrs:
 ## Review panel
 
 👉 **Decide:** none — approve if a typed, recorded orchestrator answer with Laya advice (once trained) is how decisions get settled.
-📍 relais, homelab · Phases 1–3 done (v0.14.0, sweep 2026-10-12) · next: Phase 4a, the Laya cost spike. Panel: architect, backend, go, python, rust, typescript, platform, po, tui, unix.
+📍 relais, homelab · Phases 1–3 done, 4a measured (2026-10-12: local fails, → 4b′ homelab) · next: 4b/4c when 200 person answers exist. Panel: architect, backend, go, python, rust, typescript, platform, po, tui, unix.
 **Changed by review:** advice computed once when the row opens, never on a read path; orchestrator cannot sign off human criteria; advisor ships with 4c, not PR 1.
 **Verdicts:** round 1: 9 approve-with-changes, 1 approve; round 2 and two deltas backend approve-with-changes; 1 blocker went to the person (D8: tamper-evidence); 5 findings carried into implementation.
 📄 Full reviews: [2026-10-11-orchestrator-decides.reviews.md](2026-10-11-orchestrator-decides.reviews.md)
@@ -112,6 +112,16 @@ The person decided (2026-10-11): **the orchestrator approves**, and **Laya advis
 - **Gate:** p95 ≤ 8 s at 1,024 tokens (under the 10 s advisor deadline), RSS ≤ 3 GB, and int8 vs fp32 calibrated `p_approve` within 0.02 over the same 50 inputs → local. Otherwise → homelab service (4b').
 - The numbers are recorded here either way; the RSS figure sets the 4b' requests/limits.
 
+#### 4a result (2026-10-12, measured on this Mac under load 26–198; scratch `/tmp/claude-501/laya-spike`)
+
+- Model: `convaiinnovations/laya` @ `7b928d828b7b0e022f929d9bd2e44165aa270148` (ModernBERT-large + 2-layer head, 843 MB weights). Runtime: Python 3.12.12, onnxruntime 1.23.2 CPU (wheels resolve on 3.10–3.13), `uv sync --frozen`. Export: Python 3.11.14 (ModernBERT will not import with torch 2.2.2 on 3.12: "Dynamo is not supported on Python 3.12+"), torch 2.2.2, transformers 4.57.6 (5.x disables torch < 2.5), onnx 1.23.2; `eager`, `reference_compile=False`, exported with grad enabled (else `aten::_transformer_encoder_layer_fwd` has no opset-17 export) and a hand-written head reshape (the traced one baked in 600 tokens); `onnx.checker` full check OK; ORT fp32 vs torch within 4.8e-7 at 1,024 tokens. The export took 26 min and 9.5 GB RSS.
+- Sizes: fp32 1.57 GiB; int8 (`quantize_dynamic`, QInt8, defaults) 403 MiB.
+- Each a fresh `.venv/bin/python -I laya_advise.py < req.json`, `/usr/bin/time -l`, warm cache after the first (no sudo, so no purge): int8 @ 512 ×30 p50 17.6 s, p95 42.8 s, min 6.2 s, RSS 986 MiB; int8 @ 1,024 ×30 p50 11.8 s, p95 55.7 s, min 7.6 s, RSS 1,178 MiB; fp32 @ 1,024 ×10 p50 35.2 s, max 85.9 s (n=10, no p95), min 30.9 s, RSS 2,486 MiB. 512 slower than 1,024 is load noise, not signal. Inside one process: imports 1.0 s, ORT session creation 14.8 s, one 1,024-token forward pass 19–33 s.
+- int8 vs fp32 on 50 inputs: max |Δp| 0.517 raw, 0.443 with the shipped `noul:2` temperature (1.983); int8 values all fall between 0.416 and 0.513: default dynamic quantization flattens the head toward 0.5.
+- **Gate:** p95 ≤ 8 s at 1,024 → fail (55.7 s; load-inflated, but fp32's quickest run was 30.9 s and session creation alone is 15 s); RSS ≤ 3 GB → pass (int8 1,178 MiB, fp32 2,486 MiB); int8–fp32 ≤ 0.02 → fail (0.44), independent of load. **→ 4b' (homelab service)**, per D3. The 4b' memory request starts from the fp32 figure (2,486 MiB) plus headroom, since only fp32 kept the answer.
+- Deviations from the 4a spec: the export ran on this Mac, not wk-3 (laya-lab does not exist yet); fp32 got 10 runs, not 30; no page-cache purge (no sudo); no first-run-after-reboot measured (run 1 of each series is warm after other work, not that measurement).
+- Not tried, and the only way back to local: per-channel quantization or a head left in fp32, then a re-measure at idle load; a saved ORT-optimised graph to cut the 15 s session creation. The `noul` question was used; the model card suggests a two-option `choice` (same cost).
+
 ### 4b: the advisor contract (relais, Rust)
 
 - relais never links a model (SPEC §16: an optional experiment must not become a runtime requirement). An **advisor** is an external command named in `machine.toml` `[decision.advisor] command = [...]`, absent by default. relais writes one JSON request on its stdin (`{run, raised_state, raised_reason, objective, detail, changed_paths, diff_stats, verification_summary}`; no file contents) and reads `{p_approve, model, revision, latency_ms}`.
@@ -205,6 +215,6 @@ The person decided (2026-10-11): **the orchestrator approves**, and **Laya advis
 - Noted: the PR does not claim `export-decisions` (Phase 4c).
 - Delta (tree `dbc7f28a`): **approve** (64k tokens, 9 s); all four findings resolved, none new.
 - CI on PR #202 failed on windows-latest only: the nonce read `/dev/urandom`. Fixed (`d2e69fd`): `procs::os_random` uses `BCryptGenRandom` on Windows; the terminal sign-off scenario is unix-only (it needs `script(1)`). Fresh round 1 on tree `db1d39d8`: **approve** (30k tokens, 28 s), one low finding (a stale count in a Cargo.toml comment) fixed in `63ea9f7`; Delta on `0227ea10`: **approve** (30k tokens, 6 s).
-- Next: merge, release, reinstall the plugin, then Phase 3 (the live check and the sweep of the open rows). Phase 3 done 2026-10-12; next: Phase 4a, the Laya cost spike on this Mac.
+- Next: merge, release, reinstall the plugin, then Phase 3 (the live check and the sweep of the open rows). Phase 3 done 2026-10-12; Phase 4a measured 2026-10-12 (→ 4b′); next: 4b/4c, data-gated.
 
 <!-- panel: repos=relais,homelab reviewers=architect,backend,lang:go,lang:python,lang:rust,lang:typescript,platform,po,tui,unix body-sha=fdb0e4b341aa -->
