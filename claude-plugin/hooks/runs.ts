@@ -458,7 +458,16 @@ async function refreshRun(fx: Fx, store: Store, run: string) {
     const now = await fx.clock.now()
     const fresh = rebuildRuns(JSON.parse(String(result.stdout ?? '')), now)[run]
     const held = store.models[run]
-    if (!fresh || !held || !isLive(held)) return
+    if (!fresh || !held) return
+    if (!isLive(held)) {
+      // A run that stopped awaiting a person may have been answered since.
+      if (held.outcome && AWAITS_A_PERSON.has(held.outcome.state) && fresh.outcome && fresh.outcome.state !== held.outcome.state) {
+        const outcome = { ...held.outcome, state: fresh.outcome.state, ...(fresh.outcome.answer ? { answer: fresh.outcome.answer } : {}) }
+        store.models = { ...store.models, [run]: { ...held, phase: fresh.outcome.state, outcome } }
+        markDirty(store)
+      }
+      return
+    }
     const next = fresh.outcome
       ? applyEvent(held, { kind: 'outcome', state: fresh.outcome.state, receipt: fresh.outcome.receipt, reason: fresh.outcome.reason }, now)
       : { ...held, stalled: fresh.stalled }
@@ -473,11 +482,13 @@ async function refreshRun(fx: Fx, store: Store, run: string) {
 
 // The reply of the `status` tool: this session's models, or the one asked
 // for by id (marked `foreign` when another session started it). Every live
-// model is checked against the ledger first.
+// model, and every one awaiting a person, is checked against the ledger first.
 export async function statusOf(fx: Fx, store: Store, run?: string, opts: { output?: boolean } = {}): Promise<string> {
   const now = await fx.clock.now()
   const known = () => Object.values(store.models).filter(m => (run ? m.run === run : !m.foreign))
-  const live = known().filter(m => isLive(m) && !m.run.startsWith('starting-'))
+  const live = known().filter(
+    m => !m.run.startsWith('starting-') && (isLive(m) || (m.outcome !== undefined && AWAITS_A_PERSON.has(m.outcome.state))),
+  )
   await Promise.all(live.map(m => refreshRun(fx, store, m.run)))
   if (known().length === 0) await reloadTimeline(fx, store, run)
   const models = known()
