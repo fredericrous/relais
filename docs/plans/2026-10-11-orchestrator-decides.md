@@ -6,14 +6,14 @@ adrs:
   - relais ADR-0004 (who answers a decision, and the optional decision advisor)
 ---
 
-# Decisions the orchestrator answers, recorded, advised by Laya
+# Decisions the orchestrator answers, recorded, then answered by Laya when confident
 
 ## Review panel
 
-👉 **Decide:** none — approve if a typed, recorded orchestrator answer with Laya advice (once trained) is how decisions get settled.
-📍 relais, homelab · Phases 1–3 done, 4a measured (2026-10-12: local fails, → 4b′ homelab) · next: 4b/4c when 200 person answers exist. Panel: architect, backend, go, python, rust, typescript, platform, po, tui, unix.
-**Changed by review:** advice computed once when the row opens, never on a read path; orchestrator cannot sign off human criteria; advisor ships with 4c, not PR 1.
-**Verdicts:** round 1: 9 approve-with-changes, 1 approve; round 2 and two deltas backend approve-with-changes; 1 blocker went to the person (D8: tamper-evidence); 5 findings carried into implementation.
+👉 **Decide:** none — approve if outcome-corrected orchestrator answers are Laya's labels and Laya answers only above data-derived thresholds.
+📍 relais, homelab · Phases 1–3 done, 4a measured (local fails, → 4b′) · amendment 2026-10-12: Laya learns from the orchestrator's answers corrected by outcomes, and answers when confident · next: 4c gate on labelled rows. Panel: architect, backend, go, python, rust, typescript, platform, po, tui, unix.
+**Changed by review:** (amendment) rewritten salvages are down-weighted, never test labels; outcome-only calibration/test; kill switch on the Wilson upper bound.
+**Verdicts:** original panel as before; amendment (backend): five passes, two blockers fixed (kill switch, shadow score leak), final approve-with-changes; 4 findings carried into implementation.
 📄 Full reviews: [2026-10-11-orchestrator-decides.reviews.md](2026-10-11-orchestrator-decides.reviews.md)
 
 ## Context
@@ -28,7 +28,15 @@ The live ledger (2026-10-11): **29 decisions open**, the oldest from 2026-09-30 
 
 The person decided (2026-10-11): **the orchestrator approves**, and **Laya advises the approval only — it never gates it**. Laya is the 421M ModernBERT decision model the learning-loop plan trains on the homelab (`2026-10-10-learning-loop.md` Phases 6–7). Inference runs on this Mac if it can (2019 Intel i7-9750H, 32 GB, x86_64), else as a homelab service.
 
-**Intended outcome:** every decision the orchestrator makes is recorded through one tool, with an actor that says who decided; the outcome message names that step; the 29 stale rows are answered from what actually landed; and once a Laya "approve?" model exists, its calibrated advice is computed once when the decision opens, shown with the outcome and stored beside the answer, so its agreement with the person can be measured.
+**Intended outcome:** every decision the orchestrator makes is recorded through one tool, with an actor that says who decided; the outcome message names that step; the 29 stale rows are answered from what actually landed; and once a Laya "approve?" model exists, its calibrated advice is computed once when the decision opens, shown with the outcome and stored beside the answer, so its agreement with the orchestrator and with outcomes can be measured, and above data-derived thresholds it answers itself (amendment).
+
+## Amendment (2026-10-12): Laya learns from the orchestrator, corrected by outcomes
+
+The person will never record answers of their own (2026-10-12): "I wont ever write my own answers. I expect laya to answer based on data collected from opus answers." D4's gate (200 `person` answers) would never open. The person chose (2026-10-12): **labels are the orchestrator's answers corrected by outcomes**, and **once Laya passes its bars it answers on its own when confident**, recording `actor = advisor`; anything in between still goes to the orchestrator with Laya's score attached. This supersedes D2 and D4 (D20, D21) and ADR-0004's `decisions.advisor` choice (ADR-0005).
+
+Why not plain distillation: a model trained to repeat the orchestrator's answer can at best match it and inherits its misses. The ledger already records what happened after each answer, so the label is the outcome where one is known, and the orchestrator's answer only where none is.
+
+Data today (live ledger, 2026-10-12, answered `needs_decision`/`needs_review` rows, every actor): 157 answered; 12 whose verified patch landed intact, 79 rewritten before landing, 20 approved, 32 revised, 5 rejected or abandoned, 9 other. The `outcomes` table holds 76 final outcomes (12 `accepted_unchanged`, 62 `corrected`, 2 `never_shipped`). Positives are the scarce class (≈ 30), so 4c's ≥ 30-positive test floor is what gates training, not the row count.
 
 ## Phase 1: one actor vocabulary (Rust) — done
 
@@ -102,7 +110,7 @@ The person decided (2026-10-11): **the orchestrator approves**, and **Laya advis
 | `run-65d7994f93597-509c` | 2026-10-11 | interrupted | abandoned | — | zero attempts, nothing produced; the scenario-world env isolation it asked for landed separately in 0177f51 (#192). |
 | `run-65d8b504185f3-1666f` | 2026-10-11 | needs_decision | salvaged | rewritten | LSP call recording landed on amont-agent main as 15ab958 'feat(lsp): a session remembers what it asked; 2.33.0' (#91). |
 
-## Phase 4: Laya advises the approval (data-gated)
+## Phase 4: Laya advises, then answers when confident (data-gated)
 
 ### 4a: can this Mac run Laya? (spike, before anything is built)
 
@@ -125,9 +133,10 @@ The person decided (2026-10-11): **the orchestrator approves**, and **Laya advis
 ### 4b: the advisor contract (relais, Rust)
 
 - relais never links a model (SPEC §16: an optional experiment must not become a runtime requirement). An **advisor** is an external command named in `machine.toml` `[decision.advisor] command = [...]`, absent by default. relais writes one JSON request on its stdin (`{run, raised_state, raised_reason, objective, detail, changed_paths, diff_stats, verification_summary}`; no file contents) and reads `{p_approve, model, revision, latency_ms}`.
-- Called once, never on a read path: the runner calls the advisor when the decision row opens, after the transition commits, outside the write transaction, off the run's critical path, and stores the result on the row (`advice_p_approve`, `advice_model`, `advice_revision`, or `advice_null_reason`). Neither `relais native status --run` nor `relais decide` calls it: `freshen` calls native status with `FRESHEN_TIMEOUT_MS = 1_000` (`claude-plugin/hooks/runs.ts:36`, `:122`), and a 10 s advisor there would make every outcome fail open stale. Absent, failed or timed out → advice null with the reason, never a refusal (fail-open).
+- Called once, never on a read path: the runner calls the advisor when the decision row opens, after the transition commits, outside the write transaction, off the run's critical path (with 4d thresholds configured the `done` line waits for it, bounded by `timeout_seconds`), and stores the result on the row (`advice_p_approve`, `advice_model`, `advice_revision`, or `advice_null_reason`). Neither `relais native status --run` nor `relais decide` calls it: `freshen` calls native status with `FRESHEN_TIMEOUT_MS = 1_000` (`claude-plugin/hooks/runs.ts:36`, `:122`), and a 10 s advisor there would make every outcome fail open stale. Absent, failed or timed out → advice null with the reason, never a refusal (fail-open).
 - Process contract: not `procs::run_with_timeout` as is (it merges stdout/stderr and adds a 5 s drain grace, `procs.rs:500-524`), but a variant: stdout separate and capped at 64 KiB, one JSON object parsed; stderr forwarded to relais stderr with a prefix; one total deadline of 10 s; the advisor spawned in its own process group and the whole group killed on deadline (uv→python, sh→curl grandchildren); stdin written on its own thread; `BrokenPipe` on stdin → `advice null (advisor closed stdin)`, never an error.
-- `native status` `current.decision` and the `done` line carry the stored advice; plugin `onDone` prints it in the outcome message ("Laya: p(approve)=0.83, rev …") so the orchestrator sees it before deciding; `decide --json` echoes it, and the decide pane line shows it. It is labelled advisory; nothing branches on it.
+- `native status` `current.decision` and the `done` line carry the stored advice; plugin `onDone` prints it in the outcome message ("Laya: p(approve)=0.83, rev …") so the orchestrator sees it before deciding; `decide --json` echoes it, and the decide pane line shows it. Below the confidence thresholds (4d) it is advisory and nothing branches on it. On a row drawn into the 4d shadow sample the stored advice is withheld from every display path (`onDone`, `native status`, the `done` line, `decide --json`, the pane line) and shown only in `relais report`.
+- The 10 s deadline is configurable (`[decision.advisor] timeout_seconds`); 4b′ measures the homelab call end to end on wk-3 and sets it from that p95, since the advice is computed off the critical path.
 - Tests: stub advisors that sleep 15 s, close stdin (`sh -c 'exec 0<&-; sleep 15'`), flood 10 MB to stdout, and write to stderr; each ends in ≤ ~10 s, the run exits 0, no process is left (`pgrep`). With the 15 s stub, `native status --run` p95 stays < 1 s and freshen still rewrites.
 
 ### 4b': homelab fallback (if 4a fails)
@@ -137,26 +146,44 @@ The person decided (2026-10-11): **the orchestrator approves**, and **Laya advis
 
 ### 4c: train the "approve?" model (homelab, data-gated)
 
-- Starts when the ledger holds ≥ 200 decisions answered by `person` or quote-backed `person-via-orchestrator` on `needs_decision`/`needs_review`, counted separately (today ≈ 100 across all states, ~30 approvals; the gate is checked by `relais report`). Until then the advisor is unconfigured and Phases 1–3 stand alone.
-- `relais dataset export-decisions` (0600, `--out -`) emits (request JSON as in 4b, label = approve vs. not) from `person` (TTY) and `person-via-orchestrator` with `recorded_via = plugin` answers only (never `legacy` or `cli`), temporal split; laya-lab (learning-loop Phase 6 infrastructure, same window rules) fine-tunes one yes/no question, fits a temperature on the calibration split, and exports ONNX int8 alongside `report.json`.
-- **Bars** before the advisor is configured, evaluated only when the temporal test split holds ≥ 30 approvals and ≥ 30 non-approvals: ECE (5 bins) ≤ 0.10 and Brier reported; AUROC lower 95% bound (DeLong, or stratified bootstrap) ≥ 0.70; reported precision at p ≥ 0.8. The temperature is fitted only with ≥ 30 calibration rows, else one shared temperature (as learning-loop.md:97). Below the sample floor the report says `not measurable (n=k)` and waits; below a bar, it says which and the run repeats at 400.
+- The question Laya answers: **"should this candidate be approved as it is?"** (one yes/no; `noul` or a two-option `choice`, whichever the model card's guidance favours, D16). The label, one rule, in `learn/` as a pure function next to `labelling_of` (`learn/dataset.rs:205`), versioned with its own `DECISION_LABEL_POLICY_VERSION` (bumping `LABEL_POLICY_VERSION` would re-fingerprint the learning loop's run dataset; Phase 1's `OrchestratorApproved` exclusion stays for run labels):
+  - **yes (outcome):** on a run raised `needs_review`/`review_findings` (`salvage_evidence_of`, `learn/salvage.rs:50-66`; any other raising state is `RaisedElsewhere`, excluded), the verified candidate landed intact (`candidate_contained = 1`), or an approval whose task's latest outcome stands (`outcome_stands`, `dataset.rs:185`: `accepted_unchanged` or `corrected`);
+  - **no (outcome):** an approval whose task was later `reverted` or a `confirmed_regression`; a reviewed salvage whose landed commit rewrote the candidate (`ReviewedAndRewritten`), as `label_source = rewritten`, weighted like answer labels and never in the test split (most Phase 3 rewrites were matched to a landing after the fact, and a `corrected` approval still counts as yes);
+  - **orchestrator's answer, no outcome known:** `approve` → yes, `revise`/`reject`/`abandon` → no, marked `label_source = answer` and weighted below outcome labels (weight set in laya-lab, reported);
+  - **excluded:** containment unknown, `decided`/`recorded`, an interrupted run with no candidate, `never_shipped`, and every answer recorded by the advisor itself (`actor = advisor`) unless an outcome labels it: the advisor never trains on its own guesses.
+  Every actor's rows count (the old `person`, `legacy` and `orchestrator` rows alike): an outcome is true whoever answered, and `label_source` records which kind each label is.
+- Splits are 60/20/20 train/calibration/test by `raised_at`; calibration and test hold only `label_source = outcome` rows, so bars and thresholds measure outcomes, not agreement with the orchestrator. Starts when that test split holds ≥ 30 yes and ≥ 30 no (the outcome-only no class is only reverted or confirmed-regression approvals, so it may bind before yes does); `relais report` prints the current outcome-no count and projects the date from min(yes, no), ≈ 150 outcome yes overall (≈ 5× today's ≈ 30) being the yes side only; `relais report`'s advisor line counts labelled rows by source and projects that date from the last 30 days (replacing the person-answer line from Phase 2). Until then the advisor is unconfigured.
+- `relais dataset export-decisions` (0600, `--out -`) emits (request JSON as in 4b, label, `label_source`, the answering actor) under the rule above, temporal split; laya-lab (learning-loop Phase 6 infrastructure, same window rules) fine-tunes the one question, fits a temperature on the calibration split, and exports ONNX fp32 alongside `report.json` (4a: int8 quantization flattened the answer).
+- **Bars** before the advisor is configured, evaluated only when the outcome-labelled test split holds ≥ 30 yes and ≥ 30 no: ECE (5 bins) ≤ 0.10 and Brier reported; AUROC lower 95% bound (DeLong, or stratified bootstrap) ≥ 0.70; reported precision at p ≥ 0.8. The temperature is fitted only with ≥ 30 calibration rows, else one shared temperature (as learning-loop.md:97). Below the sample floor the report says `not measurable (n=k)` and waits; below a bar, it says which and the run repeats when the outcome-labelled test split doubles.
+- `report.json` also reports agreement with the orchestrator's answers and with outcome labels separately, and the confidence thresholds of 4d.
 - `laya-advise` lives in homelab `services/laya-lab/`, beside the training code and under its ruff/pyright/pytest CI gate (learning-loop.md:94), not relais `scripts/` (relais `make check` runs no Python gate, relais Makefile:21,30). pytest covers the stdin/stdout contract: a malformed request and a missing model each exit non-zero, and stdout carries only JSON.
 - Local (4a passed): installed once on the Mac with `uv sync --frozen`; the advisor command is `.venv/bin/python -I -m laya_advise` (never a syncing `uv run`). Homelab: 4b'.
+
+### 4d: Laya answers when confident (relais, with 4b–4c)
+
+- Thresholds come from data, never a guess: on the test split, `approve_at` is the lowest p at which precision of "yes" is ≥ 0.95 with a 95% lower bound ≥ 0.90, and `revise_at` the highest p at which precision of "no" meets the same bar. A side with no threshold that meets it gets none. Arithmetic (Wilson 95%): 30/30 gives 0.886, so no threshold exists at the 4c floor; at precision 0.95 the bound reaches 0.90 only near n ≈ 200 rows above the threshold (n=100 → 0.888, n=200 → 0.910). 4d is expected to stay advise-only long after the bars pass; `report.json` states the n each side still needs, and carries both thresholds; the person's `machine.toml` `[decision.advisor] decide = { approve_at, revise_at }` records them (written by the 4c run's install step, never by a model), and absent means advise only.
+- When the stored advice crosses a threshold, the runner records the answer itself through `resolve_decision` with a fourth actor, `advisor` (`Actor::Advisor`, kept out of `Actor::ALL` so `--actor` never accepts it, added in the next free schema step (with the `advisor_suspended` table) so an older relais refuses with `SchemaAhead`; recorded_via `advisor`, the model and revision in `advice_model`/`advice_revision`): p ≥ `approve_at` → `approve` (still refused by the gap check, `open_verification_gaps`, moved from `main.rs:7408` into the library so the runner can call it, in which case the decision stays open for the orchestrator); p ≤ `revise_at` → `revise` with no successor (the run closes, its candidate is preserved, and salvage stays possible). The outcome message then says "Laya answered approve (p=0.96, rev …); the candidate is …" and nothing is waiting. With thresholds configured, the row is not delivered as waiting until advice is stored or timed out; if the orchestrator answered first, the auto-answer is a no-op recorded as `advice_null_reason = answered`, never an error.
+- Never auto-answered: a human-sign-off criterion (D5), `interrupted` runs (no candidate to judge), and `verification_inputs_changed` (a policy question, not a quality one).
+- A shadow sample keeps the thresholds honest: 10% of confident decisions, are left to the orchestrator without the score (it would anchor the answer being measured), drawn as `exploration_draw("decision-shadow", session, run)`, a seed of its own so it does not correlate with routing exploration; `relais report` prints the agreement on those and the outcome precision of the advisor's own answers. When, on ≥ 20 outcome-labelled answers, the Wilson 95% upper bound of the advisor's outcome precision falls below 0.95 (evidence it is under the bar; a lower-bound rule would fire on 20/20, whose lower bound is 0.839), relais writes an `advisor_suspended(model, revision, at, reason)` ledger row and stops auto-answering for that revision (it never edits `machine.toml`); `relais report` says so once; a new revision clears it. A `revise` rarely gets an outcome, so the no side is checked on the shadow sample.
+- An advisor answer is an `orchestrator`-level answer in every other respect: it may approve, it never signs off a criterion, and `relais decide` cannot overwrite it (a second answer is refused as today).
+- Tests: a stub advisor at p = 0.97 with `approve_at = 0.95` closes the run `accepted`, actor `advisor`; at 0.03 with `revise_at = 0.05` closes it `cancelled`/`revised`; at 0.5 leaves it open with the score; a gap refuses the auto-approve and leaves it open; a shadow-drawn decision at 0.97 stays open and its advice is absent from the outcome message, `native status` and `decide --json`; no thresholds configured → never auto-answers; `export-decisions` leaves out an `advisor` answer with no outcome.
 
 ## Delivery
 
 - **relais PR 1:** Phases 1 and 2 (one commit per phase), including the one schema step that already adds the advice columns, and ADR-0004 recording both decisions. ADR-0004: who answers a decision (the orchestrator may answer any of them, actors typed; it never signs off a human criterion), and the advisor is an optional external command, advisory only, fail-open, consistent with SPEC §16, not amending it. It cites `learning.classifier-capture` (ADR-0002) by key and states the refinement: the decision request (no file contents: objective, reason, detail, changed paths, diff stats, verification summary) leaves the Mac only on the homelab path, only to the person's own homelab over mTLS, only when the person configures that advisor command (opt-in, absent by default), per the person's 2026-10-11 decision D3; on the local path nothing leaves. `relais report` gains person answers per week (`person` and quote-backed `person-via-orchestrator` separately) and the projected date the 4c gate is reached. `make check` before push, implementation review, merge on green, release through `tag-release`. The person's step after release: `relais install --claude --user --write`, `relais coordinator stop`, restart sessions.
 - **Live:** Phase 3 sweep with the released plugin; Phase 4a spike (no code shipped).
-- **Later, data-gated:** Phase 4b and 4c together (it serves nothing until a model exists): the advisor call, process contract and plugin display, plus `export-decisions`, in a second relais PR, and the laya-lab change with `laya-advise` in homelab, like learning-loop D5. If at day 30 after release `relais report` projects the 4c gate beyond 6 months, 4c may not start and the person is told once.
+- **Later, data-gated:** Phases 4b, 4c and 4d together: the advisor call, process contract, plugin display, the label rule, `export-decisions` and the confident-answer path, in a second relais PR with ADR-0005; and the laya-lab change with `laya-advise` in homelab (4b′), like learning-loop D5. If at day 30 after the amendment `relais report` projects the 4c floor beyond 6 months, 4c may not start and the person is told once. The 4d runner path is built only once a `report.json` carries a threshold (4d needs about 200 test rows above it); before that only 4b, 4c and the report ship.
+- **ADR-0005** supersedes ADR-0004's `decisions.advisor`: the advisor is still an optional external command, fail-open and off the read path, but above data-derived thresholds recorded by the person's install step it answers as actor `advisor`; it trains on outcome-corrected answers of any actor and never on its own unlabelled answers. `decisions.who-answers` stays (the orchestrator may answer any decision).
 
 ## Measure (after release)
 
 - `person-via-orchestrator` rows with `recorded_via = cli`: `relais report` counts them, and any above 0 is said once.
 - Open decisions older than 24 h: target 0 a week after release; > 5 means the outcome text or tool does not work.
 - Share of answers since release with a typed actor: target 100%.
-- Person answers per week (`person`, quote-backed `person-via-orchestrator`), against the 4c gate projection.
+- Labelled rows per week by `label_source` (outcome, rewritten, answer), and yes/no counts, against the 4c floor projection.
+- After 4d ships: advisor answers per week, their outcome precision, and agreement on the shadow sample.
 - Tool refusals that are not relais policy refusals: any in week 1 → revisit the guard.
-- After 4b ships: advice coverage, timeouts, failures, and agreement with person answers in `relais report`.
+- After 4b ships: advice coverage, timeouts, failures, and agreement with orchestrator answers and with outcome labels in `relais report`.
 
 ## Verification
 
@@ -165,6 +192,8 @@ The person decided (2026-10-11): **the orchestrator approves**, and **Laya advis
 - `relais decide <run> --answer approve --criterion X --actor orchestrator` on a scratch ledger exits 2 (InvalidInput), the receipt unchanged; `--actor claude` exits 2 naming `orchestrator`; `--actor person` with stdin not a TTY exits 2; `--actor person-via-orchestrator` without `--person-quote` exits 2; a CLI `--actor person-via-orchestrator --person-quote x --criterion X` (no plugin nonce) exits 2 with the receipt unchanged, and a CLI-recorded `person-via-orchestrator` row is absent from `export-decisions`; a plugin call with the session's nonce writes `recorded_via = plugin`, and one with a stale or wrong nonce writes `cli`; after the migration, `recorded_via` has 0 nulls and `sqlite3` on the ledger finds no plaintext nonce; `decide --json` refusals print `{error, exit}` with the matching exit code.
 - Live, after release: a small relais run that ends `needs_decision` in a scratch repo; the session receives the new outcome text, calls `mcp__relais__decide --answer revise`; `relais status` shows it cancelled, the row's `actor = orchestrator`; a second one answered "for the person" after a real person prompt, with a quote, shows `person-via-orchestrator` and the quote in the note; the same without a prompt is refused by the tool; `approve` on a run with an open gap is refused with relais's text.
 - 4b PR, with stub advisors in a scratch `RELAIS_CONFIG_DIR`: `echo '{"p_approve":0.5,…}'` → the advice appears in the outcome message, on the row and in `decide --json`; the sleep-15 s, closed-stdin, 10 MB-flood and stderr stubs each end in ≤ ~10 s, the run exits 0, `pgrep` finds no advisor process; with the 15 s stub, `native status --run` p95 < 1 s over 30 calls and freshen still rewrites.
+- 4c: `export-decisions` on a `VACUUM INTO` copy → counts by `label_source` and reviewed state match a hand `sqlite3` count; test and calibration rows are 100% `outcome`; a `RaisedElsewhere` salvage is absent.
+- 4d: a `report.json` fixture with 250 test rows at precision 0.96 → `approve_at` set; 30/30 → none, with "needs n ≈ …"; 20 advisor answers with 4 reverted (upper bound 0.919) → an `advisor_suspended` row, and the next 0.99 stays open; 20/20 and 18/20 (upper bound 0.972) → no suspension.
 - Ledger work only against a scratch `RELAIS_STATE_DIR` until release (memory: a branch binary migrates the real ledger).
 
 ## Verification record (2026-10-11, before push)
@@ -180,7 +209,7 @@ The person decided (2026-10-11): **the orchestrator approves**, and **Laya advis
 
 ## Not in scope
 
-- Laya gating any answer (the person chose advisory only).
+- Laya answering below its data-derived thresholds, or a human-sign-off criterion, an interrupted run or a changed-verification question at any score.
 - Laya's other jobs (classifier, model choice): learning-loop Phases 6–8.
 - Changing which runs reach `needs_decision`.
 - `relais feedback --actor` (`main.rs:293`) stays a free string.
@@ -188,9 +217,9 @@ The person decided (2026-10-11): **the orchestrator approves**, and **Laya advis
 ## Decision log
 
 - **D1** The orchestrator may answer every decision, `approve` included; relais's own gap refusal still applies (person, 2026-10-11).
-- **D2** Laya advises only; it never gates (person, 2026-10-11).
+- **D2** (superseded by D21) Laya advises only; it never gates (person, 2026-10-11).
 - **D3** Laya inference on this Mac if the 4a gate passes, else a homelab service (person, 2026-10-11).
-- **D4** The advisor trains only on `person` and quote-backed `person-via-orchestrator` answers.
+- **D4** (superseded by D20) The advisor trains only on `person` and quote-backed `person-via-orchestrator` answers.
 - **D5** The orchestrator never signs off a human-sign-off criterion; relais refuses `--criterion` for actor `orchestrator`, and for `person-via-orchestrator` unless `recorded_via = plugin`.
 - **D6** Advice is computed once at raise time and stored on the decision row; no read path calls the advisor.
 - **D7** 4b ships with 4c in a later relais PR, not in PR 1; PR 1 only adds the advice columns in its one schema step.
@@ -204,7 +233,9 @@ The person decided (2026-10-11): **the orchestrator approves**, and **Laya advis
 - **D15** The nonce's OS random source lives in `procs.rs` (`os_random`), the one module allowed to name a platform API (`scripts/check-module-cycles.py`): `/dev/urandom` on unix, `BCryptGenRandom` on Windows through the already-present `windows-sys` with one more feature, no new crate.
 - **D16** (2026-10-12) The advisor (Phase 4) uses Laya's calibrated per-question probability, never its `act_probability` head, which the model card says "carries no usable signal yet"; a temperature is fitted per question type on the calibration split before any advice is shown, because the shipped checkpoints are over-confident (mean ECE 0.47 before refit, 0.08 after).
 - **D17** (2026-10-12) Nothing is salvaged from `microsoft/best-route-llm` for the advisor either; see `2026-10-10-learning-loop.md` D16.
-- **D18** (2026-10-12) Phase 3 classed work that landed in a later, rewriting commit as `salvaged` (containment `rewritten`), not `revise` or `abandon`: that is relais's own meaning of salvaged (`DecideAnswer::Salvaged`, `crates/relais/src/main.rs`: "A person finished and merged specific work … for a reason unrelated to the work itself"), and containment keeps it out of the labels. The plan's first wording allowed salvaged only for an intact patch, which no row met; the rule above is amended to what was done.
+- **D18** (2026-10-12) Phase 3 classed work that landed in a later, rewriting commit as `salvaged` (containment `rewritten`), not `revise` or `abandon`: that is relais's own meaning of salvaged (`DecideAnswer::Salvaged`, `crates/relais/src/main.rs`: "A person finished and merged specific work … for a reason unrelated to the work itself"), and containment kept it out of the labels until D20; under D20 a reviewed rewritten salvage is a down-weighted no, never a test label. The plan's first wording allowed salvaged only for an intact patch, which no row met; the rule above is amended to what was done.
+- **D20** (2026-10-12, supersedes D4) Laya's labels are the answers of any actor corrected by outcomes: an outcome (containment, a later revert or regression, a standing change) labels a row whatever its answer; the answer labels it only when no outcome is known; the advisor's own unlabelled answers never do (person: "I wont ever write my own answers. I expect laya to answer based on data collected from opus answers"; option chosen: "Opus, corrected by outcomes").
+- **D21** (2026-10-12, supersedes D2) Laya answers on its own above data-derived thresholds (approve, or revise with the candidate kept), as actor `advisor`, with a 10% shadow sample left to the orchestrator; in between, it advises (person, option chosen: "Decides when confident").
 - **D19** (2026-10-12) Phase 3's "no run waiting from before 2026-10-11" is judged on open decisions, not on `relais status`'s projected state: 17 runs from 2026-09-22/23 have closed decisions but a stale projected state, an artefact of answers recorded before the terminal transition was written with the answer. Re-projecting them is not this plan's work.
 
 ## Implementation review
@@ -217,4 +248,4 @@ The person decided (2026-10-11): **the orchestrator approves**, and **Laya advis
 - CI on PR #202 failed on windows-latest only: the nonce read `/dev/urandom`. Fixed (`d2e69fd`): `procs::os_random` uses `BCryptGenRandom` on Windows; the terminal sign-off scenario is unix-only (it needs `script(1)`). Fresh round 1 on tree `db1d39d8`: **approve** (30k tokens, 28 s), one low finding (a stale count in a Cargo.toml comment) fixed in `63ea9f7`; Delta on `0227ea10`: **approve** (30k tokens, 6 s).
 - Next: merge, release, reinstall the plugin, then Phase 3 (the live check and the sweep of the open rows). Phase 3 done 2026-10-12; Phase 4a measured 2026-10-12 (→ 4b′); next: 4b/4c, data-gated.
 
-<!-- panel: repos=relais,homelab reviewers=architect,backend,lang:go,lang:python,lang:rust,lang:typescript,platform,po,tui,unix body-sha=fdb0e4b341aa -->
+<!-- panel: repos=relais,homelab reviewers=architect,backend,lang:go,lang:python,lang:rust,lang:typescript,platform,po,tui,unix body-sha=49a76b08436a -->
