@@ -1454,12 +1454,13 @@ impl<'a> RunEngine<'a> {
                 .map_err(std::io::Error::other)
         };
         match finalize(lease, target, &mut export) {
-            Ok(Outcome::Applied) => self.transition(
+            Ok(Outcome::Applied { real_index_changed }) => self.transition(
                 self.state,
                 Reason::WorktreeRetired,
                 serde_json::json!({
                     "worktree": worktree.path.to_string_lossy(),
                     "in_place": true,
+                    "real_index_changed": real_index_changed,
                     "left": match kind {
                         TargetKind::Accepted => "the accepted change",
                         TargetKind::Start => "the tree as it was found",
@@ -10452,6 +10453,96 @@ mod tests {
         assert!(
             detail.contains("relais resume --retire run-dead"),
             "{detail}"
+        );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    fn decisions_of(fixture: &Fixture, run_id: &RunId) -> Vec<String> {
+        std::fs::read_to_string(fixture.artifacts.join(run_id.as_str()).join("events.jsonl"))
+            .expect("events.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json"))
+            .filter(|line| line["event"]["kind"] == "decision")
+            .filter_map(|line| line["event"]["what"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// An isolated run (server, CI, replay) is today's run: it announces
+    /// nothing about workspaces, makes its fork under the state directory
+    /// and seeds nothing, however many ignored dependencies the caller has.
+    #[test]
+    fn an_isolated_run_says_nothing_about_workspaces_and_seeds_nothing() {
+        use crate::workspace::reuse::Workspace;
+        let fixture = fixture_with_installed_deps();
+        let repo =
+            fixture.repo_policy_with_setup(Vec::new(), vec![versionable_main_gone_check()], 3);
+        let machine = fixture.machine_for(&repo);
+        let outcome = fixture.execute_in(
+            Workspace::Isolated,
+            &fixture.contract(Review::Off),
+            &repo,
+            &machine,
+            &conditional_worker("relais task"),
+        );
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Accepted(_),
+        } = outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        let said: Vec<String> = decisions_of(&fixture, &run_id)
+            .into_iter()
+            .filter(|what| what.starts_with("workspace_"))
+            .collect();
+        assert!(said.is_empty(), "{said:?}");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A worker that stages a file with git's own index (it bypasses
+    /// relais's private one) leaves the person's index changed: the run is
+    /// still judged on its tree, and the original index is kept for them.
+    #[test]
+    fn a_worker_that_stages_into_the_real_index_leaves_the_original_for_the_person() {
+        use crate::workspace::reuse::Workspace;
+        let fixture = fixture_in_a_linked_worktree();
+        let (repo, machine) = in_place_policy(&fixture);
+        let backend = MockBackend::new(move |spec| {
+            if spec.prompt.contains("semantic reviewer") {
+                return MockOutcome {
+                    result_text: Some("FINDINGS: none".into()),
+                    exit_code: Some(0),
+                    ..Default::default()
+                };
+            }
+            git(&spec.work_dir, &["add", "notes.txt"]);
+            std::fs::remove_file(spec.work_dir.join("src/main.rs")).expect("worker completes");
+            MockOutcome {
+                result_text: Some("DONE".into()),
+                exit_code: Some(0),
+                usage: Some(usage(100)),
+                ..Default::default()
+            }
+        });
+        let outcome = fixture.execute_in(
+            Workspace::InPlace,
+            &fixture.contract(Review::Off),
+            &repo,
+            &machine,
+            &backend,
+        );
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Accepted(_),
+        } = outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        let gd = crate::workspace::inplace::git_dir(&fixture.repo).expect("git dir");
+        assert!(
+            gd.join(format!("relais-inplace/{}.index.orig", run_id.as_str()))
+                .is_file(),
+            "the original index is kept when the real one changed"
         );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }

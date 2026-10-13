@@ -7529,12 +7529,18 @@ fn retire_in_place(
             .map_err(std::io::Error::other)
     };
     Ok(Some(match inplace::finalize(lease, target, &mut export) {
-        Ok(Outcome::Applied) => {
+        Ok(Outcome::Applied { real_index_changed }) => {
             println!(
                 "{run}: restored to {} in {} (directory kept)",
                 inplace::short(&marker.start),
                 root.display()
             );
+            if real_index_changed {
+                println!(
+                    "{run}: your git index changed during the run; the original is kept at {}/relais-inplace/{run}.index.orig",
+                    git_dir.display()
+                );
+            }
             CliOutcome::Accepted
         }
         Ok(Outcome::HeadMoved { was, now }) => {

@@ -18,6 +18,9 @@ pub struct CloneStats {
     pub files: u64,
     pub dirs: u64,
     pub symlinks: u64,
+    /// Absolute links into the source workspace, moved to the same place in
+    /// the destination (package managers link workspace packages this way).
+    pub relocated: u64,
 }
 
 #[derive(Debug)]
@@ -94,9 +97,19 @@ pub fn symlink_is_contained(link_dir: &Path, target: &Path) -> bool {
 }
 
 /// Walk `dir` (a path under `repo_root`), counting what is there and
-/// refusing any symlink that is not contained.
+/// refusing any symlink that is not contained: a relative link must stay
+/// inside the repository, an absolute one must point into `repo_root`
+/// itself (it is then relocated to the destination's own copy). A link to
+/// anywhere else would keep pointing outside the tree it was cloned into.
 pub fn survey(repo_root: &Path, dir: &Path) -> Result<CloneStats, CloneError> {
+    survey_links(repo_root, dir).map(|(stats, _)| stats)
+}
+
+/// [`survey`], also returning the absolute links (paths relative to `dir`)
+/// that the clone must relocate, so the clone does not walk the tree again.
+fn survey_links(repo_root: &Path, dir: &Path) -> Result<(CloneStats, Vec<PathBuf>), CloneError> {
     let mut stats = CloneStats::default();
+    let mut absolute = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
     while let Some(current) = pending.pop() {
         stats.dirs += 1;
@@ -107,8 +120,16 @@ pub fn survey(repo_root: &Path, dir: &Path) -> Result<CloneStats, CloneError> {
             if kind.is_symlink() {
                 let target = fs::read_link(&path)?;
                 let link_dir = current.strip_prefix(repo_root).unwrap_or(&current);
-                if !symlink_is_contained(link_dir, &target) {
+                let inside = if target.is_absolute() {
+                    target.starts_with(repo_root)
+                } else {
+                    symlink_is_contained(link_dir, &target)
+                };
+                if !inside {
                     return Err(CloneError::UnsafeSymlink { link: path, target });
+                }
+                if target.is_absolute() {
+                    absolute.push(path.strip_prefix(dir).unwrap_or(&path).to_path_buf());
                 }
                 stats.symlinks += 1;
             } else if kind.is_dir() {
@@ -118,7 +139,7 @@ pub fn survey(repo_root: &Path, dir: &Path) -> Result<CloneStats, CloneError> {
             }
         }
     }
-    Ok(stats)
+    Ok((stats, absolute))
 }
 
 /// Can the filesystem clone from the volume of `source_file` to the volume
@@ -131,10 +152,17 @@ pub fn probe(source_file: &Path, dest_dir: &Path) -> Result<(), CloneError> {
     result.map_err(|e| classify(e, source_file, dest_dir))
 }
 
-/// Clone the directory `src` (under `repo_root`) to `dst`, which must not
-/// exist. Symlinks are surveyed first; on any failure `dst` is removed.
-pub fn clone_tree(repo_root: &Path, src: &Path, dst: &Path) -> Result<CloneStats, CloneError> {
-    let stats = survey(repo_root, src)?;
+/// Clone the directory `src` (under `repo_root`) to `dst` (under
+/// `dest_root`), which must not exist. Symlinks are surveyed first, and an
+/// absolute link into `repo_root` is moved to the same place under
+/// `dest_root`; on any failure `dst` is removed.
+pub fn clone_tree(
+    repo_root: &Path,
+    dest_root: &Path,
+    src: &Path,
+    dst: &Path,
+) -> Result<CloneStats, CloneError> {
+    let (mut stats, absolute) = survey_links(repo_root, src)?;
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -142,7 +170,39 @@ pub fn clone_tree(repo_root: &Path, src: &Path, dst: &Path) -> Result<CloneStats
         let _ = fs::remove_dir_all(dst);
         return Err(classify(e, src, dst));
     }
+    match relocate_links(repo_root, dest_root, dst, &absolute) {
+        Ok(moved) => stats.relocated = moved,
+        Err(e) => {
+            let _ = fs::remove_dir_all(dst);
+            return Err(CloneError::Io(e));
+        }
+    }
     Ok(stats)
+}
+
+/// Point each of `links` (paths under `dir`, found by the survey) at the
+/// same place under `to_root` instead of `from_root`. Only the link inodes
+/// are rewritten.
+fn relocate_links(
+    from_root: &Path,
+    to_root: &Path,
+    dir: &Path,
+    links: &[PathBuf],
+) -> io::Result<u64> {
+    let mut moved = 0;
+    for link in links {
+        let path = dir.join(link);
+        let target = fs::read_link(&path)?;
+        if let Ok(rest) = target.strip_prefix(from_root) {
+            fs::remove_file(&path)?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(to_root.join(rest), &path)?;
+            #[cfg(not(unix))]
+            return Err(io::Error::from(io::ErrorKind::Unsupported));
+            moved += 1;
+        }
+    }
+    Ok(moved)
 }
 
 fn classify(e: io::Error, from: &Path, to: &Path) -> CloneError {
@@ -229,6 +289,41 @@ mod tests {
         ));
     }
 
+    /// happier's `node_modules/react-native` is an ABSOLUTE link to
+    /// `apps/ui/node_modules/react-native` in the same checkout. Refusing it
+    /// would skip seeding on the repository this exists for; keeping it
+    /// would leave the clone pointing back at the source. It is moved to
+    /// the destination's own path, and a link to anywhere else is refused.
+    #[cfg(unix)]
+    #[test]
+    fn an_absolute_link_into_the_workspace_is_relocated_into_the_destination() {
+        let source = temp_dir("fsclone-reloc-src");
+        let dest = temp_dir("fsclone-reloc-dst");
+        let deps = source.join("node_modules");
+        fs::create_dir_all(&deps).expect("mkdir");
+        fs::create_dir_all(source.join("apps/ui/node_modules/rn")).expect("mkdir");
+        std::os::unix::fs::symlink(source.join("apps/ui/node_modules/rn"), deps.join("rn"))
+            .expect("link");
+        let out = dest.join("node_modules");
+        match clone_tree(&source, &dest, &deps, &out) {
+            Ok(stats) => {
+                assert_eq!(stats.relocated, 1);
+                assert_eq!(
+                    fs::read_link(out.join("rn")).expect("still a link"),
+                    dest.join("apps/ui/node_modules/rn"),
+                    "the clone points at the destination's own copy, not back at the source"
+                );
+            }
+            Err(CloneError::Unavailable { .. }) => {}
+            Err(other) => panic!("{other}"),
+        }
+        std::os::unix::fs::symlink("/usr/bin", deps.join("elsewhere")).expect("link");
+        assert!(matches!(
+            clone_tree(&source, &dest, &deps, &dest.join("again")),
+            Err(CloneError::UnsafeSymlink { .. })
+        ));
+    }
+
     /// On a filesystem that clones (APFS, btrfs, XFS reflink) the tree
     /// appears with its content; on one that does not, the answer is
     /// `Unavailable` and NOTHING was copied. Either is a correct outcome;
@@ -240,7 +335,7 @@ mod tests {
         fs::create_dir_all(deps.join("pkg")).expect("mkdir");
         fs::write(deps.join("pkg/index.js"), "module.exports = 1;").expect("file");
         let dst = root.join("seeded/node_modules");
-        match clone_tree(&root, &deps, &dst) {
+        match clone_tree(&root, &root, &deps, &dst) {
             Ok(stats) => {
                 assert_eq!(stats.files, 1);
                 assert_eq!(
@@ -253,6 +348,49 @@ mod tests {
             }
             Err(other) => panic!("unexpected: {other}"),
         }
+    }
+
+    /// Free kilobytes on the volume holding `dir`, as `df -k` reports it.
+    fn free_kb(dir: &Path) -> u64 {
+        let out = std::process::Command::new("df")
+            .args(["-k"])
+            .arg(dir)
+            .output()
+            .expect("df");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .nth(1)
+            .and_then(|line| line.split_whitespace().nth(3))
+            .and_then(|kb| kb.parse().ok())
+            .expect("df -k prints the available kilobytes")
+    }
+
+    /// The point of the module: cloning a large tree adds almost no disk.
+    /// Free space is volume-wide, so a parallel build makes the figure
+    /// noisy; run it alone on a copy-on-write volume (APFS, btrfs, XFS
+    /// reflink): `cargo test -- --ignored a_large_clone_adds`.
+    #[test]
+    #[ignore = "measures volume-wide free space; run alone on a copy-on-write volume"]
+    fn a_large_clone_adds_almost_no_disk() {
+        let root = temp_dir("fsclone-size");
+        let deps = root.join("node_modules");
+        fs::create_dir_all(&deps).expect("mkdir");
+        let block = vec![7u8; 4 * 1024 * 1024];
+        for n in 0..32 {
+            fs::write(deps.join(format!("f{n}.bin")), &block).expect("file"); // 128 MiB
+        }
+        let before = free_kb(&root);
+        let dst = root.join("seed/node_modules");
+        match clone_tree(&root, &root, &deps, &dst) {
+            Ok(stats) => assert_eq!(stats.files, 32),
+            Err(CloneError::Unavailable { .. }) => return,
+            Err(other) => panic!("{other}"),
+        }
+        let added_kb = before.saturating_sub(free_kb(&root));
+        assert!(
+            added_kb < 8 * 1024 + 128 * 1024 / 50,
+            "a 128 MiB clone added {added_kb} KiB; the bound is 8 MiB plus 2 percent"
+        );
     }
 
     #[test]

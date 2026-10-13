@@ -267,7 +267,7 @@ pub fn seed(source: &Path, dest: &Path, deps: &[PathBuf]) -> SeedReport {
                 .push((relative.clone(), "already present".into()));
             continue;
         }
-        match fsclone::clone_tree(source, &source.join(relative), &target) {
+        match fsclone::clone_tree(source, dest, &source.join(relative), &target) {
             Ok(stats) => report.seeded.push((relative.clone(), stats)),
             Err(e @ CloneError::UnsafeSymlink { .. }) => {
                 report.skipped.push((relative.clone(), e.to_string()));
@@ -291,20 +291,28 @@ fn first_regular_file(dir: &Path) -> Option<PathBuf> {
 
 // ---------------------------------------------------------- quiescence
 
-/// The newest mtime and the entry count over a whole directory walk.
+/// How deep the quietness check looks. A whole `node_modules` (333,000
+/// entries on happier) took 37 s to walk on a loaded machine, more than the
+/// politeness is worth; an install adds and removes packages at the top two
+/// levels, which is a few thousand entries. The check has no authority over
+/// whether a step runs, so a shallow look is the right size for it.
+const QUIET_DEPTH: usize = 2;
+
+/// The newest mtime and the entry count over the first [`QUIET_DEPTH`]
+/// levels of a directory.
 fn tree_state(dir: &Path) -> io::Result<(std::time::SystemTime, u64)> {
     let mut newest = std::time::UNIX_EPOCH;
     let mut count = 0u64;
-    let mut pending = vec![dir.to_path_buf()];
-    while let Some(current) = pending.pop() {
+    let mut pending = vec![(dir.to_path_buf(), 1usize)];
+    while let Some((current, depth)) = pending.pop() {
         for entry in std::fs::read_dir(&current)? {
             let entry = entry?;
             count += 1;
             if let Ok(modified) = entry.metadata()?.modified() {
                 newest = newest.max(modified);
             }
-            if entry.file_type()?.is_dir() {
-                pending.push(entry.path());
+            if depth < QUIET_DEPTH && entry.file_type()?.is_dir() {
+                pending.push((entry.path(), depth + 1));
             }
         }
     }
@@ -894,6 +902,28 @@ mod tests {
             decide(&failing, &key),
             SkipDecision::Run(RunReason::VerifyFailed(_))
         ));
+    }
+
+    /// What seeding costs on a real tree: one survey (symlink check and
+    /// count), one fingerprint walk, one more after. Read-only:
+    /// `RELAIS_PROBE_DIR=<repo>/node_modules cargo test -- --ignored a_real_tree_costs`.
+    #[test]
+    #[ignore = "reads RELAIS_PROBE_DIR and prints timings; not a pass/fail check"]
+    fn a_real_tree_costs() {
+        let Ok(dir) = std::env::var("RELAIS_PROBE_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let root = dir
+            .parent()
+            .expect("a directory below a repository root")
+            .to_path_buf();
+        let started = std::time::Instant::now();
+        let stats = crate::fsclone::survey(&root, &dir).expect("survey");
+        println!("survey: {:?} in {:?}", stats, started.elapsed());
+        let started = std::time::Instant::now();
+        let fingerprint = tree_fingerprint(&dir).expect("fingerprint");
+        println!("fingerprint {fingerprint} in {:?}", started.elapsed());
     }
 
     #[test]

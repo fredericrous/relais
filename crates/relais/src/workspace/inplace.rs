@@ -600,8 +600,11 @@ pub fn apply_tree(root: &Path, index: &Path, target_tree: &str) -> Result<(), Ap
 /// What the end of an in-place run decided to do with the tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// The tree now equals the target.
-    Applied,
+    /// The tree now equals the target. `real_index_changed` is true when
+    /// the person's own index listing differs from the start's, which only
+    /// something outside relais's private index can have done; the copy of
+    /// the original is kept beside the markers.
+    Applied { real_index_changed: bool },
     /// `HEAD` moved during the run (a worker commit); tree and branch were
     /// left exactly as they are.
     HeadMoved { was: String, now: String },
@@ -641,7 +644,9 @@ pub fn finalize(
     apply_tree(lease.root(), &lease.relais_index(), &target.tree)?;
     let changed = real_index_changed(lease.root(), &marker.index_listing)?;
     lease.finish(changed)?;
-    Ok(Outcome::Applied)
+    Ok(Outcome::Applied {
+        real_index_changed: changed,
+    })
 }
 
 /// Did the person's real index change since the run started?
@@ -905,7 +910,12 @@ mod tests {
             },
         )
         .expect("finalize");
-        assert_eq!(outcome, Outcome::Applied);
+        assert_eq!(
+            outcome,
+            Outcome::Applied {
+                real_index_changed: false
+            }
+        );
         assert_eq!(exports, 1);
         assert_eq!(std::fs::read_to_string(wt.join("a.txt")).expect("a"), "a\n");
         assert!(
@@ -946,7 +956,12 @@ mod tests {
             &mut || panic!("an export already on the marker is not repeated"),
         )
         .expect("finish");
-        assert_eq!(outcome, Outcome::Applied);
+        assert_eq!(
+            outcome,
+            Outcome::Applied {
+                real_index_changed: false
+            }
+        );
         assert_eq!(
             std::fs::read_to_string(wt.join("a.txt")).expect("a"),
             "accepted change\n"
