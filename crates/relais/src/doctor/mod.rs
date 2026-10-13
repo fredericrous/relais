@@ -624,10 +624,10 @@ pub fn effort_finding(
     }
 }
 
-/// Whether THIS repository's declaration is granted, and what the grants
-/// on this machine are for when it is not.
+/// Whether THIS repository is trusted, and by which grant (ADR-0007).
 ///
-/// A grant is bound to the pair (declaration, repository), so a key that
+/// A repository grant covers every policy of the repository. A legacy
+/// grant is bound to the pair (declaration, repository), so a key that
 /// does not match is not a broken grant — it is a grant for something
 /// else, and saying which is the difference between "add a grant" and
 /// "you already reviewed this, somewhere else" (P2).
@@ -646,32 +646,49 @@ pub(crate) fn trust_finding(
     };
     let identity = crate::repo::identity(root);
     let key = crate::policy::grant_key(&policy.authority_hash(), &identity);
-    match settings.trust.get(&key) {
-        Some(grant) => Finding {
-            component: "trust",
-            level: Level::Ok,
-            detail: format!(
-                "granted for {identity} by {} on {}",
-                grant.reviewed_by, grant.granted_at
-            ),
-        },
-        None => {
+    match crate::policy::trust_status(settings, &identity, &key) {
+        crate::policy::TrustStatus::Repository => {
+            let grant = &settings.trust_repos[&crate::policy::repo_key(&identity)];
+            Finding {
+                component: "trust",
+                level: Level::Ok,
+                detail: format!(
+                    "repository {identity} trusted by {} on {}",
+                    grant.reviewed_by, grant.granted_at
+                ),
+            }
+        }
+        crate::policy::TrustStatus::LegacyExact => {
+            let grant = &settings.trust[&key];
+            Finding {
+                component: "trust",
+                level: Level::Ok,
+                detail: format!(
+                    "granted for {identity} by {} on {} by a legacy grant for this exact \
+                     declaration; `relais trust grant --reviewed-by <name>` trusts the \
+                     repository once instead",
+                    grant.reviewed_by, grant.granted_at
+                ),
+            }
+        }
+        crate::policy::TrustStatus::Missing => {
             let others: Vec<String> = settings
                 .trust
                 .values()
+                .chain(settings.trust_repos.values())
                 .filter_map(|grant| grant.repo.clone())
                 .collect();
             Finding {
                 component: "trust",
                 level: Level::Warn,
                 detail: format!(
-                    "no grant for this declaration in {identity} (key {key}); `relais plan` \
-                     prints the block to review and paste. {}",
+                    "{identity} is not trusted; review it with `relais trust show`, then run \
+                     `relais trust grant --reviewed-by <name>` once. {}",
                     if others.is_empty() {
                         format!(
-                            "{} grant(s) on this machine are for other declarations or \
-                             repositories",
-                            settings.trust.len()
+                            "{} grant(s) on this machine are for other repositories or \
+                             declarations",
+                            settings.trust.len() + settings.trust_repos.len()
                         )
                     } else {
                         format!("the grants on this machine are for: {}", others.join(", "))
@@ -679,6 +696,66 @@ pub(crate) fn trust_finding(
                 ),
             }
         }
+    }
+}
+
+/// The days of runs the legacy-grant count looks back over.
+const LEGACY_GRANT_DAYS: i64 = 30;
+
+/// How many runs of the last [`LEGACY_GRANT_DAYS`] days a legacy `[trust]`
+/// grant admitted: the evidence for retiring them (a later major, once
+/// this says none).
+pub(crate) fn legacy_grants_finding(ledger: Option<&Ledger>) -> Finding {
+    let Some(ledger) = ledger else {
+        return Finding {
+            component: "legacy grants",
+            level: Level::Ok,
+            detail: "no ledger yet, so no run was admitted by a legacy grant".into(),
+        };
+    };
+    let since = (chrono::Utc::now() - chrono::Duration::days(LEGACY_GRANT_DAYS))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    match ledger.legacy_grant_runs_since(&since) {
+        Ok(count) => Finding {
+            component: "legacy grants",
+            level: Level::Ok,
+            detail: format!(
+                "{count} run(s) in the last {LEGACY_GRANT_DAYS} days were admitted by a legacy \
+                 [trust] grant"
+            ),
+        },
+        Err(e) => Finding {
+            component: "legacy grants",
+            level: Level::Warn,
+            detail: format!("the count of runs admitted by a legacy grant could not be read: {e}"),
+        },
+    }
+}
+
+/// A change to the repository's commands that no `relais run` has said
+/// yet, read without consuming it. Nothing when there is none.
+pub(crate) fn pending_commands_finding(
+    policy: &RepoPolicy,
+    root: &std::path::Path,
+    ledger: Option<&Ledger>,
+) -> Option<Finding> {
+    let key = crate::policy::repo_key(&crate::repo::identity(root));
+    let seen = match ledger {
+        Some(ledger) => crate::trust::observe(&crate::trust::Reader(ledger), &key, policy),
+        None => crate::trust::observe(&crate::trust::NoHistory, &key, policy),
+    };
+    match seen {
+        Ok(Some(change)) => Some(Finding {
+            component: "commands",
+            level: Level::Warn,
+            detail: format!("{} (the next `relais run` says it once)", change.text()),
+        }),
+        Ok(None) => None,
+        Err(e) => Some(Finding {
+            component: "commands",
+            level: Level::Warn,
+            detail: format!("the commands this repository last ran under could not be read: {e}"),
+        }),
     }
 }
 
@@ -1075,7 +1152,11 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
                     findings.push(Finding {
                         component: "machine.toml",
                         level: Level::Ok,
-                        detail: format!("valid; {} trust grant(s)", settings.trust.len()),
+                        detail: format!(
+                            "valid; {} repository grant(s), {} legacy trust grant(s)",
+                            settings.trust_repos.len(),
+                            settings.trust.len()
+                        ),
                     });
                     effort_settings = settings.efforts.clone();
                     max_effort = settings.routing.max_effort.clone();
@@ -1086,6 +1167,14 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
                         None => PricingConfig::Unconfigured,
                     };
                     findings.push(trust_finding(policy.as_ref(), &settings, repo_dir));
+                    let ledger = paths::ledger_path()
+                        .ok()
+                        .filter(|path| path.exists())
+                        .and_then(|path| Ledger::open(&path).ok());
+                    findings.push(legacy_grants_finding(ledger.as_ref()));
+                    findings.extend(policy.as_ref().and_then(|policy| {
+                        pending_commands_finding(policy, repo_dir, ledger.as_ref())
+                    }));
                     findings.push(trials_finding(&settings, policy.as_ref(), repo_dir));
                     findings.push(hook_timeout_finding(
                         merged_roots(repo_dir, home.as_deref()),

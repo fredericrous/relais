@@ -214,6 +214,11 @@ pub struct RunConfig<'a> {
     pub wire: Wire,
     /// Where the worker's program design comes from.
     pub design: DesignSource<'a>,
+    /// Where the commands this repository last ran under are kept, and
+    /// whether this run updates them: `relais run` passes a recording
+    /// store, replay one that records nothing, so only `run` consumes a
+    /// pending command change (ADR-0007).
+    pub declarations: &'a dyn crate::trust::DeclarationStore,
 }
 
 /// Where a run's program design comes from: the path its contract names,
@@ -1284,6 +1289,29 @@ impl<'a> RunEngine<'a> {
         });
     }
 
+    /// Say, once, that the commands this repository runs changed since the
+    /// last run that saw them (ADR-0007): a line on stderr and a
+    /// `commands_changed` decision on the run. Whether it is said once
+    /// is the store's: a recording one (`relais run`) stores what it saw,
+    /// so the next run is silent; one that records nothing (replay) shows
+    /// the same change again. A store that fails is said and the run goes
+    /// on, since a warning that cannot be kept must not stop work.
+    fn say_command_changes(&self, repo_key: &str) {
+        match crate::trust::observe(self.config.declarations, repo_key, self.config.repo_policy) {
+            Ok(Some(change)) => {
+                eprintln!("{}", change.text());
+                self.events.emit(Event::Decision {
+                    what: "commands_changed".into(),
+                    reason: change.summary(),
+                });
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("relais: the commands this repository ran under were not kept: {e}")
+            }
+        }
+    }
+
     fn run(mut self) -> RunOutcome {
         let outcome = match self.run_to_outcome() {
             Finish::Own(outcome) => outcome,
@@ -1611,6 +1639,12 @@ impl<'a> RunEngine<'a> {
         if let Some(first) = authority.blockers.first() {
             let (code, detail) = (first.code, first.detail.clone());
             return Ok(Phase::Ended(self.fail_preflight(code, detail)?));
+        }
+        // Which grant admitted this run, kept on the run: `relais doctor`
+        // counts the runs a legacy grant still admits (ADR-0007).
+        ledger.set_run_trust_status(&self.run_id, authority.trust_status.as_str())?;
+        if self.parent.is_none() {
+            self.say_command_changes(&this_repo_key);
         }
         // Integrations (SPEC §5): a missing required one blocks execution;
         // optional gaps travel in the receipt and are never passes.
@@ -5312,6 +5346,7 @@ mod tests {
                 allowed_models: None,
                 spending: Default::default(),
                 trust,
+                trust_repos: Default::default(),
                 permissions: Default::default(),
                 concurrency: ConcurrencyLimits::default(),
                 trials: TrialEnvelope::default(),
@@ -5371,6 +5406,7 @@ mod tests {
                 run_id,
                 wire: Wire::process(),
                 design: DesignSource::Contract,
+                declarations: &crate::trust::NoHistory,
             })
             .expect("the fixture's id source mints identifiers")
         }
@@ -5409,6 +5445,7 @@ mod tests {
                 run_id: None,
                 wire: Wire::process(),
                 design: DesignSource::Contract,
+                declarations: &crate::trust::NoHistory,
             })
             .expect("the fixture's id source mints identifiers")
         }
@@ -5470,6 +5507,7 @@ mod tests {
                 run_id: None,
                 wire,
                 design: DesignSource::Contract,
+                declarations: &crate::trust::NoHistory,
             })
             .expect("the fixture's id source mints identifiers")
         }
@@ -5676,6 +5714,7 @@ mod tests {
             run_id: None,
             wire: Wire::process(),
             design: DesignSource::Contract,
+            declarations: &crate::trust::NoHistory,
         };
         let mut engine = RunEngine::new(&config, None).expect("engine");
         let run_id = engine.run_id.clone();
@@ -6856,6 +6895,7 @@ mod tests {
             run_id: None,
             wire: Wire::process(),
             design: DesignSource::Contract,
+            declarations: &crate::trust::NoHistory,
         })
         .expect("the fixture's id source mints identifiers");
         let RunOutcome {
@@ -10905,6 +10945,7 @@ mod tests {
             run_id: None,
             wire: Wire::process(),
             design: DesignSource::Contract,
+            declarations: &crate::trust::NoHistory,
         };
         let mut engine = RunEngine::new(&config, None).expect("engine");
         let clean = manifest_with(Vec::new());
@@ -10947,7 +10988,7 @@ mod tests {
             disallowed_tools: Vec::new(),
             authority_hash: "hash".into(),
             grant_key: "key".into(),
-            trust_granted: true,
+            trust_status: crate::policy::TrustStatus::Repository,
             blockers: Vec::new(),
         };
         let request = ReviewRequest {

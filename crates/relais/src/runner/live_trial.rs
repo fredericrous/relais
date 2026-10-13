@@ -111,9 +111,13 @@ fn admit_one(
             .map_err(|rejection| format!("inadmissible: {rejection}"))?;
     let authority_hash = candidate.policy().authority_hash();
     let key = grant_key(&authority_hash, identity);
-    if !machine.trust.contains_key(&key) {
+    // The repository's grant admits any candidate of it; a legacy grant
+    // admits only the policy it was issued for, so it refuses a candidate
+    // (ADR-0007).
+    if crate::policy::trust_status(machine, identity, &key) == crate::policy::TrustStatus::Missing {
         return Err(format!(
-            "no trust grant for its authority hash {authority_hash} (grant key {key})"
+            "no trust grant for its authority hash {authority_hash} (grant key {key}) and \
+             none for the repository"
         ));
     }
     Ok(candidate)

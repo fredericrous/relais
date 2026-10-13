@@ -596,12 +596,16 @@ enum TrustCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Record a grant for this repository's policy in machine.toml.
-    /// Never reads stdin; refused when --key is not the current policy's.
+    /// Trust this repository once, in machine.toml (`[trust_repos]`): every
+    /// policy of it is then admitted, a change to its commands warns. With
+    /// the deprecated --key, record a legacy grant for the current policy
+    /// alone. Never reads stdin; refused when --key is not the current
+    /// policy's.
     Grant {
-        /// The key `relais trust show` printed
+        /// Deprecated: the key `relais trust show` printed, for a legacy
+        /// grant of this exact policy. Omit it to trust the repository.
         #[arg(long)]
-        key: String,
+        key: Option<String>,
         /// Who reviewed the commands
         #[arg(long = "reviewed-by")]
         reviewed_by: String,
@@ -3064,13 +3068,14 @@ fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
             // Read-only: the ledger is consulted only if it already
             // exists, so `show` never creates the state directory.
             let previous = previous_grant_steps(&repo_key);
-            let shown = relais::trust::show(
+            let mut shown = relais::trust::show(
                 &policy,
                 &identity,
                 &machine,
                 machine_path,
                 previous.as_deref(),
             );
+            shown.pending_change = pending_command_change(&repo_key, &policy);
             if json {
                 print_document(&shown)?;
             } else {
@@ -3087,21 +3092,6 @@ fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
         } => {
             let shown =
                 relais::trust::show(&policy, &identity, &machine, machine_path.clone(), None);
-            if key != shown.grant_key {
-                if json {
-                    print_document(&serde_json::json!({
-                        "code": "stale_grant_key",
-                        "current_key": shown.grant_key,
-                    }))?;
-                }
-                eprintln!(
-                    "relais trust grant: refused (stale_grant_key): {key} is not this policy's key; \
-                     relais.toml changed since it was shown. The current key is {}; review it with \
-                     `relais trust show`",
-                    shown.grant_key
-                );
-                return Ok(CliOutcome::StaleGrantKey);
-            }
             if reviewed_by.trim().is_empty() {
                 eprintln!(
                     "relais trust grant: --reviewed-by is empty; name who reviewed the commands"
@@ -3114,7 +3104,41 @@ fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                 note,
                 repo: Some(identity.label().to_string()),
             };
-            let granted = match relais::trust::grant(&machine_path, &key, &record) {
+            let (granted, recorded_key, scope) = match key {
+                None => (
+                    relais::trust::grant_repository(&machine_path, &repo_key, &record),
+                    repo_key.clone(),
+                    "repository",
+                ),
+                Some(key) => {
+                    if key != shown.grant_key {
+                        if json {
+                            print_document(&serde_json::json!({
+                                "code": "stale_grant_key",
+                                "current_key": shown.grant_key,
+                            }))?;
+                        }
+                        eprintln!(
+                            "relais trust grant: refused (stale_grant_key): {key} is not this \
+                             policy's key; relais.toml changed since it was shown. The current \
+                             key is {}; review it with `relais trust show`",
+                            shown.grant_key
+                        );
+                        return Ok(CliOutcome::StaleGrantKey);
+                    }
+                    eprintln!(
+                        "relais trust grant: --key is deprecated: it grants this exact policy \
+                         only. `relais trust grant --reviewed-by <name>` trusts the repository \
+                         once"
+                    );
+                    (
+                        relais::trust::grant(&machine_path, &key, &record),
+                        key,
+                        "legacy",
+                    )
+                }
+            };
+            let granted = match granted {
                 Ok(granted) => granted,
                 Err(e) => {
                     eprintln!("relais trust grant: {e}");
@@ -3122,13 +3146,22 @@ fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                 }
             };
             // The grant is in machine.toml now; the ledger row is its audit
-            // trail and the base of the next question's change marks. A
-            // ledger that cannot take it is said, not turned into a failed
-            // grant: the grant stands either way.
+            // trail and the base of the next question's change marks, and a
+            // repository grant also starts the declaration the command
+            // warning compares against. A ledger that cannot take it is
+            // said, not turned into a failed grant: the grant stands
+            // either way.
             if granted == relais::trust::Granted::Written {
-                if let Err(e) =
-                    record_grant(&shown, &key, &repo_key, &identity, &reviewed_by, source)
-                {
+                if let Err(e) = record_grant(
+                    &shown,
+                    &recorded_key,
+                    &repo_key,
+                    &identity,
+                    &reviewed_by,
+                    source,
+                    scope,
+                    &policy,
+                ) {
                     eprintln!(
                         "relais trust grant: warning: the grant is in machine.toml, but the ledger \
                          did not record it ({e}); the next question will not mark what changed"
@@ -3139,14 +3172,18 @@ fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
             if json {
                 print_document(&serde_json::json!({
                     "code": if written { "granted" } else { "already_granted" },
-                    "grant_key": key,
+                    "scope": scope,
+                    "grant_key": recorded_key,
                     "machine_settings": machine_path,
                 }))?;
             } else if written {
-                println!("trust grant: {key} recorded in {}", machine_path.display());
+                println!(
+                    "trust grant: {scope} {recorded_key} recorded in {}",
+                    machine_path.display()
+                );
             } else {
                 println!(
-                    "trust grant: {key} was already in {}",
+                    "trust grant: {scope} {recorded_key} was already in {}",
                     machine_path.display()
                 );
             }
@@ -3190,6 +3227,7 @@ fn previous_grant_steps(repo_key: &str) -> Option<Vec<relais::trust::Step>> {
 
 /// The ledger row of a grant just written: who, from where, and the steps
 /// it authorized.
+#[allow(clippy::too_many_arguments)]
 fn record_grant(
     shown: &relais::trust::Shown,
     key: &str,
@@ -3197,6 +3235,8 @@ fn record_grant(
     identity: &RepoIdentity,
     reviewed_by: &str,
     source: GrantSource,
+    scope: &str,
+    policy: &RepoPolicy,
 ) -> Result<(), CliError> {
     let steps = operational(
         serde_json::to_string(&shown.declaration.steps),
@@ -3213,7 +3253,38 @@ fn record_grant(
             steps_json: &steps,
         }),
         "recording the grant in the ledger",
-    )
+    )?;
+    // A repository grant starts the declaration the command warning
+    // compares against, so the first change after it is the first said.
+    if scope == "repository" {
+        use relais::trust::DeclarationStore;
+        operational(
+            relais::trust::Recorder(&ledger)
+                .record(repo_key, &relais::trust::commands_of(policy))
+                .map_err(std::io::Error::other),
+            "recording the starting declaration in the ledger",
+        )?;
+    }
+    Ok(())
+}
+
+/// A change to the repository's commands that no `relais run` has said
+/// yet, read without consuming it (`plan`, `trust show`): from the ledger
+/// when there is one, nothing otherwise. Best effort — a ledger that
+/// cannot be read costs the report, never the command.
+fn pending_command_change(
+    repo_key: &str,
+    policy: &RepoPolicy,
+) -> Option<relais::trust::CommandsChanged> {
+    let ledger = paths::ledger_path()
+        .ok()
+        .filter(|path| path.exists())
+        .and_then(|path| Ledger::open(&path).ok());
+    let seen = match &ledger {
+        Some(ledger) => relais::trust::observe(&relais::trust::Reader(ledger), repo_key, policy),
+        None => relais::trust::observe(&relais::trust::NoHistory, repo_key, policy),
+    };
+    seen.ok().flatten()
 }
 
 /// `relais trust show` for a person: the key on a line of its own, then
@@ -3221,18 +3292,26 @@ fn record_grant(
 fn trust_show_text(shown: &relais::trust::Shown) -> String {
     use relais::trust::{display_argv, escape_display, Change};
     let mut out = String::new();
-    out.push_str(&format!("grant key: {}\n", shown.grant_key));
+    match &shown.repository_grant {
+        Some(grant) => out.push_str(&format!(
+            "repository: granted {} by {}\n",
+            escape_display(&grant.granted_at),
+            escape_display(&grant.reviewed_by)
+        )),
+        None => out.push_str("repository: not granted\n"),
+    }
+    out.push_str(&format!(
+        "identity: {}\n",
+        escape_display(&shown.repository)
+    ));
+    out.push_str(&format!("grant key (legacy): {}\n", shown.grant_key));
     out.push_str(&format!(
         "status: {}\n",
-        if shown.granted {
-            "granted"
-        } else {
-            "not granted"
+        match (&shown.repository_grant, shown.granted) {
+            (Some(_), _) => "granted (repository)",
+            (None, true) => "granted (legacy grant for this exact policy)",
+            (None, false) => "not granted",
         }
-    ));
-    out.push_str(&format!(
-        "repository: {}\n",
-        escape_display(&shown.repository)
     ));
     out.push_str(&format!(
         "machine.toml: {} ($RELAIS_CONFIG_DIR, else ~/.config/relais)\n",
@@ -3280,6 +3359,9 @@ fn trust_show_text(shown: &relais::trust::Shown) -> String {
             integrations.join(" · ")
         }
     ));
+    if let Some(change) = &shown.pending_change {
+        out.push_str(&format!("{}\n", change.text()));
+    }
     out
 }
 
@@ -4344,13 +4426,27 @@ fn plan_command(
             eprintln!("relais plan: warning: {}", finding.detail);
         }
     }
-    if authority.trust_granted {
-        println!("trust grant: {} (in machine.toml)", authority.grant_key);
-    } else {
-        println!(
-            "{}",
-            missing_grant_text(&authority.grant_key, &repo_identity)?
-        );
+    match authority.trust_status {
+        relais::policy::TrustStatus::Repository => {
+            println!(
+                "trust grant: repository {} (in machine.toml)",
+                relais::policy::repo_key(&repo_identity)
+            );
+        }
+        relais::policy::TrustStatus::LegacyExact => {
+            println!("trust grant: {} (in machine.toml)", authority.grant_key);
+        }
+        relais::policy::TrustStatus::Missing => {
+            println!(
+                "{}",
+                missing_grant_text(&authority.grant_key, &repo_identity)?
+            );
+        }
+    }
+    // A pending change to the commands is reported here and consumed only
+    // by `run` (ADR-0007). On stderr: `plan`'s stdout stays what it was.
+    if let Some(change) = pending_command_change(&relais::policy::repo_key(&repo_identity), &repo) {
+        eprintln!("{}", change.text());
     }
     match &decision {
         route::Routed::Route(routed) => {
@@ -5389,6 +5485,9 @@ fn run_command(
         run_id: Some(run_id.clone()),
         wire: relais::protocol::Wire::process(),
         design: relais::runner::DesignSource::Contract,
+        // Only `run` consumes a pending change to the repository's
+        // commands (ADR-0007).
+        declarations: &relais::trust::Recorder(&ledger),
     }) {
         Ok(outcome) => outcome,
         Err(e) => {
@@ -5900,6 +5999,8 @@ fn replay_command(
             .map_or(relais::runner::DesignSource::Contract, |design| {
                 relais::runner::DesignSource::Given(design)
             }),
+        // A replay reports a pending change without consuming it.
+        declarations: &relais::trust::Reader(&ledger),
     });
     // Bring the replay's own refs into the live repository BEFORE the
     // checkout goes. The runner names its candidate and snapshot refs in
@@ -6513,8 +6614,9 @@ fn recipe_evaluate_command(candidate_path: &Path) -> Result<CliOutcome, CliError
 fn missing_grant_text(grant_key: &str, repo_identity: &RepoIdentity) -> Result<String, CliError> {
     Ok(format!(
         "trust grant: MISSING for {grant_key}. Review the commands with `relais trust show`, then \n\
-         run `relais trust grant --key {grant_key} --reviewed-by <your name>`, or paste this \n\
-         into {}:\n\n\
+         run `relais trust grant --reviewed-by <your name>` once to trust this repository. The \n\
+         deprecated legacy grant for this exact policy is `relais trust grant --key {grant_key} \n\
+         --reviewed-by <your name>`, or paste this into {}:\n\n\
          [trust.\"{grant_key}\"]\n\
          granted_at = \"{}\"\n\
          reviewed_by = \"<your name>\"\n\

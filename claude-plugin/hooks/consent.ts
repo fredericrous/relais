@@ -2,8 +2,9 @@
 // call: which checks accept a change (relais.toml), and whether relais may
 // run them (the trust grant in machine.toml). Both questions are put by
 // this module through Claude Code's own dialog (`$.ui.ask`), worded from
-// what relais itself reports. The model never words them, never sees the
-// answer before it is acted on, and never chooses the key that is granted.
+// what relais itself reports. The model never words them and never sees
+// the answer before it is acted on. A repository is trusted once (ADR-0007):
+// the grant has no key, and a repository already granted is not asked again.
 // SPEC §5.
 
 import type { Fx } from './fx.ts'
@@ -97,6 +98,7 @@ export type Shown = {
   grant_key: string
   repository: string
   machine_settings: string
+  // Any grant holds: the repository's, or a legacy exact one.
   granted: boolean
   declaration: {
     steps: { profile: string; kind: 'setup' | 'check'; argv: string[] }[]
@@ -126,13 +128,13 @@ export function question2(shown: Shown, repo: string): { text: string; yes: stri
     shown.changes && shown.changes.every(c => c === 'same') ? ['  commands unchanged; models or integrations changed'] : []
   return {
     text: [
-      `relais 2 of 2 · Let relais run these commands in ${escapeDisplay(repo)},`,
-      "outside Claude Code's permission prompts?",
+      `relais 2 of 2 · Allow relais to run this repository's commands`,
+      `in ${escapeDisplay(repo)}, outside Claude Code's permission prompts?`,
       ...listed,
       ...unchanged,
       `  models ${models || 'none'}${integrations ? `     integrations ${integrations}` : ''}`,
-      `Saved in ${escapeDisplay(shown.machine_settings)}.`,
-      'Any change to relais.toml asks again. They run in a worktree.',
+      `Saved once for the repository in ${escapeDisplay(shown.machine_settings)}.`,
+      'A later change to these commands is reported, not asked again.',
     ].join('\n'),
     yes: allowLabel(steps.length),
   }
@@ -208,7 +210,7 @@ function declined(reason: Declined, repo: string): string {
   }
   return (
     `declined (dismissed): the person closed the question or chose to chat about it, or nobody can be asked in this session. Nothing ran in ${repo}. ` +
-    'Ask them what they want. Where nobody can answer, the same setup by hand is: `relais init --detect --write`, then `relais trust show` and `relais trust grant --key <key> --reviewed-by <name>`.'
+    'Ask them what they want. Where nobody can answer, the same setup by hand is: `relais init --detect --write`, then `relais trust show` and `relais trust grant --reviewed-by <name>`.'
   )
 }
 
@@ -250,21 +252,20 @@ async function askTrust(fx: Fx, store: Store, repo: Repo, session: string): Prom
   const q = question2(shown, repo.name)
   const answer = await ask(fx, q.text, [NOT_NOW, q.yes])
   if (answer !== q.yes) return refuse(fx, store, repo, answer === NOT_NOW ? 'not_now' : 'dismissed')
-  const granted = await grant(fx, repo, shown.grant_key, session)
+  const granted = await grant(fx, repo, session)
   if (granted !== 'ok') return granted
   fx.ui.toast(`relais · ${repo.name} allowed · starting run`)
   return `ready: the person allowed ${shown.declaration.steps.length} command(s) in ${repo.name}. Call mcp__relais__run again.`
 }
 
-async function grant(fx: Fx, repo: Repo, key: string, session: string): Promise<'ok' | string> {
+// Trusts the repository once: no key, so nothing the repository changes while
+// the person is being asked can make the grant stale.
+async function grant(fx: Fx, repo: Repo, session: string): Promise<'ok' | string> {
   const result = await run(
     fx,
-    ['relais', 'trust', 'grant', '--key', key, '--reviewed-by', `the person in Claude Code session ${session}`, '--source', 'plugin', '--json'],
+    ['relais', 'trust', 'grant', '--reviewed-by', `the person in Claude Code session ${session}`, '--source', 'plugin', '--json'],
     repo.root,
   )
-  if (result.exitCode === 18) {
-    return 'not set up (stale_grant_key): relais.toml changed while the person was being asked. Nothing was granted. Call mcp__relais__trust again so they see the current commands.'
-  }
   if (result.exitCode !== 0) return `not set up: relais trust grant failed: ${err(result)}`
   return 'ok'
 }
@@ -336,15 +337,18 @@ async function onboard(fx: Fx, store: Store, repo: Repo, session: string): Promi
   const show = await run(fx, ['relais', 'trust', 'show', '--json'], repo.root)
   const shown = show.exitCode === 0 ? parsed<Shown>(show) : undefined
   if (!shown) return removeWritten(`not set up: relais trust show failed: ${err(show) || out(show).slice(0, 400)}`)
-  const q = question2(shown, repo.name)
-  const answer = await ask(fx, q.text, [NOT_NOW, q.yes])
-  if (answer !== q.yes) return removeWritten(refuse(fx, store, repo, answer === NOT_NOW ? 'not_now' : 'dismissed'))
+  // A repository already trusted is not asked again (ADR-0007).
+  if (!shown.granted) {
+    const q = question2(shown, repo.name)
+    const answer = await ask(fx, q.text, [NOT_NOW, q.yes])
+    if (answer !== q.yes) return removeWritten(refuse(fx, store, repo, answer === NOT_NOW ? 'not_now' : 'dismissed'))
+  }
 
   fx.ui.toast('relais · committing relais.toml (hooks may take minutes)…')
   const committed = await commitPolicy(fx, repo)
   if (committed !== 'ok') return committed
   const sha = out(await run(fx, ['git', 'rev-parse', '--short', 'HEAD'], repo.root))
-  const granted = await grant(fx, repo, shown.grant_key, session)
+  const granted = shown.granted ? 'ok' : await grant(fx, repo, session)
   if (granted !== 'ok') return granted
   fx.ui.toast(`relais · set up: relais.toml ${sha} on ${repo.branch}, grant saved · starting run`)
   return `ready: relais.toml committed as ${sha} on ${repo.branch}, and the person allowed its ${shown.declaration.steps.length} command(s). Call mcp__relais__run again.`

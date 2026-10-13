@@ -700,6 +700,11 @@ pub struct MachineSettings {
     /// hash together with the repository's own identity.
     #[serde(default)]
     pub trust: BTreeMap<String, TrustGrant>,
+    /// Repository grants (ADR-0007), keyed by [`repo_key`]: one reviewed
+    /// grant covers every policy of that repository, a routing candidate
+    /// included. Written only by `relais trust grant` without `--key`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub trust_repos: BTreeMap<String, TrustGrant>,
     #[serde(default)]
     pub permissions: Permissions,
     #[serde(default)]
@@ -1440,7 +1445,7 @@ impl MachineSettings {
                 }
             }
         }
-        for (key, grant) in &self.trust {
+        for (key, grant) in self.trust.iter().chain(&self.trust_repos) {
             grant.validate(key)?;
         }
         self.session_routing.validate()?;
@@ -1602,8 +1607,58 @@ pub struct EffectiveAuthority {
     /// The machine.toml key a grant for THIS declaration in THIS
     /// repository is recorded under; what `relais plan` prints to paste.
     pub grant_key: String,
-    pub trust_granted: bool,
+    /// Which grant, if any, lets this repository run (ADR-0007).
+    pub trust_status: TrustStatus,
     pub blockers: Vec<Blocker>,
+}
+
+impl EffectiveAuthority {
+    /// Whether any grant holds: the repository's, or a legacy exact one.
+    pub fn trust_granted(&self) -> bool {
+        self.trust_status != TrustStatus::Missing
+    }
+}
+
+/// Which grant admits a policy in a repository (ADR-0007).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustStatus {
+    /// `[trust_repos."<repo_key>"]`: the repository is trusted, whatever
+    /// its policy says.
+    Repository,
+    /// A legacy `[trust."<key>"]` grant matching this exact policy.
+    LegacyExact,
+    /// No grant: the run is blocked with `missing_trust_grant`.
+    Missing,
+}
+
+impl TrustStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Repository => "repository",
+            Self::LegacyExact => "legacy_exact",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+/// The grant that admits a policy whose [`grant_key`] is `grant_key` in
+/// the repository `repo_identity`: the repository's own grant first, else
+/// a legacy grant for exactly this policy. Pure: the settings and the
+/// identity are handed in. A legacy grant never admits another policy, so
+/// a candidate is admitted by the repository grant alone.
+pub fn trust_status(
+    machine: &MachineSettings,
+    repo_identity: &RepoIdentity,
+    grant_key: &str,
+) -> TrustStatus {
+    if machine.trust_repos.contains_key(&repo_key(repo_identity)) {
+        TrustStatus::Repository
+    } else if machine.trust.contains_key(grant_key) {
+        TrustStatus::LegacyExact
+    } else {
+        TrustStatus::Missing
+    }
 }
 
 /// The policy's models narrowed by the machine's `allowed_models`
@@ -1682,15 +1737,16 @@ pub fn effective_authority(
 
     let authority_hash = repo.authority_hash();
     let grant_key = grant_key(&authority_hash, repo_identity);
-    let trust_granted = machine.trust.contains_key(&grant_key);
-    if !trust_granted {
+    let trust_status = trust_status(machine, repo_identity, &grant_key);
+    if trust_status == TrustStatus::Missing {
         blockers.push(Blocker {
             code: BlockCode::MissingTrustGrant,
             detail: format!(
-                "no trust grant for this execution declaration (authority hash \
-                 {authority_hash}) in this repository ({repo_identity}); `relais plan` \
-                 prints the [trust.\"{grant_key}\"] block to review and paste into \
-                 machine.toml"
+                "no trust grant for this repository ({repo_identity}); review its commands \
+                 with `relais trust show`, then run `relais trust grant --reviewed-by \
+                 <your name>` once (a legacy grant for this exact declaration, authority \
+                 hash {authority_hash}, is the [trust.\"{grant_key}\"] block `relais plan` \
+                 prints)"
             ),
         });
     }
@@ -1753,7 +1809,7 @@ pub fn effective_authority(
         disallowed_tools: effective_disallowed_tools(&machine.permissions),
         authority_hash,
         grant_key,
-        trust_granted,
+        trust_status,
         blockers,
     }
 }
@@ -1987,7 +2043,7 @@ keys = ["output.contract"]
         let mut c = contract();
 
         let a = effective_authority(&repo, &machine, &c, &identity());
-        assert!(a.trust_granted);
+        assert!(a.trust_granted());
         assert!(a.blockers.is_empty(), "{:?}", a.blockers);
         assert_eq!(a.max_attempts, 3);
 
@@ -2011,7 +2067,7 @@ keys = ["output.contract"]
         let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
         let machine = MachineSettings::from_toml_str(&machine_toml("")).expect("machine parses");
         let a = authority(&repo, &machine);
-        assert!(!a.trust_granted);
+        assert!(!a.trust_granted());
         assert!(a
             .blockers
             .iter()
@@ -2142,7 +2198,10 @@ keys = ["output.contract"]
             "a setup step is executable authority; declaring one must change the hash"
         );
         let a = effective_authority(&with_setup, &machine, &contract(), &identity());
-        assert!(!a.trust_granted, "the grant was reviewed without the setup");
+        assert!(
+            !a.trust_granted(),
+            "the grant was reviewed without the setup"
+        );
     }
 
     /// `[pricing]` is machine policy, not repo policy (SPEC §11): adding
@@ -2171,7 +2230,8 @@ keys = ["output.contract"]
         let a = effective_authority(&repo, &without_pricing, &contract(), &identity());
         let b = effective_authority(&repo, &with_pricing, &contract(), &identity());
         assert_eq!(
-            a.trust_granted, b.trust_granted,
+            a.trust_granted(),
+            b.trust_granted(),
             "a pricing block must not affect whether the existing grant still holds"
         );
     }
@@ -2198,7 +2258,7 @@ keys = ["output.contract"]
         let a = effective_authority(&repo, &without, &contract(), &identity());
         let b = effective_authority(&repo, &with, &contract(), &identity());
         assert_eq!(a.authority_hash, b.authority_hash);
-        assert_eq!(a.trust_granted, b.trust_granted);
+        assert_eq!(a.trust_granted(), b.trust_granted());
     }
 
     /// `CommandSpec.name` is what a declared criterion's evidence names;
@@ -2353,7 +2413,7 @@ keys = ["output.contract"]
             "changing executable authority must change the hash"
         );
         let a = effective_authority(&changed, &machine, &contract(), &identity());
-        assert!(!a.trust_granted);
+        assert!(!a.trust_granted());
     }
 
     #[test]
@@ -2486,9 +2546,9 @@ keys = ["output.contract"]
         );
         let machine =
             MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo))).expect("parses");
-        assert!(authority(&repo, &machine).trust_granted);
+        assert!(authority(&repo, &machine).trust_granted());
         assert!(
-            !effective_authority(&repo, &machine, &contract(), &elsewhere).trust_granted,
+            !effective_authority(&repo, &machine, &contract(), &elsewhere).trust_granted(),
             "the other repository runs unreviewed until it is reviewed"
         );
         // A repository with no origin is still identified, by its
@@ -2690,7 +2750,10 @@ keys = ["output.contract"]
 
         let before = authority(&repo, &without);
         let after = authority(&repo, &with);
-        assert!(after.trust_granted, "the grant issued before still admits");
+        assert!(
+            after.trust_granted(),
+            "the grant issued before still admits"
+        );
         assert_eq!(after.authority_hash, before.authority_hash);
         assert_eq!(after.grant_key, before.grant_key);
         assert_eq!(after.disallowed_tools, before.disallowed_tools);
@@ -2722,6 +2785,77 @@ keys = ["output.contract"]
         );
     }
 
+    fn repository_grant_for(repo: &RepoIdentity) -> String {
+        format!(
+            "[trust_repos.\"{}\"]\ngranted_at = \"2026-10-13\"\nreviewed_by = \"me\"\n",
+            repo_key(repo)
+        )
+    }
+
+    fn with_recipe() -> RepoPolicy {
+        RepoPolicy::from_toml_str(&format!(
+            "{REPO_TOML}\n[[recipes]]\nname = \"docs\"\nscope_within = [\"docs/**\"]\ntier = \"research\"\n"
+        ))
+        .expect("parses")
+    }
+
+    /// ADR-0007: one grant per repository admits every policy of it, a
+    /// recipe-only candidate included, and never another repository.
+    #[test]
+    fn a_repository_grant_admits_any_policy_of_its_repository_and_no_other_repository() {
+        let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        let candidate = with_recipe();
+        assert_ne!(repo.authority_hash(), candidate.authority_hash());
+        let machine =
+            MachineSettings::from_toml_str(&machine_toml(&repository_grant_for(&identity())))
+                .expect("parses");
+        for policy in [&repo, &candidate] {
+            let a = authority(policy, &machine);
+            assert_eq!(a.trust_status, TrustStatus::Repository);
+            assert!(a.trust_granted());
+            assert!(a.blockers.is_empty(), "{:?}", a.blockers);
+        }
+        let elsewhere = RepoIdentity::origin("git@example.invalid:me/other.git");
+        let a = effective_authority(&repo, &machine, &contract(), &elsewhere);
+        assert_eq!(a.trust_status, TrustStatus::Missing);
+        assert!(a
+            .blockers
+            .iter()
+            .any(|b| b.code == BlockCode::MissingTrustGrant));
+    }
+
+    /// A legacy grant is for its exact policy: it admits that policy and
+    /// refuses a candidate; with no grant at all the run is blocked.
+    #[test]
+    fn a_legacy_grant_admits_its_exact_policy_and_refuses_a_candidate() {
+        let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
+        let candidate = with_recipe();
+        let machine =
+            MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo))).expect("parses");
+        assert_eq!(
+            authority(&repo, &machine).trust_status,
+            TrustStatus::LegacyExact
+        );
+        let refused = authority(&candidate, &machine);
+        assert_eq!(refused.trust_status, TrustStatus::Missing);
+        assert!(refused
+            .blockers
+            .iter()
+            .any(|b| b.code == BlockCode::MissingTrustGrant));
+        let none = MachineSettings::from_toml_str(&machine_toml("")).expect("parses");
+        assert_eq!(authority(&repo, &none).trust_status, TrustStatus::Missing);
+    }
+
+    #[test]
+    fn a_repository_grant_with_no_reviewer_is_refused() {
+        let text =
+            machine_toml("[trust_repos.\"k\"]\ngranted_at = \"2026-10-13\"\nreviewed_by = \" \"\n");
+        assert!(matches!(
+            MachineSettings::from_toml_str(&text),
+            Err(PolicyError::InvalidTrustGrant { .. })
+        ));
+    }
+
     #[test]
     fn recipes_are_hashed_as_executable_authority() {
         let repo = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
@@ -2739,7 +2873,7 @@ keys = ["output.contract"]
         let machine =
             MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo))).expect("parses");
         assert!(
-            !effective_authority(&with_recipe, &machine, &contract(), &identity()).trust_granted
+            !effective_authority(&with_recipe, &machine, &contract(), &identity()).trust_granted()
         );
     }
 
@@ -2956,7 +3090,7 @@ when the per-type recipes were seeded)"
         );
         let machine =
             MachineSettings::from_toml_str(&machine_toml(&grant_for(&repo))).expect("parses");
-        assert!(!effective_authority(&wider, &machine, &contract(), &identity()).trust_granted);
+        assert!(!effective_authority(&wider, &machine, &contract(), &identity()).trust_granted());
     }
 
     #[test]

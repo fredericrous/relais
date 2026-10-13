@@ -1,19 +1,27 @@
 //! Trust grants issued by a command (SPEC §5): what a grant would
 //! authorize, in a form a person can read and a plugin can put to them,
-//! and the one writer of machine.toml's `[trust]` tables.
+//! and the one writer of the machine settings' `[trust]` and
+//! `[trust_repos]` tables.
 //!
 //! A grant is executable authority, so this module never decides to
 //! issue one. `relais trust grant` is run by a person in a shell, or by
 //! the plugin after the person answered its question; no run, recipe or
-//! worker reaches [`grant`].
+//! worker reaches [`grant`] or [`grant_repository`].
+//!
+//! A repository is trusted once (ADR-0007). What a later change to its
+//! commands does is not a block but a warning, said once per change: the
+//! [`Commands`] a repository last ran under are kept by a
+//! [`DeclarationStore`], and [`observe`] compares them with the current
+//! ones.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::ledger::Ledger;
 use crate::policy::{
-    grant_key, MachineSettings, PolicyError, RepoIdentity, RepoPolicy, TrustGrant,
+    grant_key, repo_key, MachineSettings, PolicyError, RepoIdentity, RepoPolicy, TrustGrant,
     MACHINE_SCHEMA_VERSION,
 };
 
@@ -123,6 +131,218 @@ pub fn declaration(policy: &RepoPolicy) -> Declaration {
     }
 }
 
+/// What the command-change warning watches: the steps and the integrations
+/// of the [`Declaration`], never its models, so a routing candidate (which
+/// only changes models and recipes) never warns. Execution limits are not
+/// covered either.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Commands {
+    pub steps: Vec<Step>,
+    /// `name (mode)`, one per configured integration.
+    pub integrations: Vec<String>,
+}
+
+pub fn commands_of(policy: &RepoPolicy) -> Commands {
+    let declaration = declaration(policy);
+    Commands {
+        steps: declaration.steps,
+        integrations: declaration
+            .integrations
+            .iter()
+            .map(|line| format!("{} ({})", line.name, line.mode))
+            .collect(),
+    }
+}
+
+/// The hash of [`Commands`]: equal exactly when no command or integration
+/// changed.
+pub fn declaration_hash(commands: &Commands) -> String {
+    crate::ids::canonical_json_hash(&serde_json::json!({
+        "steps": commands.steps,
+        "integrations": commands.integrations,
+    }))
+}
+
+/// A change to a repository's commands since the last run that saw it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CommandsChanged {
+    /// The date (`YYYY-MM-DD`) of the declaration this one replaces.
+    pub since: String,
+    /// One line per added, removed or changed step or integration.
+    pub lines: Vec<String>,
+}
+
+impl CommandsChanged {
+    /// What `run` prints once on stderr: a header, then one line per change.
+    pub fn text(&self) -> String {
+        let mut out = format!(
+            "relais: commands changed in relais.toml since {}:",
+            self.since
+        );
+        for line in &self.lines {
+            out.push_str("\n  ");
+            out.push_str(line);
+        }
+        out
+    }
+
+    /// The same, on one line, for the `commands_changed` run event.
+    pub fn summary(&self) -> String {
+        format!("since {}: {}", self.since, self.lines.join("; "))
+    }
+}
+
+/// Each step added, removed or changed from `previous` to `now`, and each
+/// integration added or removed, as a line a person reads. Empty when the
+/// commands are the same.
+pub fn commands_diff(previous: &Commands, now: &Commands) -> Vec<String> {
+    let mut lines = Vec::new();
+    let describe = |step: &Step| {
+        format!(
+            "{} {} [{}]",
+            step.kind.as_str(),
+            display_argv(&step.argv),
+            escape_display(&step.profile)
+        )
+    };
+    for (step, change) in now.steps.iter().zip(compare(&now.steps, &previous.steps)) {
+        match change {
+            Change::Same => {}
+            Change::New => lines.push(format!("+ added {}", describe(step))),
+            Change::Changed => lines.push(format!("~ changed {}", describe(step))),
+        }
+    }
+    // A step of the old list with no counterpart in the new one: `Changed`
+    // is the same slot seen from the other side and was said above.
+    for (step, change) in previous
+        .steps
+        .iter()
+        .zip(compare(&previous.steps, &now.steps))
+    {
+        if change == Change::New {
+            lines.push(format!("- removed {}", describe(step)));
+        }
+    }
+    for added in now
+        .integrations
+        .iter()
+        .filter(|name| !previous.integrations.contains(name))
+    {
+        lines.push(format!("+ added integration {}", escape_display(added)));
+    }
+    for removed in previous
+        .integrations
+        .iter()
+        .filter(|name| !now.integrations.contains(name))
+    {
+        lines.push(format!("- removed integration {}", escape_display(removed)));
+    }
+    lines
+}
+
+/// The command declaration a repository last ran under, as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seen {
+    pub hash: String,
+    pub commands: Commands,
+    /// RFC3339.
+    pub at: String,
+}
+
+/// Where the declaration each repository last ran under is kept. A
+/// caller picks the store whose behaviour it needs: [`Recorder`] (what
+/// `relais run` passes) records what it sees, [`Reader`] and
+/// [`NoHistory`] (what replay, `plan`, `doctor` and `trust show` pass)
+/// record nothing, so looking at a pending change never consumes it.
+pub trait DeclarationStore {
+    fn last_seen(&self, repo_key: &str) -> Result<Option<Seen>, String>;
+    fn record(&self, repo_key: &str, commands: &Commands) -> Result<(), String>;
+}
+
+/// The ledger as a store that records.
+pub struct Recorder<'a>(pub &'a Ledger);
+
+/// The ledger as a store that only reads.
+pub struct Reader<'a>(pub &'a Ledger);
+
+/// No ledger to read, and nothing to record: `plan` on a machine that has
+/// not run relais yet.
+pub struct NoHistory;
+
+fn seen_in(ledger: &Ledger, repo_key: &str) -> Result<Option<Seen>, String> {
+    let Some(stored) = ledger
+        .repo_declaration(repo_key)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let commands = serde_json::from_str(&stored.declaration_json).map_err(|e| e.to_string())?;
+    Ok(Some(Seen {
+        hash: stored.declaration_hash,
+        commands,
+        at: stored.seen_at,
+    }))
+}
+
+impl DeclarationStore for Recorder<'_> {
+    fn last_seen(&self, repo_key: &str) -> Result<Option<Seen>, String> {
+        seen_in(self.0, repo_key)
+    }
+
+    fn record(&self, repo_key: &str, commands: &Commands) -> Result<(), String> {
+        let json = serde_json::to_string(commands).map_err(|e| e.to_string())?;
+        self.0
+            .upsert_repo_declaration(repo_key, &declaration_hash(commands), &json)
+            .map_err(|e| e.to_string())
+    }
+}
+
+impl DeclarationStore for Reader<'_> {
+    fn last_seen(&self, repo_key: &str) -> Result<Option<Seen>, String> {
+        seen_in(self.0, repo_key)
+    }
+
+    fn record(&self, _repo_key: &str, _commands: &Commands) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl DeclarationStore for NoHistory {
+    fn last_seen(&self, _repo_key: &str) -> Result<Option<Seen>, String> {
+        Ok(None)
+    }
+
+    fn record(&self, _repo_key: &str, _commands: &Commands) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// The change from what `repo_key` last ran under to `policy`'s commands,
+/// or `None` when they are the same, or when nothing was ever seen (a
+/// first sight is recorded, not warned about). A change is handed to the
+/// store as seen, so a recording store says it once. A store that cannot
+/// be read or written is an `Err` the caller says and goes on from: a
+/// warning that cannot be kept never stops a run.
+pub fn observe(
+    store: &dyn DeclarationStore,
+    repo_key: &str,
+    policy: &RepoPolicy,
+) -> Result<Option<CommandsChanged>, String> {
+    let now = commands_of(policy);
+    let previous = store.last_seen(repo_key)?;
+    let change = match &previous {
+        Some(seen) if seen.hash != declaration_hash(&now) => Some(CommandsChanged {
+            since: seen.at.chars().take(10).collect(),
+            lines: commands_diff(&seen.commands, &now),
+        }),
+        _ => None,
+    };
+    if previous.is_none() || change.is_some() {
+        store.record(repo_key, &now)?;
+    }
+    Ok(change)
+}
+
 /// How a step compares with the steps the previous grant for the same
 /// repository authorized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -219,12 +439,28 @@ pub struct Shown {
     pub authority_hash: String,
     pub repository: String,
     pub machine_settings: PathBuf,
+    /// Whether any grant holds: the repository's, or a legacy exact one.
     pub granted: bool,
+    /// The repository grant (`[trust_repos]`), when there is one.
+    pub repository_grant: Option<RepositoryGrant>,
+    /// [`repo_key`] of the repository: what its grant is recorded under.
+    pub repo_key: String,
     pub declaration: Declaration,
+    /// A change to the commands that `run` has not yet said; filled by the
+    /// caller from a store that records nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_change: Option<CommandsChanged>,
     /// Per step, against the latest grant this machine recorded for the
     /// repository; absent when there is none to compare with.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub changes: Option<Vec<Change>>,
+}
+
+/// Who trusted a repository, and when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepositoryGrant {
+    pub granted_at: String,
+    pub reviewed_by: String,
 }
 
 pub fn show(
@@ -238,8 +474,19 @@ pub fn show(
     let key = grant_key(&authority_hash, identity);
     let declaration = declaration(policy);
     let changes = previous.map(|previous| compare(&declaration.steps, previous));
+    let key_of_repo = repo_key(identity);
     Shown {
-        granted: machine.trust.contains_key(&key),
+        granted: crate::policy::trust_status(machine, identity, &key)
+            != crate::policy::TrustStatus::Missing,
+        repository_grant: machine
+            .trust_repos
+            .get(&key_of_repo)
+            .map(|grant| RepositoryGrant {
+                granted_at: grant.granted_at.clone(),
+                reviewed_by: grant.reviewed_by.clone(),
+            }),
+        repo_key: key_of_repo,
+        pending_change: None,
         grant_key: key,
         authority_hash,
         repository: identity.to_string(),
@@ -313,7 +560,28 @@ pub fn grant(path: &Path, key: &str, record: &TrustGrant) -> Result<Granted, Gra
         if current.trust.contains_key(key) {
             return Ok(None);
         }
-        add_grant(text, key, record).map(Some)
+        add_grant_to(text, "trust", key, record).map(Some)
+    })?;
+    Ok(if written {
+        Granted::Written
+    } else {
+        Granted::AlreadyPresent
+    })
+}
+
+/// Add `[trust_repos."<repo_key>"]` to the machine settings at `path`: the
+/// repository is trusted once (ADR-0007). Through [`edit_machine`], so
+/// under the lock, atomic, and 0600 for a new file.
+pub fn grant_repository(
+    path: &Path,
+    repo_key: &str,
+    record: &TrustGrant,
+) -> Result<Granted, GrantError> {
+    let written = edit_machine(path, |text, current| {
+        if current.trust_repos.contains_key(repo_key) {
+            return Ok(None);
+        }
+        add_grant_to(text, "trust_repos", repo_key, record).map(Some)
     })?;
     Ok(if written {
         Granted::Written
@@ -396,22 +664,27 @@ fn existing_mode(path: &Path) -> u32 {
     MACHINE_FILE_MODE
 }
 
-/// `text` with one more `[trust."<key>"]` table, everything else as it
+/// `text` with one more `[<section>."<key>"]` table, everything else as it
 /// was.
-fn add_grant(text: &str, key: &str, record: &TrustGrant) -> Result<String, GrantError> {
+fn add_grant_to(
+    text: &str,
+    section: &str,
+    key: &str,
+    record: &TrustGrant,
+) -> Result<String, GrantError> {
     let mut doc: toml_edit::DocumentMut = text
         .parse()
         .map_err(|e: toml_edit::TomlError| GrantError::Unwritable(e.to_string()))?;
     let trust = doc
-        .entry("trust")
+        .entry(section)
         .or_insert_with(|| {
             let mut table = toml_edit::Table::new();
-            // `[trust."<key>"]` headers only, no bare `[trust]` line.
+            // `[<section>."<key>"]` headers only, no bare `[<section>]` line.
             table.set_implicit(true);
             toml_edit::Item::Table(table)
         })
         .as_table_mut()
-        .ok_or_else(|| GrantError::Unwritable("`trust` is not a table".into()))?;
+        .ok_or_else(|| GrantError::Unwritable(format!("`{section}` is not a table")))?;
     let mut table = toml_edit::Table::new();
     table.insert("granted_at", toml_edit::value(record.granted_at.clone()));
     table.insert("reviewed_by", toml_edit::value(record.reviewed_by.clone()));
@@ -552,6 +825,162 @@ mod tests {
             kind,
             argv: argv.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    const BASE: &str = r#"
+schema_version = 1
+
+[models.implementation]
+id = "sonnet"
+
+[[verification.profiles.default.commands]]
+argv = ["make", "check"]
+timeout_seconds = 300
+"#;
+
+    fn policy(extra: &str) -> RepoPolicy {
+        RepoPolicy::from_toml_str(&format!("{BASE}{extra}")).expect("policy parses")
+    }
+
+    #[test]
+    fn a_repository_grant_is_written_private_under_trust_repos_and_once() {
+        let dir = dir();
+        let path = dir.join("nested").join("machine.toml");
+        assert_eq!(
+            grant_repository(&path, "repo-k", &record()).unwrap(),
+            Granted::Written
+        );
+        let before = std::fs::read(&path).unwrap();
+        let settings = MachineSettings::from_toml_str(&String::from_utf8_lossy(&before)).unwrap();
+        assert_eq!(settings.trust_repos.len(), 1);
+        assert!(settings.trust.is_empty());
+        assert_eq!(
+            settings.trust_repos["repo-k"].reviewed_by,
+            "a person (in session)"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        assert_eq!(
+            grant_repository(&path, "repo-k", &record()).unwrap(),
+            Granted::AlreadyPresent
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn twenty_concurrent_repository_grants_all_land() {
+        let dir = dir();
+        let path = dir.join("machine.toml");
+        let handles: Vec<_> = (0..20)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    grant_repository(&path, &format!("repo-{i}"), &record()).unwrap()
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let settings =
+            MachineSettings::from_toml_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(settings.trust_repos.len(), 20);
+    }
+
+    /// A store in memory that counts what was recorded.
+    #[derive(Default)]
+    struct Memory {
+        seen: std::cell::RefCell<Option<Seen>>,
+        records: std::cell::Cell<u32>,
+    }
+
+    impl DeclarationStore for Memory {
+        fn last_seen(&self, _repo_key: &str) -> Result<Option<Seen>, String> {
+            Ok(self.seen.borrow().clone())
+        }
+
+        fn record(&self, _repo_key: &str, commands: &Commands) -> Result<(), String> {
+            self.records.set(self.records.get() + 1);
+            *self.seen.borrow_mut() = Some(Seen {
+                hash: declaration_hash(commands),
+                commands: commands.clone(),
+                at: "2026-10-01T09:00:00Z".into(),
+            });
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_changed_command_warns_once_and_the_next_look_is_silent() {
+        let store = Memory::default();
+        // First sight is recorded, not warned about.
+        assert_eq!(observe(&store, "r", &policy("")).unwrap(), None);
+        assert_eq!(observe(&store, "r", &policy("")).unwrap(), None);
+        let changed = policy(
+            "\n[[verification.profiles.default.commands]]\nargv = [\"cargo\", \"test\"]\ntimeout_seconds = 300\n",
+        );
+        let change = observe(&store, "r", &changed).unwrap().expect("a change");
+        assert_eq!(change.since, "2026-10-01");
+        assert_eq!(change.lines, ["+ added check cargo test [default]"]);
+        assert!(change
+            .text()
+            .starts_with("relais: commands changed in relais.toml since 2026-10-01:\n  + added"));
+        assert_eq!(observe(&store, "r", &changed).unwrap(), None);
+    }
+
+    #[test]
+    fn a_removed_or_edited_command_is_named() {
+        let store = Memory::default();
+        observe(&store, "r", &policy("")).unwrap();
+        let edited = RepoPolicy::from_toml_str(&BASE.replace("\"check\"", "\"check\", \"-j4\""))
+            .expect("parses");
+        let change = observe(&store, "r", &edited).unwrap().expect("a change");
+        assert_eq!(change.lines, ["~ changed check make check -j4 [default]"]);
+        let none = RepoPolicy::from_toml_str(
+            "schema_version = 1\n[models.implementation]\nid = \"sonnet\"\n\
+             [verification.profiles.default]\n",
+        )
+        .expect("parses");
+        let change = observe(&store, "r", &none).unwrap().expect("a change");
+        assert_eq!(change.lines, ["- removed check make check -j4 [default]"]);
+    }
+
+    #[test]
+    fn a_recipe_or_model_tier_change_is_not_a_command_change() {
+        let store = Memory::default();
+        observe(&store, "r", &policy("")).unwrap();
+        let recipe = policy(
+            "\n[[recipes]]\nname = \"docs\"\nscope_within = [\"docs/**\"]\ntier = \"research\"\n",
+        );
+        assert_eq!(observe(&store, "r", &recipe).unwrap(), None);
+        let other_model =
+            RepoPolicy::from_toml_str(&BASE.replace("sonnet", "fable")).expect("parses");
+        assert_eq!(observe(&store, "r", &other_model).unwrap(), None);
+        assert_eq!(store.records.get(), 1, "only the first sight was recorded");
+    }
+
+    #[test]
+    fn a_reader_reports_a_change_every_time_and_consumes_nothing() {
+        let dir = dir();
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        observe(&Recorder(&ledger), "r", &policy("")).unwrap();
+        let changed = policy(
+            "\n[[verification.profiles.default.commands]]\nargv = [\"cargo\", \"test\"]\ntimeout_seconds = 300\n",
+        );
+        for _ in 0..2 {
+            assert!(observe(&Reader(&ledger), "r", &changed).unwrap().is_some());
+        }
+        assert!(observe(&NoHistory, "r", &changed).unwrap().is_none());
+        // The recording store says it once.
+        assert!(observe(&Recorder(&ledger), "r", &changed)
+            .unwrap()
+            .is_some());
+        assert_eq!(observe(&Recorder(&ledger), "r", &changed).unwrap(), None);
+        assert_eq!(observe(&Reader(&ledger), "r", &changed).unwrap(), None);
     }
 
     #[test]

@@ -5032,3 +5032,202 @@ fn doctor_reports_allowed_tools_as_no_longer_read() {
     );
     assert!(!stderr.contains("trust"), "{stderr}");
 }
+
+const DEFAULT_CHECK: &str = "[[verification.profiles.default.commands]]\n\
+     argv = [\"sh\", \"-c\", \"test ! -f src/main.rs\"]\n\
+     timeout_seconds = 30\n";
+
+const RECIPE: &str =
+    "\n[[recipes]]\nname = \"docs\"\nscope_within = [\"docs/**\"]\ntier = \"research\"\n";
+
+/// The trust status a run recorded, from the ledger itself.
+fn trust_status_of(world: &World, run_id: &str) -> Option<String> {
+    let conn = rusqlite::Connection::open(world.state.join("ledger.sqlite")).expect("ledger");
+    conn.query_row(
+        "SELECT trust_status FROM runs WHERE id = ?1",
+        [run_id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .expect("the run is on record")
+}
+
+// ADR-0007: a repository is trusted once, written to `[trust_repos]` by
+// `trust grant` without a key (private, under the lock), and a change to
+// its commands runs, warns once on stderr and is recorded on the run.
+#[test]
+fn a_repository_is_trusted_once_and_a_command_change_warns_once() {
+    let world = World::new("trust-once");
+    world.write_policy(3);
+    let machine = world.config.join("machine.toml");
+    std::fs::write(&machine, format!("schema_version = 1\n{PRICING}\n")).expect("machine");
+    let task = world.write_task("task.json", "off");
+
+    let blocked = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(blocked.status.code(), Some(3), "{}", text(&blocked.stderr));
+    assert!(text(&blocked.stderr).contains("missing_trust_grant"));
+
+    let grant = world.relais(&["trust", "grant", "--reviewed-by", "the suite"]);
+    assert_eq!(grant.status.code(), Some(0), "{}", text(&grant.stderr));
+    assert!(
+        !text(&grant.stderr).contains("deprecated"),
+        "the repository grant is not the deprecated one: {}",
+        text(&grant.stderr)
+    );
+    let written = std::fs::read_to_string(&machine).expect("machine");
+    assert!(written.contains("[trust_repos."), "{written}");
+    // toml_edit writes a hex key bare, so `[trust.` (never `[trust_repos.`)
+    // is what a legacy grant would add. The world wrote machine.toml before
+    // the grant, which keeps an existing file's mode; a new file is 0600
+    // (`trust::tests::a_repository_grant_is_written_private_under_trust_repos_and_once`).
+    assert!(!written.contains("[trust."), "{written}");
+    let show = world.relais(&["trust", "show"]);
+    assert!(
+        text(&show.stdout).contains("repository: granted "),
+        "{}",
+        text(&show.stdout)
+    );
+
+    // The first run: nothing changed since the grant recorded its
+    // declaration, and the run records which grant admitted it.
+    let first = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    let stderr = text(&first.stderr);
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "{}\n{stderr}",
+        text(&first.stdout)
+    );
+    assert!(!stderr.contains("commands changed"), "{stderr}");
+    let first_id = World::run_id_of(&text(&first.stdout));
+    assert_eq!(
+        trust_status_of(&world, &first_id).as_deref(),
+        Some("repository")
+    );
+
+    // A recipe-only edit is not a command change, and the new policy hash
+    // needs no new grant.
+    world.write_policy_verifying(3, 120, &format!("{DEFAULT_CHECK}{RECIPE}"));
+    let plan = world.relais(&["plan", "--task", task.to_str().unwrap()]);
+    assert_eq!(plan.status.code(), Some(0), "{}", text(&plan.stderr));
+    assert!(!text(&plan.stderr).contains("commands changed"));
+
+    // A changed verification command: `plan` and `trust show` report it
+    // without consuming it; `run` says it once.
+    world.write_policy_verifying(
+        3,
+        120,
+        &format!(
+            "{RECIPE}[[verification.profiles.default.commands]]\n\
+             argv = [\"sh\", \"-c\", \"test ! -f src/main.rs && true\"]\n\
+             timeout_seconds = 30\n"
+        ),
+    );
+    for _ in 0..2 {
+        let plan = world.relais(&["plan", "--task", task.to_str().unwrap()]);
+        assert_eq!(plan.status.code(), Some(0), "{}", text(&plan.stderr));
+        assert!(
+            text(&plan.stderr).contains("relais: commands changed in relais.toml since"),
+            "plan reports the pending change every time: {}",
+            text(&plan.stderr)
+        );
+    }
+    let show = world.relais(&["trust", "show", "--json"]);
+    let shown: serde_json::Value = serde_json::from_slice(&show.stdout).expect("show json");
+    assert!(shown["pending_change"]["lines"][0]
+        .as_str()
+        .is_some_and(|line| line.starts_with("~ changed check")));
+    let second = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    let stderr = text(&second.stderr);
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "{}\n{stderr}",
+        text(&second.stdout)
+    );
+    assert_eq!(
+        stderr
+            .matches("relais: commands changed in relais.toml since")
+            .count(),
+        1,
+        "{stderr}"
+    );
+    let second_id = World::run_id_of(&text(&second.stdout));
+    let events = events_jsonl(&world.run_dir(&second_id));
+    assert!(
+        events
+            .iter()
+            .any(|e| e["event"]["kind"] == "decision" && e["event"]["what"] == "commands_changed"),
+        "the run records commands_changed"
+    );
+    let third = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(third.status.code(), Some(0), "{}", text(&third.stderr));
+    assert!(
+        !text(&third.stderr).contains("commands changed"),
+        "the next run prints nothing: {}",
+        text(&third.stderr)
+    );
+    let plan = world.relais(&["plan", "--task", task.to_str().unwrap()]);
+    assert!(!text(&plan.stderr).contains("commands changed"));
+
+    // Another repository stays blocked: the grant is this repository's.
+    let other = World::new("trust-once-other");
+    other.write_policy(3);
+    std::fs::write(
+        other.config.join("machine.toml"),
+        std::fs::read_to_string(&machine).expect("machine"),
+    )
+    .expect("copied settings");
+    let other_task = other.write_task("task.json", "off");
+    let blocked = other.relais(&["plan", "--task", other_task.to_str().unwrap()]);
+    assert_eq!(blocked.status.code(), Some(3), "{}", text(&blocked.stderr));
+}
+
+// `--key` still writes a legacy grant for the exact policy, says it is
+// deprecated, and a run it admits records `legacy_exact`, which `doctor`
+// counts over the last 30 days.
+#[test]
+fn a_legacy_key_grant_still_works_is_deprecated_and_counted_by_doctor() {
+    let world = World::new("trust-legacy");
+    let hash = world.write_policy(3);
+    world.write_machine(&hash, "");
+    let task = world.write_task("task.json", "off");
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(0), "{}", text(&run.stderr));
+    let run_id = World::run_id_of(&text(&run.stdout));
+    assert_eq!(
+        trust_status_of(&world, &run_id).as_deref(),
+        Some("legacy_exact")
+    );
+
+    let doctor = world.relais(&["doctor", "--json"]);
+    let report: serde_json::Value = serde_json::from_slice(&doctor.stdout).expect("doctor json");
+    let legacy = report["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .find(|finding| finding["component"] == "legacy grants")
+        .unwrap_or_else(|| panic!("no legacy grants line: {report}"));
+    assert!(
+        legacy["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.starts_with("1 run(s) in the last 30 days")),
+        "{legacy}"
+    );
+
+    // The deprecated spelling, on a machine with no grant yet.
+    let fresh = World::new("trust-legacy-key");
+    fresh.write_policy(3);
+    let show = fresh.relais(&["trust", "show", "--json"]);
+    let shown: serde_json::Value = serde_json::from_slice(&show.stdout).expect("show json");
+    let key = shown["grant_key"].as_str().expect("grant_key");
+    let grant = fresh.relais(&["trust", "grant", "--key", key, "--reviewed-by", "the suite"]);
+    assert_eq!(grant.status.code(), Some(0), "{}", text(&grant.stderr));
+    assert!(
+        text(&grant.stderr).contains("--key is deprecated"),
+        "{}",
+        text(&grant.stderr)
+    );
+    let written = std::fs::read_to_string(fresh.config.join("machine.toml")).expect("machine");
+    assert!(written.contains("[trust."), "{written}");
+    assert!(!written.contains("[trust_repos"), "{written}");
+}
