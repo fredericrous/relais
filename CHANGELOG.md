@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+`relais resume --retire` now also removes a decomposed run's package verification checkouts (`runs/<root>/packages/verify/<child>/`), and reports a kept checkout's modified files as repo-relative paths.
+
 ## v0.19.0
 
 A repository is trusted once (#234, relais ADR-0007), and the replay tool can hand a program design to the Haiku + design arm (#233). After upgrading, grant each repository once with `relais trust grant --reviewed-by <name>` (or the plugin's trust tool); existing grants keep working for their exact policy. Reinstall the plugin as for v0.12.0 and restart sessions, so the trust and replay tools are current. Rollback to v0.18.0: remove `[trust_repos]` from machine.toml and restore the ledger from `ledger.sqlite.bak-v30`.

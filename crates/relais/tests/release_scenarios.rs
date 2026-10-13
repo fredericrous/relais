@@ -3677,6 +3677,51 @@ fn a_leftover_verification_checkout_is_removed_by_resume() {
     assert!(!listed.contains("verify-base"), "{listed}");
 }
 
+// A decomposed run's package keeps its verification checkout under the
+// root's artifacts (`runs/<root>/packages/verify/<child>/`): `resume
+// --retire` covers it like a root run's.
+#[test]
+fn a_package_runs_leftover_verification_checkout_is_removed_by_resume() {
+    let world = World::new("verifypackage");
+    let hash = world.write_policy(1);
+    world.write_machine(&hash, "");
+    let task = world.write_task("task.json", "off");
+    let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(5), "{}", text(&run.stderr));
+    let run_id = world.only_run_id();
+    let checkout = world
+        .state
+        .join("runs")
+        .join(&run_id)
+        .join("packages/verify")
+        .join(&run_id)
+        .join("verify-base");
+    git(
+        &world.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            &checkout.to_string_lossy(),
+            "HEAD",
+        ],
+    );
+
+    make_non_terminal(&world, &run_id, std::time::Duration::from_secs(60));
+    let kept = world.relais(&["resume", "--retire", "--all"]);
+    assert!(checkout.exists(), "{}", text(&kept.stdout));
+
+    make_non_terminal(&world, &run_id, std::time::Duration::from_secs(3 * 3600));
+    let swept = world.relais(&["resume", "--retire", "--all"]);
+    let out = text(&swept.stdout);
+    assert_eq!(swept.status.code(), Some(0), "{out}");
+    assert!(out.contains("removed verification checkout"), "{out}");
+    assert!(!checkout.exists());
+    let listed = git(&world.repo, &["worktree", "list"]);
+    assert!(!listed.contains("verify-base"), "{listed}");
+}
+
 #[test]
 fn a_live_runs_verification_checkout_is_kept_and_an_orphans_is_removed() {
     let world = World::new("verifyorphan");
