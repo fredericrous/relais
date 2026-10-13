@@ -171,6 +171,13 @@ enum Command {
         /// Claude Code with the relais plugin, which passes this
         #[arg(long)]
         protocol: bool,
+        /// Where the run works: `auto` (default: edit a linked worktree in
+        /// place, otherwise fork it with copy-on-write dependencies),
+        /// `fork`, `in-place` (refused outside a linked worktree) or
+        /// `isolated` (a fresh worktree and every setup step, as before).
+        /// `RELAIS_WORKSPACE` sets the same; `CI` forces `isolated`
+        #[arg(long)]
+        workspace: Option<String>,
     },
     /// What the relais plugin calls: short processes that tell the
     /// coordinator what its agents did (SPEC §23)
@@ -1359,13 +1366,14 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             task,
             revise,
             protocol,
+            workspace,
         } => {
             let host = std::env::var("RELAIS_HOST").ok();
             let origin = relais::native::RunOrigin {
                 protocol,
                 host: host.as_deref(),
             };
-            run_command(&task, revise.as_deref(), &origin)
+            run_command(&task, revise.as_deref(), &origin, workspace.as_deref())
         }
         Command::Native { cmd } => native_command(cmd),
         Command::Quiet { cmd } => quiet_command(cmd),
@@ -5324,10 +5332,66 @@ fn run_refusal(
 }
 
 /// A `relais run` starts only from Claude Code with the relais plugin.
+/// Where this run works (ADR-0008): the flag, `RELAIS_WORKSPACE`, `CI`, the
+/// machine setting and git's own answer about the checkout, through the one
+/// pure decision. `Ok(Err(..))` is a refusal that blocks the run with its
+/// remedy; an unknown value is a usage error.
+fn run_workspace(
+    flag: Option<&str>,
+    root: &Path,
+    machine: &MachineSettings,
+    repo: &RepoPolicy,
+) -> Result<Result<relais::workspace::reuse::Workspace, String>, CliError> {
+    use relais::workspace::reuse::{resolve, ModeInputs, ModeRefusal, Requested};
+    let flag = flag
+        .map(Requested::parse)
+        .transpose()
+        .map_err(|refusal| CliError::Usage {
+            detail: format!(
+                "relais run: --workspace takes auto, fork, in-place or isolated ({})",
+                match refusal {
+                    ModeRefusal::Unknown(value) => format!("not `{value}`"),
+                    _ => "unknown value".to_string(),
+                }
+            ),
+        })?;
+    let env_workspace = std::env::var("RELAIS_WORKSPACE").ok();
+    let ci = std::env::var("CI").ok();
+    let inputs = ModeInputs {
+        flag,
+        env_workspace: env_workspace.as_deref(),
+        ci: ci.as_deref(),
+        machine: machine.workspace.mode,
+        repo_opts_out_of_in_place: repo.workspace.in_place == Some(false),
+        linked_worktree: relais::repo::is_linked_worktree(root),
+    };
+    Ok(match resolve(inputs) {
+        Ok(workspace) => Ok(workspace),
+        Err(ModeRefusal::Unknown(value)) => {
+            return Err(CliError::Usage {
+                detail: format!(
+                    "relais run: RELAIS_WORKSPACE takes auto, fork, in-place or isolated, not `{value}`"
+                ),
+            })
+        }
+        Err(ModeRefusal::WidenedPastTheEnvironment) => Err(
+            "relais run: RELAIS_WORKSPACE=isolated or CI forces an isolated workspace, and --workspace cannot widen it; unset the variable or drop the flag".to_string(),
+        ),
+        Err(ModeRefusal::PrimaryCheckout) => Err(format!(
+            "relais run: {} is the primary checkout; in-place needs a linked worktree (git worktree add …), or drop --workspace to fork",
+            root.display()
+        )),
+        Err(ModeRefusal::InPlaceOptedOut) => Err(
+            "relais run: this repository's relais.toml sets [workspace] in_place = false; drop --workspace to fork".to_string(),
+        ),
+    })
+}
+
 fn run_command(
     task: &Path,
     revise: Option<&str>,
     origin: &relais::native::RunOrigin<'_>,
+    workspace_flag: Option<&str>,
 ) -> Result<CliOutcome, CliError> {
     if let Some(detail) = relais::native::origin_refusal(origin) {
         return Err(CliError::Usage { detail });
@@ -5335,6 +5399,13 @@ fn run_command(
     let session = relais::coordinator::resolve_session();
     let (root, repo) = load_repo_policy()?;
     let machine = load_machine()?;
+    let workspace = match run_workspace(workspace_flag, &root, &machine, &repo)? {
+        Ok(workspace) => workspace,
+        Err(refusal) => {
+            eprintln!("{refusal}");
+            return Ok(CliOutcome::Blocked);
+        }
+    };
     let contract = load_contract(task)?;
     let ledger = open_ledger()?;
     let task_override = match resolve_task_override(&ledger, &contract, revise) {
@@ -5506,6 +5577,7 @@ fn run_command(
         None => &repo,
     };
     let outcome = match execute(&RunConfig {
+        workspace,
         repo_dir: &root,
         contract: &contract,
         repo_policy: run_policy,
@@ -6021,6 +6093,7 @@ fn replay_command(
     };
     eprintln!("{}", log.start_line());
     let outcome = execute(&RunConfig {
+        workspace: relais::workspace::reuse::Workspace::Isolated,
         repo_dir: &checkout_dir,
         contract: &replay_contract,
         repo_policy: candidate.policy(),

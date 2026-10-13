@@ -1116,12 +1116,59 @@ pub fn run_setup(
     events: &Events,
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<CheckOutcome>, VerifyError> {
+    run_setup_gated(
+        dir,
+        profile,
+        logs_dir,
+        prefix,
+        events,
+        cancel,
+        &mut RunEveryStep,
+    )
+}
+
+/// Decides, per setup step, whether it runs, and hears how it ended. The
+/// default ([`RunEveryStep`]) runs all of them; a workspace that was seeded
+/// from another (ADR-0008) may skip a step that proved its result.
+pub trait SetupGate {
+    /// `true` skips step `index` in the tree being set up.
+    fn skip(&mut self, index: usize, step: &CommandSpec) -> bool;
+    /// Step `index` ran and `succeeded`.
+    fn ran(&mut self, index: usize, step: &CommandSpec, succeeded: bool);
+}
+
+/// Today's behaviour: every declared step runs.
+pub struct RunEveryStep;
+
+impl SetupGate for RunEveryStep {
+    fn skip(&mut self, _: usize, _: &CommandSpec) -> bool {
+        false
+    }
+
+    fn ran(&mut self, _: usize, _: &CommandSpec, _: bool) {}
+}
+
+/// [`run_setup`] with a gate over which steps run. A skipped step leaves no
+/// outcome: it ran nothing, so it is neither evidence nor a check.
+pub fn run_setup_gated(
+    dir: &Path,
+    profile: &VerificationProfile,
+    logs_dir: &Path,
+    prefix: &str,
+    events: &Events,
+    cancel: Option<&AtomicBool>,
+    gate: &mut dyn SetupGate,
+) -> Result<Vec<CheckOutcome>, VerifyError> {
     let mut outcomes = Vec::new();
     for (index, command) in profile.setup.iter().enumerate() {
+        if gate.skip(index, command) {
+            continue;
+        }
         let label = setup_label(command);
         let log_stem = format!("{prefix}-setup{index}");
         let outcome = run_observed(dir, command, logs_dir, &label, &log_stem, events, cancel)?;
         let failed = outcome.failed();
+        gate.ran(index, command, !failed);
         outcomes.push(outcome);
         if failed {
             break;

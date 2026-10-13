@@ -291,11 +291,8 @@ fn first_regular_file(dir: &Path) -> Option<PathBuf> {
 
 // ---------------------------------------------------------- quiescence
 
-/// A cheap fingerprint of a directory tree: the newest mtime and the entry
-/// count over the whole walk. Used ONLY to decide when it is polite to
-/// clone (not mid-install); it has no authority over whether a step runs,
-/// because a timestamp-preserving rewrite defeats it.
-pub fn tree_fingerprint(dir: &Path) -> io::Result<String> {
+/// The newest mtime and the entry count over a whole directory walk.
+fn tree_state(dir: &Path) -> io::Result<(std::time::SystemTime, u64)> {
     let mut newest = std::time::UNIX_EPOCH;
     let mut count = 0u64;
     let mut pending = vec![dir.to_path_buf()];
@@ -303,8 +300,7 @@ pub fn tree_fingerprint(dir: &Path) -> io::Result<String> {
         for entry in std::fs::read_dir(&current)? {
             let entry = entry?;
             count += 1;
-            let meta = entry.metadata()?;
-            if let Ok(modified) = meta.modified() {
+            if let Ok(modified) = entry.metadata()?.modified() {
                 newest = newest.max(modified);
             }
             if entry.file_type()?.is_dir() {
@@ -312,6 +308,15 @@ pub fn tree_fingerprint(dir: &Path) -> io::Result<String> {
             }
         }
     }
+    Ok((newest, count))
+}
+
+/// A cheap fingerprint of a directory tree: the newest mtime and the entry
+/// count over the whole walk. Used ONLY to decide when it is polite to
+/// clone (not mid-install); it has no authority over whether a step runs,
+/// because a timestamp-preserving rewrite defeats it.
+pub fn tree_fingerprint(dir: &Path) -> io::Result<String> {
+    let (newest, count) = tree_state(dir)?;
     let nanos = newest
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
@@ -329,6 +334,17 @@ pub fn wait_until_quiet(
     sleep: &mut dyn FnMut(Duration),
     progress: &mut dyn FnMut(Duration),
 ) -> bool {
+    // Already still for `quiet_for`: nothing changed since before the
+    // window began, so there is nothing to wait out. A future-dated file
+    // reads as "changed just now" and waits the full window.
+    if let Ok((newest, _)) = tree_state(dir) {
+        if std::time::SystemTime::now()
+            .duration_since(newest)
+            .is_ok_and(|age| age >= quiet_for)
+        {
+            return true;
+        }
+    }
     let mut waited = Duration::ZERO;
     let mut stable = Duration::ZERO;
     let mut last = tree_fingerprint(dir).ok();
@@ -686,6 +702,32 @@ mod tests {
             ],
             "a bare name matches at any depth; src is tracked and .venv is an environment"
         );
+    }
+
+    #[test]
+    fn a_tree_untouched_for_the_window_needs_no_waiting() {
+        let root = temp_dir("reuse-old");
+        let file = root.join("a");
+        std::fs::write(&file, "1").expect("file");
+        let long_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .expect("open")
+            .set_modified(long_ago)
+            .expect("mtime");
+        // The directory's own mtime is not read; only entries are.
+        let mut slept = Duration::ZERO;
+        let quiet = wait_until_quiet(
+            &root,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            &mut |d| slept += d,
+            &mut |_| {},
+        );
+        assert!(quiet);
+        assert_eq!(slept, Duration::ZERO);
     }
 
     #[test]

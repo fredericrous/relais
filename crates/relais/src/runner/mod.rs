@@ -54,6 +54,7 @@ use crate::workspace::{self, TaskWorktree, WorkspaceError};
 pub mod live_trial;
 pub mod machine;
 pub mod scheduler;
+mod setup_gate;
 
 pub use machine::{decide, AttemptKind, Budget, Limit, Next, Observation, Terminal, WorktreeEnd};
 
@@ -161,6 +162,8 @@ impl From<crate::ids::IdError> for RunError {
 
 pub struct RunConfig<'a> {
     pub repo_dir: &'a Path,
+    /// Where this run works (ADR-0008). `Isolated` is today's behaviour.
+    pub workspace: crate::workspace::reuse::Workspace,
     pub contract: &'a TaskContract,
     pub repo_policy: &'a RepoPolicy,
     pub machine: &'a MachineSettings,
@@ -1280,6 +1283,46 @@ impl<'a> RunEngine<'a> {
         }
     }
 
+    /// Set a tree up before the profile's commands run in it. `Isolated` is
+    /// exactly [`verify::run_setup`]. A `Fork` or `InPlace` run first seeds
+    /// `dir` with the dependency directories of `seed_from` copy-on-write,
+    /// then runs every step, skipping only one that declared `reuse` and
+    /// proved its outputs (ADR-0008).
+    fn setup_tree(
+        &self,
+        dir: &Path,
+        seed_from: Option<&Path>,
+        profile: &crate::policy::VerificationProfile,
+        logs_dir: &Path,
+        prefix: &str,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Vec<verify::CheckOutcome>, verify::VerifyError> {
+        use crate::workspace::reuse::{StampStore, Workspace};
+        if self.config.workspace == Workspace::Isolated {
+            return verify::run_setup(dir, profile, logs_dir, prefix, &self.events, cancel);
+        }
+        let source = seed_from.filter(|source| *source != dir);
+        if let Some(source) = source {
+            setup_gate::seed_tree(self.config.repo_policy, source, dir, &self.events);
+        }
+        let state = self
+            .config
+            .artifacts_dir
+            .parent()
+            .unwrap_or(&self.config.artifacts_dir);
+        let stamps = StampStore::new(state);
+        let mut gate = setup_gate::ReuseGate::new(dir, source, &stamps, &self.events);
+        verify::run_setup_gated(
+            dir,
+            profile,
+            logs_dir,
+            prefix,
+            &self.events,
+            cancel,
+            &mut gate,
+        )
+    }
+
     /// A step of the run the pane shows (`protocol::Event::Step`).
     pub(crate) fn step(&self, name: &str, detail: String) {
         self.events.emit(Event::Step {
@@ -1493,12 +1536,12 @@ impl<'a> RunEngine<'a> {
         // setup is proven when the baseline came from the cache: a
         // cached verdict skipped the base's copy, not the machine.
         let setup = self.while_watching_cancel(|cancel| {
-            verify::run_setup(
+            self.setup_tree(
                 &worktree_path,
+                Some(self.config.repo_dir),
                 &preflight.authority.verification_profile,
                 &baseline.logs_dir,
                 "task",
-                &self.events,
                 cancel,
             )
         })?;
@@ -1651,6 +1694,16 @@ impl<'a> RunEngine<'a> {
             && self.config.purpose != Some(crate::lifecycle::RunPurpose::Replay)
         {
             self.say_command_changes(&this_repo_key);
+        }
+        if self.config.workspace != crate::workspace::reuse::Workspace::Isolated {
+            self.events.emit(Event::Decision {
+                what: "workspace_resolved".into(),
+                reason: format!(
+                    "{} in {}",
+                    self.config.workspace.as_str(),
+                    self.config.repo_dir.display()
+                ),
+            });
         }
         // Integrations (SPEC §5): a missing required one blocks execution;
         // optional gaps travel in the receipt and are never passes.
@@ -1973,12 +2026,12 @@ impl<'a> RunEngine<'a> {
                     // commands to run against — blocked, before any
                     // worker is bought (SPEC §10).
                     let setup = self.while_watching_cancel(|cancel| {
-                        verify::run_setup(
+                        self.setup_tree(
                             baseline.path(),
+                            Some(self.config.repo_dir),
                             &authority.verification_profile,
                             &logs_dir,
                             "base",
-                            &self.events,
                             cancel,
                         )
                     })?;
@@ -3769,12 +3822,14 @@ impl<'a> RunEngine<'a> {
             (None, Some(holder)) => {
                 let setup = self
                     .while_watching_cancel(|cancel| {
-                        verify::run_setup(
+                        self.setup_tree(
                             holder.path(),
+                            Some(&self.worktrees.join("task"))
+                                .filter(|task| task.is_dir())
+                                .map(|task| task.as_path()),
                             &authority.verification_profile,
                             logs_dir,
                             &label.log_prefix(),
-                            &self.events,
                             cancel,
                         )
                     })
@@ -5393,6 +5448,7 @@ mod tests {
                 reason: None,
             };
             execute(&RunConfig {
+                workspace: crate::workspace::reuse::Workspace::Isolated,
                 repo_dir: &self.repo,
                 contract,
                 repo_policy: repo,
@@ -5426,12 +5482,30 @@ mod tests {
             machine: &MachineSettings,
             backend: &dyn Backend,
         ) -> RunOutcome {
+            self.execute_in(
+                crate::workspace::reuse::Workspace::Isolated,
+                contract,
+                repo,
+                machine,
+                backend,
+            )
+        }
+
+        fn execute_in(
+            &self,
+            workspace: crate::workspace::reuse::Workspace,
+            contract: &TaskContract,
+            repo: &RepoPolicy,
+            machine: &MachineSettings,
+            backend: &dyn Backend,
+        ) -> RunOutcome {
             let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
                 adr: "ADR-0001".into(),
                 choice: None,
                 reason: None,
             };
             execute(&RunConfig {
+                workspace,
                 repo_dir: &self.repo,
                 contract,
                 repo_policy: repo,
@@ -5475,6 +5549,7 @@ mod tests {
                 reason: None,
             };
             execute(&RunConfig {
+                workspace: crate::workspace::reuse::Workspace::Isolated,
                 repo_dir: &self.repo,
                 contract,
                 repo_policy: repo,
@@ -5537,6 +5612,7 @@ mod tests {
                 reason: None,
             };
             execute(&RunConfig {
+                workspace: crate::workspace::reuse::Workspace::Isolated,
                 repo_dir: &self.repo,
                 contract,
                 repo_policy: repo,
@@ -5809,6 +5885,7 @@ mod tests {
             reason: None,
         };
         let config = RunConfig {
+            workspace: crate::workspace::reuse::Workspace::Isolated,
             repo_dir: &fixture.repo,
             contract: &contract,
             repo_policy: &repo,
@@ -6991,6 +7068,7 @@ mod tests {
         let not_a_repo = fixture.dir.join("not-a-repo");
         std::fs::create_dir_all(&not_a_repo).expect("mkdir");
         let outcome = execute(&RunConfig {
+            workspace: crate::workspace::reuse::Workspace::Isolated,
             repo_dir: &not_a_repo,
             contract: &contract,
             repo_policy: &repo,
@@ -9870,6 +9948,183 @@ mod tests {
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
+    /// A repository with an ignored, untracked `node_modules` the caller
+    /// installed, as happier-wt-n1 has: what a fork seeds from.
+    fn fixture_with_installed_deps() -> Fixture {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.repo.join(".gitignore"), "node_modules/\n").expect("ignore");
+        std::fs::write(fixture.repo.join("package.json"), "{}\n").expect("manifest");
+        git(&fixture.repo, &["add", "-A"]);
+        git(&fixture.repo, &["commit", "-q", "-m", "ignore deps"]);
+        std::fs::create_dir_all(fixture.repo.join("node_modules/dep")).expect("mkdir");
+        std::fs::write(fixture.repo.join("node_modules/dep/index.js"), "ok").expect("dep");
+        fixture
+    }
+
+    fn bash_step(script: &str) -> CommandSpec {
+        CommandSpec {
+            name: None,
+            junit: None,
+            reuse: None,
+            argv: vec!["bash".into(), "-c".into(), script.into()],
+            timeout_seconds: 30,
+        }
+    }
+
+    /// Can this filesystem clone? A test on one that cannot asserts the
+    /// fallback instead, which is today's full setup.
+    fn cow_here(fixture: &Fixture) -> bool {
+        let sample = fixture.repo.join(".gitignore");
+        crate::fsclone::probe(&sample, &fixture.dir).is_ok()
+    }
+
+    /// The setup needs the caller's installed dependency: a fork has it
+    /// before any step runs, copy-on-write, and an isolated run (today)
+    /// does not, so the same policy blocks there.
+    #[test]
+    fn a_fork_seeds_the_callers_dependencies_and_isolated_does_not() {
+        use crate::workspace::reuse::Workspace;
+        let fixture = fixture_with_installed_deps();
+        let repo = fixture.repo_policy_with_setup(
+            vec![bash_step("test -f node_modules/dep/index.js")],
+            vec![versionable_main_gone_check()],
+            3,
+        );
+        let machine = fixture.machine_for(&repo);
+        let backend = conditional_worker("relais task");
+        let isolated = fixture.execute_in(
+            Workspace::Isolated,
+            &fixture.contract(Review::Off),
+            &repo,
+            &machine,
+            &backend,
+        );
+        let RunOutcome {
+            terminal: Terminal::Blocked { code, .. },
+            ..
+        } = isolated
+        else {
+            panic!("isolated must not see the caller's node_modules: {isolated:?}");
+        };
+        assert_eq!(code, BlockCode::VerificationSetupFailed);
+
+        let fork = fixture.execute_in(
+            Workspace::Fork,
+            &fixture.contract(Review::Off),
+            &repo,
+            &machine,
+            &backend,
+        );
+        if cow_here(&fixture) {
+            let RunOutcome {
+                run_id,
+                terminal: Terminal::Accepted(_),
+            } = fork
+            else {
+                panic!("a fork seeds node_modules before setup: {fork:?}");
+            };
+            let logs = fixture.artifacts.join(run_id.as_str()).join("logs");
+            assert!(
+                logs.join("task-setup0.log").exists(),
+                "seeding does not skip setup: every step still ran"
+            );
+        } else {
+            assert!(
+                matches!(fork.terminal, Terminal::Blocked { .. }),
+                "without copy-on-write the fork degrades to today's behaviour: {fork:?}"
+            );
+        }
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    fn reusing_step(script: &str) -> CommandSpec {
+        CommandSpec {
+            reuse: Some(crate::policy::ReuseSpec {
+                inputs: vec!["package.json".into()],
+                outputs: vec!["node_modules".into()],
+                verify: vec!["true".into()],
+            }),
+            ..bash_step(script)
+        }
+    }
+
+    /// The stamp relais would have left in the caller's workspace after it
+    /// ran the step itself.
+    fn stamp_the_callers_workspace(fixture: &Fixture, step: &CommandSpec) {
+        let reuse = step.reuse.as_ref().expect("reuse");
+        let version = crate::tooling::program_version("bash", None).expect("bash");
+        let toolchain = format!("{} {}", version.program, version.version);
+        let key = crate::workspace::reuse::step_key(&fixture.repo, step, reuse, &toolchain, &[])
+            .expect("key");
+        crate::workspace::reuse::StampStore::new(&fixture.dir)
+            .put(&fixture.repo, 0, key, 1)
+            .expect("stamp");
+    }
+
+    /// A step that declared `reuse` and whose key, outputs and verify all
+    /// hold is not run in any tree of the run; one whose inputs changed
+    /// since the recorded result is.
+    #[test]
+    fn a_fork_skips_a_step_only_when_it_proved_its_result() {
+        use crate::workspace::reuse::Workspace;
+        let fixture = fixture_with_installed_deps();
+        if !cow_here(&fixture) {
+            return;
+        }
+        let step = reusing_step("exit 1");
+        let repo = fixture.repo_policy_with_setup(
+            vec![step.clone()],
+            vec![versionable_main_gone_check()],
+            3,
+        );
+        let machine = fixture.machine_for(&repo);
+        let backend = conditional_worker("relais task");
+
+        stamp_the_callers_workspace(&fixture, &step);
+        let skipped = fixture.execute_in(
+            Workspace::Fork,
+            &fixture.contract(Review::Off),
+            &repo,
+            &machine,
+            &backend,
+        );
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Accepted(_),
+        } = skipped
+        else {
+            panic!("the step proved its result and must not run: {skipped:?}");
+        };
+        let logs = fixture.artifacts.join(run_id.as_str()).join("logs");
+        for stem in ["base", "task", "attempt1"] {
+            assert!(
+                !logs.join(format!("{stem}-setup0.log")).exists(),
+                "{stem}: a skipped step leaves no log"
+            );
+        }
+
+        // The input the key covers changes after the result was recorded.
+        stamp_the_callers_workspace(&fixture, &step);
+        std::fs::write(fixture.repo.join("package.json"), "{\"v\":2}\n").expect("edit");
+        git(&fixture.repo, &["commit", "-q", "-am", "change an input"]);
+        let ran = fixture.execute_in(
+            Workspace::Fork,
+            &fixture.contract(Review::Off),
+            &repo,
+            &machine,
+            &backend,
+        );
+        let RunOutcome {
+            terminal: Terminal::Blocked { code, .. },
+            ..
+        } = ran
+        else {
+            panic!("a changed input means the step runs (and this one fails): {ran:?}");
+        };
+        assert_eq!(code, BlockCode::VerificationSetupFailed);
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
     /// A cached baseline skips the base's copy of the setup, not the
     /// task worktree's: a setup that fails there still blocks the run
     /// before a worker is bought.
@@ -11050,6 +11305,7 @@ mod tests {
         let backend = MockBackend::new(|_| unreachable!("no dispatch"));
         let resolver = |_: &str, _: Option<&str>| AvalVerdict::Unknown;
         let config = RunConfig {
+            workspace: crate::workspace::reuse::Workspace::Isolated,
             repo_dir: &fixture.repo,
             contract: &contract,
             repo_policy: &repo,
