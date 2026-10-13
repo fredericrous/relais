@@ -441,6 +441,16 @@ pub(crate) struct RunEngine<'a> {
     cancel_asked: Arc<AtomicBool>,
     /// Everything this run does, as events (SPEC §29).
     pub(crate) events: Events,
+    /// The caller's worktree this run holds when it works in place
+    /// (ADR-0008); `None` for every other workspace.
+    inplace: Option<InPlaceRun>,
+}
+
+/// An in-place run's hold on the caller's worktree.
+struct InPlaceRun {
+    /// Taken at the end, when the tree is finalized.
+    lease: Option<workspace::inplace::Lease>,
+    start: workspace::inplace::Start,
 }
 
 /// What a run has spent so far, and how well that figure is known.
@@ -731,6 +741,7 @@ impl<'a> RunEngine<'a> {
             parent,
             harness: None,
             own_write_leases: std::collections::BTreeSet::new(),
+            inplace: None,
             reviewer_gap: None,
             cancel_asked: Arc::new(AtomicBool::new(false)),
             events,
@@ -1283,6 +1294,228 @@ impl<'a> RunEngine<'a> {
         }
     }
 
+    /// Take the caller's worktree for this run and snapshot it (ADR-0008).
+    /// The snapshot, not `HEAD`, becomes the base of every diff, scope
+    /// check and verification tree, so uncommitted work the person had
+    /// is neither the worker's nor lost. A refusal carries its block code.
+    fn enter_in_place(&mut self, base_sha: String) -> Result<String, (BlockCode, String)> {
+        use crate::workspace::inplace::{start_snapshot, Lease, LeaseRefusal};
+        let lease = Lease::acquire(self.config.repo_dir, self.run_id.as_str()).map_err(|e| match e {
+            LeaseRefusal::Busy { holder } => (
+                BlockCode::WorkspaceBusy,
+                format!(
+                    "run {} holds this worktree; wait for its outcome (relais status {})",
+                    holder.as_deref().unwrap_or("?"),
+                    holder.as_deref().unwrap_or("<run>")
+                ),
+            ),
+            LeaseRefusal::Interrupted { run } => (
+                BlockCode::WorkspaceHasInterruptedRun,
+                format!(
+                    "run {run} was interrupted here with edits applied; run: relais resume --retire {run}"
+                ),
+            ),
+            LeaseRefusal::Io(e) => (BlockCode::WorktreeUnavailable, e.to_string()),
+        })?;
+        let start = start_snapshot(&lease).map_err(|e| {
+            (
+                BlockCode::WorktreeUnavailable,
+                format!("the start snapshot failed: {e}"),
+            )
+        })?;
+        if start.head_sha != base_sha {
+            return Err((
+                BlockCode::BaseUnresolvable,
+                format!(
+                    "the contract's base resolves to {} but this worktree is at {}; an in-place run works from the worktree's own HEAD",
+                    &base_sha[..base_sha.len().min(12)],
+                    &start.head_sha[..start.head_sha.len().min(12)]
+                ),
+            ));
+        }
+        self.events.emit(Event::Decision {
+            what: "workspace_in_place".into(),
+            reason: format!(
+                "in place in {}: do not edit it until the outcome arrives (lease held){}",
+                self.config.repo_dir.display(),
+                if start.dirty.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; the start snapshot includes {} uncommitted path(s)",
+                        start.dirty.len()
+                    )
+                }
+            ),
+        });
+        let sha = start.sha.clone();
+        self.inplace = Some(InPlaceRun {
+            lease: Some(lease),
+            start,
+        });
+        Ok(sha)
+    }
+
+    /// The run's worker tree when it works in place: the caller's own
+    /// worktree, against a private index. The marker is written here,
+    /// before anything can edit the tree, so a run that dies from now on
+    /// is found and finished by `resume --retire`.
+    fn take_in_place_worktree(&mut self) -> Option<Result<TaskWorktree, String>> {
+        use crate::workspace::inplace::{Marker, Stage};
+        let state = self.inplace.as_ref()?;
+        let lease = state.lease.as_ref()?;
+        let start = &state.start;
+        let marker = Marker {
+            run: self.run_id.as_str().to_string(),
+            stage: Stage::Running,
+            head_symbolic: start.head_symbolic.clone(),
+            head_sha: start.head_sha.clone(),
+            start: start.sha.clone(),
+            index_listing: start.index_listing.clone(),
+            target: None,
+            exported: None,
+        };
+        Some(
+            lease
+                .write_marker(&marker)
+                .map(|()| TaskWorktree {
+                    path: self.config.repo_dir.to_path_buf(),
+                    base_sha: start.sha.clone(),
+                    index: Some(lease.relais_index()),
+                })
+                .map_err(|e| format!("the in-place marker could not be written: {e}")),
+        )
+    }
+
+    /// The end of an in-place run: decide what the worktree must be (the
+    /// accepted change, or how it was found), then export what no
+    /// candidate holds, apply it, and release the worktree. The directory
+    /// is never removed. An interrupted run keeps its marker and its
+    /// edits for `relais resume --retire`.
+    fn finish_in_place(
+        &mut self,
+        worktree: &TaskWorktree,
+        outcome: &RunOutcome,
+    ) -> Result<(), RunError> {
+        use crate::workspace::inplace::{finalize, ApplyError, Outcome, Target, TargetKind};
+        let Some(lease) = self.inplace.as_mut().and_then(|state| state.lease.take()) else {
+            return Ok(());
+        };
+        if matches!(outcome.terminal.worktree_end(), WorktreeEnd::Keep) {
+            self.events.emit(Event::Stderr {
+                text: format!(
+                    "worktree {} kept with the run's edits in it; `relais resume --retire {}` finishes it",
+                    worktree.path.display(),
+                    self.run_id
+                ),
+            });
+            return Ok(());
+        }
+        let tree_of = |rev: &str| {
+            self.config
+                .git
+                .run(&worktree.path, &["rev-parse", &format!("{rev}^{{tree}}")])
+                .map(|tree| tree.trim().to_string())
+        };
+        let target = match &outcome.terminal {
+            Terminal::Accepted(receipt) => tree_of(&receipt.candidate_sha).map(|tree| Target {
+                kind: TargetKind::Accepted,
+                tree,
+            }),
+            _ => tree_of(&worktree.base_sha).map(|tree| Target {
+                kind: TargetKind::Start,
+                tree,
+            }),
+        };
+        let target = match target {
+            Ok(target) => target,
+            Err(e) => {
+                return self.transition(
+                    self.state,
+                    Reason::WorktreeNotReleased,
+                    serde_json::json!({
+                        "worktree": worktree.path.to_string_lossy(),
+                        "error": e.to_string(),
+                        "detail": "the tree the worktree must end as could not be read; it is as the run left it",
+                    }),
+                );
+            }
+        };
+        let kind = target.kind;
+        let artifacts = self.artifacts.clone();
+        let run_id = self.run_id.as_str().to_string();
+        let mut export = || {
+            workspace::export_unkept(worktree, &run_id, &artifacts)
+                .map(|exported| {
+                    exported
+                        .map(|exported| exported.reference)
+                        .unwrap_or_else(|| "none".to_string())
+                })
+                .map_err(std::io::Error::other)
+        };
+        match finalize(lease, target, &mut export) {
+            Ok(Outcome::Applied) => self.transition(
+                self.state,
+                Reason::WorktreeRetired,
+                serde_json::json!({
+                    "worktree": worktree.path.to_string_lossy(),
+                    "in_place": true,
+                    "left": match kind {
+                        TargetKind::Accepted => "the accepted change",
+                        TargetKind::Start => "the tree as it was found",
+                    },
+                    "detail": "the directory is kept",
+                }),
+            ),
+            Ok(Outcome::HeadMoved { was, now }) => {
+                self.events.emit(Event::Stderr {
+                    text: format!(
+                        "HEAD moved from {} to {} during the run; relais did not touch the branch, review it yourself",
+                        &was[..was.len().min(12)],
+                        &now[..now.len().min(12)]
+                    ),
+                });
+                self.transition(
+                    self.state,
+                    Reason::WorktreeNotReleased,
+                    serde_json::json!({
+                        "worktree": worktree.path.to_string_lossy(),
+                        "code": BlockCode::InPlaceHeadMoved.as_str(),
+                        "was": was,
+                        "now": now,
+                        "detail": "a worker committed on the person's branch; the tree and the branch were left as they are",
+                    }),
+                )
+            }
+            Err(e) => {
+                let code = match &e {
+                    ApplyError::Collisions(_) => BlockCode::RestoreBlockedIgnoredCollision,
+                    _ => BlockCode::WorktreeUnavailable,
+                };
+                self.transition(
+                    self.state,
+                    Reason::WorktreeNotReleased,
+                    serde_json::json!({
+                        "worktree": worktree.path.to_string_lossy(),
+                        "code": code.as_str(),
+                        "error": e.to_string(),
+                        "detail": "the worktree is as the run left it; `relais resume --retire` retries once the paths named are dealt with",
+                    }),
+                )
+            }
+        }
+    }
+
+    /// The tree the worker edits, when it exists: the caller's own worktree
+    /// for an in-place run, else this run's task worktree. Candidate
+    /// verification trees are seeded from it.
+    fn task_tree(&self) -> Option<PathBuf> {
+        if self.inplace.is_some() {
+            return Some(self.config.repo_dir.to_path_buf());
+        }
+        Some(self.worktrees.join("task")).filter(|task| task.is_dir())
+    }
+
     /// Set a tree up before the profile's commands run in it. `Isolated` is
     /// exactly [`verify::run_setup`]. A `Fork` or `InPlace` run first seeds
     /// `dir` with the dependency directories of `seed_from` copy-on-write,
@@ -1523,14 +1756,21 @@ impl<'a> RunEngine<'a> {
         // stops everything (SPEC §8, §9).
         let worktree_path = self.worktrees.join("task");
         self.step("worktree · setup", String::new());
-        let worktree = match workspace::create_worktree(
-            self.config.repo_dir,
-            &preflight.base_sha,
-            &worktree_path,
-        ) {
-            Ok(worktree) => worktree,
-            Err(e) => return self.fail_preflight(BlockCode::WorktreeUnavailable, e.to_string()),
+        let worktree = match self.take_in_place_worktree() {
+            Some(Ok(worktree)) => worktree,
+            Some(Err(e)) => return self.fail_preflight(BlockCode::WorktreeUnavailable, e),
+            None => match workspace::create_worktree(
+                self.config.repo_dir,
+                &preflight.base_sha,
+                &worktree_path,
+            ) {
+                Ok(worktree) => worktree,
+                Err(e) => {
+                    return self.fail_preflight(BlockCode::WorktreeUnavailable, e.to_string())
+                }
+            },
         };
+        let worktree_path = worktree.path.clone();
         // The same setup in the worker's own tree, so the worker can run
         // the checks it is told to pass. This is also the one place the
         // setup is proven when the baseline came from the cache: a
@@ -1646,7 +1886,17 @@ impl<'a> RunEngine<'a> {
         // forbids, performed on an unknown tree (audit B11). The refusal
         // is the same one a dirty tree gets, with the reason the check
         // gave.
-        match workspace::dirty_paths(self.config.repo_dir) {
+        // An in-place run starts from the tree as it is: uncommitted work
+        // is part of the start snapshot, not a refusal (ADR-0008).
+        let in_place = self.config.workspace == crate::workspace::reuse::Workspace::InPlace
+            && self.parent.is_none();
+        match workspace::dirty_paths(self.config.repo_dir).map(|dirty| {
+            if in_place {
+                Vec::new()
+            } else {
+                dirty
+            }
+        }) {
             Ok(dirty) if dirty.is_empty() => {}
             Ok(dirty) => {
                 return Ok(Phase::Ended(self.fail_preflight(
@@ -1751,6 +2001,17 @@ impl<'a> RunEngine<'a> {
                     ))
                 }
             };
+
+        let base_sha = if in_place {
+            match self.enter_in_place(base_sha) {
+                Ok(sha) => sha,
+                Err((code, detail)) => {
+                    return Ok(Phase::Ended(self.fail_preflight(code, detail)?));
+                }
+            }
+        } else {
+            base_sha
+        };
 
         let contract_hash = self.config.contract.hash();
         let revision_id = ledger.insert_contract_revision(
@@ -1993,9 +2254,22 @@ impl<'a> RunEngine<'a> {
         let toolchain = verify::resolve_toolchain(&authority.verification_profile, &|program| {
             crate::tooling::program_version(program, None)
         });
+        // The base's content, not its commit: the same files reached by a
+        // different commit (an empty one between, an in-place start
+        // snapshot) have the same verdict (ADR-0008). A tree git cannot
+        // name falls back to the commit, which only narrows the cache.
+        let base_tree = self
+            .config
+            .git
+            .run(
+                self.config.repo_dir,
+                &["rev-parse", &format!("{}^{{tree}}", preflight.base_sha)],
+            )
+            .map(|tree| tree.trim().to_string())
+            .unwrap_or_else(|_| preflight.base_sha.clone());
         let baseline_key = match &toolchain {
             Ok(toolchain) => Some(verify::baseline_key(
-                &preflight.base_sha,
+                &base_tree,
                 &authority.verification_profile,
                 &preflight.manifest.tool_versions,
                 toolchain,
@@ -3391,6 +3665,9 @@ impl<'a> RunEngine<'a> {
         worktree: &TaskWorktree,
         outcome: &RunOutcome,
     ) -> Result<(), RunError> {
+        if self.inplace.is_some() {
+            return self.finish_in_place(worktree, outcome);
+        }
         match outcome.terminal.worktree_end() {
             WorktreeEnd::Keep => {
                 // A write lease on the tree is a writer, whatever the
@@ -3824,9 +4101,7 @@ impl<'a> RunEngine<'a> {
                     .while_watching_cancel(|cancel| {
                         self.setup_tree(
                             holder.path(),
-                            Some(&self.worktrees.join("task"))
-                                .filter(|task| task.is_dir())
-                                .map(|task| task.as_path()),
+                            self.task_tree().as_deref(),
                             &authority.verification_profile,
                             logs_dir,
                             &label.log_prefix(),
@@ -9945,6 +10220,239 @@ mod tests {
             "the commands never ran"
         );
         assert!(evidence_of(&fixture, &run_id, EvidenceKind::CheckLog).is_empty());
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// The baseline verdict belongs to the CONTENT of the base: the same
+    /// files reached by another commit (an empty one between the runs, an
+    /// in-place start snapshot) are the same base, so the second run reads
+    /// the first's verdict, and a changed tree does not (ADR-0008).
+    #[test]
+    fn a_baseline_verdict_is_keyed_by_the_tree_not_the_commit() {
+        let fixture = Fixture::new();
+        let mut repo = fixture.repo_policy_with_setup(
+            vec![bash_step("true")],
+            vec![versionable_main_gone_check()],
+            3,
+        );
+        repo.verification
+            .profiles
+            .get_mut("profile")
+            .expect("profile")
+            .cache_baseline = true;
+        let machine = fixture.machine_for(&repo);
+        let backend = conditional_worker("relais task");
+        let run = |fixture: &Fixture| {
+            fixture.execute_with_machine(&fixture.contract(Review::Off), &repo, &machine, &backend)
+        };
+        let RunOutcome {
+            terminal: Terminal::Accepted(first),
+            ..
+        } = run(&fixture)
+        else {
+            panic!("first run");
+        };
+        assert!(!first.verification.baseline_cached);
+
+        git(
+            &fixture.repo,
+            &["commit", "-q", "--allow-empty", "-m", "same tree"],
+        );
+        let RunOutcome {
+            terminal: Terminal::Accepted(second),
+            ..
+        } = run(&fixture)
+        else {
+            panic!("second run");
+        };
+        assert_ne!(first.base_sha, second.base_sha, "another commit");
+        assert!(
+            second.verification.baseline_cached,
+            "the same tree under another commit reads the cached verdict"
+        );
+
+        std::fs::write(fixture.repo.join("README"), "changes the tree\n").expect("write");
+        git(&fixture.repo, &["add", "-A"]);
+        git(&fixture.repo, &["commit", "-q", "-m", "new tree"]);
+        let RunOutcome {
+            terminal: Terminal::Accepted(third),
+            ..
+        } = run(&fixture)
+        else {
+            panic!("third run");
+        };
+        assert!(!third.verification.baseline_cached, "a changed tree misses");
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A fixture whose repository directory is a LINKED worktree of the
+    /// primary checkout, as happier-wt-n1 is, with an uncommitted file the
+    /// person had before the run.
+    fn fixture_in_a_linked_worktree() -> Fixture {
+        let mut fixture = Fixture::new();
+        let wt = fixture.dir.join("wt");
+        git(
+            &fixture.repo,
+            &["worktree", "add", "-q", "-b", "task", &wt.to_string_lossy()],
+        );
+        fixture.repo = wt;
+        std::fs::write(fixture.repo.join("notes.txt"), "the person's own work\n").expect("notes");
+        fixture
+    }
+
+    fn in_place_policy(fixture: &Fixture) -> (RepoPolicy, MachineSettings) {
+        let repo =
+            fixture.repo_policy_with_setup(Vec::new(), vec![versionable_main_gone_check()], 1);
+        let machine = fixture.machine_for(&repo);
+        (repo, machine)
+    }
+
+    /// In place: no fork is made, the worker edits the caller's own
+    /// worktree, an accepted change is left applied beside the person's
+    /// uncommitted work, and nothing is left behind.
+    #[test]
+    fn an_accepted_in_place_run_leaves_its_change_applied_beside_the_persons_work() {
+        use crate::workspace::reuse::Workspace;
+        let fixture = fixture_in_a_linked_worktree();
+        let (repo, machine) = in_place_policy(&fixture);
+        let outcome = fixture.execute_in(
+            Workspace::InPlace,
+            &fixture.contract(Review::Off),
+            &repo,
+            &machine,
+            &conditional_worker("relais task"),
+        );
+        let RunOutcome {
+            run_id,
+            terminal: Terminal::Accepted(receipt),
+        } = outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert!(
+            !fixture.repo.join("src/main.rs").exists(),
+            "the accepted change is left in the caller's worktree"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.repo.join("notes.txt")).expect("notes"),
+            "the person's own work\n",
+            "uncommitted work the person had survives"
+        );
+        assert!(
+            !fixture.worktree(&run_id).exists(),
+            "no fork was made for an in-place run"
+        );
+        let gd = crate::workspace::inplace::git_dir(&fixture.repo).expect("git dir");
+        assert!(
+            crate::workspace::inplace::leftover_markers(&gd)
+                .expect("ls")
+                .is_empty(),
+            "a finished run leaves no marker"
+        );
+        assert_ne!(receipt.base_sha, receipt.candidate_sha);
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// A run that is not accepted returns the worktree to how it was found,
+    /// the person's uncommitted work included.
+    #[test]
+    fn a_failed_in_place_run_restores_the_worktree_as_it_was_found() {
+        use crate::workspace::reuse::Workspace;
+        let fixture = fixture_in_a_linked_worktree();
+        let (repo, machine) = in_place_policy(&fixture);
+        let before = std::fs::read_to_string(fixture.repo.join("src/main.rs")).expect("main");
+        let outcome = fixture.execute_in(
+            Workspace::InPlace,
+            &fixture.contract(Review::Off),
+            &repo,
+            &machine,
+            // Churns the tree every attempt and never completes.
+            &churning_worker(""),
+        );
+        assert!(
+            !matches!(outcome.terminal, Terminal::Accepted(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.repo.join("src/main.rs")).expect("main"),
+            before
+        );
+        assert!(
+            !fixture.repo.join("src/tick-0.txt").exists(),
+            "the worker's additions are gone"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.repo.join("notes.txt")).expect("notes"),
+            "the person's own work\n"
+        );
+        let gd = crate::workspace::inplace::git_dir(&fixture.repo).expect("git dir");
+        assert!(crate::workspace::inplace::leftover_markers(&gd)
+            .expect("ls")
+            .is_empty());
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// One run at a time per worktree, and a worktree a run died in is not
+    /// started on top of until it is retired.
+    #[test]
+    fn a_held_or_interrupted_worktree_blocks_the_next_in_place_run_with_its_remedy() {
+        use crate::workspace::inplace::{head, Lease, Marker, Stage};
+        use crate::workspace::reuse::Workspace;
+        let fixture = fixture_in_a_linked_worktree();
+        let (repo, machine) = in_place_policy(&fixture);
+        let run = |fixture: &Fixture| {
+            fixture.execute_in(
+                Workspace::InPlace,
+                &fixture.contract(Review::Off),
+                &repo,
+                &machine,
+                &conditional_worker("relais task"),
+            )
+        };
+        let holder = Lease::acquire(&fixture.repo, "run-holder").expect("lease");
+        let RunOutcome {
+            terminal: Terminal::Blocked { code, detail },
+            ..
+        } = run(&fixture)
+        else {
+            panic!("busy");
+        };
+        assert_eq!(code, BlockCode::WorkspaceBusy);
+        assert!(detail.contains("run-holder"), "{detail}");
+
+        let (symbolic, sha) = head(&fixture.repo).expect("head");
+        holder
+            .write_marker(&Marker {
+                run: "run-dead".into(),
+                stage: Stage::Running,
+                head_symbolic: symbolic,
+                head_sha: sha.clone(),
+                start: sha,
+                index_listing: String::new(),
+                target: None,
+                exported: None,
+            })
+            .expect("marker");
+        // The marker is named for the run that died, not the holder.
+        let gd = holder.git_dir().to_path_buf();
+        std::fs::rename(
+            gd.join("relais-inplace/run-holder.json"),
+            gd.join("relais-inplace/run-dead.json"),
+        )
+        .ok();
+        drop(holder);
+        let RunOutcome {
+            terminal: Terminal::Blocked { code, detail },
+            ..
+        } = run(&fixture)
+        else {
+            panic!("interrupted");
+        };
+        assert_eq!(code, BlockCode::WorkspaceHasInterruptedRun);
+        assert!(
+            detail.contains("relais resume --retire run-dead"),
+            "{detail}"
+        );
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 

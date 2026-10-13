@@ -1664,6 +1664,17 @@ pub enum BlockCode {
     /// The contract's `design` cannot be read at the base revision: it is
     /// missing there, oversized or not text.
     DesignUnreadable,
+    /// Another run holds the caller's worktree (ADR-0008).
+    WorkspaceBusy,
+    /// A run was interrupted in the caller's worktree and has not been
+    /// retired; its partial edits are still there.
+    WorkspaceHasInterruptedRun,
+    /// `HEAD` moved during an in-place run: a worker committed on the
+    /// person's branch. The tree and the branch were left as they are.
+    InPlaceHeadMoved,
+    /// Restoring an in-place worktree would replace a path that holds
+    /// files relais did not make; nothing was deleted.
+    RestoreBlockedIgnoredCollision,
 }
 
 impl BlockCode {
@@ -1702,6 +1713,10 @@ impl BlockCode {
             Self::SandboxUnverified => "sandbox_unverified",
             Self::NativeUnpriced => "native_unpriced",
             Self::DesignUnreadable => "design_unreadable",
+            Self::WorkspaceBusy => "workspace_busy",
+            Self::WorkspaceHasInterruptedRun => "workspace_has_interrupted_run",
+            Self::InPlaceHeadMoved => "inplace_head_moved",
+            Self::RestoreBlockedIgnoredCollision => "restore_blocked_ignored_collision",
         }
     }
 }

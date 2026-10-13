@@ -2002,8 +2002,12 @@ pub fn resolve_toolchain(
 /// lockfiles, toolchain, command, configuration"). Lockfiles are part of
 /// the base tree; the toolchain is the resolved programs the commands
 /// run, on the machine identity they run on.
+///
+/// `base_tree` is the base's TREE object, not its commit: the verdict is a
+/// function of content, so a synthetic start commit of an in-place run and
+/// a real commit holding the same files share one entry (ADR-0008).
 pub fn baseline_key(
-    base_sha: &str,
+    base_tree: &str,
     profile: &VerificationProfile,
     tools: &crate::context::ToolVersions,
     toolchain: &Toolchain,
@@ -2020,7 +2024,7 @@ pub fn baseline_key(
             // entry written under the old meaning, at the cost of one
             // baseline run each.
             "meaning": BASELINE_MEANING_VERSION,
-            "base": base_sha,
+            "tree": base_tree,
             "profile": profile,
             "tools": tools,
             "toolchain": toolchain,
@@ -2032,8 +2036,9 @@ pub fn baseline_key(
 
 /// Bumped when what a cached baseline entry means changes, rather than
 /// what it was computed from. v2: a check that did not run to a verdict
-/// is `BaselineUnrunnable` and is never cached as a failure.
-const BASELINE_MEANING_VERSION: u32 = 2;
+/// is `BaselineUnrunnable` and is never cached as a failure. v3: the key
+/// names the base's tree object instead of its commit (ADR-0008).
+const BASELINE_MEANING_VERSION: u32 = 3;
 
 /// Cached baseline failures, one JSON file per key, opt-in per profile
 /// (SPEC §18: not cacheable by default). A miss reruns the checks; a

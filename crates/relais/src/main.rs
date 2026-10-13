@@ -7440,6 +7440,118 @@ fn retire_verification_checkout(
     }
 }
 
+/// Finish an in-place run that died, if `run` was one (ADR-0008): the
+/// worktree is the caller's own and is never removed. Its marker names the
+/// tree it must end as; the work no candidate holds is exported first, the
+/// target applied, and the marker removed last. `None` = not an in-place run.
+fn retire_in_place(
+    ledger: &Ledger,
+    run: &RunId,
+    state: State,
+    reconciliation: &resume::Reconciliation,
+) -> Result<Option<CliOutcome>, CliError> {
+    use relais::workspace::inplace::{self, Lease, LeaseRefusal, Outcome, Target, TargetKind};
+    let Some(workspace) = operational(ledger.run_workspace(run), "resume")? else {
+        return Ok(None);
+    };
+    let root = workspace.repo_path;
+    let Ok(git_dir) = inplace::git_dir(&root) else {
+        return Ok(None);
+    };
+    let Ok(marker) = inplace::read_marker(&git_dir, run.as_str()) else {
+        return Ok(None);
+    };
+    if !reconciliation.all_provably_dead() {
+        println!(
+            "{run}: kept, a dispatch may still write {} ({})",
+            root.display(),
+            reconciliation.detail()
+        );
+        return Ok(Some(CliOutcome::OperationalFailure));
+    }
+    let lease = match Lease::reclaim(&root, run.as_str()) {
+        Ok(lease) => lease,
+        Err(LeaseRefusal::Busy { holder }) => {
+            println!(
+                "{run}: kept, run {} holds {}",
+                holder.as_deref().unwrap_or("?"),
+                root.display()
+            );
+            return Ok(Some(CliOutcome::OperationalFailure));
+        }
+        Err(LeaseRefusal::Interrupted { .. }) => return Ok(None),
+        Err(LeaseRefusal::Io(e)) => {
+            println!("{run}: kept, {} could not be taken: {e}", root.display());
+            return Ok(Some(CliOutcome::OperationalFailure));
+        }
+    };
+    let tree_of = |rev: &str| -> Result<String, CliError> {
+        let output = workspace::git_command(&root)
+            .args(["rev-parse", &format!("{rev}^{{tree}}")])
+            .output()
+            .map_err(|e| CliError::Usage {
+                detail: format!("git could not be launched: {e}"),
+            })?;
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    // An accepted run is left holding its change, also when it died before
+    // the marker said so: the ledger and the receipt know.
+    let artifacts = paths::runs_dir()
+        .map_err(CliError::Home)?
+        .join(run.as_str());
+    let accepted = (state == State::Accepted)
+        .then(|| std::fs::read_to_string(artifacts.join("receipt.json")).ok())
+        .flatten()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|receipt| receipt["candidate_sha"].as_str().map(str::to_string));
+    let target = match accepted {
+        Some(candidate) => Target {
+            kind: TargetKind::Accepted,
+            tree: tree_of(&candidate)?,
+        },
+        None => Target {
+            kind: TargetKind::Start,
+            tree: tree_of(&marker.start)?,
+        },
+    };
+    let worktree = workspace::TaskWorktree {
+        path: root.clone(),
+        base_sha: marker.start.clone(),
+        index: Some(lease.relais_index()),
+    };
+    let mut export = || {
+        workspace::export_unkept(&worktree, run.as_str(), &artifacts)
+            .map(|exported| {
+                exported
+                    .map(|exported| exported.reference)
+                    .unwrap_or_else(|| "none".to_string())
+            })
+            .map_err(std::io::Error::other)
+    };
+    Ok(Some(match inplace::finalize(lease, target, &mut export) {
+        Ok(Outcome::Applied) => {
+            println!(
+                "{run}: restored to {} in {} (directory kept)",
+                inplace::short(&marker.start),
+                root.display()
+            );
+            CliOutcome::Accepted
+        }
+        Ok(Outcome::HeadMoved { was, now }) => {
+            println!(
+                "{run}: kept, HEAD moved from {} to {} during the run; the tree and the branch were not touched, review them yourself",
+                inplace::short(&was),
+                inplace::short(&now)
+            );
+            CliOutcome::OperationalFailure
+        }
+        Err(e) => {
+            println!("{run}: kept, {e}");
+            CliOutcome::OperationalFailure
+        }
+    }))
+}
+
 /// Retire every worktree one terminal run still holds.
 fn retire_run(
     ledger: &Ledger,
@@ -7447,6 +7559,9 @@ fn retire_run(
     state: State,
     reconciliation: &resume::Reconciliation,
 ) -> Result<CliOutcome, CliError> {
+    if let Some(done) = retire_in_place(ledger, run, state, reconciliation)? {
+        return Ok(done);
+    }
     let state_dir = paths::state_dir().map_err(CliError::Home)?;
     let retained: Vec<_> = retained_with_verification(&state_dir)?
         .into_iter()
@@ -7512,6 +7627,7 @@ fn retire_worktree(
     let worktree = workspace::TaskWorktree {
         path: path.to_path_buf(),
         base_sha,
+        index: None,
     };
     let artifacts = paths::runs_dir()
         .map_err(CliError::Home)?

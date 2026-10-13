@@ -8,6 +8,14 @@ missing here.
 
 ## Unreleased
 
+Local runs reuse the caller's workspace (relais ADR-0008). The default is local; a server or CI keeps today's isolation (`CI` set, `RELAIS_WORKSPACE=isolated`, or machine.toml `[workspace] mode = "isolated"`).
+
+A run in a primary checkout forks it and clones the caller's ignored `node_modules` and `target` copy-on-write instead of installing them again: seconds and almost no disk, where a happier run cost 6.5 GB and 10-25 minutes per tree. On a filesystem that cannot clone it says `workspace_cow_unavailable` and installs as before. A setup step that declares `reuse = { inputs, outputs, verify }` is skipped when its recorded result matches and its outputs verify; no other step is.
+
+A run in a linked git worktree edits that worktree in place (`relais run --workspace in-place`, refused in the primary checkout). It holds a lock, takes uncommitted work into its start snapshot, leaves an accepted change applied, and otherwise restores the tree; `relais resume --retire <run>` finishes a run that died. The plugin's run tool takes `workspace`.
+
+The baseline cache is keyed by the base's tree, not its commit, in every mode (entries from earlier versions miss once). A machine.toml with `[workspace]` cannot be read by v0.19.0; it is absent unless you set it.
+
 `relais resume --retire` now also removes a decomposed run's package verification checkouts (`runs/<root>/packages/verify/<child>/`), and reports a kept checkout's modified files as repo-relative paths.
 
 ## v0.19.0

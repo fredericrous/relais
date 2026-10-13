@@ -17,6 +17,7 @@ use std::process::Command;
 use crate::contract::TaskContract;
 use crate::ids::sha256_hex;
 
+pub mod inplace;
 pub mod reuse;
 
 /// The author and committer date every candidate snapshot is stamped
@@ -250,6 +251,11 @@ impl ScratchPrefix {
 pub struct TaskWorktree {
     pub path: PathBuf,
     pub base_sha: String,
+    /// The index relais reads and writes in this tree. `None` = the tree's
+    /// own (a worktree relais made, whose index nobody else uses). An
+    /// in-place run names a private one, so relais never stages the
+    /// person's real index (ADR-0008).
+    pub index: Option<PathBuf>,
 }
 
 /// What git tracks in a candidate: the ground truth a read-only reviewer
@@ -285,15 +291,37 @@ pub fn create_worktree(
     Ok(TaskWorktree {
         path: worktree_path.to_path_buf(),
         base_sha: base_sha.to_string(),
+        index: None,
     })
 }
 
 impl TaskWorktree {
+    /// `git` in this tree, against its index when it has a private one.
+    fn git_indexed(&self, args: &[&str]) -> Result<String> {
+        let mut command = git_command(&self.path);
+        command.args(args);
+        if let Some(index) = &self.index {
+            command.env("GIT_INDEX_FILE", index);
+        }
+        let output = command
+            .output()
+            .map_err(|e| WorkspaceError::Git(format!("git could not be launched: {e}")))?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        } else {
+            Err(WorkspaceError::Git(format!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    }
+
     /// Paths changed vs. the base, untracked files included — what the
     /// scope check actually judges (SPEC §8: on the actual diff).
     pub fn changed_paths(&self) -> Result<Vec<String>> {
-        let tracked = git(&self.path, &["diff", "--name-only", &self.base_sha])?;
-        let untracked = git(&self.path, &["ls-files", "--others", "--exclude-standard"])?;
+        let tracked = self.git_indexed(&["diff", "--name-only", &self.base_sha])?;
+        let untracked = self.git_indexed(&["ls-files", "--others", "--exclude-standard"])?;
         let mut paths: Vec<String> = tracked
             .lines()
             .chain(untracked.lines())
@@ -314,8 +342,21 @@ impl TaskWorktree {
     /// would otherwise stamp the wall clock into the object and give the
     /// same tree a new identity every second.
     pub fn snapshot_candidate(&self, _label: &str) -> Result<String> {
-        git(&self.path, &["add", "-A"])?;
-        let tree = git(&self.path, &["write-tree"])?;
+        if let Some(index) = &self.index {
+            // A private index starts from the base each time, so a path
+            // the worker deleted is not carried over from a previous
+            // snapshot, and the person's own index is never read.
+            let _ = std::fs::remove_file(index);
+            self.git_indexed(&["read-tree", &self.base_sha])?;
+        }
+        if self.index.is_some() {
+            // The caller's own worktree holds relais's scratch directory
+            // (the task contract); it is never part of a candidate.
+            self.git_indexed(&["add", "-A", "--", ".", ":(exclude).relais"])?;
+        } else {
+            self.git_indexed(&["add", "-A"])?;
+        }
+        let tree = self.git_indexed(&["write-tree"])?;
         let commit = git_command(&self.path)
             .args([
                 "commit-tree",
@@ -580,6 +621,42 @@ pub struct Retirement {
     pub bytes_reclaimed: u64,
 }
 
+/// Keep whatever the tree holds that no named candidate of the run (and not
+/// the base) already holds: snapshot it, name it `…/final` (or the first
+/// free `final-N`), and export it as a patch. `None` when nothing needed
+/// keeping. Shared by [`retire`] and the end of an in-place run (ADR-0008),
+/// which keeps the directory.
+pub fn export_unkept(
+    worktree: &TaskWorktree,
+    run_id: &str,
+    artifacts_dir: &Path,
+) -> Result<Option<Exported>> {
+    // Every repository-level command below runs INSIDE the worktree: its
+    // `.git` file names the repository's common dir, which is where refs
+    // and the worktree list live. The path the run was launched from is
+    // deliberately not consulted — it is often a task worktree that was
+    // removed long before the leftover is swept (the four legacy runs on
+    // the first `resume --retire`), and git answers from the link anyway.
+    let repo_dir = &worktree.path;
+    let snapshot = worktree.snapshot_candidate("retirement")?;
+    let tree = tree_of(&worktree.path, &snapshot)?;
+    let base_tree = tree_of(&worktree.path, &worktree.base_sha)?;
+    let named = named_candidates(repo_dir, run_id)?;
+    let already_kept = tree == base_tree || named.iter().any(|(_, kept)| *kept == tree);
+    if already_kept {
+        return Ok(None);
+    }
+    let reference = free_final_ref(run_id, &named);
+    git(repo_dir, &["update-ref", &reference, &snapshot])?;
+    let stem = reference.rsplit('/').next().unwrap_or("final").to_string();
+    let patch_path = artifacts_dir.join(format!("candidate-{stem}.patch"));
+    worktree.export_patch(&snapshot, &patch_path)?;
+    Ok(Some(Exported {
+        reference,
+        patch_path,
+    }))
+}
+
 /// Retire a run's worktree: keep everything tracked, then remove the
 /// directory, ignored build output and all (SPEC §8).
 ///
@@ -603,31 +680,8 @@ pub struct Retirement {
 /// and exports nothing. A worktree that is gone already is an error,
 /// not a silent success, because "retired" must mean it was seen.
 pub fn retire(worktree: &TaskWorktree, run_id: &str, artifacts_dir: &Path) -> Result<Retirement> {
-    // Every repository-level command below runs INSIDE the worktree: its
-    // `.git` file names the repository's common dir, which is where refs
-    // and the worktree list live. The path the run was launched from is
-    // deliberately not consulted — it is often a task worktree that was
-    // removed long before the leftover is swept (the four legacy runs on
-    // the first `resume --retire`), and git answers from the link anyway.
     let repo_dir = &worktree.path;
-    let snapshot = worktree.snapshot_candidate("retirement")?;
-    let tree = tree_of(&worktree.path, &snapshot)?;
-    let base_tree = tree_of(&worktree.path, &worktree.base_sha)?;
-    let named = named_candidates(repo_dir, run_id)?;
-    let already_kept = tree == base_tree || named.iter().any(|(_, kept)| *kept == tree);
-    let exported = if already_kept {
-        None
-    } else {
-        let reference = free_final_ref(run_id, &named);
-        git(repo_dir, &["update-ref", &reference, &snapshot])?;
-        let stem = reference.rsplit('/').next().unwrap_or("final").to_string();
-        let patch_path = artifacts_dir.join(format!("candidate-{stem}.patch"));
-        worktree.export_patch(&snapshot, &patch_path)?;
-        Some(Exported {
-            reference,
-            patch_path,
-        })
-    };
+    let exported = export_unkept(worktree, run_id, artifacts_dir)?;
     let bytes_reclaimed = dir_size(&worktree.path)?;
     // `worktree remove` cannot run from inside the directory it deletes;
     // the common dir is where the worktree list lives, so ask git for it.

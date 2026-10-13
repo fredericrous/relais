@@ -17,6 +17,21 @@ test('the run tool returns at once with what it started', async ($: any, on: any
   expect(engine.calls.spawn.length).toBe(2)
 })
 
+test('the run tool passes the requested workspace to relais and names it in what it returns', async ($: any, on: any) => {
+  const engine = await startedRun($, on)
+  const reply = await $.tool.call({ tool: 'mcp__relais__run', task: 'next.json', cwd: '/repo', workspace: 'in-place' })
+  expect(reply.result).toContain('(workspace: in-place)')
+  await startQueued(engine)
+  const argvs = engine.calls.spawn.map((child: any) => child.argv)
+  expect(argvs[1]).toEqual(['relais', 'run', '--task', 'next.json', '--workspace', 'in-place', '--protocol'])
+})
+
+test('the run tool refuses a workspace that is not one of the four', async ($: any, on: any) => {
+  await startedRun($, on)
+  const reply = await $.tool.call({ tool: 'mcp__relais__run', task: 'next.json', cwd: '/repo', workspace: 'everywhere' })
+  expect(reply.deny).toContain('auto, fork, in-place, isolated')
+})
+
 test('a spawn line spawns an agent in the hook-chosen cwd, then binds it', async ($: any, on: any) => {
   const engine = await startedRun($, on)
   engine.stream.push('stdout', spawnLine('d1'))
