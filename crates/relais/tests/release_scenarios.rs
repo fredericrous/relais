@@ -4685,6 +4685,276 @@ fn a_protocol_replay_sends_its_worker_as_a_spawn_line_and_ends_with_done() {
     assert!(outcome.is_some(), "the trial is settled before `done`");
 }
 
+/// Grant trust to a candidate policy too: its recipes are part of the
+/// declaration a replay executes under.
+fn grant_candidate(world: &World, candidate: &str) {
+    let hash = RepoPolicy::from_toml_str(candidate)
+        .expect("valid candidate")
+        .authority_hash();
+    let key = relais::policy::grant_key(&hash, &relais::repo::identity(&world.repo));
+    let machine = world.config.join("machine.toml");
+    let mut text = std::fs::read_to_string(&machine).expect("machine.toml");
+    text.push_str(&format!(
+        "\n[trust.\"{key}\"]\ngranted_at = \"2026-10-13\"\nreviewed_by = \"the release suite\"\n"
+    ));
+    std::fs::write(&machine, text).expect("machine.toml");
+}
+
+/// The replay arguments the plugin passes, with extra flags.
+fn replay_args<'a>(task_id: &'a str, recipe: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec!["dataset", "replay", "--task", task_id, "--recipe", recipe];
+    args.extend_from_slice(extra);
+    args
+}
+
+/// The replay's own trial row: (design sha, contract hash, outcome, arm).
+fn replay_trial(world: &World, run: &str) -> (Option<String>, String, String, String) {
+    let conn = rusqlite::Connection::open(world.state.join("ledger.sqlite")).expect("the ledger");
+    conn.query_row(
+        "SELECT design_sha256, contract_hash, outcome, arm_recipe_id FROM trials
+          WHERE arm_run_id = ?1",
+        [run],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )
+    .expect("the replay's trial")
+}
+
+/// The run a protocol replay's worker spawn line names.
+fn replay_run_of(stdout: &str) -> String {
+    stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|line| line["relais"] == "spawn" && line["agent_kind"] == "worker")
+        .and_then(|line| line["run"].as_str().map(str::to_string))
+        .unwrap_or_else(|| panic!("no worker spawn line: {stdout}"))
+}
+
+/// Every stderr line that starts with `relais dataset replay: <event> `.
+fn replay_log_lines<'a>(stderr: &'a str, event: &str) -> Vec<&'a str> {
+    let prefix = format!("relais dataset replay: {event} ");
+    stderr
+        .lines()
+        .filter(|line| line.starts_with(&prefix))
+        .collect()
+}
+
+/// `--design`: a missing or oversized file is refused before anything
+/// runs; a 10 KiB one goes verbatim into the worker's package, its sha-256
+/// on the trial and in the manifest, while the trial's contract hash stays
+/// the source run's; without the flag the trial records no design.
+#[test]
+fn a_replay_design_reaches_the_package_and_the_trial_and_nothing_else() {
+    let (world, task_id, recipe) = world_with_accepted_run("replay-design");
+    // The arm that takes a design: a revision of the covering recipe.
+    let candidate = format!(
+        "{}\n[[recipes]]\nname = \"src-change\"\nscope_within = [\"src/**\"]\n\
+         tier = \"implementation\"\nrevision = 1\nrequires_design = true\n",
+        std::fs::read_to_string(&recipe).expect("candidate")
+    );
+    std::fs::write(&recipe, &candidate).expect("candidate with a designed arm");
+    grant_candidate(&world, &candidate);
+    let recipe = recipe.to_string_lossy().to_string();
+    // The world's one run so far is the accepted source.
+    let source_run = world.only_run_id();
+    let source_receipt: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(world.run_dir(&source_run).join("receipt.json"))
+            .expect("source receipt"),
+    )
+    .expect("receipt json");
+
+    // Refused before anything runs: oversized, then missing.
+    let big = world.root.join("big.md");
+    std::fs::write(&big, "b".repeat(20 * 1024)).expect("big design");
+    let missing = world.root.join("absent.md");
+    let launches = world.worker_launches();
+    for design in [&big, &missing] {
+        let design = design.to_string_lossy().to_string();
+        let out = world.plugin().run(
+            &replay_args(&task_id, &recipe, &["--design", &design, "--protocol"]),
+            &[],
+        );
+        let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+        assert_ne!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+        assert!(stderr.contains("refused (design_unreadable)"), "{stderr}");
+        assert!(!stdout.contains("\"spawn\""), "{stdout}");
+        assert!(replay_log_lines(&stderr, "start").is_empty(), "{stderr}");
+    }
+    assert!(!world.state.join("worktrees").join("replay").exists());
+    assert_eq!(world.worker_launches(), launches);
+
+    let design_text = "# design\n".to_string() + &"d".repeat(10 * 1024) + "\n";
+    let design = world.root.join("design.md");
+    std::fs::write(&design, &design_text).expect("design");
+    let design = design.to_string_lossy().to_string();
+    let out = world.plugin().run(
+        &replay_args(&task_id, &recipe, &["--design", &design, "--protocol"]),
+        &[],
+    );
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let run = replay_run_of(&stdout);
+    let sha = relais::ids::sha256_hex(design_text.as_bytes());
+    let (design_sha, contract_hash, outcome, _) = replay_trial(&world, &run);
+    assert_eq!(design_sha.as_deref(), Some(sha.as_str()));
+    assert_eq!(
+        Some(contract_hash.as_str()),
+        source_receipt["contract_hash"].as_str(),
+        "the trial keeps the source run's contract hash"
+    );
+    assert_eq!(outcome, "accepted", "{stderr}");
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(world.run_dir(&run).join("manifest.json")).expect("manifest"),
+    )
+    .expect("manifest json");
+    assert_eq!(manifest["design"].as_str(), Some(design_text.as_str()));
+    assert_eq!(manifest["design_sha256"].as_str(), Some(sha.as_str()));
+    assert!(manifest["package_bytes"].as_u64().expect("package bytes") >= design_text.len() as u64);
+
+    let out = world
+        .plugin()
+        .run(&replay_args(&task_id, &recipe, &["--protocol"]), &[]);
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let run = replay_run_of(&stdout);
+    let (design_sha, _, outcome, _) = replay_trial(&world, &run);
+    assert_eq!(design_sha, None);
+    assert_eq!(outcome, "accepted", "{stderr}");
+    world.stop_coordinator();
+}
+
+/// A world whose accepted run is a typed change (`mechanical`), routed by
+/// `change-mechanical` revision 1 at the implementation tier, and a
+/// candidate whose revision 2 moves that type to the research tier.
+fn world_with_typed_accepted_run(name: &str) -> (World, String, PathBuf) {
+    let world = World::new(name);
+    git(
+        &world.repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/acme/widgets.git",
+        ],
+    );
+    world.write_policy(3);
+    let typed = |revision: u32, tier: &str| {
+        format!(
+            "\n[[recipes]]\nname = \"change-mechanical\"\nrevision = {revision}\nkind = \"change\"\n\
+             scope_within = [\"src/**\"]\ntask_type = [\"mechanical\"]\ntier = \"{tier}\"\n"
+        )
+    };
+    let policy_path = world.repo.join("relais.toml");
+    let policy = format!(
+        "{}{}",
+        std::fs::read_to_string(&policy_path).expect("policy"),
+        typed(1, "implementation")
+    );
+    std::fs::write(&policy_path, &policy).expect("typed policy");
+    git(&world.repo, &["add", "relais.toml"]);
+    git(&world.repo, &["commit", "-q", "-m", "typed recipe"]);
+    let hash = RepoPolicy::from_toml_str(&policy)
+        .expect("valid policy")
+        .authority_hash();
+    world.write_machine(&hash, "");
+    let task = world.root.join("typed.json");
+    std::fs::write(
+        &task,
+        serde_json::json!({
+            "schema_version": 1,
+            "kind": "change",
+            "task_type": "mechanical",
+            "objective": "an easy one",
+            "base_ref": "HEAD",
+            "write_scope": ["src/**"],
+            "acceptance": ["src/main.rs no longer exists"],
+            "verification_profile": "default",
+            "review": "off",
+        })
+        .to_string(),
+    )
+    .expect("typed task");
+    let accepted = world.relais(&["run", "--task", task.to_str().unwrap()]);
+    assert_eq!(
+        accepted.status.code(),
+        Some(0),
+        "{}",
+        text(&accepted.stderr)
+    );
+    let run_id = World::run_id_of(&text(&accepted.stdout));
+    let ledger =
+        relais::ledger::Ledger::open(&world.state.join("ledger.sqlite")).expect("open ledger");
+    let task_id = ledger
+        .task_of_run(&relais::ids::RunId::from_stored(run_id))
+        .expect("query task")
+        .expect("the run is on record under a task");
+    let recipe = world.root.join("candidate.toml");
+    let candidate = format!("{policy}{}", typed(2, "research"));
+    std::fs::write(&recipe, &candidate).expect("candidate");
+    grant_candidate(&world, &candidate);
+    (world, task_id.as_str().to_string(), recipe)
+}
+
+/// A typed change replayed under its research candidate: the dry run names
+/// the research recipe, tier and model before anything is spent, and the
+/// replay itself runs the research model first, records a valid trial and
+/// prints exactly one start and one end line.
+#[test]
+fn a_typed_replay_names_its_research_arm_and_logs_one_start_and_end() {
+    let (world, task_id, recipe) = world_with_typed_accepted_run("replay-typed");
+    let recipe = recipe.to_string_lossy().to_string();
+    let launches = world.worker_launches();
+    let dry = world
+        .command(&[])
+        .args(replay_args(&task_id, &recipe, &["--dry-run"]))
+        .output()
+        .expect("relais runs");
+    let (stdout, stderr) = (text(&dry.stdout), text(&dry.stderr));
+    assert_eq!(dry.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("task type: mechanical"), "{stdout}");
+    assert!(
+        stdout.contains("arm: change-mechanical revision 2, tier research, model haiku"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("design: none"), "{stdout}");
+    assert_eq!(
+        world.worker_launches(),
+        launches,
+        "a dry run spends nothing"
+    );
+    assert!(replay_log_lines(&stderr, "start").is_empty(), "{stderr}");
+
+    let out = world
+        .plugin()
+        .run(&replay_args(&task_id, &recipe, &["--protocol"]), &[]);
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let run = replay_run_of(&stdout);
+    let (design_sha, _, outcome, _) = replay_trial(&world, &run);
+    assert_eq!(design_sha, None);
+    assert_eq!(outcome, "accepted", "{stderr}");
+    let starts = replay_log_lines(&stderr, "start");
+    let ends = replay_log_lines(&stderr, "end");
+    assert_eq!(starts.len(), 1, "{stderr}");
+    assert_eq!(ends.len(), 1, "{stderr}");
+    let task = format!("task={task_id}");
+    assert!(starts[0].contains("type=mechanical"), "{}", starts[0]);
+    assert!(starts[0].contains(&task), "{}", starts[0]);
+    assert!(starts[0].contains("model=haiku"), "{}", starts[0]);
+    assert!(starts[0].contains(" load="), "{}", starts[0]);
+    for field in [
+        "type=mechanical",
+        task.as_str(),
+        "outcome=accepted",
+        "model=haiku",
+        " cost=",
+        " wall=",
+        " load=",
+    ] {
+        assert!(ends[0].contains(field), "{field} missing: {}", ends[0]);
+    }
+    world.stop_coordinator();
+}
+
 // A machine.toml from before the native mod still loads: its `[sandbox]`
 // section, keys and all, parses and is reported as no longer read, by the
 // real `relais doctor` in text and in `--json`.

@@ -493,6 +493,9 @@ pub struct DesignInput {
 pub enum DesignError {
     /// No such file at the base revision, or git would not answer.
     Missing { path: String, detail: String },
+    /// A design file handed in from disk ([`read_design_file`]) that
+    /// could not be read.
+    FileUnreadable { path: String, detail: String },
     /// Over [`crate::contract::MAX_DESIGN_BYTES`].
     TooLarge { path: String, bytes: usize },
     /// Not UTF-8: it could not be put verbatim in a prompt.
@@ -507,6 +510,9 @@ impl std::fmt::Display for DesignError {
                     f,
                     "the design `{path}` cannot be read at the base revision: {detail}"
                 )
+            }
+            Self::FileUnreadable { path, detail } => {
+                write!(f, "the design file `{path}` cannot be read: {detail}")
             }
             Self::TooLarge { path, bytes } => write!(
                 f,
@@ -562,6 +568,28 @@ pub fn read_design(
         path: path.to_string(),
         text,
     })
+}
+
+/// Read a design handed in from disk (`relais dataset replay --design`),
+/// under the same limits a contract's design meets: at most
+/// [`crate::contract::MAX_DESIGN_BYTES`], UTF-8 text. The size is asked
+/// first so an oversized file is never loaded.
+pub fn read_design_file(path: &Path) -> Result<DesignInput, DesignError> {
+    let shown = path.display().to_string();
+    let unreadable = |e: std::io::Error| DesignError::FileUnreadable {
+        path: shown.clone(),
+        detail: e.to_string(),
+    };
+    let bytes = std::fs::metadata(path).map_err(unreadable)?.len();
+    let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
+    if bytes > crate::contract::MAX_DESIGN_BYTES {
+        return Err(DesignError::TooLarge { path: shown, bytes });
+    }
+    let raw = std::fs::read(path).map_err(unreadable)?;
+    let text = String::from_utf8(raw).map_err(|_| DesignError::NotText {
+        path: shown.clone(),
+    })?;
+    Ok(DesignInput { path: shown, text })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1540,6 +1568,28 @@ mod tests {
         assert!(matches!(
             read_design(&git, &repo, &sha, "docs/absent.md"),
             Err(DesignError::Missing { .. })
+        ));
+    }
+
+    /// `dataset replay --design`: a file from disk meets the contract's
+    /// limits, read whole when it fits, refused when absent or oversized.
+    #[test]
+    fn a_design_file_is_read_whole_and_refused_when_missing_or_oversized() {
+        let dir = crate::test_support::temp_dir("design-file");
+        let fits = dir.join("fits.md");
+        let text = "# design\n".to_string() + &"w".repeat(10 * 1024);
+        std::fs::write(&fits, &text).expect("write");
+        assert_eq!(read_design_file(&fits).expect("reads").text, text);
+
+        let big = dir.join("big.md");
+        std::fs::write(&big, "v".repeat(20 * 1024)).expect("write");
+        assert!(matches!(
+            read_design_file(&big),
+            Err(DesignError::TooLarge { bytes, .. }) if bytes == 20 * 1024
+        ));
+        assert!(matches!(
+            read_design_file(&dir.join("absent.md")),
+            Err(DesignError::FileUnreadable { .. })
         ));
     }
 

@@ -262,6 +262,10 @@ impl Decision {
             workspace_isolation: LIVE_WORKTREE,
             arms_json: Some(&arms_json),
             arm_run_id: run_id,
+            // A live arm is the contract's own run: whatever design the
+            // contract names is read at preflight and recorded in its
+            // manifest, not handed in beside the contract as a replay's is.
+            design_sha256: None,
         })?;
         Ok(Some(trial_id))
     }
@@ -423,6 +427,95 @@ pub fn trial_outcome_of(terminal: &Terminal) -> (TrialOutcome, bool) {
     }
 }
 
+/// What a replay checks about itself before its result counts as its
+/// arm's (docs/plans/2026-10-12-task-types.md): its first attempt ran the
+/// model the arm's recipe names, and the design it was handed agrees with
+/// the recipe's `requires_design`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayCheck<'a> {
+    /// The model the arm's recipe names for its own tier: the research
+    /// model for a typed research candidate.
+    pub arm_model: &'a str,
+    /// The model the replay's first worker attempt dispatched; `None` when
+    /// it dispatched none (the run ended before a worker started).
+    pub dispatched_model: Option<&'a str>,
+    pub requires_design: bool,
+    pub design_sha256: Option<&'a str>,
+}
+
+/// Why a replay did not measure the arm it was recorded under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayMismatch {
+    /// The first attempt ran another model than the arm's.
+    FirstModel {
+        expected: String,
+        dispatched: String,
+    },
+    /// A design was handed to an arm that takes none, or none to one that
+    /// requires it.
+    Design { requires_design: bool },
+}
+
+impl std::fmt::Display for ReplayMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FirstModel {
+                expected,
+                dispatched,
+            } => write!(
+                f,
+                "the first attempt dispatched `{dispatched}`, not the arm's `{expected}`"
+            ),
+            Self::Design {
+                requires_design: true,
+            } => f.write_str("the arm requires a design and the replay was handed none"),
+            Self::Design {
+                requires_design: false,
+            } => f.write_str("the arm takes no design and the replay was handed one"),
+        }
+    }
+}
+
+/// A replay's settled result: the run's own outcome, or `Invalid` naming
+/// why the replay did not measure its arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayVerdict {
+    pub outcome: TrialOutcome,
+    pub accepted_without_escalation: bool,
+    pub mismatch: Option<ReplayMismatch>,
+}
+
+impl ReplayCheck<'_> {
+    /// Settle a replay from its run's `(outcome, accepted without
+    /// escalation)` ([`trial_outcome_of`]). Only the FIRST attempt's model
+    /// is checked: an arm attempt that repaired and escalated to a
+    /// stronger tier ran its arm and failed it, so it keeps the run's own
+    /// outcome, never `Invalid`.
+    pub fn settle(&self, run: (TrialOutcome, bool)) -> ReplayVerdict {
+        let mismatch = match self.dispatched_model {
+            Some(dispatched) if dispatched != self.arm_model => Some(ReplayMismatch::FirstModel {
+                expected: self.arm_model.to_string(),
+                dispatched: dispatched.to_string(),
+            }),
+            _ if self.requires_design != self.design_sha256.is_some() => {
+                Some(ReplayMismatch::Design {
+                    requires_design: self.requires_design,
+                })
+            }
+            _ => None,
+        };
+        let (outcome, accepted_without_escalation) = match mismatch {
+            Some(_) => (TrialOutcome::Invalid, false),
+            None => run,
+        };
+        ReplayVerdict {
+            outcome,
+            accepted_without_escalation,
+            mismatch,
+        }
+    }
+}
+
 /// The cost (paired with its completeness) and duration a run settled
 /// with, in the form a trial row takes them.
 pub fn settled_figures(ledger: &Ledger, run_id: &RunId) -> Result<(TrialCost, i64), LedgerError> {
@@ -508,6 +601,80 @@ pub fn status(
 mod tests {
     use super::*;
     use crate::test_support::{short_temp_dir, TempDir};
+
+    fn research_check(dispatched: &str) -> ReplayCheck<'_> {
+        ReplayCheck {
+            arm_model: "haiku",
+            dispatched_model: Some(dispatched),
+            requires_design: false,
+            design_sha256: None,
+        }
+    }
+
+    /// A replay whose first attempt ran another model than the arm's
+    /// measured nothing about the arm: invalid, whatever the run did.
+    #[test]
+    fn a_replay_whose_first_attempt_ran_another_model_is_invalid() {
+        let verdict = research_check("sonnet").settle((TrialOutcome::Accepted, true));
+        assert_eq!(verdict.outcome, TrialOutcome::Invalid);
+        assert!(!verdict.accepted_without_escalation);
+        assert_eq!(
+            verdict.mismatch,
+            Some(ReplayMismatch::FirstModel {
+                expected: "haiku".into(),
+                dispatched: "sonnet".into()
+            })
+        );
+    }
+
+    /// A research first attempt that repaired and escalated ran its arm
+    /// and failed it: the run's own outcome, not accepted without
+    /// escalation, never invalid.
+    #[test]
+    fn a_research_first_attempt_that_escalated_is_a_failure_not_invalid() {
+        let escalated = research_check("haiku").settle((TrialOutcome::Accepted, false));
+        assert_eq!(escalated.outcome, TrialOutcome::Accepted);
+        assert!(!escalated.accepted_without_escalation);
+        assert_eq!(escalated.mismatch, None);
+        let rejected = research_check("haiku").settle((TrialOutcome::Rejected, false));
+        assert_eq!(rejected.outcome, TrialOutcome::Rejected);
+        assert_eq!(rejected.mismatch, None);
+        let clean = research_check("haiku").settle((TrialOutcome::Accepted, true));
+        assert!(clean.accepted_without_escalation);
+    }
+
+    /// The design a replay was handed must agree with its arm's recipe.
+    #[test]
+    fn a_design_that_disagrees_with_the_arm_is_invalid() {
+        let designed = ReplayCheck {
+            requires_design: true,
+            ..research_check("haiku")
+        };
+        assert_eq!(
+            designed.settle((TrialOutcome::Accepted, true)).outcome,
+            TrialOutcome::Invalid
+        );
+        let with_sha = ReplayCheck {
+            design_sha256: Some("abc"),
+            ..designed
+        };
+        assert_eq!(
+            with_sha.settle((TrialOutcome::Accepted, true)).outcome,
+            TrialOutcome::Accepted
+        );
+        let alone_with_one = ReplayCheck {
+            design_sha256: Some("abc"),
+            ..research_check("haiku")
+        };
+        assert_eq!(
+            alone_with_one
+                .settle((TrialOutcome::Accepted, true))
+                .mismatch,
+            Some(ReplayMismatch::Design {
+                requires_design: false
+            })
+        );
+    }
 
     fn base_policy(review: &str) -> String {
         format!(

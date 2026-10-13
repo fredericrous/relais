@@ -154,8 +154,8 @@ fn parse_cost_completeness(stored: &str) -> Result<CostCompleteness> {
 }
 
 /// What became of one trial arm's run, once settled (SPEC §17). `NULL`
-/// on the row means "not settled yet" — a trial in flight — never a
-/// fourth, unnamed outcome.
+/// on the row means "not settled yet" — a trial in flight — never an
+/// unnamed outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrialOutcome {
     /// The arm's candidate was accepted.
@@ -167,6 +167,12 @@ pub enum TrialOutcome {
     /// cancellation — rather than a verification verdict, so it is not
     /// comparable evidence for or against the arm.
     Errored,
+    /// The replay did not run the arm it was recorded under: its first
+    /// attempt dispatched another model than the arm's, or the design it
+    /// was handed disagrees with the arm's `requires_design`
+    /// (docs/plans/2026-10-12-task-types.md). Never evidence for or
+    /// against any arm, and never counted as the arm's failure.
+    Invalid,
 }
 
 impl TrialOutcome {
@@ -175,6 +181,7 @@ impl TrialOutcome {
             Self::Accepted => "accepted",
             Self::Rejected => "rejected",
             Self::Errored => "errored",
+            Self::Invalid => "invalid",
         }
     }
 
@@ -183,6 +190,7 @@ impl TrialOutcome {
             "accepted" => Some(Self::Accepted),
             "rejected" => Some(Self::Rejected),
             "errored" => Some(Self::Errored),
+            "invalid" => Some(Self::Invalid),
             _ => None,
         }
     }
@@ -616,6 +624,9 @@ pub struct TrialRow {
     /// replay, the run itself for a live trial. `None` on a row written
     /// before ledger step v17, whose arm run is not on record.
     pub arm_run_id: Option<RunId>,
+    /// SHA-256 of the program design the arm was handed; `None` when it
+    /// was handed none (and on every row written before ledger step v29).
+    pub design_sha256: Option<String>,
 }
 
 /// What recording a fresh trial row needs — everything a comparison
@@ -642,6 +653,8 @@ pub struct NewTrial<'a> {
     pub arms_json: Option<&'a str>,
     /// The run the arm executed as; see [`TrialRow::arm_run_id`].
     pub arm_run_id: &'a RunId,
+    /// See [`TrialRow::design_sha256`].
+    pub design_sha256: Option<&'a str>,
 }
 
 /// What recording a REPLAY's arm needs. Grouped rather than passed
@@ -670,6 +683,8 @@ pub struct NewReplayTrial<'a> {
     pub workspace_isolation: &'a str,
     /// The replay's own run, known once `execute` has returned.
     pub arm_run_id: &'a RunId,
+    /// SHA-256 of the design `dataset replay --design` handed the arm.
+    pub design_sha256: Option<&'a str>,
 }
 
 /// Raw columns of one `trials` row, in the order [`parse_trial_row`]
@@ -694,6 +709,7 @@ type TrialColumns = (
     Option<String>,
     Option<i64>,
     String,
+    Option<String>,
     Option<String>,
 );
 
@@ -721,6 +737,7 @@ fn parse_trial_row(columns: TrialColumns) -> Result<TrialRow> {
         duration_ms,
         created_at,
         arm_run_id,
+        design_sha256,
     ) = columns;
     Ok(TrialRow {
         trial_id: TrialId::from_stored(trial_id),
@@ -751,6 +768,7 @@ fn parse_trial_row(columns: TrialColumns) -> Result<TrialRow> {
         duration_ms,
         created_at,
         arm_run_id: arm_run_id.map(RunId::from_stored),
+        design_sha256,
     })
 }
 
@@ -5335,6 +5353,7 @@ impl Ledger {
             workspace_isolation: replay.workspace_isolation,
             arms_json: None,
             arm_run_id: replay.arm_run_id,
+            design_sha256: replay.design_sha256,
         })
     }
 
@@ -5387,8 +5406,8 @@ impl Ledger {
                 (trial_id, task_id, source_run_id, incumbent_recipe_id,
                  arm_recipe_id, arm_index, assignment_probability, seed,
                  base_sha, contract_hash, verification_profile_hash,
-                 workspace_isolation, created_at, arms_json, arm_run_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                 workspace_isolation, created_at, arms_json, arm_run_id, design_sha256)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 trial.trial_id.as_str(),
                 trial.task_id.as_str(),
@@ -5405,6 +5424,7 @@ impl Ledger {
                 now,
                 trial.arms_json,
                 trial.arm_run_id.as_str(),
+                trial.design_sha256,
             ],
         )?;
         Ok(())
@@ -5465,7 +5485,7 @@ impl Ledger {
          arm_recipe_id, arm_index, assignment_probability, seed, base_sha,
          contract_hash, verification_profile_hash, workspace_isolation,
          outcome, accepted_without_escalation, cost_micros, cost_completeness,
-         duration_ms, created_at, arm_run_id";
+         duration_ms, created_at, arm_run_id, design_sha256";
 
     /// Every trial recorded for one task, oldest first — a typed reader:
     /// a row with an unrecognised outcome or cost completeness is a
@@ -5539,7 +5559,7 @@ impl Ledger {
             Self::TRIAL_COLUMNS
         ))?;
         let rows = stmt.query_map([LIVE_WORKTREE], |row| {
-            Ok((Self::trial_columns(row)?, row.get::<_, String>(19)?))
+            Ok((Self::trial_columns(row)?, row.get::<_, String>(20)?))
         })?;
         let rows: Vec<(TrialColumns, String)> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
         let mut kept = Vec::new();
@@ -5579,6 +5599,7 @@ impl Ledger {
             row.get(16)?,
             row.get(17)?,
             row.get(18)?,
+            row.get(19)?,
         ))
     }
 
@@ -8971,6 +8992,7 @@ mod tests {
             workspace_isolation: "worktree",
             arms_json: None,
             arm_run_id: source_run,
+            design_sha256: None,
         }
     }
 

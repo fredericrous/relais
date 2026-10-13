@@ -276,6 +276,12 @@ pub fn parent_pid() -> Option<u32> {
     imp::parent_pid()
 }
 
+/// The one-minute load average, when the platform keeps one. Recorded
+/// beside a measurement, never used to gate one.
+pub fn load_average() -> Option<f64> {
+    imp::load_average()
+}
+
 /// Arrange for `kill_tree` to reach everything the command spawns. Every
 /// subprocess relais waits on goes through here.
 pub fn own_process_group(command: &mut Command) {
@@ -753,6 +759,13 @@ mod imp {
 
     use super::GroupKill;
 
+    pub fn load_average() -> Option<f64> {
+        let mut loads = [0.0f64; 1];
+        // SAFETY: the buffer holds the one sample asked for.
+        let read = unsafe { libc::getloadavg(loads.as_mut_ptr(), 1) };
+        (read == 1).then_some(loads[0])
+    }
+
     pub fn alive(pid: u32) -> bool {
         // SAFETY: signal 0 performs error checking only; no signal is sent.
         if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
@@ -1029,6 +1042,11 @@ mod imp {
     use std::process::Command;
 
     use super::GroupKill;
+
+    /// Windows keeps no load average.
+    pub fn load_average() -> Option<f64> {
+        None
+    }
 
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER,

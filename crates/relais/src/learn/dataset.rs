@@ -553,6 +553,13 @@ pub fn build(
             ));
             continue;
         }
+        // Nor is a replay that did not run its arm a label for it.
+        if outcome == TrialOutcome::Invalid {
+            exclusions.push(format!(
+                "{run_id}: replay: its trial is invalid; it did not run its arm"
+            ));
+            continue;
+        }
         let Some((source_run, family)) = live_of_task.get(&task_id) else {
             exclusions.push(format!(
                 "{run_id}: replay of task {task_id}, which has no live example"
@@ -1544,6 +1551,7 @@ argv = ["true"]
                     verification_profile_hash: "profile",
                     workspace_isolation: "fresh_checkout_no_accepted_answer",
                     arm_run_id: &run_id(run),
+                    design_sha256: None,
                 })
                 .expect("replay trial");
             self.ledger

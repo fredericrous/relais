@@ -551,6 +551,13 @@ enum DatasetCommand {
         /// no trial recorded, no usage recorded
         #[arg(long = "dry-run")]
         dry_run: bool,
+        /// A program design (markdown, at most 16 KiB) handed to the
+        /// worker's context package only: the recorded contract and its
+        /// hash stay the source run's, and the trial records the design's
+        /// sha-256. Read before anything runs; a missing or oversized file
+        /// is refused
+        #[arg(long)]
+        design: Option<PathBuf>,
         /// Speak the protocol of `relais run --protocol` on stdout; how
         /// the relais plugin starts a replay that spends
         #[arg(long)]
@@ -1374,6 +1381,7 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
                 task,
                 recipe,
                 dry_run,
+                design,
                 protocol,
             } => {
                 let host = std::env::var("RELAIS_HOST").ok();
@@ -1381,7 +1389,7 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
                     protocol,
                     host: host.as_deref(),
                 };
-                replay_command(&task, &recipe, dry_run, &origin)
+                replay_command(&task, &recipe, dry_run, design.as_deref(), &origin)
             }
         },
         Command::Recipe { cmd } => match cmd {
@@ -5369,6 +5377,7 @@ fn run_command(
         purpose: trial_id.as_ref().map(|_| RunPurpose::TrialArm),
         run_id: Some(run_id.clone()),
         wire: relais::protocol::Wire::process(),
+        design: relais::runner::DesignSource::Contract,
     }) {
         Ok(outcome) => outcome,
         Err(e) => {
@@ -5512,8 +5521,18 @@ fn replay_command(
     task: &str,
     recipe: &Path,
     dry_run: bool,
+    design: Option<&Path>,
     origin: &relais::native::RunOrigin<'_>,
 ) -> Result<CliOutcome, CliError> {
+    // The design file first, before anything else is read or run: a
+    // missing or oversized one refuses the replay outright.
+    let given_design = match design.map(relais::context::read_design_file).transpose() {
+        Ok(given) => given,
+        Err(e) => {
+            eprintln!("relais dataset replay: refused (design_unreadable): {e}");
+            return Ok(CliOutcome::InvalidInput);
+        }
+    };
     // A dry run spends nothing and is allowed anywhere; a spending replay
     // starts only the way a run does.
     if !dry_run {
@@ -5605,6 +5624,30 @@ fn replay_command(
     let base_sha = base_sha.to_string();
     let source_profile_hash = source_profile_hash.to_string();
     let contract_hash = contract_hash.to_string();
+    // The design the arm is handed: `--design`, else whatever the source
+    // contract named, read here at its base so routing, the package and
+    // the trial row all see the one design.
+    let design_input = match (given_design, &source_contract.design) {
+        (Some(given), _) => Some(given),
+        (None, None) => None,
+        (None, Some(path)) => {
+            match relais::context::read_design(
+                &relais::workspace::SystemGit,
+                &root,
+                &base_sha,
+                path,
+            ) {
+                Ok(read) => Some(read),
+                Err(e) => {
+                    eprintln!("relais dataset replay: blocked (design_unreadable): {e}");
+                    return Ok(CliOutcome::Blocked);
+                }
+            }
+        }
+    };
+    let design_sha256 = design_input
+        .as_ref()
+        .map(|design| relais::ids::sha256_hex(design.text.as_bytes()));
 
     // The profile hash that would judge THIS replay: the candidate's own
     // verification is byte-identical to the incumbent's
@@ -5637,12 +5680,15 @@ fn replay_command(
         ledger.routing_type(&task_id, source_contract.task_type),
         "dataset replay",
     )?;
+    // The incumbent is what routed the source run, with its own design;
+    // the arm is routed with the design it is handed.
     let incumbent_facts = route::TaskFacts {
         task_type,
         has_design: source_contract.design.is_some(),
         admission: route::Admission::Live,
     };
     let replay_facts = route::TaskFacts {
+        has_design: design_input.is_some(),
         admission: route::Admission::Replay,
         ..incumbent_facts
     };
@@ -5675,19 +5721,36 @@ fn replay_command(
     println!(
         "this replay is one arm's result; it does not compare, score, rank or promote anything"
     );
+    let arm = arm_recipe
+        .as_deref()
+        .and_then(|id| ReplayArm::of(candidate.policy(), id));
     if dry_run {
         println!("dry run: nothing was dispatched, no trial was recorded, no usage was spent");
         println!("would replay source run: {source_run} (task {task_id})");
+        println!(
+            "task type: {}",
+            task_type.map_or("none", relais::contract::TaskType::as_str)
+        );
         println!(
             "candidate recipe: {}",
             arm_recipe
                 .as_deref()
                 .unwrap_or("(no recipe covers this task under the candidate)")
         );
+        if let Some(arm) = &arm {
+            println!(
+                "arm: {} revision {}, tier {}, model {}",
+                arm.spec.name,
+                arm.spec.revision,
+                arm.spec.tier.as_str(),
+                arm.model.unwrap_or("(none configured)")
+            );
+        }
+        println!("design: {}", design_sha256.as_deref().unwrap_or("none"));
         println!("verification profile hash checked: {replay_profile_hash}");
         return Ok(CliOutcome::Accepted);
     }
-    let Some(arm_recipe) = arm_recipe else {
+    let (Some(arm_recipe), Some(arm)) = (arm_recipe, arm) else {
         eprintln!("relais dataset replay: no recipe in the candidate policy covers task {task_id}");
         return Ok(CliOutcome::Blocked);
     };
@@ -5792,6 +5855,14 @@ fn replay_command(
             session.source
         );
     }
+    let log = ReplayLog {
+        task_type,
+        task: &task_id,
+        arm_model: arm.model.unwrap_or("none"),
+        load: relais::procs::load_average(),
+        started: std::time::Instant::now(),
+    };
+    eprintln!("{}", log.start_line());
     let outcome = execute(&RunConfig {
         repo_dir: &checkout_dir,
         contract: &replay_contract,
@@ -5813,6 +5884,11 @@ fn replay_command(
         purpose: Some(RunPurpose::Replay),
         run_id: Some(run_id.clone()),
         wire: relais::protocol::Wire::process(),
+        design: design_input
+            .as_ref()
+            .map_or(relais::runner::DesignSource::Contract, |design| {
+                relais::runner::DesignSource::Given(design)
+            }),
     });
     // Bring the replay's own refs into the live repository BEFORE the
     // checkout goes. The runner names its candidate and snapshot refs in
@@ -5841,6 +5917,7 @@ fn replay_command(
         Ok(outcome) => outcome,
         Err(e) => {
             eprintln!("relais dataset replay: {e}");
+            eprintln!("{}", log.end_line(&ReplayEnd::unrecorded("interrupted")));
             announce_replay_done(&artifacts_dir, run_id.as_str(), "interrupted", None);
             return Ok(CliOutcome::OperationalFailure);
         }
@@ -5862,19 +5939,29 @@ fn replay_command(
             verification_profile_hash: &replay_profile_hash,
             workspace_isolation: "fresh_checkout_no_accepted_answer",
             arm_run_id: &outcome.run_id,
+            design_sha256: design_sha256.as_deref(),
         },
+        &arm,
     );
     let trial_outcome = match recorded {
-        Ok(trial_outcome) => {
+        Ok(settled) => {
+            if let Some(mismatch) = &settled.verdict.mismatch {
+                eprintln!("relais dataset replay: recorded invalid: {mismatch}");
+            }
+            eprintln!("{}", log.end_line(&settled.end()));
             announce_replay_done(
                 &artifacts_dir,
                 outcome.run_id(),
                 outcome.state().as_str(),
                 Some(replay_id.as_str()),
             );
-            trial_outcome
+            settled.verdict.outcome
         }
         Err(e) => {
+            eprintln!(
+                "{}",
+                log.end_line(&ReplayEnd::unrecorded(outcome.state().as_str()))
+            );
             announce_replay_done(
                 &artifacts_dir,
                 outcome.run_id(),
@@ -5894,15 +5981,76 @@ fn replay_command(
     Ok(CliOutcome::Accepted)
 }
 
-/// Writes the replay's trial and settles it from the arm run's outcome.
+/// The recipe a replay's arm runs, and the model its first attempt must
+/// dispatch: the recipe's own `models[tier]`, else the policy's (the
+/// profile the router's ladder resolves for a covering recipe).
+struct ReplayArm<'a> {
+    spec: &'a RecipeSpec,
+    model: Option<&'a str>,
+}
+
+impl<'a> ReplayArm<'a> {
+    fn of(policy: &'a RepoPolicy, recipe_id: &str) -> Option<Self> {
+        let spec = policy
+            .recipes
+            .iter()
+            .find(|spec| spec.recipe_id() == recipe_id)?;
+        let model = spec
+            .models
+            .as_ref()
+            .and_then(|models| models.get(&spec.tier))
+            .or_else(|| policy.models.get(&spec.tier))
+            .map(|profile| profile.id.as_str());
+        Some(Self { spec, model })
+    }
+}
+
+/// A replay's trial as written: the self-check's verdict and the figures
+/// it settled with.
+struct SettledReplay {
+    verdict: live_trial::ReplayVerdict,
+    dispatched_model: Option<String>,
+    cost: relais::ledger::TrialCost,
+}
+
+impl SettledReplay {
+    fn end(&self) -> ReplayEnd<'_> {
+        ReplayEnd {
+            outcome: self.verdict.outcome.as_str(),
+            dispatched_model: self.dispatched_model.as_deref(),
+            cost: Some(self.cost),
+        }
+    }
+}
+
+/// Writes the replay's trial and settles it from the arm run's outcome,
+/// after the replay's self-check: a first attempt that ran another model
+/// than the arm's, or a design that disagrees with the arm's recipe, is
+/// recorded `invalid`, never as the arm's result.
 fn record_replay_trial(
     ledger: &relais::ledger::Ledger,
     outcome: &relais::runner::RunOutcome,
     trial: &relais::ledger::NewReplayTrial<'_>,
-) -> Result<relais::ledger::TrialOutcome, CliError> {
-    let (trial_outcome, accepted_without_escalation) =
-        live_trial::trial_outcome_of(&outcome.terminal);
-    let (trial_cost, duration_ms) = operational(
+    arm: &ReplayArm<'_>,
+) -> Result<SettledReplay, CliError> {
+    let dispatched_model = operational(
+        ledger.first_dispatch_intent(&outcome.run_id),
+        "dataset replay",
+    )?
+    .and_then(|intent| {
+        intent
+            .get("model")
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+    });
+    let verdict = live_trial::ReplayCheck {
+        arm_model: arm.model.unwrap_or_default(),
+        dispatched_model: dispatched_model.as_deref(),
+        requires_design: arm.spec.requires_design,
+        design_sha256: trial.design_sha256,
+    }
+    .settle(live_trial::trial_outcome_of(&outcome.terminal));
+    let (cost, duration_ms) = operational(
         live_trial::settled_figures(ledger, &outcome.run_id),
         "dataset replay",
     )?;
@@ -5910,14 +6058,96 @@ fn record_replay_trial(
     operational(
         ledger.settle_trial(
             trial.trial_id,
-            trial_outcome,
-            accepted_without_escalation,
-            trial_cost,
+            verdict.outcome,
+            verdict.accepted_without_escalation,
+            cost,
             duration_ms,
         ),
         "dataset replay",
     )?;
-    Ok(trial_outcome)
+    Ok(SettledReplay {
+        verdict,
+        dispatched_model,
+        cost,
+    })
+}
+
+/// The two lines every replay prints to stderr, one as its arm starts and
+/// one as it ends; the plan's record is copied from them
+/// (docs/plans/2026-10-12-task-types.md).
+struct ReplayLog<'a> {
+    task_type: Option<relais::contract::TaskType>,
+    task: &'a TaskId,
+    /// The model the arm's first attempt is meant to dispatch.
+    arm_model: &'a str,
+    /// The one-minute load average when the replay started.
+    load: Option<f64>,
+    started: std::time::Instant,
+}
+
+/// How a replay ended, for its end line.
+struct ReplayEnd<'a> {
+    outcome: &'a str,
+    /// What the first attempt dispatched; `None` when nothing was.
+    dispatched_model: Option<&'a str>,
+    /// `None` when no trial was settled to carry a figure.
+    cost: Option<relais::ledger::TrialCost>,
+}
+
+impl ReplayEnd<'_> {
+    /// A replay whose trial could not be written: its run's state, and no
+    /// figures.
+    fn unrecorded(outcome: &str) -> ReplayEnd<'_> {
+        ReplayEnd {
+            outcome,
+            dispatched_model: None,
+            cost: None,
+        }
+    }
+}
+
+impl ReplayLog<'_> {
+    fn head(&self, event: &str) -> String {
+        format!(
+            "relais dataset replay: {event} type={} task={}",
+            self.task_type
+                .map_or("none", relais::contract::TaskType::as_str),
+            self.task
+        )
+    }
+
+    fn load_text(&self) -> String {
+        self.load
+            .map_or_else(|| "unknown".to_string(), |load| format!("{load:.2}"))
+    }
+
+    fn start_line(&self) -> String {
+        format!(
+            "{} model={} load={}",
+            self.head("start"),
+            self.arm_model,
+            self.load_text()
+        )
+    }
+
+    fn end_line(&self, end: &ReplayEnd<'_>) -> String {
+        self.end_line_after(end, self.started.elapsed())
+    }
+
+    fn end_line_after(&self, end: &ReplayEnd<'_>, wall: std::time::Duration) -> String {
+        let cost = end
+            .cost
+            .and_then(|cost| cost.cost())
+            .map_or_else(|| "unknown".to_string(), |cost| cost.to_string());
+        format!(
+            "{} outcome={} model={} cost={cost} wall={:.1}s load={}",
+            self.head("end"),
+            end.outcome,
+            end.dispatched_model.unwrap_or("none"),
+            wall.as_secs_f64(),
+            self.load_text()
+        )
+    }
 }
 
 /// `kind` as `list`/`show` print it — never `Debug`'s capitalised
@@ -8454,6 +8684,52 @@ fn reseal_receipt_in(
 mod tests {
     use super::*;
     use relais::ledger::{Ledger, Transition};
+
+    /// The start and end lines carry the type, the task, the outcome, the
+    /// dispatched model, the cost, the wall time and the load at start.
+    #[test]
+    fn a_replay_logs_one_start_and_one_end_line() {
+        let task = TaskId::from_stored("task-abc");
+        let log = ReplayLog {
+            task_type: Some(relais::contract::TaskType::Feature),
+            task: &task,
+            arm_model: "haiku",
+            load: Some(3.5),
+            started: std::time::Instant::now(),
+        };
+        assert_eq!(
+            log.start_line(),
+            "relais dataset replay: start type=feature task=task-abc model=haiku load=3.50"
+        );
+        let cost = relais::ledger::TrialCost::new(
+            Some(relais::money::MicroUsd::from_micros(300_000)),
+            relais::money::CostCompleteness::Actual,
+        )
+        .expect("a coherent cost");
+        let end = ReplayEnd {
+            outcome: "invalid",
+            dispatched_model: Some("sonnet"),
+            cost: Some(cost),
+        };
+        assert_eq!(
+            log.end_line_after(&end, std::time::Duration::from_millis(12_340)),
+            "relais dataset replay: end type=feature task=task-abc outcome=invalid \
+             model=sonnet cost=$0.3 wall=12.3s load=3.50"
+        );
+        let untyped = ReplayLog {
+            task_type: None,
+            load: None,
+            ..log
+        };
+        assert_eq!(
+            untyped.end_line_after(
+                &ReplayEnd::unrecorded("interrupted"),
+                std::time::Duration::ZERO
+            ),
+            "relais dataset replay: end type=none task=task-abc outcome=interrupted \
+             model=none cost=unknown wall=0.0s load=unknown"
+        );
+    }
 
     fn temp_ledger(label: &str) -> (Ledger, relais::test_support::TempDir) {
         // Through the shared helper, not a hand-rolled path: this one

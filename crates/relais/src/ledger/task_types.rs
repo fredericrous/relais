@@ -247,15 +247,6 @@ impl Ledger {
         Ok(imported)
     }
 
-    /// Record the sha-256 of the design a trial's arm was handed.
-    pub fn set_trial_design_sha256(&self, trial_id: &str, sha256: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE trials SET design_sha256 = ?2 WHERE trial_id = ?1",
-            params![trial_id, sha256],
-        )?;
-        Ok(())
-    }
-
     /// Whether the trial arm that ran as `run` was handed a design.
     pub fn run_had_design(&self, run: &RunId) -> Result<bool> {
         let count: i64 = self.conn.query_row(
