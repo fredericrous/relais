@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: feat/trust-once-per-repo
 repos: [relais]
 adrs:
@@ -35,7 +35,7 @@ Other tools trust a location once: VS Code Workspace Trust (the folder), `git sa
 - **The grant.** A new machine.toml table, `[trust_repos."<repo_key>"]`, with the same fields as `TrustGrant` (`granted_at`, `reviewed_by`, `repo` label, `note`; `mod.rs:1038`, validated the same way). Written only by `relais trust grant`, through the existing locked, atomic `trust::grant` path (`src/trust.rs:311`).
 - **The check.** `effective_authority` (`mod.rs:1632`, the only grant check `run` and replay pass through) holds when the repository has a repo grant, **or** a legacy `[trust."<key>"]` grant matches the policy exactly (expand step: every existing grant keeps working). Otherwise `missing_trust_grant` as today, so an untrusted, newly cloned repository is still blocked until the person grants it once.
 - **Candidates.** Live-trial admission (`live_trial.rs:100-120`) checks the repository's grant, not the candidate's key; a candidate whose commands differ from the incumbent's is still refused by `validate_candidate` (unchanged). Replay preflight passes on the repository's grant.
-- **The warning.** relais keeps, per repository, the command declaration it last ran under: the `steps` and `integrations` of `trust::declaration()` (`trust.rs:68-124`; `models` excluded, so a routing candidate never warns; execution limits are not covered) hashed, stored in the ledger next to `trust_grants`. At preflight, when the current declaration differs from the last one seen, relais prints once on stderr `relais: commands changed in relais.toml since <date>: <one line per added / removed / changed step>`, records a `commands_changed` event on the run (`relais status`, `relais report`), and updates the stored declaration (an upsert keyed by `repo_key`; two concurrent runs may both warn, neither fails), so the warning appears once per change, not on every run. Only `run` preflight updates it; `plan`, `doctor`, `trust show` and replay report a pending change without consuming it. `trust grant` records the starting declaration. A recipe, tier, model-routing or context change is not a command change and prints nothing. The plugin relays the warning in the run's outcome message.
+- **The warning.** relais keeps, per repository, the command declaration it last ran under: the `steps` and `integrations` of `trust::declaration()` (`trust.rs:68-124`; `models` excluded, so a routing candidate never warns; execution limits are not covered) hashed, stored in the ledger next to `trust_grants`. At preflight, when the current declaration differs from the last one seen, relais prints once on stderr `relais: commands changed in relais.toml since <date>: <one line per added / removed / changed step>`, records a `commands_changed` event on the run (`relais status`, `relais report`), and updates the stored declaration (an upsert keyed by `repo_key`; two concurrent runs may both warn, neither fails), so the warning appears once per change, not on every run. Only `run` preflight updates it; `plan`, `doctor` and `trust show` report a pending change without consuming it, and a replay neither says nor records one (changed in implementation: a replay that reported it printed and recorded it again on every replay run). `trust grant` records the starting declaration. A recipe, tier, model-routing or context change is not a command change and prints nothing. The plugin relays the warning in the run's outcome message.
 - **`relais trust grant`** with no `--key` grants the current repository (`--reviewed-by` still required, `--note` optional, `--json`). `--key` keeps writing a legacy hash grant and prints that it is deprecated in favour of the repository grant (CLI interface is public, `cli.compat.interface-is-public`; removed only in a later major). `trust show` reports `repository: granted <date> by <who>` or `not granted`, then the declaration.
 - **Plugin.** `mcp__relais__trust` and `mcp__relais__onboard` (`claude-plugin/hooks/consent.ts:237-262`) ask once per repository ("Allow relais to run this repository's commands?", showing them) and call `relais trust grant --source plugin` without a key; a repository already granted returns `ready` without asking. `runs.ts:59`'s `missing_trust_grant` text stays. The machine.toml and `relais trust grant` guards stay (`guards.ts:~85`): only the person grants, now once.
 - **What does not change.** Nothing grants on its own; no run, recipe, learner or worker writes machine.toml; the bypass-mode limit; `deny_unknown_fields`; escaping of displayed commands.
@@ -78,5 +78,29 @@ One relais PR, then a release through `tag-release` (the plugin's trust tool nee
 - **D2** The warning is once per change, stored per repository in the ledger, so it stays readable rather than becoming noise on every run.
 - **D3** Legacy hash grants keep working (expand step), so no existing grant breaks on upgrade.
 - **D4** A grant keyed by origin URL also covers any other clone with the same origin on this machine (a fork branch in a scratch directory); this follows from D1 and ADR-0007 says so. ADR-0005 and ADR-0006 are reserved by the orchestrator-decides and task-types plans, so this is ADR-0007.
+
+## Record
+
+Done in one PR: commits be49d1c (salvaged from relais run run-65db401540a09-173a3, interrupted at wall time), 8634332 (review fixes), de65b51. Observed before the push, branch binary on scratch `RELAIS_STATE_DIR`/`RELAIS_CONFIG_DIR`:
+
+| check | expected | actual |
+|---|---|---|
+| `make check` on 8634332 | exit 0 | exit 0 at load ~15: fmt, clippy, module cycles, cargo test, MSRV, audit, plugin 282/282 |
+| scratch repo, no grant | blocked | `plan` rc=3, `trust grant: MISSING` |
+| `trust grant --reviewed-by pilot` | `[trust_repos]` | rc=0, `[trust_repos.8e87c32c…]` written; `plan` "trust grant: repository …" |
+| recipe edit, then model-tier edit | trusted, silent | rc=0, 0 warning lines each |
+| verification edit, `plan` twice | pending shown, not consumed | both `plan`s show `commands changed` |
+| a second scratch repository | still blocked | rc=3, `MISSING` |
+| `doctor`, `trust show` | grant reported, legacy count | "1 repository grant(s), 0 legacy"; "0 run(s) in the last 30 days were admitted by a legacy [trust] grant"; `repository: granted … by pilot`, pending `~ changed check sh -c true [default]` |
+| downgrade: v0.18.0 on the new machine.toml | refuses | rc=2, parse error at `[trust_repos.…]` |
+| rollback: remove `[trust_repos]`, restore a ledger copy | v0.18.0 works, asks for `--key` | rc=3, legacy `--key` grant asked; the new binary then upgrades a ledger with runs to v30 and writes `ledger.sqlite.bak-v30` |
+
+Not piloted, covered by tests only: `run` warns once then is silent (scenario `a_repository_is_trusted_once_and_a_command_change_warns_once`); a model-tier change never warns (`trust::tests::a_recipe_or_model_tier_change_is_not_a_command_change`); a replay neither says nor records a pending change (`runner::tests::a_replay_neither_says_nor_records_a_pending_command_change`, a bug found in review: replays repeated the warning). Next: the release, then the person grants the relais repository once and the task-types pilot replay runs with no further grant.
+
+## Implementation review
+
+- **approve** after two Deltas (round 1 approve-with-changes, 89k tokens, 154 s; Deltas 97k/46 s and 100k/98 s).
+- Fixed: ledger errors no longer swallowed (doctor, pending change); no text says a candidate needs its own grant; a live-trial test under a repository grant alone; `GrantScope` enum; the v30 backup comment; replays no longer repeat the warning.
+- Carried: `commandsChangedText` in the plugin has no test; check a real outcome message after release.
 
 <!-- panel: repos=relais reviewers=backend body-sha=dd97337efb51 -->
