@@ -37,7 +37,7 @@ pub use task_types::{
     ExportedTasks, ImportedTaskTypes, StoredTaskType, TaskExportRow, TaskTypeSource,
 };
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 29;
+pub const LEDGER_SCHEMA_VERSION: u64 = 30;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -1746,6 +1746,27 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ALTER TABLE trials ADD COLUMN design_sha256 TEXT;
     "#,
     ),
+    (
+        // A repository is trusted once (ADR-0007). `repo_declarations` is
+        // the command declaration (steps and integrations, never models)
+        // each repository last ran under, one row per `repo_key`, so a
+        // change to the commands is said once and not on every run.
+        // `runs.trust_status` is which grant admitted a run
+        // (`repository` or `legacy_exact`), what `relais doctor` counts to
+        // say whether a legacy grant is still in use. Additive: a run
+        // written before the step has no status, never a guessed one. The
+        // step is preceded by a copy of the ledger file (`TRUST_STEP`).
+        "v30",
+        r#"
+    CREATE TABLE repo_declarations (
+        repo_key TEXT PRIMARY KEY,
+        declaration_hash TEXT NOT NULL,
+        declaration_json TEXT NOT NULL,
+        seen_at TEXT NOT NULL
+    );
+    ALTER TABLE runs ADD COLUMN trust_status TEXT;
+    "#,
+    ),
 ];
 
 /// `advice_p_approve, advice_model, advice_revision, advice_null_reason`.
@@ -1754,6 +1775,12 @@ type StoredAdvice = (Option<f64>, Option<String>, Option<String>, Option<String>
 /// The version of the step that types the actor; it needs a backup and a
 /// pre-check that a SQL batch cannot do.
 const ACTOR_STEP: &str = "v27";
+
+/// The step that adds the repository grant's records. A binary from before
+/// it refuses a ledger past its own version, so a rollback restores the
+/// copy this step leaves beside the ledger; runs recorded after the
+/// upgrade are lost with it.
+const TRUST_STEP: &str = "v30";
 
 /// Every actor spelling a ledger written before the typed [`Actor`] may
 /// hold, and the actor it becomes. The v27 SQL `CASE` repeats this table;
@@ -1887,6 +1914,14 @@ pub struct PersonAnswerCounts {
 /// How long a minted decide nonce is honoured when its session never said
 /// it ended (a crash, a kill): past this, minting any nonce sweeps it.
 const DECIDE_NONCE_TTL_DAYS: i64 = 7;
+
+/// One row of `repo_declarations`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredDeclaration {
+    pub declaration_hash: String,
+    pub declaration_json: String,
+    pub seen_at: String,
+}
 
 /// One row of `trust_grants`: what [`Ledger::record_trust_grant`] writes.
 #[derive(Debug, Clone, Copy)]
@@ -2163,6 +2198,9 @@ fn migrate(conn: &Connection, clock: &dyn Clock) -> Result<()> {
         if *version == ACTOR_STEP {
             prepare_actor_step(conn)?;
         }
+        if *version == TRUST_STEP {
+            prepare_trust_step(conn)?;
+        }
         apply_step(conn, version, sql, &clock.now_rfc3339())?;
     }
     Ok(())
@@ -2236,6 +2274,52 @@ fn prepare_actor_step(conn: &Connection) -> Result<()> {
     };
     let backup = format!("{path}.bak-{ACTOR_STEP}");
     let partial = format!("{backup}.partial");
+    match std::fs::remove_file(&partial) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    conn.execute("VACUUM INTO ?1", [&partial])?;
+    std::fs::rename(&partial, &backup)?;
+    Ok(())
+}
+
+/// Before v30 runs: write a copy of the ledger file beside it
+/// (`<ledger>.bak-v30`, by `VACUUM INTO`, because a file copy can miss WAL
+/// pages), so a rollback to the previous relais has a ledger it can read.
+/// Does nothing when the step is already applied or for an in-memory
+/// ledger. A ledger that holds no run is skipped too, because a fresh file
+/// several openers are creating at once, whose earlier steps this same
+/// open just applied, must not race to back itself up; such a ledger may
+/// still hold other rows (trust grants, learning rows), and those are not
+/// copied. A copy left by an earlier
+/// attempt is replaced, so the copy is always of the ledger as it was just
+/// before the step.
+fn prepare_trust_step(conn: &Connection) -> Result<()> {
+    let applied = |version: &str| -> Result<bool> {
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM schema_migrations WHERE version = ?1",
+                [version],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    };
+    if applied(TRUST_STEP)? || applied_count(conn)? == 0 {
+        return Ok(());
+    }
+    let runs: i64 = conn.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))?;
+    if runs == 0 {
+        return Ok(());
+    }
+    let Some(path) = conn.path().filter(|p| !p.is_empty()) else {
+        return Ok(());
+    };
+    let backup = format!("{path}.bak-{TRUST_STEP}");
+    // A name of this process's own, so two openers upgrading at once do
+    // not write the same partial file.
+    let partial = format!("{backup}.partial-{}", std::process::id());
     match std::fs::remove_file(&partial) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -4273,6 +4357,70 @@ impl Ledger {
                 |row| row.get::<_, String>(0),
             )
             .optional()?)
+    }
+
+    /// The command declaration `repo_key` last ran under (ADR-0007):
+    /// `None` when none was ever recorded.
+    pub fn repo_declaration(&self, repo_key: &str) -> Result<Option<StoredDeclaration>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT declaration_hash, declaration_json, seen_at
+                 FROM repo_declarations WHERE repo_key = ?1",
+                [repo_key],
+                |row| {
+                    Ok(StoredDeclaration {
+                        declaration_hash: row.get(0)?,
+                        declaration_json: row.get(1)?,
+                        seen_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Record the declaration `repo_key` runs under now, replacing the
+    /// last one. An upsert: two runs recording at once both land, the
+    /// later one stands, and neither fails.
+    pub fn upsert_repo_declaration(
+        &self,
+        repo_key: &str,
+        declaration_hash: &str,
+        declaration_json: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO repo_declarations
+                (repo_key, declaration_hash, declaration_json, seen_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(repo_key) DO UPDATE SET
+                declaration_hash = excluded.declaration_hash,
+                declaration_json = excluded.declaration_json,
+                seen_at = excluded.seen_at",
+            params![repo_key, declaration_hash, declaration_json, self.now()],
+        )?;
+        Ok(())
+    }
+
+    /// Which grant admitted a run (`repository` or `legacy_exact`).
+    pub fn set_run_trust_status(&self, id: &RunId, status: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET trust_status = ?2 WHERE id = ?1",
+            params![id.as_str(), status],
+        )?;
+        Ok(())
+    }
+
+    /// How many runs created at or after `since` (RFC3339) a legacy
+    /// `[trust]` grant admitted: what `relais doctor` reports before the
+    /// legacy grants can be retired.
+    pub fn legacy_grant_runs_since(&self, since: &str) -> Result<u64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM runs
+             WHERE trust_status = 'legacy_exact' AND created_at >= ?1",
+            [since],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
     }
 
     /// The advisor's stored advice for one run's decision, as JSON, or
@@ -9499,7 +9647,7 @@ mod tests {
     /// appear, NULL on the row written before them.
     #[test]
     fn v28_adds_the_driver_columns_to_an_older_ledger() {
-        assert_eq!(LEDGER_SCHEMA_VERSION, 29);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 30);
         let dir = temp_dir("v26-to-v28");
         let path = dir.join("ledger.sqlite");
         {
@@ -9528,8 +9676,102 @@ mod tests {
             .expect("a run written before v28");
         }
         let ledger = Ledger::open(&path).expect("upgrade");
-        assert_eq!(ledger.schema_version().expect("version"), 29);
+        assert_eq!(ledger.schema_version().expect("version"), 30);
         assert_eq!(driver_of(&ledger, "run-old"), (None, None, None));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ADR-0007: the step that adds the repository grant's records first
+    /// writes a copy of the ledger beside it (what a rollback restores),
+    /// then applies; a run records the grant that admitted it, which
+    /// `legacy_grant_runs_since` counts; a repository's declaration is an
+    /// upsert.
+    #[test]
+    fn v30_copies_the_ledger_first_then_records_trust_status_and_declarations() {
+        let dir = temp_dir("v29-to-v30");
+        let path = dir.join("ledger.sqlite");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );",
+            )
+            .expect("migrations table");
+            for (version, sql) in &MIGRATIONS[..29] {
+                conn.execute_batch(sql).expect("apply step");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, "then"],
+                )
+                .expect("record step");
+            }
+            conn.execute(
+                "INSERT INTO runs (id, repo_path, status, created_at, updated_at)
+                 VALUES ('run-old', '/r', 'prepared', '2020-01-01T00:00:00Z', 'then')",
+                [],
+            )
+            .expect("a run written before v30");
+        }
+        let ledger = Ledger::open(&path).expect("upgrade");
+        assert_eq!(ledger.schema_version().expect("version"), 30);
+
+        let copy = format!("{}.bak-v30", path.display());
+        let before = Connection::open(&copy).expect("the copy opens as a ledger");
+        assert_eq!(
+            applied_count(&before).expect("count"),
+            29,
+            "as it was before"
+        );
+        let old_runs: i64 = before
+            .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+            .expect("the copy holds the run");
+        assert_eq!(old_runs, 1);
+        assert!(
+            before.prepare("SELECT trust_status FROM runs").is_err(),
+            "the copy is from before the step"
+        );
+
+        // The status a run records, and the count doctor reads.
+        let old = RunId::from_stored("run-old".to_string());
+        ledger
+            .set_run_trust_status(&old, "legacy_exact")
+            .expect("status");
+        assert_eq!(
+            ledger
+                .legacy_grant_runs_since("2019-01-01T00:00:00Z")
+                .expect("count"),
+            1
+        );
+        assert_eq!(
+            ledger
+                .legacy_grant_runs_since("2021-01-01T00:00:00Z")
+                .expect("count"),
+            0,
+            "a run older than the window is not counted"
+        );
+        ledger
+            .set_run_trust_status(&old, "repository")
+            .expect("status");
+        assert_eq!(
+            ledger
+                .legacy_grant_runs_since("2019-01-01T00:00:00Z")
+                .expect("count"),
+            0
+        );
+
+        // A repository's declaration is upserted, one row per repository.
+        assert_eq!(ledger.repo_declaration("rk").expect("read"), None);
+        ledger
+            .upsert_repo_declaration("rk", "h1", "{}")
+            .expect("first");
+        ledger
+            .upsert_repo_declaration("rk", "h2", "{\"a\":1}")
+            .expect("second");
+        let stored = ledger.repo_declaration("rk").expect("read").expect("a row");
+        assert_eq!(stored.declaration_hash, "h2");
+        assert_eq!(stored.declaration_json, "{\"a\":1}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -9564,7 +9806,7 @@ mod tests {
             .expect("a task written before v29");
         }
         let ledger = Ledger::open(&path).expect("upgrade");
-        assert_eq!(ledger.schema_version().expect("version"), 29);
+        assert_eq!(ledger.schema_version().expect("version"), 30);
         assert_eq!(
             ledger
                 .task_type_of(&task("old"))

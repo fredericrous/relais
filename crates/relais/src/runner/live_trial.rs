@@ -4,8 +4,9 @@
 //! The draw is pure and lives in `route::trial`. This module is where a
 //! machine's `[trials]` envelope meets the world: it reads the candidate
 //! files, admits each one — parsed, run through [`validate_candidate`]
-//! against the repository's CURRENT policy, and required to hold a trust
-//! grant for its own authority hash — counts today's trials out of the
+//! against the repository's CURRENT policy, and required to run under the
+//! repository's grant, or a legacy grant for its exact authority hash —
+//! counts today's trials out of the
 //! ledger, asks for the assignment, and records and settles the row.
 //!
 //! OFF is a value, not a code path that half-runs: with the envelope
@@ -36,7 +37,8 @@ pub struct Dropped {
 }
 
 /// A candidate that passed admission: parsed, admissible against the
-/// current policy, and granted.
+/// current policy, and covered by the repository's grant or a legacy
+/// grant for its exact authority hash.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Admitted {
     pub path: PathBuf,
@@ -111,9 +113,13 @@ fn admit_one(
             .map_err(|rejection| format!("inadmissible: {rejection}"))?;
     let authority_hash = candidate.policy().authority_hash();
     let key = grant_key(&authority_hash, identity);
-    if !machine.trust.contains_key(&key) {
+    // The repository's grant admits any candidate of it; a legacy grant
+    // admits only the exact policy it was issued for, so a candidate needs
+    // one for its own hash when the repository is not granted (ADR-0007).
+    if crate::policy::trust_status(machine, identity, &key) == crate::policy::TrustStatus::Missing {
         return Err(format!(
-            "no trust grant for its authority hash {authority_hash} (grant key {key})"
+            "no trust grant for its authority hash {authority_hash} (grant key {key}) and \
+             none for the repository"
         ));
     }
     Ok(candidate)
@@ -719,6 +725,17 @@ mod tests {
         MachineSettings::from_toml_str(&text).expect("machine parses")
     }
 
+    /// machine.toml with the given `[trials]` body and ONLY a repository
+    /// grant (`[trust_repos]`) for [`identity`]: no legacy grant at all.
+    fn machine_trusting_repository(trials: &str) -> MachineSettings {
+        let repo_key = crate::policy::repo_key(&identity());
+        let text = format!(
+            "schema_version = 1\n[trials]\n{trials}\n\
+             [trust_repos.\"{repo_key}\"]\ngranted_at = \"2026-10-13\"\nreviewed_by = \"test\"\n"
+        );
+        MachineSettings::from_toml_str(&text).expect("machine parses")
+    }
+
     fn write(dir: &TempDir, name: &str, text: &str) -> PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, text).expect("write");
@@ -739,7 +756,8 @@ mod tests {
     }
 
     /// An admitted candidate needs all three: it parses, it is admissible
-    /// against the CURRENT policy, and its own authority hash is granted.
+    /// against the CURRENT policy, and it is granted — here, on a machine
+    /// with legacy grants only, by a grant for its exact authority hash.
     /// A missing file, an inadmissible policy and an ungranted one are each
     /// dropped with the reason named.
     #[test]
@@ -812,6 +830,26 @@ mod tests {
             "{}",
             why(&garbage_path)
         );
+    }
+
+    /// The repository's grant covers its candidates (ADR-0007): a
+    /// recipe-only candidate is admitted on a machine that holds a
+    /// `[trust_repos]` grant and no legacy grant for any hash.
+    #[test]
+    fn a_repository_grant_admits_a_recipe_only_candidate() {
+        let dir = short_temp_dir("lt-repo-grant");
+        let incumbent = RepoPolicy::from_toml_str(&base_policy("required")).expect("incumbent");
+        let candidate_path = write(&dir, "candidate.toml", &revision_one("required"));
+        let machine = machine_trusting_repository(&trials_body(&[&candidate_path], "seed = 1", 5));
+        assert!(
+            machine.trust.is_empty(),
+            "the fixture holds no legacy grant"
+        );
+
+        let admission = admit_candidates(&dir, &machine.trials, &incumbent, &machine, &identity());
+        assert!(admission.dropped.is_empty(), "{:?}", admission.dropped);
+        let admitted: Vec<&PathBuf> = admission.admitted.iter().map(|a| &a.path).collect();
+        assert_eq!(admitted, vec![&candidate_path]);
     }
 
     #[test]

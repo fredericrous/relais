@@ -734,6 +734,7 @@ fn run_package(
         run_id: None,
         wire: engine.config.wire.clone(),
         design: engine.config.design,
+        declarations: engine.config.declarations,
     };
     engine.transition(
         State::Running,
@@ -1366,7 +1367,7 @@ mod tests {
             disallowed_tools: Vec::new(),
             authority_hash: "hash".into(),
             grant_key: "key".into(),
-            trust_granted: true,
+            trust_status: crate::policy::TrustStatus::Repository,
             blockers: Vec::new(),
         };
         // The shape check refuses the plan before the multiplication,

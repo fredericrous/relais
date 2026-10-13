@@ -371,7 +371,7 @@ async function onDone(fx: Fx, store: Store, child: Child, line: any, now: number
     typeof line.run === 'string'
       ? `relais ${trial ? 'replay' : 'run'} ${run} finished: ${outcome}${why}.`
       : `relais ${trial ? 'replay' : 'run'} ${outcome}${why}. Nothing ran.`
-  const facts = [receipt ? `Receipt: ${receipt}` : '', summaryText(line.summary), trial ? `Replay trial: ${trial}` : ''].filter(Boolean)
+  const facts = [receipt ? `Receipt: ${receipt}` : '', summaryText(line.summary), trial ? `Replay trial: ${trial}` : '', commandsChangedText(model)].filter(Boolean)
   const awaits = AWAITS_A_PERSON.has(outcome) && typeof line.run === 'string'
   const text = [headline, ...facts, code ? NEXT_STEP[code] ?? '' : '', awaits ? DECIDE_STEP : '', outcome === 'accepted' && typeof line.run === 'string' && !trial ? FEEDBACK_STEP : ''].filter(Boolean).join('\n')
   // The stream hook descends from the `run` tool call, and a prompt cannot
@@ -381,6 +381,14 @@ async function onDone(fx: Fx, store: Store, child: Child, line: any, now: number
   if (awaits) {
     store.pendingOutcomes.set(text, { run, outcome, code, kind: trial ? 'replay' : 'run', facts, noted: new Set() })
   }
+}
+
+// The run's `commands_changed` decision, when relais warned that the
+// repository's commands changed since the last run (ADR-0007): the person
+// is told once, here, in the outcome message.
+export function commandsChangedText(model: RunModel | undefined): string {
+  const warned = model?.decisions.find(d => d.text.startsWith('commands_changed · '))
+  return warned ? `relais warned: the repository's commands changed ${warned.text.slice('commands_changed · '.length)}`.slice(0, MAX_SUMMARY) : ''
 }
 
 // What relais's `done` says the candidate changed: an object

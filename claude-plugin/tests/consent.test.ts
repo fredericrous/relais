@@ -12,8 +12,9 @@ function world(options: { detected?: string[][] | null; changes?: Shown['changes
     staged: [] as string[],
     commits: [] as string[],
     grants: [] as string[],
+    grantArgs: [] as string[][],
+    preGranted: false,
     commitFails: false,
-    stale: false,
     showFails: false,
     showGarbage: false,
     rmFails: false,
@@ -35,7 +36,7 @@ function world(options: { detected?: string[][] | null; changes?: Shown['changes
     grant_key: `key-${steps().length}-${state.typedCommand?.join('_') ?? ''}`,
     repository: '/repo/.git (no origin)',
     machine_settings: '/home/p/.config/relais/machine.toml',
-    granted: state.grants.length > 0,
+    granted: state.preGranted || state.grants.length > 0,
     declaration: {
       steps: steps(),
       models: [{ tier: 'implementation', id: 'sonnet' }],
@@ -92,9 +93,9 @@ function world(options: { detected?: string[][] | null; changes?: Shown['changes
         return ok(JSON.stringify(shown()))
       }
       if (line.startsWith('trust grant')) {
-        if (state.stale) return fail(18, 'stale_grant_key')
-        state.grants.push(rest[rest.indexOf('--key') + 1])
-        return ok('{"code":"granted"}')
+        state.grantArgs.push(rest)
+        state.grants.push(rest.includes('--key') ? rest[rest.indexOf('--key') + 1] : 'repository')
+        return ok('{"code":"granted","scope":"repository"}')
       }
     }
     return fail(127, `unscripted: ${argv.join(' ')}`)
@@ -163,13 +164,28 @@ test('trust: two calls at once ask once and grant once', async () => {
   expect(a).toBe(b)
 })
 
-test('trust: a key that went stale while asking grants nothing and says so', async () => {
+test('trust: asks once without a key, then a granted repository returns ready without asking', async () => {
   const w = world()
   w.state.policy = true
-  w.state.stale = true
   w.answers.push(YES2)
-  expect(await trustTool(w.fx, w.store, '/repo', 's')).toContain('stale_grant_key')
-  expect(w.state.grants.length).toBe(0)
+  expect(await trustTool(w.fx, w.store, '/repo', 's')).toContain('ready')
+  expect(w.asks.length).toBe(1)
+  // The grant is the repository's, with no key: asked once, then never.
+  expect(w.state.grantArgs.length).toBe(1)
+  expect(w.state.grantArgs[0].includes('--key')).toBe(false)
+  expect(w.state.grantArgs[0].includes('--reviewed-by')).toBe(true)
+  expect(w.state.grants).toEqual(['repository'])
+  const again = await trustTool(w.fx, w.store, '/repo', 's')
+  expect(again).toContain('ready: repo is already allowed')
+  expect(w.asks.length).toBe(1)
+  expect(w.state.grants.length).toBe(1)
+
+  const v = world()
+  v.state.policy = true
+  v.state.preGranted = true
+  expect(await trustTool(v.fx, v.store, '/repo', 's')).toContain('ready: repo is already allowed')
+  expect(v.asks.length).toBe(0)
+  expect(v.state.grants.length).toBe(0)
 })
 
 test('the trust question lists every command, the models and integrations, safe option first', async () => {
@@ -177,13 +193,13 @@ test('the trust question lists every command, the models and integrations, safe 
   const q = question2(w.shown(), 'repo')
   expect(q.text).toBe(
     [
-      'relais 2 of 2 · Let relais run these commands in repo,',
-      "outside Claude Code's permission prompts?",
+      "relais 2 of 2 · Allow relais to run this repository's commands",
+      "in repo, outside Claude Code's permission prompts?",
       '  setup  pnpm install --frozen-lockfile',
       '  check  make check',
       '  models sonnet     integrations amont (required)',
-      'Saved in /home/p/.config/relais/machine.toml.',
-      'Any change to relais.toml asks again. They run in a worktree.',
+      'Saved once for the repository in /home/p/.config/relais/machine.toml.',
+      'A later change to these commands is reported, not asked again.',
     ].join('\n'),
   )
   expect(q.yes).toBe('Allow 2 commands')
@@ -215,6 +231,22 @@ test('onboard: both questions, then the commit of relais.toml alone, then the gr
   expect(w.state.commits).toEqual(['commit -m chore(relais): add relais.toml -- relais.toml'])
   expect(w.state.grants.length).toBe(1)
   expect(w.toasts.some(t => t.startsWith('relais · set up: relais.toml abc1234 on main'))).toBe(true)
+})
+
+test('onboard: grants the repository without a key, and does not ask a trusted repository again', async () => {
+  const w = world()
+  w.answers.push(USE_CHECKS, YES2)
+  await onboardTool(w.fx, w.store, '/repo', 's')
+  expect(w.state.grants).toEqual(['repository'])
+  expect(w.state.grantArgs[0].includes('--key')).toBe(false)
+
+  const v = world()
+  v.state.preGranted = true
+  v.answers.push(USE_CHECKS)
+  const result = await onboardTool(v.fx, v.store, '/repo', 's')
+  expect(result).toContain('ready: relais.toml committed as abc1234 on main')
+  expect(v.asks.length).toBe(1)
+  expect(v.state.grants.length).toBe(0)
 })
 
 test('onboard: declining the trust question removes the relais.toml it wrote', async () => {

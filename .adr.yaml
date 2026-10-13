@@ -35,6 +35,8 @@ keys:
     description: Who may answer a run waiting on a person, how the answer records who decided, and what counts as the person's judgment
   decisions.advisor:
     description: Whether a model advises a decision, how relais calls it, and whether its advice can gate an answer
+  trust.scope:
+    description: What a trust grant names (a repository or one exact policy), and what relais does when the commands it would run change
 
 # Which parts of this repository have which traits (aval 1.7, SEMANTICS
 # section 2.5), as `aval traits --detect` proposed and a reviewer accepted.
