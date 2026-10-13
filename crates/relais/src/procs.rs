@@ -367,6 +367,28 @@ impl Captured {
     }
 }
 
+/// Clone one regular file copy-on-write: `clonefile(2)` on macOS,
+/// `FICLONE` on Linux, `Unsupported` elsewhere. Never copies bytes.
+pub fn clone_file(src: &Path, dst: &Path) -> io::Result<()> {
+    imp::clone_file(src, dst)
+}
+
+/// Does the platform clone a whole directory in one call (macOS)? When it
+/// does not, the caller walks the tree and clones file by file.
+pub const CLONES_DIRECTORIES: bool = cfg!(target_os = "macos");
+
+/// Clone a directory tree in one call, symlinks kept as links. Only
+/// meaningful where [`CLONES_DIRECTORIES`] is true.
+pub fn clone_directory(src: &Path, dst: &Path) -> io::Result<()> {
+    imp::clone_directory(src, dst)
+}
+
+/// Is `error` the filesystem saying it cannot clone (another volume, no
+/// reflink support, an old kernel) rather than a real failure?
+pub fn clone_unsupported(error: &io::Error) -> bool {
+    imp::clone_unsupported(error)
+}
+
 /// An exclusive lock the KERNEL holds on a file for as long as the
 /// holder lives, and releases however it dies — SIGKILL, a panic, a
 /// power cut. `flock(LOCK_EX|LOCK_NB)` on Unix, `LockFile` on Windows,
@@ -755,6 +777,7 @@ fn read_to_end(mut pipe: impl std::io::Read, into: &std::sync::Mutex<Vec<u8>>) -
 mod imp {
     use std::io;
     use std::os::unix::process::CommandExt;
+    use std::path::Path;
     use std::process::Command;
 
     use super::GroupKill;
@@ -993,6 +1016,90 @@ mod imp {
         }
     }
 
+    /// `CLONE_NOFOLLOW` from `<sys/clonefile.h>`: clone a symlink as a link.
+    #[cfg(target_os = "macos")]
+    const CLONE_NOFOLLOW: u32 = 0x0001;
+
+    #[cfg(target_os = "macos")]
+    fn clonefile(src: &Path, dst: &Path) -> io::Result<()> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let src = CString::new(src.as_os_str().as_bytes())?;
+        let dst = CString::new(dst.as_os_str().as_bytes())?;
+        // SAFETY: both are NUL-terminated and live across the call.
+        let rc = unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), CLONE_NOFOLLOW) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn clone_file(src: &Path, dst: &Path) -> io::Result<()> {
+        clonefile(src, dst)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn clone_directory(src: &Path, dst: &Path) -> io::Result<()> {
+        clonefile(src, dst)
+    }
+
+    /// `_IOW(0x94, 9, int)`: the same value on every architecture Linux
+    /// ships FICLONE for that relais targets.
+    #[cfg(target_os = "linux")]
+    const FICLONE: libc::c_ulong = 0x4004_9409;
+
+    #[cfg(target_os = "linux")]
+    pub fn clone_file(src: &Path, dst: &Path) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let from = std::fs::File::open(src)?;
+        let to = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dst)?;
+        // SAFETY: both descriptors are open for the whole call.
+        let rc = unsafe { libc::ioctl(to.as_raw_fd(), FICLONE, from.as_raw_fd()) };
+        if rc != 0 {
+            let error = io::Error::last_os_error();
+            drop(to);
+            let _ = std::fs::remove_file(dst);
+            return Err(error);
+        }
+        to.set_permissions(from.metadata()?.permissions())?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn clone_directory(_: &Path, _: &Path) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub fn clone_file(_: &Path, _: &Path) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub fn clone_directory(_: &Path, _: &Path) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    pub fn clone_unsupported(error: &io::Error) -> bool {
+        let codes = [
+            libc::EXDEV,
+            libc::ENOTSUP,
+            libc::EOPNOTSUPP,
+            libc::ENOTTY,
+            libc::EINVAL,
+            libc::ENOSYS,
+        ];
+        error.kind() == io::ErrorKind::Unsupported
+            || error
+                .raw_os_error()
+                .is_some_and(|code| codes.contains(&code))
+    }
+
     pub fn try_lock_exclusive(file: &std::fs::File) -> io::Result<bool> {
         use std::os::unix::io::AsRawFd;
         // SAFETY: an advisory lock on a descriptor this process owns; the
@@ -1039,6 +1146,7 @@ mod imp {
 mod imp {
     use std::io;
     use std::os::windows::process::CommandExt;
+    use std::path::Path;
     use std::process::Command;
 
     use super::GroupKill;
@@ -1120,6 +1228,18 @@ mod imp {
             Some(ERROR_ACCESS_DENIED) => super::SignalFailure::NotOurs,
             _ => super::SignalFailure::Refused,
         }
+    }
+
+    pub fn clone_file(_: &Path, _: &Path) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    pub fn clone_directory(_: &Path, _: &Path) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    pub fn clone_unsupported(error: &io::Error) -> bool {
+        error.kind() == io::ErrorKind::Unsupported
     }
 
     pub fn try_lock_exclusive(file: &std::fs::File) -> io::Result<bool> {

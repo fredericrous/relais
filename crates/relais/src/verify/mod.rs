@@ -2362,6 +2362,7 @@ mod tests {
             argv: argv.iter().map(|a| a.to_string()).collect(),
             timeout_seconds,
             junit: None,
+            reuse: None,
         }
     }
 
@@ -3366,6 +3367,7 @@ mod tests {
             argv: argv.iter().map(|a| a.to_string()).collect(),
             timeout_seconds,
             junit: None,
+            reuse: None,
         }
     }
 

@@ -17,6 +17,8 @@ use std::process::Command;
 use crate::contract::TaskContract;
 use crate::ids::sha256_hex;
 
+pub mod reuse;
+
 /// The author and committer date every candidate snapshot is stamped
 /// with, and the unix seconds that is.
 ///

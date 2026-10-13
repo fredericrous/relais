@@ -388,6 +388,7 @@ fn fixed_fields_match(
         risk: i_risk,
         architecture: i_architecture,
         recipes: _incumbent_recipes,
+        workspace: i_workspace,
     } = incumbent;
     let RepoPolicy {
         schema_version: c_schema_version,
@@ -399,6 +400,7 @@ fn fixed_fields_match(
         risk: c_risk,
         architecture: c_architecture,
         recipes: _candidate_recipes,
+        workspace: c_workspace,
     } = candidate;
 
     if i_schema_version != c_schema_version {
@@ -432,6 +434,9 @@ fn fixed_fields_match(
         return Err(CandidateRejection::FixedFieldChanged {
             field: "architecture",
         });
+    }
+    if i_workspace != c_workspace {
+        return Err(CandidateRejection::FixedFieldChanged { field: "workspace" });
     }
     Ok(())
 }
@@ -1390,6 +1395,7 @@ mod tests {
 
     fn policy_with_recipes(recipes: Vec<RecipeSpec>) -> RepoPolicy {
         RepoPolicy {
+            workspace: Default::default(),
             schema_version: crate::policy::POLICY_SCHEMA_VERSION,
             models: BTreeMap::new(),
             execution: ExecutionPolicy::default(),

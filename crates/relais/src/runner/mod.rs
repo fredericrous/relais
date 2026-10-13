@@ -5261,6 +5261,7 @@ mod tests {
 
         fn repo_policy(&self, commands: Vec<CommandSpec>, max_attempts: u32) -> RepoPolicy {
             RepoPolicy {
+                workspace: Default::default(),
                 schema_version: 1,
                 context: Default::default(),
                 models: BTreeMap::from([
@@ -5348,6 +5349,7 @@ mod tests {
                 },
             );
             MachineSettings {
+                workspace: Default::default(),
                 schema_version: 1,
                 allowed_models: None,
                 spending: Default::default(),
@@ -5632,6 +5634,7 @@ mod tests {
         CommandSpec {
             name: None,
             junit: None,
+            reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/main.rs".into()],
             timeout_seconds: 30,
         }
@@ -5651,6 +5654,7 @@ mod tests {
         CommandSpec {
             name: None,
             junit: None,
+            reuse: None,
             argv: vec![shell.into(), "-c".into(), "test ! -f src/main.rs".into()],
             timeout_seconds: 30,
         }
@@ -5660,6 +5664,7 @@ mod tests {
         CommandSpec {
             name: None,
             junit: None,
+            reuse: None,
             argv: vec!["sh".into(), "-c".into(), "true".into()],
             timeout_seconds: 30,
         }
@@ -6067,6 +6072,7 @@ mod tests {
         let no_evil = CommandSpec {
             name: None,
             junit: None,
+            reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/evil.txt".into()],
             timeout_seconds: 30,
         };
@@ -7540,6 +7546,7 @@ mod tests {
         let no_tick0 = CommandSpec {
             name: None,
             junit: None,
+            reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/tick-0.txt".into()],
             timeout_seconds: 30,
         };
@@ -7597,6 +7604,7 @@ mod tests {
         let no_tick0 = CommandSpec {
             name: None,
             junit: None,
+            reuse: None,
             argv: vec![
                 "sh".into(),
                 "-c".into(),
@@ -7657,6 +7665,7 @@ mod tests {
         let marker = CommandSpec {
             name: None,
             junit: None,
+            reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test -f src/marker.txt".into()],
             timeout_seconds: 30,
         };
@@ -8294,6 +8303,7 @@ mod tests {
         let check = CommandSpec {
             name: None,
             junit: None,
+            reuse: None,
             argv: vec![
                 shell.into(),
                 "-c".into(),
@@ -9107,6 +9117,7 @@ mod tests {
         let hanging = CommandSpec {
             name: None,
             junit: None,
+            reuse: None,
             argv: vec!["sh".into(), "-c".into(), "sleep 60".into()],
             timeout_seconds: 120,
         };
@@ -9630,6 +9641,7 @@ mod tests {
         CommandSpec {
             name: None,
             junit: None,
+            reuse: None,
             argv: vec!["sh".into(), "-c".into(), script.into()],
             timeout_seconds: 30,
         }
@@ -9674,6 +9686,7 @@ mod tests {
                 CommandSpec {
                     name: None,
                     junit: None,
+                    reuse: None,
                     argv: vec!["relais-no-such-binary-4f3a".into()],
                     timeout_seconds: 30,
                 },
@@ -9747,6 +9760,7 @@ mod tests {
             vec![CommandSpec {
                 name: None,
                 junit: None,
+                reuse: None,
                 argv: vec!["sh".into(), "-c".into(), "sleep 5".into()],
                 timeout_seconds: 1,
             }],
@@ -9871,6 +9885,7 @@ mod tests {
         let setup = CommandSpec {
             name: None,
             junit: None,
+            reuse: None,
             argv: vec![
                 shell.into(),
                 "-c".into(),
@@ -11230,6 +11245,7 @@ mod tests {
         let no_tick0 = CommandSpec {
             name: None,
             junit: None,
+            reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/tick-0.txt".into()],
             timeout_seconds: 30,
         };
@@ -11334,6 +11350,7 @@ mod tests {
         let green = CommandSpec {
             name: None,
             junit: None,
+            reuse: None,
             argv: vec!["sh".into(), "-c".into(), "test ! -f src/main.rs".into()],
             timeout_seconds: 30,
         };
