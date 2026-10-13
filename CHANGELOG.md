@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+The replay tool takes an optional `design` (an absolute path to a markdown program design) and passes it to `relais dataset replay --design`, the input of the Haiku + design arm.
+
 ## v0.18.0
 
 Tasks carry a type, contracts may name a program design, and replays can measure Haiku per type, with and without a design (#231, the task-types plan's PR 1); live routing is unchanged. Upgrade before running relais in this repository: its `relais.toml` now seeds typed recipes that v0.17.0 refuses to load, and its authority hash changed, so re-grant its trust. Reinstall the plugin as for v0.12.0 and restart sessions, so the run tool lists the task types.

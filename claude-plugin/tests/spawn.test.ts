@@ -80,11 +80,11 @@ test('a TaskStop that fails is said in the run\'s timeline, not dropped', async 
 
 const REPLAY = { tool: 'mcp__relais__replay', task: 'fix it', recipe: '/tmp/candidate.toml', cwd: '/repo' }
 
-async function startedReplay($: any, on: any) {
+async function startedReplay($: any, on: any, extra: Record<string, unknown> = {}) {
   const engine = scriptedEngine(on)
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
   await settle(engine)
-  await $.tool.call(REPLAY)
+  await $.tool.call({ ...REPLAY, ...extra })
   await startQueued(engine)
   return engine
 }
@@ -95,6 +95,18 @@ test('the replay tool starts relais dataset replay with the protocol flag, the h
   expect(child.argv).toEqual(['relais', 'dataset', 'replay', '--task', 'fix it', '--recipe', '/tmp/candidate.toml', '--protocol'])
   expect(child.cwd).toBe('/repo')
   expect(child.env).toEqual({ RELAIS_HOST: 'claude-code-mod', RELAIS_SESSION_ID: 'session-1' })
+})
+
+test('a replay with a design passes --design before the protocol flag', async ($: any, on: any) => {
+  const engine = await startedReplay($, on, { design: '/tmp/design.md' })
+  expect(engine.calls.spawn[0].argv).toEqual([
+    'relais', 'dataset', 'replay', '--task', 'fix it', '--recipe', '/tmp/candidate.toml', '--design', '/tmp/design.md', '--protocol',
+  ])
+})
+
+test('a replay with an empty design passes no --design', async ($: any, on: any) => {
+  const engine = await startedReplay($, on, { design: '' })
+  expect(engine.calls.spawn[0].argv).not.toContain('--design')
 })
 
 test("a replay's spawn line spawns an agent in the hook-chosen cwd like a run's", async ($: any, on: any) => {
