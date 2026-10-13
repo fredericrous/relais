@@ -2679,7 +2679,8 @@ fn export_classifier_command(out: &Path, since: Option<&str>) -> Result<CliOutco
 /// finishing, not a failure: it ends quietly with exit 0.
 fn export_tasks_command(out: &Path) -> Result<CliOutcome, CliError> {
     let ledger = open_ledger()?;
-    let rows = operational(ledger.export_tasks(), "export-tasks")?;
+    let exported = operational(ledger.export_tasks(), "export-tasks")?;
+    let rows = exported.rows;
     let mut text = String::new();
     for row in &rows {
         text.push_str(&serde_json::to_string(row).expect("an export row serializes"));
@@ -2709,6 +2710,12 @@ fn export_tasks_command(out: &Path) -> Result<CliOutcome, CliError> {
         "relais dataset export-tasks: {} task(s) written",
         rows.len()
     );
+    if exported.unreadable_contracts > 0 {
+        eprintln!(
+            "relais dataset export-tasks: {} task(s) with an unreadable contract exported without one",
+            exported.unreadable_contracts
+        );
+    }
     Ok(CliOutcome::Accepted)
 }
 

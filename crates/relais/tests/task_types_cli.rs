@@ -94,14 +94,42 @@ fn the_export_carries_the_contract_and_no_file_contents() {
     let world = World::new("export");
     let ledger = world.ledger();
     world.add_task(&ledger, "one", "Fix the escaping", None);
+    // A task whose contract names a file, in a repository that holds it:
+    // only the path may be exported, never the file's text.
+    let repo = world.root.join("repo");
+    std::fs::create_dir_all(repo.join("crates")).expect("repo");
+    std::fs::write(repo.join("crates/lib.rs"), "FILE-CONTENT-MARKER").expect("write");
+    let run = RunId::from_stored("run-hinted".to_string());
+    ledger
+        .insert_typed_run(
+            &run,
+            &repo.to_string_lossy(),
+            None,
+            &TaskId::from_stored("task-hinted".to_string()),
+            "rk",
+            None,
+        )
+        .expect("run");
+    let contract = TaskContract::from_json_str(
+        r#"{"schema_version":1,"kind":"change","objective":"Tidy lib.rs",
+            "base_ref":"HEAD","write_scope":["crates/lib.rs"],"read_hints":["crates/lib.rs"],
+            "acceptance":["parses"],"verification_profile":"p"}"#,
+    )
+    .expect("contract");
+    let json = serde_json::to_string(&contract.canonical_value()).expect("json");
+    ledger
+        .insert_contract_revision(&run, &contract.hash(), &json, "HEAD", None)
+        .expect("revision");
     drop(ledger);
-    // A file in the working directory whose text must never be exported.
-    std::fs::write(world.root.join("secret.txt"), "FILE-CONTENT-MARKER").expect("write");
 
     let out = world.run(&["export-tasks", "--out", "-"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let stdout = text(&out.stdout);
     assert!(!stdout.contains("FILE-CONTENT-MARKER"));
+    assert!(
+        stdout.contains(r#""write_scope":["crates/lib.rs"]"#),
+        "{stdout}"
+    );
     let row: serde_json::Value =
         serde_json::from_str(stdout.lines().next().expect("one row")).expect("json");
     assert_eq!(row["task_id"], "task-one");
@@ -129,7 +157,7 @@ fn the_export_carries_the_contract_and_no_file_contents() {
         ]
     );
     assert!(
-        text(&out.stderr).contains("1 task(s)"),
+        text(&out.stderr).contains("2 task(s)"),
         "{}",
         text(&out.stderr)
     );

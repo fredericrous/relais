@@ -61,6 +61,16 @@ pub struct TaskExportRow {
     pub acceptance: Vec<String>,
 }
 
+/// What `export_tasks` read: a row per task, and how many tasks had a
+/// stored contract that no longer parses (their row carries no contract
+/// fields, like a task with none on record, so the count is the only way
+/// a caller can tell the two apart).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportedTasks {
+    pub rows: Vec<TaskExportRow>,
+    pub unreadable_contracts: u32,
+}
+
 /// What an import did, label by label.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportedTaskTypes {
@@ -94,7 +104,9 @@ fn stored_type(
         })?,
         source: TaskTypeSource::parse(&source)
             .ok_or_else(|| corrupt(format!("`{source}` is not a task type source")))?,
-        taxonomy_version: version.unwrap_or(0) as u32,
+        taxonomy_version: version
+            .ok_or_else(|| corrupt(format!("`{task_type}` is stored with no taxonomy version")))?
+            as u32,
     }))
 }
 
@@ -150,7 +162,7 @@ impl Ledger {
     /// One row per recorded task, oldest first: the repository its first
     /// run ran in, and the objective, scope and acceptance of the task's
     /// newest contract revision. No file contents.
-    pub fn export_tasks(&self) -> Result<Vec<TaskExportRow>> {
+    pub fn export_tasks(&self) -> Result<ExportedTasks> {
         let mut stmt = self.conn.prepare(
             "SELECT t.task_id,
                     COALESCE((SELECT r.repo_path FROM runs r WHERE r.id = t.first_run), t.repo_key),
@@ -169,12 +181,17 @@ impl Ledger {
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows
+        let mut unreadable_contracts = 0;
+        let rows = rows
             .into_iter()
             .map(|(task_id, repo, contract_json)| {
-                let contract = contract_json
-                    .as_deref()
-                    .and_then(|json| TaskContract::from_json_str(json).ok());
+                let contract = contract_json.as_deref().and_then(|json| {
+                    let parsed = TaskContract::from_json_str(json).ok();
+                    if parsed.is_none() {
+                        unreadable_contracts += 1;
+                    }
+                    parsed
+                });
                 TaskExportRow {
                     task_id,
                     repo,
@@ -196,7 +213,11 @@ impl Ledger {
                         .unwrap_or_default(),
                 }
             })
-            .collect())
+            .collect();
+        Ok(ExportedTasks {
+            rows,
+            unreadable_contracts,
+        })
     }
 
     /// Write classified labels, all in one transaction. A label never
@@ -339,5 +360,44 @@ mod tests {
         ];
         assert!(ledger.import_task_types(&labels).is_err());
         assert_eq!(ledger.typed_task_count().expect("count"), 0);
+    }
+
+    #[test]
+    fn an_unreadable_contract_is_exported_without_one_and_counted() {
+        let (_dir, ledger) = ledger("unreadable");
+        task(&ledger, "none", None);
+        task(&ledger, "broken", None);
+        let contract = TaskContract::from_json_str(
+            r#"{"schema_version":1,"kind":"change","objective":"o","base_ref":"HEAD",
+                "write_scope":["a"],"acceptance":["b"],"verification_profile":"p"}"#,
+        )
+        .expect("contract");
+        ledger
+            .insert_contract_revision(
+                &RunId::from_stored("run-broken"),
+                &contract.hash(),
+                "{not json",
+                "HEAD",
+                None,
+            )
+            .expect("revision");
+        let exported = ledger.export_tasks().expect("export");
+        assert_eq!(exported.rows.len(), 2);
+        assert!(exported.rows.iter().all(|row| row.objective.is_none()));
+        assert_eq!(exported.unreadable_contracts, 1);
+    }
+
+    #[test]
+    fn a_type_stored_with_no_taxonomy_version_is_corrupt() {
+        let (_dir, ledger) = ledger("no-version");
+        let task = task(&ledger, "typed", Some(TaskType::Feature));
+        ledger
+            .conn
+            .execute(
+                "UPDATE tasks SET taxonomy_version = NULL WHERE task_id = ?1",
+                [task.as_str()],
+            )
+            .expect("update");
+        assert!(ledger.task_type_of(&task).is_err());
     }
 }

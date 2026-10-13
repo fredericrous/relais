@@ -94,8 +94,11 @@ impl TaskFacts {
     /// For callers that rebuild a route's recipe without the ledger at
     /// hand (evidence keying, trial arms); the router itself is given the
     /// ledger's classified type as well.
-    // holds-until: the predictor trait and dataset construction carry the
-    // routed type, so a task typed only by the classifier is keyed too.
+    // holds-until: no task whose type is only classified (history) runs
+    // live again; new contracts declare their type. Such a task is routed
+    // by `change-<type>` (the runner reads the ledger's type) but keyed to
+    // `change-routing` here, by the trial control arm, the predictor and
+    // the dataset; this ends when they take the routed type instead.
     pub fn live_of(contract: &TaskContract) -> Self {
         Self {
             task_type: contract.task_type,

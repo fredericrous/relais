@@ -33,7 +33,9 @@ pub use router::{
     RouterExplorationStop, RouterProvenance, RouterReassessRow, RouterRecord, RouterTaskOutcomeRow,
     RouterTaskRow, RouterUsageRow, RouterWindow,
 };
-pub use task_types::{ImportedTaskTypes, StoredTaskType, TaskExportRow, TaskTypeSource};
+pub use task_types::{
+    ExportedTasks, ImportedTaskTypes, StoredTaskType, TaskExportRow, TaskTypeSource,
+};
 
 pub const LEDGER_SCHEMA_VERSION: u64 = 29;
 
