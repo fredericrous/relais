@@ -210,9 +210,10 @@ export async function startRun(fx: Fx, store: Store, input: { task: string; cwd:
 export async function startReplay(
   fx: Fx,
   store: Store,
-  input: { task: string; recipe: string; cwd: string },
+  input: { task: string; recipe: string; cwd: string; design?: string },
 ) {
-  const argv = ['relais', 'dataset', 'replay', '--task', input.task, '--recipe', input.recipe, '--protocol']
+  const design = input.design ? ['--design', input.design] : []
+  const argv = ['relais', 'dataset', 'replay', '--task', input.task, '--recipe', input.recipe, ...design, '--protocol']
   await startChild(fx, store, argv, input.cwd)
   return `Started relais replay of ${input.task} under ${input.recipe} (in ${input.cwd}). It runs in the relais pane and /relais-status; its outcome arrives here as a message when it ends.`
 }

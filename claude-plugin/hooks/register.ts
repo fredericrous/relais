@@ -179,6 +179,11 @@ export function register(on: any) {
           task: { type: 'string', description: 'The id of the task whose accepted run to replay.' },
           recipe: { type: 'string', description: 'Path to the candidate relais.toml.' },
           cwd: { type: 'string', description: 'The repository to work in (absolute path).' },
+          design: {
+            type: 'string',
+            description:
+              "Optional: absolute path to a markdown program design (at most 16 KiB), the input of the Haiku + design arm. Passed to relais as --design; relais refuses a missing or oversized file.",
+          },
         },
         required: ['task', 'recipe', 'cwd'],
       },
@@ -322,7 +327,12 @@ export function register(on: any) {
     }
     const fx = effects($)
     ensurePump(fx)
-    return { result: await startReplay(fx, store, { task: e.task, recipe: e.recipe, cwd: e.cwd }) }
+    return { result: await startReplay(fx, store, {
+      task: e.task,
+      recipe: e.recipe,
+      cwd: e.cwd,
+      design: typeof e.design === 'string' ? e.design : undefined,
+    }) }
   })
 
   on('tool.call', { tool: DECIDE_TOOL }, async ($: any, e: any) => decideTool(effects($), store, e)).catch(() => ({
