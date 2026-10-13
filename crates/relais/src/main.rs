@@ -2743,10 +2743,14 @@ fn import_task_types_command(file: &Path) -> Result<CliOutcome, CliError> {
         .iter()
         .map(|(task_type, count)| format!("{task_type} {count}"))
         .collect();
+    let by_type = if by_type.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", by_type.join(", "))
+    };
     eprintln!(
-        "relais dataset import-task-types: {} labelled ({}), {} unchanged, {} kept as declared",
+        "relais dataset import-task-types: {} labelled{by_type}, {} unchanged, {} kept as declared",
         imported.applied.values().sum::<u32>(),
-        by_type.join(", "),
         imported.unchanged,
         imported.kept_declared
     );
