@@ -124,5 +124,31 @@ Eight types, one per task, a closed enum `TaskType` in the library with a doc co
 - **D3** The implementation floor for `change` relaxes only for a recipe that names task types: under `Admission::Replay` to measure, under `Admission::Promote` only with replay evidence; a replay never routes a live run.
 - **D5** (person, 2026-10-12) Program design is planned twice, linked: the general step in a fleet plan, and here the `design` contract input, the Haiku + design replay arm and design-gated routes, so its effect on Haiku is measured rather than assumed.
 - **D4** Rollback takes both the backend and product owner rules: a low acceptance bound, or a cost per accepted task no better than Sonnet's, since cost is why the plan exists.
+- **D6** (2026-10-13) The seeded `change-<type>` recipes use a field the installed relais (0.17.0) refuses, so from this branch on, relais cannot run against the relais repository until PR 1 is released and installed. The replay half was therefore implemented in the session; the release follows the merge, and the person re-grants trust for the changed `relais.toml`.
+- **D7** (2026-10-13) A replay candidate appends its new revision at the end of `[[recipes]]`: a candidate that inserts it beside rev 1 is refused ("a candidate may only append new revisions").
+
+## Record (PR 1)
+
+Phase 1 and Phase 2's code are done (commits a4f9a3e, 63e894e, 6667125, 26ba68a, 00bdb5e). Observed before the push, with the branch binary on a scratch `RELAIS_STATE_DIR` holding a `VACUUM INTO` copy of the live ledger:
+
+| check | expected | actual |
+|---|---|---|
+| `make check` (amont pre-commit, every commit) | exit 0 | 30/30 checks passed; lib 1,489 tests, plugin 281/281 (plugin-test skipped on a4f9a3e after a standalone 281/281 pass, load 60–170) |
+| `plan` on `"task_type": "chore"` | refused naming the eight | exit 2, `unknown task_type \`chore\`: it must be one of report, mechanical, pattern, review-fix, feature, refactor, ui, infra` |
+| `plan` route of a typed contract | `change-<type>`, implementation | not shown: blocked on a missing trust grant (the person's step); covered by unit tests |
+| `export-tasks --out <file>` | one row per task, 0600, no file contents | 233 rows for 233 tasks, mode 600, keys exactly acceptance/kind/objective/repo/task_id/write_scope |
+| `export-tasks --out - \| head -1` | exit 0, empty stderr | exit 0, 0 stderr bytes |
+| import, one unknown id and one unknown type | exit 2, `<file>:<line>`, nothing written | exit 2, lines 3 and 4 named, typed count 0 → 0 |
+| import of 5 labels, then again | labelled once, re-import no-op | 5 labelled (report 1, feature 4); then 0 labelled, 5 unchanged; source `classified`, taxonomy 1 |
+| `dataset replay --dry-run`, task-f1bc7e1662b5eaf3 (`pattern`), candidate `change-pattern` rev 2 research | names the research arm | `arm: change-pattern revision 2, tier research, model haiku`, `design: none`, exit 0 |
+| `recipe evaluate` on that candidate | refused (`Admission::Promote`) | exit 3, "puts a `change` at the research tier; only a replay admits that today" |
+
+Next: release, then the live phase (historical classification, pilot, replays), then PR 2.
+
+## Implementation review
+
+- **approve** after one Delta (round 1 approve-with-changes, 112k tokens, 143 s; Delta 119k, 17 s).
+- Fixed: unreadable contracts counted on export; a null taxonomy version is corrupt; the no-file-contents test can now fail; the `live_of` holds-until names its limit.
+- Carried to Measure: new contracts carry a declared type (target 100% in a week), which the holds-until relies on.
 
 <!-- panel: repos=relais reviewers=architect,backend,lang:rust,lang:typescript,po,tui,unix body-sha=25845c3bb661 -->
