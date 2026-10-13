@@ -8,6 +8,10 @@ missing here.
 
 ## Unreleased
 
+## v0.18.0
+
+Tasks carry a type, contracts may name a program design, and replays can measure Haiku per type, with and without a design (#231, the task-types plan's PR 1); live routing is unchanged. Upgrade before running relais in this repository: its `relais.toml` now seeds typed recipes that v0.17.0 refuses to load, and its authority hash changed, so re-grant its trust. Reinstall the plugin as for v0.12.0 and restart sessions, so the run tool lists the task types.
+
 Every task can now carry a task type (phase 1 of the task-types plan, `docs/plans/2026-10-12-task-types.md`). A contract may declare `task_type`, one of `report`, `mechanical`, `pattern`, `review-fix`, `feature`, `refactor`, `ui` or `infra`; any other value is refused naming the eight, and a contract without one hashes exactly as before. The type is stored with the task (ledger step v29: `tasks.task_type`, `task_type_source`, `taxonomy_version`), and `relais report --by task-type` groups cost, acceptance and escalation by it (arms per tier in `--json` only). The run tool's contract description lists the types from an exported `TASK_TYPES`, pinned to the Rust list by tests, and the relais skill tells the orchestrator to declare one: after upgrading, reinstall the plugin as for v0.12.0.
 
 A contract may also name a `design`: a repo-relative markdown file of at most 16 KiB, read at preflight from the base revision (never the working tree), refused inside the write scope or when missing or oversized, put verbatim in the worker's context package, counted in `package_bytes` and recorded as `design_sha256` in the manifest. The reviewer is handed the same design.
