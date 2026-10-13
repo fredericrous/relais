@@ -24,6 +24,103 @@ pub enum Kind {
     Inspect,
 }
 
+/// What kind of work a task is (docs/plans/2026-10-12-task-types.md). The
+/// orchestrator declares one in the contract; relais never infers it from
+/// prose at routing time. A closed set: a type is added by changing this
+/// enum and bumping [`TASK_TYPE_TAXONOMY_VERSION`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskType {
+    /// Read-only inspection.
+    Report,
+    /// A change whose content is fully specified: bumps, renames, a new
+    /// field through its literals, a dependency or package-manager
+    /// migration.
+    Mechanical,
+    /// A new instance of an existing pattern the contract names.
+    Pattern,
+    /// Fix named review findings on a branch.
+    ReviewFix,
+    /// A plan phase: new module, CLI surface, schema step.
+    Feature,
+    /// A cross-cutting type or structure change.
+    Refactor,
+    /// An interface or design-system component.
+    Ui,
+    /// Manifests, CI, deployment config.
+    Infra,
+    /// History the classifier could not place. Never declared by a new
+    /// contract.
+    Unclassified,
+}
+
+/// The version of the closed [`TaskType`] set, stored beside every label so
+/// a later split or merge of types can tell old labels from new.
+pub const TASK_TYPE_TAXONOMY_VERSION: u32 = 1;
+
+impl TaskType {
+    /// The eight types a contract may declare, in the order the plan lists
+    /// them. The plugin's `TASK_TYPES` is pinned to this list by a test.
+    pub const DECLARABLE: [TaskType; 8] = [
+        TaskType::Report,
+        TaskType::Mechanical,
+        TaskType::Pattern,
+        TaskType::ReviewFix,
+        TaskType::Feature,
+        TaskType::Refactor,
+        TaskType::Ui,
+        TaskType::Infra,
+    ];
+
+    /// The wire and ledger spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Report => "report",
+            Self::Mechanical => "mechanical",
+            Self::Pattern => "pattern",
+            Self::ReviewFix => "review-fix",
+            Self::Feature => "feature",
+            Self::Refactor => "refactor",
+            Self::Ui => "ui",
+            Self::Infra => "infra",
+            Self::Unclassified => "unclassified",
+        }
+    }
+
+    /// Any stored spelling, `unclassified` included: what a ledger row or
+    /// an imported label may hold.
+    pub fn parse_stored(text: &str) -> Option<Self> {
+        Self::DECLARABLE
+            .into_iter()
+            .chain([Self::Unclassified])
+            .find(|task_type| task_type.as_str() == text)
+    }
+
+    /// A type a contract may declare: one of the eight, never
+    /// `unclassified`.
+    pub fn parse_declared(text: &str) -> Option<Self> {
+        Self::DECLARABLE
+            .into_iter()
+            .find(|task_type| task_type.as_str() == text)
+    }
+
+    /// The eight declarable spellings, comma separated, for an error that
+    /// names the choices.
+    pub fn declarable_list() -> String {
+        Self::DECLARABLE
+            .iter()
+            .map(|task_type| task_type.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl std::fmt::Display for TaskType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Whether a semantic reviewer must look at candidates. Risk rules can
 /// raise this to `Required` but nothing can lower a floor set by policy
 /// (SPEC §4: worker-supplied hints may increase caution, never lower it).
@@ -228,7 +325,19 @@ pub struct TaskContract {
     /// CLI's `--revise` flag decides it; omitted from the canonical form
     /// when absent so existing contract hashes are unchanged.
     pub task_id: Option<TaskId>,
+    /// What kind of work this is, declared by whoever writes the contract.
+    /// Absent for a contract that does not say; omitted from the canonical
+    /// form when absent so existing contract hashes are unchanged.
+    pub task_type: Option<TaskType>,
+    /// A repo-relative markdown file (at most [`MAX_DESIGN_BYTES`]) holding
+    /// the program design the worker is handed. Only the path is part of
+    /// the contract; relais reads the file at preflight from `base_sha`.
+    /// Omitted from the canonical form when absent.
+    pub design: Option<String>,
 }
+
+/// The largest design file a contract may name.
+pub const MAX_DESIGN_BYTES: usize = 16 * 1024;
 
 /// The contract exactly as it is written and stored: flat `kind` and
 /// `write_scope` fields, unknown fields refused (SPEC §4). It exists so
@@ -260,6 +369,12 @@ struct ContractWire {
     decomposition: Option<Decomposition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     task_id: Option<TaskId>,
+    /// Text on the wire, parsed in `try_from` so an unknown spelling is a
+    /// [`ContractError::UnknownTaskType`] naming the eight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    design: Option<String>,
 }
 
 impl From<&TaskContract> for ContractWire {
@@ -284,6 +399,8 @@ impl From<&TaskContract> for ContractWire {
             review: contract.review,
             decomposition: contract.decomposition.clone(),
             task_id: contract.task_id.clone(),
+            task_type: contract.task_type.map(|t| t.as_str().to_string()),
+            design: contract.design.clone(),
         }
     }
 }
@@ -301,6 +418,10 @@ impl TryFrom<ContractWire> for TaskContract {
                 Task::Inspect
             }
         };
+        let task_type = wire
+            .task_type
+            .map(|text| TaskType::parse_declared(&text).ok_or(ContractError::UnknownTaskType(text)))
+            .transpose()?;
         let contract = TaskContract {
             schema_version: wire.schema_version,
             task,
@@ -315,6 +436,8 @@ impl TryFrom<ContractWire> for TaskContract {
             review: wire.review,
             decomposition: wire.decomposition,
             task_id: wire.task_id,
+            task_type,
+            design: wire.design,
         };
         contract.validate()?;
         Ok(contract)
@@ -621,6 +744,13 @@ pub enum ContractError {
     PlanPackageIncomplete(String, &'static str),
     PlanBadDependency(String, String),
     PlanCycle,
+    /// `task_type` is not one of the eight declarable types.
+    UnknownTaskType(String),
+    /// `design` is not a clean repo-relative path.
+    BadDesignPath(String),
+    /// `design` names a file the worker may write: a design the worker can
+    /// rewrite is not an input.
+    DesignInWriteScope(String),
 }
 
 impl std::fmt::Display for ContractError {
@@ -689,6 +819,19 @@ impl std::fmt::Display for ContractError {
                 "package `{id}` depends on `{dep}`, which is itself or not a package"
             ),
             Self::PlanCycle => write!(f, "work plan dependencies form a cycle"),
+            Self::UnknownTaskType(text) => write!(
+                f,
+                "unknown task_type `{text}`: it must be one of {}",
+                TaskType::declarable_list()
+            ),
+            Self::BadDesignPath(path) => write!(
+                f,
+                "design `{path}` is not a clean repo-relative path (no leading `/`, no `.` or `..` segment)"
+            ),
+            Self::DesignInWriteScope(path) => write!(
+                f,
+                "design `{path}` is inside the write scope: the worker could rewrite its own design"
+            ),
         }
     }
 }
@@ -791,6 +934,23 @@ impl TaskContract {
         if let Some(Decomposition::Plan(plan)) = &self.decomposition {
             plan.validate()?;
         }
+        if let Some(design) = &self.design {
+            let clean = !design.trim().is_empty()
+                && !design.starts_with('/')
+                && !std::path::Path::new(design).is_absolute()
+                && !design
+                    .split(['/', '\\'])
+                    .any(|segment| segment.is_empty() || segment == "." || segment == "..");
+            if !clean {
+                return Err(ContractError::BadDesignPath(design.clone()));
+            }
+            if self
+                .write_scope()
+                .is_some_and(|scope| scope.is_match(design))
+            {
+                return Err(ContractError::DesignInWriteScope(design.clone()));
+            }
+        }
         Ok(())
     }
 
@@ -856,7 +1016,9 @@ pub fn changed_controls(old: &TaskContract, new: &TaskContract) -> ChangedContro
             || old.review != new.review
             || old.architecture != new.architecture
             || old.risk_hints != new.risk_hints
-            || old.read_hints != new.read_hints,
+            || old.read_hints != new.read_hints
+            || old.task_type != new.task_type
+            || old.design != new.design,
     }
 }
 
@@ -1359,5 +1521,104 @@ mod tests {
         );
         assert!(err.to_string().contains(a.as_str()));
         assert!(err.to_string().contains(b.as_str()));
+    }
+
+    const TYPED_BASE: &str = r#"{
+      "schema_version": 1,
+      "kind": "change",
+      "objective": "Preserve quotes",
+      "base_ref": "HEAD",
+      "write_scope": ["src/**"],
+      "acceptance": ["it builds"],
+      "verification_profile": "rust-change"__EXTRA__
+    }"#;
+
+    fn typed(extra: &str) -> Result<TaskContract, ContractError> {
+        TaskContract::from_json_str(&TYPED_BASE.replace("__EXTRA__", extra))
+    }
+
+    #[test]
+    fn a_contract_with_each_task_type_round_trips() {
+        for task_type in TaskType::DECLARABLE {
+            let extra = format!(r#", "task_type": "{}""#, task_type.as_str());
+            let contract = typed(&extra).expect("a declared type parses");
+            assert_eq!(contract.task_type, Some(task_type));
+            let again: TaskContract =
+                serde_json::from_value(contract.canonical_value()).expect("round trips");
+            assert_eq!(again, contract);
+            assert_eq!(again.canonical_value()["task_type"], task_type.as_str());
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_unclassified_task_type_is_refused_naming_the_eight() {
+        for text in ["chore", "unclassified", "Feature", ""] {
+            let err = typed(&format!(r#", "task_type": "{text}""#)).unwrap_err();
+            assert_eq!(err, ContractError::UnknownTaskType(text.to_string()));
+            let message = err.to_string();
+            for declared in TaskType::DECLARABLE {
+                assert!(
+                    message.contains(declared.as_str()),
+                    "`{message}` names {declared}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_stored_spellings_include_unclassified_and_the_taxonomy_is_versioned() {
+        assert_eq!(TASK_TYPE_TAXONOMY_VERSION, 1);
+        assert_eq!(
+            TaskType::parse_stored("unclassified"),
+            Some(TaskType::Unclassified)
+        );
+        assert_eq!(TaskType::parse_declared("unclassified"), None);
+        assert_eq!(
+            TaskType::parse_stored("review-fix"),
+            Some(TaskType::ReviewFix)
+        );
+    }
+
+    /// The hash of this contract, taken by the code before `task_type` and
+    /// `design` existed.
+    #[test]
+    fn a_typeless_and_designless_contract_hashes_as_it_always_did() {
+        let contract = typed("").expect("parses");
+        let canonical = contract.canonical_value();
+        assert!(canonical.get("task_type").is_none());
+        assert!(canonical.get("design").is_none());
+        let before = TaskContract::from_json_str(
+            r#"{"schema_version":1,"kind":"change","objective":"Preserve quotes","base_ref":"HEAD","write_scope":["src/**"],"acceptance":["it builds"],"verification_profile":"rust-change"}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            before.hash(),
+            "f75e729fd56b6ff44e96fffd7036a09b7fd53a2008665c2d3c541ff232a84baf"
+        );
+    }
+
+    #[test]
+    fn a_type_or_a_design_changes_the_hash() {
+        let plain = typed("").expect("parses").hash();
+        let with_type = typed(r#", "task_type": "ui""#).expect("parses").hash();
+        let with_design = typed(r#", "design": "docs/d.md""#).expect("parses").hash();
+        assert_ne!(plain, with_type);
+        assert_ne!(plain, with_design);
+    }
+
+    #[test]
+    fn a_design_inside_the_write_scope_or_not_a_clean_path_is_refused() {
+        assert_eq!(
+            typed(r#", "design": "src/design.md""#).unwrap_err(),
+            ContractError::DesignInWriteScope("src/design.md".into())
+        );
+        for bad in ["/etc/d.md", "../d.md", "docs//d.md", "./d.md", " "] {
+            assert_eq!(
+                typed(&format!(r#", "design": "{bad}""#)).unwrap_err(),
+                ContractError::BadDesignPath(bad.into()),
+                "{bad}"
+            );
+        }
+        assert!(typed(r#", "design": "docs/plans/d.md""#).is_ok());
     }
 }

@@ -91,6 +91,9 @@ pub enum Dimension {
     /// The effort the task's first run's first worker attempt REQUESTED
     /// (SPEC §11), through the ledger's one reader of it.
     Effort,
+    /// The task's type (`declared` by its contract, or `classified` for
+    /// history). Not `task-class`, which is the verification profile.
+    TaskType,
 }
 
 impl Dimension {
@@ -103,6 +106,7 @@ impl Dimension {
             Self::Repository => "repository",
             Self::Recipe => "recipe",
             Self::Effort => "effort",
+            Self::TaskType => "task_type",
         }
     }
 }
@@ -142,6 +146,130 @@ struct CohortTaskRow {
     duration_seconds: Option<f64>,
     cost: MicroUsd,
     cost_completeness: CostCompleteness,
+    /// The arms the task's runs ran as; filled for `--by task-type` only.
+    arms: Vec<ArmSeen>,
+    /// The task's settled replay trials; filled for `--by task-type` only.
+    replays: Vec<crate::ledger::TrialRow>,
+}
+
+/// One run of a task, as an arm: the tier it dispatched at, whether it was
+/// a replay, whether its trial arm was handed a design.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArmSeen {
+    tier: String,
+    replay: bool,
+    with_design: bool,
+}
+
+/// What a cohort's runs ran as, per tier. In `--json` only: the table
+/// stays within 80 columns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArmCount {
+    pub tier: String,
+    pub live: usize,
+    pub replay: usize,
+    pub with_design: usize,
+}
+
+/// One replay arm of a cohort's type, in `--json` only: its candidate
+/// recipe and whether it was handed a design, and how its settled replays
+/// ended (docs/plans/2026-10-12-task-types.md).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct ReplayArm {
+    pub arm_recipe_id: String,
+    pub with_design: bool,
+    pub replays: usize,
+    pub accepted_without_escalation: usize,
+    /// Rejected, or accepted only after a repair or an escalation.
+    pub failed: usize,
+    /// Ended on an infrastructure fault: no evidence either way.
+    pub unknown: usize,
+    /// Did not run its arm (the replay self-check).
+    pub invalid: usize,
+    /// Known cost of the arm's replays; `None` when none was known.
+    pub cost: Option<MicroUsd>,
+    /// How many replays carried no known cost.
+    pub cost_unknown: usize,
+    pub duration_ms: i64,
+}
+
+/// What every replay of a cohort's tasks shows, all arms together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ReplayTally {
+    replays: usize,
+    accepted_without_escalation: usize,
+    failed: usize,
+    unknown: usize,
+    invalid: usize,
+}
+
+/// The settled replay trials of a cohort, one entry per arm and design
+/// presence: the two arms of one type stay apart.
+fn replay_arms(rows: &[CohortTaskRow]) -> Vec<ReplayArm> {
+    use crate::ledger::TrialOutcome;
+    let mut by_arm: std::collections::BTreeMap<(&str, bool), ReplayArm> =
+        std::collections::BTreeMap::new();
+    for trial in rows.iter().flat_map(|row| &row.replays) {
+        let Some(outcome) = trial.outcome else {
+            continue;
+        };
+        let with_design = trial.design_sha256.is_some();
+        let arm = by_arm
+            .entry((&trial.arm_recipe_id, with_design))
+            .or_insert_with(|| ReplayArm {
+                arm_recipe_id: trial.arm_recipe_id.clone(),
+                with_design,
+                ..ReplayArm::default()
+            });
+        arm.replays += 1;
+        match outcome {
+            TrialOutcome::Accepted if trial.accepted_without_escalation == Some(true) => {
+                arm.accepted_without_escalation += 1
+            }
+            TrialOutcome::Accepted | TrialOutcome::Rejected => arm.failed += 1,
+            TrialOutcome::Errored => arm.unknown += 1,
+            TrialOutcome::Invalid => arm.invalid += 1,
+        }
+        match trial.cost.and_then(|cost| cost.cost()) {
+            Some(cost) => arm.cost = Some(arm.cost.unwrap_or(MicroUsd::ZERO) + cost),
+            None => arm.cost_unknown += 1,
+        }
+        arm.duration_ms += trial.duration_ms.unwrap_or(0);
+    }
+    by_arm.into_values().collect()
+}
+
+fn replay_tally(arms: &[ReplayArm]) -> ReplayTally {
+    arms.iter()
+        .fold(ReplayTally::default(), |tally, arm| ReplayTally {
+            replays: tally.replays + arm.replays,
+            accepted_without_escalation: tally.accepted_without_escalation
+                + arm.accepted_without_escalation,
+            failed: tally.failed + arm.failed,
+            unknown: tally.unknown + arm.unknown,
+            invalid: tally.invalid + arm.invalid,
+        })
+}
+
+fn arm_counts(rows: &[CohortTaskRow]) -> Vec<ArmCount> {
+    let mut by_tier: std::collections::BTreeMap<&str, ArmCount> = std::collections::BTreeMap::new();
+    for arm in rows.iter().flat_map(|row| &row.arms) {
+        let count = by_tier.entry(&arm.tier).or_insert_with(|| ArmCount {
+            tier: arm.tier.clone(),
+            live: 0,
+            replay: 0,
+            with_design: 0,
+        });
+        if arm.replay {
+            count.replay += 1;
+        } else {
+            count.live += 1;
+        }
+        if arm.with_design {
+            count.with_design += 1;
+        }
+    }
+    by_tier.into_values().collect()
 }
 
 /// Total cost of the cohort's tasks, divided by its accepted count — the
@@ -245,6 +373,15 @@ pub struct Cohort {
     pub median_duration_seconds: Option<f64>,
     pub regressions: usize,
     pub pending_feedback: usize,
+    /// Arms seen per tier, live and replay (`--by task-type` only, and in
+    /// `--json` only).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub arms: Vec<ArmCount>,
+    /// Replay trials of the cohort's tasks, one entry per candidate recipe
+    /// and design presence (`--by task-type` only; the table prints their
+    /// sum, the arms are in `--json` only).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub replays: Vec<ReplayArm>,
 }
 
 fn build_cohort(key: String, rows: Vec<CohortTaskRow>) -> Cohort {
@@ -264,6 +401,8 @@ fn build_cohort(key: String, rows: Vec<CohortTaskRow>) -> Cohort {
     let median_duration_seconds = median_duration_seconds(&rows);
     let regressions = regressions_count(&rows);
     let pending_feedback = pending_feedback_count(&rows);
+    let arms = arm_counts(&rows);
+    let replays = replay_arms(&rows);
     Cohort {
         key,
         tasks: rows.len(),
@@ -282,6 +421,8 @@ fn build_cohort(key: String, rows: Vec<CohortTaskRow>) -> Cohort {
         median_duration_seconds,
         regressions,
         pending_feedback,
+        arms,
+        replays,
     }
 }
 
@@ -334,7 +475,30 @@ fn cohort_key(
             Some(attempt) => ledger.requested_effort(attempt.id)?,
             None => UNKNOWN.to_string(),
         },
+        Dimension::TaskType => ledger
+            .task_type_of(&task_row.task_id)?
+            .map(|stored| stored.task_type.as_str().to_string())
+            .unwrap_or_else(|| UNKNOWN.to_string()),
     })
+}
+
+/// The arms a task's runs ran as, for `--by task-type`'s JSON.
+fn arms_seen(
+    ledger: &Ledger,
+    runs: &[crate::ids::RunId],
+) -> Result<Vec<ArmSeen>, crate::ledger::LedgerError> {
+    let mut arms = Vec::new();
+    for run in runs {
+        let Some((_, tier)) = ledger.run_contract_and_tier(run)? else {
+            continue;
+        };
+        arms.push(ArmSeen {
+            tier: tier.as_str().to_string(),
+            replay: ledger.run_purpose(run)? == Some(RunPurpose::Replay),
+            with_design: ledger.run_had_design(run)?,
+        });
+    }
+    Ok(arms)
 }
 
 /// The cohort name of the recipe that routed a task's first worker
@@ -398,7 +562,8 @@ fn cohort_runs(
         | Dimension::Model
         | Dimension::Policy
         | Dimension::Repository
-        | Dimension::Effort => Ok(runs.to_vec()),
+        | Dimension::Effort
+        | Dimension::TaskType => Ok(runs.to_vec()),
     }
 }
 
@@ -890,6 +1055,22 @@ pub fn runs_report(
                 duration_seconds,
                 cost,
                 cost_completeness,
+                arms: if dimension == Dimension::TaskType {
+                    arms_seen(ledger, &cohort_counts)?
+                } else {
+                    Vec::new()
+                },
+                // Trials joined to the type through their task; a live
+                // trial is not a replay.
+                replays: if dimension == Dimension::TaskType {
+                    ledger
+                        .trials_by_task(&task_row.task_id)?
+                        .into_iter()
+                        .filter(|trial| trial.workspace_isolation != crate::ledger::LIVE_WORKTREE)
+                        .collect()
+                } else {
+                    Vec::new()
+                },
             });
         }
         tasks.push(TaskLine {
@@ -1214,6 +1395,17 @@ impl Report {
                     "      regressions: {}, pending feedback: {}\n",
                     cohort.regressions, cohort.pending_feedback
                 ));
+                let tally = replay_tally(&cohort.replays);
+                if tally.replays > 0 {
+                    out.push_str(&format!(
+                        "      replays {}: {} accepted unescalated, {} failed, {} unknown, {} invalid\n",
+                        tally.replays,
+                        tally.accepted_without_escalation,
+                        tally.failed,
+                        tally.unknown,
+                        tally.invalid
+                    ));
+                }
             }
         }
         self.push_repair_lines(&mut out);
@@ -1408,6 +1600,8 @@ mod tests {
             duration_seconds: None,
             cost,
             cost_completeness: CostCompleteness::Actual,
+            arms: Vec::new(),
+            replays: Vec::new(),
         }
     }
 
@@ -3102,6 +3296,133 @@ mod tests {
             "{}",
             report.render()
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `--by task-type` groups tasks by their stored type, with the untyped
+    /// in `unknown`, every rendered line fits 80 columns, and the default
+    /// report carries no cohort section at all.
+    #[test]
+    fn by_task_type_groups_by_type_and_fits_80_columns() {
+        use crate::contract::TaskType;
+        let dir = temp_dir("task-type-cohorts");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        for (name, declared) in [
+            ("run-a", Some(TaskType::ReviewFix)),
+            ("run-b", Some(TaskType::ReviewFix)),
+            ("run-c", Some(TaskType::Mechanical)),
+            ("run-d", None),
+        ] {
+            let run = crate::ids::RunId::from_stored(name);
+            let task = crate::ids::TaskId::from_stored(format!("task-{name}"));
+            ledger
+                .insert_typed_run(&run, "/repo", None, &task, "rk", declared)
+                .expect("run");
+        }
+        let report = runs_report(&ledger, SINCE, Some(Dimension::TaskType)).expect("report");
+        assert_eq!(cohort(&report, "review-fix").tasks, 2);
+        assert_eq!(cohort(&report, "mechanical").tasks, 1);
+        assert_eq!(cohort(&report, "unknown").tasks, 1);
+        let text = report.render();
+        assert!(text.contains("by task_type:"), "{text}");
+        // The cohort section: from its heading to the blank line after it.
+        let section: Vec<&str> = text
+            .lines()
+            .skip_while(|line| !line.starts_with("by task_type:"))
+            .take_while(|line| !line.is_empty())
+            .collect();
+        assert!(section.len() > 8, "{section:?}");
+        for line in section {
+            assert!(line.chars().count() <= 80, "{} columns: {line}", line.len());
+        }
+        let default = runs_report(&ledger, SINCE, None).expect("report");
+        assert!(default.cohorts.is_none());
+        assert!(!default.render().contains("by task_type"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `--by task-type` joins replay trials to their task's type: the
+    /// table prints one summed line within 80 columns, and the JSON keeps
+    /// each arm apart by recipe and design presence.
+    #[test]
+    fn by_task_type_counts_replays_per_arm_and_design() {
+        use crate::contract::TaskType;
+        use crate::ledger::{NewReplayTrial, TrialCost, TrialOutcome};
+        let dir = temp_dir("task-type-replays");
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger");
+        let run = crate::ids::RunId::from_stored("run-src");
+        let task = crate::ids::TaskId::from_stored("task-feature");
+        ledger
+            .insert_typed_run(&run, "/repo", None, &task, "rk", Some(TaskType::Feature))
+            .expect("run");
+        for (id, arm, design, outcome, clean) in [
+            ("t-1", "arm-alone", None, TrialOutcome::Accepted, true),
+            ("t-2", "arm-alone", None, TrialOutcome::Accepted, false),
+            (
+                "t-3",
+                "arm-designed",
+                Some("sha"),
+                TrialOutcome::Errored,
+                false,
+            ),
+            (
+                "t-4",
+                "arm-designed",
+                Some("sha"),
+                TrialOutcome::Invalid,
+                false,
+            ),
+        ] {
+            let trial = crate::ids::TrialId::from_stored(id);
+            let arm_run = crate::ids::RunId::from_stored(format!("run-{id}"));
+            ledger
+                .insert_replay_trial(&NewReplayTrial {
+                    trial_id: &trial,
+                    task_id: &task,
+                    source_run_id: &run,
+                    incumbent_recipe_id: "incumbent",
+                    arm_recipe_id: arm,
+                    base_sha: "base",
+                    contract_hash: "contract",
+                    verification_profile_hash: "profile",
+                    workspace_isolation: "fresh_checkout_no_accepted_answer",
+                    arm_run_id: &arm_run,
+                    design_sha256: design,
+                })
+                .expect("trial");
+            ledger
+                .settle_trial(&trial, outcome, clean, TrialCost::UNKNOWN, 1_000)
+                .expect("settle");
+        }
+        let report = runs_report(&ledger, SINCE, Some(Dimension::TaskType)).expect("report");
+        let feature = cohort(&report, "feature");
+        let arm = |id: &str| {
+            feature
+                .replays
+                .iter()
+                .find(|arm| arm.arm_recipe_id == id)
+                .unwrap_or_else(|| panic!("no arm {id}: {:?}", feature.replays))
+        };
+        assert_eq!(feature.replays.len(), 2);
+        assert!(!arm("arm-alone").with_design);
+        assert_eq!(arm("arm-alone").accepted_without_escalation, 1);
+        assert_eq!(arm("arm-alone").failed, 1, "an escalated acceptance fails");
+        assert!(arm("arm-designed").with_design);
+        assert_eq!(arm("arm-designed").unknown, 1);
+        assert_eq!(arm("arm-designed").invalid, 1);
+        assert_eq!(arm("arm-designed").duration_ms, 2_000);
+        let json = serde_json::to_value(&report).expect("json");
+        assert!(json.to_string().contains("\"with_design\":true"), "{json}");
+        let text = report.render();
+        let line = text
+            .lines()
+            .find(|line| line.trim_start().starts_with("replays 4:"))
+            .unwrap_or_else(|| panic!("no replay line: {text}"));
+        assert_eq!(
+            line.trim(),
+            "replays 4: 1 accepted unescalated, 1 failed, 1 unknown, 1 invalid"
+        );
+        assert!(line.chars().count() <= 80, "{line}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -213,7 +213,9 @@ enum Command {
         json: bool,
         /// Group the window's tasks into cohorts over one dimension, so
         /// cost, acceptance, escalation and correction figures compare
-        /// like task classes rather than blending every task together
+        /// like task classes rather than blending every task together.
+        /// `task-type` groups by the task's type (what kind of work it
+        /// is); it is not `task-class`, which is the verification profile
         #[arg(long, value_enum)]
         by: Option<report::Dimension>,
         /// Skip importing orchestration usage before rendering: the
@@ -549,10 +551,39 @@ enum DatasetCommand {
         /// no trial recorded, no usage recorded
         #[arg(long = "dry-run")]
         dry_run: bool,
+        /// A program design (markdown, at most 16 KiB) handed to the
+        /// worker's context package only: the recorded contract and its
+        /// hash stay the source run's, and the trial records the design's
+        /// sha-256. Read before anything runs; a missing or oversized file
+        /// is refused
+        #[arg(long)]
+        design: Option<PathBuf>,
         /// Speak the protocol of `relais run --protocol` on stdout; how
         /// the relais plugin starts a replay that spends
         #[arg(long)]
         protocol: bool,
+    },
+    /// Write one JSON line per recorded task, for a classifier: task id,
+    /// repo, kind, objective, write scope and acceptance, with no file
+    /// contents. relais links no model; the orchestrator labels the
+    /// export and `import-task-types` reads the labels back
+    #[command(name = "export-tasks")]
+    ExportTasks {
+        /// The file to create (mode 0600, through a temporary file in its
+        /// directory, then renamed), or `-` for stdout
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Read classified task types, one JSON line each
+    /// (`{"task_id": ..., "task_type": ...}`), and store them as
+    /// `classified`. Every row is checked first: a file with an unknown
+    /// task id or type is refused whole (exit 2, each bad row printed as
+    /// `<file>:<line>: <reason>`) and writes nothing. A declared type is
+    /// never overwritten, and importing the same file again changes nothing
+    #[command(name = "import-task-types")]
+    ImportTaskTypes {
+        /// The file of labels
+        file: PathBuf,
     },
 }
 
@@ -1344,10 +1375,13 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
         },
         Command::Dataset { cmd } => match cmd {
             DatasetCommand::Build => dataset_build_command(),
+            DatasetCommand::ExportTasks { out } => export_tasks_command(&out),
+            DatasetCommand::ImportTaskTypes { file } => import_task_types_command(&file),
             DatasetCommand::Replay {
                 task,
                 recipe,
                 dry_run,
+                design,
                 protocol,
             } => {
                 let host = std::env::var("RELAIS_HOST").ok();
@@ -1355,7 +1389,7 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
                     protocol,
                     host: host.as_deref(),
                 };
-                replay_command(&task, &recipe, dry_run, &origin)
+                replay_command(&task, &recipe, dry_run, design.as_deref(), &origin)
             }
         },
         Command::Recipe { cmd } => match cmd {
@@ -2637,6 +2671,96 @@ fn export_classifier_command(out: &Path, since: Option<&str>) -> Result<CliOutco
         return Ok(CliOutcome::OperationalFailure);
     }
     eprintln!("{}", export.counts.summary());
+    Ok(CliOutcome::Accepted)
+}
+
+/// `relais dataset export-tasks --out <file|->`. Exit 0 written, 1 on a
+/// ledger or IO failure. A closed stdout (`| head -1`) is the reader
+/// finishing, not a failure: it ends quietly with exit 0.
+fn export_tasks_command(out: &Path) -> Result<CliOutcome, CliError> {
+    let ledger = open_ledger()?;
+    let exported = operational(ledger.export_tasks(), "export-tasks")?;
+    let rows = exported.rows;
+    let mut text = String::new();
+    for row in &rows {
+        text.push_str(&serde_json::to_string(row).expect("an export row serializes"));
+        text.push('\n');
+    }
+    if out == Path::new("-") {
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        match stdout
+            .write_all(text.as_bytes())
+            .and_then(|()| stdout.flush())
+        {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                return Ok(CliOutcome::Accepted)
+            }
+            Err(e) => {
+                eprintln!("relais dataset export-tasks: stdout: {e}");
+                return Ok(CliOutcome::OperationalFailure);
+            }
+        }
+    } else if let Err(e) = relais::fsutil::write_atomic_with_mode(out, &text, Some(0o600)) {
+        eprintln!("relais dataset export-tasks: {}: {e}", out.display());
+        return Ok(CliOutcome::OperationalFailure);
+    }
+    eprintln!(
+        "relais dataset export-tasks: {} task(s) written",
+        rows.len()
+    );
+    if exported.unreadable_contracts > 0 {
+        eprintln!(
+            "relais dataset export-tasks: {} task(s) with an unreadable contract exported without one",
+            exported.unreadable_contracts
+        );
+    }
+    Ok(CliOutcome::Accepted)
+}
+
+/// `relais dataset import-task-types <file>`. Every row is validated
+/// before anything is written; one bad row refuses the file (exit 2).
+fn import_task_types_command(file: &Path) -> Result<CliOutcome, CliError> {
+    let text = match std::fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("relais dataset import-task-types: {}: {e}", file.display());
+            return Ok(CliOutcome::OperationalFailure);
+        }
+    };
+    let ledger = open_ledger()?;
+    let known = operational(ledger.task_id_set(), "import-task-types")?;
+    let labels = match relais::task_labels::parse_labels(&text, &known) {
+        Ok(labels) => labels,
+        Err(problems) => {
+            for problem in &problems {
+                eprintln!("{}:{}: {}", file.display(), problem.line, problem.reason);
+            }
+            eprintln!(
+                "relais dataset import-task-types: {} bad row(s); nothing was written",
+                problems.len()
+            );
+            return Ok(CliOutcome::InvalidInput);
+        }
+    };
+    let imported = operational(ledger.import_task_types(&labels), "import-task-types")?;
+    let by_type: Vec<String> = imported
+        .applied
+        .iter()
+        .map(|(task_type, count)| format!("{task_type} {count}"))
+        .collect();
+    let by_type = if by_type.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", by_type.join(", "))
+    };
+    eprintln!(
+        "relais dataset import-task-types: {} labelled{by_type}, {} unchanged, {} kept as declared",
+        imported.applied.values().sum::<u32>(),
+        imported.unchanged,
+        imported.kept_declared
+    );
     Ok(CliOutcome::Accepted)
 }
 
@@ -4157,6 +4281,16 @@ fn plan_command(
         );
         return Ok(CliOutcome::Blocked);
     }
+    // And the design: `run` refuses a contract whose design is missing,
+    // oversized or not text at the base revision, so `plan` does too.
+    if let Some(design) = &contract.design {
+        if let Err(e) =
+            relais::context::read_design(&relais::workspace::SystemGit, &root, &base_sha, design)
+        {
+            eprintln!("relais plan: blocked (design_unreadable): {e} (base {base_sha})");
+            return Ok(CliOutcome::Blocked);
+        }
+    }
     let repo_identity = relais::repo::identity(&root);
     let authority = effective_authority(&repo, &machine, &contract, &repo_identity);
     let probe = harness_identity();
@@ -4166,7 +4300,15 @@ fn plan_command(
         .as_ref()
         .map(|registry| RegistryPredictor::new(registry, &repo, harness.as_deref()));
     let catalogs = route::resolve_catalogs(&repo, &authority, &machine, probe.efforts.as_ref());
+    let task_type = match (&task_override, contract.task_type) {
+        (_, Some(declared)) => Some(declared),
+        (Some(task), None) => operational(open_ledger()?.routing_type(task, None), "plan")?,
+        (None, None) => None,
+    };
     let decision = route::route(route::RouteInputs {
+        task_type,
+        has_design: contract.design.is_some(),
+        admission: route::Admission::Live,
         contract: &contract,
         repo: &repo,
         machine: &machine,
@@ -5246,6 +5388,7 @@ fn run_command(
         purpose: trial_id.as_ref().map(|_| RunPurpose::TrialArm),
         run_id: Some(run_id.clone()),
         wire: relais::protocol::Wire::process(),
+        design: relais::runner::DesignSource::Contract,
     }) {
         Ok(outcome) => outcome,
         Err(e) => {
@@ -5389,8 +5532,18 @@ fn replay_command(
     task: &str,
     recipe: &Path,
     dry_run: bool,
+    design: Option<&Path>,
     origin: &relais::native::RunOrigin<'_>,
 ) -> Result<CliOutcome, CliError> {
+    // The design file first, before anything else is read or run: a
+    // missing or oversized one refuses the replay outright.
+    let given_design = match design.map(relais::context::read_design_file).transpose() {
+        Ok(given) => given,
+        Err(e) => {
+            eprintln!("relais dataset replay: refused (design_unreadable): {e}");
+            return Ok(CliOutcome::InvalidInput);
+        }
+    };
     // A dry run spends nothing and is allowed anywhere; a spending replay
     // starts only the way a run does.
     if !dry_run {
@@ -5413,7 +5566,12 @@ fn replay_command(
     // Admitted through the same door a learner's proposal is — never a
     // second, looser one for replay.
     let bounds = tuning_bounds(&incumbent);
-    let candidate = match route::validate_candidate(&incumbent, &candidate_policy, &bounds) {
+    let candidate = match route::validate_candidate(
+        &incumbent,
+        &candidate_policy,
+        &bounds,
+        route::CandidateAdmission::Replay,
+    ) {
         Ok(candidate) => candidate,
         Err(rejection) => {
             eprintln!("relais dataset replay: candidate refused: {rejection}");
@@ -5477,6 +5635,30 @@ fn replay_command(
     let base_sha = base_sha.to_string();
     let source_profile_hash = source_profile_hash.to_string();
     let contract_hash = contract_hash.to_string();
+    // The design the arm is handed: `--design`, else whatever the source
+    // contract named, read here at its base so routing, the package and
+    // the trial row all see the one design.
+    let design_input = match (given_design, &source_contract.design) {
+        (Some(given), _) => Some(given),
+        (None, None) => None,
+        (None, Some(path)) => {
+            match relais::context::read_design(
+                &relais::workspace::SystemGit,
+                &root,
+                &base_sha,
+                path,
+            ) {
+                Ok(read) => Some(read),
+                Err(e) => {
+                    eprintln!("relais dataset replay: blocked (design_unreadable): {e}");
+                    return Ok(CliOutcome::Blocked);
+                }
+            }
+        }
+    };
+    let design_sha256 = design_input
+        .as_ref()
+        .map(|design| relais::ids::sha256_hex(design.text.as_bytes()));
 
     // The profile hash that would judge THIS replay: the candidate's own
     // verification is byte-identical to the incumbent's
@@ -5503,37 +5685,83 @@ fn replay_command(
         return Ok(CliOutcome::Blocked);
     }
 
-    let incumbent_eligible = route::eligible_tiers(&source_contract, &incumbent, &incumbent.models);
-    let incumbent_recipe_id =
-        route::covering_recipe_id(&source_contract, &incumbent, &incumbent_eligible.tiers)
-            .unwrap_or_default();
+    // The recorded contract carries no type; the ledger's (declared or
+    // classified) one comes in through the facts.
+    let task_type = operational(
+        ledger.routing_type(&task_id, source_contract.task_type),
+        "dataset replay",
+    )?;
+    // The incumbent is what routed the source run, with its own design;
+    // the arm is routed with the design it is handed.
+    let incumbent_facts = route::TaskFacts {
+        task_type,
+        has_design: source_contract.design.is_some(),
+        admission: route::Admission::Live,
+    };
+    let replay_facts = route::TaskFacts {
+        has_design: design_input.is_some(),
+        admission: route::Admission::Replay,
+        ..incumbent_facts
+    };
+    let incumbent_eligible = route::eligible_tiers(
+        &source_contract,
+        &incumbent,
+        &incumbent.models,
+        incumbent_facts,
+    );
+    let incumbent_recipe_id = route::covering_recipe_id(
+        &source_contract,
+        &incumbent,
+        &incumbent_eligible.tiers,
+        incumbent_facts,
+    )
+    .unwrap_or_default();
     let candidate_eligible = route::eligible_tiers(
         &source_contract,
         candidate.policy(),
         &candidate.policy().models,
+        replay_facts,
     );
     let arm_recipe = route::covering_recipe_id(
         &source_contract,
         candidate.policy(),
         &candidate_eligible.tiers,
+        replay_facts,
     );
 
     println!(
         "this replay is one arm's result; it does not compare, score, rank or promote anything"
     );
+    let arm = arm_recipe
+        .as_deref()
+        .and_then(|id| ReplayArm::of(candidate.policy(), id));
     if dry_run {
         println!("dry run: nothing was dispatched, no trial was recorded, no usage was spent");
         println!("would replay source run: {source_run} (task {task_id})");
+        println!(
+            "task type: {}",
+            task_type.map_or("none", relais::contract::TaskType::as_str)
+        );
         println!(
             "candidate recipe: {}",
             arm_recipe
                 .as_deref()
                 .unwrap_or("(no recipe covers this task under the candidate)")
         );
+        if let Some(arm) = &arm {
+            println!(
+                "arm: {} revision {}, tier {}, model {}",
+                arm.spec.name,
+                arm.spec.revision,
+                arm.spec.tier.as_str(),
+                arm.model.unwrap_or("(none configured)")
+            );
+        }
+        println!("design: {}", design_sha256.as_deref().unwrap_or("none"));
         println!("verification profile hash checked: {replay_profile_hash}");
         return Ok(CliOutcome::Accepted);
     }
-    let Some(arm_recipe) = arm_recipe else {
+    let (Some(arm_recipe), Some(arm)) = (arm_recipe, arm) else {
         eprintln!("relais dataset replay: no recipe in the candidate policy covers task {task_id}");
         return Ok(CliOutcome::Blocked);
     };
@@ -5638,6 +5866,14 @@ fn replay_command(
             session.source
         );
     }
+    let log = ReplayLog {
+        task_type,
+        task: &task_id,
+        arm_model: arm.model.unwrap_or("none"),
+        load: relais::procs::load_average(),
+        started: std::time::Instant::now(),
+    };
+    eprintln!("{}", log.start_line());
     let outcome = execute(&RunConfig {
         repo_dir: &checkout_dir,
         contract: &replay_contract,
@@ -5659,6 +5895,11 @@ fn replay_command(
         purpose: Some(RunPurpose::Replay),
         run_id: Some(run_id.clone()),
         wire: relais::protocol::Wire::process(),
+        design: design_input
+            .as_ref()
+            .map_or(relais::runner::DesignSource::Contract, |design| {
+                relais::runner::DesignSource::Given(design)
+            }),
     });
     // Bring the replay's own refs into the live repository BEFORE the
     // checkout goes. The runner names its candidate and snapshot refs in
@@ -5687,6 +5928,7 @@ fn replay_command(
         Ok(outcome) => outcome,
         Err(e) => {
             eprintln!("relais dataset replay: {e}");
+            eprintln!("{}", log.end_line(&ReplayEnd::unrecorded("interrupted")));
             announce_replay_done(&artifacts_dir, run_id.as_str(), "interrupted", None);
             return Ok(CliOutcome::OperationalFailure);
         }
@@ -5708,19 +5950,29 @@ fn replay_command(
             verification_profile_hash: &replay_profile_hash,
             workspace_isolation: "fresh_checkout_no_accepted_answer",
             arm_run_id: &outcome.run_id,
+            design_sha256: design_sha256.as_deref(),
         },
+        &arm,
     );
     let trial_outcome = match recorded {
-        Ok(trial_outcome) => {
+        Ok(settled) => {
+            if let Some(mismatch) = &settled.verdict.mismatch {
+                eprintln!("relais dataset replay: recorded invalid: {mismatch}");
+            }
+            eprintln!("{}", log.end_line(&settled.end()));
             announce_replay_done(
                 &artifacts_dir,
                 outcome.run_id(),
                 outcome.state().as_str(),
                 Some(replay_id.as_str()),
             );
-            trial_outcome
+            settled.verdict.outcome
         }
         Err(e) => {
+            eprintln!(
+                "{}",
+                log.end_line(&ReplayEnd::unrecorded(outcome.state().as_str()))
+            );
             announce_replay_done(
                 &artifacts_dir,
                 outcome.run_id(),
@@ -5740,15 +5992,76 @@ fn replay_command(
     Ok(CliOutcome::Accepted)
 }
 
-/// Writes the replay's trial and settles it from the arm run's outcome.
+/// The recipe a replay's arm runs, and the model its first attempt must
+/// dispatch: the recipe's own `models[tier]`, else the policy's (the
+/// profile the router's ladder resolves for a covering recipe).
+struct ReplayArm<'a> {
+    spec: &'a RecipeSpec,
+    model: Option<&'a str>,
+}
+
+impl<'a> ReplayArm<'a> {
+    fn of(policy: &'a RepoPolicy, recipe_id: &str) -> Option<Self> {
+        let spec = policy
+            .recipes
+            .iter()
+            .find(|spec| spec.recipe_id() == recipe_id)?;
+        let model = spec
+            .models
+            .as_ref()
+            .and_then(|models| models.get(&spec.tier))
+            .or_else(|| policy.models.get(&spec.tier))
+            .map(|profile| profile.id.as_str());
+        Some(Self { spec, model })
+    }
+}
+
+/// A replay's trial as written: the self-check's verdict and the figures
+/// it settled with.
+struct SettledReplay {
+    verdict: live_trial::ReplayVerdict,
+    dispatched_model: Option<String>,
+    cost: relais::ledger::TrialCost,
+}
+
+impl SettledReplay {
+    fn end(&self) -> ReplayEnd<'_> {
+        ReplayEnd {
+            outcome: self.verdict.outcome.as_str(),
+            dispatched_model: self.dispatched_model.as_deref(),
+            cost: Some(self.cost),
+        }
+    }
+}
+
+/// Writes the replay's trial and settles it from the arm run's outcome,
+/// after the replay's self-check: a first attempt that ran another model
+/// than the arm's, or a design that disagrees with the arm's recipe, is
+/// recorded `invalid`, never as the arm's result.
 fn record_replay_trial(
     ledger: &relais::ledger::Ledger,
     outcome: &relais::runner::RunOutcome,
     trial: &relais::ledger::NewReplayTrial<'_>,
-) -> Result<relais::ledger::TrialOutcome, CliError> {
-    let (trial_outcome, accepted_without_escalation) =
-        live_trial::trial_outcome_of(&outcome.terminal);
-    let (trial_cost, duration_ms) = operational(
+    arm: &ReplayArm<'_>,
+) -> Result<SettledReplay, CliError> {
+    let dispatched_model = operational(
+        ledger.first_dispatch_intent(&outcome.run_id),
+        "dataset replay",
+    )?
+    .and_then(|intent| {
+        intent
+            .get("model")
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+    });
+    let verdict = live_trial::ReplayCheck {
+        arm_model: arm.model.unwrap_or_default(),
+        dispatched_model: dispatched_model.as_deref(),
+        requires_design: arm.spec.requires_design,
+        design_sha256: trial.design_sha256,
+    }
+    .settle(live_trial::trial_outcome_of(&outcome.terminal));
+    let (cost, duration_ms) = operational(
         live_trial::settled_figures(ledger, &outcome.run_id),
         "dataset replay",
     )?;
@@ -5756,14 +6069,96 @@ fn record_replay_trial(
     operational(
         ledger.settle_trial(
             trial.trial_id,
-            trial_outcome,
-            accepted_without_escalation,
-            trial_cost,
+            verdict.outcome,
+            verdict.accepted_without_escalation,
+            cost,
             duration_ms,
         ),
         "dataset replay",
     )?;
-    Ok(trial_outcome)
+    Ok(SettledReplay {
+        verdict,
+        dispatched_model,
+        cost,
+    })
+}
+
+/// The two lines every replay prints to stderr, one as its arm starts and
+/// one as it ends; the plan's record is copied from them
+/// (docs/plans/2026-10-12-task-types.md).
+struct ReplayLog<'a> {
+    task_type: Option<relais::contract::TaskType>,
+    task: &'a TaskId,
+    /// The model the arm's first attempt is meant to dispatch.
+    arm_model: &'a str,
+    /// The one-minute load average when the replay started.
+    load: Option<f64>,
+    started: std::time::Instant,
+}
+
+/// How a replay ended, for its end line.
+struct ReplayEnd<'a> {
+    outcome: &'a str,
+    /// What the first attempt dispatched; `None` when nothing was.
+    dispatched_model: Option<&'a str>,
+    /// `None` when no trial was settled to carry a figure.
+    cost: Option<relais::ledger::TrialCost>,
+}
+
+impl ReplayEnd<'_> {
+    /// A replay whose trial could not be written: its run's state, and no
+    /// figures.
+    fn unrecorded(outcome: &str) -> ReplayEnd<'_> {
+        ReplayEnd {
+            outcome,
+            dispatched_model: None,
+            cost: None,
+        }
+    }
+}
+
+impl ReplayLog<'_> {
+    fn head(&self, event: &str) -> String {
+        format!(
+            "relais dataset replay: {event} type={} task={}",
+            self.task_type
+                .map_or("none", relais::contract::TaskType::as_str),
+            self.task
+        )
+    }
+
+    fn load_text(&self) -> String {
+        self.load
+            .map_or_else(|| "unknown".to_string(), |load| format!("{load:.2}"))
+    }
+
+    fn start_line(&self) -> String {
+        format!(
+            "{} model={} load={}",
+            self.head("start"),
+            self.arm_model,
+            self.load_text()
+        )
+    }
+
+    fn end_line(&self, end: &ReplayEnd<'_>) -> String {
+        self.end_line_after(end, self.started.elapsed())
+    }
+
+    fn end_line_after(&self, end: &ReplayEnd<'_>, wall: std::time::Duration) -> String {
+        let cost = end
+            .cost
+            .and_then(|cost| cost.cost())
+            .map_or_else(|| "unknown".to_string(), |cost| cost.to_string());
+        format!(
+            "{} outcome={} model={} cost={cost} wall={:.1}s load={}",
+            self.head("end"),
+            end.outcome,
+            end.dispatched_model.unwrap_or("none"),
+            wall.as_secs_f64(),
+            self.load_text()
+        )
+    }
 }
 
 /// `kind` as `list`/`show` print it — never `Debug`'s capitalised
@@ -5907,6 +6302,8 @@ struct RecipeSpecFull {
     execution: Option<relais::policy::ExecutionPolicy>,
     context: Option<relais::policy::ContextPolicy>,
     review: Option<relais::contract::Review>,
+    task_type: Vec<relais::contract::TaskType>,
+    requires_design: bool,
 }
 
 impl From<&RecipeSpec> for RecipeSpecFull {
@@ -5922,6 +6319,8 @@ impl From<&RecipeSpec> for RecipeSpecFull {
             execution,
             context,
             review,
+            task_type,
+            requires_design,
         } = spec.clone();
         Self {
             name,
@@ -5934,6 +6333,8 @@ impl From<&RecipeSpec> for RecipeSpecFull {
             execution,
             context,
             review,
+            task_type,
+            requires_design,
         }
     }
 }
@@ -6035,7 +6436,12 @@ fn recipe_diff_command(candidate_path: &Path) -> Result<CliOutcome, CliError> {
     }
 
     let bounds = tuning_bounds(&incumbent);
-    match route::validate_candidate(&incumbent, &candidate_policy, &bounds) {
+    match route::validate_candidate(
+        &incumbent,
+        &candidate_policy,
+        &bounds,
+        route::CandidateAdmission::Promote,
+    ) {
         Ok(_) => println!(
             "admissible: route::validate_candidate would ADMIT this candidate — admissible is \
              not approved: it still needs its own trust grant, and nothing here grants, \
@@ -6072,7 +6478,12 @@ fn recipe_evaluate_command(candidate_path: &Path) -> Result<CliOutcome, CliError
     // Admitted through the same door a learner's proposal, or a replay's
     // candidate, is — never a second, looser one for evaluation.
     let bounds = tuning_bounds(&incumbent);
-    let candidate = match route::validate_candidate(&incumbent, &candidate_policy, &bounds) {
+    let candidate = match route::validate_candidate(
+        &incumbent,
+        &candidate_policy,
+        &bounds,
+        route::CandidateAdmission::Promote,
+    ) {
         Ok(candidate) => candidate,
         Err(rejection) => {
             eprintln!("relais recipe evaluate: candidate refused: {rejection}");
@@ -6205,7 +6616,12 @@ fn recipe_promote_command(candidate_path: &Path, mode: AmendMode) -> Result<CliO
             cause: Box::new(cause),
         })?;
     let bounds = tuning_bounds(&incumbent);
-    let candidate = match route::validate_candidate(&incumbent, &candidate_policy, &bounds) {
+    let candidate = match route::validate_candidate(
+        &incumbent,
+        &candidate_policy,
+        &bounds,
+        route::CandidateAdmission::Promote,
+    ) {
         Ok(candidate) => candidate,
         Err(rejection) => {
             eprintln!("relais recipe promote: candidate refused: {rejection}");
@@ -8280,6 +8696,52 @@ mod tests {
     use super::*;
     use relais::ledger::{Ledger, Transition};
 
+    /// The start and end lines carry the type, the task, the outcome, the
+    /// dispatched model, the cost, the wall time and the load at start.
+    #[test]
+    fn a_replay_logs_one_start_and_one_end_line() {
+        let task = TaskId::from_stored("task-abc");
+        let log = ReplayLog {
+            task_type: Some(relais::contract::TaskType::Feature),
+            task: &task,
+            arm_model: "haiku",
+            load: Some(3.5),
+            started: std::time::Instant::now(),
+        };
+        assert_eq!(
+            log.start_line(),
+            "relais dataset replay: start type=feature task=task-abc model=haiku load=3.50"
+        );
+        let cost = relais::ledger::TrialCost::new(
+            Some(relais::money::MicroUsd::from_micros(300_000)),
+            relais::money::CostCompleteness::Actual,
+        )
+        .expect("a coherent cost");
+        let end = ReplayEnd {
+            outcome: "invalid",
+            dispatched_model: Some("sonnet"),
+            cost: Some(cost),
+        };
+        assert_eq!(
+            log.end_line_after(&end, std::time::Duration::from_millis(12_340)),
+            "relais dataset replay: end type=feature task=task-abc outcome=invalid \
+             model=sonnet cost=$0.3 wall=12.3s load=3.50"
+        );
+        let untyped = ReplayLog {
+            task_type: None,
+            load: None,
+            ..log
+        };
+        assert_eq!(
+            untyped.end_line_after(
+                &ReplayEnd::unrecorded("interrupted"),
+                std::time::Duration::ZERO
+            ),
+            "relais dataset replay: end type=none task=task-abc outcome=interrupted \
+             model=none cost=unknown wall=0.0s load=unknown"
+        );
+    }
+
     fn temp_ledger(label: &str) -> (Ledger, relais::test_support::TempDir) {
         // Through the shared helper, not a hand-rolled path: this one
         // built its own `relais-main-test-*` directory under the
@@ -8881,6 +9343,8 @@ mod tests {
             execution: None,
             context: None,
             review: None,
+            task_type: Vec::new(),
+            requires_design: false,
         }
     }
 
@@ -8912,6 +9376,8 @@ mod tests {
             execution: base_execution,
             context: base_context,
             review: base_review,
+            task_type: base_task_type,
+            requires_design: base_requires_design,
         } = base.clone();
 
         let cases: Vec<(&str, RecipeSpec)> = vec![
@@ -8978,6 +9444,20 @@ mod tests {
                     ..base.clone()
                 },
             ),
+            (
+                "task_type",
+                RecipeSpec {
+                    task_type: vec![relais::contract::TaskType::Feature],
+                    ..base.clone()
+                },
+            ),
+            (
+                "requires_design",
+                RecipeSpec {
+                    requires_design: true,
+                    ..base.clone()
+                },
+            ),
         ];
         // The destructure above stands for the whole field list; assert
         // against it so the base used in every case really is the base.
@@ -8989,6 +9469,8 @@ mod tests {
         assert_eq!(base_execution, None);
         assert_eq!(base_context, None);
         assert_eq!(base_review, None);
+        assert!(base_task_type.is_empty());
+        assert!(!base_requires_design);
 
         // The case list must name every field the diff compares. The
         // destructure above only forces a binding for a new field, not a

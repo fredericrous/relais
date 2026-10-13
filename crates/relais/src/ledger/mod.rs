@@ -26,14 +26,18 @@ use crate::route::RoutedBy;
 
 mod review;
 mod router;
+mod task_types;
 pub use review::{MergeTotals, ReviewClassTotals, ReviewOutcomeRow};
 pub use router::{
     ExplorationTask, RouterCheck, RouterClass, RouterClassificationRow, RouterDecisionRow,
     RouterExplorationStop, RouterProvenance, RouterReassessRow, RouterRecord, RouterTaskOutcomeRow,
     RouterTaskRow, RouterUsageRow, RouterWindow,
 };
+pub use task_types::{
+    ExportedTasks, ImportedTaskTypes, StoredTaskType, TaskExportRow, TaskTypeSource,
+};
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 28;
+pub const LEDGER_SCHEMA_VERSION: u64 = 29;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -152,8 +156,8 @@ fn parse_cost_completeness(stored: &str) -> Result<CostCompleteness> {
 }
 
 /// What became of one trial arm's run, once settled (SPEC §17). `NULL`
-/// on the row means "not settled yet" — a trial in flight — never a
-/// fourth, unnamed outcome.
+/// on the row means "not settled yet" — a trial in flight — never an
+/// unnamed outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrialOutcome {
     /// The arm's candidate was accepted.
@@ -165,6 +169,12 @@ pub enum TrialOutcome {
     /// cancellation — rather than a verification verdict, so it is not
     /// comparable evidence for or against the arm.
     Errored,
+    /// The replay did not run the arm it was recorded under: its first
+    /// attempt dispatched another model than the arm's, or the design it
+    /// was handed disagrees with the arm's `requires_design`
+    /// (docs/plans/2026-10-12-task-types.md). Never evidence for or
+    /// against any arm, and never counted as the arm's failure.
+    Invalid,
 }
 
 impl TrialOutcome {
@@ -173,6 +183,7 @@ impl TrialOutcome {
             Self::Accepted => "accepted",
             Self::Rejected => "rejected",
             Self::Errored => "errored",
+            Self::Invalid => "invalid",
         }
     }
 
@@ -181,6 +192,7 @@ impl TrialOutcome {
             "accepted" => Some(Self::Accepted),
             "rejected" => Some(Self::Rejected),
             "errored" => Some(Self::Errored),
+            "invalid" => Some(Self::Invalid),
             _ => None,
         }
     }
@@ -614,6 +626,9 @@ pub struct TrialRow {
     /// replay, the run itself for a live trial. `None` on a row written
     /// before ledger step v17, whose arm run is not on record.
     pub arm_run_id: Option<RunId>,
+    /// SHA-256 of the program design the arm was handed; `None` when it
+    /// was handed none (and on every row written before ledger step v29).
+    pub design_sha256: Option<String>,
 }
 
 /// What recording a fresh trial row needs — everything a comparison
@@ -640,6 +655,8 @@ pub struct NewTrial<'a> {
     pub arms_json: Option<&'a str>,
     /// The run the arm executed as; see [`TrialRow::arm_run_id`].
     pub arm_run_id: &'a RunId,
+    /// See [`TrialRow::design_sha256`].
+    pub design_sha256: Option<&'a str>,
 }
 
 /// What recording a REPLAY's arm needs. Grouped rather than passed
@@ -668,6 +685,8 @@ pub struct NewReplayTrial<'a> {
     pub workspace_isolation: &'a str,
     /// The replay's own run, known once `execute` has returned.
     pub arm_run_id: &'a RunId,
+    /// SHA-256 of the design `dataset replay --design` handed the arm.
+    pub design_sha256: Option<&'a str>,
 }
 
 /// Raw columns of one `trials` row, in the order [`parse_trial_row`]
@@ -692,6 +711,7 @@ type TrialColumns = (
     Option<String>,
     Option<i64>,
     String,
+    Option<String>,
     Option<String>,
 );
 
@@ -719,6 +739,7 @@ fn parse_trial_row(columns: TrialColumns) -> Result<TrialRow> {
         duration_ms,
         created_at,
         arm_run_id,
+        design_sha256,
     ) = columns;
     Ok(TrialRow {
         trial_id: TrialId::from_stored(trial_id),
@@ -749,6 +770,7 @@ fn parse_trial_row(columns: TrialColumns) -> Result<TrialRow> {
         duration_ms,
         created_at,
         arm_run_id: arm_run_id.map(RunId::from_stored),
+        design_sha256,
     })
 }
 
@@ -1708,6 +1730,20 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ALTER TABLE runs ADD COLUMN driver_pid INTEGER;
     ALTER TABLE runs ADD COLUMN driver_started TEXT;
     ALTER TABLE runs ADD COLUMN driver_since TEXT;
+    "#,
+    ),
+    (
+        // A task's type (docs/plans/2026-10-12-task-types.md): the label,
+        // how it was given (`declared` by the contract, `classified` for
+        // history) and the taxonomy version it was given under, plus the
+        // design a trial's arm was handed. Additive and nullable: a task
+        // that predates the step has no type, never a guessed one.
+        "v29",
+        r#"
+    ALTER TABLE tasks ADD COLUMN task_type TEXT;
+    ALTER TABLE tasks ADD COLUMN task_type_source TEXT;
+    ALTER TABLE tasks ADD COLUMN taxonomy_version INTEGER;
+    ALTER TABLE trials ADD COLUMN design_sha256 TEXT;
     "#,
     ),
 ];
@@ -2816,9 +2852,38 @@ impl Ledger {
         task: &TaskId,
         repo_key: &str,
     ) -> Result<()> {
+        self.insert_typed_run(id, repo_path, root_session, task, repo_key, None)
+    }
+
+    /// [`Ledger::insert_run`] for a contract that declares a task type:
+    /// the type is written with the task, in the same transaction. A
+    /// declared type replaces a classified one and an earlier declared one
+    /// (the contract of the newest run is the orchestrator's latest word);
+    /// `None` leaves whatever the task has.
+    pub fn insert_typed_run(
+        &self,
+        id: &RunId,
+        repo_path: &str,
+        root_session: Option<&str>,
+        task: &TaskId,
+        repo_key: &str,
+        declared: Option<crate::contract::TaskType>,
+    ) -> Result<()> {
         let now = self.now();
         let tx = self.write_tx()?;
         Self::ensure_task(&tx, task, repo_key, id, &now)?;
+        if let Some(task_type) = declared {
+            tx.execute(
+                "UPDATE tasks SET task_type = ?2, task_type_source = ?3, taxonomy_version = ?4
+                  WHERE task_id = ?1",
+                params![
+                    task.as_str(),
+                    task_type.as_str(),
+                    task_types::TaskTypeSource::Declared.as_str(),
+                    crate::contract::TASK_TYPE_TAXONOMY_VERSION
+                ],
+            )?;
+        }
         tx.execute(
             "INSERT INTO runs (id, repo_path, status, root_session, created_at, updated_at, task_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
@@ -5290,6 +5355,7 @@ impl Ledger {
             workspace_isolation: replay.workspace_isolation,
             arms_json: None,
             arm_run_id: replay.arm_run_id,
+            design_sha256: replay.design_sha256,
         })
     }
 
@@ -5342,8 +5408,8 @@ impl Ledger {
                 (trial_id, task_id, source_run_id, incumbent_recipe_id,
                  arm_recipe_id, arm_index, assignment_probability, seed,
                  base_sha, contract_hash, verification_profile_hash,
-                 workspace_isolation, created_at, arms_json, arm_run_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                 workspace_isolation, created_at, arms_json, arm_run_id, design_sha256)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 trial.trial_id.as_str(),
                 trial.task_id.as_str(),
@@ -5360,6 +5426,7 @@ impl Ledger {
                 now,
                 trial.arms_json,
                 trial.arm_run_id.as_str(),
+                trial.design_sha256,
             ],
         )?;
         Ok(())
@@ -5420,7 +5487,7 @@ impl Ledger {
          arm_recipe_id, arm_index, assignment_probability, seed, base_sha,
          contract_hash, verification_profile_hash, workspace_isolation,
          outcome, accepted_without_escalation, cost_micros, cost_completeness,
-         duration_ms, created_at, arm_run_id";
+         duration_ms, created_at, arm_run_id, design_sha256";
 
     /// Every trial recorded for one task, oldest first — a typed reader:
     /// a row with an unrecognised outcome or cost completeness is a
@@ -5494,7 +5561,7 @@ impl Ledger {
             Self::TRIAL_COLUMNS
         ))?;
         let rows = stmt.query_map([LIVE_WORKTREE], |row| {
-            Ok((Self::trial_columns(row)?, row.get::<_, String>(19)?))
+            Ok((Self::trial_columns(row)?, row.get::<_, String>(20)?))
         })?;
         let rows: Vec<(TrialColumns, String)> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
         let mut kept = Vec::new();
@@ -5534,6 +5601,7 @@ impl Ledger {
             row.get(16)?,
             row.get(17)?,
             row.get(18)?,
+            row.get(19)?,
         ))
     }
 
@@ -8926,6 +8994,7 @@ mod tests {
             workspace_isolation: "worktree",
             arms_json: None,
             arm_run_id: source_run,
+            design_sha256: None,
         }
     }
 
@@ -9430,7 +9499,7 @@ mod tests {
     /// appear, NULL on the row written before them.
     #[test]
     fn v28_adds_the_driver_columns_to_an_older_ledger() {
-        assert_eq!(LEDGER_SCHEMA_VERSION, 28);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 29);
         let dir = temp_dir("v26-to-v28");
         let path = dir.join("ledger.sqlite");
         {
@@ -9459,8 +9528,49 @@ mod tests {
             .expect("a run written before v28");
         }
         let ledger = Ledger::open(&path).expect("upgrade");
-        assert_eq!(ledger.schema_version().expect("version"), 28);
+        assert_eq!(ledger.schema_version().expect("version"), 29);
         assert_eq!(driver_of(&ledger, "run-old"), (None, None, None));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A ledger frozen at v26 upgrades to v29: a task written before it
+    /// has no type, never a guessed one, and a trial no design.
+    #[test]
+    fn v29_adds_task_types_and_the_trial_design_without_touching_old_rows() {
+        let dir = temp_dir("v26-to-v29");
+        let path = dir.join("ledger.sqlite");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );",
+            )
+            .expect("migrations table");
+            for (version, sql) in &MIGRATIONS[..26] {
+                conn.execute_batch(sql).expect("apply step");
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![version, "then"],
+                )
+                .expect("record step");
+            }
+            conn.execute(
+                "INSERT INTO tasks (task_id, repo_key, first_run, origin, created_at)
+                 VALUES ('task-old', 'rk', 'run-old', 'created', 'then')",
+                [],
+            )
+            .expect("a task written before v29");
+        }
+        let ledger = Ledger::open(&path).expect("upgrade");
+        assert_eq!(ledger.schema_version().expect("version"), 29);
+        assert_eq!(
+            ledger
+                .task_type_of(&task("old"))
+                .expect("reads the new columns"),
+            None
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

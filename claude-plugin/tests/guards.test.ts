@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import { continueLine, RELAIS_AGENT_TYPE, settle, spawnLine, startedRun } from './support.ts'
-import { containsWords, decideTool, feedbackTool, mintNonce } from '../hooks/decide.ts'
+import { containsWords, decideTool, feedbackTool, mintNonce, RUN_CONTRACT_DESCRIPTION, TASK_TYPES } from '../hooks/decide.ts'
 import { DECIDE_MESSAGE, decideGuard } from '../hooks/guards.ts'
 import { createStore } from '../hooks/store.ts'
 
@@ -216,4 +216,17 @@ test('the Bash reminder catches relais feedback as a command, not as text', () =
     expect(decideGuard('Bash', { command })).toBe(DECIDE_MESSAGE)
   }
   expect(decideGuard('Bash', { command: 'grep -rn "relais feedback" docs/' })).toBe(undefined)
+})
+
+// The task types (docs/plans/2026-10-12-task-types.md): the plugin's list is
+// the Rust `TaskType::DECLARABLE`, spelling for spelling, and the run tool's
+// contract description names every one. This sandbox reads no files, so the
+// literal below is the Rust list as written; the Rust test
+// `tests/task_type_pin.rs` pins the same literal to `TaskType::DECLARABLE`
+// and to the `TASK_TYPES` line of hooks/decide.ts, so the three cannot drift.
+test('TASK_TYPES is the Rust TaskType list and the run tool description lists it', () => {
+  const rust = ['report', 'mechanical', 'pattern', 'review-fix', 'feature', 'refactor', 'ui', 'infra']
+  expect([...TASK_TYPES]).toEqual(rust)
+  for (const type of rust) expect(RUN_CONTRACT_DESCRIPTION).toContain(`"${type}"`)
+  expect(RUN_CONTRACT_DESCRIPTION).toContain('task_type')
 })

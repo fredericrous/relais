@@ -1522,6 +1522,9 @@ pub enum BlockCode {
     /// is refused up front, or ends after the attempt that showed it,
     /// rather than on a budget refusal it did not earn (SPEC §11).
     NativeUnpriced,
+    /// The contract's `design` cannot be read at the base revision: it is
+    /// missing there, oversized or not text.
+    DesignUnreadable,
 }
 
 impl BlockCode {
@@ -1559,6 +1562,7 @@ impl BlockCode {
             Self::SandboxWeakened => "sandbox_weakened",
             Self::SandboxUnverified => "sandbox_unverified",
             Self::NativeUnpriced => "native_unpriced",
+            Self::DesignUnreadable => "design_unreadable",
         }
     }
 }
@@ -2841,8 +2845,9 @@ timeout_seconds = 60
             .expect("this repository's own relais.toml parses");
         assert_eq!(
             own.authority_hash(),
-            "afff01a0df657a98568c538fd07d0281e15b41d64073d277b4bf6e49f1f8880c",
-            "the hash of this repository's own policy must not move"
+            "5e3a12d5df507c3783544df03b8434bd7e3dedf941accac28f3f56a805afd27e",
+            "the hash of this repository's own policy must not move (it moved once, deliberately, \
+when the per-type recipes were seeded)"
         );
         let tiered = RepoPolicy::from_toml_str(REPO_TOML).expect("parses");
         assert_eq!(

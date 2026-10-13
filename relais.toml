@@ -120,3 +120,92 @@ revision = 1
 kind = "change"
 scope_within = ["**"]
 tier = "implementation"
+
+# One recipe per task type (docs/plans/2026-10-12-task-types.md): each type
+# has its own revision chain, so `relais recipe rollback change-<type>`
+# returns only that type. Same scope and tier as `change-routing`, so
+# routing is unchanged; a replay measures rev 2 of a name at the research
+# tier. `-designed` recipes cover only a contract that names a design.
+
+[[recipes]]
+name = "change-mechanical"
+revision = 1
+kind = "change"
+scope_within = ["**"]
+task_type = ["mechanical"]
+tier = "implementation"
+
+[[recipes]]
+name = "change-pattern"
+revision = 1
+kind = "change"
+scope_within = ["**"]
+task_type = ["pattern"]
+tier = "implementation"
+
+[[recipes]]
+name = "change-review-fix"
+revision = 1
+kind = "change"
+scope_within = ["**"]
+task_type = ["review-fix"]
+tier = "implementation"
+
+[[recipes]]
+name = "change-feature"
+revision = 1
+kind = "change"
+scope_within = ["**"]
+task_type = ["feature"]
+tier = "implementation"
+
+[[recipes]]
+name = "change-refactor"
+revision = 1
+kind = "change"
+scope_within = ["**"]
+task_type = ["refactor"]
+tier = "implementation"
+
+[[recipes]]
+name = "change-ui"
+revision = 1
+kind = "change"
+scope_within = ["**"]
+task_type = ["ui"]
+tier = "implementation"
+
+[[recipes]]
+name = "change-infra"
+revision = 1
+kind = "change"
+scope_within = ["**"]
+task_type = ["infra"]
+tier = "implementation"
+
+[[recipes]]
+name = "change-feature-designed"
+revision = 1
+kind = "change"
+scope_within = ["**"]
+task_type = ["feature"]
+requires_design = true
+tier = "implementation"
+
+[[recipes]]
+name = "change-refactor-designed"
+revision = 1
+kind = "change"
+scope_within = ["**"]
+task_type = ["refactor"]
+requires_design = true
+tier = "implementation"
+
+[[recipes]]
+name = "change-pattern-designed"
+revision = 1
+kind = "change"
+scope_within = ["**"]
+task_type = ["pattern"]
+requires_design = true
+tier = "implementation"

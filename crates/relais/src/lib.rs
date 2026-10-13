@@ -41,6 +41,7 @@ pub mod rng;
 pub mod route;
 pub mod router;
 pub mod runner;
+pub mod task_labels;
 /// Scratch-directory test helpers. `pub`, not `#[cfg(test)]`: the
 /// integration suites under `tests/` build this crate as an ordinary
 /// dependency and cannot see `pub(crate)`, so this is the one

@@ -553,6 +553,13 @@ pub fn build(
             ));
             continue;
         }
+        // Nor is a replay that did not run its arm a label for it.
+        if outcome == TrialOutcome::Invalid {
+            exclusions.push(format!(
+                "{run_id}: replay: its trial is invalid; it did not run its arm"
+            ));
+            continue;
+        }
         let Some((source_run, family)) = live_of_task.get(&task_id) else {
             exclusions.push(format!(
                 "{run_id}: replay of task {task_id}, which has no live example"
@@ -756,8 +763,13 @@ impl Reading<'_> {
         };
         let routed_by: Option<RoutedBy> =
             read_of(run_id, "routed by", ledger.first_dispatch_routed_by(run_id))?;
-        let eligibility =
-            crate::route::eligible_tiers(&contract, self.repo_policy, &self.repo_policy.models);
+        let facts = crate::route::TaskFacts::live_of(&contract);
+        let eligibility = crate::route::eligible_tiers(
+            &contract,
+            self.repo_policy,
+            &self.repo_policy.models,
+            facts,
+        );
         // The recipe that produced this run: for a live run, reconstructed
         // the same pure way the router itself would decide it (SPEC §17);
         // for a replay, the arm its trial names — never the incumbent the
@@ -765,7 +777,12 @@ impl Reading<'_> {
         // wrong recipe. Two revisions of one recipe are never pooled.
         let (recipe_id, family, origin) = match observation {
             Observation::Live => (
-                crate::route::covering_recipe_id(&contract, self.repo_policy, &eligibility.tiers),
+                crate::route::covering_recipe_id(
+                    &contract,
+                    self.repo_policy,
+                    &eligibility.tiers,
+                    facts,
+                ),
                 task_family(&contract),
                 Origin::Live,
             ),
@@ -1534,6 +1551,7 @@ argv = ["true"]
                     verification_profile_hash: "profile",
                     workspace_isolation: "fresh_checkout_no_accepted_answer",
                     arm_run_id: &run_id(run),
+                    design_sha256: None,
                 })
                 .expect("replay trial");
             self.ledger
@@ -1594,7 +1612,7 @@ argv = ["true"]
     /// recent attempt, not one per attempt.
     #[test]
     fn a_task_retried_to_acceptance_contributes_one_record() {
-        let times: Vec<String> = (0..30)
+        let times: Vec<String> = (0..80)
             .map(|minute| format!("2026-01-01T00:{minute:02}:00+00:00"))
             .collect();
         let fixture = LedgerFixture::open_with_clock("dataset-retry", times);
@@ -1637,7 +1655,7 @@ argv = ["true"]
             (CostCompleteness::IncompleteLowerBound, false),
             (CostCompleteness::Unknown, false),
         ] {
-            let times: Vec<String> = (0..30)
+            let times: Vec<String> = (0..80)
                 .map(|minute| format!("2026-01-01T00:{minute:02}:00+00:00"))
                 .collect();
             let fixture = LedgerFixture::open_with_clock("dataset-estimated", times);

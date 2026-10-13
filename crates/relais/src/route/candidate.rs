@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::catalog::{Admissible, EffortCatalogs};
-use crate::contract::Review;
+use crate::contract::{Kind, Review};
 use crate::policy::{
     validate_recipes, ContextPolicy, EffortId, ExecutionPolicy, ModelProfile, RecipeError,
     RecipeSpec, RepoPolicy, RiskRule, Tier,
@@ -80,7 +80,10 @@ pub struct TuningBounds {
 /// to build one fails to compile, which is the only version of this
 /// guarantee that cannot rot.
 mod sealed {
-    use super::{fixed_fields_match, validate_recipe_history, CandidateRejection, TuningBounds};
+    use super::{
+        fixed_fields_match, validate_recipe_history, CandidateAdmission, CandidateRejection,
+        TuningBounds,
+    };
     use crate::policy::RepoPolicy;
 
     /// A candidate `RepoPolicy` [`validate_candidate`] accepted: the
@@ -113,9 +116,16 @@ mod sealed {
         incumbent: &RepoPolicy,
         candidate: &RepoPolicy,
         bounds: &TuningBounds,
+        admission: CandidateAdmission,
     ) -> Result<CandidateRecipe, CandidateRejection> {
         fixed_fields_match(incumbent, candidate)?;
-        validate_recipe_history(incumbent, &candidate.recipes, &candidate.risk, bounds)?;
+        validate_recipe_history(
+            incumbent,
+            &candidate.recipes,
+            &candidate.risk,
+            bounds,
+            admission,
+        )?;
         Ok(CandidateRecipe {
             policy: candidate.clone(),
         })
@@ -123,6 +133,20 @@ mod sealed {
 }
 
 pub use sealed::{validate_candidate, CandidateRecipe};
+
+/// Which door a candidate comes through. They share one validator on
+/// purpose, so the one difference between them is named here rather than
+/// loosened by accident (docs/plans/2026-10-12-task-types.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateAdmission {
+    /// A replay measuring a candidate. Accepts a research-tier `change`
+    /// recipe that names task types; a replay never changes what a live
+    /// run does.
+    Replay,
+    /// `recipe evaluate` / `recipe promote`. Refuses a research-tier
+    /// `change` recipe until typed promotion exists.
+    Promote,
+}
 
 /// Why [`validate_candidate`] refused a proposed policy — one variant per
 /// rule, each naming what it refused and why.
@@ -228,6 +252,9 @@ pub enum CandidateRejection {
     /// `(name, revision)` pair, or two recipes declaring the same content
     /// under different names ([`RecipeError`]).
     InvalidRecipe(RecipeError),
+    /// A research-tier `change` recipe that names task types, offered at
+    /// the promotion door. Only a replay admits it today.
+    ResearchChangeNotPromotable { name: String },
 }
 
 impl std::fmt::Display for CandidateRejection {
@@ -330,6 +357,11 @@ impl std::fmt::Display for CandidateRejection {
                 "recipe `{name}` sets `{knob}` to {value}, above its cap of {cap}"
             ),
             Self::InvalidRecipe(err) => write!(f, "{err}"),
+            Self::ResearchChangeNotPromotable { name } => write!(
+                f,
+                "recipe `{name}` puts a `change` at the research tier; only a replay admits \
+                 that today, `recipe evaluate` and `recipe promote` refuse it"
+            ),
         }
     }
 }
@@ -413,6 +445,7 @@ fn validate_recipe_history(
     candidate_recipes: &[RecipeSpec],
     candidate_risk: &[RiskRule],
     bounds: &TuningBounds,
+    admission: CandidateAdmission,
 ) -> Result<(), CandidateRejection> {
     let incumbent_recipes = incumbent.recipes.as_slice();
     if candidate_recipes.len() < incumbent_recipes.len() {
@@ -430,7 +463,7 @@ fn validate_recipe_history(
         }
     }
     for new_recipe in &candidate_recipes[incumbent_recipes.len()..] {
-        validate_new_recipe(incumbent, new_recipe, candidate_risk, bounds)?;
+        validate_new_recipe(incumbent, new_recipe, candidate_risk, bounds, admission)?;
     }
     validate_recipes(candidate_recipes).map_err(CandidateRejection::InvalidRecipe)?;
     Ok(())
@@ -441,6 +474,7 @@ fn validate_new_recipe(
     new: &RecipeSpec,
     candidate_risk: &[RiskRule],
     bounds: &TuningBounds,
+    admission: CandidateAdmission,
 ) -> Result<(), CandidateRejection> {
     let base = incumbent
         .recipes
@@ -471,6 +505,8 @@ fn validate_new_recipe(
         execution: new_execution,
         context: new_context,
         review: new_review_field,
+        task_type: new_task_types,
+        requires_design: new_requires_design,
     } = new;
 
     if new_kind != &base.kind {
@@ -493,13 +529,54 @@ fn validate_new_recipe(
         });
     }
 
-    let floor = recipe_tier_floor(*new_kind, new_scope, candidate_risk);
-    if *new_tier < floor {
-        return Err(CandidateRejection::TierBelowFloor {
+    // NARROWING knobs: coverage may shrink, never grow. A list added to a
+    // recipe that had none narrows it; a list wider than the base's, or
+    // dropped, widens it. `requires_design` may be turned on, never off.
+    let widens_types = !base.task_type.is_empty()
+        && (new_task_types.is_empty()
+            || new_task_types
+                .iter()
+                .any(|task_type| !base.task_type.contains(task_type)));
+    if widens_types {
+        return Err(CandidateRejection::FixedRecipeFieldChanged {
             name: new_name.clone(),
-            tier: *new_tier,
-            floor,
+            field: "task_type",
         });
+    }
+    if base.requires_design && !new_requires_design {
+        return Err(CandidateRejection::FixedRecipeFieldChanged {
+            name: new_name.clone(),
+            field: "requires_design",
+        });
+    }
+
+    // A research-tier `change` is below the kind floor. It is admitted only
+    // when the recipe names task types and the door is a replay; the floor
+    // then stays per task, so the risk rules over the recipe's whole
+    // `scope_within` are not evaluated here (routing applies each task's
+    // own). Without a type it is refused under both doors, as before.
+    let typed_research_change = *new_tier == Tier::Research
+        && new_kind.unwrap_or(Kind::Change) == Kind::Change
+        && !new_task_types.is_empty();
+    if typed_research_change && admission == CandidateAdmission::Promote {
+        return Err(CandidateRejection::ResearchChangeNotPromotable {
+            name: new_name.clone(),
+        });
+    }
+    let floor_risk: &[RiskRule] = if typed_research_change {
+        &[]
+    } else {
+        candidate_risk
+    };
+    if !typed_research_change {
+        let floor = recipe_tier_floor(*new_kind, new_scope, candidate_risk);
+        if *new_tier < floor {
+            return Err(CandidateRejection::TierBelowFloor {
+                name: new_name.clone(),
+                tier: *new_tier,
+                floor,
+            });
+        }
     }
 
     // `Review::default()` is `Optional`, NOT `Off`. Reading an absent
@@ -518,7 +595,7 @@ fn validate_new_recipe(
     }
 
     if let Some(models) = new_models {
-        let floors = recipe_effort_floors(*new_kind, new_scope, candidate_risk);
+        let floors = recipe_effort_floors(*new_kind, new_scope, floor_risk);
         for (tier, profile) in models {
             // EXHAUSTIVE, like the destructures around it: a field added
             // to `ModelProfile` fails to compile here until someone
@@ -633,7 +710,7 @@ fn validate_new_recipe(
         )?;
     }
 
-    check_ladder(incumbent, new, candidate_risk, bounds)
+    check_ladder(incumbent, new, floor_risk, bounds)
 }
 
 /// A new recipe is admitted only when routing would not block the ladder it
@@ -932,7 +1009,12 @@ mod tests {
         candidate.recipes.push(tuned);
         assert!(
             matches!(
-                validate_candidate(&incumbent, &candidate, &bounds()),
+                validate_candidate(
+                    &incumbent,
+                    &candidate,
+                    &bounds(),
+                    CandidateAdmission::Promote
+                ),
                 Err(CandidateRejection::CapabilityNotGranted {
                     capability: "execution.allow_nested_agents",
                     ..
@@ -961,7 +1043,7 @@ mod tests {
         candidate.recipes.push(tuned);
         assert!(
             matches!(
-                validate_candidate(&incumbent, &candidate, &bounds()),
+                validate_candidate(&incumbent, &candidate, &bounds(), CandidateAdmission::Promote),
                 Err(CandidateRejection::EffortNotAdmissible { effort, .. })
                     if effort.as_str() == "high"
             ),
@@ -1001,10 +1083,21 @@ mod tests {
         let mut bounds = bounds();
         bounds.catalogs = catalogs(&["low", "high"], "max");
         assert!(matches!(
-            validate_candidate(&incumbent, &appended(&incumbent, "medium"), &bounds),
+            validate_candidate(
+                &incumbent,
+                &appended(&incumbent, "medium"),
+                &bounds,
+                CandidateAdmission::Promote
+            ),
             Err(CandidateRejection::EffortNotAdmissible { .. })
         ));
-        assert!(validate_candidate(&incumbent, &appended(&incumbent, "high"), &bounds).is_ok());
+        assert!(validate_candidate(
+            &incumbent,
+            &appended(&incumbent, "high"),
+            &bounds,
+            CandidateAdmission::Promote
+        )
+        .is_ok());
     }
 
     /// (f) An effort under the floor the recipe's scope demands is
@@ -1023,12 +1116,14 @@ mod tests {
         let mut low = appended(&incumbent, "low");
         low.risk = incumbent.risk.clone();
         assert!(matches!(
-            validate_candidate(&incumbent, &low, &bounds),
+            validate_candidate(&incumbent, &low, &bounds, CandidateAdmission::Promote),
             Err(CandidateRejection::EffortBelowFloor { floor, .. }) if floor == "medium"
         ));
         let mut at_floor = appended(&incumbent, "medium");
         at_floor.risk = incumbent.risk.clone();
-        assert!(validate_candidate(&incumbent, &at_floor, &bounds).is_ok());
+        assert!(
+            validate_candidate(&incumbent, &at_floor, &bounds, CandidateAdmission::Promote).is_ok()
+        );
     }
 
     /// (f) The ceiling is the AUTHORITY's, and a candidate's start effort —
@@ -1071,8 +1166,12 @@ mod tests {
 
         let lowered = appended(&incumbent, "low");
         let raised = appended(&incumbent, "high");
-        assert!(validate_candidate(&incumbent, &lowered, &bounds).is_ok());
-        assert!(validate_candidate(&incumbent, &raised, &bounds).is_ok());
+        assert!(
+            validate_candidate(&incumbent, &lowered, &bounds, CandidateAdmission::Promote).is_ok()
+        );
+        assert!(
+            validate_candidate(&incumbent, &raised, &bounds, CandidateAdmission::Promote).is_ok()
+        );
         // The ceiling is read from the authority models alone, never from a
         // recipe, so there is no candidate-dependent ceiling to compare: what
         // this test proves is the refusal below, at the authority-derived
@@ -1081,7 +1180,7 @@ mod tests {
         let above = appended_model(&incumbent, "haiku", "max");
         assert!(
             matches!(
-                validate_candidate(&incumbent, &above, &bounds),
+                validate_candidate(&incumbent, &above, &bounds, CandidateAdmission::Promote),
                 Err(CandidateRejection::EffortNotAdmissible { effort, .. })
                     if effort.as_str() == "max"
             ),
@@ -1107,7 +1206,12 @@ mod tests {
         )]));
         candidate.recipes.push(tuned);
         assert!(matches!(
-            validate_candidate(&incumbent, &candidate, &bounds()),
+            validate_candidate(
+                &incumbent,
+                &candidate,
+                &bounds(),
+                CandidateAdmission::Promote
+            ),
             Err(CandidateRejection::FixedRecipeFieldChanged {
                 field: "models.max_effort",
                 ..
@@ -1124,9 +1228,20 @@ mod tests {
         bounds
             .configured
             .insert(Tier::Implementation, ("sonnet".into(), effort("medium")));
-        assert!(validate_candidate(&incumbent, &appended(&incumbent, "medium"), &bounds).is_ok());
+        assert!(validate_candidate(
+            &incumbent,
+            &appended(&incumbent, "medium"),
+            &bounds,
+            CandidateAdmission::Promote
+        )
+        .is_ok());
         assert!(matches!(
-            validate_candidate(&incumbent, &appended(&incumbent, "low"), &bounds),
+            validate_candidate(
+                &incumbent,
+                &appended(&incumbent, "low"),
+                &bounds,
+                CandidateAdmission::Promote
+            ),
             Err(CandidateRejection::EffortNotAdmissible { .. })
         ));
     }
@@ -1146,14 +1261,16 @@ mod tests {
             validate_candidate(
                 &incumbent,
                 &appended_model(&incumbent, "haiku", "medium"),
-                &bounds
+                &bounds,
+                CandidateAdmission::Promote,
             ),
             Err(CandidateRejection::EffortNotAdmissible { .. })
         ));
         assert!(validate_candidate(
             &incumbent,
             &appended_model(&incumbent, "sonnet", "medium"),
-            &bounds
+            &bounds,
+            CandidateAdmission::Promote,
         )
         .is_ok());
     }
@@ -1175,7 +1292,12 @@ mod tests {
         candidate.recipes.push(tuned);
         assert!(
             matches!(
-                validate_candidate(&incumbent, &candidate, &bounds()),
+                validate_candidate(
+                    &incumbent,
+                    &candidate,
+                    &bounds(),
+                    CandidateAdmission::Promote
+                ),
                 Err(CandidateRejection::ReviewLowered {
                     from: Review::Optional,
                     to: Review::Off,
@@ -1280,10 +1402,123 @@ mod tests {
         }
     }
 
+    fn typed_recipe(revision: u32, tier: Tier, types: &[crate::contract::TaskType]) -> RecipeSpec {
+        RecipeSpec {
+            kind: Some(Kind::Change),
+            scope_within: vec!["**".into()],
+            revision,
+            task_type: types.to_vec(),
+            ..RecipeSpec::covering("change-feature", tier)
+        }
+    }
+
+    fn with_new(incumbent: &RepoPolicy, new: RecipeSpec) -> RepoPolicy {
+        let mut candidate = incumbent.clone();
+        candidate.recipes.push(new);
+        candidate
+    }
+
+    #[test]
+    fn replay_accepts_a_typed_research_change_and_promote_refuses_it() {
+        use crate::contract::TaskType::Feature;
+        let incumbent =
+            policy_with_recipes(vec![typed_recipe(1, Tier::Implementation, &[Feature])]);
+        // Under a risk rule that fires over the recipe's whole scope: the
+        // floor is per task, so admission does not evaluate it.
+        let mut incumbent = incumbent;
+        incumbent.risk.push(RiskRule {
+            paths: vec!["**/trust/**".into()],
+            minimum_tier: Tier::Escalation,
+            review: None,
+            minimum_effort: None,
+        });
+        let candidate = with_new(&incumbent, typed_recipe(2, Tier::Research, &[Feature]));
+        assert!(validate_candidate(
+            &incumbent,
+            &candidate,
+            &bounds(),
+            CandidateAdmission::Replay
+        )
+        .is_ok());
+        assert_eq!(
+            validate_candidate(
+                &incumbent,
+                &candidate,
+                &bounds(),
+                CandidateAdmission::Promote
+            )
+            .unwrap_err(),
+            CandidateRejection::ResearchChangeNotPromotable {
+                name: "change-feature".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_research_change_without_a_task_type_is_refused_under_both_doors() {
+        let incumbent = policy_with_recipes(vec![typed_recipe(1, Tier::Implementation, &[])]);
+        let candidate = with_new(&incumbent, typed_recipe(2, Tier::Research, &[]));
+        for admission in [CandidateAdmission::Replay, CandidateAdmission::Promote] {
+            assert!(matches!(
+                validate_candidate(&incumbent, &candidate, &bounds(), admission),
+                Err(CandidateRejection::TierBelowFloor { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn task_type_may_be_added_but_never_widened_and_requires_design_never_dropped() {
+        use crate::contract::TaskType::{Feature, Ui};
+        let door = CandidateAdmission::Promote;
+        // Adding a list to a recipe that had none narrows it.
+        let untyped = policy_with_recipes(vec![typed_recipe(1, Tier::Implementation, &[])]);
+        let added = with_new(&untyped, typed_recipe(2, Tier::Implementation, &[Feature]));
+        assert!(validate_candidate(&untyped, &added, &bounds(), door).is_ok());
+        // Widening or dropping an existing list is refused.
+        let typed = policy_with_recipes(vec![typed_recipe(1, Tier::Implementation, &[Feature])]);
+        for wider in [vec![Feature, Ui], vec![Ui], vec![]] {
+            let candidate = with_new(&typed, typed_recipe(2, Tier::Implementation, &wider));
+            assert_eq!(
+                validate_candidate(&typed, &candidate, &bounds(), door).unwrap_err(),
+                CandidateRejection::FixedRecipeFieldChanged {
+                    name: "change-feature".into(),
+                    field: "task_type"
+                },
+                "{wider:?}"
+            );
+        }
+        // requires_design may be turned on, never off.
+        let designed = RecipeSpec {
+            requires_design: true,
+            ..typed_recipe(1, Tier::Implementation, &[Feature])
+        };
+        let incumbent = policy_with_recipes(vec![designed]);
+        let off = with_new(
+            &incumbent,
+            typed_recipe(2, Tier::Implementation, &[Feature]),
+        );
+        assert_eq!(
+            validate_candidate(&incumbent, &off, &bounds(), door).unwrap_err(),
+            CandidateRejection::FixedRecipeFieldChanged {
+                name: "change-feature".into(),
+                field: "requires_design"
+            }
+        );
+        let on = with_new(
+            &typed,
+            RecipeSpec {
+                requires_design: true,
+                ..typed_recipe(2, Tier::Implementation, &[Feature])
+            },
+        );
+        assert!(validate_candidate(&typed, &on, &bounds(), door).is_ok());
+    }
+
     #[test]
     fn identical_policies_are_accepted() {
         let policy = policy_with_recipes(vec![base_recipe()]);
-        let accepted = validate_candidate(&policy, &policy, &bounds()).expect("no change admits");
+        let accepted = validate_candidate(&policy, &policy, &bounds(), CandidateAdmission::Promote)
+            .expect("no change admits");
         assert_eq!(accepted.policy(), &policy);
     }
 
@@ -1292,7 +1527,13 @@ mod tests {
         let incumbent = policy_with_recipes(vec![base_recipe()]);
         let mut candidate = incumbent.clone();
         candidate.execution.max_attempts += 1;
-        let err = validate_candidate(&incumbent, &candidate, &bounds()).unwrap_err();
+        let err = validate_candidate(
+            &incumbent,
+            &candidate,
+            &bounds(),
+            CandidateAdmission::Promote,
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             CandidateRejection::FixedFieldChanged { field: "execution" }
@@ -1309,7 +1550,8 @@ mod tests {
         let mut schema = incumbent.clone();
         schema.schema_version += 1;
         assert_eq!(
-            validate_candidate(&incumbent, &schema, &bounds()).unwrap_err(),
+            validate_candidate(&incumbent, &schema, &bounds(), CandidateAdmission::Promote)
+                .unwrap_err(),
             CandidateRejection::FixedFieldChanged {
                 field: "schema_version"
             }
@@ -1325,28 +1567,42 @@ mod tests {
             },
         );
         assert_eq!(
-            validate_candidate(&incumbent, &models, &bounds()).unwrap_err(),
+            validate_candidate(&incumbent, &models, &bounds(), CandidateAdmission::Promote)
+                .unwrap_err(),
             CandidateRejection::FixedFieldChanged { field: "models" }
         );
 
         let mut execution = incumbent.clone();
         execution.execution.max_wall_seconds += 1;
         assert_eq!(
-            validate_candidate(&incumbent, &execution, &bounds()).unwrap_err(),
+            validate_candidate(
+                &incumbent,
+                &execution,
+                &bounds(),
+                CandidateAdmission::Promote
+            )
+            .unwrap_err(),
             CandidateRejection::FixedFieldChanged { field: "execution" }
         );
 
         let mut context = incumbent.clone();
         context.context.budget_bytes += 1;
         assert_eq!(
-            validate_candidate(&incumbent, &context, &bounds()).unwrap_err(),
+            validate_candidate(&incumbent, &context, &bounds(), CandidateAdmission::Promote)
+                .unwrap_err(),
             CandidateRejection::FixedFieldChanged { field: "context" }
         );
 
         let mut integrations = incumbent.clone();
         integrations.integrations.aval = Some(Dependency::Mode(DependencyMode::Required));
         assert_eq!(
-            validate_candidate(&incumbent, &integrations, &bounds()).unwrap_err(),
+            validate_candidate(
+                &incumbent,
+                &integrations,
+                &bounds(),
+                CandidateAdmission::Promote
+            )
+            .unwrap_err(),
             CandidateRejection::FixedFieldChanged {
                 field: "integrations"
             }
@@ -1358,7 +1614,13 @@ mod tests {
             .profiles
             .insert("default".into(), Default::default());
         assert_eq!(
-            validate_candidate(&incumbent, &verification, &bounds()).unwrap_err(),
+            validate_candidate(
+                &incumbent,
+                &verification,
+                &bounds(),
+                CandidateAdmission::Promote
+            )
+            .unwrap_err(),
             CandidateRejection::FixedFieldChanged {
                 field: "verification"
             }
@@ -1372,7 +1634,8 @@ mod tests {
             minimum_effort: None,
         });
         assert_eq!(
-            validate_candidate(&incumbent, &risk, &bounds()).unwrap_err(),
+            validate_candidate(&incumbent, &risk, &bounds(), CandidateAdmission::Promote)
+                .unwrap_err(),
             CandidateRejection::FixedFieldChanged { field: "risk" }
         );
 
@@ -1386,7 +1649,13 @@ mod tests {
                 scope: None,
             });
         assert_eq!(
-            validate_candidate(&incumbent, &architecture, &bounds()).unwrap_err(),
+            validate_candidate(
+                &incumbent,
+                &architecture,
+                &bounds(),
+                CandidateAdmission::Promote
+            )
+            .unwrap_err(),
             CandidateRejection::FixedFieldChanged {
                 field: "architecture"
             }
@@ -1397,7 +1666,13 @@ mod tests {
     fn a_new_recipe_with_no_incumbent_family_is_refused() {
         let incumbent = policy_with_recipes(vec![]);
         let candidate = policy_with_recipes(vec![base_recipe()]);
-        let err = validate_candidate(&incumbent, &candidate, &bounds()).unwrap_err();
+        let err = validate_candidate(
+            &incumbent,
+            &candidate,
+            &bounds(),
+            CandidateAdmission::Promote,
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             CandidateRejection::UnknownRecipeTemplate {
@@ -1414,7 +1689,13 @@ mod tests {
         tuned.tier = Tier::Escalation;
         // revision left at 0: does not advance past the incumbent's 0.
         let candidate = policy_with_recipes(vec![base, tuned]);
-        let err = validate_candidate(&incumbent, &candidate, &bounds()).unwrap_err();
+        let err = validate_candidate(
+            &incumbent,
+            &candidate,
+            &bounds(),
+            CandidateAdmission::Promote,
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             CandidateRejection::RevisionNotAdvanced {
@@ -1435,7 +1716,13 @@ mod tests {
         kind_changed.kind = Some(Kind::Inspect);
         let candidate = policy_with_recipes(vec![base.clone(), kind_changed]);
         assert_eq!(
-            validate_candidate(&incumbent, &candidate, &bounds()).unwrap_err(),
+            validate_candidate(
+                &incumbent,
+                &candidate,
+                &bounds(),
+                CandidateAdmission::Promote
+            )
+            .unwrap_err(),
             CandidateRejection::FixedRecipeFieldChanged {
                 name: "docs-touchup".into(),
                 field: "kind",
@@ -1447,7 +1734,13 @@ mod tests {
         scope_changed.scope_within = vec!["**".into()];
         let candidate = policy_with_recipes(vec![base, scope_changed]);
         assert_eq!(
-            validate_candidate(&incumbent, &candidate, &bounds()).unwrap_err(),
+            validate_candidate(
+                &incumbent,
+                &candidate,
+                &bounds(),
+                CandidateAdmission::Promote
+            )
+            .unwrap_err(),
             CandidateRejection::FixedRecipeFieldChanged {
                 name: "docs-touchup".into(),
                 field: "scope_within",
@@ -1463,7 +1756,13 @@ mod tests {
         tuned.revision = 1;
         tuned.tier = Tier::Research; // below the change floor
         let candidate = policy_with_recipes(vec![base, tuned]);
-        let err = validate_candidate(&incumbent, &candidate, &bounds()).unwrap_err();
+        let err = validate_candidate(
+            &incumbent,
+            &candidate,
+            &bounds(),
+            CandidateAdmission::Promote,
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             CandidateRejection::TierBelowFloor {
@@ -1489,7 +1788,13 @@ mod tests {
         tuned.tier = Tier::Implementation; // below the risk-raised floor
         let mut candidate = incumbent.clone();
         candidate.recipes.push(tuned);
-        let err = validate_candidate(&incumbent, &candidate, &bounds()).unwrap_err();
+        let err = validate_candidate(
+            &incumbent,
+            &candidate,
+            &bounds(),
+            CandidateAdmission::Promote,
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             CandidateRejection::TierBelowFloor {
@@ -1510,7 +1815,13 @@ mod tests {
         tuned.tier = Tier::Escalation;
         tuned.review = Some(Review::Optional);
         let candidate = policy_with_recipes(vec![base, tuned]);
-        let err = validate_candidate(&incumbent, &candidate, &bounds()).unwrap_err();
+        let err = validate_candidate(
+            &incumbent,
+            &candidate,
+            &bounds(),
+            CandidateAdmission::Promote,
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             CandidateRejection::ReviewLowered {
@@ -1536,7 +1847,13 @@ mod tests {
             },
         )]));
         let candidate = policy_with_recipes(vec![base, tuned]);
-        let err = validate_candidate(&incumbent, &candidate, &bounds()).unwrap_err();
+        let err = validate_candidate(
+            &incumbent,
+            &candidate,
+            &bounds(),
+            CandidateAdmission::Promote,
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             CandidateRejection::ModelNotAllowed {
@@ -1558,7 +1875,13 @@ mod tests {
             ..ExecutionPolicy::default()
         });
         let candidate = policy_with_recipes(vec![base, tuned]);
-        let err = validate_candidate(&incumbent, &candidate, &bounds()).unwrap_err();
+        let err = validate_candidate(
+            &incumbent,
+            &candidate,
+            &bounds(),
+            CandidateAdmission::Promote,
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             CandidateRejection::KnobAboveCap {
@@ -1591,7 +1914,13 @@ mod tests {
         tuned_b.tier = Tier::Escalation;
 
         let candidate = policy_with_recipes(vec![family_a, family_b, tuned_a, tuned_b]);
-        let err = validate_candidate(&incumbent, &candidate, &bounds()).unwrap_err();
+        let err = validate_candidate(
+            &incumbent,
+            &candidate,
+            &bounds(),
+            CandidateAdmission::Promote,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, CandidateRejection::InvalidRecipe(_)),
             "{err:?}"
@@ -1605,7 +1934,13 @@ mod tests {
         let mut rewritten = base.clone();
         rewritten.tier = Tier::Escalation; // same (name, revision), different content
         let candidate = policy_with_recipes(vec![rewritten]);
-        let err = validate_candidate(&incumbent, &candidate, &bounds()).unwrap_err();
+        let err = validate_candidate(
+            &incumbent,
+            &candidate,
+            &bounds(),
+            CandidateAdmission::Promote,
+        )
+        .unwrap_err();
         assert_eq!(err, CandidateRejection::RecipeHistoryRewritten { index: 0 });
     }
 
@@ -1614,7 +1949,13 @@ mod tests {
         let base = base_recipe();
         let incumbent = policy_with_recipes(vec![base]);
         let candidate = policy_with_recipes(vec![]);
-        let err = validate_candidate(&incumbent, &candidate, &bounds()).unwrap_err();
+        let err = validate_candidate(
+            &incumbent,
+            &candidate,
+            &bounds(),
+            CandidateAdmission::Promote,
+        )
+        .unwrap_err();
         assert_eq!(err, CandidateRejection::RecipeHistoryRewritten { index: 0 });
     }
 
@@ -1748,6 +2089,8 @@ mod tests {
             review: Default::default(),
             decomposition: None,
             task_id: None,
+            task_type: None,
+            design: None,
         };
         match crate::route::risk_floor(&contract, risk).tier {
             Some(rule_floor) if rule_floor > floor => rule_floor,
@@ -1919,7 +2262,7 @@ mod tests {
                 // `incumbent.clone()` with the incumbent.
                 apply_tamper(&mut candidate, tamper);
 
-                if let Ok(accepted) = validate_candidate(&incumbent, &candidate, &bounds()) {
+                if let Ok(accepted) = validate_candidate(&incumbent, &candidate, &bounds(), CandidateAdmission::Promote) {
                     let accepted_policy = accepted.policy();
                     prop_assert_eq!(
                         serde_json::to_value(&accepted_policy.risk).unwrap(),
@@ -2032,7 +2375,7 @@ mod tests {
                 });
             }
 
-            let result = validate_candidate(&incumbent, &candidate, &bounds());
+            let result = validate_candidate(&incumbent, &candidate, &bounds(), CandidateAdmission::Promote);
             if below_floor || weaken_verification || edit_risk {
                 prop_assert!(result.is_err());
             }

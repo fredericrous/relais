@@ -9,6 +9,14 @@
 //! run: a task with more runs must not weigh more than one with a single
 //! run.
 //!
+//! An arm is its candidate recipe id, nothing more
+//! (docs/plans/2026-10-12-task-types.md): trials are selected and kept one
+//! per task WITHIN each arm, never across arms, so a task replayed under
+//! `change-<type>` and under `change-<type>-designed` is one observation
+//! of each, and neither arm's score depends on the other's trials or on
+//! the order they ran in. The design a trial was handed is checked per
+//! trial against its arm's `requires_design` and never keys the arm.
+//!
 //! Promotion is gated: [`ComparisonReport::promotable`] hands back a
 //! [`Promotable`] only when every gate in [`ComparisonReport::failures`]
 //! holds, and that value has no public constructor and no field a caller
@@ -126,6 +134,17 @@ pub struct CostPerAcceptance {
     pub known_mean: Option<MicroUsd>,
     pub accepted_with_known_cost: usize,
     pub accepted_with_unknown_cost: usize,
+}
+
+/// One arm of a candidate, compared on its own: its recipe id and the
+/// paired comparison over the tasks it alone observed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArmComparison {
+    pub arm_recipe_id: String,
+    pub paired_tasks: usize,
+    pub incumbent: ArmSummary,
+    pub arm: ArmSummary,
+    pub interval: PairedInterval,
 }
 
 /// One arm's summary: an off-policy acceptance estimate (or an
@@ -325,6 +344,17 @@ pub struct ComparisonReport {
     /// report written before this field existed reads back as 0.
     #[serde(default)]
     pub incumbent_replay_trials_set_aside: usize,
+    /// Settled replay trials that did not measure their arm: recorded
+    /// [`TrialOutcome::Invalid`], or handed a design their arm's
+    /// `requires_design` disagrees with. Never evidence for or against
+    /// any arm. Additive: reads back as 0.
+    #[serde(default)]
+    pub invalid_trials_set_aside: usize,
+    /// Each of the candidate's arms compared on its own, in recipe id
+    /// order. The fields above pool these arms' pairs; the paired-task
+    /// gate reads each arm's own count. Additive: reads back empty.
+    #[serde(default)]
+    pub arms: Vec<ArmComparison>,
     pub incumbent: ArmSummary,
     pub arm: ArmSummary,
     pub interval: PairedInterval,
@@ -371,9 +401,17 @@ impl ComparisonReport {
         if self.basis == ComparisonBasis::Observational {
             failures.push(GateFailure::NonComparableBasis(self.basis));
         }
-        if self.paired_tasks < self.min_paired_tasks {
+        // Sample support is each arm's own: a second arm never lends the
+        // first its tasks.
+        let observed = self
+            .arms
+            .iter()
+            .map(|arm| arm.paired_tasks)
+            .min()
+            .unwrap_or(self.paired_tasks);
+        if observed < self.min_paired_tasks {
             failures.push(GateFailure::InsufficientPairedTasks {
-                observed: self.paired_tasks,
+                observed,
                 minimum: self.min_paired_tasks,
             });
         }
@@ -412,8 +450,27 @@ impl ComparisonReport {
             "replay trials on an unchanged incumbent recipe set aside: {}\n",
             self.incumbent_replay_trials_set_aside
         ));
+        if self.invalid_trials_set_aside > 0 {
+            out.push_str(&format!(
+                "invalid trials set aside (did not run their arm): {}\n",
+                self.invalid_trials_set_aside
+            ));
+        }
         out.push_str(&format!("incumbent: {}\n", render_arm(&self.incumbent)));
         out.push_str(&format!("candidate arm: {}\n", render_arm(&self.arm)));
+        if self.arms.len() > 1 {
+            for arm in &self.arms {
+                out.push_str(&format!(
+                    "  arm {}: n={}, {}; difference {:.3} [{:.3}, {:.3}]\n",
+                    arm.arm_recipe_id,
+                    arm.paired_tasks,
+                    render_arm(&arm.arm),
+                    arm.interval.point,
+                    arm.interval.low,
+                    arm.interval.high,
+                ));
+            }
+        }
         out.push_str(&format!(
             "paired acceptance difference (candidate - incumbent) over {} task(s): {:.3} \
              [{:.3}, {:.3}] ({} bootstrap resample(s), seed {})\n",
@@ -575,36 +632,40 @@ pub fn evaluate_candidate(
         replay_trials(ledger.settled_trials_for_recipes(&recipe_ids)?),
         &arm_ids,
     );
-    let (by_task, errored_trials_set_aside) = earliest_non_errored_per_task(trials);
+    let (trials, invalid_trials_set_aside) = set_aside_invalid(trials, candidate);
 
-    let basis = comparison_basis(by_task.values());
-
-    let mut pairs = Vec::with_capacity(by_task.len());
-    let mut arm_observations: Vec<(f64, ArmObservation)> = Vec::with_capacity(by_task.len());
-    let mut incumbent_observations: Vec<(f64, ArmObservation)> = Vec::with_capacity(by_task.len());
-    for (task_id, trial) in &by_task {
-        let arm_outcome = trial
-            .outcome
-            .expect("settled_trials_for_recipes only returns settled trials");
-        let arm = ArmObservation {
-            accepted: arm_outcome == TrialOutcome::Accepted,
-            cost: trial.cost,
-        };
-        let incumbent_accepted = ledger.run_status(&trial.source_run_id)? == Some(State::Accepted);
-        let incumbent = ArmObservation {
-            accepted: incumbent_accepted,
-            cost: Some(trial_cost_from_run(ledger, &trial.source_run_id)?),
-        };
-        arm_observations.push((trial.assignment_probability, arm));
-        // The incumbent is what already shipped for this task, not a
-        // draw: its assignment probability is 1.0 by construction.
-        incumbent_observations.push((1.0, incumbent));
-        pairs.push(PairedTask {
-            task_id: task_id.clone(),
-            incumbent,
-            arm,
-        });
+    let mut by_arm: BTreeMap<String, Vec<TrialRow>> = BTreeMap::new();
+    for trial in trials {
+        by_arm
+            .entry(trial.arm_recipe_id.clone())
+            .or_default()
+            .push(trial);
     }
+    let mut errored_trials_set_aside = 0;
+    let mut kept: Vec<TrialRow> = Vec::new();
+    let mut arms = Vec::with_capacity(by_arm.len());
+    let mut pairs = Vec::new();
+    for (arm_recipe_id, rows) in by_arm {
+        let (by_task, errored) = earliest_non_errored_per_task(rows);
+        errored_trials_set_aside += errored;
+        let arm_pairs = paired_tasks(ledger, &by_task)?;
+        arms.push(compare_arm(arm_recipe_id, &arm_pairs, resamples));
+        pairs.extend(arm_pairs);
+        kept.extend(by_task.into_values());
+    }
+
+    let basis = comparison_basis(kept.iter());
+    let arm_observations: Vec<(f64, ArmObservation)> = pairs
+        .iter()
+        .map(|(probability, pair)| (*probability, pair.arm))
+        .collect();
+    // The incumbent is what already shipped for this task, not a draw:
+    // its assignment probability is 1.0 by construction.
+    let incumbent_observations: Vec<(f64, ArmObservation)> = pairs
+        .iter()
+        .map(|(_, pair)| (1.0, pair.incumbent))
+        .collect();
+    let pairs: Vec<PairedTask> = pairs.into_iter().map(|(_, pair)| pair).collect();
 
     let incumbent_summary = arm_summary(&incumbent_observations);
     let arm_summary_value = arm_summary(&arm_observations);
@@ -619,7 +680,7 @@ pub fn evaluate_candidate(
 
     let live = ledger.settled_live_trials_for_arms(&arm_ids)?;
     let (model_caveats, model_caveats_unchecked) =
-        arm_model_caveats(ledger, &by_task, &live, &arm_ids)?;
+        arm_model_caveats(ledger, &kept, &live, &arm_ids)?;
     let randomized = randomized_comparison(live, &arm_ids, resamples);
 
     Ok(ComparisonReport {
@@ -629,6 +690,8 @@ pub fn evaluate_candidate(
         min_paired_tasks,
         errored_trials_set_aside,
         incumbent_replay_trials_set_aside,
+        invalid_trials_set_aside,
+        arms,
         incumbent: incumbent_summary,
         arm: arm_summary_value,
         interval,
@@ -636,6 +699,88 @@ pub fn evaluate_candidate(
         model_caveats,
         model_caveats_unchecked,
     })
+}
+
+/// Each task's arm trial paired with the incumbent result its source run
+/// already earned, with the arm's assignment probability.
+fn paired_tasks(
+    ledger: &Ledger,
+    by_task: &BTreeMap<TaskId, TrialRow>,
+) -> Result<Vec<(f64, PairedTask)>, LedgerError> {
+    let mut pairs = Vec::with_capacity(by_task.len());
+    for (task_id, trial) in by_task {
+        let arm_outcome = trial
+            .outcome
+            .expect("settled_trials_for_recipes only returns settled trials");
+        let arm = ArmObservation {
+            accepted: arm_outcome == TrialOutcome::Accepted,
+            cost: trial.cost,
+        };
+        let incumbent = ArmObservation {
+            accepted: ledger.run_status(&trial.source_run_id)? == Some(State::Accepted),
+            cost: Some(trial_cost_from_run(ledger, &trial.source_run_id)?),
+        };
+        pairs.push((
+            trial.assignment_probability,
+            PairedTask {
+                task_id: task_id.clone(),
+                incumbent,
+                arm,
+            },
+        ));
+    }
+    Ok(pairs)
+}
+
+/// One arm's own paired comparison, from its pairs alone.
+fn compare_arm(
+    arm_recipe_id: String,
+    pairs: &[(f64, PairedTask)],
+    resamples: usize,
+) -> ArmComparison {
+    let arm: Vec<(f64, ArmObservation)> = pairs
+        .iter()
+        .map(|(probability, pair)| (*probability, pair.arm))
+        .collect();
+    let incumbent: Vec<(f64, ArmObservation)> = pairs
+        .iter()
+        .map(|(_, pair)| (1.0, pair.incumbent))
+        .collect();
+    let pairs: Vec<PairedTask> = pairs.iter().map(|(_, pair)| pair.clone()).collect();
+    let seed = derive_seed(
+        &pairs
+            .iter()
+            .map(|pair| pair.task_id.clone())
+            .collect::<Vec<_>>(),
+    );
+    ArmComparison {
+        arm_recipe_id,
+        paired_tasks: pairs.len(),
+        incumbent: arm_summary(&incumbent),
+        arm: arm_summary(&arm),
+        interval: bootstrap_paired_interval(&pairs, seed, resamples),
+    }
+}
+
+/// Set aside the replay trials that did not measure their arm: settled
+/// [`TrialOutcome::Invalid`], or whose design presence disagrees with
+/// their arm's `requires_design` (a design sha on every trial of a
+/// `requires_design` recipe, none on any other). Counted, never dropped.
+fn set_aside_invalid(trials: Vec<TrialRow>, candidate: &RepoPolicy) -> (Vec<TrialRow>, usize) {
+    let requires_design: BTreeMap<String, bool> = candidate
+        .recipes
+        .iter()
+        .map(|recipe| (recipe.recipe_id(), recipe.requires_design))
+        .collect();
+    let (valid, invalid): (Vec<TrialRow>, Vec<TrialRow>) = trials.into_iter().partition(|trial| {
+        trial.outcome != Some(TrialOutcome::Invalid)
+            && requires_design
+                .get(&trial.arm_recipe_id)
+                .copied()
+                .unwrap_or(false)
+                == trial.design_sha256.is_some()
+    });
+    (valid, invalid.len())
 }
 
 /// The aliases whose effective models differ between the incumbent's runs
@@ -647,14 +792,14 @@ pub fn evaluate_candidate(
 /// no arm run contributes nothing and is counted, never guessed at.
 fn arm_model_caveats(
     ledger: &Ledger,
-    replays: &BTreeMap<TaskId, TrialRow>,
+    replays: &[TrialRow],
     live: &[TrialRow],
     arm_ids: &BTreeSet<String>,
 ) -> Result<(Vec<ModelCaveat>, usize), LedgerError> {
     let mut incumbent = Vec::new();
     let mut candidate = Vec::new();
     let mut unchecked = 0;
-    for trial in replays.values() {
+    for trial in replays {
         match &trial.arm_run_id {
             Some(arm_run) => {
                 incumbent.extend(ledger.run_models(&trial.source_run_id)?);
@@ -730,8 +875,12 @@ fn randomized_comparison(
     if live.is_empty() {
         return None;
     }
-    let (control_rows, rest): (Vec<TrialRow>, Vec<TrialRow>) =
-        live.into_iter().partition(|trial| trial.arm_index == 0);
+    // No writer settles a live arm `Invalid`; one that did would measure
+    // nothing, so it is left out rather than read as a rejection.
+    let (control_rows, rest): (Vec<TrialRow>, Vec<TrialRow>) = live
+        .into_iter()
+        .filter(|trial| trial.outcome != Some(TrialOutcome::Invalid))
+        .partition(|trial| trial.arm_index == 0);
     let candidate_rows: Vec<TrialRow> = rest
         .into_iter()
         .filter(|trial| arm_ids.contains(&trial.arm_recipe_id))
@@ -1101,6 +1250,7 @@ mod tests {
             duration_ms: Some(1),
             created_at: created_at.into(),
             arm_run_id: None,
+            design_sha256: None,
         }
     }
 
@@ -1193,6 +1343,8 @@ mod tests {
             min_paired_tasks: MIN_PAIRED_TASKS,
             errored_trials_set_aside: 0,
             incumbent_replay_trials_set_aside: 0,
+            invalid_trials_set_aside: 0,
+            arms: Vec::new(),
             randomized: None,
             model_caveats: Vec::new(),
             model_caveats_unchecked: 0,
@@ -1311,6 +1463,8 @@ mod tests {
             min_paired_tasks: MIN_PAIRED_TASKS,
             errored_trials_set_aside: 0,
             incumbent_replay_trials_set_aside: 0,
+            invalid_trials_set_aside: 0,
+            arms: Vec::new(),
             randomized: None,
             model_caveats: Vec::new(),
             model_caveats_unchecked: 0,
@@ -1483,6 +1637,7 @@ mod tests {
                     verification_profile_hash: "profile",
                     workspace_isolation: "fresh_checkout_no_accepted_answer",
                     arm_run_id: &run_id,
+                    design_sha256: None,
                 })
                 .expect("insert replay");
             ledger
@@ -1555,6 +1710,7 @@ mod tests {
                 workspace_isolation: LIVE_WORKTREE,
                 arms_json: Some(&arms_json),
                 arm_run_id: &run_id,
+                design_sha256: None,
             })
             .expect("insert live");
         ledger
@@ -1587,6 +1743,181 @@ mod tests {
 
     /// A replay-only ledger evaluates with no randomized section, and its
     /// rendering carries no trace of one.
+    /// A candidate with both arms of one type: `docs` alone (revision 2)
+    /// and `docs` requiring a design (revision 3), with their ids.
+    fn candidate_with_two_arms() -> (RepoPolicy, String, String) {
+        let appended = "[[recipes]]\nname = \"docs\"\nscope_within = [\"docs/**\"]\n\
+             tier = \"implementation\"\nrevision = 2\nreview = \"required\"\n\
+             [[recipes]]\nname = \"docs\"\nscope_within = [\"docs/**\"]\n\
+             tier = \"implementation\"\nrevision = 3\nreview = \"required\"\n\
+             requires_design = true\n";
+        let policy =
+            RepoPolicy::from_toml_str(&[BASE_RECIPE, appended].concat()).expect("policy parses");
+        let alone = policy.recipes[1].recipe_id();
+        let designed = policy.recipes[2].recipe_id();
+        (policy, alone, designed)
+    }
+
+    /// One settled replay trial of `task` under `arm`.
+    fn insert_replay(
+        ledger: &Ledger,
+        trial: &str,
+        task: &str,
+        arm: &str,
+        design_sha256: Option<&str>,
+        outcome: TrialOutcome,
+    ) {
+        let trial_id = TrialId::from_stored(trial);
+        let run_id = RunId::from_stored(format!("run-{trial}"));
+        ledger
+            .insert_replay_trial(&NewReplayTrial {
+                trial_id: &trial_id,
+                task_id: &TaskId::from_stored(task),
+                source_run_id: &RunId::from_stored(format!("source-{task}")),
+                incumbent_recipe_id: "incumbent",
+                arm_recipe_id: arm,
+                base_sha: "base",
+                contract_hash: "contract",
+                verification_profile_hash: "profile",
+                workspace_isolation: "fresh_checkout_no_accepted_answer",
+                arm_run_id: &run_id,
+                design_sha256,
+            })
+            .expect("insert replay");
+        ledger
+            .settle_trial(
+                &trial_id,
+                outcome,
+                outcome == TrialOutcome::Accepted,
+                TrialCost::UNKNOWN,
+                1,
+            )
+            .expect("settle replay");
+    }
+
+    /// The two arms replayed over the same five tasks, `first` before the
+    /// other, plus one trial per arm whose design presence disagrees with
+    /// its recipe. The alone arm accepts 4 of 5, the designed arm 2 of 5.
+    fn two_arm_ledger(tag: &str, designed_first: bool) -> (Ledger, std::path::PathBuf) {
+        let (_, alone, designed) = candidate_with_two_arms();
+        let dir = crate::test_support::short_temp_dir(tag).to_path_buf();
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger opens");
+        let outcome = |accepted: bool| {
+            if accepted {
+                TrialOutcome::Accepted
+            } else {
+                TrialOutcome::Rejected
+            }
+        };
+        let run_alone = |ledger: &Ledger, order: &str| {
+            for n in 0..5 {
+                let trial = format!("{order}-alone-{n}");
+                insert_replay(
+                    ledger,
+                    &trial,
+                    &format!("task-{n}"),
+                    &alone,
+                    None,
+                    outcome(n < 4),
+                );
+            }
+            // Handed a design it takes none of: set aside, not a task.
+            let trial = format!("{order}-alone-mismatch");
+            insert_replay(ledger, &trial, "task-9", &alone, Some("sha"), outcome(true));
+        };
+        let run_designed = |ledger: &Ledger, order: &str| {
+            for n in 0..5 {
+                let trial = format!("{order}-designed-{n}");
+                let sha = format!("sha-{n}");
+                let task = format!("task-{n}");
+                insert_replay(ledger, &trial, &task, &designed, Some(&sha), outcome(n < 2));
+            }
+            // Requires a design and was handed none.
+            let trial = format!("{order}-designed-mismatch");
+            insert_replay(ledger, &trial, "task-8", &designed, None, outcome(true));
+        };
+        if designed_first {
+            run_designed(&ledger, "1");
+            run_alone(&ledger, "2");
+        } else {
+            run_alone(&ledger, "1");
+            run_designed(&ledger, "2");
+        }
+        (ledger, dir)
+    }
+
+    /// An arm is its recipe id: each arm keeps its own trial per task, so
+    /// replaying the two arms in either order gives each the same score,
+    /// and a trial whose design disagrees with its arm counts for neither.
+    ///
+    /// Keying the per-task de-duplication on the task alone (as before
+    /// arms were named) gives whichever arm ran first every task and the
+    /// other none, so the two orders disagree.
+    #[test]
+    fn two_arms_in_either_order_keep_their_own_scores() {
+        let (candidate, alone, designed) = candidate_with_two_arms();
+        let mut reports = Vec::new();
+        for (tag, designed_first) in [("cmp-arms-a", false), ("cmp-arms-b", true)] {
+            let (ledger, dir) = two_arm_ledger(tag, designed_first);
+            reports.push(
+                evaluate_candidate(&ledger, &base_policy(), &candidate, 20, 200)
+                    .expect("evaluates"),
+            );
+            std::fs::remove_dir_all(dir).ok();
+        }
+        assert_eq!(reports[0].arms, reports[1].arms, "the order moved a score");
+        let arm = |id: &str| {
+            reports[0]
+                .arms
+                .iter()
+                .find(|arm| arm.arm_recipe_id == id)
+                .unwrap_or_else(|| panic!("no arm {id}: {:?}", reports[0].arms))
+                .clone()
+        };
+        assert_eq!(arm(&alone).paired_tasks, 5);
+        assert_eq!(arm(&designed).paired_tasks, 5);
+        assert_eq!(
+            arm(&alone).arm.acceptance,
+            AcceptanceEstimate::Estimated(0.8)
+        );
+        assert_eq!(
+            arm(&designed).arm.acceptance,
+            AcceptanceEstimate::Estimated(0.4)
+        );
+        for report in &reports {
+            assert_eq!(report.invalid_trials_set_aside, 2, "{}", report.render());
+            assert_eq!(report.paired_tasks, 10);
+            assert!(
+                report
+                    .render()
+                    .contains("invalid trials set aside (did not run their arm): 2"),
+                "{}",
+                report.render()
+            );
+        }
+        // Each arm's own sample support gates: 5 per arm is not 10.
+        assert!(reports[0].failures().iter().any(|failure| matches!(
+            failure,
+            GateFailure::InsufficientPairedTasks { observed: 5, .. }
+        )));
+    }
+
+    /// A trial recorded `invalid` is never evidence for or against its arm.
+    #[test]
+    fn an_invalid_trial_is_set_aside_and_never_paired() {
+        let (candidate, arm) = candidate_with_one_recipe();
+        let dir = crate::test_support::short_temp_dir("cmp-invalid").to_path_buf();
+        let ledger = Ledger::open(&dir.join("ledger.sqlite")).expect("ledger opens");
+        insert_replay(&ledger, "t-1", "task-1", &arm, None, TrialOutcome::Invalid);
+        insert_replay(&ledger, "t-2", "task-2", &arm, None, TrialOutcome::Accepted);
+        let report =
+            evaluate_candidate(&ledger, &base_policy(), &candidate, 20, 200).expect("evaluates");
+        assert_eq!(report.paired_tasks, 1);
+        assert_eq!(report.invalid_trials_set_aside, 1);
+        assert_eq!(report.arm.acceptance, AcceptanceEstimate::Estimated(1.0));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn a_replay_only_ledger_has_no_randomized_section() {
         let (candidate, arm) = candidate_with_one_recipe();
@@ -1985,6 +2316,7 @@ mod tests {
                 verification_profile_hash: "profile",
                 workspace_isolation: "fresh_checkout_no_accepted_answer",
                 arm_run_id: &replay,
+                design_sha256: None,
             })
             .expect("insert replay");
         ledger
@@ -2041,6 +2373,7 @@ mod tests {
                 verification_profile_hash: "profile",
                 workspace_isolation: "fresh_checkout_no_accepted_answer",
                 arm_run_id: arm_run,
+                design_sha256: None,
             })
             .expect("insert replay");
         ledger

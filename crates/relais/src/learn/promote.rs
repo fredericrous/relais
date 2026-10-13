@@ -376,6 +376,39 @@ mod tests {
     }
 
     #[test]
+    fn rolling_back_one_typed_recipe_returns_only_that_type() {
+        use crate::contract::TaskType;
+        let typed = |name: &str, revision: u32, tier: Tier, task_type: TaskType| RecipeSpec {
+            revision,
+            task_type: vec![task_type],
+            ..RecipeSpec::covering(name, tier)
+        };
+        let incumbent = policy(vec![
+            typed("change-ui", 1, Tier::Implementation, TaskType::Ui),
+            typed("change-infra", 1, Tier::Implementation, TaskType::Infra),
+            typed("change-ui", 2, Tier::Research, TaskType::Ui),
+            typed("change-infra", 2, Tier::Research, TaskType::Infra),
+        ]);
+        let amendment = Amendment::for_rollback(&incumbent, "change-ui").expect("rolls back");
+        let [added] = amendment.added() else {
+            panic!("one revision: {:?}", amendment.added())
+        };
+        assert_eq!(added.name, "change-ui");
+        assert_eq!(added.revision, 3);
+        assert_eq!(added.tier, Tier::Implementation);
+        assert_eq!(added.task_type, vec![TaskType::Ui]);
+        // `change-infra` is untouched: its effective revision is still 2.
+        let mut after = incumbent.clone();
+        after.recipes.extend(amendment.added().iter().cloned());
+        let effective = |name: &str| {
+            select_highest_enabled_revision(&after.recipes, |recipe| recipe.name == name)
+                .map(|recipe| (recipe.revision, recipe.tier))
+        };
+        assert_eq!(effective("change-ui"), Some((3, Tier::Implementation)));
+        assert_eq!(effective("change-infra"), Some((2, Tier::Research)));
+    }
+
+    #[test]
     fn rollback_of_one_revision_or_an_unknown_name_names_what_exists() {
         let single = policy(vec![recipe(0, true, Tier::Research)]);
         let too_few = Amendment::for_rollback(&single, "docs").unwrap_err();
