@@ -8,6 +8,10 @@ missing here.
 
 ## Unreleased
 
+## v0.19.0
+
+A repository is trusted once (#234, relais ADR-0007), and the replay tool can hand a program design to the Haiku + design arm (#233). After upgrading, grant each repository once with `relais trust grant --reviewed-by <name>` (or the plugin's trust tool); existing grants keep working for their exact policy. Reinstall the plugin as for v0.12.0 and restart sessions, so the trust and replay tools are current. Rollback to v0.18.0: remove `[trust_repos]` from machine.toml and restore the ledger from `ledger.sqlite.bak-v30`.
+
 A repository is now trusted once (relais ADR-0007): `relais trust grant --reviewed-by <name>` with no `--key` grants the repository in machine.toml's `[trust_repos]`, and every policy of it runs under that grant, candidate recipes, replays and live-trial arms included. When the commands relais would run change (verification setup and commands, integrations), the first `run` prints `relais: commands changed in relais.toml since <date>:` on stderr and records `commands_changed`; it never blocks, and model, tier or recipe changes say nothing. `plan`, `doctor` and `trust show` show a pending change without consuming it, and a replay neither says nor records one. Grants made before this release keep admitting their exact policy; `--key` still writes one and says it is deprecated, and `relais doctor` counts the legacy grants matched in the last 30 days. The plugin's trust and onboard tools grant the repository and return ready without asking when it is already granted. Ledger step v30 records each run's trust status and writes `ledger.sqlite.bak-v30` first. Rollback: remove `[trust_repos]` from machine.toml, restore the ledger from `ledger.sqlite.bak-v30`, and re-grant with `relais trust grant --key`.
 
 The replay tool takes an optional `design` (an absolute path to a markdown program design) and passes it to `relais dataset replay --design`, the input of the Haiku + design arm.
