@@ -636,6 +636,23 @@ impl GrantSource {
     }
 }
 
+/// What a `relais trust grant` trusts: the repository once (ADR-0007), or
+/// one exact policy through the deprecated `--key`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GrantScope {
+    Repository,
+    Legacy,
+}
+
+impl GrantScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            GrantScope::Repository => "repository",
+            GrantScope::Legacy => "legacy",
+        }
+    }
+}
+
 /// Exit 0 acknowledges; non-zero asks the plugin to retry.
 #[derive(Subcommand)]
 enum NativeCommand {
@@ -3075,7 +3092,7 @@ fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                 machine_path,
                 previous.as_deref(),
             );
-            shown.pending_change = pending_command_change(&repo_key, &policy);
+            shown.pending_change = pending_command_change("trust show", &repo_key, &policy);
             if json {
                 print_document(&shown)?;
             } else {
@@ -3108,7 +3125,7 @@ fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                 None => (
                     relais::trust::grant_repository(&machine_path, &repo_key, &record),
                     repo_key.clone(),
-                    "repository",
+                    GrantScope::Repository,
                 ),
                 Some(key) => {
                     if key != shown.grant_key {
@@ -3134,7 +3151,7 @@ fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
                     (
                         relais::trust::grant(&machine_path, &key, &record),
                         key,
-                        "legacy",
+                        GrantScope::Legacy,
                     )
                 }
             };
@@ -3172,18 +3189,20 @@ fn trust_command(cmd: TrustCommand) -> Result<CliOutcome, CliError> {
             if json {
                 print_document(&serde_json::json!({
                     "code": if written { "granted" } else { "already_granted" },
-                    "scope": scope,
+                    "scope": scope.as_str(),
                     "grant_key": recorded_key,
                     "machine_settings": machine_path,
                 }))?;
             } else if written {
                 println!(
-                    "trust grant: {scope} {recorded_key} recorded in {}",
+                    "trust grant: {} {recorded_key} recorded in {}",
+                    scope.as_str(),
                     machine_path.display()
                 );
             } else {
                 println!(
-                    "trust grant: {scope} {recorded_key} was already in {}",
+                    "trust grant: {} {recorded_key} was already in {}",
+                    scope.as_str(),
                     machine_path.display()
                 );
             }
@@ -3235,7 +3254,7 @@ fn record_grant(
     identity: &RepoIdentity,
     reviewed_by: &str,
     source: GrantSource,
-    scope: &str,
+    scope: GrantScope,
     policy: &RepoPolicy,
 ) -> Result<(), CliError> {
     let steps = operational(
@@ -3254,37 +3273,63 @@ fn record_grant(
         }),
         "recording the grant in the ledger",
     )?;
-    // A repository grant starts the declaration the command warning
-    // compares against, so the first change after it is the first said.
-    if scope == "repository" {
-        use relais::trust::DeclarationStore;
-        operational(
-            relais::trust::Recorder(&ledger)
-                .record(repo_key, &relais::trust::commands_of(policy))
-                .map_err(std::io::Error::other),
-            "recording the starting declaration in the ledger",
-        )?;
+    match scope {
+        // A repository grant starts the declaration the command warning
+        // compares against, so the first change after it is the first said.
+        GrantScope::Repository => {
+            use relais::trust::DeclarationStore;
+            operational(
+                relais::trust::Recorder(&ledger)
+                    .record(repo_key, &relais::trust::commands_of(policy))
+                    .map_err(std::io::Error::other),
+                "recording the starting declaration in the ledger",
+            )
+        }
+        // A legacy grant trusts one exact policy; the commands it covers
+        // are its key, so there is no declaration to start.
+        GrantScope::Legacy => Ok(()),
     }
-    Ok(())
 }
 
 /// A change to the repository's commands that no `relais run` has said
 /// yet, read without consuming it (`plan`, `trust show`): from the ledger
 /// when there is one, nothing otherwise. Best effort — a ledger that
-/// cannot be read costs the report, never the command.
+/// cannot be read costs the report, never the command, and is said on
+/// stderr under `command`'s name.
 fn pending_command_change(
+    command: &str,
     repo_key: &str,
     policy: &RepoPolicy,
 ) -> Option<relais::trust::CommandsChanged> {
-    let ledger = paths::ledger_path()
+    let ledger = match paths::ledger_path()
         .ok()
         .filter(|path| path.exists())
-        .and_then(|path| Ledger::open(&path).ok());
+        .map(|path| Ledger::open(&path))
+        .transpose()
+    {
+        Ok(ledger) => ledger,
+        Err(e) => {
+            eprintln!(
+                "relais {command}: warning: the ledger could not be opened ({e}); a pending \
+                 change to the commands is not reported"
+            );
+            return None;
+        }
+    };
     let seen = match &ledger {
         Some(ledger) => relais::trust::observe(&relais::trust::Reader(ledger), repo_key, policy),
         None => relais::trust::observe(&relais::trust::NoHistory, repo_key, policy),
     };
-    seen.ok().flatten()
+    match seen {
+        Ok(change) => change,
+        Err(e) => {
+            eprintln!(
+                "relais {command}: warning: the commands this repository last ran under could \
+                 not be read ({e}); a pending change to them is not reported"
+            );
+            None
+        }
+    }
 }
 
 /// `relais trust show` for a person: the key on a line of its own, then
@@ -4445,7 +4490,9 @@ fn plan_command(
     }
     // A pending change to the commands is reported here and consumed only
     // by `run` (ADR-0007). On stderr: `plan`'s stdout stays what it was.
-    if let Some(change) = pending_command_change(&relais::policy::repo_key(&repo_identity), &repo) {
+    if let Some(change) =
+        pending_command_change("plan", &relais::policy::repo_key(&repo_identity), &repo)
+    {
         eprintln!("{}", change.text());
     }
     match &decision {
@@ -5999,8 +6046,10 @@ fn replay_command(
             .map_or(relais::runner::DesignSource::Contract, |design| {
                 relais::runner::DesignSource::Given(design)
             }),
-        // A replay reports a pending change without consuming it.
-        declarations: &relais::trust::Reader(&ledger),
+        // A replay neither says nor records a pending command change: the
+        // runner skips it for a replay, and `plan`, `doctor` and `trust
+        // show` report it.
+        declarations: &relais::trust::NoHistory,
     });
     // Bring the replay's own refs into the live repository BEFORE the
     // checkout goes. The runner names its candidate and snapshot refs in
@@ -6545,7 +6594,8 @@ fn recipe_diff_command(candidate_path: &Path) -> Result<CliOutcome, CliError> {
     ) {
         Ok(_) => println!(
             "admissible: route::validate_candidate would ADMIT this candidate — admissible is \
-             not approved: it still needs its own trust grant, and nothing here grants, \
+             not approved: it runs only under the repository's grant, or a legacy grant for \
+             its exact hash, and nothing here grants, \
              replays, evaluates or writes anything"
         ),
         Err(rejection) => println!(

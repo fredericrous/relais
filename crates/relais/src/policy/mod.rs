@@ -1361,7 +1361,8 @@ pub struct TrialEnvelope {
     /// whose cost is unknown counts as this full amount. 0: none.
     pub max_trial_cost_micros: i64,
     /// Candidate `relais.toml` files, each admitted at run time against
-    /// the repository's current policy and its own trust grant.
+    /// the repository's current policy, and run under the repository's
+    /// grant or a legacy grant for its exact authority hash.
     pub candidates: Vec<std::path::PathBuf>,
 }
 
@@ -1646,7 +1647,8 @@ impl TrustStatus {
 /// the repository `repo_identity`: the repository's own grant first, else
 /// a legacy grant for exactly this policy. Pure: the settings and the
 /// identity are handed in. A legacy grant never admits another policy, so
-/// a candidate is admitted by the repository grant alone.
+/// a candidate is admitted by the repository grant, or by a legacy grant
+/// for its own exact authority hash.
 pub fn trust_status(
     machine: &MachineSettings,
     repo_identity: &RepoIdentity,

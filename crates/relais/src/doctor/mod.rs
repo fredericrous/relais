@@ -732,6 +732,20 @@ pub(crate) fn legacy_grants_finding(ledger: Option<&Ledger>) -> Finding {
     }
 }
 
+/// A ledger that exists but cannot be opened: neither the legacy-grant
+/// count nor a pending command change can be read from it, and saying
+/// "none" for either would be a claim the doctor cannot make.
+pub(crate) fn ledger_unreadable_finding(error: &dyn std::fmt::Display) -> Finding {
+    Finding {
+        component: "legacy grants",
+        level: Level::Warn,
+        detail: format!(
+            "the ledger could not be opened ({error}), so neither the runs admitted by a legacy \
+             grant nor a pending command change could be read"
+        ),
+    }
+}
+
 /// A change to the repository's commands that no `relais run` has said
 /// yet, read without consuming it. Nothing when there is none.
 pub(crate) fn pending_commands_finding(
@@ -1167,14 +1181,20 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
                         None => PricingConfig::Unconfigured,
                     };
                     findings.push(trust_finding(policy.as_ref(), &settings, repo_dir));
-                    let ledger = paths::ledger_path()
+                    match paths::ledger_path()
                         .ok()
                         .filter(|path| path.exists())
-                        .and_then(|path| Ledger::open(&path).ok());
-                    findings.push(legacy_grants_finding(ledger.as_ref()));
-                    findings.extend(policy.as_ref().and_then(|policy| {
-                        pending_commands_finding(policy, repo_dir, ledger.as_ref())
-                    }));
+                        .map(|path| Ledger::open(&path))
+                        .transpose()
+                    {
+                        Ok(ledger) => {
+                            findings.push(legacy_grants_finding(ledger.as_ref()));
+                            findings.extend(policy.as_ref().and_then(|policy| {
+                                pending_commands_finding(policy, repo_dir, ledger.as_ref())
+                            }));
+                        }
+                        Err(e) => findings.push(ledger_unreadable_finding(&e)),
+                    }
                     findings.push(trials_finding(&settings, policy.as_ref(), repo_dir));
                     findings.push(hook_timeout_finding(
                         merged_roots(repo_dir, home.as_deref()),

@@ -216,8 +216,8 @@ pub struct RunConfig<'a> {
     pub design: DesignSource<'a>,
     /// Where the commands this repository last ran under are kept, and
     /// whether this run updates them: `relais run` passes a recording
-    /// store, replay one that records nothing, so only `run` consumes a
-    /// pending command change (ADR-0007).
+    /// store, so only `run` consumes a pending command change (ADR-0007).
+    /// A replay never reads it: it neither says nor records a change.
     pub declarations: &'a dyn crate::trust::DeclarationStore,
 }
 
@@ -1293,9 +1293,9 @@ impl<'a> RunEngine<'a> {
     /// last run that saw them (ADR-0007): a line on stderr and a
     /// `commands_changed` decision on the run. Whether it is said once
     /// is the store's: a recording one (`relais run`) stores what it saw,
-    /// so the next run is silent; one that records nothing (replay) shows
-    /// the same change again. A store that fails is said and the run goes
-    /// on, since a warning that cannot be kept must not stop work.
+    /// so the next run is silent. A replay never gets here. A store that
+    /// fails is said and the run goes on, since a warning that cannot be
+    /// kept must not stop work.
     fn say_command_changes(&self, repo_key: &str) {
         match crate::trust::observe(self.config.declarations, repo_key, self.config.repo_policy) {
             Ok(Some(change)) => {
@@ -1643,7 +1643,13 @@ impl<'a> RunEngine<'a> {
         // Which grant admitted this run, kept on the run: `relais doctor`
         // counts the runs a legacy grant still admits (ADR-0007).
         ledger.set_run_trust_status(&self.run_id, authority.trust_status.as_str())?;
-        if self.parent.is_none() {
+        // A pending command change is `relais run`'s to say: a replay
+        // neither says nor records it, so a batch of replays does not
+        // repeat the warning once per run (`plan`, `doctor` and `trust
+        // show` report it).
+        if self.parent.is_none()
+            && self.config.purpose != Some(crate::lifecycle::RunPurpose::Replay)
+        {
             self.say_command_changes(&this_repo_key);
         }
         // Integrations (SPEC §5): a missing required one blocks execution;
@@ -5450,6 +5456,49 @@ mod tests {
             .expect("the fixture's id source mints identifiers")
         }
 
+        /// `execute` with the run's purpose and the store of the commands
+        /// the repository last ran under chosen by the test.
+        fn execute_declared(
+            &self,
+            purpose: Option<crate::lifecycle::RunPurpose>,
+            declarations: &dyn crate::trust::DeclarationStore,
+            contract: &TaskContract,
+            repo: &RepoPolicy,
+            backend: &dyn Backend,
+        ) -> RunOutcome {
+            let machine = self.machine_for(repo);
+            let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
+                adr: "ADR-0001".into(),
+                choice: None,
+                reason: None,
+            };
+            execute(&RunConfig {
+                repo_dir: &self.repo,
+                contract,
+                repo_policy: repo,
+                machine: &machine,
+                ledger: &self.ledger,
+                ids: &self.ids,
+                backend,
+                git: &crate::workspace::SystemGit,
+                hooks: &crate::verify::FixedInventory(None),
+                attest: &crate::verify::FixedAttest::default(),
+                artifacts_dir: self.artifacts.clone(),
+                aval_resolver: &resolver,
+                predictor: None,
+                gate: None,
+                session_id: "test-session".into(),
+                heartbeat_every: Duration::from_millis(50),
+                task_override: None,
+                purpose,
+                run_id: None,
+                wire: Wire::process(),
+                design: DesignSource::Contract,
+                declarations,
+            })
+            .expect("the fixture's id source mints identifiers")
+        }
+
         fn execute_managed(
             &self,
             contract: &TaskContract,
@@ -5676,6 +5725,68 @@ mod tests {
                 ..Default::default()
             }
         })
+    }
+
+    /// Whether the run's events carry the `commands_changed` decision.
+    fn said_commands_changed(fixture: &Fixture, run_id: &RunId) -> bool {
+        std::fs::read_to_string(fixture.artifacts.join(run_id.as_str()).join("events.jsonl"))
+            .expect("events.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json"))
+            .any(|line| {
+                line["event"]["kind"] == "decision" && line["event"]["what"] == "commands_changed"
+            })
+    }
+
+    /// A pending command change is `relais run`'s to say (ADR-0007): a
+    /// replay neither records a `commands_changed` decision nor stores the
+    /// new commands, even handed a store that records, so a batch of
+    /// replays does not repeat the warning; the next plain run says it.
+    #[test]
+    fn a_replay_neither_says_nor_records_a_pending_command_change() {
+        use crate::trust::DeclarationStore;
+        let fixture = Fixture::new();
+        let before = fixture.repo_policy(vec![passing_check()], 1);
+        let after = fixture.repo_policy(vec![passing_check(), main_gone_check()], 1);
+        let key = repo_key(&crate::repo::identity(&fixture.repo));
+        let store = crate::trust::Recorder(&fixture.ledger);
+        store
+            .record(&key, &crate::trust::commands_of(&before))
+            .expect("the earlier commands are stored");
+        let stored_hash = || {
+            fixture
+                .ledger
+                .repo_declaration(&key)
+                .expect("read")
+                .expect("a declaration is stored")
+                .declaration_hash
+        };
+        let seeded = stored_hash();
+        let contract = fixture.contract(Review::Off);
+        let backend = conditional_worker("relais task");
+
+        for _ in 0..2 {
+            let replay = fixture.execute_declared(
+                Some(crate::lifecycle::RunPurpose::Replay),
+                &store,
+                &contract,
+                &after,
+                &backend,
+            );
+            assert!(
+                !said_commands_changed(&fixture, &replay.run_id),
+                "a replay says nothing about the commands"
+            );
+            assert_eq!(stored_hash(), seeded, "a replay records nothing");
+        }
+
+        let run = fixture.execute_declared(None, &store, &contract, &after, &backend);
+        assert!(
+            said_commands_changed(&fixture, &run.run_id),
+            "the change is still pending for `relais run`"
+        );
+        assert_ne!(stored_hash(), seeded, "the run consumes it");
+        std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
     // -- release scenarios (SPEC §14) -------------------------------------

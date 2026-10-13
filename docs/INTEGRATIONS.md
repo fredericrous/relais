@@ -356,8 +356,9 @@ candidates = ["/path/to/candidate-relais.toml"]
 - **`candidates`** — paths to candidate `relais.toml` files (relative
   paths are read from the repository root). Each is admitted at run time:
   it must parse, be admissible against the repository's current policy
-  (`relais recipe diff` shows the verdict), and hold its own trust grant
-  in `machine.toml`. One that fails is dropped, and `plan` and `run` say
+  (`relais recipe diff` shows the verdict), and be covered in
+  `machine.toml` by the repository's grant, or by a legacy grant for its
+  exact authority hash. One that fails is dropped, and `plan` and `run` say
   which and why.
 
 `relais plan` prints the assignment it would make and writes nothing;

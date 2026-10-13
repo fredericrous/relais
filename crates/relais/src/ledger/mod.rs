@@ -2287,10 +2287,12 @@ fn prepare_actor_step(conn: &Connection) -> Result<()> {
 /// Before v30 runs: write a copy of the ledger file beside it
 /// (`<ledger>.bak-v30`, by `VACUUM INTO`, because a file copy can miss WAL
 /// pages), so a rollback to the previous relais has a ledger it can read.
-/// Does nothing when the step is already applied, when the ledger holds no
-/// run (nothing to lose — and a fresh file several openers are creating at
-/// once, whose earlier steps this same open just applied, must not race to
-/// back itself up) or for an in-memory ledger. A copy left by an earlier
+/// Does nothing when the step is already applied or for an in-memory
+/// ledger. A ledger that holds no run is skipped too, because a fresh file
+/// several openers are creating at once, whose earlier steps this same
+/// open just applied, must not race to back itself up; such a ledger may
+/// still hold other rows (trust grants, learning rows), and those are not
+/// copied. A copy left by an earlier
 /// attempt is replaced, so the copy is always of the ledger as it was just
 /// before the step.
 fn prepare_trust_step(conn: &Connection) -> Result<()> {
