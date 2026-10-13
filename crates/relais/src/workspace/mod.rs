@@ -770,12 +770,24 @@ pub fn retained_worktrees(state_dir: &Path) -> Result<Vec<RetainedWorktree>> {
 /// checkouts (the runner's `verify_root`).
 const VERIFY_DIR: &str = "verify";
 
-/// Every verification checkout still under `state_dir/verify/<run>/`: the
-/// `verify-base` baseline and any per-attempt checkout a run that died
-/// mid-verification left behind. Each carries a `.git`; path order.
+/// Every verification checkout still on disk: `verify/<run>/` for a root
+/// run, and — nested to any depth — `runs/<root>/packages/verify/<child>/`
+/// for a decomposed run's package (the runner's `verify_root` sits beside
+/// the package's artifacts). The `verify-base` baseline and any
+/// per-attempt checkout a run that died mid-verification left behind each
+/// carry a `.git`; path order.
 pub fn retained_verify_worktrees(state_dir: &Path) -> Result<Vec<RetainedWorktree>> {
     let mut found = Vec::new();
     collect_worktree_runs(&mut found, &state_dir.join(VERIFY_DIR))?;
+    let runs = state_dir.join(crate::paths::RUNS_DIR);
+    let mut pending = subdirectories(&runs)?;
+    while let Some(dir) = pending.pop() {
+        if dir.file_name().is_some_and(|n| n == VERIFY_DIR) {
+            collect_worktree_runs(&mut found, &dir)?;
+        } else if !dir.join(".git").exists() {
+            pending.extend(subdirectories(&dir)?);
+        }
+    }
     found.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(found)
 }
@@ -787,7 +799,8 @@ pub enum VerifyRetirement {
         bytes_reclaimed: u64,
     },
     /// Tracked files differ from the checked-out commit, so someone
-    /// edited it: kept.
+    /// edited it: kept. Repo-relative paths (a rename's destination),
+    /// without status codes.
     Modified {
         files: Vec<String>,
     },
@@ -797,12 +810,11 @@ pub enum VerifyRetirement {
 /// detached checkout of a base or candidate commit plus setup output), so
 /// nothing is exported; one with tracked modifications is kept.
 pub fn retire_verification(path: &Path) -> Result<VerifyRetirement> {
-    let status = git(path, &["status", "--porcelain", "--untracked-files=no"])?;
-    let files: Vec<String> = status
-        .lines()
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty())
-        .collect();
+    let status = git_raw(
+        path,
+        &["status", "--porcelain", "-z", "--untracked-files=no"],
+    )?;
+    let files = porcelain_paths(&status);
     if !files.is_empty() {
         return Ok(VerifyRetirement::Modified { files });
     }
@@ -819,6 +831,25 @@ pub fn retire_verification(path: &Path) -> Result<VerifyRetirement> {
     git(common, &["worktree", "prune"])?;
     remove_if_empty(path.parent())?;
     Ok(VerifyRetirement::Removed { bytes_reclaimed })
+}
+
+/// The repo-relative paths of `git status --porcelain -z` output: each
+/// entry is a 2-char status, a space, then the path; a rename or copy is
+/// followed by its source as a separate NUL-terminated field, which is
+/// skipped so only the destination is reported.
+fn porcelain_paths(status: &str) -> Vec<String> {
+    let mut fields = status.split('\0').filter(|field| !field.is_empty());
+    let mut paths = Vec::new();
+    while let Some(entry) = fields.next() {
+        let Some((codes, path)) = entry.split_at_checked(3) else {
+            continue;
+        };
+        if codes.contains(['R', 'C']) {
+            fields.next();
+        }
+        paths.push(path.to_string());
+    }
+    paths
 }
 
 /// `<worktrees>/<run>/<name>`: each run's directories that are worktrees.
@@ -1746,5 +1777,58 @@ mod tests {
         assert_eq!(found[1].path, package);
         assert_eq!(found[2].path, task);
         assert!(found.iter().all(|w| w.bytes > 0), "{found:?}");
+    }
+
+    /// A package run's verification checkout lives under the root's
+    /// artifacts; the sweep finds it beside a root run's.
+    #[test]
+    fn retained_verify_worktrees_include_package_runs() {
+        let (dir, repo) = temp_repo();
+        let state = dir.join("state");
+        let sha = resolve_base(&repo, "HEAD").expect("base");
+        let root = state.join("verify/run-a/verify-base");
+        create_worktree(&repo, &sha, &root).expect("root verify");
+        let package = state.join("runs/run-d/packages/verify/run-d-child/verify-base");
+        create_worktree(&repo, &sha, &package).expect("package verify");
+        let task = state.join("runs/run-d/packages/worktrees/run-d-child/task");
+        create_worktree(&repo, &sha, &task).expect("package task");
+        let found = retained_verify_worktrees(&state).expect("scan");
+        assert_eq!(
+            found
+                .iter()
+                .map(|w| (w.run_id.as_str(), w.path.clone()))
+                .collect::<Vec<_>>(),
+            vec![("run-d-child", package), ("run-a", root)],
+            "{found:?}"
+        );
+    }
+
+    /// A modified and a renamed tracked file are reported as plain
+    /// repo-relative paths, and the checkout is kept.
+    #[test]
+    fn modified_verification_checkouts_report_paths_only() {
+        let (dir, repo) = temp_repo();
+        let sha = resolve_base(&repo, "HEAD").expect("base");
+        let edited = dir.join("state/verify/run-a/verify-base");
+        create_worktree(&repo, &sha, &edited).expect("worktree");
+        std::fs::write(edited.join("file.txt"), "edited\n").expect("edit");
+        assert_eq!(
+            retire_verification(&edited).expect("retire"),
+            VerifyRetirement::Modified {
+                files: vec!["file.txt".to_string()]
+            }
+        );
+        assert!(edited.exists());
+
+        let renamed = dir.join("state/verify/run-b/verify-base");
+        create_worktree(&repo, &sha, &renamed).expect("worktree");
+        git(&renamed, &["mv", "file.txt", "moved.txt"]).expect("mv");
+        assert_eq!(
+            retire_verification(&renamed).expect("retire"),
+            VerifyRetirement::Modified {
+                files: vec!["moved.txt".to_string()]
+            }
+        );
+        assert!(renamed.exists());
     }
 }
