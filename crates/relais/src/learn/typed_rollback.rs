@@ -4,26 +4,33 @@
 //! A recipe that routes a type below the implementation tier is kept only
 //! while its live runs earn it. Over its live runs of one type, counting
 //! only runs that ended with a verdict (an infrastructure stop is unknown
-//! and counted neither way), it is rolled back, through the same
-//! [`Amendment::for_rollback`] `relais recipe rollback` uses, when
+//! and counted neither way), it is due for rollback when
 //!
 //! - the Wilson 95% lower bound of acceptance without escalation is below
 //!   [`MIN_LOWER_BOUND`], or
 //! - its cost per accepted task (every attempt of the research run,
 //!   escalation included) is at or above the type's Sonnet median cost
 //!   of an accepted run, from the drawn arm once it holds
-//!   [`DRAWN_ARM_MIN`] runs, else from the ledger's historical Sonnet
-//!   runs of the type.
+//!   [`DRAWN_ARM_MIN`] runs, else from the ledger's historical runs of the
+//!   type on the implementation tier's model.
 //!
 //! It is checked at [`FIRST_CHECK`] live runs and then every
-//! [`CHECK_EVERY`], each time over the runs up to that checkpoint. Once
-//! rolled back the recipe's effective revision is no longer research, so
-//! the rule has nothing left to say about it: it speaks once.
+//! [`CHECK_EVERY`], each time over the runs up to that checkpoint.
+//!
+//! The rule decides that a rollback is due; it never writes `relais.toml`.
+//! The learn cycle says so in its note, once per recipe revision
+//! ([`unsaid`]), naming the reason and the `relais recipe rollback <name>`
+//! command for the person or the orchestrator to run: that command makes
+//! the amendment ([`crate::learn::promote::Amendment::for_rollback`]).
+//! Once it is applied the recipe's effective revision is no longer
+//! research, and the rule has nothing left to say about it.
+
+use chrono::{DateTime, Utc};
 
 use crate::contract::TaskType;
 use crate::ids::RunId;
 use crate::ledger::{Ledger, LedgerError, LiveRun};
-use crate::policy::{select_highest_enabled_revision, RecipeSpec, RepoPolicy};
+use crate::policy::{select_highest_enabled_revision, RecipeSpec, RepoPolicy, Tier};
 use crate::route::is_typed_research_change;
 use crate::router::stats::{median, wilson, Z95};
 
@@ -141,12 +148,76 @@ pub fn verdict(runs: &[Observed], sonnet_median_micros: Option<i64>) -> Option<R
         .find_map(|checkpoint| judge_window(&runs[..checkpoint], sonnet_median_micros))
 }
 
-/// A promoted typed research recipe the rule rolls back.
+/// A promoted typed research recipe the rule says is due for rollback.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rollback {
     pub name: String,
+    /// The effective revision that is due: what the note is said once for.
+    pub revision: u32,
     pub task_type: TaskType,
     pub reason: Reason,
+}
+
+impl Rollback {
+    /// What the person or the orchestrator runs: it prints the restored
+    /// revision, and with `--write` appends it to `relais.toml`.
+    pub fn command(&self) -> String {
+        format!("relais recipe rollback {}", self.name)
+    }
+
+    /// The learn cycle's note, which begins with [`Self::subject`].
+    pub fn note(&self) -> String {
+        format!(
+            "{} {} runs: {}; run `{}`, then add `--write` to append the restored revision to \
+             relais.toml",
+            self.subject(),
+            self.task_type.as_str(),
+            self.reason,
+            self.command()
+        )
+    }
+
+    /// Names the recipe revision and nothing that changes between cycles,
+    /// so an earlier note that said it is found again. The colon ends it:
+    /// revision 2's subject is not a prefix of revision 20's.
+    fn subject(&self) -> String {
+        format!(
+            "typed rollback due for recipe `{}`@{}:",
+            self.name, self.revision
+        )
+    }
+}
+
+/// The rollbacks in `due` that no earlier learning cycle's note has said:
+/// a recipe revision's rollback is said once, not on every cycle.
+pub fn unsaid(ledger: &Ledger, due: Vec<Rollback>) -> Result<Vec<Rollback>, LedgerError> {
+    if due.is_empty() {
+        return Ok(due);
+    }
+    let notes: Vec<String> = ledger
+        .learning_cycles()?
+        .into_iter()
+        .filter_map(|row| row.note)
+        .collect();
+    Ok(due
+        .into_iter()
+        .filter(|rollback| {
+            let subject = rollback.subject();
+            !notes.iter().any(|note| note.contains(&subject))
+        })
+        .collect())
+}
+
+/// A stamp the ledger wrote, as an instant. Stamps are compared as times,
+/// never as text: `Z` and `+00:00`, or a fractional second against none,
+/// order differently as strings than as times.
+fn instant(what: &str, stamp: &str) -> Result<DateTime<Utc>, LedgerError> {
+    DateTime::parse_from_rfc3339(stamp)
+        .map(|at| at.with_timezone(&Utc))
+        .map_err(|e| LedgerError::Corrupt {
+            what: what.into(),
+            detail: format!("`{stamp}` is not an RFC3339 timestamp: {e}"),
+        })
 }
 
 /// The recipes of `repo` whose effective revision is a typed research
@@ -169,8 +240,11 @@ fn promoted(repo: &RepoPolicy) -> Vec<&RecipeSpec> {
 /// the ledger has no verdict for it (an infrastructure stop, in flight).
 pub type Verdict<'a> = &'a dyn Fn(&RunId) -> Result<Option<bool>, LedgerError>;
 
-/// Every promoted typed research recipe in `repo` that the rule rolls
-/// back, from the live runs in `ledger`. `ended` says how a run ended.
+/// Every promoted typed research recipe in `repo` that the rule says is
+/// due for rollback, from the live runs in `ledger`. `ended` says how a
+/// run ended. The Sonnet history is the type's implementation-tier runs on
+/// the policy's implementation model: a run on another model is not
+/// Sonnet's cost.
 pub fn due_rollbacks(
     ledger: &Ledger,
     repo: &RepoPolicy,
@@ -180,6 +254,10 @@ pub fn due_rollbacks(
     if specs.is_empty() {
         return Ok(Vec::new());
     }
+    let sonnet = repo
+        .models
+        .get(&Tier::Implementation)
+        .map(|profile| profile.id.as_str());
     let live = ledger.live_runs_with_first_intent("")?;
     let observe = |run: &RunId| -> Result<Option<Observed>, LedgerError> {
         let Some(accepted) = ended(run)? else {
@@ -193,11 +271,13 @@ pub fn due_rollbacks(
     let mut due = Vec::new();
     for spec in specs {
         let recipe_id = spec.recipe_id();
-        let since = ledger
-            .recipe_promotions(&recipe_id)?
-            .last()
-            .map(|promotion| promotion.promoted_at.clone())
-            .unwrap_or_default();
+        let since = match ledger.recipe_promotions(&recipe_id)?.last() {
+            Some(promotion) => Some(instant(
+                "a recipe promotion's promoted_at",
+                &promotion.promoted_at,
+            )?),
+            None => None,
+        };
         for task_type in &spec.task_type {
             let mut research = Vec::new();
             let mut drawn = Vec::new();
@@ -217,12 +297,19 @@ pub fn due_rollbacks(
                 let tier = intent.get("tier").and_then(|tier| tier.as_str());
                 let by_recipe = intent.get("recipe_id").and_then(|id| id.as_str());
                 if tier == Some("research") && by_recipe == Some(recipe_id.as_str()) {
-                    if *created_at >= since {
+                    let after_promotion = match since {
+                        Some(since) => instant("a run's created_at", created_at)? >= since,
+                        None => true,
+                    };
+                    if after_promotion {
                         research.extend(observe(run)?);
                     }
                 } else if tier == Some("implementation") {
                     let observed = observe(run)?;
-                    historical.extend(observed);
+                    let model = intent.get("model").and_then(|model| model.as_str());
+                    if sonnet.is_some() && model == sonnet {
+                        historical.extend(observed);
+                    }
                     if intent["task_type_draw"]["drawn"] == true {
                         drawn.extend(observed);
                     }
@@ -231,6 +318,7 @@ pub fn due_rollbacks(
             if let Some(reason) = verdict(&research, sonnet_median(&drawn, &historical)) {
                 due.push(Rollback {
                     name: spec.name.clone(),
+                    revision: spec.revision,
                     task_type: *task_type,
                     reason,
                 });
@@ -385,13 +473,39 @@ tier = "research"
 
     impl World {
         fn new() -> Self {
+            Self::on_clock(Box::new(crate::ledger::SystemClock))
+        }
+
+        /// A world whose ledger stamps every row from `clock`.
+        fn on_clock(clock: Box<dyn crate::ledger::Clock>) -> Self {
             let dir = crate::test_support::short_temp_dir("typed-rollback");
             Self {
-                ledger: Ledger::open(&dir.join("ledger.sqlite")).expect("ledger"),
+                ledger: Ledger::open_with_clock(&dir.join("ledger.sqlite"), clock).expect("ledger"),
                 repo: RepoPolicy::from_toml_str(POLICY).expect("policy parses"),
                 count: 0,
                 _dir: dir,
             }
+        }
+
+        /// Record a promotion of `recipe` stamped `at`, through a second
+        /// connection on the same ledger file with its own clock.
+        fn promoted_at(&self, recipe: usize, at: &str) {
+            let other = Ledger::open_with_clock(
+                &self._dir.join("ledger.sqlite"),
+                Box::new(crate::ledger::FixedClock::new([at])),
+            )
+            .expect("second connection");
+            let spec = &self.repo.recipes[recipe];
+            other
+                .record_recipe_promotion(&crate::ledger::NewRecipePromotion {
+                    recipe_id: &spec.recipe_id(),
+                    recipe_name: &spec.name,
+                    revision: spec.revision,
+                    task_type: spec.task_type[0].as_str(),
+                    gate: "typed-research",
+                    trial_ids: &[],
+                })
+                .expect("promotion");
         }
 
         fn recipe_id(&self, index: usize) -> String {
@@ -399,7 +513,8 @@ tier = "research"
         }
 
         /// A live run of `task_type`, named by how it ended (`ok`, `bad`,
-        /// `infra`), first dispatched at `tier` under `recipe_id`.
+        /// `infra`), first dispatched at `tier` under `recipe_id`, on the
+        /// policy's model for that tier.
         fn run(
             &mut self,
             outcome: &str,
@@ -407,6 +522,29 @@ tier = "research"
             tier: &str,
             recipe_id: &str,
             drawn: bool,
+            cost: i64,
+        ) {
+            let model = if tier == "research" {
+                "haiku"
+            } else {
+                "sonnet"
+            };
+            let intent = serde_json::json!({
+                "tier": tier,
+                "recipe_id": recipe_id,
+                "model": model,
+                "task_type_draw": drawn.then(|| serde_json::json!({ "drawn": true })),
+            });
+            self.run_with_intent(outcome, task_type, &intent, cost);
+        }
+
+        /// A live run of `task_type`, named by how it ended, whose first
+        /// dispatch intent is `intent`.
+        fn run_with_intent(
+            &mut self,
+            outcome: &str,
+            task_type: TaskType,
+            intent: &serde_json::Value,
             cost: i64,
         ) {
             self.count += 1;
@@ -421,11 +559,7 @@ tier = "research"
                     &DispatchId::from_stored(format!("d-{name}")),
                     &run,
                     None,
-                    &serde_json::json!({
-                        "tier": tier,
-                        "recipe_id": recipe_id,
-                        "task_type_draw": drawn.then(|| serde_json::json!({ "drawn": true })),
-                    }),
+                    intent,
                     0,
                     crate::route::RoutedBy::DeterministicRecipe,
                 )
@@ -556,5 +690,95 @@ tier = "research"
         w.research(2, TaskType::Ui, [20, 0, 0], 100);
         w.run("ok", TaskType::Infra, "implementation", &rev1, false, 1);
         assert_eq!(w.due(), Vec::new());
+    }
+
+    #[test]
+    fn the_history_is_read_on_the_implementation_model_only() {
+        let mut w = World::new();
+        w.research(2, TaskType::Ui, [20, 0, 0], 100);
+        let rev1 = w.recipe_id(0);
+        for _ in 0..3 {
+            w.run("ok", TaskType::Ui, "implementation", &rev1, false, 100);
+        }
+        // Five implementation-tier runs on another model at 1000 would
+        // move a model-blind median to 1000 and keep the recipe.
+        let other_model = serde_json::json!({
+            "tier": "implementation",
+            "recipe_id": rev1,
+            "model": "opus",
+        });
+        for _ in 0..5 {
+            w.run_with_intent("ok", TaskType::Ui, &other_model, 1000);
+        }
+        let due = w.due();
+        assert_eq!(due.len(), 1);
+        assert!(matches!(
+            due[0].reason,
+            Reason::CostNotBelowSonnet {
+                sonnet_median_micros: 100,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn promotion_and_run_stamps_are_compared_as_times_not_text() {
+        // As text, `10:00:00.5+00:00` sorts before `10:00:00Z`; as times
+        // the runs come half a second after the promotion and count.
+        let mut w = World::on_clock(Box::new(crate::ledger::FixedClock::new([
+            "2026-10-14T10:00:00.5+00:00",
+        ])));
+        w.promoted_at(2, "2026-10-14T10:00:00Z");
+        w.research(2, TaskType::Ui, [0, 20, 0], 1);
+        assert_eq!(w.due().len(), 1, "runs after the promotion count");
+        // The same runs a second before a later promotion do not.
+        let mut w = World::on_clock(Box::new(crate::ledger::FixedClock::new([
+            "2026-10-14T10:00:00.5+00:00",
+        ])));
+        w.promoted_at(2, "2026-10-14T10:00:01Z");
+        w.research(2, TaskType::Ui, [0, 20, 0], 1);
+        assert_eq!(w.due(), Vec::new(), "runs before the promotion do not");
+    }
+
+    #[test]
+    fn a_due_rollback_is_said_once_per_recipe_revision_with_its_command() {
+        let mut w = World::new();
+        w.research(2, TaskType::Ui, [10, 10, 0], 1);
+        let due = w.due();
+        let [rollback] = due.as_slice() else {
+            panic!("one rollback: {due:?}")
+        };
+        let note = rollback.note();
+        assert!(
+            note.starts_with("typed rollback due for recipe `change-ui`@2: ui runs: 10 of 20"),
+            "{note}"
+        );
+        assert!(
+            note.contains("`relais recipe rollback change-ui`"),
+            "{note}"
+        );
+        assert_eq!(unsaid(&w.ledger, due.clone()).expect("reads"), due);
+        // A cycle row whose note said it, among other notes.
+        let cycle = w.ledger.begin_learning_cycle().expect("begin");
+        w.ledger
+            .finish_learning_cycle(
+                cycle,
+                &crate::ledger::LearningCycleFinish {
+                    note: Some(format!("something else; {note}")),
+                    ..Default::default()
+                },
+            )
+            .expect("finish");
+        assert_eq!(unsaid(&w.ledger, due.clone()).expect("reads"), Vec::new());
+        // Another revision of the same recipe is said afresh; revision 2's
+        // note is not revision 20's.
+        let later = Rollback {
+            revision: 20,
+            ..rollback.clone()
+        };
+        assert_eq!(
+            unsaid(&w.ledger, vec![later.clone()]).expect("reads"),
+            vec![later]
+        );
     }
 }

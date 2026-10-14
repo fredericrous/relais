@@ -385,10 +385,6 @@ pub struct CycleInputs<'a> {
     pub ledger: &'a Ledger,
     pub registry: &'a Registry,
     pub repo: &'a RepoPolicy,
-    /// The repository's `relais.toml`, where a rolled-back typed research
-    /// recipe's restored revision is appended; `None` when none was
-    /// located, and the cycle then only says the rollback is wanted.
-    pub recipes_file: Option<PathBuf>,
     pub datasets_dir: &'a Path,
     pub gates: GateSettings,
     /// The `[learning]` envelope is recorded: promote on passing gates.
@@ -750,42 +746,6 @@ pub fn active_artifact_verdict(
     Ok(active_artifact_check(ledger, registry)?.reason)
 }
 
-/// Roll a typed research recipe back through the amendment `relais recipe
-/// rollback --write` makes, and say what happened in one sentence.
-fn roll_back_recipe(
-    inputs: &CycleInputs<'_>,
-    rollback: &super::typed_rollback::Rollback,
-) -> String {
-    let said = format!(
-        "recipe `{}` ({}): {}",
-        rollback.name,
-        rollback.task_type.as_str(),
-        rollback.reason
-    );
-    let Some(path) = &inputs.recipes_file else {
-        return format!("{said}; rollback wanted but no relais.toml was located");
-    };
-    let appended = (|| -> Result<(), String> {
-        let subject = path.display().to_string();
-        let amendment = super::promote::Amendment::for_rollback(inputs.repo, &rollback.name)
-            .map_err(|e| e.to_string())?;
-        let existing = std::fs::read_to_string(path).map_err(|e| format!("{subject}: {e}"))?;
-        let appendix = amendment
-            .appendix(&existing, &subject)
-            .map_err(|e| e.to_string())?;
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(path)
-            .map_err(|e| format!("{subject}: {e}"))?;
-        std::io::Write::write_all(&mut file, appendix.as_bytes())
-            .map_err(|e| format!("{subject}: {e}"))
-    })();
-    match appended {
-        Ok(()) => format!("{said}; rolled back, a restored revision was appended to relais.toml"),
-        Err(why) => format!("{said}; rollback wanted but not written: {why}"),
-    }
-}
-
 /// Run one cycle. The caller holds the Training lease and has decided the
 /// cycle is wanted; this opens the row, closes the ones a dead process left,
 /// and never leaves its own row unfinished unless the process is killed.
@@ -863,7 +823,9 @@ fn cycle_body(
     let registry = inputs.registry;
 
     // A promoted typed research recipe that its live runs have not earned
-    // is returned to the revision below it, before anything else.
+    // is due for rollback. The cycle never writes relais.toml: its note
+    // says so once per recipe revision, with the reason and the command
+    // the person or the orchestrator runs.
     let ended = |run: &RunId| -> Result<Option<bool>, LedgerError> {
         Ok(match routed_outcome(ledger, run)? {
             RoutedOutcome::Accepted => Some(true),
@@ -871,8 +833,9 @@ fn cycle_body(
             RoutedOutcome::Unlabelled => None,
         })
     };
-    for rollback in super::typed_rollback::due_rollbacks(ledger, inputs.repo, &ended)? {
-        add_note(report, roll_back_recipe(inputs, &rollback));
+    let due = super::typed_rollback::due_rollbacks(ledger, inputs.repo, &ended)?;
+    for rollback in super::typed_rollback::unsaid(ledger, due)? {
+        add_note(report, rollback.note());
     }
 
     // The active artifact is judged first: a regression is acted on before
@@ -1317,7 +1280,6 @@ argv = ["true"]
                 ledger: &self.ledger,
                 registry: &self.registry,
                 repo,
-                recipes_file: None,
                 datasets_dir: &self.datasets,
                 gates: GateSettings {
                     quality_floor: 0.75,
@@ -1952,34 +1914,74 @@ tier = "research"
 "#;
 
     #[test]
-    fn a_wanted_typed_rollback_is_appended_to_relais_toml_through_the_amendment() {
+    fn a_due_typed_rollback_is_said_once_and_never_written() {
         let world = World::new("typed-rollback");
         let repo = RepoPolicy::from_toml_str(TYPED_POLICY).expect("policy");
-        let rollback = super::super::typed_rollback::Rollback {
-            name: "change-ui".into(),
-            task_type: crate::contract::TaskType::Ui,
-            reason: super::super::typed_rollback::Reason::LowAcceptance {
-                accepted: 10,
-                runs: 20,
-                lower: 0.3,
-            },
+        let research = repo.recipes[1].recipe_id();
+        // Twenty live research runs of ui that failed: 0 of 20.
+        for index in 0..20 {
+            let name = format!("haiku-{index}");
+            let run = RunId::from_stored(&name);
+            world
+                .ledger
+                .insert_typed_run(
+                    &run,
+                    "/r",
+                    None,
+                    &TaskId::from_stored(format!("task-{name}")),
+                    "rk",
+                    Some(crate::contract::TaskType::Ui),
+                )
+                .expect("run");
+            world
+                .ledger
+                .record_dispatch_intent(
+                    &DispatchId::from_stored(format!("d-{name}")),
+                    &run,
+                    None,
+                    &serde_json::json!({
+                        "tier": "research",
+                        "recipe_id": research,
+                        "model": "haiku",
+                    }),
+                    0,
+                    RoutedBy::DeterministicRecipe,
+                )
+                .expect("dispatch");
+            world.ended(&name, State::Failed);
+        }
+        let said = |report: &CycleReport| {
+            report
+                .note
+                .as_deref()
+                .unwrap_or_default()
+                .matches("typed rollback due")
+                .count()
         };
-        // Without a located file the cycle says it is wanted and writes nothing.
-        let unwritten = roll_back_recipe(&world.inputs(&repo, false), &rollback);
-        assert!(unwritten.contains("rollback wanted"), "{unwritten}");
-        let file = world._dir.join("relais.toml");
-        std::fs::write(&file, TYPED_POLICY).expect("toml");
-        let mut inputs = world.inputs(&repo, false);
-        inputs.recipes_file = Some(file.clone());
-        let said = roll_back_recipe(&inputs, &rollback);
-        assert!(said.contains("rolled back"), "{said}");
-        let after =
-            RepoPolicy::from_toml_str(&std::fs::read_to_string(&file).unwrap()).expect("parses");
-        let effective = crate::policy::select_highest_enabled_revision(&after.recipes, |r| {
-            r.name == "change-ui"
-        })
-        .expect("a revision");
-        assert_eq!(effective.revision, 3);
-        assert_eq!(effective.tier, crate::policy::Tier::Implementation);
+        let first = run_cycle(&world.inputs(&repo, false), &mut silent()).expect("cycle");
+        let note = first.note.clone().unwrap_or_default();
+        assert_eq!(said(&first), 1, "{note}");
+        assert!(
+            note.contains("recipe `change-ui`@2: ui runs: 0 of 20 live runs"),
+            "{note}"
+        );
+        assert!(
+            note.contains("`relais recipe rollback change-ui`"),
+            "{note}"
+        );
+        // The next cycle finds it said and says nothing more.
+        let second = run_cycle(&world.inputs(&repo, false), &mut silent()).expect("cycle");
+        assert_eq!(said(&second), 0, "{:?}", second.note);
+        // The cycle applied nothing: the rollback stays due until the
+        // command is run.
+        let ended = |run: &RunId| -> Result<Option<bool>, LedgerError> {
+            Ok(match routed_outcome(&world.ledger, run)? {
+                RoutedOutcome::Accepted => Some(true),
+                _ => Some(false),
+            })
+        };
+        let due = super::super::typed_rollback::due_rollbacks(&world.ledger, &repo, &ended)
+            .expect("reads");
+        assert_eq!(due.len(), 1);
     }
 }

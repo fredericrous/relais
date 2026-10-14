@@ -23,8 +23,12 @@
 //! 15 qualifying trials and never earlier, so a run of successes cannot be
 //! stopped on while it is ahead; later trials do not move it.
 //!
-//! A trial's recorded outcome is taken as is: ground-truth judgement of a
-//! rejected replay (plan D9) is not in the ledger yet.
+//! A trial's recorded outcome is taken as is ([`judge`]).
+//!
+//! holds-until: ground-truth verdicts of rejected replays (plan D9) are
+//! stored on the trial row; until then a review-rejected replay counts as a
+//! failure even when the source Sonnet code has the same defect, so a
+//! type's count can understate Haiku.
 
 use crate::contract::TaskType;
 use crate::ids::{TaskId, TrialId};
@@ -88,6 +92,10 @@ pub fn judge(
     if !in_arm || !research_first {
         return Judgement::NotCounted;
     }
+    // holds-until: ground-truth verdicts of rejected replays (plan D9) are
+    // stored on the trial row; until then a review-rejected replay counts
+    // as a failure even when the source Sonnet code has the same defect,
+    // so a type's count can understate Haiku.
     match (trial.outcome, trial.accepted_without_escalation) {
         (Some(TrialOutcome::Accepted), Some(true)) => Judgement::Success,
         (Some(TrialOutcome::Accepted), Some(false)) | (Some(TrialOutcome::Rejected), _) => {
@@ -331,14 +339,10 @@ tier = "research"
         without_escalation: bool,
     }
 
-    impl World {
-        fn recipe_id(&self, index: usize) -> String {
-            self.candidate.recipes[index].recipe_id()
-        }
-
-        /// The plain candidate `change-feature` rev 2 and its settled
-        /// trial on `task-<n>`: a qualifying success unless `tweak` moves it.
-        fn trial(&self, n: usize, tweak: impl FnOnce(&mut Spec)) {
+    impl Spec {
+        /// The plain candidate `change-feature` rev 2: a qualifying
+        /// success unless `tweak` moves it.
+        fn tweaked(tweak: impl FnOnce(&mut Spec)) -> Spec {
             let mut spec = Spec {
                 recipe: 3,
                 task_type: TaskType::Feature,
@@ -348,13 +352,38 @@ tier = "research"
                 without_escalation: true,
             };
             tweak(&mut spec);
+            spec
+        }
+    }
+
+    impl World {
+        fn recipe_id(&self, index: usize) -> String {
+            self.candidate.recipes[index].recipe_id()
+        }
+
+        /// The plain candidate `change-feature` rev 2 and its settled
+        /// trial on `task-<n>`: a qualifying success unless `tweak` moves it.
+        fn trial(&self, n: usize, tweak: impl FnOnce(&mut Spec)) {
+            let spec = Spec::tweaked(tweak);
             let task = TaskId::from_stored(format!("task-{n}"));
             let source = RunId::from_stored(format!("source-{n}"));
             self.ledger
                 .insert_typed_run(&source, "/r", None, &task, "rk", Some(spec.task_type))
                 .expect("task");
-            let trial_id = TrialId::from_stored(format!("trial-{n:03}"));
-            let arm_run = RunId::from_stored(format!("arm-{n}"));
+            self.settled(n, &format!("{n:03}"), &spec);
+        }
+
+        /// Another settled trial `trial-<id>` of the task `trial(n, ..)`
+        /// already made, recorded after every trial before it.
+        fn retrial(&self, n: usize, id: &str, tweak: impl FnOnce(&mut Spec)) {
+            self.settled(n, id, &Spec::tweaked(tweak));
+        }
+
+        fn settled(&self, n: usize, id: &str, spec: &Spec) {
+            let task = TaskId::from_stored(format!("task-{n}"));
+            let source = RunId::from_stored(format!("source-{n}"));
+            let trial_id = TrialId::from_stored(format!("trial-{id}"));
+            let arm_run = RunId::from_stored(format!("arm-{id}"));
             let arm = self.recipe_id(spec.recipe);
             self.ledger
                 .insert_replay_trial(&NewReplayTrial {
@@ -373,7 +402,7 @@ tier = "research"
                 .expect("trial");
             self.ledger
                 .record_dispatch_intent(
-                    &crate::ids::DispatchId::from_stored(format!("d-{n}")),
+                    &crate::ids::DispatchId::from_stored(format!("d-{id}")),
                     &arm_run,
                     None,
                     &serde_json::json!({ "model": spec.model }),
@@ -485,18 +514,33 @@ tier = "research"
     }
 
     #[test]
-    fn a_task_counts_once() {
+    fn a_task_counts_once_by_its_earliest_qualifying_trial() {
         let w = world();
-        w.qualifying(0, 14, 0);
-        // A second qualifying trial of task-0 adds nothing.
-        let again = w.recipe_id(3);
-        let first = w
-            .ledger
-            .trials_by_task(&TaskId::from_stored("task-0"))
-            .expect("trials");
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].arm_recipe_id, again);
-        assert_eq!(w.count().qualifying, 14);
+        w.qualifying(0, 15, 0);
+        // A later qualifying trial of task-0 that failed: the earlier
+        // success decides the task, and the failure is not counted.
+        w.retrial(0, "900", |spec| {
+            spec.outcome = TrialOutcome::Rejected;
+            spec.without_escalation = false;
+        });
+        assert_eq!(
+            w.ledger
+                .trials_by_task(&TaskId::from_stored("task-0"))
+                .expect("trials")
+                .len(),
+            2
+        );
+        assert_eq!(
+            w.count(),
+            TypedGateCount {
+                qualifying: 15,
+                accepted: 15
+            }
+        );
+        let assessment = assess(&w.ledger, &w.incumbent, &w.candidate).expect("reads");
+        let counted = &assessment.authorisations[0].trial_ids;
+        assert!(counted.contains(&TrialId::from_stored("trial-000")));
+        assert!(!counted.contains(&TrialId::from_stored("trial-900")));
     }
 
     /// Fourteen real successes plus one trial that must not be the
