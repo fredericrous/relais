@@ -458,6 +458,7 @@ mod tests {
     }
 
     /// A fake `claude` that answers `--version` only after `delay`.
+    #[cfg(unix)]
     fn fake_claude(dir: &Path, script: &str) -> ClaudeBackend {
         use std::os::unix::fs::PermissionsExt;
         let binary = dir.join("claude");
@@ -472,6 +473,7 @@ mod tests {
     }
 
     /// A fake `claude` that never answers in time, counting its starts.
+    #[cfg(unix)]
     fn slow_claude(dir: &Path, count: &Path) -> ClaudeBackend {
         fake_claude(
             dir,
@@ -482,6 +484,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     fn starts(count: &Path) -> usize {
         std::fs::read_to_string(count)
             .expect("count")
@@ -489,6 +492,7 @@ mod tests {
             .count()
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_probe_that_times_out_is_typed_and_stands_until_the_retry() {
         let dir = crate::test_support::temp_dir("claude-slow");
@@ -509,6 +513,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_probe_that_timed_out_is_asked_again_after_the_retry() {
         let dir = crate::test_support::temp_dir("claude-slow-retry");
@@ -521,6 +526,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_probe_that_fails_otherwise_is_cached() {
         let dir = crate::test_support::temp_dir("claude-exit1");
