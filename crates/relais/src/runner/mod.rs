@@ -2350,19 +2350,21 @@ impl<'a> RunEngine<'a> {
         let cache_refused = toolchain.err();
         let cacheable = authority.verification_profile.cache_baseline;
         let cached = match (cacheable, &baseline_key) {
-            (true, Some(key)) => baseline_cache.get(key),
+            (true, Some(key)) => baseline_cache.get(key, &logs_dir),
             _ => None,
         };
         let was_cached = cached.is_some();
         // The baseline's check outcomes are kept: a candidate identical to
         // the base has exactly these results, without re-running them.
         let (failures, checks) = match cached {
-            // holds-until: the cache stores failed labels only, so a hit
-            // cannot reuse the base's check outcomes for a candidate that
-            // carries the base tree (the candidate's checks run again, which
-            // costs time and never a verdict). It ends when the cache keeps
-            // the outcomes, which needs them serializable (ADR-0008).
-            Some(failures) => (failures, None),
+            // A hit that kept the outcomes has written their logs into this
+            // run's `logs/`: they are this run's evidence like any check's.
+            Some(hit) => {
+                if let Some(checks) = &hit.checks {
+                    self.record_logs(None, EvidenceKind::CheckLog, checks)?;
+                }
+                (hit.failures, hit.checks)
+            }
             None => match verify::verification_worktree(
                 self.config.git,
                 self.config.repo_dir,
@@ -2461,7 +2463,17 @@ impl<'a> RunEngine<'a> {
                         .map(|outcome| outcome.label.clone())
                         .collect();
                     if let (true, Some(key)) = (cacheable, &baseline_key) {
-                        baseline_cache.put(key, &failures);
+                        if let verify::Stored::FailuresOnly { bytes } =
+                            baseline_cache.put(key, &failures, &checks)
+                        {
+                            self.events.emit(Event::Decision {
+                                what: "baseline_cache_outcomes_skipped".into(),
+                                reason: format!(
+                                    "the base's logs came to {} MiB; only its failed checks are cached",
+                                    bytes / (1024 * 1024)
+                                ),
+                            });
+                        }
                     }
                     if let Err(e) = baseline.release() {
                         // Best effort: the verdict is already in hand and
@@ -8784,6 +8796,24 @@ mod tests {
             "a green base fills the cache: {first:?}"
         );
         std::fs::write(&flag, "red").expect("flag");
+        // A cache hit now keeps the base's outcomes, and an identical
+        // candidate reuses them instead of re-running (ADR-0009). The
+        // entry an over-limit base leaves keeps its failures alone, so the
+        // candidate is measured by running its checks, which is the path
+        // this test pins: strip the outcomes from the entry.
+        let cache = fixture
+            .artifacts
+            .parent()
+            .expect("state dir")
+            .join("baseline-cache");
+        let entries: Vec<_> = std::fs::read_dir(&cache)
+            .expect("cache")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .collect();
+        assert_eq!(entries.len(), 1, "one entry from the first run");
+        std::fs::write(&entries[0], r#"{"failures":[],"outcomes":null}"#).expect("strip");
         let launches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = std::sync::Arc::clone(&launches);
         let counting = MockBackend::new(move |_| {
@@ -9288,6 +9318,98 @@ mod tests {
                 .any(|row| row.kind == EvidenceKind::WorkerResult),
             "{evidence:?}"
         );
+        std::fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// The base's check outcomes survive in the cache (ADR-0009): a second
+    /// inspect run reads them, so its identical candidate needs no worktree
+    /// and no re-run, and the logs it cites are its own copies with the hash
+    /// the first run recorded.
+    #[test]
+    fn a_cache_hit_keeps_the_bases_outcomes_for_an_identical_candidate() {
+        let fixture = Fixture::new();
+        let shell = if cfg!(windows) { "sh" } else { "bash" };
+        let mut repo = fixture.repo_policy(
+            vec![CommandSpec {
+                name: None,
+                junit: None,
+                reuse: None,
+                argv: vec![shell.into(), "-c".into(), "true".into()],
+                timeout_seconds: 30,
+            }],
+            3,
+        );
+        repo.verification
+            .profiles
+            .get_mut("profile")
+            .expect("profile")
+            .cache_baseline = true;
+        let (backend, _) =
+            inspecting_backend("REPORT: nothing to change", "[1] met: read the code");
+        let contract = TaskContract::from_json_str(
+            &serde_json::json!({
+                "schema_version": 1,
+                "kind": "inspect",
+                "objective": "Say whether anything needs changing",
+                "base_ref": "HEAD",
+                "acceptance": ["evidence that nothing needs changing"],
+                "verification_profile": "profile",
+            })
+            .to_string(),
+        )
+        .expect("contract");
+
+        let RunOutcome {
+            run_id: first_id,
+            terminal: Terminal::Accepted(first),
+        } = fixture.execute(&contract, &repo, &backend)
+        else {
+            panic!("first run");
+        };
+        assert!(
+            !first.verification.baseline_cached,
+            "the first run fills the cache"
+        );
+
+        let RunOutcome {
+            run_id: second_id,
+            terminal: Terminal::Accepted(second),
+        } = fixture.execute(&contract, &repo, &backend)
+        else {
+            panic!("second run");
+        };
+        assert!(
+            second.verification.baseline_cached,
+            "the second run reads it"
+        );
+        assert!(
+            !fixture.verify_dir(&second_id).join("verify-1").exists(),
+            "an identical candidate re-ran nothing, also on a hit"
+        );
+        let check = &second.verification.checks[0];
+        let own_logs = fixture.artifacts.join(second_id.as_str()).join("logs");
+        assert!(
+            Path::new(&check.log_path).starts_with(&own_logs),
+            "{} is not under {}",
+            check.log_path,
+            own_logs.display()
+        );
+        assert_eq!(
+            check.log_sha256, first.verification.checks[0].log_sha256,
+            "the log is the one the first run recorded"
+        );
+        assert_eq!(
+            crate::ids::sha256_hex(&std::fs::read(&check.log_path).expect("the copy exists")),
+            check.log_sha256
+        );
+        let evidence = fixture.ledger.evidence(&second_id).expect("evidence");
+        assert!(
+            evidence
+                .iter()
+                .any(|row| row.kind == EvidenceKind::CheckLog),
+            "the second run records the base's logs as its own evidence: {evidence:?}"
+        );
+        assert_ne!(first_id, second_id);
         std::fs::remove_dir_all(&fixture.dir).ok();
     }
 
