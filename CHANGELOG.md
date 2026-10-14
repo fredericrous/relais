@@ -8,6 +8,10 @@ missing here.
 
 ## Unreleased
 
+## v0.21.0
+
+Typed recipes can now be promoted on replay evidence (#242, relais ADR-0006): a research-tier `change` recipe that names task types is promoted only on 14 of its first 15 qualifying replays, a seeded 10% of a promoted type's live runs still go to the implementation tier, and the learn cycle says (never writes) when a promoted type should be rolled back. `relais dataset judge-trial` records a ground-truth verdict on a review-rejected replay, which the gate reads (#243). Ledger step v32 adds the verdict columns. No recipe is promoted by this release.
+
 `relais dataset judge-trial <TRIAL_ID> --verdict pass|fail --note <TEXT> [--json]` stores a ground-truth verdict on a review-rejected replay trial (ledger schema version 32, additive: three nullable `trials` columns; a binary from before it cannot read the upgraded ledger). It refuses, exit 2 and writing nothing, an unknown trial, a trial that was not rejected, an empty note, and a trial already judged the other way; the same verdict again is a no-op. The typed-research gate now counts a rejected replay judged `pass` as accepted, so a type's count no longer understates Haiku when the source Sonnet code has the same defect; `fail` and no verdict still count as a failure, and a verdict changes no other outcome. `relais report --by task-type` shows the count on its replay line (`--json`: `accepted_by_ground_truth`).
 
 A mandatory typed-research gate now sits in the promotion path: `relais recipe promote` (and `recipe evaluate`) admits a research-tier `change` recipe that names task types only when, recomputed from qualifying trials alone (that recipe id, that task type, that arm, the research model dispatched first; invalid and errored trials count neither way), at least 14 of the first 15 were accepted without escalation. A refusal names the gate, the qualifying count and the bar, and `--write` records the authorising trial ids in the ledger (schema version 31, so a v0.20.0 binary cannot read the upgraded ledger).
