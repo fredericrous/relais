@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+A mandatory typed-research gate now sits in the promotion path: `relais recipe promote` (and `recipe evaluate`) admits a research-tier `change` recipe that names task types only when, recomputed from qualifying trials alone (that recipe id, that task type, that arm, the research model dispatched first; invalid and errored trials count neither way), at least 14 of the first 15 were accepted without escalation. A refusal names the gate, the qualifying count and the bar, and `--write` records the authorising trial ids in the ledger (schema version 31, so a v0.20.0 binary cannot read the upgraded ledger).
+
 ## v0.20.1
 
 Fixes the release build of v0.20.0 (#239), which never published: the copy-on-write clone call was typed for glibc and did not compile for `x86_64-unknown-linux-musl`. v0.20.0 was tagged and its release workflow failed before publishing anything, so v0.20.1 is the first release with local workspace reuse; read the v0.20.0 notes below for what it brings. It also carries #240.

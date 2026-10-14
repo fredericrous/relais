@@ -7,7 +7,10 @@
 //! stays append-only, as `route::validate_candidate` already demands of a
 //! candidate. Adding a change is gated: [`Amendment::for_promotion`]
 //! takes a [`Promotable`], which only [`ComparisonReport::promotable`]
-//! can hand out. Removing one is not: [`Amendment::for_rollback`] appends
+//! can hand out, and the typed-research gate's evidence
+//! ([`super::typed_gate`]): a research-tier `change` recipe is added only
+//! when that gate's recomputed count meets its bar, whatever the generic
+//! comparison says. Removing one is not: [`Amendment::for_rollback`] appends
 //! a new revision that repeats an older one, and needs no evaluation.
 //!
 //! Nothing here reads a machine file, issues a trust grant, or runs
@@ -17,6 +20,7 @@
 use std::fmt;
 
 use crate::policy::{select_highest_enabled_revision, PolicyError, RecipeSpec, RepoPolicy};
+use crate::route::{is_typed_research_change, TypedGateCount, TypedGateEvidence};
 
 use super::comparison::{ComparisonReport, GateFailure, Promotable};
 
@@ -71,6 +75,29 @@ pub fn admit(report: &ComparisonReport, subject: &str) -> Result<Promotable, Pro
     })
 }
 
+/// Every typed research-tier `change` among `added` must meet the
+/// typed-research gate's bar, by the count the gate recomputed for it.
+/// The generic comparison's proof never stands in for this.
+fn check_typed_gate(
+    added: &[RecipeSpec],
+    typed_gate: &TypedGateEvidence,
+) -> Result<(), AmendError> {
+    for recipe in added
+        .iter()
+        .filter(|recipe| is_typed_research_change(recipe))
+    {
+        let count = typed_gate.count_of(&recipe.name, recipe.revision);
+        if !count.passes() {
+            return Err(AmendError::TypedResearchGate {
+                name: recipe.name.clone(),
+                revision: recipe.revision,
+                count,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Why an amendment could not be built or appended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AmendError {
@@ -78,6 +105,13 @@ pub enum AmendError {
     NothingAdded { subject: String },
     /// No recipe carries the name; `known` is every name that exists.
     UnknownRecipe { name: String, known: Vec<String> },
+    /// An added recipe is a typed research-tier `change` and the
+    /// typed-research gate's count for it does not meet the bar.
+    TypedResearchGate {
+        name: String,
+        revision: u32,
+        count: TypedGateCount,
+    },
     /// Rollback needs a revision below the effective one to restore.
     TooFewRevisions { name: String, revisions: Vec<u32> },
     /// Every revision of the recipe is disabled, so none is effective.
@@ -107,7 +141,7 @@ impl AmendError {
             | Self::TooFewRevisions { .. }
             | Self::NoEffectiveRevision { .. }
             | Self::NothingBelow { .. } => Operation::Rollback,
-            Self::NothingAdded { .. } => Operation::Promote,
+            Self::NothingAdded { .. } | Self::TypedResearchGate { .. } => Operation::Promote,
             Self::Render { operation, .. } | Self::NotAppendable { operation, .. } => *operation,
         }
     }
@@ -130,6 +164,11 @@ impl fmt::Display for AmendError {
                 "{operation}: {subject} adds no recipe revision the repository does not already \
                  declare"
             ),
+            Self::TypedResearchGate {
+                name,
+                revision,
+                count,
+            } => write!(f, "{operation}: {}", count.refusal(name, *revision)),
             Self::UnknownRecipe { name, known } if known.is_empty() => write!(
                 f,
                 "{operation}: no recipe named `{name}`; relais.toml declares no recipes"
@@ -193,6 +232,7 @@ impl Amendment {
     /// guarantees it starts with every recipe the incumbent declares.
     pub fn for_promotion(
         _proof: Promotable,
+        typed_gate: &TypedGateEvidence,
         incumbent: &RepoPolicy,
         candidate: &RepoPolicy,
         subject: &str,
@@ -208,6 +248,9 @@ impl Amendment {
                 subject: subject.to_string(),
             });
         }
+        // The generic proof above says nothing about a research-tier
+        // change: only the typed-research gate's count can authorise one.
+        check_typed_gate(&added, typed_gate)?;
         Ok(Self {
             operation: Operation::Promote,
             added,
@@ -358,6 +401,42 @@ mod tests {
         let mut policy = RepoPolicy::from_toml_str(BASE).expect("base parses");
         policy.recipes = recipes;
         policy
+    }
+
+    #[test]
+    fn a_typed_research_change_is_added_only_on_a_passing_gate_count() {
+        use crate::contract::TaskType;
+        use crate::route::TypedGateCount;
+        let added = vec![RecipeSpec {
+            revision: 2,
+            task_type: vec![TaskType::Ui],
+            ..RecipeSpec::covering("change-ui", Tier::Research)
+        }];
+        let evidence = |qualifying, accepted| {
+            let mut evidence = TypedGateEvidence::default();
+            evidence.insert(
+                "change-ui",
+                2,
+                TypedGateCount {
+                    qualifying,
+                    accepted,
+                },
+            );
+            evidence
+        };
+        assert!(check_typed_gate(&added, &evidence(15, 14)).is_ok());
+        let refused = check_typed_gate(&added, &evidence(7, 7)).unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "relais recipe promote: typed-research gate: change-ui@2 has 7 qualifying trials, \
+             needs 15 with at least 14 accepted without escalation"
+        );
+        // A recipe that is not a typed research change is not the gate's.
+        let implementation = vec![RecipeSpec {
+            revision: 2,
+            ..RecipeSpec::covering("docs", Tier::Implementation)
+        }];
+        assert!(check_typed_gate(&implementation, &TypedGateEvidence::default()).is_ok());
     }
 
     #[test]

@@ -37,7 +37,7 @@ pub use task_types::{
     ExportedTasks, ImportedTaskTypes, StoredTaskType, TaskExportRow, TaskTypeSource,
 };
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 30;
+pub const LEDGER_SCHEMA_VERSION: u64 = 31;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -687,6 +687,31 @@ pub struct NewReplayTrial<'a> {
     pub arm_run_id: &'a RunId,
     /// SHA-256 of the design `dataset replay --design` handed the arm.
     pub design_sha256: Option<&'a str>,
+}
+
+/// What recording a recipe promotion's provenance needs.
+#[derive(Debug, Clone, Copy)]
+pub struct NewRecipePromotion<'a> {
+    pub recipe_id: &'a str,
+    pub recipe_name: &'a str,
+    pub revision: u32,
+    pub task_type: &'a str,
+    /// The gate that authorised it, by name.
+    pub gate: &'a str,
+    /// The trials the gate counted, in the order it counted them.
+    pub trial_ids: &'a [TrialId],
+}
+
+/// A recorded promotion: the trials that authorised a recipe revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecipePromotion {
+    pub recipe_id: String,
+    pub recipe_name: String,
+    pub revision: u32,
+    pub task_type: String,
+    pub gate: String,
+    pub trial_ids: Vec<TrialId>,
+    pub promoted_at: String,
 }
 
 /// Raw columns of one `trials` row, in the order [`parse_trial_row`]
@@ -1765,6 +1790,28 @@ const MIGRATIONS: &[(&str, &str)] = &[
         seen_at TEXT NOT NULL
     );
     ALTER TABLE runs ADD COLUMN trust_status TEXT;
+    "#,
+    ),
+    (
+        // Which trials authorised a typed research recipe's promotion
+        // (docs/plans/2026-10-12-task-types.md, Phase 3). Outside the
+        // recipe content on purpose: the recipe id is a hash of that
+        // content, and it must equal the measured candidate's. One row per
+        // promoted recipe and task type. Additive: a promotion made before
+        // the step left no row, and no row is ever guessed for it.
+        "v31",
+        r#"
+    CREATE TABLE recipe_promotions (
+        promotion_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        recipe_id TEXT NOT NULL,
+        recipe_name TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        task_type TEXT NOT NULL,
+        gate TEXT NOT NULL,
+        trial_ids_json TEXT NOT NULL,
+        promoted_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_recipe_promotions_recipe ON recipe_promotions(recipe_id);
     "#,
     ),
 ];
@@ -5629,6 +5676,67 @@ impl Ledger {
             });
         }
         Ok(())
+    }
+
+    /// Record which trials authorised a recipe's promotion. Append-only:
+    /// a recipe promoted twice has two rows, and none is ever rewritten.
+    pub fn record_recipe_promotion(&self, promotion: &NewRecipePromotion<'_>) -> Result<()> {
+        let trial_ids: Vec<&str> = promotion.trial_ids.iter().map(TrialId::as_str).collect();
+        self.conn.execute(
+            "INSERT INTO recipe_promotions
+                (recipe_id, recipe_name, revision, task_type, gate, trial_ids_json, promoted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                promotion.recipe_id,
+                promotion.recipe_name,
+                promotion.revision,
+                promotion.task_type,
+                promotion.gate,
+                serde_json::to_string(&trial_ids).expect("trial ids serialize"),
+                self.now(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The promotions recorded for one recipe id, oldest first.
+    pub fn recipe_promotions(&self, recipe_id: &str) -> Result<Vec<RecipePromotion>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT recipe_id, recipe_name, revision, task_type, gate, trial_ids_json, promoted_at
+               FROM recipe_promotions WHERE recipe_id = ?1 ORDER BY promotion_id",
+        )?;
+        let rows = stmt.query_map([recipe_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u32>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?;
+        let rows: Vec<_> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(recipe_id, recipe_name, revision, task_type, gate, trials, promoted_at)| {
+                    let trial_ids: Vec<String> =
+                        serde_json::from_str(&trials).map_err(|e| LedgerError::Corrupt {
+                            what: "recipe_promotions.trial_ids_json".into(),
+                            detail: e.to_string(),
+                        })?;
+                    Ok(RecipePromotion {
+                        recipe_id,
+                        recipe_name,
+                        revision,
+                        task_type,
+                        gate,
+                        trial_ids: trial_ids.into_iter().map(TrialId::from_stored).collect(),
+                        promoted_at,
+                    })
+                },
+            )
+            .collect()
     }
 
     const TRIAL_COLUMNS: &'static str = "trial_id, task_id, source_run_id, incumbent_recipe_id,
@@ -9647,7 +9755,6 @@ mod tests {
     /// appear, NULL on the row written before them.
     #[test]
     fn v28_adds_the_driver_columns_to_an_older_ledger() {
-        assert_eq!(LEDGER_SCHEMA_VERSION, 30);
         let dir = temp_dir("v26-to-v28");
         let path = dir.join("ledger.sqlite");
         {
@@ -9676,7 +9783,10 @@ mod tests {
             .expect("a run written before v28");
         }
         let ledger = Ledger::open(&path).expect("upgrade");
-        assert_eq!(ledger.schema_version().expect("version"), 30);
+        assert_eq!(
+            ledger.schema_version().expect("version"),
+            LEDGER_SCHEMA_VERSION
+        );
         assert_eq!(driver_of(&ledger, "run-old"), (None, None, None));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -9715,7 +9825,10 @@ mod tests {
             .expect("a run written before v30");
         }
         let ledger = Ledger::open(&path).expect("upgrade");
-        assert_eq!(ledger.schema_version().expect("version"), 30);
+        assert_eq!(
+            ledger.schema_version().expect("version"),
+            LEDGER_SCHEMA_VERSION
+        );
 
         let copy = format!("{}.bak-v30", path.display());
         let before = Connection::open(&copy).expect("the copy opens as a ledger");
@@ -9806,7 +9919,10 @@ mod tests {
             .expect("a task written before v29");
         }
         let ledger = Ledger::open(&path).expect("upgrade");
-        assert_eq!(ledger.schema_version().expect("version"), 30);
+        assert_eq!(
+            ledger.schema_version().expect("version"),
+            LEDGER_SCHEMA_VERSION
+        );
         assert_eq!(
             ledger
                 .task_type_of(&task("old"))

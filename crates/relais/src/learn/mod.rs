@@ -28,3 +28,4 @@ pub mod registry;
 pub mod revert;
 pub mod salvage;
 pub mod summary;
+pub mod typed_gate;

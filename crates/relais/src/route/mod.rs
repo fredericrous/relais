@@ -28,8 +28,9 @@ mod rung;
 pub mod trial;
 pub use arm::{learner_arms, Arm};
 pub use candidate::{
-    default_tuning_bounds, validate_candidate, CandidateAdmission, CandidateRecipe,
-    CandidateRejection, TuningBounds,
+    default_tuning_bounds, is_typed_research_change, validate_candidate, CandidateAdmission,
+    CandidateRecipe, CandidateRejection, TuningBounds, TypedGateCount, TypedGateEvidence,
+    TYPED_GATE_ACCEPTED, TYPED_GATE_TRIALS,
 };
 pub use ladder::{held_repair_models, held_text, held_would_text, Ladder, RungIndex, RungRole};
 pub use rung::{authority_ceiling, models_in_play, resolve_catalogs, EffortRequest, Rung};
