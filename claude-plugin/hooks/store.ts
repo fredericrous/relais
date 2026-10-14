@@ -104,6 +104,10 @@ export type Store = {
   // The session's decide proof (decide.ts): minted at session start, sent
   // on stdin with every decide call, forgotten at session end.
   decideNonce: { session: string; nonce: string } | undefined
+  // The successor intents this session has launched (runs.ts, `startIntent`):
+  // an intent is launched once per session, whoever asks (a decide answer,
+  // the reconcile on start, a status poll). Relais itself claims atomically.
+  launchedIntents: Set<string>
   // When each run's outcome message reached the model, in the clock's ms:
   // a person's answer to it can only come after.
   outcomeDeliveredAt: Map<string, number>
@@ -179,6 +183,7 @@ export const createStore = (): Store => ({
   pendingOutcomes: new Map(),
   isCurrentMissingNoted: false,
   decideNonce: undefined,
+  launchedIntents: new Set(),
   outcomeDeliveredAt: new Map(),
   lastPersonPrompt: undefined,
   router: createRouterMemory(),

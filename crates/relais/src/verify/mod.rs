@@ -2342,6 +2342,10 @@ pub struct Receipt {
     /// once at validation (SPEC §8). Absent on every other receipt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate: Option<crate::contract::ResolvedCandidate>,
+    /// The run this one was launched to follow, and the scope it widened
+    /// (SPEC §9). Absent on every run an intent did not launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predecessor: Option<crate::contract::Predecessor>,
     pub models_used: Vec<String>,
     pub attempts: u32,
     pub cost_completeness: CostCompleteness,
@@ -5143,6 +5147,7 @@ mod tests {
             },
             kind: Kind::Change,
             candidate: None,
+            predecessor: None,
             models_used: vec!["sonnet".into()],
             attempts: 1,
             cost_completeness: CostCompleteness::Actual,

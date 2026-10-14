@@ -63,7 +63,19 @@ up, and the person answers there.
 ```
 
    Use `"kind": "inspect"` with evidence criteria for investigations
-   that must not edit files. relais validates the contract and saves it
+   that must not edit files.
+   - **An existing candidate.** To verify one, use `"kind": "verify"`
+     with `"candidate": {"run": "<run>"}` (and `"index"` for an attempt
+     other than the latest): no worker runs, relais applies the candidate
+     and checks it. To continue one, use `"kind": "change"` with
+     `"from_candidate": {"run": "<run>"}`: the tree starts with it
+     applied, and a conflict is the worker's to resolve first. Never
+     write "apply this patch" or a patch path into an objective: the
+     candidate is named by run, never by path.
+   - **A run stopped on `scope_exceeded`.** Answer it with
+     `mcp__relais__decide` `answer: "revise"` and `widen_scope: true`
+     (or `successor_contract` for a contract you write): relais records
+     the successor and the plugin launches it; do not start it yourself. relais validates the contract and saves it
    under `.relais/tasks/`; a refusal names the field to fix. Write no
    task file and run no `relais plan` yourself. The tool starts the run
    and returns at once. To replay a recorded run, call

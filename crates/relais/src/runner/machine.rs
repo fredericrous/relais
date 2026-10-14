@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::lifecycle::{Reason, State, UsagePhase};
 use crate::policy::{BlockCode, Tier};
 use crate::route::RungIndex;
+use crate::workspace::OutOfScope;
 
 /// What kind of attempt is being dispatched (SPEC §9: initial, one
 /// repair, one stronger attempt).
@@ -238,7 +239,7 @@ pub enum Observation {
     /// check green, so no repair is bought.
     CheckCriteriaUnmet(Vec<String>),
     /// The diff leaves the contract's write scope.
-    ScopeViolation(Vec<String>),
+    ScopeViolation(Vec<OutOfScope>),
     /// The worker proposed that something outside the task blocks it.
     WorkerBlockage(String),
     /// The reviewer reported findings.
@@ -444,12 +445,21 @@ pub fn decide(budget: &Budget, observation: Observation) -> Decision {
             )
         }
 
-        Observation::ScopeViolation(paths) => {
-            let detail = format!("the diff leaves the contract scope: {}", paths.join(", "));
+        Observation::ScopeViolation(out) => {
+            // `paths` stay bare: `decide revise --widen-scope` reads them
+            // back as exactly the paths the successor's scope adds.
+            let paths: Vec<&str> = out.iter().map(|o| o.path.as_str()).collect();
+            let detail = format!(
+                "the diff leaves the contract scope: {}",
+                out.iter()
+                    .map(OutOfScope::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             Decision::stop(
                 State::NeedsDecision,
                 Reason::ScopeExceeded,
-                serde_json::json!({ "paths": paths }),
+                serde_json::json!({ "paths": paths, "changes": out }),
                 Terminal::NeedsDecision {
                     reason: Reason::ScopeExceeded,
                     detail,
@@ -729,7 +739,7 @@ mod tests {
     fn scope_gap_review_crash_cancel_and_limits_each_land_on_their_row() {
         let b = budget(0, Some(Tier::Escalation));
         assert_eq!(
-            decide(&b, Observation::ScopeViolation(vec!["x".into()])).state,
+            decide(&b, Observation::ScopeViolation(vec![OutOfScope::bare("x")])).state,
             State::NeedsDecision
         );
         assert_eq!(

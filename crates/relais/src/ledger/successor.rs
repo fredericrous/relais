@@ -1,0 +1,703 @@
+//! Successor intents (docs/plans/2026-10-14-runs-survive-a-loaded-machine.md,
+//! A5): the transactional outbox a `revise` answer writes.
+//!
+//! The decision answer and the intent row are one commit, keyed by the
+//! decision, so a repeated answer finds the same intent. Only the plugin
+//! starts runs: it claims an intent (`pending -> claimed(run)`, atomic) and
+//! launches it. A second claim returns the run that holds the claim; a
+//! claimed intent is handed to a new run only when the claiming run left no
+//! row, or left a live-looking row whose driver process is gone, by
+//! compare-and-set on the old run id.
+
+use std::collections::BTreeSet;
+
+use rusqlite::{params, OptionalExtension};
+
+use crate::contract::ResolvedCandidate;
+use crate::ids::{sha256_hex, RunId};
+use crate::lifecycle::State;
+
+use super::{parse_state, DecisionAnswer, Ledger, LedgerError, Result};
+
+/// How long a claim may go without the run it launched appearing in the
+/// ledger before the claim is called abandoned: a run inserts its row in
+/// preflight, seconds after the claim.
+pub const CLAIM_GRACE_SECONDS: i64 = 120;
+
+/// What a `revise` answer asks the plugin to launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewIntent {
+    /// The run whose decision this answers.
+    pub predecessor: RunId,
+    pub contract_digest: String,
+    pub contract_json: String,
+    /// The paths a widened scope adds, exactly; empty for a contract the
+    /// answer's author wrote.
+    pub scope_delta: Vec<String>,
+    /// The candidate the successor applies, resolved and pinned with the
+    /// answer.
+    pub candidate: Option<ResolvedCandidate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntentState {
+    Pending,
+    Claimed,
+}
+
+impl IntentState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Claimed => "claimed",
+        }
+    }
+
+    fn parse(stored: &str) -> Result<Self> {
+        match stored {
+            "pending" => Ok(Self::Pending),
+            "claimed" => Ok(Self::Claimed),
+            other => Err(LedgerError::Corrupt {
+                what: "a successor intent state".into(),
+                detail: format!("`{other}` is neither pending nor claimed"),
+            }),
+        }
+    }
+}
+
+/// One successor intent as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuccessorIntent {
+    pub intent_id: String,
+    pub decision_id: String,
+    pub predecessor: RunId,
+    pub contract_digest: String,
+    pub contract_json: String,
+    pub scope_delta: Vec<String>,
+    pub candidate: Option<ResolvedCandidate>,
+    pub state: IntentState,
+    pub run_id: Option<RunId>,
+}
+
+/// What a claim ended in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Claim {
+    /// This run holds the claim now.
+    Claimed(Box<SuccessorIntent>),
+    /// Another run holds it: `intent_already_claimed`, with that run.
+    AlreadyClaimed { run: RunId },
+    /// No such intent.
+    Unknown,
+}
+
+/// The intent id a decision's answer gets: a function of the decision, so
+/// the same decision cannot name two.
+pub fn intent_id_of(decision_id: &str) -> String {
+    format!("intent-{}", &sha256_hex(decision_id.as_bytes())[..16])
+}
+
+const COLUMNS: &str = "intent_id, decision_id, predecessor, contract_digest, contract_json, \
+                       scope_delta_json, candidate_json, state, run_id";
+
+type Row = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+);
+
+fn row_of(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+    ))
+}
+
+fn corrupt(what: &str, e: impl std::fmt::Display) -> LedgerError {
+    LedgerError::Corrupt {
+        what: what.into(),
+        detail: e.to_string(),
+    }
+}
+
+fn intent_of_row(row: Row) -> Result<SuccessorIntent> {
+    let (
+        intent_id,
+        decision_id,
+        predecessor,
+        contract_digest,
+        contract_json,
+        scope_delta_json,
+        candidate_json,
+        state,
+        run_id,
+    ) = row;
+    Ok(SuccessorIntent {
+        intent_id,
+        decision_id,
+        predecessor: RunId::from_stored(predecessor),
+        contract_digest,
+        contract_json,
+        scope_delta: serde_json::from_str(&scope_delta_json)
+            .map_err(|e| corrupt("a successor intent's scope delta", e))?,
+        candidate: candidate_json
+            .map(|json| serde_json::from_str(&json))
+            .transpose()
+            .map_err(|e| corrupt("a successor intent's candidate", e))?,
+        state: IntentState::parse(&state)?,
+        run_id: run_id.map(RunId::from_stored),
+    })
+}
+
+fn seconds_since(then: &str, now: &str) -> Option<i64> {
+    let parse = |stamp: &str| chrono::DateTime::parse_from_rfc3339(stamp).ok();
+    Some((parse(now)? - parse(then)?).num_seconds())
+}
+
+impl Ledger {
+    /// Answer an open decision AND write its successor intent, one
+    /// transaction. `Ok(None)` when the run has no open decision: neither
+    /// the answer nor the intent was written.
+    pub fn resolve_decision_with_intent(
+        &self,
+        run_id: &RunId,
+        answer: &DecisionAnswer<'_>,
+        intent: &NewIntent,
+    ) -> Result<Option<SuccessorIntent>> {
+        let tx = self.write_tx()?;
+        if !self.resolve_decision_in(&tx, run_id, answer)? {
+            return Ok(None);
+        }
+        let decision_id = run_id.as_str();
+        let intent_id = intent_id_of(decision_id);
+        let candidate_json = intent
+            .candidate
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| corrupt("a successor intent's candidate", e))?;
+        tx.execute(
+            "INSERT INTO successor_intents
+                (intent_id, decision_id, predecessor, contract_digest, contract_json,
+                 scope_delta_json, candidate_json, pin_run, pin_index, state, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', ?10)",
+            params![
+                intent_id,
+                decision_id,
+                intent.predecessor.as_str(),
+                intent.contract_digest,
+                intent.contract_json,
+                serde_json::to_string(&intent.scope_delta)
+                    .map_err(|e| corrupt("a successor intent's scope delta", e))?,
+                candidate_json,
+                intent.candidate.as_ref().map(|c| c.source_run.clone()),
+                intent.candidate.as_ref().map(|c| i64::from(c.index)),
+                self.now(),
+            ],
+        )?;
+        let stored = read_intent(&tx, &intent_id)?;
+        tx.commit()?;
+        Ok(stored)
+    }
+
+    /// The intent a decision's answer wrote, if it wrote one.
+    pub fn intent_of_decision(&self, decision_id: &RunId) -> Result<Option<SuccessorIntent>> {
+        self.conn
+            .query_row(
+                &format!("SELECT {COLUMNS} FROM successor_intents WHERE decision_id = ?1"),
+                [decision_id.as_str()],
+                row_of,
+            )
+            .optional()?
+            .map(intent_of_row)
+            .transpose()
+    }
+
+    /// How many successor intents the outbox holds.
+    pub fn count_successor_intents(&self) -> Result<u64> {
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM successor_intents", [], |row| {
+                    row.get(0)
+                })?;
+        Ok(count as u64)
+    }
+
+    pub fn successor_intent(&self, intent_id: &str) -> Result<Option<SuccessorIntent>> {
+        read_intent(&self.conn, intent_id)
+    }
+
+    /// The intent a run was launched from, for its receipt.
+    pub fn intent_of_run(&self, run: &RunId) -> Result<Option<SuccessorIntent>> {
+        self.conn
+            .query_row(
+                &format!("SELECT {COLUMNS} FROM successor_intents WHERE run_id = ?1"),
+                [run.as_str()],
+                row_of,
+            )
+            .optional()?
+            .map(intent_of_row)
+            .transpose()
+    }
+
+    /// Claim an intent for `new_run`. Pending: the claim is taken. Claimed:
+    /// the existing run is returned, unless that run left no row (after the
+    /// grace a launch needs) or is not terminal and its driver is gone, in
+    /// which case the claim moves to `new_run` by compare-and-set on the
+    /// old run id.
+    pub fn claim_intent(
+        &self,
+        intent_id: &str,
+        new_run: &RunId,
+        alive: &dyn Fn(u32) -> bool,
+    ) -> Result<Claim> {
+        let tx = self.write_tx()?;
+        let Some(current) = read_intent(&tx, intent_id)? else {
+            return Ok(Claim::Unknown);
+        };
+        let now = self.now();
+        let took = match (&current.state, &current.run_id) {
+            (IntentState::Pending, _) => tx.execute(
+                "UPDATE successor_intents SET state = 'claimed', run_id = ?2, claimed_at = ?3
+                  WHERE intent_id = ?1 AND state = 'pending'",
+                params![intent_id, new_run.as_str(), now],
+            )?,
+            (IntentState::Claimed, Some(old)) if self.abandoned(&tx, intent_id, old, alive)? => tx
+                .execute(
+                    "UPDATE successor_intents SET run_id = ?2, claimed_at = ?3
+                      WHERE intent_id = ?1 AND state = 'claimed' AND run_id = ?4",
+                    params![intent_id, new_run.as_str(), now, old.as_str()],
+                )?,
+            (IntentState::Claimed, _) => 0,
+        };
+        let after = read_intent(&tx, intent_id)?;
+        tx.commit()?;
+        match after {
+            Some(intent) if took == 1 => Ok(Claim::Claimed(Box::new(intent))),
+            Some(SuccessorIntent {
+                run_id: Some(run), ..
+            }) => Ok(Claim::AlreadyClaimed { run }),
+            _ => Ok(Claim::Unknown),
+        }
+    }
+
+    /// Has the run that holds a claim left nothing a live launch would
+    /// have: no row after the grace, or a row not yet terminal whose driver
+    /// process is gone?
+    fn abandoned(
+        &self,
+        conn: &rusqlite::Connection,
+        intent_id: &str,
+        run: &RunId,
+        alive: &dyn Fn(u32) -> bool,
+    ) -> Result<bool> {
+        let row: Option<(Option<i64>, Option<String>)> = conn
+            .query_row(
+                &format!(
+                    "SELECT driver_pid, (SELECT {} FROM runs r2 WHERE r2.id = runs.id)
+                       FROM runs WHERE id = ?1",
+                    super::PROJECTED_STATUS
+                ),
+                [run.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((pid, status)) = row else {
+            let claimed_at: Option<String> = conn
+                .query_row(
+                    "SELECT claimed_at FROM successor_intents WHERE intent_id = ?1",
+                    [intent_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            return Ok(claimed_at
+                .and_then(|at| seconds_since(&at, &self.now()))
+                .is_some_and(|waited| waited >= CLAIM_GRACE_SECONDS));
+        };
+        let terminal = status
+            .as_deref()
+            .is_some_and(|status| parse_state(status).is_ok_and(State::is_terminal));
+        Ok(!terminal
+            && pid
+                .and_then(|pid| u32::try_from(pid).ok())
+                .is_some_and(|pid| !alive(pid)))
+    }
+
+    /// Intents the plugin should launch now: every pending one, and every
+    /// claimed one whose claim was abandoned (what a claim would take).
+    pub fn launchable_intents(&self, alive: &dyn Fn(u32) -> bool) -> Result<Vec<SuccessorIntent>> {
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM successor_intents ORDER BY created_at, intent_id"
+        ))?;
+        let rows = statement
+            .query_map([], row_of)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut launchable = Vec::new();
+        for row in rows {
+            let intent = intent_of_row(row)?;
+            let abandoned = match (&intent.state, &intent.run_id) {
+                (IntentState::Pending, _) => true,
+                (IntentState::Claimed, Some(run)) => {
+                    self.abandoned(&self.conn, &intent.intent_id, run, alive)?
+                }
+                (IntentState::Claimed, None) => false,
+            };
+            if abandoned {
+                launchable.push(intent);
+            }
+        }
+        Ok(launchable)
+    }
+
+    /// `(source run, attempt index)` of every candidate a successor intent
+    /// still needs: pending intents, and claimed ones whose run has not
+    /// ended.
+    pub(super) fn pinned_by_intents(&self) -> Result<BTreeSet<(String, u32)>> {
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT pin_run, pin_index, state,
+                    (SELECT {} FROM runs WHERE runs.id = successor_intents.run_id)
+               FROM successor_intents WHERE pin_run IS NOT NULL AND pin_index IS NOT NULL",
+            super::PROJECTED_STATUS
+        ))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, _, state, status)| {
+                state == "pending"
+                    || !status
+                        .as_deref()
+                        .is_some_and(|status| parse_state(status).is_ok_and(State::is_terminal))
+            })
+            .map(|(run, index, _, _)| (run, index as u32))
+            .collect())
+    }
+}
+
+fn read_intent(conn: &rusqlite::Connection, intent_id: &str) -> Result<Option<SuccessorIntent>> {
+    conn.query_row(
+        &format!("SELECT {COLUMNS} FROM successor_intents WHERE intent_id = ?1"),
+        [intent_id],
+        row_of,
+    )
+    .optional()?
+    .map(intent_of_row)
+    .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ledger::{Actor, Clock, RecordedVia};
+    use crate::lifecycle::Reason;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Arc;
+
+    struct Tick(Arc<AtomicI64>);
+
+    impl Clock for Tick {
+        fn now_rfc3339(&self) -> String {
+            chrono::DateTime::from_timestamp(1_800_000_000 + self.0.load(Ordering::SeqCst), 0)
+                .expect("a time")
+                .to_rfc3339()
+        }
+    }
+
+    fn run(id: &str) -> RunId {
+        RunId::from_stored(id)
+    }
+
+    fn intent_for(predecessor: &str) -> NewIntent {
+        NewIntent {
+            predecessor: run(predecessor),
+            contract_digest: "digest".into(),
+            contract_json: "{}".into(),
+            scope_delta: vec!["a.rs".into()],
+            candidate: Some(ResolvedCandidate {
+                source_run: predecessor.into(),
+                index: 2,
+                candidate_commit: "c".repeat(40),
+                patch_sha256: "p".into(),
+                source_base_sha: "b".repeat(40),
+                target_base_sha: "b".repeat(40),
+            }),
+        }
+    }
+
+    fn answer<'a>() -> DecisionAnswer<'a> {
+        DecisionAnswer {
+            resolution: Reason::DecisionRevised,
+            actor: Actor::Orchestrator,
+            person_quote: None,
+            recorded_via: RecordedVia::Cli,
+            note: None,
+            successor_run: None,
+            from_state: State::NeedsDecision,
+            to_state: State::Failed,
+        }
+    }
+
+    /// A ledger on a clock the test moves, and a run waiting on a decision.
+    fn waiting(label: &str) -> (Ledger, Arc<AtomicI64>, crate::test_support::TempDir) {
+        let dir = crate::test_support::temp_dir(&format!("ledger-successor-{label}"));
+        let seconds = Arc::new(AtomicI64::new(0));
+        let ledger = Ledger::open_with_clock(
+            &dir.join("ledger.sqlite"),
+            Box::new(Tick(Arc::clone(&seconds))),
+        )
+        .expect("ledger");
+        ledger
+            .insert_run(
+                &run("run-a"),
+                "/r",
+                None,
+                &crate::ids::TaskId::from_stored("task-a"),
+                "rk",
+            )
+            .expect("run");
+        ledger
+            .record_transition(&crate::ledger::Transition {
+                run_id: run("run-a"),
+                attempt_id: None,
+                from_state: None,
+                to_state: State::NeedsDecision,
+                reason: "scope_exceeded".into(),
+                detail: None,
+                at: ledger.now(),
+            })
+            .expect("waiting");
+        (ledger, seconds, dir)
+    }
+
+    #[test]
+    fn the_answer_and_one_intent_are_written_together_and_repeat_to_the_same_intent() {
+        let (ledger, _, _dir) = waiting("together");
+        let first = ledger
+            .resolve_decision_with_intent(&run("run-a"), &answer(), &intent_for("run-a"))
+            .expect("written")
+            .expect("an open decision");
+        assert_eq!(first.state, IntentState::Pending);
+        assert_eq!(first.scope_delta, vec!["a.rs".to_string()]);
+        let decision = ledger
+            .decision_of_run(&run("run-a"))
+            .expect("read")
+            .expect("row");
+        assert_eq!(decision.resolution, Some(Reason::DecisionRevised));
+        assert_eq!(
+            ledger.intent_of_decision(&run("run-a")).expect("read"),
+            Some(first.clone())
+        );
+        // The decision is answered now: a second write finds no open
+        // decision and writes no second intent.
+        assert_eq!(
+            ledger
+                .resolve_decision_with_intent(&run("run-a"), &answer(), &intent_for("run-a"))
+                .expect("second"),
+            None
+        );
+        let count: i64 = ledger
+            .conn
+            .query_row("SELECT COUNT(*) FROM successor_intents", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn a_failed_intent_write_leaves_the_decision_open() {
+        let (ledger, _, _dir) = waiting("atomic");
+        ledger
+            .conn
+            .execute("DROP TABLE successor_intents", [])
+            .expect("break the outbox");
+        assert!(ledger
+            .resolve_decision_with_intent(&run("run-a"), &answer(), &intent_for("run-a"))
+            .is_err());
+        let decision = ledger
+            .decision_of_run(&run("run-a"))
+            .expect("read")
+            .expect("row");
+        assert_eq!(decision.resolution, None, "the answer rolled back with it");
+    }
+
+    #[test]
+    fn two_concurrent_claims_yield_one_run() {
+        let (ledger, _, dir) = waiting("concurrent");
+        let intent = ledger
+            .resolve_decision_with_intent(&run("run-a"), &answer(), &intent_for("run-a"))
+            .expect("written")
+            .expect("open");
+        let path = ledger.path().to_path_buf();
+        let outcomes: Vec<Claim> = (0..2)
+            .map(|n| {
+                let path = path.clone();
+                let id = intent.intent_id.clone();
+                std::thread::spawn(move || {
+                    let ledger = Ledger::open(&path).expect("own connection");
+                    ledger
+                        .claim_intent(&id, &run(&format!("run-new-{n}")), &|_| true)
+                        .expect("claim")
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().expect("thread"))
+            .collect();
+        let won: Vec<&Claim> = outcomes
+            .iter()
+            .filter(|c| matches!(c, Claim::Claimed(_)))
+            .collect();
+        assert_eq!(won.len(), 1, "{outcomes:?}");
+        let Claim::Claimed(winner) = won[0] else {
+            unreachable!()
+        };
+        let existing = winner.run_id.clone().expect("a run id");
+        assert!(
+            outcomes.iter().any(|c| matches!(
+                c,
+                Claim::AlreadyClaimed { run } if *run == existing
+            )),
+            "the other claim returns the existing run: {outcomes:?}"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn a_claim_whose_run_row_is_absent_is_taken_over_once_after_the_grace() {
+        let (ledger, seconds, _dir) = waiting("absent");
+        let intent = ledger
+            .resolve_decision_with_intent(&run("run-a"), &answer(), &intent_for("run-a"))
+            .expect("written")
+            .expect("open");
+        let id = intent.intent_id;
+        assert!(matches!(
+            ledger
+                .claim_intent(&id, &run("run-1"), &|_| true)
+                .expect("claim"),
+            Claim::Claimed(_)
+        ));
+        // Inside the grace the first launch may still be starting.
+        assert_eq!(
+            ledger
+                .claim_intent(&id, &run("run-2"), &|_| true)
+                .expect("claim"),
+            Claim::AlreadyClaimed { run: run("run-1") }
+        );
+        seconds.store(CLAIM_GRACE_SECONDS + 1, Ordering::SeqCst);
+        assert_eq!(ledger.launchable_intents(&|_| true).expect("list").len(), 1);
+        assert!(matches!(
+            ledger.claim_intent(&id, &run("run-2"), &|_| true).expect("claim"),
+            Claim::Claimed(intent) if intent.run_id == Some(run("run-2"))
+        ));
+        // Compare-and-set: the claim moved once; the next caller finds
+        // run-2 and, run-2 having no row yet, waits out the grace again.
+        assert_eq!(
+            ledger
+                .claim_intent(&id, &run("run-3"), &|_| true)
+                .expect("claim"),
+            Claim::AlreadyClaimed { run: run("run-2") }
+        );
+    }
+
+    #[test]
+    fn a_claim_whose_driver_is_alive_is_not_taken_over_and_a_dead_one_is() {
+        let (ledger, seconds, _dir) = waiting("pid");
+        // The claiming run exists, running, driven by pid 4242.
+        ledger
+            .insert_run(
+                &run("run-1"),
+                "/r",
+                None,
+                &crate::ids::TaskId::from_stored("task-a"),
+                "rk",
+            )
+            .expect("run");
+        ledger
+            .record_transition_as_driver(&crate::ledger::Transition {
+                run_id: run("run-1"),
+                attempt_id: None,
+                from_state: None,
+                to_state: State::Running,
+                reason: "worker_dispatched".into(),
+                detail: None,
+                at: ledger.now(),
+            })
+            .expect("running");
+        ledger
+            .conn
+            .execute("UPDATE runs SET driver_pid = 4242 WHERE id = 'run-1'", [])
+            .expect("bind a pid");
+        let intent = ledger
+            .resolve_decision_with_intent(&run("run-a"), &answer(), &intent_for("run-a"))
+            .expect("written")
+            .expect("open");
+        let id = intent.intent_id;
+        assert!(matches!(
+            ledger
+                .claim_intent(&id, &run("run-1"), &|_| true)
+                .expect("claim"),
+            Claim::Claimed(_)
+        ));
+        seconds.store(CLAIM_GRACE_SECONDS * 10, Ordering::SeqCst);
+        assert_eq!(
+            ledger
+                .claim_intent(&id, &run("run-2"), &|pid| pid == 4242)
+                .expect("claim"),
+            Claim::AlreadyClaimed { run: run("run-1") },
+            "a live driver keeps its claim, however old"
+        );
+        assert!(ledger
+            .launchable_intents(&|pid| pid == 4242)
+            .expect("list")
+            .is_empty());
+        assert!(matches!(
+            ledger
+                .claim_intent(&id, &run("run-2"), &|_| false)
+                .expect("claim"),
+            Claim::Claimed(_)
+        ));
+    }
+
+    #[test]
+    fn a_pending_intent_pins_its_candidate_and_a_finished_run_releases_it() {
+        let (ledger, _, _dir) = waiting("pin");
+        let intent = ledger
+            .resolve_decision_with_intent(&run("run-a"), &answer(), &intent_for("run-a"))
+            .expect("written")
+            .expect("open");
+        assert!(ledger
+            .pinned_candidates()
+            .expect("pins")
+            .contains(&("run-a".to_string(), 2)));
+        ledger
+            .claim_intent(&intent.intent_id, &run("run-a"), &|_| true)
+            .expect("claim");
+        // The claiming run (here run-a itself, already terminal) has ended.
+        assert!(!ledger
+            .pinned_candidates()
+            .expect("pins")
+            .contains(&("run-a".to_string(), 2)));
+    }
+}

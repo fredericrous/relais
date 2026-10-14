@@ -26,6 +26,8 @@ use crate::route::RoutedBy;
 
 mod review;
 mod router;
+mod successor;
+pub use successor::{Claim, IntentState, NewIntent, SuccessorIntent, CLAIM_GRACE_SECONDS};
 mod task_types;
 pub use review::{MergeTotals, ReviewClassTotals, ReviewOutcomeRow};
 pub use router::{
@@ -37,7 +39,7 @@ pub use task_types::{
     ExportedTasks, ImportedTaskTypes, StoredTaskType, TaskExportRow, TaskTypeSource,
 };
 
-pub const LEDGER_SCHEMA_VERSION: u64 = 33;
+pub const LEDGER_SCHEMA_VERSION: u64 = 34;
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -1943,6 +1945,33 @@ const MIGRATIONS: &[(&str, &str)] = &[
         ON candidate_inputs(source_run, candidate_index);
     "#,
     ),
+    (
+        // The successor intent (plan A5): the transactional outbox row a
+        // `revise` answer writes in the same transaction as the answer.
+        // `decision_id` (the decided run) is UNIQUE, so a repeated answer
+        // finds the same intent. The row also pins the candidate it
+        // resolved (`pin_run`, `pin_index`) until the run it launched
+        // ends. Expand-only: a new table, nothing an older binary reads.
+        "v34",
+        r#"
+    CREATE TABLE successor_intents (
+        intent_id TEXT PRIMARY KEY,
+        decision_id TEXT NOT NULL UNIQUE,
+        predecessor TEXT NOT NULL,
+        contract_digest TEXT NOT NULL,
+        contract_json TEXT NOT NULL,
+        scope_delta_json TEXT NOT NULL,
+        candidate_json TEXT,
+        pin_run TEXT,
+        pin_index INTEGER,
+        state TEXT NOT NULL,
+        run_id TEXT,
+        created_at TEXT NOT NULL,
+        claimed_at TEXT
+    );
+    CREATE INDEX idx_successor_intents_run ON successor_intents(run_id);
+    "#,
+    ),
 ];
 
 /// `advice_p_approve, advice_model, advice_revision, advice_null_reason`.
@@ -3436,10 +3465,11 @@ impl Ledger {
     /// cannot read keeps its pin: a pin is only ever released by a state
     /// that is known to be terminal.
     ///
-    // holds-until: successor intents and open decisions exist (plan A5): the
-    // plan also pins a candidate while an open decision or a pending intent
-    // references it, and neither is built yet, so only a run that has not
-    // ended pins today.
+    /// A pending successor intent pins its candidate too, and so does a
+    /// claimed one while the run it launched has not ended (plan A5).
+    // holds-until: the decision advisor reads candidates (plan A6 follow-up):
+    // an open decision does not pin one yet; its run is terminal and the
+    // candidate is kept by the intent a revise writes.
     pub fn pinned_candidates(&self) -> Result<std::collections::BTreeSet<(String, u32)>> {
         let mut statement = self.conn.prepare(&format!(
             "SELECT candidate_inputs.source_run, candidate_inputs.candidate_index,
@@ -3455,7 +3485,7 @@ impl Ledger {
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows
+        let mut pinned: std::collections::BTreeSet<(String, u32)> = rows
             .into_iter()
             .filter(|(_, _, status)| {
                 status
@@ -3463,7 +3493,9 @@ impl Ledger {
                     .is_none_or(|status| !parse_state(status).is_ok_and(State::is_terminal))
             })
             .map(|(run, index, _)| (run, index as u32))
-            .collect())
+            .collect();
+        pinned.extend(self.pinned_by_intents()?);
+        Ok(pinned)
     }
 
     /// Close every dispatch of a run that never recorded a terminal state,
@@ -4296,8 +4328,22 @@ impl Ledger {
     /// waiting" by name rather than silently overwriting a prior answer;
     /// in that case neither the decision nor the run's state changed.
     pub fn resolve_decision(&self, run_id: &RunId, answer: &DecisionAnswer<'_>) -> Result<bool> {
-        let now = self.now();
         let tx = self.write_tx()?;
+        let changed = self.resolve_decision_in(&tx, run_id, answer)?;
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// [`Self::resolve_decision`] inside a transaction the caller owns, so
+    /// the answer and a row that must stand or fall with it (a successor
+    /// intent) are one commit.
+    fn resolve_decision_in(
+        &self,
+        tx: &Transaction<'_>,
+        run_id: &RunId,
+        answer: &DecisionAnswer<'_>,
+    ) -> Result<bool> {
+        let now = self.now();
         let changed = tx.execute(
             "UPDATE decisions SET resolved_at = ?2, resolution = ?3, actor = ?4, actor_raw = ?4,
                     note = ?5, successor_run = ?6, person_quote = ?7, recorded_via = ?8
@@ -4315,7 +4361,7 @@ impl Ledger {
         )?;
         if changed > 0 {
             append_transition(
-                &tx,
+                tx,
                 &Transition {
                     run_id: run_id.clone(),
                     attempt_id: None,
@@ -4326,9 +4372,8 @@ impl Ledger {
                     at: now.clone(),
                 },
             )?;
-            stamp_driver(&tx, run_id, &now)?;
+            stamp_driver(tx, run_id, &now)?;
         }
-        tx.commit()?;
         Ok(changed > 0)
     }
 

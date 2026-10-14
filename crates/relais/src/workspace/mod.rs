@@ -36,6 +36,9 @@ pub enum WorkspaceError {
     Git(String),
     DirtyBase(Vec<String>),
     ScopeViolation(Vec<String>),
+    /// A path a candidate's merge conflicted in still has an unmerged index
+    /// entry or a conflict marker: it cannot be snapshotted (plan A4).
+    UnresolvedConflict(Vec<String>),
     Io(std::io::Error),
 }
 
@@ -51,6 +54,11 @@ impl std::fmt::Display for WorkspaceError {
             Self::ScopeViolation(paths) => write!(
                 f,
                 "diff leaves the declared write scope: {}",
+                paths.join(", ")
+            ),
+            Self::UnresolvedConflict(paths) => write!(
+                f,
+                "unresolved_conflict: {} still carries an unmerged entry or a conflict marker",
                 paths.join(", ")
             ),
             Self::Io(e) => write!(f, "{e}"),
@@ -477,6 +485,72 @@ impl TaskWorktree {
         Ok(())
     }
 
+    /// [`Self::check_out_tree`] for a conflicted merge: the tree (with its
+    /// markers in the working files), then the unmerged stages in the index
+    /// (`index_info` from [`Merged::Conflicted`]).
+    pub fn check_out_conflicted(&self, tree: &str, index_info: &[u8]) -> Result<()> {
+        self.check_out_tree(tree)?;
+        let mut command = git_command(&self.path);
+        command.args(["update-index", "-z", "--index-info"]);
+        if let Some(index) = &self.index {
+            command.env("GIT_INDEX_FILE", index);
+        }
+        let mut child = command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| WorkspaceError::Git(format!("git could not be launched: {e}")))?;
+        {
+            use std::io::Write;
+            let mut stdin = child.stdin.take().expect("stdin was piped");
+            stdin.write_all(index_info)?;
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|e| WorkspaceError::Git(format!("git update-index: {e}")))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(WorkspaceError::Git(format!(
+                "git update-index --index-info failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    }
+
+    /// The paths among `conflicted` that still carry an unmerged index entry
+    /// or a conflict marker in their working file.
+    pub fn unresolved_conflicts(&self, conflicted: &[String]) -> Result<Vec<String>> {
+        if conflicted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let unmerged = self.git_indexed(&["ls-files", "-u", "-z"])?;
+        let unmerged: std::collections::BTreeSet<&str> = unmerged
+            .split('\0')
+            .filter_map(|entry| entry.split_once('\t').map(|(_, path)| path))
+            .collect();
+        let mut open: Vec<String> = conflicted
+            .iter()
+            .filter(|path| {
+                unmerged.contains(path.as_str()) || has_conflict_marker(&self.path.join(path))
+            })
+            .cloned()
+            .collect();
+        open.sort();
+        Ok(open)
+    }
+
+    /// [`Self::snapshot_candidate`], refused while a conflicted path is
+    /// unresolved: `git add -A` would otherwise stage markers as content.
+    pub fn snapshot_resolved(&self, label: &str, conflicted: &[String]) -> Result<String> {
+        let open = self.unresolved_conflicts(conflicted)?;
+        if !open.is_empty() {
+            return Err(WorkspaceError::UnresolvedConflict(open));
+        }
+        self.snapshot_candidate(label)
+    }
+
     /// Export the candidate as a patch artifact. Untrimmed: a patch whose
     /// last line lost its newline is one `git apply` calls corrupt.
     pub fn export_patch(&self, candidate_sha: &str, out_path: &Path) -> Result<()> {
@@ -487,6 +561,87 @@ impl TaskWorktree {
         std::fs::write(out_path, diff.as_bytes())?;
         Ok(())
     }
+}
+
+/// The paths of a scope violation with the lines each one adds and removes
+/// against `base`, for the decision text. A count git cannot give (a binary
+/// file, a failed call) is left out, never guessed.
+pub fn out_of_scope(
+    repo_dir: &Path,
+    base: &str,
+    candidate: &str,
+    paths: Vec<String>,
+) -> Vec<OutOfScope> {
+    let counts = git_raw(
+        repo_dir,
+        &["diff", "--numstat", "-z", "--no-renames", base, candidate],
+    )
+    .unwrap_or_default();
+    // `<added>\t<removed>\t<path>` NUL-terminated.
+    let counted: std::collections::BTreeMap<&str, (Option<u64>, Option<u64>)> = counts
+        .split('\0')
+        .filter_map(|entry| {
+            let mut parts = entry.splitn(3, '\t');
+            let added = parts.next()?.parse().ok();
+            let removed = parts.next()?.parse().ok();
+            Some((parts.next()?, (added, removed)))
+        })
+        .collect();
+    paths
+        .into_iter()
+        .map(|path| {
+            let (added, removed) = counted.get(path.as_str()).copied().unwrap_or((None, None));
+            OutOfScope {
+                path,
+                added,
+                removed,
+            }
+        })
+        .collect()
+}
+
+/// A path a diff changed outside the write scope, with how much.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct OutOfScope {
+    pub path: String,
+    /// Lines added and removed against the base; `None` for a binary file
+    /// or a count that could not be read.
+    pub added: Option<u64>,
+    pub removed: Option<u64>,
+}
+
+impl OutOfScope {
+    /// A path whose change size is not known.
+    pub fn bare(path: &str) -> Self {
+        Self {
+            path: path.to_string(),
+            added: None,
+            removed: None,
+        }
+    }
+}
+
+impl std::fmt::Display for OutOfScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.added, self.removed) {
+            (Some(added), Some(removed)) => write!(f, "{} (+{added}/-{removed})", self.path),
+            _ => write!(f, "{}", self.path),
+        }
+    }
+}
+
+/// Does this file hold a git conflict marker line? An unreadable or absent
+/// file (the path was resolved by deleting it) holds none.
+fn has_conflict_marker(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    String::from_utf8_lossy(&bytes).lines().any(|line| {
+        ["<<<<<<<", ">>>>>>>"].iter().any(|marker| {
+            line.strip_prefix(marker)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+        })
+    })
 }
 
 /// Protected repository configuration (SPEC §8): changes here are rejected
@@ -1081,9 +1236,16 @@ pub fn forget_run_candidates(
 pub enum Merged {
     /// The merge is clean; this is its result tree.
     Clean { tree: String },
-    /// The candidate conflicts with the target; these are the conflicted
-    /// paths, sorted.
-    Conflicted { files: Vec<String> },
+    /// The candidate conflicts with the target. `tree` is the result tree
+    /// git still writes (conflicted files carry markers); `files` are the
+    /// conflicted paths, sorted; `index_info` is the input
+    /// `git update-index -z --index-info` needs to turn those paths'
+    /// stage-0 entries into the unmerged stages merge-tree reported.
+    Conflicted {
+        tree: String,
+        files: Vec<String>,
+        index_info: Vec<u8>,
+    },
 }
 
 /// The oldest git whose `merge-tree` has `--write-tree`.
@@ -1139,27 +1301,67 @@ pub fn merge_candidate(
         ])
         .output()
         .map_err(|e| WorkspaceError::Git(format!("git could not be launched: {e}")))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let mut fields = stdout.split('\0');
-    let tree = fields.next().unwrap_or("").trim().to_string();
+    let mut fields = output.stdout.split(|byte| *byte == 0);
+    let tree = String::from_utf8_lossy(fields.next().unwrap_or(&[]))
+        .trim()
+        .to_string();
     match output.status.code() {
         Some(0) if !tree.is_empty() => Ok(Merged::Clean { tree }),
-        Some(1) => {
-            // Conflicted file info: `<mode> <oid> <stage>\t<path>`, one
-            // NUL-terminated entry each.
-            let mut files: Vec<String> = fields
-                .take_while(|entry| !entry.is_empty())
-                .filter_map(|entry| entry.split_once('\t').map(|(_, path)| path.to_string()))
-                .collect();
-            files.sort();
-            files.dedup();
-            Ok(Merged::Conflicted { files })
+        Some(1) if !tree.is_empty() => {
+            // Only the conflicted-file-info section: `<mode> <oid>
+            // <stage>\t<path>`, one NUL-terminated entry each, ended by an
+            // empty field. What follows is informational messages.
+            let entries: Vec<&[u8]> = fields.take_while(|entry| !entry.is_empty()).collect();
+            let (files, index_info) = conflict_index_info(&entries);
+            Ok(Merged::Conflicted {
+                tree,
+                files,
+                index_info,
+            })
         }
         _ => Err(WorkspaceError::Git(format!(
             "git merge-tree failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ))),
     }
+}
+
+/// The conflicted paths (sorted) and the `git update-index -z --index-info`
+/// input for merge-tree's conflicted-file-info entries. The result tree
+/// already holds each conflicted path at stage 0 (with markers), and
+/// git-update-index(1) says an unmerged stage is only added beside nothing,
+/// so each path first gets a mode-0 removal, then its stage lines.
+fn conflict_index_info(entries: &[&[u8]]) -> (Vec<String>, Vec<u8>) {
+    let mut by_path: std::collections::BTreeMap<Vec<u8>, Vec<&[u8]>> =
+        std::collections::BTreeMap::new();
+    let mut zeros = 40;
+    for entry in entries {
+        let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
+            continue;
+        };
+        let (meta, path) = (&entry[..tab], &entry[tab + 1..]);
+        if let Some(oid) = meta.split(|byte| *byte == b' ').nth(1) {
+            zeros = oid.len();
+        }
+        by_path.entry(path.to_vec()).or_default().push(entry);
+    }
+    let mut info = Vec::new();
+    for (path, lines) in &by_path {
+        info.extend_from_slice(b"0 ");
+        info.extend(std::iter::repeat_n(b'0', zeros));
+        info.push(b'\t');
+        info.extend_from_slice(path);
+        info.push(0);
+        for line in lines {
+            info.extend_from_slice(line);
+            info.push(0);
+        }
+    }
+    let files = by_path
+        .keys()
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect();
+    (files, info)
 }
 
 /// Is this a commit the object store holds?
@@ -1724,12 +1926,97 @@ mod tests {
         let left = on("both.txt", "left\n");
         git(&repo, &["reset", "-q", "--hard", &base]).expect("back to base");
         let right = on("both.txt", "right\n");
-        assert_eq!(
-            merge_candidate(&repo, &base, &right, &left).expect("merges"),
-            Merged::Conflicted {
-                files: vec!["both.txt".to_string()]
+        match merge_candidate(&repo, &base, &right, &left).expect("merges") {
+            Merged::Conflicted { files, tree, .. } => {
+                assert_eq!(files, vec!["both.txt".to_string()]);
+                assert!(!tree.is_empty(), "git still writes the tree with markers");
             }
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+    }
+
+    /// A conflicted merge is built into the task tree as unmerged stages:
+    /// no stage-0 entry survives beside them, the working file carries the
+    /// markers, and the tree cannot be snapshotted until the path is
+    /// resolved (plan A2, A4).
+    #[test]
+    fn a_conflicted_tree_has_only_unmerged_stages_and_snapshots_only_once_resolved() {
+        let (dir, repo) = temp_repo();
+        let base = resolve_base(&repo, "HEAD").expect("base");
+        let on = |path: &str, content: &str| {
+            std::fs::write(repo.join(path), content).expect("write");
+            git(&repo, &["add", "-A"]).expect("add");
+            git(&repo, &["commit", "-q", "-m", path]).expect("commit");
+            resolve_base(&repo, "HEAD").expect("sha")
+        };
+        let left = on("both.txt", "left\n");
+        git(&repo, &["reset", "-q", "--hard", &base]).expect("back to base");
+        let right = on("both.txt", "right\n");
+        let Merged::Conflicted {
+            tree,
+            files,
+            index_info,
+        } = merge_candidate(&repo, &base, &right, &left).expect("merges")
+        else {
+            panic!("expected a conflict");
+        };
+        let worktree = create_worktree(&repo, &right, &dir.join("task-tree")).expect("worktree");
+        worktree
+            .check_out_conflicted(&tree, &index_info)
+            .expect("the index is built");
+
+        let staged = git(&worktree.path, &["ls-files", "-s", "--", "both.txt"]).expect("index");
+        let stages: Vec<&str> = staged
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(2))
+            .collect();
+        assert!(
+            !stages.contains(&"0"),
+            "a stage-0 entry survived beside the unmerged stages: {staged}"
         );
+        assert!(
+            stages.contains(&"2") && stages.contains(&"3"),
+            "ours and theirs are staged: {staged}"
+        );
+        let text = std::fs::read_to_string(worktree.path.join("both.txt")).expect("file");
+        assert!(
+            text.contains("<<<<<<<") && text.contains(">>>>>>>"),
+            "{text}"
+        );
+
+        assert_eq!(worktree.unresolved_conflicts(&files).expect("check"), files);
+        assert!(matches!(
+            worktree.snapshot_resolved("attempt-1", &files),
+            Err(WorkspaceError::UnresolvedConflict(paths)) if paths == files
+        ));
+        // Markers gone from the file but the path still unmerged: refused.
+        std::fs::write(worktree.path.join("both.txt"), "resolved\n").expect("resolve");
+        assert!(matches!(
+            worktree.snapshot_resolved("attempt-1", &files),
+            Err(WorkspaceError::UnresolvedConflict(_))
+        ));
+        // Staged and clean: accepted.
+        git(&worktree.path, &["add", "both.txt"]).expect("stage the resolution");
+        assert!(worktree
+            .unresolved_conflicts(&files)
+            .expect("check")
+            .is_empty());
+        let candidate = worktree
+            .snapshot_resolved("attempt-1", &files)
+            .expect("snapshot");
+        let content =
+            git(&worktree.path, &["show", &format!("{candidate}:both.txt")]).expect("show");
+        assert_eq!(content, "resolved");
+        // Markers left in a staged file are refused as well.
+        std::fs::write(
+            worktree.path.join("both.txt"),
+            "<<<<<<< ours\nx\n>>>>>>> theirs\n",
+        )
+        .expect("markers");
+        assert!(matches!(
+            worktree.snapshot_resolved("attempt-2", &files),
+            Err(WorkspaceError::UnresolvedConflict(_))
+        ));
     }
 
     #[test]

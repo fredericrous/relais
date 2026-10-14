@@ -222,6 +222,61 @@ export async function startRun(fx: Fx, store: Store, input: { task: string; cwd:
   return `Started relais run for: ${input.task} (in ${input.cwd})${asked}. It runs in the relais pane and /relais-status; its outcome arrives here as a message when it ends.`
 }
 
+// A successor intent a `decide revise` recorded (relais ADR-0009 A5): launched
+// as `relais run --intent <id>`, which claims it atomically; a second claim
+// is refused `intent_already_claimed` with the run that holds it. Launched
+// once per session, whoever asks.
+export async function startIntent(fx: Fx, store: Store, input: { intent: string; cwd: string }) {
+  if (store.launchedIntents.has(input.intent)) {
+    return `Successor intent ${input.intent} was already launched in this session.`
+  }
+  store.launchedIntents.add(input.intent)
+  await startChild(fx, store, ['relais', 'run', '--intent', input.intent, '--protocol'], input.cwd)
+  return `Started relais successor intent ${input.intent} (in ${input.cwd}). It runs in the relais pane and /relais-status; its outcome arrives here as a message when it ends.`
+}
+
+export type PendingIntent = { intent_id: string; repo: string }
+
+// The intents `relais native status --session` lists as launchable: pending
+// ones, and claimed ones whose run is gone. Anything else it says is not
+// this function's.
+export function launchableIntents(text: string): PendingIntent[] {
+  let parsed: any
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return []
+  }
+  const listed: unknown[] = Array.isArray(parsed?.intents) ? parsed.intents : []
+  return listed.flatMap((intent: any) =>
+    typeof intent?.intent_id === 'string' && typeof intent?.repo === 'string' && intent.repo !== ''
+      ? [{ intent_id: intent.intent_id, repo: intent.repo }]
+      : [],
+  )
+}
+
+// The plugin is the only launcher of successor intents: on start and at each
+// status poll it asks relais what is waiting and launches what this session
+// has not launched. Fails open: a status that cannot be read launches nothing.
+export async function reconcileIntents(fx: Fx, store: Store): Promise<string[]> {
+  try {
+    const session = await fx.session.id()
+    const result = await fx.process.run(['relais', 'native', 'status', '--session', session], {
+      timeoutMs: STATUS_TIMEOUT_MS,
+    })
+    if (result.exitCode !== 0) return []
+    const started: string[] = []
+    for (const intent of launchableIntents(String(result.stdout ?? ''))) {
+      if (store.launchedIntents.has(intent.intent_id)) continue
+      await startIntent(fx, store, { intent: intent.intent_id, cwd: intent.repo })
+      started.push(intent.intent_id)
+    }
+    return started
+  } catch {
+    return []
+  }
+}
+
 export async function startReplay(
   fx: Fx,
   store: Store,
@@ -512,6 +567,7 @@ async function refreshRun(fx: Fx, store: Store, run: string) {
 // for by id (marked `foreign` when another session started it). Every live
 // model, and every one awaiting a person, is checked against the ledger first.
 export async function statusOf(fx: Fx, store: Store, run?: string, opts: { output?: boolean } = {}): Promise<string> {
+  await reconcileIntents(fx, store)
   const now = await fx.clock.now()
   const known = () => Object.values(store.models).filter(m => (run ? m.run === run : !m.foreign))
   const live = known().filter(

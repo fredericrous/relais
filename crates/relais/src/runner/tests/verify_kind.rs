@@ -450,3 +450,309 @@ fn a_pinned_candidate_survives_release_while_its_consumer_is_running() {
     assert!(!source_dir.join("candidate-1.patch").exists());
     std::fs::remove_dir_all(&fixture.dir).ok();
 }
+
+// -- from_candidate on kind: change (A4) ---------------------------------
+
+/// The contract of a change that continues from `source`'s candidate.
+fn continue_contract(source: &RunId) -> TaskContract {
+    TaskContract::from_json_str(
+        &serde_json::json!({
+            "schema_version": 1,
+            "kind": "change",
+            "objective": "Carry on from the earlier candidate",
+            "base_ref": "HEAD",
+            "write_scope": ["src/**"],
+            "from_candidate": { "run": source.as_str() },
+            "acceptance": ["the profile's checks pass"],
+            "verification_profile": "profile",
+            "review": "off",
+        })
+        .to_string(),
+    )
+    .expect("a from_candidate contract")
+}
+
+/// A source run whose candidate rewrites `src/main.rs`, accepted.
+fn rewriting_source(fixture: &Fixture) -> RunId {
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let backend = MockBackend::new(|spec| {
+        std::fs::write(
+            spec.work_dir.join("src/main.rs"),
+            "fn main() { /* candidate */ }\n",
+        )
+        .expect("the worker rewrites the file");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let RunOutcome {
+        run_id,
+        terminal: Terminal::Accepted(_),
+    } = fixture.execute(&fixture.contract(Review::Off), &repo, &backend)
+    else {
+        panic!("the source run is accepted");
+    };
+    run_id
+}
+
+#[test]
+fn a_conflicting_from_candidate_hands_the_merge_to_the_worker_and_refuses_the_snapshot_until_resolved(
+) {
+    let fixture = Fixture::new();
+    let source = rewriting_source(&fixture);
+    commit_file(
+        &fixture,
+        "src/main.rs",
+        "fn main() { println!(\"target\"); }\n",
+    );
+    let target_base = git(&fixture.repo, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+
+    // What each launch saw in its tree and its prompt.
+    let seen: Arc<std::sync::Mutex<Vec<(String, String, String)>>> = Arc::default();
+    let record = Arc::clone(&seen);
+    let backend = MockBackend::new(move |spec| {
+        let unmerged = git(&spec.work_dir, &["ls-files", "-u", "--", "src/main.rs"]);
+        let file = std::fs::read_to_string(spec.work_dir.join("src/main.rs")).unwrap_or_default();
+        let mut record = record.lock().expect("lock");
+        record.push((spec.prompt.clone(), unmerged, file));
+        // The first launch leaves the conflict alone; the second resolves.
+        if record.len() == 2 {
+            std::fs::write(
+                spec.work_dir.join("src/main.rs"),
+                "fn main() { /* both */ }\n",
+            )
+            .expect("resolve");
+            git(&spec.work_dir, &["add", "src/main.rs"]);
+        }
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let RunOutcome {
+        run_id,
+        terminal: Terminal::Accepted(receipt),
+    } = fixture.execute(&continue_contract(&source), &repo, &backend)
+    else {
+        panic!("the resolved candidate is accepted");
+    };
+
+    let seen = seen.lock().expect("lock");
+    assert_eq!(seen.len(), 2, "one attempt refused, one repair");
+    let (prompt, unmerged, file) = &seen[0];
+    assert!(
+        unmerged.contains("src/main.rs") && unmerged.lines().count() >= 2,
+        "unmerged stages in the index: {unmerged}"
+    );
+    assert!(file.contains("<<<<<<<"), "markers in the file: {file}");
+    assert!(prompt.contains("conflicts: [{"), "{prompt}");
+    assert!(prompt.contains("\"path\":\"src/main.rs\""), "{prompt}");
+    assert!(prompt.contains("\"ours\":\"target_base\""), "{prompt}");
+    assert!(prompt.contains("\"theirs\":\"candidate\""), "{prompt}");
+    assert!(prompt.contains("resolve these first"), "{prompt}");
+    assert!(
+        seen[1].0.contains("unresolved_conflict: src/main.rs"),
+        "the repair is told why the first attempt was refused: {}",
+        seen[1].0
+    );
+    assert!(seen[1].0.contains("resolve these first"));
+
+    // The refused attempt is a failed attempt on record.
+    let transitions = fixture.ledger.transitions(&run_id).expect("transitions");
+    assert!(
+        transitions.iter().any(|t| t
+            .detail
+            .as_ref()
+            .is_some_and(|d| d.to_string().contains("unresolved_conflict: src/main.rs"))),
+        "{transitions:?}"
+    );
+    // Patch and scope stay relative to the target base.
+    assert_eq!(receipt.base_sha, target_base);
+    let content = git(
+        &fixture.repo,
+        &["show", &format!("{}:src/main.rs", receipt.candidate_sha)],
+    );
+    assert_eq!(content, "fn main() { /* both */ }\n");
+    assert_eq!(
+        receipt.candidate.as_ref().map(|c| c.source_run.as_str()),
+        Some(source.as_str())
+    );
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+#[test]
+fn a_clean_from_candidate_starts_with_the_candidate_applied_and_no_conflict_text() {
+    let fixture = Fixture::new();
+    let source = rewriting_source(&fixture);
+    commit_file(&fixture, "README.md", "unrelated\n");
+    let seen: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::default();
+    let record = Arc::clone(&seen);
+    let backend = MockBackend::new(move |spec| {
+        let file = std::fs::read_to_string(spec.work_dir.join("src/main.rs")).unwrap_or_default();
+        record
+            .lock()
+            .expect("lock")
+            .push((spec.prompt.clone(), file));
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    let outcome = fixture.execute(&continue_contract(&source), &repo, &backend);
+    assert!(
+        matches!(outcome.terminal, Terminal::Accepted(_)),
+        "{outcome:?}"
+    );
+    let seen = seen.lock().expect("lock");
+    assert_eq!(seen[0].1, "fn main() { /* candidate */ }\n");
+    assert!(!seen[0].0.contains("resolve these first"), "{}", seen[0].0);
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}
+
+// -- successor intent: widen scope (A5) -----------------------------------
+
+#[test]
+fn a_widened_scope_verify_names_the_source_run_and_its_receipt_carries_the_delta() {
+    use crate::ledger::DecisionAnswer;
+    use crate::runner::successor;
+
+    let fixture = Fixture::new();
+    let repo = fixture.repo_policy(vec![passing_check()], 3);
+    // The worker leaves the scope the contract declares (`src/**`).
+    let backend = MockBackend::new(|spec| {
+        std::fs::create_dir_all(spec.work_dir.join("docs")).expect("mkdir");
+        std::fs::write(spec.work_dir.join("docs/extra.md"), "one\ntwo\n").expect("write");
+        std::fs::write(
+            spec.work_dir.join("src/main.rs"),
+            "fn main() {}\n// edited\n",
+        )
+        .expect("write");
+        MockOutcome {
+            result_text: Some("DONE".into()),
+            exit_code: Some(0),
+            usage: Some(usage(100)),
+            ..Default::default()
+        }
+    });
+    let RunOutcome {
+        run_id: decided,
+        terminal: Terminal::NeedsDecision { reason, detail },
+    } = fixture.execute(&fixture.contract(Review::Off), &repo, &backend)
+    else {
+        panic!("a write outside the scope waits on a person");
+    };
+    assert_eq!(reason, Reason::ScopeExceeded);
+    // The decision text lists the out-of-scope path with +/- counts.
+    assert!(detail.contains("docs/extra.md (+2/-0)"), "{detail}");
+
+    // The recorded paths are the bare out-of-scope ones.
+    let paths = successor::out_of_scope_paths(&fixture.ledger, &decided).expect("paths");
+    assert_eq!(paths, vec!["docs/extra.md".to_string()]);
+
+    // The widened contract: same contract, kind verify, this run's
+    // candidate, scope plus exactly those paths.
+    let (original, _) = fixture
+        .ledger
+        .run_contract_and_tier(&decided)
+        .expect("read")
+        .expect("recorded");
+    let widened = successor::widened_contract(&original, &decided, &paths).expect("widened");
+    assert!(widened.is_verify());
+    assert_eq!(
+        widened.candidate().map(|c| (c.run.as_str(), c.index)),
+        Some((decided.as_str(), None))
+    );
+    assert_eq!(
+        widened.scope_patterns(),
+        vec!["src/**".to_string(), "docs/extra.md".to_string()]
+    );
+    assert_eq!(widened.objective, original.objective);
+    assert_eq!(widened.acceptance, original.acceptance);
+
+    // Answering writes the decision and the intent together.
+    let intent = successor::plan(
+        &fixture.ledger,
+        &decided,
+        &widened,
+        paths.clone(),
+        &fixture.artifacts,
+    )
+    .expect("planned");
+    assert_eq!(
+        intent.candidate.as_ref().map(|c| c.source_run.as_str()),
+        Some(decided.as_str()),
+        "the candidate is resolved and pinned with the answer"
+    );
+    let stored = fixture
+        .ledger
+        .resolve_decision_with_intent(
+            &decided,
+            &DecisionAnswer {
+                resolution: Reason::DecisionRevised,
+                actor: crate::ledger::Actor::Orchestrator,
+                person_quote: None,
+                recorded_via: crate::ledger::RecordedVia::Cli,
+                note: None,
+                successor_run: None,
+                from_state: State::NeedsDecision,
+                to_state: State::Failed,
+            },
+            &intent,
+        )
+        .expect("written")
+        .expect("open decision");
+
+    // The plugin's side: claim for a run id, run the intent's contract.
+    let new_run = fixture.ids.run_id().expect("a run id");
+    assert!(matches!(
+        fixture
+            .ledger
+            .claim_intent(&stored.intent_id, &new_run, &|_| true)
+            .expect("claim"),
+        crate::ledger::Claim::Claimed(_)
+    ));
+    let contract = TaskContract::from_json_str(&stored.contract_json).expect("the stored contract");
+    let seen = launches();
+    let counting = counting_worker(Arc::clone(&seen));
+    let RunOutcome {
+        run_id,
+        terminal: Terminal::Accepted(receipt),
+    } = fixture.execute_as(Some(new_run.clone()), &contract, &repo, &counting)
+    else {
+        panic!("the widened verify is accepted");
+    };
+    assert_eq!(run_id, new_run);
+    assert_eq!(
+        seen.load(Ordering::SeqCst),
+        0,
+        "a verify dispatches no worker"
+    );
+    let predecessor = receipt
+        .predecessor
+        .expect("the receipt names its predecessor");
+    assert_eq!(predecessor.run, decided.as_str());
+    assert_eq!(predecessor.intent_id, stored.intent_id);
+    assert_eq!(predecessor.scope_delta, vec!["docs/extra.md".to_string()]);
+    assert_eq!(
+        receipt.candidate.map(|c| c.source_run),
+        Some(decided.as_str().to_string())
+    );
+    let written: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fixture.artifacts.join(run_id.as_str()).join("receipt.json"))
+            .expect("receipt.json"),
+    )
+    .expect("json");
+    assert_eq!(written["predecessor"]["scope_delta"][0], "docs/extra.md");
+    std::fs::remove_dir_all(&fixture.dir).ok();
+}

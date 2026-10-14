@@ -4,6 +4,7 @@
 // module only sets who answered and proves the call was its own.
 
 import { note } from './agents.ts'
+import { contractPath, startIntent } from './runs.ts'
 import type { Fx } from './fx.ts'
 import type { Store } from './store.ts'
 
@@ -22,7 +23,7 @@ export const TASK_TYPES = ['report', 'mechanical', 'pattern', 'review-fix', 'fea
 
 // What the run tool says a task contract is, built from TASK_TYPES so the
 // two cannot drift.
-export const RUN_CONTRACT_DESCRIPTION = `The task contract: {schema_version: 1, kind: "change" | "inspect", task_type: ${TASK_TYPES.map(type => `"${type}"`).join(' | ')} (declare the one that fits the work), objective, base_ref: "HEAD", write_scope: [globs], read_hints: [paths], acceptance: [criteria a command can verify], verification_profile: "default", review: "optional"}. A path to a contract .json file is also accepted.`
+export const RUN_CONTRACT_DESCRIPTION = `The task contract: {schema_version: 1, kind: "change" | "inspect" | "verify", task_type: ${TASK_TYPES.map(type => `"${type}"`).join(' | ')} (declare the one that fits the work), objective, base_ref: "HEAD", write_scope: [globs], read_hints: [paths], acceptance: [criteria a command can verify], verification_profile: "default", review: "optional"}. To verify an existing candidate use kind "verify" with candidate: {run, index?} (no worker runs); to continue one use kind "change" with from_candidate: {run, index?}. Never write "apply this patch" into an objective. A path to a contract .json file is also accepted.`
 
 export const DECIDE_TOOL_DESCRIPTION =
   "Record the answer to a relais run waiting on a decision (needs_decision, needs_review, interrupted): approve, revise, reject, salvaged, abandon or decided. A decision is not made until it is recorded here. Answer it yourself when the request or the approved plan already answers it; otherwise ask the person, and record their answer with on_behalf_of_person and their own words as person_quote. relais refuses what may not be answered (an approval with open verification gaps) and says why."
@@ -34,6 +35,14 @@ export const DECIDE_INPUT_SCHEMA = {
     answer: { type: 'string', enum: [...ANSWERS], description: 'What was decided.' },
     note: { type: 'string', description: 'Why: the evidence the answer rests on.' },
     successor: { type: 'string', description: 'The run that carries a revision, for revise.' },
+    widen_scope: {
+      type: 'boolean',
+      description: 'For revise on a scope_exceeded decision: verify this run\'s candidate again with the write scope widened by exactly the out-of-scope paths. relais records the successor and this tool launches it.',
+    },
+    successor_contract: {
+      description: 'For revise: the contract of the successor run (an object, or the path of a .json file). relais records it with the answer and this tool launches it.',
+    },
+    cwd: { type: 'string', description: 'The repository (absolute path); needed to save a successor_contract object.' },
     candidate: { type: 'string', description: 'The commit sha that landed the candidate, for salvaged.' },
     criterion: { type: 'string', description: "An acceptance criterion the person signs off (approve only; the person's answer only)." },
     on_behalf_of_person: { type: 'boolean', description: 'The person gave this answer in their last message.' },
@@ -116,6 +125,8 @@ export type DecideInput = {
   answer?: unknown
   note?: unknown
   successor?: unknown
+  widen_scope?: unknown
+  successor_contract?: unknown
   candidate?: unknown
   criterion?: unknown
   on_behalf_of_person?: unknown
@@ -148,6 +159,9 @@ export async function decideTool(fx: Fx, store: Store, input: DecideInput): Prom
   ] as const) {
     if (typeof value === 'string' && value !== '') argv.push(flag, value)
   }
+  const successor = await successorFlags(fx, input, answer)
+  if ('deny' in successor) return { deny: successor.deny }
+  argv.push(...successor.argv)
   const proof = store.decideNonce
   if (proof) argv.push('--proof-stdin')
   const result = await fx.process.run(argv, {
@@ -166,9 +180,37 @@ export async function decideTool(fx: Fx, store: Store, input: DecideInput): Prom
   }
   const advice = reply?.advice && typeof reply.advice.p_approve === 'number' ? `, advice p(approve)=${reply.advice.p_approve.toFixed(2)}` : ''
   await note(fx, store, run, `decided ${answer} for ${run} as ${reply?.actor ?? actor}${advice}`)
-  return {
-    result: `Recorded ${reply?.resolution ?? answer} for ${run} by ${reply?.actor ?? actor}: ${reply?.from_state ?? '?'} -> ${reply?.to_state ?? '?'}.`,
+  const recorded = `Recorded ${reply?.resolution ?? answer} for ${run} by ${reply?.actor ?? actor}: ${reply?.from_state ?? '?'} -> ${reply?.to_state ?? '?'}.`
+  // The answer wrote a successor intent: this plugin is its launcher. A
+  // repeated answer returns the same intent, and it is launched once.
+  const intent = reply?.successor_intent
+  if (typeof intent?.intent_id === 'string') {
+    const cwd = typeof intent.repo === 'string' && intent.repo !== '' ? intent.repo : typeof input.cwd === 'string' ? input.cwd : undefined
+    if (cwd === undefined) {
+      return { result: `${recorded} Successor intent ${intent.intent_id} is pending; it is launched when relais reports where it runs (the next status poll).` }
+    }
+    return { result: `${recorded} ${await startIntent(fx, store, { intent: intent.intent_id, cwd })}` }
   }
+  return { result: recorded }
+}
+
+// The flags `widen_scope` and `successor_contract` become, or the refusal
+// that says what they need. Both belong to a revise.
+async function successorFlags(fx: Fx, input: DecideInput, answer: string): Promise<{ argv: string[] } | { deny: string }> {
+  const widen = input.widen_scope === true
+  const contract = input.successor_contract
+  if (!widen && contract === undefined) return { argv: [] }
+  if (answer !== 'revise') return { deny: 'widen_scope and successor_contract belong to answer revise.' }
+  if (widen && contract !== undefined) return { deny: 'widen_scope and successor_contract are two ways to write the successor: pass one.' }
+  if (widen) return { argv: ['--widen-scope'] }
+  if (typeof contract === 'string' && contract !== '') return { argv: ['--successor-contract', contract] }
+  if (contract && typeof contract === 'object') {
+    if (typeof input.cwd !== 'string') return { deny: 'a successor_contract object is saved in the repository: pass cwd (absolute path), or pass the path of a .json file.' }
+    const saved = await contractPath(fx, contract, input.cwd)
+    if (saved.deny) return { deny: saved.deny }
+    return { argv: ['--successor-contract', saved.path] }
+  }
+  return { deny: 'successor_contract is a contract object or the path of a .json file.' }
 }
 
 export const FEEDBACK_OUTCOMES = ['reverted', 'regression', 'corrected'] as const

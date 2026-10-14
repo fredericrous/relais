@@ -398,7 +398,15 @@ fn execute_waves(
         match workspace::check_scope(integration, &assembly.head, contract) {
             Ok(_) => {}
             Err(WorkspaceError::ScopeViolation(paths)) => {
-                return engine.stop(&budget, Observation::ScopeViolation(paths));
+                return engine.stop(
+                    &budget,
+                    Observation::ScopeViolation(
+                        paths
+                            .iter()
+                            .map(|path| crate::workspace::OutOfScope::bare(path))
+                            .collect(),
+                    ),
+                );
             }
             Err(e) => {
                 return engine.fail_preflight(BlockCode::ScopeCheckFailed, e.to_string());
@@ -1070,6 +1078,7 @@ fn accept_integrated(
         verification: report,
         kind: engine.config.contract.kind(),
         candidate: None,
+        predecessor: None,
         models_used: std::mem::take(&mut assembly.models_used),
         attempts: assembly.attempts_total,
         cost_completeness: spend.completeness,

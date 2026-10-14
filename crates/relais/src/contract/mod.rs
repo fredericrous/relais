@@ -263,6 +263,10 @@ impl WriteScope {
 pub enum Task {
     Change {
         write_scope: WriteScope,
+        /// A candidate to continue from (SPEC §4): the task tree starts
+        /// with it applied. A conflict does not block the run; the worker
+        /// is handed the merge (SPEC §8).
+        from_candidate: Option<CandidateRef>,
     },
     Inspect,
     /// Verify an existing candidate (SPEC §4): no worker, no repair, no
@@ -304,6 +308,17 @@ pub struct ResolvedCandidate {
     pub target_base_sha: String,
 }
 
+/// The run a successor was launched from, and what its contract changed
+/// about the scope: carried on the successor's receipt (SPEC §9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Predecessor {
+    pub run: String,
+    pub intent_id: String,
+    /// The paths the successor's write scope adds, exactly; empty when the
+    /// successor's contract was written whole.
+    pub scope_delta: Vec<String>,
+}
+
 impl Task {
     /// A change bounded by these patterns. Refuses an empty scope and a
     /// pattern that is not a relative, compilable glob.
@@ -313,7 +328,25 @@ impl Task {
         }
         Ok(Task::Change {
             write_scope: WriteScope::compile(patterns)?,
+            from_candidate: None,
         })
+    }
+
+    /// A change that continues from an existing candidate.
+    pub fn change_from(
+        patterns: Vec<String>,
+        from_candidate: CandidateRef,
+    ) -> Result<Self, ContractError> {
+        if from_candidate.run.trim().is_empty() {
+            return Err(ContractError::EmptyCandidateRun);
+        }
+        match Self::change(patterns)? {
+            Task::Change { write_scope, .. } => Ok(Task::Change {
+                write_scope,
+                from_candidate: Some(from_candidate),
+            }),
+            other => Ok(other),
+        }
     }
 
     /// A verification of an existing candidate, bounded by these patterns.
@@ -342,7 +375,9 @@ impl Task {
 
     pub fn write_scope(&self) -> Option<&WriteScope> {
         match self {
-            Task::Change { write_scope } | Task::Verify { write_scope, .. } => Some(write_scope),
+            Task::Change { write_scope, .. } | Task::Verify { write_scope, .. } => {
+                Some(write_scope)
+            }
             Task::Inspect => None,
         }
     }
@@ -353,6 +388,20 @@ impl Task {
             Task::Verify { candidate, .. } => Some(candidate),
             Task::Change { .. } | Task::Inspect => None,
         }
+    }
+
+    /// The candidate a `kind: change` continues from; `None` otherwise.
+    pub fn from_candidate(&self) -> Option<&CandidateRef> {
+        match self {
+            Task::Change { from_candidate, .. } => from_candidate.as_ref(),
+            Task::Verify { .. } | Task::Inspect => None,
+        }
+    }
+
+    /// The candidate this task applies to its tree: a verify's, or the
+    /// one a change continues from.
+    pub fn source_candidate(&self) -> Option<&CandidateRef> {
+        self.candidate().or_else(|| self.from_candidate())
     }
 
     pub fn is_verify(&self) -> bool {
@@ -434,6 +483,8 @@ struct ContractWire {
     write_scope: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     candidate: Option<CandidateRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    from_candidate: Option<CandidateRef>,
     #[serde(default)]
     read_hints: Vec<String>,
     acceptance: Vec<crate::acceptance::AcceptanceEntry>,
@@ -468,6 +519,7 @@ impl From<&TaskContract> for ContractWire {
                 Task::Verify { .. } => WireKind::Verify,
             },
             candidate: contract.task.candidate().cloned(),
+            from_candidate: contract.task.from_candidate().cloned(),
             objective: contract.objective.clone(),
             base_ref: contract.base_ref.clone(),
             // `null` for an inspect, exactly as it has always been
@@ -495,8 +547,15 @@ impl TryFrom<ContractWire> for TaskContract {
     type Error = ContractError;
 
     fn try_from(wire: ContractWire) -> Result<Self, ContractError> {
+        let from_candidate = wire.from_candidate;
+        if from_candidate.is_some() && wire.kind != WireKind::Change {
+            return Err(ContractError::FromCandidateOnNonChange);
+        }
         let task = match (wire.kind, wire.candidate) {
-            (WireKind::Change, None) => Task::change(wire.write_scope.unwrap_or_default())?,
+            (WireKind::Change, None) => match from_candidate {
+                Some(from) => Task::change_from(wire.write_scope.unwrap_or_default(), from)?,
+                None => Task::change(wire.write_scope.unwrap_or_default())?,
+            },
             (WireKind::Inspect, None) => {
                 if wire.write_scope.is_some_and(|scope| !scope.is_empty()) {
                     return Err(ContractError::WriteScopeOnInspect);
@@ -511,6 +570,7 @@ impl TryFrom<ContractWire> for TaskContract {
                 return Err(ContractError::CandidateOnNonVerify)
             }
         };
+
         let task_type = wire
             .task_type
             .map(|text| TaskType::parse_declared(&text).ok_or(ContractError::UnknownTaskType(text)))
@@ -815,6 +875,11 @@ pub enum ContractError {
     CandidateOnNonVerify,
     /// `candidate.run` is empty.
     EmptyCandidateRun,
+    /// `from_candidate` is only meaningful for `kind: change`.
+    FromCandidateOnNonChange,
+    /// A change that continues from a candidate is one tree; there is
+    /// nothing to split.
+    DecompositionOnFromCandidate,
     /// A verify applies an existing candidate; there is nothing to split.
     DecompositionOnVerify,
     /// One declared write-scope pattern cannot be used as a bound.
@@ -878,6 +943,12 @@ impl std::fmt::Display for ContractError {
                 write!(f, "`candidate` is only meaningful with kind=verify")
             }
             Self::EmptyCandidateRun => write!(f, "candidate.run is empty"),
+            Self::FromCandidateOnNonChange => {
+                write!(f, "`from_candidate` is only meaningful with kind=change")
+            }
+            Self::DecompositionOnFromCandidate => {
+                write!(f, "a change with `from_candidate` cannot be decomposed")
+            }
             Self::DecompositionOnVerify => {
                 write!(f, "kind=verify cannot be decomposed into work packages")
             }
@@ -993,6 +1064,17 @@ impl TaskContract {
         self.task.candidate()
     }
 
+    /// The candidate a `kind: change` contract continues from.
+    pub fn from_candidate(&self) -> Option<&CandidateRef> {
+        self.task.from_candidate()
+    }
+
+    /// The candidate this contract's task tree starts with: a verify's, or
+    /// a change's `from_candidate`.
+    pub fn source_candidate(&self) -> Option<&CandidateRef> {
+        self.task.source_candidate()
+    }
+
     /// The declared write scope, or `None` for an inspect contract.
     pub fn write_scope(&self) -> Option<&WriteScope> {
         self.task.write_scope()
@@ -1046,8 +1128,12 @@ impl TaskContract {
                 ));
             }
         }
-        match self.task {
-            Task::Change { .. } => {}
+        match &self.task {
+            Task::Change { from_candidate, .. } => {
+                if from_candidate.is_some() && self.decomposition.is_some() {
+                    return Err(ContractError::DecompositionOnFromCandidate);
+                }
+            }
             Task::Inspect => {
                 if self.decomposition.is_some() {
                     return Err(ContractError::DecompositionOnInspect);
