@@ -11,6 +11,7 @@
 //! They live here, with no shell and no fake worker anywhere.
 
 mod common;
+mod fake_bin;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -83,12 +84,10 @@ impl World {
     /// in `plugin_install.rs`.
     #[cfg(unix)]
     fn with_plugin_claude(mut self) -> Self {
-        use std::os::unix::fs::PermissionsExt;
         let claude = self.root.join("claude");
         let script =
             "#!/bin/sh\nif [ \"$1 $2 $3\" = \"plugin list --json\" ]; then echo '[]'; fi\nexit 0\n";
-        std::fs::write(&claude, script).expect("fake claude");
-        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        fake_bin::install_script(&claude, script);
         self.claude = claude;
         self
     }

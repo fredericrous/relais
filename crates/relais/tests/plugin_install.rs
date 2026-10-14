@@ -8,6 +8,7 @@
 #![cfg(unix)]
 
 mod common;
+mod fake_bin;
 
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -54,9 +55,7 @@ impl World {
             std::fs::create_dir_all(dir).expect("mkdir");
         }
         let claude = fake.join("claude");
-        std::fs::write(&claude, FAKE_CLAUDE).expect("fake claude");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        fake_bin::install_script(&claude, FAKE_CLAUDE);
         let world = Self {
             _scratch: scratch,
             root,

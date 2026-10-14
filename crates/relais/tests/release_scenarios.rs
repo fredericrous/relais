@@ -13,6 +13,7 @@
 #![cfg(unix)]
 
 mod common;
+mod fake_bin;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -138,11 +139,7 @@ impl World {
         git(&repo, &["add", "-A"]);
         git(&repo, &["commit", "-q", "-m", "base"]);
         let claude = root.join("claude");
-        std::fs::write(&claude, FAKE_CLAUDE).expect("fake claude");
-        let mut mode = std::fs::metadata(&claude).expect("meta").permissions();
-        use std::os::unix::fs::PermissionsExt;
-        mode.set_mode(0o755);
-        std::fs::set_permissions(&claude, mode).expect("chmod");
+        fake_bin::install_script(&claude, FAKE_CLAUDE);
         Self {
             _scratch: scratch,
             root,
@@ -785,6 +782,23 @@ else
 fi
 printf '{"result":"DONE","session_id":"w-1","total_cost_usd":0.01,"modelUsage":{"%s":{"outputTokens":10}},"permission_denials":[],"usage":{"input_tokens":100,"output_tokens":10}}\n' "$model"
 "#;
+
+// Two worlds' fakes are one already-run inode, so neither pays macOS's
+// first-exec check inside relais's 30 s `claude --version` probe.
+#[test]
+fn every_worlds_fake_claude_is_the_one_warmed_inode() {
+    use std::os::unix::fs::MetadataExt;
+    let a = World::new("ino-a");
+    let b = World::new("ino-b");
+    let meta_a = std::fs::metadata(&a.claude).expect("meta a");
+    let meta_b = std::fs::metadata(&b.claude).expect("meta b");
+    assert_eq!(
+        (meta_a.dev(), meta_a.ino()),
+        (meta_b.dev(), meta_b.ino()),
+        "each world wrote its own fake"
+    );
+    assert!(meta_a.nlink() >= 3, "shared copy plus two worlds");
+}
 
 // SPEC §14: a bounded change routes to the configured model, passes
 // required verification and produces a receipt bound to the candidate.
