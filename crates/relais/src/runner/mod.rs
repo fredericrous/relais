@@ -1419,6 +1419,7 @@ impl<'a> RunEngine<'a> {
     ) -> Result<(), RunError> {
         use crate::workspace::inplace::{
             finalize, ApplyError, IndexOutcome, IndexPolicy, Outcome, Target, TargetKind,
+            Unrestored,
         };
         let Some(lease) = self.inplace.as_mut().and_then(|state| state.lease.take()) else {
             return Ok(());
@@ -1477,17 +1478,21 @@ impl<'a> RunEngine<'a> {
         };
         match finalize(lease, target, IndexPolicy::Restore, &mut export) {
             Ok(Outcome::Applied { index }) => {
-                self.say_index(index, worktree);
+                self.say_index(&index, worktree);
                 self.transition(
                     self.state,
                     Reason::WorktreeRetired,
                     serde_json::json!({
                         "worktree": worktree.path.to_string_lossy(),
                         "in_place": true,
-                        "index": match index {
+                        "index": match &index {
                             IndexOutcome::Untouched => "untouched",
                             IndexOutcome::Restored => "restored",
-                            IndexOutcome::Changed => "changed",
+                            IndexOutcome::Changed(_) => "changed",
+                        },
+                        "restore_error": match &index {
+                            IndexOutcome::Changed(Unrestored::Failed(why)) => Some(why.as_str()),
+                            _ => None,
                         },
                         "left": match kind {
                             TargetKind::Accepted => "the accepted change",
@@ -1537,8 +1542,8 @@ impl<'a> RunEngine<'a> {
     }
 
     /// Say, as a decision on the run, what became of the person's git index.
-    fn say_index(&self, index: crate::workspace::inplace::IndexOutcome, worktree: &TaskWorktree) {
-        use crate::workspace::inplace::IndexOutcome;
+    fn say_index(&self, index: &crate::workspace::inplace::IndexOutcome, worktree: &TaskWorktree) {
+        use crate::workspace::inplace::{IndexOutcome, Unrestored};
         let (what, reason) = match index {
             IndexOutcome::Untouched => return,
             IndexOutcome::Restored => (
@@ -1548,11 +1553,15 @@ impl<'a> RunEngine<'a> {
                     worktree.path.display()
                 ),
             ),
-            IndexOutcome::Changed => (
+            IndexOutcome::Changed(unrestored) => (
                 "real_index_changed",
                 format!(
-                    "the worker changed your git index in {} and it could not be restored; the original is kept in the git directory as {}.index.orig",
+                    "the worker changed your git index in {} and it could not be restored{}; the original is kept in the git directory as {}.index.orig",
                     worktree.path.display(),
+                    match unrestored {
+                        Unrestored::Failed(why) => format!(" ({why})"),
+                        Unrestored::NotAsked => String::new(),
+                    },
                     self.run_id
                 ),
             ),
@@ -2463,15 +2472,25 @@ impl<'a> RunEngine<'a> {
                         .map(|outcome| outcome.label.clone())
                         .collect();
                     if let (true, Some(key)) = (cacheable, &baseline_key) {
-                        if let verify::Stored::FailuresOnly { bytes } =
-                            baseline_cache.put(key, &failures, &checks)
-                        {
+                        let skipped = match baseline_cache.put(key, &failures, &checks) {
+                            verify::Stored::WithOutcomes => None,
+                            verify::Stored::OverLimit { bytes } => Some(format!(
+                                "the base's logs came to {} MiB; only its failed checks are cached",
+                                bytes / (1024 * 1024)
+                            )),
+                            verify::Stored::LogsUnreadable => Some(
+                                "a base log could not be read back to match its hash; only its failed checks are cached"
+                                    .to_string(),
+                            ),
+                            verify::Stored::NotWritten => Some(
+                                "the baseline cache could not be written; the next run of this base runs its checks again"
+                                    .to_string(),
+                            ),
+                        };
+                        if let Some(reason) = skipped {
                             self.events.emit(Event::Decision {
                                 what: "baseline_cache_outcomes_skipped".into(),
-                                reason: format!(
-                                    "the base's logs came to {} MiB; only its failed checks are cached",
-                                    bytes / (1024 * 1024)
-                                ),
+                                reason,
                             });
                         }
                     }

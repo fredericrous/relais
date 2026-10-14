@@ -2056,11 +2056,20 @@ pub struct CachedBaseline {
 pub enum Stored {
     /// The failures and the outcomes with their logs.
     WithOutcomes,
-    /// The failures only: the logs came to `bytes`, over the limit, or one
-    /// could not be read back to match its recorded hash.
-    FailuresOnly { bytes: u64 },
-    /// Nothing could be written.
-    Nothing,
+    /// The failures only: the logs came to `bytes`, over the limit.
+    OverLimit { bytes: u64 },
+    /// The failures only: a log could not be read back, or no longer
+    /// matches the hash recorded for it.
+    LogsUnreadable,
+    /// The cache could not be written: the next run of this base runs its
+    /// checks again.
+    NotWritten,
+}
+
+/// Why `collect` kept no outcomes.
+enum Skipped {
+    OverLimit(u64),
+    Unreadable,
 }
 
 /// The most log bytes an entry keeps outcomes for. The largest base-check log
@@ -2126,6 +2135,11 @@ impl BaselineCache {
         let mut checks = Vec::with_capacity(stored.len());
         for piece in stored {
             let mut outcome = piece.outcome;
+            // The hash the receipt will carry must be the hash of the bytes
+            // written: an entry edited by hand so that they differ is a miss.
+            if piece.log != outcome.log_sha256 {
+                return None;
+            }
             outcome.log_path = self.restore(&piece.log, &outcome.log_path, logs_dir)?;
             if let (
                 Some(sha),
@@ -2135,6 +2149,9 @@ impl BaselineCache {
                 }),
             ) = (&piece.junit, &mut outcome.junit)
             {
+                if *sha != artifact.sha256 {
+                    return None;
+                }
                 artifact.path = self.restore(sha, &artifact.path, logs_dir)?;
             }
             checks.push(outcome);
@@ -2168,7 +2185,7 @@ impl BaselineCache {
     /// longer matches its recorded hash.
     pub fn put(&self, key: &str, failures: &[String], checks: &[CheckOutcome]) -> Stored {
         if std::fs::create_dir_all(&self.dir).is_err() {
-            return Stored::Nothing;
+            return Stored::NotWritten;
         }
         let kept = self.collect(checks);
         let (outcomes, stored) = match kept {
@@ -2177,9 +2194,10 @@ impl BaselineCache {
                 .try_for_each(|(sha, bytes)| self.write_blob(sha, bytes))
             {
                 Ok(()) => (Some(outcomes), Stored::WithOutcomes),
-                Err(_) => (None, Stored::Nothing),
+                Err(_) => (None, Stored::NotWritten),
             },
-            Err(bytes) => (None, Stored::FailuresOnly { bytes }),
+            Err(Skipped::OverLimit(bytes)) => (None, Stored::OverLimit { bytes }),
+            Err(Skipped::Unreadable) => (None, Stored::LogsUnreadable),
         };
         let entry = Entry {
             failures: failures.to_vec(),
@@ -2189,7 +2207,7 @@ impl BaselineCache {
         // Best effort, as before: an entry that cannot be written is a cache
         // miss next time, which costs one baseline run and nothing else.
         if crate::fsutil::write_atomic(&self.dir.join(format!("{key}.json")), &text).is_err() {
-            return Stored::Nothing;
+            return Stored::NotWritten;
         }
         self.prune();
         stored
@@ -2198,15 +2216,15 @@ impl BaselineCache {
     /// The outcomes with their paths reduced to file names, and the blobs
     /// (hash, bytes) they refer to; or `Err(total bytes)` when they cannot
     /// all be kept.
-    fn collect(&self, checks: &[CheckOutcome]) -> Result<Kept, u64> {
+    fn collect(&self, checks: &[CheckOutcome]) -> Result<Kept, Skipped> {
         let mut total = 0u64;
         let mut blobs = Vec::new();
         let mut outcomes = Vec::with_capacity(checks.len());
         for check in checks {
             let mut outcome = check.clone();
-            let log = std::fs::read(&check.log_path).map_err(|_| total)?;
+            let log = std::fs::read(&check.log_path).map_err(|_| Skipped::Unreadable)?;
             if sha256_hex(&log) != check.log_sha256 {
-                return Err(total);
+                return Err(Skipped::Unreadable);
             }
             total += log.len() as u64;
             let mut junit = None;
@@ -2215,9 +2233,9 @@ impl BaselineCache {
                 ..
             }) = &mut outcome.junit
             {
-                let bytes = std::fs::read(&artifact.path).map_err(|_| total)?;
+                let bytes = std::fs::read(&artifact.path).map_err(|_| Skipped::Unreadable)?;
                 if sha256_hex(&bytes) != artifact.sha256 {
-                    return Err(total);
+                    return Err(Skipped::Unreadable);
                 }
                 total += bytes.len() as u64;
                 junit = Some(artifact.sha256.clone());
@@ -2232,7 +2250,7 @@ impl BaselineCache {
                 junit,
             });
             if total > OUTCOME_LOG_LIMIT {
-                return Err(total);
+                return Err(Skipped::OverLimit(total));
             }
         }
         Ok((outcomes, blobs))
@@ -2961,7 +2979,7 @@ mod tests {
         let stored = cache.put("k", &["failed@x".to_string()], &checks);
         assert_eq!(
             stored,
-            Stored::FailuresOnly {
+            Stored::OverLimit {
                 bytes: OUTCOME_LOG_LIMIT + 1
             }
         );

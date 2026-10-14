@@ -7558,13 +7558,17 @@ fn settle_state(ledger: &Ledger, run: &RunId, path: &Path) -> Result<Option<Stat
 /// carries on: this is a sweep, and one unreadable worktree (a pruned one,
 /// say) must not hide the others.
 fn in_place_leftovers() -> Vec<(RunId, PathBuf)> {
-    let Ok(here) = project_dir() else {
-        return Vec::new();
+    let here = match project_dir() {
+        Ok(here) => here,
+        Err(e) => {
+            println!("interrupted in-place runs are not looked for: {e}");
+            return Vec::new();
+        }
     };
     let worktrees = match workspace::worktree_paths(&here) {
         Ok(worktrees) => worktrees,
-        Err(_) => {
-            println!("not in a git repository: interrupted in-place runs are not looked for");
+        Err(e) => {
+            println!("interrupted in-place runs are not looked for: {e}");
             return Vec::new();
         }
     };
@@ -7767,7 +7771,7 @@ fn retire_in_place(
                     inplace::short(&marker.start),
                     root.display()
                 );
-                if index == inplace::IndexOutcome::Changed {
+                if matches!(index, inplace::IndexOutcome::Changed(_)) {
                     println!(
                     "{run}: your git index changed during the run; the original is kept at {}/relais-inplace/{run}.index.orig",
                     git_dir.display()

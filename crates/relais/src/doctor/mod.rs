@@ -1306,10 +1306,20 @@ pub(crate) struct WorkspaceFacts {
 /// Where a run started from here would work, why, whether copy-on-write
 /// seeding is available, and any in-place run left unfinished. A left run
 /// or a seed that cannot clone is a warning that names its fix.
+/// The interrupted in-place runs found in the repository's worktrees, and
+/// the places that could not be searched: a git directory that cannot be
+/// read is not a clean one.
+#[derive(Debug, Default)]
+pub(crate) struct LeftoverScan {
+    /// `(run, worktree)`.
+    pub runs: Vec<(String, PathBuf)>,
+    pub unreadable: Vec<String>,
+}
+
 pub(crate) fn workspace_finding(
     facts: &WorkspaceFacts,
     cow: &CowProbe,
-    leftovers: &[(String, PathBuf)],
+    scan: &LeftoverScan,
 ) -> Finding {
     use crate::workspace::reuse::{resolve, ModeInputs, ModeRefusal, Workspace};
     let inputs = ModeInputs {
@@ -1374,12 +1384,16 @@ pub(crate) fn workspace_finding(
             }
         }
     }
-    for (run, path) in leftovers {
+    for (run, path) in &scan.runs {
         level = Level::Warn;
         detail.push_str(&format!(
             "\nrun {run} was interrupted in {}: relais resume --retire {run}",
             path.display()
         ));
+    }
+    for problem in &scan.unreadable {
+        level = Level::Warn;
+        detail.push_str(&format!("\ncould not look for interrupted runs: {problem}"));
     }
     Finding {
         component: "workspace",
@@ -1425,20 +1439,23 @@ fn workspace_finding_on_disk(
         repo_opts_out_of_in_place: policy.is_some_and(|p| p.workspace.in_place == Some(false)),
         linked_worktree: crate::repo::is_linked_worktree(repo_dir),
     };
-    let leftovers = crate::workspace::worktree_paths(repo_dir)
-        .map(|paths| {
-            paths
-                .into_iter()
-                .filter_map(|path| {
-                    let git_dir = crate::workspace::inplace::git_dir(&path).ok()?;
-                    let markers = crate::workspace::inplace::leftover_markers(&git_dir).ok()?;
-                    Some(markers.into_iter().map(move |m| (m.run, path.clone())))
-                })
-                .flatten()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    workspace_finding(&facts, &cow, &leftovers)
+    let mut scan = LeftoverScan::default();
+    match crate::workspace::worktree_paths(repo_dir) {
+        Ok(paths) => {
+            for path in paths {
+                match crate::workspace::inplace::git_dir(&path)
+                    .and_then(|git_dir| crate::workspace::inplace::leftover_markers(&git_dir))
+                {
+                    Ok(markers) => scan
+                        .runs
+                        .extend(markers.into_iter().map(|m| (m.run, path.clone()))),
+                    Err(e) => scan.unreadable.push(format!("{}: {e}", path.display())),
+                }
+            }
+        }
+        Err(e) => scan.unreadable.push(format!("{}: {e}", repo_dir.display())),
+    }
+    workspace_finding(&facts, &cow, &scan)
 }
 
 /// `relais doctor --effort-template`: the machine.toml block for this
@@ -3586,7 +3603,8 @@ mod tests {
     /// each says why, so the line explains itself on a machine nobody set up.
     #[test]
     fn the_workspace_line_names_the_mode_and_why() {
-        let primary = workspace_finding(&workspace_facts(), &CowProbe::Ok, &[]);
+        let primary =
+            workspace_finding(&workspace_facts(), &CowProbe::Ok, &LeftoverScan::default());
         assert_eq!(primary.level, Level::Ok);
         assert_eq!(
             primary.detail,
@@ -3598,7 +3616,7 @@ mod tests {
             ..workspace_facts()
         };
         assert_eq!(
-            workspace_finding(&linked, &CowProbe::Ok, &[]).detail,
+            workspace_finding(&linked, &CowProbe::Ok, &LeftoverScan::default()).detail,
             "in_place (a linked worktree); copy-on-write ok"
         );
 
@@ -3607,7 +3625,7 @@ mod tests {
             ..linked
         };
         assert_eq!(
-            workspace_finding(&opted_out, &CowProbe::Ok, &[]).detail,
+            workspace_finding(&opted_out, &CowProbe::Ok, &LeftoverScan::default()).detail,
             "fork (this repository sets [workspace] in_place = false); copy-on-write ok"
         );
     }
@@ -3619,7 +3637,7 @@ mod tests {
             ci: Some("true".into()),
             ..workspace_facts()
         };
-        let finding = workspace_finding(&ci, &CowProbe::Ok, &[]);
+        let finding = workspace_finding(&ci, &CowProbe::Ok, &LeftoverScan::default());
         assert_eq!(finding.level, Level::Ok);
         assert_eq!(
             finding.detail,
@@ -3631,7 +3649,7 @@ mod tests {
             ..workspace_facts()
         };
         assert_eq!(
-            workspace_finding(&env, &CowProbe::Ok, &[]).detail,
+            workspace_finding(&env, &CowProbe::Ok, &LeftoverScan::default()).detail,
             "isolated (RELAIS_WORKSPACE=isolated); no dependencies are seeded"
         );
 
@@ -3640,7 +3658,7 @@ mod tests {
             ..workspace_facts()
         };
         assert_eq!(
-            workspace_finding(&machine, &CowProbe::Ok, &[]).detail,
+            workspace_finding(&machine, &CowProbe::Ok, &LeftoverScan::default()).detail,
             "isolated (machine.toml [workspace] mode); no dependencies are seeded"
         );
 
@@ -3648,7 +3666,7 @@ mod tests {
             env_workspace: Some("everywhere".into()),
             ..workspace_facts()
         };
-        let finding = workspace_finding(&bad, &CowProbe::Ok, &[]);
+        let finding = workspace_finding(&bad, &CowProbe::Ok, &LeftoverScan::default());
         assert_eq!(finding.level, Level::Warn);
         assert!(
             finding.detail.contains("RELAIS_WORKSPACE=everywhere"),
@@ -3664,7 +3682,7 @@ mod tests {
         let finding = workspace_finding(
             &workspace_facts(),
             &CowProbe::Unavailable("another volume".into()),
-            &[],
+            &LeftoverScan::default(),
         );
         assert_eq!(finding.level, Level::Warn);
         assert!(
@@ -3682,7 +3700,7 @@ mod tests {
         let unprobed = workspace_finding(
             &workspace_facts(),
             &CowProbe::NotProbed("the state directory does not exist yet".into()),
-            &[],
+            &LeftoverScan::default(),
         );
         assert_eq!(unprobed.level, Level::Ok);
 
@@ -3691,7 +3709,12 @@ mod tests {
             ..workspace_facts()
         };
         assert_eq!(
-            workspace_finding(&isolated, &CowProbe::Unavailable("x".into()), &[]).level,
+            workspace_finding(
+                &isolated,
+                &CowProbe::Unavailable("x".into()),
+                &LeftoverScan::default()
+            )
+            .level,
             Level::Ok,
             "isolation never clones, so an unavailable clone costs nothing"
         );
@@ -3701,7 +3724,10 @@ mod tests {
     /// in the text report and in `--json`.
     #[test]
     fn an_interrupted_in_place_run_is_a_warning_with_the_retire_command() {
-        let leftovers = vec![("run-65dc-1".to_string(), PathBuf::from("/work/wt-a"))];
+        let leftovers = LeftoverScan {
+            runs: vec![("run-65dc-1".to_string(), PathBuf::from("/work/wt-a"))],
+            unreadable: Vec::new(),
+        };
         let finding = workspace_finding(&workspace_facts(), &CowProbe::Ok, &leftovers);
         assert_eq!(finding.level, Level::Warn);
         let sentence =
@@ -3714,6 +3740,23 @@ mod tests {
         let json = serde_json::to_value(&report).expect("serializes");
         assert_eq!(json["findings"][0]["component"], "workspace");
         assert_eq!(json["findings"][0]["level"], "warn");
+    }
+
+    /// A worktree whose git directory cannot be read is a warning, not a
+    /// clean bill: the scan did not see it.
+    #[test]
+    fn an_unreadable_worktree_is_a_warning_not_a_clean_scan() {
+        let scan = LeftoverScan {
+            runs: Vec::new(),
+            unreadable: vec!["/work/wt-b: not a git repository".to_string()],
+        };
+        let finding = workspace_finding(&workspace_facts(), &CowProbe::Ok, &scan);
+        assert_eq!(finding.level, Level::Warn);
+        assert!(
+            finding.detail.contains("/work/wt-b: not a git repository"),
+            "{}",
+            finding.detail
+        );
     }
 
     #[test]

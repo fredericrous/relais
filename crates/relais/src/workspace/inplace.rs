@@ -633,15 +633,25 @@ pub enum Outcome {
 
 /// What became of the person's own git index. Only something outside
 /// relais's private index can have changed it: a worker that ran `git add`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexOutcome {
     /// Its listing at the end is the one at the start.
     Untouched,
     /// It had changed, and the byte copy taken at the start is back in place.
     Restored,
-    /// It had changed and was left so (restore not asked for, or it failed);
-    /// the copy of the original is kept beside the markers.
-    Changed,
+    /// It had changed and was left so; the copy of the original is kept
+    /// beside the markers.
+    Changed(Unrestored),
+}
+
+/// Why a changed index was left as it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unrestored {
+    /// The caller does not restore (`IndexPolicy::Keep`).
+    NotAsked,
+    /// The restore was tried and failed: the lock was held, the rename was
+    /// refused, the copy was missing, or the listing still differed.
+    Failed(String),
 }
 
 /// What `finalize` does about a changed index. The run that did the work
@@ -722,13 +732,15 @@ pub fn finalize(
     apply_tree(lease.root(), &lease.relais_index(), &target.tree)?;
     let outcome = if !real_index_changed(lease.root(), &marker.index_listing)? {
         IndexOutcome::Untouched
-    } else if index == IndexPolicy::Restore && restore_index(&lease, &marker.index_listing).is_ok()
-    {
-        IndexOutcome::Restored
+    } else if index == IndexPolicy::Restore {
+        match restore_index(&lease, &marker.index_listing) {
+            Ok(()) => IndexOutcome::Restored,
+            Err(error) => IndexOutcome::Changed(Unrestored::Failed(error.to_string())),
+        }
     } else {
-        IndexOutcome::Changed
+        IndexOutcome::Changed(Unrestored::NotAsked)
     };
-    lease.finish(outcome == IndexOutcome::Changed)?;
+    lease.finish(matches!(outcome, IndexOutcome::Changed(_)))?;
     Ok(Outcome::Applied { index: outcome })
 }
 
@@ -1190,11 +1202,14 @@ mod tests {
             &mut || Ok("refs/relais/candidates/run-1/final".to_string()),
         )
         .expect("finalize");
-        assert_eq!(
-            outcome,
-            Outcome::Applied {
-                index: IndexOutcome::Changed
-            }
+        assert!(
+            matches!(
+                &outcome,
+                Outcome::Applied {
+                    index: IndexOutcome::Changed(Unrestored::Failed(why))
+                } if !why.is_empty()
+            ),
+            "a failed restore says why: {outcome:?}"
         );
         assert_eq!(std::fs::read(gd.join("index")).expect("index"), staged);
         assert!(
@@ -1236,7 +1251,7 @@ mod tests {
         assert_eq!(
             outcome,
             Outcome::Applied {
-                index: IndexOutcome::Changed
+                index: IndexOutcome::Changed(Unrestored::NotAsked)
             }
         );
         assert_eq!(std::fs::read(gd.join("index")).expect("index"), staged);
