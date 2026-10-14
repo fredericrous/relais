@@ -8,6 +8,10 @@ missing here.
 
 ## Unreleased
 
+## v0.22.0
+
+`/relais-verified-push` lands with `amont land --json` (#249), and a relais worker can no longer publish through `amont land` (the deny floor refuses it beside `git push`). A late Claude Code version probe warns instead of refusing the run (#247), and an advisor's tokens are booked at the advisor model's rate (#246). The skill reaches a session after the plugin reinstall.
+
 A Claude Code version probe that times out no longer refuses the run. Under heavy load `claude --version` could take longer than the 30 s probe timeout, and relais read the silence as an unsupported version, so every `relais run` and `relais dataset replay` stopped. A probe that timed out now leaves the version unchecked: relais warns once on stderr, records an `environment_warning` event (`what: claude_code_version_unchecked`) on the run, and goes on, the hello check still applying; the context manifest's `turn_ceiling` reads `unknown (timed out)`, a timed-out probe stands for five minutes, so one run start waits it out once, and the next use after that asks again, and `relais doctor` reports it as a warning. A version outside >= 2.1.291, < 2.2.0, an unparsable answer, a non-zero exit, silence or a missing binary still refuse.
 
 `/relais-verified-push` now lands with `amont land --json` (amont 1.54.0): it pushes the branch and reads the remote back, and the amont-agent push guards (2.41.0) judge a land as they judge a `git push`. The skill says what each exit asks for (0 is the proof; 4, read `remote_after`; 3, run the printed `git ls-remote` before landing again) and keeps a bare `git push` plus `git ls-remote` where amont or amont-agent is missing or older. The worker deny floor now also refuses `amont land`, which runs `git push` itself: a worker publishes nothing through it either. Reaching a session takes the plugin reinstall.
