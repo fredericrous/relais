@@ -8,6 +8,10 @@ missing here.
 
 ## Unreleased
 
+## v0.20.0
+
+Local runs reuse the caller's workspace (#237, relais ADR-0008): a fork seeds `node_modules` and `target` copy-on-write instead of installing them again, and a run in a linked git worktree edits it in place. After upgrading, reinstall the plugin and run `relais coordinator stop`; a run then uses `auto` with no setting, and `CI` or `RELAIS_WORKSPACE=isolated` keep full isolation.
+
 Local runs reuse the caller's workspace (relais ADR-0008). The default is local; a server or CI keeps today's isolation (`CI` set, `RELAIS_WORKSPACE=isolated`, or machine.toml `[workspace] mode = "isolated"`).
 
 A run in a primary checkout forks it and clones the caller's ignored `node_modules` and `target` copy-on-write instead of installing them again: seconds and almost no disk, where a happier run cost 6.5 GB and 10-25 minutes per tree. On a filesystem that cannot clone it says `workspace_cow_unavailable` and installs as before. A setup step that declares `reuse = { inputs, outputs, verify }` is skipped when its recorded result matches and its outputs verify; no other step is.
