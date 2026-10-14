@@ -175,7 +175,8 @@ Deliberate: the live `relais run` check (35 s sleeper → one warning, one event
 
 ## Implementation review
 
-PR 0: approve-with-changes, three passes on one reviewer (round 1 50k/77 s; delta 56k/24 s; comment-only delta 58k/18 s); final tree `ee55ea09`, nothing blocking.
+PR 0: approve, four passes on one reviewer (round 1 50k/77 s; delta 56k/24 s; comment-only 58k/18 s; Windows CI fix 61k/17 s); final tree `87456d3f`, nothing open.
+CI: the first push failed on `windows-latest` (the fake-`claude` test helper used `std::os::unix`); the helper and its three tests are now `#[cfg(unix)]`.
 Fixed: typed `TurnCeiling::UnknownTimedOut`; pure `harness_reading` with its own test; §0.4 and D12 written down; two inaccurate doc lines; Verification 0 split, load figure sourced.
 Deliberate: the live `relais run` check waits for the first install of v0.22.0 (`holds-until` in Verification 0); the `report` entry is deferred to PR 3.
 Next: PR 1 (candidate identity), on a new branch from `origin/main` after this merges.
