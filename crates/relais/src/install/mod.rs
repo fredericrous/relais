@@ -330,28 +330,40 @@ these four steps in order, from the repository the branch lives in.
    run, with no remote connection open, so the push itself is fast and
    does not hold the remote idle while a suite runs.
 
-3. Push, bare — never piped:
+3. Land the branch, bare, alone in its command, in the foreground:
+
+   ```sh
+   amont land --json
+   ```
+
+   It pushes the branch and reads the remote back. The push guards judge
+   a land as they judge a `git push`, in that shape only. Where `amont
+   --version` is below 1.54 or `amont-agent --version` below 2.41 (the
+   guards would not see the land), push instead, bare:
 
    ```sh
    git push
    ```
 
-   Never pipe `git push` into `tail`, `head` or `grep`. A pipeline's exit
-   status is the LAST command's, so the trimming command reports exit 0
-   however the push actually ended, and the trimmed output discards the
-   one line that would have said why it failed. If output must be
-   trimmed, redirect to a file and read the file — never pipe a mutating
-   command's own exit status away.
+   Never pipe `amont land` or `git push` into `tail`, `head` or `grep`. A
+   pipeline's exit status is the LAST command's, so the trimming command
+   reports exit 0 however the push actually ended, and the trimmed output
+   discards the one line that would have said why it failed. If output
+   must be trimmed, redirect to a file and read the file — never pipe a
+   mutating command's own exit status away.
 
 4. Confirm the ref actually moved, against the remote, not the local
-   log: `git ls-remote origin refs/heads/<branch>`. Compare the sha it
-   reports to `git log --oneline -1 <branch>`; only a match is a push
-   that left.
+   log. After `amont land`, exit 0 is that proof (exit 4: the remote
+   accepted the push but shows another sha, so read `remote_after` before
+   anything else). After a `git push`: `git ls-remote origin
+   refs/heads/<branch>`, and compare the sha it reports to `git log
+   --oneline -1 <branch>`; only a match is a push that left.
 
 ## Rules
 
 - Never trust a `git push` exit code alone; step 4 is the actual
-  verification.
+  verification. `amont land` does step 4 itself, which is why its exit
+  code can be trusted.
 - A rehearsal failure is the push gate telling you now what `git push`
   would have refused later — fix it before step 3, not after.
 "#;
@@ -1521,6 +1533,7 @@ mod tests {
         for needle in [
             "amont list",
             "amont rehearse --wait",
+            "amont land --json",
             "git push",
             "git ls-remote",
         ] {
@@ -1539,7 +1552,9 @@ mod tests {
         // separate code spans, so a line carrying both is always a
         // genuine invocation.
         for line in body.lines() {
-            let has_mutation = line.contains("git push") || line.contains("git commit");
+            let has_mutation = line.contains("git push")
+                || line.contains("git commit")
+                || line.contains("amont land");
             let pipes_into_trim =
                 line.contains("| tail") || line.contains("| head") || line.contains("| grep");
             assert!(
