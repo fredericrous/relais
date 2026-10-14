@@ -62,6 +62,7 @@ use relais::learn::comparison::{
 };
 use relais::learn::predict::RegistryPredictor;
 use relais::learn::promote::{admit, Amendment};
+use relais::learn::typed_gate;
 use relais::ledger::OrchestrationUsageRow;
 use relais::lifecycle::RunPurpose;
 use relais::money::{CostCompleteness, MicroUsd};
@@ -4441,6 +4442,7 @@ fn plan_command(
         (None, None) => None,
     };
     let decision = route::route(route::RouteInputs {
+        draw_key: None,
         task_type,
         has_design: contract.design.is_some(),
         admission: route::Admission::Live,
@@ -6229,12 +6231,7 @@ impl<'a> ReplayArm<'a> {
             .recipes
             .iter()
             .find(|spec| spec.recipe_id() == recipe_id)?;
-        let model = spec
-            .models
-            .as_ref()
-            .and_then(|models| models.get(&spec.tier))
-            .or_else(|| policy.models.get(&spec.tier))
-            .map(|profile| profile.id.as_str());
+        let model = typed_gate::arm_model(policy, spec);
         Some(Self { spec, model })
     }
 }
@@ -6702,11 +6699,16 @@ fn recipe_evaluate_command(candidate_path: &Path) -> Result<CliOutcome, CliError
     // Admitted through the same door a learner's proposal, or a replay's
     // candidate, is — never a second, looser one for evaluation.
     let bounds = tuning_bounds(&incumbent);
+    let ledger = open_ledger()?;
+    let gate = operational(
+        typed_gate::assess(&ledger, &incumbent, &candidate_policy),
+        "recipe evaluate",
+    )?;
     let candidate = match route::validate_candidate(
         &incumbent,
         &candidate_policy,
         &bounds,
-        route::CandidateAdmission::Promote,
+        route::CandidateAdmission::PromoteGated(&gate.evidence),
     ) {
         Ok(candidate) => candidate,
         Err(rejection) => {
@@ -6715,7 +6717,6 @@ fn recipe_evaluate_command(candidate_path: &Path) -> Result<CliOutcome, CliError
         }
     };
 
-    let ledger = open_ledger()?;
     let report = operational(
         evaluate_candidate(
             &ledger,
@@ -6841,11 +6842,20 @@ fn recipe_promote_command(candidate_path: &Path, mode: AmendMode) -> Result<CliO
             cause: Box::new(cause),
         })?;
     let bounds = tuning_bounds(&incumbent);
+    // Recomputed here, from the ledger's settled trials — never read from
+    // a verdict an earlier `recipe evaluate` printed. The typed-research
+    // gate comes first: a research-tier change is admitted only on its
+    // count, and the generic gates below cannot stand in for it.
+    let ledger = open_ledger()?;
+    let gate = operational(
+        typed_gate::assess(&ledger, &incumbent, &candidate_policy),
+        "recipe promote",
+    )?;
     let candidate = match route::validate_candidate(
         &incumbent,
         &candidate_policy,
         &bounds,
-        route::CandidateAdmission::Promote,
+        route::CandidateAdmission::PromoteGated(&gate.evidence),
     ) {
         Ok(candidate) => candidate,
         Err(rejection) => {
@@ -6853,10 +6863,6 @@ fn recipe_promote_command(candidate_path: &Path, mode: AmendMode) -> Result<CliO
             return Ok(CliOutcome::Blocked);
         }
     };
-
-    // Recomputed here, from the ledger's settled trials — never read from
-    // a verdict an earlier `recipe evaluate` printed.
-    let ledger = open_ledger()?;
     let report = operational(
         evaluate_candidate(
             &ledger,
@@ -6877,12 +6883,34 @@ fn recipe_promote_command(candidate_path: &Path, mode: AmendMode) -> Result<CliO
             return Ok(CliOutcome::PromotionRefused);
         }
     };
-    let amendment = Amendment::for_promotion(proof, &incumbent, candidate.policy(), &subject)
-        .map_err(CliError::Amend)?;
+    let amendment = Amendment::for_promotion(
+        proof,
+        &gate.evidence,
+        &incumbent,
+        candidate.policy(),
+        &subject,
+    )
+    .map_err(CliError::Amend)?;
     println!("evaluation this rests on:");
     print!("{}", report.render_evidence());
     println!();
-    present_amendment(&root, &incumbent, &amendment, mode)
+    let outcome = present_amendment(&root, &incumbent, &amendment, mode)?;
+    match mode {
+        AmendMode::Print => {}
+        AmendMode::Write => {
+            operational(typed_gate::record(&ledger, &gate), "recipe promote")?;
+            for authorisation in &gate.authorisations {
+                println!(
+                    "recorded in the ledger: {} revision {} ({}) was authorised by {} trials",
+                    authorisation.name,
+                    authorisation.revision,
+                    authorisation.task_type.as_str(),
+                    authorisation.trial_ids.len()
+                );
+            }
+        }
+    }
+    Ok(outcome)
 }
 
 /// Restore the revision below the effective one by appending a new

@@ -28,8 +28,9 @@ mod rung;
 pub mod trial;
 pub use arm::{learner_arms, Arm};
 pub use candidate::{
-    default_tuning_bounds, validate_candidate, CandidateAdmission, CandidateRecipe,
-    CandidateRejection, TuningBounds,
+    default_tuning_bounds, is_typed_research_change, validate_candidate, CandidateAdmission,
+    CandidateRecipe, CandidateRejection, TuningBounds, TypedGateCount, TypedGateEvidence,
+    TYPED_GATE_ACCEPTED, TYPED_GATE_TRIALS,
 };
 pub use ladder::{held_repair_models, held_text, held_would_text, Ladder, RungIndex, RungRole};
 pub use rung::{authority_ceiling, models_in_play, resolve_catalogs, EffortRequest, Rung};
@@ -69,13 +70,52 @@ pub struct Estimates {
 /// `Replay`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Admission {
-    /// A live run. A research-tier `change` recipe is ignored, even one
-    /// that names task types.
+    /// A live run. A research-tier `change` recipe that names task types
+    /// covers it (such a recipe is in relais.toml only through the
+    /// typed-research promotion gate), with a seeded draw to the
+    /// implementation tier on top.
     #[default]
     Live,
     /// A replay of a recorded task, to measure a candidate. Admits a
     /// research-tier `change` for a recipe that names the task's type.
     Replay,
+}
+
+/// The seed of the task-type draw (`rng::exploration_draw`), the same
+/// helper the session router's exploration uses.
+pub const TYPE_DRAW_SEED: &str = "task-type";
+/// The share of live runs a typed research recipe sends to the
+/// implementation tier, so a Sonnet arm keeps accruing beside it.
+pub const TYPE_DRAW_RATE: f64 = 0.1;
+
+/// Whose draw it is: the task and the run, the two strings the seeded draw
+/// keys on. A caller that routes without running (`relais plan`) passes
+/// none and no draw is made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrawKey<'a> {
+    pub task: &'a str,
+    pub run: &'a str,
+}
+
+/// One seeded draw on a run routed by a typed research recipe, recorded on
+/// the dispatch intent. The propensity is the probability of being drawn
+/// whatever the outcome, so the two arms can be compared without bias.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct TypeDraw {
+    pub draw: f64,
+    pub propensity: f64,
+    /// The run took the implementation tier instead of research.
+    pub drawn: bool,
+}
+
+/// The draw for `key`: reproducible for the same task and run.
+pub fn type_draw(key: DrawKey<'_>) -> TypeDraw {
+    let draw = crate::rng::exploration_draw(TYPE_DRAW_SEED, key.task, key.run);
+    TypeDraw {
+        draw,
+        propensity: TYPE_DRAW_RATE,
+        drawn: draw < TYPE_DRAW_RATE,
+    }
 }
 
 /// What a recipe's coverage depends on besides the contract's kind and
@@ -115,6 +155,8 @@ pub struct RouteInputs<'a> {
     /// Whether the task carries a program design.
     pub has_design: bool,
     pub admission: Admission,
+    /// Who is drawing, for a live run; `None` draws nothing.
+    pub draw_key: Option<DrawKey<'a>>,
     pub contract: &'a TaskContract,
     pub repo: &'a RepoPolicy,
     pub machine: &'a MachineSettings,
@@ -190,6 +232,10 @@ pub struct Route {
     /// baseline decided instead. Named on the run's receipt and dispatch
     /// intent (SPEC §12, §17) via [`Recipe::covering_identity`].
     pub covering: Option<Recipe>,
+    /// Boxed, like `estimates`: `Routed` holds a much smaller `Blocked`.
+    /// The seeded draw made on this run, when a typed research recipe
+    /// covered it under live admission; `None` when no draw applied.
+    pub type_draw: Option<Box<TypeDraw>>,
     pub reasons: Vec<RouteReason>,
 }
 
@@ -566,22 +612,29 @@ pub fn eligible_tiers(
             floor = rule_floor;
         }
     }
-    // A research-tier `change` is admitted only for a replay, only when the
-    // recipe that wins for this task names its type, and only when no risk
+    // A research-tier `change` is admitted only when the recipe that wins
+    // for this task names its type (a live recipe got there through the
+    // typed-research promotion gate, a replay's is the candidate), and only
+    // when no risk
     // rule fired above research: each task's own risk floor still applies,
     // so a typed task touching a protected path stays at implementation.
     if floor == Tier::Implementation
         && contract.kind() == Kind::Change
-        && facts.admission == Admission::Replay
         && rule_floor.is_none_or(|rule| rule <= Tier::Research)
     {
         let all = [Tier::Research, Tier::Implementation, Tier::Escalation];
         let winner = covering_recipe_spec(contract, repo, &all, facts);
         if winner.is_some_and(|spec| spec.tier == Tier::Research && !spec.task_type.is_empty()) {
-            reasons.push(RouteReason::new(
-                "typed_research_replay",
-                "replay: a recipe naming this task's type admits the research tier",
-            ));
+            reasons.push(match facts.admission {
+                Admission::Replay => RouteReason::new(
+                    "typed_research_replay",
+                    "replay: a recipe naming this task's type admits the research tier",
+                ),
+                Admission::Live => RouteReason::new(
+                    "typed_research_recipe",
+                    "a promoted recipe naming this task's type admits the research tier",
+                ),
+            });
             floor = Tier::Research;
         }
     }
@@ -675,6 +728,7 @@ pub fn route(inputs: RouteInputs<'_>) -> Routed {
         task_type,
         has_design,
         admission,
+        draw_key,
         contract,
         repo,
         machine,
@@ -711,10 +765,44 @@ pub fn route(inputs: RouteInputs<'_>) -> Routed {
     // the router would actually have offered it.
     let Eligibility {
         floor,
-        tiers: eligible,
+        tiers: mut eligible,
         reasons: eligibility_reasons,
     } = eligible_tiers(contract, repo, &authority.models, facts);
     reasons.extend(eligibility_reasons);
+
+    // A live run a typed research recipe covers draws 10% of the time to
+    // the implementation tier: research is withdrawn from the eligible
+    // tiers, so the recipe below it (or the policy) routes the run, and a
+    // Sonnet arm keeps accruing beside the research one. A replay always
+    // runs the research tier.
+    let type_draw = match (admission, draw_key) {
+        (Admission::Live, Some(key))
+            if covering_recipe_spec(contract, repo, &eligible, facts).is_some_and(|spec| {
+                spec.tier == Tier::Research && is_typed_research_change(spec)
+            }) =>
+        {
+            Some(Box::new(self::type_draw(key)))
+        }
+        _ => None,
+    };
+    if let Some(drawn) = type_draw.as_deref().copied() {
+        reasons.push(RouteReason::new(
+            "task_type_draw",
+            format!(
+                "seeded draw {:.4} against {:.2}: {}",
+                drawn.draw,
+                drawn.propensity,
+                if drawn.drawn {
+                    "drawn to the implementation tier"
+                } else {
+                    "not drawn; research tier stands"
+                }
+            ),
+        ));
+        if drawn.drawn {
+            eligible.retain(|tier| *tier != Tier::Research);
+        }
+    }
 
     // Worker-supplied risk hints increase caution, never lower floors
     // (SPEC §4). They cannot lift a tier — only the evidence of a
@@ -877,6 +965,7 @@ pub fn route(inputs: RouteInputs<'_>) -> Routed {
         routed_by: selected.1,
         estimates: estimates_seen,
         covering,
+        type_draw,
         reasons,
     })
 }
@@ -1206,6 +1295,7 @@ mod tests {
     ) -> Routed {
         let authority = effective_authority(repo, machine, contract, &identity());
         route(RouteInputs {
+            draw_key: None,
             task_type: None,
             has_design: false,
             admission: Admission::Live,
@@ -1573,6 +1663,7 @@ mod tests {
             (Tier::Escalation, 0.95, 4000),
         ]);
         let d = expect_route(route(RouteInputs {
+            draw_key: None,
             task_type: None,
             has_design: false,
             admission: Admission::Live,
@@ -1602,6 +1693,7 @@ mod tests {
             (Tier::Escalation, 0.40, 900),
         ]);
         let d = expect_route(route(RouteInputs {
+            draw_key: None,
             task_type: None,
             has_design: false,
             admission: Admission::Live,
@@ -1857,6 +1949,7 @@ mod tests {
             favoured: favoured.clone(),
         };
         let d = expect_route(route(RouteInputs {
+            draw_key: None,
             task_type: None,
             has_design: false,
             admission: Admission::Live,
@@ -1900,6 +1993,7 @@ mod tests {
             favoured: favoured.clone(),
         };
         let d = expect_route(route(RouteInputs {
+            draw_key: None,
             task_type: None,
             has_design: false,
             admission: Admission::Live,
@@ -1966,6 +2060,7 @@ mod tests {
             &identity(),
         );
         let d = expect_route(route(RouteInputs {
+            draw_key: None,
             task_type: None,
             has_design: false,
             admission: Admission::Live,
@@ -2141,6 +2236,7 @@ mod tests {
         let machine = machine_for(repo);
         let authority = effective_authority(repo, &machine, contract, &identity());
         expect_route(route(RouteInputs {
+            draw_key: None,
             task_type,
             has_design,
             admission,
@@ -2242,13 +2338,128 @@ mod tests {
         );
     }
 
+    fn route_drawn(
+        contract: &TaskContract,
+        repo: &RepoPolicy,
+        admission: Admission,
+        key: Option<DrawKey<'_>>,
+    ) -> Route {
+        let machine = machine_for(repo);
+        let authority = effective_authority(repo, &machine, contract, &identity());
+        expect_route(route(RouteInputs {
+            task_type: Some(TaskType::Ui),
+            has_design: false,
+            admission,
+            draw_key: key,
+            contract,
+            repo,
+            machine: &machine,
+            authority: &authority,
+            predictor: None,
+            catalogs: &EffortCatalogs::default(),
+        }))
+    }
+
+    /// The first run id, of `task-1`'s runs, whose draw is `drawn`.
+    fn run_with_draw(drawn: bool) -> String {
+        (0..10_000)
+            .map(|n| format!("run-{n}"))
+            .find(|run| {
+                type_draw(DrawKey {
+                    task: "task-1",
+                    run,
+                })
+                .drawn
+                    == drawn
+            })
+            .expect("a run with this draw exists")
+    }
+
     #[test]
-    fn live_routing_ignores_a_typed_research_recipe_written_by_hand() {
+    fn a_live_run_a_promoted_typed_research_recipe_covers_takes_research_unless_drawn() {
         let repo = typed_research_repo();
         let safe = change_contract(&["docs/guide.md"]);
-        let d = route_typed(&safe, &repo, Some(TaskType::Ui), false, Admission::Live);
+        let kept = run_with_draw(false);
+        let key = DrawKey {
+            task: "task-1",
+            run: &kept,
+        };
+        let d = route_drawn(&safe, &repo, Admission::Live, Some(key));
+        assert_eq!(d.tier, Tier::Research);
+        assert_eq!(d.routed_by, RoutedBy::DeterministicRecipe);
+        let draw = d.type_draw.expect("the draw is recorded");
+        assert!(!draw.drawn);
+        assert_eq!(draw.propensity, 0.1);
+        assert!(d.reasons.iter().any(|r| r.id == "task_type_draw"));
+
+        let taken = run_with_draw(true);
+        let key = DrawKey {
+            task: "task-1",
+            run: &taken,
+        };
+        let d = route_drawn(&safe, &repo, Admission::Live, Some(key));
         assert_eq!(d.tier, Tier::Implementation);
-        assert_ne!(d.routed_by, RoutedBy::DeterministicRecipe);
+        assert_eq!(d.rung.tier, Tier::Implementation);
+        let draw = d.type_draw.expect("a drawn run records its draw too");
+        assert!(draw.drawn);
+        assert_eq!(draw.propensity, 0.1);
+    }
+
+    #[test]
+    fn the_task_type_draw_is_reproducible_and_about_a_tenth() {
+        let key = DrawKey {
+            task: "task-9",
+            run: "run-9",
+        };
+        assert_eq!(type_draw(key), type_draw(key));
+        assert_eq!(
+            type_draw(key).draw,
+            crate::rng::exploration_draw("task-type", "task-9", "run-9")
+        );
+        let drawn = (0..10_000)
+            .filter(|n| {
+                type_draw(DrawKey {
+                    task: &format!("task-{n}"),
+                    run: &format!("run-{n}"),
+                })
+                .drawn
+            })
+            .count();
+        assert!((900..=1100).contains(&drawn), "{drawn} of 10,000 drawn");
+    }
+
+    #[test]
+    fn a_replay_is_never_drawn_and_a_route_without_a_key_or_recipe_draws_nothing() {
+        let repo = typed_research_repo();
+        let safe = change_contract(&["docs/guide.md"]);
+        let taken = run_with_draw(true);
+        let key = DrawKey {
+            task: "task-1",
+            run: &taken,
+        };
+        let d = route_drawn(&safe, &repo, Admission::Replay, Some(key));
+        assert_eq!(d.tier, Tier::Research, "a replay always runs research");
+        assert_eq!(d.type_draw, None);
+        // `relais plan` names no run: no draw.
+        let d = route_drawn(&safe, &repo, Admission::Live, None);
+        assert_eq!(d.tier, Tier::Research);
+        assert_eq!(d.type_draw, None);
+        // A task the typed recipe does not cover, or a protected path
+        // that stays at implementation, makes no draw.
+        let protected = change_contract(&["crates/x/trust/keys.rs"]);
+        let d = route_drawn(&protected, &repo, Admission::Live, Some(key));
+        assert_eq!(d.tier, Tier::Implementation);
+        assert_eq!(d.type_draw, None);
+        let mut implementation = repo_policy();
+        implementation.recipes.push(typed_change(
+            "change-ui",
+            1,
+            Tier::Implementation,
+            TaskType::Ui,
+            false,
+        ));
+        let d = route_drawn(&safe, &implementation, Admission::Live, Some(key));
+        assert_eq!(d.type_draw, None);
     }
 
     #[test]
@@ -2891,6 +3102,7 @@ mod tests {
         let open = machine_for(&repo);
         let authority = effective_authority(&repo, &open, &contract, &identity());
         let d = expect_route(route(RouteInputs {
+            draw_key: None,
             task_type: None,
             has_design: false,
             admission: Admission::Live,

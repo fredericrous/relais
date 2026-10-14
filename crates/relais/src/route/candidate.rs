@@ -116,7 +116,7 @@ mod sealed {
         incumbent: &RepoPolicy,
         candidate: &RepoPolicy,
         bounds: &TuningBounds,
-        admission: CandidateAdmission,
+        admission: CandidateAdmission<'_>,
     ) -> Result<CandidateRecipe, CandidateRejection> {
         fixed_fields_match(incumbent, candidate)?;
         validate_recipe_history(
@@ -138,14 +138,89 @@ pub use sealed::{validate_candidate, CandidateRecipe};
 /// purpose, so the one difference between them is named here rather than
 /// loosened by accident (docs/plans/2026-10-12-task-types.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CandidateAdmission {
+pub enum CandidateAdmission<'a> {
     /// A replay measuring a candidate. Accepts a research-tier `change`
     /// recipe that names task types; a replay never changes what a live
     /// run does.
     Replay,
-    /// `recipe evaluate` / `recipe promote`. Refuses a research-tier
-    /// `change` recipe until typed promotion exists.
+    /// `recipe evaluate` / `recipe promote` with no typed-research gate
+    /// evidence. Refuses every research-tier `change` recipe: the gate
+    /// cannot have been met by evidence nobody supplied.
     Promote,
+    /// `recipe evaluate` / `recipe promote` with the typed-research gate's
+    /// recomputed counts. Accepts a research-tier `change` recipe only
+    /// when it names task types AND its counts meet the bar.
+    PromoteGated(&'a TypedGateEvidence),
+}
+
+/// The typed-research gate's bar (docs/plans/2026-10-12-task-types.md,
+/// Phase 3): an arm is evaluated only at n = 15 qualifying trials and
+/// passes at 14 of 15 accepted without escalation, a Wilson 95% lower
+/// bound of 0.7017.
+pub const TYPED_GATE_TRIALS: usize = 15;
+/// See [`TYPED_GATE_TRIALS`].
+pub const TYPED_GATE_ACCEPTED: usize = 14;
+
+/// One arm's qualifying trials, as the gate counted them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TypedGateCount {
+    /// Qualifying trials on record, one per task.
+    pub qualifying: usize,
+    /// How many of the first [`TYPED_GATE_TRIALS`] qualifying trials
+    /// were accepted without escalation. Later trials never move it: the
+    /// bar is evaluated at n = 15 and never peeked at earlier.
+    pub accepted: usize,
+}
+
+impl TypedGateCount {
+    /// Whether the bar is met.
+    pub fn passes(self) -> bool {
+        self.qualifying >= TYPED_GATE_TRIALS && self.accepted >= TYPED_GATE_ACCEPTED
+    }
+
+    /// The refusal for `name` at `revision`, naming the gate, the arm's
+    /// qualifying count and the bar.
+    pub fn refusal(self, name: &str, revision: u32) -> String {
+        let mut text = format!(
+            "typed-research gate: {name}@{revision} has {} qualifying trials, needs \
+             {TYPED_GATE_TRIALS} with at least {TYPED_GATE_ACCEPTED} accepted without escalation",
+            self.qualifying
+        );
+        if self.qualifying >= TYPED_GATE_TRIALS {
+            text.push_str(&format!(" (only {} did)", self.accepted));
+        }
+        text
+    }
+}
+
+/// The gate's counts for each typed research recipe a candidate adds,
+/// keyed by recipe name and revision. A recipe with no entry has no
+/// qualifying trial.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TypedGateEvidence {
+    counts: std::collections::BTreeMap<(String, u32), TypedGateCount>,
+}
+
+impl TypedGateEvidence {
+    pub fn insert(&mut self, name: &str, revision: u32, count: TypedGateCount) {
+        self.counts.insert((name.to_string(), revision), count);
+    }
+
+    pub fn count_of(&self, name: &str, revision: u32) -> TypedGateCount {
+        self.counts
+            .get(&(name.to_string(), revision))
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+/// Whether `spec` is a research-tier `change` that names task types: the
+/// one shape allowed below the implementation floor, and only through a
+/// replay or the typed-research gate.
+pub fn is_typed_research_change(spec: &RecipeSpec) -> bool {
+    spec.tier == Tier::Research
+        && spec.kind.unwrap_or(Kind::Change) == Kind::Change
+        && !spec.task_type.is_empty()
 }
 
 /// Why [`validate_candidate`] refused a proposed policy — one variant per
@@ -255,6 +330,13 @@ pub enum CandidateRejection {
     /// A research-tier `change` recipe that names task types, offered at
     /// the promotion door. Only a replay admits it today.
     ResearchChangeNotPromotable { name: String },
+    /// A typed research-tier `change` recipe offered with gate evidence
+    /// that does not meet the bar.
+    TypedResearchGate {
+        name: String,
+        revision: u32,
+        count: TypedGateCount,
+    },
 }
 
 impl std::fmt::Display for CandidateRejection {
@@ -359,9 +441,14 @@ impl std::fmt::Display for CandidateRejection {
             Self::InvalidRecipe(err) => write!(f, "{err}"),
             Self::ResearchChangeNotPromotable { name } => write!(
                 f,
-                "recipe `{name}` puts a `change` at the research tier; only a replay admits \
-                 that today, `recipe evaluate` and `recipe promote` refuse it"
+                "recipe `{name}` puts a `change` at the research tier; only a replay, or \
+                 `recipe promote` with the typed-research gate's evidence, admits that"
             ),
+            Self::TypedResearchGate {
+                name,
+                revision,
+                count,
+            } => f.write_str(&count.refusal(name, *revision)),
         }
     }
 }
@@ -450,7 +537,7 @@ fn validate_recipe_history(
     candidate_recipes: &[RecipeSpec],
     candidate_risk: &[RiskRule],
     bounds: &TuningBounds,
-    admission: CandidateAdmission,
+    admission: CandidateAdmission<'_>,
 ) -> Result<(), CandidateRejection> {
     let incumbent_recipes = incumbent.recipes.as_slice();
     if candidate_recipes.len() < incumbent_recipes.len() {
@@ -479,7 +566,7 @@ fn validate_new_recipe(
     new: &RecipeSpec,
     candidate_risk: &[RiskRule],
     bounds: &TuningBounds,
-    admission: CandidateAdmission,
+    admission: CandidateAdmission<'_>,
 ) -> Result<(), CandidateRejection> {
     let base = incumbent
         .recipes
@@ -563,10 +650,25 @@ fn validate_new_recipe(
     let typed_research_change = *new_tier == Tier::Research
         && new_kind.unwrap_or(Kind::Change) == Kind::Change
         && !new_task_types.is_empty();
-    if typed_research_change && admission == CandidateAdmission::Promote {
-        return Err(CandidateRejection::ResearchChangeNotPromotable {
-            name: new_name.clone(),
-        });
+    if typed_research_change {
+        match admission {
+            CandidateAdmission::Replay => {}
+            CandidateAdmission::Promote => {
+                return Err(CandidateRejection::ResearchChangeNotPromotable {
+                    name: new_name.clone(),
+                });
+            }
+            CandidateAdmission::PromoteGated(evidence) => {
+                let count = evidence.count_of(new_name, *new_revision);
+                if !count.passes() {
+                    return Err(CandidateRejection::TypedResearchGate {
+                        name: new_name.clone(),
+                        revision: *new_revision,
+                        count,
+                    });
+                }
+            }
+        }
     }
     let floor_risk: &[RiskRule] = if typed_research_change {
         &[]
@@ -1458,6 +1560,97 @@ mod tests {
                 name: "change-feature".into()
             }
         );
+    }
+
+    #[test]
+    fn the_gated_door_admits_a_typed_research_change_only_on_a_passing_count() {
+        use crate::contract::TaskType::Feature;
+        let incumbent =
+            policy_with_recipes(vec![typed_recipe(1, Tier::Implementation, &[Feature])]);
+        let candidate = with_new(&incumbent, typed_recipe(2, Tier::Research, &[Feature]));
+        let admit = |qualifying, accepted| {
+            let mut evidence = TypedGateEvidence::default();
+            evidence.insert(
+                "change-feature",
+                2,
+                TypedGateCount {
+                    qualifying,
+                    accepted,
+                },
+            );
+            validate_candidate(
+                &incumbent,
+                &candidate,
+                &bounds(),
+                CandidateAdmission::PromoteGated(&evidence),
+            )
+        };
+        assert!(admit(15, 15).is_ok());
+        assert!(admit(15, 14).is_ok());
+        assert!(admit(15, 13).is_err(), "13/15 is below the bar");
+        assert!(admit(14, 14).is_err(), "14/14 is not n = 15");
+        assert!(admit(30, 13).is_err());
+        // No entry at all is no qualifying trial.
+        assert!(validate_candidate(
+            &incumbent,
+            &candidate,
+            &bounds(),
+            CandidateAdmission::PromoteGated(&TypedGateEvidence::default()),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_refusal_names_the_gate_the_qualifying_count_and_the_bar() {
+        use crate::contract::TaskType::Feature;
+        let incumbent =
+            policy_with_recipes(vec![typed_recipe(1, Tier::Implementation, &[Feature])]);
+        let candidate = with_new(&incumbent, typed_recipe(2, Tier::Research, &[Feature]));
+        let mut evidence = TypedGateEvidence::default();
+        evidence.insert(
+            "change-feature",
+            2,
+            TypedGateCount {
+                qualifying: 7,
+                accepted: 7,
+            },
+        );
+        let refusal = validate_candidate(
+            &incumbent,
+            &candidate,
+            &bounds(),
+            CandidateAdmission::PromoteGated(&evidence),
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal.to_string(),
+            "typed-research gate: change-feature@2 has 7 qualifying trials, needs 15 with at \
+             least 14 accepted without escalation"
+        );
+    }
+
+    #[test]
+    fn gate_evidence_never_admits_a_research_change_without_a_task_type() {
+        let incumbent = policy_with_recipes(vec![typed_recipe(1, Tier::Implementation, &[])]);
+        let candidate = with_new(&incumbent, typed_recipe(2, Tier::Research, &[]));
+        let mut evidence = TypedGateEvidence::default();
+        evidence.insert(
+            "change-feature",
+            2,
+            TypedGateCount {
+                qualifying: 15,
+                accepted: 15,
+            },
+        );
+        assert!(matches!(
+            validate_candidate(
+                &incumbent,
+                &candidate,
+                &bounds(),
+                CandidateAdmission::PromoteGated(&evidence)
+            ),
+            Err(CandidateRejection::TierBelowFloor { .. })
+        ));
     }
 
     #[test]

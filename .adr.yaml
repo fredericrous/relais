@@ -37,6 +37,8 @@ keys:
     description: Whether a model advises a decision, how relais calls it, and whether its advice can gate an answer
   trust.scope:
     description: What a trust grant names (a repository or one exact policy), and what relais does when the commands it would run change
+  routing.task-type-research:
+    description: Whether a change may run below the implementation tier, on what evidence, what keeps a Sonnet arm accruing beside it, and what rolls it back
   workspace.local-reuse:
     description: Where a local run works (a fork with copy-on-write dependencies, or the caller's own linked worktree) and what a server or CI run keeps
 

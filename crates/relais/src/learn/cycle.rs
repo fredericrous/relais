@@ -822,6 +822,22 @@ fn cycle_body(
     let ledger = inputs.ledger;
     let registry = inputs.registry;
 
+    // A promoted typed research recipe that its live runs have not earned
+    // is due for rollback. The cycle never writes relais.toml: its note
+    // says so once per recipe revision, with the reason and the command
+    // the person or the orchestrator runs.
+    let ended = |run: &RunId| -> Result<Option<bool>, LedgerError> {
+        Ok(match routed_outcome(ledger, run)? {
+            RoutedOutcome::Accepted => Some(true),
+            RoutedOutcome::NotAccepted | RoutedOutcome::Regressed => Some(false),
+            RoutedOutcome::Unlabelled => None,
+        })
+    };
+    let due = super::typed_rollback::due_rollbacks(ledger, inputs.repo, &ended)?;
+    for rollback in super::typed_rollback::unsaid(ledger, due)? {
+        add_note(report, rollback.note());
+    }
+
     // The active artifact is judged first: a regression is acted on before
     // anything new is trained over it.
     let check = active_artifact_check(ledger, registry)?;
@@ -1875,5 +1891,97 @@ argv = ["true"]
         world.later_terminal_run("later-9");
         let promoted = promote_it(&world, true, "art-new");
         assert_eq!(promoted.action, LearningAction::Promoted);
+    }
+    const TYPED_POLICY: &str = r#"schema_version = 1
+[models.research]
+id = "haiku"
+[models.implementation]
+id = "sonnet"
+[[recipes]]
+name = "change-ui"
+revision = 1
+kind = "change"
+scope_within = ["**"]
+task_type = ["ui"]
+tier = "implementation"
+[[recipes]]
+name = "change-ui"
+revision = 2
+kind = "change"
+scope_within = ["**"]
+task_type = ["ui"]
+tier = "research"
+"#;
+
+    #[test]
+    fn a_due_typed_rollback_is_said_once_and_never_written() {
+        let world = World::new("typed-rollback");
+        let repo = RepoPolicy::from_toml_str(TYPED_POLICY).expect("policy");
+        let research = repo.recipes[1].recipe_id();
+        // Twenty live research runs of ui that failed: 0 of 20.
+        for index in 0..20 {
+            let name = format!("haiku-{index}");
+            let run = RunId::from_stored(&name);
+            world
+                .ledger
+                .insert_typed_run(
+                    &run,
+                    "/r",
+                    None,
+                    &TaskId::from_stored(format!("task-{name}")),
+                    "rk",
+                    Some(crate::contract::TaskType::Ui),
+                )
+                .expect("run");
+            world
+                .ledger
+                .record_dispatch_intent(
+                    &DispatchId::from_stored(format!("d-{name}")),
+                    &run,
+                    None,
+                    &serde_json::json!({
+                        "tier": "research",
+                        "recipe_id": research,
+                        "model": "haiku",
+                    }),
+                    0,
+                    RoutedBy::DeterministicRecipe,
+                )
+                .expect("dispatch");
+            world.ended(&name, State::Failed);
+        }
+        let said = |report: &CycleReport| {
+            report
+                .note
+                .as_deref()
+                .unwrap_or_default()
+                .matches("typed rollback due")
+                .count()
+        };
+        let first = run_cycle(&world.inputs(&repo, false), &mut silent()).expect("cycle");
+        let note = first.note.clone().unwrap_or_default();
+        assert_eq!(said(&first), 1, "{note}");
+        assert!(
+            note.contains("recipe `change-ui`@2: ui runs: 0 of 20 live runs"),
+            "{note}"
+        );
+        assert!(
+            note.contains("`relais recipe rollback change-ui`"),
+            "{note}"
+        );
+        // The next cycle finds it said and says nothing more.
+        let second = run_cycle(&world.inputs(&repo, false), &mut silent()).expect("cycle");
+        assert_eq!(said(&second), 0, "{:?}", second.note);
+        // The cycle applied nothing: the rollback stays due until the
+        // command is run.
+        let ended = |run: &RunId| -> Result<Option<bool>, LedgerError> {
+            Ok(match routed_outcome(&world.ledger, run)? {
+                RoutedOutcome::Accepted => Some(true),
+                _ => Some(false),
+            })
+        };
+        let due = super::super::typed_rollback::due_rollbacks(&world.ledger, &repo, &ended)
+            .expect("reads");
+        assert_eq!(due.len(), 1);
     }
 }
