@@ -88,10 +88,28 @@ impl TranscriptSource {
     }
 }
 
+/// The suffix of an advisor record's `message_id`: `<message id>#advisor<n>`,
+/// the key that books each advisor call once.
+const ADVISOR_ID_MARKER: &str = "#advisor";
+
+/// Whose tokens a record counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageSource {
+    /// The worker's own turn.
+    Executor,
+    /// A Claude Code advisor call (`usage.iterations[]` of type
+    /// `advisor_message`). It runs on its own model, so its tokens are
+    /// priced at that model's rate, and it is never the model the run is
+    /// said to have used.
+    Advisor,
+}
+
 /// One API message's usage, already deduplicated by `message.id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageRecord {
     pub message_id: String,
+    pub source: UsageSource,
+    /// Empty when an advisor call reported no model: its cost is unknown.
     pub model: String,
     pub speed: Speed,
     pub input_tokens: u64,
@@ -128,6 +146,60 @@ struct RawUsage {
     cache_creation: Option<RawCacheCreation>,
     #[serde(default)]
     speed: Option<String>,
+    /// Read entry by entry, so one malformed entry never costs the line.
+    #[serde(default)]
+    iterations: Option<serde_json::Value>,
+}
+
+/// A token count of an `iterations` entry: absent is zero, present but not
+/// a count is `None`.
+fn iteration_tokens(entry: &serde_json::Value, key: &str) -> Option<u64> {
+    match entry.get(key) {
+        None | Some(serde_json::Value::Null) => Some(0),
+        Some(value) => value.as_u64(),
+    }
+}
+
+/// The advisor calls of `usage.iterations`, one record each. An entry that
+/// is not an advisor call is left out; an advisor entry whose counts are
+/// malformed is left out too, and one without a model is kept with an empty
+/// model, which prices as unknown.
+fn advisor_records(
+    iterations: Option<&serde_json::Value>,
+    message_id: &str,
+    timestamp: &str,
+) -> Vec<UsageRecord> {
+    let Some(entries) = iterations.and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter(|entry| entry.get("type").and_then(|t| t.as_str()) == Some("advisor_message"))
+        .enumerate()
+        .filter_map(|(n, entry)| {
+            Some(UsageRecord {
+                message_id: format!("{message_id}{ADVISOR_ID_MARKER}{n}"),
+                source: UsageSource::Advisor,
+                model: entry
+                    .get("model")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                speed: Speed::Standard,
+                input_tokens: iteration_tokens(entry, "input_tokens")?,
+                output_tokens: iteration_tokens(entry, "output_tokens")?,
+                cache_read_input_tokens: iteration_tokens(entry, "cache_read_input_tokens")?,
+                cache_writes: CacheWrites {
+                    ephemeral_5m_input_tokens: iteration_tokens(
+                        entry,
+                        "cache_creation_input_tokens",
+                    )?,
+                    ephemeral_1h_input_tokens: 0,
+                },
+                timestamp: timestamp.to_string(),
+            })
+        })
+        .collect()
 }
 
 #[derive(Deserialize, Default)]
@@ -181,8 +253,10 @@ pub fn parse_transcript(content: &str) -> Vec<UsageRecord> {
             continue;
         };
         let cache_creation = usage.cache_creation.unwrap_or_default();
-        let record = UsageRecord {
+        let advisors = advisor_records(usage.iterations.as_ref(), &message_id, &timestamp);
+        let executor = UsageRecord {
             message_id,
+            source: UsageSource::Executor,
             model,
             speed: match usage.speed {
                 Some(tier) if tier != "standard" => Speed::Other(tier),
@@ -197,12 +271,14 @@ pub fn parse_transcript(content: &str) -> Vec<UsageRecord> {
             },
             timestamp,
         };
-        match index.get(&record.message_id) {
-            Some(&at) if records[at].output_tokens >= record.output_tokens => {}
-            Some(&at) => records[at] = record,
-            None => {
-                index.insert(record.message_id.clone(), records.len());
-                records.push(record);
+        for record in std::iter::once(executor).chain(advisors) {
+            match index.get(&record.message_id) {
+                Some(&at) if records[at].output_tokens >= record.output_tokens => {}
+                Some(&at) => records[at] = record,
+                None => {
+                    index.insert(record.message_id.clone(), records.len());
+                    records.push(record);
+                }
             }
         }
     }
@@ -297,6 +373,93 @@ mod tests {
         let content = line("msg_1", "claude-haiku-4-5", "");
         let records = parse_transcript(&content);
         assert_eq!(records[0].speed, Speed::Standard);
+    }
+
+    fn advisor_line(id: &str, output: u64, iterations: Option<&str>) -> String {
+        let its = iterations
+            .map(|i| format!(r#","iterations":{i}"#))
+            .unwrap_or_default();
+        format!(
+            r#"{{"type":"assistant","timestamp":"2026-09-28T00:00:00Z","message":{{"id":"{id}","model":"claude-haiku-5-5","usage":{{"input_tokens":10,"output_tokens":{output},"cache_read_input_tokens":0{its}}}}}}}"#
+        )
+    }
+
+    const ADVISOR_ITERATIONS: &str = r#"[{"type":"message","input_tokens":10,"output_tokens":5},{"type":"advisor_message","model":"claude-opus-5-5","input_tokens":61536,"output_tokens":604,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}]"#;
+
+    fn executor(id: &str, output: u64) -> UsageRecord {
+        UsageRecord {
+            message_id: id.into(),
+            source: UsageSource::Executor,
+            model: "claude-haiku-5-5".into(),
+            speed: Speed::Standard,
+            input_tokens: 10,
+            output_tokens: output,
+            cache_read_input_tokens: 0,
+            cache_writes: CacheWrites::default(),
+            timestamp: "2026-09-28T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn advisor_iterations_become_their_own_record_once_per_message() {
+        let content = [
+            advisor_line("msg_1", 5, None),
+            advisor_line("msg_1", 5, Some(ADVISOR_ITERATIONS)),
+            advisor_line("msg_1", 5, Some(ADVISOR_ITERATIONS)),
+        ]
+        .join("\n");
+        let records = parse_transcript(&content);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0], executor("msg_1", 5));
+        assert_eq!(
+            records[1],
+            UsageRecord {
+                message_id: "msg_1#advisor0".into(),
+                source: UsageSource::Advisor,
+                model: "claude-opus-5-5".into(),
+                input_tokens: 61536,
+                output_tokens: 604,
+                ..executor("msg_1", 604)
+            }
+        );
+    }
+
+    #[test]
+    fn a_malformed_iteration_never_costs_the_lines_executor_record() {
+        for its in [
+            r#"[{"type":"message","input_tokens":1.5}]"#,
+            r#"[{"type":"advisor_message","model":"claude-opus-5-5","input_tokens":1.5}]"#,
+            r#"[7,null,"x"]"#,
+            r#"{"not":"an array"}"#,
+        ] {
+            let records = parse_transcript(&advisor_line("msg_1", 5, Some(its)));
+            assert_eq!(records, vec![executor("msg_1", 5)], "{its}");
+        }
+    }
+
+    #[test]
+    fn an_advisor_call_without_a_model_is_kept_with_an_empty_model() {
+        let its = r#"[{"type":"advisor_message","input_tokens":3,"output_tokens":4}]"#;
+        let records = parse_transcript(&advisor_line("msg_1", 5, Some(its)));
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].source, UsageSource::Advisor);
+        assert_eq!(records[1].model, "");
+        assert_eq!(records[1].input_tokens, 3);
+    }
+
+    #[test]
+    fn a_transcript_without_iterations_keeps_the_highest_output_per_id() {
+        let content = [
+            advisor_line("msg_1", 2, None),
+            advisor_line("msg_2", 7, None),
+            advisor_line("msg_1", 9, None),
+            advisor_line("msg_2", 3, None),
+        ]
+        .join("\n");
+        assert_eq!(
+            parse_transcript(&content),
+            vec![executor("msg_1", 9), executor("msg_2", 7)]
+        );
     }
 
     #[test]

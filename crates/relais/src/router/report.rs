@@ -172,6 +172,7 @@ fn priced(row: &RouterUsageRow, pricing: &PriceTable) -> Option<MicroUsd> {
     // cache writes are 1-hour writes).
     let record = UsageRecord {
         message_id: String::new(),
+        source: crate::orchestration::UsageSource::Executor,
         model: row.model.clone(),
         speed: Speed::Standard,
         input_tokens: row.input_tokens,

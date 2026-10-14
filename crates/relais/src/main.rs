@@ -5603,6 +5603,15 @@ fn run_command(
         relais::adapter::native::Waits::DEFAULT,
         Some(prices),
     );
+    // The advisor calls an agent's transcript holds are booked into the
+    // ledger beside the plugin's figures, which never contain them.
+    let native_backend = match paths::ledger_path() {
+        Ok(path) => native_backend.with_advisor_ledger(path),
+        Err(e) => {
+            eprintln!("advisor usage will not be booked: the ledger path is unknown: {e}");
+            native_backend
+        }
+    };
     let run_backend: &dyn relais::backend::Backend = &native_backend;
     // Printed here, before `execute`, so it is visible on every path —
     // including the `Err` arm below that returns early — and only once:
@@ -6175,6 +6184,15 @@ fn replay_command(
         relais::adapter::native::Waits::DEFAULT,
         Some(prices),
     );
+    // The advisor calls an agent's transcript holds are booked into the
+    // ledger beside the plugin's figures, which never contain them.
+    let native_backend = match paths::ledger_path() {
+        Ok(path) => native_backend.with_advisor_ledger(path),
+        Err(e) => {
+            eprintln!("advisor usage will not be booked: the ledger path is unknown: {e}");
+            native_backend
+        }
+    };
     // Same placement as `relais run`: before `execute`, so it is visible
     // on every path rather than deferred to the end of a run that spends
     // real money and can take minutes.

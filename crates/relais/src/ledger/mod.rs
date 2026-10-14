@@ -2090,6 +2090,11 @@ pub struct TrustGrantRecord<'a> {
     pub steps_json: &'a str,
 }
 
+/// The `event_id` prefix of the usage row of a Claude Code advisor call:
+/// `advisor:<message id>#advisor<n>`. Such a row carries the advisor's own
+/// model, never a requested one, and is no model a run or task used.
+pub const ADVISOR_EVENT_PREFIX: &str = "advisor:";
+
 /// The one `usage_events` insert: a duplicate event id is ignored.
 fn insert_usage_event(conn: &Connection, event: &UsageEvent) -> Result<bool> {
     // A blank model is no model: store NULL, never "".
@@ -3546,7 +3551,8 @@ impl Ledger {
     pub fn models_used(&self, run_id: &RunId) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT model FROM usage_events
-             WHERE run_id = ?1 AND model IS NOT NULL ORDER BY model",
+             WHERE run_id = ?1 AND model IS NOT NULL AND event_id NOT LIKE 'advisor:%'
+             ORDER BY model",
         )?;
         let rows = stmt.query_map([run_id.as_str()], |row| row.get::<_, String>(0))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -3829,6 +3835,7 @@ impl Ledger {
                 "SELECT usage_events.model FROM usage_events
                  JOIN runs ON runs.id = usage_events.run_id
                  WHERE runs.task_id = ?1 AND usage_events.model IS NOT NULL
+                   AND usage_events.event_id NOT LIKE 'advisor:%'
                  ORDER BY usage_events.at ASC, usage_events.id ASC
                  LIMIT 1",
                 [task_id.as_str()],
@@ -4787,6 +4794,33 @@ impl Ledger {
         insert_usage_event(&self.conn, event)
     }
 
+    /// An advisor call's usage row, with the dispatch that booked it kept
+    /// in `native_usage_messages` (keyed by the call's message id, the
+    /// row's `event_id` without [`ADVISOR_EVENT_PREFIX`]). The row is no
+    /// part of the dispatch's own `<id>#…` range, so its figures stay out
+    /// of [`Self::record_usage_delta`]'s sum; the owner is what lets the
+    /// dispatch's final booking repair the row's phase.
+    pub fn record_advisor_usage(&self, event: &UsageEvent, dispatch_id: &str) -> Result<bool> {
+        let tx = self.write_tx()?;
+        let inserted = insert_usage_event(&tx, event)?;
+        let message_id = event
+            .event_id
+            .strip_prefix(ADVISOR_EVENT_PREFIX)
+            .unwrap_or(&event.event_id);
+        tx.execute(
+            "INSERT OR IGNORE INTO native_usage_messages
+                (message_id, dispatch_id, run_id, recorded_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![message_id, dispatch_id, event.run_id.as_str(), event.at],
+        )?;
+        tx.execute(
+            "DELETE FROM orchestration_usage WHERE message_id = ?1",
+            params![message_id],
+        )?;
+        tx.commit()?;
+        Ok(inserted)
+    }
+
     /// A native attempt's usage event and the transcript messages it was
     /// booked for, in one transaction. Those messages belong to the run:
     /// an `orchestration_usage` row an earlier import made of any of them
@@ -4877,6 +4911,18 @@ impl Ledger {
                 "UPDATE usage_events SET phase = ?2
                  WHERE event_id >= ?1 || '#' AND event_id < ?1 || '$'",
                 params![event.event_id, event.phase.map(UsagePhase::as_str)],
+            )?;
+            // The advisor calls this dispatch booked are its rows too.
+            tx.execute(
+                "UPDATE usage_events SET phase = ?2
+                 WHERE event_id LIKE ?3 || '%'
+                   AND substr(event_id, length(?3) + 1) IN
+                       (SELECT message_id FROM native_usage_messages WHERE dispatch_id = ?1)",
+                params![
+                    event.event_id,
+                    event.phase.map(UsagePhase::as_str),
+                    ADVISOR_EVENT_PREFIX
+                ],
             )?;
         }
         for message_id in message_ids {

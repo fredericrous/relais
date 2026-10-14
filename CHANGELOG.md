@@ -26,6 +26,8 @@ Workers no longer spend the run's wall budget on the full verification: the work
 
 `make check` no longer goes red when the plugin tests fail only with `timed out after 5000 ms` under machine load: `scripts/plugin-test.sh` reruns the suite once in that case, and exits non-zero at once on any other failure.
 
+Claude Code's advisor tool is now counted. When a worker or a session runs with an advisor (`claude --advisor opus`, `advisorModel`), the advisor's tokens appear only in `usage.iterations[]` as `advisor_message` entries, never in the top-level usage relais read, so they went unbooked. relais now books each advisor call at the advisor model's own rate: for a native dispatch from the agent's transcript when it stops, once per call across continuations, with the dispatch's phase; and through `relais usage import` for session transcripts. The worker's model stays the run's model, so an Opus advisor never reads as a model substitution or an alias drift.
+
 ## v0.20.0
 
 Local runs reuse the caller's workspace (#237, relais ADR-0008): a fork seeds `node_modules` and `target` copy-on-write instead of installing them again, and a run in a linked git worktree edits it in place. After upgrading, reinstall the plugin and run `relais coordinator stop`; a run then uses `auto` with no setting, and `CI` or `RELAIS_WORKSPACE=isolated` keep full isolation.
