@@ -202,9 +202,24 @@ export async function contractPath(fx: Fx, task: unknown, cwd: string): Promise<
   return { path: String(saved.stdout ?? '').trim() }
 }
 
-export async function startRun(fx: Fx, store: Store, input: { task: string; cwd: string }) {
-  await startChild(fx, store, ['relais', 'run', '--task', input.task, '--protocol'], input.cwd)
-  return `Started relais run for: ${input.task} (in ${input.cwd}). It runs in the relais pane and /relais-status; its outcome arrives here as a message when it ends.`
+const WORKSPACES = ['auto', 'fork', 'in-place', 'isolated']
+
+// The run tool's optional `workspace`, checked here so a typo is refused with
+// the four spellings instead of reaching relais as a usage error mid-run.
+export function workspaceOf(value: unknown): { value?: string; deny?: string } {
+  if (value === undefined || value === null) return {}
+  if (typeof value === 'string' && WORKSPACES.includes(value)) return { value }
+  return { deny: `relais run: workspace is one of ${WORKSPACES.join(', ')}.` }
+}
+
+export async function startRun(fx: Fx, store: Store, input: { task: string; cwd: string; workspace?: string }) {
+  const flag = input.workspace ? ['--workspace', input.workspace] : []
+  await startChild(fx, store, ['relais', 'run', '--task', input.task, ...flag, '--protocol'], input.cwd)
+  // The plugin returns before relais resolves where the run works, so this names only
+  // what was asked for. The run's own first event says where it works and, in place,
+  // that the worktree is held until the outcome arrives.
+  const asked = input.workspace ? ` (workspace: ${input.workspace})` : ''
+  return `Started relais run for: ${input.task} (in ${input.cwd})${asked}. It runs in the relais pane and /relais-status; its outcome arrives here as a message when it ends.`
 }
 
 export async function startReplay(

@@ -93,6 +93,21 @@ pub fn identity(root: &Path) -> RepoIdentity {
     RepoIdentity::common_dir(&canonical)
 }
 
+/// Is `root` a LINKED worktree — a checkout made by `git worktree add` —
+/// rather than the repository's primary checkout? Git answers it itself:
+/// in a linked worktree the git dir (`.git/worktrees/<name>`) differs from
+/// the common dir (`.git`), in the primary checkout they are one
+/// directory. A submodule's git dir is its own common dir, so it reads as
+/// primary. `None` when git cannot say (not a repository, git missing),
+/// which callers treat as "not provably linked" (ADR-0008).
+pub fn is_linked_worktree(root: &Path) -> Option<bool> {
+    let answer = |flag: &str| {
+        git_answer(root, &["rev-parse", "--path-format=absolute", flag])
+            .map(|dir| std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.into()))
+    };
+    Some(answer("--git-dir")? != answer("--git-common-dir")?)
+}
+
 /// One trimmed line of git's answer, when it answers at all.
 ///
 /// Every way of not getting one — no such remote, no repository, git not
@@ -382,6 +397,44 @@ mod tests {
             args.join(" "),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// The primary checkout is not a linked worktree; one made by
+    /// `git worktree add` is, which is what in-place runs key on.
+    #[test]
+    fn a_linked_worktree_is_told_from_the_primary_checkout() {
+        let base = temp_dir("linked-wt");
+        let live = base.join("live");
+        std::fs::create_dir_all(&live).expect("mkdir");
+        let no_hooks = base.join("no-hooks");
+        std::fs::create_dir_all(&no_hooks).expect("mkdir");
+        git(&live, &["init", "-q"]);
+        git(
+            &live,
+            &["config", "core.hooksPath", &no_hooks.to_string_lossy()],
+        );
+        git(&live, &["config", "user.email", "relais@test"]);
+        git(&live, &["config", "user.name", "relais test"]);
+        std::fs::write(live.join("relais.toml"), "schema_version = 1\n").expect("policy");
+        git(&live, &["add", "-A"]);
+        git(&live, &["commit", "-q", "-m", "base"]);
+        let linked = base.join("wt");
+        git(
+            &live,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                &linked.to_string_lossy(),
+                "HEAD",
+            ],
+        );
+        assert_eq!(is_linked_worktree(&live), Some(false));
+        assert_eq!(is_linked_worktree(&linked), Some(true));
+        let nowhere = base.join("not-a-repo");
+        std::fs::create_dir_all(&nowhere).expect("mkdir");
+        assert_eq!(is_linked_worktree(&nowhere), None);
     }
 
     /// The identity names the REPOSITORY: the live checkout and two

@@ -18,7 +18,7 @@ import {
   mintNonce,
 } from './decide.ts'
 import { DENY_MESSAGE, isRelaisNotification, isRelaisType, relaisAddresses } from './guards.ts'
-import { cancelRun, childOf, contractPath, onChunk, pump, reloadTimeline, startReplay, startRun, statusOf } from './runs.ts'
+import { cancelRun, childOf, contractPath, onChunk, pump, reloadTimeline, startReplay, startRun, statusOf, workspaceOf } from './runs.ts'
 import { onboardTool, onPersonPrompt, trustTool, withRoutingSection } from './consent.ts'
 import { decideGuard, learningEnvelopeGuard, machineSettingsGuard, routerEnvelopeGuard } from './guards.ts'
 import { ensureWatcher } from './quiet-watch.ts'
@@ -145,6 +145,12 @@ export function register(on: any) {
             description: RUN_CONTRACT_DESCRIPTION,
           },
           cwd: { type: 'string', description: 'The repository to work in (absolute path).' },
+          workspace: {
+            type: 'string',
+            enum: ['auto', 'fork', 'in-place', 'isolated'],
+            description:
+              'Where the run works. auto (default): edit cwd in place when it is a linked git worktree, else fork it with copy-on-write dependencies. in-place is refused outside a linked worktree; isolated is a fresh worktree with every setup step.',
+          },
         },
         required: ['task', 'cwd'],
       },
@@ -287,7 +293,9 @@ export function register(on: any) {
     const task = await contractPath(fx, e.task, e.cwd)
     if (task.deny) return { deny: task.deny }
     ensurePump(fx)
-    return { result: await startRun(fx, store, { task: task.path, cwd: e.cwd }) }
+    const workspace = workspaceOf(e.workspace)
+    if (workspace.deny) return { deny: workspace.deny }
+    return { result: await startRun(fx, store, { task: task.path, cwd: e.cwd, workspace: workspace.value }) }
   })
 
   // Both ask the person from inside the tool call; anything that throws is

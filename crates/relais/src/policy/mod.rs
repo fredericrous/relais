@@ -234,7 +234,53 @@ pub struct CommandSpec {
     /// authority hash of a policy that declares none is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub junit: Option<String>,
+    /// How a SETUP step may be skipped in a tree seeded from a workspace
+    /// that already ran it (SPEC §18, ADR-0008). Absent = the step always
+    /// runs. Omitted from the serialized form when absent, so no existing
+    /// authority hash moves; meaningful only on a setup step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse: Option<ReuseSpec>,
 }
+
+/// What lets a setup step be skipped (ADR-0008): the files its result
+/// depends on, the paths it leaves behind, and a command that proves them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReuseSpec {
+    /// Globs over TRACKED files whose content the step's result depends
+    /// on: manifests, lockfiles, patches, package-manager config, the
+    /// step's own script, and for a build the sources it compiles.
+    pub inputs: Vec<String>,
+    /// Git-ignored paths the step leaves behind; all must exist and be
+    /// non-empty in the seeded tree.
+    pub outputs: Vec<String>,
+    /// Exits 0 in the seeded tree iff the outputs are good.
+    pub verify: Vec<String>,
+}
+
+/// Directories seeded copy-on-write into a fork (ADR-0008). Data only: it
+/// names no command, and is omitted from the serialized form when it says
+/// nothing, so no existing authority hash moves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct WorkspacePolicy {
+    /// Dependency directories to seed, by name or relative path. Empty =
+    /// detect `node_modules` and `target`.
+    pub deps: Vec<String>,
+    /// `false` opts this repository out of in-place runs. A repository can
+    /// only narrow: there is no way to write `true` that widens the machine.
+    pub in_place: Option<bool>,
+}
+
+impl WorkspacePolicy {
+    pub fn is_default(&self) -> bool {
+        self.deps.is_empty() && self.in_place.is_none()
+    }
+}
+
+/// Directory names that are never seeded: an environment embeds absolute
+/// interpreter paths and is not portable (ADR-0008).
+pub const NEVER_SEEDED_DIRS: &[&str] = &[".venv", "venv"];
 
 /// The command a profile defines under `name`, if any — what a declared
 /// criterion's `Evidence::Check { name }` refers to.
@@ -463,6 +509,9 @@ pub struct RepoPolicy {
     /// when one fully covers the task; never inferred from prose.
     #[serde(default)]
     pub recipes: Vec<RecipeSpec>,
+    /// Workspace reuse data (ADR-0008); omitted when it says nothing.
+    #[serde(default, skip_serializing_if = "WorkspacePolicy::is_default")]
+    pub workspace: WorkspacePolicy,
 }
 
 impl RepoPolicy {
@@ -489,6 +538,21 @@ impl RepoPolicy {
                 }
             }
         }
+        for profile in self.verification.profiles.values() {
+            for step in &profile.setup {
+                if let Some(reuse) = &step.reuse {
+                    validate_reuse(reuse)?;
+                }
+            }
+            for command in &profile.commands {
+                if command.reuse.is_some() {
+                    return Err(PolicyError::InvalidWorkspace(
+                        "`reuse` is only meaningful on a setup step".into(),
+                    ));
+                }
+            }
+        }
+        validate_workspace_deps(&self.workspace.deps)?;
         validate_recipes(&self.recipes).map_err(PolicyError::InvalidRecipe)?;
         Ok(())
     }
@@ -618,12 +682,53 @@ pub fn repo_key(repo: &RepoIdentity) -> String {
     canonical_json_hash(&serde_json::json!({ "repo": repo }))
 }
 
+/// A path a workspace declaration may name: relative, inside the tree,
+/// not `.git`, and not an environment that cannot be moved (ADR-0008).
+fn validate_workspace_path(path: &str, what: &str) -> Result<(), PolicyError> {
+    let bad = |why: &str| PolicyError::InvalidWorkspace(format!("{what} `{path}` {why}"));
+    if path.is_empty() || path.starts_with('/') || path.contains('\\') {
+        return Err(bad("must be a non-empty relative path"));
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.iter().any(|part| *part == ".." || part.is_empty()) {
+        return Err(bad("must not contain `..` or empty segments"));
+    }
+    if parts.first() == Some(&".git") {
+        return Err(bad("must not be under .git"));
+    }
+    if parts.iter().any(|part| NEVER_SEEDED_DIRS.contains(part)) {
+        return Err(bad(
+            "is a Python environment, which embeds absolute paths and is never seeded",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_workspace_deps(deps: &[String]) -> Result<(), PolicyError> {
+    deps.iter()
+        .try_for_each(|dep| validate_workspace_path(dep, "[workspace] deps entry"))
+}
+
+fn validate_reuse(reuse: &ReuseSpec) -> Result<(), PolicyError> {
+    if reuse.inputs.is_empty() || reuse.outputs.is_empty() || reuse.verify.is_empty() {
+        return Err(PolicyError::InvalidWorkspace(
+            "`reuse` needs inputs, outputs and a verify command: a step that cannot be identified and checked is never skipped".into(),
+        ));
+    }
+    reuse
+        .outputs
+        .iter()
+        .try_for_each(|output| validate_workspace_path(output, "reuse output"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyError {
     UnsupportedSchemaVersion(u64),
     MalformedToml(String),
     EmptyRiskPaths,
     EmptyCommandArgv,
+    /// A `[workspace]` or `reuse` declaration that names something unsafe.
+    InvalidWorkspace(String),
     /// A spending ceiling below zero. A negative ceiling is not a tight
     /// one: every comparison against it is already past, and the
     /// remaining-budget subtraction would go somewhere nobody meant.
@@ -663,6 +768,7 @@ impl std::fmt::Display for PolicyError {
             Self::MalformedToml(detail) => write!(f, "policy file is not valid TOML: {detail}"),
             Self::EmptyRiskPaths => write!(f, "a [[risk]] rule needs at least one path pattern"),
             Self::EmptyCommandArgv => write!(f, "a verification command needs a non-empty argv"),
+            Self::InvalidWorkspace(detail) => write!(f, "workspace reuse: {detail}"),
             Self::NegativeCeiling { field, micros } => write!(
                 f,
                 "[spending] {field} is {micros}; a ceiling is a number of micro-USD and cannot be negative"
@@ -682,6 +788,30 @@ impl std::fmt::Display for PolicyError {
 }
 
 impl std::error::Error for PolicyError {}
+
+/// How a run's workspace is chosen (ADR-0008).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspaceMode {
+    /// Local: fork with copy-on-write deps, or in place in a linked worktree.
+    #[default]
+    Auto,
+    /// Today's full isolation: a fresh worktree and verification trees,
+    /// every setup step in each.
+    Isolated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct WorkspaceSettings {
+    pub mode: WorkspaceMode,
+}
+
+impl WorkspaceSettings {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
 
 /// Machine-owned settings, `~/.config/relais/machine.toml`. Never written
 /// by a run; workers cannot update grants or policy during a run (SPEC §5).
@@ -711,6 +841,9 @@ pub struct MachineSettings {
     pub concurrency: ConcurrencyLimits,
     #[serde(default)]
     pub trials: TrialEnvelope,
+    /// Where runs happen (ADR-0008). Absent = `auto`.
+    #[serde(default, skip_serializing_if = "WorkspaceSettings::is_default")]
+    pub workspace: WorkspaceSettings,
     #[serde(default)]
     pub routing: RoutingSettings,
     /// What a hook-admitted agent needs that the rest of this struct does
@@ -1531,6 +1664,17 @@ pub enum BlockCode {
     /// The contract's `design` cannot be read at the base revision: it is
     /// missing there, oversized or not text.
     DesignUnreadable,
+    /// Another run holds the caller's worktree (ADR-0008).
+    WorkspaceBusy,
+    /// A run was interrupted in the caller's worktree and has not been
+    /// retired; its partial edits are still there.
+    WorkspaceHasInterruptedRun,
+    /// `HEAD` moved during an in-place run: a worker committed on the
+    /// person's branch. The tree and the branch were left as they are.
+    InPlaceHeadMoved,
+    /// Restoring an in-place worktree would replace a path that holds
+    /// files relais did not make; nothing was deleted.
+    RestoreBlockedIgnoredCollision,
 }
 
 impl BlockCode {
@@ -1569,6 +1713,10 @@ impl BlockCode {
             Self::SandboxUnverified => "sandbox_unverified",
             Self::NativeUnpriced => "native_unpriced",
             Self::DesignUnreadable => "design_unreadable",
+            Self::WorkspaceBusy => "workspace_busy",
+            Self::WorkspaceHasInterruptedRun => "workspace_has_interrupted_run",
+            Self::InPlaceHeadMoved => "inplace_head_moved",
+            Self::RestoreBlockedIgnoredCollision => "restore_blocked_ignored_collision",
         }
     }
 }

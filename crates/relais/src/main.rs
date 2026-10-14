@@ -171,6 +171,13 @@ enum Command {
         /// Claude Code with the relais plugin, which passes this
         #[arg(long)]
         protocol: bool,
+        /// Where the run works: `auto` (default: edit a linked worktree in
+        /// place, otherwise fork it with copy-on-write dependencies),
+        /// `fork`, `in-place` (refused outside a linked worktree) or
+        /// `isolated` (a fresh worktree and every setup step, as before).
+        /// `RELAIS_WORKSPACE` sets the same; `CI` forces `isolated`
+        #[arg(long)]
+        workspace: Option<String>,
     },
     /// What the relais plugin calls: short processes that tell the
     /// coordinator what its agents did (SPEC §23)
@@ -1359,13 +1366,14 @@ fn dispatch(command: Command) -> Result<CliOutcome, CliError> {
             task,
             revise,
             protocol,
+            workspace,
         } => {
             let host = std::env::var("RELAIS_HOST").ok();
             let origin = relais::native::RunOrigin {
                 protocol,
                 host: host.as_deref(),
             };
-            run_command(&task, revise.as_deref(), &origin)
+            run_command(&task, revise.as_deref(), &origin, workspace.as_deref())
         }
         Command::Native { cmd } => native_command(cmd),
         Command::Quiet { cmd } => quiet_command(cmd),
@@ -5324,10 +5332,66 @@ fn run_refusal(
 }
 
 /// A `relais run` starts only from Claude Code with the relais plugin.
+/// Where this run works (ADR-0008): the flag, `RELAIS_WORKSPACE`, `CI`, the
+/// machine setting and git's own answer about the checkout, through the one
+/// pure decision. `Ok(Err(..))` is a refusal that blocks the run with its
+/// remedy; an unknown value is a usage error.
+fn run_workspace(
+    flag: Option<&str>,
+    root: &Path,
+    machine: &MachineSettings,
+    repo: &RepoPolicy,
+) -> Result<Result<relais::workspace::reuse::Workspace, String>, CliError> {
+    use relais::workspace::reuse::{resolve, ModeInputs, ModeRefusal, Requested};
+    let flag = flag
+        .map(Requested::parse)
+        .transpose()
+        .map_err(|refusal| CliError::Usage {
+            detail: format!(
+                "relais run: --workspace takes auto, fork, in-place or isolated ({})",
+                match refusal {
+                    ModeRefusal::Unknown(value) => format!("not `{value}`"),
+                    _ => "unknown value".to_string(),
+                }
+            ),
+        })?;
+    let env_workspace = std::env::var("RELAIS_WORKSPACE").ok();
+    let ci = std::env::var("CI").ok();
+    let inputs = ModeInputs {
+        flag,
+        env_workspace: env_workspace.as_deref(),
+        ci: ci.as_deref(),
+        machine: machine.workspace.mode,
+        repo_opts_out_of_in_place: repo.workspace.in_place == Some(false),
+        linked_worktree: relais::repo::is_linked_worktree(root),
+    };
+    Ok(match resolve(inputs) {
+        Ok(workspace) => Ok(workspace),
+        Err(ModeRefusal::Unknown(value)) => {
+            return Err(CliError::Usage {
+                detail: format!(
+                    "relais run: RELAIS_WORKSPACE takes auto, fork, in-place or isolated, not `{value}`"
+                ),
+            })
+        }
+        Err(ModeRefusal::WidenedPastTheEnvironment) => Err(
+            "relais run: RELAIS_WORKSPACE=isolated or CI forces an isolated workspace, and --workspace cannot widen it; unset the variable or drop the flag".to_string(),
+        ),
+        Err(ModeRefusal::PrimaryCheckout) => Err(format!(
+            "relais run: {} is the primary checkout; in-place needs a linked worktree (git worktree add …), or drop --workspace to fork",
+            root.display()
+        )),
+        Err(ModeRefusal::InPlaceOptedOut) => Err(
+            "relais run: this repository's relais.toml sets [workspace] in_place = false; drop --workspace to fork".to_string(),
+        ),
+    })
+}
+
 fn run_command(
     task: &Path,
     revise: Option<&str>,
     origin: &relais::native::RunOrigin<'_>,
+    workspace_flag: Option<&str>,
 ) -> Result<CliOutcome, CliError> {
     if let Some(detail) = relais::native::origin_refusal(origin) {
         return Err(CliError::Usage { detail });
@@ -5335,6 +5399,13 @@ fn run_command(
     let session = relais::coordinator::resolve_session();
     let (root, repo) = load_repo_policy()?;
     let machine = load_machine()?;
+    let workspace = match run_workspace(workspace_flag, &root, &machine, &repo)? {
+        Ok(workspace) => workspace,
+        Err(refusal) => {
+            eprintln!("{refusal}");
+            return Ok(CliOutcome::Blocked);
+        }
+    };
     let contract = load_contract(task)?;
     let ledger = open_ledger()?;
     let task_override = match resolve_task_override(&ledger, &contract, revise) {
@@ -5506,6 +5577,7 @@ fn run_command(
         None => &repo,
     };
     let outcome = match execute(&RunConfig {
+        workspace,
         repo_dir: &root,
         contract: &contract,
         repo_policy: run_policy,
@@ -6021,6 +6093,7 @@ fn replay_command(
     };
     eprintln!("{}", log.start_line());
     let outcome = execute(&RunConfig {
+        workspace: relais::workspace::reuse::Workspace::Isolated,
         repo_dir: &checkout_dir,
         contract: &replay_contract,
         repo_policy: candidate.policy(),
@@ -7367,6 +7440,124 @@ fn retire_verification_checkout(
     }
 }
 
+/// Finish an in-place run that died, if `run` was one (ADR-0008): the
+/// worktree is the caller's own and is never removed. Its marker names the
+/// tree it must end as; the work no candidate holds is exported first, the
+/// target applied, and the marker removed last. `None` = not an in-place run.
+fn retire_in_place(
+    ledger: &Ledger,
+    run: &RunId,
+    state: State,
+    reconciliation: &resume::Reconciliation,
+) -> Result<Option<CliOutcome>, CliError> {
+    use relais::workspace::inplace::{self, Lease, LeaseRefusal, Outcome, Target, TargetKind};
+    let Some(workspace) = operational(ledger.run_workspace(run), "resume")? else {
+        return Ok(None);
+    };
+    let root = workspace.repo_path;
+    let Ok(git_dir) = inplace::git_dir(&root) else {
+        return Ok(None);
+    };
+    let Ok(marker) = inplace::read_marker(&git_dir, run.as_str()) else {
+        return Ok(None);
+    };
+    if !reconciliation.all_provably_dead() {
+        println!(
+            "{run}: kept, a dispatch may still write {} ({})",
+            root.display(),
+            reconciliation.detail()
+        );
+        return Ok(Some(CliOutcome::OperationalFailure));
+    }
+    let lease = match Lease::reclaim(&root, run.as_str()) {
+        Ok(lease) => lease,
+        Err(LeaseRefusal::Busy { holder }) => {
+            println!(
+                "{run}: kept, run {} holds {}",
+                holder.as_deref().unwrap_or("?"),
+                root.display()
+            );
+            return Ok(Some(CliOutcome::OperationalFailure));
+        }
+        Err(LeaseRefusal::Interrupted { .. }) => return Ok(None),
+        Err(LeaseRefusal::Io(e)) => {
+            println!("{run}: kept, {} could not be taken: {e}", root.display());
+            return Ok(Some(CliOutcome::OperationalFailure));
+        }
+    };
+    let tree_of = |rev: &str| -> Result<String, CliError> {
+        let output = workspace::git_command(&root)
+            .args(["rev-parse", &format!("{rev}^{{tree}}")])
+            .output()
+            .map_err(|e| CliError::Usage {
+                detail: format!("git could not be launched: {e}"),
+            })?;
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    // An accepted run is left holding its change, also when it died before
+    // the marker said so: the ledger and the receipt know.
+    let artifacts = paths::runs_dir()
+        .map_err(CliError::Home)?
+        .join(run.as_str());
+    let accepted = (state == State::Accepted)
+        .then(|| std::fs::read_to_string(artifacts.join("receipt.json")).ok())
+        .flatten()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|receipt| receipt["candidate_sha"].as_str().map(str::to_string));
+    let target = match accepted {
+        Some(candidate) => Target {
+            kind: TargetKind::Accepted,
+            tree: tree_of(&candidate)?,
+        },
+        None => Target {
+            kind: TargetKind::Start,
+            tree: tree_of(&marker.start)?,
+        },
+    };
+    let worktree = workspace::TaskWorktree {
+        path: root.clone(),
+        base_sha: marker.start.clone(),
+        index: Some(lease.relais_index()),
+    };
+    let mut export = || {
+        workspace::export_unkept(&worktree, run.as_str(), &artifacts)
+            .map(|exported| {
+                exported
+                    .map(|exported| exported.reference)
+                    .unwrap_or_else(|| "none".to_string())
+            })
+            .map_err(std::io::Error::other)
+    };
+    Ok(Some(match inplace::finalize(lease, target, &mut export) {
+        Ok(Outcome::Applied { real_index_changed }) => {
+            println!(
+                "{run}: restored to {} in {} (directory kept)",
+                inplace::short(&marker.start),
+                root.display()
+            );
+            if real_index_changed {
+                println!(
+                    "{run}: your git index changed during the run; the original is kept at {}/relais-inplace/{run}.index.orig",
+                    git_dir.display()
+                );
+            }
+            CliOutcome::Accepted
+        }
+        Ok(Outcome::HeadMoved { was, now }) => {
+            println!(
+                "{run}: kept, HEAD moved from {} to {} during the run; the tree and the branch were not touched, review them yourself",
+                inplace::short(&was),
+                inplace::short(&now)
+            );
+            CliOutcome::OperationalFailure
+        }
+        Err(e) => {
+            println!("{run}: kept, {e}");
+            CliOutcome::OperationalFailure
+        }
+    }))
+}
+
 /// Retire every worktree one terminal run still holds.
 fn retire_run(
     ledger: &Ledger,
@@ -7374,6 +7565,9 @@ fn retire_run(
     state: State,
     reconciliation: &resume::Reconciliation,
 ) -> Result<CliOutcome, CliError> {
+    if let Some(done) = retire_in_place(ledger, run, state, reconciliation)? {
+        return Ok(done);
+    }
     let state_dir = paths::state_dir().map_err(CliError::Home)?;
     let retained: Vec<_> = retained_with_verification(&state_dir)?
         .into_iter()
@@ -7439,6 +7633,7 @@ fn retire_worktree(
     let worktree = workspace::TaskWorktree {
         path: path.to_path_buf(),
         base_sha,
+        index: None,
     };
     let artifacts = paths::runs_dir()
         .map_err(CliError::Home)?

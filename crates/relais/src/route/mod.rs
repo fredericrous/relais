@@ -1063,6 +1063,7 @@ mod tests {
 
     fn repo_policy() -> RepoPolicy {
         RepoPolicy {
+            workspace: Default::default(),
             schema_version: 1,
             context: Default::default(),
             models: BTreeMap::from([
@@ -1111,6 +1112,7 @@ mod tests {
                             argv: vec!["make".into(), "check".into()],
                             timeout_seconds: 300,
                             junit: None,
+                            reuse: None,
                         }],
                         amont_checks: Vec::new(),
                         amont_waivers: Vec::new(),
@@ -1127,6 +1129,7 @@ mod tests {
 
     fn machine_for(repo: &RepoPolicy) -> MachineSettings {
         let mut machine = MachineSettings {
+            workspace: Default::default(),
             schema_version: 1,
             allowed_models: None,
             spending: Default::default(),
@@ -1487,6 +1490,7 @@ mod tests {
     fn authority_blockers_stop_routing_before_dispatch() {
         let repo = repo_policy();
         let machine = MachineSettings {
+            workspace: Default::default(),
             schema_version: 1,
             allowed_models: None,
             spending: Default::default(),
@@ -1994,6 +1998,7 @@ mod tests {
     fn blocked_explanation_lists_codes() {
         let repo = repo_policy();
         let machine = MachineSettings {
+            workspace: Default::default(),
             schema_version: 1,
             allowed_models: None,
             spending: Default::default(),

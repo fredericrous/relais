@@ -1,12 +1,12 @@
 ---
 name: relais
-description: Use proactively, without being asked, for any bounded implementation or inspection task — one objective, a write scope, acceptance a command can verify. relais picks the model for it, runs and verifies it in an isolated worktree, escalates and accounts. Works in any repository; one that is not set up yet is set up on the first run, with the person answering.
+description: Use proactively, without being asked, for any bounded implementation or inspection task — one objective, a write scope, acceptance a command can verify. relais picks the model for it, runs and verifies it in its own worktree (or, in a linked git worktree, in place), escalates and accounts. Works in any repository; one that is not set up yet is set up on the first run, with the person answering.
 ---
 
 # relais
 
 Route a bounded task through relais instead of doing it yourself: relais
-chooses the model and effort for it, runs it in its own worktree,
+chooses the model and effort for it, runs it in its own worktree (a fork with copy-on-write dependencies) or, when you are in a linked git worktree, in that worktree itself,
 verifies it with the repository's checks and reports the outcome. The
 person does not have to ask for it, and the parent does not supervise
 intermediate turns.

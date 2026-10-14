@@ -14,6 +14,7 @@ pub mod context;
 pub mod contract;
 pub mod coordinator;
 pub mod doctor;
+pub mod fsclone;
 pub mod fsutil;
 pub mod hook;
 pub mod ids;

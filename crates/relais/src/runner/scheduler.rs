@@ -703,6 +703,7 @@ fn run_package(
             .map_or(remaining_agents, |cap| cap.min(remaining_agents)),
     );
     let child_config = RunConfig {
+        workspace: crate::workspace::reuse::Workspace::Isolated,
         ids: engine.config.ids,
         repo_dir: engine.config.repo_dir,
         contract: &child_contract,
