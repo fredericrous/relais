@@ -2500,8 +2500,12 @@ fn learn_cycle_command(
             return Ok(CliOutcome::Accepted);
         }
     }
+    let mut recipes_file = None;
     let repo = match load_repo_policy() {
-        Ok((_, repo)) => repo,
+        Ok((root, repo)) => {
+            recipes_file = Some(root.join("relais.toml"));
+            repo
+        }
         // A cycle started from a directory with no relais.toml still has a
         // ledger to learn from; task features then read the default policy.
         // Any other failure (a parse error, a permission error) is surfaced.
@@ -2535,6 +2539,7 @@ fn learn_cycle_command(
         ledger: &ledger,
         registry: &registry,
         repo: &repo,
+        recipes_file,
         datasets_dir: &datasets,
         gates: relais::learn::cycle::GateSettings {
             quality_floor: machine
@@ -4442,6 +4447,7 @@ fn plan_command(
         (None, None) => None,
     };
     let decision = route::route(route::RouteInputs {
+        draw_key: None,
         task_type,
         has_design: contract.design.is_some(),
         admission: route::Admission::Live,

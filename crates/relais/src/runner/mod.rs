@@ -2049,11 +2049,16 @@ impl<'a> RunEngine<'a> {
         // The declared type, else the ledger's classified one. Only a run
         // the replay command started (`RunPurpose::Replay`, set nowhere
         // else) is admitted below the implementation tier for a change.
-        let task_type = match ledger.task_of_run(&self.run_id)? {
-            Some(task) => ledger.routing_type(&task, self.config.contract.task_type)?,
+        let task = ledger.task_of_run(&self.run_id)?;
+        let task_type = match &task {
+            Some(task) => ledger.routing_type(task, self.config.contract.task_type)?,
             None => self.config.contract.task_type,
         };
         let decision = match route(RouteInputs {
+            draw_key: task.as_ref().map(|task| crate::route::DrawKey {
+                task: task.as_str(),
+                run: self.run_id.as_str(),
+            }),
             task_type,
             has_design: self.config.design.is_present(self.config.contract),
             admission: if self.config.purpose == Some(crate::lifecycle::RunPurpose::Replay) {
@@ -2598,6 +2603,7 @@ impl<'a> RunEngine<'a> {
                 "recipe_id": ctx.preflight.decision.covering.as_ref().map(|r| &r.recipe_id),
                 "recipe_name": ctx.preflight.decision.covering.as_ref().map(|r| &r.name),
                 "recipe_revision": ctx.preflight.decision.covering.as_ref().map(|r| r.revision),
+                "task_type_draw": ctx.preflight.decision.type_draw,
             }),
             0,
             ctx.preflight.decision.routed_by,

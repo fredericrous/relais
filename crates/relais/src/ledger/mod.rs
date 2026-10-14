@@ -702,6 +702,15 @@ pub struct NewRecipePromotion<'a> {
     pub trial_ids: &'a [TrialId],
 }
 
+/// A live root run with its first dispatch intent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveRun {
+    pub run: RunId,
+    pub created_at: String,
+    /// The run's first dispatch intent.
+    pub intent: serde_json::Value,
+}
+
 /// A recorded promotion: the trials that authorised a recipe revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecipePromotion {
@@ -6576,6 +6585,46 @@ impl Ledger {
             .into_iter()
             .map(RunId::from_stored)
             .collect())
+    }
+
+    /// Every root run created at or after `since` that is not a replay and
+    /// has a dispatch, oldest first, with its first dispatch intent: the
+    /// live runs a recipe routed.
+    // holds-until: the runs table stays in the tens of thousands; this
+    // reads every live run since `since` and filters in Rust. A selective
+    // index on the intent's recipe id ends it.
+    pub fn live_runs_with_first_intent(&self, since: &str) -> Result<Vec<LiveRun>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.created_at,
+                    (SELECT d.intent_json FROM dispatches d WHERE d.run_id = r.id
+                      ORDER BY d.created_at, d.dispatch_id LIMIT 1)
+               FROM runs r
+              WHERE r.parent_run IS NULL AND COALESCE(r.purpose, '') <> ?2
+                AND r.created_at >= ?1
+              ORDER BY r.created_at, r.id",
+        )?;
+        let rows = stmt.query_map(params![since, RunPurpose::Replay.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        let rows: Vec<_> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut out = Vec::new();
+        for (id, created_at, text) in rows {
+            let Some(text) = text else { continue };
+            let intent = serde_json::from_str(&text).map_err(|e| LedgerError::Corrupt {
+                what: format!("the dispatch intent of run {id}"),
+                detail: e.to_string(),
+            })?;
+            out.push(LiveRun {
+                run: RunId::from_stored(id),
+                created_at,
+                intent,
+            });
+        }
+        Ok(out)
     }
 
     /// `(runs with a recorded route, of which routed by a learned
