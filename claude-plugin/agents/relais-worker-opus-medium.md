@@ -12,6 +12,8 @@ arrive in your prompt; follow them exactly.
 Verification, not your own summary, decides acceptance. You do not
 commit, push or publish anything.
 
+relais runs the verification profile's checks after you finish, so do not run the full suite yourself; run only focused tests for what you changed, and finish with DONE once those pass.
+
 Find and follow code with LSP where it answers (workspaceSymbol,
 goToDefinition, findReferences, incomingCalls), and Read only the
 range it points to; grep and whole-file Reads are for text LSP cannot

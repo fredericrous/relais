@@ -12,6 +12,10 @@ missing here.
 
 Local runs reuse the caller's workspace (#237, relais ADR-0008): a fork seeds `node_modules` and `target` copy-on-write instead of installing them again, and a run in a linked git worktree edits it in place. After upgrading, reinstall the plugin and run `relais coordinator stop`; a run then uses `auto` with no setting, and `CI` or `RELAIS_WORKSPACE=isolated` keep full isolation.
 
+Workers no longer spend the run's wall budget on the full verification: the worker prompt and every `relais-worker-*` agent now say that relais runs the verification profile's checks after the worker finishes, so the worker runs only focused tests for what it changed.
+
+`make check` no longer goes red when the plugin tests fail only with `timed out after 5000 ms` under machine load: `scripts/plugin-test.sh` reruns the suite once in that case, and exits non-zero at once on any other failure.
+
 Local runs reuse the caller's workspace (relais ADR-0008). The default is local; a server or CI keeps today's isolation (`CI` set, `RELAIS_WORKSPACE=isolated`, or machine.toml `[workspace] mode = "isolated"`).
 
 A run in a primary checkout forks it and clones the caller's ignored `node_modules` and `target` copy-on-write instead of installing them again: seconds and almost no disk, where a happier run cost 6.5 GB and 10-25 minutes per tree. On a filesystem that cannot clone it says `workspace_cow_unavailable` and installs as before. A setup step that declares `reuse = { inputs, outputs, verify }` is skipped when its recorded result matches and its outputs verify; no other step is.

@@ -5119,7 +5119,10 @@ fn worker_rules() -> String {
      do not leave scratch files in this directory: they become part of the\n\
      candidate. give findings and reports in your final message.\n\
      finish with a line starting DONE when you believe the criteria are met,\n\
-     or relais-blocked: <reason> when something outside the task blocks you.\n"
+     or relais-blocked: <reason> when something outside the task blocks you.\n\
+     relais runs the verification profile's checks after you finish, so do\n\
+     not run the full suite yourself; run only focused tests for what you\n\
+     changed, and finish with DONE once those pass.\n"
         .to_string()
 }
 
@@ -11604,6 +11607,26 @@ mod tests {
     fn rules_of(prompt: &str) -> &str {
         let at = prompt.find("\nrules:").expect("a rules paragraph");
         &prompt[at..]
+    }
+
+    #[test]
+    fn the_prompt_says_to_run_focused_tests_not_the_full_suite() {
+        let fixture = Fixture::new();
+        let contract = fixture.contract(Review::Off);
+        let manifest = manifest_with(Vec::new());
+        let prompt = build_prompt(&contract, &manifest, 1, None, AttemptKind::Initial);
+        let rules = rules_of(&prompt)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            rules.contains("relais runs the verification profile's checks after you finish"),
+            "{rules}"
+        );
+        assert!(
+            rules.contains("do not run the full suite yourself; run only focused tests"),
+            "{rules}"
+        );
     }
 
     #[test]
