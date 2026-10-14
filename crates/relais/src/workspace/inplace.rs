@@ -706,6 +706,9 @@ mod tests {
         );
         git(&live, &["config", "user.email", "t@t"]);
         git(&live, &["config", "user.name", "t"]);
+        // Byte-exact checkouts: the tests compare file contents, and git's
+        // CRLF conversion on Windows would read back "a\r\n" for "a\n".
+        git(&live, &["config", "core.autocrlf", "false"]);
         std::fs::write(live.join(".gitignore"), "*.log\ncache/\n").expect("ignore");
         std::fs::write(live.join("a.txt"), "a\n").expect("a");
         git(&live, &["add", "-A"]);

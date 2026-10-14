@@ -10566,11 +10566,14 @@ mod tests {
     }
 
     fn bash_step(script: &str) -> CommandSpec {
+        // `bash` on a Windows PATH is the WSL launcher; the shell git ships
+        // is `sh` (the same choice `versionable_main_gone_check` makes).
+        let shell = if cfg!(windows) { "sh" } else { "bash" };
         CommandSpec {
             name: None,
             junit: None,
             reuse: None,
-            argv: vec!["bash".into(), "-c".into(), script.into()],
+            argv: vec![shell.into(), "-c".into(), script.into()],
             timeout_seconds: 30,
         }
     }
@@ -10656,7 +10659,8 @@ mod tests {
     /// ran the step itself.
     fn stamp_the_callers_workspace(fixture: &Fixture, step: &CommandSpec) {
         let reuse = step.reuse.as_ref().expect("reuse");
-        let version = crate::tooling::program_version("bash", None).expect("bash");
+        let shell = if cfg!(windows) { "sh" } else { "bash" };
+        let version = crate::tooling::program_version(shell, None).expect("shell");
         let toolchain = format!("{} {}", version.program, version.version);
         let key = crate::workspace::reuse::step_key(&fixture.repo, step, reuse, &toolchain, &[])
             .expect("key");
