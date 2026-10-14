@@ -5423,7 +5423,12 @@ fn golden_document(world: &World, run_id: &str, label: &str) -> serde_json::Valu
     let run_dir = world.run_dir(run_id);
     let events: Vec<serde_json::Value> = events_jsonl(&run_dir)
         .iter()
-        .filter(|event| event["event"]["kind"] != "stderr")
+        // `guidance` decisions say what the machine has (an `aval` on PATH or
+        // not), which is not a property of the isolated path.
+        .filter(|event| {
+            event["event"]["kind"] != "stderr"
+                && !(event["event"]["kind"] == "decision" && event["event"]["what"] == "guidance")
+        })
         .map(|event| {
             let body = &event["event"];
             let mut kept = serde_json::Map::new();

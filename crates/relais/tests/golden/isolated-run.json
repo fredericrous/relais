@@ -6,16 +6,6 @@
         "name": "preflight"
       },
       {
-        "kind": "decision",
-        "reason": "index missing (aval exit 3)",
-        "what": "guidance"
-      },
-      {
-        "kind": "decision",
-        "reason": "relevant missing (aval exit 3)",
-        "what": "guidance"
-      },
-      {
         "kind": "step",
         "name": "preflight"
       },
@@ -281,16 +271,6 @@
       {
         "kind": "step",
         "name": "preflight"
-      },
-      {
-        "kind": "decision",
-        "reason": "index missing (aval exit 3)",
-        "what": "guidance"
-      },
-      {
-        "kind": "decision",
-        "reason": "relevant missing (aval exit 3)",
-        "what": "guidance"
       },
       {
         "kind": "step",
