@@ -190,7 +190,7 @@ pub enum TurnCeiling {
 
 impl TurnCeiling {
     /// The value recorded in the context manifest, which is where a
-    /// run says which of the two it was.
+    /// run says which of these it was.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Harness => "harness",
@@ -204,7 +204,7 @@ impl TurnCeiling {
         match self {
             Self::Harness => "turn ceiling: enforced by the harness",
             Self::Unavailable => "turn ceiling: not available on this Claude Code — attempts and wall time are enforced by the runner, turns are not",
-            Self::UnknownTimedOut => "turn ceiling: unknown — `claude --help` did not answer in time",
+            Self::UnknownTimedOut => "turn ceiling: unknown — the Claude Code probe did not answer in time",
         }
     }
 }
