@@ -439,10 +439,51 @@ impl CliEffortProbe {
 /// `--effort-template`: a harness that could not be found and one that
 /// did not answer are both named by the reason.
 fn probe_harness() -> Result<crate::backend::Capabilities, String> {
-    let backend = crate::adapter::claude::ClaudeBackend::discover().map_err(|e| e.to_string())?;
-    backend
-        .probe_report()
-        .map_err(|failure| failure.to_string())
+    probe_harness_typed().map_err(|e| e.reason())
+}
+
+/// Why the harness could not be probed: not found, or probed and failed.
+enum HarnessProbeError {
+    Missing(String),
+    Failed(crate::adapter::claude::ProbeFailure),
+}
+
+impl HarnessProbeError {
+    fn reason(&self) -> String {
+        match self {
+            Self::Missing(reason) => reason.clone(),
+            Self::Failed(failure) => failure.to_string(),
+        }
+    }
+}
+
+fn probe_harness_typed() -> Result<crate::backend::Capabilities, HarnessProbeError> {
+    let backend = crate::adapter::claude::ClaudeBackend::discover()
+        .map_err(|e| HarnessProbeError::Missing(e.to_string()))?;
+    backend.probe_report().map_err(HarnessProbeError::Failed)
+}
+
+/// The Claude Code line for a probe that failed. A probe that timed out
+/// leaves the version unchecked, which is a warning: `relais run` warns
+/// and goes on. Any other failure is one `relais run` refuses.
+pub(crate) fn claude_code_probe_failure_finding(
+    failure: &crate::adapter::claude::ProbeFailure,
+) -> Finding {
+    match failure {
+        crate::adapter::claude::ProbeFailure::TimedOut { after, .. } => Finding {
+            component: "claude-code",
+            level: Level::Warn,
+            detail: format!(
+                "version unchecked (timed out after {}s) — runs will warn, not refuse",
+                after.as_secs()
+            ),
+        },
+        other => Finding {
+            component: "claude-code",
+            level: Level::Fail,
+            detail: other.to_string(),
+        },
+    }
 }
 
 /// Find and probe the installed Claude Code for its `--effort` list.
@@ -1020,14 +1061,17 @@ pub fn doctor(repo_dir: &Path) -> DoctorReport {
 
     // A probe that errored says so: "not found", "did not answer" and
     // "answered and refused" are different things to fix.
-    let cli_probe = match probe_harness() {
-        Err(reason) => {
-            findings.push(Finding {
-                component: "claude-code",
-                level: Level::Fail,
-                detail: reason.clone(),
+    let cli_probe = match probe_harness_typed() {
+        Err(error) => {
+            findings.push(match &error {
+                HarnessProbeError::Failed(failure) => claude_code_probe_failure_finding(failure),
+                HarnessProbeError::Missing(reason) => Finding {
+                    component: "claude-code",
+                    level: Level::Fail,
+                    detail: reason.clone(),
+                },
             });
-            CliEffortProbe::failed(reason)
+            CliEffortProbe::failed(error.reason())
         }
         Ok(caps) => {
             findings.push(claude_code_finding(&caps));
@@ -2115,6 +2159,25 @@ mod tests {
         .expect("parses")
         .remove("d")
         .expect("d")
+    }
+
+    #[test]
+    fn a_probe_that_timed_out_is_a_warning_and_any_other_failure_a_failure() {
+        use crate::adapter::claude::ProbeFailure;
+        let late = claude_code_probe_failure_finding(&ProbeFailure::TimedOut {
+            args: "--version".into(),
+            after: std::time::Duration::from_secs(30),
+        });
+        assert_eq!(late.level, Level::Warn);
+        assert_eq!(
+            late.detail,
+            "version unchecked (timed out after 30s) — runs will warn, not refuse"
+        );
+        let refused = claude_code_probe_failure_finding(&ProbeFailure::Refused {
+            args: "--version".into(),
+            ended: "exit 1".into(),
+        });
+        assert_eq!(refused.level, Level::Fail);
     }
 
     #[test]

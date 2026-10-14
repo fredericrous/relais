@@ -324,6 +324,8 @@ export function applyEvent(model: RunModel, event: any, at: number): RunModel {
       const entry = { at, kind: 'decision', text: `${event.what} · ${event.reason}` }
       return withEntry({ ...m, decisions: pushEntry(m.decisions, entry) }, at, 'decision', entry.text)
     }
+    case 'environment_warning':
+      return withEntry(m, at, 'warning', `warning · ${event.what ?? 'environment'} · ${event.detail ?? ''}`)
     case 'outcome': {
       m = closeStep(m, at, isFailing(event.state) ? 'fail' : 'done')
       const changed = changedText(event.summary)

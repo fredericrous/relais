@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+A Claude Code version probe that times out no longer refuses the run. Under heavy load `claude --version` could take longer than the 30 s probe timeout, and relais read the silence as an unsupported version, so every `relais run` and `relais dataset replay` stopped. A probe that timed out now leaves the version unchecked: relais warns once on stderr, records an `environment_warning` event (`what: claude_code_version_unchecked`) on the run, and goes on, the hello check still applying; the context manifest's `turn_ceiling` reads `unknown (timed out)`, a timed-out probe stands for five minutes, so one run start waits it out once, and the next use after that asks again, and `relais doctor` reports it as a warning. A version outside >= 2.1.291, < 2.2.0, an unparsable answer, a non-zero exit, silence or a missing binary still refuse.
+
 Claude Code's advisor tool is now counted. When a worker or a session runs with an advisor (`claude --advisor opus`, `advisorModel`), the advisor's tokens appear only in `usage.iterations[]` as `advisor_message` entries, never in the top-level usage relais read, so they went unbooked. relais now books each advisor call at the advisor model's own rate: for a native dispatch from the agent's transcript when it stops, once per call across continuations, with the dispatch's phase; and through `relais usage import` for session transcripts. The worker's model stays the run's model, so an Opus advisor never reads as a model substitution or an alias drift.
 
 ## v0.21.0

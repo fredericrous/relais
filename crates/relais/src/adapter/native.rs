@@ -1025,6 +1025,10 @@ impl Harness for NativeBackend<'_> {
     fn probe(&self) -> Option<Capabilities> {
         self.harness.probe()
     }
+
+    fn probe_timed_out(&self) -> Option<String> {
+        self.harness.probe_timed_out()
+    }
 }
 
 impl Backend for NativeBackend<'_> {

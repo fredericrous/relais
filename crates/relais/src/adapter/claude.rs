@@ -11,7 +11,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
-use std::sync::OnceLock;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::backend::{BackendError, Capabilities, Harness, PermissionEnforcement};
 use crate::procs::{run_with_timeout, Ended};
@@ -26,9 +27,12 @@ use crate::tooling::PROBE_TIMEOUT;
 /// (`errors.never-swallowed`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeFailure {
-    /// The probe process could not be started, timed out, or was
-    /// cancelled.
+    /// The probe process could not be started, or was cancelled.
     NotRun { args: String, detail: String },
+    /// It did not answer within `after`: the machine may be busy. Not a
+    /// fact about the CLI, so never cached and never read as an
+    /// unsupported version.
+    TimedOut { args: String, after: Duration },
     /// It ran and did not exit 0.
     Refused { args: String, ended: String },
     /// It exited 0 with nothing on either stream.
@@ -41,6 +45,11 @@ impl std::fmt::Display for ProbeFailure {
             Self::NotRun { args, detail } => {
                 write!(f, "`claude {args}` did not run: {detail}")
             }
+            Self::TimedOut { args, after } => write!(
+                f,
+                "`claude {args}` did not answer within {}s (machine busy?)",
+                after.as_secs_f64()
+            ),
             Self::Refused { args, ended } => write!(f, "`claude {args}` {ended}"),
             Self::Silent { args } => {
                 write!(f, "`claude {args}` exited 0 and printed nothing")
@@ -51,6 +60,36 @@ impl std::fmt::Display for ProbeFailure {
 
 impl std::error::Error for ProbeFailure {}
 
+/// Whether this Claude Code is one the plugin supports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Support {
+    Supported,
+    /// Outside the range, unreadable or unanswering: the run is refused.
+    Unsupported(String),
+    /// The probe was late, not wrong: nothing says it does not work, and
+    /// nothing says it does. The run warns and goes on.
+    Unchecked(String),
+}
+
+/// The three-way verdict on an installed Claude Code. `printed` is what
+/// `claude --version` printed; `failure` is why the probe could not say.
+/// Only a probe that timed out is `Unchecked`: an answer outside the range,
+/// an unparsable one, a non-zero exit, silence or a missing binary mean
+/// nothing says it works (`crate::native::unsupported_claude_code_because`).
+pub fn claude_code_support(printed: Option<&str>, failure: Option<&ProbeFailure>) -> Support {
+    let answered = printed.is_some_and(|text| !text.trim().is_empty());
+    if !answered {
+        if let Some(late @ ProbeFailure::TimedOut { .. }) = failure {
+            return Support::Unchecked(late.to_string());
+        }
+    }
+    let shown = failure.map(ToString::to_string);
+    match crate::native::unsupported_claude_code_because(printed, shown.as_deref()) {
+        Some(refusal) => Support::Unsupported(refusal),
+        None => Support::Supported,
+    }
+}
+
 #[derive(Debug)]
 pub struct ClaudeBackend {
     binary: PathBuf,
@@ -58,8 +97,26 @@ pub struct ClaudeBackend {
     /// about an installed CLI, and asking again before every dispatch
     /// spent two processes per launch to learn the same thing (audit V6).
     /// The failure is kept too, so a probe that errored is reported as
-    /// an error rather than as a CLI without the flags.
-    capabilities: OnceLock<Result<Capabilities, ProbeFailure>>,
+    /// an error rather than as a CLI without the flags. A probe that
+    /// timed out is the exception: it says nothing about the CLI, so it
+    /// is kept only for `timeout_retry`, then asked again.
+    probed: Mutex<Probed>,
+    /// How long one probe call may take.
+    probe_timeout: Duration,
+    /// How long a timed-out probe stands before the next use asks again:
+    /// one run start must not wait out the timeout once per caller.
+    timeout_retry: Duration,
+}
+
+/// How long a timed-out probe stands before the next use asks again.
+pub const TIMEOUT_RETRY: Duration = Duration::from_secs(300);
+
+#[derive(Debug, Default)]
+struct Probed {
+    /// An answer, or a failure that is a fact about the CLI.
+    settled: Option<Result<Capabilities, ProbeFailure>>,
+    /// The last probe that timed out, and when.
+    timed_out: Option<(Instant, ProbeFailure)>,
 }
 
 impl ClaudeBackend {
@@ -101,8 +158,25 @@ impl ClaudeBackend {
         }
         Ok(Self {
             binary: resolved,
-            capabilities: OnceLock::new(),
+            probed: Mutex::new(Probed::default()),
+            probe_timeout: PROBE_TIMEOUT,
+            timeout_retry: TIMEOUT_RETRY,
         })
+    }
+
+    /// The same backend with another probe timeout; tests use it to avoid
+    /// waiting out `PROBE_TIMEOUT`.
+    #[must_use]
+    pub fn with_probe_timeout(mut self, probe_timeout: Duration) -> Self {
+        self.probe_timeout = probe_timeout;
+        self
+    }
+
+    /// The same backend with another `timeout_retry`.
+    #[must_use]
+    pub fn with_timeout_retry(mut self, timeout_retry: Duration) -> Self {
+        self.timeout_retry = timeout_retry;
+        self
     }
 
     /// The binary this backend probes.
@@ -113,23 +187,58 @@ impl ClaudeBackend {
     /// The probe, cached, with the reason it failed when it did.
     /// `cancel` aborts a probe that hangs; the timeout bounds one that
     /// merely takes its time.
-    fn capability_report(
-        &self,
-        cancel: Option<&AtomicBool>,
-    ) -> &Result<Capabilities, ProbeFailure> {
-        self.capabilities.get_or_init(|| self.probe_now(cancel))
+    fn capability_report(&self, cancel: Option<&AtomicBool>) -> Result<Capabilities, ProbeFailure> {
+        let mut probed = self
+            .probed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(report) = probed.settled.as_ref() {
+            return report.clone();
+        }
+        if let Some((at, failure)) = probed.timed_out.as_ref() {
+            if at.elapsed() < self.timeout_retry {
+                return Err(failure.clone());
+            }
+        }
+        let report = self.probe_now(cancel);
+        match &report {
+            Err(failure @ ProbeFailure::TimedOut { .. }) => {
+                probed.timed_out = Some((Instant::now(), failure.clone()));
+            }
+            _ => {
+                probed.timed_out = None;
+                probed.settled = Some(report.clone());
+            }
+        }
+        report
+    }
+
+    /// Why the probe could not say in time, when that is why it has no
+    /// answer: the version is unchecked, not unsupported.
+    pub fn probe_timed_out(&self) -> Option<ProbeFailure> {
+        let probed = self
+            .probed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match probed.settled {
+            Some(_) => None,
+            None => probed
+                .timed_out
+                .as_ref()
+                .map(|(_, failure)| failure.clone()),
+        }
     }
 
     /// What the installed CLI can be asked to do, or why that could not
     /// be established — the answer `doctor` reports.
     pub fn probe_report(&self) -> Result<Capabilities, ProbeFailure> {
-        self.capability_report(None).clone()
+        self.capability_report(None)
     }
 
     fn capabilities(&self, cancel: Option<&AtomicBool>) -> Option<Capabilities> {
         // The failure is not dropped here: `probe_report` is what
         // `doctor` prints. This is the `Harness::probe` shape.
-        self.capability_report(cancel).clone().ok()
+        self.capability_report(cancel).ok()
     }
 
     fn probe_now(&self, cancel: Option<&AtomicBool>) -> Result<Capabilities, ProbeFailure> {
@@ -150,12 +259,18 @@ impl ClaudeBackend {
         let mut command = Command::new(&self.binary);
         command.args(args);
         let named = args.join(" ");
-        let end = run_with_timeout(command, PROBE_TIMEOUT, None, cancel).map_err(|e| {
+        let end = run_with_timeout(command, self.probe_timeout, None, cancel).map_err(|e| {
             ProbeFailure::NotRun {
                 args: named.clone(),
                 detail: e.to_string(),
             }
         })?;
+        if end.ended == Ended::TimedOut {
+            return Err(ProbeFailure::TimedOut {
+                args: named,
+                after: self.probe_timeout,
+            });
+        }
         if end.ended != Ended::Exited(0) {
             return Err(ProbeFailure::Refused {
                 args: named,
@@ -177,6 +292,10 @@ impl Harness for ClaudeBackend {
 
     fn probe(&self) -> Option<Capabilities> {
         self.capabilities(None)
+    }
+
+    fn probe_timed_out(&self) -> Option<String> {
+        ClaudeBackend::probe_timed_out(self).map(|failure| failure.to_string())
     }
 }
 
@@ -286,6 +405,139 @@ mod tests {
         );
         assert_eq!(TurnCeiling::Unavailable.as_str(), "unavailable");
         assert_eq!(TurnCeiling::Harness.as_str(), "harness");
+    }
+
+    #[test]
+    fn only_a_late_probe_is_unchecked_every_other_unreadable_answer_is_unsupported() {
+        use std::time::Duration;
+        let late = ProbeFailure::TimedOut {
+            args: "--version".into(),
+            after: Duration::from_secs(30),
+        };
+        assert!(matches!(
+            claude_code_support(None, Some(&late)),
+            Support::Unchecked(_)
+        ));
+        assert_eq!(
+            claude_code_support(Some("2.1.291 (Claude Code)"), None),
+            Support::Supported
+        );
+        for outside in ["2.0.0", "2.2.0", "not a version", ""] {
+            assert!(
+                matches!(
+                    claude_code_support(Some(outside), None),
+                    Support::Unsupported(_)
+                ),
+                "{outside}"
+            );
+        }
+        let exited = ProbeFailure::Refused {
+            args: "--version".into(),
+            ended: "exit 1".into(),
+        };
+        let silent = ProbeFailure::Silent {
+            args: "--version".into(),
+        };
+        let missing = ProbeFailure::NotRun {
+            args: "--version".into(),
+            detail: "No such file".into(),
+        };
+        for failure in [&exited, &silent, &missing] {
+            assert!(
+                matches!(
+                    claude_code_support(None, Some(failure)),
+                    Support::Unsupported(_)
+                ),
+                "{failure}"
+            );
+        }
+        assert!(matches!(
+            claude_code_support(None, None),
+            Support::Unsupported(_)
+        ));
+    }
+
+    /// A fake `claude` that answers `--version` only after `delay`.
+    fn fake_claude(dir: &Path, script: &str) -> ClaudeBackend {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = dir.join("claude");
+        std::fs::write(&binary, script).expect("write");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        // The first exec of a fresh script can take longer than the
+        // probe timeout (Gatekeeper); run it once before the probe.
+        Command::new(&binary).arg("prime").status().expect("prime");
+        ClaudeBackend::with_binary(binary)
+            .expect("backend")
+            .with_probe_timeout(Duration::from_millis(200))
+    }
+
+    /// A fake `claude` that never answers in time, counting its starts.
+    fn slow_claude(dir: &Path, count: &Path) -> ClaudeBackend {
+        fake_claude(
+            dir,
+            &format!(
+                "#!/bin/sh\n[ \"$1\" = prime ] && exit 0\necho x >> {}\nexec sleep 5\n",
+                count.display()
+            ),
+        )
+    }
+
+    fn starts(count: &Path) -> usize {
+        std::fs::read_to_string(count)
+            .expect("count")
+            .lines()
+            .count()
+    }
+
+    #[test]
+    fn a_probe_that_times_out_is_typed_and_stands_until_the_retry() {
+        let dir = crate::test_support::temp_dir("claude-slow");
+        let count = dir.join("count");
+        let backend = slow_claude(&dir, &count);
+        let first = backend.probe_report().expect_err("timed out");
+        assert!(matches!(first, ProbeFailure::TimedOut { .. }), "{first:?}");
+        assert!(first.to_string().contains("did not answer within 0.2s"));
+        assert!(matches!(
+            claude_code_support(None, Some(&first)),
+            Support::Unchecked(_)
+        ));
+        assert_eq!(Harness::probe_timed_out(&backend), Some(first.to_string()));
+        // Every caller of one run start gets the same answer, not a
+        // second wait.
+        assert_eq!(Harness::probe(&backend), None);
+        assert_eq!(starts(&count), 1, "within the retry, no second probe");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_probe_that_timed_out_is_asked_again_after_the_retry() {
+        let dir = crate::test_support::temp_dir("claude-slow-retry");
+        let count = dir.join("count");
+        let backend = slow_claude(&dir, &count).with_timeout_retry(Duration::ZERO);
+        backend.probe_report().expect_err("timed out");
+        let second = backend.probe_report().expect_err("timed out again");
+        assert!(matches!(second, ProbeFailure::TimedOut { .. }));
+        assert_eq!(starts(&count), 2, "past the retry, the binary runs again");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_probe_that_fails_otherwise_is_cached() {
+        let dir = crate::test_support::temp_dir("claude-exit1");
+        let count = dir.join("count");
+        let backend = fake_claude(
+            &dir,
+            &format!(
+                "#!/bin/sh\n[ \"$1\" = prime ] && exit 0\necho x >> {}\nexit 1\n",
+                count.display()
+            ),
+        );
+        let first = backend.probe_report().expect_err("refused");
+        assert!(matches!(first, ProbeFailure::Refused { .. }), "{first:?}");
+        backend.probe_report().expect_err("refused");
+        assert_eq!(starts(&count), 1, "other failures stay cached");
+        assert_eq!(Harness::probe_timed_out(&backend), None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// V13: a binary named relatively is probed in one place and could be

@@ -216,3 +216,13 @@ test('statusOf does not refresh a terminal model that awaits no person', async (
   expect(run.outcome.state).toBe('accepted')
   expect(nativeCalls(engine.calls, 'status').length).toBe(before)
 })
+
+test('an environment_warning event is rendered as a text line', () => {
+  const model = applyEvent(
+    emptyRun('run-w', NOW),
+    { kind: 'environment_warning', what: 'claude_code_version_unchecked', detail: '`claude --version` did not answer within 30s (machine busy?)' },
+    NOW,
+  )
+  expect(model.events.map(e => e.text).join('\n')).toContain('warning · claude_code_version_unchecked')
+  expect(model.events.map(e => e.text).join('\n')).toContain('did not answer within 30s')
+})

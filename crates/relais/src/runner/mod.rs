@@ -2154,6 +2154,16 @@ impl<'a> RunEngine<'a> {
                 }
             }
         };
+        let probe_timeout = match capabilities {
+            Some(_) => None,
+            None => self.config.backend.probe_timed_out(),
+        };
+        if let Some(detail) = &probe_timeout {
+            self.events.emit(Event::EnvironmentWarning {
+                what: "claude_code_version_unchecked".to_string(),
+                detail: detail.clone(),
+            });
+        }
         let assembled = context::assemble(context::ContextInputs {
             contract: self.config.contract,
             repo: self.config.repo_policy,
@@ -2169,9 +2179,11 @@ impl<'a> RunEngine<'a> {
             },
             // Recorded so a receipt says whether a turn ceiling was
             // enforceable at all on this harness (SPEC §11).
-            turn_ceiling: capabilities
-                .map(crate::backend::Capabilities::turn_ceiling)
-                .unwrap_or_default(),
+            turn_ceiling: match (capabilities, &probe_timeout) {
+                (Some(capabilities), _) => capabilities.turn_ceiling().as_str(),
+                (None, Some(_)) => "unknown (timed out)",
+                (None, None) => crate::backend::TurnCeiling::default().as_str(),
+            },
             resolver: self.config.aval_resolver,
             design,
         });

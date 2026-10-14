@@ -5417,20 +5417,34 @@ fn reap_for_status(
 /// Why this `relais run` must not start, if it must not: it comes from the
 /// relais plugin, whose session said hello recently, on a Claude Code the
 /// plugin supports. `installed` is what `claude --version` printed;
-/// `probe_failure` is why the probe could not say, when it could not.
+/// `probe_failure` is why the probe could not say, when it could not. A
+/// probe that merely timed out leaves the version unchecked: one warning
+/// on stderr under `command`'s name, and the run goes on if the hello is
+/// fresh.
 fn run_refusal(
+    command: &str,
     gate: &dyn Gate,
     session: &str,
     installed: Option<&str>,
-    probe_failure: Option<&str>,
+    probe_failure: Option<&relais::adapter::claude::ProbeFailure>,
 ) -> Result<Option<String>, GateError> {
-    if let Some(detail) = relais::native::unsupported_claude_code_because(installed, probe_failure)
-    {
-        return Ok(Some(detail));
+    use relais::adapter::claude::{claude_code_support, Support};
+    let unchecked = match claude_code_support(installed, probe_failure) {
+        Support::Unsupported(detail) => return Ok(Some(detail)),
+        Support::Unchecked(reason) => Some(reason),
+        Support::Supported => None,
+    };
+    let refusal = relais::native::hello_refusal(gate.native_hello_age(session)?);
+    if refusal.is_none() {
+        if let Some(reason) = unchecked {
+            eprintln!(
+                "{command}: warning: Claude Code version unchecked: {reason}; continuing \
+                 (supported: {})",
+                relais::native::SUPPORTED_CLAUDE_CODE
+            );
+        }
     }
-    Ok(relais::native::hello_refusal(
-        gate.native_hello_age(session)?,
-    ))
+    Ok(refusal)
 }
 
 /// A `relais run` starts only from Claude Code with the relais plugin.
@@ -5550,8 +5564,13 @@ fn run_command(
         .as_ref()
         .ok()
         .and_then(|capabilities| capabilities.version.as_deref());
-    let probe_failure = report.as_ref().err().map(ToString::to_string);
-    match run_refusal(&gate, &session.id, installed, probe_failure.as_deref()) {
+    match run_refusal(
+        "relais run",
+        &gate,
+        &session.id,
+        installed,
+        report.as_ref().err(),
+    ) {
         Ok(None) => {}
         Ok(Some(detail)) => return Err(CliError::Usage { detail }),
         Err(e) => {
@@ -6118,8 +6137,13 @@ fn replay_command(
         .as_ref()
         .ok()
         .and_then(|capabilities| capabilities.version.as_deref());
-    let probe_failure = report.as_ref().err().map(ToString::to_string);
-    match run_refusal(&gate, &session.id, installed, probe_failure.as_deref()) {
+    match run_refusal(
+        "relais dataset replay",
+        &gate,
+        &session.id,
+        installed,
+        report.as_ref().err(),
+    ) {
         Ok(None) => {}
         Ok(Some(detail)) => return Err(CliError::Usage { detail }),
         Err(e) => {
@@ -9270,35 +9294,65 @@ mod tests {
 
     #[test]
     fn a_run_is_refused_without_a_recent_hello_or_on_a_claude_code_outside_the_range() {
+        use relais::adapter::claude::ProbeFailure;
         let gate = relais::admission::LocalGate::new(Default::default());
         let supported = Some("2.1.291 (Claude Code)");
-        let silent = run_refusal(&gate, "s1", supported, None)
+        let silent = run_refusal("relais run", &gate, "s1", supported, None)
             .expect("answers")
             .expect("no hello is refused");
         assert!(silent.contains("hello"), "{silent}");
         gate.native_hello("s1").expect("hello");
         assert_eq!(
-            run_refusal(&gate, "s1", supported, None).expect("answers"),
+            run_refusal("relais run", &gate, "s1", supported, None).expect("answers"),
             None
         );
-        assert!(run_refusal(&gate, "other", supported, None)
+        assert!(run_refusal("relais run", &gate, "other", supported, None)
             .expect("answers")
             .is_some());
-        let old = run_refusal(&gate, "s1", Some("2.1.0 (Claude Code)"), None)
-            .expect("answers")
-            .expect("refused");
-        assert!(old.contains(relais::native::SUPPORTED_CLAUDE_CODE), "{old}");
-        assert!(old.contains("2.1.0"), "{old}");
+        for outside in ["2.0.0", "2.2.0", "not a version", "2.1.0 (Claude Code)"] {
+            let refused = run_refusal("relais run", &gate, "s1", Some(outside), None)
+                .expect("answers")
+                .unwrap_or_else(|| panic!("{outside} is refused"));
+            assert!(
+                refused.contains(relais::native::SUPPORTED_CLAUDE_CODE),
+                "{refused}"
+            );
+        }
+        let empty = run_refusal("relais run", &gate, "s1", Some(""), None).expect("answers");
+        assert!(empty.is_some(), "an empty answer is refused");
         let failed = run_refusal(
+            "relais run",
             &gate,
             "s1",
             None,
-            Some("`claude --version` killed by signal 9"),
+            Some(&ProbeFailure::Refused {
+                args: "--version".into(),
+                ended: "exit 1".into(),
+            }),
         )
         .expect("answers")
-        .expect("refused");
-        assert!(failed.contains("killed by signal 9"), "{failed}");
+        .expect("a non-zero exit is refused");
+        assert!(failed.contains("exit 1"), "{failed}");
         assert!(!failed.contains("printed nothing"), "{failed}");
+    }
+
+    #[test]
+    fn a_timed_out_probe_continues_on_a_fresh_hello_and_is_refused_on_a_stale_one() {
+        let gate = relais::admission::LocalGate::new(Default::default());
+        let late = relais::adapter::claude::ProbeFailure::TimedOut {
+            args: "--version".into(),
+            after: std::time::Duration::from_secs(30),
+        };
+        let stale = run_refusal("relais run", &gate, "s1", None, Some(&late))
+            .expect("answers")
+            .expect("no hello is refused");
+        assert!(stale.contains("hello"), "{stale}");
+        gate.native_hello("s1").expect("hello");
+        assert_eq!(
+            run_refusal("relais run", &gate, "s1", None, Some(&late)).expect("answers"),
+            None,
+            "a late probe warns and continues"
+        );
     }
 
     /// A session transcript: one assistant message with this id.
