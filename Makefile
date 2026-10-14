@@ -97,7 +97,7 @@ plugin:
 	fi; \
 	echo "plugin: claude $$(claude --version) (plugin tested on >= $(CLAUDE_CODE_MIN) < $(CLAUDE_CODE_MAX); CI pins $(CLAUDE_CODE_PIN))"
 	claude plugin validate claude-plugin
-	cd claude-plugin && claude plugin test
+	sh scripts/plugin-test.sh
 
 build:
 	$(CARGO) build --release

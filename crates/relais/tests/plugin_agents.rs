@@ -105,6 +105,12 @@ fn each_definition_names_its_own_kind_model_and_effort_and_cannot_spawn() {
             text.contains("Find and follow code with LSP"),
             "{name}: says to navigate with LSP, or the tool goes unused"
         );
+        if matches!(kind, AgentKind::Worker) {
+            assert!(
+                text.contains("relais runs the verification profile's checks after you finish, so do not run the full suite yourself; run only focused tests for what you changed, and finish with DONE once those pass."),
+                "{name}: carries the run-focused-tests rule"
+            );
+        }
         assert_eq!(
             field(&fields, "maxTurns"),
             max_turns_of(kind),
