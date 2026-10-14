@@ -148,5 +148,27 @@ One PR, reviewable commits: (1) SPEC + ADR-0008 + plan, (2) `fsclone` + deps + s
 - D6 no byte-copy fallback, ever; D7 only git-ignored paths are seeded.
 - D8 (person's review, 2026-10-13) setup is skipped only per step, only when the step declares `reuse` (inputs, outputs, verify) and all three hold; the default is that every step runs on a seeded tree. Mtime/count never authorize.
 - D9 `.venv` is not seeded. D10 a finalization decision is persisted before the tree is touched, restore is a preflighted idempotent diff-apply, and the worker runs with the temp index: relais promises detection and recovery evidence, not byte-identity against a worker that bypasses it.
+- D11 (implementation) A worker is a native Claude Code agent that inherits the session environment, so relais cannot hand it a private `GIT_INDEX_FILE`; setup steps run without one too. relais builds its own snapshots in a private index and **detects** a changed real index (`git ls-files -s` at start vs end), keeping `<git-dir>/relais-inplace/<run>.index.orig`. SPEC §8 and ADR-0008 promise detection, not containment. Supersedes the "worker.index" wording in D10.
+- D12 No ledger step 31: an in-place run is found by its marker under the git dir and `run_workspace().repo_path`, so no new columns are needed. `resume --retire <run>` recovers it; `resume --retire` with no run id does not scan for in-place runs (the block message names the run id).
+- D13 The baseline cache still stores failed labels only; a hit cannot reuse the base's check outcomes (`holds-until` in `runner/mod.rs`). Not the `Baseline.checks` shortcut the plan listed.
+- D14 The isolated-unchanged acceptance is the existing ~1500-test suite (every one runs `Isolated`), the pinned authority-hash tests, and `an_isolated_run_says_nothing_about_workspaces_and_seeds_nothing`; no byte-golden fixture from v0.19.0 was generated.
+- D15 No `installing` lock for relais-owned setups and no `doctor` workspace line. The quiet check looks two levels deep (`holds-until` in `reuse.rs`): a full walk of happier's `node_modules` took 37 s, depth 2 takes 0.47 s, and the check authorizes nothing.
+- D16 Absolute symlinks INTO the source workspace are relocated to the destination (found on happier: `node_modules/react-native -> <checkout>/apps/ui/node_modules/react-native`); any other absolute link aborts that tree's seed. This replaces the plan's "absolute target refused".
+
+## Outcome (observed before the push)
+
+| Check | Input → expected → actual |
+|---|---|
+| 1 disk | `clonefile` of happier-wt-n1 `node_modules` (4.9 GB, 286k files) → seconds, near-zero disk → 17 s, free space moved by 109 MiB on a noisy 8 GB-free disk (2.2 %); `fsclone` unit test: clone counts and layout hold; `a_large_clone_adds_almost_no_disk` (ignored, run alone, APFS) passes |
+| 2 skip | `a_fork_skips_a_step_only_when_it_proved_its_result`: stamped source → no `*-setup0.log` in base/task/attempt; changed tracked input → step runs and fails the run. `reuse.rs` unit tests: key moves with lockfile, manifest, patch, argv, toolchain, earlier step; outputs missing, empty or `verify` failing → run |
+| 3 primary | `explicit_in_place_is_refused_rather_than_downgraded` (resolve) and the CLI refusal text; in a linked worktree `an_accepted_in_place_run_*` runs |
+| 4 isolated | existing suite unchanged and green; `an_isolated_run_says_nothing_*` (D14) |
+| 5 base reuse | `a_baseline_verdict_is_keyed_by_the_tree_not_the_commit`: empty commit between runs → cached; changed tree → miss |
+| 6 failures | `workspace::inplace` (9): busy, interrupted, clean/dirty start with the real index and `git status` unchanged, restore of edits/additions/deletions, ignored files kept, file↔directory both ways, symlink→directory, collision blocks and deletes nothing, finalize exports once, crash after deciding finishes the persisted target, `HEAD` moved leaves tree and branch. Runner: accepted left applied beside uncommitted work, failed restored, held/interrupted blocked with the remedy, `a_worker_that_stages_into_the_real_index_*` keeps `.index.orig` |
+| 7 cost | happier: survey 8 s, depth-2 fingerprint 0.47 s, clone 17 s → a seed is about 25 s, under the plan's 60 s line |
+| 8 plugin | `claude plugin validate` and `claude plugin test` pass, including the two `workspace` tests |
+
+Not run: a full `relais run` through the plugin on happier-wt-n1 (a run starts only from a Claude Code session with the plugin installed); the person's pilot after release.
+
 
 <!-- panel: repos=relais reviewers=backend,language,tui,unix body-sha=83fdb871c362 -->

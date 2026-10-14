@@ -148,6 +148,8 @@ fn survey_links(repo_root: &Path, dir: &Path) -> Result<(CloneStats, Vec<PathBuf
 pub fn probe(source_file: &Path, dest_dir: &Path) -> Result<(), CloneError> {
     let probe_path = dest_dir.join(format!(".relais-cow-probe-{}", std::process::id()));
     let result = crate::procs::clone_file(source_file, &probe_path);
+    // The probe file is a one-byte scratch; the clone's own result is what
+    // is reported, and a leftover with this process id is overwritten next time.
     let _ = fs::remove_file(&probe_path);
     result.map_err(|e| classify(e, source_file, dest_dir))
 }
@@ -167,12 +169,14 @@ pub fn clone_tree(
         fs::create_dir_all(parent)?;
     }
     if let Err(e) = clone_directory(src, dst) {
+        // Remove the partial tree; the clone's error is the one reported.
         let _ = fs::remove_dir_all(dst);
         return Err(classify(e, src, dst));
     }
     match relocate_links(repo_root, dest_root, dst, &absolute) {
         Ok(moved) => stats.relocated = moved,
         Err(e) => {
+            // Same: the relocation error is the one reported.
             let _ = fs::remove_dir_all(dst);
             return Err(CloneError::Io(e));
         }

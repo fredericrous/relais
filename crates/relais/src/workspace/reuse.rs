@@ -291,6 +291,11 @@ fn first_regular_file(dir: &Path) -> Option<PathBuf> {
 
 // ---------------------------------------------------------- quiescence
 
+/// holds-until: a clone of a half-written install is observed that a check
+/// of the first two levels called quiet. The check has no authority: every
+/// setup step runs after a seed, and a `reuse` skip needs its own outputs
+/// and `verify`, so a wrong answer here costs an install, never a verdict.
+///
 /// How deep the quietness check looks. A whole `node_modules` (333,000
 /// entries on happier) took 37 s to walk on a loaded machine, more than the
 /// politeness is worth; an install adds and removes packages at the top two
@@ -355,6 +360,8 @@ pub fn wait_until_quiet(
     }
     let mut waited = Duration::ZERO;
     let mut stable = Duration::ZERO;
+    // An unreadable tree is a changing one: two failures in a row must not
+    // compare equal and read as stable.
     let mut last = tree_fingerprint(dir).ok();
     while stable < quiet_for {
         if waited >= give_up {
@@ -363,7 +370,7 @@ pub fn wait_until_quiet(
         sleep(poll);
         waited += poll;
         let now = tree_fingerprint(dir).ok();
-        if now == last {
+        if now.is_some() && now == last {
             stable += poll;
         } else {
             stable = Duration::ZERO;

@@ -242,11 +242,20 @@ impl Lease {
     /// The end of a clean run: the marker and the run's private files go,
     /// last. The original-index copy stays when the real index changed.
     pub fn finish(self, keep_original_index: bool) -> io::Result<()> {
-        let _ = std::fs::remove_file(self.relais_index());
-        if !keep_original_index {
-            let _ = std::fs::remove_file(self.orig_index());
+        // The run's private files are scratch: one left behind costs disk
+        // and nothing else, so a failure to remove them must not keep the
+        // marker alive and make the next run read a finished one as dead.
+        // The marker is the record, and its removal is the one that counts.
+        for scratch in [self.relais_index(), self.dir.join(HOLDER_FILE)]
+            .into_iter()
+            .chain((!keep_original_index).then(|| self.orig_index()))
+        {
+            if let Err(e) = std::fs::remove_file(&scratch) {
+                if e.kind() != io::ErrorKind::NotFound {
+                    eprintln!("relais: {} was not removed: {e}", scratch.display());
+                }
+            }
         }
-        let _ = std::fs::remove_file(self.dir.join(HOLDER_FILE));
         std::fs::remove_file(marker_path(&self.dir, &self.run))
     }
 
@@ -294,7 +303,15 @@ pub struct Start {
 /// `.relais/` scratch excluded) built in the private `index`, which is
 /// reset to `HEAD` first so nothing from a previous call leaks in.
 pub fn working_tree(root: &Path, index: &Path) -> io::Result<String> {
-    let _ = std::fs::remove_file(index);
+    // A stale private index is rebuilt below; one that cannot be removed
+    // fails the `read-tree` that follows, which is reported.
+    std::fs::remove_file(index).or_else(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(e)
+        }
+    })?;
     git_text(root, Some(index), &["read-tree", "HEAD"])?;
     git_text(
         root,
@@ -574,7 +591,13 @@ pub fn apply_tree(root: &Path, index: &Path, target_tree: &str) -> Result<(), Ap
         (Change::Write(a), Change::Write(b)) => a.cmp(b),
         _ => std::cmp::Ordering::Equal,
     });
-    let _ = std::fs::remove_file(index);
+    std::fs::remove_file(index).or_else(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(e)
+        }
+    })?;
     git_text(root, Some(index), &["read-tree", target_tree])?;
     for change in &plan {
         let Change::Write(path) = change else {

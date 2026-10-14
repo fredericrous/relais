@@ -2287,6 +2287,11 @@ impl<'a> RunEngine<'a> {
         // The baseline's check outcomes are kept: a candidate identical to
         // the base has exactly these results, without re-running them.
         let (failures, checks) = match cached {
+            // holds-until: the cache stores failed labels only, so a hit
+            // cannot reuse the base's check outcomes for a candidate that
+            // carries the base tree (the candidate's checks run again, which
+            // costs time and never a verdict). It ends when the cache keeps
+            // the outcomes, which needs them serializable (ADR-0008).
             Some(failures) => (failures, None),
             None => match verify::verification_worktree(
                 self.config.git,
