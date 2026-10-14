@@ -11,6 +11,7 @@
 //! They live here, with no shell and no fake worker anywhere.
 
 mod common;
+#[cfg(unix)]
 mod fake_bin;
 
 use std::path::{Path, PathBuf};
